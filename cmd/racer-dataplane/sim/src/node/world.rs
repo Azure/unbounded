@@ -104,8 +104,8 @@ pub struct ClientRead {
 #[derive(Clone, Copy, Debug)]
 pub enum Want {
     Client(ClientRead),
-    /// A peer request waiting at its destination: an acquire, or a
-    /// copy-only request joined to a running acquisition (`copy_only`).
+    /// A peer request waiting at its destination: an acquire, or a copy-only request joined to a
+    /// running acquisition (`copy_only`).
     Peer {
         msg: u64,
         copy_only: bool,
@@ -118,9 +118,7 @@ pub enum Reply {
     /// The exchange failed without a signed response.
     Transport,
     Response(ResponseKind),
-    /// `Overloaded` signed by the destination itself, not by a relay
-    /// (production: `VerifiedResponse::origin` is the destination). The
-    /// walk reports it as `Outcome::Shed`.
+    /// `Overloaded` signed by the destination itself, not by a relay.
     Shed,
 }
 
@@ -170,10 +168,10 @@ pub enum Event {
         node: u32,
         factor: u8,
     },
-    /// The waiter a fill serves reached its deadline while the fill's origin
-    /// request was outstanding: hand the fill over to another live waiter,
-    /// or cancel it like production's fill driver (`src/read/fill.rs`,
-    /// `FlightOperation::poll_cancellation` and `owned_scope.cancel()`).
+    /// The waiter a fill serves reached its deadline while the fill's origin request was
+    /// outstanding: hand the fill over to another live waiter, or cancel it like production's fill
+    /// driver (`src/read/fill.rs`, `FlightOperation::poll_cancellation` and
+    /// `owned_scope.cancel()`).
     OriginCancel {
         fill: u64,
     },
@@ -183,8 +181,8 @@ pub enum Event {
     HedgeDelay {
         fill: u64,
     },
-    /// A relayed reply finished streaming (or was abandoned): release the
-    /// relays' `Relay` reservations held under `id`.
+    /// A relayed reply finished streaming (or was abandoned): release the relays' `Relay`
+    /// reservations held under `id`.
     Release {
         id: u64,
     },
@@ -192,17 +190,16 @@ pub enum Event {
     Slice {
         task: u64,
     },
-    /// A fill's wait for a destination that is behind ended (Known issue 26).
+    /// A fill's wait for a destination that is behind ended.
     StaleWait {
         fill: u64,
     },
-    /// Orphan notices of `node` may be due (Known issue 37).
+    /// Orphan notices of `node` may be due.
     Notice {
         node: u32,
     },
-    /// The requester of `msg` gives up: if its destination has not answered
-    /// the last link's sender by now, that sender notes the timeout (Known
-    /// issues 41 and 43).
+    /// The requester of `msg` gives up: if its destination has not answered the last link's sender
+    /// by now, that sender notes the timeout.
     LastHop {
         msg: u64,
     },
@@ -262,8 +259,8 @@ type TaskFuture = Pin<Box<dyn Future<Output = Result<Vec<usize>, topology::Error
 
 /// What to do with a finished ranking or route search.
 enum Then {
-    /// A ranking a fill's acquisition asked for (`Action::Rank`) under
-    /// membership `version`; `recent` for `Ranking::Previous`.
+    /// A ranking a fill's acquisition asked for (`Action::Rank`) under membership `version`;
+    /// `recent` for `Ranking::Previous`.
     Ranked {
         fill: u64,
         ranking: Ranking,
@@ -279,9 +276,8 @@ enum Then {
     },
 }
 
-/// A yielding ranking or route search: the real future, polled once per
-/// simulated CPU slice on its worker's CPU FIFO (see the design doc,
-/// "Round 2: fidelity").
+/// A yielding ranking or route search: the real future, polled once per simulated CPU slice on its
+/// worker's CPU FIFO (see the design doc, "Round 2: fidelity").
 struct Task {
     node: u32,
     worker: u8,
@@ -295,14 +291,12 @@ struct Task {
     route: bool,
     then: Then,
     done: Option<Result<Vec<usize>, topology::Error>>,
-    /// Pending without having woken itself: waiting in the route search
-    /// queue (`Paths::with_queue`) until another task wakes it.
+    /// Pending without having woken itself: waiting in the route search queue (`Paths::with_queue`)
+    /// until another task wakes it.
     parked: bool,
 }
 
-/// A task waker: records the task id so the world can schedule its next
-/// slice. Searches wake themselves after each step; a queued search is woken
-/// by the task that frees a slot.
+/// A task waker: records the task id so the world can schedule its next slice.
 struct TaskWaker {
     task: u64,
     woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
@@ -331,15 +325,13 @@ struct Fill {
     core: racer_core::read::walk::Fill,
     budget: AcquisitionBudget,
     scope: Instant,
-    /// Kind of the pending granted probe, for counters: `successor`,
-    /// `lineage` or `demoted`.
+    /// Kind of the pending granted probe, for counters: `successor`, `lineage` or `demoted`.
     granted_kind: Option<&'static str>,
     /// The outstanding walk probe's answer and mode, for `Action::Validate`.
     kind: ResponseKind,
     acquire: bool,
     probe: Option<u64>,
-    /// Granted probes sent at once (`Step::Granted`), and whether one of
-    /// them returned a copy.
+    /// Granted probes sent at once (`Step::Granted`), and whether one of them returned a copy.
     batch: Vec<BatchProbe>,
     batch_copy: bool,
     /// The leader's retention observation, used at publication.
@@ -353,25 +345,24 @@ struct Fill {
     sent: Nanos,
     /// Why the outstanding walk probe failed in transport, if it did.
     cut: Option<Cut>,
-    /// The outstanding walk probe's answer was signed by a relay on the
-    /// route rather than by its destination (Known issue 38).
+    /// The outstanding walk probe's answer was signed by a relay on the route rather than by its
+    /// destination.
     relayed: bool,
-    /// Walk probes so far: destination and how each ended (repeat
-    /// classification, [`NodeWorld::classify_repeat`]).
+    /// Walk probes so far: destination and how each ended (repeat classification,
+    /// [`NodeWorld::classify_repeat`]).
     asked: Vec<(u32, Asked)>,
     /// Diagnostic (`RACER_SIM_TRACE_FAILED`): each walk probe's outcome.
     outcomes: Vec<String>,
     /// Outstanding origin request and its outcome (drawn at issue).
     origin: Option<(OriginHandle, OriginOutcome)>,
-    /// The fill was canceled at its scope (Known issue 29).
+    /// The fill was canceled at its scope.
     canceled: bool,
     /// Its origin request overlapped another node's request for the page
-    /// (`origin_repeats_concurrent`, Known issue 31).
+    /// (`origin_repeats_concurrent`).
     concurrent: bool,
 }
 
-/// A due copy offer: keyed by page and the target's owner rank (Known issue
-/// 51).
+/// A due copy offer: keyed by page and the target's owner rank.
 type OfferDue = Due<(u64, u8), u32>;
 
 /// How one walk probe ended, for repeat classification.
@@ -381,13 +372,11 @@ enum Asked {
     Miss,
     /// Transport failure, and why (see [`Cut`]).
     Unreachable(Cut),
-    /// The destination answered with a failure of its own (for a
-    /// delegation: rank 0's own acquisition, such as its origin request,
-    /// failed).
+    /// The destination answered with a failure of its own (for a delegation: rank 0's own
+    /// acquisition, such as its origin request, failed).
     Failed,
-    /// A relay on the route answered with a failure (`Unavailable` signed
-    /// by the relay, `fail_hop`): the destination never saw the request
-    /// (Known issue 38).
+    /// A relay on the route answered with a failure (`Unavailable` signed by the relay,
+    /// `fail_hop`): the destination never saw the request.
     Relayed,
     /// The destination or a relay shed the request, or it was behind.
     Busy,
@@ -398,8 +387,7 @@ enum Asked {
 /// Why a walk probe failed in transport (repeat classification).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Cut {
-    /// A node on the way, or the destination, is a member that does not
-    /// serve yet (no membership; Known issue 14).
+    /// A node on the way, or the destination, is a member that does not serve yet.
     NotServing,
     /// A site partition cut a link on the way.
     Partition,
@@ -458,8 +446,8 @@ fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
     }
 }
 
-/// `origin_repeats_concurrent_skip_<skip>`: a concurrent repeat by an owner
-/// above rank 0, by why it skipped rank 0 (Known issue 31).
+/// `origin_repeats_concurrent_skip_<skip>`: a concurrent repeat by an owner above rank 0, by why it
+/// skipped rank 0.
 fn concurrent_counter(skip: &'static str) -> &'static str {
     match skip {
         "not_serving" => "origin_repeats_concurrent_skip_not_serving",
@@ -487,8 +475,7 @@ struct LastOrigin {
     ok: Option<bool>,
     /// When it completed.
     done: Nanos,
-    /// For a fetch by an owner above rank 0: why rank 0 did not serve it
-    /// (`origin_skips_*`).
+    /// For a fetch by an owner above rank 0: why rank 0 did not serve it (`origin_skips_*`).
     skip: Option<&'static str>,
     /// Membership version of that request.
     version: u64,
@@ -524,9 +511,8 @@ struct Waiting {
     want: Want,
     /// Retention observation latched when this operation joined.
     eligible: bool,
-    /// Budget and plaintext need, kept so a waiter re-elected after the
-    /// leader's origin rejection can lead its own fill.
-    /// `None` once this waiter leads (its fill owns the budget).
+    /// Budget and plaintext need, kept so a waiter re-elected after the leader's origin rejection
+    /// can lead its own fill.
     budget: Option<AcquisitionBudget>,
     plaintext: bool,
 }
@@ -552,10 +538,9 @@ struct Msg {
     relay_first: Nanos,
     /// A pinned single-link hedge exchange.
     direct: bool,
-    /// An orphan notice's copy offer (Known issue 37): answered `Miss`
-    /// without a body.
+    /// An orphan notice's copy offer: answered `Miss` without a body.
     offer: bool,
-    /// A silence ping (Known issues 41 and 43): answered `Miss` at once.
+    /// A silence ping: answered `Miss` at once.
     ping: bool,
 }
 
@@ -571,21 +556,19 @@ struct SimPing {
 struct Probing {
     fill: u64,
     acquire: bool,
-    /// Remote credits the request carried, refunded on a verified
-    /// `StaleMembership` (`AcquisitionBudget::refund_remote`).
+    /// Remote credits the request carried, refunded on a verified `StaleMembership`
+    /// (`AcquisitionBudget::refund_remote`).
     remote: u32,
     /// Links the request was charged (`AttemptPlan::links`).
     links: u8,
-    /// Links the answer travelled back over (`forwarders + 1` on a verified
-    /// production answer), set when the answer is sent.
+    /// Links the answer travelled back over (`forwarders + 1` on a verified production answer), set
+    /// when the answer is sent.
     hops: usize,
     /// `Some(true)` for a hedge primary, `Some(false)` for its duplicate.
     hedge: Option<bool>,
-    /// Index in the fill's `batch`: one of a run of granted probes sent at
-    /// once (`Step::Granted`, Known issue 45).
+    /// Index in the fill's `batch`: one of a run of granted probes sent at once (`Step::Granted`).
     granted: Option<usize>,
-    /// The destination, and when the request was sent (silence evidence
-    /// on a timeout).
+    /// The destination, and when the request was sent (silence evidence on a timeout).
     dest: u32,
     sent: Nanos,
 }
@@ -598,7 +581,7 @@ struct BatchProbe {
     kind: &'static str,
     /// Why it failed in transport, if it did (first cause wins).
     cut: Option<Cut>,
-    /// A relay on the route signed its answer (Known issue 38).
+    /// A relay on the route signed its answer.
     relayed: bool,
     /// Answered (or timed out).
     done: bool,
@@ -685,8 +668,8 @@ fn response_kind(r: Response) -> ResponseKind {
     }
 }
 
-/// Production link backoff (`racer_core::route::link_backoff`), with jitter
-/// from a fixed mix instead of SHA-256 of the node name.
+/// Production link backoff (`racer_core::route::link_backoff`), with jitter from a fixed mix
+/// instead of SHA-256 of the node name.
 fn link_backoff(node: &u32, failures: u32) -> Duration {
     racer_core::route::link_backoff(
         failures,
@@ -717,39 +700,36 @@ pub struct NodeWorld {
     tokens: HashMap<u64, Waiting, Fixed>,
     msgs: HashMap<u64, Msg, Fixed>,
     probes: HashMap<u64, Probing, Fixed>,
-    /// Outstanding copy offers: the sending node, its incarnation, and the
-    /// notice (Known issue 37).
+    /// Outstanding copy offers: the sending node, its incarnation, and the notice.
     offers: HashMap<u64, (u32, u32, OfferDue), Fixed>,
-    /// Outstanding offers a relay answered (Known issue 50: cut evidence).
+    /// Outstanding offers a relay answered (cut evidence).
     offers_relayed: HashSet<u64, Fixed>,
     ranges: HashMap<u64, RangeRead, Fixed>,
     writes: HashMap<u64, SimCharge, Fixed>,
     /// Relay reservations of replies still streaming (see `Event::Release`).
     held: HashMap<u64, Vec<SimCharge>, Fixed>,
-    /// End times of page bodies each (node, page) is still streaming
-    /// (production: page responses being written, `send_http_response`).
+    /// End times of page bodies each (node, page) is still streaming (production: page responses
+    /// being written, `send_http_response`).
     streaming: HashMap<(u32, u64), Vec<Nanos>, Fixed>,
     /// End times of all page bodies each node is still streaming.
     bodies: HashMap<u32, Vec<Nanos>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
-    /// Per page, origin requests classified `origin_repeats_after_failure`
-    /// (the previous request for the page failed). Known issue 55: the
-    /// worst pages are such retries; the report's
+    /// Per page, origin requests classified `origin_repeats_after_failure` (the previous request
+    /// for the page failed); the report's
     /// `max_requests_per_page_excluding_failure_retries` leaves them out.
     failure_retries_per_page: HashMap<u64, u32, Fixed>,
-    /// Earliest scheduled [`Event::OriginWake`], which delivers origin
-    /// completions a cancellation moved earlier ([`Origin::pop_moved`]), so
-    /// a cancellation schedules one event, not one per moved request.
+    /// Earliest scheduled [`Event::OriginWake`], which delivers origin completions a cancellation
+    /// moved earlier ([`Origin::pop_moved`]), so a cancellation schedules one event, not one per
+    /// moved request.
     origin_wake: Option<Nanos>,
-    /// Per page: the node that last asked origin for it and the page's rank 0
-    /// under that request's membership (see [`Self::classify_repeat`]).
+    /// Per page: the node that last asked origin for it and the page's rank 0 under that request's
+    /// membership (see [`Self::classify_repeat`]).
     last_origin: HashMap<u64, LastOrigin, Fixed>,
     tasks: HashMap<u64, Task, Fixed>,
-    /// When each currently down node went down (Known issue 7 evidence).
+    /// When each currently down node went down.
     down_since: HashMap<u32, Nanos, Fixed>,
-    /// Messages sent over their last link and not answered yet: the sender
-    /// of that link, the destination, the page and the send time (Known issues 41
-    /// and 43).
+    /// Messages sent over their last link and not answered yet: the sender of that link, the
+    /// destination, the page and the send time.
     last_hops: HashMap<u64, (u32, u32, u64, Nanos), Fixed>,
     /// Outstanding silence pings by probe id.
     pings: HashMap<u64, SimPing, Fixed>,
@@ -757,13 +737,13 @@ pub struct NodeWorld {
     woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     publish_scheduled: bool,
     profile: Profile,
-    /// Diagnostic (`RACER_SIM_TRACE_FAILED`): per (node, page), why its
-    /// failed fills failed, printed when a client read of it fails.
+    /// Diagnostic (`RACER_SIM_TRACE_FAILED`): per (node, page), why its failed fills failed,
+    /// printed when a client read of it fails.
     failed_trace: Option<HashMap<(u32, u64), Vec<String>, Fixed>>,
 }
 
-/// Host wall time spent in the real topology code, for the report only
-/// (never feeds simulated time or decisions).
+/// Host wall time spent in the real topology code, for the report only (never feeds simulated time
+/// or decisions).
 #[derive(Debug, Default)]
 struct Profile {
     rank_ns: u64,
@@ -781,11 +761,8 @@ impl NodeWorld {
         Self::build(config, seed, false)
     }
 
-    /// Combined mode: membership versions come from the control plane
-    /// ([`Self::commit_membership`]) and each node adopts the version its
-    /// control client applied ([`Self::apply_membership`]). No node is
-    /// enrolled until its client applies a version; until then it neither
-    /// reads nor accepts peer links.
+    /// Combined mode: membership versions come from the control plane ([`Self::commit_membership`])
+    /// and each node adopts the version its control client applied ([`Self::apply_membership`]).
     pub fn new_combined(config: Config, seed: u64) -> Self {
         Self::build(config, seed, true)
     }
@@ -964,8 +941,8 @@ impl NodeWorld {
         true
     }
 
-    /// Combined mode: the control plane committed membership `number` with
-    /// `members` (node ids) at `now`. Prunes versions no live node needs.
+    /// Combined mode: the control plane committed membership `number` with `members` (node ids) at
+    /// `now`. Prunes versions no live node needs.
     pub fn commit_membership(&mut self, number: u64, members: Vec<u32>, now: Nanos) {
         let started = wall_clock();
         let added = self.versions.commit(number, members, now);
@@ -978,8 +955,8 @@ impl NodeWorld {
         self.prune_versions();
     }
 
-    /// Combined mode: `node`'s control client applied `number` (0 when the
-    /// client restarted and has no snapshot yet).
+    /// Combined mode: `node`'s control client applied `number` (0 when the client restarted and has
+    /// no snapshot yet).
     pub fn apply_membership(&mut self, node: u32, number: u64) {
         if self.valid(node) {
             self.versions.apply(node, number);
@@ -1045,14 +1022,13 @@ impl NodeWorld {
                             self.hedge_result(p.fill, primary, Err(Error::Unavailable))
                         }
                         None if let Some(index) = p.granted => {
-                            // A granted probe of a batch is never rank 0's:
-                            // its timeout only demotes, as a sequential
-                            // granted probe's does (Known issues 41 and 45).
+                            // A granted probe of a batch is never rank 0's: its timeout only
+                            // demotes, as a sequential granted probe's does.
                             self.requester_timeout(p.fill, p.dest, p.sent, NO_PING);
                             self.complete_batch_probe(p.fill, index, Ok(Outcome::TimedOut))
                         }
-                        // Sent, but unanswered within the attempt's own bound
-                        // (production `request_traced`, attempt scope).
+                        // Sent, but unanswered within the attempt's own bound (production
+                        // `request_traced`, attempt scope).
                         None => {
                             if let Some(fill) = self.fills.get_mut(&p.fill) {
                                 fill.probe = None;
@@ -1086,8 +1062,7 @@ impl NodeWorld {
                     self.down_since.remove(&node);
                     self.fabric.reset_node(node, self.now());
                     self.metrics.incr("restarts");
-                    // The restarted process's membership chain starts at
-                    // the membership it finds (Known issue 25).
+                    // The restarted process's membership chain starts at the membership it finds.
                     self.nodes[node as usize].lineage_base = self
                         .versions
                         .get(self.versions.latest_number())
@@ -1164,8 +1139,8 @@ impl NodeWorld {
         self.down_since.insert(node, self.now());
     }
 
-    /// Adopt the newest membership version visible to `node` now, running
-    /// placement maintenance on every worker when it changes.
+    /// Adopt the newest membership version visible to `node` now, running placement maintenance on
+    /// every worker when it changes.
     fn adopt(&mut self, node: u32) -> u64 {
         let now = self.now();
         let version = self.versions.adopted(node, now);
@@ -1224,10 +1199,8 @@ impl NodeWorld {
             self.metrics.incr("reads_skipped_not_enrolled");
             return;
         }
-        // Not listed in the membership it holds: production `/readyz` is
-        // false (`WorkerApplication::membership_usable`) and a read could
-        // not route. A new node is listed only after it serves (Known
-        // issue 14), a little after it applied its first membership.
+        // Not listed in the membership it holds: production `/readyz` is false
+        // (`WorkerApplication::membership_usable`) and a read could not route.
         if self
             .versions
             .adopted(node, now)
@@ -1365,10 +1338,8 @@ impl NodeWorld {
         let costs = self.fabric.costs;
         let t = self.fabric.cpu(now, node, w, costs.request_ns);
         let peer = matches!(want, Want::Peer { .. });
-        // Production observes retention once per client operation, before
-        // the memory lookup result is used (`src/read/fill.rs`
-        // `acquire_with_prefetch`: `retention.observe` on a plaintext hit and
-        // before joining a flight); peer acquires use `owned_only`.
+        // Production observes retention once per client operation, before the memory lookup result
+        // is used (`src/read/fill.rs` `acquire_with_prefetch`.
         let eligible = if peer {
             self.owned(node, w, page)
         } else {
@@ -1524,9 +1495,9 @@ impl NodeWorld {
             }
             Ok(FlightEvent::Failed(e)) | Err(e) => Err(e),
             Ok(FlightEvent::Lead) if waiting.budget.is_some() => {
-                // The previous leader's origin attempt was rejected for its
-                // credentials (`PageFlights::finish`); this waiter fills with
-                // its own budget, as production re-elects in `Flights::fail`.
+                // The previous leader's origin attempt was rejected for its credentials
+                // (`PageFlights::finish`); this waiter fills with its own budget, as production
+                // re-elects in `Flights::fail`.
                 self.metrics.incr("flight_reelected");
                 let mut waiting = waiting;
                 let budget = waiting.budget.take().expect("checked");
@@ -1540,8 +1511,7 @@ impl NodeWorld {
                 return;
             }
             Ok(FlightEvent::Lead) => {
-                // A waiter whose budget already moved to a fill cannot lead
-                // twice.
+                // A waiter whose budget already moved to a fill cannot lead twice.
                 self.metrics.incr("flight_unexpected_lead");
                 worker.flights.cancel(&page_id, waiting.id, &mut wakes);
                 Err(Error::Unavailable)
@@ -1630,11 +1600,11 @@ impl NodeWorld {
                             if self.hangs
                                 && crate::faults::hung(&self.config.faults, r.node, self.now())
                             {
-                                // The reader's own peer server hangs: the
-                                // answers to its requests are lost.
+                                // The reader's own peer server hangs: the answers to its requests
+                                // are lost.
                                 self.metrics.incr("reads_failed_on_hung_nodes");
                             } else if self.hangs {
-                                // Whose hang it was (Known issues 39, 41).
+                                // Whose hang it was.
                                 let now = self.now();
                                 let owners = self.owners_at(r.node, 0, r.page, true);
                                 let hung =
@@ -1648,8 +1618,7 @@ impl NodeWorld {
                                 });
                             }
                             if self.versions.unready_members() > 0 {
-                                // Known issue 17: reads failing while some
-                                // member cannot serve yet.
+                                // Reads failing while some member cannot serve yet.
                                 self.metrics.incr("reads_failed_while_members_unready");
                             }
                             self.range_slot_done(r, false);
@@ -1672,8 +1641,8 @@ impl NodeWorld {
                                 now / MILLIS
                             ));
                         }
-                        // Production notes a failed acquire, not a failed
-                        // copy-only wait (`Coordinator::serve_peer`).
+                        // Production notes a failed acquire, not a failed copy-only wait
+                        // (`Coordinator::serve_peer`).
                         if !copy_only {
                             self.note_hint(dest, page, m.requester, false);
                         }
@@ -1685,10 +1654,7 @@ impl NodeWorld {
         }
     }
 
-    /// Production `Coordinator::serve_peer` (Known issue 21): `node` holds
-    /// no copy of `page` and a hint naming another current owner that
-    /// fetched it after `node` answered it without a copy; a non-owner
-    /// requester is answered `Miss` and asks that owner next.
+    /// Production `Coordinator::serve_peer`.
     fn defer_to_successor(&mut self, node: u32, page: u64, requester: u32) -> bool {
         if !self.config.node.successor_hints {
             return false;
@@ -1706,9 +1672,7 @@ impl NodeWorld {
         if hints.is_empty() {
             let all = n.hints.peek(&page, instant);
             if !all.is_empty() {
-                // Known issue 58: the requester came back after a deferral.
-                // Why the hinted owner it was most likely sent to did not
-                // serve it, as of now.
+                // The requester came back after a deferral.
                 self.metrics.incr("successor_deferrals_declined_returning");
                 let owners = self.owners_at(node, w, page, false);
                 if let Some(to) = successor_deferral(all, &node, &requester, &owners) {
@@ -1746,7 +1710,7 @@ impl NodeWorld {
             return false;
         };
         if self.down_since.contains_key(&to) {
-            // Known issue 58: deferred to a crashed owner (simulator truth).
+            // Deferred to a crashed owner (simulator truth).
             self.metrics.incr("successor_deferrals_to_down");
         }
         self.nodes[node as usize]
@@ -1755,10 +1719,9 @@ impl NodeWorld {
         true
     }
 
-    /// Arrival generations of `owners` in `node`'s membership chain
-    /// (production `Membership::since`): the shared chain clamped to the
-    /// generation this node's process started from (Known issue 25).
-    /// The generation `node`'s membership chain began at (production: 0).
+    /// Arrival generations of `owners` in `node`'s membership chain (production
+    /// `Membership::since`): the shared chain clamped to the generation this node's process started
+    /// from.
     fn chain_base(&self, node: u32) -> u32 {
         self.versions
             .chain_base(node)
@@ -1782,9 +1745,9 @@ impl NodeWorld {
             .collect()
     }
 
-    /// The page's owners under the membership `at` adopted, ranking them
-    /// when `rank` (production `CandidatePolicy::candidates_scoped`) or only
-    /// from the placement cache (production `Placement::cached`).
+    /// The page's owners under the membership `at` adopted, ranking them when `rank` (production
+    /// `CandidatePolicy::candidates_scoped`) or only from the placement cache (production
+    /// `Placement::cached`).
     fn owners_at(&self, at: u32, w: u8, page: u64, rank: bool) -> Vec<u32> {
         let n = &self.nodes[at as usize];
         let Some(version) = self.versions.get(n.version) else {
@@ -1805,10 +1768,7 @@ impl NodeWorld {
     }
 
     /// `node` answered `requester`'s page probe without a copy (production
-    /// `Coordinator::serve_peer`, Known issue 21). A copy-only miss is noted
-    /// without ranking (`successor_deferral` checks ownership); a failed
-    /// acquisition checks the ranking its own walk cached, so neither path
-    /// ranks a page or disturbs the placement cache.
+    /// `Coordinator::serve_peer`).
     fn note_hint(&mut self, node: u32, page: u64, requester: u32, copy_only: bool) {
         if !self.config.node.successor_hints || node == requester {
             return;
@@ -1827,9 +1787,9 @@ impl NodeWorld {
     pub(super) fn memory_insert(&mut self, node: u32, w: u8, page: u64) {
         let cap = (self.config.memory_pages / u32::from(self.fabric.workers)).max(1) as usize;
         let memory = &mut self.nodes[node as usize].workers[w as usize].memory;
-        // Production `MemoryCache::publish` keeps a resident page's position:
-        // a duplicate publish is not a use (`src/memory.rs`, "must not ...
-        // turn its historical deadline into renewed freshness").
+        // Production `MemoryCache::publish` keeps a resident page's position: a duplicate publish
+        // is not a use (`src/memory.rs`, "must not ... turn its historical deadline into renewed
+        // freshness").
         if memory.pages.contains_key(&page) {
             return;
         }
@@ -1881,13 +1841,8 @@ impl NodeWorld {
                 }
             }
         }
-        // Production lets the running fill pass to another live waiter when
-        // its leader expires (Known issue 30, `Flights::allow_handover`),
-        // bounded by a hard ceiling on its owned scope. It then retains the
-        // fill as a flight operation before submitting it
-        // (`Flights::retain_driver_operation`): a revoked leader's
-        // still-running fill keeps the flight draining, so no second leader
-        // starts a concurrent fill for the page (Known issue 24).
+        // Production lets the running fill pass to another live waiter when its leader expires (,
+        // `Flights::allow_handover`), bounded by a hard ceiling on its owned scope.
         let handover = self.config.node.flight_handover;
         let page_id = self.ids.page(page);
         let mut wakes = Vec::new();
@@ -1992,8 +1947,8 @@ impl NodeWorld {
     ) {
         let costs = self.fabric.costs;
         let (first_ns, slice_ns) = if route {
-            // A cache hit answers on the first poll; each further poll
-            // expands up to 32 nodes (`SEARCH_QUANTUM`).
+            // A cache hit answers on the first poll; each further poll expands up to 32 nodes
+            // (`SEARCH_QUANTUM`).
             (0, 32 * costs.path_expand_ns_per_node)
         } else {
             // Each poll scores up to 256 members (`WORK_QUANTUM`).
@@ -2020,10 +1975,8 @@ impl NodeWorld {
         self.slice(id);
     }
 
-    /// Run one slice of `task`: deliver a finished result, or poll the
-    /// future once and reserve that poll's CPU on the worker FIFO. Other
-    /// work queued on the CPU meanwhile runs before the next slice, as an
-    /// executor runs other tasks after a yield.
+    /// Run one slice of `task`: deliver a finished result, or poll the future once and reserve that
+    /// poll's CPU on the worker FIFO.
     fn slice(&mut self, id: u64) {
         let now = self.now();
         let Some(task) = self.tasks.get_mut(&id) else {
@@ -2084,8 +2037,8 @@ impl NodeWorld {
         self.engine.at(end.max(now + 1), Event::Slice { task: id });
     }
 
-    /// Schedule a slice now for every parked task woken since the last call.
-    /// Returns whether `current` (the task being polled) woke itself.
+    /// Schedule a slice now for every parked task woken since the last call. Returns whether
+    /// `current` (the task being polled) woke itself.
     fn wake_tasks(&mut self, current: Option<u64>) -> bool {
         let woken = std::mem::take(&mut *self.woken.lock().expect("single thread"));
         let mut itself = false;
@@ -3165,22 +3118,22 @@ impl NodeWorld {
 
     // ---- peer messages ----
 
-    /// Route `msg` one hop from `holder`. `plan` is the relay plan at a relay;
-    /// `None` at the requester.
+    /// Route `msg` one hop from `holder`. `plan` is the relay plan at a relay; `None` at the
+    /// requester.
     fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
         let m = self.msgs.get(&mid).expect("message");
         let instant = self.instant(self.now());
         let own_ping = m.ping && holder == m.requester;
         if !own_ping && self.nodes[holder as usize].silence.silent(&m.dest, instant) {
-            // Production `Paths::shortest_async`: the destination is a
-            // silent next hop of this node (Known issues 41 and 43).
+            // Production `Paths::shortest_async`: the destination is a silent next hop of this
+            // node.
             self.metrics.incr("silent_destination_fails");
             return self.fail_hop(mid, holder, Fault::Unavailable);
         }
         let m = self.msgs.get(&mid).expect("message");
         if m.direct && plan.is_none() {
-            // A pinned direct hedge exchange: one link, no route search
-            // (production `request_direct`).
+            // A pinned direct hedge exchange: one link, no route search (production
+            // `request_direct`).
             let dest = m.dest;
             return self.link(mid, holder, None, dest);
         }
@@ -3208,8 +3161,8 @@ impl NodeWorld {
         let Some(visited) = visited else {
             return self.fail_hop(mid, holder, Fault::Unavailable);
         };
-        // Production `shortest_probe_async`: an origin's own ping may use
-        // the link to the destination it holds silent (Known issue 43).
+        // Production `shortest_probe_async`: an origin's own ping may use the link to the
+        // destination it holds silent.
         let exempt = own_ping.then_some(m.dest);
         let blocked = self.blocked(holder, &members, exempt);
         let seed = m.probe.to_be_bytes();
@@ -3253,8 +3206,7 @@ impl NodeWorld {
             .filter(|s| !n.links.available(s, instant))
             .filter_map(|s| members.position(&s.to_be_bytes()))
             .collect();
-        // Production `LinkHealth::available`: silent next hops too (Known
-        // issue 41).
+        // Production `LinkHealth::available`: silent next hops too.
         let me = members.position(&holder.to_be_bytes());
         let mut silent: Vec<usize> = n
             .silence
@@ -3269,9 +3221,8 @@ impl NodeWorld {
         blocked
     }
 
-    /// The requester of `mid` gave up: a last link still unanswered is a
-    /// timeout for its sender (production: the exchange ends with the
-    /// attempt's deadline or the upstream's cancellation).
+    /// The requester of `mid` gave up: a last link still unanswered is a timeout for its sender
+    /// (production: the exchange ends with the attempt's deadline or the upstream's cancellation).
     fn last_hop_timeout(&mut self, mid: u64) {
         let Some((sender, dest, page, sent)) = self.last_hops.remove(&mid) else {
             return;
@@ -3280,9 +3231,8 @@ impl NodeWorld {
         self.silence_timeout(sender, dest, page, sent, LINK_TIMEOUTS);
     }
 
-    /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester
-    /// asks whether `dest` hangs (production `request_traced`, Known issues
-    /// 41 and 43).
+    /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester asks whether `dest`
+    /// hangs (production `request_traced`).
     fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos, needed: u32) {
         if !self.config.node.silence {
             return;
@@ -3292,9 +3242,9 @@ impl NodeWorld {
         }
     }
 
-    /// `node`'s exchange with `dest`, sent at `sent`, timed out: ping `dest`
-    /// at once when the timeout asks for it (production instead drains
-    /// `Silence::due_pings` each turn, capped by `MAX_PINGS_IN_FLIGHT`).
+    /// `node`'s exchange with `dest`, sent at `sent`, timed out: ping `dest` at once when the
+    /// timeout asks for it (production instead drains `Silence::due_pings` each turn, capped by
+    /// `MAX_PINGS_IN_FLIGHT`).
     fn silence_timeout(&mut self, node: u32, dest: u32, page: u64, sent: Nanos, needed: u32) {
         let (sent, at) = (self.instant(sent), self.instant(self.now()));
         let silence = &mut self.nodes[node as usize].silence;
@@ -3304,10 +3254,9 @@ impl NodeWorld {
         }
     }
 
-    /// Ping `dest` from `node` (production `CandidatePolicy::poll_pings`):
-    /// a page request in mode `ping` on its own route grant
-    /// ([`NOTICE_LINKS`], no attempts), which the destination answers `Miss`
-    /// at once.
+    /// Ping `dest` from `node` (production `CandidatePolicy::poll_pings`): a page request in mode
+    /// `ping` on its own route grant ([`NOTICE_LINKS`], no attempts), which the destination answers
+    /// `Miss` at once.
     fn launch_ping(&mut self, node: u32, dest: u32, page: u64) {
         let now = self.now();
         let timeout = now + self.config.node.attempt_timeout_ns;
@@ -3349,8 +3298,8 @@ impl NodeWorld {
         self.forward(mid, node, None);
     }
 
-    /// A ping ended with `reply`, or unanswered within its time bound
-    /// (`None`), classified by `ping_verdict`.
+    /// A ping ended with `reply`, or unanswered within its time bound (`None`), classified by
+    /// `ping_verdict`.
     fn ping_done(&mut self, ping: SimPing, reply: Option<Reply>) {
         let n = &self.nodes[ping.node as usize];
         if n.down || n.incarnation != ping.incarnation {
@@ -3382,8 +3331,7 @@ impl NodeWorld {
         }
     }
 
-    /// Re-ping silent next hops of `from` that are due (production
-    /// `CandidatePolicy::poll_pings`).
+    /// Re-ping silent next hops of `from` that are due (production `CandidatePolicy::poll_pings`).
     fn silence_recheck(&mut self, from: u32) {
         let at = self.instant(self.now());
         let due = self.nodes[from as usize].silence.due_pings(at, usize::MAX);
@@ -3409,9 +3357,8 @@ impl NodeWorld {
         if self.nodes[holder as usize].down {
             return;
         }
-        // Production `Paths::shortest` (`src/topology.rs`): link health may
-        // change while the search yields; a changed blocked set fails the
-        // attempt with `Unavailable` under the same budget.
+        // Production `Paths::shortest` (`src/topology.rs`): link health may change while the search
+        // yields; a changed blocked set fails the attempt with `Unavailable` under the same budget.
         let exempt = self
             .msgs
             .get(&mid)
@@ -3442,7 +3389,7 @@ impl NodeWorld {
                 .silence
                 .silent(&next, self.instant(self.now()))
         {
-            // Known issue 43: the ping tests the link it holds silent.
+            // The ping tests the link it holds silent.
             self.metrics.incr("silence_pings_direct");
         }
         self.link(mid, holder, plan, next);
@@ -3500,8 +3447,7 @@ impl NodeWorld {
         if up {
             n.links.success(&next);
             if next == self.msgs[&mid].dest && self.config.node.silence {
-                // The last link: this sender learns whether the destination
-                // answers (Known issues 41 and 43).
+                // The last link: this sender learns whether the destination answers.
                 let (abandon, page) = (self.msgs[&mid].abandon, self.msgs[&mid].page);
                 self.last_hops.insert(mid, (holder, next, page, now));
                 self.engine
@@ -3511,8 +3457,8 @@ impl NodeWorld {
             let signed = self.fabric.crypto(now, holder, costs.sign_ns);
             let arrive = self.fabric.message(signed, holder, next);
             self.metrics.incr("peer_messages");
-            // The receiver verifies when the message arrives (in `hop`), so
-            // no future slot is reserved on its crypto helper.
+            // The receiver verifies when the message arrives (in `hop`), so no future slot is
+            // reserved on its crypto helper.
             self.engine.at(arrive, Event::Hop { msg: mid });
         } else {
             self.metrics.incr("link_failures");
@@ -3521,13 +3467,12 @@ impl NodeWorld {
                 if let Some(m) = self.msgs.get(&mid)
                     && m.offer
                 {
-                    // Known issue 50: a copy offer crossed the cut.
+                    // A copy offer crossed the cut.
                     self.metrics.incr("partition_link_failures_offers");
                 }
             }
             if let Some(restarted) = unready {
-                // A member that has not applied a membership yet: no peer
-                // listener (Known issue 14).
+                // A member that has not applied a membership yet: no peer listener.
                 self.metrics.incr("unready_member_links");
                 if restarted {
                     self.metrics.incr("unready_member_links_restarted");
@@ -3551,8 +3496,6 @@ impl NodeWorld {
     }
 
     /// Forwarding from `holder` failed with `fault`.
-    /// Record why walk probe message `mid` failed in transport (the first
-    /// cause wins).
     fn note_cut(&mut self, mid: u64, cut: Cut) {
         let Some(m) = self.msgs.get(&mid) else {
             return;
@@ -3631,15 +3574,15 @@ impl NodeWorld {
             return;
         }
         if self.hangs && crate::faults::hung(&self.config.faults, at, now) {
-            // A hung peer server (Known issue 39): accepted, never answered
-            // or forwarded; the requester's attempt times out.
+            // A hung peer server: accepted, never answered or forwarded; the requester's attempt
+            // times out.
             self.metrics.incr("messages_lost_to_hang");
             self.msgs.remove(&mid);
             return;
         }
         if now >= m.abandon {
-            // The requester gave up: production relays and the destination
-            // see the upstream connection close and drop the exchange.
+            // The requester gave up: production relays and the destination see the upstream
+            // connection close and drop the exchange.
             self.metrics.incr("requests_abandoned");
             self.msgs.remove(&mid);
             return;
@@ -3695,8 +3638,8 @@ impl NodeWorld {
     }
 
     /// The member fill `id`'s node asks to acquire its page (production
-    /// `CandidatePolicy::fanout_helper`): one of the page's helpers, never an
-    /// owner or the node itself, preferring a direct overlay neighbor.
+    /// `CandidatePolicy::fanout_helper`): one of the page's helpers, never an owner or the node
+    /// itself, preferring a direct overlay neighbor.
     fn fanout_helper(&self, id: u64) -> Option<u32> {
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
@@ -3714,9 +3657,7 @@ impl NodeWorld {
         .map(at)
     }
 
-    /// Bodies of one page an owner streams before it may shed (production
-    /// `hot_page_threshold`): `hot_page_bodies` of the simulated page size,
-    /// unless `node.hot_page_bodies` overrides it.
+    /// Bodies of one page an owner streams before it may shed (production `hot_page_threshold`).
     fn hot_page_threshold(&self) -> usize {
         match self.config.node.hot_page_bodies {
             0 => hot_page_bodies(self.config.page_bytes),
@@ -3724,10 +3665,10 @@ impl NodeWorld {
         }
     }
 
-    /// Production hot-page shed (`racer_core::read::budget::shed_hot_page`):
-    /// an owner already streaming [`Self::hot_page_threshold`] bodies of `page`, at
-    /// least half of all bodies it streams, answers `Overloaded` to a
-    /// requester that is neither an owner nor a helper of the page.
+    /// Production hot-page shed (`racer_core::read::budget::shed_hot_page`): an owner already
+    /// streaming [`Self::hot_page_threshold`] bodies of `page`, at least half of all bodies it
+    /// streams, answers `Overloaded` to a requester that is neither an owner nor a helper of the
+    /// page.
     fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
         let now = self.now();
         let streaming = match self.streaming.get_mut(&(dest, page)) {
@@ -3756,11 +3697,9 @@ impl NodeWorld {
             }
             None => 0,
         };
-        // Production ranks the page here (`PeerServer::shed_hot_page`,
-        // `placement.rank`), not only from the placement cache: an owner that
-        // holds the page without having ranked it under its current
-        // membership (fetched under an older one, or never missed it since)
-        // still sheds (Known issue 23).
+        // Production ranks the page here (`PeerServer::shed_hot_page`, `placement.rank`), not only
+        // from the placement cache: an owner that holds the page without having ranked it under its
+        // current membership (fetched under an older one, or never missed it since) still sheds.
         let w = self.ids.worker(page);
         let owners = self.owners_at(dest, w, page, true);
         if !owners.contains(&dest) {
@@ -3790,8 +3729,8 @@ impl NodeWorld {
             return self.serve_offer(mid, dest, page, requester);
         }
         if m.ping {
-            // Production: mode `ping` is answered `Miss` at once, without
-            // looking at the cache or flights (Known issues 41 and 43).
+            // Production: mode `ping` is answered `Miss` at once, without looking at the cache or
+            // flights.
             let t = self.fabric.cpu(now, dest, 0, self.fabric.costs.request_ns);
             return self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
         }
@@ -3839,9 +3778,8 @@ impl NodeWorld {
                 }
             }
             ServeAction::Acquire if self.defer_to_successor(dest, page, requester) => {
-                // Another owner fetched this page after this node answered
-                // it without a copy: let the requester ask it (Known issue
-                // 21) instead of fetching again.
+                // Another owner fetched this page after this node answered it without a copy: let
+                // the requester ask it instead of fetching again.
                 self.metrics.incr("successor_deferrals");
                 self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), now);
             }
@@ -3893,16 +3831,13 @@ impl NodeWorld {
         }
     }
 
-    /// A copy-only request found no local copy: join the destination's
-    /// running acquisition of the page without acquisition rights, like
-    /// production `FillEngine::copy_only` (`Flights::join_copy`), and answer
-    /// with its result (Known issue 31). Returns false for a miss (no
-    /// acquisition to wait for), which the caller answers.
+    /// A copy-only request found no local copy: join the destination's running acquisition of the
+    /// page without acquisition rights, like production `FillEngine::copy_only`
+    /// (`Flights::join_copy`), and answer with its result.
     fn join_copy(&mut self, mid: u64, dest: u32, page: u64, t: Nanos) -> bool {
         let now = self.now();
-        // Production `Coordinator::copy_join_allowed` (Known issue 44): an
-        // owner ranked before this node, asking it for a copy, must not wait
-        // on its acquisition, which most likely waits on that owner.
+        // Production `Coordinator::copy_join_allowed`: an owner ranked before this node, asking it
+        // for a copy, must not wait on its acquisition, which most likely waits on that owner.
         let w = self.ids.worker(page);
         if self.config.node.copy_join_rank
             && self.nodes[dest as usize].workers[w as usize]
@@ -3985,8 +3920,8 @@ impl NodeWorld {
         handled
     }
 
-    /// Send `reply` for `mid` from `from` back along the reverse route,
-    /// starting at `ready`. Pages travel as cut-through transfers.
+    /// Send `reply` for `mid` from `from` back along the reverse route, starting at `ready`. Pages
+    /// travel as cut-through transfers.
     fn send_reply(&mut self, mid: u64, from: u32, reply: Reply, ready: Nanos) {
         let Some(m) = self.msgs.remove(&mid) else {
             return;
@@ -4004,7 +3939,7 @@ impl NodeWorld {
             && p.hedge.is_none()
             && let Some(fill) = self.fills.get_mut(&p.fill)
         {
-            // A relay signs this answer (Known issue 38).
+            // A relay signs this answer.
             match p.granted.and_then(|i| fill.batch.get_mut(i)) {
                 Some(b) => b.relayed = true,
                 None => fill.relayed = true,
@@ -4044,15 +3979,14 @@ impl NodeWorld {
         let arrive = if reply == Reply::Response(ResponseKind::Page) {
             let bytes = self.config.page_bytes;
             let sealed = self.fabric.crypto(ready, from, costs.sign_ns);
-            // The body streams only while the requester still waits; relays
-            // hold their `Relay` reservation until the body has passed
-            // (production keeps it on the connection while streaming,
-            // `peer/server.rs` `relay.reservation`).
+            // The body streams only while the requester still waits; relays hold their `Relay`
+            // reservation until the body has passed (production keeps it on the connection while
+            // streaming, `peer/server.rs` `relay.reservation`).
             let done = self.fabric.transfer_until(sealed, &route, bytes, m.abandon);
             let release = done.unwrap_or(m.abandon);
             if !m.relays.is_empty() {
-                // How long the first relay holds its `Relay` reservation:
-                // waiting for the destination's answer, then streaming.
+                // How long the first relay holds its `Relay` reservation: waiting for the
+                // destination's answer, then streaming.
                 self.metrics
                     .observe("relay_hold_wait_ns", ready.saturating_sub(m.relay_first));
                 self.metrics
@@ -4095,7 +4029,7 @@ impl NodeWorld {
             return self.ping_done(ping, Some(reply));
         }
         if let Some((node, incarnation, due)) = self.offers.remove(&pid) {
-            // A relay's answer is cut evidence (Known issue 50).
+            // A relay's answer is cut evidence.
             let relayed = self.offers_relayed.remove(&pid);
             let end = OfferEnd::of(
                 (!relayed && reply != Reply::Transport)
@@ -4107,8 +4041,8 @@ impl NodeWorld {
         let Some(probe) = self.probes.remove(&pid) else {
             self.metrics.incr("late_replies");
             if reply == Reply::Response(ResponseKind::Page) {
-                // A page body that kept streaming after its requester gave
-                // up (bodies stop at the requester's attempt deadline).
+                // A page body that kept streaming after its requester gave up (bodies stop at the
+                // requester's attempt deadline).
                 self.metrics.incr("late_page_replies");
             }
             return;
@@ -4125,9 +4059,8 @@ impl NodeWorld {
             None => fill.relayed,
         };
         if probe.hedge.is_none() && !relayed && reply == Reply::Shed {
-            // The same owner shed this node's request for the page within
-            // half a request timeout before (Known issue 54; measurement
-            // only, the last few sheds per node).
+            // The same owner shed this node's request for the page within half a request timeout
+            // before (; measurement only, the last few sheds per node).
             let window = self.config.node.read_timeout_ns / 2;
             let recent = &mut self.nodes[node as usize].recent_sheds;
             recent.retain(|&(.., t)| now.saturating_sub(t) < window);
@@ -4139,8 +4072,8 @@ impl NodeWorld {
             }
             recent.push((probe.dest, page, now));
         }
-        // A phantom page claims the page it was asked for; the identity
-        // check is the same callback production runs.
+        // A phantom page claims the page it was asked for; the identity check is the same callback
+        // production runs.
         let outcome = || match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
             Reply::Shed => Ok(Outcome::Shed),
@@ -4160,8 +4093,7 @@ impl NodeWorld {
         match probe.hedge {
             None if let Some(index) = probe.granted => {
                 if !relayed && reply != Reply::Transport {
-                    // The destination answered this node: it is not hung
-                    // (Known issue 41).
+                    // The destination answered this node: it is not hung.
                     let at = self.instant(now);
                     let silence = &mut self.nodes[node as usize].silence;
                     if reply == Reply::Shed && self.config.node.shed_busy {
@@ -4177,10 +4109,9 @@ impl NodeWorld {
                 let fill = self.fills.get_mut(&probe.fill).expect("present");
                 fill.probe = None;
                 if reply == Reply::Response(ResponseKind::StaleMembership) {
-                    // The answering node could not resolve the request's
-                    // membership, so the credits it carried were never used
-                    // (production `request_traced`, Known issue 26), and
-                    // neither were the links past it (Known issues 47, 49).
+                    // The answering node could not resolve the request's membership, so the credits
+                    // it carried were never used (production `request_traced`), and neither were
+                    // the links past it.
                     let budget = fill.core.request_budget(&mut fill.budget);
                     let unused = if self.config.node.stale_link_refund {
                         stale_unused_links(probe.links, probe.hops)
@@ -4221,10 +4152,9 @@ impl NodeWorld {
                 self.drive(probe.fill, FillEvent::Reply(reply));
             }
             Some(primary) => {
-                // Production `hedge_page` contenders: a page wins, a stale
-                // reply marks the race stale, any other answer is a
-                // recoverable `Unavailable` (the primary's is kept as the
-                // walk's first evidence).
+                // Production `hedge_page` contenders: a page wins, a stale reply marks the race
+                // stale, any other answer is a recoverable `Unavailable` (the primary's is kept as
+                // the walk's first evidence).
                 let result = match outcome() {
                     Ok(Outcome::Copy) => Ok(()),
                     Ok(Outcome::StaleMembership) => {
@@ -4264,9 +4194,8 @@ impl NodeWorld {
         }
     }
 
-    /// Record how fill `id`'s walk probe ended: rank 0 watch, repeat
-    /// classification, and route evidence (production
-    /// `CandidatePolicy::apply`).
+    /// Record how fill `id`'s walk probe ended: rank 0 watch, repeat classification, and route
+    /// evidence (production `CandidatePolicy::apply`).
     fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>, evidence: &Evidence) {
         if evidence.helper {
             let label = match &outcome {
@@ -4298,7 +4227,7 @@ impl NodeWorld {
         if let Some(note) = evidence.rank0
             && self.config.node.rank0_watch
         {
-            // Production `CandidatePolicy::apply` (Known issue 39).
+            // Production `CandidatePolicy::apply`.
             let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
             let rank0 = fill.core.owners[0];
             let instant = self.instant(self.now());
@@ -4314,8 +4243,8 @@ impl NodeWorld {
         let Some(fill) = self.fills.get_mut(&id) else {
             return;
         };
-        // Both are per probe: a cut noted for a relay-signed answer must not
-        // leak into the next probe's classification.
+        // Both are per probe: a cut noted for a relay-signed answer must not leak into the next
+        // probe's classification.
         let cut = fill.cut.take();
         let relayed = std::mem::take(&mut fill.relayed);
         let Some(dest) = fill.asking.take() else {
@@ -4348,9 +4277,7 @@ impl NodeWorld {
                 fill.budget.remaining_links()
             ));
         }
-        // Known issue 50: this node's reads see cuts its offers would cross.
-        // Production `CandidatePolicy::apply`: answers a relay may have
-        // signed say nothing.
+        // This node's reads see cuts its offers would cross.
         let cut = match asked {
             Asked::Unreachable(_) => Some(true),
             Asked::Copy | Asked::Miss | Asked::Failed => Some(false),
@@ -4368,10 +4295,9 @@ impl NodeWorld {
         }
     }
 
-    /// Validate origin authority before fill `id`'s owner at `rank` fetches
-    /// (production `OriginAuthority::validate` and `begin_attempt` in
-    /// `src/read/fill.rs`), and check that only a ranked owner reaches the
-    /// origin.
+    /// Validate origin authority before fill `id`'s owner at `rank` fetches (production
+    /// `OriginAuthority::validate` and `begin_attempt` in `src/read/fill.rs`), and check that only
+    /// a ranked owner reaches the origin.
     fn origin_authority(&mut self, id: u64, rank: usize) -> Result<(), Error> {
         let now = self.now();
         let fill = &self.fills[&id];
@@ -4411,14 +4337,13 @@ impl NodeWorld {
         }
         let instant = self.instant(now);
         let fill = self.fills.get_mut(&id).expect("present");
-        // Production debits one attempt before origin
-        // (`src/read/fill.rs`, `budget.begin_attempt` after
-        // `authority.validate`); an owner without one fails the fill.
+        // Production debits one attempt before origin (`src/read/fill.rs`, `budget.begin_attempt`
+        // after `authority.validate`); an owner without one fails the fill.
         let scope = fill.scope;
         if let Err(e) = fill.budget.begin_attempt(instant, scope) {
             self.metrics.incr("origin_unfunded");
-            // Started with fewer credits than its predecessor probes and
-            // its origin attempt need (Known issue 57), or spent them.
+            // Started with fewer credits than its predecessor probes and its origin attempt need,
+            // or spent them.
             self.metrics
                 .incr(if fill.initial_attempts < owner_funding_min(rank) - 1 {
                     "origin_unfunded_short"
@@ -4443,9 +4368,9 @@ impl NodeWorld {
         self.classify_repeat(id);
         let fill = self.fills.get_mut(&id).expect("present");
         fill.origin = Some((handle, outcome));
-        // Production bounds the origin exchange by the deadline of the waiter
-        // the fill currently serves, then hands it over or cancels it
-        // (`src/read/fill.rs`, `FlightOperation::poll_cancellation`).
+        // Production bounds the origin exchange by the deadline of the waiter the fill currently
+        // serves, then hands it over or cancels it (`src/read/fill.rs`,
+        // `FlightOperation::poll_cancellation`).
         if let Some(check) = self.origin_check_at(id)
             && done > check
         {
@@ -4455,8 +4380,8 @@ impl NodeWorld {
             .at(done, Event::OriginDone { fill: id, outcome });
     }
 
-    /// Close an outstanding origin request now and move the completions of
-    /// the requests queued behind it.
+    /// Close an outstanding origin request now and move the completions of the requests queued
+    /// behind it.
     fn cancel_origin(&mut self, handle: OriginHandle) {
         let now = self.engine.now();
         if self.origin.cancel(handle, now) > 0 {
@@ -4484,9 +4409,9 @@ impl NodeWorld {
         self.schedule_origin_wake();
     }
 
-    /// The fill's scope expired with its origin request outstanding: close
-    /// it (freeing origin concurrency and bandwidth for later requests) and
-    /// fail the fill with `DeadlineExceeded`, as production does.
+    /// The fill's scope expired with its origin request outstanding: close it (freeing origin
+    /// concurrency and bandwidth for later requests) and fail the fill with `DeadlineExceeded`, as
+    /// production does.
     fn origin_cancel(&mut self, id: u64) {
         let now = self.now();
         let Some(fill) = self.fills.get(&id) else {
@@ -4521,9 +4446,8 @@ impl NodeWorld {
         self.drive(id, FillEvent::Origin(Err(Error::DeadlineExceeded)));
     }
 
-    /// When the fill's origin request must next be checked: the deadline of
-    /// the waiter it serves, capped by the fill's ceiling. `None` once no
-    /// live waiter remains.
+    /// When the fill's origin request must next be checked: the deadline of the waiter it serves,
+    /// capped by the fill's ceiling.
     fn origin_check_at(&self, id: u64) -> Option<Nanos> {
         let fill = &self.fills[&id];
         let flights = &self.nodes[fill.node as usize].workers[fill.worker as usize].flights;
@@ -4531,11 +4455,7 @@ impl NodeWorld {
         Some(self.nanos(deadline.min(fill.scope)))
     }
 
-    /// The waiter fill `id` serves reached its deadline. Refresh the flight
-    /// so another live waiter adopts the fill (Known issue 30). If one did,
-    /// fail the elected leader's own read, which production ends at its
-    /// deadline while its driver keeps running, and return when to check
-    /// again; `None` cancels the fill.
+    /// The waiter fill `id` serves reached its deadline.
     fn hand_over(&mut self, id: u64) -> Option<Nanos> {
         let now = self.now();
         let instant = self.instant(now);
@@ -4570,9 +4490,8 @@ impl NodeWorld {
         self.origin_check_at(id)
     }
 
-    /// Counter for the rendezvous rank of `holder` for fill `id`'s page in
-    /// the fill's membership, and whether it arrived before the fetching
-    /// owner (so a lineage rule could have named it): Known issue 46.
+    /// Counter for the rendezvous rank of `holder` for fill `id`'s page in the fill's membership,
+    /// and whether it arrived before the fetching owner (so a lineage rule could have named it):.
     fn holder_rank_bucket(&self, id: u64, holder: u32) -> &'static str {
         let fill = &self.fills[&id];
         let Some(members) = self
@@ -4640,9 +4559,8 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
         let rank0 = fill.core.owners.first().copied().unwrap_or(node);
-        // An owner above rank 0 reaches origin only with transient evidence
-        // against rank 0: record why rank 0 did not serve (the last probe of
-        // rank 0 decides).
+        // An owner above rank 0 reaches origin only with transient evidence against rank 0: record
+        // why rank 0 did not serve (the last probe of rank 0 decides).
         let skip = (fill.core.rank.is_some_and(|r| r > 0)).then(|| {
             let last = fill
                 .asked
@@ -4691,9 +4609,8 @@ impl NodeWorld {
                         .any(|w| w.memory.pages.contains_key(&page)))
         };
         let class = if last.rank0 != rank0 {
-            // Why a move repeats (Known issue 20): the earlier fetcher lost
-            // the copy, or still holds it and this owner did or did not ask
-            // it; and whether the page moved over one version or more.
+            // Why a move repeats: the earlier fetcher lost the copy, or still holds it and this
+            // owner did or did not ask it; and whether the page moved over one version or more.
             let sub = if !held(self) {
                 "origin_repeats_after_move_lost"
             } else if let Some(&(_, a)) = fill
@@ -4729,8 +4646,7 @@ impl NodeWorld {
             };
             self.metrics.incr(sub);
             if sub.contains("_unasked") {
-                // Where the unasked holder ranks for this page in the
-                // fetching owner's membership (Known issue 46).
+                // Where the unasked holder ranks for this page in the fetching owner's membership.
                 let bucket = self.holder_rank_bucket(id, last.node);
                 self.metrics.incr(bucket);
             }
@@ -4738,8 +4654,8 @@ impl NodeWorld {
         } else if last.ok == Some(false) {
             "origin_repeats_after_failure"
         } else if last.ok.is_none() {
-            // Known issue 31: who overlaps whom. `F` above rank 0 skipped
-            // rank 0 (why), or `F` is rank 0 and `A` skipped it earlier.
+            // Who overlaps whom. `F` above rank 0 skipped rank 0 (why), or `F` is rank 0 and `A`
+            // skipped it earlier.
             let sub = if last.node == node {
                 "origin_repeats_concurrent_same_node"
             } else if let Some(skip) = skip {
@@ -4775,24 +4691,17 @@ impl NodeWorld {
                 "origin_repeats_held_unasked"
             };
             self.metrics.incr(cause);
-            // `A` fetched as an owner above rank 0, so rank 0 has no copy
-            // and fetches again: charge the repeat to why `A` skipped it.
+            // `A` fetched as an owner above rank 0, so rank 0 has no copy and fetches again: charge
+            // the repeat to why `A` skipped it.
             if let Some(orphan) = last.skip {
                 self.metrics
                     .incr(skip_counter("origin_repeats_orphan_", orphan));
-                // Rank 0 refetching although it noted the holder (round 4,
-                // orphan2): its one successor probe of the hint was spent,
-                // missed, or the hint expired. Without a note, the holder
-                // never reached it (partition, route, a relay failure).
+                // Rank 0 refetching although it noted the holder (round 4, orphan2): its one
+                // successor probe of the hint was spent, missed, or the hint expired.
                 if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
                     self.metrics.incr("origin_repeats_orphan_noted");
                 }
-                // Known issue 51: why the holder's copy did not reach this
-                // owner. `unreachable`: this walk asked the holder and the
-                // route failed; `pending`: the holder's offer to this
-                // owner's rank is still scheduled (not yet due, or held by
-                // a cut); `noted`: this owner knew of the holder; `other`:
-                // none of these.
+                // Why the holder's copy did not reach this owner.
                 let index = fill.core.owners.iter().position(|c| *c == node);
                 let pending = index.is_some_and(|i| {
                     self.nodes[last.node as usize]
@@ -4812,10 +4721,8 @@ impl NodeWorld {
                 };
                 self.metrics.incr(why);
             }
-            // Every such repeat is a skip itself (`F` above rank 0), an
-            // orphan (`A` fetched as a skip), or raced. Anything else is
-            // the avoidable class (rank 0 fetching although the copy it
-            // or its delegate fetched is still held); tests keep it at 0.
+            // Every such repeat is a skip itself (`F` above rank 0), an orphan (`A` fetched as a
+            // skip), or raced.
             let explained =
                 skip.is_some() || last.skip.is_some() || cause == "origin_repeats_held_raced";
             if !explained {
@@ -4841,8 +4748,8 @@ impl NodeWorld {
         self.metrics.incr(class);
     }
 
-    /// The completion event scheduled at issue. Stale if the request was
-    /// canceled or a cancellation moved it ([`Self::origin_wake`]).
+    /// The completion event scheduled at issue. Stale if the request was canceled or a cancellation
+    /// moved it ([`Self::origin_wake`]).
     fn origin_done(&mut self, id: u64) {
         let now = self.engine.now();
         if let Some((handle, _)) = self.fills.get(&id).and_then(|f| f.origin)
@@ -4868,8 +4775,7 @@ impl NodeWorld {
             .check("origin_within_scope", now <= scope, now, Some(node), || {
                 format!("fill {id} origin answered at {now} after its scope {scope}")
             });
-        // Known issue 30: a handed-over fill runs only while some waiter
-        // it serves is live.
+        // A handed-over fill runs only while some waiter it serves is live.
         let live = self.origin_check_at(id).is_some_and(|check| now <= check);
         self.invariants
             .check("origin_for_live_waiter", live, now, Some(node), || {
@@ -4880,7 +4786,7 @@ impl NodeWorld {
             OriginOutcome::Ok => {
                 self.metrics.add("origin_bytes", self.config.page_bytes);
                 if fill.concurrent {
-                    // Known issue 31: overlapping requests that cost egress.
+                    // Overlapping requests that cost egress.
                     self.metrics.incr("origin_concurrent_completed");
                 }
                 Ok(())
@@ -4902,8 +4808,8 @@ impl NodeWorld {
         let ok = result.is_ok();
         let failed = matches!(result, Err(Error::Unavailable));
         let notice = ok && should_notice(fill.core.rank);
-        // The walk's predecessor evidence in rank order (the last answer of
-        // each predecessor; production `OriginAuthority`).
+        // The walk's predecessor evidence in rank order (the last answer of each predecessor;
+        // production `OriginAuthority`).
         let evidence: Vec<ProbeOutcome> = fill
             .core
             .owners
@@ -4943,9 +4849,8 @@ impl NodeWorld {
         self.drive(id, FillEvent::Origin(result));
     }
 
-    /// Production `CandidatePolicy::note_origin_failure` (Known issue 52):
-    /// an owner above rank 0 whose own origin request failed leaves retries
-    /// after rank 0's own failures to rank 0 for a while.
+    /// Production `CandidatePolicy::note_origin_failure`: an owner above rank 0 whose own origin
+    /// request failed leaves retries after rank 0's own failures to rank 0 for a while.
     fn note_origin_failure(&mut self, id: u64) {
         if !self.config.node.rank0_watch || !self.config.node.rank0_failure_hold {
             return;
@@ -4963,9 +4868,8 @@ impl NodeWorld {
         self.metrics.incr("rank0_watch_origin_failures");
     }
 
-    /// `node` fetched `page` from origin as an owner after `targets` (owner
-    /// rank, node): offer the copy to rank 0 later (Known issue 37), and to
-    /// rank 1 (Known issue 51, `node.offer_predecessors`).
+    /// `node` fetched `page` from origin as an owner after `targets` (owner rank, node): offer the
+    /// copy to rank 0 later, and to rank 1 (, `node.offer_predecessors`).
     fn note_notice(&mut self, node: u32, page: u64, targets: &[(u8, u32)]) {
         let config = &self.config.node;
         if !config.orphan_notices || !config.successor_hints {
@@ -4998,8 +4902,7 @@ impl NodeWorld {
         let group = |t: &u32| sites[*t as usize];
         loop {
             let notices = &mut self.nodes[node as usize].notices;
-            // Without cut groups (`node.offer_cut_groups` 0) offers go as
-            // before Known issue 50.
+            // Without cut groups (`node.offer_cut_groups` 0) offers go as before.
             let next = if grouped {
                 notices.pop_open(instant, group)
             } else {
@@ -5024,8 +4927,7 @@ impl NodeWorld {
                 }
             }
         }
-        // Offers deferred by a blocked site come due when the block ends
-        // (Known issue 50).
+        // Offers deferred by a blocked site come due when the block ends.
         if let Some(at) = self.nodes[node as usize].notices.next_due()
             && at > instant
             && self.nodes[node as usize].notices.has_deferred()
@@ -5034,8 +4936,8 @@ impl NodeWorld {
         }
     }
 
-    /// Send one copy offer for `due` from `node`, on its own route grant
-    /// ([`NOTICE_LINKS`], no attempts).
+    /// Send one copy offer for `due` from `node`, on its own route grant ([`NOTICE_LINKS`], no
+    /// attempts).
     fn launch_offer(&mut self, node: u32, due: OfferDue) {
         let now = self.now();
         let timeout = now + self.config.node.attempt_timeout_ns;
@@ -5103,9 +5005,8 @@ impl NodeWorld {
         }
     }
 
-    /// Answer a copy offer `Miss`, noting the requester as a successor hint
-    /// when this node neither holds the page nor is fetching it (production
-    /// `Coordinator::serve_peer`, Known issue 37).
+    /// Answer a copy offer `Miss`, noting the requester as a successor hint when this node neither
+    /// holds the page nor is fetching it (production `Coordinator::serve_peer`).
     fn serve_offer(&mut self, mid: u64, dest: u32, page: u64, requester: u32) {
         let now = self.now();
         let w = self.ids.worker(page);
@@ -5116,8 +5017,8 @@ impl NodeWorld {
             .flights
             .acquiring(&self.ids.page(page));
         let instant = self.instant(now);
-        // Production `Coordinator::serve_offer`: armed for this node's own
-        // successor probe, deferring no readers.
+        // Production `Coordinator::serve_offer`: armed for this node's own successor probe,
+        // deferring no readers.
         if self.config.node.successor_hints
             && dest != requester
             && self.nodes[dest as usize]
@@ -5133,9 +5034,8 @@ impl NodeWorld {
         self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
     }
 
-    /// Whether `node` owns `page` in its current published snapshot, from
-    /// the worker's cached ranking only (production `Retention::is_owned`:
-    /// missing or partial rankings are not owned).
+    /// Whether `node` owns `page` in its current published snapshot, from the worker's cached
+    /// ranking only (production `Retention::is_owned`: missing or partial rankings are not owned).
     fn owned(&self, node: u32, w: u8, page: u64) -> bool {
         let n = &self.nodes[node as usize];
         let Some(version) = self.versions.get(n.version) else {
@@ -5149,8 +5049,8 @@ impl NodeWorld {
             .is_owner(&version.members, &page.to_be_bytes(), |o| o == me)
     }
 
-    /// Production `Retention::observe_at` for one client operation: the
-    /// ownership predicate, then second-sight history and heat.
+    /// Production `Retention::observe_at` for one client operation: the ownership predicate, then
+    /// second-sight history and heat.
     fn observe(&mut self, node: u32, w: u8, page: u64) -> bool {
         let owned = self.owned(node, w, page);
         let instant = self.instant(self.now());
@@ -5165,8 +5065,8 @@ impl NodeWorld {
         eligible
     }
 
-    /// Production `persist_verified`: write an eligible, not yet resident
-    /// page, with ownership reclassified now and the observation latched.
+    /// Production `persist_verified`: write an eligible, not yet resident page, with ownership
+    /// reclassified now and the observation latched.
     fn persist_page(&mut self, node: u32, w: u8, page: u64, eligible: bool) {
         let owned = self.owned(node, w, page);
         let n = &self.nodes[node as usize];
@@ -5351,17 +5251,16 @@ impl NodeWorld {
         let page_id = self.ids.page(fill.page);
         let mut wakes = Vec::new();
         let worker = &mut n.workers[fill.worker as usize];
-        // Production completes the retained operation first, then publishes
-        // and ignores `StaleFlight` (`src/read/fill.rs`, `operation.complete()`
-        // and `let _ = flights.publish_acquired(..)`): a leader revoked while
-        // its fill ran (canceled or past its deadline) cannot settle the
-        // flight, which already drained to a retry once the fill completed.
+        // Production completes the retained operation first, then publishes and ignores
+        // `StaleFlight` (`src/read/fill.rs`, `operation.complete()` and `let _ =
+        // flights.publish_acquired(..)`): a leader revoked while its fill ran (canceled or past its
+        // deadline) cannot settle the flight, which already drained to a retry once the fill
+        // completed.
         if fill.canceled {
             // Production cancels the fill because the leader's scope expired
-            // (`Operation::cancellation_requested`) and completes the
-            // operation with the clock at that time, so the table sees the
-            // leader revoked; the sim's table clock only advances on joins
-            // and polls.
+            // (`Operation::cancellation_requested`) and completes the operation with the clock at
+            // that time, so the table sees the leader revoked; the sim's table clock only advances
+            // on joins and polls.
             worker
                 .flights
                 .refresh(&page_id, self.base + Duration::from_nanos(now), &mut wakes);
@@ -5371,8 +5270,8 @@ impl NodeWorld {
         if !active {
             self.metrics.incr("flight_stale_finishes");
         }
-        // Same leader settlement as production `Fill` (`src/read/fill.rs`):
-        // a credential rejection fails only the leader and re-elects.
+        // Same leader settlement as production `Fill` (`src/read/fill.rs`): a credential rejection
+        // fails only the leader and re-elects.
         let finished = if active {
             worker.flights.finish(
                 &page_id,
@@ -5407,8 +5306,8 @@ impl NodeWorld {
             });
             self.resolve(leader.want, got);
         }
-        // A rejection both notifies and settles, so a waiter can appear
-        // twice; wake each once (a second wake would re-lead it).
+        // A rejection both notifies and settles, so a waiter can appear twice; wake each once (a
+        // second wake would re-lead it).
         let mut seen = HashSet::new();
         for token in wakes {
             if token != fill.token && seen.insert(token) {
@@ -5425,9 +5324,8 @@ impl NodeWorld {
             n.account(&mut sums);
         }
         let mut list: Vec<_> = COMPONENTS.into_iter().zip(sums).collect();
-        // Shared memos: real rankings (`RETAINED_DEPTH` 16-byte scores and
-        // a cursor; 48 bytes more than five 24-byte scores with one spare)
-        // and route alternatives, estimated per entry.
+        // Shared memos: real rankings (`RETAINED_DEPTH` 16-byte scores and a cursor; 48 bytes more
+        // than five 24-byte scores with one spare) and route alternatives, estimated per entry.
         list.push(("placement_memo", self.shared.phantom.memo_len() * 288));
         list.push(("route_memo", self.shared.routes.memo_len() * 320));
         list.push(("membership_versions", self.versions.approximate_bytes()));
@@ -5477,8 +5375,8 @@ impl NodeWorld {
         let nodes = self.config.nodes.max(1) as usize;
         let duplicated = self.origin_per_page.values().filter(|c| **c > 1).count();
         let max_per_page = self.origin_per_page.values().copied().max().unwrap_or(0);
-        // Known issue 55: requests per page other than retries after a
-        // failed origin request, and the most such retries on one page.
+        // Requests per page other than retries after a failed origin request, and the most such
+        // retries on one page.
         let retries = |p: &u64| self.failure_retries_per_page.get(p).copied().unwrap_or(0);
         let max_without_retries = self
             .origin_per_page
@@ -5649,12 +5547,9 @@ fn granted_counter(kind: &str, what: &str) -> &'static str {
 mod shed_tests {
     use super::*;
 
-    /// Known issue 23: production `PeerServer::shed_hot_page` ranks the page
-    /// (`placement.rank`), so an owner sheds even when its placement cache
-    /// holds no ranking of the page under its current membership (it fetched
-    /// the page under an older one, or has served it from memory since). The
-    /// simulator used the cache-only ownership test of retention, and owners
-    /// queued every reader after a membership change.
+    /// Production `PeerServer::shed_hot_page` ranks the page (`placement.rank`), so an owner
+    /// sheds even when its placement cache holds no ranking of the page under its current
+    /// membership (it fetched the page under an older one, or has served it from memory since).
     #[test]
     fn owner_without_a_cached_ranking_sheds_a_hot_page() {
         let nodes = 256;
@@ -5673,8 +5568,7 @@ mod shed_tests {
             .unwrap()
             .members
             .clone();
-        // Rank on a node that is not asked below, so the owners' own caches
-        // stay empty.
+        // Rank on a node that is not asked below, so the owners' own caches stay empty.
         let ranker = (0..nodes)
             .find(|n| !world.owners_at(*n, w, page, true).contains(n))
             .unwrap();
