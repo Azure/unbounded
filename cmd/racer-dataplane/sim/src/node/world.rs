@@ -37,7 +37,7 @@ use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused
 use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
-    Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, offer_noted, should_notice,
+    Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, should_notice,
 };
 use racer_core::read::hints::{
     MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets,
@@ -5670,15 +5670,17 @@ impl NodeWorld {
         let acquiring = n.workers[w as usize]
             .flights
             .acquiring(&self.ids.page(page));
-        if offer_noted(holds, acquiring) && self.config.node.successor_hints && dest != requester {
-            // Production `Coordinator::serve_offer`: armed for this node's
-            // own successor probe, deferring no readers.
+        let instant = self.instant(now);
+        // Production `Coordinator::serve_offer`: armed for this node's own
+        // successor probe, deferring no readers.
+        if self.config.node.successor_hints
+            && dest != requester
+            && self.nodes[dest as usize]
+                .hints
+                .note_offer(page, requester, holds, acquiring, instant)
+        {
             self.metrics.incr("orphan_offers_noted");
             self.metrics.incr("successor_hints_noted");
-            let instant = self.instant(now);
-            self.nodes[dest as usize]
-                .hints
-                .note_offer(page, requester, instant);
         } else {
             self.metrics.incr("orphan_offers_redundant");
         }

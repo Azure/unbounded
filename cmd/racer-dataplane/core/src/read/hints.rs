@@ -14,7 +14,7 @@
 //! offer mode that carries no origin credentials and no attempts, and is
 //! answered `Miss` without a body. A receiver that neither holds the page nor
 //! is acquiring it notes the requester as a successor hint, exactly as if it
-//! had missed a copy-only probe ([`offer_noted`]); its next walk then copies
+//! had missed a copy-only probe ([`SuccessorHints::note_offer`]); its next walk then copies
 //! the page from the holder instead of fetching it. An offer that does not get
 //! an answer signed by its destination (transport failure, a relay's answer,
 //! shed) is tried again after the next delay, at most [`NOTICE_TRIES`] times
@@ -511,13 +511,6 @@ pub fn notice_target<N: PartialEq + Clone>(
     (holds && index < rank).then(|| owners[index].clone())
 }
 
-/// Whether a node receiving an offer notes the requester as a successor
-/// hint: only when it has no copy and is not fetching one (then its own copy
-/// serves readers, and the offer is redundant). Either way it answers `Miss`.
-pub fn offer_noted(holds: bool, acquiring: bool) -> bool {
-    !holds && !acquiring
-}
-
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod notice_tests {
@@ -694,10 +687,14 @@ mod notice_tests {
 
     #[test]
     fn offers_are_noted_only_without_a_copy_or_a_fetch() {
-        assert!(offer_noted(false, false));
-        assert!(!offer_noted(true, false));
-        assert!(!offer_noted(false, true));
-        assert!(!offer_noted(true, true));
+        let now = Instant::now();
+        let mut h = SuccessorHints::new(8, HINT_TTL);
+        assert!(!h.note_offer(1u64, 7u32, true, false, now));
+        assert!(!h.note_offer(1, 7, false, true, now));
+        assert!(!h.note_offer(1, 7, true, true, now));
+        assert!(h.is_empty());
+        assert!(h.note_offer(1, 7, false, false, now));
+        assert_eq!(h.len(), 1);
     }
 
     /// Known issue 50: a cut blocks the target's group until the failed
@@ -1071,7 +1068,21 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     /// the time a reader would be sent to it, and this node asks it itself on
     /// its next acquisition (DST `dst_generated_traffic_churn_oracle` seed 1
     /// returned a 503 when offers deferred readers).
-    pub fn note_offer(&mut self, key: K, node: N, now: Instant) {
+    ///
+    /// Notes only when this node `holds` no copy and is not `acquiring` one
+    /// (then its own copy serves readers, and the offer is redundant).
+    /// Returns whether it noted. Either way the offer is answered `Miss`.
+    pub fn note_offer(
+        &mut self,
+        key: K,
+        node: N,
+        holds: bool,
+        acquiring: bool,
+        now: Instant,
+    ) -> bool {
+        if holds || acquiring {
+            return false;
+        }
         let kept = self.entries.get(&key).map(|e| (e.uses, e.max));
         self.note(key.clone(), node.clone(), now);
         if let Some(entry) = self.entries.get_mut(&key) {
@@ -1079,6 +1090,7 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
             entry.offered = true;
             entry.senders.push(node);
         }
+        true
     }
 
     /// The unexpired hints for `key` still usable for deferral, oldest
@@ -1318,12 +1330,12 @@ mod successor_tests {
     fn offers_arm_probes_without_deferrals() {
         let now = Instant::now();
         let mut h = SuccessorHints::new(8, HINT_TTL);
-        h.note_offer(1u64, 7u32, now);
+        h.note_offer(1u64, 7u32, false, false, now);
         assert!(h.peek(&1, now).is_empty());
         assert_eq!(h.probe(&1, now + PROBE_AFTER), [7]);
         h.note(2u64, 8u32, now);
         h.charge(&2, 100, &0, 2, now);
-        h.note_offer(2, 9, now);
+        h.note_offer(2, 9, false, false, now);
         assert_eq!(h.peek(&2, now), [8, 9]);
         h.charge(&2, 100, &0, 2, now);
         assert!(h.peek(&2, now).is_empty());
@@ -1338,10 +1350,10 @@ mod successor_tests {
         let mut h = SuccessorHints::new(8, HINT_TTL);
         h.note(1u64, 7u32, now);
         assert!(h.probe(&1, now).is_empty());
-        h.note_offer(2u64, 8u32, now);
+        h.note_offer(2u64, 8u32, false, false, now);
         assert_eq!(h.probe(&2, now), [8]);
         assert!(h.probe(&2, now).is_empty());
-        h.note_offer(3u64, 9u32, now);
+        h.note_offer(3u64, 9u32, false, false, now);
         h.note(3, 10, now);
         assert!(h.probe(&3, now).is_empty());
         assert_eq!(h.probe(&3, now + PROBE_AFTER), [9, 10]);
@@ -1391,7 +1403,7 @@ mod successor_tests {
         h.note(1u64, 7u32, now);
         h.charge(&1, 100, &7, MAX_DEFERRALS, now);
         assert_eq!(h.peek_for(&1, &100, now), [7]);
-        h.note_offer(1, 9, now);
+        h.note_offer(1, 9, false, false, now);
         assert_eq!(h.peek_for(&1, &100, now), [7, 9]);
         h.charge(&1, 100, &9, MAX_DEFERRALS, now);
         assert!(h.peek_for(&1, &100, now).is_empty());
@@ -1407,7 +1419,7 @@ mod successor_tests {
         let later = now + RETURN_WITHIN + Duration::from_secs(1);
         assert_eq!(h.peek_for(&1, &100, later), [7, 9]);
         // Bounded: the oldest deferred requester is forgotten first.
-        h.note_offer(1, 8, now);
+        h.note_offer(1, 8, false, false, now);
         for r in 0..=MAX_DEFERRALS {
             h.note(1, 9, now);
             h.charge(&1, 200 + r, &8, MAX_DEFERRALS, now);
@@ -1417,7 +1429,7 @@ mod successor_tests {
         // A sender pushed out of the hint is no longer one.
         h.note(1, 10, now);
         h.note(1, 11, now);
-        h.note_offer(1, 12, now);
+        h.note_offer(1, 12, false, false, now);
         h.charge(&1, 300, &11, MAX_DEFERRALS, now);
         assert_eq!(h.peek_for(&1, &300, now), [11, 12]);
     }

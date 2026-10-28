@@ -287,10 +287,9 @@ impl Coordinator {
     ) -> Result<PeerResponse> {
         let holds = self.fill.holds(page);
         let acquiring = self.fill.dependencies.flights.acquiring(page);
-        if racer_core::read::hints::offer_noted(holds, acquiring)
-            && &self.fill.dependencies.candidates.node != requester
-        {
-            self.fill
+        if &self.fill.dependencies.candidates.node != requester
+            && self
+                .fill
                 .dependencies
                 .candidates
                 .successors
@@ -298,8 +297,11 @@ impl Coordinator {
                 .note_offer(
                     page.clone(),
                     requester.clone(),
+                    holds,
+                    acquiring,
                     uring_runtime::environment::now(),
-                );
+                )
+        {
             self.fill
                 .metrics
                 .record(crate::telemetry::Event::SuccessorHint, 1);
