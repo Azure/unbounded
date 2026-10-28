@@ -268,14 +268,20 @@ kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/<dataplane-pod>:9090
   | grep -E 'racer_gpu|racer_rdma_pages_landed'
 ```
 
-| Metric | Counts |
-|--------|--------|
+| Metric | What to look for |
+|--------|------------------|
+| `racer_gpu_enabled` | 1 when GPU mode is on |
+| `racer_gpu_cufile_enabled` | 1 while cuFile reads are on |
+| `racer_gpu_read_requests_total{outcome}` | `gpu` should grow. `wrong_device` means the client's GPU is not one the dataplane can use |
+| `racer_gpu_read_pages_total{decrypt}` | Pages written to GPU memory. `decrypt="gpu"` should grow |
 | `racer_gpu_direct_disk_reads_total` | Pages read from disk with cuFile |
-| `racer_gpu_direct_disk_read_bytes_total` | Bytes read from disk with cuFile |
+| `racer_gpu_staging_exhausted_total` | Disk reads that found no free staging slot |
+| `racer_gpu_cufile_unsupported_total` | Devices cuFile rejected |
 | `racer_rdma_pages_landed_total` | Pages peers wrote straight into GPU memory |
+| `racer_gpu_landing_slots{rail,ordinal}` | Landing slots for each GPU on each rail |
+| `racer_gpu_landing_exhausted_total{rail,ordinal}` | Landing requests that found no free slot |
 
-See [Diagnostics and metrics]({{< relref "reference/racer" >}}#diagnostics-and-metrics)
-for the other GPU metrics.
+See [GPU metrics]({{< relref "reference/racer" >}}#gpu-metrics) for the full list.
 
 ### Client
 
@@ -302,6 +308,6 @@ with cuda.GpuAllocation(meta.size) as alloc:
 | `cufile-disabled` at startup | GPUDirect Storage is missing on the host, or cuFile could not turn on P2PDMA | Load `nvidia-fs` or set up P2PDMA, then restart the machine. With `RACER_GPU_PCI_P2PDMA=true`, check that the host meets the P2PDMA needs |
 | `cufile-disabled` later | A cuFile driver error turned cuFile off | Read `/var/log/cufile/cufile.log` in the dataplane pod. Fix the cause, then restart the dataplane |
 | `cufile-unsupported` | The device or filesystem is not one cuFile supports, or ext4 is not mounted with `data=ordered` | Use file slabs on ext4 or xfs, as in [Slab Storage](#slab-storage) |
-| `racer_gpu_direct_disk_reads_total` stays at 0 | Pages came from the origin, from peers, or from memory. Pages are stored in record format v1. All staging slots were busy | Load the model a second time. Raise `RACER_GPU_STAGING_BYTES` |
-| `racer_rdma_pages_landed_total` stays at 0 | Different Site, no shared rail, or no free landing slot | Check the `stage=gpu-landing` lines and the RDMA setup |
+| `racer_gpu_direct_disk_reads_total` stays at 0 | Pages came from the origin, from peers, or from memory. Pages are stored in record format v1. All staging slots were busy | Load the model a second time. If `racer_gpu_staging_exhausted_total` grows, raise `RACER_GPU_STAGING_BYTES` |
+| `racer_rdma_pages_landed_total` stays at 0 | Different Site, no shared rail, or no free landing slot | Check the `stage=gpu-landing` lines and the RDMA setup. If `racer_gpu_landing_exhausted_total` grows, raise `RACER_GPU_LANDING_BYTES` |
 | vLLM log shows `host` reads | The GPU is not usable by the dataplane, or the client memory is not shareable | Read the client warning. Check the GPU compute mode. Keep `use_vmm` on |
