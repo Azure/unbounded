@@ -267,6 +267,9 @@ func TestDocsResolveScript(t *testing.T) {
 		{name: "no latest release", event: "workflow_dispatch", tag: latestTag, ref: "refs/heads/main", latest: "-", wantErr: true},
 		{name: "bad sha", event: "workflow_dispatch", tag: latestTag, ref: "refs/heads/main", sha: "nope", wantErr: true},
 		{name: "multiline sha", event: "workflow_dispatch", tag: latestTag, ref: "refs/heads/main", sha: tagSHA + "\ntag=evil", wantErr: true},
+		{name: "release latest lookup fails", event: "release", tag: latestTag, latest: "-", wantErr: true},
+		{name: "release commit lookup fails", event: "release", tag: latestTag, sha: "-", wantErr: true},
+		{name: "release bad sha", event: "release", tag: latestTag, sha: "nope", wantErr: true},
 	}
 
 	for _, tc := range cases {
@@ -302,8 +305,11 @@ func TestDocsResolveScript(t *testing.T) {
 			}
 
 			sha := tc.sha
-			if sha == "" {
+			switch sha {
+			case "":
 				sha = tagSHA
+			case "-":
+				sha = ""
 			}
 
 			output := filepath.Join(dir, "output")
