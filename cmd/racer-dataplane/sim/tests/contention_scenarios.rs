@@ -466,130 +466,22 @@ fn relays_hold_their_reservation_only_while_the_body_streams() {
     assert_eq!(counter(&report, "reads_failed"), 0, "{report}");
 }
 
-/// (round 4, hang): an owner above rank 0 leaves the fetch to a rank 0 whose probe timed out, so a
-/// rank 0 whose peer server accepts requests and never answers used to block its pages for as long
-/// as it stayed a member.
-#[test]
-fn a_hung_rank_zero_blocks_its_pages_for_at_most_one_request_timeout() {
-    // Failed reads of members whose own peer server does not hang (a hung reader loses the answers
-    // to its own requests).
+/// Runs ten hung peers (hung until `until_ns`) under two storms 30 s apart, and returns the reads
+/// that failed on members whose own peer server does not hang, before and after 29 s.
+fn hang(watch: bool, silence: bool, until_ns: u64) -> (u64, u64, Value) {
     let failed = |m: &racer_sim::report::Metrics| {
         m.get("reads_failed") - m.get("reads_failed_on_hung_nodes")
     };
-    let run_hang = |watch: bool, silence: bool| {
-        let mut config = quiet(200);
-        config.duration_ns = 45 * SECONDS;
-        config.pages_per_object = 64;
-        config.node.rank0_watch = watch;
-        config.node.silence = silence;
-        config.faults = (0..10)
-            .map(|node| Fault::Hang {
-                node: node * 20,
-                from_ns: 0,
-                until_ns: config.duration_ns,
-            })
-            .collect();
-        config.storms = vec![
-            storm(0, 0, 100, 100 * MILLIS),
-            storm(30 * SECONDS, 0, 100, 100 * MILLIS),
-        ];
-        let mut world = NodeWorld::new(config, 5);
-        world.run(29 * SECONDS);
-        let early = failed(&world.metrics);
-        let end = world.config.duration_ns;
-        world.run(end);
-        let late = failed(&world.metrics) - early;
-        let report = world.report("contention", 5);
-        assert_eq!(
-            report["invariants"]["hard_failures"], 0,
-            "{}",
-            report["invariants"]
-        );
-        assert!(counter(&report, "messages_lost_to_hang") > 0, "{report}");
-        (early, late, report)
-    };
-    // The watch alone (silence off are measured in
-    // `a_hung_peer_is_found_by_a_ping_and_shared_through_its_links`).
-    let (early, late, report) = run_hang(true, false);
-    assert!(
-        counter(&report, "rank0_watch_overdue_walks") > 0,
-        "{report}"
-    );
-    assert!(
-        late <= 1,
-        "second storm still fails {late} (first: {early}): {report}"
-    );
-    let (old_early, old_late, _) = run_hang(false, false);
-    assert!(
-        old_late >= 100 && old_late > 50 * late,
-        "without the watch: {old_early} early, {old_late} late"
-    );
-}
-
-/// (round 4, hang2): each owner above a hung rank 0 learned on its own, after half a request
-/// timeout, that rank 0 hangs, and readers never learned that a peer hangs, so the first storm on
-/// pages whose rank 0 hangs failed almost every read.
-#[test]
-fn a_hung_peer_is_found_by_a_ping_and_shared_through_its_links() {
-    let failed = |m: &racer_sim::report::Metrics| {
-        m.get("reads_failed") - m.get("reads_failed_on_hung_nodes")
-    };
-    let run_hang = |watch: bool, silence: bool| {
-        let mut config = quiet(200);
-        config.duration_ns = 45 * SECONDS;
-        config.pages_per_object = 64;
-        config.node.rank0_watch = watch;
-        config.node.silence = silence;
-        config.faults = (0..10)
-            .map(|node| Fault::Hang {
-                node: node * 20,
-                from_ns: 0,
-                until_ns: config.duration_ns,
-            })
-            .collect();
-        config.storms = vec![
-            storm(0, 0, 100, 100 * MILLIS),
-            storm(30 * SECONDS, 0, 100, 100 * MILLIS),
-        ];
-        let mut world = NodeWorld::new(config, 5);
-        world.run(29 * SECONDS);
-        let early = failed(&world.metrics);
-        let end = world.config.duration_ns;
-        world.run(end);
-        let late = failed(&world.metrics) - early;
-        let report = world.report("contention", 5);
-        assert_eq!(
-            report["invariants"]["hard_failures"], 0,
-            "{}",
-            report["invariants"]
-        );
-        (early, late, report)
-    };
-    for watch in [true, false] {
-        let (early, late, report) = run_hang(watch, true);
-        assert!(
-            early <= 2 && late <= 1,
-            "watch {watch}: {early} early, {late} late: {report}"
-        );
-        assert!(counter(&report, "silence_marks") > 0, "{report}");
-        assert!(counter(&report, "silent_destination_fails") > 0, "{report}");
-    }
-    let (early, _, report) = run_hang(true, false);
-    assert!(early >= 50, "the watch alone: {early} early: {report}");
-    assert_eq!(counter(&report, "silence_pings"), 0, "{report}");
-}
-
-/// A recovery ping tests the link to the peer its sender holds silent.
-#[test]
-fn a_recovered_peer_answers_its_recovery_ping() {
     let mut config = quiet(200);
     config.duration_ns = 45 * SECONDS;
     config.pages_per_object = 64;
+    config.node.rank0_watch = watch;
+    config.node.silence = silence;
     config.faults = (0..10)
         .map(|node| Fault::Hang {
             node: node * 20,
             from_ns: 0,
-            until_ns: 10 * SECONDS,
+            until_ns,
         })
         .collect();
     config.storms = vec![
@@ -598,12 +490,53 @@ fn a_recovered_peer_answers_its_recovery_ping() {
     ];
     let mut world = NodeWorld::new(config, 5);
     world.run(29 * SECONDS);
-    let early = world.metrics.get("reads_failed");
+    let early = failed(&world.metrics);
     let end = world.config.duration_ns;
     world.run(end);
-    let late = world.metrics.get("reads_failed") - early;
+    let late = failed(&world.metrics) - early;
     let report = world.report("contention", 5);
-    assert_eq!(report["invariants"]["hard_failures"], 0, "{report}");
+    assert_eq!(
+        report["invariants"]["hard_failures"], 0,
+        "{}",
+        report["invariants"]
+    );
+    assert!(counter(&report, "messages_lost_to_hang") > 0, "{report}");
+    (early, late, report)
+}
+
+/// A rank 0 whose peer server accepts requests and never answers used to block its pages for as
+/// long as it stayed a member (`rank0_watch`), and each owner and reader learned on its own that it
+/// hangs (`silence`: a ping finds it and the verdict is shared through the sender's links). A
+/// recovered peer answers its recovery ping.
+#[test]
+fn hung_peers_are_found_and_recovered_peers_are_used_again() {
+    let forever = 45 * SECONDS;
+    let (early, late, report) = hang(true, false, forever);
+    assert!(
+        counter(&report, "rank0_watch_overdue_walks") > 0,
+        "{report}"
+    );
+    assert!(
+        late <= 1,
+        "second storm still fails {late} (first: {early}): {report}"
+    );
+    assert!(early >= 50, "the watch alone: {early} early: {report}");
+    assert_eq!(counter(&report, "silence_pings"), 0, "{report}");
+    let (old_early, old_late, _) = hang(false, false, forever);
+    assert!(
+        old_late >= 100 && old_late > 50 * late,
+        "without the watch: {old_early} early, {old_late} late"
+    );
+    for watch in [true, false] {
+        let (early, late, report) = hang(watch, true, forever);
+        assert!(
+            early <= 2 && late <= 1,
+            "watch {watch}: {early} early, {late} late: {report}"
+        );
+        assert!(counter(&report, "silence_marks") > 0, "{report}");
+        assert!(counter(&report, "silent_destination_fails") > 0, "{report}");
+    }
+    let (_, late, report) = hang(true, true, 10 * SECONDS);
     assert!(counter(&report, "silence_marks") > 0, "{report}");
     assert!(counter(&report, "silence_recoveries") > 0, "{report}");
     assert!(counter(&report, "silence_pings_direct") > 0, "{report}");
