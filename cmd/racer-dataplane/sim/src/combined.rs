@@ -254,7 +254,7 @@ impl Combined {
         faults: Vec<CtlFault>,
     ) -> Self {
         let mut ctl = ControlSim::new(settings, seed, faults);
-        ctl.record_changes();
+        ctl.record = true;
         Self {
             node: NodeWorld::new_combined(config, seed),
             ctl,
@@ -285,14 +285,11 @@ impl Combined {
 
     /// Apply control changes to the data plane at time `at`.
     fn sync(&mut self, at: Nanos) {
-        if !self.ctl.has_changes() {
-            return;
-        }
         let Changes {
             memberships,
             applied,
             lives,
-        } = self.ctl.drain();
+        } = std::mem::take(&mut self.ctl.changes);
         for (version, pods) in memberships {
             self.node.commit_membership(version, pods, at);
         }

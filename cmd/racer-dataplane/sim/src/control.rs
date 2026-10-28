@@ -378,8 +378,8 @@ pub enum Life {
     Removed,
 }
 
-/// Changes since the last [`ControlSim::drain`], recorded only when
-/// [`ControlSim::record_changes`] is on.
+/// Changes since a co-stepped data plane last took them, recorded only
+/// when [`ControlSim::record`] is on.
 #[derive(Debug, Default)]
 pub struct Changes {
     /// Newly committed membership versions with their member Pods.
@@ -387,12 +387,6 @@ pub struct Changes {
     /// `(pod, membership version)` applied by its client (0 on restart).
     pub applied: Vec<(u32, u64)>,
     pub lives: Vec<(u32, Life)>,
-}
-
-impl Changes {
-    pub fn is_empty(&self) -> bool {
-        self.memberships.is_empty() && self.applied.is_empty() && self.lives.is_empty()
-    }
 }
 
 /// Pod index of a published member: the model names Node `i` with the UID
@@ -446,8 +440,10 @@ pub struct ControlSim {
     base: Instant,
     enrolled: u32,
     live_clients: u32,
-    record: bool,
-    changes: Changes,
+    /// Record membership commits, applied versions and Pod lifecycle
+    /// changes in `changes`.
+    pub(crate) record: bool,
+    pub(crate) changes: Changes,
     pub metrics: Metrics,
     pub invariants: Invariants,
 }
@@ -562,31 +558,10 @@ impl ControlSim {
         c
     }
 
-    /// Record membership commits, applied versions and Pod lifecycle
-    /// changes for [`Self::drain`].
-    pub fn record_changes(&mut self) {
-        self.record = true;
-    }
-
-    /// Take the changes recorded since the last call.
-    pub fn drain(&mut self) -> Changes {
-        std::mem::take(&mut self.changes)
-    }
-
-    /// Whether changes are waiting for [`Self::drain`].
-    pub fn has_changes(&self) -> bool {
-        !self.changes.is_empty()
-    }
-
     /// Membership version the client on `node` has applied (0 before its
     /// first snapshot). Data-plane nodes use this to lag like their client.
     pub fn membership_version(&self, node: u32) -> u64 {
         self.applied_mv.get(node as usize).copied().unwrap_or(0)
-    }
-
-    /// Publication sequence the client on `node` has applied (0 if none).
-    pub fn applied_sequence(&self, node: u32) -> u64 {
-        self.applied_seq.get(node as usize).copied().unwrap_or(0)
     }
 
     /// The committed membership version, if any.
@@ -3003,7 +2978,7 @@ mod tests {
             .filter(|n| sim.membership_version(*n) == committed)
             .count();
         assert!(caught_up > 50, "{caught_up}");
-        assert!(sim.applied_sequence(0) > 0);
+        assert!(sim.applied_seq[0] > 0);
         assert!(sim.cp.sequence().is_some());
     }
 
