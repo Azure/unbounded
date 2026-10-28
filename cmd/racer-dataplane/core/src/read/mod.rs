@@ -1180,9 +1180,8 @@ pub fn visit_order(
 ///
 /// A non-neighbor never moves ahead of a direct `neighbor` visited first: its
 /// funded route spends most of the reader's links, so when it misses (for
-/// example it defers the reader to a successor, Known issue 21) the reader can
-/// no longer route to a non-neighbor owner after it (found by the DST oracle,
-/// seed 16, at the wave 4 merge).
+/// example it defers the reader to a successor) the reader can
+/// no longer route to a non-neighbor owner after it.
 pub fn lineage_first(
     mut order: VisitOrder,
     since: &[Option<u32>],
@@ -1578,7 +1577,7 @@ mod candidates_tests {
         );
     }
 
-    /// Wave 4 merge (DST oracle seed 16): an older later owner that is not a
+    /// An older later owner that is not a
     /// neighbor never moves ahead of a neighbor visited first; one that is a
     /// neighbor still does, and with a non-neighbor first any older one may.
     #[test]

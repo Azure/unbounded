@@ -3622,8 +3622,7 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
 /// credit, kept for its origin attempt. It still asks its lineage targets
 /// (later owners that arrived before it) and the member ranked fourth, which
 /// was an owner before rank 0 arrived, each copy-only on its own grant, all
-/// at once, and keeps the credit. Before, handoff probes stopped short of the origin
-/// credit, so it fetched without asking anyone.
+/// at once, and keeps the credit.
 #[test]
 fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();

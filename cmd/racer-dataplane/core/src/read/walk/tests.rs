@@ -370,7 +370,7 @@ fn owner_with_tight_links_partitions_predecessor_routes() {
     // 0 comes first the same way: it decides whether this owner leaves the
     // fetch to rank 0 (a route failure gives origin authority; an equal
     // split left rank 2 two links and made it fetch pages rank 0 was
-    // fetching, Known issue 40).
+    // fetching).
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
     let mut b = budget(3, 7);
     b.note_route_failure();
@@ -751,7 +751,7 @@ fn spent_links_end_the_walk_exhausted() {
     assert_eq!(b.remaining_links(), 0);
 }
 
-/// Merge of round 3 route and origin: `pending_handoff` tells callers a
+/// A pending handoff probe tells callers a
 /// stale answer comes from a handoff target (a miss, no refresh), and a
 /// `StaleDestination` from one is also only a miss, never walk evidence.
 #[test]
@@ -1308,7 +1308,7 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
 
 /// The rank 0 watch bounds the timeout rule. Once rank 0 stayed silent for a request timeout
 /// (`Overdue`), a timeout gives authority; `Fetching` keeps the rule and changes nothing else (a
-/// route failure, `Overloaded`, shed or miss from rank 0 still gives authority, Known issue 40).
+/// route failure, `Overloaded`, shed or miss from rank 0 still gives authority).
 /// Probes are planned the same in every state.
 #[test]
 fn rank_zero_watch_bounds_the_timeout_rule() {
@@ -1651,7 +1651,7 @@ fn owner_above_rank_zero_asks_successors_after_its_delegation() {
     assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
 }
 
-/// Wave 4 merge: rank 0 asks a successor (own grant) and then a lineage target before origin. A
+/// Rank 0 asks a successor (own grant) and then a lineage target before origin. A
 /// `StaleMembership` refund of the successor's remote credits lands in the grant, which is dropped,
 /// so the walk's budget never grows; and neither probe timing out is a rank 0 timeout, so rank 0
 /// keeps origin authority.
@@ -1925,7 +1925,7 @@ fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
     }
 }
 
-/// Wave 5 interplay of the lineage grants with the rank 0 timeout rule: an owner above rank 0 whose
+/// Interplay of the lineage grants with the rank 0 timeout rule: an owner above rank 0 whose
 /// granted targets time out keeps origin authority, since only its probe of rank 0 decides it; a
 /// timeout of rank 0 still withholds it after granted probes; and the grants never draw on the
 /// walk's budget.
@@ -2130,7 +2130,7 @@ fn unknown_age_demoted_members_are_targets_when_the_owner_arrived_later() {
     assert!(demoted_targets(&since, &demoted, &demoted_since, 1, Some(5)).is_empty());
 }
 
-/// Known issue 42 (round 4, hang2): an `Overloaded` signed by a relay on an
+/// An `Overloaded` signed by a relay on an
 /// owner's route to rank 0 (`Outcome::Probe(Overloaded)`; rank 0's own is
 /// `Outcome::Shed`) gives an owner above rank 0 origin authority after one
 /// probe of rank 0, without a retry, and never gives a non-owner authority.
@@ -2459,10 +2459,10 @@ fn a_busy_owner_keeps_the_next_in_order_owner_on_its_share() {
 
 #[test]
 fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
-    // Wave 7 merge: Known issue 54 demotes an owner that shed this node
+    // Silence demotes an owner that shed this node
     // (`Silence::shed`) behind the other owners, so ranks 1 and 2 are
     // visited first, out of order, and funded by their canonical rank.
-    // Known issue 57's in-order funding never applies to them there
+    // In-order funding never applies to them there
     // (canonical > index), and no hop carries more than its sender had.
     let answering = |r: usize| {
         if r == 0 {

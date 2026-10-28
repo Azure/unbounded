@@ -502,7 +502,7 @@ fn expired_leader_with_retained_operation_blocks_reelection_until_complete() {
 }
 
 /// Without a retained operation the same sequence reproduces the simulator's
-/// original Known issue 24 failure: the expired leader's detach removes the
+/// original failure: the expired leader's detach removes the
 /// entry, a new caller leads a second fill, and the first leader's finish is
 /// stale.
 #[test]

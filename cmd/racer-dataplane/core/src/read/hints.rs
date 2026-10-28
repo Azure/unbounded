@@ -460,7 +460,7 @@ pub fn should_notice(rank: Option<usize>) -> bool {
 /// predecessor evidence in rank order, is not `CopyMiss` or `VersionUnavailable`). An owner that
 /// did answer noted this one as a successor hint then, so an offer would only repeat that. Rank 0
 /// is always noticed (its offer also re-arms a hint its successor probe may have spent before this
-/// fetch ended, Known issue 37). Empty unless [`should_notice`].
+/// fetch ended). Empty unless [`should_notice`].
 pub fn notice_indexes(rank: Option<usize>, evidence: &[crate::read::ProbeOutcome]) -> Vec<u8> {
     use crate::read::ProbeOutcome;
     (0..rank.map_or(0, |r| r.min(2)))
@@ -876,7 +876,7 @@ mod notice_tests {
 // each probe funded by a fixed grant rather than the requester's budget
 // (the walk's credits never grow; the grant's leftovers are dropped). A hint
 // funds one such probe ([`SuccessorHints::probe`]), so the extra exchanges
-// are bounded by the hints noted (round 4, orphan2).
+// are bounded by the hints noted.
 //
 // Only owners ranked after this node are deferred to or probed: an owner
 // fetches after asking its predecessors, so a predecessor that asked this
@@ -904,8 +904,7 @@ pub const HINT_TTL: Duration = Duration::from_secs(600);
 /// [`HINT_TTL`]: a stale probe costs one granted copy-only miss, while a
 /// stale deferral costs every deferred reader an extra owner visit. Rank 0
 /// often refetches an orphan more than 10 minutes after it learned of it
-/// (5k `full-failover`: most remaining noted refetches after orphan notices,
-/// Known issue 37).
+/// (5k `full-failover`: most remaining noted refetches after orphan notices).
 pub const PROBE_TTL: Duration = Duration::from_secs(3600);
 
 /// Deferrals per hint before this owner fetches the page again.
@@ -1022,8 +1021,7 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
         self.compact();
     }
 
-    /// `node` offered its copy of `key` (Known issue 37,
-    /// [`crate::read::hints`]). Like [`Self::note`] for this node's own
+    /// `node` offered its copy of `key` ([`crate::read::hints`]). Like [`Self::note`] for this node's own
     /// successor probe, but a new hint defers no readers, and an existing
     /// one keeps its deferral count: the holder may be far away or gone by
     /// the time a reader would be sent to it, and this node asks it itself on
@@ -1207,7 +1205,7 @@ pub fn defer_allowed(acquiring: bool) -> bool {
 /// anyway.
 ///
 /// A hinted owner that is also a handoff or lineage target stays a successor target:
-/// [`with_successors`] moves it to the front on its own grant. Excluding it (round 4, orphan2) left
+/// [`with_successors`] moves it to the front on its own grant. Excluding it left
 /// it an opportunistic handoff probe that rank 0, holding the single credit of a delegation, never
 /// sends: in 5k `full-failover` most rank 0 refetches of a holder rank 0 had noted were such
 /// lineage targets.

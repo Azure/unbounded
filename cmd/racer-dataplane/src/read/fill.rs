@@ -1723,8 +1723,8 @@ impl Fill {
         Ok(result)
     }
     /// Whether this node holds a copy of `page` in memory, pending write, or
-    /// the disk index, without reading it (orphan notices and copy offers,
-    /// Known issue 37). Lookup errors count as not held.
+    /// the disk index, without reading it (orphan notices and copy offers).
+    /// Lookup errors count as not held.
     pub(crate) fn holds(&self, page: &PageId) -> bool {
         let deps = &self.dependencies;
         deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())

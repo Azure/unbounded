@@ -68,8 +68,7 @@ pub(crate) struct WalkConfig {
     /// The first `granted` handoff targets (successors, then lineage) are asked copy-only on their
     /// own grant, never the walk's budget, so a delegated rank 0 keeps its origin credit.
     pub granted: usize,
-    /// Send a run of granted probes at once ([`Step::Granted`], Known issue
-    /// 45). Only a copy changes the walk, so their order cannot matter.
+    /// Send a run of granted probes at once ([`Step::Granted`]). Only a copy changes the walk, so their order cannot matter.
     pub parallel_granted: bool,
     /// What this owner knows about rank 0's acquisition: `Overdue` makes a rank 0 timeout grant
     /// authority, `Failed` makes [`Outcome::Failed`] withhold it.

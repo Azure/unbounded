@@ -834,7 +834,7 @@ impl CandidatePolicy {
 
     /// How long rank 0 may stay silent on a page after an owner's probe of
     /// it timed out before the owner presumes it hung (half the client
-    /// request timeout; see `racer_core::liveness`, Known issue 39).
+    /// request timeout; see `racer_core::liveness`).
     pub(crate) fn with_rank0_hang_after(self, hang_after: std::time::Duration) -> Self {
         *self.rank0_watch.borrow_mut() = Rank0Watch::new(
             racer_core::liveness::WATCH_CAPACITY,
@@ -893,7 +893,7 @@ impl CandidatePolicy {
         })
     }
     /// Whether `node` owns `page` under `membership` by a completed cached
-    /// ranking; never ranks (successor hints, Known issue 21).
+    /// ranking; never ranks (successor hints).
     pub(crate) fn owns_cached(
         &self,
         membership: &crate::topology::Membership,
@@ -1683,8 +1683,7 @@ impl CandidatePolicy {
         })
     }
 
-    /// Send a run of granted probes at once (`Step::Granted`, Known issue
-    /// 45): copy-only, each on its own grant
+    /// Send a run of granted probes at once (`Step::Granted`): copy-only, each on its own grant
     /// (`racer_core::read::walk::granted_budget`), all sharing the first
     /// probe's time share, so the run costs one round trip instead of one per
     /// target. Waits for every answer before validating, so no exchange is
@@ -2260,7 +2259,7 @@ impl CandidatePolicy {
             facts.stop = stop;
             // The caller's scope and budget still hold here, so a deadline is
             // the attempt's own bound: the request was sent and is unanswered
-            // (`WalkOutcome::TimedOut`, Known issue 31).
+            // (`WalkOutcome::TimedOut`).
             match stop {
                 Some(Error::DeadlineExceeded) => {
                     *timed_out = true;
