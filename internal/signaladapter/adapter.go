@@ -1060,29 +1060,26 @@ func podTemplate(
 }
 
 func mpiWorkerAffinity(runName string, participants []signalv1.Participant) *corev1.Affinity {
-	nodeNames := make([]string, len(participants))
-
-	nodeUIDs := make([]string, len(participants))
+	nodeSelectorTerms := make([]corev1.NodeSelectorTerm, len(participants))
 	for index := range participants {
-		nodeNames[index] = participants[index].NodeName
-		nodeUIDs[index] = string(participants[index].NodeUID)
+		nodeSelectorTerms[index] = corev1.NodeSelectorTerm{
+			MatchFields: []corev1.NodeSelectorRequirement{{
+				Key:      "metadata.name",
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{participants[index].NodeName},
+			}},
+			MatchExpressions: []corev1.NodeSelectorRequirement{{
+				Key:      signalv1.ReservationNodeUIDLabel,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{string(participants[index].NodeUID)},
+			}},
+		}
 	}
 
 	return &corev1.Affinity{
 		NodeAffinity: &corev1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
-					MatchFields: []corev1.NodeSelectorRequirement{{
-						Key:      "metadata.name",
-						Operator: corev1.NodeSelectorOpIn,
-						Values:   nodeNames,
-					}},
-					MatchExpressions: []corev1.NodeSelectorRequirement{{
-						Key:      signalv1.ReservationNodeUIDLabel,
-						Operator: corev1.NodeSelectorOpIn,
-						Values:   nodeUIDs,
-					}},
-				}},
+				NodeSelectorTerms: nodeSelectorTerms,
 			},
 		},
 		PodAntiAffinity: &corev1.PodAntiAffinity{
