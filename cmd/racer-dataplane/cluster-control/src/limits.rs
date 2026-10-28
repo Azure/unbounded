@@ -50,14 +50,9 @@ pub const MIN_WRITE_BYTES_PER_SEC: u64 = 100 * 1024;
 /// cap is lowered further when `RLIMIT_NOFILE` is smaller, see
 /// [`connection_capacity`].
 ///
-/// Connections are not the binding limit when a publication lands. All
-/// waiting long polls wake together, and at most [`MAX_WRITES`] (64) write
-/// at once. The rest queue for a slot in FIFO order (`exec::Slots::acquire`,
-/// [`MAX_WRITE_WAITERS`], [`WRITE_QUEUE_GRACE`]) instead of answering 429, so
-/// a seat with 12500 polls drains a new publication in about 12500 / 64
-/// write rounds with no client retries. Waking W polls costs O(W): each
-/// `Signal::changed` waiter owns one waker slot and re-registers in O(1)
-/// (modeled in `racer-sim`).
+/// When a publication lands every waiting long poll wakes; beyond
+/// [`MAX_WRITES`] they queue for a write slot ([`MAX_WRITE_WAITERS`],
+/// [`WRITE_QUEUE_GRACE`]) instead of answering 429.
 pub const MAX_CONTROL_CONNECTIONS: usize = 16384;
 
 /// Maximum concurrent TLS handshakes, the CPU-heavy stage of a connection.
@@ -109,14 +104,8 @@ pub const MAX_WEBHOOK_CONNECTIONS: usize = 64;
 pub const MAX_BOOTSTRAPS: usize = 32;
 
 /// Most Kubernetes API calls per second this process spends on bearer
-/// authorization (TokenReview and binding reads), see
-/// [`crate::step::authz::ApiBudget`]. The budget halves on an API 429 and
-/// grows back, so 16 seats settle near what the API server admits rather
-/// than at 16 times this. An authorization beyond it answers `Overloaded`
-/// before making any call, rather than starting calls the API server would
-/// answer 429. The ceiling is high so a cluster with only 3 seats is not
-/// held below what its API server admits; the 429 feedback, not this
-/// number, is what sizes the rate in a storm.
+/// authorization, see [`crate::step::authz::ApiBudget`]. A ceiling: the 429
+/// feedback, not this number, sizes the rate in a storm.
 pub const AUTH_API_QPS: f64 = 400.0;
 
 /// Longest an authorization waits in the seat for [`AUTH_API_QPS`] budget
@@ -133,18 +122,13 @@ pub const AUTH_API_BURST: f64 = 100.0;
 /// shared, so this bounds bandwidth and TLS buffers, not copies.
 pub const MAX_WRITES: usize = 64;
 
-/// Maximum responses queued for a write slot per server. Woken long polls
-/// wait here instead of answering 429 when the only problem is that all
-/// [`MAX_WRITES`] slots are busy. Sized to the connection bound, so every
-/// connection may wait; the deadline ([`WRITE_QUEUE_GRACE`]) is what turns
-/// sustained overload into 429.
+/// Maximum responses queued for a write slot per server: every connection
+/// may wait; the deadline ([`WRITE_QUEUE_GRACE`]) turns overload into 429.
 pub const MAX_WRITE_WAITERS: usize = MAX_CONTROL_CONNECTIONS;
 
 /// How long past its poll deadline a woken long poll may wait for a write
-/// slot. Clients give a long poll `POLL_WAIT` plus 10 s
-/// (`src/control/session.rs` `turn`), so 5 s of queueing leaves 5 s to
-/// write. The wait is also bounded by seat authority and the caller's
-/// credential. Past it the poll answers 429, as before.
+/// slot. Clients give a long poll `POLL_WAIT` plus 10 s, so this leaves 5 s
+/// to write. Past it the poll answers 429.
 pub const WRITE_QUEUE_GRACE: Duration = Duration::from_secs(5);
 
 /// Maximum concurrent outbound Kubernetes API requests.

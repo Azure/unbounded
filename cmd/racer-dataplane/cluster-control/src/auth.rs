@@ -200,17 +200,11 @@ async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
     Ok(b)
 }
 
-/// Full bearer authorization of a dataplane Pod.
-///
-/// A whole authorization of the same token younger than
-/// [`authz::CALLER_TTL`] is reused. Otherwise the Pod and Node are read
-/// live, and the TokenReview and the DaemonSet and ServiceAccount reads may
-/// come from [`Shared::authz`]. All
-/// API calls the authorization will make are reserved from
-/// [`Shared::auth_budget`] first, waiting up to
-/// [`limits::AUTH_BUDGET_WAIT`] for it; beyond that it answers `Overloaded`
-/// before calling the API, so a storm is shed here rather than by API
-/// server 429s part way through an authorization.
+/// Full bearer authorization of a dataplane Pod. A recent whole
+/// authorization of the token is reused; otherwise the Pod and Node are read
+/// live and the review and bindings may come from [`Shared::authz`]. Every
+/// API call is reserved from [`Shared::auth_budget`] first (waiting up to
+/// [`limits::AUTH_BUDGET_WAIT`]), else `Overloaded` before any call.
 pub async fn authorize(
     shared: &Shared,
     header: Option<&str>,
