@@ -3184,6 +3184,36 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
             "metadata bypasses saturated body gate"
         );
     }
+    // Bodyless page modes bypass too; a body-carrying page still queues.
+    for mode in 0..3 {
+        for (f, t) in fixtures.iter().zip(&transfers) {
+            let mut page = request(&f.admission, 22);
+            page.operation = Operation::Page {
+                page: PageId {
+                    version: ObjectVersion {
+                        object: page.origin.object.clone(),
+                        etag: StrongEtag::test_value("incast"),
+                    },
+                    number: PageNumber(0),
+                },
+                mode: [FetchMode::Ping, FetchMode::Offer, FetchMode::CopyOnly]
+                    .into_iter()
+                    .nth(mode)
+                    .unwrap(),
+            };
+            let mut admit = Box::pin(t.admit_receive(&page, &scope));
+            match (mode, admit.as_mut().poll(&mut cx)) {
+                (2, poll) => {
+                    assert!(poll.is_pending(), "body page waits at saturated gate")
+                }
+                (_, std::task::Poll::Ready(Ok(None))) => {}
+                (_, poll) => panic!(
+                    "bodyless page must bypass the gate, ready: {}",
+                    poll.is_ready()
+                ),
+            }
+        }
+    }
     clock.advance(Duration::from_millis(11));
     for g in &gates {
         g.poll_deadlines(64);
