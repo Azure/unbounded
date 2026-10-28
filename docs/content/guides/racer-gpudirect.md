@@ -248,7 +248,7 @@ kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu'
 | Line | Meaning |
 |------|---------|
 | `stage=gpu ordinal=0 uuid=... usable=true` | One line per GPU found |
-| `stage=gpu state=enabled usable=N decrypt=M staging_slots=S` | GPU mode is on. `decrypt=0` means the CPU decrypts every page |
+| `stage=gpu state=enabled usable=N decrypt=M staging_slots=S pci_p2pdma=B` | GPU mode is on. `decrypt=0` means the CPU decrypts every page. `pci_p2pdma` shows the `RACER_GPU_PCI_P2PDMA` setting |
 | `stage=gpu state=disabled reason=not-built` | The image was built without CUDA |
 | `stage=gpu state=disabled reason=...` | No usable GPU, or the CUDA library failed to load |
 | `stage=gpu ordinal=N decrypt=unavailable` | The GPU cannot run the decrypt kernels |
@@ -299,7 +299,7 @@ with cuda.GpuAllocation(meta.size) as alloc:
 |---------|-------|-----|
 | Dataplane fails to start with `RACER_ENABLE_GPU=true` | No usable GPU, or the image has no CUDA | Check the `stage=gpu` lines. Set `RACER_DATAPLANE_CUDA=true`. Set the GPUs to `Default` compute mode |
 | `decrypt=0` | The GPU is older than compute capability 8.0 | Use a newer GPU |
-| `cufile-disabled` at startup | GPUDirect Storage is missing on the host | Load `nvidia-fs` or set up P2PDMA, then restart the machine |
+| `cufile-disabled` at startup | GPUDirect Storage is missing on the host, or cuFile could not turn on P2PDMA | Load `nvidia-fs` or set up P2PDMA, then restart the machine. With `RACER_GPU_PCI_P2PDMA=true`, check that the host meets the P2PDMA needs |
 | `cufile-disabled` later | A cuFile driver error turned cuFile off | Read `/var/log/cufile/cufile.log` in the dataplane pod. Fix the cause, then restart the dataplane |
 | `cufile-unsupported` | The device or filesystem is not one cuFile supports, or ext4 is not mounted with `data=ordered` | Use file slabs on ext4 or xfs, as in [Slab Storage](#slab-storage) |
 | `racer_gpu_direct_disk_reads_total` stays at 0 | Pages came from the origin, from peers, or from memory. Pages are stored in record format v1. All staging slots were busy | Load the model a second time. Raise `RACER_GPU_STAGING_BYTES` |
