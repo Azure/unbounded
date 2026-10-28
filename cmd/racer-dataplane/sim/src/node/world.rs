@@ -712,17 +712,19 @@ struct Race {
     _escrow: Vec<SimCharge>,
 }
 
-/// Production `DUPLICATE_BYTES` (`src/read/candidates.rs`).
-pub const DUPLICATE_BYTES: usize = PAGE_BYTES * 2 + 16;
+/// Production `DUPLICATE_BYTES` at the simulated page size.
+pub const DUPLICATE_BYTES: usize = racer_core::read::candidates::duplicate_bytes(PAGE_BYTES);
 
 /// Production `reserve_hedge_pages`: plaintext and ciphertext for `pages`.
 fn hedge_pages(
     quotas: &super::admission::SimQuotas,
     pages: usize,
 ) -> Result<Vec<SimCharge>, Error> {
+    let (plaintext, ciphertext) =
+        racer_core::read::candidates::hedge_page_charges(PAGE_BYTES, pages);
     Ok(vec![
-        reserve(quotas, ResourceClass::Plaintext, PAGE_BYTES * pages)?,
-        reserve(quotas, ResourceClass::Ciphertext, (PAGE_BYTES + 16) * pages)?,
+        reserve(quotas, ResourceClass::Plaintext, plaintext)?,
+        reserve(quotas, ResourceClass::Ciphertext, ciphertext)?,
     ])
 }
 

@@ -52,17 +52,10 @@ fn reserve_hedge_pages(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
     use crate::admission::ResourceClass;
-    use crate::model::PAGE_BYTES;
-    let plaintext = admission.reserve(
-        Some(cache),
-        ResourceClass::Plaintext,
-        PAGE_BYTES as usize * pages,
-    )?;
-    let ciphertext = admission.reserve(
-        Some(cache),
-        ResourceClass::Ciphertext,
-        (PAGE_BYTES as usize + 16) * pages,
-    )?;
+    let (plaintext, ciphertext) =
+        racer_core::read::candidates::hedge_page_charges(crate::model::PAGE_BYTES as usize, pages);
+    let plaintext = admission.reserve(Some(cache), ResourceClass::Plaintext, plaintext)?;
+    let ciphertext = admission.reserve(Some(cache), ResourceClass::Ciphertext, ciphertext)?;
     Ok((plaintext, ciphertext))
 }
 
@@ -3112,7 +3105,8 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
 // A valid winner waits for the losing exchange/crypto fence before return:
 // this can limit the latency benefit and is not an early-publication implementation.
 
-pub const DUPLICATE_BYTES: usize = crate::model::PAGE_BYTES as usize * 2 + 16;
+pub const DUPLICATE_BYTES: usize =
+    racer_core::read::candidates::duplicate_bytes(crate::model::PAGE_BYTES as usize);
 #[derive(Clone, Copy)]
 pub struct HedgeConfig {
     pub delay: Duration,

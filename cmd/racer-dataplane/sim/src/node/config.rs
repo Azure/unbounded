@@ -302,8 +302,8 @@ impl NodeConfig {
     }
 }
 
-/// Production `DUPLICATE_BYTES`: two pages plus a tag.
-const DUPLICATE_BYTES: u64 = 2 * MIB + 16;
+/// Production `DUPLICATE_BYTES` at the simulated page size.
+const DUPLICATE_BYTES: u64 = super::world::DUPLICATE_BYTES as u64;
 
 #[cfg(test)]
 mod tests {

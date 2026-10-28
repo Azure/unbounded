@@ -338,9 +338,25 @@ pub fn validate_origin_authority(
     Ok(())
 }
 
+/// Bytes one hedge duplicate holds: two pages plus a tag.
+pub const fn duplicate_bytes(page_bytes: usize) -> usize {
+    page_bytes * 2 + 16
+}
+
+/// Plaintext and ciphertext bytes a hedge reserves for `pages` pages.
+pub const fn hedge_page_charges(page_bytes: usize, pages: usize) -> (usize, usize) {
+    (page_bytes * pages, (page_bytes + 16) * pages)
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
+    #[test]
+    fn hedge_sizes() {
+        assert_eq!(super::duplicate_bytes(1 << 20), (2 << 20) + 16);
+        assert_eq!(super::hedge_page_charges(100, 2), (200, 232));
+    }
+
     use super::*;
     use racer_control_wire::CacheId;
     use racer_object_wire::model::CacheKey;
