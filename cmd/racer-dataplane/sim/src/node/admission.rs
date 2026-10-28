@@ -19,8 +19,8 @@ use flow_control::{Charge, Policy, Quotas, Rejection};
 use racer_core::read::Error;
 use racer_core::read::flight::Reserve;
 
-use super::config::NodeConfig;
-use super::ids::CACHE;
+use super::state::CACHE;
+use crate::config::NodeConfig;
 
 pub use racer_core::admission::ResourceClass;
 use racer_core::admission::{Floors, Limits, Rules};

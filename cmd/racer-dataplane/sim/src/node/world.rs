@@ -74,8 +74,8 @@ use serde_json::{Value, json};
 use topology::{PathQuery, Placement};
 
 use super::admission::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
-use super::ids::Ids;
 use super::membership::{Members, Versions, position};
+use super::state::Ids;
 use super::state::{Components, Disk, Node, Shared, record_bytes};
 use crate::config::Config;
 use crate::engine::Fixed;
