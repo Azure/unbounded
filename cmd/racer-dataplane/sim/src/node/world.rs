@@ -65,10 +65,8 @@ use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 use topology::{PathQuery, Placement};
 
-use super::admission::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
-use super::membership::{Members, Versions, position};
-use super::state::Ids;
-use super::state::{Components, Disk, Node, Shared, record_bytes};
+use super::state::{COMPONENTS, Disk, Ids, Members, Node, Shared, Versions, record_bytes};
+use super::state::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
 use crate::config::Config;
 use crate::engine::Fixed;
 use crate::engine::{Engine, MILLIS, Nanos, Role, SECONDS, Streams, mix};
@@ -634,10 +632,7 @@ struct Race {
 pub const DUPLICATE_BYTES: usize = racer_core::read::duplicate_bytes(PAGE_BYTES);
 
 /// Production `reserve_hedge_pages`: plaintext and ciphertext for `pages`.
-fn hedge_pages(
-    quotas: &super::admission::SimQuotas,
-    pages: usize,
-) -> Result<Vec<SimCharge>, Error> {
+fn hedge_pages(quotas: &super::state::SimQuotas, pages: usize) -> Result<Vec<SimCharge>, Error> {
     let (plaintext, ciphertext) = racer_core::read::hedge_page_charges(PAGE_BYTES, pages);
     Ok(vec![
         reserve(quotas, ResourceClass::Plaintext, plaintext)?,
@@ -1197,7 +1192,7 @@ impl NodeWorld {
         for (w, worker) in n.workers.iter().enumerate() {
             let mut steps = 0u64;
             while steps < 4096 {
-                match worker.placement.maintain(&*members) {
+                match worker.placement.maintain(&members) {
                     topology::Maintenance::Progress => steps += 1,
                     topology::Maintenance::Idle | topology::Maintenance::Blocked => break,
                 }
@@ -1233,7 +1228,13 @@ impl NodeWorld {
         // false (`WorkerApplication::membership_usable`) and a read could
         // not route. A new node is listed only after it serves (Known
         // issue 14), a little after it applied its first membership.
-        if position(&self.versions.adopted(node, now).members, node).is_none() {
+        if self
+            .versions
+            .adopted(node, now)
+            .members
+            .position(&node.to_be_bytes())
+            .is_none()
+        {
             self.metrics.incr("reads_skipped_not_member");
             return;
         }
@@ -1773,7 +1774,8 @@ impl NodeWorld {
         owners
             .iter()
             .map(|c| {
-                position(members, *c)
+                members
+                    .position(&c.to_be_bytes())
                     .and_then(|p| members.since(p))
                     .map(|s| s.max(base))
             })
@@ -1791,11 +1793,9 @@ impl NodeWorld {
         let key = page.to_be_bytes();
         let placement = &n.workers[w as usize].placement;
         let ranked = if rank {
-            placement.rank(&*version.members, &key)
+            placement.rank(&version.members, &key)
         } else {
-            placement
-                .cached(&*version.members, &key)
-                .unwrap_or_default()
+            placement.cached(&version.members, &key).unwrap_or_default()
         };
         ranked
             .into_iter()
@@ -2165,7 +2165,7 @@ impl NodeWorld {
         let held = members.clone();
         let future: TaskFuture = Box::pin(async move {
             let key = page.to_be_bytes();
-            placement.rank_async(&*held, &key).await
+            placement.rank_async(&held, &key).await
         });
         self.spawn(node, w, future, members, false, then);
     }
@@ -2333,7 +2333,10 @@ impl NodeWorld {
                 let owners: Vec<u32> = cands
                     .iter()
                     .map(|n| {
-                        if current.as_ref().is_some_and(|m| position(m, *n).is_some()) {
+                        if current
+                            .as_ref()
+                            .is_some_and(|m| m.position(&n.to_be_bytes()).is_some())
+                        {
                             *n
                         } else {
                             NOT_MEMBER
@@ -2359,8 +2362,8 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let (node, w, page) = (fill.node, fill.worker, fill.page);
         let rank = cands.iter().position(|c| *c == node);
-        let me = position(members, node);
-        let neighbor = |r: usize| matches!((me, position(members, cands[r])), (Some(a), Some(b)) if members.is_neighbor(a, b));
+        let me = members.position(&node.to_be_bytes());
+        let neighbor = |r: usize| matches!((me, members.position(&cands[r].to_be_bytes())), (Some(a), Some(b)) if members.is_neighbor(a, b));
         // Arrival order of the owners in this node's chain (production
         // `Membership::since`, Known issue 25): the shared chain clamped to
         // the generation this node's process started from.
@@ -2475,7 +2478,7 @@ impl NodeWorld {
         let member = version
             .checked_sub(1)
             .and_then(|v| self.versions.get(v))
-            .is_some_and(|v| position(&v.members, node).is_some());
+            .is_some_and(|v| v.members.position(&node.to_be_bytes()).is_some());
         let recent = self.config.node.retained_versions >= 1
             && self.versions.get(version).is_some_and(|v| {
                 now.saturating_sub(v.published) <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
@@ -3192,13 +3195,15 @@ impl NodeWorld {
         let Ok((keep, links)) = search else {
             return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
         };
-        let (Some(from), Some(to)) = (position(&members, holder), position(&members, m.dest))
-        else {
+        let (Some(from), Some(to)) = (
+            members.position(&holder.to_be_bytes()),
+            members.position(&m.dest.to_be_bytes()),
+        ) else {
             return self.fail_hop(mid, holder, Fault::Unavailable);
         };
         let visited: Option<Vec<usize>> = m.path[..keep]
             .iter()
-            .map(|n| position(&members, *n))
+            .map(|n| members.position(&n.to_be_bytes()))
             .collect();
         let Some(visited) = visited else {
             return self.fail_hop(mid, holder, Fault::Unavailable);
@@ -3221,7 +3226,7 @@ impl NodeWorld {
                 blocked: &hint,
                 seed: &seed,
             };
-            paths.route(&*held, query).await
+            paths.route(&held, query).await
         });
         self.spawn(
             holder,
@@ -3246,16 +3251,16 @@ impl NodeWorld {
             .suspects
             .iter()
             .filter(|s| !n.links.available(s, instant))
-            .filter_map(|s| position(members, *s))
+            .filter_map(|s| members.position(&s.to_be_bytes()))
             .collect();
         // Production `LinkHealth::available`: silent next hops too (Known
         // issue 41).
-        let me = position(members, holder);
+        let me = members.position(&holder.to_be_bytes());
         let mut silent: Vec<usize> = n
             .silence
             .silent_peers(instant)
             .filter(|s| Some(**s) != exempt)
-            .filter_map(|s| position(members, *s))
+            .filter_map(|s| members.position(&s.to_be_bytes()))
             .filter(|p| me.is_some_and(|me| members.is_neighbor(me, *p)))
             .filter(|p| !blocked.contains(p))
             .collect();
@@ -3696,7 +3701,7 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
         let members = &self.versions.get(fill.core.version)?.members;
-        let me = position(members, node);
+        let me = members.position(&node.to_be_bytes());
         let at = |p: usize| members.members()[p].node;
         fanout_helper(
             &self.ids.object(page),
@@ -3766,7 +3771,7 @@ impl NodeWorld {
             return false;
         };
         let exempt = owners.contains(&requester)
-            || position(&members, requester).is_some_and(|p| {
+            || members.position(&requester.to_be_bytes()).is_some_and(|p| {
                 is_helper(
                     &self.ids.object(page),
                     self.ids.number(page),
@@ -4384,7 +4389,7 @@ impl NodeWorld {
                 page: number,
                 rank,
                 predecessor_evidence: fill.core.evidence.len(),
-                member: position(&members, node).is_some(),
+                member: members.position(&node.to_be_bytes()).is_some(),
             },
             &object,
             number,
@@ -4577,10 +4582,10 @@ impl NodeWorld {
         else {
             return "moved_unasked_holder_rank_unknown";
         };
-        let Some(at) = position(&members, holder) else {
+        let Some(at) = members.position(&holder.to_be_bytes()) else {
             return "moved_unasked_holder_not_member";
         };
-        let rank = topology::rank_of(&*members, &fill.page.to_be_bytes(), at);
+        let rank = topology::rank_of(&members, &fill.page.to_be_bytes(), at);
         let mine = self.since_of(fill.node, &members, &[fill.node])[0];
         let theirs = self.since_of(fill.node, &members, &[holder])[0];
         let older = matches!((theirs, mine), (Some(t), Some(m)) if t < m);
@@ -5136,12 +5141,12 @@ impl NodeWorld {
         let Some(version) = self.versions.get(n.version) else {
             return false;
         };
-        let Some(me) = position(&version.members, node) else {
+        let Some(me) = version.members.position(&node.to_be_bytes()) else {
             return false;
         };
         n.workers[w as usize]
             .placement
-            .is_owner(&*version.members, &page.to_be_bytes(), |o| o == me)
+            .is_owner(&version.members, &page.to_be_bytes(), |o| o == me)
     }
 
     /// Production `Retention::observe_at` for one client operation: the
@@ -5194,7 +5199,9 @@ impl NodeWorld {
         let record = record_bytes(page_bytes);
         let version = self.nodes[node as usize].version;
         let members = self.versions.get(version).map(|v| v.members.clone());
-        let me = members.as_ref().and_then(|m| position(m, node));
+        let me = members
+            .as_ref()
+            .and_then(|m| m.position(&node.to_be_bytes()));
         let n = &mut self.nodes[node as usize];
         let charge = match reserve(
             &n.workers[w as usize].quotas,
@@ -5218,7 +5225,7 @@ impl NodeWorld {
             let ids = &self.ids;
             let owned = |p: &u64| match (&members, me) {
                 (Some(m), Some(me)) => workers[ids.worker(*p) as usize].placement.is_owner(
-                    &**m,
+                    &*m,
                     &p.to_be_bytes(),
                     |o| o == me,
                 ),
@@ -5297,7 +5304,7 @@ impl NodeWorld {
             state(fill.node),
             fill.core.version,
             fill.core.rank,
-            &*fill.core.handoff,
+            &fill.core.handoff,
             fill.outcomes,
             fill.core.stale,
             fill.core.waits,
@@ -5413,11 +5420,11 @@ impl NodeWorld {
     // ---- report ----
 
     pub fn memory(&self) -> Vec<(&'static str, usize)> {
-        let mut components = Components::default();
+        let mut sums = [0; COMPONENTS.len()];
         for n in &self.nodes {
-            n.account(&mut components);
+            n.account(&mut sums);
         }
-        let mut list = components.list();
+        let mut list: Vec<_> = COMPONENTS.into_iter().zip(sums).collect();
         // Shared memos: real rankings (`RETAINED_DEPTH` 16-byte scores and
         // a cursor; 48 bytes more than five 24-byte scores with one spare)
         // and route alternatives, estimated per entry.
@@ -5611,7 +5618,7 @@ impl NodeWorld {
     pub fn owners(&self, page: u64) -> Vec<u32> {
         let members = self.members();
         Placement::<Phantom>::with_rankings(0, self.shared.phantom.clone())
-            .rank(&*members, &page.to_be_bytes())
+            .rank(&members, &page.to_be_bytes())
             .into_iter()
             .map(|p| members.members()[p].node)
             .collect()
@@ -5676,7 +5683,7 @@ mod shed_tests {
         let owner = owners[0];
         assert!(world.owners_at(owner, w, page, false).is_empty());
         let helper = |n: u32| {
-            position(&members, n).is_some_and(|p| {
+            members.position(&n.to_be_bytes()).is_some_and(|p| {
                 is_helper(
                     &world.ids.object(page),
                     world.ids.number(page),

@@ -42,8 +42,6 @@ pub mod node {
     //! publications and faults. See `designs/racer-core-simulation.md`, section
     //! "Node model".
 
-    pub mod admission;
-    pub mod membership;
     pub mod state;
     pub mod world;
 
