@@ -956,11 +956,6 @@ mod tests {
         }
     }
 
-    /// Mirror of the requester check in `forwarding::response_matches`.
-    fn requester_accepts(requested: Option<u16>, granted: Option<u16>) -> bool {
-        granted.is_some() == requested.is_some() && granted <= requested
-    }
-
     #[test]
     fn late_selection_grant_is_capped_at_its_own_request() {
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
@@ -971,7 +966,7 @@ mod tests {
         let grant = waiter.try_result(2).unwrap().unwrap().grant;
         assert_eq!(grant.sequence, 4);
         assert_eq!(grant.flights, Some(1));
-        assert!(requester_accepts(late.flights, grant.flights));
+        assert!(racer_core::route::flights_ok(grant.flights, late.flights));
         let key = EntryKey {
             membership: MembershipVersion(1),
             receiver: NodeId("a".into()),
@@ -992,9 +987,9 @@ mod tests {
         let grant = waiter.try_result(2).unwrap().unwrap().grant;
         assert_eq!(grant.sequence, 4);
         assert_eq!(grant.flights, None);
-        assert!(requester_accepts(late.flights, grant.flights));
-        assert!(!requester_accepts(Some(1), Some(3)));
-        assert!(!requester_accepts(None, Some(1)));
+        assert!(racer_core::route::flights_ok(grant.flights, late.flights));
+        assert!(!racer_core::route::flights_ok(Some(3), Some(1)));
+        assert!(!racer_core::route::flights_ok(Some(1), None));
     }
 
     #[test]

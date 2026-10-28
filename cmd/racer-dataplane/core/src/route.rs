@@ -354,7 +354,8 @@ impl Outcome {
         }
     }
 
-    /// Outcomes that assert successful data or authoritative absence.
+    /// Outcomes that assert successful data or authoritative absence; only the
+    /// requested destination may sign these, a relay only its own failure.
     pub fn asserts_success(self) -> bool {
         !matches!(self, Self::Other)
     }
@@ -373,12 +374,6 @@ impl Outcome {
     pub fn echoes_operation(self) -> bool {
         matches!(self, Self::Page | Self::Metadata | Self::Bootstrap)
     }
-}
-
-/// A relay may report its own failure, but only the requested destination may
-/// assert successful data or authoritative absence.
-pub fn authority_ok(outcome: Outcome, signer_is_destination: bool) -> bool {
-    signer_is_destination || !outcome.asserts_success()
 }
 
 /// `not-found` answers only a fresh acquire for metadata or bootstrap.
@@ -417,19 +412,9 @@ pub fn flights_ok(granted: Option<u16>, requested: Option<u16>) -> bool {
     granted.is_some() == requested.is_some() && granted <= requested
 }
 
-/// An owner may shorten a hold to its own TTL cap, never extend the ask.
-pub fn hold_ok(granted_until: u64, requested_until: u64) -> bool {
-    granted_until <= requested_until
-}
-
 /// A bootstrap carries page zero exactly when the object is nonempty.
 pub fn bootstrap_presence_ok(length: u64, present: u64) -> bool {
     present == u64::from(length != 0)
-}
-
-/// A present bootstrap page is page zero.
-pub fn bootstrap_page_ok(present: u64, page: u64) -> bool {
-    present != 1 || page == 0
 }
 
 #[cfg(test)]
@@ -780,8 +765,6 @@ mod tests {
         ] {
             let outcome = Outcome::from_wire(wire);
             assert_eq!(outcome.asserts_success(), success, "{wire}");
-            assert!(authority_ok(outcome, true));
-            assert_eq!(authority_ok(outcome, false), !success, "{wire}");
         }
         assert_eq!(Outcome::Held.warm_action(), Some("hold"));
         assert_eq!(Outcome::Warmed.warm_action(), Some("fill"));
@@ -815,9 +798,7 @@ mod tests {
         assert!(flights_ok(None, None));
         assert!(!flights_ok(Some(1), None));
         assert!(!grant_receiver_ok::<u32>(&[], &1));
-        assert!(hold_ok(5, 5) && hold_ok(4, 5) && !hold_ok(6, 5));
         assert!(bootstrap_presence_ok(0, 0) && bootstrap_presence_ok(9, 1));
         assert!(!bootstrap_presence_ok(0, 1) && !bootstrap_presence_ok(9, 0));
-        assert!(bootstrap_page_ok(0, 9) && bootstrap_page_ok(1, 0) && !bootstrap_page_ok(1, 1));
     }
 }

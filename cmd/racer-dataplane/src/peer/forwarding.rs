@@ -955,10 +955,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
             return Err(Error::Unauthorized);
         }
         if typed == route::Outcome::Held
-            && !route::hold_ok(
-                number(response, "racer-warm-until")?,
-                number(request, "racer-warm-until")?,
-            )
+            && number(response, "racer-warm-until")? > number(request, "racer-warm-until")?
         {
             // An owner may shorten a hold to its own TTL cap, never extend the ask.
             // Longer pre-existing holds are reported as the requested expiry.
@@ -989,8 +986,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         let length = protocol::number(response, "racer-length")?;
         let present = protocol::number(response, "racer-page-present")?;
         if !route::bootstrap_presence_ok(length, present)
-            || (present == 1
-                && !route::bootstrap_page_ok(present, protocol::number(response, "racer-page")?))
+            || (present == 1 && protocol::number(response, "racer-page")? != 0)
         {
             return Err(Error::Unauthorized);
         }
@@ -1005,12 +1001,7 @@ fn response_authority(
     signer: &NodeId,
 ) -> Result<()> {
     let outcome = route::Outcome::from_wire(&field(response, "racer-outcome")?);
-    if outcome.asserts_success()
-        && !route::authority_ok(
-            outcome,
-            signer == &node_field(request, "racer-route-destination")?,
-        )
-    {
+    if outcome.asserts_success() && signer != &node_field(request, "racer-route-destination")? {
         return Err(Error::Unauthorized);
     }
     Ok(())
