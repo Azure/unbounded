@@ -17,7 +17,9 @@ func TestValidateDataplaneConfigAccepts(t *testing.T) {
 		"gpu": {
 			"RACER_ENABLE_GPU": "true", "RACER_GPU_STAGING_BYTES": "2097152",
 			"RACER_GPU_LANDING_BYTES": "0", "RACER_DATAPLANE_NVIDIA": "cdi",
+			"RACER_GPU_PCI_P2PDMA": "true",
 		},
+		"gpu pci p2pdma off":          {"RACER_GPU_PCI_P2PDMA": "false"},
 		"gpu auto with large landing": {"RACER_ENABLE_GPU": "auto", "RACER_GPU_LANDING_BYTES": "268435456"},
 		"booleans and enums": {
 			"RACER_ALLOW_SMT": "true", "RACER_PPROF_ENABLED": "false", "RACER_ENABLE_RDMA": "false",
@@ -52,6 +54,9 @@ func TestValidateDataplaneConfigRejects(t *testing.T) {
 		{"RACER_GPU_LANDING_BYTES", "+2097152"},
 		{"RACER_DATAPLANE_NVIDIA", "on"},
 		{"RACER_ALLOW_SMT", "1"},
+		{"RACER_GPU_PCI_P2PDMA", "TRUE"},
+		{"RACER_GPU_PCI_P2PDMA", "1"},
+		{"RACER_GPU_PCI_P2PDMA", ""},
 		{"RACER_REPLICA_SELECTION", "random"},
 		{"RACER_ADMISSION_MODE", "on"},
 		{"RACER_SHARES", "0"},

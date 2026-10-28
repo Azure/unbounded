@@ -42,7 +42,7 @@ var (
 	// Booleans parse with Rust's bool FromStr, which accepts only true and false.
 	dataplaneBoolKeys = []string{
 		"RACER_ALLOW_SMT", "RACER_OPAQUE_RELAY", "RACER_PEER_TCP_NODELAY",
-		"RACER_MEMORY_PRESSURE", "RACER_PPROF_ENABLED",
+		"RACER_MEMORY_PRESSURE", "RACER_PPROF_ENABLED", "RACER_GPU_PCI_P2PDMA",
 	}
 
 	// Unsigned decimal keys that may be zero.
