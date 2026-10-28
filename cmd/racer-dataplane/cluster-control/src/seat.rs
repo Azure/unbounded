@@ -137,7 +137,7 @@ pub fn initial_seats(shared: &Shared) -> usize {
 }
 
 fn jitter(shared: &Shared, salt: u32, max: Duration) -> Duration {
-    crate::step::jitter(
+    lottery::jitter(
         &shared.config.pod_uid,
         &mut **shared.rng.borrow_mut(),
         salt,

@@ -6,8 +6,12 @@
 //! vacancies come from the primary Lease annotations; without one, the Pod
 //! contends for the initial seats with an exponentially growing window.
 
-use super::{Entropy, LeaseObservation, Observer, PrimaryView, SeatView, jitter};
-use crate::{authority::election, lease};
+use crate::{
+    authority::election::{self, LeaseObservation, Observer, SeatView},
+    entropy::Entropy,
+    lease,
+    shared::PrimaryView,
+};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -152,9 +156,31 @@ pub fn claim_views(
         .collect()
 }
 
+/// Pseudo-random delay below `max`, spread by Pod UID, `stream`, and `rng`.
+///
+/// `stream` separates independent delays drawn for the same Pod; it is not a
+/// cryptographic input.
+pub fn jitter(pod_uid: &str, rng: &mut dyn Entropy, stream: u32, max: Duration) -> Duration {
+    let r = rng.u32_or_zero();
+    election::claim_delay(pod_uid, stream ^ r, max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jitter_is_bounded_and_seeded() {
+        use crate::entropy::{Failing, Seeded};
+        let max = Duration::from_secs(5);
+        let a = jitter("u", &mut Seeded::new(1), 0, max);
+        assert!(a < max);
+        assert_eq!(a, jitter("u", &mut Seeded::new(1), 0, max));
+        assert_eq!(
+            jitter("u", &mut Failing, 3, max),
+            election::claim_delay("u", 3, max)
+        );
+    }
     use crate::{
         annotations,
         authority::election::LeaseSpec,

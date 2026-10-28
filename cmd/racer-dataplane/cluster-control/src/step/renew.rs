@@ -1,7 +1,6 @@
 //! Seat renewal and release, lifted from `seat::seat_task`.
 
-use super::PrimaryView;
-use crate::{authority::election, limits};
+use crate::{authority::election, limits, shared::PrimaryView};
 use std::time::{Duration, Instant};
 
 /// Retry delay after a failed renew.

@@ -8,15 +8,17 @@
 //! Production performs the reads, the CAS write, and the Lease and webhook
 //! writes around these calls.
 
-use super::{CacheInfo, Entropy, Image, LeaseObservation, NodeInfo, Ownership, PodInfo, Record};
 use crate::{
     DiscoveredEndpoint, SeatPolicy, annotations,
     authority::{
-        catalog, election,
+        catalog::{self, CacheInfo},
+        election::{self, LeaseObservation},
         keyring::{self, Offer, Policy},
-        members, publication,
+        members::{self, NodeInfo, Ownership, PodInfo},
+        publication::{self, Image, Record},
         state::{self, StateError, StateRecord, Writer},
     },
+    entropy::Entropy,
     pki,
     primary::{WebhookSeat, seat_ready, webhook_ips},
     seat::encode_endpoints,

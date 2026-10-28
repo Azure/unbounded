@@ -1,8 +1,10 @@
 //! Following committed state on a seat, lifted from `seat::follow_once` and
 //! `seat::install_record`.
 
-use super::{Record, StateError, StateRecord};
-use crate::authority::state;
+use crate::authority::{
+    publication::Record,
+    state::{self, StateError, StateRecord},
+};
 use std::time::{Duration, Instant};
 
 /// Least time between state Secret reads.

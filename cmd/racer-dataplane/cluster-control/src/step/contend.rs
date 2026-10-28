@@ -1,7 +1,10 @@
 //! Primary Lease contention, lifted from `primary::contend`.
 
-use super::{Entropy, LeaseObservation, Observer};
-use crate::{authority::election, limits};
+use crate::{
+    authority::election::{self, LeaseObservation, Observer},
+    entropy::Entropy,
+    limits,
+};
 use std::time::{Duration, Instant};
 
 /// Contention state of one seat holder.
