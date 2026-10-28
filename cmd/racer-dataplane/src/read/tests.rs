@@ -2961,8 +2961,7 @@ mod timeouts {
         f = f.bounded(207, 60, 24);
         let second = resolve_once(&mut f, true);
         assert!(matches!(second, Err(Error::Unavailable)));
-        // t = 10: rank 0 is overdue; a timeout gives authority (Known
-        // issue 39).
+        // t = 10: rank 0 is overdue; a timeout gives authority.
         clock.advance(Duration::from_secs(3));
         f = f.bounded(208, 60, 24);
         let third = resolve_once(&mut f, true);
@@ -3255,8 +3254,7 @@ mod timeouts {
             ordered: f.candidates.ordered.clone(),
         };
         // A metadata walk: rank 1 takes origin authority from rank 0's
-        // timeout. (A page walk leaves the fetch to rank 0 instead, Known
-        // issue 31; see `owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out`.)
+        // timeout. (A page walk leaves the fetch to rank 0 instead; see `owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out`.)
         let mut resolve = f.policy.resolve_with_budget(
             candidates,
             &f.context,

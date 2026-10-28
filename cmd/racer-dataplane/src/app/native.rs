@@ -1239,8 +1239,7 @@ mod tests {
                 caches: vec![],
             })
             .unwrap();
-        // Not a member yet (a new node joins only once it serves, Known
-        // issue 14): startup continues without native rails, and local
+        // Not a member yet (a new node joins only once it serves): startup continues without native rails, and local
         // configuration does not stand in for the missing membership.
         assert_eq!(
             futures::executor::block_on(

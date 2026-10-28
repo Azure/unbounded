@@ -404,8 +404,8 @@ impl Relay {
                 Some(reservation) => reservation.clone(),
                 None => Rc::new(self.admission.reserve(None, ResourceClass::Relay, 1)?),
             };
-            // A destination this node holds silent fails at once (Known
-            // issues 41 and 43): signed `Unavailable`, as for no route.
+            // A destination this node holds silent fails at once:
+            // signed `Unavailable`, as for no route.
             if self.paths.link_health().silent(&budget.destination) {
                 return Err(Error::Unavailable);
             }
