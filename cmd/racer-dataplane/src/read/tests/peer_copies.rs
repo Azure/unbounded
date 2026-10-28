@@ -3250,6 +3250,61 @@ fn own(f: &Fixture, owned: bool) {
         .set_ownership(Rc::new(move |_| owned));
 }
 
+/// Version `v` of the fixture's members that `keep` accepts, chained to `old` when given.
+fn version(
+    f: &Fixture,
+    v: u64,
+    keep: impl Fn(&NodeId) -> bool,
+    old: Option<&Membership>,
+) -> Arc<Membership> {
+    let members = f.membership.members().iter().filter(|m| keep(&m.node));
+    Arc::new(
+        Membership::validate_with_predecessor(
+            racer_control_wire::MembershipVersion(v),
+            members.cloned().collect(),
+            old,
+        )
+        .unwrap(),
+    )
+}
+
+/// Publish `versions` (oldest first, each with how many seconds ago), make the last one the
+/// fixture's membership, and install a candidate policy for `local` over them.
+fn install_versions(
+    f: &mut Fixture,
+    peers: &Rc<ScriptedPeers>,
+    local: &NodeId,
+    versions: &[(Arc<Membership>, u64)],
+    wait: bool,
+) -> Rc<Placement> {
+    let published = Arc::new(controlplane::Published::new(
+        crate::control::Snapshot::retention(2),
+    ));
+    let now = uring_runtime::environment::now();
+    for (i, (membership, ago)) in versions.iter().enumerate() {
+        let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
+        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+        let at = now - Duration::from_secs(*ago);
+        published
+            .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
+            .unwrap();
+    }
+    let placement = Rc::new(Placement::new(16));
+    let mut deps = f.fill.dependencies.clone();
+    let policy = CandidatePolicy::new(
+        local.clone(),
+        placement.clone(),
+        peers.requester(),
+        deps.credentials.clone(),
+        published,
+    );
+    policy.instant_stale_wait.set(wait);
+    deps.candidates = Rc::new(policy);
+    f.fill = Fill::new(deps);
+    f.membership = versions.last().unwrap().0.clone();
+    placement
+}
+
 fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
@@ -3346,57 +3401,23 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
         let good = encrypted_copy(&mut f);
-        let members = f.membership.members().to_vec();
         let local = node(peers.local);
-        let current = Arc::new(
-            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
-                .unwrap(),
-        );
+        let current = version(&f, 2, |_| true, None);
         // Version 1 ranks the same owners: they are only behind.
-        let old = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                members
-                    .into_iter()
-                    .filter(|m| member || m.node != local)
-                    .collect(),
-            )
-            .unwrap(),
+        let old = version(&f, 1, |n| member || *n != local, None);
+        let placement = install_versions(
+            &mut f,
+            &peers,
+            &local,
+            &[(old.clone(), 60), (current, age)],
+            false,
         );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let now = uring_runtime::environment::now();
-        for (i, (membership, at)) in [
-            (old.clone(), now - Duration::from_secs(60)),
-            (current.clone(), now - Duration::from_secs(age)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
-                .unwrap();
-        }
-        let placement = Rc::new(Placement::new(16));
         let previous = placement
-            .rank(old.clone(), &f.context.object, f.page.number)
+            .rank(old, &f.context.object, f.page.number)
             .ordered;
         if member {
             assert_eq!(previous, ordered);
         }
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(CandidatePolicy::new(
-            local.clone(),
-            placement,
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        ));
-        f.fill = Fill::new(deps);
-        f.membership = current;
         if fell_back {
             peers.reply(&ordered[0], Reply::Stale);
             peers.replies.borrow_mut().extend(previous.iter().map(|n| {
@@ -3470,43 +3491,11 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
         let good = encrypted_copy(&mut f);
-        let members = f.membership.members().to_vec();
         let local = node(peers.local);
-        let current = Arc::new(
-            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
-                .unwrap(),
-        );
+        let current = version(&f, 2, |_| true, None);
         // Version 1 does not list this node: it joined in version 2.
-        let old = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                members.into_iter().filter(|m| m.node != local).collect(),
-            )
-            .unwrap(),
-        );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let now = uring_runtime::environment::now();
-        for (i, membership) in [old, current.clone()].into_iter().enumerate() {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
-                .unwrap();
-        }
-        let mut deps = f.fill.dependencies.clone();
-        let policy = CandidatePolicy::new(
-            local.clone(),
-            Rc::new(Placement::new(16)),
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        );
-        policy.instant_stale_wait.set(wait);
-        deps.candidates = Rc::new(policy);
-        f.fill = Fill::new(deps);
-        f.membership = current;
+        let old = version(&f, 1, |n| *n != local, None);
+        install_versions(&mut f, &peers, &local, &[(old, 0), (current, 0)], wait);
         let expected: Vec<_> = asked.iter().map(|i| ordered[*i].clone()).collect();
         for (k, n) in expected.iter().enumerate() {
             let reply = if adopts && k + 1 == expected.len() {
@@ -3571,44 +3560,9 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
         let good = encrypted_copy(&mut f);
         let members = f.membership.members().to_vec();
         let local = node(peers.local);
-        let old = Membership::validate(
-            racer_control_wire::MembershipVersion(1),
-            members
-                .iter()
-                .filter(|m| !chained || m.node != local)
-                .cloned()
-                .collect(),
-        )
-        .unwrap();
-        let current = Arc::new(
-            Membership::validate_with_predecessor(
-                racer_control_wire::MembershipVersion(2),
-                members.clone(),
-                Some(&old),
-            )
-            .unwrap(),
-        );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let now = uring_runtime::environment::now();
-        for (i, membership) in [Arc::new(old), current.clone()].into_iter().enumerate() {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
-                .unwrap();
-        }
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(CandidatePolicy::new(
-            local.clone(),
-            Rc::new(Placement::new(16)),
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        ));
-        f.fill = Fill::new(deps);
-        f.membership = current;
+        let old = version(&f, 1, |n| !chained || *n != local, None);
+        let current = version(&f, 2, |_| true, Some(&old));
+        install_versions(&mut f, &peers, &local, &[(old, 0), (current, 0)], false);
         own(&f, true);
         let case = format!("chained {chained} holder {holder:?}");
         let mut expected = Vec::new();
@@ -3691,45 +3645,15 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
             .map(|m| m.node.clone())
             .find(|n| !ordered.contains(n))
             .unwrap();
-        let old = Membership::validate(
-            racer_control_wire::MembershipVersion(1),
-            members
-                .iter()
-                .filter(|m| !chained || m.node != local)
-                .cloned()
-                .collect(),
-        )
-        .unwrap();
-        let current = Arc::new(
-            Membership::validate_with_predecessor(
-                racer_control_wire::MembershipVersion(2),
-                members.clone(),
-                Some(&old),
-            )
-            .unwrap(),
+        let old = version(&f, 1, |n| !chained || *n != local, None);
+        let current = version(&f, 2, |_| true, Some(&old));
+        let placement = install_versions(
+            &mut f,
+            &peers,
+            &local,
+            &[(old, 0), (current.clone(), 0)],
+            false,
         );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let now = uring_runtime::environment::now();
-        for (i, membership) in [Arc::new(old), current.clone()].into_iter().enumerate() {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
-                .unwrap();
-        }
-        let placement = Rc::new(Placement::new(16));
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(CandidatePolicy::new(
-            local.clone(),
-            placement.clone(),
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        ));
-        f.fill = Fill::new(deps);
-        f.membership = current.clone();
         own(&f, true);
         let case = format!("chained {chained} holder {holder:?}");
         let mut expected = Vec::new();
@@ -3808,44 +3732,9 @@ fn a_granted_batch_feeds_silence_evidence() {
         .map(|m| m.node.clone())
         .find(|n| !ordered.contains(n))
         .unwrap();
-    let old = Membership::validate(
-        racer_control_wire::MembershipVersion(1),
-        members
-            .iter()
-            .filter(|m| m.node != local)
-            .cloned()
-            .collect(),
-    )
-    .unwrap();
-    let current = Arc::new(
-        Membership::validate_with_predecessor(
-            racer_control_wire::MembershipVersion(2),
-            members.clone(),
-            Some(&old),
-        )
-        .unwrap(),
-    );
-    let published = Arc::new(controlplane::Published::new(
-        crate::control::Snapshot::retention(2),
-    ));
-    let now = uring_runtime::environment::now();
-    for (i, membership) in [Arc::new(old), current.clone()].into_iter().enumerate() {
-        let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-        published
-            .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
-            .unwrap();
-    }
-    let mut deps = f.fill.dependencies.clone();
-    deps.candidates = Rc::new(CandidatePolicy::new(
-        local.clone(),
-        Rc::new(Placement::new(16)),
-        peers.requester(),
-        deps.credentials.clone(),
-        published,
-    ));
-    f.fill = Fill::new(deps);
-    f.membership = current;
+    let old = version(&f, 1, |n| *n != local, None);
+    let current = version(&f, 2, |_| true, Some(&old));
+    install_versions(&mut f, &peers, &local, &[(old, 0), (current, 0)], false);
     own(&f, true);
     let health = f.fill.dependencies.candidates.link_health();
     // No minimum wait, so the scripted timeout counts.
@@ -3888,60 +3777,24 @@ fn stale_fallback_never_makes_a_previous_owner_fetch() {
     for wait in [false, true] {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
-        let members = f.membership.members().to_vec();
         let local = node(peers.local);
-        let current = Arc::new(
-            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
-                .unwrap(),
-        );
+        let current = version(&f, 2, |_| true, None);
         // Without rank 0, version 1 has three members, this node among them, so
         // this node owns the page under version 1.
-        let old = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                members
-                    .into_iter()
-                    .filter(|m| m.node != ordered[0])
-                    .collect(),
-            )
-            .unwrap(),
+        let old = version(&f, 1, |n| *n != ordered[0], None);
+        let placement = install_versions(
+            &mut f,
+            &peers,
+            &local,
+            &[(old.clone(), 60), (current, 0)],
+            wait,
         );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let now = uring_runtime::environment::now();
-        for (i, (membership, at)) in [
-            (old.clone(), now - Duration::from_secs(60)),
-            (current.clone(), now),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
-                .unwrap();
-        }
-        let placement = Rc::new(Placement::new(16));
         assert!(
             placement
-                .rank(old.clone(), &f.context.object, f.page.number)
+                .rank(old, &f.context.object, f.page.number)
                 .ordered
                 .contains(&local)
         );
-        let mut deps = f.fill.dependencies.clone();
-        let policy = CandidatePolicy::new(
-            local,
-            placement,
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        );
-        policy.instant_stale_wait.set(wait);
-        deps.candidates = Rc::new(policy);
-        f.fill = Fill::new(deps);
-        f.membership = current;
         let good = encrypted_copy(&mut f);
         if wait {
             // The first owner adopts version 2 during the wait.
@@ -3994,60 +3847,19 @@ fn owner_asks_previous_membership_owners_before_origin() {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, Some(0));
         let good = encrypted_copy(&mut f);
-        let current = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(2),
-                f.membership.members().to_vec(),
-            )
-            .unwrap(),
-        );
-        let old = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                f.membership
-                    .members()
-                    .iter()
-                    .filter(|m| m.node != ordered[0])
-                    .cloned()
-                    .collect(),
-            )
-            .unwrap(),
-        );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let snapshots = if retained {
-            vec![old.clone(), current.clone()]
+        let current = version(&f, 2, |_| true, None);
+        let old = version(&f, 1, |n| *n != ordered[0], None);
+        let versions = [(old.clone(), 0), (current, 0)];
+        let versions = if retained {
+            &versions[..]
         } else {
-            vec![current.clone()]
+            &versions[1..]
         };
-        for (i, membership) in snapshots.into_iter().enumerate() {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(
-                    Arc::new(snapshot),
-                    uring_runtime::environment::now(),
-                    |_, _| Ok::<_, Error>(()),
-                    || (),
-                )
-                .unwrap();
-        }
-        let placement = Rc::new(Placement::new(16));
+        let placement = install_versions(&mut f, &peers, &ordered[0], versions, false);
         let previous = placement
-            .rank(old.clone(), &f.context.object, f.page.number)
+            .rank(old, &f.context.object, f.page.number)
             .ordered;
         assert!(!previous.contains(&ordered[0]));
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(CandidatePolicy::new(
-            ordered[0].clone(),
-            placement,
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        ));
-        f.fill = Fill::new(deps);
-        f.membership = current;
         let replies = previous.iter().map(|node| {
             (
                 node.clone(),
@@ -4104,58 +3916,15 @@ fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, Some(1));
         let good = encrypted_copy(&mut f);
-        let members = f.membership.members().to_vec();
-        let current = Arc::new(
-            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
-                .unwrap(),
-        );
+        let current = version(&f, 2, |_| true, None);
         // Without rank 0, version 1 ranks someone else first.
-        let old = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                if same {
-                    members
-                } else {
-                    members
-                        .into_iter()
-                        .filter(|m| m.node != ordered[0])
-                        .collect()
-                },
-            )
-            .unwrap(),
-        );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        let now = uring_runtime::environment::now();
-        for (i, (membership, at)) in [
-            (old.clone(), now - Duration::from_secs(60)),
-            (current.clone(), now - Duration::from_secs(age)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
-                .unwrap();
-        }
-        let placement = Rc::new(Placement::new(16));
+        let old = version(&f, 1, |n| same || *n != ordered[0], None);
+        let versions = [(old.clone(), 60), (current, age)];
+        let placement = install_versions(&mut f, &peers, &ordered[1], &versions, false);
         let previous = placement
-            .rank(old.clone(), &f.context.object, f.page.number)
+            .rank(old, &f.context.object, f.page.number)
             .ordered;
         assert_eq!(previous[0] == ordered[0], same);
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(CandidatePolicy::new(
-            ordered[1].clone(),
-            placement,
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        ));
-        f.fill = Fill::new(deps);
-        f.membership = current;
         peers.reply(
             &ordered[0],
             if copy {
@@ -4201,44 +3970,13 @@ fn owner_with_handoff_targets_delegates_with_spare_credits() {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, Some(1));
         let good = encrypted_copy(&mut f);
-        let current = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(2),
-                f.membership.members().to_vec(),
-            )
-            .unwrap(),
-        );
+        let current = version(&f, 2, |_| true, None);
         // Rank 0 joined in version 2.
-        let old = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                f.membership
-                    .members()
-                    .iter()
-                    .filter(|m| m.node != ordered[0])
-                    .cloned()
-                    .collect(),
-            )
-            .unwrap(),
-        );
-        let published = Arc::new(controlplane::Published::new(
-            crate::control::Snapshot::retention(2),
-        ));
-        for (i, membership) in [old.clone(), current.clone()].into_iter().enumerate() {
-            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-            published
-                .publish(
-                    Arc::new(snapshot),
-                    uring_runtime::environment::now(),
-                    |_, _| Ok::<_, Error>(()),
-                    || (),
-                )
-                .unwrap();
-        }
-        let placement = Rc::new(Placement::new(16));
+        let old = version(&f, 1, |n| *n != ordered[0], None);
+        let versions = [(old.clone(), 0), (current, 0)];
+        let placement = install_versions(&mut f, &peers, &ordered[1], &versions, false);
         let previous = placement
-            .rank(old.clone(), &f.context.object, f.page.number)
+            .rank(old, &f.context.object, f.page.number)
             .ordered;
         // The owner set changed, and a previous owner is neither this node
         // nor its predecessor: it is a handoff target.
@@ -4247,16 +3985,6 @@ fn owner_with_handoff_targets_delegates_with_spare_credits() {
                 .iter()
                 .any(|n| !ordered.contains(n) && n != &ordered[0] && n != &ordered[1])
         );
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(CandidatePolicy::new(
-            ordered[1].clone(),
-            placement,
-            peers.requester(),
-            deps.credentials.clone(),
-            published,
-        ));
-        f.fill = Fill::new(deps);
-        f.membership = current;
         peers.reply(&ordered[0], Reply::Copy(good.clone()));
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, attempts, 16);
         let result = acquire(&mut f, &mut budget).unwrap();
