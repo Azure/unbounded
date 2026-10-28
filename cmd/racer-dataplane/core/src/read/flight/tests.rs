@@ -43,6 +43,13 @@ fn table<R>(limits: FlightLimits, now: Instant) -> Table<R> {
     PageFlights::new(limits, split, now, RandomState::new())
 }
 
+/// A default table at `now`, a deadline 10 s later, and an empty wake list.
+fn setup<R>() -> (Instant, Instant, Table<R>, Vec<u64>) {
+    let now = Instant::now();
+    let t = table(FlightLimits::default(), now);
+    (now, now + Duration::from_secs(10), t, Vec::new())
+}
+
 /// Admission that never rejects.
 fn free(_: Reserve) -> Result<()> {
     Ok(())
@@ -61,10 +68,7 @@ fn waiter(joined: Result<Joined<u32, u32>>) -> u64 {
 
 #[test]
 fn first_caller_leads_followers_share_completion() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(0);
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
@@ -91,10 +95,7 @@ fn first_caller_leads_followers_share_completion() {
 
 #[test]
 fn acquiring_only_while_a_leader_fetches() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(0);
     assert!(!t.acquiring(&p));
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
@@ -108,10 +109,7 @@ fn acquiring_only_while_a_leader_fetches() {
 
 #[test]
 fn partial_result_serves_ciphertext_callers_and_reelects_plaintext() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(1);
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
@@ -139,10 +137,7 @@ fn partial_result_serves_ciphertext_callers_and_reelects_plaintext() {
 
 #[test]
 fn failure_and_retry_semantics() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(2);
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
@@ -186,10 +181,7 @@ fn failure_and_retry_semantics() {
 
 #[test]
 fn rejected_leader_fails_and_next_waiter_leads() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(4);
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
@@ -234,10 +226,7 @@ fn rejected_leader_fails_and_next_waiter_leads() {
 
 #[test]
 fn canceled_leader_is_revoked_and_follower_takes_over() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(4);
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
@@ -386,10 +375,7 @@ impl Drop for Charge {
 
 #[test]
 fn admission_is_released_on_rejection_and_detach() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let quota = Quota::new(1);
     let a = waiter(t.join(
         &page(8),
@@ -545,10 +531,7 @@ fn expired_leader_without_operation_is_stale_after_new_leader() {
 
 #[test]
 fn operation_errors_and_completed_operation_settles_published_result() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(22);
     assert_eq!(t.retain_operation(&p, 0, &mut wakes), Err(Error::Internal));
     assert_eq!(t.complete_operation(&p, &mut wakes), Err(Error::Internal));
@@ -772,10 +755,7 @@ fn copy_waiter(joined: Result<Joined<u32, u32>>) -> u64 {
 /// for its result, and never leads.
 #[test]
 fn copy_join_waits_for_the_running_acquisition_and_never_leads() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(0);
     // No flight: a miss, and no flight is created.
     assert_eq!(
@@ -807,10 +787,7 @@ fn copy_join_waits_for_the_running_acquisition_and_never_leads() {
 
 #[test]
 fn copy_join_misses_failed_and_takes_partial_results() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(10);
-    let mut t = table(FlightLimits::default(), now);
-    let mut wakes = Vec::new();
+    let (now, deadline, mut t, mut wakes) = setup();
     let p = page(1);
     let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
