@@ -126,7 +126,7 @@ Differences from production:
 
 `ControlSim` (`sim/src/control.rs`) runs every Pod's lottery, seat, primary, and commit steps from
 `cluster-control` and one client per Pod on a single event queue and RNG stream. Clients enroll through seat bootstrap slots and the bearer authorization API calls
-against a rate-limited fake API server, then long poll snapshots with the real seat admission
+against a rate-limited API server, then long poll snapshots with the real seat admission
 steps (write slots, a bounded FIFO, delta or full bodies). Clients send the base hash they hold.
 See the header of `sim/src/control.rs` for details.
 

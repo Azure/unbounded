@@ -4,8 +4,8 @@
 //! the real seat admission and authorization steps, all on one [`Engine`].
 //!
 //! Leases and the state record are typed values with resourceVersion
-//! counters, not JSON objects; authorization calls go through a fake
-//! [`Store`] with a [`TokenBucket`]. A co-stepped data plane reads
+//! counters, not JSON objects; authorization API calls share one token
+//! bucket rate limit. A co-stepped data plane reads
 //! [`ControlSim::membership_version`] per node so its nodes lag behind the
 //! committed membership exactly as their clients do.
 
@@ -290,7 +290,7 @@ impl CtlFault {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ev {
+pub(crate) enum Ev {
     Enroll(u32, u32),
     Enrolled(u32, u32, u8),
     Poll(u32, u32),
@@ -306,7 +306,7 @@ enum Ev {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PodEv {
+pub(crate) enum PodEv {
     Lottery,
     Attempt(u8),
     Renew,
@@ -488,7 +488,7 @@ fn identity(pod: u32) -> String {
 /// Control plane plus clients on one deterministic timeline.
 pub struct ControlSim {
     pub settings: Settings,
-    engine: Engine<Ev>,
+    pub(crate) engine: Engine<Ev>,
     api: ApiLimit,
     seats: Vec<Seat>,
     rng: SplitMix64,
@@ -711,28 +711,12 @@ impl ControlSim {
         self.committed.as_ref().map(|r| r.membership_version)
     }
 
-    pub fn now_ns(&self) -> Nanos {
-        self.engine.now()
-    }
-
-    pub fn next_event_ns(&self) -> Option<Nanos> {
-        self.engine.next_at()
-    }
-
-    pub fn trace_hash(&self) -> u64 {
-        self.engine.trace.value()
-    }
-
     /// Run every event up to and including `until`.
     pub fn advance_to(&mut self, until: Nanos) {
         while let Some(ev) = self.engine.pop_until(until) {
             self.handle(ev);
         }
         self.engine.finish(until);
-    }
-
-    fn trace(&mut self, at: Nanos, tag: u64, a: u64, b: u64) {
-        self.engine.trace.record(at, tag, a, b);
     }
 
     /// Count `n` API calls toward the per-second peak.
@@ -759,7 +743,7 @@ impl ControlSim {
                     if let Some(lost) = self.primary_lost_ns.take() {
                         self.metrics.observe("ctl_failover_ns", at - lost);
                     }
-                    self.trace(at, 0xC2, u64::from(p), 0);
+                    self.engine.trace.record(at, 0xC2, u64::from(p), 0);
                 }
                 (None, None) => {}
             }
@@ -772,7 +756,9 @@ impl ControlSim {
             }
             let previous = self.seats[i].served;
             self.seats[i].served = served;
-            self.trace(at, 0xC4, i as u64, served.unwrap_or(u64::MAX));
+            self.engine
+                .trace
+                .record(at, 0xC4, i as u64, served.unwrap_or(u64::MAX));
             let waiters = std::mem::take(&mut self.seats[i].waiters);
             // One O(1) waker registration per waiter (`exec::Changed`).
             self.metrics
@@ -831,7 +817,7 @@ impl ControlSim {
             }
         }
         self.commits.push((at, seq, mv));
-        self.trace(at, 0xC3, seq, mv);
+        self.engine.trace.record(at, 0xC3, seq, mv);
     }
 
     fn ready_seats(&self) -> impl Iterator<Item = u8> + '_ {
@@ -877,7 +863,9 @@ impl ControlSim {
                 self.metrics.incr("ctl_enrollments");
                 self.metrics
                     .observe("ctl_enroll_ns", now - self.started_ns[c as usize]);
-                self.trace(now, 0xD1, u64::from(c), u64::from(s));
+                self.engine
+                    .trace
+                    .record(now, 0xD1, u64::from(c), u64::from(s));
                 if self.enrolled == self.live_clients
                     && self.metrics.get("ctl_all_enrolled_ns") == 0
                 {
@@ -1235,11 +1223,11 @@ impl ControlSim {
             self.metrics
                 .observe("ctl_client_lag_ns", now.saturating_sub(from));
         }
-        self.trace(now, 0xD2, u64::from(c), seq);
+        self.engine.trace.record(now, 0xD2, u64::from(c), seq);
     }
 
     fn fault(&mut self, i: usize, now: Nanos) {
-        self.trace(now, 0xF0, i as u64, 0);
+        self.engine.trace.record(now, 0xF0, i as u64, 0);
         let primary = self.primary.holder.filter(|p| self.alive(*p));
         let choose = |sim: &mut Self, fraction: f64| -> Vec<usize> {
             let threshold = (fraction.clamp(0.0, 1.0) * (1u64 << 53) as f64) as u64;
@@ -1449,9 +1437,9 @@ impl ControlSim {
             "scenario": scenario,
             "nodes": self.state.len(),
             "seed": seed,
-            "duration_ns": self.now_ns(),
+            "duration_ns": self.engine.now(),
             "events": self.engine.processed(),
-            "trace_hash": format!("{:016x}", self.trace_hash()),
+            "trace_hash": format!("{:016x}", self.engine.trace.value()),
             "metrics": self.metrics.to_json(),
             "control": {
                 "live_clients": self.live_clients,
@@ -1809,7 +1797,7 @@ impl ControlSim {
         );
         self.last_terms = transitions;
         self.metrics.incr("ctl_primary_terms");
-        self.trace(ns, 0xC1, transitions, 0);
+        self.engine.trace.record(ns, 0xC1, transitions, 0);
         let term = Term {
             lease_uid: format!("lease-{}", self.primary.uid),
             transitions: self.primary.spec.transitions,
@@ -2163,12 +2151,44 @@ pub fn run(
 mod tests {
     use super::*;
 
+    fn tuned(scenario: &str, nodes: u32, secs: u64, seed: u64, overrides: Value) -> Value {
+        run(
+            scenario,
+            nodes,
+            seed,
+            Some(secs * SECONDS),
+            Some(&overrides),
+        )
+        .unwrap()
+    }
+
     fn quick(scenario: &str, nodes: u32, secs: u64, seed: u64) -> Value {
-        run(scenario, nodes, seed, Some(secs * SECONDS), None).unwrap()
+        tuned(scenario, nodes, secs, seed, json!({}))
     }
 
     fn counter(r: &Value, k: &str) -> u64 {
         r["metrics"]["counters"][k].as_u64().unwrap_or(0)
+    }
+
+    fn histogram_count(r: &Value, k: &str) -> u64 {
+        r["metrics"]["histograms"][k]["count"].as_u64().unwrap()
+    }
+
+    /// Each counter is at least its bound.
+    fn at_least(r: &Value, bounds: &[(&str, u64)]) {
+        for (k, min) in bounds {
+            assert!(
+                counter(r, k) >= *min,
+                "{k} < {min}: {}",
+                r["metrics"]["counters"]
+            );
+        }
+    }
+
+    fn zero(r: &Value, keys: &[&str]) {
+        for k in keys {
+            assert_eq!(counter(r, k), 0, "{k}: {}", r["metrics"]["counters"]);
+        }
     }
 
     fn assert_clean(r: &Value) {
@@ -2190,163 +2210,122 @@ mod tests {
         let r = quick("enrollment-storm", 300, 300, 1);
         assert_clean(&r);
         assert_eq!(r["control"]["enrolled"], 300, "{}", r["control"]);
-        assert!(counter(&r, "ctl_all_enrolled_ns") > 0);
+        at_least(
+            &r,
+            &[
+                ("ctl_all_enrolled_ns", 1),
+                ("ctl_api_qps_peak", 1),
+                ("ctl_client_replies", 300),
+            ],
+        );
         assert_eq!(
             counter(&r, "ctl_api_tokenreviews"),
             counter(&r, "ctl_enrollments")
         );
-        assert!(counter(&r, "ctl_api_qps_peak") > 0);
-        assert!(counter(&r, "ctl_client_replies") >= 300);
-        assert!(
-            r["metrics"]["histograms"]["ctl_client_lag_ns"]["count"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
+        assert!(histogram_count(&r, "ctl_client_lag_ns") > 0);
     }
 
+    /// Tight API limits answer 429s, and still everyone enrolls. With a tight
+    /// authorization budget instead, seats refuse locally before any API call
+    /// and the API server sheds nothing.
     #[test]
-    fn storm_under_tight_api_limit_sees_429s() {
-        let overrides = json!({"api_qps": 20.0, "api_burst": 20.0});
-        let r = run(
+    fn api_and_budget_limits_shed_and_everyone_enrolls() {
+        let r = tuned(
             "enrollment-storm",
             200,
+            300,
             2,
-            Some(300 * SECONDS),
-            Some(&overrides),
-        )
-        .unwrap();
-        assert_clean(&r);
-        assert!(
-            counter(&r, "ctl_api_429") > 0,
-            "{}",
-            r["metrics"]["counters"]
+            json!({"api_qps": 20.0, "api_burst": 20.0}),
         );
+        assert_clean(&r);
+        at_least(&r, &[("ctl_api_429", 1)]);
         assert_eq!(r["control"]["enrolled"], 200);
+        let r = tuned(
+            "enrollment-storm",
+            500,
+            300,
+            1,
+            json!({"auth_qps": 20.0, "auth_burst": 10.0}),
+        );
+        assert_clean(&r);
+        assert_eq!(r["control"]["enrolled"], 500);
+        at_least(&r, &[("ctl_auth_overloaded", 1)]);
+        zero(&r, &["ctl_api_429"]);
     }
 
-    /// With the legacy authorization model an enrollment storm makes three full authorizations per
-    /// client and the API server sheds them with 429s part way through.
-    /// The cached model (`step::authz`) makes at most two, reuses the
-    /// TokenReview and binding reads, and its adaptive budget keeps the
-    /// seats' sum near the API rate, so 429s drop by an order of magnitude
-    /// and everyone enrolls sooner.
+    /// With the legacy authorization model an enrollment storm makes three
+    /// full authorizations per client and the API server sheds them with
+    /// 429s part way through. The cached model (`step::authz`) makes at most
+    /// two, reuses the TokenReview and binding reads, and its adaptive budget
+    /// keeps the seats' sum near the API rate, so 429s drop by an order of
+    /// magnitude and everyone enrolls sooner.
     #[test]
     fn cached_authorization_cuts_api_calls_and_429s() {
         let storm = |auth: &str| {
-            let overrides = json!({"api_qps": 300.0, "api_burst": 300.0, "auth": auth});
-            let r = run(
-                "enrollment-storm",
-                3000,
-                1,
-                Some(400 * SECONDS),
-                Some(&overrides),
-            )
-            .unwrap();
+            let o = json!({"api_qps": 300.0, "api_burst": 300.0, "auth": auth});
+            let r = tuned("enrollment-storm", 3000, 400, 1, o);
             assert_clean(&r);
             assert_eq!(r["control"]["enrolled"], 3000, "{auth}");
             r
         };
-        let legacy = storm("legacy");
-        let cached = storm("cached");
-        let c = |r: &Value| r["metrics"]["counters"].clone();
+        let (legacy, cached) = (storm("legacy"), storm("cached"));
         let calls = |r: &Value| counter(r, "ctl_api_tokenreviews") + counter(r, "ctl_api_gets");
+        let both = format!(
+            "legacy {} cached {}",
+            legacy["metrics"]["counters"], cached["metrics"]["counters"]
+        );
         // Successful calls per enrollment: 15 before, about 3 after.
-        assert!(calls(&legacy) >= 15 * 3000, "{}", c(&legacy));
-        assert!(calls(&cached) <= 4 * 3000, "{}", c(&cached));
-        assert!(counter(&cached, "ctl_auth_caller_hits") > 0);
-        assert!(counter(&legacy, "ctl_api_tokenreviews") >= 3 * 3000);
-        assert!(counter(&cached, "ctl_api_tokenreviews") < 2 * 3000);
+        assert!(calls(&legacy) >= 15 * 3000, "{both}");
+        assert!(calls(&cached) <= 4 * 3000, "{both}");
+        at_least(&cached, &[("ctl_auth_caller_hits", 1)]);
+        at_least(&legacy, &[("ctl_api_tokenreviews", 3 * 3000)]);
+        assert!(
+            counter(&cached, "ctl_api_tokenreviews") < 2 * 3000,
+            "{both}"
+        );
         assert!(
             counter(&cached, "ctl_api_429") * 10 < counter(&legacy, "ctl_api_429"),
-            "legacy {} cached {}",
-            c(&legacy),
-            c(&cached)
+            "{both}"
         );
-        assert!(
-            counter(&cached, "ctl_all_enrolled_ns") < counter(&legacy, "ctl_all_enrolled_ns"),
-            "legacy {} cached {}",
-            c(&legacy),
-            c(&cached)
-        );
-    }
-
-    /// The budget refuses locally, before any API call, when the seat is
-    /// out of authorization budget; clients back off and still enroll.
-    #[test]
-    fn auth_budget_sheds_locally_and_everyone_enrolls() {
-        let overrides = json!({"auth_qps": 20.0, "auth_burst": 10.0});
-        let r = run(
-            "enrollment-storm",
-            500,
-            1,
-            Some(300 * SECONDS),
-            Some(&overrides),
-        )
-        .unwrap();
-        assert_clean(&r);
-        assert_eq!(r["control"]["enrolled"], 500);
-        assert!(
-            counter(&r, "ctl_auth_overloaded") > 0,
-            "{}",
-            r["metrics"]["counters"]
-        );
-        assert_eq!(
-            counter(&r, "ctl_api_429"),
-            0,
-            "{}",
-            r["metrics"]["counters"]
-        );
+        let enrolled = |r: &Value| counter(r, "ctl_all_enrolled_ns");
+        assert!(enrolled(&cached) < enrolled(&legacy), "{both}");
     }
 
     /// More polls per seat than write slots: woken polls queue and drain in
-    /// FIFO order instead of answering 429.
+    /// FIFO order instead of answering 429. Writes slower than the queue wait
+    /// allows still answer 429 past the deadline, and clients retry.
     #[test]
-    fn mass_wake_queues_for_write_slots() {
-        let overrides = json!({"write_ns": 20_000_000u64});
-        let r = run("ctl-churn", 600, 1, Some(600 * SECONDS), Some(&overrides)).unwrap();
+    fn woken_polls_queue_for_write_slots_and_slow_writes_shed() {
+        let r = tuned("ctl-churn", 600, 600, 1, json!({"write_ns": 20_000_000u64}));
         assert_clean(&r);
-        let c = &r["metrics"]["counters"];
-        assert!(counter(&r, "ctl_write_queued") > 0, "{c}");
+        at_least(&r, &[("ctl_write_queued", 1)]);
         assert_eq!(
             counter(&r, "ctl_write_queued"),
             counter(&r, "ctl_write_dequeued") + counter(&r, "ctl_write_429"),
-            "{c}"
+            "{}",
+            r["metrics"]["counters"]
         );
-        assert_eq!(counter(&r, "ctl_write_429"), 0, "{c}");
+        zero(&r, &["ctl_write_429"]);
         assert_eq!(
             counter(&r, "ctl_notify_registrations") > 0,
             counter(&r, "ctl_client_replies") > 0
         );
-    }
-
-    /// Writes slower than the queue wait allows: queued polls past their
-    /// deadline still answer 429 (overload protection), and clients retry.
-    #[test]
-    fn slow_writes_still_shed_with_429() {
-        let overrides = json!({"write_ns": 20_000_000_000u64});
-        let r = run("ctl-churn", 600, 1, Some(300 * SECONDS), Some(&overrides)).unwrap();
-        let c = &r["metrics"]["counters"];
-        assert!(counter(&r, "ctl_write_429") > 0, "{c}");
-        assert!(counter(&r, "ctl_write_dequeued") > 0, "{c}");
+        let r = tuned(
+            "ctl-churn",
+            600,
+            300,
+            1,
+            json!({"write_ns": 20_000_000_000u64}),
+        );
+        at_least(&r, &[("ctl_write_429", 1), ("ctl_write_dequeued", 1)]);
     }
 
     #[test]
     fn failover_elects_new_terms() {
         let r = quick("failover", 200, 900, 1);
         assert_clean(&r);
-        assert!(
-            counter(&r, "ctl_primary_terms") >= 3,
-            "{}",
-            r["metrics"]["counters"]
-        );
-        assert!(
-            r["metrics"]["histograms"]["ctl_failover_ns"]["count"]
-                .as_u64()
-                .unwrap()
-                >= 2
-        );
-        assert!(counter(&r, "ctl_crashes") >= 3);
+        at_least(&r, &[("ctl_primary_terms", 3), ("ctl_crashes", 3)]);
+        assert!(histogram_count(&r, "ctl_failover_ns") >= 2);
         assert!(checks(&r, "ctl_client_converges") > 0);
     }
 
@@ -2355,37 +2334,27 @@ mod tests {
         let r = quick("ctl-churn", 320, 1200, 1);
         assert_clean(&r);
         assert_eq!(r["nodes"], 320);
-        assert!(counter(&r, "ctl_pods_removed") > 0);
-        assert!(
-            counter(&r, "ctl_membership_versions") >= 8,
-            "{}",
-            r["metrics"]["counters"]
+        at_least(
+            &r,
+            &[
+                ("ctl_pods_removed", 1),
+                ("ctl_membership_versions", 8),
+                ("ctl_delta_replies", 1),
+                ("ctl_full_replies", 1),
+            ],
         );
-        assert!(
-            counter(&r, "ctl_delta_replies") > 0,
-            "{}",
-            r["metrics"]["counters"]
-        );
-        assert!(counter(&r, "ctl_full_replies") > 0);
         assert!(checks(&r, "ctl_client_converges") > 0);
-        // A primary pass that changes nothing keeps the image's delta, so
-        // a client one version behind never gets a full image for lack of
-        // one.
-        assert_eq!(
-            counter(&r, "ctl_full_fallbacks_no_delta"),
-            0,
-            "{}",
-            r["metrics"]["counters"]
-        );
+        // A primary pass that changes nothing keeps the image's delta, so a
+        // client one version behind never gets a full image for lack of one.
+        zero(&r, &["ctl_full_fallbacks_no_delta"]);
     }
 
     #[test]
     fn lagging_clients_catch_up() {
         let r = quick("lagging", 300, 900, 1);
         assert_clean(&r);
-        assert!(counter(&r, "ctl_unreachable") > 0);
+        at_least(&r, &[("ctl_unreachable", 1), ("ctl_full_fallbacks", 1)]);
         assert!(checks(&r, "ctl_client_converges") > 0);
-        assert!(counter(&r, "ctl_full_fallbacks") > 0);
     }
 
     #[test]
@@ -2410,13 +2379,13 @@ mod tests {
         assert_eq!(sim.membership_version(10_000), 0);
         let mut last = 0;
         // Co-step in small increments as a data-plane world would.
-        while let Some(t) = sim.next_event_ns() {
+        while let Some(t) = sim.engine.next_at() {
             if t > 240 * SECONDS {
                 break;
             }
             sim.advance_to(t);
-            assert!(sim.now_ns() >= last);
-            last = sim.now_ns();
+            assert!(sim.engine.now() >= last);
+            last = sim.engine.now();
         }
         let committed = sim.committed_membership_version().unwrap();
         let caught_up = (0..60)
@@ -2462,13 +2431,10 @@ mod tests {
         }
         sim.advance_to(1200 * SECONDS);
         let r = sim.report("ctl-churn", 2);
-        let c = |k: &str| r["metrics"]["counters"][k].as_u64().unwrap_or(0);
-        assert!(
-            c("ctl_base_hash_mismatches") > 0,
-            "{}",
-            r["metrics"]["counters"]
+        at_least(
+            &r,
+            &[("ctl_base_hash_mismatches", 1), ("ctl_delta_replies", 1)],
         );
-        assert!(c("ctl_delta_replies") > 0);
         assert_eq!(r["invariants"]["hard_failures"], 0);
     }
 
@@ -2514,12 +2480,12 @@ mod tests {
 
     /// Restart crashed Pod `p` and its client now.
     fn restart(sim: &mut ControlSim, p: u32) {
-        let (now, e) = (sim.now_ns(), sim.epoch[p as usize]);
+        let (now, e) = (sim.engine.now(), sim.epoch[p as usize]);
         sim.engine.at(now, Ev::Restart(p));
         sim.engine.at(now, Ev::Enroll(p, e));
         sim.started_ns[p as usize] = now;
         sim.live_clients += 1;
-        sim.advance_to(sim.now_ns());
+        sim.advance_to(sim.engine.now());
     }
 
     fn members(sim: &ControlSim) -> usize {
@@ -2558,7 +2524,7 @@ mod tests {
         let before = seq(sim);
         let victim = bystander(sim);
         sim.crash(victim, None);
-        let mut t = sim.now_ns();
+        let mut t = sim.engine.now();
         while seq(sim) == before {
             t += S / 100;
             sim.advance_to(t);
@@ -2591,15 +2557,15 @@ mod tests {
         let first = sim.primary.holder.unwrap();
         let before = seq(&sim).unwrap();
         sim.crash(first, None);
-        sim.advance_to(sim.now_ns() + 180 * S);
+        sim.advance_to(sim.engine.now() + 180 * S);
         assert_ne!(sim.primary.holder, Some(first));
         assert!(sim.primary.holder.is_some());
         assert_eq!(sim.metrics.get("ctl_primary_terms"), 2);
         sim.add_client();
-        sim.advance_to(sim.now_ns() + 60 * S);
+        sim.advance_to(sim.engine.now() + 60 * S);
         assert!(seq(&sim).unwrap() > before, "growth publishes");
         restart(&mut sim, first);
-        sim.advance_to(sim.now_ns() + 60 * S);
+        sim.advance_to(sim.engine.now() + 60 * S);
         assert!(sim.alive(first));
         assert!(sim.memory()[0].1 > 0);
         assert_eq!(sim.invariants.to_json()["hard_failures"], 0);
@@ -2612,7 +2578,7 @@ mod tests {
         let v = mv(&sim);
         let victim = bystander(&sim);
         sim.crash(victim, None);
-        let t = sim.now_ns();
+        let t = sim.engine.now();
         // Before the node monitor grace plus the readiness grace: kept.
         sim.advance_to(t + 39 * S);
         assert!(sim.node_ready(victim));
@@ -2627,7 +2593,7 @@ mod tests {
         assert_eq!(mv(&sim), v + 1);
         restart(&mut sim, victim);
         assert!(sim.node_ready(victim));
-        sim.advance_to(sim.now_ns() + 15 * S);
+        sim.advance_to(sim.engine.now() + 15 * S);
         assert_eq!(members(&sim), 30);
         assert_eq!(mv(&sim), v + 2);
     }
@@ -2638,7 +2604,7 @@ mod tests {
         let v = mv(&sim);
         let victim = bystander(&sim);
         sim.crash(victim, None);
-        let t = sim.now_ns();
+        let t = sim.engine.now();
         sim.advance_to(t + 30 * S);
         restart(&mut sim, victim);
         sim.advance_to(t + 200 * S);
@@ -2731,7 +2697,11 @@ mod tests {
         let mut sim = model(30, 240, 5, |_| {});
         let s = seq(&sim).unwrap();
         assert_eq!(sim.image.as_ref().map(|i| i.record.sequence), Some(s));
-        assert!(sim.commit_at.get(&s).is_some_and(|t| *t <= sim.now_ns()));
+        assert!(
+            sim.commit_at
+                .get(&s)
+                .is_some_and(|t| *t <= sim.engine.now())
+        );
         let served = (0..annotations::MAX_SEATS)
             .filter_map(|i| sim.seat_served(i))
             .count();
@@ -2740,7 +2710,7 @@ mod tests {
         let victim = bystander(&sim);
         sim.remove(victim);
         assert!(!sim.alive(victim));
-        sim.advance_to(sim.now_ns() + 60 * S);
+        sim.advance_to(sim.engine.now() + 60 * S);
         assert!(mv(&sim) > v);
         assert_eq!(sim.seat_served(99), None);
     }

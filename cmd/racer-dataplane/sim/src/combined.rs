@@ -235,7 +235,7 @@ impl Combined {
     pub fn run(&mut self, end: Nanos) {
         loop {
             let tn = self.node.engine.next_at().filter(|t| *t <= end);
-            let tc = self.ctl.next_event_ns().filter(|t| *t <= end);
+            let tc = self.ctl.engine.next_at().filter(|t| *t <= end);
             match (tn, tc) {
                 (None, None) => break,
                 (tn, Some(c)) if tn.is_none_or(|n| c <= n) => {
@@ -282,7 +282,7 @@ impl Combined {
     }
 
     pub fn trace_hash(&self) -> u64 {
-        mix(self.node.engine.trace.value() ^ self.ctl.trace_hash().rotate_left(29))
+        mix(self.node.engine.trace.value() ^ self.ctl.engine.trace.value().rotate_left(29))
     }
 
     pub fn report(&mut self, scenario: &str, seed: u64) -> Value {
@@ -417,6 +417,23 @@ mod tests {
         r["metrics"]["counters"][k].as_u64().unwrap_or(0)
     }
 
+    /// Each data-plane counter is at least its bound.
+    fn at_least(r: &Value, bounds: &[(&str, u64)]) {
+        for (k, min) in bounds {
+            assert!(
+                counter(r, k) >= *min,
+                "{k} < {min}: {}",
+                r["metrics"]["counters"]
+            );
+        }
+    }
+
+    fn zero(r: &Value, keys: &[&str]) {
+        for k in keys {
+            assert_eq!(counter(r, k), 0, "{k}: {}", r["metrics"]["counters"]);
+        }
+    }
+
     fn ctl_counter(r: &Value, k: &str) -> u64 {
         r["combined"]["control_metrics"]["counters"][k]
             .as_u64()
@@ -466,12 +483,8 @@ mod tests {
         let r = quick("full-cold-start", 200, 120, 1, 0.05);
         assert_clean(&r);
         assert_eq!(r["combined"]["control"]["enrolled"], 200);
-        assert!(
-            counter(&r, "reads_skipped_not_enrolled") > 0,
-            "{}",
-            r["metrics"]
-        );
-        assert!(counter(&r, "reads_completed") > 0);
+        at_least(&r, &[("reads_skipped_not_enrolled", 1)]);
+        at_least(&r, &[("reads_completed", 1)]);
         assert!(counter(&r, "flight_joins") + counter(&r, "peer_requests_acquire") > 0);
         assert!(counter(&r, "membership_publications") >= 1);
         let max = r["origin_per_page"]["max_requests_per_page"]
@@ -487,7 +500,7 @@ mod tests {
         assert!(ctl_counter(&r, "ctl_primary_terms") >= 3);
         assert!(counter(&r, "crashes") >= 3, "{}", r["metrics"]["counters"]);
         assert!(counter(&r, "restarts") >= 1);
-        assert!(counter(&r, "reads_completed") > 0);
+        at_least(&r, &[("reads_completed", 1)]);
     }
 
     /// In a failover run (crashes, a site partition, origin
@@ -565,13 +578,9 @@ mod tests {
         // 400 nodes, seed 2: 152 such orphans without hints, 104 with.
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
-        assert_eq!(counter(&off, "successor_deferrals"), 0);
+        zero(&off, &["successor_deferrals"]);
         assert!(counter(&on, "successor_deferrals") > 0, "{}", on["metrics"]);
-        assert!(
-            counter(&on, "successor_hints_noted") > 0,
-            "{}",
-            on["metrics"]
-        );
+        at_least(&on, &[("successor_hints_noted", 1)]);
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
     }
 
@@ -588,7 +597,7 @@ mod tests {
         };
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
-        assert_eq!(counter(&off, "successor_probes"), 0);
+        zero(&off, &["successor_probes"]);
         assert!(counter(&on, "successor_copies") > 0, "{}", on["metrics"]);
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
         // A refetch by rank 0 that noted the holder is rare: its one probe
@@ -619,7 +628,7 @@ mod tests {
         };
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
-        assert_eq!(counter(&off, "orphan_offers_sent"), 0);
+        zero(&off, &["orphan_offers_sent"]);
         // Only offers that failed with cut evidence cross
         // a partition, and without cut groups offers cross it at least as
         // often.
@@ -638,18 +647,10 @@ mod tests {
         );
         let noted = counter(&on, "orphan_notices_noted");
         let sent = counter(&on, "orphan_offers_sent");
-        assert!(
-            counter(&on, "orphan_offers_delivered") > 0,
-            "{}",
-            on["metrics"]
-        );
+        at_least(&on, &[("orphan_offers_delivered", 1)]);
         assert!(sent <= noted * NOTICE_TRIES as u64, "{}", on["metrics"]);
         // Rank 2 holders also notice rank 1.
-        assert!(
-            counter(&on, "orphan_notices_noted_rank1") > 0,
-            "{}",
-            on["metrics"]
-        );
+        at_least(&on, &[("orphan_notices_noted_rank1", 1)]);
         assert_eq!(
             sent,
             counter(&on, "orphan_offers_delivered") + counter(&on, "orphan_offers_failed"),
@@ -692,13 +693,9 @@ mod tests {
                 .unwrap_or(0)
         };
         assert!(skips(&off) > 0, "{}", off["origin_per_page"]);
-        assert!(
-            counter(&on, "origin_left_to_rank0_failed") > 0,
-            "{}",
-            on["metrics"]
-        );
+        at_least(&on, &[("origin_left_to_rank0_failed", 1)]);
         assert!(skips(&on) < skips(&off), "{} {}", skips(&on), skips(&off));
-        assert!(counter(&on, "rank0_watch_origin_failures") > 0);
+        at_least(&on, &[("rank0_watch_origin_failures", 1)]);
         assert!(
             counter(&on, "origin_5xx") < counter(&off, "origin_5xx"),
             "{} {}",
@@ -786,14 +783,14 @@ mod tests {
         );
         assert!(moved(&all) <= moved(&grants));
         assert!(origin(&all) < origin(&before));
-        assert!(counter(&all, "lineage_grant_copies") > 0);
-        assert!(counter(&all, "demoted_probes") > 0);
-        assert_eq!(counter(&before, "lineage_grant_probes"), 0);
-        assert_eq!(counter(&grants, "demoted_probes"), 0);
+        at_least(&all, &[("lineage_grant_copies", 1)]);
+        at_least(&all, &[("demoted_probes", 1)]);
+        zero(&before, &["lineage_grant_probes"]);
+        zero(&grants, &["demoted_probes"]);
         // Without the join rule, lineage probes wait on acquisitions that
         // wait on the prober and fail; with it they almost never do.
         assert!(counter(&cycles, "copy_only_join_declined") == 0);
-        assert!(counter(&all, "copy_only_join_declined") > 0);
+        at_least(&all, &[("copy_only_join_declined", 1)]);
         assert!(
             counter(&all, "lineage_grant_failures") * 4
                 < counter(&cycles, "lineage_grant_failures"),
@@ -849,8 +846,8 @@ mod tests {
                 + counter(&parallel, "moved_unasked_holder_rank_4_5"),
             0
         );
-        assert!(counter(&parallel, "granted_batches") > 0);
-        assert_eq!(counter(&sequential, "granted_batches"), 0);
+        at_least(&parallel, &[("granted_batches", 1)]);
+        zero(&sequential, &["granted_batches"]);
         assert!(counter(&parallel, "reads_failed") <= counter(&narrow, "reads_failed") + 1);
     }
 
@@ -871,26 +868,17 @@ mod tests {
         };
         let before = run_with(true);
         assert_clean(&before);
-        assert!(
-            counter(&before, "unready_member_links") > 0,
-            "{}",
-            before["metrics"]["counters"]
-        );
-        assert!(counter(&before, "reads_failed_while_members_unready") > 0);
+        at_least(&before, &[("unready_member_links", 1)]);
+        at_least(&before, &[("reads_failed_while_members_unready", 1)]);
         let after = run_with(false);
         assert_clean(&after);
         assert_eq!(after["combined"]["control"]["enrolled"], 300);
-        assert_eq!(
-            counter(&after, "unready_member_links"),
-            0,
-            "{}",
-            after["metrics"]["counters"]
-        );
-        assert_eq!(counter(&after, "reads_failed_while_members_unready"), 0);
-        assert_eq!(counter(&after, "reads_failed"), 0);
+        zero(&after, &["unready_member_links"]);
+        zero(&after, &["reads_failed_while_members_unready"]);
+        zero(&after, &["reads_failed"]);
         // The price: a node does not read until a membership lists it.
-        assert!(counter(&after, "reads_skipped_not_member") > 0);
-        assert!(counter(&after, "reads_completed") > 0);
+        at_least(&after, &[("reads_skipped_not_member", 1)]);
+        at_least(&after, &[("reads_completed", 1)]);
         assert_eq!(ctl_counter(&after, "ctl_reports"), 300);
         // Joins are batched: at most one version per hold, plus the empty
         // bootstrap version and the first join.
@@ -915,8 +903,8 @@ mod tests {
             r["metrics"]["counters"]
         );
         assert!(ctl_counter(&r, "ctl_pods_removed") > 0);
-        assert!(counter(&r, "membership_adoptions") > 0);
-        assert!(counter(&r, "reads_completed") > 0);
+        at_least(&r, &[("membership_adoptions", 1)]);
+        at_least(&r, &[("reads_completed", 1)]);
     }
 
     #[test]
@@ -924,7 +912,7 @@ mod tests {
         let r = quick("full-lagging", 300, 600, 1, 0.2);
         assert_clean(&r);
         assert!(ctl_counter(&r, "ctl_unreachable") > 0);
-        assert!(counter(&r, "reads_completed") > 0);
+        at_least(&r, &[("reads_completed", 1)]);
         assert!(
             counter(&r, "stale_membership_replies") + counter(&r, "error_incompatible_membership")
                 > 0,
@@ -971,16 +959,8 @@ mod tests {
 
         let r = quick("full-failover", 200, 300, 1, 0.2);
         assert_clean(&r);
-        assert!(
-            counter(&r, "origin_5xx") > 0,
-            "{}",
-            r["metrics"]["counters"]
-        );
-        assert!(
-            counter(&r, "link_failures") > 0,
-            "{}",
-            r["metrics"]["counters"]
-        );
+        at_least(&r, &[("origin_5xx", 1)]);
+        at_least(&r, &[("link_failures", 1)]);
 
         let mut config = Config {
             nodes: 200,
@@ -998,7 +978,7 @@ mod tests {
         )
         .unwrap();
         assert_clean(&r);
-        assert_eq!(counter(&r, "origin_5xx"), 0);
+        zero(&r, &["origin_5xx"]);
         // An explicit fault list replaces the defaults.
         config.combined_faults.enabled = true;
         config.faults = vec![Fault::Slow {
@@ -1008,7 +988,7 @@ mod tests {
             until_ns: SECONDS,
         }];
         let r = run("full-failover", config, 1, Some(300 * SECONDS), None).unwrap();
-        assert_eq!(counter(&r, "origin_5xx"), 0);
+        zero(&r, &["origin_5xx"]);
     }
 
     #[test]
