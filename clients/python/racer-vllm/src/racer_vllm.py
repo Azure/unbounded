@@ -125,6 +125,20 @@ def _changed(uri: ModelURI, name: str, etag: str) -> ModelChangedError:
     )
 
 
+def _unpinned(uri: ModelURI, name: str) -> ModelChangedError:
+    return ModelChangedError(
+        f"racer: {uri.key(name)} in {uri} is not pinned in {MARKER}; the checkpoint layout changed "
+        "since racer-vllm-fetch ran, so rerun racer-vllm-fetch"
+    )
+
+
+def check_pinned(uri: ModelURI, files: list, pins: dict) -> None:
+    """With pins, every weight file must have one, so the load uses the layout fetch saw."""
+    for name in files:
+        if pins and name not in pins:
+            raise _unpinned(uri, name)
+
+
 def stat_pinned(client, uri: ModelURI, name: str, etag: str | None = None):
     """Stat a file, at version etag when given."""
     try:
@@ -155,6 +169,8 @@ def weight_files(client, uri: ModelURI, pins: dict | None = None) -> list:
     """Safetensors files named by the index, else model.safetensors."""
     pins = pins or {}
     got = read_pinned(client, uri, INDEX, pins.get(INDEX))
+    if got is not None and pins and INDEX not in pins:
+        raise _unpinned(uri, INDEX)  # fetch saw no index; one was uploaded since
     if got is None:
         stat_pinned(client, uri, SINGLE, pins.get(SINGLE))  # raises NotFound when absent
         return [SINGLE]
@@ -167,11 +183,13 @@ def weight_files(client, uri: ModelURI, pins: dict | None = None) -> list:
     return files
 
 
-def fetch(uri, dest: str, client=None) -> list:
+def fetch(uri, dest: str, client=None, pattern=None) -> list:
     """Copy the small model files to dest and write racer-model.json.
 
     racer-model.json records the URI and the ETag of every fetched file and
-    every weight file, so the loader reads the same model version.
+    every weight file, so the loader reads the same model version. Without
+    safetensors weights, it records the files of a sharded_state checkpoint
+    (pattern, else vLLM's default patterns) for every rank.
     """
     u = parse_uri(uri) if isinstance(uri, str) else uri
     client = client or racer.Client(cache=u.cache)
@@ -201,7 +219,7 @@ def fetch(uri, dest: str, client=None) -> list:
     try:
         weights = weight_files(client, u, etags)
     except racer.NotFound:
-        weights = []  # for example a sharded_state checkpoint; the loader stats its own files
+        weights = sharded_files(client, u, pattern)
     for name in weights:
         etags[name] = stat_pinned(client, u, name).etag
     _write(os.path.join(dest, MARKER), json.dumps({"uri": str(u), "etags": etags}, sort_keys=True).encode())
@@ -560,6 +578,27 @@ def rank_files(client, uri: ModelURI, pattern, ranks: dict) -> list:
     return files
 
 
+def sharded_files(client, uri: ModelURI, pattern=None) -> list:
+    """Every rank's sharded_state files, probing rank 0, 1, ... until one has no part 0."""
+    for pat in [pattern] if pattern else [TP_ONLY_PATTERN, PP_AND_TP_PATTERN]:
+        pp = "{pp_rank}" in pat
+        tp = "{tp_rank}" in pat or "{rank}" in pat
+        files = []
+        for pp_rank in range(MAX_PARTS if pp else 1):
+            n = len(files)
+            for tp_rank in range(MAX_PARTS if tp else 1):
+                ranks = {"tp_rank": tp_rank, "tp_size": 2 if tp else 1, "pp_rank": pp_rank, "pp_size": 2 if pp else 1}
+                try:
+                    files += rank_files(client, uri, pat, ranks)
+                except ValueError:
+                    break
+            if len(files) == n:
+                break
+        if files:
+            return files
+    return []
+
+
 def vllm_ranks() -> dict:
     from vllm.distributed import (
         get_pipeline_model_parallel_rank,
@@ -652,9 +691,15 @@ def register() -> None:
             )
             try:
                 if o["sharded_state"]:
-                    files = rank_files(client, uri, o["pattern"], vllm_ranks())
+                    ranks = vllm_ranks()
+                    files = rank_files(client, uri, o["pattern"], ranks)
+                    # A pinned part past the last one found was deleted at the origin.
+                    after = render_pattern(o["pattern"], len(files), **ranks)
+                    if after in pins:
+                        raise _changed(uri, after, pins[after])
                 else:
                     files = weight_files(client, uri, pins)
+                check_pinned(uri, files, pins)
             except BaseException:
                 client.close()
                 raise
@@ -711,8 +756,9 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="racer-vllm-fetch", description="Fetch model config files from Racer.")
     p.add_argument("uri", help="racer://<cache>/<bucket>/<prefix>")
     p.add_argument("dest", help="local directory")
+    p.add_argument("--pattern", help="sharded_state file name pattern, as the loader's pattern option")
     a = p.parse_args(argv)
-    for name in fetch(a.uri, a.dest):
+    for name in fetch(a.uri, a.dest, pattern=a.pattern):
         print(name)
     return 0
 

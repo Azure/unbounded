@@ -54,7 +54,10 @@ writes `racer-model.json`, which tells the loader where the weights are and
 records the ETag of every fetched file and every weight file. The loader reads
 the weights at those ETags, so they match the config and tokenizer. If the
 model at the origin changes after the fetch, the load fails with
-`ModelChangedError`; run `racer-vllm-fetch` again.
+`ModelChangedError`; run `racer-vllm-fetch` again. The loader also refuses
+any weight file that `racer-model.json` does not pin, so a layout change
+(such as an index uploaded after a single-file fetch) fails the same way.
+Without `racer-model.json`, nothing is pinned.
 
 Then start vLLM on that directory:
 
@@ -135,7 +138,11 @@ which uses `ShardedStateLoader.save_model`), upload it, and load with
 (`part-0`, `part-1`, ... until one is missing) and copies each tensor straight
 into the model's state dict, as vLLM's `sharded_state` loader does. The
 checkpoint must be saved with the same tensor and pipeline parallel sizes.
-Each rank pins its own files at the ETags seen when its load starts.
+`racer-vllm-fetch` finds no safetensors weights for such a checkpoint, so it
+probes vLLM's default patterns (or `--pattern`) and records every rank's
+parts. Each rank then loads only the parts pinned there; a new, missing, or
+replaced part fails with `ModelChangedError`. Without `racer-model.json`, each
+rank pins its own files at the ETags seen when its load starts.
 
 With `clone` set to false, tensors are views into staging memory. They stay
 valid only until vLLM asks for the next tensors after the buffer's last one.

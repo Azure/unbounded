@@ -678,3 +678,88 @@ def test_pyproject():
         assert p["urls"]["Source"].startswith("https://github.com/Azure/unbounded")
     for d in ("racer", "racer-vllm"):
         assert os.path.exists(os.path.join(HERE, "..", "..", d, "LICENSE"))
+
+
+def test_loader_rejects_index_added_after_single_file_fetch(server, uri, torch, monkeypatch, tmp_path):
+    setup_model(server, uri, index=False)
+    rv.fetch(uri, str(tmp_path), client=client(server))
+    setup_model(server, uri)  # an index and shards are uploaded later
+    inst = make_loader(monkeypatch, server)
+    mc = types.SimpleNamespace(model=str(tmp_path), quantization=None)
+    with pytest.raises(rv.ModelChangedError, match=f"{rv.INDEX}.*not pinned.*racer-vllm-fetch"):
+        inst.download_model(mc)
+    assert not range_reads(server)
+
+
+def test_loader_rejects_unpinned_weight_file(server, uri, torch, monkeypatch, tmp_path):
+    # Fetch found no weights, so the marker pins none; a single file appears later.
+    put(server, uri, "config.json", b"{}")
+    rv.fetch(uri, str(tmp_path), client=client(server))
+    setup_model(server, uri, index=False)
+    inst = make_loader(monkeypatch, server)
+    with pytest.raises(rv.ModelChangedError, match=f"{rv.SINGLE}.*not pinned"):
+        inst.download_model(types.SimpleNamespace(model=str(tmp_path), quantization=None))
+
+
+def test_loader_without_marker_is_unpinned(server, uri, torch, monkeypatch, tmp_path):
+    setup_model(server, uri, index=False)
+    inst = make_loader(monkeypatch, server, uri=str(uri))
+    mc = types.SimpleNamespace(model=str(tmp_path), quantization=None)
+    setup_model(server, uri)  # layout changes, but nothing was pinned
+    inst.load_weights(Model(), mc)
+    # A marker for another URI is ignored too.
+    (tmp_path / rv.MARKER).write_text(json.dumps({"uri": "racer://cache1/models/other", "etags": {}}))
+    inst.load_weights(Model(), mc)
+
+
+def put_sharded(server, uri, ranks=2, parts=2, etag='"v1"'):
+    for r in range(ranks):
+        for p in range(parts):
+            data = make_safetensors([(f"w{p}", "U8", (2,), bytes([r * 10 + p]) * 2)])
+            put(server, uri, f"model-rank-{r}-part-{p}.safetensors", data, etag)
+
+
+def test_fetch_pins_sharded_state_files(server, uri, tmp_path):
+    put(server, uri, "config.json", b"{}")
+    put_sharded(server, uri)
+    rv.fetch(uri, str(tmp_path), client=client(server))
+    etags = json.loads((tmp_path / rv.MARKER).read_text())["etags"]
+    shards = [f"model-rank-{r}-part-{p}.safetensors" for r in (0, 1) for p in (0, 1)]
+    assert sorted(etags) == sorted(["config.json", *shards])
+
+    pp = tmp_path / "pp"
+    put(server, uri, "model-pp-0-tp-0-part-0.safetensors", b"x")
+    put(server, uri, "model-pp-1-tp-0-part-0.safetensors", b"x")
+    pattern = "model-pp-{pp_rank}-tp-{tp_rank}-part-{part}.safetensors"
+    rv.fetch(uri, str(pp), client=client(server), pattern=pattern)
+    etags = json.loads((pp / rv.MARKER).read_text())["etags"]
+    assert sorted(etags) == ["config.json", "model-pp-0-tp-0-part-0.safetensors", "model-pp-1-tp-0-part-0.safetensors"]
+
+
+@pytest.mark.parametrize("change", ["none", "new part", "deleted part", "replaced"])
+def test_loader_sharded_state_uses_pins(server, uri, torch, monkeypatch, tmp_path, change):
+    put(server, uri, "config.json", b"{}")
+    put_sharded(server, uri)
+    rv.fetch(uri, str(tmp_path), client=client(server))
+    if change == "new part":
+        put(server, uri, "model-rank-1-part-2.safetensors", make_safetensors([("w2", "U8", (2,), b"zz")]))
+    elif change == "deleted part":
+        del server.objects[uri.request("model-rank-1-part-1.safetensors").hex]
+    elif change == "replaced":
+        replace(server, uri, "model-rank-1-part-0.safetensors")
+    inst = make_loader(monkeypatch, server, sharded_state=True)
+    install_fake_vllm(monkeypatch, tp_rank=1, tp_size=2)
+    params = {"w0": ft(b"\0" * 2), "w1": ft(b"\0" * 2)}
+
+    class Sharded:
+        def state_dict(self):
+            return params
+
+    mc = types.SimpleNamespace(model=str(tmp_path), quantization=None)
+    if change == "none":
+        inst.load_weights(Sharded(), mc)
+        assert params["w0"].bytes() == b"\x0a\x0a" and params["w1"].bytes() == b"\x0b\x0b"
+        return
+    match = {"new part": "part-2.*not pinned", "deleted part": "part-1", "replaced": "part-0"}[change]
+    with pytest.raises(rv.ModelChangedError, match=match):
+        inst.load_weights(Sharded(), mc)

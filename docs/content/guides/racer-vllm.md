@@ -153,8 +153,10 @@ takes two steps:
 2. `vllm serve <dir> --load-format racer` reads the weights through Racer, at
    the ETags in `racer-model.json`. If the model changed at the origin since
    the fetch, or changes during the load, the load fails with
-   `ModelChangedError`. Run `racer-vllm-fetch` again to pick up the new
-   version.
+   `ModelChangedError`. It also fails if the checkpoint layout changed, for
+   example an index was added after a single-file fetch, because a weight file
+   it would read has no ETag in `racer-model.json`. Run `racer-vllm-fetch`
+   again to pick up the new version.
 
 After each load, vLLM's log shows one `racer: loaded ...` line with the file
 count, bytes, time, throughput, and the number of reads in each delivery mode
@@ -166,7 +168,9 @@ With tensor parallelism, each rank reads every weight file of a regular
 checkpoint. Ranks on one node share the dataplane, so repeat reads come from
 its cache, not the origin. To have each rank read only its own files, save a
 vLLM `sharded_state` checkpoint and pass
-`--model-loader-extra-config '{"sharded_state": true}'`.
+`--model-loader-extra-config '{"sharded_state": true}'`. `racer-vllm-fetch`
+records every rank's files; pass `--pattern` if the checkpoint uses a custom
+file name pattern.
 
 See the `racer-vllm` README for loader options such as `staging_bytes`.
 
