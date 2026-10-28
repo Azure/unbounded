@@ -94,18 +94,35 @@ impl ReactorKernel {
 
 impl QueueKernel for ReactorKernel {
     fn command(&self, cmd_op: u32, cmd: [u8; 16]) -> Local<'_, Result<i32>> {
+        // Queue commands are FETCH_REQ / COMMIT_AND_FETCH_REQ built by
+        // `io_cmd_bytes` (src/ublk/queue.rs:157), whose only pointer field,
+        // `ublksrv_io_cmd.addr` at bytes 8..16, is 0 because every device is
+        // added with `UBLK_F_USER_COPY` (src/ublk/manager.rs:476). Data moves
+        // through `pread`/`pwrite` on the char device instead.
+        debug_assert_eq!(
+            u64::from_ne_bytes(cmd[8..16].try_into().unwrap()),
+            0,
+            "ublk queue command must not carry a buffer address under USER_COPY"
+        );
         match &self.commands {
-            Some(commands) => self.reactor.uring_cmd_reserved(
-                self.fd.clone(),
-                cmd_op,
-                cmd,
-                (),
-                commands.clone(),
-                &self.scope,
-            ),
-            None => self
-                .reactor
-                .uring_cmd(self.fd.clone(), cmd_op, cmd, (), &self.scope),
+            // SAFETY: the payload carries no user address (addr is 0, checked
+            // above in debug builds), so the kernel accesses no caller memory
+            // through it; `fd` is retained by the reactor until the fence.
+            Some(commands) => unsafe {
+                self.reactor.uring_cmd_reserved(
+                    self.fd.clone(),
+                    cmd_op,
+                    cmd,
+                    (),
+                    commands.clone(),
+                    &self.scope,
+                )
+            },
+            // SAFETY: as above; the payload references no caller memory.
+            None => unsafe {
+                self.reactor
+                    .uring_cmd(self.fd.clone(), cmd_op, cmd, (), &self.scope)
+            },
         }
     }
 

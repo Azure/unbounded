@@ -2080,7 +2080,20 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// publishes an `AsyncCancel`, and `fd` and `lease` stay retained until the
     /// kernel's final CQE fence even if this future is dropped. While pending
     /// the command occupies an ordinary submission slot.
-    pub fn uring_cmd<'a, L: 'static>(
+    ///
+    /// # Safety
+    ///
+    /// `cmd` is passed to the driver behind `fd` uninterpreted, and may encode
+    /// user addresses (for example ublk `ublksrv_io_cmd.addr` without
+    /// `UBLK_F_USER_COPY`, or a control command's buffer). The caller must
+    /// know the semantics of `cmd_op` for `fd`, and any memory the command
+    /// makes the kernel read or write must stay valid, and not be accessed in
+    /// a conflicting way by Rust code, for the whole time the kernel owns the
+    /// command: until the final CQE fence, which can come after the returned
+    /// future is dropped. Keeping that memory owned by `lease` satisfies the
+    /// lifetime part, since the reactor retains `lease` until the fence.
+    /// Commands that carry no user addresses have no extra requirement.
+    pub unsafe fn uring_cmd<'a, L: 'static>(
         &'a self,
         fd: Rc<Descriptor>,
         cmd_op: u32,
@@ -2096,7 +2109,11 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// [`Self::reserve_submissions`]). The slot stays taken until the result
     /// is consumed, so a partition sized to the number of commands that may
     /// be outstanding at once never refuses one.
-    pub fn uring_cmd_reserved<'a, L: 'static>(
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`Self::uring_cmd`].
+    pub unsafe fn uring_cmd_reserved<'a, L: 'static>(
         &'a self,
         fd: Rc<Descriptor>,
         cmd_op: u32,

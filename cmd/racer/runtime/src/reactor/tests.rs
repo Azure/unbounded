@@ -4130,6 +4130,36 @@ mod uring_cmd {
     //! Raw-result passthrough and owner retention for 16-byte URING_CMD operations.
     use super::*;
 
+    // Every payload in these tests is a filler byte pattern sent either to a
+    // descriptor whose driver rejects URING_CMD (socket, pipe) or to the
+    // simulated kernel, which never dereferences it. No payload names memory.
+
+    fn submit<'a, L: 'static>(
+        reactor: &'a Reactor,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, i32, Error> {
+        // SAFETY: see the module note; the payload references no memory.
+        unsafe { reactor.uring_cmd(fd, cmd_op, cmd, lease, scope) }
+    }
+
+    #[cfg(feature = "simulation")]
+    fn submit_reserved<'a, L: 'static>(
+        reactor: &'a Reactor,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, i32, Error> {
+        // SAFETY: see the module note; the payload references no memory.
+        unsafe { reactor.uring_cmd_reserved(fd, cmd_op, cmd, lease, capacity, scope) }
+    }
+
     #[test]
     /// An unsupported descriptor completes with a raw negative errno, not Err.
     fn real_unsupported_descriptor_returns_negative_result() {
@@ -4146,7 +4176,14 @@ mod uring_cmd {
             let drops = Rc::new(Cell::new(0));
             let result = drive(
                 &reactor,
-                reactor.uring_cmd(Rc::new(fd), 0x20, [7; 16], Lease(drops.clone()), &scope),
+                submit(
+                    &reactor,
+                    Rc::new(fd),
+                    0x20,
+                    [7; 16],
+                    Lease(drops.clone()),
+                    &scope,
+                ),
             )
             .unwrap();
             eprintln!("uring_cmd on unsupported descriptor completed with {result}");
@@ -4171,7 +4208,7 @@ mod uring_cmd {
             let (fd, _peer) = sim.socket_pair();
             let fd = Rc::new(fd);
             for result in [0, 5, -libc::ENODEV, -libc::EINTR, -libc::EAGAIN] {
-                let mut op = reactor.uring_cmd(fd.clone(), 0x21, [1; 16], (), &request);
+                let mut op = submit(&reactor, fd.clone(), 0x21, [1; 16], (), &request);
                 assert!(poll(&mut op).is_pending());
                 // Commands stay outstanding until the simulated kernel completes them.
                 for _ in 0..4 {
@@ -4195,8 +4232,8 @@ mod uring_cmd {
             let request = scope();
             let (fd, _peer) = sim.socket_pair();
             let fd = Rc::new(fd);
-            let mut first = reactor.uring_cmd(fd.clone(), 1, [1; 16], (), &request);
-            let mut second = reactor.uring_cmd(fd.clone(), 1, [2; 16], (), &request);
+            let mut first = submit(&reactor, fd.clone(), 1, [1; 16], (), &request);
+            let mut second = submit(&reactor, fd.clone(), 1, [2; 16], (), &request);
             assert!(poll(&mut first).is_pending());
             assert!(poll(&mut second).is_pending());
             sim.complete_uring_cmd(&fd, 2, None, 9).unwrap();
@@ -4221,7 +4258,14 @@ mod uring_cmd {
             let fd = Rc::new(fd);
             let weak = Rc::downgrade(&fd);
             let drops = Rc::new(Cell::new(0));
-            let mut op = reactor.uring_cmd(fd.clone(), 1, [0; 16], Lease(drops.clone()), &request);
+            let mut op = submit(
+                &reactor,
+                fd.clone(),
+                1,
+                [0; 16],
+                Lease(drops.clone()),
+                &request,
+            );
             assert!(poll(&mut op).is_pending());
             reactor.poll_budgeted(4).unwrap();
             drop(op);
@@ -4263,24 +4307,45 @@ mod uring_cmd {
             ));
             // Two ordinary slots remain.
             let mut ordinary: Vec<_> = (0..2)
-                .map(|n| reactor.uring_cmd(fd.clone(), 9, [n; 16], (), &request))
+                .map(|n| submit(&reactor, fd.clone(), 9, [n; 16], (), &request))
                 .collect();
             for op in &mut ordinary {
                 assert!(poll(op).is_pending());
             }
-            let mut full = reactor.uring_cmd(fd.clone(), 9, [7; 16], (), &request);
+            let mut full = submit(&reactor, fd.clone(), 9, [7; 16], (), &request);
             assert!(matches!(
                 poll(&mut full),
                 Poll::Ready(Err(Error::Overloaded))
             ));
-            let mut first =
-                reactor.uring_cmd_reserved(fd.clone(), 1, [1; 16], (), commands.clone(), &request);
-            let mut second =
-                reactor.uring_cmd_reserved(fd.clone(), 1, [2; 16], (), commands.clone(), &request);
+            let mut first = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [1; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
+            let mut second = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [2; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
             assert!(poll(&mut first).is_pending());
             assert!(poll(&mut second).is_pending());
-            let mut third =
-                reactor.uring_cmd_reserved(fd.clone(), 1, [3; 16], (), commands.clone(), &request);
+            let mut third = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [3; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
             assert!(matches!(
                 poll(&mut third),
                 Poll::Ready(Err(Error::Overloaded))
@@ -4289,8 +4354,15 @@ mod uring_cmd {
                 .unwrap();
             assert_eq!(drive(&reactor, first).unwrap(), -libc::ENODEV);
             // The consumed result freed its slot.
-            let mut again =
-                reactor.uring_cmd_reserved(fd.clone(), 1, [4; 16], (), commands.clone(), &request);
+            let mut again = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [4; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
             assert!(poll(&mut again).is_pending());
             drop((ordinary, second, again, control, commands));
         }
@@ -4304,7 +4376,14 @@ mod uring_cmd {
             let request = scope();
             let (fd, _peer) = sim.socket_pair();
             let drops = Rc::new(Cell::new(0));
-            let mut op = reactor.uring_cmd(Rc::new(fd), 1, [0; 16], Lease(drops.clone()), &request);
+            let mut op = submit(
+                &reactor,
+                Rc::new(fd),
+                1,
+                [0; 16],
+                Lease(drops.clone()),
+                &request,
+            );
             assert!(poll(&mut op).is_pending());
             reactor.poll_budgeted(4).unwrap();
             request.cancellation.cancel().unwrap();
