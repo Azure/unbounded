@@ -1,13 +1,25 @@
 //! Measures per-node heap cost of phantom placement and replayed routes at
 //! production default capacities, for simulator memory planning.
 
-use futures::executor::block_on;
+use racer_sim::phantom::{Phantom, SharedRoutes};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     num::NonZeroU32,
     sync::atomic::{AtomicUsize, Ordering},
+    task::{Context, Poll, Waker},
 };
-use topology::{Member, Membership, PathQuery, Paths, Phantom, Placement, Rankings, SharedRoutes};
+use topology::{Member, Membership, PathQuery, Paths, Placement, Rankings};
+
+/// Poll a future to completion with a no-op waker.
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+    }
+}
 
 /// Counts live heap bytes for this test binary.
 struct Counting;

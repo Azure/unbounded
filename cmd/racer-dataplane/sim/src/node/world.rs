@@ -28,6 +28,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use crate::phantom::{Phantom, SharedRoutes};
 use page_alloc::SegmentId;
 use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
 use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
@@ -70,7 +71,7 @@ use racer_core::route::{
 };
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
-use topology::{PathQuery, Phantom, Placement, SharedRoutes};
+use topology::{PathQuery, Placement};
 
 use super::admission::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
 use super::ids::Ids;

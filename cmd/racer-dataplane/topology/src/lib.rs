@@ -133,12 +133,12 @@ mod placement;
 
 pub use paths::{
     Alternatives, DEFAULT_SEARCH_QUEUE, EqualCostSearch, Exhaustive, PathKey, PathQuery, Paths,
-    ReplayedSearch, Searches, SharedRoutes,
+    Searches,
 };
 
 pub use placement::{
-    Maintenance, Phantom, PhantomEntry, Placement, RANKED_DEPTH, REPLICAS, RETAINED_DEPTH, Ranking,
-    RankingEntry, Rankings, SLOT_BITS, SLOT_COUNT, Scored, rank_of, slot,
+    Maintenance, Placement, RANKED_DEPTH, REPLICAS, RETAINED_DEPTH, Ranking, RankingEntry,
+    Rankings, SLOT_BITS, SLOT_COUNT, Scored, rank_of, slot,
 };
 
 use sha2::Digest;
@@ -515,8 +515,8 @@ impl<M: Member> Membership<M> {
 
     /// Hash of the domain and IDs. Weights are left out.
     ///
-    /// This is the graph identity that route cache keys use, so callers of
-    /// [`SharedRoutes::forget`] pass it to keep a membership's routes.
+    /// This is the graph identity that route cache keys use
+    /// ([`PathKey::topology`]).
     #[must_use]
     pub fn topology_identity(&self) -> [u8; 32] {
         self.topology_identity

@@ -11,6 +11,8 @@
 //! - [`workload`] and [`faults`]: Poisson, Zipf, ranges, storms, churn,
 //!   partitions, crashes, slow nodes, origin errors.
 //! - [`report`]: histograms, counters, invariants, memory accounting.
+//! - [`phantom`]: shared-memo placement rankings and route searches that
+//!   keep every node's caches small.
 //! - [`node`]: real node logic (placement, routes, walk, flights, fill,
 //!   serve, caches, admission) driven by events; every scenario runs it.
 
@@ -20,6 +22,7 @@ pub mod control;
 pub mod engine;
 pub mod faults;
 pub mod node;
+pub mod phantom;
 pub mod report;
 pub mod resources;
 pub mod workload;

@@ -55,10 +55,10 @@ pub enum Maintenance {
 /// Not thread-safe. Give each worker its own `Placement`.
 ///
 /// `R` decides how one slot's ranking is stored and computed. The default,
-/// [`Scored`], keeps the real scores in every entry. [`Phantom`] keeps only a
-/// cursor per entry and shares the real results across many placements, for
-/// simulation. CLOCK eviction, pinning, admission, refresh, and maintenance
-/// are the same code for both.
+/// [`Scored`], keeps the real scores in every entry. The simulator plugs in
+/// a ranking that keeps only a cursor per entry and shares the real results
+/// across many placements. CLOCK eviction, pinning, admission, refresh, and
+/// maintenance are the same code for both.
 pub struct Placement<R: Rankings = Scored> {
     /// How rankings are stored and computed.
     rankings: R,
@@ -89,61 +89,43 @@ pub trait Rankings {
     const ENTRY_BYTES: usize;
 
     /// Score up to `work` more members, continuing where the last call
-    /// stopped. Returns true when every member has been scored.
+    /// stopped.
     fn advance<M: Member>(
         &self,
         entry: &mut Self::Entry,
         membership: &Membership<M>,
         slot: u32,
         work: usize,
-    ) -> bool;
+    );
 
-    /// True when every member of `membership` has been scored.
-    fn complete<M: Member>(&self, entry: &Self::Entry, membership: &Membership<M>) -> bool;
-
-    /// Ranked member positions, best first. Only called on complete entries.
-    fn candidates<M: Member>(
+    /// Run `read` on the real ranking of a complete entry.
+    fn read<M: Member, T>(
         &self,
         entry: &Self::Entry,
         membership: &Membership<M>,
         slot: u32,
-    ) -> Vec<usize>;
+        read: impl FnOnce(&Ranking) -> T,
+    ) -> T;
 
-    /// Member positions ranked just below the owners, best first, at most
-    /// [`RETAINED_DEPTH`] - [`REPLICAS`] (see [`Placement::demoted`]). Only
-    /// called on complete entries.
-    fn demoted<M: Member>(
-        &self,
-        entry: &Self::Entry,
-        membership: &Membership<M>,
-        slot: u32,
-    ) -> Vec<usize>;
-
-    /// True if `matches` accepts one of the first three owners. Only called on
-    /// complete entries.
-    fn owner<M: Member>(
-        &self,
-        entry: &Self::Entry,
-        membership: &Membership<M>,
-        slot: u32,
-        matches: impl Fn(usize) -> bool,
-    ) -> bool;
-
-    /// Build this slot's entry for `membership` from the predecessor entry,
-    /// or `None` when a full rescore is needed. Same contract as the real
-    /// incremental update.
+    /// Build this slot's entry for `membership` from the complete entry of
+    /// the predecessor membership `base`, or `None` when a full rescore is
+    /// needed. Same contract as [`Ranking::updated`].
     fn updated<M: Member>(
         &self,
         old: &Self::Entry,
         membership: &Membership<M>,
         slot: u32,
+        base: [u8; 32],
     ) -> Option<Self::Entry>;
 }
 
-/// Access to the CLOCK bit shared by every [`Rankings::Entry`].
+/// Progress and the CLOCK bit shared by every [`Rankings::Entry`].
 pub trait RankingEntry {
     /// The CLOCK "recently used" bit.
     fn referenced(&mut self) -> &mut bool;
+
+    /// Members scored so far.
+    fn cursor(&self) -> usize;
 }
 
 /// Default [`Rankings`]: every entry holds its real best scores.
@@ -153,6 +135,10 @@ pub struct Scored;
 impl RankingEntry for Ranking {
     fn referenced(&mut self) -> &mut bool {
         &mut self.referenced
+    }
+
+    fn cursor(&self) -> usize {
+        self.cursor
     }
 }
 
@@ -168,39 +154,19 @@ impl Rankings for Scored {
         membership: &Membership<M>,
         slot: u32,
         work: usize,
-    ) -> bool {
+    ) {
         entry.advance(membership, slot, work);
-        entry.cursor == membership.members().len()
     }
 
     #[inline]
-    fn complete<M: Member>(&self, entry: &Ranking, membership: &Membership<M>) -> bool {
-        entry.cursor == membership.members().len()
-    }
-
-    #[inline]
-    fn candidates<M: Member>(&self, entry: &Ranking, _: &Membership<M>, _: u32) -> Vec<usize> {
-        entry.candidates()
-    }
-
-    #[inline]
-    fn demoted<M: Member>(&self, entry: &Ranking, _: &Membership<M>, _: u32) -> Vec<usize> {
-        entry.demoted()
-    }
-
-    #[inline]
-    fn owner<M: Member>(
+    fn read<M: Member, T>(
         &self,
         entry: &Ranking,
         _: &Membership<M>,
         _: u32,
-        matches: impl Fn(usize) -> bool,
-    ) -> bool {
-        entry
-            .best
-            .iter()
-            .take(3)
-            .any(|score| matches(score.node as usize))
+        read: impl FnOnce(&Ranking) -> T,
+    ) -> T {
+        read(entry)
     }
 
     #[inline]
@@ -209,204 +175,15 @@ impl Rankings for Scored {
         old: &Ranking,
         membership: &Membership<M>,
         slot: u32,
+        _: [u8; 32],
     ) -> Option<Ranking> {
         old.updated(membership, slot)
     }
 }
 
-/// Simulation [`Rankings`]: entries hold only a cursor and the CLOCK bit.
-///
-/// Results come from a memo shared by every `Phantom` clone, keyed by
-/// (membership identity, slot). The memo runs the real scoring and the real
-/// incremental update once per key, so many simulated nodes pay for one
-/// ranking while their caches make the same decisions as [`Scored`]: the
-/// cursor advances by the same work quanta, completes on the same poll, and
-/// `updated` succeeds exactly when the real update does.
-///
-/// The memo grows until [`Phantom::forget`] drops old memberships.
-#[derive(Clone, Default)]
-pub struct Phantom {
-    memo: Rc<RefCell<std::collections::HashMap<CacheKey, PhantomResult>>>,
-}
-
-/// Memoized result for one (membership identity, slot).
-struct PhantomResult {
-    /// The real complete ranking.
-    ranking: Ranking,
-
-    /// Whether the real incremental update from this ranking's predecessor
-    /// succeeded, keyed by predecessor identity. Usually one element.
-    updates: Vec<([u8; 32], bool)>,
-}
-
-/// Phantom cache entry: progress and the CLOCK bit, no scores.
-#[derive(Debug, Eq, PartialEq)]
-pub struct PhantomEntry {
-    /// Members scored so far.
-    cursor: u32,
-
-    /// CLOCK "recently used" bit.
-    referenced: bool,
-}
-
-impl Default for PhantomEntry {
-    fn default() -> Self {
-        Self {
-            cursor: 0,
-            referenced: true,
-        }
-    }
-}
-
-impl RankingEntry for PhantomEntry {
-    fn referenced(&mut self) -> &mut bool {
-        &mut self.referenced
-    }
-}
-
-impl Phantom {
-    /// Create a phantom with an empty shared memo.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Drop memoized results for every membership except `keep`.
-    pub fn forget(&self, keep: &[[u8; 32]]) {
-        self.memo
-            .borrow_mut()
-            .retain(|(identity, _), _| keep.contains(identity));
-    }
-
-    /// Number of memoized (membership, slot) results.
-    #[must_use]
-    pub fn memo_len(&self) -> usize {
-        self.memo.borrow().len()
-    }
-
-    /// Run `body` on the memoized real ranking, computing it on first use.
-    fn with<M: Member, T>(
-        &self,
-        membership: &Membership<M>,
-        slot: u32,
-        body: impl FnOnce(&mut PhantomResult) -> T,
-    ) -> T {
-        let mut memo = self.memo.borrow_mut();
-        let result = memo
-            .entry((membership.identity(), slot))
-            .or_insert_with(|| {
-                let mut ranking = Ranking::default();
-                ranking.advance(membership, slot, usize::MAX);
-                PhantomResult {
-                    ranking,
-                    updates: Vec::new(),
-                }
-            });
-        body(result)
-    }
-}
-
-impl Rankings for Phantom {
-    type Entry = PhantomEntry;
-
-    /// Map node share, `Rc` header, and `RefCell<PhantomEntry>`.
-    const ENTRY_BYTES: usize = 128;
-
-    fn advance<M: Member>(
-        &self,
-        entry: &mut PhantomEntry,
-        membership: &Membership<M>,
-        _: u32,
-        work: usize,
-    ) -> bool {
-        let count = membership.members().len();
-        let end = (entry.cursor as usize).saturating_add(work).min(count);
-        entry.cursor = u32::try_from(end).expect("membership fits u32");
-        end == count
-    }
-
-    fn complete<M: Member>(&self, entry: &PhantomEntry, membership: &Membership<M>) -> bool {
-        entry.cursor as usize == membership.members().len()
-    }
-
-    fn candidates<M: Member>(
-        &self,
-        _: &PhantomEntry,
-        membership: &Membership<M>,
-        slot: u32,
-    ) -> Vec<usize> {
-        self.with(membership, slot, |result| result.ranking.candidates())
-    }
-
-    fn demoted<M: Member>(
-        &self,
-        _: &PhantomEntry,
-        membership: &Membership<M>,
-        slot: u32,
-    ) -> Vec<usize> {
-        self.with(membership, slot, |result| result.ranking.demoted())
-    }
-
-    fn owner<M: Member>(
-        &self,
-        _: &PhantomEntry,
-        membership: &Membership<M>,
-        slot: u32,
-        matches: impl Fn(usize) -> bool,
-    ) -> bool {
-        self.with(membership, slot, |result| {
-            result
-                .ranking
-                .best
-                .iter()
-                .take(3)
-                .any(|score| matches(score.node as usize))
-        })
-    }
-
-    fn updated<M: Member>(
-        &self,
-        old: &PhantomEntry,
-        membership: &Membership<M>,
-        slot: u32,
-    ) -> Option<PhantomEntry> {
-        let delta = membership.delta.as_ref()?;
-        if old.cursor as usize != delta.old_count {
-            return None;
-        }
-        let base = delta.base;
-        let known = self.with(membership, slot, |result| {
-            result
-                .updates
-                .iter()
-                .find(|(identity, _)| *identity == base)
-                .map(|(_, ok)| *ok)
-        });
-        let ok = known.unwrap_or_else(|| {
-            // The predecessor is complete, so its real ranking was memoized
-            // unless it was forgotten. Treat a forgotten one as a rescore.
-            let previous = self
-                .memo
-                .borrow()
-                .get(&(base, slot))
-                .and_then(|old| old.ranking.updated(membership, slot));
-            let ok = previous.is_some();
-            debug_assert!(
-                previous.is_none_or(|next| {
-                    self.with(membership, slot, |result| {
-                        next.candidates() == result.ranking.candidates()
-                    })
-                }),
-                "incremental update disagrees with full scoring"
-            );
-            self.with(membership, slot, |result| result.updates.push((base, ok)));
-            ok
-        });
-        ok.then(|| PhantomEntry {
-            cursor: u32::try_from(membership.members().len()).expect("membership fits u32"),
-            referenced: true,
-        })
-    }
+/// True when every member of `membership` has been scored into `entry`.
+fn complete<M: Member>(entry: &impl RankingEntry, membership: &Membership<M>) -> bool {
+    entry.cursor() == membership.members().len()
 }
 
 /// Progress of moving cached entries from the old membership to the new one.
@@ -640,7 +417,8 @@ impl Ranking {
     /// needed: there is no change list, the old ranking is unfinished, or a
     /// retained score's member left or lost weight (an unseen member could
     /// move up).
-    fn updated<M: Member>(&self, membership: &Membership<M>, slot: u32) -> Option<Self> {
+    #[must_use]
+    pub fn updated<M: Member>(&self, membership: &Membership<M>, slot: u32) -> Option<Self> {
         let delta = membership.delta.as_ref()?;
         debug_assert!(delta.changes.len() <= MAX_INCREMENTAL_CHANGES);
         if self.cursor != delta.old_count {
@@ -706,7 +484,7 @@ impl Ranking {
     }
 
     /// Score up to `work` more members, continuing where the last call stopped.
-    fn advance<M: Member>(&mut self, membership: &Membership<M>, slot: u32, work: usize) {
+    pub fn advance<M: Member>(&mut self, membership: &Membership<M>, slot: u32, work: usize) {
         let end = self
             .cursor
             .saturating_add(work)
@@ -719,7 +497,8 @@ impl Ranking {
     }
 
     /// Return the owners' member positions, best first.
-    fn candidates(&self) -> Vec<usize> {
+    #[must_use]
+    pub fn candidates(&self) -> Vec<usize> {
         self.best
             .iter()
             .take(REPLICAS)
@@ -729,12 +508,21 @@ impl Ranking {
 
     /// Return the positions ranked just below the owners, best first: the
     /// exact ranks up to [`RANKED_DEPTH`], then the best-effort tail.
-    fn demoted(&self) -> Vec<usize> {
+    #[must_use]
+    pub fn demoted(&self) -> Vec<usize> {
         self.best
             .iter()
             .skip(REPLICAS)
             .map(|score| score.node as usize)
             .collect()
+    }
+
+    /// True if `matches` accepts one of the owners.
+    pub fn is_owner(&self, matches: impl Fn(usize) -> bool) -> bool {
+        self.best
+            .iter()
+            .take(REPLICAS)
+            .any(|score| matches(score.node as usize))
     }
 }
 
@@ -799,6 +587,25 @@ impl<R: Rankings> Placement<R> {
         )
     }
 
+    /// Observable cache state for tests comparing [`Rankings`]: each entry's
+    /// key, whether it is complete for `membership`, and its pin count, then
+    /// the CLOCK hand and the maintenance rescan flag.
+    #[doc(hidden)]
+    pub fn snapshot<M: Member>(&self, membership: &Membership<M>) -> Vec<(CacheKey, bool, usize)> {
+        let cache = self.cache.borrow();
+        let mut out: Vec<_> = cache
+            .entries
+            .iter()
+            .map(|(key, entry)| {
+                let complete =
+                    key.0 == membership.identity() && complete(&*entry.borrow(), membership);
+                (*key, complete, Rc::strong_count(entry))
+            })
+            .collect();
+        out.push((cache.hand.unwrap_or_default(), cache.predecessor_dirty, 0));
+        out
+    }
+
     /// Look up completed current-placement owners without scoring, admission,
     /// eviction, or refreshing CLOCK. Partial and obsolete rankings are misses.
     #[must_use]
@@ -807,9 +614,10 @@ impl<R: Rankings> Placement<R> {
         let slot = slot::<M>(key);
         let ranking = cache.entries.get(&(membership.identity(), slot))?;
         let ranking = ranking.borrow();
-        self.rankings
-            .complete(&ranking, membership)
-            .then(|| self.rankings.candidates(&ranking, membership, slot))
+        complete(&*ranking, membership).then(|| {
+            self.rankings
+                .read(&ranking, membership, slot, Ranking::candidates)
+        })
     }
 
     /// Completed cached members ranked just below the owners, best first (at
@@ -825,9 +633,10 @@ impl<R: Rankings> Placement<R> {
         let slot = slot::<M>(key);
         let ranking = cache.entries.get(&(membership.identity(), slot))?;
         let ranking = ranking.borrow();
-        self.rankings
-            .complete(&ranking, membership)
-            .then(|| self.rankings.demoted(&ranking, membership, slot))
+        complete(&*ranking, membership).then(|| {
+            self.rankings
+                .read(&ranking, membership, slot, Ranking::demoted)
+        })
     }
 
     /// Test the first three cached owners without allocating a candidate list.
@@ -844,8 +653,10 @@ impl<R: Rankings> Placement<R> {
             return false;
         };
         let ranking = ranking.borrow();
-        self.rankings.complete(&ranking, membership)
-            && self.rankings.owner(&ranking, membership, slot, matches)
+        complete(&*ranking, membership)
+            && self.rankings.read(&ranking, membership, slot, |ranking| {
+                ranking.is_owner(matches)
+            })
     }
 
     /// Refresh one resident key with at most 256 scores and 64 CLOCK visits.
@@ -865,10 +676,9 @@ impl<R: Rankings> Placement<R> {
             *work = Some((cache_key, R::Entry::default()));
         }
         let (_, ranking) = work.as_mut().unwrap();
-        if !self
-            .rankings
-            .advance(ranking, membership, cache_key.1, WORK_QUANTUM)
-        {
+        self.rankings
+            .advance(ranking, membership, cache_key.1, WORK_QUANTUM);
+        if !complete(ranking, membership) {
             return None;
         }
         let mut cache = self.cache.borrow_mut();
@@ -880,7 +690,9 @@ impl<R: Rankings> Placement<R> {
             return None;
         }
         let (_, ranking) = work.take().unwrap();
-        let candidates = self.rankings.candidates(&ranking, membership, cache_key.1);
+        let candidates = self
+            .rankings
+            .read(&ranking, membership, cache_key.1, Ranking::candidates);
         if self.capacity != 0 {
             if let Some(existing) = cache.entries.get(&cache_key) {
                 // A foreground request may hold this partial entry. Complete it
@@ -911,10 +723,18 @@ impl<R: Rankings> Placement<R> {
             *ranking.borrow_mut().referenced() = true;
             return Ok(ranking.clone());
         }
-        let predecessor = membership.delta.as_ref().map(|delta| (delta.base, slot));
+        let delta = membership.delta.as_ref();
+        let predecessor = delta.map(|delta| (delta.base, slot));
         let old = predecessor.and_then(|key| cache.entries.get(&key));
-        let updated =
-            old.and_then(|ranking| self.rankings.updated(&ranking.borrow(), membership, slot));
+        let updated = old.zip(delta).and_then(|(ranking, delta)| {
+            let ranking = ranking.borrow();
+            (ranking.cursor() == delta.old_count)
+                .then(|| {
+                    self.rankings
+                        .updated(&ranking, membership, slot, delta.base)
+                })
+                .flatten()
+        });
         let replace = old.is_some_and(|ranking| Rc::strong_count(ranking) == 1);
         // Replace this slot, never some other populated predecessor slot. An
         // in-flight old request owns its immutable generation until it finishes.
@@ -949,7 +769,8 @@ impl<R: Rankings> Placement<R> {
         let mut ranking = ranking.borrow_mut();
         self.rankings
             .advance(&mut ranking, membership, slot, usize::MAX);
-        self.rankings.candidates(&ranking, membership, slot)
+        self.rankings
+            .read(&ranking, membership, slot, Ranking::candidates)
     }
 
     /// Like [`Self::rank`], but yields so it does not block the executor.
@@ -974,11 +795,15 @@ impl<R: Rankings> Placement<R> {
             let ranking = self.ranking(membership, slot)?;
             std::future::poll_fn(|cx| {
                 let mut ranking = ranking.borrow_mut();
-                if self
-                    .rankings
-                    .advance(&mut ranking, membership, slot, WORK_QUANTUM)
-                {
-                    Poll::Ready(Ok(self.rankings.candidates(&ranking, membership, slot)))
+                self.rankings
+                    .advance(&mut ranking, membership, slot, WORK_QUANTUM);
+                if complete(&*ranking, membership) {
+                    Poll::Ready(Ok(self.rankings.read(
+                        &ranking,
+                        membership,
+                        slot,
+                        Ranking::candidates,
+                    )))
                 } else {
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -1026,9 +851,11 @@ impl<R: Rankings> Placement<R> {
             return Maintenance::Idle;
         }
         if let Some((slot, ranking)) = &work.active {
-            let done =
-                self.rankings
-                    .advance(&mut ranking.borrow_mut(), membership, *slot, WORK_QUANTUM);
+            let mut entry = ranking.borrow_mut();
+            self.rankings
+                .advance(&mut entry, membership, *slot, WORK_QUANTUM);
+            let done = complete(&*entry, membership);
+            drop(entry);
             if done {
                 work.active = None;
             }
@@ -1060,7 +887,7 @@ impl<R: Rankings> Placement<R> {
         // capacity, remove its now-unpinned predecessor as part of this migration.
         self.cache.borrow_mut().remove(&key);
         work.cursor = Some(key);
-        if !self.rankings.complete(&ranking.borrow(), membership) {
+        if !complete(&*ranking.borrow(), membership) {
             work.active = Some((key.1, ranking));
         }
         Maintenance::Progress
@@ -1096,8 +923,7 @@ mod tests {
     }
 
     /// Members ranked just below the owners come from complete cached
-    /// rankings only, match full scoring, and agree between `Scored` and
-    /// `Phantom` (Known issue 34).
+    /// rankings only and match full scoring (Known issue 34).
     #[test]
     fn demoted_lists_the_next_ranks_from_complete_cached_rankings_only() {
         let members = membership(1000);
@@ -1129,9 +955,6 @@ mod tests {
         let small = membership(4);
         placement.rank(&small, key);
         assert_eq!(placement.demoted(&small, key).unwrap().len(), 1);
-        let phantom = Placement::with_rankings(4, Phantom::new());
-        phantom.rank(&members, key);
-        assert_eq!(phantom.demoted(&members, key), Some(demoted));
         assert_eq!(Placement::new(0).demoted(&members, key), None, "uncached");
     }
 
@@ -1998,155 +1821,5 @@ mod tests {
         let empty_bytes = placement.retained_bytes();
         placement.rank(&membership(4), b"key");
         assert!(placement.retained_bytes() >= empty_bytes + Placement::ENTRY_BYTES);
-    }
-
-    /// Observable cache state: keys, CLOCK hand, completion, and pins.
-    fn snapshot<R: Rankings>(
-        placement: &Placement<R>,
-        members: &Membership<TestMember>,
-    ) -> Vec<(CacheKey, bool, usize)> {
-        let cache = placement.cache.borrow();
-        let mut out: Vec<_> = cache
-            .entries
-            .iter()
-            .map(|(key, entry)| {
-                let complete = key.0 == members.identity()
-                    && placement.rankings.complete(&entry.borrow(), members);
-                (*key, complete, Rc::strong_count(entry))
-            })
-            .collect();
-        out.push((cache.hand.unwrap_or_default(), cache.predecessor_dirty, 0));
-        out
-    }
-
-    /// Phantom and scored placements make identical decisions under a seeded
-    /// workload with held requests, refreshes, maintenance, and churn.
-    #[test]
-    fn phantom_matches_scored_on_seeded_workloads_with_churn() {
-        type Pending<'a> = std::pin::Pin<Box<dyn Future<Output = Result<Vec<usize>, Error>> + 'a>>;
-        for seed in 1..=6u64 {
-            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-            let mut draw = move || {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state
-            };
-            let mut generations = vec![membership(300 + usize::try_from(seed).unwrap() * 50)];
-            for generation in 0..8usize {
-                let old = generations.last().unwrap();
-                let mut values = old.members().to_vec();
-                let pick = usize::try_from(draw()).unwrap() % values.len();
-                if generation % 3 == 0 {
-                    values.remove(pick);
-                } else if generation % 3 == 1 {
-                    values[pick].1 =
-                        NonZeroU32::new(u32::try_from(draw() % 9).unwrap() + 1).unwrap();
-                } else {
-                    values.push(member(10_000 + generation, 4));
-                }
-                let next = Membership::new(values).unwrap().with_predecessor(old);
-                generations.push(next);
-            }
-            let capacity = usize::try_from(seed % 3).unwrap() * 8;
-            let scored = Placement::new(capacity);
-            let phantom = Placement::with_rankings(capacity, Phantom::new());
-            let mut held: Vec<(Pending<'_>, Pending<'_>)> = Vec::new();
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let mut polls = [0usize; 2];
-            let mut current = 0;
-            for step in 0..3000 {
-                let value = draw();
-                if step % 300 == 299 && current + 1 < generations.len() {
-                    current += 1;
-                }
-                let members = &generations[current];
-                // Requests sometimes use the previous generation, like
-                // in-flight old requests do.
-                let view = if value & 64 != 0 && current > 0 {
-                    &generations[current - 1]
-                } else {
-                    members
-                };
-                let page = key((value >> 8) % 40);
-                match value % 8 {
-                    0 => assert_eq!(scored.rank(view, &page), phantom.rank(view, &page)),
-                    1 => {
-                        let mut a: Pending<'_> = Box::pin(scored.rank_async(view, &page));
-                        let mut b: Pending<'_> = Box::pin(phantom.rank_async(view, &page));
-                        let (x, y) = (a.as_mut().poll(&mut cx), b.as_mut().poll(&mut cx));
-                        assert_eq!(x, y, "seed {seed} step {step}");
-                        if x.is_pending() {
-                            held.push((a, b));
-                        }
-                    }
-                    2 | 3 => {
-                        if !held.is_empty() {
-                            let index = usize::try_from(value >> 20).unwrap() % held.len();
-                            let (a, b) = &mut held[index];
-                            polls[0] += 1;
-                            polls[1] += 1;
-                            let (x, y) = (a.as_mut().poll(&mut cx), b.as_mut().poll(&mut cx));
-                            assert_eq!(x, y, "seed {seed} step {step}");
-                            if x.is_ready() || value & 1024 != 0 {
-                                drop(held.swap_remove(index));
-                            }
-                        }
-                    }
-                    4 => assert_eq!(scored.refresh(view, &page), phantom.refresh(view, &page)),
-                    5 => assert_eq!(scored.maintain(members), phantom.maintain(members)),
-                    6 => assert_eq!(scored.cached(view, &page), phantom.cached(view, &page)),
-                    _ => {
-                        let node = usize::try_from(value >> 32).unwrap() % 8;
-                        assert_eq!(
-                            scored.is_owner(view, &page, |i| i == node),
-                            phantom.is_owner(view, &page, |i| i == node)
-                        );
-                    }
-                }
-                assert_eq!(
-                    snapshot(&scored, members),
-                    snapshot(&phantom, members),
-                    "seed {seed} step {step}"
-                );
-                assert_eq!(scored.retained_bytes() > 0, phantom.retained_bytes() > 0);
-            }
-            assert_eq!(polls[0], polls[1]);
-        }
-    }
-
-    /// Phantom entries are tiny and the memo is shared across placements.
-    #[test]
-    fn phantom_entries_are_small_and_share_one_memo() {
-        use std::mem::size_of;
-        assert!(size_of::<PhantomEntry>() <= 8);
-        let map_node = 11 * size_of::<(CacheKey, Rc<RefCell<PhantomEntry>>)>()
-            + 12 * size_of::<usize>()
-            + 4 * size_of::<usize>();
-        // B-tree nodes hold up to 11 entries; count a per-entry share.
-        let per_entry = map_node / 11 + 2 * size_of::<usize>() + size_of::<RefCell<PhantomEntry>>();
-        assert!(per_entry <= Phantom::ENTRY_BYTES, "{per_entry}");
-        let shared = Phantom::new();
-        let members = membership(500);
-        let nodes: Vec<_> = (0..50)
-            .map(|_| Placement::with_rankings(16, shared.clone()))
-            .collect();
-        for node in &nodes {
-            for page in 0..10 {
-                assert_eq!(
-                    node.rank(&members, &key(page)),
-                    Placement::new(0).rank(&members, &key(page))
-                );
-            }
-        }
-        assert_eq!(shared.memo_len(), 10);
-        shared.forget(&[]);
-        assert_eq!(shared.memo_len(), 0);
-        // A forgotten predecessor forces a full rescore instead of a wrong answer.
-        let next = membership(501).with_predecessor(&members);
-        assert_eq!(
-            nodes[0].rank(&next, &key(0)),
-            Placement::new(0).rank(&next, &key(0))
-        );
     }
 }

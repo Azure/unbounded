@@ -3,6 +3,7 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::phantom::{Phantom, SharedRoutes};
 use flow_control::Circuits;
 use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
@@ -12,7 +13,7 @@ use racer_core::liveness::{SILENCE_CAPACITY, Silence};
 use racer_core::read::flight::{FlightLimits, PageFlights};
 use racer_core::read::hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
 use racer_core::read::hints::{NOTICE_CAPACITY, OrphanNotices};
-use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
+use topology::{MAX_DEGREE, Paths, Placement};
 
 use super::admission::{Rejections, SimCharge, SimPolicy, SimQuotas};
 use super::config::NodeConfig;
