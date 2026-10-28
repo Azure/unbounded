@@ -34,7 +34,6 @@ name: unbounded release
 #         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> python-packages   (racer-client and racer-vllm sdists and wheels)
-#         -> pypi-publish  (only when vars.PYPI_PUBLISH is "true")
 #     -> finalize          (attach extras + krew manifest)
 #
 # All artifacts land on a single GitHub release that is left as a draft.
@@ -1172,8 +1171,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Build sdists and wheels for the Racer Python packages (racer-client and
-  # racer-vllm), attach them to the draft release, and keep them as an
-  # artifact for pypi-publish.
+  # racer-vllm) and attach them to the draft release. The release is the only
+  # place they are published; nothing is uploaded to PyPI.
   # ---------------------------------------------------------------------------
   python-packages:
     needs: version
@@ -1193,14 +1192,6 @@ jobs:
           done
           ls -l dist/python
 
-      - name: Upload Python packages artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: python-packages
-          path: dist/python/*
-          # See manifests-tarball for why this is 7.
-          retention-days: 7
-
       - name: Attach Python packages to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1209,33 +1200,6 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TAG" dist/python/* --clobber
-
-  # ---------------------------------------------------------------------------
-  # Publish the Python packages to PyPI with trusted publishing (OIDC, no
-  # stored token). Runs only when the repository variable PYPI_PUBLISH is
-  # "true", after the PyPI projects trust this workflow and the "pypi"
-  # environment. Prereleases are not published. The packages carry their own
-  # versions in pyproject.toml; bump them to publish a new version. A version
-  # already on PyPI is skipped, so a re-run of this job succeeds.
-  # ---------------------------------------------------------------------------
-  pypi-publish:
-    needs: [version, python-packages]
-    if: vars.PYPI_PUBLISH == 'true' && needs.version.outputs.is_prerelease != 'true'
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
-        with:
-          name: python-packages
-          path: dist
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
-        with:
-          packages-dir: dist
-          skip-existing: true
 
   # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
@@ -1254,6 +1218,7 @@ jobs:
       - component-images
       - gantry-chart
       - manifests-tarball
+      - python-packages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
