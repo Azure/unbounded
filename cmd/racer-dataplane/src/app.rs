@@ -246,8 +246,15 @@ impl NodeState {
 /// Remove slab files left by workers that no longer exist after a worker-count change.
 ///
 /// Only regular files named `worker-<id>-slab-0.dat` with an id outside `workers` are
-/// removed. Failures are logged and ignored because stale files never affect correctness.
+/// removed. Each file is removed only while holding the same exclusive lock that slab
+/// startup takes, and only if the path still names the locked inode, so a concurrent
+/// instance's live slabs are skipped. Failures are logged and ignored because stale
+/// files never affect correctness.
 fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
@@ -265,6 +272,39 @@ fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
             continue;
         }
         let path = entry.path();
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "racer-dataplane: stage=slabs failed to open stale slab file {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        // SAFETY: flock synchronously borrows this live descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            eprintln!(
+                "racer-dataplane: stage=slabs kept locked stale slab file {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        let same = match (file.metadata(), std::fs::symlink_metadata(&path)) {
+            (Ok(locked), Ok(current)) => {
+                current.is_file() && locked.dev() == current.dev() && locked.ino() == current.ino()
+            }
+            _ => false,
+        };
+        if !same {
+            continue;
+        }
+        // The lock is held until `file` drops, after the unlink.
         match std::fs::remove_file(&path) {
             Ok(()) => eprintln!(
                 "racer-dataplane: stage=slabs removed stale slab file {}",

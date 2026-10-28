@@ -4922,3 +4922,31 @@ fn prune_stale_slab_files_removes_only_extra_worker_files() {
     super::prune_stale_slab_files(&directory.join("missing"), &[WorkerId(0)]);
     std::fs::remove_dir_all(&directory).unwrap();
 }
+
+/// A stale slab file still locked by another instance is kept.
+#[test]
+fn prune_stale_slab_files_skips_locked_files() {
+    use std::os::fd::AsRawFd;
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("prune-locked-slabs-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let locked = directory.join("worker-3-slab-0.dat");
+    let unlocked = directory.join("worker-4-slab-0.dat");
+    std::fs::write(&locked, b"x").unwrap();
+    std::fs::write(&unlocked, b"x").unwrap();
+    let holder = std::fs::File::open(&locked).unwrap();
+    // SAFETY: flock borrows a live descriptor owned by this test.
+    assert_eq!(
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    super::prune_stale_slab_files(&directory, &[WorkerId(0)]);
+    assert!(locked.exists());
+    assert!(!unlocked.exists());
+    drop(holder);
+    super::prune_stale_slab_files(&directory, &[WorkerId(0)]);
+    assert!(!locked.exists());
+    std::fs::remove_dir_all(&directory).unwrap();
+}
