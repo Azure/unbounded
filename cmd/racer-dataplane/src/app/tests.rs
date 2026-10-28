@@ -4880,3 +4880,45 @@ fn snapshot_refresh_applies_priority_live_and_reweighs_memory() {
         );
     }
 }
+
+/// Slab files for workers outside the current plan are removed; others are kept.
+#[test]
+fn prune_stale_slab_files_removes_only_extra_worker_files() {
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("prune-slabs-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    for name in [
+        "worker-0-slab-0.dat",
+        "worker-1-slab-0.dat",
+        "worker-2-slab-0.dat",
+        "worker-3-slab-0.dat",
+        "worker-4-slab-0.dat",
+        "checkpoint.0",
+        "worker-x-slab-0.dat",
+    ] {
+        std::fs::write(directory.join(name), b"x").unwrap();
+    }
+    std::fs::create_dir(directory.join("worker-9-slab-0.dat")).unwrap();
+    super::prune_stale_slab_files(&directory, &[WorkerId(0), WorkerId(1), WorkerId(2)]);
+    let mut left: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "checkpoint.0",
+            "worker-0-slab-0.dat",
+            "worker-1-slab-0.dat",
+            "worker-2-slab-0.dat",
+            "worker-9-slab-0.dat",
+            "worker-x-slab-0.dat",
+        ]
+    );
+    // A missing directory is not an error.
+    super::prune_stale_slab_files(&directory.join("missing"), &[WorkerId(0)]);
+    std::fs::remove_dir_all(&directory).unwrap();
+}

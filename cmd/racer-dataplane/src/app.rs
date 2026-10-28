@@ -243,6 +243,41 @@ impl NodeState {
     }
 }
 
+/// Remove slab files left by workers that no longer exist after a worker-count change.
+///
+/// Only regular files named `worker-<id>-slab-0.dat` with an id outside `workers` are
+/// removed. Failures are logged and ignored because stale files never affect correctness.
+fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("worker-"))
+            .and_then(|n| n.strip_suffix("-slab-0.dat"))
+            .and_then(|n| n.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        if workers.contains(&WorkerId(id)) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => eprintln!(
+                "racer-dataplane: stage=slabs removed stale slab file {}",
+                path.display()
+            ),
+            Err(error) => eprintln!(
+                "racer-dataplane: stage=slabs failed to remove stale slab file {}: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
 impl Application {
     /// Composition only. Does not open files, spawn threads, or accept requests.
     pub fn assemble(config: Config) -> Result<Self> {
@@ -346,6 +381,10 @@ impl Application {
                 .map(devices::Plan::claimed_disks)
                 .unwrap_or_default(),
         });
+        if devices.is_none() {
+            let workers: Vec<_> = plan.pairs.iter().map(|p| p.worker).collect();
+            prune_stale_slab_files(&self.config.slab_directory, &workers);
+        }
         node.devices = devices;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
@@ -1509,6 +1548,10 @@ impl WorkerApplication {
                 config.segment_bytes,
                 crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
             )
+            // Slab files are a re-fetchable cache. A changed slab size makes any
+            // checkpoint for this file incompatible (its recorded slab_bytes no
+            // longer match), so recovery starts this worker cold.
+            .reset_mismatched_size()
         });
         let reader = Rc::new(
             StoreReader::new(
