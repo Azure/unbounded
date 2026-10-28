@@ -279,6 +279,7 @@ The Unbounded agent daemon composes the shared package as follows:
   - `OperationNodeReboot`
   - `OperationAgentUpgrade`
   - `OperationAgentReset`
+  - `OperationHostOSReboot`
 - Creates a `repaveReconciler` that watches local Node delete events and queues
   `NewRepaveRequest("node-delete")`.
 - Calls `daemon.SetupController("unbounded-agent-daemon", mgr, machineOps,

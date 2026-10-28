@@ -186,7 +186,7 @@ spec:
 |-------|------|----------|-------------|
 | `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
 | `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Supported for agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`). Each matching agent independently picks up the operation. Not supported for host operations. |
-| `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
+| `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostOutOfBandReboot`, `HostOOBReboot` (alias of `HostOutOfBandReboot`), `HostOSReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
 | `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
 | `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
@@ -202,7 +202,7 @@ The Azure VM provider handles:
 
 | Operation | Azure action |
 |-----------|--------------|
-| `HostReboot` | `VirtualMachinesClient.BeginRestart` |
+| `HostOutOfBandReboot` | `VirtualMachinesClient.BeginRestart` |
 | `HostPowerOff` | `VirtualMachinesClient.BeginPowerOff` |
 | `HostPowerOn` | `VirtualMachinesClient.BeginStart` |
 | `HostReplace` | `VirtualMachinesClient.Get`, `BeginDelete`, then `BeginCreateOrUpdate` |
@@ -215,7 +215,7 @@ The OCI instance provider handles:
 
 | Operation | OCI action |
 |-----------|------------|
-| `HostReboot` | `RESET` |
+| `HostOutOfBandReboot` | `RESET` |
 | `HostPowerOff` | `STOP` |
 | `HostPowerOn` | `START` |
 | `HostReplace` | `STOP` old instance, `LaunchInstance` replacement, patch `Machine.spec.host.external.providerID`, then terminate old instance |
@@ -371,7 +371,7 @@ metadata:
   name: azure-worker-01-hardreboot
 spec:
   machineRef: azure-worker-01
-  operationKind: HostReboot
+  operationKind: HostOutOfBandReboot
   ttlSecondsAfterFinished: 300
 ```
 

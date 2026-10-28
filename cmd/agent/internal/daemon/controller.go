@@ -92,11 +92,7 @@ func runController(
 		mgr.GetAPIReader(),
 		machineName,
 		nodeName,
-		daemon.MachineOperationHandlers{
-			v1alpha3.OperationNodeReboot:   machineOperations.reconcileNodeReboot,
-			v1alpha3.OperationAgentUpgrade: machineOperations.reconcileAgentUpgrade,
-			v1alpha3.OperationAgentReset:   machineOperations.reconcileAgentReset,
-		},
+		machineOperations.handlers(),
 	)
 	if err != nil {
 		return fmt.Errorf("create MachineOperation reconciler: %w", err)

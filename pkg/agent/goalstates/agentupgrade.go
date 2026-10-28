@@ -67,6 +67,12 @@ func agentUpgradePathsIn(binDir string) (AgentUpgradePaths, error) {
 	return paths, nil
 }
 
+// ResolvedHostOSRebootSignalPath returns the HostOSReboot signal path,
+// after applying its environment override.
+func ResolvedHostOSRebootSignalPath() string {
+	return resolveDaemonBinaryPath(EnvDaemonHostOSRebootSignalPath, DaemonHostOSRebootSignalPath)
+}
+
 func resolveDaemonBinaryPath(envName, defaultPath string) string {
 	if path := strings.TrimSpace(os.Getenv(envName)); path != "" {
 		return path

@@ -241,7 +241,7 @@ kubectl unbounded machine reboot server-01
 kubectl unbounded machine repave server-01
 ```
 
-`machine reboot` creates a `HostReboot` operation. `machine repave` creates a
+`machine reboot` creates a `HostOutOfBandReboot` operation. `machine repave` creates a
 `HostReplace` operation. Metalman records progress on the operation target and
 conditions, including `BootImageWritten` and `CloudInitDone`.
 
