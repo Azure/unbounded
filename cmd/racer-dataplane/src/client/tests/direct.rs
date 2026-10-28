@@ -406,6 +406,13 @@ fn gpu_read_is_validated_then_501_without_a_backend() {
         settle(&fixture);
         assert_eq!(memfd.open_copies(), 1);
     }
+    use crate::gpu_telemetry::GpuReadOutcome;
+    let gpu = fixture.listeners.metrics.gpu();
+    assert_eq!(gpu.requests(GpuReadOutcome::NotEnabled), 1);
+    // A head the parser rejects is not known to be a gpu-read: only the
+    // missing descriptor counts.
+    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 1);
+    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 0);
 }
 
 /// Records what a GPU backend would be asked to do.

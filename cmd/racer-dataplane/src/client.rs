@@ -855,6 +855,11 @@ impl Responses {
         self
     }
 
+    /// Whether this worker serves `gpu-read`.
+    pub(crate) fn has_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
+
     /// Check the descriptors that came with a request and open its sink.
     pub(crate) fn open_sink(
         &self,

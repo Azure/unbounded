@@ -930,6 +930,42 @@ network access, especially with host networking.
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 
+### GPU metrics
+
+`/metrics` also reports `gpu-read` state. Labels have fixed values or come
+from the GPUs found at startup and the active RDMA rails.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
+| `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
+
+The rest are reported only when `racer_gpu_enabled` is 1:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_decrypt_available{ordinal,uuid}` | gauge | 1 when the GPU can decrypt sealed pages. 0 means pages for it are decrypted by the CPU. |
+| `racer_gpu_staging_slots_free{ordinal}` | gauge | Free cuFile staging slots on the GPU. |
+| `racer_gpu_cufile_enabled` | gauge | 1 while cuFile reads are on. A driver-level failure turns it off until restart. |
+| `racer_gpu_cufile_disabled_total{reason}` | counter | Times cuFile was turned off: `driver_open`, `staging_register`, or `file_open`. |
+| `racer_gpu_read_pages_total{decrypt}` | counter | Pages written to GPU memory: `gpu` (decrypted on the GPU) or `cpu` (plaintext from host memory, decrypted by the CPU or already cached). |
+| `racer_gpu_pages_rejected_total` | counter | Sealed pages the GPU rejected for a CRC or tag mismatch. |
+| `racer_gpu_cufile_staged_pages_total` | counter | Pages cuFile read from disk straight into GPU staging. |
+| `racer_gpu_cufile_failures_total` | counter | cuFile reads or registrations that failed. The page is read through host memory instead. |
+| `racer_gpu_staging_exhausted_total` | counter | Disk reads that found no free staging slot and went through host memory. |
+| `racer_gpu_landed_pages_decrypted_total` | counter | Pages decrypted on the GPU from an RDMA landing buffer. |
+| `racer_gpu_landing_exhausted_total` | counter | RDMA landing grants that found no free landing slot. The page lands in host memory instead. |
+| `racer_gpu_open_requests` | gauge | `gpu-read` requests that hold GPU resources now. |
+| `racer_gpu_leaked_resources` | gauge | GPU resources leaked on purpose after a failed release. |
+
+When GPU landing is configured (GPU decrypt and RDMA both on), each active
+rail also reports:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_landing_enabled{rail}` | gauge | 1 when a GPU landing buffer is registered on the rail. |
+| `racer_gpu_landing_slots{rail,ordinal}` | gauge | NIC slots in that rail's landing buffer, and the GPU it is on. |
+
 ## Upgrade and recovery
 
 Keep the operator, dataplane, SDK, and origin adapters on matching

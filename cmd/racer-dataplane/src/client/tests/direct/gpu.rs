@@ -222,6 +222,12 @@ fn gpu_read_errors_before_the_head_release_everything() {
         "nothing written"
     );
     assert_no_body_leases(&fixture);
+    // The 412 comes after the import, so it counts as a GPU open.
+    use crate::gpu_telemetry::GpuReadOutcome;
+    let gpu = fixture.listeners.metrics.gpu();
+    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 1);
+    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 2);
+    assert_eq!(gpu.requests(GpuReadOutcome::WrongDevice), 1);
 }
 
 #[test]
@@ -716,6 +722,7 @@ fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
     let fixture = gpu_fixture(data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
     let mark = trace_len(&helper);
+    let plaintext = counter(&helper.counters().plaintext);
     let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
     assert!(head.starts_with("http/1.1 200"), "{head}");
     assert_eq!(frames, [(1, 0, 0, 5000), (2, 1, 5000, 0)]);
@@ -723,5 +730,7 @@ fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
     assert_eq!(calls(&helper, mark, Operation::Decrypt), 0);
     assert_eq!(calls(&helper, mark, Operation::FileRead), 0);
     assert_eq!(worker(&fixture).cpu_decrypts(), 1);
+    assert_eq!(counter(&helper.counters().plaintext), plaintext + 1);
+    assert_eq!(counter(&helper.counters().decrypted), 0);
     assert_idle(&fixture, &helper, default_slots());
 }

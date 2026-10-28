@@ -291,6 +291,9 @@ impl Application {
             self.config.gpu_staging_bytes,
             self.config.gpu_pci_p2pdma,
         )?;
+        if let Some(gpu) = &self.node.gpu {
+            self.node.metrics[0].1.gpu().attach_helper(gpu.clone());
+        }
         // GPU decrypt and RDMA together: peers' NICs may write gpu-read pages
         // straight into GPU landing buffers (GPUDirect RDMA). Activation
         // registers them per rail and leaves a rail host-only on any failure.
@@ -301,6 +304,10 @@ impl Application {
                 .native
                 .link_node()
                 .set_gpu_landing(gpu.clone(), self.config.gpu_landing_bytes);
+            self.node.metrics[0]
+                .1
+                .gpu()
+                .attach_links(self.node.native.link_node());
         }
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;

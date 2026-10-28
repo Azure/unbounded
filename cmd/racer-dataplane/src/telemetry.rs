@@ -3017,6 +3017,9 @@ pub struct Metrics {
     memory: Arc<MemoryShards>,
     cache_disks: ::telemetry::SnapshotShards<Vec<CacheDiskUsage>>,
 
+    /// GPU, cuFile, and GPU landing sources, shared by every worker.
+    gpu: Arc<crate::gpu_telemetry::GpuTelemetry>,
+
     shard: usize,
 }
 
@@ -3698,6 +3701,7 @@ impl Metrics {
             process: ::telemetry::SnapshotShards::new(1),
         });
         let cache_disks = ::telemetry::SnapshotShards::new(count);
+        let gpu = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
@@ -3709,6 +3713,7 @@ impl Metrics {
                 disks: disks.clone(),
                 memory: memory.clone(),
                 cache_disks: cache_disks.clone(),
+                gpu: gpu.clone(),
                 shard,
             })
             .collect())
@@ -3733,6 +3738,10 @@ impl Metrics {
         let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
         self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         self.record(count, 1);
+    }
+    /// GPU metric sources shared by every worker.
+    pub fn gpu(&self) -> &crate::gpu_telemetry::GpuTelemetry {
+        &self.gpu
     }
     pub(crate) fn writer_shard(&self) -> usize {
         self.shard
@@ -3772,6 +3781,7 @@ impl Metrics {
         self.write_memory(out)?;
         self.write_worker_pools(out)?;
         self.write_cache_disks(out)?;
+        self.gpu.write(out)?;
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -6336,6 +6346,7 @@ pub(crate) mod tests {
                     + RETENTION_METRICS.len()
                     + HELD_METRICS.len()
                     + DISK_CLASS_METRICS.len() * 2
+                    + crate::gpu_telemetry::BASE_SERIES
             );
             assert_only_disk_class_labels(&output);
             assert!(output.len() < 64 * 1024);
@@ -6408,6 +6419,7 @@ pub(crate) mod tests {
                             + RETENTION_METRICS.len()
                             + HELD_METRICS.len()
                             + DISK_CLASS_METRICS.len() * 2
+                            + crate::gpu_telemetry::BASE_SERIES
                     );
                     assert_only_disk_class_labels(&output);
                 }
@@ -6431,7 +6443,12 @@ pub(crate) mod tests {
         }
 
         fn assert_only_disk_class_labels(output: &str) {
-            let labeled: Vec<_> = output.lines().filter(|line| line.contains('{')).collect();
+            let labeled: Vec<_> = output
+                .lines()
+                .filter(|line| {
+                    line.contains('{') && !line.starts_with("racer_gpu_read_requests_total{")
+                })
+                .collect();
             assert_eq!(labeled.len(), DISK_CLASS_METRICS.len() * 2);
             for line in labeled {
                 let (name, rest) = line.split_once('{').unwrap();
