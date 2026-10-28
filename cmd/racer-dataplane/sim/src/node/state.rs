@@ -33,7 +33,6 @@ pub fn record_bytes(page_bytes: u64) -> u64 {
 }
 
 /// Measured per-entry heap bytes (cache track, design doc table).
-pub const PLACEMENT_ENTRY_BYTES: usize = 99;
 pub const ROUTE_ENTRY_BYTES: usize = 199;
 pub const SEGMENT_MAPPING_BYTES: usize = 121;
 pub const TICK_LRU_ENTRY_BYTES: usize = 67;

@@ -102,11 +102,6 @@ impl Histogram {
     }
 }
 
-/// Approximate heap and inline bytes owned by a simulated component.
-pub trait MemoryUsage {
-    fn approximate_bytes(&self) -> usize;
-}
-
 /// Peak resident set size of this process in bytes (VmHWM), if available.
 pub fn peak_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;

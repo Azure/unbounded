@@ -955,7 +955,7 @@ Verified against the code at the start of this work.
 - `workload`, `faults`, `config`: Poisson, Zipf, range reads, cold-start storms, churn; partitions,
   crash/restart (disk survives), slow nodes, origin error windows; every knob overridable with `--config`.
 - `report`: fixed-memory log-bucket histograms, counters, `Invariants` (named checks, capped violation log,
-  relaxed invariants with a reason), `MemoryUsage::approximate_bytes`, peak RSS from `VmHWM`.
+  relaxed invariants with a reason), per-component memory accounting, peak RSS from `VmHWM`.
 - The first stand-in world (hash ownership, direct-mapped tiers, a fixed owner-fetch flow) served as a
   substrate baseline and was removed once every scenario ran the real `racer-core` read path.
 
