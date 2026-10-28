@@ -34,7 +34,7 @@ fn budget(attempts: u32, links: u8) -> AcquisitionBudget {
 fn drive(
     walk: &mut CandidateWalk,
     budget: &mut AcquisitionBudget,
-    mut outcome: impl FnMut(&Probe, &AcquisitionBudget) -> Outcome,
+    mut outcome: impl FnMut(&Probe, &mut AcquisitionBudget) -> Outcome,
 ) -> (Vec<(Probe, u32, u8)>, End) {
     let mut probes = Vec::new();
     loop {
@@ -54,9 +54,9 @@ fn drive(
             Step::Granted(batch) => {
                 let mut copy = false;
                 for probe in batch {
-                    let grant = granted_budget(budget.deadline());
+                    let mut grant = granted_budget(budget.deadline());
                     probes.push((probe, grant.remaining_attempts(), grant.remaining_links()));
-                    copy |= outcome(&probe, &grant) == Outcome::Copy;
+                    copy |= outcome(&probe, &mut grant) == Outcome::Copy;
                 }
                 if let Some(end) = walk.complete_granted(copy) {
                     return (probes, end);
@@ -67,12 +67,28 @@ fn drive(
     }
 }
 
+/// Plan `probe`'s exchange on `request` with a one second attempt timeout.
+fn plan(request: &mut AcquisitionBudget, deadline: Instant, probe: &Probe) -> Result<AttemptPlan> {
+    plan_attempt(
+        request,
+        AttemptInputs {
+            now: Instant::now(),
+            caller_deadline: deadline,
+            remaining_opportunities: probe.remaining_opportunities,
+            route: probe.route,
+            mode: probe.mode,
+            attempt_timeout: Duration::from_secs(1),
+            failure_links: 8,
+        },
+    )
+}
+
 /// Walk `cfg` with a fresh budget and scripted outcomes.
 fn run(
     cfg: WalkConfig,
     attempts: u32,
     links: u8,
-    outcome: impl FnMut(&Probe, &AcquisitionBudget) -> Outcome,
+    outcome: impl FnMut(&Probe, &mut AcquisitionBudget) -> Outcome,
 ) -> (Vec<(Probe, u32, u8)>, End) {
     drive(
         &mut CandidateWalk::new(cfg),
@@ -82,7 +98,7 @@ fn run(
 }
 
 /// Every probe answers `outcome`.
-fn always(outcome: ProbeOutcome) -> impl FnMut(&Probe, &AcquisitionBudget) -> Outcome {
+fn always(outcome: ProbeOutcome) -> impl FnMut(&Probe, &mut AcquisitionBudget) -> Outcome {
     move |_, _| Outcome::Probe(outcome.clone())
 }
 
@@ -172,22 +188,17 @@ fn non_owner_funds_delegation_from_slack_only() {
     // Default page budget, visit order [1, 2, 0]: rank 1 gets `owner_funding`
     // because rank 2's minimum (4) still fits; rank 2 then gets its minimum.
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
-    let mut walk = CandidateWalk::new(config(None, 3, order));
-    let mut b = budget(8, 16);
-    let mut seen = Vec::new();
-    while let Step::Probe(p) = walk.next(&mut b).unwrap() {
-        let request = walk.request_budget(&mut b);
-        seen.push((p.canonical, request.remaining_attempts()));
+    let (probes, end) = run(config(None, 3, order), 8, 16, |_, request| {
         // Spend the child entirely, as a forwarded funded route does.
-        let spent = request.remaining_attempts();
-        let _ = request.partition(spent, 0).unwrap();
-        assert_eq!(
-            walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
-                .unwrap(),
-            None
-        );
-    }
+        let _ = request.partition(request.remaining_attempts(), 0).unwrap();
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
     assert_eq!(order.ranks().collect::<Vec<_>>(), [1, 2, 0]);
+    let seen: Vec<_> = probes
+        .iter()
+        .map(|(p, attempts, _)| (p.canonical, *attempts))
+        .collect();
     assert_eq!(
         seen[..2],
         [(1, owner_funding(1)), (2, owner_funding_min(2))]
@@ -288,25 +299,12 @@ fn handoff_probes_never_spend_the_origin_credit() {
     // spends one) and keeps one credit for origin.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 3;
-    let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(3, 32);
-    let mut probes = 0;
-    let end = loop {
-        match walk.next(&mut b).unwrap() {
-            Step::Granted(_) => unreachable!("grants are sequential here"),
-            Step::Probe(_) => {
-                probes += 1;
-                let _ = walk.request_budget(&mut b).partition(1, 0).unwrap();
-                assert_eq!(
-                    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
-                        .unwrap(),
-                    None
-                );
-            }
-            Step::End(end) => break end,
-        }
-    };
-    assert_eq!(probes, 2);
+    let (probes, end) = drive(&mut CandidateWalk::new(cfg), &mut b, |_, request| {
+        let _ = request.partition(1, 0).unwrap();
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(probes.len(), 2);
     assert_eq!(b.remaining_attempts(), 1);
     assert!(matches!(end, End::Origin { rank: 0, .. }));
     // One credit: straight to origin.
@@ -718,34 +716,18 @@ fn spent_links_end_the_walk_exhausted() {
     let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
     let mut b = budget(32, 16);
     b.note_route_failure();
-    let now = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut ends = Vec::new();
-    let end = loop {
-        match walk.next(&mut b).unwrap() {
-            Step::Granted(_) => unreachable!("grants are sequential here"),
-            Step::End(end) => break end,
-            Step::Probe(probe) => {
-                let inputs = AttemptInputs {
-                    now,
-                    caller_deadline: now + Duration::from_secs(10),
-                    remaining_opportunities: probe.remaining_opportunities,
-                    route: probe.route,
-                    mode: probe.mode,
-                    attempt_timeout: Duration::from_secs(1),
-                    failure_links: 8,
-                };
-                let outcome = match plan_attempt(walk.request_budget(&mut b), inputs) {
-                    // The route was spent on an overloaded relay.
-                    Ok(_) => ProbeOutcome::Overloaded,
-                    Err(error) => {
-                        ends.push(error);
-                        transport_outcome(error).expect("recoverable")
-                    }
-                };
-                walk.complete(&mut b, Outcome::Transport(outcome)).unwrap();
+    let (_, end) = drive(&mut walk, &mut b, |probe, request| {
+        Outcome::Transport(match plan(request, deadline, probe) {
+            // The route was spent on an overloaded relay.
+            Ok(_) => ProbeOutcome::Overloaded,
+            Err(error) => {
+                ends.push(error);
+                transport_outcome(error).expect("recoverable")
             }
-        }
-    };
+        })
+    });
     assert!(ends.contains(&Error::HopBudgetExhausted), "{ends:?}");
     assert_eq!(end, End::Exhausted { funding: false });
     assert_eq!(b.remaining_links(), 0);
@@ -1118,18 +1100,17 @@ fn helper_is_skipped_when_too_little_is_left() {
     // Rank 2 first is funded with `owner_funding(2)` = 5 of 6 and spends it
     // all (forwarded credits never come back), leaving 1 < the floor.
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
-    let mut walk = CandidateWalk::new(helper_config(order));
-    let mut b = budget(HELPER_MIN_ATTEMPTS + 1, 16);
-    let mut canon = Vec::new();
-    while let Step::Probe(probe) = walk.next(&mut b).unwrap() {
-        canon.push(probe.canonical);
-        // The exchange forwards every credit of its budget.
-        let _ = walk.request_budget(&mut b).transfer();
-        let outcome = Outcome::Shed;
-        if walk.complete(&mut b, outcome).unwrap().is_some() {
-            break;
-        }
-    }
+    let (probes, _) = run(
+        helper_config(order),
+        HELPER_MIN_ATTEMPTS + 1,
+        16,
+        |_, request| {
+            // The exchange forwards every credit of its budget.
+            let _ = request.transfer();
+            Outcome::Shed
+        },
+    );
+    let canon: Vec<_> = probes.iter().map(|(p, ..)| p.canonical).collect();
     assert_eq!(canon[0], 2);
     assert!(canon.iter().all(|c| *c < 3), "{canon:?}");
 }
@@ -1867,18 +1848,7 @@ fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
             };
             let deadline = b.deadline();
             let request = walk.request_budget(&mut b);
-            let Ok(plan) = plan_attempt(
-                request,
-                AttemptInputs {
-                    now: Instant::now(),
-                    caller_deadline: deadline,
-                    remaining_opportunities: probe.remaining_opportunities,
-                    route: probe.route,
-                    mode: probe.mode,
-                    attempt_timeout: Duration::from_secs(1),
-                    failure_links: 8,
-                },
-            ) else {
+            let Ok(plan) = plan(request, deadline, &probe) else {
                 return affordable;
             };
             // A verified `StaleMembership` returns the remote credits.
@@ -2024,7 +1994,7 @@ fn parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk() {
             let mut cfg = config(Some(rank), 3, VisitOrder::canonical(3));
             cfg.handoff = granted + 1;
             cfg.granted = granted;
-            let script = |p: &Probe, _: &AcquisitionBudget| {
+            let script = |p: &Probe, _: &mut AcquisitionBudget| {
                 if p.canonical < 3 {
                     Outcome::Transport(ProbeOutcome::Unreachable)
                 } else {
@@ -2295,19 +2265,7 @@ fn forwarded_non_owner_funds_an_out_of_order_owner_with_its_route_links() {
         (request.remaining_attempts(), request.remaining_links()),
         (owner_funding_min(2), 7)
     );
-    let plan = plan_attempt(
-        request,
-        AttemptInputs {
-            now,
-            caller_deadline: deadline,
-            remaining_opportunities: probe.remaining_opportunities,
-            attempt_timeout: Duration::from_secs(1),
-            mode: probe.mode,
-            route: probe.route,
-            failure_links: 8,
-        },
-    )
-    .unwrap();
+    let plan = plan(request, deadline, &probe).unwrap();
     assert_eq!((plan.links, plan.remote_attempts), (7, 3));
     // Budgets never grow: the walk kept nothing it did not have.
     assert_eq!((b.remaining_attempts(), b.remaining_links()), (0, 0));
@@ -2348,21 +2306,8 @@ fn funded_links_match_a_shared_route_below_a_full_route() {
 }
 
 fn charge(walk: &mut CandidateWalk, b: &mut AcquisitionBudget, probe: &Probe) -> AttemptPlan {
-    let now = Instant::now();
     let deadline = b.deadline();
-    plan_attempt(
-        walk.request_budget(b),
-        AttemptInputs {
-            now,
-            caller_deadline: deadline,
-            remaining_opportunities: probe.remaining_opportunities,
-            attempt_timeout: Duration::from_secs(1),
-            mode: probe.mode,
-            route: probe.route,
-            failure_links: 8,
-        },
-    )
-    .unwrap()
+    plan(walk.request_budget(b), deadline, probe).unwrap()
 }
 
 #[test]
@@ -2485,18 +2430,7 @@ fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
                         break;
                     };
                     let deadline = b.deadline();
-                    let Ok(plan) = plan_attempt(
-                        walk.request_budget(&mut b),
-                        AttemptInputs {
-                            now: Instant::now(),
-                            caller_deadline: deadline,
-                            remaining_opportunities: probe.remaining_opportunities,
-                            attempt_timeout: Duration::from_secs(1),
-                            mode: probe.mode,
-                            route: probe.route,
-                            failure_links: 8,
-                        },
-                    ) else {
+                    let Ok(plan) = plan(walk.request_budget(&mut b), deadline, &probe) else {
                         // Not affordable: nothing is sent.
                         break;
                     };
@@ -2559,26 +2493,17 @@ fn a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority() {
                 ..config(Some(rank), 3, VisitOrder::canonical(3))
             });
             let mut b = budget(credits, 7);
-            let mut probes = Vec::new();
-            let end = loop {
-                match walk.next(&mut b).unwrap() {
-                    Step::Probe(p) => {
-                        // Spend each probe's exchange as the caller would.
-                        charge(&mut walk, &mut b, &p);
-                        probes.push(p);
-                        let result = if p.canonical == 0 {
-                            rank0
-                        } else {
-                            Outcome::Probe(ProbeOutcome::CopyMiss)
-                        };
-                        if let Some(end) = walk.complete(&mut b, result).unwrap() {
-                            break end;
-                        }
-                    }
-                    Step::Granted(_) => panic!("no granted probes configured"),
-                    Step::End(end) => break end,
+            let deadline = b.deadline();
+            let (probes, end) = drive(&mut walk, &mut b, |p, request| {
+                // Spend each probe's exchange as the caller would.
+                plan(request, deadline, p).unwrap();
+                if p.canonical == 0 {
+                    rank0
+                } else {
+                    Outcome::Probe(ProbeOutcome::CopyMiss)
                 }
-            };
+            });
+            let probes: Vec<Probe> = probes.into_iter().map(|(p, ..)| p).collect();
             let what = format!("rank {rank} {state:?} {rank0:?}: {end:?}");
             // One copy-only probe per predecessor asked, never a delegation.
             assert!(probes.iter().all(|p| p.mode == Mode::CopyOnly), "{what}");
