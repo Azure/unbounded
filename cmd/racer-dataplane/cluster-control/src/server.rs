@@ -667,6 +667,14 @@ impl Server {
                 let write = self
                     .queued_write_slot(deadline, id2.expires.min(id.expires))
                     .await?;
+                // The slot wait may be long: recheck the certificate, then
+                // readiness, before data leaves.
+                if self.certificate(chain)?.node != id.node {
+                    return Err(ProtocolFailure::Forbidden);
+                }
+                if !self.shared.ready() {
+                    return Err(ProtocolFailure::Unavailable);
+                }
                 // A newer image may have landed while queued.
                 let image = self.shared.image().filter(newer).unwrap_or(image);
                 let base = head.one(DELTA_HEADER).ok().flatten();
@@ -703,6 +711,7 @@ impl Server {
         if bearer && !chain.is_empty() {
             return Err(ProtocolFailure::Unauthenticated);
         }
+        let authorized_at = Instant::now();
         let (node, expires) = if bearer {
             let c = self.authorize_bearer(head).await?;
             (c.node.uid, c.expires)
@@ -720,10 +729,44 @@ impl Server {
                 .filter(|(g, _)| after.is_none_or(|a| *g > a))
         };
         // Data already there: the authorization above is current, so the
-        // bearer recheck below is skipped. An unenrolled client's first
-        // keyring poll (no cursor) always takes this path.
+        // bearer recheck below may be skipped if the write slot comes
+        // quickly. An unenrolled client's first keyring poll (no cursor)
+        // takes this path.
         let immediate = newer().is_some();
         let found = self.wait_until(deadline, newer).await;
+        let reply = match found {
+            None => {
+                self.recheck_keyring_caller(head, chain, bearer, &node, expires, false)
+                    .await?;
+                Reply::no_content()
+            }
+            Some((_, bytes)) => {
+                // The slot wait may outlast the authorization cache, so the
+                // caller is rechecked after it, then readiness after that.
+                let write = self.queued_write_slot(deadline, expires).await?;
+                let full = bearer_recheck(true, immediate, authorized_at.elapsed());
+                self.recheck_keyring_caller(head, chain, bearer, &node, expires, full)
+                    .await?;
+                Reply::ok(bytes, write)
+            }
+        };
+        Ok(reply.until(expires).polling(poll))
+    }
+
+    /// Recheck a keyring caller before replying, then readiness. `full`
+    /// re-runs bearer authorization (normally served by the cache); without
+    /// it a bearer caller is only checked for token expiry. An empty 204
+    /// reveals nothing, so it needs no API calls, which keeps idle bearer
+    /// polls from amplifying into reviews.
+    async fn recheck_keyring_caller(
+        &self,
+        head: &Head,
+        chain: &[Vec<u8>],
+        bearer: bool,
+        node: &str,
+        expires: u64,
+        full: bool,
+    ) -> Result<(), ProtocolFailure> {
         if !bearer {
             let again = self.certificate(chain)?;
             if again.node != node {
@@ -731,11 +774,7 @@ impl Server {
             }
         } else if expires <= unix_now() {
             return Err(ProtocolFailure::Unauthenticated);
-        } else if bearer_recheck(found.is_some(), immediate) {
-            // Data is about to leave after a wait: the Pod, Node, and token
-            // must still be live. An empty 204 reveals nothing, so it needs
-            // no API calls, which keeps idle bearer polls from amplifying
-            // into reviews.
+        } else if full {
             let again = self.authorize_bearer(head).await?;
             if again.node.uid != node {
                 return Err(ProtocolFailure::Forbidden);
@@ -744,11 +783,7 @@ impl Server {
         if !self.shared.ready() {
             return Err(ProtocolFailure::Unavailable);
         }
-        let reply = match found {
-            None => Reply::no_content(),
-            Some((_, bytes)) => Reply::ok(bytes, self.queued_write_slot(deadline, expires).await?),
-        };
-        Ok(reply.until(expires).polling(poll))
+        Ok(())
     }
 
     async fn replica(
@@ -784,10 +819,20 @@ impl Server {
             None => Reply::no_content(),
             Some(i) => {
                 let slot = self.queued_write_slot(deadline, expires).await?;
-                // The primary term can end while this reply waits for a
-                // slot, and a follower seat stays ready, so recheck the role
-                // before serving an image from a former primary.
+                // Recheck the seat caller after the slot wait (the review
+                // is normally cached). The primary term can also end while
+                // this reply waits, and a follower seat stays ready, so
+                // recheck the role, then readiness.
+                exec::timeout(
+                    self.budget.io,
+                    auth::authorize_seat(&self.shared, authorization, unix_now()),
+                )
+                .await
+                .map_err(|_| ProtocolFailure::Unavailable)??;
                 require_primary(self.shared.is_primary.get())?;
+                if !self.shared.ready() {
+                    return Err(ProtocolFailure::Unavailable);
+                }
                 Reply::ok(i.encoded.clone(), slot)
             }
         };
@@ -1146,10 +1191,13 @@ pub fn pinned_client(certificate: &[u8]) -> Result<Arc<rustls::ClientConfig>, cr
 }
 
 /// Whether a bearer keyring poll authorizes again before replying. Only
-/// data that leaves after a wait needs it: a 204 reveals nothing, and data
-/// found before waiting leaves under the authorization just made.
-fn bearer_recheck(found: bool, immediate: bool) -> bool {
-    found && !immediate
+/// data needs it: a 204 reveals nothing. Data found before waiting may
+/// leave under the authorization just made, but only while that
+/// authorization is younger than
+/// [`crate::step::authz::CALLER_TTL`]; a long write slot
+/// wait otherwise outlasts it.
+fn bearer_recheck(found: bool, immediate: bool, age: Duration) -> bool {
+    found && (!immediate || age >= crate::step::authz::CALLER_TTL)
 }
 
 #[cfg(test)]
@@ -1964,10 +2012,16 @@ mod tests {
 
     #[test]
     fn bearer_keyring_rechecks_only_after_a_wait() {
-        assert!(bearer_recheck(true, false));
-        assert!(!bearer_recheck(true, true));
-        assert!(!bearer_recheck(false, false));
-        assert!(!bearer_recheck(false, true));
+        let ttl = crate::step::authz::CALLER_TTL;
+        let zero = Duration::ZERO;
+        assert!(bearer_recheck(true, false, zero));
+        assert!(!bearer_recheck(true, true, zero));
+        assert!(!bearer_recheck(true, true, ttl - Duration::from_millis(1)));
+        // A write slot wait that reaches the cache TTL forces a recheck.
+        assert!(bearer_recheck(true, true, ttl));
+        assert!(bearer_recheck(true, true, ttl * 3));
+        assert!(!bearer_recheck(false, false, zero));
+        assert!(!bearer_recheck(false, true, ttl * 3));
     }
 
     #[test]
