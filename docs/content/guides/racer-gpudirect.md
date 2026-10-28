@@ -23,7 +23,9 @@ source that works:
 2. **Local disk (GPUDirect Storage).** cuFile reads the encrypted page from
    disk into GPU memory. The GPU decrypts it.
 3. **A peer over RDMA (GPUDirect RDMA).** The peer's NIC writes the encrypted
-   page into GPU memory on this node. The GPU decrypts it.
+   page into GPU memory on this node. The GPU decrypts it. The host never
+   sees the page, so this node does not keep it. The next load fetches it from
+   a peer again.
 4. **Anything else.** The page comes through host memory. Encrypted pages are
    still decrypted on the GPU. Pages fetched from the origin are decrypted on
    the CPU.
