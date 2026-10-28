@@ -22,6 +22,11 @@ BUSYBOX=mcr.microsoft.com/azurelinux/busybox:1.36
 
 mkdir -p "$OUT"
 
+origin_tx() {
+	kubectl -n "$NS" exec "$(tools_pod)" -- wget -qO- http://origin:5001/metrics |
+		awk '$1 == "process_network_transmit_bytes_total" {printf "%.0f\n", $2}'
+}
+
 tools_pod() {
 	kubectl -n "$NS" get pod -l app=tools -o jsonpath='{.items[0].metadata.name}'
 }
@@ -98,6 +103,61 @@ EOF
 	kubectl -n "$NS" rollout status ds/prep --timeout=15m
 }
 
+# cmd_diskprep frees the Azure resource disk (mounted at /mnt) on every worker
+# that has one, zeroes its head and tail so racer's device guard accepts it,
+# and annotates the Node so racer uses it as a raw block device.
+cmd_diskprep() {
+	kubectl -n "$NS" delete ds diskprep --ignore-not-found --wait=true >/dev/null
+	kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: diskprep
+  namespace: $NS
+spec:
+  selector:
+    matchLabels:
+      app: diskprep
+  template:
+    metadata:
+      labels:
+        app: diskprep
+    spec:
+$(worker_affinity)
+      hostPID: true
+      terminationGracePeriodSeconds: 1
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: diskprep
+          image: $BUSYBOX
+          securityContext:
+            privileged: true
+          command: ["chroot", "/host", "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "--", "bash", "-c"]
+          args:
+            - |
+$(sed 's/^/              /' "$DIR/diskprep.sh")
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          volumeMounts:
+            - name: host
+              mountPath: /host
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+EOF
+	kubectl -n "$NS" rollout status ds/diskprep --timeout=15m
+	kubectl -n "$NS" get pods -l app=diskprep -o name |
+		xargs -P 64 -I{} sh -c "kubectl -n $NS logs {} | grep '^DISK' || true" >"$OUT/disks.txt"
+	awk '$3 != "none" {print $2, $3}' "$OUT/disks.txt" |
+		xargs -P 64 -n 2 sh -c 'kubectl annotate node "$0" --overwrite "racer.unbounded-cloud.io/block-devices=^$1\$" >/dev/null'
+	awk '{print $3 == "none" ? $4 : "device"}' "$OUT/disks.txt" | sort | uniq -c
+	kubectl -n "$NS" delete ds diskprep --wait=false >/dev/null
+}
+
 cmd_gen() {
 	local name=$1 layers=$2 bytes=$3
 	kubectl -n "$NS" exec "$(tools_pod)" -- /tmp/genimage -registry http://origin:5000 \
@@ -117,6 +177,9 @@ cmd_run() {
 			"http://origin:5000/v2/$repo/manifests/$digest" |
 			python3 -c 'import json,sys; print(" ".join(l["digest"] for l in json.load(sys.stdin)["layers"]))')
 	fi
+
+	local tx0
+	tx0=$(origin_tx)
 
 	echo "run=$label ds=$name start_at=$start_at ($(date -d @"$start_at" -u +%T)) ref=$ref mode=$mode" >&2
 
@@ -232,6 +295,9 @@ EOF
 	done
 
 	mv "$results.tmp" "$results"
+	local tx1
+	tx1=$(origin_tx)
+	echo "ORIGIN_TX $((tx1 - tx0))" >>"$results"
 	late=$(awk -v s="$start_at" '$1 == "READY" && $3 > s' "$results" | wc -l)
 	echo "pods ready after start: $late" >&2
 	kubectl -n "$NS" delete ds "$name" --wait=false >/dev/null
@@ -255,6 +321,8 @@ for line in open(path):
     f = line.split()
     if f[0] == "RESULT":
         rows.append((f[1], float(f[3]), float(f[4]), int(f[5]), int(f[6])))
+    elif f[0] == "ORIGIN_TX":
+        print(f"origin egress: {int(f[1]) / 2**30:.2f} GiB")
     elif f[0] == "ERROR":
         errors.append(line.strip())
 if not rows:
@@ -283,6 +351,7 @@ EOF
 
 case ${1:-} in
 prep) cmd_prep ;;
+diskprep) cmd_diskprep ;;
 gen) shift; cmd_gen "$@" ;;
 run) shift; cmd_run "$@" ;;
 summarize) shift; cmd_summarize "$@" ;;
