@@ -2525,6 +2525,56 @@ mod timeouts {
             }
         }
 
+        fn page(&self) -> crate::model::PageId {
+            crate::model::PageId {
+                version: ObjectVersion {
+                    object: self.context.object.clone(),
+                    etag: StrongEtag::test_value("v"),
+                },
+                number: PageNumber(0),
+            }
+        }
+
+        /// Resolve an `Acquire` of page 0; with `stall`, poll once and let `clock` pass the
+        /// attempt timeout first.
+        fn resolve_page(
+            &mut self,
+            clock: &uring_runtime::environment::SimulationClock,
+            stall: bool,
+        ) -> Result<CandidateResolution> {
+            let operation = PeerOperation::Page {
+                page: self.page(),
+                mode: FetchMode::Acquire,
+            };
+            let candidates = Candidates {
+                membership: self.candidates.membership.clone(),
+                ordered: self.candidates.ordered.clone(),
+            };
+            let mut resolve = self.policy.resolve_with_budget(
+                candidates,
+                &self.context,
+                operation,
+                &self.scope,
+                &mut self.budget,
+            );
+            if stall {
+                assert!(poll(resolve.as_mut()).is_pending());
+                clock.advance(Duration::from_secs(2));
+            }
+            let Poll::Ready(result) = poll(resolve.as_mut()) else {
+                panic!("bounded resolution")
+            };
+            result
+        }
+
+        /// Destinations of the calls from the `from`th on.
+        fn visited(&self, from: usize) -> Vec<NodeId> {
+            self.peers.calls.borrow()[from..]
+                .iter()
+                .map(|c| c.destination.clone())
+                .collect()
+        }
+
         fn operation(&self) -> PeerOperation {
             PeerOperation::Metadata {
                 object: self.context.object.clone(),
@@ -2866,32 +2916,8 @@ mod timeouts {
                 // Rank 0 refuses at once: a transport failure, not a timeout.
                 f.peers.fail_pages.set(true);
             }
-            let operation = PeerOperation::Page {
-                page: crate::model::PageId {
-                    version: ObjectVersion {
-                        object: f.context.object.clone(),
-                        etag: StrongEtag::test_value("v"),
-                    },
-                    number: PageNumber(0),
-                },
-                mode: FetchMode::Acquire,
-            };
             let rank0 = f.candidates.ordered[0].clone();
-            let mut resolve = f.policy.resolve_with_budget(
-                f.candidates,
-                &f.context,
-                operation,
-                &f.scope,
-                &mut f.budget,
-            );
-            if stalled != 0 {
-                assert!(poll(resolve.as_mut()).is_pending());
-                clock.advance(Duration::from_secs(2));
-            }
-            let Poll::Ready(result) = poll(resolve.as_mut()) else {
-                panic!("bounded resolution")
-            };
-            drop(resolve);
+            let result = f.resolve_page(&clock, stalled != 0);
             let calls = f.peers.calls.borrow();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].destination, rank0);
@@ -2919,52 +2945,20 @@ mod timeouts {
             .policy
             .with_attempt_timeout(Duration::from_secs(1))
             .with_rank0_hang_after(Duration::from_secs(5));
-        let page = crate::model::PageId {
-            version: ObjectVersion {
-                object: f.context.object.clone(),
-                etag: StrongEtag::test_value("v"),
-            },
-            number: PageNumber(0),
-        };
         let rank0 = f.candidates.ordered[0].clone();
-        let resolve_once = |f: &mut Fixture, stall: bool| {
-            let operation = PeerOperation::Page {
-                page: page.clone(),
-                mode: FetchMode::Acquire,
-            };
-            let candidates = Candidates {
-                membership: f.candidates.membership.clone(),
-                ordered: f.candidates.ordered.clone(),
-            };
-            let mut resolve = f.policy.resolve_with_budget(
-                candidates,
-                &f.context,
-                operation,
-                &f.scope,
-                &mut f.budget,
-            );
-            if stall {
-                assert!(poll(resolve.as_mut()).is_pending());
-                clock.advance(Duration::from_secs(2));
-            }
-            let Poll::Ready(result) = poll(resolve.as_mut()) else {
-                panic!("bounded resolution")
-            };
-            result
-        };
         // t = 0..2: rank 0 accepts and stays silent; leave the fetch to it.
-        let first = resolve_once(&mut f, true);
+        let first = f.resolve_page(&clock, true);
         assert!(matches!(first, Err(Error::Unavailable)));
         // t = 5..7: past the first request's 3 s deadline but within the
         // 5 s allowance: a timeout still leaves the fetch to rank 0.
         clock.advance(Duration::from_secs(3));
         f = f.bounded(207, 60, 24);
-        let second = resolve_once(&mut f, true);
+        let second = f.resolve_page(&clock, true);
         assert!(matches!(second, Err(Error::Unavailable)));
         // t = 10: rank 0 is overdue; a timeout gives authority.
         clock.advance(Duration::from_secs(3));
         f = f.bounded(208, 60, 24);
-        let third = resolve_once(&mut f, true);
+        let third = f.resolve_page(&clock, true);
         assert!(matches!(third, Ok(CandidateResolution::Origin(_))));
         let calls = f.peers.calls.borrow();
         assert_eq!(calls.len(), 3);
@@ -2987,36 +2981,15 @@ mod timeouts {
             .with_attempt_timeout(Duration::from_secs(1))
             .with_rank0_hang_after(Duration::from_secs(5));
         f.peers.pages_unavailable.set(true);
-        let page = crate::model::PageId {
-            version: ObjectVersion {
-                object: f.context.object.clone(),
-                etag: StrongEtag::test_value("v"),
-            },
-            number: PageNumber(0),
-        };
+        let page = f.page();
         let rank0 = f.candidates.ordered[0].clone();
         let ordered = f.candidates.ordered.clone();
         let resolve_once = |f: &mut Fixture, request: u8| {
             *f = std::mem::replace(f, Fixture::new(Some(1), 0, false)).bounded(request, 60, 24);
-            let operation = PeerOperation::Page {
-                page: page.clone(),
-                mode: FetchMode::Acquire,
-            };
-            let candidates = Candidates {
-                membership: f.candidates.membership.clone(),
-                ordered: f.candidates.ordered.clone(),
-            };
-            let mut resolve = f.policy.resolve_with_budget(
-                candidates,
-                &f.context,
-                operation,
-                &f.scope,
-                &mut f.budget,
-            );
-            let Poll::Ready(result) = poll(resolve.as_mut()) else {
-                panic!("immediate answer")
-            };
-            matches!(result, Ok(CandidateResolution::Origin(_)))
+            matches!(
+                f.resolve_page(&clock, false),
+                Ok(CandidateResolution::Origin(_))
+            )
         };
         // A failure local to rank 0: the owner fetches.
         assert!(resolve_once(&mut f, 210));
@@ -3067,45 +3040,8 @@ mod timeouts {
         f.policy
             .link_health()
             .set_silence(Duration::ZERO, Duration::from_secs(1));
-        let page = crate::model::PageId {
-            version: ObjectVersion {
-                object: f.context.object.clone(),
-                etag: StrongEtag::test_value("v"),
-            },
-            number: PageNumber(0),
-        };
-        let resolve_once = |f: &mut Fixture, stall: bool| {
-            let operation = PeerOperation::Page {
-                page: page.clone(),
-                mode: FetchMode::Acquire,
-            };
-            let candidates = Candidates {
-                membership: f.candidates.membership.clone(),
-                ordered: f.candidates.ordered.clone(),
-            };
-            let mut resolve = f.policy.resolve_with_budget(
-                candidates,
-                &f.context,
-                operation,
-                &f.scope,
-                &mut f.budget,
-            );
-            if stall {
-                assert!(poll(resolve.as_mut()).is_pending());
-                clock.advance(Duration::from_secs(2));
-            }
-            let Poll::Ready(_) = poll(resolve.as_mut()) else {
-                panic!("bounded resolution")
-            };
-        };
-        let visited = |f: &Fixture, from: usize| -> Vec<NodeId> {
-            f.peers.calls.borrow()[from..]
-                .iter()
-                .map(|c| c.destination.clone())
-                .collect()
-        };
-        resolve_once(&mut f, true);
-        let first = visited(&f, 0);
+        let _ = f.resolve_page(&clock, true);
+        let first = f.visited(0);
         assert!(first.len() >= 2, "{first:?}");
         let hung = first[0].clone();
         assert_eq!(
@@ -3115,8 +3051,8 @@ mod timeouts {
         // The next walk visits it last: everyone else answered.
         let before = f.peers.calls.borrow().len();
         f = f.bounded(210, 60, 24);
-        resolve_once(&mut f, false);
-        let second = visited(&f, before);
+        let _ = f.resolve_page(&clock, false);
+        let second = f.visited(before);
         assert_eq!(second.last(), Some(&hung), "{first:?} then {second:?}");
         assert_ne!(second[0], hung);
         // It answered this time: its place is restored.
@@ -3126,8 +3062,8 @@ mod timeouts {
         );
         let before = f.peers.calls.borrow().len();
         f = f.bounded(211, 60, 24);
-        resolve_once(&mut f, false);
-        assert_eq!(visited(&f, before)[0], hung);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(f.visited(before)[0], hung);
     }
 
     /// An owner that itself shed a reader's
@@ -3150,50 +3086,17 @@ mod timeouts {
         f.policy
             .link_health()
             .set_silence(Duration::from_secs(5), Duration::from_secs(1));
-        let page = crate::model::PageId {
-            version: ObjectVersion {
-                object: f.context.object.clone(),
-                etag: StrongEtag::test_value("v"),
-            },
-            number: PageNumber(0),
-        };
-        let resolve_once = |f: &mut Fixture| {
-            let operation = PeerOperation::Page {
-                page: page.clone(),
-                mode: FetchMode::Acquire,
-            };
-            let candidates = Candidates {
-                membership: f.candidates.membership.clone(),
-                ordered: f.candidates.ordered.clone(),
-            };
-            let mut resolve = f.policy.resolve_with_budget(
-                candidates,
-                &f.context,
-                operation,
-                &f.scope,
-                &mut f.budget,
-            );
-            let Poll::Ready(_) = poll(resolve.as_mut()) else {
-                panic!("bounded resolution")
-            };
-        };
-        let visited = |f: &Fixture, from: usize| -> Vec<NodeId> {
-            f.peers.calls.borrow()[from..]
-                .iter()
-                .map(|c| c.destination.clone())
-                .collect()
-        };
         // Without a shed, the first owner visited.
-        resolve_once(&mut f);
-        let usual = visited(&f, 0);
+        let _ = f.resolve_page(&clock, false);
+        let usual = f.visited(0);
         let busy = usual[0].clone();
         assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
         // It sheds this time: busy, alive, never pinged.
         f.peers.shed_pages.set(1);
         let before = f.peers.calls.borrow().len();
         f = f.bounded(213, 60, 24);
-        resolve_once(&mut f);
-        assert_eq!(visited(&f, before)[0], busy);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(f.visited(before)[0], busy);
         assert_eq!(
             f.policy.link_health().answering(&busy),
             Answering::Unanswered
@@ -3208,15 +3111,15 @@ mod timeouts {
         // The next walk visits it last; it answers, which restores its place.
         let before = f.peers.calls.borrow().len();
         f = f.bounded(214, 60, 24);
-        resolve_once(&mut f);
-        let next = visited(&f, before);
+        let _ = f.resolve_page(&clock, false);
+        let next = f.visited(before);
         assert_ne!(next[0], busy, "{usual:?} then {next:?}");
         assert_eq!(next.last(), Some(&busy), "{usual:?} then {next:?}");
         assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
         // A shed is forgotten after the quiet time without another answer.
         f.peers.shed_pages.set(1);
         f = f.bounded(215, 60, 24);
-        resolve_once(&mut f);
+        let _ = f.resolve_page(&clock, false);
         assert_eq!(
             f.policy.link_health().answering(&busy),
             Answering::Unanswered
@@ -3225,8 +3128,8 @@ mod timeouts {
         assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
         let before = f.peers.calls.borrow().len();
         f = f.bounded(216, 60, 24);
-        resolve_once(&mut f);
-        assert_eq!(visited(&f, before)[0], busy);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(f.visited(before)[0], busy);
     }
 
     #[test]
