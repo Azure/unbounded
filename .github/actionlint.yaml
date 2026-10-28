@@ -11,11 +11,3 @@ self-hosted-runner:
   labels:
     - pve
     - ubuntu-26.04
-
-paths:
-  .github/workflows/docs.yaml:
-    ignore:
-      # actionlint 1.7.12 does not know `concurrency.queue`, which GitHub
-      # supports: https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
-      # hack/release/docs_workflow_test.go checks the value instead.
-      - 'unexpected key "queue" for "concurrency" section'

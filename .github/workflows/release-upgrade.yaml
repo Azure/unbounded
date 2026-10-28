@@ -1148,22 +1148,8 @@ jobs:
             echo "- Artifact signatures and BOM: verified"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------------
-  # Publish the production docs site from the release that just became Latest.
-  #
-  # Releases published with GITHUB_TOKEN do not emit the `release` event, so
-  # docs.yaml's own trigger never fires for this path. Dispatching docs.yaml
-  # instead is exempt from that rule: GITHUB_TOKEN may start workflow_dispatch
-  # runs. It is a dispatch rather than a reusable call so the Pages deploy,
-  # and any approval wait on the github-pages environment, runs outside this
-  # workflow's deploy-unbounded-stable concurrency group and never blocks the
-  # next cluster upgrade. `--ref main` runs main's docs.yaml, not the copy
-  # stored in the tag.
-  #
-  # Either publish path counts; they are mutually exclusive. Non-Latest
-  # releases (prereleases, older-series patches) never replace the site.
-  # docs.yaml re-validates the tag against releases/latest regardless.
-  # ---------------------------------------------------------------------------
+  # GITHUB_TOKEN suppresses release events, but permits workflow dispatches.
+  # Dispatch separately so Pages approval does not hold the cluster lock.
   docs:
     needs: [resolve, publish, publish-forced]
     if: >
@@ -1179,9 +1165,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: gh workflow run docs.yaml --ref main -f tag="$TAG"
-
+        run: gh workflow run docs.yaml --ref main
 
   # ---------------------------------------------------------------------------
   # CUSTOMIZE: Teams notification (NOT YET ENABLED)
