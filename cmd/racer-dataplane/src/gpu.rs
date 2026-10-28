@@ -38,15 +38,19 @@
 //!
 //! # RDMA landing
 //!
-//! When RDMA is active, each rail may get one GPU's landing buffer
+//! When RDMA is active, each decrypting GPU may get one landing buffer
 //! ([`GpuHelper::landing`]): separate GPU memory, capped by
-//! `RACER_GPU_LANDING_BYTES`, exported once as a dma-buf and registered with
-//! the rail's NIC as an `rdma_verbs` device pool. A peer's NIC writes a
-//! `gpu-read` page's ciphertext straight into it, and the GPU decrypts from
-//! there ([`LandedCiphertext`]). The CPU never reads or copies those bytes.
-//! Landing buffers are never freed while the process runs, and are leaked on
-//! purpose when the helper exits, because a NIC registration may still cover
-//! them.
+//! `RACER_GPU_LANDING_BYTES`, exported once as a dma-buf. Disjoint slices of
+//! it ([`GpuLanding::slice`]) are registered with the rails' NICs as
+//! `rdma_verbs` device pools. A peer's NIC writes a `gpu-read` page's
+//! ciphertext straight into it, and the GPU decrypts from there
+//! ([`LandedCiphertext`]). The CPU never reads or copies those bytes.
+//! The buffer is freed when the last [`GpuLanding`] referring to it drops:
+//! the NIC registrations and received pages hold one, so this happens only
+//! after every registration is gone. A registration `rdma_verbs` leaks on
+//! purpose keeps its reference, so that memory is never freed. Buffers still
+//! referenced when the helper exits are leaked on purpose for the same
+//! reason.
 //!
 //! At startup the helper probes each GPU with a zero-length decrypt. A GPU
 //! whose shim has no decrypt kernels, or whose staging cap cannot hold the two
@@ -73,6 +77,7 @@ use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -204,30 +209,74 @@ impl Drop for StagedCiphertext {
 /// value works: the address is local to the memory registration.
 const LANDING_IOVA: u64 = 1 << 40;
 
-/// One GPU's RDMA landing buffer, shared with `rdma_verbs` as a dma-buf.
-/// See the module docs, "RDMA landing".
-pub struct GpuLanding {
-    /// Export of the whole landing buffer.
-    fd: OwnedFd,
+/// One GPU landing allocation. Dropping the last reference asks the helper
+/// to free the GPU memory.
+struct LandingAllocation {
+    /// Helper-side key of the memory.
+    id: u64,
     ordinal: i32,
+    /// Export of the whole allocation. `None` only during drop.
+    fd: Option<OwnedFd>,
+    jobs: mpsc::Sender<Job>,
+}
+
+impl Drop for LandingAllocation {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            // The helper closes the export before it frees the memory. If
+            // it is gone, the memory is leaked with it.
+            let _ = self.jobs.send(Job::FreeLanding { id: self.id, fd });
+        }
+    }
+}
+
+/// A slice of one GPU's RDMA landing buffer, shared with `rdma_verbs` as a
+/// dma-buf. See the module docs, "RDMA landing".
+pub struct GpuLanding {
+    allocation: Arc<LandingAllocation>,
+    /// Start of the slice in the allocation.
+    offset: u64,
     length: u64,
 }
 
 impl GpuLanding {
     /// The GPU the memory is on.
     pub fn ordinal(&self) -> i32 {
-        self.ordinal
+        self.allocation.ordinal
+    }
+
+    /// `length` bytes at `offset` of this slice, as their own slice that
+    /// keeps the GPU memory alive. `None` unless both are 4 KiB aligned,
+    /// `length` is nonzero, and the range fits.
+    pub fn slice(&self, offset: u64, length: u64) -> Option<Arc<GpuLanding>> {
+        let aligned = offset.is_multiple_of(4096) && length.is_multiple_of(4096);
+        (aligned && length != 0 && offset.checked_add(length)? <= self.length).then(|| {
+            Arc::new(GpuLanding {
+                allocation: self.allocation.clone(),
+                offset: self.offset + offset,
+                length,
+            })
+        })
+    }
+
+    /// True if `other` is a slice of the same GPU memory.
+    pub fn same_allocation(&self, other: &GpuLanding) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
     }
 }
 
 impl rdma_verbs::DmabufMemory for GpuLanding {
     fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;
-        self.fd.as_fd()
+        self.allocation
+            .fd
+            .as_ref()
+            .expect("landing export lives until drop")
+            .as_fd()
     }
 
     fn offset(&self) -> u64 {
-        0
+        self.offset
     }
 
     fn length(&self) -> usize {
@@ -235,7 +284,7 @@ impl rdma_verbs::DmabufMemory for GpuLanding {
     }
 
     fn iova(&self) -> u64 {
-        LANDING_IOVA * (self.ordinal as u64 + 1)
+        LANDING_IOVA * (self.allocation.ordinal as u64 + 1) + self.offset
     }
 }
 
@@ -245,6 +294,9 @@ pub struct LandedCiphertext {
     /// Holds the slot. `None` only for test pages written without a NIC.
     _page: Option<rdma_verbs::DevicePage>,
     ordinal: i32,
+    /// Helper-side key of the landing allocation.
+    allocation: u64,
+    /// Byte offset in the allocation.
     offset: u64,
     length: u64,
 }
@@ -257,8 +309,9 @@ impl LandedCiphertext {
             return Err(Error::Internal);
         }
         Ok(Self {
-            ordinal: landing.ordinal,
-            offset: page.offset(),
+            ordinal: landing.ordinal(),
+            allocation: landing.allocation.id,
+            offset: landing.offset + page.offset(),
             length: page.len() as u64,
             _page: Some(page),
         })
@@ -271,8 +324,9 @@ impl LandedCiphertext {
         assert!(offset + length <= landing.length);
         Self {
             _page: None,
-            ordinal: landing.ordinal,
-            offset,
+            ordinal: landing.ordinal(),
+            allocation: landing.allocation.id,
+            offset: landing.offset + offset,
             length,
         }
     }
@@ -292,7 +346,7 @@ impl LandedCiphertext {
         self.length == 0
     }
 
-    /// Byte offset in the landing buffer.
+    /// Byte offset in the landing allocation.
     pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
@@ -361,10 +415,13 @@ enum Job {
     },
     /// Allocate a GPU's RDMA landing buffer and export it as a dma-buf.
     Landing {
+        id: u64,
         ordinal: i32,
         length: u64,
         reply: oneshot::Sender<Result<OwnedFd>>,
     },
+    /// Close a landing buffer's export, then free it: nothing refers to it.
+    FreeLanding { id: u64, fd: OwnedFd },
     #[cfg(test)]
     Run(Box<dyn FnOnce() + Send>),
 }
@@ -381,8 +438,9 @@ pub struct GpuHelper {
     cufile: Arc<AtomicBool>,
     counters: Arc<GpuCounters>,
     kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
-    /// Landing buffers made so far, one per GPU at most.
-    landings: Mutex<HashMap<i32, Arc<GpuLanding>>>,
+    /// Live landing buffers, one per GPU at most. Weak: a buffer is freed
+    /// once nothing registers or reads it, and made again on demand.
+    landings: Mutex<HashMap<i32, Weak<GpuLanding>>>,
 }
 
 impl GpuHelper {
@@ -565,28 +623,36 @@ impl GpuHelper {
             .landings
             .lock()
             .ok()
-            .and_then(|l| l.get(&ordinal).cloned())
+            .and_then(|l| l.get(&ordinal).and_then(Weak::upgrade))
         {
             return Ok(landing);
         }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (reply, mut receiver) = oneshot::channel();
         self.send(Job::Landing {
+            id,
             ordinal,
             length,
             reply,
         })?;
-        let fd = answer(&mut receiver, scope).await??;
+        // Dropped on any failure below, which frees the memory again.
+        let made = Arc::new(GpuLanding {
+            allocation: Arc::new(LandingAllocation {
+                id,
+                ordinal,
+                fd: Some(answer(&mut receiver, scope).await??),
+                jobs: self.jobs.clone(),
+            }),
+            offset: 0,
+            length,
+        });
         let mut landings = self.landings.lock().map_err(|_| Error::Internal)?;
-        Ok(landings
-            .entry(ordinal)
-            .or_insert_with(|| {
-                Arc::new(GpuLanding {
-                    fd,
-                    ordinal,
-                    length,
-                })
-            })
-            .clone())
+        // A concurrent caller may have made one first: keep that one.
+        if let Some(landing) = landings.get(&ordinal).and_then(Weak::upgrade) {
+            return Ok(landing);
+        }
+        landings.insert(ordinal, Arc::downgrade(&made));
+        Ok(made)
     }
 
     /// Where a request on GPU `ordinal` should have sealed pages delivered,
@@ -894,9 +960,10 @@ struct Helper {
     /// Opens the cuFile driver ahead of the first sealed page.
     opener: Option<std::thread::JoinHandle<()>>,
     requests: HashMap<u64, Request>,
-    /// RDMA landing buffers by GPU. Never freed: a NIC may hold a
-    /// registration over them.
-    landing: HashMap<i32, racer_gpu::StagingBuffer>,
+    /// RDMA landing buffers by allocation id. Freed by `FreeLanding` once
+    /// nothing refers to them; leaked if still referenced at exit, because
+    /// a NIC may hold a registration over them.
+    landing: HashMap<u64, racer_gpu::StagingBuffer>,
     state: HelperState,
 }
 
@@ -1149,22 +1216,38 @@ impl Helper {
                 }
             }
             Job::Landing {
+                id,
                 ordinal,
                 length,
                 reply,
             } => {
-                let result = self.landing(ordinal, length);
+                let result = self.landing(id, ordinal, length);
+                if result.is_err() {
+                    self.landing.remove(&id);
+                }
                 self.note_leaks();
-                let _ = reply.send(result);
+                // The caller stopped waiting, so no FreeLanding will come:
+                // close the export and free the memory now.
+                if let Err(Ok(fd)) = reply.send(result) {
+                    drop(fd);
+                    self.landing.remove(&id);
+                }
+            }
+            Job::FreeLanding { id, fd } => {
+                drop(fd);
+                if self.landing.remove(&id).is_some() {
+                    eprintln!("racer-dataplane: stage=gpu-landing allocation={id} state=freed");
+                }
+                self.note_leaks();
             }
             #[cfg(test)]
             Job::Run(f) => f(),
         }
     }
 
-    /// Allocate GPU `ordinal`'s landing buffer, once, and export it.
-    fn landing(&mut self, ordinal: i32, length: u64) -> Result<OwnedFd> {
-        if !self.landing.contains_key(&ordinal) {
+    /// Allocate landing buffer `id` on GPU `ordinal`, and export it.
+    fn landing(&mut self, id: u64, ordinal: i32, length: u64) -> Result<OwnedFd> {
+        if !self.landing.contains_key(&id) {
             let context = self
                 .contexts
                 .iter()
@@ -1176,9 +1259,9 @@ impl Helper {
                 );
                 Error::Overloaded
             })?;
-            self.landing.insert(ordinal, buffer);
+            self.landing.insert(id, buffer);
         }
-        let buffer = self.landing.get(&ordinal).ok_or(Error::Internal)?;
+        let buffer = self.landing.get(&id).ok_or(Error::Internal)?;
         if buffer.size() != length {
             return Err(Error::InvalidConfiguration);
         }
@@ -1458,7 +1541,10 @@ impl Helper {
                 if landed.ordinal() != ordinal || landed.len() != length + 16 {
                     return Err(Error::Internal);
                 }
-                let buffer = self.landing.get(&ordinal).ok_or(Error::Internal)?;
+                let buffer = self
+                    .landing
+                    .get(&landed.allocation)
+                    .ok_or(Error::Internal)?;
                 (buffer, landed.offset())
             }
         };
@@ -1558,6 +1644,11 @@ pub(crate) mod testing {
         SIM.with(|sim| sim.borrow().as_ref().unwrap().0.clone())
     }
 
+    /// Live simulated staging and landing buffers. Run on the helper thread.
+    pub(crate) fn live_staging() -> usize {
+        simulation().live().staging as usize
+    }
+
     /// A test scope with a few seconds on the real clock.
     pub(crate) fn scope() -> RequestScope {
         RequestScope::new(
@@ -1580,8 +1671,9 @@ pub(crate) mod testing {
     /// a NIC would.
     pub(crate) fn nic_write(landing: &GpuLanding, at: u64, bytes: &[u8]) {
         use std::os::unix::fs::FileExt;
-        let file = std::fs::File::from(landing.fd.try_clone().unwrap());
-        file.write_all_at(bytes, at).unwrap();
+        let fd = landing.allocation.fd.as_ref().unwrap();
+        let file = std::fs::File::from(fd.try_clone().unwrap());
+        file.write_all_at(bytes, landing.offset + at).unwrap();
     }
 
     /// Import a fresh allocation on GPU `ordinal` as request `id`.

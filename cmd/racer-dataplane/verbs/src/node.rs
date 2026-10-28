@@ -159,6 +159,7 @@ enum Command {
 
     AttachDevice {
         rail: u16,
+        id: u32,
         memory: DeviceMemory,
         done: Completer<usize>,
     },
@@ -166,7 +167,7 @@ enum Command {
     Grant {
         key: LinkKey,
         epoch: Epoch,
-        device: bool,
+        device: Option<u32>,
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
@@ -198,8 +199,8 @@ struct NodeShared {
 
     pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
 
-    /// Device pools by rail, once attached.
-    device_pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
+    /// Device pools by rail and pool id, once attached.
+    device_pools: RwLock<BTreeMap<(u16, u32), Arc<PoolShared>>>,
 
     /// Breaks that did not fit in a command queue.
     breaks: Mutex<Vec<(LinkKey, Epoch)>>,
@@ -355,7 +356,7 @@ impl Client {
         self.submit(|done| Command::Grant {
             key,
             epoch,
-            device: false,
+            device: None,
             transfer,
             length,
             deadline,
@@ -364,16 +365,18 @@ impl Client {
     }
 
     /// Receiver: like [`Self::grant`], but over a free buffer of the rail's
-    /// device pool (see [`Self::attach_device`]). The arrival is
+    /// device pool `id` (see [`Self::attach_device`]). The arrival is
     /// [`crate::Arrival::Device`]. The fence is the same: the page is handed
     /// out only after the peer's write completion and the window's signaled
     /// invalidation, so the peer can no longer write it. Fails with
-    /// `Unavailable` if the rail has no device pool, and `Overloaded` if no
-    /// device buffer is free. Nothing falls back to host memory.
+    /// `Unavailable` if the rail has no device pool `id`, and `Overloaded`
+    /// if no buffer of it is free. Nothing falls back to host memory.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_device(
         &self,
         key: LinkKey,
         epoch: Epoch,
+        id: u32,
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
@@ -381,7 +384,7 @@ impl Client {
         self.submit(|done| Command::Grant {
             key,
             epoch,
-            device: true,
+            device: Some(id),
             transfer,
             length,
             deadline,
@@ -390,12 +393,19 @@ impl Client {
     }
 
     /// Register `memory` (a dma-buf, such as GPU memory) on `rail` as its
-    /// device pool, split into page buffers of the node's buffer length.
-    /// Once per rail per round, after [`Self::activate`]. Resolves to the
-    /// number of device buffers. The memory stays registered until the node
-    /// drains; it is never read or written by the CPU.
-    pub fn attach_device(&self, rail: u16, memory: DeviceMemory) -> Op<usize> {
-        self.submit(|done| Command::AttachDevice { rail, memory, done })
+    /// device pool `id`, split into page buffers of the node's buffer
+    /// length. A rail may hold several device pools with different ids (one
+    /// per GPU, say); each id once per rail per round, after
+    /// [`Self::activate`]. Resolves to the number of device buffers. The
+    /// memory stays registered until the node drains, and the node holds
+    /// `memory` until then; it is never read or written by the CPU.
+    pub fn attach_device(&self, rail: u16, id: u32, memory: DeviceMemory) -> Op<usize> {
+        self.submit(|done| Command::AttachDevice {
+            rail,
+            id,
+            memory,
+            done,
+        })
     }
 
     /// Sender: write `source` into the peer's grant `tag` with immediate,
@@ -452,11 +462,11 @@ impl Client {
         Some(pools.get(&rail)?.count_in(state))
     }
 
-    /// Device page buffers of `rail` in `state`, for diagnostics. `None`
-    /// without a device pool.
-    pub fn device_buffers(&self, rail: u16, state: BufferState) -> Option<usize> {
+    /// Page buffers of `rail`'s device pool `id` in `state`, for
+    /// diagnostics. `None` without that device pool.
+    pub fn device_buffers(&self, rail: u16, id: u32, state: BufferState) -> Option<usize> {
         let pools = self.shared.device_pools.try_read().ok()?;
-        Some(pools.get(&rail)?.count_in(state))
+        Some(pools.get(&(rail, id))?.count_in(state))
     }
 
     /// Close the node: the owner sends `Close` on ready links, breaks every
@@ -715,8 +725,13 @@ impl Owner {
             } => {
                 let _ = done.complete(self.connect(key, epoch, remote, link_id, now));
             }
-            Command::AttachDevice { rail, memory, done } => {
-                let _ = done.complete(self.attach_device(rail, memory));
+            Command::AttachDevice {
+                rail,
+                id,
+                memory,
+                done,
+            } => {
+                let _ = done.complete(self.attach_device(rail, id, memory));
             }
             Command::Grant {
                 key,
@@ -789,8 +804,8 @@ impl Owner {
         }
     }
 
-    /// Register `memory` as `rail`'s device pool.
-    fn attach_device(&mut self, rail: u16, memory: DeviceMemory) -> Result<usize> {
+    /// Register `memory` as `rail`'s device pool `id`.
+    fn attach_device(&mut self, rail: u16, id: u32, memory: DeviceMemory) -> Result<usize> {
         #[cfg(any(test, feature = "simulation"))]
         let _simulation = self
             .simulation
@@ -799,20 +814,20 @@ impl Owner {
         let quota = self.quota.clone().ok_or(Error::InvalidRequest)?;
         let state = self.devices.get_mut(&rail).ok_or(Error::InvalidRequest)?;
 
-        if state.pool.device_shared().is_some() {
+        if state.pool.device_shared(id).is_some() {
             return Err(Error::InvalidRequest);
         }
 
         let region = NativeRegion::dmabuf(state.device.clone(), memory, quota)?;
-        state.pool.attach_device(region)?;
+        state.pool.attach_device(id, region)?;
         // The driver waker reaches the device pool on its next registration.
-        let shared = state.pool.device_shared().expect("just attached").clone();
+        let shared = state.pool.device_shared(id).expect("just attached").clone();
         let count = shared.count();
         self.shared
             .device_pools
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(rail, shared);
+            .insert((rail, id), shared);
         Ok(count)
     }
 

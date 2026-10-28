@@ -98,36 +98,45 @@ pub struct LinkNode {
     /// in GPU memory (GPUDirect RDMA).
     gpu_landing: Mutex<Option<(Arc<crate::gpu::GpuHelper>, u64)>>,
 
-    /// The GPU landing buffer registered on each rail this round.
-    landings: Mutex<HashMap<u16, Arc<crate::gpu::GpuLanding>>>,
+    /// GPU landing slices registered this round, by rail and GPU.
+    landings: Mutex<HashMap<(u16, i32), Arc<crate::gpu::GpuLanding>>>,
 }
 
-/// Pick at most one GPU per rail for landing, and each GPU for at most one
-/// rail. A rail first takes a free GPU on its NUMA node, then any free GPU.
-/// `rails` and `gpus` give each one's NUMA node, if known. PCI distance is
-/// not used: only NUMA locality is known on both sides.
-pub fn assign_landing(
+/// Split each GPU's landing buffer of `slots` page slots across `rails`.
+/// Every GPU gets a slice on every rail when there are enough slots, so a
+/// read on any GPU can land over whichever rail its peer link uses. With
+/// fewer slots than rails, a GPU's rails on its own NUMA node come first,
+/// then the rest in rail order. Slots are shared out evenly; the first
+/// rails get the remainder. `rails` and `gpus` give each one's NUMA node,
+/// if known. PCI distance is not used: only NUMA locality is known on both
+/// sides. Returns `(ordinal, rail, slots)` for each slice.
+pub fn plan_landing(
     rails: &[(RailId, Option<usize>)],
     gpus: &[(i32, Option<usize>)],
-) -> Vec<(RailId, i32)> {
-    let mut free: Vec<(i32, Option<usize>)> = gpus.to_vec();
-    let mut assigned = Vec::new();
-    let mut later = Vec::new();
-    for &(rail, numa) in rails {
-        match free
+    slots: usize,
+) -> Vec<(i32, RailId, usize)> {
+    let mut plan = Vec::new();
+    for &(ordinal, gpu_numa) in gpus {
+        let local = |numa: Option<usize>| gpu_numa.is_some() && numa == gpu_numa;
+        let mut ordered: Vec<RailId> = rails
             .iter()
-            .position(|&(_, node)| numa.is_some() && node == numa)
-        {
-            Some(index) => assigned.push((rail, free.remove(index).0)),
-            None => later.push(rail),
+            .filter(|&&(_, numa)| local(numa))
+            .map(|&(rail, _)| rail)
+            .collect();
+        ordered.extend(
+            rails
+                .iter()
+                .filter(|&&(_, numa)| !local(numa))
+                .map(|&(rail, _)| rail),
+        );
+        ordered.truncate(slots);
+        let count = ordered.len();
+        for (index, rail) in ordered.into_iter().enumerate() {
+            let share = slots / count + usize::from(index < slots % count);
+            plan.push((ordinal, rail, share));
         }
     }
-    for rail in later {
-        if !free.is_empty() {
-            assigned.push((rail, free.remove(0).0));
-        }
-    }
-    assigned
+    plan
 }
 
 /// One setup this node initiated: reserved before the owner answers, then
@@ -186,15 +195,15 @@ impl LinkNode {
     }
 
     /// Let `gpu-read` pages land in GPU memory: on each activation, give
-    /// each rail one GPU's landing buffer of `bytes` (see
-    /// [`assign_landing`]). 0 bytes turns landing off.
+    /// each decrypting GPU a landing buffer of `bytes`, split across the
+    /// rails (see [`plan_landing`]). 0 bytes turns landing off.
     pub fn set_gpu_landing(&self, helper: Arc<crate::gpu::GpuHelper>, bytes: u64) {
         *Self::lock(&self.gpu_landing) = (bytes != 0).then_some((helper, bytes));
     }
 
-    /// The GPU landing buffer on `rail` this round, if any.
-    pub fn landing(&self, rail: RailId) -> Option<Arc<crate::gpu::GpuLanding>> {
-        Self::lock(&self.landings).get(&rail.0).cloned()
+    /// GPU `ordinal`'s landing slice on `rail` this round, if any.
+    pub fn landing(&self, rail: RailId, ordinal: i32) -> Option<Arc<crate::gpu::GpuLanding>> {
+        Self::lock(&self.landings).get(&(rail.0, ordinal)).cloned()
     }
 
     fn reset(&self) {
@@ -483,12 +492,14 @@ impl Links {
     }
 
     /// Register GPU landing buffers on the activated `rails`. Failures only
-    /// log: pages then land in host memory as usual.
-    async fn attach_landings(&self, rails: &[RailMapping], scope: &RequestScope) {
+    /// log: pages then land in host memory as usual. A GPU whose buffer no
+    /// rail registered drops it again, which frees the GPU memory.
+    pub(crate) async fn attach_landings(&self, rails: &[RailMapping], scope: &RequestScope) {
         let Some((helper, bytes)) = LinkNode::lock(&self.node.gpu_landing).clone() else {
             return;
         };
-        if bytes < BUFFER_LEN as u64 {
+        let slots = (bytes / BUFFER_LEN as u64) as usize;
+        if slots == 0 {
             eprintln!(
                 "racer-dataplane: stage=gpu-landing state=disabled reason=too-small bytes={bytes}"
             );
@@ -502,40 +513,65 @@ impl Links {
             .collect();
         let rails: Vec<(RailId, Option<usize>)> =
             rails.iter().map(|m| (m.rail, m.numa_node)).collect();
-        for (rail, ordinal) in assign_landing(&rails, &gpus) {
+        let plan = plan_landing(&rails, &gpus, slots);
+        for &(ordinal, _) in &gpus {
+            let mine: Vec<(RailId, usize)> = plan
+                .iter()
+                .filter(|&&(o, _, _)| o == ordinal)
+                .map(|&(_, rail, slots)| (rail, slots))
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
             let landing = match helper.landing(ordinal, bytes, scope).await {
                 Ok(landing) => landing,
                 Err(error) => {
                     eprintln!(
-                        "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
-                        rail.0
+                        "racer-dataplane: stage=gpu-landing ordinal={ordinal} state=failed reason={error}"
                     );
                     continue;
                 }
             };
-            let memory = landing.clone() as rdma_verbs::DeviceMemory;
-            match self
-                .wait(self.client.attach_device(rail.0, memory), scope)
-                .await
-            {
-                Ok(slots) => {
+            let mut offset = 0u64;
+            for (rail, slots) in mine {
+                let length = (slots * BUFFER_LEN) as u64;
+                let slice = landing.slice(offset, length);
+                offset += length;
+                let Some(slice) = slice else {
                     eprintln!(
-                        "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=enabled slots={slots}",
+                        "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason=bad-slice",
                         rail.0
                     );
-                    LinkNode::lock(&self.node.landings).insert(rail.0, landing);
+                    continue;
+                };
+                let memory = slice.clone() as rdma_verbs::DeviceMemory;
+                match self
+                    .wait(
+                        self.client
+                            .attach_device(rail.0, landing_pool(ordinal), memory),
+                        scope,
+                    )
+                    .await
+                {
+                    Ok(slots) => {
+                        eprintln!(
+                            "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=enabled slots={slots}",
+                            rail.0
+                        );
+                        LinkNode::lock(&self.node.landings).insert((rail.0, ordinal), slice);
+                    }
+                    Err(error) => eprintln!(
+                        "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
+                        rail.0
+                    ),
                 }
-                Err(error) => eprintln!(
-                    "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
-                    rail.0
-                ),
             }
         }
     }
 
-    /// The GPU whose landing buffer is on `rail`, if any.
-    pub fn landing_ordinal(&self, rail: RailId) -> Option<i32> {
-        self.node.landing(rail).map(|landing| landing.ordinal())
+    /// Whether GPU `ordinal` has a landing slice on `rail` this round.
+    pub fn has_landing(&self, rail: RailId, ordinal: i32) -> bool {
+        self.node.landing(rail, ordinal).is_some()
     }
 
     /// Close the node: every link breaks and the owner drains. A later
@@ -793,10 +829,10 @@ impl Links {
         })
     }
 
-    /// Receiver: like [`Self::grant`], but the window is over a slot of the
-    /// GPU landing buffer on `rail`, which must be on GPU `ordinal`. Fails
-    /// with `Unavailable` if it is not, and `Overloaded` if no slot is free;
-    /// the caller then grants host memory.
+    /// Receiver: like [`Self::grant`], but the window is over a slot of GPU
+    /// `ordinal`'s landing slice on `rail`. Fails with `Unavailable` if the
+    /// rail has none, and `Overloaded` if no slot is free; the caller then
+    /// grants host memory.
     pub async fn grant_landing(
         &self,
         peer: &NodeId,
@@ -806,11 +842,7 @@ impl Links {
         scope: &RequestScope,
     ) -> Result<PendingReceive> {
         scope.check()?;
-        let landing = self
-            .node
-            .landing(rail)
-            .filter(|landing| landing.ordinal() == ordinal)
-            .ok_or(Error::Unavailable)?;
+        let landing = self.node.landing(rail, ordinal).ok_or(Error::Unavailable)?;
         let (epoch, link) = self.ready(peer, rail).ok_or(Error::Unavailable)?;
         let length = MAX_CIPHERTEXT as u32;
         let granted = self
@@ -818,6 +850,7 @@ impl Links {
                 self.client.grant_device(
                     link_key(peer, rail),
                     epoch,
+                    landing_pool(ordinal),
                     transfer.0,
                     length,
                     scope.deadline.0,
@@ -900,6 +933,11 @@ impl Links {
             }
         }
     }
+}
+
+/// The `rdma_verbs` device pool id of GPU `ordinal`'s landing slice.
+fn landing_pool(ordinal: i32) -> u32 {
+    ordinal as u32
 }
 
 /// Lends a ciphertext page to the owner as write source bytes.

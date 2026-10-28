@@ -409,7 +409,7 @@ impl Transfers {
             links
                 .active()
                 .iter()
-                .any(|rail| links.landing_ordinal(rail.rail) == Some(ordinal))
+                .any(|rail| links.has_landing(rail.rail, ordinal))
         })
     }
     /// Receiver: when the hop plan is RDMA and the link is ready, grant a page
@@ -455,7 +455,7 @@ impl Transfers {
                 if matches!(
                     request.request.operation,
                     crate::peer::protocol::Operation::Page { .. }
-                ) && links.landing_ordinal(rail) == Some(ordinal) =>
+                ) && links.has_landing(rail, ordinal) =>
             {
                 match links
                     .grant_landing(&peer, rail, binding.transfer, ordinal, &native_scope(scope))
@@ -2115,7 +2115,7 @@ mod tests {
                 let bytes = (crate::rdma::BUFFER_LEN as u64)
                     .next_multiple_of(crate::config::GPU_STAGING_UNIT);
                 crate::rdma::links::tests::attach_landing(&mut w, &helper, bytes);
-                assert_eq!(w.a.links.landing_ordinal(RailId(7)), Some(0));
+                assert!(w.a.links.has_landing(RailId(7), 0));
                 helper
             });
             // The receiver grants in-band and names the grant in its signed Accept.
@@ -2286,7 +2286,7 @@ mod tests {
                     // Read what the NIC wrote, through the landing dma-buf.
                     use std::os::unix::fs::FileExt;
                     assert_eq!(landed.envelope.ciphertext_length, 144);
-                    let buffer = w.a.links.node().landing(RailId(7)).unwrap();
+                    let buffer = w.a.links.node().landing(RailId(7), 0).unwrap();
                     let file = std::fs::File::from(
                         rdma_verbs::DmabufMemory::fd(&*buffer)
                             .try_clone_to_owned()

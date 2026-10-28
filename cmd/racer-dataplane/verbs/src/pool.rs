@@ -31,6 +31,7 @@
 //! may use it.
 
 use std::{
+    collections::BTreeMap,
     rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -184,13 +185,18 @@ impl PoolShared {
 pub(crate) struct Buffer {
     index: u32,
 
-    /// In the device pool.
-    device: bool,
+    /// The device pool it is in, if any.
+    device: Option<u32>,
 }
 
 impl Buffer {
     /// True for a device pool buffer.
     pub(crate) fn is_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// The device pool it is in, if any.
+    pub(crate) fn device(&self) -> Option<u32> {
         self.device
     }
 }
@@ -214,8 +220,8 @@ pub(crate) struct Pool {
     /// every write source. `None` only during drop.
     implicit: Option<Rc<NativeRegion>>,
 
-    /// Device page buffers, once attached.
-    device: Option<DevicePool>,
+    /// Device page buffers by caller id, once attached.
+    device: BTreeMap<u32, DevicePool>,
 
     quota: Arc<GuardOwner>,
 }
@@ -261,15 +267,17 @@ impl Pool {
             }),
             region: Some(region),
             implicit: Some(implicit),
-            device: None,
+            device: BTreeMap::new(),
             quota,
         })
     }
 
     /// Split the dma-buf `region` (from [`NativeRegion::dmabuf`]) into
-    /// device page buffers of the host buffer length. At most one per pool.
-    pub(crate) fn attach_device(&mut self, region: Rc<NativeRegion>) -> Result<()> {
-        if self.device.is_some() {
+    /// device page buffers of the host buffer length, as device pool `id`.
+    /// A rail may hold several device pools (one per GPU, say), each with
+    /// its own id.
+    pub(crate) fn attach_device(&mut self, id: u32, region: Rc<NativeRegion>) -> Result<()> {
+        if self.device.contains_key(&id) {
             return Err(Error::InvalidRequest);
         }
 
@@ -283,41 +291,44 @@ impl Pool {
             return Err(Error::InvalidConfiguration);
         }
 
-        self.device = Some(DevicePool {
-            shared: Arc::new(PoolShared {
-                base: std::ptr::null_mut(),
-                memory: Some(memory),
-                buffer_len,
-                states: (0..count)
-                    .map(|_| AtomicU8::new(BufferState::Free.code()))
-                    .collect(),
-                free: Mutex::new((0..count as u32).rev().collect()),
-                owner: AtomicWaker::new(),
-            }),
-            region: Some(region),
-        });
+        self.device.insert(
+            id,
+            DevicePool {
+                shared: Arc::new(PoolShared {
+                    base: std::ptr::null_mut(),
+                    memory: Some(memory),
+                    buffer_len,
+                    states: (0..count)
+                        .map(|_| AtomicU8::new(BufferState::Free.code()))
+                        .collect(),
+                    free: Mutex::new((0..count as u32).rev().collect()),
+                    owner: AtomicWaker::new(),
+                }),
+                region: Some(region),
+            },
+        );
         Ok(())
     }
 
-    /// State shared with device pages, if a device pool is attached.
-    pub(crate) fn device_shared(&self) -> Option<&Arc<PoolShared>> {
-        self.device.as_ref().map(|d| &d.shared)
+    /// State shared with device pages of pool `id`, if attached.
+    pub(crate) fn device_shared(&self, id: u32) -> Option<&Arc<PoolShared>> {
+        self.device.get(&id).map(|d| &d.shared)
     }
 
     /// Register the owner's waker for buffers returned to either pool.
     pub(crate) fn register_owner(&self, waker: &Waker) {
         self.shared.register_owner(waker);
-        if let Some(device) = &self.device {
+        for device in self.device.values() {
             device.shared.register_owner(waker);
         }
     }
 
     /// State shared by `buffer`'s pool.
     fn shared_of(&self, buffer: &Buffer) -> &Arc<PoolShared> {
-        if buffer.device {
+        if let Some(id) = buffer.device {
             &self
                 .device
-                .as_ref()
+                .get(&id)
                 .expect("device buffer without pool")
                 .shared
         } else {
@@ -327,22 +338,22 @@ impl Pool {
 
     /// The registered region `buffer` lives in.
     pub(crate) fn region_of(&self, buffer: &Buffer) -> &Rc<NativeRegion> {
-        if buffer.device {
-            let device = self.device.as_ref().expect("device buffer without pool");
+        if let Some(id) = buffer.device {
+            let device = self.device.get(&id).expect("device buffer without pool");
             device.region.as_ref().unwrap()
         } else {
             self.region()
         }
     }
 
-    /// Take a free device buffer straight into an owner `state`. `None` if
-    /// no device pool is attached or none is free.
-    pub(crate) fn take_device(&self, state: BufferState) -> Option<Buffer> {
+    /// Take a free buffer of device pool `id` straight into an owner
+    /// `state`. `None` if that pool is not attached or none is free.
+    pub(crate) fn take_device(&self, id: u32, state: BufferState) -> Option<Buffer> {
         assert!(state.owner_held() && state != BufferState::Quarantined);
-        let device = self.device.as_ref()?;
+        let device = self.device.get(&id)?;
         device.shared.pop(state).map(|index| Buffer {
             index,
-            device: true,
+            device: Some(id),
         })
     }
 
@@ -353,7 +364,7 @@ impl Pool {
         buffer: Buffer,
         len: usize,
     ) -> std::result::Result<DevicePage, Buffer> {
-        if !buffer.device || len == 0 || len > self.shared.buffer_len {
+        if buffer.device.is_none() || len == 0 || len > self.shared.buffer_len {
             return Err(buffer);
         }
 
@@ -392,7 +403,7 @@ impl Pool {
         assert!(state.owner_held() && state != BufferState::Quarantined);
         self.shared.pop(state).map(|index| Buffer {
             index,
-            device: false,
+            device: None,
         })
     }
 
@@ -413,7 +424,7 @@ impl Pool {
         buffer: Buffer,
         len: usize,
     ) -> std::result::Result<RegisteredPage, Buffer> {
-        if buffer.device || len == 0 || len > self.shared.buffer_len {
+        if buffer.device.is_some() || len == 0 || len > self.shared.buffer_len {
             return Err(buffer);
         }
 
@@ -437,8 +448,9 @@ impl Pool {
         Arc::strong_count(&self.shared) - 1
             + self
                 .device
-                .as_ref()
-                .map_or(0, |d| Arc::strong_count(&d.shared) - 1)
+                .values()
+                .map(|d| Arc::strong_count(&d.shared) - 1)
+                .sum::<usize>()
     }
 
     /// True if dropping now would deregister the region: no buffer is
@@ -447,7 +459,7 @@ impl Pool {
         let free = |shared: &PoolShared| shared.count_in(BufferState::Free) == shared.count();
         self.outstanding() == 0
             && free(&self.shared)
-            && self.device.as_ref().is_none_or(|d| free(&d.shared))
+            && self.device.values().all(|d| free(&d.shared))
     }
 }
 
@@ -460,7 +472,7 @@ impl Drop for Pool {
             std::mem::forget(self.quota.clone());
             std::mem::forget(self.region.take());
             std::mem::forget(self.implicit.take());
-            if let Some(device) = &mut self.device {
+            for device in self.device.values_mut() {
                 std::mem::forget(device.region.take());
             }
         }
@@ -757,18 +769,22 @@ mod tests {
         let mut pool = Pool::new(region, implicit, LEN, quota).unwrap();
         let memory = crate::simulation::MemfdMemory::new(2 * LEN + 1, 0x9000).unwrap();
         let (quota, _observer) = lifetime_tests::quota();
-        assert!(pool.take_device(BufferState::Binding).is_none());
+        assert!(pool.take_device(0, BufferState::Binding).is_none());
         // Host regions are refused as device pools.
         let host =
             NativeRegion::with_access(device.clone(), LEN, Access::PAGES, quota.clone()).unwrap();
-        assert_eq!(pool.attach_device(host), Err(Error::InvalidConfiguration));
+        assert_eq!(
+            pool.attach_device(0, host),
+            Err(Error::InvalidConfiguration)
+        );
         let region = NativeRegion::dmabuf(device.clone(), memory.clone(), quota.clone()).unwrap();
-        pool.attach_device(region.clone()).unwrap();
-        assert_eq!(pool.attach_device(region), Err(Error::InvalidRequest));
-        let shared = pool.device_shared().unwrap().clone();
+        pool.attach_device(0, region.clone()).unwrap();
+        assert_eq!(pool.attach_device(0, region), Err(Error::InvalidRequest));
+        let shared = pool.device_shared(0).unwrap().clone();
         assert_eq!(shared.count(), 2);
-        let buffer = pool.take_device(BufferState::Binding).unwrap();
+        let buffer = pool.take_device(0, BufferState::Binding).unwrap();
         assert!(buffer.is_device());
+        assert_eq!(buffer.device(), Some(0));
         assert!(pool.region_of(&buffer).is_device());
         assert_eq!(pool.region_of(&buffer).address(), 0x9000);
         pool.set(&buffer, BufferState::Invalidating);
@@ -779,10 +795,11 @@ mod tests {
         let page = pool.own_device(buffer, 10).unwrap();
         assert_eq!((page.offset(), page.len()), (0, 10));
         assert_eq!(shared.state(0), BufferState::Owned);
-        let second = pool.take_device(BufferState::Binding).unwrap();
+        let second = pool.take_device(0, BufferState::Binding).unwrap();
         let second = pool.own_device(second, LEN).unwrap();
         assert_eq!(second.offset(), LEN as u64);
-        assert!(pool.take_device(BufferState::Binding).is_none());
+        assert!(pool.take_device(0, BufferState::Binding).is_none());
+        assert!(pool.take_device(1, BufferState::Binding).is_none());
         let host = pool.take(BufferState::Binding).unwrap();
         let host = pool.own_device(host, 1).unwrap_err();
         pool.release(host);
@@ -798,5 +815,44 @@ mod tests {
             Arc::strong_count(&memory) > 1,
             "leaked region keeps the owner"
         );
+    }
+
+    #[test]
+    /// Several device pools on one rail keep their buffers apart: each id
+    /// hands out its own buffers over its own memory, and the pool is idle
+    /// only when every device pool is.
+    fn device_pools_are_kept_apart_by_id() {
+        let sim = Simulation::new();
+        let device = self::device(&sim);
+        let (quota, _charge) = lifetime_tests::quota();
+        let region =
+            NativeRegion::with_access(device.clone(), LEN, Access::PAGES, quota.clone()).unwrap();
+        let implicit = NativeRegion::implicit(device.clone(), quota.clone()).unwrap();
+        let mut pool = Pool::new(region, implicit, LEN, quota).unwrap();
+        let (quota, _observer) = lifetime_tests::quota();
+        let first = crate::simulation::MemfdMemory::new(LEN, 0x9000).unwrap();
+        let second = crate::simulation::MemfdMemory::new(2 * LEN, 0xa000).unwrap();
+        let attach = |pool: &mut Pool, id, memory| {
+            let region = NativeRegion::dmabuf(device.clone(), memory, quota.clone()).unwrap();
+            pool.attach_device(id, region)
+        };
+        attach(&mut pool, 3, first.clone()).unwrap();
+        attach(&mut pool, 7, second.clone()).unwrap();
+        assert_eq!(attach(&mut pool, 7, second), Err(Error::InvalidRequest));
+        assert_eq!(pool.device_shared(3).unwrap().count(), 1);
+        assert_eq!(pool.device_shared(7).unwrap().count(), 2);
+        let a = pool.take_device(3, BufferState::Binding).unwrap();
+        assert!(pool.take_device(3, BufferState::Binding).is_none());
+        let b = pool.take_device(7, BufferState::Binding).unwrap();
+        assert_eq!((a.device(), b.device()), (Some(3), Some(7)));
+        assert_eq!(pool.region_of(&a).address(), 0x9000);
+        assert_eq!(pool.region_of(&b).address(), 0xa000);
+        let page = pool.own_device(b, 5).unwrap();
+        assert_eq!(page.memory().length(), 2 * LEN);
+        pool.release(a);
+        assert!(!pool.idle(), "a page of pool 7 is outstanding");
+        drop(page);
+        assert!(pool.idle());
+        drop(first);
     }
 }
