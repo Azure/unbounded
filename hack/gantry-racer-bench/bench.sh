@@ -203,6 +203,7 @@ spec:
         run: $name
     spec:
 $(worker_affinity)
+      hostNetwork: true
       tolerations:
         - operator: Exists
       terminationGracePeriodSeconds: 1

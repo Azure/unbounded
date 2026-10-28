@@ -41,6 +41,22 @@ if [ -z "$disk" ]; then
 	echo "DISK $node none no-disk"
 	exec sleep infinity
 fi
+# Drop stale partition entries. This fails while any mount namespace still
+# holds the old /mnt filesystem, for example a pod with hostPath / created
+# before the unmount.
+b=$(basename "$disk")
+if ls "/sys/block/$b" | grep -q "^$b[0-9]"; then
+	blockdev --rereadpt "$disk" 2>/dev/null || partx -d "$disk" 2>/dev/null || true
+	udevadm settle 2>/dev/null || true
+fi
+if ls "/sys/block/$b" | grep -q "^$b[0-9]"; then
+	echo "DISK $node none partitions-busy"
+	exec sleep infinity
+fi
+if [ "$(head -c 1048576 "$disk" | tr -d '\0' | wc -c)" != 0 ]; then
+	echo "DISK $node none head-not-zero"
+	exec sleep infinity
+fi
 id=""
 for l in /dev/disk/by-id/wwn-* /dev/disk/by-id/scsi-3* /dev/disk/by-id/*; do
 	[ -e "$l" ] || continue
