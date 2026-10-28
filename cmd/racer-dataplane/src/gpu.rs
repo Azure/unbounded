@@ -377,8 +377,9 @@ pub struct GpuCounters {
     /// CPU or already plaintext in cache).
     pub plaintext: AtomicU64,
 
-    /// RDMA landing grants that found no free landing slot.
-    pub landing_exhausted: AtomicU64,
+    /// Devices (`st_dev`) cuFile rejected as unsupported. Each device is
+    /// counted once; cuFile stays on for other devices.
+    pub cufile_unsupported: AtomicU64,
 
     /// Times cuFile was turned off, indexed by [`CufileDisable`].
     pub cufile_disabled: [AtomicU64; CufileDisable::ALL.len()],
@@ -1577,6 +1578,10 @@ impl Helper {
     /// them. Other devices keep using cuFile.
     fn unsupported_device(&mut self, device: u64, error: racer_gpu::Error) {
         if self.unsupported.insert(device) {
+            self.state
+                .counters
+                .cufile_unsupported
+                .fetch_add(1, Ordering::Relaxed);
             let (major, minor) = (libc::major(device), libc::minor(device));
             eprintln!(
                 "racer-dataplane: stage=gpu state=cufile-unsupported dev={major}:{minor} reason={error}"
@@ -2114,6 +2119,10 @@ mod tests {
         assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
         assert!(helper.cufile());
         assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            helper.counters().cufile_unsupported.load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(operations(&helper, Operation::File), 1);
         // Same device: no second registration, still the host path.
         let other = slab(&[8; 4096]);
@@ -2129,6 +2138,16 @@ mod tests {
         assert_eq!(operations(&helper, Operation::File), 2);
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
         assert!(helper.cufile());
+        // The device is counted once, and cuFile was not turned off.
+        assert_eq!(
+            helper.counters().cufile_unsupported.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            helper.counters().cufile_disabled[CufileDisable::FileOpen as usize]
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -2142,6 +2161,15 @@ mod tests {
         assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
         assert!(!helper.cufile());
         assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            helper.counters().cufile_disabled[CufileDisable::FileOpen as usize]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            helper.counters().cufile_unsupported.load(Ordering::Relaxed),
+            0
+        );
     }
 
     /// Wait for the helper's background work to reach `done`.

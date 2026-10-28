@@ -26,7 +26,8 @@ pub enum GpuReadOutcome {
     Gpu,
     /// `gpu-read` is off on this node (501).
     NotEnabled,
-    /// The allocation is on a GPU the dataplane cannot use (501).
+    /// The allocation is on a GPU the dataplane cannot use, or the
+    /// `Racer-Gpu-Uuid` header names a GPU it did not find (501).
     WrongDevice,
     /// Too many open requests or no GPU memory (503).
     Busy,
@@ -200,9 +201,9 @@ impl GpuTelemetry {
                 load(&counters.landed),
             ),
             (
-                "racer_gpu_landing_exhausted_total",
+                "racer_gpu_cufile_unsupported_total",
                 "counter",
-                load(&counters.landing_exhausted),
+                load(&counters.cufile_unsupported),
             ),
             (
                 "racer_gpu_open_requests",
@@ -233,6 +234,13 @@ impl GpuTelemetry {
                         "racer_gpu_landing_slots{{rail=\"{rail}\",ordinal=\"{ordinal}\"}} {slots}"
                     )?;
                 }
+            }
+            writeln!(out, "# TYPE racer_gpu_landing_exhausted_total counter")?;
+            for ((rail, ordinal), count) in links.landing_exhausted() {
+                writeln!(
+                    out,
+                    "racer_gpu_landing_exhausted_total{{rail=\"{rail}\",ordinal=\"{ordinal}\"}} {count}"
+                )?;
             }
         }
         Ok(())
@@ -317,7 +325,7 @@ mod tests {
             "racer_gpu_cufile_failures_total",
             "racer_gpu_staging_exhausted_total",
             "racer_gpu_landed_pages_decrypted_total",
-            "racer_gpu_landing_exhausted_total",
+            "racer_gpu_cufile_unsupported_total",
             "racer_gpu_open_requests",
             "racer_gpu_leaked_resources",
         ] {
@@ -338,5 +346,14 @@ mod tests {
         let text = render(&telemetry);
         assert!(text.contains("# TYPE racer_gpu_landing_enabled gauge\n"));
         assert!(text.contains("# TYPE racer_gpu_landing_slots gauge\n"));
+        assert!(text.contains("# TYPE racer_gpu_landing_exhausted_total counter\n"));
+        links.count_landing_exhausted(racer_control_wire::RailId(2), 0);
+        links.count_landing_exhausted(racer_control_wire::RailId(2), 0);
+        links.count_landing_exhausted(racer_control_wire::RailId(1), 3);
+        let text = render(&telemetry);
+        assert!(text.contains(
+            "racer_gpu_landing_exhausted_total{rail=\"1\",ordinal=\"3\"} 1\n\
+             racer_gpu_landing_exhausted_total{rail=\"2\",ordinal=\"0\"} 2\n"
+        ));
     }
 }

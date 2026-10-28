@@ -103,6 +103,10 @@ pub struct LinkNode {
 
     /// NIC slots in each registered landing slice this round, by rail and GPU.
     landing_slots: Mutex<HashMap<(u16, i32), usize>>,
+
+    /// Landing grants that found no free slot, by rail and GPU. Kept across
+    /// rounds so the metric only grows.
+    landing_exhausted: Mutex<HashMap<(u16, i32), u64>>,
 }
 
 /// Split each GPU's landing buffer of `slots` page slots across `rails`.
@@ -230,6 +234,31 @@ impl LinkNode {
                 gpus.sort_unstable();
                 (rail, gpus)
             })
+            .collect()
+    }
+
+    /// Count one landing grant on `rail` for GPU `ordinal` that found no
+    /// free slot.
+    pub fn count_landing_exhausted(&self, rail: RailId, ordinal: i32) {
+        let mut counts = Self::lock(&self.landing_exhausted);
+        let count = counts.entry((rail.0, ordinal)).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// Landing exhaustion counts for metrics: every slice registered this
+    /// round (0 if none yet) and every slice that ever exhausted, sorted by
+    /// rail then GPU ordinal.
+    pub fn landing_exhausted(&self) -> Vec<((u16, i32), u64)> {
+        let counts = Self::lock(&self.landing_exhausted);
+        let mut keys: Vec<(u16, i32)> = Self::lock(&self.landing_slots)
+            .keys()
+            .chain(counts.keys())
+            .copied()
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.into_iter()
+            .map(|key| (key, counts.get(&key).copied().unwrap_or(0)))
             .collect()
     }
 
@@ -895,12 +924,7 @@ impl Links {
         {
             Ok(granted) => granted,
             Err(Error::Overloaded) => {
-                if let Some((helper, _)) = LinkNode::lock(&self.node.gpu_landing).as_ref() {
-                    helper
-                        .counters()
-                        .landing_exhausted
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                self.node.count_landing_exhausted(rail, ordinal);
                 return Err(Error::Overloaded);
             }
             Err(error) => return Err(error),
