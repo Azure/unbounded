@@ -720,11 +720,6 @@ pub struct NodeWorld {
     publish_scheduled: bool,
 }
 
-#[allow(clippy::disallowed_methods)] // Only a base for offsets; runs replay.
-fn wall_clock() -> Instant {
-    Instant::now()
-}
-
 impl NodeWorld {
     pub fn new(config: Config, seed: u64) -> Self {
         Self::build(config, seed, false)
@@ -742,7 +737,8 @@ impl NodeWorld {
         let origin = Origin::new(&config, streams.stream(Role::Origin, 0));
         let n = config.nodes;
         // Instants are only used as offsets from this base, so runs replay.
-        let base = wall_clock();
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
         let shared = Shared {
             phantom: Phantom::new(),
             routes: SharedRoutes::new(),
@@ -1003,7 +999,13 @@ impl NodeWorld {
                     }
                 }
             }
-            Event::OriginDone { fill, .. } => self.origin_done(fill),
+            Event::OriginDone { fill, .. } => {
+                if let Some((handle, _)) = self.fills.get(&fill).and_then(|f| f.origin)
+                    && self.origin.due_as_issued(handle, self.engine.now())
+                {
+                    self.origin_complete(fill);
+                }
+            }
             Event::Resolve { want, result } => self.resolve(want, result),
             Event::Written { write } => {
                 self.writes.remove(&write);
@@ -1043,7 +1045,13 @@ impl NodeWorld {
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
             Event::StaleWait { fill } => self.drive(fill, FillEvent::Timer),
             Event::Notice { node } => self.send_notices(node),
-            Event::LastHop { msg } => self.last_hop_timeout(msg),
+            // The requester gave up: a last link still unanswered is a timeout for its sender.
+            Event::LastHop { msg } => {
+                if let Some((sender, dest, page, sent)) = self.last_hops.remove(&msg) {
+                    self.metrics.incr("silence_timeouts");
+                    self.silence_timeout(sender, dest, page, sent, LINK_TIMEOUTS);
+                }
+            }
             Event::SilenceRecheck { from, .. } => self.poll_pings(from),
             Event::OriginCancel { fill } => self.origin_cancel(fill),
             Event::OriginWake => self.origin_wake(),
@@ -3085,16 +3093,6 @@ impl NodeWorld {
         blocked
     }
 
-    /// The requester of `mid` gave up: a last link still unanswered is a timeout for its sender
-    /// (production: the exchange ends with the attempt's deadline or the upstream's cancellation).
-    fn last_hop_timeout(&mut self, mid: u64) {
-        let Some((sender, dest, page, sent)) = self.last_hops.remove(&mid) else {
-            return;
-        };
-        self.metrics.incr("silence_timeouts");
-        self.silence_timeout(sender, dest, page, sent, LINK_TIMEOUTS);
-    }
-
     /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester asks whether `dest`
     /// hangs (production `request_traced`).
     fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos, needed: u32) {
@@ -3130,23 +3128,19 @@ impl NodeWorld {
             if self.nodes[node as usize].silence.silent(&to, at) {
                 self.metrics.incr("silence_rechecks");
             }
-            self.launch_ping(node, to, page);
+            // Production `CandidatePolicy::poll_pings`: answered `Miss` at once.
+            self.nodes[node as usize].pings += 1;
+            let pid = self.launch_control(node, to, page, false);
+            let incarnation = self.nodes[node as usize].incarnation;
+            let ping = SimPing {
+                node,
+                incarnation,
+                dest: to,
+                relayed: false,
+            };
+            self.pings.insert(pid, ping);
+            self.metrics.incr("silence_pings");
         }
-    }
-
-    /// Ping `dest` from `node` (production `CandidatePolicy::poll_pings`), answered `Miss` at once.
-    fn launch_ping(&mut self, node: u32, dest: u32, page: u64) {
-        self.nodes[node as usize].pings += 1;
-        let pid = self.launch_control(node, dest, page, false);
-        let incarnation = self.nodes[node as usize].incarnation;
-        let ping = SimPing {
-            node,
-            incarnation,
-            dest,
-            relayed: false,
-        };
-        self.pings.insert(pid, ping);
-        self.metrics.incr("silence_pings");
     }
 
     /// Send a ping or copy offer from `node` on its own route grant ([`NOTICE_LINKS`], no
@@ -4428,17 +4422,6 @@ impl NodeWorld {
         self.metrics.incr(class);
     }
 
-    /// The completion event scheduled at issue. Stale if the request was canceled or a cancellation
-    /// moved it ([`Self::origin_wake`]).
-    fn origin_done(&mut self, id: u64) {
-        let now = self.engine.now();
-        if let Some((handle, _)) = self.fills.get(&id).and_then(|f| f.origin)
-            && self.origin.due_as_issued(handle, now)
-        {
-            self.origin_complete(id);
-        }
-    }
-
     fn origin_complete(&mut self, id: u64) {
         let now = self.engine.now();
         let Some(fill) = self.fills.get_mut(&id) else {
@@ -4596,7 +4579,14 @@ impl NodeWorld {
                 || n.disk.entries.get(&page).is_some();
             let owners = self.owners_at(node, w, page, true);
             match notice_target(&node, &owners, holds, index) {
-                Some(target) => self.launch_offer(node, Due { target, ..due }),
+                Some(target) => {
+                    let due = Due { target, ..due };
+                    let incarnation = self.nodes[node as usize].incarnation;
+                    self.nodes[node as usize].offers += 1;
+                    let pid = self.launch_control(node, due.target, due.key.0, true);
+                    self.offers.insert(pid, (node, incarnation, due));
+                    self.metrics.incr("orphan_offers_sent");
+                }
                 None => {
                     self.metrics.incr("orphan_notices_dropped");
                     let group = self.fabric.site[due.target as usize];
@@ -4611,14 +4601,6 @@ impl NodeWorld {
         {
             self.engine.at(self.nanos(at), Event::Notice { node });
         }
-    }
-
-    fn launch_offer(&mut self, node: u32, due: OfferDue) {
-        let incarnation = self.nodes[node as usize].incarnation;
-        self.nodes[node as usize].offers += 1;
-        let pid = self.launch_control(node, due.target, due.key.0, true);
-        self.offers.insert(pid, (node, incarnation, due));
-        self.metrics.incr("orphan_offers_sent");
     }
 
     /// A copy offer ended: delivered, or try again after the next delay.
