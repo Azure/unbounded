@@ -682,20 +682,22 @@ type retryPolicy struct {
 	observe           func(stage string)
 }
 
-// retryState tracks one request's retry budget across all stages.
+// retryState tracks one request's retry budget across all stages. Only
+// backoff counts against the budget, so time spent successfully streaming a
+// long body does not prevent resuming it after a later transient failure.
 type retryState struct {
-	policy   retryPolicy
-	deadline time.Time
-	attempt  int
+	policy  retryPolicy
+	spent   time.Duration
+	attempt int
 }
 
 func (p retryPolicy) start() *retryState {
-	return &retryState{policy: p, deadline: time.Now().Add(p.budget)}
+	return &retryState{policy: p}
 }
 
 // wait sleeps for a jittered exponential backoff and reports whether the
-// caller should retry. It refuses when the sleep would exceed the budget or
-// the request context ends.
+// caller should retry. It refuses when the sleep would push the total backoff
+// past the budget or the request context ends.
 func (r *retryState) wait(ctx context.Context, stage string) bool {
 	if r.policy.budget <= 0 || ctx.Err() != nil {
 		return false
@@ -710,9 +712,11 @@ func (r *retryState) wait(ctx context.Context, stage string) bool {
 	// Equal jitter keeps a floor while spreading synchronized retries.
 	delay := backoff/2 + rand.N(backoff/2+1) //nolint:gosec // jitter, not security
 
-	if time.Now().Add(delay).After(r.deadline) {
+	if r.spent+delay > r.policy.budget {
 		return false
 	}
+
+	r.spent += delay
 
 	if r.policy.observe != nil {
 		r.policy.observe(stage)

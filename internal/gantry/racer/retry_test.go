@@ -431,14 +431,30 @@ func TestRacerRetryMetrics(t *testing.T) {
 func TestRacerRetryWaitBudget(t *testing.T) {
 	var stages retryStages
 
-	r := &retryState{policy: retryPolicy{budget: time.Second, base: time.Millisecond, cap: time.Millisecond, observe: stages.observe}, deadline: time.Now().Add(time.Second)}
+	r := retryPolicy{budget: time.Second, base: time.Millisecond, cap: time.Millisecond, observe: stages.observe}.start()
 	if !r.wait(context.Background(), "get") || stages.count("get") != 1 {
 		t.Fatal("expected retry")
 	}
 
-	expired := &retryState{policy: r.policy, deadline: time.Now()}
+	expired := &retryState{policy: r.policy, spent: time.Second}
 	if expired.wait(context.Background(), "get") {
 		t.Fatal("retried past budget")
+	}
+}
+
+// The budget bounds backoff, not elapsed time: a long successful transfer
+// must still be able to retry its first transient failure.
+func TestRacerRetryBudgetExcludesElapsedTime(t *testing.T) {
+	r := retryPolicy{budget: 5 * time.Millisecond, base: time.Millisecond, cap: time.Millisecond}.start()
+
+	time.Sleep(20 * time.Millisecond)
+
+	if !r.wait(context.Background(), "write_body") {
+		t.Fatal("elapsed time without backoff consumed the retry budget")
+	}
+
+	if r.spent <= 0 || r.spent > time.Millisecond {
+		t.Fatalf("spent = %v, want (0, 1ms]", r.spent)
 	}
 }
 
