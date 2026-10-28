@@ -794,11 +794,11 @@ mod scenarios {
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;
         use crate::peer::protocol::PeerResponse;
-        use crate::peer::subscriptions::Demand;
-        use crate::peer::subscriptions::PageInterval;
         use crate::peer::subscriptions::Subscription;
         use crate::security::OriginContext;
         use crate::topology::RouteBudget;
+        use flow_control::subscriptions::Interval;
+        use racer_core::subscriptions::Demand;
 
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -854,7 +854,7 @@ mod scenarios {
                             object: object.clone(),
                             etag: StrongEtag::test_value("absent"),
                         },
-                        demand: Demand::new(vec![PageInterval { start: 0, end: 1 }]).unwrap(),
+                        demand: Demand::new(vec![Interval { start: 0, end: 1 }]).unwrap(),
                         page_budget: 3 - u32::from(sequence),
                         byte_budget: PAGE_BYTES + 16,
                         flights: None,

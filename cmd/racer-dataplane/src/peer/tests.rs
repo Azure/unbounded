@@ -1734,8 +1734,6 @@ mod subscriptions {
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;
-    use crate::peer::subscriptions::Demand;
-    use crate::peer::subscriptions::PageInterval;
     use crate::peer::subscriptions::Subscription;
     use crate::peer::subscriptions::TransferGrant;
     use crate::runtime::Reactor;
@@ -1743,9 +1741,11 @@ mod subscriptions {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
+    use flow_control::subscriptions::Interval;
     use racer_control_wire::BundleGeneration;
     use racer_control_wire::KeyringBundle;
     use racer_control_wire::SCHEMA_VERSION;
+    use racer_core::subscriptions::Demand;
     use std::cell::Cell;
     use std::task::Context;
     use std::task::Poll;
@@ -1776,7 +1776,7 @@ mod subscriptions {
                     object: request.origin.object.clone(),
                     etag: StrongEtag::test_value("v1"),
                 },
-                demand: Demand::new(vec![PageInterval { start, end: 20 }]).unwrap(),
+                demand: Demand::new(vec![Interval { start, end: 20 }]).unwrap(),
             },
             mode,
         };
@@ -2096,7 +2096,7 @@ mod subscriptions {
         };
         subscription.demand = Demand::new(
             (0..64)
-                .map(|i| PageInterval {
+                .map(|i| Interval {
                     start: i * 2,
                     end: i * 2 + 1,
                 })
@@ -3158,10 +3158,9 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
                 object: requests[1].origin.object.clone(),
                 etag: StrongEtag::test_value("incast"),
             },
-            demand: super::subscriptions::Demand::new(vec![super::subscriptions::PageInterval {
-                start: 0,
-                end: 1,
-            }])
+            demand: racer_core::subscriptions::Demand::new(vec![
+                flow_control::subscriptions::Interval { start: 0, end: 1 },
+            ])
             .unwrap(),
         },
         mode: FetchMode::CopyOnly,

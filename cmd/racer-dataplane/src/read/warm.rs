@@ -2497,10 +2497,12 @@ mod tests {
             p.until = Some(SystemTime::UNIX_EPOCH);
         });
         let scheduler = super::super::range_stream::Scheduler::new(4);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let selection =
             super::super::range_stream::Selection::for_test(&scheduler, version.clone(), demand);
         // Reads hold no exclusive selection, so an expired job is replaced.

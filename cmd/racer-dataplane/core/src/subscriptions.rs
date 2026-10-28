@@ -74,6 +74,39 @@ impl SubscriptionLimits {
     }
 }
 
+/// Most intervals one demand may carry.
+pub const MAX_DEMAND_INTERVALS: usize = 64;
+
+/// Canonical intervals, never an expanded list of pages. Adjacent intervals must
+/// be merged by the sender, so one logical demand has one encoding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Demand(Vec<Interval>);
+
+impl Demand {
+    /// `None` unless `intervals` is canonical and within [`MAX_DEMAND_INTERVALS`].
+    pub fn new(intervals: Vec<Interval>) -> Option<Self> {
+        flow_control::subscriptions::canonical(&intervals, MAX_DEMAND_INTERVALS)
+            .then_some(Self(intervals))
+    }
+
+    pub fn intervals(&self) -> &[Interval] {
+        &self.0
+    }
+
+    pub fn contains(&self, page: u64) -> bool {
+        flow_control::subscriptions::contains(&self.0, page)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn page_count(&self) -> u64 {
+        // Disjoint intervals in [0, u64::MAX) cannot overflow this sum.
+        self.0.iter().map(|i| i.end - i.start).sum()
+    }
+}
+
 /// Failures the scheduler itself produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -96,14 +129,14 @@ pub trait Fault: Clone {
     fn promotes(&self) -> bool;
 }
 
-/// One request on a contract. `demand` must be canonical.
+/// One request on a contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Contract<V> {
     pub id: [u8; 16],
 
     pub version: V,
 
-    pub demand: Vec<Interval>,
+    pub demand: Demand,
 
     pub sequence: u64,
 
@@ -182,7 +215,7 @@ pub enum Polled<T> {
 #[derive(Clone)]
 struct Reservation {
     sequence: u64,
-    demand: Vec<Interval>,
+    demand: Demand,
     page_budget: u32,
     byte_budget: u64,
     deadline: u64,
@@ -580,7 +613,7 @@ where
         if self.fanout.pending().len() >= self.limits.max_pending {
             return Err(Kind::Overloaded);
         }
-        let number = match self.vote(key, &reservation.demand, &eligible) {
+        let number = match self.vote(key, &reservation.demand.0, &eligible) {
             Ok(number) => number.ok_or(Kind::Unavailable)?,
             Err(page) => return Ok(Err(page)),
         };
@@ -648,7 +681,7 @@ where
                     &key.receiver,
                     false,
                     flow_control::subscriptions::outstanding(
-                        &entry.subscription.demand,
+                        &entry.subscription.demand.0,
                         &entry.completed,
                     ),
                 ));
@@ -882,7 +915,7 @@ mod tests {
         Contract {
             id: [id; 16],
             version: 1,
-            demand: vec![Interval { start: 0, end }],
+            demand: Demand(vec![Interval { start: 0, end }]),
             sequence,
             page_budget: 10,
             byte_budget: 1 << 20,
@@ -1045,5 +1078,25 @@ mod tests {
         s.complete(selected.work.unwrap(), Ok(("p", 10)), None);
         let grant = ready(s.poll(selected.waiter, 1)).unwrap().grant;
         assert_eq!((grant.sequence, grant.flights), (2, Some(3)));
+    }
+
+    #[test]
+    fn compact_demand_rejects_noncanonical_and_never_expands_pages() {
+        for intervals in [
+            vec![Interval { start: 1, end: 1 }],
+            vec![Interval { start: 1, end: 3 }, Interval { start: 3, end: 4 }],
+            vec![Interval { start: 2, end: 4 }, Interval { start: 1, end: 2 }],
+            vec![Interval { start: 1, end: 2 }; MAX_DEMAND_INTERVALS + 1],
+        ] {
+            assert!(Demand::new(intervals).is_none());
+        }
+        let demand = Demand::new(vec![Interval {
+            start: 0,
+            end: u64::MAX,
+        }])
+        .unwrap();
+        assert_eq!(demand.page_count(), u64::MAX);
+        assert!(demand.contains(u64::MAX - 1));
+        assert!(!demand.contains(u64::MAX));
     }
 }

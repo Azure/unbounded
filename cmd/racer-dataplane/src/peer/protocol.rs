@@ -989,10 +989,10 @@ fn version(head: &MessageHead) -> Result<ObjectVersion> {
         etag: etag(head)?,
     })
 }
-pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand> {
-    use super::subscriptions::Demand;
-    use super::subscriptions::MAX_DEMAND_INTERVALS;
-    use super::subscriptions::PageInterval;
+pub(crate) fn demand(head: &MessageHead) -> Result<racer_core::subscriptions::Demand> {
+    use flow_control::subscriptions::Interval;
+    use racer_core::subscriptions::Demand;
+    use racer_core::subscriptions::MAX_DEMAND_INTERVALS;
     let encoded = bytes(head, "racer-demand")?;
     if encoded.len() % 16 != 0 || encoded.len() / 16 > MAX_DEMAND_INTERVALS {
         return Err(Error::InvalidRequest);
@@ -1000,12 +1000,13 @@ pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand>
     Demand::new(
         encoded
             .chunks_exact(16)
-            .map(|chunk| PageInterval {
+            .map(|chunk| Interval {
                 start: u64::from_be_bytes(chunk[..8].try_into().unwrap()),
                 end: u64::from_be_bytes(chunk[8..].try_into().unwrap()),
             })
             .collect(),
     )
+    .ok_or(Error::InvalidRequest)
 }
 pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::TransferGrant> {
     Ok(super::subscriptions::TransferGrant {

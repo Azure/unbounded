@@ -22,46 +22,10 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
-pub const MAX_DEMAND_INTERVALS: usize = 64;
-
-/// Largest number of selections one subscription may request in flight. The
-/// replay window is a 64-bit map, so no contract may grant more than this.
+use racer_core::subscriptions::Demand;
+use racer_core::subscriptions::MAX_DEMAND_INTERVALS;
 pub use racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS;
-
-pub use flow_control::subscriptions::Interval as PageInterval;
-use flow_control::subscriptions::contains;
-
-/// Canonical intervals, never an expanded list of pages. Adjacent intervals must
-/// be merged by the sender, so one logical demand has one encoding.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Demand(Vec<PageInterval>);
-
-impl Demand {
-    pub fn new(intervals: Vec<PageInterval>) -> Result<Self> {
-        if !flow_control::subscriptions::canonical(&intervals, MAX_DEMAND_INTERVALS) {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(Self(intervals))
-    }
-
-    pub fn intervals(&self) -> &[PageInterval] {
-        &self.0
-    }
-
-    pub fn contains(&self, page: u64) -> bool {
-        contains(&self.0, page)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    #[cfg(test)]
-    pub fn page_count(&self) -> u64 {
-        // Disjoint intervals in [0, u64::MAX) cannot overflow this sum.
-        self.0.iter().map(|i| i.end - i.start).sum()
-    }
-}
+use racer_core::subscriptions::SubscriptionLimits;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
@@ -107,8 +71,6 @@ pub struct TransferGrant {
     /// when the selecting request carried `Subscription::flights`.
     pub flights: Option<u16>,
 }
-
-pub use racer_core::subscriptions::SubscriptionLimits;
 
 /// The sans-IO scheduler this module wraps with a mutex, handles and wakers.
 type Core = racer_core::subscriptions::Scheduler<
@@ -370,7 +332,7 @@ impl Subscriptions {
         let contract = racer_core::subscriptions::Contract {
             id: subscription.id,
             version: subscription.version,
-            demand: subscription.demand.0,
+            demand: subscription.demand,
             sequence: subscription.sequence,
             page_budget: subscription.page_budget,
             byte_budget: subscription.byte_budget,
@@ -546,6 +508,7 @@ mod tests {
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::StrongEtag;
+    use flow_control::subscriptions::Interval;
     use racer_control_wire::CacheId;
     use std::rc::Rc;
 
@@ -563,7 +526,7 @@ mod tests {
                 },
                 etag: StrongEtag::test_value("v1"),
             },
-            demand: Demand::new(vec![PageInterval { start, end }]).unwrap(),
+            demand: Demand::new(vec![Interval { start, end }]).unwrap(),
         }
     }
     fn schedule(s: &Arc<Subscriptions>, sub: Subscription, receiver: &str) -> Result<Selection> {
@@ -595,31 +558,6 @@ mod tests {
         assert_eq!(scheduler.inspect(|c| c.entry_count()), 0);
         scheduler.prune(0);
         assert_eq!(scheduler.inspect(|c| c.now()), 60_149);
-    }
-    #[test]
-    fn compact_demand_rejects_noncanonical_and_never_expands_pages() {
-        for intervals in [
-            vec![PageInterval { start: 1, end: 1 }],
-            vec![
-                PageInterval { start: 1, end: 3 },
-                PageInterval { start: 3, end: 4 },
-            ],
-            vec![
-                PageInterval { start: 2, end: 4 },
-                PageInterval { start: 1, end: 2 },
-            ],
-            vec![PageInterval { start: 1, end: 2 }; MAX_DEMAND_INTERVALS + 1],
-        ] {
-            assert!(Demand::new(intervals).is_err());
-        }
-        let demand = Demand::new(vec![PageInterval {
-            start: 0,
-            end: u64::MAX,
-        }])
-        .unwrap();
-        assert_eq!(demand.page_count(), u64::MAX);
-        assert!(demand.contains(u64::MAX - 1));
-        assert!(!demand.contains(u64::MAX));
     }
     #[test]
     fn deferred_selection_rechecks_fairness_sequence_expiry_capacity_and_credits() {
@@ -1157,7 +1095,7 @@ mod tests {
         let five = admit(multi(1, 5, 3)).unwrap();
         // An older request in the window is admitted once, using its own demand.
         let mut four = multi(1, 4, 3);
-        four.demand = Demand::new(vec![PageInterval { start: 7, end: 8 }]).unwrap();
+        four.demand = Demand::new(vec![Interval { start: 7, end: 8 }]).unwrap();
         let four = admit(four).unwrap();
         assert!(matches!(admit(multi(1, 4, 3)), Err(Error::Replay)));
         assert!(matches!(admit(multi(1, 5, 3)), Err(Error::Replay)));

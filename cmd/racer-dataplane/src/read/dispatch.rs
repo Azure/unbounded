@@ -1571,8 +1571,8 @@ mod tests {
                     envelope,
                 )
             } else {
-                let demand = crate::peer::subscriptions::Demand::new(vec![
-                    crate::peer::subscriptions::PageInterval { start: 8, end: 10 },
+                let demand = racer_core::subscriptions::Demand::new(vec![
+                    flow_control::subscriptions::Interval { start: 8, end: 10 },
                 ])
                 .unwrap();
                 Work::Select(

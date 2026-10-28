@@ -50,7 +50,7 @@ struct ScriptedPeers {
 
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 
-    demands: RefCell<Vec<crate::peer::subscriptions::Demand>>,
+    demands: RefCell<Vec<racer_core::subscriptions::Demand>>,
 }
 impl ScriptedPeers {
     fn requester(self: &Rc<Self>) -> Rc<Requester> {
@@ -868,8 +868,8 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 peers.requester(),
             );
             let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
-            let demand = crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+            let demand = racer_core::subscriptions::Demand::new(vec![
+                flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
             .unwrap();
             let scheduler = crate::read::range_stream::Scheduler::new(1);
@@ -942,7 +942,7 @@ fn subscription_behind_remote_warm_fills_only_the_published_head() {
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
     // Page 0 starts a demand whose tail [1, 4) warm has not reached yet.
     let demand =
-        crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
+        racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
             start: 0,
             end: 4,
         }])

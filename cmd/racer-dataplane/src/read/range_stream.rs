@@ -51,7 +51,7 @@ use racer_core::read::{self, DIRECT_AHEAD, SlotKind};
 /// Flights requested per provider contract. A provider grants at most this
 /// many pending selections per contract, or one if it predates multi-flight.
 pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
-const _: () = assert!(REQUESTED_FLIGHTS <= crate::peer::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
+const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
 
 /// Spill fills (hold plus warm fill) a read keeps in flight.
 const SPILL_FILLS: usize = 2;
@@ -373,7 +373,7 @@ impl Drop for WindowLease {
 pub(crate) struct Selection {
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) version: ObjectVersion,
-    pub(crate) demand: crate::peer::subscriptions::Demand,
+    pub(crate) demand: racer_core::subscriptions::Demand,
     /// The contract this selection holds a flight on, once issued.
     contract: Mutex<Option<ContractKey>>,
 }
@@ -396,7 +396,7 @@ impl Selection {
     pub(crate) fn for_test(
         scheduler: &Arc<Scheduler>,
         version: ObjectVersion,
-        demand: crate::peer::subscriptions::Demand,
+        demand: racer_core::subscriptions::Demand,
     ) -> Self {
         Self {
             scheduler: scheduler.clone(),
@@ -1101,9 +1101,7 @@ impl RangeStream {
     /// window of this version is selecting are left to that selection's
     /// fan-out. While a warm job runs for the version, reads only fetch pages
     /// directly, each waiting for the warm job to finish that page.
-    fn plan_selection(
-        &self,
-    ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
+    fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
         if self.directory.warm.contains(&self.metadata.version) {
             return Ok(None);
         }
@@ -1183,8 +1181,9 @@ impl RangeStream {
         &self,
         elsewhere: &BTreeSet<u64>,
         limit: usize,
-    ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
-        use crate::peer::subscriptions::{Demand, MAX_DEMAND_INTERVALS, PageInterval};
+    ) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
+        use flow_control::subscriptions::Interval;
+        use racer_core::subscriptions::{Demand, MAX_DEMAND_INTERVALS};
         let Some((intervals, pages)) = read::selection_demand(
             &self.kinds(),
             self.next,
@@ -1196,12 +1195,15 @@ impl RangeStream {
         };
         let intervals = intervals
             .into_iter()
-            .map(|r| PageInterval {
+            .map(|r| Interval {
                 start: r.start,
                 end: r.end,
             })
             .collect();
-        Ok(Some((Demand::new(intervals)?, pages)))
+        Ok(Some((
+            Demand::new(intervals).ok_or(Error::InvalidRequest)?,
+            pages,
+        )))
     }
 
     /// Publish this window's wanted and in-flight pages for fan-out.
@@ -1890,8 +1892,8 @@ pub(super) mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             stream.inject(Slot::Selecting);
             stream.sync(&cx);
-            let demand = crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+            let demand = racer_core::subscriptions::Demand::new(vec![
+                flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
             .unwrap();
             Selection::for_test(&directory.subscriptions, metadata.version.clone(), demand)
@@ -2464,10 +2466,12 @@ pub(super) mod tests {
             streams[0].lease.as_ref().unwrap().busy_elsewhere(),
             BTreeSet::from([1])
         );
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 1, end: 2 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 1,
+                end: 2,
+            }])
+            .unwrap();
         let selection = Selection::for_test(
             &f.streams.directory.subscriptions,
             metadata.version.clone(),
@@ -2621,9 +2625,10 @@ pub(super) mod tests {
         let granted = Selection::for_test(
             scheduler,
             metadata.version.clone(),
-            crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-            ])
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
             .unwrap(),
         );
         scheduler
@@ -2665,8 +2670,8 @@ pub(super) mod tests {
                 let held = Selection::for_test(
                     scheduler,
                     metadata.version.clone(),
-                    crate::peer::subscriptions::Demand::new(vec![
-                        crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+                    racer_core::subscriptions::Demand::new(vec![
+                        flow_control::subscriptions::Interval { start: 0, end: 1 },
                     ])
                     .unwrap(),
                 );
@@ -2711,13 +2716,13 @@ pub(super) mod tests {
             .selection_demand(&BTreeSet::from([5]), usize::MAX)
             .unwrap()
             .unwrap();
-        use crate::peer::subscriptions::PageInterval;
+        use flow_control::subscriptions::Interval;
         assert_eq!(
             demand.intervals(),
             &[
-                PageInterval { start: 2, end: 3 },
-                PageInterval { start: 4, end: 5 },
-                PageInterval { start: 6, end: 8 },
+                Interval { start: 2, end: 3 },
+                Interval { start: 4, end: 5 },
+                Interval { start: 6, end: 8 },
             ]
         );
         assert_eq!(pages, BTreeSet::from([2, 4, 6, 7]));
@@ -3032,12 +3037,12 @@ pub(super) mod tests {
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::StrongEtag;
-        use crate::peer::subscriptions::Demand as WireDemand;
-        use crate::peer::subscriptions::PageInterval;
         use flow_control::Quotas;
+        use flow_control::subscriptions::Interval;
         use racer_control_wire::CacheId;
         use racer_control_wire::MembershipVersion;
         use racer_control_wire::NodeId;
+        use racer_core::subscriptions::Demand as WireDemand;
         fn version() -> ObjectVersion {
             ObjectVersion {
                 object: ObjectId {
@@ -3048,7 +3053,7 @@ pub(super) mod tests {
             }
         }
         fn demand(start: u64, end: u64) -> WireDemand {
-            WireDemand::new(vec![PageInterval { start, end }]).unwrap()
+            WireDemand::new(vec![Interval { start, end }]).unwrap()
         }
         fn page(version: &ObjectVersion, number: u64) -> PageResult {
             let metadata = crate::model::ObjectMetadata {

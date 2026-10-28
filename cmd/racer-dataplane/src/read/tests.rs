@@ -3364,10 +3364,12 @@ mod timeouts {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let version = ObjectVersion {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
@@ -3487,10 +3489,12 @@ mod timeouts {
         let mut f = Fixture::new(Some(1), 0, false);
         f.peers.refuse_flights.set(true);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let version = ObjectVersion {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
@@ -3559,10 +3563,12 @@ mod timeouts {
         // `Unavailable` for the dropped exchange.
         f.peers.relay_unavailable.set(true);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let version = ObjectVersion {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
@@ -3628,10 +3634,12 @@ mod timeouts {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let selection = crate::read::range_stream::Selection::for_test(
             &scheduler,
             ObjectVersion {
