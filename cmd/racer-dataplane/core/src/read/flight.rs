@@ -1,11 +1,4 @@
 //! Sans-IO page singleflight rules.
-//!
-//! The flight transitions run in `flow_control::coalesce::flight::state::State`.
-//! The step functions here hold the business decisions taken on top of it (join
-//! gates, the wait/elect decision, publication, and failure settlement), and
-//! are generic over the wake target `T`: production `Flights`
-//! (src/read/flight.rs) calls them with `Waker`s inside its table borrow, and
-//! the simulator drives them through [`PageFlights`] with plain [`Token`]s.
 
 use crate::read::{Error, FailureKind, Result};
 use flow_control::coalesce::flight::Identity;
@@ -100,10 +93,8 @@ impl From<JoinReject> for Error {
     }
 }
 
-/// Gates of an acquisition join on an existing, refreshed flight: a complete
-/// result, then a partial result for a ciphertext caller, then a settled
-/// failure, then the waiter cap. `None` means register a waiter (after
-/// [`join_budget_gate`] and admission).
+/// Gates of an acquisition join on an existing, refreshed flight: a complete result, then a partial
+/// result for a ciphertext caller, then a settled failure, then the waiter cap.
 pub fn join_existing<
     C: Clone,
     P: Clone,
@@ -141,9 +132,8 @@ pub enum CopyJoin<C, P> {
     Register,
 }
 
-/// Gates of a copy-only join on an existing, refreshed flight: a settled
-/// result first, then a failed or draining phase (a miss), then the waiter
-/// cap (`Overloaded`). A copy join never creates a flight.
+/// Gates of a copy-only join on an existing, refreshed flight: a settled result first, then a
+/// failed or draining phase (a miss), then the waiter cap (`Overloaded`).
 pub fn join_copy_existing<
     C: Clone,
     P: Clone,
@@ -210,13 +200,8 @@ pub fn settle<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From
     state.settle(idle, Error::Unavailable.into(), split, wakes);
 }
 
-/// Poll acquisition waiter `id` of a refreshed flight. The caller already
-/// checked its request scope. Order: the waiter's recorded error, a complete
-/// result, a partial result for a ciphertext waiter, a settled failure; then
-/// on a pending retry an unissued waiter re-checks its own budget
-/// (`budget_deadline`, `attempts`) and is elected under `identity`. An
-/// exhausted generation fails the cohort `Unavailable`. Otherwise `park`
-/// stores the wake target.
+/// Poll acquisition waiter `id` of a refreshed flight. The caller already checked its request
+/// scope.
 #[allow(clippy::too_many_arguments)] // The waiter's budget plus the flight's step inputs.
 pub fn wait<
     C: Clone,
@@ -275,9 +260,8 @@ pub fn wait<
     Wait::Pending
 }
 
-/// Poll copy waiter `id` of a refreshed flight: its recorded error, a settled
-/// failure, a complete result, then the partial result. `None` after `park`
-/// stores the wake target.
+/// Poll copy waiter `id` of a refreshed flight: its recorded error, a settled failure, a complete
+/// result, then the partial result. `None` after `park` stores the wake target.
 pub fn copy_wait<
     C: Clone,
     P: Clone,
@@ -319,12 +303,8 @@ pub fn publish<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + Fro
     settle(state, idle, split, wakes);
 }
 
-/// The validated leader `caller` failed. A credential-specific origin
-/// rejection fails only `caller` and retries for the next eligible waiter.
-/// After a handover the elected caller's own deadline or cancellation no
-/// longer describes the cohort, so it also retries for the adopter. Other
-/// errors fail the cohort. Waiters are notified at once, before retained
-/// operations drain.
+/// The validated leader `caller` failed. A credential-specific origin rejection fails only `caller`
+/// and retries for the next eligible waiter.
 pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<Error>>(
     state: &mut State<C, P, O, W, T>,
     caller: u64,
@@ -357,9 +337,7 @@ pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<E
 }
 
 /// Hard ceiling of a fill that may be handed over: the leader's deadline plus `HANDOVER_SPANS`
-/// times its remaining span. The fill normally ends earlier, when no live waiter remains to adopt
-/// it; the ceiling only bounds the owned scope's timers. Without handover the ceiling is the
-/// leader's deadline.
+/// times its remaining span.
 pub fn handover_ceiling(now: Instant, leader_deadline: Instant, handover: bool) -> Instant {
     if !handover {
         return leader_deadline;
@@ -378,9 +356,8 @@ pub enum Reserve {
     Flight,
 }
 
-/// Simulated waiter: its deadline is both the request scope's and the
-/// budget's, read against the table's current time. It owns its admission
-/// charge `R` like production `WaiterRecord`.
+/// Simulated waiter: its deadline is both the request scope's and the budget's, read against the
+/// table's current time. It owns its admission charge `R` like production `WaiterRecord`.
 struct Waiter<R> {
     deadline: Instant,
     now: Rc<Cell<Instant>>,
@@ -400,8 +377,7 @@ impl<R> WaiterPolicy for Waiter<R> {
 struct Flight<C, P, O, R> {
     state: State<C, P, O, Waiter<R>, Token>,
     identity: Identity,
-    /// Retained leader operations still running (production
-    /// `Entry::operations`).
+    /// Retained leader operations still running (production `Entry::operations`).
     operations: usize,
     _charge: R,
 }
@@ -422,11 +398,7 @@ pub enum Joined<C, P> {
     Waiter(u64),
 }
 
-/// Single-owner page flight table for sans-IO drivers (the simulator). It
-/// mirrors production `Flights` table glue (src/read/flight.rs) around the
-/// shared step functions above, with an explicit clock and [`Token`] wakes.
-/// `R` is the admission charge each waiter and flight owns; dropping it
-/// releases the charge.
+/// Single-owner page flight table for sans-IO drivers (the simulator).
 pub struct PageFlights<C, P, O, R, S> {
     flights: HashMap<PageId, Flight<C, P, O, R>, S>,
     limits: FlightLimits,
@@ -540,8 +512,7 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
         Ok(Joined::Waiter(id))
     }
 
-    /// Copy-only join (production `Flights::join_copy`): never creates a
-    /// flight, leads, or adopts.
+    /// Copy-only join (production `Flights::join_copy`): never creates a flight, leads, or adopts.
     pub fn join_copy(
         &mut self,
         page: &PageId,
@@ -567,11 +538,8 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
         Ok(Joined::Waiter(id))
     }
 
-    /// Poll waiter `id` at `now` with its remaining `attempts`; parks `token`
-    /// when nothing is ready. Copy waiters follow production
-    /// `CopyWaiter::wait`, others `AcquisitionWaiter::wait`. Both first check
-    /// the request scope: a canceled waiter fails `Cancelled`, and one past
-    /// its deadline is canceled with `DeadlineExceeded`.
+    /// Poll waiter `id` at `now` with its remaining `attempts`; parks `token` when nothing is
+    /// ready. Copy waiters follow production `CopyWaiter::wait`, others `AcquisitionWaiter::wait`.
     pub fn poll(
         &mut self,
         page: &PageId,
@@ -620,9 +588,8 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
         ))
     }
 
-    /// Leader `id` finished (production `Flights::publish_acquired` or
-    /// `Flights::fail`). `Internal` for a stale leader (production
-    /// `StaleFlight`).
+    /// Leader `id` finished (production `Flights::publish_acquired` or `Flights::fail`). `Internal`
+    /// for a stale leader (production `StaleFlight`).
     pub fn finish(
         &mut self,
         page: &PageId,
@@ -640,8 +607,7 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
         Ok(())
     }
 
-    /// The refreshed flight `id` currently leads (production
-    /// `Flights::leader_entry`).
+    /// The refreshed flight `id` currently leads (production `Flights::leader_entry`).
     fn leader(
         &mut self,
         page: &PageId,
@@ -671,16 +637,14 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
             .and_then(|f| f.state.leader_deadline())
     }
 
-    /// Whether `page` has an acquisition running (production
-    /// `Flights::acquiring`).
+    /// Whether `page` has an acquisition running (production `Flights::acquiring`).
     pub fn acquiring(&self, page: &PageId) -> bool {
         self.flights
             .get(page)
             .is_some_and(|f| matches!(f.state.phase, Phase::Acquiring))
     }
 
-    /// Whether `page`'s running acquisition passed to a waiter other than
-    /// the elected one.
+    /// Whether `page`'s running acquisition passed to a waiter other than the elected one.
     pub fn handed_over(&self, page: &PageId) -> bool {
         self.flights
             .get(page)
@@ -695,8 +659,7 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
     }
 
     /// Retain one operation for leader `id` before it starts (production
-    /// `Flights::retain_operation`). Until [`PageFlights::complete_operation`]
-    /// runs, a revoked acquisition stays draining and the entry is kept.
+    /// `Flights::retain_operation`).
     pub fn retain_operation(
         &mut self,
         page: &PageId,
@@ -707,9 +670,8 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
         Ok(())
     }
 
-    /// The retained operation finished (production
-    /// `Flights::complete_operation`): settle, notify, and remove a quiescent
-    /// entry. Call it before `finish`, as production does.
+    /// The retained operation finished (production `Flights::complete_operation`): settle, notify,
+    /// and remove a quiescent entry. Call it before `finish`, as production does.
     pub fn complete_operation(&mut self, page: &PageId, wakes: &mut Vec<Token>) -> Result<()> {
         let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
         flight.operations = flight.operations.checked_sub(1).ok_or(Error::Internal)?;

@@ -871,7 +871,7 @@ impl PeerServer {
             }
             let binding = request.binding().clone();
             // A copy offer or a silence ping carries no body, so hot-page
-            // shedding does not apply (Known issues 37, 41 and 43).
+            // shedding does not apply.
             if let super::protocol::Operation::Page { page, mode } = &request.request().operation
                 && !matches!(
                     mode,

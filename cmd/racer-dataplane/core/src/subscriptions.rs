@@ -1,16 +1,4 @@
 //! Token-based subscription scheduler without locks, wakers, or clocks.
-//!
-//! [`Scheduler`] is the node-wide bounded provider selection that the
-//! dataplane wraps in `src/peer/subscriptions.rs` (a mutex, `Arc` handles and
-//! `Waker`s). Every transition is an explicit method call. Methods that take
-//! `now_ms` first expire deadlines at that time; the others do not read time.
-//! A transition may make parked response slots ready; [`Scheduler::take_wakes`]
-//! returns their tokens, and the caller notifies them after the transition.
-//!
-//! The handle `Drop` logic of the dataplane maps to explicit transitions:
-//! dropping unfinished work is [`Scheduler::cancel_work`], dropping a waiter
-//! is [`Scheduler::cancel_waiter`], and dropping an admitted request that did
-//! not select is [`Scheduler::release`].
 
 use flow_control::subscriptions::{Fanout, Interval, include as include_page};
 use std::collections::HashMap;
@@ -42,9 +30,8 @@ pub struct SubscriptionLimits {
     /// Includes unconsumed completed/error responses, not just active waiters.
     pub max_pending: usize,
 
-    /// Most selections one subscription may have pending at once. A request
-    /// asking for more is granted this many. Bounded by `max_inflight`,
-    /// `max_pending` and [`MAX_SUBSCRIPTION_FLIGHTS`].
+    /// Most selections one subscription may have pending at once. A request asking for more is
+    /// granted this many.
     pub max_flights_per_subscription: usize,
 }
 
@@ -278,8 +265,7 @@ impl<V> Entry<V> {
         }
     }
 
-    /// Forfeit what newer ceilings granted on account of a request that will
-    /// not consume it.
+    /// Forfeit what newer ceilings granted on account of a request that will not consume it.
     fn forfeit(&mut self, page: bool, bytes: u64) {
         if page {
             self.subscription.page_budget = self.subscription.page_budget.saturating_sub(1);
@@ -287,13 +273,7 @@ impl<V> Entry<V> {
         self.subscription.byte_budget = self.subscription.byte_budget.saturating_sub(bytes);
     }
 
-    /// Apply a newer request's ceilings. The requester debits a full page and
-    /// `PAGE_BYTES + 16` bytes per selection when issuing it, so the newer
-    /// ceilings already exclude every earlier outstanding request. Widen them
-    /// by at most those reservations, never above the current budgets, and
-    /// record the widening on the outstanding requests. Each must charge or
-    /// forfeit its share, so the contract minus every recorded widening never
-    /// exceeds the newest ceiling.
+    /// Apply a newer request's ceilings.
     fn apply_ceiling(&mut self, sequence: u64, page_budget: u32, byte_budget: u64) {
         let older = |r: &&mut Reservation| r.sequence != sequence;
         // Lower sequences in the window that have not arrived. Must run after
@@ -351,9 +331,8 @@ impl<V> Entry<V> {
         }
     }
 
-    /// Take a flight slot for `reservation`, superseding the oldest admitted
-    /// request if every slot is taken. A request older than every admitted
-    /// one would be superseded at once, so it is a replay.
+    /// Take a flight slot for `reservation`, superseding the oldest admitted request if every slot
+    /// is taken.
     fn reserve(&mut self, reservation: Reservation) -> Result<(), Kind> {
         if self.pending.len() >= self.flights {
             return Err(Kind::Overloaded);
@@ -402,8 +381,7 @@ where
         std::mem::take(&mut self.wake)
     }
 
-    /// Advance time: expire response slots and prune spent contracts. Time
-    /// never moves backward.
+    /// Advance time: expire response slots and prune spent contracts. Time never moves backward.
     pub fn advance(&mut self, now_ms: u64) {
         self.now = self.now.max(now_ms);
         self.fanout
@@ -425,13 +403,8 @@ where
         // Never release acquisition capacity while the owner can still run Fill.
     }
 
-    /// Admit one request on its contract. The caller has validated the fields
-    /// (nonzero membership, bounded receiver and cache names, flights in
-    /// `1..=MAX_SUBSCRIPTION_FLIGHTS`). Sequences are strictly increasing per
-    /// contract, but with `flights > 1` requests may arrive out of order: a
-    /// sequence below the highest admitted one is accepted once if it is
-    /// within the granted flight window. Only the highest sequence replaces
-    /// demand, budgets and deadline.
+    /// Admit one request on its contract. The caller has validated the fields (nonzero membership,
+    /// bounded receiver and cache names, flights in `1..=MAX_SUBSCRIPTION_FLIGHTS`).
     pub fn admit(
         &mut self,
         subscription: Contract<V>,
@@ -485,9 +458,8 @@ where
                 entry.seen |= 1 << offset;
                 return Ok((key, sequence));
             }
-            // The single-flight contract refuses any attempt to raise its
-            // deadline or budgets. A multi-flight contract clamps instead;
-            // neither can ever increase.
+            // The single-flight contract refuses any attempt to raise its deadline or budgets. A
+            // multi-flight contract clamps instead; neither can ever increase.
             let strict = entry.flights == 1;
             if entry.subscription.version != subscription.version
                 || (strict
@@ -557,10 +529,7 @@ where
         }
     }
 
-    /// Select one page for an admitted request. `eligible(page)` says whether
-    /// this node should supply `page`; an unknown endpoint (`None`) is returned
-    /// as `Ok(Err(page))` without reserving a flight, so the caller can rank it
-    /// and repeat.
+    /// Select one page for an admitted request.
     pub fn select(
         &mut self,
         admitted: &Admitted<M, R>,
@@ -641,9 +610,8 @@ where
         }))
     }
 
-    /// The target votes with the selecting request's own demand, excluding
-    /// pages it already has in flight. Other receivers vote with their latest
-    /// demand.
+    /// The target votes with the selecting request's own demand, excluding pages it already has in
+    /// flight. Other receivers vote with their latest demand.
     fn vote(
         &self,
         target: &EntryKey<M, R>,
@@ -698,11 +666,8 @@ where
         Some(pending)
     }
 
-    /// Finish acquisition `work` with the payload and its byte length, or a
-    /// failure. Every waiter on the flight receives its own grant or error.
-    /// `promote` marks an origin rejection of the supplier's credentials: it
-    /// elects one retained follower to retry with its own credentials instead.
-    /// `now_ms` expires deadlines first when present.
+    /// Finish acquisition `work` with the payload and its byte length, or a failure. Every waiter
+    /// on the flight receives its own grant or error.
     pub fn complete(
         &mut self,
         work: u64,
@@ -722,9 +687,8 @@ where
     }
 
     fn finish(&mut self, flight: u64, result: Result<(P, u64), E>, promote: bool) {
-        // An origin rejection says nothing about another credential supplier.
-        // Elect exactly one retained follower to retry with its own verified
-        // request and original route credits. Never clone or refund authority.
+        // An origin rejection says nothing about another credential supplier. Elect exactly one
+        // retained follower to retry with its own verified request and original route credits.
         let promote = promote && result.is_err();
         let limit = self.limits.max_completed_intervals;
         let entries = &mut self.entries;

@@ -1,17 +1,4 @@
 //! The single route budget rule shared by the dataplane and `peer-wire`.
-//!
-//! A route is a path of nodes `origin, relay.., destination`. Each step between
-//! two nodes is one link. A route may use at most [`MAX_LINKS`] links.
-//!
-//! Two encodings differ by one node:
-//!
-//! - Wire form (signed headers): `visited` includes the sender, so the rule is
-//!   `visited.len() + links <= MAX_LINKS + 1` (the origin sends `[origin]`
-//!   with 8 links).
-//! - Search form: `visited` excludes the holder, so the rule is
-//!   `visited.len() + links <= MAX_LINKS`. [`search_budget`] converts.
-//!
-//! The module also holds per-hop failure tables and response-validity rules.
 
 use std::time::Instant;
 
@@ -101,9 +88,8 @@ pub fn forward<N: PartialEq>(
     Ok(links - 1)
 }
 
-/// Search budget for `local` from a received wire-form route: how many
-/// leading `visited` entries to keep and the links left. The origin searching
-/// its own route spends no link.
+/// Search budget for `local` from a received wire-form route: how many leading `visited` entries to
+/// keep and the links left. The origin searching its own route spends no link.
 pub fn search_budget<N: PartialEq>(
     visited: &[N],
     links: u8,
@@ -129,9 +115,8 @@ pub fn relay<N: PartialEq>(
     links.checked_sub(1).ok_or(RouteFault::HopBudgetExhausted)
 }
 
-/// Link retry backoff after `failures` consecutive failures: 100 ms
-/// doubling per failure up to 20 s, plus `jitter` reduced to at most a
-/// quarter of the base. Callers supply `jitter` deterministically per link.
+/// Link retry backoff after `failures` consecutive failures: 100 ms doubling per failure up to 20
+/// s, plus `jitter` reduced to at most a quarter of the base.
 pub fn link_backoff(failures: u32, jitter: u64) -> std::time::Duration {
     let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
     std::time::Duration::from_millis(base + jitter % (base / 4 + 1))
@@ -220,9 +205,7 @@ pub enum RelayFailure {
     Propagate,
 }
 
-/// Relay failure table. A relay never signs `Unavailable` for a ping's
-/// transport failure: the pinger would hold a possibly alive destination
-/// silent (an old destination closes on the unknown ping mode).
+/// Relay failure table.
 pub fn relay_failure(fault: Fault, ping: bool) -> RelayFailure {
     match fault {
         Fault::Io | Fault::Os if ping => RelayFailure::Propagate,
@@ -277,16 +260,14 @@ pub fn operation_link_outcome(result: Result<(), Fault>) -> Option<LinkOutcome> 
     }
 }
 
-/// Result of one outbound exchange, as the requester sees it after verifying
-/// the reverse chain.
+/// Result of one outbound exchange, as the requester sees it after verifying the reverse chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exchange {
     /// A materialized response. `overloaded` is true for a signed overload.
     Complete { overloaded: bool },
     /// An opaque HTTP relay response, still streaming.
     Streaming,
-    /// The exchange failed. `socket_failure` is true when the immediate socket
-    /// failed.
+    /// The exchange failed. `socket_failure` is true when the immediate socket failed.
     Failed { fault: Fault, socket_failure: bool },
 }
 
@@ -616,8 +597,7 @@ mod tests {
                 _ => RelayFailure::Propagate,
             };
             assert_eq!(relay, expected, "{fault:?}");
-            // Other modes keep the table; a ping drops only transport
-            // failures to unsigned.
+            // Other modes keep the table; a ping drops only transport failures to unsigned.
             let ping = if matches!(fault, Io | Os) {
                 RelayFailure::Propagate
             } else {
@@ -625,9 +605,8 @@ mod tests {
             };
             assert_eq!(relay_failure(fault, true), ping, "{fault:?}");
         }
-        // A pre-ping destination closes on the unknown mode (`Io` at the
-        // relay): unsigned, not an `Unavailable` that silences it. A relay
-        // that holds the destination silent still signs `Unavailable`.
+        // A pre-ping destination closes on the unknown mode (`Io` at the relay): unsigned, not an
+        // `Unavailable` that silences it.
         assert_eq!(relay_failure(Io, true), RelayFailure::Propagate);
         assert_eq!(
             relay_failure(Unavailable, true),

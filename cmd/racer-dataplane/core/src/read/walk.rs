@@ -58,9 +58,8 @@ pub(crate) struct WalkConfig {
     /// Predecessors (bit `c` for rank `c`) asked under version - 1, where they held the same rank,
     /// so one that has not adopted the current version still serves.
     pub previous: u8,
-    /// A non-owner page walk may ask an overflow helper (`canonical =
-    /// owners`) once, right after an owner itself sheds the probe. A relay's
-    /// `Overloaded` or a timeout says the route is congested, not the page.
+    /// A non-owner page walk may ask an overflow helper (`canonical = owners`) once, right after an
+    /// owner itself sheds the probe.
     pub helper: bool,
     /// Lineage targets per owner rank, funded from slack only: without slack the walk funds exactly
     /// as before.
@@ -108,8 +107,7 @@ pub fn owner_funding_min(canonical: usize) -> u32 {
     canonical as u32 + 2
 }
 
-/// [`owner_funding_min`] plus, above rank 0, the credit for the owner's
-/// delegation to rank 0.
+/// [`owner_funding_min`] plus, above rank 0, the credit for the owner's delegation to rank 0.
 pub fn owner_funding(canonical: usize) -> u32 {
     owner_funding_min(canonical) + u32::from(canonical > 0)
 }
@@ -118,8 +116,7 @@ pub fn owner_funding(canonical: usize) -> u32 {
 pub(crate) const FUNDED_MIN_LINKS: u8 = 2;
 
 /// Links a non-owner funds an out-of-order Acquire with: a full route when available, else what a
-/// shared route would charge, if that leaves the owner a link. Requiring a full route left
-/// forwarded owners with one credit.
+/// shared route would charge, if that leaves the owner a link.
 pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
     if budget.remaining_links() >= MAX_ROUTE_LINKS {
         Some(MAX_ROUTE_LINKS)
@@ -130,9 +127,7 @@ pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
 }
 
 /// Whether a shared route would give the owner at `canonical` fewer remote credits than it needs to
-/// probe its predecessors and still fetch. The walk then funds the owner instead, unless an earlier
-/// owner was busy: it is likely fetching, and funding the next one would only overlap its origin
-/// request. The cost is bounded: a funded owner sends at most one origin request.
+/// probe its predecessors and still fetch.
 pub fn shared_share_short(
     budget: &AcquisitionBudget,
     canonical: usize,
@@ -224,9 +219,8 @@ fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usize) 
         .fold(0, |bits, c| bits | (1 << c))
 }
 
-/// Previous owners a page owner asks before origin, in previous rank order,
-/// without this node and its current predecessors. Empty when the owner set
-/// did not change, so a steady cold miss pays no extra probe.
+/// Previous owners a page owner asks before origin, in previous rank order, without this node and
+/// its current predecessors.
 fn handoff_targets<N: PartialEq + Copy + Default>(
     previous: &[N],
     current: &[N],
@@ -245,8 +239,7 @@ fn handoff_targets<N: PartialEq + Copy + Default>(
 }
 
 /// Later owners that arrived before the owner at `rank`. Under rendezvous hashing they could only
-/// have outranked it, and fetched the page, before it arrived. Equal or unknown arrivals never
-/// qualify.
+/// have outranked it, and fetched the page, before it arrived.
 fn lineage_targets<N: Copy + Default>(
     owners: &[N],
     since: &[Option<u32>],
@@ -265,9 +258,7 @@ fn lineage_targets<N: Copy + Default>(
 }
 
 /// Demoted members (ranked just below the owners) that arrived before the owner at `rank` and were
-/// owners then: fewer than [`MAX_HANDOFF`] members above them had arrived. Unknown arrivals count
-/// as present, so they never add a target. Members whose arrival is `oldest` (the start of this
-/// node's membership chain) always qualify, since no rule can tell.
+/// owners then: fewer than [`MAX_HANDOFF`] members above them had arrived.
 fn demoted_targets<N: Copy + Default>(
     since: &[Option<u32>],
     demoted: &[N],
@@ -317,10 +308,8 @@ fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
     counts
 }
 
-/// Lineage targets first, then version - 1 targets while fewer than
-/// [`MAX_HANDOFF`] are listed (those spend the walk's budget). A lineage
-/// target outranked this owner before it arrived, so it is the likelier
-/// holder.
+/// Lineage targets first, then version - 1 targets while fewer than [`MAX_HANDOFF`] are listed
+/// (those spend the walk's budget).
 fn merge_handoff<N: PartialEq + Copy + Default>(
     previous: &[N],
     lineage: &[N],
@@ -372,9 +361,7 @@ pub enum Outcome {
     /// The destination itself (not a relay) answered `Overloaded`. Like
     /// `Probe(Overloaded)` without a route failure; asks a reader's helper.
     Shed,
-    /// Unanswered within the attempt's time bound. Like `Transport(Unreachable)`, except that an
-    /// owner's probe of rank 0 withholds origin authority: rank 0 is most likely still fetching,
-    /// unless it is `Overdue`.
+    /// Unanswered within the attempt's time bound.
     TimedOut,
     /// Rank 0 itself answered an owner's probe `Unavailable`. Like `Probe(Unreachable)`, except
     /// that it withholds authority when this owner's own origin request failed recently.
@@ -395,8 +382,7 @@ pub enum End {
     },
     /// All visited owners authoritatively lacked the version.
     VersionUnavailable,
-    /// Exhausted without authority; `funding` is true when a probe could not
-    /// be funded.
+    /// Exhausted without authority; `funding` is true when a probe could not be funded.
     Exhausted { funding: bool },
 }
 
@@ -404,8 +390,7 @@ pub enum End {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Step {
     Probe(Probe),
-    /// Granted probes to send at once, reported with
-    /// [`CandidateWalk::complete_granted`].
+    /// Granted probes to send at once, reported with [`CandidateWalk::complete_granted`].
     Granted(Vec<Probe>),
     /// No probes remain. The caller still checks its scope before acting.
     End(End),
@@ -661,9 +646,8 @@ impl CandidateWalk {
                 && self.config.page_operation
                 && canonical < 8
                 && self.config.previous & (1 << canonical) != 0;
-            // An owner above rank 0 asks rank 0 to acquire, so concurrent
-            // misses coalesce in rank 0's flight; it costs the exchange plus
-            // rank 0's origin credit ([`owner_funding`]).
+            // An owner above rank 0 asks rank 0 to acquire, so concurrent misses coalesce in rank
+            // 0's flight; it costs the exchange plus rank 0's origin credit ([`owner_funding`]).
             let delegated = rank.is_some_and(|rank| rank > 0)
                 && canonical == 0
                 && self.config.page_operation
@@ -678,9 +662,8 @@ impl CandidateWalk {
                 self.index += 1;
                 continue;
             }
-            // With only the sender attempt left, a page Acquire would carry
-            // zero remote credits and reject before checking disk/pending copies.
-            // Spend the same last route on local copies, never new acquisition.
+            // With only the sender attempt left, a page Acquire would carry zero remote credits and
+            // reject before checking disk/pending copies.
             let copy_only = (rank.is_some() && !delegated)
                 || (!continuation.bounded_routes
                     && budget.remaining_attempts() == 1
@@ -875,8 +858,7 @@ impl CandidateWalk {
         Ok(())
     }
 
-    /// Whether asking the pending destination again still leaves every later
-    /// visit funded.
+    /// Whether asking the pending destination again still leaves every later visit funded.
     pub fn retry_affordable(&self, budget: &AcquisitionBudget) -> bool {
         // The pending probe's child holds its credits and its route share.
         let (attempts, links, route) = match &self.pending {
@@ -982,9 +964,8 @@ impl CandidateWalk {
                 Ok(None)
             }
             Outcome::StaleDestination | Outcome::StaleMembership if pending.previous => {
-                // The destination no longer resolves the previous
-                // membership: transient evidence, like a destination that
-                // is behind.
+                // The destination no longer resolves the previous membership: transient evidence,
+                // like a destination that is behind.
                 self.saw_transient = true;
                 self.evidence.push(ProbeOutcome::Unreachable);
                 Ok(None)
@@ -1146,8 +1127,7 @@ enum StaleAction {
     Skip,
 }
 
-/// Each epoch refreshes at most once, and only to a strictly newer
-/// membership.
+/// Each epoch refreshes at most once, and only to a strictly newer membership.
 fn stale_action(retried: bool, previous: u64, latest: Option<u64>) -> Result<StaleAction> {
     let latest = latest.ok_or(Error::Unavailable)?;
     Ok(if !retried && latest > previous {
@@ -1295,8 +1275,7 @@ pub fn hedge_fallback(error: Error) -> bool {
 mod tests;
 
 // Stale destinations. A non-owner whose destination is behind walks the page's owners under N - 1
-// instead, once ([`previous_fallback`]), unless it owns the page there. A reader that cannot fall
-// back waits for the destination to adopt N ([`stale_wait`]).
+// instead, once ([`previous_fallback`]), unless it owns the page there.
 
 /// Most time one wait for a destination that is behind may take.
 pub const MAX_STALE_WAIT: Duration = Duration::from_secs(4);
@@ -1308,11 +1287,9 @@ pub const MAX_STALE_WAITS: u8 = 2;
 /// Shortest wait worth making.
 pub const MIN_STALE_WAIT: Duration = Duration::from_millis(250);
 
-/// How long a non-owner that cannot fall back waits before asking a
-/// destination that is behind again: a third of the `remaining` time, within
-/// [`MIN_STALE_WAIT`] and [`MAX_STALE_WAIT`], at most [`MAX_STALE_WAITS`]
-/// times. A wait after the first must be `affordable` (later visits stay
-/// funded). The verified `StaleMembership` refunds the probe's credits.
+/// How long a non-owner that cannot fall back waits before asking a destination that is behind
+/// again: a third of the `remaining` time, within [`MIN_STALE_WAIT`] and [`MAX_STALE_WAIT`], at
+/// most [`MAX_STALE_WAITS`] times.
 fn stale_wait(waits: u8, affordable: bool, remaining: Duration) -> Option<Duration> {
     if waits >= MAX_STALE_WAITS || (waits > 0 && !affordable) {
         return None;
@@ -1321,16 +1298,14 @@ fn stale_wait(waits: u8, affordable: bool, remaining: Duration) -> Option<Durati
     (wait >= MIN_STALE_WAIT).then_some(wait)
 }
 
-/// Whether a reader walks the page's owners under N - 1 instead of skipping
-/// a destination that is behind: once, and only when N - 1 is recent and
-/// lists this node.
+/// Whether a reader walks the page's owners under N - 1 instead of skipping a destination that is
+/// behind: once, and only when N - 1 is recent and lists this node.
 fn previous_fallback(owner: bool, retried: bool, previous_recent_member: bool) -> bool {
     !owner && !retried && previous_recent_member
 }
 
-// [`Fill`]: one read's acquisition as a sans-IO state machine. Production
-// drives it from `src/read/candidates.rs`, the simulator from
-// `sim/src/node/world.rs`. Node identities are caller-chosen `u32`s.
+// [`Fill`]: one read's acquisition as a sans-IO state machine. Production drives it from
+// `src/read/candidates.rs`, the simulator from `sim/src/node/world.rs`.
 
 /// Previous owners that are not current members ([`Ranking::Previous`]).
 pub const NOT_MEMBER: u32 = u32::MAX;
@@ -1355,8 +1330,7 @@ impl Features {
     pub const LINEAGE_SLACK: u32 = 1 << 1;
     /// Granted probes go out at once ([`WalkConfig::parallel_granted`]).
     pub const PARALLEL_GRANTED: u32 = 1 << 2;
-    /// A non-owner page walk may ask an overflow helper
-    /// ([`WalkConfig::helper`]).
+    /// A non-owner page walk may ask an overflow helper ([`WalkConfig::helper`]).
     pub const HELPER: u32 = 1 << 3;
     /// A non-owner walks the previous membership at a destination that is behind.
     pub const STALE_FALLBACK: u32 = 1 << 4;
@@ -1430,8 +1404,7 @@ pub enum Ranking {
     Authority,
 }
 
-/// One ranking of the page under `version`; the caller computes what needs
-/// its membership.
+/// One ranking of the page under `version`; the caller computes what needs its membership.
 #[derive(Clone, Copy, Debug)]
 pub struct Ranked {
     pub version: u64,
@@ -1447,8 +1420,7 @@ pub struct Ranked {
     /// arrivals (empty without [`demoted_targets`]).
     pub demoted: List<u32, DEMOTED>,
     pub demoted_since: [Option<u32>; DEMOTED],
-    /// The generation this node's membership chain began at
-    /// ([`demoted_targets`]).
+    /// The generation this node's membership chain began at ([`demoted_targets`]).
     pub oldest: Option<u32>,
     /// Members of `version`.
     pub members: usize,
@@ -1499,8 +1471,7 @@ pub enum Reply {
     /// Sent, but unanswered within the attempt's own time bound while the
     /// request's scope still runs.
     TimedOut,
-    /// Failed without a response; `sent` is false when it never left this
-    /// node.
+    /// Failed without a response; `sent` is false when it never left this node.
     Failed {
         error: Error,
         sent: bool,
@@ -1527,11 +1498,9 @@ pub enum Event<'a> {
     Reply(Reply),
     /// [`Action::Validate`]: `Ok(None)` for a usable copy.
     Validated(Result<Option<ProbeOutcome>, Error>),
-    /// [`Action::Probe`] asked the helper, but every candidate helper is
-    /// excluded.
+    /// [`Action::Probe`] asked the helper, but every candidate helper is excluded.
     NoHelper,
-    /// Every probe of [`Action::Batch`] answered; `copy` when one returned a
-    /// validated copy.
+    /// Every probe of [`Action::Batch`] answered; `copy` when one returned a validated copy.
     BatchDone {
         copy: bool,
     },
@@ -1545,8 +1514,7 @@ pub enum Event<'a> {
     },
     Origin(Result<(), Error>),
     Published(Result<(), Error>),
-    /// The caller failed the read (for example an origin attempt it could
-    /// not fund).
+    /// The caller failed the read (for example an origin attempt it could not fund).
     Abort(Error),
 }
 
@@ -1568,8 +1536,7 @@ pub enum Action {
     },
     /// Report the newest adopted membership; answer [`Event::Membership`].
     Refresh,
-    /// Send to [`Fill::dest`] (the helper when `None`) with
-    /// [`Fill::request_budget`].
+    /// Send to [`Fill::dest`] (the helper when `None`) with [`Fill::request_budget`].
     Probe(Probe),
     /// Validate the payload of the last answer; answer [`Event::Validated`].
     Validate,
@@ -1580,8 +1547,7 @@ pub enum Action {
         count: usize,
         remaining_opportunities: u32,
     },
-    /// Wait this long for a destination that is behind; answer
-    /// [`Event::Timer`].
+    /// Wait this long for a destination that is behind; answer [`Event::Timer`].
     Wait(Duration),
     /// This owner at `rank` fetches from origin; answer [`Event::Origin`].
     Origin {
@@ -1607,8 +1573,7 @@ pub enum SilenceNote {
     },
 }
 
-/// What a probe of rank 0 says about its acquisition
-/// ([`crate::liveness::Rank0Watch`]).
+/// What a probe of rank 0 says about its acquisition ([`crate::liveness::Rank0Watch`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rank0Note {
     Answered,
@@ -1621,8 +1586,7 @@ pub enum Rank0Note {
 pub struct Evidence {
     /// How the probe the event answered ended, when it was sent.
     pub outcome: Option<Result<Outcome, Error>>,
-    /// That probe asked the overflow helper, a granted target, or rank 0
-    /// (an owner's page probe).
+    /// That probe asked the overflow helper, a granted target, or rank 0 (an owner's page probe).
     pub helper: bool,
     pub granted: bool,
     pub rank0_probe: bool,
@@ -1956,8 +1920,7 @@ impl Fill {
             }
             Event::Origin(Ok(())) => Ok(self.publish(Source::Origin)),
             Event::Origin(Err(Error::VersionUnavailable)) => {
-                // After an origin version miss, old copies on later owners
-                // remain useful.
+                // After an origin version miss, old copies on later owners remain useful.
                 self.note(Notes::REMAINING);
                 self.walk = Walking::Remaining(RemainingWalk::new(
                     self.rank.unwrap_or(0),
@@ -2206,9 +2169,8 @@ impl Fill {
             } => {
                 let outcome = match transport_outcome(error) {
                     Some(outcome) => outcome,
-                    // A successor probe is opportunistic and runs on its own
-                    // grant: any failure of it is only a miss, unless this
-                    // request itself is over.
+                    // A successor probe is opportunistic and runs on its own grant: any failure of
+                    // it is only a miss, unless this request itself is over.
                     None if self.out.granted && scope_live => ProbeOutcome::Unreachable,
                     None => {
                         if sent {

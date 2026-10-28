@@ -1,10 +1,4 @@
 //! Racer resource classes and the pure parts of the admission policy.
-//!
-//! The dataplane's `AdmissionPolicy` (`src/admission.rs`) and the simulator's
-//! policy both delegate `limit`, `floor`, `max_keys`, `wakes`,
-//! `allows_stopped`, and `covers` to [`Rules`], so the two cannot drift.
-//! Rejection reporting (telemetry in production, counters in the simulator)
-//! stays with each caller.
 
 use std::num::NonZeroUsize;
 
@@ -122,10 +116,7 @@ fn nz(value: usize) -> NonZeroUsize {
 }
 
 impl Default for Limits {
-    /// Per-worker defaults used for every dimension the environment leaves
-    /// unset. Byte and count dimensions are divided by the I/O worker count
-    /// during sizing, so they are stated per worker and multiplied back out by
-    /// the dataplane's `Config::scale_limits`.
+    /// Per-worker defaults used for every dimension the environment leaves unset.
     fn default() -> Self {
         Self {
             plaintext_bytes: nz(64 * MIB),
@@ -167,8 +158,6 @@ const ALLOCATION_UNIT: usize = 64 * 1024;
 
 impl Floors {
     /// Floors for `page_bytes` pages and `max_header_bytes` record headers.
-    /// Disk ciphertext retains one padded, size-class-rounded slab
-    /// allocation; dirty and registered bytes hold one sealed page.
     pub fn for_page(page_bytes: usize, max_header_bytes: usize) -> Self {
         let record = page_bytes + 16 + max_header_bytes + 4096;
         Self {
@@ -232,14 +221,8 @@ impl Rules {
         }
     }
 
-    /// Per-cache working allowance of a weighted class (`Policy::progress`).
-    /// Plaintext is request working memory; ciphertext is both working and
-    /// retained memory. Each cache keeps an allowance sized for one range
-    /// window, the same amount configuration validation requires of each whole
-    /// budget. All concurrent requests on the cache share it, and the
-    /// equal-share cap can make it smaller, so a low-priority cache can still
-    /// see `Overloaded`. It limits how far low priority shrinks the share; it
-    /// does not guarantee progress.
+    /// Per-cache working allowance of a weighted class (`Policy::progress`). Plaintext is request
+    /// working memory; ciphertext is both working and retained memory.
     pub fn progress(&self, class: ResourceClass) -> usize {
         let window = self.limits.range_window_pages.get();
         match class {
@@ -253,9 +236,8 @@ impl Rules {
         }
     }
 
-    /// Priority weights page-memory budgets (`Policy::weighted`). Other
-    /// request-serving classes keep an equal split so a priority-0 cache can
-    /// still serve requests.
+    /// Priority weights page-memory budgets (`Policy::weighted`). Other request-serving classes
+    /// keep an equal split so a priority-0 cache can still serve requests.
     pub fn weighted(class: ResourceClass) -> bool {
         matches!(
             class,

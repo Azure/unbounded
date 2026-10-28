@@ -1,8 +1,5 @@
-//! Sans-IO read-path decisions: acquisition budgets, candidate ordering and
-//! response classification, fill/serve policy, and the candidate walk.
-//!
-//! The dataplane re-exports these from their historical paths under
-//! `racer_dataplane::read`, so there is one implementation of each rule.
+//! Sans-IO read-path decisions: acquisition budgets, candidate ordering and response
+//! classification, fill/serve policy, and the candidate walk.
 
 pub use budget::AcquisitionBudget;
 use racer_control_wire::NodeId;
@@ -20,10 +17,6 @@ pub mod hints;
 pub mod walk;
 
 // Read-path decision errors.
-//
-// A subset of the dataplane's boundary errors. The dataplane converts in both
-// directions (`From<racer_core::read::Error>` and a fallible reverse), so core
-// decisions never widen what the dataplane can observe.
 
 /// Errors produced or interpreted by sans-IO read decisions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,9 +128,6 @@ mod worker_tests {
 }
 
 // Peer responses generic over their page payload.
-//
-// The dataplane instantiates [`PeerResponse`] with real ciphertext pages and
-// transfer grants.
 
 /// Unsigned local result. Transport must sign it against the admitted request.
 pub enum PeerResponse<P, G> {
@@ -214,11 +204,6 @@ mod response_tests {
 }
 
 // Metadata refresh cohort bounds, purposes, and settlement.
-//
-// Concurrent metadata resolutions for one object and purpose share one
-// refresh through `flow_control::coalesce::Table` in production
-// `MetadataService`. Elections are bounded by [`MAX_REFRESH_ATTEMPTS`].
-// [`refresh_settlement`] is the shared rule for a leader's outcome.
 
 /// Waiters per refresh cohort.
 pub const MAX_WAITERS: usize = 64;
@@ -267,14 +252,12 @@ impl RefreshPurpose {
 pub enum Settlement {
     /// Broadcast the result to every waiter.
     Finish,
-    /// Release leadership so another waiter may try with its own credentials
-    /// or budget.
+    /// Release leadership so another waiter may try with its own credentials or budget.
     Retry,
 }
 
-/// Settle a failed refresh. Credential-specific origin rejections and
-/// failures of the leader's own budget let another waiter retry; other
-/// failures finish the cohort.
+/// Settle a failed refresh. Credential-specific origin rejections and failures of the leader's own
+/// budget let another waiter retry; other failures finish the cohort.
 pub fn refresh_settlement(error: Error, remaining_attempts: u32) -> Settlement {
     let rejected = matches!(error, Error::OriginRejected | Error::OriginForbidden);
     let caller_budget = matches!(
@@ -332,10 +315,6 @@ mod metadata_tests {
 }
 
 // Sans-IO policy for serving an authenticated peer read request.
-//
-// Production `Coordinator::serve_peer` (src/read.rs) calls [`serve_action`]
-// to dispatch, [`crate::read::budget::inherited_budget`] for acquisition credits,
-// and [`crate::read::peer_error`] to translate failures.
 
 /// Facts available after request authentication.
 #[derive(Clone, Copy, Debug)]
@@ -384,17 +363,9 @@ pub fn serve_deadline(scope: Instant, route: Instant) -> Instant {
     scope.min(route)
 }
 
-/// Whether a copy-only page request from `requester` may wait on this
-/// node's (`local`) running acquisition of the page, given the page's
-/// `owners` (canonical order) under the request's membership.
-///
-/// Waiting is right when the requester is a reader, or an owner ranked after this node asking a
-/// predecessor that is fetching for everyone. It is wrong when the requester is an owner ranked
-/// before this node, or this node is not an owner: owners delegate a cold fetch to rank 0 through
-/// their predecessors and readers walk the owners, so this node's acquisition most likely waits on
-/// the requester itself, which waits on this answer until its time share runs out. Owners ask such
-/// nodes only as handoff, lineage or successor targets, which look for a copy fetched earlier, so a
-/// local copy or a miss is the whole answer.
+/// Whether a copy-only page request from `requester` may wait on this node's (`local`) running
+/// acquisition of the page, given the page's `owners` (canonical order) under the request's
+/// membership.
 pub fn copy_join_allowed<N: PartialEq>(owners: &[N], local: &N, requester: &N) -> bool {
     let Some(theirs) = owners.iter().position(|n| n == requester) else {
         return true;
@@ -492,9 +463,7 @@ mod serve_tests {
 
 // Small read-path policy rules shared by fill, serve, and race drivers.
 
-/// Whether a contender's failure leaves the other contender of a race free to
-/// win. Malformed framing is local to that contender, not authority to cancel
-/// another independently authenticated usable page.
+/// Whether a contender's failure leaves the other contender of a race free to win.
 pub fn recoverable(error: Error) -> bool {
     matches!(
         error,
@@ -526,10 +495,8 @@ pub fn peer_error(error: Error) -> Option<ResponseKind> {
     })
 }
 
-/// Optional writes may use half of the aggregate class budget, with a floor
-/// sufficient for one valid page when the configured budget can hold it. Owned
-/// usage counts against this conservative ceiling; quota admission remains the
-/// authority for per-cache fairness and all completion-owned allocations.
+/// Optional writes may use half of the aggregate class budget, with a floor sufficient for one
+/// valid page when the configured budget can hold it.
 pub fn optional_headroom(limit: usize, used: usize, amount: usize, one_page: usize) -> bool {
     let ceiling = optional_ceiling(limit, one_page);
     amount <= ceiling && used <= ceiling - amount
@@ -546,8 +513,7 @@ pub fn retention_eligible(owned: bool, enabled: bool, seen: bool) -> bool {
     owned || (enabled && seen)
 }
 
-/// Resident retention score: exact heat plus one for owned pages, zero when
-/// retention is disabled.
+/// Resident retention score: exact heat plus one for owned pages, zero when retention is disabled.
 pub fn retention_score(heat: u8, owned: bool, enabled: bool) -> u8 {
     if enabled { heat + u8::from(owned) } else { 0 }
 }
@@ -719,19 +685,14 @@ mod policy_tests {
     }
 }
 
-// Sans-IO range stream scheduling: which window slots to fill directly,
-// whether to start another provider selection, how many holes it demands,
-// and the per-page acquisition budget.
-//
-// Production `RangeStream` (src/read/range_stream.rs) calls these with its
-// window state; the simulator calls them with its own slot model.
+// Sans-IO range stream scheduling: which window slots to fill directly, whether to start another
+// provider selection, how many holes it demands, and the per-page acquisition budget.
 
 /// Direct fills a read keeps in flight beyond its head page.
 pub const DIRECT_AHEAD: usize = 1;
 
-/// Provider selections a read keeps in flight. Beyond the first, a read only
-/// starts another while some contract of its version has an unused granted
-/// flight. Each selection demands a disjoint share of the selectable holes.
+/// Provider selections a read keeps in flight. Beyond the first, a read only starts another while
+/// some contract of its version has an unused granted flight.
 pub const SELECTIONS: usize = 4;
 
 /// Attempts and links each independently admitted page receives.
@@ -753,11 +714,9 @@ pub enum SlotKind {
     Failed,
 }
 
-/// Slots to start direct fills for, in order: the head when it is a hole or
-/// only selected, then up to `direct_ahead` (normally [`DIRECT_AHEAD`]) more
-/// missing holes that no other window is busy with. Nothing at or after the
-/// first failed slot is planned. The driver stops at the first fill the budget
-/// refuses.
+/// Slots to start direct fills for, in order: the head when it is a hole or only selected, then up
+/// to `direct_ahead` (normally [`DIRECT_AHEAD`]) more missing holes that no other window is busy
+/// with.
 pub fn direct_fills(
     slots: &[SlotKind],
     direct_ahead: usize,
@@ -808,9 +767,8 @@ pub fn share(holes: usize, selections: usize, spare: usize) -> usize {
     holes.div_ceil(startable.max(1)).max(1)
 }
 
-/// Up to `limit` selectable holes starting at page `next`, excluding pages
-/// another window is busy with, as at most `max_intervals - 1` contiguous
-/// page intervals plus the page set.
+/// Up to `limit` selectable holes starting at page `next`, excluding pages another window is busy
+/// with, as at most `max_intervals - 1` contiguous page intervals plus the page set.
 pub fn selection_demand(
     slots: &[SlotKind],
     next: u64,
@@ -973,9 +931,8 @@ mod range_tests {
     }
 }
 
-// Leader rules around a page fill (the fill itself is
-// [`crate::read::walk::Fill`]): production calls [`leader_source`],
-// [`acquisition_failure`], and [`ciphertext_publish_tolerated`].
+// Leader rules around a page fill (the fill itself is [`crate::read::walk::Fill`]): production
+// calls [`leader_source`], [`acquisition_failure`], and [`ciphertext_publish_tolerated`].
 
 /// Which local source an elected leader tries before network acquisition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -988,9 +945,7 @@ pub enum LeaderSource {
     Cached,
 }
 
-/// Order of local sources for an elected leader. `retained` is the flight's
-/// partial ciphertext; `local_job` is an existing shared plaintext job; and
-/// `unverified` is cached ciphertext in memory.
+/// Order of local sources for an elected leader.
 pub fn leader_source(
     retained: bool,
     plaintext: bool,
@@ -1099,19 +1054,13 @@ pub enum ProbeOutcome {
     /// An authenticated response carried a copy that could not be used locally.
     UnusableCopy,
 }
-/// How a non-owner requester orders its remote attempts across a page's
-/// ranked owners. Placement, rank, and origin authority are unchanged: this only
-/// chooses which owner receives the first Acquire.
+/// How a non-owner requester orders its remote attempts across a page's ranked owners.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReplicaSelection {
     /// Visit owners in canonical rank order, so every remote read of a page
     /// lands on the primary owner first.
     Primary,
-    /// Visit owners that are direct overlay neighbors before owners that need
-    /// a relay hop. Among equally preferred owners, a rendezvous hash of the
-    /// requester and page picks a stable order, so one requester keeps using
-    /// the same replica for a page while different requesters spread the
-    /// load across all replicas.
+    /// Visit owners that are direct overlay neighbors before owners that need a relay hop.
     #[default]
     Spread,
 }
@@ -1148,9 +1097,7 @@ impl VisitOrder {
     }
 }
 
-/// Order `len` canonical ranks for a non-owner requester. `Primary` returns the
-/// canonical order. `Spread` visits ranks for which `neighbor` holds first, then
-/// orders each group by descending `score` (ties keep canonical order).
+/// Order `len` canonical ranks for a non-owner requester. `Primary` returns the canonical order.
 pub fn visit_order(
     selection: ReplicaSelection,
     len: usize,
@@ -1170,18 +1117,7 @@ pub fn visit_order(
 }
 
 /// When the owner a non-owner would visit first arrived after a later owner (`since`, see
-/// [`crate::read::walk::lineage_targets`]), visit that later owner first. Placement is rendezvous
-/// hashing, so the later owner was above the first one before it arrived and may hold a copy
-/// fetched then; asking the newer owner first made it fetch the page from origin again, and its own
-/// copy-only probes of the older owner carry only the credits and links the reader forwarded (too
-/// few to route to a non-neighbor). The rest of the order is unchanged. Members with equal or
-/// unknown arrival never move, so a cluster whose members arrived together visits exactly as
-/// before.
-///
-/// A non-neighbor never moves ahead of a direct `neighbor` visited first: its
-/// funded route spends most of the reader's links, so when it misses (for
-/// example it defers the reader to a successor) the reader can
-/// no longer route to a non-neighbor owner after it.
+/// [`crate::read::walk::lineage_targets`]), visit that later owner first.
 pub fn lineage_first(
     mut order: VisitOrder,
     since: &[Option<u32>],
@@ -1210,8 +1146,7 @@ pub fn lineage_first(
     order
 }
 
-/// What this node last learned about an owner's answers (see
-/// [`crate::liveness::Silence`]).
+/// What this node last learned about an owner's answers (see [`crate::liveness::Silence`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum Answering {
     /// Nothing against it.
@@ -1225,13 +1160,7 @@ pub enum Answering {
 }
 
 /// Visit owners that recently left one of this node's requests unanswered after the others, and
-/// silent owners last, keeping the order within each group. A reader's out-of-order `Acquire`
-/// carries most of its attempt's credits, so an owner that hangs costs the whole attempt; without
-/// this, every retry of the read visited the same hung owner first (`Spread` is deterministic per
-/// requester and page) and the read failed with healthy owners left. A reader pings the page's rank
-/// 0 when its probe of rank 0 goes unanswered, so a busy rank 0 (whose acquisition the probe
-/// joined) answers the ping and keeps its place, while a hung one becomes silent and goes last: the
-/// owners above it, which also find it silent, fetch the page.
+/// silent owners last, keeping the order within each group.
 pub fn demote_unanswered(order: VisitOrder, answering: impl Fn(usize) -> Answering) -> VisitOrder {
     let len = usize::from(order.len);
     let mut ranks = [0u8; 3];
@@ -1324,13 +1253,6 @@ impl ResponseKind {
 }
 
 /// Classify one authenticated candidate response.
-///
-/// `acquire` describes the actual probe, which may be CopyOnly even when the
-/// caller's operation requests acquisition (predecessors and remaining copies).
-/// Payload responses that answer the operation's kind call `validate`, which
-/// checks payload identity and content and returns `Ok(())` for a usable copy;
-/// mismatched kinds are `CorruptRecord` without calling it. `Ok(None)` means a
-/// usable payload; `Ok(Some(outcome))` is a recoverable probe outcome.
 pub fn classify<E: From<Error>>(
     response: ResponseKind,
     operation: OperationKind,
@@ -1366,9 +1288,7 @@ pub fn classify<E: From<Error>>(
     Ok(Some(outcome))
 }
 
-/// Map a payload validation failure to a recoverable probe outcome. Only page
-/// content validation is recoverable; transport and security errors never reach
-/// here, and `Unauthorized` remains terminal.
+/// Map a payload validation failure to a recoverable probe outcome.
 pub fn unusable_copy(error: Error, operation: OperationKind) -> Option<ProbeOutcome> {
     (matches!(error, Error::CorruptRecord | Error::MissingKey)
         && matches!(operation, OperationKind::Page | OperationKind::Bootstrap))
@@ -1401,9 +1321,7 @@ pub struct AuthorityFacts<'a> {
     pub member: bool,
 }
 
-/// Validate an origin authority for `object`/`page`. Private construction
-/// follows a recomputed ranking under an immutable membership, so validation
-/// need not rehash the entire cluster on each write.
+/// Validate an origin authority for `object`/`page`.
 pub fn validate_origin_authority(
     facts: AuthorityFacts<'_>,
     object: &ObjectId,
@@ -1577,9 +1495,8 @@ mod candidates_tests {
         );
     }
 
-    /// An older later owner that is not a
-    /// neighbor never moves ahead of a neighbor visited first; one that is a
-    /// neighbor still does, and with a non-neighbor first any older one may.
+    /// An older later owner that is not a neighbor never moves ahead of a neighbor visited first;
+    /// one that is a neighbor still does, and with a non-neighbor first any older one may.
     #[test]
     fn lineage_first_keeps_a_neighbor_ahead_of_a_non_neighbor() {
         let order = |first: usize| {

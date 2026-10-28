@@ -1,8 +1,4 @@
 //! Memory cache recency indexes, generic over the cached value.
-//!
-//! The dataplane memory cache stores ciphertext pages in these indexes. The
-//! simulator stores payload-free values in the same indexes, so both make the
-//! same admission, reclamation, and idle-expiry decisions.
 
 use std::{
     collections::{BTreeMap, HashMap, hash_map::RandomState},
@@ -13,9 +9,7 @@ use std::{
 /// Most entries one reclamation pass examines, per lane or overall.
 pub const RECLAIM_WINDOW: usize = 256;
 
-/// Most lanes one global pressure pass examines. The window rotates and
-/// resumes after the last examined lane, so every lane with entries is
-/// checked within `ceil(lanes / PRESSURE_WINDOW)` full passes.
+/// Most lanes one global pressure pass examines.
 pub const PRESSURE_WINDOW: usize = 8;
 
 /// Assigns each key to a lane (for the dataplane, its cache) so one lane's
@@ -58,9 +52,8 @@ impl<K> Default for Lane<K> {
     }
 }
 
-/// Per-lane tick order. Each insert, touch, and remove costs
-/// O(log lanes + log entries); nothing here walks all lanes or entries.
-/// Empty lanes are dropped.
+/// Per-lane tick order. Each insert, touch, and remove costs O(log lanes + log entries); nothing
+/// here walks all lanes or entries. Empty lanes are dropped.
 pub struct Lanes<G, K>(pub BTreeMap<G, Lane<K>>);
 
 impl<G, K> Default for Lanes<G, K> {
@@ -95,8 +88,7 @@ impl<G: Ord + Clone, K: Clone> Lanes<G, K> {
         }
     }
 
-    /// Up to [`RECLAIM_WINDOW`] of one lane's entries, oldest first after its
-    /// cursor, wrapping.
+    /// Up to [`RECLAIM_WINDOW`] of one lane's entries, oldest first after its cursor, wrapping.
     #[must_use]
     pub fn candidates(&self, group: &G) -> Vec<(u64, K)> {
         let Some(lane) = self.0.get(group) else {
@@ -134,9 +126,6 @@ impl<G: Ord + Clone, K: Clone> Lanes<G, K> {
 }
 
 /// Verified entries keyed by `K`, each with a unique recency tick.
-///
-/// Reclamation resumes after `reclaim_after`, wrapping around, so repeated
-/// passes over busy entries make progress instead of rescanning the oldest.
 pub struct TickLru<K, V, H = RandomState, G: Grouping<K> = Ungrouped> {
     /// Entries and their current tick.
     pub pages: HashMap<K, (u64, V), H>,
@@ -208,9 +197,6 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher, G: Grouping<K>> TickLru<K, V, H, G
     }
 
     /// Add an entry at the newest tick. The key must not be present.
-    ///
-    /// # Errors
-    /// Returns [`Exhausted`] when the tick counter would overflow.
     pub fn insert(&mut self, id: K, value: V) -> Result<(), Exhausted> {
         self.clock = self.clock.checked_add(1).ok_or(Exhausted)?;
         self.lru.insert(self.clock, id.clone());
@@ -220,9 +206,6 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher, G: Grouping<K>> TickLru<K, V, H, G
     }
 
     /// Move `id` to the newest tick. Missing keys are ignored.
-    ///
-    /// # Errors
-    /// Returns [`Exhausted`] when the tick counter would overflow.
     pub fn touch(&mut self, id: &K) -> Result<(), Exhausted> {
         let Some((old, _)) = self.pages.get(id) else {
             return Ok(());
@@ -259,9 +242,8 @@ impl<K: Eq + Hash + Clone, V, H: BuildHasher, G: Grouping<K>> TickLru<K, V, H, G
         })
     }
 
-    /// One bounded reclamation pass. `visit` decides each candidate in
-    /// order. The cursor moves to every candidate decided, except one that
-    /// returns [`Visit::Stop`].
+    /// One bounded reclamation pass. `visit` decides each candidate in order. The cursor moves to
+    /// every candidate decided, except one that returns [`Visit::Stop`].
     pub fn reclaim(&mut self, mut visit: impl FnMut(&K, &V) -> Visit) {
         for (tick, id) in self.candidates() {
             let decision = visit(&id, &self.pages[&id].1);
@@ -305,9 +287,7 @@ fn expiring<K: Clone>(
     (selected, next)
 }
 
-/// Unverified entries ordered by key, with a recency tick per entry for idle
-/// expiry. Reads go through `Deref`; every mutation goes through these
-/// methods so the tick index never drifts from the entries.
+/// Unverified entries ordered by key, with a recency tick per entry for idle expiry.
 pub struct OrderedLru<K, V, H = RandomState, G: Grouping<K> = Ungrouped> {
     /// Entries by key.
     pub pages: BTreeMap<K, V>,
@@ -409,10 +389,8 @@ impl<K: Ord + Eq + Hash + Clone, V, H: BuildHasher, G: Grouping<K>> OrderedLru<K
     }
 }
 
-/// Entries nobody inserted or hit for this long are released by
-/// the dataplane memory cache, so a worker that served a burst does not keep
-/// its cached pages (and their pooled buffers) forever. Busy workers keep hot
-/// pages because every hit renews them.
+/// Entries nobody inserted or hit for this long are released by the dataplane memory cache, so a
+/// worker that served a burst does not keep its cached pages (and their pooled buffers) forever.
 pub const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
 pub const EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -445,11 +423,8 @@ impl Expiry {
             .is_none_or(|(at, _, _)| now.saturating_duration_since(*at) >= EXPIRY_CHECKPOINT)
         {
             self.checkpoints.push_back((now, verified, ciphertext));
-            // Each new checkpoint may move the cutoff: start a fresh pass that
-            // also revisits entries that were busy last time. An unfinished
-            // pass keeps its cursor so a long busy prefix cannot starve later
-            // entries; it adopts the newer cutoff, which is safe because a
-            // touched entry moves to a tick above every aged checkpoint.
+            // Each new checkpoint may move the cutoff: start a fresh pass that also revisits
+            // entries that were busy last time.
             self.verified.get_or_insert(0);
             self.ciphertext.get_or_insert(0);
         }
@@ -644,10 +619,6 @@ mod lru_tests {
 }
 
 // Disk segment value used to order CLOCK eviction candidates.
-//
-// The catalog sums live payload value, not padded disk size, over a bounded
-// prefix of a segment's mappings and charges a conservative value for the
-// unseen suffix. Scores are preferences, never eviction exemptions.
 
 /// Most mappings inspected when scoring one segment.
 pub const SCAN_BUDGET: usize = 256;
@@ -675,11 +646,7 @@ pub const fn unseen_value_for(page_bytes: u64, any_over_share: bool) -> u64 {
     })
 }
 
-/// Per-byte value of one page given its retention `score` (at most
-/// [`MAX_SCORE`]). While any cache is over share, every under-share page
-/// outvalues every over-share page, so segments dominated by over-share data
-/// recycle first; the retention score still orders pages within one class.
-/// With no cache over share this is the plain retention score.
+/// Per-byte value of one page given its retention `score` (at most [`MAX_SCORE`]).
 #[must_use]
 pub const fn class_score(score: u8, any_over_share: bool, page_over_share: bool) -> u8 {
     if !any_over_share || page_over_share {

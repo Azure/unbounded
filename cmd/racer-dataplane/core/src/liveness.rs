@@ -1,12 +1,4 @@
 //! Peer silence: a neighbor that accepts requests and never answers them.
-//!
-//! A timeout alone cannot tell a hung peer from a busy one, so a timeout only
-//! raises a question and a ping (answered `Miss` at once, never waiting on
-//! work) answers it. The sender over the last link to a destination asks, so
-//! no relay is blamed. A silent peer fails its requests at once and is routed
-//! around until it answers anything; it is pinged again every
-//! [`Silence::hold`]. Any answer, or a signed shed ([`Silence::shed`]), quiets
-//! a peer for [`Silence::quiet`].
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -51,9 +43,7 @@ struct SilenceEntry<P> {
     seq: u64,
 }
 
-/// Classify a ping: `Ok((by_peer, unavailable))` for a signed answer,
-/// `Err(timed_out)` for none. `Some(true)` alive, `Some(false)` silent (a
-/// relay's `Unavailable` or a timeout), `None` proves nothing.
+/// Classify a ping: `Ok((by_peer, unavailable))` for a signed answer, `Err(timed_out)` for none.
 pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
     match answer {
         Ok((true, _)) => Some(true),
@@ -62,8 +52,7 @@ pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
     }
 }
 
-/// Bounded, expiring map from a destination to its silence. `P` is what a
-/// ping carries.
+/// Bounded, expiring map from a destination to its silence. `P` is what a ping carries.
 pub struct Silence<N, P = ()> {
     capacity: usize,
     hang_after: Duration,
@@ -156,9 +145,8 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         needed <= 1
     }
 
-    /// `peer` signed an `Overloaded`: alive but busy, so readers visit it
-    /// last for [`Self::quiet`]. Otherwise a retried read repeats the same
-    /// deterministic walk and is shed again.
+    /// `peer` signed an `Overloaded`: alive but busy, so readers visit it last for [`Self::quiet`].
+    /// Otherwise a retried read repeats the same deterministic walk and is shed again.
     pub fn shed(&mut self, peer: N, subject: P, now: Instant) {
         let quiet = self.quiet();
         if !self.entries.contains_key(&peer) {
@@ -239,8 +227,7 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         became
     }
 
-    /// `peer` answered: clear its evidence and quiet it.
-    /// Untracked peers get no entry.
+    /// `peer` answered: clear its evidence and quiet it. Untracked peers get no entry.
     pub fn answered(&mut self, peer: &N, now: Instant) {
         let quiet = self.quiet();
         if let Some(entry) = self.entries.get_mut(peer) {
@@ -432,10 +419,7 @@ mod silence_tests {
 
     #[test]
     fn a_peer_that_shed_this_node_is_busy_for_the_quiet_time() {
-        // An owner that signed `Overloaded` for this node is
-        // alive and busy. Readers visit it after the other owners until the
-        // quiet time passes or it answers something else; it is never
-        // pinged or silent for it.
+        // An owner that signed `Overloaded` for this node is alive and busy.
         let t = Instant::now();
         let mut s = silence();
         assert!(!s.unanswered(&1, t));
@@ -455,8 +439,7 @@ mod silence_tests {
         s.start_ping(&2, t + 21 * S);
         s.ping_result(&1, Some(true), t + 22 * S);
         assert!(s.unanswered(&1, t + 22 * S));
-        // A shed clears a silent verdict (the peer answered) and voids an
-        // outstanding ping.
+        // A shed clears a silent verdict (the peer answered) and voids an outstanding ping.
         assert!(s.ping_result(&2, Some(false), t + 23 * S));
         assert!(s.silent(&2, t + 23 * S));
         s.shed(2, (), t + 24 * S);
@@ -522,8 +505,7 @@ mod silence_tests {
             assert!(!s.timed_out(2, (), t + i * S, t + i * S + S / 4, 1));
         }
         assert!(s.is_empty());
-        // A ping whose outcome never came back is replaced after twice its
-        // time bound.
+        // A ping whose outcome never came back is replaced after twice its time bound.
         assert!(s.timed_out(3, (), t, t + S, 1));
         s.start_ping(&3, t + S);
         assert!(!s.timed_out(3, (), t, t + 4 * S, 1));
@@ -548,17 +530,7 @@ mod silence_tests {
     }
 }
 
-// Rank 0 watch: what an owner above rank 0 last
-// learned about rank 0's acquisition of a page.
-//
-// A probe timeout marks the page `Fetching` for `hang_after` (or until the
-// request deadline, if later); the owner leaves the fetch to rank 0. Past
-// that it is `Overdue` and a further timeout gives origin authority and marks
-// rank 0 silent for all its pages. A failure of the owner's own origin fetch
-// marks the page `Failed` for `hang_after`, so a later `Unavailable` from
-// rank 0 does not cost a second origin request. Any answer signed by rank 0
-// forgets the page. Only timeouts withhold origin: in the sim, withholding it
-// after relay `Overloaded` too failed 29 to 55 more reads.
+// Rank 0 watch: what an owner above rank 0 last learned about rank 0's acquisition of a page.
 
 /// Default bound on watched pages per node.
 pub const WATCH_CAPACITY: usize = 4096;
@@ -651,8 +623,7 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         }
     }
 
-    /// A probe for `key` timed out. Repeated timeouts cannot postpone
-    /// [`Rank0State::Overdue`].
+    /// A probe for `key` timed out. Repeated timeouts cannot postpone [`Rank0State::Overdue`].
     pub fn timed_out(&mut self, key: K, rank0: N, now: Instant, deadline: Instant) {
         let live = self.entries.get(&key).is_some_and(|e| {
             e.node == rank0 && !e.failed && now.saturating_duration_since(e.last) <= self.ttl

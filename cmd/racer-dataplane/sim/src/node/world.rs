@@ -1,26 +1,4 @@
 //! Event-driven read path over real node logic.
-//!
-//! One client page read at node `n`:
-//!
-//! 1. Dispatch to the worker `WorkerMap::select` picks; CPU `request_ns`.
-//! 2. Memory index (`TickLru`), then disk index (`PhantomEntries`).
-//! 3. Miss: join the worker's `PageFlights`. A waiter sleeps on a token; the
-//!    leader drives the production acquisition machine
-//!    (`racer_core::read::walk::Fill`): each placement ranking it asks for is
-//!    a phantom `Placement::rank_async`, polled to completion, one CPU ranking
-//!    chunk per poll. Each walk `Probe` becomes a peer
-//!    request sized by `plan_attempt`, routed hop by hop: every holder runs
-//!    `decide_hop`, relays search their own route (`Paths<SharedRoutes>`) with
-//!    the budget `search_budget`/`relay` allow, take a `Relay` quota, sign, and
-//!    forward. Link failures feed the node's link circuits.
-//! 4. The destination applies `serve_action`: copy-only probes check local
-//!    tiers; acquire probes get `inherited_budget` and run the same flight and
-//!    fill logic. Replies travel the reverse route; pages are cut-through
-//!    transfers on the [`Fabric`].
-//! 5. Only a walk that ends with origin authority, validated, reaches the
-//!    origin. 412 continues with the remaining-copy walk; publication inserts the
-//!    page into memory and applies the `persist` rule to write it to disk,
-//!    reclaiming with the scored segment CLOCK.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -1697,8 +1675,7 @@ impl NodeWorld {
         let cap = (self.config.memory_pages / u32::from(self.fabric.workers)).max(1) as usize;
         let memory = &mut self.nodes[node as usize].workers[w as usize].memory;
         // Production `MemoryCache::publish` keeps a resident page's position: a duplicate publish
-        // is not a use (`src/memory.rs`, "must not ... turn its historical deadline into renewed
-        // freshness").
+        // is not a use (`src/memory.rs`, "must not ...
         if memory.pages.contains_key(&page) {
             return;
         }
@@ -2027,9 +2004,8 @@ impl NodeWorld {
         self.spawn(node, w, future, members, false, then);
     }
 
-    /// Feed `event` to fill `id`'s acquisition and perform the actions it
-    /// asks for until one waits on a scheduled event (production
-    /// `CandidatePolicy::drive`).
+    /// Feed `event` to fill `id`'s acquisition and perform the actions it asks for until one waits
+    /// on a scheduled event (production `CandidatePolicy::drive`).
     fn drive(&mut self, id: u64, mut event: FillEvent<'_>) {
         loop {
             let now = self.instant(self.now());
@@ -2093,7 +2069,7 @@ impl NodeWorld {
                 Action::Wait(wait) => {
                     let fill = self.fills.get_mut(&id).expect("present");
                     if fill.core.waits > 1 {
-                        // A further wait (Known issue 36).
+                        // A further wait.
                         self.metrics.incr("stale_waits_again");
                     }
                     fill.asking = None;
@@ -2137,13 +2113,9 @@ impl NodeWorld {
         let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
             return Some(Err(Error::IncompatibleMembership));
         };
-        // Production asks predecessors under the previous membership only
-        // within `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only with
-        // grace retention on (`Published::resolve_recent`), so peers still
-        // resolve it. The simulator measures from the version's publication,
-        // which is no later than this node's adoption, so it is the stricter
-        // of the two; peers resolve older versions only with
-        // `retained_versions` of at least 1.
+        // Production asks predecessors under the previous membership only within
+        // `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only with grace retention on
+        // (`Published::resolve_recent`), so peers still resolve it.
         let recent = ranking == Ranking::Previous && {
             let (member, recent) = self.previous_facts(id);
             member && recent
@@ -2212,18 +2184,16 @@ impl NodeWorld {
         self.drive(id, FillEvent::Ranked(ranked));
     }
 
-    /// What fill `id` walks under `members`: production
-    /// `CandidatePolicy::visit_order` and the arrivals and demoted members
-    /// `CandidatePolicy::ranked` collects.
+    /// What fill `id` walks under `members`: production `CandidatePolicy::visit_order` and the
+    /// arrivals and demoted members `CandidatePolicy::ranked` collects.
     fn walk_ranking(&self, id: u64, version: u64, members: &Members, cands: &[u32]) -> Ranked {
         let fill = &self.fills[&id];
         let (node, w, page) = (fill.node, fill.worker, fill.page);
         let rank = cands.iter().position(|c| *c == node);
         let me = members.position(&node.to_be_bytes());
         let neighbor = |r: usize| matches!((me, members.position(&cands[r].to_be_bytes())), (Some(a), Some(b)) if members.is_neighbor(a, b));
-        // Arrival order of the owners in this node's chain (production
-        // `Membership::since`, Known issue 25): the shared chain clamped to
-        // the generation this node's process started from.
+        // Arrival order of the owners in this node's chain (production `Membership::since`, Known
+        // issue 25): the shared chain clamped to the generation this node's process started from.
         let since = self.since_of(node, members, cands);
         let mut ranked = Ranked::new(version, cands, rank);
         ranked.members = members.members().len();
@@ -2237,10 +2207,9 @@ impl NodeWorld {
                 replica_score(requester, &object, number, self.ids.node(cands[r]))
             });
             // A non-owner visits an older later owner before the newer owner
-            // that displaced it (Known issue 25).
+            // that displaced it.
             let order = lineage_first(order, &since, neighbor);
-            // Owners that left this node's request unanswered go last
-            // (Known issue 41).
+            // Owners that left this node's request unanswered go last.
             ranked.order = if self.config.node.silence {
                 let at = self.instant(self.now());
                 let silence = &self.nodes[node as usize].silence;
@@ -2258,7 +2227,7 @@ impl NodeWorld {
             };
         } else if self.config.node.demoted_targets {
             // Members ranked just below the owners that were owners when
-            // they arrived (production `Placement::demoted`, Known issue 34).
+            // they arrived (production `Placement::demoted`).
             let below: Vec<u32> = self.nodes[node as usize].workers[w as usize]
                 .placement
                 .demoted(members, &page.to_be_bytes())
@@ -2272,7 +2241,7 @@ impl NodeWorld {
                 *s = *c;
             }
             // Arrivals at the chain's start are unknown (production
-            // `Membership::since` 0, Known issue 46).
+            // `Membership::since` 0).
             ranked.oldest = self
                 .config
                 .node
@@ -2282,9 +2251,8 @@ impl NodeWorld {
         ranked
     }
 
-    /// Production `CandidatePolicy::drive` hints (Known issues 21 and 39): an
-    /// owner's successor hints for the page, and what it last learned about
-    /// rank 0's acquisition of it.
+    /// Production `CandidatePolicy::drive` hints: an owner's successor
+    /// hints for the page, and what it last learned about rank 0's acquisition of it.
     fn hints(&mut self, id: u64) {
         let fill = &self.fills[&id];
         let (node, page, rank, rank0) = (
@@ -2324,10 +2292,9 @@ impl NodeWorld {
         );
     }
 
-    /// Fill `id`'s membership version - 1: whether this node is a member of
-    /// it, and whether it was replaced recently enough that peers still
-    /// resolve it (`PREVIOUS_MEMBERSHIP_WITHIN`, measured from the
-    /// publication).
+    /// Fill `id`'s membership version - 1: whether this node is a member of it, and whether it was
+    /// replaced recently enough that peers still resolve it (`PREVIOUS_MEMBERSHIP_WITHIN`, measured
+    /// from the publication).
     fn previous_facts(&self, id: u64) -> (bool, bool) {
         let now = self.now();
         let fill = &self.fills[&id];
@@ -2359,8 +2326,7 @@ impl NodeWorld {
             (Some(note), Some(dest)) => {
                 let silence = &mut self.nodes[node as usize].silence;
                 if note == SilenceNote::Shed && self.config.node.shed_busy {
-                    // The destination itself shed the request: busy, not
-                    // hung (Known issue 54).
+                    // The destination itself shed the request: busy, not hung.
                     silence.shed(dest, page, at);
                 } else {
                     silence.answered(&dest, at);
@@ -2391,7 +2357,7 @@ impl NodeWorld {
             }
         }
         if notes & Notes::FALLBACK_BLOCKED != 0 {
-            // Why a non-owner could not fall back (Known issue 19).
+            // Why a non-owner could not fall back.
             let (member, recent) = self.previous_facts(id);
             self.metrics.incr(if !member {
                 "stale_fallback_not_member"
@@ -2402,7 +2368,7 @@ impl NodeWorld {
             });
         }
         if notes & Notes::RANK0_LEFT != 0 {
-            // Known issue 52: rank 0's own acquisition failed.
+            // rank 0's own acquisition failed.
             let fill = &self.fills[&id];
             let rank0 = fill.core.owners.first().copied();
             if fill
@@ -2424,9 +2390,8 @@ impl NodeWorld {
         self.nodes[node as usize].links.available(&dest, instant)
     }
 
-    /// Production `hedge_page` (`src/read/candidates.rs`): start a hedge
-    /// race when enabled, eligible, directly reachable, and admitted.
-    /// Returns whether it started.
+    /// Production `hedge_page` (`src/read/candidates.rs`): start a hedge race when enabled,
+    /// eligible, directly reachable, and admitted. Returns whether it started.
     fn try_hedge(&mut self, id: u64, eligible: bool, first: usize, second: usize) -> bool {
         let now = self.now();
         let instant = self.instant(now);
@@ -2598,8 +2563,7 @@ impl NodeWorld {
         }
     }
 
-    /// One hedge contender finished (production `record_result` in
-    /// `uring_runtime::drivers::race`).
+    /// One hedge contender finished (production `record_result` in `uring_runtime::drivers::race`).
     fn hedge_result(&mut self, id: u64, primary: bool, result: Result<(), Error>) {
         let Some(fill) = self.fills.get_mut(&id) else {
             return;
@@ -2642,9 +2606,8 @@ impl NodeWorld {
         }
         let finished = race.primary_done && race.secondary_done;
         for pid in cancel {
-            // The loser is canceled: its exchange and relay charges are
-            // released now. Production waits for the loser's completion
-            // fence; the simulator releases at cancellation.
+            // The loser is canceled: its exchange and relay charges are released now. Production
+            // waits for the loser's completion fence; the simulator releases at cancellation.
             self.metrics.incr("hedge_losers_canceled");
             self.probes.remove(&pid);
             if let Some(mid) = self
@@ -2726,10 +2689,9 @@ impl NodeWorld {
         kind
     }
 
-    /// Production `CandidatePolicy::granted_batch` (Known issue 45): send
-    /// handoff targets `first..first + count` at once, each copy-only on its
-    /// own grant, and report them together once all have answered
-    /// (`batch_maybe_done`).
+    /// Production `CandidatePolicy::granted_batch`: send handoff targets
+    /// `first..first + count` at once, each copy-only on its own grant, and report them together
+    /// once all have answered (`batch_maybe_done`).
     fn send_granted(&mut self, id: u64, first: usize, count: usize, remaining_opportunities: u32) {
         let now = self.now();
         let instant = self.instant(now);
@@ -2911,9 +2873,8 @@ impl NodeWorld {
                     && probe.mode == Mode::Acquire
                     && plan.links < MAX_LINKS
                 {
-                    // A non-owner funds an out-of-order owner with less than
-                    // a full route: it was reached by a funded route itself
-                    // (Known issue 57, `walk::funded_links`).
+                    // A non-owner funds an out-of-order owner with less than a full route: it was
+                    // reached by a funded route itself (`walk::funded_links`).
                     self.metrics.incr("forwarded_funded_routes");
                 }
                 plan
@@ -2943,7 +2904,7 @@ impl NodeWorld {
         );
         let acquire = probe.mode == Mode::Acquire;
         // Predecessors that held the same rank under the previous membership
-        // are asked under it (`Probe::previous`, Known issue 12).
+        // are asked under it (`Probe::previous`).
         if probe.previous {
             self.metrics.incr("previous_membership_probes");
         }
@@ -4347,9 +4308,6 @@ impl NodeWorld {
 
     /// Counter for the rendezvous rank of `holder` for fill `id`'s page in the fill's membership,
     /// and whether it arrived before the fetching owner (so a lineage rule could have named it):.
-    /// Classify a repeated origin request for a page against the last request `A` for it:
-    /// rank 0 moved, `A` failed, `A` still in flight (concurrent), `A` lost its copy, or `A` still
-    /// holds it (`origin_repeats_held_*`, the avoidable class unless a skip, orphan or race).
     fn classify_repeat(&mut self, id: u64) {
         let now = self.now();
         let fill = &self.fills[&id];

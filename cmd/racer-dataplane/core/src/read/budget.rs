@@ -1,22 +1,11 @@
 //! Acquisition credits: deadline, attempts, and route links.
-//!
-//! Errors are racer-core errors; the dataplane converts them with `?`.
 
 use crate::read::{Error, Result};
 use racer_control_wire::NodeId;
 use racer_object_wire::model::{ObjectId, PageNumber};
 use std::time::Instant;
 
-/// Original acquisition budget, owned by one metadata/bootstrap operation or
-/// page acquisition. Client range progress admits distinct pages with separate
-/// bounded allowances under the same deadline. Retry never reconstructs an
-/// acquisition budget from defaults. Fanout must partition credits;
-/// route attempts must charge actual forwarded links here as well as on the wire.
-/// No Clone: a replacement caller uses its own remaining credits, not fresh ones.
-/// ```compile_fail
-/// use racer_core::read::AcquisitionBudget;
-/// fn duplicate(budget: AcquisitionBudget) { let _other = budget.clone(); }
-/// ```
+/// Original acquisition budget, owned by one metadata/bootstrap operation or page acquisition.
 pub struct AcquisitionBudget {
     deadline: Instant,
     attempts: u32,
@@ -52,8 +41,7 @@ impl AcquisitionBudget {
 
     /// Return remote credits that a verified `StaleMembership` answer shows were never used: the
     /// answering node could not resolve the request's membership, so neither it nor the destination
-    /// behind it acted on the request. Never more than was sent, so a refund cannot mint credits;
-    /// lost or unverified answers are not refunded.
+    /// behind it acted on the request.
     pub fn refund_remote(&mut self, attempts: u32) -> Result<()> {
         let sent = self
             .remote_sent
@@ -200,9 +188,7 @@ impl AcquisitionBudget {
 /// Links a verified `StaleMembership` answer shows were never used: the answering node could not
 /// resolve the request's membership, so it neither served the request nor forwarded it, and every
 /// link past the `hops` the request travelled to it (`forwarders + 1` on the verified answer) was
-/// left unspent ([`AcquisitionBudget::refund_links`]). Like the remote credits
-/// ([`AcquisitionBudget::refund_remote`]), never more than was charged, so a refund cannot mint
-/// links.
+/// left unspent ([`AcquisitionBudget::refund_links`]).
 pub fn stale_unused_links(charged: u8, hops: usize) -> u8 {
     charged.saturating_sub(u8::try_from(hops).unwrap_or(u8::MAX))
 }
@@ -214,9 +200,7 @@ pub(crate) const MAX_ROUTE_LINKS: u8 = 8;
 /// Links per attempt before any route failure has been observed.
 pub const NORMAL_ROUTE_LINKS: u8 = 4;
 
-/// Inherit a forwarded peer's remaining route allowance without extending its
-/// deadline. `scope_deadline` is the local request deadline; the route fields
-/// come from the verified forwarding budget. The caller checks cancellation.
+/// Inherit a forwarded peer's remaining route allowance without extending its deadline.
 pub fn inherited_budget(
     scope_deadline: Instant,
     route_deadline: Instant,
@@ -402,17 +386,7 @@ mod budget_tests {
     }
 }
 
-// Overflow fan-out for hot pages. Only a page's owners serve it, so an owner streaming
-// [`hot_page_bodies`] bodies sheds further readers ([`shed_hot_page`]), and a shed non-owner asks one
-// of the page's [`fanout_width`] hash-chosen helpers (non-owner members) to acquire it
-// ([`crate::read::walk::WalkConfig::helper`]). Every node computes the same helpers, so readers
-// converge on them and owners see at most that many extra requests.
-//
-// Bounds: a helper probe carries at most [`HELPER_ATTEMPTS`] and only walks starting with
-// [`HELPER_MIN_ATTEMPTS`] (more) may ask one, so requests never chain. Owner probes are planned as
-// without a helper. Helpers are non-owners, so they never reach origin. A helper's answer is an
-// ordinary signed `Page` response validated like an owner's, and it acquires with the requester's
-// signed origin context.
+// Overflow fan-out for hot pages.
 
 /// Most attempts a requester funds a helper probe with: the exchange plus
 /// the helper's own walk of the owners.
@@ -425,13 +399,10 @@ pub const HELPER_LINKS: u8 = 8;
 /// one exchange with rank 0 plus the credit rank 0 needs for origin.
 pub const HELPER_FLOOR_ATTEMPTS: u32 = 3;
 
-/// Fewest links left for a helper probe: a route to the helper and a route
-/// from it to an owner.
+/// Fewest links left for a helper probe: a route to the helper and a route from it to an owner.
 pub const HELPER_FLOOR_LINKS: u8 = 4;
 
-/// A walk may ask a helper only if it starts with at least this many
-/// attempts. Larger than [`HELPER_ATTEMPTS`], so a helper, whose inherited
-/// budget is smaller than its funding, never asks another helper.
+/// A walk may ask a helper only if it starts with at least this many attempts.
 pub const HELPER_MIN_ATTEMPTS: u32 = HELPER_ATTEMPTS + 1;
 
 /// Most helpers one page has.
@@ -440,10 +411,8 @@ pub const MAX_HELPERS: usize = 256;
 const _: () = assert!(HELPER_MIN_ATTEMPTS > HELPER_ATTEMPTS);
 const _: () = assert!(HELPER_FLOOR_ATTEMPTS <= HELPER_ATTEMPTS);
 
-/// Helpers per page for a membership of `members`: the integer square root,
-/// at most [`MAX_HELPERS`]. With `n` readers of a page, owners then send about
-/// `sqrt(n)` copies and each helper about `sqrt(n)`, instead of the owners
-/// sending all `n`.
+/// Helpers per page for a membership of `members`: the integer square root, at most
+/// [`MAX_HELPERS`].
 pub fn fanout_width(members: usize) -> usize {
     members.isqrt().min(MAX_HELPERS)
 }
@@ -465,22 +434,16 @@ fn fnv(parts: &[&[u8]]) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Queued egress of one page, in bytes, an owner writes before it may shed
-/// further readers of that page with `Overloaded` (see [`shed_hot_page`] and
-/// [`hot_page_bodies`]). Stated in bytes so the rule means the same backlog
-/// (about 27 ms at 10 Gbit/s) for the simulator's 1 MiB pages and
-/// production's 16 MiB pages. Chosen by measurement in `racer-sim` ("Hot page
-/// fanout" in `designs/racer-core-simulation.md`).
+/// Queued egress of one page, in bytes, an owner writes before it may shed further readers of that
+/// page with `Overloaded` (see [`shed_hot_page`] and [`hot_page_bodies`]).
 pub const HOT_PAGE_QUEUE_BYTES: u64 = 32 << 20;
 
-/// Fewest concurrent bodies of one page before an owner may shed, whatever
-/// the page size: below this a shed reader's extra helper hop costs more than
-/// waiting behind the other bodies.
+/// Fewest concurrent bodies of one page before an owner may shed, whatever the page size: below
+/// this a shed reader's extra helper hop costs more than waiting behind the other bodies.
 pub const HOT_PAGE_MIN_BODIES: usize = 2;
 
-/// Concurrent bodies of one `page_bytes` page an owner writes before it may
-/// shed: [`HOT_PAGE_QUEUE_BYTES`] of that page, at least
-/// [`HOT_PAGE_MIN_BODIES`]. 32 for 1 MiB pages, 2 for production's 16 MiB.
+/// Concurrent bodies of one `page_bytes` page an owner writes before it may shed:
+/// [`HOT_PAGE_QUEUE_BYTES`] of that page, at least [`HOT_PAGE_MIN_BODIES`].
 pub const fn hot_page_bodies(page_bytes: u64) -> usize {
     let bodies = HOT_PAGE_QUEUE_BYTES / if page_bytes == 0 { 1 } else { page_bytes };
     if bodies < HOT_PAGE_MIN_BODIES as u64 {
@@ -494,11 +457,7 @@ pub const fn hot_page_bodies(page_bytes: u64) -> usize {
 
 /// Whether `local` sheds `requester`'s request for a page it is already writing to at least
 /// `threshold` requesters ([`hot_page_bodies`]), when that page is at least half of the `all`
-/// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop). Only one
-/// of the page's first three ranked `owners` sheds, and never to another owner or to one of the
-/// page's helpers (`helper`, evaluated last): the shed requester asks a helper, which the owner
-/// always serves, so the owner's NIC feeds at most [`fanout_width`] helpers instead of a queue of
-/// readers that time out.
+/// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop).
 pub fn shed_hot_page<N: PartialEq>(
     owners: &[N],
     local: &N,
@@ -526,16 +485,8 @@ pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: 
         .any(|j| fnv(&[cache, key, &number, &j.to_le_bytes()]) as usize % members == position)
 }
 
-/// Position (in membership order) of the member `requester` asks to acquire
-/// `page` for it, or `None` when the membership has no eligible helper.
-///
-/// `excluded(position)` must be true for the page's owners and for the
-/// requester itself. Helper `j` of a page is `hash(page, j) % members`; the
-/// requester starts at `hash(requester, page) % width` and takes the first
-/// helper that is not excluded and is `preferred` (a direct overlay neighbor,
-/// so the exchange needs no relay), else the first that is not excluded.
-/// Scans at most [`fanout_width`] helpers; callers compute it only when the
-/// walk asks for the helper.
+/// Position (in membership order) of the member `requester` asks to acquire `page` for it, or
+/// `None` when the membership has no eligible helper.
 pub fn fanout_helper(
     object: &ObjectId,
     page: PageNumber,
@@ -688,8 +639,7 @@ mod fanout_tests {
         assert_eq!(hot_page_bodies(1 << 30), HOT_PAGE_MIN_BODIES);
         assert_eq!(hot_page_bodies(1), (32 << 20) as usize);
         assert_eq!(hot_page_bodies(0), (32 << 20) as usize);
-        // Within the floor, the queued bytes never exceed the byte budget
-        // by more than one page.
+        // Within the floor, the queued bytes never exceed the byte budget by more than one page.
         for shift in 10..=26 {
             let page = 1u64 << shift;
             let bodies = hot_page_bodies(page) as u64;
