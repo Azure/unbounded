@@ -74,13 +74,14 @@ impl GpuReadOutcome {
 }
 
 /// Samples written without a GPU helper: one per request outcome, plus
-/// `racer_gpu_enabled`.
-pub const BASE_SERIES: usize = GpuReadOutcome::ALL.len() + 1;
+/// `racer_gpu_enabled` and `racer_gpu_standby`.
+pub const BASE_SERIES: usize = GpuReadOutcome::ALL.len() + 2;
 
 /// GPU metric sources shared by every worker's metrics handle.
 #[derive(Default)]
 pub struct GpuTelemetry {
     helper: OnceLock<Arc<GpuHelper>>,
+    slot: OnceLock<Arc<crate::gpu_slot::GpuSlot>>,
     links: OnceLock<Arc<LinkNode>>,
     requests: [AtomicU64; GpuReadOutcome::ALL.len()],
 }
@@ -89,6 +90,13 @@ impl GpuTelemetry {
     /// Report this GPU helper. Later calls are ignored.
     pub fn attach_helper(&self, helper: Arc<GpuHelper>) {
         let _ = self.helper.set(helper);
+    }
+
+    /// Report the helper in `slot` once it starts, and standby until the
+    /// first `gpu-read` resolves it. Reading never starts it. Later calls are
+    /// ignored.
+    pub fn attach_slot(&self, slot: Arc<crate::gpu_slot::GpuSlot>) {
+        let _ = self.slot.set(slot);
     }
 
     /// Report GPU landing state from this link node. Later calls are ignored.
@@ -120,11 +128,22 @@ impl GpuTelemetry {
                 self.requests(outcome)
             )?;
         }
-        let helper = self.helper.get();
+        let slot = self.slot.get();
+        let helper = self
+            .helper
+            .get()
+            .or_else(|| slot.and_then(|slot| slot.get()));
         writeln!(
             out,
             "# TYPE racer_gpu_enabled gauge\nracer_gpu_enabled {}",
             u8::from(helper.is_some())
+        )?;
+        // 1 while `RACER_ENABLE_GPU=auto` waits for the first `gpu-read`
+        // before touching any GPU; 0 once that start resolves either way.
+        writeln!(
+            out,
+            "# TYPE racer_gpu_standby gauge\nracer_gpu_standby {}",
+            u8::from(slot.is_some_and(|slot| slot.standby()))
         )?;
         let Some(helper) = helper else {
             return Ok(());
@@ -284,13 +303,46 @@ mod tests {
         assert!(text.contains("racer_gpu_read_requests_total{outcome=\"not_enabled\"} 2\n"));
         assert!(text.contains("racer_gpu_read_requests_total{outcome=\"gpu\"} 0\n"));
         assert!(text.contains("racer_gpu_enabled 0\n"));
+        assert!(text.contains("racer_gpu_standby 0\n"));
         assert!(!text.contains("racer_gpu_cufile_enabled"));
         assert!(!text.contains("racer_gpu_landing"));
-        assert_eq!(text.matches("# TYPE").count(), 2);
+        assert_eq!(text.matches("# TYPE").count(), 3);
         assert_eq!(
             text.lines().filter(|l| !l.starts_with('#')).count(),
             BASE_SERIES
         );
+    }
+
+    #[test]
+    /// A lazy slot reports standby without starting, then the helper once
+    /// it starts.
+    fn lazy_slot_reports_standby_then_helper() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let slot = Arc::new(crate::gpu_slot::GpuSlot::lazy(
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(crate::gpu::testing::helper(&[None])))
+            }),
+            Box::new(|_| {}),
+        ));
+        let telemetry = GpuTelemetry::default();
+        telemetry.attach_slot(slot.clone());
+        let text = render(&telemetry);
+        assert!(text.contains("racer_gpu_enabled 0\n"));
+        assert!(text.contains("racer_gpu_standby 1\n"));
+        assert_eq!(
+            text.lines().filter(|l| !l.starts_with('#')).count(),
+            BASE_SERIES
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(futures::executor::block_on(slot.get_or_start()).is_some());
+        let text = render(&telemetry);
+        assert!(text.contains("racer_gpu_enabled 1\n"));
+        assert!(text.contains("racer_gpu_standby 0\n"));
+        assert!(text.contains("racer_gpu_cufile_enabled"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -315,6 +367,7 @@ mod tests {
         for name in [
             "racer_gpu_read_requests_total",
             "racer_gpu_enabled",
+            "racer_gpu_standby",
             "racer_gpu_decrypt_available",
             "racer_gpu_staging_slots_free",
             "racer_gpu_cufile_enabled",

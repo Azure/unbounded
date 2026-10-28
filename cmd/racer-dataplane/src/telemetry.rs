@@ -3743,6 +3743,10 @@ impl Metrics {
     pub fn gpu(&self) -> &crate::gpu_telemetry::GpuTelemetry {
         &self.gpu
     }
+    /// A shared handle to the GPU metric sources, for the lazy GPU start.
+    pub fn gpu_shared(&self) -> Arc<crate::gpu_telemetry::GpuTelemetry> {
+        self.gpu.clone()
+    }
     pub(crate) fn writer_shard(&self) -> usize {
         self.shard
     }
