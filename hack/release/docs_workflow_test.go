@@ -28,6 +28,7 @@ type docsStep struct {
 type docsConcurrency struct {
 	Group            string `yaml:"group"`
 	CancelInProgress bool   `yaml:"cancel-in-progress"`
+	Queue            string `yaml:"queue"`
 }
 
 type docsJob struct {
@@ -121,8 +122,9 @@ func TestDocsWorkflowTriggers(t *testing.T) {
 	for name, job := range wf.Jobs {
 		c := job.Concurrency
 		if name == "deploy" {
-			if c == nil || c.Group != "pages" || c.CancelInProgress {
-				t.Fatalf("deploy concurrency = %+v, want pages without cancel", c)
+			// actionlint cannot parse queue, so this is the only typo guard.
+			if c == nil || c.Group != "pages" || c.CancelInProgress || c.Queue != "max" {
+				t.Fatalf("deploy concurrency = %+v, want pages, no cancel, queue max", c)
 			}
 		} else if c != nil {
 			t.Fatalf("%s concurrency = %+v, want none", name, c)

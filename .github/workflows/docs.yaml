@@ -158,9 +158,12 @@ jobs:
     if: needs.resolve.outputs.tag != ''
     runs-on: ubuntu-latest
     # Never cancel: a stale run must not abort a deployment in progress.
+    # queue: max keeps every pending run instead of letting a later one
+    # replace it, so a slow older build cannot displace a newer release.
     concurrency:
       group: pages
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       pages: write
