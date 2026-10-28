@@ -398,8 +398,8 @@ def iter_weights(
     stats, a dict, gets counts and bytes of reads per delivery mode.
     """
     import torch
-    from racer import cuda as rcuda
-    from racer import tensors as rtensors
+    import racer.cuda as rcuda
+    import racer.tensors as rtensors
 
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
