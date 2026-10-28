@@ -5,11 +5,7 @@
 //! name field selector. They read a seat Lease only after a paced, jittered
 //! delay when the primary reports a vacancy, or when no primary is live.
 
-use crate::step::{
-    follower,
-    lottery::{self, Lottery},
-    renew::{self, SeatRenew},
-};
+use crate::step::seat::{self as rules, Lottery, SeatRenew};
 use crate::{
     DiscoveredEndpoint, DiscoveredEndpoints, Error, annotations,
     authority::{
@@ -137,7 +133,7 @@ pub fn initial_seats(shared: &Shared) -> usize {
 }
 
 fn jitter(shared: &Shared, salt: u32, max: Duration) -> Duration {
-    lottery::jitter(
+    rules::jitter(
         &shared.config.pod_uid,
         &mut **shared.rng.borrow_mut(),
         salt,
@@ -367,7 +363,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
     while !shared.stopping.get() {
         let view = shared.primary.borrow().clone();
         let plan = lottery.plan(
-            &lottery::Inputs {
+            &rules::LotteryInputs {
                 holds_seat: shared.seat.borrow().is_some(),
                 cluster_known: !shared.cluster.borrow().is_empty(),
                 view: &view,
@@ -380,11 +376,11 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
             &mut **shared.rng.borrow_mut(),
         );
         let index = match plan {
-            lottery::Plan::Idle(d) | lottery::Plan::NoVacancy(d) => {
+            rules::Plan::Idle(d) | rules::Plan::NoVacancy(d) => {
                 exec::sleep(d).await;
                 continue;
             }
-            lottery::Plan::Attempt { delay, index } => {
+            rules::Plan::Attempt { delay, index } => {
                 exec::sleep(delay).await;
                 index
             }
@@ -516,7 +512,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
         }
         let now = Instant::now();
         let view = shared.primary.borrow().clone();
-        let inputs = renew::Inputs::from_view(
+        let inputs = rules::RenewInputs::from_view(
             &view,
             seat.index,
             &shared.config.node_name,
@@ -526,8 +522,8 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
             ready_changed(&shared, &seat, &object),
         );
         match schedule.decide(now, inputs) {
-            renew::Action::Wait => continue,
-            renew::Action::Release => {
+            rules::Action::Wait => continue,
+            rules::Action::Release => {
                 let spec = election::release(&lease::observe(&object).spec);
                 let a: BTreeMap<_, _> = my_seat_annotations(&shared, &seat)
                     .into_keys()
@@ -543,7 +539,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                 .await;
                 return;
             }
-            renew::Action::Renew => {}
+            rules::Action::Renew => {}
         }
         rotate(&shared, &seat);
         let obs = lease::observe(&object);
@@ -577,16 +573,16 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                     )
                 });
                 match schedule.conflict(same, Instant::now()) {
-                    renew::Conflict::Retry => {
+                    rules::Conflict::Retry => {
                         if let Ok(v) = read {
                             object = v;
                         }
                     }
-                    renew::Conflict::Lose => {
+                    rules::Conflict::Lose => {
                         shared.lose_seat();
                         return;
                     }
-                    renew::Conflict::Later => {}
+                    rules::Conflict::Later => {}
                 }
             }
             _ => schedule.put_failed(Instant::now()),
@@ -640,7 +636,7 @@ pub async fn follow_once(shared: &Shared, started: Instant) -> Result<(), Error>
         .as_str()
         .map(|s| STANDARD.decode(s).map_err(|_| ()));
     let cluster = shared.cluster.borrow().clone();
-    let read = follower::read(&follower::SecretRead {
+    let read = rules::read(&rules::SecretRead {
         cluster: &cluster,
         uid,
         initialized,
@@ -649,16 +645,16 @@ pub async fn follow_once(shared: &Shared, started: Instant) -> Result<(), Error>
         accepted_before: shared.serving.borrow().high_water.is_some(),
     });
     let record = match read {
-        follower::Read::Install(r) => *r,
-        follower::Read::Uninitialized => return Ok(()),
-        follower::Read::FailClosed => {
+        rules::Read::Install(r) => *r,
+        rules::Read::Uninitialized => return Ok(()),
+        rules::Read::FailClosed => {
             fail_closed(shared);
             return Err(Error::InvalidState);
         }
     };
     let superseded = {
         let s = shared.serving.borrow();
-        follower::superseded(installs != s.installs, s.high_water.as_ref(), &record)
+        rules::superseded(installs != s.installs, s.high_water.as_ref(), &record)
     };
     if superseded {
         // The primary committed while this read was in flight.
@@ -670,7 +666,7 @@ pub async fn follow_once(shared: &Shared, started: Instant) -> Result<(), Error>
         let Some(r) = s.record.as_ref() else {
             return Err(Error::InvalidState);
         };
-        follower::need_image(
+        rules::need_image(
             r,
             s.image.as_ref().map(|i| &i.record),
             shared.is_primary.get(),
@@ -715,7 +711,7 @@ pub fn install_record(
 ) -> Result<(), state::StateError> {
     let cluster = shared.cluster.borrow().clone();
     let mut s = shared.serving.borrow_mut();
-    if follower::admit(s.high_water.as_ref(), &record).is_err() {
+    if rules::admit(s.high_water.as_ref(), &record).is_err() {
         // A rollback is never accepted.
         drop(s);
         fail_closed(shared);
@@ -837,7 +833,7 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{authority::election::Observer, step::lottery::claim_views};
+    use crate::{authority::election::Observer, step::seat::claim_views};
     use crate::{
         authority::keyring::{self, Durable, MAX_ROOTS, Offer},
         kube::fake,

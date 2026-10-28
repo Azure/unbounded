@@ -49,7 +49,7 @@ pub struct Serving {
     /// refused for the life of the process.
     pub high_water: Option<StateRecord>,
     /// Records installed so far, by the follower or the primary (see
-    /// [`crate::step::follower::superseded`]).
+    /// [`crate::step::seat::superseded`]).
     pub installs: u64,
 }
 

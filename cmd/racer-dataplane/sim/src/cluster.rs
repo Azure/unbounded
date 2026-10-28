@@ -28,11 +28,8 @@ use racer_cluster_control::{
     entropy::Seeded,
     limits,
     step::{
-        contend::Contend,
-        follower::{self, Follower},
-        lottery::{self, Lottery},
-        primary::{Inventory, PassInputs, discovery, plan_pass},
-        renew::{self, SeatRenew},
+        primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
+        seat::{self as rules, Follower, Lottery, SeatRenew},
     },
 };
 use std::{
@@ -599,7 +596,7 @@ impl ControlPlane {
         let uid = uuid(u64::from(pod), 1);
         let p = &mut self.pods[pod as usize];
         let plan = p.lottery.plan(
-            &lottery::Inputs {
+            &rules::LotteryInputs {
                 holds_seat: p.seat.is_some(),
                 cluster_known: true,
                 view: &self.view,
@@ -612,10 +609,10 @@ impl ControlPlane {
             &mut self.rng,
         );
         match plan {
-            lottery::Plan::Idle(d) | lottery::Plan::NoVacancy(d) => {
+            rules::Plan::Idle(d) | rules::Plan::NoVacancy(d) => {
                 self.after(d, pod, Ev::Lottery(pod))
             }
-            lottery::Plan::Attempt { delay, index } => {
+            rules::Plan::Attempt { delay, index } => {
                 self.after(delay, pod, Ev::Attempt(pod, index as u8))
             }
         }
@@ -679,7 +676,7 @@ impl ControlPlane {
             .then(|| self.sequence())
             .flatten();
         let lease_ready = self.seats[index as usize].ready;
-        let inputs = renew::Inputs::from_view(
+        let inputs = rules::RenewInputs::from_view(
             &self.view,
             index as usize,
             &format!("n{pod}"),
@@ -693,8 +690,8 @@ impl ControlPlane {
         };
         let action = schedule.decide(now, inputs);
         match action {
-            renew::Action::Wait => {}
-            renew::Action::Release => {
+            rules::Action::Wait => {}
+            rules::Action::Release => {
                 self.stats.api_writes += 1;
                 self.stats.seat_releases += 1;
                 let lease = &mut self.seats[index as usize];
@@ -708,7 +705,7 @@ impl ControlPlane {
                 p.primary = None;
                 return;
             }
-            renew::Action::Renew => {
+            rules::Action::Renew => {
                 self.stats.api_writes += 1;
                 schedule.put_started(now);
                 let wall = election::now_micro(self.wall());
@@ -739,7 +736,7 @@ impl ControlPlane {
         let wait = schedule
             .next
             .saturating_duration_since(now)
-            .clamp(Duration::from_millis(1), renew::READY_MIN_INTERVAL);
+            .clamp(Duration::from_millis(1), rules::READY_MIN_INTERVAL);
         self.after(wait, pod, Ev::Renew(pod));
     }
 
@@ -1015,13 +1012,13 @@ impl ControlPlane {
         // `started`.
         let started = self.at(p_followed(&self.pods[pod as usize], self.now));
         let f = &self.pods[pod as usize].follower;
-        let record = read.record.filter(|r| {
-            !follower::superseded(f.installs != read.installs, f.high_water.as_ref(), r)
-        });
+        let record = read
+            .record
+            .filter(|r| !rules::superseded(f.installs != read.installs, f.high_water.as_ref(), r));
         if let Some(r) = record {
             let f = &mut self.pods[pod as usize].follower;
             if f.install(r.clone(), started).is_ok()
-                && follower::need_image(&r, f.image.as_ref(), is_primary)
+                && rules::need_image(&r, f.image.as_ref(), is_primary)
                 && let Some(i) = &self.image
                 && i.record.sequence == r.sequence
             {

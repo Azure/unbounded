@@ -6,10 +6,7 @@
 //! Secret, checks the term (see [`state::Writer`]), and checks the Lease is
 //! still fresh by the monotonic clock.
 
-use crate::step::{
-    contend::Contend,
-    primary::{Inventory, PassInputs, PassPlan, discovery, plan_pass},
-};
+use crate::step::primary::{Contend, Inventory, PassInputs, PassPlan, discovery, plan_pass};
 use crate::{
     annotations,
     authority::{

@@ -60,8 +60,8 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
   `racer_core::cache` with `ByCache` grouping (`src/memory.rs`).
 - The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
   `MAX_HOPS = racer_core::route::MAX_LINKS`.
-- `racer-cluster-control` exposes pure step functions in `cluster-control/src/step/` (lottery,
-  seats, primary plan pass, seat admission). Wall time and entropy are inputs: `now_micro` takes a
+- `racer-cluster-control` exposes pure step functions in `cluster-control/src/step/` (seat
+  lottery and renewal, primary contention and plan pass, seat admission, authorization). Wall time and entropy are inputs: `now_micro` takes a
   `SystemTime` (`cluster-control/src/authority/election.rs:126`) and `new_key` takes an `Entropy`
   (`cluster-control/src/authority/keyring.rs:352`).
 
@@ -90,7 +90,8 @@ Path: `cmd/racer-dataplane/sim`, crate and binary `racer-sim`.
 | `node` | Real node logic for every node (below) |
 | `phantom` | Shared-memo `Phantom` rankings and `SharedRoutes` searches for every node's caches |
 | `config` | One `Config` (with its `node` knobs) parsed from `--config` JSON and validated in one place |
-| `control` | `ControlSim`: the real `cluster-control` model plus a client model |
+| `cluster`, `cost` | `ControlPlane`: a whole-cluster model built from the `cluster-control` steps; notify and write-drain cost models |
+| `control` | `ControlSim`: the `cluster` model plus a client model |
 | `combined` | Control plane and data plane on one timeline |
 | `report` | Histograms, counters, invariants, memory accounting, JSON output |
 
@@ -120,7 +121,8 @@ Differences from production:
 
 ### Control model
 
-`ControlSim` co-steps the `cluster-control` model (lottery, seats, primary, commits) with one
+`ControlSim` co-steps the `ControlPlane` model (`sim/src/cluster.rs`: lottery, seats, primary,
+commits, built from the `cluster-control` steps) with one
 client per Pod. Clients enroll through seat bootstrap slots and the bearer authorization API calls
 against a rate-limited fake API server, then long poll snapshots with the real seat admission
 steps (write slots, a bounded FIFO, delta or full bodies). Clients send the base hash they hold.
@@ -211,7 +213,7 @@ These are production rules that the simulator motivated. Code comments refer to 
 A new member is added to the membership only after it reports that it serves peer links
 (`src/control/session.rs` `mark_serving`). Before that, a listed member would refuse every link
 and reads toward it would fail. Joins are batched by a hold that grows with membership size
-(`join_hold_secs` in `cluster-control/src/step/primary.rs:97`), so clients stay within one version
+(`join_hold_secs` in `cluster-control/src/step/primary.rs:102`), so clients stay within one version
 during large enrollments instead of falling back to full images.
 
 ### Hot page fanout
