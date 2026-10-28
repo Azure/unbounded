@@ -97,7 +97,7 @@ jobs:
           fi
 
           # Stable semver only: no prerelease suffix, no shell metacharacters.
-          if ! printf '%s' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'; then
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             reject "'${TAG}' is not a stable release tag"
           fi
 
@@ -112,7 +112,7 @@ jobs:
           # validation.
           SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/refs/tags/${TAG}" --jq .sha)" \
             || reject "could not resolve ${TAG} to a commit"
-          if ! printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'; then
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
             reject "${TAG} resolved to an invalid commit '${SHA}'"
           fi
 

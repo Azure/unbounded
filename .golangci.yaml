@@ -143,6 +143,12 @@ linters:
         linters:
           - misspell
         text: '`cancelled` is a misspelling'
+      # GitHub Actions spells its status function `cancelled()`. Preserve the
+      # literal when testing workflow conditions.
+      - path: hack/release/docs_workflow_test\.go
+        linters:
+          - misspell
+        text: '`cancelled` is a misspelling'
     paths:
       - examples$
       - hack/scratch

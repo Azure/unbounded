@@ -4,11 +4,13 @@
 package release
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -164,6 +166,7 @@ func TestReleaseUpgradeCallsDocs(t *testing.T) {
 	t.Parallel()
 
 	wf := loadWorkflow(t, "release-upgrade.yaml")
+
 	docs, ok := wf.Jobs["docs"]
 	if !ok {
 		t.Fatal("release-upgrade must call docs")
@@ -175,6 +178,7 @@ func TestReleaseUpgradeCallsDocs(t *testing.T) {
 	}
 
 	needs, _ := docs.Needs.([]any)
+
 	got := []string{}
 	for _, n := range needs {
 		got = append(got, n.(string))
@@ -227,6 +231,7 @@ func TestDocsResolveScript(t *testing.T) {
 	t.Parallel()
 
 	var script string
+
 	for _, step := range loadWorkflow(t, "docs.yaml").Jobs["resolve"].Steps {
 		if step.ID == "validate" {
 			script = step.Run
@@ -261,6 +266,7 @@ func TestDocsResolveScript(t *testing.T) {
 		{name: "newline injection", event: "workflow_dispatch", tag: "v1.4.0\nsha=evil", ref: "refs/heads/main", wantErr: true},
 		{name: "no latest release", event: "workflow_dispatch", tag: latestTag, ref: "refs/heads/main", latest: "-", wantErr: true},
 		{name: "bad sha", event: "workflow_dispatch", tag: latestTag, ref: "refs/heads/main", sha: "nope", wantErr: true},
+		{name: "multiline sha", event: "workflow_dispatch", tag: latestTag, ref: "refs/heads/main", sha: tagSHA + "\ntag=evil", wantErr: true},
 	}
 
 	for _, tc := range cases {
@@ -288,9 +294,10 @@ func TestDocsResolveScript(t *testing.T) {
 			}
 
 			latest := tc.latest
-			if latest == "" {
+			switch latest {
+			case "":
 				latest = latestTag
-			} else if latest == "-" {
+			case "-":
 				latest = ""
 			}
 
@@ -300,12 +307,16 @@ func TestDocsResolveScript(t *testing.T) {
 			}
 
 			output := filepath.Join(dir, "output")
+
 			inputTag, eventTag := tc.tag, ""
 			if tc.event == "release" {
 				inputTag, eventTag = "", tc.tag
 			}
 
-			cmd := exec.Command("bash", "-c", script)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, "bash", "-c", script)
 			cmd.Dir = dir
 			cmd.Env = []string{
 				"PATH=" + dir + ":" + os.Getenv("PATH"),
@@ -330,6 +341,7 @@ func TestDocsResolveScript(t *testing.T) {
 			}
 
 			got, _ := os.ReadFile(output)
+
 			want := ""
 			if tc.wantTag != "" {
 				want = "tag=" + tc.wantTag + "\nsha=" + tagSHA + "\n"
