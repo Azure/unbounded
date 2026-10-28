@@ -90,7 +90,8 @@ the GPU reads section of the Racer reference.
    when there is one. Every later read sends `If-Match` with that ETag, so the
    whole model is read at one version. A file that changes during the load
    fails it with `ModelChangedError`.
-3. For each file, read the 8-byte header length and the JSON header.
+3. For each file, read the 8-byte header length and the JSON header. All
+   headers are read before any tensor data.
 4. Group tensors into ranges that fit a staging buffer. Each range ends on a
    Racer page boundary (16 MiB), so no page is read twice. A tensor that
    crosses the boundary is split across two ranges and joined again before vLLM
