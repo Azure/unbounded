@@ -44,15 +44,9 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
-/// Direct fills a read keeps in flight beyond its head page. A sealed read
-/// fills its whole window directly (see `RangeStream::direct_ahead`).
-const DIRECT_AHEAD: usize = 1;
-
-/// Provider selections a read keeps in flight. Beyond the first, a read only
-/// starts another while some contract of its version has an unused granted
-/// flight (see `Scheduler::spare`). Each selection demands a disjoint share of
-/// the read's selectable holes.
-const SELECTIONS: usize = 4;
+#[cfg(test)]
+use racer_core::read::range::SELECTIONS;
+use racer_core::read::range::{self, DIRECT_AHEAD, SlotKind};
 
 /// Flights requested per provider contract. A provider grants at most this
 /// many pending selections per contract, or one if it predates multi-flight.
@@ -1000,29 +994,8 @@ impl RangeStream {
         // A failed page stops admission at and after it until it reaches the
         // client. Pages before it are still filled, or the stream could never
         // deliver them and so never surface the error.
-        let failed = self
-            .slots
-            .iter()
-            .position(|slot| matches!(slot, Slot::Ready(Err(_))));
-        let limit = failed.unwrap_or(self.slots.len());
-        let mut changed = false;
-        if limit > 0
-            && matches!(
-                self.slots.front(),
-                Some(Slot::Missing { .. } | Slot::Selecting)
-            )
-        {
-            if !self.start_fetch(0, scope)? {
-                return Ok(changed);
-            }
-            changed = true;
-        }
-        let mut ahead = self
-            .slots
-            .iter()
-            .skip(1)
-            .filter(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
-            .count();
+        let kinds = self.kinds();
+        let failed = range::first_failure(&kinds);
         // Pages another window is selecting or filling arrive through its
         // fan-out. Only the head is always filled directly, so it never waits
         // on another window; a concurrent fill of the same page joins the
@@ -1032,19 +1005,15 @@ impl RangeStream {
             .as_ref()
             .map(WindowLease::busy_elsewhere)
             .unwrap_or_default();
-        let mut index = 1;
-        let direct_ahead = self.direct_ahead();
-        while ahead < direct_ahead && index < limit {
-            if matches!(self.slots[index], Slot::Missing { .. })
-                && !elsewhere.contains(&self.page_at(index))
-            {
-                if !self.start_fetch(index, scope)? {
-                    return Ok(changed);
-                }
-                changed = true;
-                ahead += 1;
+        let plan = range::direct_fills(&kinds, self.direct_ahead(), |index| {
+            elsewhere.contains(&self.page_at(index))
+        });
+        let mut changed = false;
+        for index in plan {
+            if !self.start_fetch(index, scope)? {
+                return Ok(changed);
             }
-            index += 1;
+            changed = true;
         }
         // Earlier holes behind a failure are filled directly: each becomes the
         // head in turn, so no new selection is needed to reach the error.
@@ -1107,9 +1076,25 @@ impl RangeStream {
     /// Whether the read may start another selection: its first always, more
     /// only while a contract of the version has an unused granted flight.
     fn may_select(&self) -> bool {
-        self.selections.len() < SELECTIONS
-            && (self.selections.is_empty()
-                || self.directory.subscriptions.spare(&self.metadata.version) > 0)
+        range::may_select(
+            self.selections.len(),
+            self.directory.subscriptions.spare(&self.metadata.version),
+        )
+    }
+
+    /// Scheduling state of each window slot, for the core range planner.
+    fn kinds(&self) -> Vec<SlotKind> {
+        self.slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Probing(_) => SlotKind::Probing,
+                Slot::Missing { select } => SlotKind::Missing { select: *select },
+                Slot::Fetching(_) | Slot::FetchingSealed(_) => SlotKind::Fetching,
+                Slot::Selecting => SlotKind::Selecting,
+                Slot::Ready(Err(_)) => SlotKind::Failed,
+                Slot::Ready(Ok(_)) | Slot::Sealed(_) => SlotKind::Ready,
+            })
+            .collect()
     }
 
     /// The demand and pages of the next selection, if any. Pages that another
@@ -1187,15 +1172,8 @@ impl RangeStream {
             .iter()
             .filter(|slot| matches!(slot, Slot::Missing { select: true }))
             .count();
-        let free = SELECTIONS.saturating_sub(self.selections.len());
         let spare = self.directory.subscriptions.spare(&self.metadata.version);
-        // The read's first selection may run before any spare flight exists.
-        let startable = if self.selections.is_empty() {
-            free.min(spare + 1)
-        } else {
-            free.min(spare)
-        };
-        holes.div_ceil(startable.max(1)).max(1)
+        range::share(holes, self.selections.len(), spare)
     }
 
     /// Up to `limit` selectable holes of the window, excluding pages that
@@ -1206,38 +1184,24 @@ impl RangeStream {
         elsewhere: &BTreeSet<u64>,
         limit: usize,
     ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
-        use crate::peer::subscriptions::MAX_DEMAND_INTERVALS;
-        use crate::peer::subscriptions::PageInterval;
-        let mut intervals: Vec<PageInterval> = Vec::new();
-        let mut pages = BTreeSet::new();
-        for index in 0..self.slots.len() {
-            if pages.len() >= limit {
-                break;
-            }
-            let number = self.page_at(index);
-            if !matches!(self.slots[index], Slot::Missing { select: true })
-                || elsewhere.contains(&number)
-            {
-                continue;
-            }
-            let full = intervals.len() == MAX_DEMAND_INTERVALS - 1;
-            match intervals.last_mut() {
-                Some(last) if last.end == number => last.end += 1,
-                _ if full => break,
-                _ => intervals.push(PageInterval {
-                    start: number,
-                    end: number + 1,
-                }),
-            }
-            pages.insert(number);
-        }
-        if pages.is_empty() {
+        use crate::peer::subscriptions::{Demand, MAX_DEMAND_INTERVALS, PageInterval};
+        let Some((intervals, pages)) = range::selection_demand(
+            &self.kinds(),
+            self.next,
+            |number| elsewhere.contains(&number),
+            limit,
+            MAX_DEMAND_INTERVALS,
+        ) else {
             return Ok(None);
-        }
-        Ok(Some((
-            crate::peer::subscriptions::Demand::new(intervals)?,
-            pages,
-        )))
+        };
+        let intervals = intervals
+            .into_iter()
+            .map(|r| PageInterval {
+                start: r.start,
+                end: r.end,
+            })
+            .collect();
+        Ok(Some((Demand::new(intervals)?, pages)))
     }
 
     /// Publish this window's wanted and in-flight pages for fan-out.

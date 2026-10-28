@@ -52,7 +52,7 @@ use racer_core::read::notice::{
 use racer_core::read::policy::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
-use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
+use racer_core::read::range::{DIRECT_AHEAD, PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{
     ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline,
 };
@@ -1381,7 +1381,7 @@ impl NodeWorld {
             }
             return;
         }
-        let plan = direct_fills(window, |_| false);
+        let plan = direct_fills(window, DIRECT_AHEAD, |_| false);
         let offset = range.offset;
         let mut start = Vec::with_capacity(plan.len());
         for i in plan {

@@ -39,10 +39,15 @@ pub enum SlotKind {
 }
 
 /// Slots to start direct fills for, in order: the head when it is a hole or
-/// only selected, then up to [`DIRECT_AHEAD`] more missing holes that no other
-/// window is busy with. Nothing at or after the first failed slot is planned.
-/// The driver stops at the first fill the budget refuses.
-pub fn direct_fills(slots: &[SlotKind], elsewhere: impl Fn(usize) -> bool) -> Vec<usize> {
+/// only selected, then up to `direct_ahead` (normally [`DIRECT_AHEAD`]) more
+/// missing holes that no other window is busy with. Nothing at or after the
+/// first failed slot is planned. The driver stops at the first fill the budget
+/// refuses.
+pub fn direct_fills(
+    slots: &[SlotKind],
+    direct_ahead: usize,
+    elsewhere: impl Fn(usize) -> bool,
+) -> Vec<usize> {
     let limit = first_failure(slots).unwrap_or(slots.len());
     let mut plan = Vec::new();
     if limit > 0 && matches!(slots[0], SlotKind::Missing { .. } | SlotKind::Selecting) {
@@ -54,7 +59,7 @@ pub fn direct_fills(slots: &[SlotKind], elsewhere: impl Fn(usize) -> bool) -> Ve
         .filter(|slot| **slot == SlotKind::Fetching)
         .count();
     let mut index = 1;
-    while ahead < DIRECT_AHEAD && index < limit {
+    while ahead < direct_ahead && index < limit {
         if matches!(slots[index], SlotKind::Missing { .. }) && !elsewhere(index) {
             plan.push(index);
             ahead += 1;
@@ -157,22 +162,43 @@ mod tests {
 
     #[test]
     fn head_and_one_ahead() {
-        assert_eq!(direct_fills(&[HOLE, HOLE, HOLE], |_| false), [0, 1]);
-        assert_eq!(direct_fills(&[Selecting, HOLE], |_| false), [0, 1]);
-        assert_eq!(direct_fills(&[Ready, HOLE, HOLE], |_| false), [1]);
-        assert_eq!(direct_fills(&[HOLE, Fetching, HOLE], |_| false), [0]);
-        assert_eq!(direct_fills(&[HOLE, HOLE, HOLE], |i| i == 1), [0, 2]);
         assert_eq!(
-            direct_fills(&[Probing, Missing { select: false }], |_| false),
+            direct_fills(&[HOLE, HOLE, HOLE], DIRECT_AHEAD, |_| false),
+            [0, 1]
+        );
+        assert_eq!(
+            direct_fills(&[Selecting, HOLE], DIRECT_AHEAD, |_| false),
+            [0, 1]
+        );
+        assert_eq!(
+            direct_fills(&[Ready, HOLE, HOLE], DIRECT_AHEAD, |_| false),
             [1]
         );
-        assert!(direct_fills(&[], |_| false).is_empty());
+        assert_eq!(
+            direct_fills(&[HOLE, Fetching, HOLE], DIRECT_AHEAD, |_| false),
+            [0]
+        );
+        assert_eq!(
+            direct_fills(&[HOLE, HOLE, HOLE], DIRECT_AHEAD, |i| i == 1),
+            [0, 2]
+        );
+        assert_eq!(
+            direct_fills(&[Probing, Missing { select: false }], DIRECT_AHEAD, |_| {
+                false
+            }),
+            [1]
+        );
+        assert!(direct_fills(&[], DIRECT_AHEAD, |_| false).is_empty());
+        assert_eq!(direct_fills(&[HOLE, HOLE, HOLE], 2, |_| false), [0, 1, 2]);
     }
 
     #[test]
     fn failure_stops_admission() {
-        assert_eq!(direct_fills(&[HOLE, Failed, HOLE], |_| false), [0]);
-        assert!(direct_fills(&[Failed, HOLE], |_| false).is_empty());
+        assert_eq!(
+            direct_fills(&[HOLE, Failed, HOLE], DIRECT_AHEAD, |_| false),
+            [0]
+        );
+        assert!(direct_fills(&[Failed, HOLE], DIRECT_AHEAD, |_| false).is_empty());
         assert_eq!(first_failure(&[Ready, Failed]), Some(1));
     }
 
