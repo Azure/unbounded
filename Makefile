@@ -589,6 +589,8 @@ racer-gpu-test: ## Build the CUDA shim with kernels (needs nvcc) and run GPU har
 		test -x "$(RACER_PY_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
 			timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q pytest; }; \
 		cd clients/python/racer && PYTHONPATH=src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider -m gpu -rs; \
+	elif [ "$$RACER_GPU_E2E" = require ]; then \
+		echo "RACER_GPU_E2E=require but RACER_GPU_E2E_SOCKET is unset" >&2; exit 1; \
 	else echo "RACER_GPU_E2E_SOCKET unset: skipping the Python gpu-read test against a live dataplane"; fi
 
 RACER_PY_VENV ?= $(CURDIR)/tmp/racer-python-venv

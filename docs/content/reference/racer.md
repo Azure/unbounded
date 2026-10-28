@@ -1206,7 +1206,8 @@ or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
 `gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
 running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
 object it can serve (`RACER_GPU_E2E_METADATA` and
-`RACER_GPU_E2E_AUTHORIZATION` are optional).
+`RACER_GPU_E2E_AUTHORIZATION` are optional). Without the socket, that test is
+skipped; set `RACER_GPU_E2E=require` to make it a failure.
 
 The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
 nightly and on demand. It runs only when the repository variable
