@@ -62,15 +62,8 @@ fn fingerprint(hash: &str) -> u64 {
 }
 
 /// A queued write waiter still wants its slot at `now`: same connection
-/// epoch, still polling, deadline not passed.
-fn queued_live(epoch: &[u32], state: &[State], w: &WriteWaiter, now: Nanos) -> bool {
-    epoch[w.node as usize] == w.epoch
-        && matches!(state[w.node as usize], State::Polling)
-        && w.deadline_ns >= now
-}
-
-/// [`queued_live`], collecting connected waiters whose deadline passed so
-/// the caller can answer them 429.
+/// epoch, still polling, deadline not passed. Connected waiters whose
+/// deadline passed are collected so the caller can answer them 429.
 fn expire(
     epoch: &[u32],
     state: &[State],
@@ -78,7 +71,8 @@ fn expire(
     now: Nanos,
     expired: &mut Vec<u32>,
 ) -> bool {
-    let connected = queued_live(epoch, state, w, Nanos::MIN);
+    let connected =
+        epoch[w.node as usize] == w.epoch && matches!(state[w.node as usize], State::Polling);
     if connected && w.deadline_ns < now {
         expired.push(w.node);
     }
@@ -202,9 +196,7 @@ impl Settings {
             AuthModel::Cached => (2, 10),
         }
     }
-}
 
-impl Settings {
     /// Apply a JSON object of overrides.
     pub fn apply_json(&mut self, value: &Value) -> Result<(), String> {
         let obj = value
@@ -475,12 +467,9 @@ impl ControlSim {
             path.ends_with("/tokenreviews")
                 .then(|| (201, json!({"status": {"authenticated": true}})))
         });
+        api.put_object(DAEMONSET, json!({"metadata": {"name": "racer-dataplane"}}));
         api.put_object(
-            &daemonset_path(),
-            json!({"metadata": {"name": "racer-dataplane"}}),
-        );
-        api.put_object(
-            &service_account_path(),
+            SERVICE_ACCOUNT,
             json!({"metadata": {"name": "racer-dataplane"}}),
         );
         let mut sim = Self {
@@ -986,8 +975,6 @@ impl ControlSim {
         }
         let pod = pod_path(c);
         let node = node_path(c);
-        let ds = daemonset_path();
-        let sa = service_account_path();
         // (method, path, metric); None marks a cache check.
         let review_cached = cached && {
             let t = at(now + *latency);
@@ -999,8 +986,8 @@ impl ControlSim {
         }
         calls.push(("GET", &pod, b"", "ctl_api_gets"));
         let bindings_index = calls.len();
-        calls.push(("GET", &ds, b"", "ctl_api_gets"));
-        calls.push(("GET", &sa, b"", "ctl_api_gets"));
+        calls.push(("GET", DAEMONSET, b"", "ctl_api_gets"));
+        calls.push(("GET", SERVICE_ACCOUNT, b"", "ctl_api_gets"));
         calls.push(("GET", &node, b"", "ctl_api_gets"));
         let mut issued = 0u32;
         let mut throttled = false;
@@ -1583,13 +1570,8 @@ fn node_path(c: u32) -> String {
     format!("/api/v1/nodes/n{c}")
 }
 
-fn daemonset_path() -> String {
-    format!("/apis/apps/v1/namespaces/{NS}/daemonsets/racer-dataplane")
-}
-
-fn service_account_path() -> String {
-    format!("/api/v1/namespaces/{NS}/serviceaccounts/racer-dataplane")
-}
+const DAEMONSET: &str = "/apis/apps/v1/namespaces/racer-system/daemonsets/racer-dataplane";
+const SERVICE_ACCOUNT: &str = "/api/v1/namespaces/racer-system/serviceaccounts/racer-dataplane";
 
 /// Scenario defaults: duration and fault plan for `nodes` Pods.
 pub fn plan(
