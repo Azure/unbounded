@@ -1,0 +1,12 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM scratch
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.description="MetalMan Ubuntu 24.04 ARM64 GB200 access host disk" \
+      io.unbounded.host.architecture="arm64" \
+      io.unbounded.host.base.digest="sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb"
+COPY images/host-ubuntu2404-gb200-access/output/disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/

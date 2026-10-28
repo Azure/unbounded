@@ -73,7 +73,13 @@ jobs:
             exit 1
           fi
 
-          if [[ -n "$INPUT_PLATFORMS" ]]; then
+          if [[ "$name" == host-ubuntu2404-gb200-access ]]; then
+            if [[ -n "$INPUT_PLATFORMS" && "$INPUT_PLATFORMS" != linux/arm64 ]]; then
+              echo "::error::host-ubuntu2404-gb200-access requires linux/arm64"
+              exit 1
+            fi
+            platforms="linux/arm64"
+          elif [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
           else
             platforms="linux/amd64,linux/arm64"
@@ -95,7 +101,7 @@ jobs:
   build:
     needs: resolve
     if: needs.resolve.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.resolve.outputs.name == 'host-ubuntu2404-gb200-access' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Normalize container registry
         run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
@@ -103,6 +109,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: needs.resolve.outputs.name != 'host-ubuntu2404-gb200-access'
         with:
           platforms: linux/amd64,linux/arm64
 
@@ -141,7 +148,28 @@ jobs:
           cache-from: type=gha,scope=netboot-azurelinux
           cache-to: type=gha,scope=netboot-azurelinux,mode=max
 
+      - name: Build GB200 access disk
+        if: needs.resolve.outputs.name == 'host-ubuntu2404-gb200-access'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pigz qemu-efi-aarch64 qemu-system-arm qemu-utils
+          sudo images/host-ubuntu2404-gb200-access/build.sh
+
+      - name: Build and push GB200 access image
+        if: needs.resolve.outputs.name == 'host-ubuntu2404-gb200-access'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ needs.resolve.outputs.file }}
+          platforms: ${{ needs.resolve.outputs.platforms }}
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+
       - name: Build and push
+        if: needs.resolve.outputs.name != 'host-ubuntu2404-gb200-access'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
