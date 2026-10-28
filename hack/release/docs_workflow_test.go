@@ -81,7 +81,11 @@ func TestDocsWorkflowTriggers(t *testing.T) {
 		t.Fatalf("release types = %v, want [published]", release.Types)
 	}
 
-	for _, event := range []string{"workflow_dispatch", "workflow_call"} {
+	if _, ok := wf.On["workflow_call"]; ok {
+		t.Fatal("docs must not be a reusable workflow; release-upgrade dispatches it")
+	}
+
+	for _, event := range []string{"workflow_dispatch"} {
 		var trig struct {
 			Inputs map[string]struct {
 				Required bool   `yaml:"required"`
@@ -162,19 +166,20 @@ func TestDocsWorkflowPermissionsAndOrdering(t *testing.T) {
 	}
 }
 
-func TestReleaseUpgradeCallsDocs(t *testing.T) {
+func TestReleaseUpgradeDispatchesDocs(t *testing.T) {
 	t.Parallel()
 
 	wf := loadWorkflow(t, "release-upgrade.yaml")
 
 	docs, ok := wf.Jobs["docs"]
 	if !ok {
-		t.Fatal("release-upgrade must call docs")
+		t.Fatal("release-upgrade must dispatch docs")
 	}
 
-	if docs.Uses != "./.github/workflows/docs.yaml" ||
-		docs.With["tag"] != "${{ needs.resolve.outputs.tag }}" {
-		t.Fatalf("docs call = uses %q with %v", docs.Uses, docs.With)
+	// A reusable call would hold deploy-unbounded-stable while the
+	// github-pages environment waits for approval.
+	if docs.Uses != "" {
+		t.Fatalf("docs must be dispatched, not called: uses %q", docs.Uses)
 	}
 
 	needs, _ := docs.Needs.([]any)
@@ -199,13 +204,84 @@ func TestReleaseUpgradeCallsDocs(t *testing.T) {
 		}
 	}
 
-	if len(docs.Permissions) != 3 || docs.Permissions["contents"] != "read" ||
-		docs.Permissions["pages"] != "write" || docs.Permissions["id-token"] != "write" {
-		t.Fatalf("docs permissions = %v", docs.Permissions)
+	if len(docs.Permissions) != 1 || docs.Permissions["actions"] != "write" {
+		t.Fatalf("docs permissions = %v, want only actions: write", docs.Permissions)
 	}
 
-	if _, ok := docs.Permissions["actions"]; ok {
-		t.Fatal("docs call must not need actions permission")
+	if len(docs.Steps) != 1 {
+		t.Fatalf("docs steps = %d, want 1", len(docs.Steps))
+	}
+
+	step := docs.Steps[0]
+	if step.Uses != "" {
+		t.Fatalf("dispatch step uses %q", step.Uses)
+	}
+
+	if step.Env["TAG"] != "${{ needs.resolve.outputs.tag }}" ||
+		step.Env["GH_TOKEN"] != "${{ github.token }}" ||
+		step.Env["GH_REPO"] != "${{ github.repository }}" {
+		t.Fatalf("dispatch env = %v", step.Env)
+	}
+
+	if strings.Contains(step.Run, "${{") {
+		t.Fatalf("dispatch script interpolates expressions; use env vars:\n%s", step.Run)
+	}
+
+	runDispatch(t, step.Run)
+}
+
+// runDispatch runs the dispatch script against a fake gh and checks that it
+// targets main's docs.yaml with the resolved tag, passed as one argument.
+func runDispatch(t *testing.T, script string) {
+	t.Helper()
+
+	if err := os.MkdirAll("../../tmp", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, err := os.MkdirTemp("../../tmp", "docs-dispatch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gh := "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$GH_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(gh), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	log := filepath.Join(dir, "gh.log")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", "-euo", "pipefail", "-c", script)
+	cmd.Env = []string{
+		"PATH=" + dir + ":" + os.Getenv("PATH"),
+		"GH_LOG=" + log,
+		"GH_TOKEN=token",
+		"GH_REPO=Azure/unbounded",
+		"TAG=v1.4.0 extra",
+	}
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dispatch failed: %v\n%s", err, out)
+	}
+
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "workflow\nrun\ndocs.yaml\n--ref\nmain\n-f\ntag=v1.4.0 extra\n"
+	if string(data) != want {
+		t.Fatalf("gh args = %q, want %q", data, want)
 	}
 }
 

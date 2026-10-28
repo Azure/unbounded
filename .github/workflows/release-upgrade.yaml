@@ -1152,9 +1152,13 @@ jobs:
   # Publish the production docs site from the release that just became Latest.
   #
   # Releases published with GITHUB_TOKEN do not emit the `release` event, so
-  # docs.yaml's own trigger never fires for this path. A reusable call keeps the
-  # caller free of actions: write and works no matter which tag is deployed,
-  # since the called workflow comes from this run's commit, not the tag.
+  # docs.yaml's own trigger never fires for this path. Dispatching docs.yaml
+  # instead is exempt from that rule: GITHUB_TOKEN may start workflow_dispatch
+  # runs. It is a dispatch rather than a reusable call so the Pages deploy,
+  # and any approval wait on the github-pages environment, runs outside this
+  # workflow's deploy-unbounded-stable concurrency group and never blocks the
+  # next cluster upgrade. `--ref main` runs main's docs.yaml, not the copy
+  # stored in the tag.
   #
   # Either publish path counts; they are mutually exclusive. Non-Latest
   # releases (prereleases, older-series patches) never replace the site.
@@ -1167,13 +1171,16 @@ jobs:
       needs.resolve.result == 'success' &&
       needs.resolve.outputs.latest == 'true' &&
       (needs.publish.result == 'success' || needs.publish-forced.result == 'success')
+    runs-on: ubuntu-latest
     permissions:
-      contents: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/docs.yaml
-    with:
-      tag: ${{ needs.resolve.outputs.tag }}
+      actions: write
+    steps:
+      - name: Dispatch docs workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: gh workflow run docs.yaml --ref main -f tag="$TAG"
 
 
   # ---------------------------------------------------------------------------

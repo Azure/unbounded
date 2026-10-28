@@ -4,9 +4,12 @@
 
 `docs.yaml` deploys the docs from the latest published stable release tag, not
 from `main`. Drafts, prereleases, and older releases do not replace production.
-Publishing a release by hand triggers the workflow. The release upgrade workflow
-calls it after publishing a release because events created with `GITHUB_TOKEN`
-do not start new release workflows.
+Publishing a release by hand triggers the workflow. After the release upgrade
+workflow publishes a release, it dispatches the workflow on `main` because
+releases created with `GITHUB_TOKEN` do not trigger `release` workflows.
+Dispatching with `GITHUB_TOKEN` is allowed. The docs deployment runs as its own
+workflow, so waiting for `github-pages` approval does not delay later cluster
+upgrades.
 
 Keep this repository's Pages source set to **GitHub Actions**. In the
 `github-pages` environment, allow the `main` branch and tags matching `v*`.

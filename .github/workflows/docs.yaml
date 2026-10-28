@@ -13,11 +13,9 @@ name: unbounded docs
 #   release: published   a release published by a human. GitHub suppresses
 #                        this event for releases published with GITHUB_TOKEN,
 #                        so the automated publish path cannot rely on it.
-#   workflow_call        release-upgrade.yaml after it publishes a Latest
-#                        release. A reusable call rather than a dispatch, so
-#                        the caller needs no actions: write and older tags
-#                        never need to know about this workflow's inputs.
-#   workflow_dispatch    manual retry for a given tag, from main only.
+#   workflow_dispatch    release-upgrade.yaml after it publishes a Latest
+#                        release, or a manual retry for a given tag. Runs
+#                        from main only.
 #
 # Whatever the trigger, `resolve` checks the tag against the repository's
 # latest published release before anything is checked out. Drafts and
@@ -33,13 +31,6 @@ on:
         description: "Release tag to publish docs from; must be the latest published stable release"
         required: true
         type: string
-  workflow_call:
-    inputs:
-      tag:
-        description: "Release tag to publish docs from; must be the latest published stable release"
-        required: true
-        type: string
-
 permissions:
   contents: read
 
@@ -59,10 +50,9 @@ jobs:
       # Inputs reach the shell only through env vars, never through expression
       # interpolation into the script, so a crafted tag cannot inject commands.
       #
-      # In a reusable workflow github.event_name and github.ref are the
-      # caller's, so only the release event is treated specially: every other
-      # event, including release-upgrade's workflow_run, must supply a tag and
-      # run on main.
+      # Only the release event is treated specially: every other event,
+      # including release-upgrade's dispatch, must supply a tag and run on
+      # main.
       - name: Validate tag
         id: validate
         env:
