@@ -3390,17 +3390,8 @@ impl NodeWorld {
         let Some((sender, dest, page, sent)) = self.last_hops.remove(&mid) else {
             return;
         };
-        let now = self.now();
-        let (sent, at) = (self.instant(sent), self.instant(now));
         self.metrics.incr("silence_timeouts");
-        if !self.nodes[sender as usize]
-            .silence
-            .timed_out(dest, page, sent, at, LINK_TIMEOUTS)
-        {
-            return;
-        }
-        self.nodes[sender as usize].silence.start_ping(&dest, at);
-        self.launch_ping(sender, dest, page);
+        self.silence_timeout(sender, dest, page, sent, LINK_TIMEOUTS);
     }
 
     /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester
@@ -3410,9 +3401,15 @@ impl NodeWorld {
         if !self.config.node.silence {
             return;
         }
-        let Some((node, page)) = self.fills.get(&id).map(|f| (f.node, f.page)) else {
-            return;
-        };
+        if let Some((node, page)) = self.fills.get(&id).map(|f| (f.node, f.page)) {
+            self.silence_timeout(node, dest, page, sent, needed);
+        }
+    }
+
+    /// `node`'s exchange with `dest`, sent at `sent`, timed out: ping `dest`
+    /// at once when the timeout asks for it (production instead drains
+    /// `Silence::due_pings` each turn, capped by `MAX_PINGS_IN_FLIGHT`).
+    fn silence_timeout(&mut self, node: u32, dest: u32, page: u64, sent: Nanos, needed: u32) {
         let (sent, at) = (self.instant(sent), self.instant(self.now()));
         let silence = &mut self.nodes[node as usize].silence;
         if silence.timed_out(dest, page, sent, at, needed) {
