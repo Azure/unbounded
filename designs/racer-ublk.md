@@ -308,13 +308,17 @@ fetching the next page, at most two pages at a time per queue.
     flight.
   - An external `STOP_DEV` of a running device makes the manager tear it down.
   - One queue served through `DirectorySource`, `WorkerDirectory`, and a scripted origin.
-- These root tests have run on Linux 7.0 only. The 6.8 paths (`ENOTSUPP` fallback and
-  pinned `DEL_DEV`) are covered by unit tests and the racer-block Go code.
+  - The real `racer` binary with two I/O workers, a fake control plane, and a
+    fake origin (`tests/process_restart/ublk.rs`). It reads the whole device from CPUs
+    mapped to different hardware queues, checks that writes fail, sends `SIGTERM` while
+    reads are in flight, and checks a clean exit and that the device is gone.
+- These root tests pass on the host (Linux 7.0) and in the QEMU harness
+  `hack/scripts/racer-ublk-vm-test.sh` on Linux 6.8 and 7.0.
 
 ## Follow-ups not done
 
-- An end-to-end test through a full multi-worker dataplane with peers. The root tests cover
-  one worker's read path with a scripted origin, not `WorkerApplication` startup or peers.
+- An end-to-end test with peers. The real-process root test uses one dataplane and a
+  scripted origin.
 - A device that fails is not retried. It stays down until the dataplane restarts.
 - No metrics for ublk requests yet. Failures are logged.
 - No per-request deadline from the kernel. Each page read uses `RACER_REQUEST_TIMEOUT_MS`.
