@@ -22,12 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::task::Waker;
 
 pub use racer_core::admission::ResourceClass;
-pub use racer_core::admission::Rules;
-
-/// Production floors: 16 MiB pages and the store's maximum record header.
-pub fn production_floors() -> racer_core::admission::Floors {
-    racer_core::admission::Floors::for_page(PAGE_BYTES as usize, crate::store::MAX_HEADER_BYTES)
-}
+use racer_core::admission::Rules;
 
 pub struct AdmissionPolicy {
     rules: Rules,
@@ -49,7 +44,13 @@ impl Clone for AdmissionPolicy {
 impl AdmissionPolicy {
     pub fn new(limits: Limits) -> Self {
         Self {
-            rules: Rules::new(limits, production_floors()),
+            rules: Rules::new(
+                limits,
+                racer_core::admission::Floors::for_page(
+                    PAGE_BYTES as usize,
+                    crate::store::MAX_HEADER_BYTES,
+                ),
+            ),
             observer: OnceLock::new(),
             weights: crate::priority::Weights::default(),
         }
@@ -383,7 +384,6 @@ mod capture_tests {
         ));
     }
 }
-pub use racer_core::admission::METADATA_OUTBOUND_RESERVE;
 
 /// Compound socket role admission, retained through kernel completion.
 pub struct ConnectionReservation {
@@ -987,7 +987,8 @@ mod rules_equivalence_tests {
             ResourceClass::OutboundConnection => limits.client_connections.get() / 4,
             ResourceClass::OrdinaryOutboundConnection => {
                 let outbound = legacy_limit(limits, ResourceClass::OutboundConnection);
-                outbound - usize::from(outbound >= 2) * METADATA_OUTBOUND_RESERVE
+                outbound
+                    - usize::from(outbound >= 2) * racer_core::admission::METADATA_OUTBOUND_RESERVE
             }
             ResourceClass::IngressConnection => limits.client_connections.get().saturating_sub(
                 legacy_limit(limits, ResourceClass::ControlConnection)
