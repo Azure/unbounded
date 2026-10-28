@@ -159,10 +159,9 @@ impl LinkHealth {
     }
     /// Whether `peer` is silent: requests for it fail at once.
     pub fn silent(&self, peer: &NodeId) -> bool {
-        self.silent_at(peer, uring_runtime::environment::now())
-    }
-    pub fn silent_at(&self, peer: &NodeId, now: Instant) -> bool {
-        self.silence.borrow().silent(peer, now)
+        self.silence
+            .borrow()
+            .silent(peer, uring_runtime::environment::now())
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
         self.observe_at(neighbor, outcome, uring_runtime::environment::now())
@@ -182,12 +181,7 @@ impl LinkHealth {
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
         // A silent neighbor is routed around.
-        Ok(self.inner.available(neighbor, now) && !self.silent_at(neighbor, now))
-    }
-    /// Circuit state only: whether `neighbor` may carry a ping meant for
-    /// itself even while this node holds it silent.
-    pub fn circuit_available_at(&self, neighbor: &NodeId, now: Instant) -> bool {
-        self.inner.available(neighbor, now)
+        Ok(self.inner.available(neighbor, now) && !self.silence.borrow().silent(neighbor, now))
     }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
         self.try_acquire_at(neighbor, uring_runtime::environment::now())
@@ -807,7 +801,8 @@ impl Paths {
         let mut blocked = Vec::new();
         for (position, node) in positions.into_iter().zip(&neighbors) {
             let available = if exempt == Some(node) {
-                self.health.circuit_available_at(node, now)
+                // Circuit state only: a ping may reach the silent neighbor it tests.
+                self.health.inner.available(node, now)
             } else {
                 self.health.available_at(node, now)?
             };
