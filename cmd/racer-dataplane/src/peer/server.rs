@@ -414,16 +414,21 @@ impl PeerServer {
         }
         let (object, number) = (&page.version.object, page.number);
         let owners = self.placement.rank(membership.clone(), object, number);
-        let owner = owners
-            .ordered
-            .iter()
-            .take(3)
-            .any(|node| node == &self.relay.network.local);
-        let exempt = owners.ordered.iter().take(3).any(|node| node == requester)
-            || membership
+        let helper = || {
+            membership
                 .position(requester)
-                .is_ok_and(|p| is_helper(object, number, p, membership.members().len()));
-        shed_hot_page(owner, streaming, all, exempt, threshold)
+                .is_ok_and(|p| is_helper(object, number, p, membership.members().len()))
+        };
+        let local = &self.relay.network.local;
+        shed_hot_page(
+            &owners.ordered,
+            local,
+            requester,
+            helper,
+            streaming,
+            all,
+            threshold,
+        )
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.

@@ -3612,23 +3612,19 @@ impl NodeWorld {
         // current membership (fetched under an older one, or never missed it since) still sheds.
         let w = self.ids.worker(page);
         let owners = self.owners_at(dest, w, page, true);
-        if !owners.contains(&dest) {
-            return false;
-        }
         let version = self.nodes[dest as usize].version;
-        let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
+        let Some(members) = self.versions.get(version).map(|v| &v.members) else {
             return false;
         };
-        let exempt = owners.contains(&requester)
-            || members.position(&requester.to_be_bytes()).is_some_and(|p| {
-                is_helper(
-                    &self.ids.object(page),
-                    self.ids.number(page),
-                    p,
-                    members.members().len(),
-                )
-            });
-        shed_hot_page(true, streaming, all, exempt, threshold)
+        let helper = || {
+            members.position(&requester.to_be_bytes()).is_some_and(|p| {
+                let (object, number) = (self.ids.object(page), self.ids.number(page));
+                is_helper(&object, number, p, members.members().len())
+            })
+        };
+        shed_hot_page(
+            &owners, &dest, &requester, helper, streaming, all, threshold,
+        )
     }
 
     fn serve(&mut self, mid: u64) {

@@ -492,25 +492,28 @@ pub const fn hot_page_bodies(page_bytes: u64) -> usize {
     }
 }
 
-/// Whether an owner sheds a request for a page it is already writing to at
-/// least `threshold` requesters ([`hot_page_bodies`]), when that page is at
-/// least half of
-/// the `all` bodies the owner is writing (the page is the owner's queue; when
-/// many pages share a busy NIC, moving their readers to helpers only adds a
-/// relayed hop for each of them). The shed requester asks its helper (the
-/// walk's overflow step), which the owner always serves, so the owner's NIC
-/// feeds at most [`fanout_width`] helpers plus a few readers per page instead
-/// of a queue of readers that time out. Owners and helpers of the page are
-/// never shed (`exempt`), and non-owners never shed: a helper queues the
-/// readers it was chosen for.
-pub fn shed_hot_page(
-    owner: bool,
+/// Whether `local` sheds `requester`'s request for a page it is already writing to at least
+/// `threshold` requesters ([`hot_page_bodies`]), when that page is at least half of the `all`
+/// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop). Only one
+/// of the page's first three ranked `owners` sheds, and never to another owner or to one of the
+/// page's helpers (`helper`, evaluated last): the shed requester asks a helper, which the owner
+/// always serves, so the owner's NIC feeds at most [`fanout_width`] helpers instead of a queue of
+/// readers that time out.
+pub fn shed_hot_page<N: PartialEq>(
+    owners: &[N],
+    local: &N,
+    requester: &N,
+    helper: impl FnOnce() -> bool,
     streaming: usize,
     all: usize,
-    exempt: bool,
     threshold: usize,
 ) -> bool {
-    owner && !exempt && streaming >= threshold.max(1) && streaming * 2 >= all
+    let owners = &owners[..owners.len().min(3)];
+    streaming >= threshold.max(1)
+        && streaming * 2 >= all
+        && owners.contains(local)
+        && !owners.contains(requester)
+        && !helper()
 }
 
 /// Whether the member at `position` is one of `page`'s helpers (any reader
@@ -654,17 +657,26 @@ mod fanout_tests {
 
     #[test]
     fn owners_shed_only_non_exempt_requesters_of_a_dominant_hot_page() {
+        let shed = |owners: &[u8], requester, helper, streaming, all, n| {
+            shed_hot_page(owners, &0, &requester, || helper, streaming, all, n)
+        };
         for n in [hot_page_bodies(1 << 20), hot_page_bodies(16 << 20)] {
-            assert!(!shed_hot_page(true, n - 1, n - 1, false, n));
-            assert!(shed_hot_page(true, n, n, false, n));
-            assert!(shed_hot_page(true, n, 2 * n, false, n));
+            assert!(!shed(&[0, 1, 2], 9, false, n - 1, n - 1, n));
+            assert!(shed(&[0, 1, 2], 9, false, n, n, n));
+            assert!(shed(&[1, 0, 2], 9, false, n, 2 * n, n));
             // A page that is not most of the owner's queue is not shed.
-            assert!(!shed_hot_page(true, n, 2 * n + 1, false, n));
-            assert!(!shed_hot_page(true, n, n, true, n));
-            assert!(!shed_hot_page(false, n, n, false, n));
+            assert!(!shed(&[0, 1, 2], 9, false, n, 2 * n + 1, n));
+            // Owners and helpers are exempt.
+            assert!(!shed(&[0, 1, 2], 2, false, n, n, n));
+            assert!(!shed(&[0, 1, 2], 9, true, n, n, n));
+            // Non-owners, including ranks past the first three, never shed.
+            assert!(!shed(&[1, 2, 3], 9, false, n, n, n));
+            assert!(!shed(&[1, 2, 3, 0], 9, false, n, n, n));
+            // A requester ranked past the first three is not an owner.
+            assert!(shed(&[0, 1, 2, 9], 9, false, n, n, n));
         }
         // A zero threshold still needs one body in flight.
-        assert!(!shed_hot_page(true, 0, 0, false, 0));
+        assert!(!shed(&[0], 9, false, 0, 0, 0));
     }
 
     #[test]
