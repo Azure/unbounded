@@ -83,6 +83,9 @@ pub(crate) struct DeviceView {
     pub abandon: bool,
 }
 
+/// Opens a fresh control channel for [`Manager::settle`].
+pub(super) type Reopen<'a> = dyn FnMut() -> Result<Box<dyn DeviceControl>, UblkError> + 'a;
+
 /// The blocking control operations, as a trait so tests can fake the kernel.
 pub(crate) trait DeviceControl {
     fn add_dev(&mut self, spec: &DevSpec) -> Result<DevInfo, UblkError>;
@@ -284,8 +287,9 @@ impl Manager {
             .map(|attach| attach.dev_id)
     }
 
-    /// Whether the control thread has exited. Every device it started has
-    /// been stopped by then, so no kernel request still waits for a read.
+    /// Whether the control thread has finished its loop. Every device it
+    /// started has been stopped by then, or is being stopped by
+    /// [`Manager::settle`], so no kernel request still waits for a read.
     pub(crate) fn control_done(&self) -> bool {
         self.lock().control_done
     }
@@ -377,17 +381,109 @@ impl Manager {
     }
 
     /// Open `/dev/ublk-control` and run the control loop until stop.
+    ///
+    /// Whatever way the loop ends, including a panic, no worker queue may be
+    /// left with FETCH commands only the kernel can complete: they cannot be
+    /// canceled, and the worker's runtime fence waits for them. See
+    /// [`Manager::settle`]. If that fails, the process exits, which makes
+    /// the kernel abort them.
     pub(crate) fn run(&self) {
-        match Control::open(&self.device_directory) {
-            Ok(mut control) => {
-                control.set_timeout(self.shutdown_timeout.max(MIN_COMMAND_TIMEOUT));
-                self.run_with(&mut control);
+        let directory = self.device_directory.clone();
+        let timeout = self.shutdown_timeout.max(MIN_COMMAND_TIMEOUT);
+        let settled = self.run_guarded(
+            |manager| match Control::open(&manager.device_directory) {
+                Ok(mut control) => {
+                    control.set_timeout(timeout);
+                    manager.run_with(&mut control);
+                }
+                Err(error) => log(None, "open", &format!("error=\"{error}\"")),
+            },
+            &mut || {
+                let mut control = Control::open(&directory)?;
+                control.set_timeout(timeout);
+                Ok(Box::new(control))
+            },
+        );
+        if !settled {
+            log(
+                None,
+                "settle",
+                "state=failed action=exit reason=\"queues hold kernel commands\"",
+            );
+            std::process::exit(1);
+        }
+    }
+
+    /// Run `body`, even if it panics, then mark the control thread done and
+    /// [`settle`](Manager::settle) with `reopen`.
+    pub(super) fn run_guarded(&self, body: impl FnOnce(&Self), reopen: &mut Reopen<'_>) -> bool {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
+        if outcome.is_err() {
+            log(None, "control", "state=panicked");
+        }
+        self.finish();
+        self.settle(reopen)
+    }
+
+    /// Make sure no attached queue still waits on the kernel once the
+    /// control thread is done. Returns false when that cannot be ensured.
+    ///
+    /// A queue still attached here means teardown did not finish: it timed
+    /// out, its channel broke, or the loop panicked. Its FETCH commands end
+    /// only when the device is stopped or the process exits. This sends
+    /// STOP_DEV for each such device over a fresh `/dev/ublk-control`
+    /// descriptor, bounded by the command timeout. STOP_DEV on an already
+    /// stopped device succeeds, and ENODEV means the device is gone; both
+    /// leave no FETCH outstanding. Devices are not deleted here.
+    fn settle(&self, reopen: &mut Reopen<'_>) -> bool {
+        let stuck: Vec<(usize, u32)> = {
+            let shared = self.lock();
+            shared
+                .devices
+                .iter()
+                .enumerate()
+                .filter_map(|(index, device)| {
+                    let attached = device.queues.contains(&QueueReport::Attached);
+                    device
+                        .attach
+                        .filter(|_| attached)
+                        .map(|attach| (index, attach.dev_id))
+                })
+                .collect()
+        };
+        if stuck.is_empty() {
+            return true;
+        }
+        self.update(|shared| {
+            for &(index, _) in &stuck {
+                shared.devices[index].stopping = true;
             }
+        });
+        let mut control = match reopen() {
+            Ok(control) => control,
             Err(error) => {
-                log(None, "open", &format!("error=\"{error}\""));
-                self.finish();
+                log(None, "settle", &format!("state=failed error=\"{error}\""));
+                return false;
+            }
+        };
+        let mut settled = true;
+        for (index, id) in stuck {
+            match control.stop_dev(id) {
+                Ok(()) => log(Some(index), "settle", &format!("state=stopped id={id}")),
+                Err(error) if error.errno() == Some(libc::ENODEV) => {
+                    log(Some(index), "settle", &format!("state=gone id={id}"))
+                }
+                Err(error) => {
+                    log(
+                        Some(index),
+                        "settle",
+                        &format!("state=failed id={id} error=\"{error}\""),
+                    );
+                    settled = false;
+                }
             }
         }
+        settled
     }
 
     fn finish(&self) {
@@ -811,7 +907,7 @@ mod tests {
         stale: bool,
         /// ADD_DEV grants this depth and buffer size instead.
         grant: Option<(u16, u32)>,
-        stop_errno: Option<i32>,
+        stop_errno: Arc<Mutex<Option<i32>>>,
         /// DEL_DEV fails with an unknown outcome and poisons the channel.
         del_unknown: bool,
         poisoned: Arc<Mutex<bool>>,
@@ -871,7 +967,7 @@ mod tests {
 
         fn stop_dev(&mut self, id: u32) -> Result<(), UblkError> {
             self.push(format!("stop {id}"));
-            match self.stop_errno {
+            match *self.stop_errno.lock().unwrap() {
                 Some(errno) => Err(UblkError::Kernel {
                     op: "STOP_DEV",
                     errno,
@@ -1058,7 +1154,7 @@ mod tests {
     fn external_stop_tears_down_and_ignores_enodev() {
         let manager = manager(None);
         let fake = Fake {
-            stop_errno: Some(libc::ENODEV),
+            stop_errno: Arc::new(Mutex::new(Some(libc::ENODEV))),
             ..Default::default()
         };
         let thread = spawn(&manager, &fake);
@@ -1350,6 +1446,152 @@ mod tests {
         manager.report_queue(0, 0, QueueReport::Closed);
         thread.join().unwrap();
         assert_eq!(fake.ops().last().unwrap(), &format!("del {DEV_ID}"));
+    }
+
+    /// A manager with one started device whose single queue stays attached.
+    fn started_with_stuck_queue(fake: &Fake) -> Arc<Manager> {
+        let manager = Arc::new(Manager::new(
+            &config(None),
+            1,
+            Path::new("/nonexistent"),
+            Duration::from_millis(20),
+            Duration::from_secs(2),
+        ));
+        *fake.manager.lock().unwrap() = Some(manager.clone());
+        manager.report_resolved(0, Ok(resolved()));
+        manager
+    }
+
+    /// Runs the guarded loop on a thread; the scripted worker attaches the
+    /// queue and never closes it.
+    fn run_stuck(
+        manager: &Arc<Manager>,
+        fake: &Fake,
+        panic_after_start: bool,
+        reopen_fails: bool,
+    ) -> std::thread::JoinHandle<bool> {
+        let (runner, mut loop_fake, reopen_fake) = (manager.clone(), fake.clone(), fake.clone());
+        std::thread::spawn(move || {
+            runner.run_guarded(
+                |manager| {
+                    if panic_after_start {
+                        // The loop added the device and a worker attached,
+                        // then the loop died before any teardown.
+                        manager.update(|shared| {
+                            shared.devices[0].attach = Some(Attach {
+                                dev_id: DEV_ID,
+                                depth: 4,
+                                max_io_bytes: 1 << 20,
+                                length: 1000,
+                            });
+                            shared.devices[0].queues[0] = QueueReport::Attached;
+                        });
+                        panic!("injected control panic");
+                    }
+                    manager.run_with(&mut loop_fake);
+                },
+                &mut || {
+                    if reopen_fails {
+                        return Err(UblkError::Kernel {
+                            op: "open",
+                            errno: libc::EACCES,
+                        });
+                    }
+                    reopen_fake.push("reopen".into());
+                    Ok(Box::new(reopen_fake.clone()))
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn teardown_timeout_stops_stuck_devices_again() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let thread = run_stuck(&manager, &fake, false, false);
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        manager.request_stop();
+        assert!(thread.join().unwrap(), "a second STOP_DEV settles");
+        let ops = fake.ops();
+        let tail = &ops[ops.len() - 3..];
+        assert_eq!(
+            tail,
+            [
+                format!("del {DEV_ID}"),
+                "reopen".into(),
+                format!("stop {DEV_ID}")
+            ]
+        );
+        assert!(manager.control_done());
+        assert!(manager.stopping(0));
+    }
+
+    #[test]
+    fn panicked_control_loop_still_stops_devices() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let thread = run_stuck(&manager, &fake, true, false);
+        assert!(thread.join().unwrap());
+        assert!(manager.control_done(), "a panic still marks the loop done");
+        assert!(view(&manager, 0).abandon, "workers stop serving reads");
+        assert_eq!(fake.ops(), ["reopen".to_string(), format!("stop {DEV_ID}")]);
+    }
+
+    #[test]
+    fn failed_second_stop_reports_unsettled() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let thread = run_stuck(&manager, &fake, false, false);
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        // Neither STOP_DEV can finish.
+        *fake.stop_errno.lock().unwrap() = Some(libc::ETIMEDOUT);
+        manager.request_stop();
+        assert!(!thread.join().unwrap());
+    }
+
+    #[test]
+    fn unreachable_control_device_reports_unsettled() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let thread = run_stuck(&manager, &fake, false, true);
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        manager.request_stop();
+        assert!(!thread.join().unwrap());
+    }
+
+    #[test]
+    fn gone_device_counts_as_settled() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let thread = run_stuck(&manager, &fake, false, false);
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        *fake.stop_errno.lock().unwrap() = Some(libc::ENODEV);
+        manager.request_stop();
+        assert!(thread.join().unwrap());
+    }
+
+    #[test]
+    fn closed_queues_need_no_second_stop() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let thread = run_stuck(&manager, &fake, false, true);
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        manager.request_stop();
+        eventually("stop", || fake.ops().contains(&format!("stop {DEV_ID}")));
+        manager.report_queue(0, 0, QueueReport::Closed);
+        // Reopening would fail, so success means it was never tried.
+        assert!(thread.join().unwrap());
+        assert!(!fake.ops().contains(&"reopen".to_string()));
     }
 
     #[test]

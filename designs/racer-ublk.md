@@ -158,6 +158,13 @@ root test). Instead, an abandoned queue answers every request it holds, or is ha
 with `EIO`. That lets a waiting `STOP_DEV` finish, and the abort then ends the queue. A
 worker's drain finishes once the control thread has exited and its queues hold no request.
 
+A worker's runtime fence still waits for the queue's outstanding fetches, and only the
+kernel can end them. So when the control loop ends with any queue still attached, because
+teardown timed out, its control channel broke, or the loop panicked, the control thread
+opens a fresh `/dev/ublk-control` and sends `STOP_DEV` to each such device. Success, or
+`ENODEV`, means no fetch is left. If that fails too, the process logs an error and exits,
+which makes the kernel abort the fetches. Without this step, shutdown could hang forever.
+
 A dedicated ring per queue, closed on abandon, was not used. Closing a ring early is unsafe
 in other ways: on 7.0 it does not complete requests already handed out, so `STOP_DEV`
 still hangs, and on 6.8 it aborts them but leaves them owned, so a later commit completes

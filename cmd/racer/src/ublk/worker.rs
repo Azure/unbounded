@@ -232,8 +232,10 @@ impl<B: Backend> UblkWorker<B> {
     /// Nothing here can still hold up a device. Either no queue is
     /// attached, or the control thread has finished and no queue holds a
     /// request the kernel waits on. A queue left in the second case only
-    /// has FETCH commands outstanding, which a later STOP_DEV, or closing
-    /// the ring at exit, completes.
+    /// has FETCH commands outstanding. The control thread already stopped
+    /// its device, or stops it again on finishing, or exits the process
+    /// (see `Manager::settle`), so the runtime fence cannot wait on them
+    /// forever.
     pub(crate) fn is_idle(&self) -> bool {
         let control_done = self.manager.control_done();
         self.devices.iter().all(|device| {

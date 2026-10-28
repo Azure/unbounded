@@ -869,3 +869,103 @@ fn ublk_unpinned_delete_with_held_dups_does_not_block() {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A real control channel whose STOP_DEV panics, standing in for a control
+/// loop that dies during teardown.
+struct PanicOnStop(Control);
+
+impl super::manager::DeviceControl for PanicOnStop {
+    fn add_dev(&mut self, spec: &DevSpec) -> super::control::Result<super::uapi::DevInfo> {
+        self.0.add_dev(spec)
+    }
+    fn set_params(&mut self, id: u32, params: &Params) -> super::control::Result<()> {
+        self.0.set_params(id, params)
+    }
+    fn start_dev(
+        &mut self,
+        id: u32,
+        pid: i32,
+        should_stop: &dyn Fn() -> bool,
+    ) -> super::control::Result<()> {
+        self.0.start_dev(id, pid, should_stop)
+    }
+    fn stop_dev(&mut self, _id: u32) -> super::control::Result<()> {
+        panic!("injected panic before STOP_DEV");
+    }
+    fn get_dev_info(&mut self, id: u32) -> super::control::Result<super::uapi::DevInfo> {
+        self.0.get_dev_info(id)
+    }
+    fn del_dev(&mut self, id: u32) -> super::control::Result<()> {
+        self.0.del_dev(id)
+    }
+    fn del_dev_unpinned(&mut self, id: u32) -> super::control::Result<()> {
+        self.0.del_dev_unpinned(id)
+    }
+    fn is_poisoned(&self) -> bool {
+        self.0.is_poisoned()
+    }
+}
+
+/// The control loop dies before stopping a running device. The manager
+/// still stops it over a fresh control channel, so every worker's FETCH
+/// commands end and its reactor drains to nothing in flight instead of
+/// waiting forever.
+#[test]
+fn ublk_control_panic_still_stops_the_device() {
+    if !enabled() {
+        return;
+    }
+    let manager = Arc::new(super::manager::Manager::new(
+        &stub_config(),
+        2,
+        Path::new("/dev"),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ));
+    let done = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..2)
+        .map(|q| {
+            let manager = manager.clone();
+            let done = done.clone();
+            thread::spawn(move || run_worker(q, manager, done))
+        })
+        .collect();
+    let control = {
+        let manager = manager.clone();
+        thread::spawn(move || {
+            manager.run_guarded(
+                |manager| {
+                    let control = Control::open(Path::new("/dev")).expect("open ublk-control");
+                    manager.run_with(&mut PanicOnStop(control));
+                },
+                &mut || {
+                    let control = Control::open(Path::new("/dev"))?;
+                    Ok(Box::new(control))
+                },
+            )
+        })
+    };
+    let id = wait_dev_id(&manager);
+    let block_path = Path::new("/dev").join(format!("ublkb{id}"));
+    assert!(
+        wait_for(&block_path),
+        "{} did not appear",
+        block_path.display()
+    );
+    manager.request_stop();
+    let settled = control.join().expect("control thread");
+    done.store(true, Ordering::Relaxed);
+    let in_flight: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker thread"))
+        .collect();
+    assert!(manager.control_done());
+    drop(manager);
+    // Settling stops but does not delete. Every descriptor is closed now.
+    Control::open(Path::new("/dev"))
+        .expect("open ublk-control")
+        .del_dev(id)
+        .expect("DEL_DEV");
+    assert!(settled, "the fresh STOP_DEV succeeded");
+    assert_eq!(in_flight, [0, 0], "every FETCH ended");
+}
