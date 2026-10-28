@@ -849,43 +849,6 @@ pub fn bootstrap_page_ok(present: u64, page: u64) -> bool {
     present != 1 || page == 0
 }
 
-/// Selected-grant fields, for callers that hold typed values.
-#[derive(Clone, Copy, Debug)]
-pub struct Grant<'a, N> {
-    pub page_demanded: bool,
-    pub membership: u64,
-    pub receiver: &'a N,
-    pub deadline_ms: u64,
-    pub page_budget: u64,
-    pub byte_budget: u64,
-    pub ciphertext: u64,
-    pub flights: Option<u16>,
-}
-
-/// Request fields a selected grant is checked against.
-#[derive(Clone, Copy, Debug)]
-pub struct GrantRequest<'a, N> {
-    pub membership: u64,
-    pub visited: &'a [N],
-    pub deadline_ms: u64,
-    pub page_budget: u64,
-    pub byte_budget: u64,
-    pub flights: Option<u16>,
-}
-
-impl<N: PartialEq> Grant<'_, N> {
-    /// All selected-grant rules, in production order.
-    pub fn valid(&self, request: &GrantRequest<'_, N>, now_ms: u64) -> bool {
-        self.page_demanded
-            && grant_membership_ok(self.membership, request.membership)
-            && grant_receiver_ok(request.visited, self.receiver)
-            && grant_deadline_ok(self.deadline_ms, request.deadline_ms, now_ms)
-            && page_budget_ok(self.page_budget, request.page_budget)
-            && byte_budget_ok(self.byte_budget, self.ciphertext, request.byte_budget)
-            && flights_ok(self.flights, request.flights)
-    }
-}
-
 #[cfg(test)]
 mod validity_tests {
     use super::*;
@@ -926,63 +889,17 @@ mod validity_tests {
     #[test]
     fn grant_arithmetic() {
         let visited = [1u32, 2, 3];
-        let request = GrantRequest {
-            membership: 7,
-            visited: &visited,
-            deadline_ms: 1000,
-            page_budget: 4,
-            byte_budget: 100,
-            flights: Some(3),
-        };
-        let good = Grant {
-            page_demanded: true,
-            membership: 7,
-            receiver: &1,
-            deadline_ms: 1000,
-            page_budget: 3,
-            byte_budget: 60,
-            ciphertext: 40,
-            flights: Some(2),
-        };
-        assert!(good.valid(&request, 999));
-        assert!(!good.valid(&request, 1000), "expired grant");
-        let receiver = 2;
-        for bad in [
-            Grant {
-                page_demanded: false,
-                ..good
-            },
-            Grant {
-                membership: 8,
-                ..good
-            },
-            Grant {
-                receiver: &receiver,
-                ..good
-            },
-            Grant {
-                deadline_ms: 1001,
-                ..good
-            },
-            Grant {
-                page_budget: 4,
-                ..good
-            },
-            Grant {
-                byte_budget: 61,
-                ..good
-            },
-            Grant {
-                flights: Some(4),
-                ..good
-            },
-            Grant {
-                flights: None,
-                ..good
-            },
-        ] {
-            assert!(!bad.valid(&request, 0), "{bad:?}");
-        }
+        // A grant valid against membership 7, receiver 1, deadline 1000, page
+        // budget 4, byte budget 100, and 3 flights, then each field broken.
+        assert!(grant_membership_ok(7, 7) && !grant_membership_ok(8, 7));
+        assert!(grant_receiver_ok(&visited, &1) && !grant_receiver_ok(&visited, &2));
+        assert!(grant_deadline_ok(1000, 1000, 999));
+        assert!(!grant_deadline_ok(1000, 1000, 1000), "expired grant");
+        assert!(!grant_deadline_ok(1001, 1000, 0));
+        assert!(page_budget_ok(3, 4) && !page_budget_ok(4, 4));
+        assert!(byte_budget_ok(60, 40, 100) && !byte_budget_ok(61, 40, 100));
+        assert!(flights_ok(Some(2), Some(3)));
+        assert!(!flights_ok(Some(4), Some(3)) && !flights_ok(None, Some(3)));
         assert!(!page_budget_ok(u64::MAX, 0));
         assert!(!byte_budget_ok(u64::MAX, 1, 0));
         assert!(flights_ok(None, None));

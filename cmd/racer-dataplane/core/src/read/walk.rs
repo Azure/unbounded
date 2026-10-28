@@ -141,7 +141,7 @@ pub const SUCCESSOR_GRANT_ATTEMPTS: u32 = 1;
 
 /// Extra opportunities a successor probe's time share is divided by, so it
 /// takes at most a fifth of the time left ([`plan_attempt`]).
-pub const SUCCESSOR_SHARE_DIVISOR: u32 = 4;
+pub(crate) const SUCCESSOR_SHARE_DIVISOR: u32 = 4;
 
 /// Links granted to one successor probe, as a reader funds an owner.
 pub const SUCCESSOR_GRANT_LINKS: u8 = 8;
@@ -159,7 +159,7 @@ pub const MAX_LINEAGE: usize = 6;
 
 /// Most handoff targets one owner walk lists ([`WalkConfig::handoff`]):
 /// successor targets (later owners, at most two) and lineage targets.
-pub const MAX_TARGETS: usize = REPLICAS_BELOW + MAX_LINEAGE;
+pub(crate) const MAX_TARGETS: usize = REPLICAS_BELOW + MAX_LINEAGE;
 
 /// Later owners an owner can have (successor targets).
 const REPLICAS_BELOW: usize = MAX_HANDOFF - 1;
@@ -188,7 +188,7 @@ pub fn owner_funding(canonical: usize) -> u32 {
 /// Fewest links a funded out-of-order Acquire may carry: the owner keeps
 /// `links - 1` ([`crate::read::budget::inherited_budget`]), at least one to reach
 /// its rank 0.
-pub const FUNDED_MIN_LINKS: u8 = 2;
+pub(crate) const FUNDED_MIN_LINKS: u8 = 2;
 
 /// Links a non-owner funds an out-of-order Acquire with: a full failure
 /// route ([`MAX_ROUTE_LINKS`]) when it has one to give, else exactly what a

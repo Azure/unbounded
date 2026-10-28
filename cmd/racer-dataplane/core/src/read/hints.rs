@@ -18,7 +18,7 @@
 //! the page from the holder instead of fetching it. An offer that does not get
 //! an answer signed by its destination (transport failure, a relay's answer,
 //! shed) is tried again after the next delay, at most [`NOTICE_TRIES`] times
-//! over about [`NOTICE_SPAN`] (longer than the simulator's 90 s partitions).
+//! over about 155 s (longer than the simulator's 90 s partitions).
 //!
 //! Every predecessor (Known issue 51). A holder at rank 2 also offers the
 //! copy to rank 1: when rank 1 later cannot reach rank 0 it fetches the page
@@ -81,9 +81,6 @@ pub const NOTICE_DELAYS: [Duration; 4] = [
 
 /// Offers per notice.
 pub const NOTICE_TRIES: usize = NOTICE_DELAYS.len();
-
-/// Time from the fetch to the last offer.
-pub const NOTICE_SPAN: Duration = Duration::from_secs(5 + 15 + 45 + 90);
 
 /// Default bound on pending notices per node.
 pub const NOTICE_CAPACITY: usize = 1024;
@@ -524,7 +521,7 @@ mod notice_tests {
             }
         }
         assert_eq!(sent, NOTICE_TRIES);
-        assert_eq!(now, start + NOTICE_SPAN);
+        assert_eq!(now, start + Duration::from_secs(5 + 15 + 45 + 90));
         assert!(n.is_empty());
     }
 

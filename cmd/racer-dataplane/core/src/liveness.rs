@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 pub const SILENCE_CAPACITY: usize = 256;
 
 /// How long an entry outlives its last event.
-pub const SILENCE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const SILENCE_TTL: Duration = Duration::from_secs(60);
 
 /// Unanswered exchanges over the last link before its sender pings: two, so
 /// that a busy neighbor, which answers something between two timeouts, is
