@@ -193,7 +193,7 @@ while [ ! -c /dev/ublk-control ] && [ \$i -lt 50 ]; do sleep 0.1; i=\$((i + 1));
 if [ -f /proc/sys/kernel/io_uring_disabled ]; then echo 0 >/proc/sys/kernel/io_uring_disabled; fi
 ( sleep $GUEST_TIMEOUT; echo "RACER_VM_FATAL tests hung for ${GUEST_TIMEOUT}s"; poweroff -n -f ) &
 cd /tmp
-/tests/test-bin '$TEST_FILTER' --test-threads=1 2>&1
+/tests/test-bin '$TEST_FILTER' --test-threads=1 --nocapture 2>&1
 echo "RACER_VM_RESULT \$?"
 poweroff -n -f
 EOF
