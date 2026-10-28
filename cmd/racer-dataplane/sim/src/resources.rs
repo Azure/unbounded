@@ -14,8 +14,7 @@ use racer_core::time::SplitMix64;
 use crate::config::{Config, Costs};
 use crate::engine::{Nanos, SECONDS, mix, unit};
 
-/// Service time of `bytes` at `bytes_per_sec`, rounded up, at least 1 ns
-/// for a nonzero transfer.
+/// Service time of `bytes` at `bytes_per_sec`, rounded up, at least 1 ns for a nonzero transfer.
 pub fn service_ns(bytes: u64, bytes_per_sec: u64) -> Nanos {
     if bytes == 0 {
         return 0;
@@ -42,8 +41,8 @@ pub struct RttMatrix {
 }
 
 impl RttMatrix {
-    /// Same-site RTT `local_ns`; cross-site RTT `remote_ns` plus a stable
-    /// random jitter in `0..jitter_ns`.
+    /// Same-site RTT `local_ns`; cross-site RTT `remote_ns` plus a stable random jitter in
+    /// `0..jitter_ns`.
     pub fn generate(
         sites: u32,
         local_ns: u32,
@@ -88,8 +87,7 @@ impl RttMatrix {
 /// Per-node NICs, disks, CPUs, with node placement into sites.
 pub struct Fabric {
     pub site: std::rc::Rc<[u16]>,
-    /// Slowdown multiplier per node (1 = normal), applied to CPU, disk and
-    /// NIC service times.
+    /// Slowdown multiplier per node (1 = normal), applied to CPU, disk and NIC service times.
     pub slow: Vec<u8>,
     pub tx_free: Vec<Nanos>,
     pub rx_free: Vec<Nanos>,
@@ -159,19 +157,16 @@ impl Fabric {
         now + self.latency(from, to)
     }
 
-    /// Transfer `bytes` along `route` (node ids, first is the sender) with
-    /// cut-through relay per chunk: each chunk is forwarded by a relay as soon
-    /// as it has fully arrived there, so a long transfer pipelines across
-    /// hops. Returns the time the last byte reaches the final node.
+    /// Transfer `bytes` along `route` (node ids, first is the sender) with cut-through relay per
+    /// chunk: each chunk is forwarded by a relay as soon as it has fully arrived there, so a long
+    /// transfer pipelines across hops.
     pub fn transfer(&mut self, now: Nanos, route: &[u32], bytes: u64) -> Nanos {
         self.transfer_until(now, route, bytes, Nanos::MAX)
             .expect("no cutoff")
     }
 
-    /// [`Fabric::transfer`] for an exchange the receiver abandons at
-    /// `cutoff`, as production drops it: no chunk starts at or after
-    /// `cutoff`, started chunks keep their reservations. `None` when the last
-    /// byte does not arrive before `cutoff`.
+    /// [`Fabric::transfer`] for an exchange the receiver abandons at `cutoff`, as production drops
+    /// it: no chunk starts at or after `cutoff`, started chunks keep their reservations.
     pub fn transfer_until(
         &mut self,
         now: Nanos,
@@ -194,9 +189,8 @@ impl Fabric {
                 let (a, b) = (hop[0], hop[1]);
                 let wire = service_ns(chunk, self.nic_bps);
                 let (send, receive) = (self.scale(a, wire), self.scale(b, wire));
-                // NICs are work-conserving backlogs from the transfer's
-                // issue, not slots at a chunk's future send time, so a relay
-                // or slow sender does not idle the other side (Known issue 18).
+                // NICs are work-conserving backlogs from the transfer's issue, not slots at a
+                // chunk's future send time, so a relay or slow sender does not idle the other side.
                 let backlog = self.tx_free[a as usize].max(now);
                 let start = ready.max(backlog);
                 if start >= cutoff {
@@ -300,13 +294,8 @@ pub struct OriginErrors {
     pub p5xx: f64,
 }
 
-/// The origin: per-cache concurrency cap (a pool of `cap` FIFO slots per
-/// cache), one shared bandwidth FIFO, fixed latency, injected errors.
-///
-/// Canceling a tracked request frees its slot and unsent bandwidth at the
-/// cancel time, as production closing the connection does, and replays later
-/// unstarted requests in issue order. Without cancellations the schedule is
-/// plain FIFO. Do not mix tracked and untracked requests on one `Origin`.
+/// The origin: per-cache concurrency cap (a pool of `cap` FIFO slots per cache), one shared
+/// bandwidth FIFO, fixed latency, injected errors.
 pub struct Origin {
     slots: Vec<Nanos>,
     cap: u32,
@@ -315,14 +304,11 @@ pub struct Origin {
     bps: u64,
     latency: Nanos,
     rng: SplitMix64,
-    /// Tracked requests in issue order. Finished and canceled ones are
-    /// marked dead and compacted away in bulk, so a cancellation's replay is
-    /// a scan of a contiguous vector.
+    /// Tracked requests in issue order.
     pending: Vec<OriginEntry>,
     dead: usize,
-    /// Outstanding requests whose completion a cancellation moved earlier,
-    /// by `(end, seq)`; rebuilt by each cancellation (see
-    /// [`Origin::pop_moved`]).
+    /// Outstanding requests whose completion a cancellation moved earlier, by `(end, seq)`; rebuilt
+    /// by each cancellation (see [`Origin::pop_moved`]).
     moved: BinaryHeap<Reverse<(Nanos, u64)>>,
     next_seq: u64,
     /// Slot and bandwidth free times left by finished tracked requests.
@@ -338,8 +324,8 @@ pub struct OriginHandle(u64);
 struct OriginEntry {
     seq: u64,
     live: bool,
-    /// A cancellation moved this request's completion: its original
-    /// completion time is stale and [`Origin::pop_moved`] delivers it.
+    /// A cancellation moved this request's completion: its original completion time is stale and
+    /// [`Origin::pop_moved`] delivers it.
     moved: bool,
     tag: u64,
     issue: Nanos,
@@ -392,8 +378,8 @@ impl Origin {
         }
     }
 
-    /// Earliest free slot of `cache`; ties go to the lowest index
-    /// (deterministic). Returns the global slot index.
+    /// Earliest free slot of `cache`; ties go to the lowest index (deterministic). Returns the
+    /// global slot index.
     fn pick(slots: &[Nanos], cache: u32, cap: u32) -> usize {
         let base = (cache * cap) as usize;
         let (slot, _) = slots[base..base + cap as usize]
@@ -418,8 +404,8 @@ impl Origin {
         (slot, start, body, end)
     }
 
-    /// Issue a request for `bytes` of `object`. Returns completion time and
-    /// outcome. Errors still pay latency but no bandwidth.
+    /// Issue a request for `bytes` of `object`. Returns completion time and outcome. Errors still
+    /// pay latency but no bandwidth.
     pub fn request(
         &mut self,
         now: Nanos,
@@ -438,8 +424,6 @@ impl Origin {
     }
 
     /// Like [`Origin::request`], but the request can later be canceled.
-    /// `tag` identifies the request in [`Origin::cancel`]'s reschedules.
-    /// Call [`Origin::finish`] when it completes.
     pub fn request_tracked(
         &mut self,
         now: Nanos,
@@ -508,8 +492,8 @@ impl Origin {
         }
     }
 
-    /// Cancel a tracked request at `now`. Returns how many outstanding
-    /// requests moved earlier; [`Origin::pop_moved`] delivers them.
+    /// Cancel a tracked request at `now`. Returns how many outstanding requests moved earlier;
+    /// [`Origin::pop_moved`] delivers them.
     pub fn cancel(&mut self, handle: OriginHandle, now: Nanos) -> usize {
         let Some(mut canceled) = self.take(handle) else {
             return 0;
@@ -524,9 +508,9 @@ impl Origin {
             canceled.service = canceled.service.min(now.saturating_sub(canceled.body));
             self.retire(&canceled);
         }
-        // Rebuild free times from finished requests and the requests issued
-        // before the canceled one (their schedule does not depend on it),
-        // then replay the later outstanding ones in issue order.
+        // Rebuild free times from finished requests and the requests issued before the canceled one
+        // (their schedule does not depend on it), then replay the later outstanding ones in issue
+        // order.
         self.slots.clone_from(&self.base_slots);
         self.bandwidth_free = self.base_bandwidth;
         let split = self.pending.partition_point(|e| e.seq < handle.0);
@@ -541,8 +525,8 @@ impl Origin {
         for e in self.pending[split..].iter_mut().filter(|e| e.live) {
             let before = e.end;
             if e.start <= now {
-                // Started: slot fixed. A body already flowing keeps its
-                // reservation; otherwise it waits for bandwidth again.
+                // Started: slot fixed. A body already flowing keeps its reservation; otherwise it
+                // waits for bandwidth again.
                 if e.service > 0 && e.body > now {
                     let ready = (e.start + latency).max(now);
                     let (body, end) = reserve(&mut self.bandwidth_free, ready, e.service);
@@ -573,8 +557,8 @@ impl Origin {
             }
         }
         if moved > 0 {
-            // Rebuild rather than push per move: a cancellation can move
-            // every queued request, and stale heap entries would pile up.
+            // Rebuild rather than push per move: a cancellation can move every queued request, and
+            // stale heap entries would pile up.
             self.moved = self
                 .pending
                 .iter()
@@ -598,8 +582,8 @@ impl Origin {
         self.entry(handle).map(|e| e.end)
     }
 
-    /// Whether the completion time returned at issue still holds and is
-    /// `now` (no cancellation moved it).
+    /// Whether the completion time returned at issue still holds and is `now` (no cancellation
+    /// moved it).
     pub fn due_as_issued(&self, handle: OriginHandle, now: Nanos) -> bool {
         self.entry(handle).is_some_and(|e| !e.moved && e.end == now)
     }
@@ -615,8 +599,8 @@ impl Origin {
         None
     }
 
-    /// Tags of moved requests completing at or before `now`, in completion
-    /// then issue order. The caller then calls [`Origin::finish`] for each.
+    /// Tags of moved requests completing at or before `now`, in completion then issue order. The
+    /// caller then calls [`Origin::finish`] for each.
     pub fn pop_moved(&mut self, now: Nanos) -> Vec<u64> {
         let mut due = Vec::new();
         while let Some(end) = self.next_moved()
@@ -689,8 +673,8 @@ mod tests {
         let chunk = f.chunk_bytes;
         let per_chunk = service_ns(chunk, f.nic_bps);
         let lat = f.latency(0, 1);
-        // 4 chunks over 2 hops: store-and-forward would cost 8 chunk times,
-        // cut-through costs 4 + 1.
+        // 4 chunks over 2 hops: store-and-forward would cost 8 chunk times, cut-through costs 4 +
+        // 1.
         let done = f.transfer(0, &[0, 1, 2], 4 * chunk);
         assert_eq!(done, 5 * per_chunk + 2 * lat);
         // Direct link is now busy at node 0 tx; a second transfer queues.
@@ -710,12 +694,12 @@ mod tests {
             f.transfer_until(0, &[0, 1], chunk, Nanos::MAX - 1),
             Some(per_chunk + lat)
         );
-        // Node 0 is busy until `per_chunk`; a cutoff at that instant means
-        // no chunk may start, so nothing is reserved.
+        // Node 0 is busy until `per_chunk`; a cutoff at that instant means no chunk may start, so
+        // nothing is reserved.
         assert_eq!(f.transfer_until(0, &[0, 1], 4 * chunk, per_chunk), None);
         assert_eq!(f.tx_free[0], per_chunk);
-        // A cutoff partway through: chunks that started keep their slots,
-        // later chunks are never sent.
+        // A cutoff partway through: chunks that started keep their slots, later chunks are never
+        // sent.
         assert_eq!(f.transfer_until(0, &[0, 1], 8 * chunk, 3 * per_chunk), None);
         assert_eq!(f.tx_free[0], 3 * per_chunk);
         // Arriving exactly at the cutoff is too late.
@@ -723,8 +707,8 @@ mod tests {
         assert_eq!(g.transfer_until(0, &[0, 1], chunk, per_chunk + lat), None);
     }
 
-    /// Known issue 18: a relay forwarding a body still queued upstream must
-    /// not keep its own transmit side idle until the body arrives.
+    /// A relay forwarding a body still queued upstream must not keep its own transmit side idle
+    /// until the body arrives.
     #[test]
     fn relay_transmit_is_not_held_by_a_body_queued_upstream() {
         let mut f = fabric(3, 1);
@@ -736,8 +720,8 @@ mod tests {
         // A body from 0 relayed by 1 to 2 waits behind that backlog.
         let relayed = f.transfer(0, &[0, 1, 2], chunk);
         assert!(relayed >= 101 * per_chunk + 2 * lat, "relayed {relayed}");
-        // The relay's own send at time 0 waits only for the relayed
-        // chunk's service time, not for that chunk to arrive.
+        // The relay's own send at time 0 waits only for the relayed chunk's service time, not for
+        // that chunk to arrive.
         assert_eq!(f.transfer(0, &[1, 0], chunk), 2 * per_chunk + lat);
         // The relay's backlog is the work it has accepted, not a future slot.
         assert_eq!(f.tx_free[1], 2 * per_chunk);
@@ -768,8 +752,8 @@ mod tests {
         assert!(f.crypto(0, 1, 10) == 40);
     }
 
-    /// A slow sender takes longer, but holds the receiver's NIC only for the
-    /// receiver's own service time, so a fast sender is not queued behind it.
+    /// A slow sender takes longer, but holds the receiver's NIC only for the receiver's own service
+    /// time, so a fast sender is not queued behind it.
     #[test]
     fn slow_sender_does_not_hold_the_receiver() {
         let mut f = fabric(3, 1);
@@ -924,8 +908,8 @@ mod tests {
         assert_eq!(b_end, 10 * MILLIS + 2 * SECONDS);
         // `c` waits for `b`'s slot, then for bandwidth.
         assert_eq!(c_end, b_end + 10 * MILLIS + SECONDS);
-        // Cancel `b` while it waits for bandwidth (started, no body yet):
-        // `c` gets the slot now and the bandwidth once `a` is done.
+        // Cancel `b` while it waits for bandwidth (started, no body yet): `c` gets the slot now and
+        // the bandwidth once `a` is done.
         assert_eq!(o.cancel(b, 500 * MILLIS), 1);
         assert_eq!(o.end(c), Some(a_end + SECONDS));
         // Completing the rest leaves nothing outstanding.

@@ -19,15 +19,6 @@ use topology::{Paths, Placement};
 type CacheKey = ([u8; 32], u32);
 
 /// Simulation [`Rankings`]: entries hold only a cursor and the CLOCK bit.
-///
-/// Results come from a memo shared by every `Phantom` clone, keyed by
-/// (membership identity, slot). The memo runs the real scoring and the real
-/// incremental update once per key, so many simulated nodes pay for one
-/// ranking while their caches make the same decisions as [`topology::Scored`]: the
-/// cursor advances by the same work quanta, completes on the same poll, and
-/// `updated` succeeds exactly when the real update does.
-///
-/// The memo grows until [`Phantom::forget`] drops old memberships.
 #[derive(Clone, Default)]
 pub struct Phantom {
     memo: Rc<RefCell<std::collections::HashMap<CacheKey, PhantomResult>>>,
@@ -38,8 +29,8 @@ struct PhantomResult {
     /// The real complete ranking.
     ranking: Ranking,
 
-    /// Whether the real incremental update from this ranking's predecessor
-    /// succeeded, keyed by predecessor identity. Usually one element.
+    /// Whether the real incremental update from this ranking's predecessor succeeded, keyed by
+    /// predecessor identity. Usually one element.
     updates: Vec<([u8; 32], bool)>,
 }
 
@@ -158,8 +149,8 @@ impl Rankings for Phantom {
                 .map(|(_, ok)| *ok)
         });
         let ok = known.unwrap_or_else(|| {
-            // The predecessor is complete, so its real ranking was memoized
-            // unless it was forgotten. Treat a forgotten one as a rescore.
+            // The predecessor is complete, so its real ranking was memoized unless it was
+            // forgotten. Treat a forgotten one as a rescore.
             let previous = self
                 .memo
                 .borrow()
@@ -185,12 +176,6 @@ impl Rankings for Phantom {
 }
 
 /// Simulation [`Searches`]: replay results from a shared memo.
-///
-/// The first search for a key runs the real search to completion and records
-/// how many steps it took and its result. Later searches for the same key, by
-/// any `Paths` sharing this memo, count down the same number of steps and
-/// return the same shared result. Keys include the graph identity, so a memo
-/// entry never outlives its meaning. [`SharedRoutes::forget`] bounds memory.
 #[derive(Clone, Default)]
 pub struct SharedRoutes {
     memo: Rc<RefCell<RouteMemo>>,
@@ -219,8 +204,7 @@ impl SharedRoutes {
         self.memo.borrow().len()
     }
 
-    /// Drop memoized searches for every graph except `keep` (topology
-    /// identities).
+    /// Drop memoized searches for every graph except `keep` (topology identities).
     pub fn forget(&self, keep: &[[u8; 32]]) {
         self.memo
             .borrow_mut()
@@ -316,7 +300,7 @@ mod tests {
         }
     }
 
-    /// Demoted members agree between `Scored` and `Phantom` (Known issue 34).
+    /// Demoted members agree between `Scored` and `Phantom`.
     #[test]
     fn phantom_demoted_matches_scored() {
         let members = membership(1000);
@@ -330,8 +314,8 @@ mod tests {
         assert_eq!(phantom.demoted(&members, key), Some(demoted));
     }
 
-    /// Phantom and scored placements make identical decisions under a seeded
-    /// workload with held requests, refreshes, maintenance, and churn.
+    /// Phantom and scored placements make identical decisions under a seeded workload with held
+    /// requests, refreshes, maintenance, and churn.
     #[test]
     fn phantom_matches_scored_on_seeded_workloads_with_churn() {
         type Pending<'a> = std::pin::Pin<Box<dyn Future<Output = Result<Vec<usize>, Error>> + 'a>>;
@@ -372,8 +356,7 @@ mod tests {
                     current += 1;
                 }
                 let members = &generations[current];
-                // Requests sometimes use the previous generation, like
-                // in-flight old requests do.
+                // Requests sometimes use the previous generation, like in-flight old requests do.
                 let view = if value & 64 != 0 && current > 0 {
                     &generations[current - 1]
                 } else {
@@ -461,8 +444,8 @@ mod tests {
         );
     }
 
-    /// Replayed searches make the same decisions as real ones: results,
-    /// cache contents and bytes, admission, and polls per search.
+    /// Replayed searches make the same decisions as real ones: results, cache contents and bytes,
+    /// admission, and polls per search.
     #[test]
     fn shared_routes_match_exhaustive_on_seeded_workloads() {
         type Pending<'a> = std::pin::Pin<Box<dyn Future<Output = Result<Vec<usize>, Error>> + 'a>>;
@@ -553,8 +536,8 @@ mod tests {
             );
         }
         assert_eq!(shared.memo_len(), 1);
-        // Every node's cache holds the memo's allocation, not a copy: the
-        // memo plus one cached entry per node.
+        // Every node's cache holds the memo's allocation, not a copy: the memo plus one cached
+        // entry per node.
         let memo = shared.memo.borrow();
         let (_, result) = memo.values().next().unwrap();
         assert_eq!(Rc::strong_count(result.as_ref().unwrap()), 1 + nodes.len());

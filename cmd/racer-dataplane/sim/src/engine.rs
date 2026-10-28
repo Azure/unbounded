@@ -88,8 +88,8 @@ impl<E> Engine<E> {
         self.heap.len()
     }
 
-    /// Schedule `event` at absolute time `at`. Times in the past are clamped
-    /// to now, so causality is never violated.
+    /// Schedule `event` at absolute time `at`. Times in the past are clamped to now, so causality
+    /// is never violated.
     pub fn at(&mut self, at: Nanos, event: E) {
         let at = at.max(self.now);
         self.seq += 1;
@@ -162,8 +162,8 @@ pub const fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Roles that own an independent random stream. Adding a role never shifts
-/// the sequence another role sees.
+/// Roles that own an independent random stream. Adding a role never shifts the sequence another
+/// role sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u64)]
 pub enum Role {

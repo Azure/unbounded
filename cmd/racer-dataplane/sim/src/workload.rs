@@ -35,8 +35,8 @@ impl Poisson {
     }
 }
 
-/// Zipf sampler over ranks `0..n` with exponent `s`, by inverse CDF.
-/// Memory is `8 * n` bytes; shared by all nodes.
+/// Zipf sampler over ranks `0..n` with exponent `s`, by inverse CDF. Memory is `8 * n` bytes;
+/// shared by all nodes.
 #[derive(Clone, Debug)]
 pub struct Zipf {
     cdf: Vec<f64>,
@@ -124,8 +124,8 @@ pub fn page_id(object: u64, page: u32, pages_per_object: u32) -> u64 {
     object * u64::from(pages_per_object) + u64::from(page)
 }
 
-/// Cold-start storm: `nodes` nodes (the first `nodes` live ids from a seeded
-/// shuffle) all read every page of `object` within `window_ns` after `at_ns`.
+/// Cold-start storm: `nodes` nodes (the first `nodes` live ids from a seeded shuffle) all read
+/// every page of `object` within `window_ns` after `at_ns`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Storm {
     pub at_ns: Nanos,
@@ -145,8 +145,8 @@ impl Storm {
         })
     }
 
-    /// Expand into `(time, node)` start events, using `rng` for the node
-    /// choice and arrival jitter. Node ids come from `0..total`.
+    /// Expand into `(time, node)` start events, using `rng` for the node choice and arrival jitter.
+    /// Node ids come from `0..total`.
     pub fn expand(&self, total: u32, rng: &mut SplitMix64) -> Vec<(Nanos, u32)> {
         let count = self.nodes.min(total) as usize;
         // Partial Fisher-Yates on a lazily materialized permutation.
@@ -186,8 +186,8 @@ impl Churn {
         })
     }
 
-    /// Random churn: `events` leave/rejoin pairs spread over `duration`, each
-    /// node away for `away_ns`.
+    /// Random churn: `events` leave/rejoin pairs spread over `duration`, each node away for
+    /// `away_ns`.
     pub fn random(
         nodes: u32,
         events: u32,

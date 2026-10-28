@@ -6,8 +6,8 @@ use serde_json::{Map, Value, json};
 
 use crate::engine::Nanos;
 
-/// Log-bucket histogram with fixed memory: 64 power-of-two octaves, each
-/// split into `SUB` linear sub-buckets (relative error under 1/SUB).
+/// Log-bucket histogram with fixed memory: 64 power-of-two octaves, each split into `SUB` linear
+/// sub-buckets (relative error under 1/SUB).
 #[derive(Clone, Debug)]
 pub struct Histogram {
     buckets: Box<[u64; Self::LEN]>,
@@ -119,10 +119,9 @@ pub struct Violation {
     pub detail: String,
 }
 
-/// Named invariants. Each check counts; failures are stored (capped) with
-/// time, node and detail. An invariant may be marked relaxed with a reason
-/// (a known issue): its failures are counted separately and do not fail the
-/// run.
+/// Named invariants. Each check counts; failures are stored (capped) with time, node and detail. An
+/// invariant may be marked relaxed with a reason (a known issue): its failures are counted
+/// separately and do not fail the run.
 #[derive(Debug, Default)]
 pub struct Invariants {
     checks: BTreeMap<&'static str, u64>,

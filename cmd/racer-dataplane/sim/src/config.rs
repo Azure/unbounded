@@ -137,20 +137,11 @@ impl Default for Config {
     }
 }
 
-/// Node knobs: cache capacities, flight and relay limits, timeouts and the
-/// membership publication model.
-///
-/// Capacities default far below production (see the design doc, section
-/// "Node integration") so 50,000 nodes fit the memory budget; the decision
-/// code is the same at any capacity. Flight, waiter and relay limits and the
-/// fill quotas default to the production per-worker values in
-/// `src/config.rs` (`flights` 64, `waiters_per_flight` 64,
-/// `relay_transfers` 16, plaintext 64 MiB, ciphertext 128 MiB, dirty
-/// 160 MiB).
+/// Node knobs: cache capacities, flight and relay limits, timeouts and the membership publication
+/// model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeConfig {
-    /// Phantom placement cache entries per worker (production: about
-    /// 16,384 from a 16 MiB budget).
+    /// Phantom placement cache entries per worker (production: about 16,384 from a 16 MiB budget).
     pub placement_entries: u32,
     /// Route cache entries per node (production `cached_paths` 128).
     pub path_entries: u32,
@@ -173,11 +164,10 @@ pub struct NodeConfig {
     pub history_bytes: u32,
     /// Membership changes are batched and published at this period.
     pub membership_batch_ns: Nanos,
-    /// Each node adopts a publication after a per-node lag in
-    /// `0..=membership_lag_ns` (must not exceed the batch period).
+    /// Each node adopts a publication after a per-node lag in `0..=membership_lag_ns` (must not
+    /// exceed the batch period).
     pub membership_lag_ns: Nanos,
-    /// Old membership versions a node can still resolve (production
-    /// `retained_snapshots` 2).
+    /// Old membership versions a node can still resolve (production `retained_snapshots` 2).
     pub retained_versions: u64,
     /// Per-attempt peer timeout (`attempt_timeout`).
     pub attempt_timeout_ns: Nanos,
@@ -187,29 +177,24 @@ pub struct NodeConfig {
     pub connect_timeout_ns: Nanos,
     /// Request scope at a serving peer.
     pub serve_timeout_ns: Nanos,
-    /// Concurrent page hedges per node (production `page_hedge_slots`,
-    /// default 0: hedging off).
+    /// Concurrent page hedges per node (production `page_hedge_slots`, default 0: hedging off).
     pub hedge_slots: u32,
-    /// Delay before the duplicate starts (production `page_hedge_delay_ms`,
-    /// default 100 ms).
+    /// Delay before the duplicate starts (production `page_hedge_delay_ms`, default 100 ms).
     pub hedge_delay_ns: Nanos,
-    /// Speculative bytes per node (production `page_hedge_bytes`, default
-    /// one `DUPLICATE_BYTES`).
+    /// Speculative bytes per node (production `page_hedge_bytes`, default one `DUPLICATE_BYTES`).
     pub hedge_bytes: u64,
-    // Ablation switches: production always has these on (except
-    // `lineage_slack`); set false to measure without the fix for the Known
-    // issue named.
+    // Ablation switches: production always has these on (except `lineage_slack`); set false to
+    // measure without the fix for the Known issue named.
     /// Overflow fan-out to page helpers (16).
     pub fanout: bool,
-    /// Bodies of one page an owner streams before shedding its readers; 0
-    /// derives it from the page size like production.
+    /// Bodies of one page an owner streams before shedding its readers; 0 derives it from the page
+    /// size like production.
     pub hot_page_bodies: u32,
     /// Fill handover to a live waiter when the leader expires (30).
     pub flight_handover: bool,
     /// Rank 0 asks a successor that recently missed it before origin (21).
     pub successor_hints: bool,
-    /// Owners ask hinted later owners copy-only first (21). Needs
-    /// `successor_hints`.
+    /// Owners ask hinted later owners copy-only first (21). Needs `successor_hints`.
     pub successor_targets: bool,
     /// Non-owners walk the previous membership at a lagging destination (19).
     pub stale_fallback: bool,
@@ -223,13 +208,11 @@ pub struct NodeConfig {
     pub demoted_targets: bool,
     /// Lineage targets get their own grant (35).
     pub lineage_grants: bool,
-    /// With `lineage_grants`, still fund lineage probes from slack (35;
-    /// production off).
+    /// With `lineage_grants`, still fund lineage probes from slack (35; production off).
     pub lineage_slack: bool,
     /// Copy-only requests from earlier-ranked owners do not join (44).
     pub copy_join_rank: bool,
-    /// Owners above rank 0 offer origin copies to rank 0 (37). Needs
-    /// `successor_hints`.
+    /// Owners above rank 0 offer origin copies to rank 0 (37). Needs `successor_hints`.
     pub orphan_notices: bool,
     /// Owners above rank 0 track rank 0 per page (39).
     pub rank0_watch: bool,
@@ -243,8 +226,7 @@ pub struct NodeConfig {
     pub silence: bool,
     /// Visit owners that shed us last (54). Needs `silence`.
     pub shed_busy: bool,
-    /// Leave the retry to rank 0 after its own failure (52). Needs
-    /// `rank0_watch`.
+    /// Leave the retry to rank 0 after its own failure (52). Needs `rank0_watch`.
     pub rank0_failure_hold: bool,
     /// Copy offers wait out a cut toward their target's site (50).
     pub offer_cut_groups: bool,

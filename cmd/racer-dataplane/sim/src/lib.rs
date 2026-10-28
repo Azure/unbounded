@@ -171,9 +171,8 @@ impl Options {
         Ok(options)
     }
 
-    /// Build the configuration: scenario defaults, then `--config` JSON,
-    /// then `--nodes` and `--duration`, then scenario-generated schedules
-    /// (only when the config left them empty).
+    /// Build the configuration: scenario defaults, then `--config` JSON, then `--nodes` and
+    /// `--duration`, then scenario-generated schedules (only when the config left them empty).
     pub fn build_config(&self) -> Result<Config, String> {
         self.build_config_with(self.read_config()?.as_deref())
     }
@@ -270,9 +269,7 @@ fn scenario_schedules(scenario: &str, config: &mut Config, seed: u64) {
     }
 }
 
-/// Run a scenario and return its JSON report. A control-plane or combined
-/// scenario's `--config` may carry a `"control"` object of
-/// [`control::Settings`] overrides; other keys go to [`Config`].
+/// Run a scenario and return its JSON report.
 pub fn run(options: &Options) -> Result<Value, String> {
     let scenario = options.scenario.as_str();
     let mut json = options
@@ -478,10 +475,8 @@ mod tests {
                 .unwrap()
                 > 0
         );
-        // Singleflight per owner: without errors each page reaches the origin
-        // at most once per ranked owner. A later owner fetches only after its
-        // predecessors answered without a copy (`End::Origin` evidence), which
-        // happens in a cold storm while the first owner is still fetching.
+        // Singleflight per owner: without errors each page reaches the origin at most once per
+        // ranked owner.
         let max = storm["origin_per_page"]["max_requests_per_page"]
             .as_u64()
             .unwrap();
@@ -513,8 +508,8 @@ mod tests {
         );
     }
 
-    /// 50k nodes x 2 workers, substrate only, must fit far below 32 GiB.
-    /// Run with `cargo test --release -p racer-sim -- --ignored`.
+    /// 50k nodes x 2 workers, substrate only, must fit far below 32 GiB. Run with `cargo test
+    /// --release -p racer-sim -- --ignored`.
     #[test]
     #[ignore]
     fn empty_substrate_50k_rss() {

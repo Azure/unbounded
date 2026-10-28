@@ -19,8 +19,7 @@ pub enum Fault {
         site_a: u16,
         site_b: u16,
     },
-    /// Node loses memory state at `at_ns` and comes back at `restart_ns`.
-    /// Its disk survives.
+    /// Node loses memory state at `at_ns` and comes back at `restart_ns`. Its disk survives.
     Crash {
         node: u32,
         at_ns: Nanos,
@@ -33,10 +32,9 @@ pub enum Fault {
         from_ns: Nanos,
         until_ns: Nanos,
     },
-    /// Node's peer server hangs during `[from_ns, until_ns)`: it accepts
-    /// every peer request it receives, as destination or relay, and never
-    /// answers or forwards it, without failing the connection. Its own reads
-    /// still run (Known issue 39).
+    /// Node's peer server hangs during `[from_ns, until_ns)`: it accepts every peer request it
+    /// receives, as destination or relay, and never answers or forwards it, without failing the
+    /// connection.
     Hang {
         node: u32,
         from_ns: Nanos,
@@ -166,8 +164,7 @@ pub fn hung(faults: &[Fault], node: u32, now: Nanos) -> bool {
     })
 }
 
-/// Origin error rates in effect at `now`: the last matching window wins,
-/// otherwise `base`.
+/// Origin error rates in effect at `now`: the last matching window wins, otherwise `base`.
 pub fn origin_errors_at(faults: &[Fault], base: OriginErrors, now: Nanos) -> OriginErrors {
     faults
         .iter()

@@ -34,10 +34,7 @@ fn quiet(nodes: u32) -> Config {
     }
 }
 
-/// One reader fetches an object, then every node reads it. Each page reaches
-/// the origin exactly once: whichever owner a reader asks first, an owner
-/// above rank 0 asks rank 0 to acquire (`CandidateWalk` delegation), so rank
-/// 0 alone fetches and later owners copy from it (Known issue 4).
+/// One reader fetches an object, then every node reads it.
 #[test]
 fn single_reader_then_storm_reuses_copies() {
     let mut config = quiet(64);
@@ -62,7 +59,7 @@ fn single_reader_then_storm_reuses_copies() {
     let per_page: Vec<u32> = (0..pages)
         .map(|p| world.origin_requests(3 * pages + p))
         .collect();
-    // Before owners delegated to rank 0 (Known issue 4) this was 33.
+    // Before owners delegated to rank 0 this was 33.
     assert_eq!(origin, pages, "{per_page:?}");
     assert!(counter(&report, "peer_bytes") > 0);
     assert!(counter(&report, "flight_joins") + counter(&report, "peer_memory_hits") > 0);
@@ -112,8 +109,8 @@ fn churny(nodes: u32, retained: u64) -> Config {
     config
 }
 
-/// Churn publishes new memberships, nodes adopt them with lag, placement
-/// maintenance runs, and lagging receivers answer stale membership.
+/// Churn publishes new memberships, nodes adopt them with lag, placement maintenance runs, and
+/// lagging receivers answer stale membership.
 #[test]
 fn churn_exercises_membership_adoption() {
     let (world, report) = run(churny(120, 2), 1);
@@ -130,8 +127,8 @@ fn churn_exercises_membership_adoption() {
     );
 }
 
-/// Without retained old versions, receivers that moved ahead answer stale
-/// membership to lagging requesters, which refresh and walk again.
+/// Without retained old versions, receivers that moved ahead answer stale membership to lagging
+/// requesters, which refresh and walk again.
 #[test]
 fn stale_requesters_refresh_their_walk() {
     let (_, report) = run(churny(120, 0), 2);
@@ -141,10 +138,8 @@ fn stale_requesters_refresh_their_walk() {
     );
 }
 
-/// Known issue 3: requesters that adopted a publication before their
-/// destination get `StaleMembership` with nothing newer to refresh to. They
-/// skip that owner and try the next one; no read fails with
-/// `IncompatibleMembership`. Before round 3 this run failed such reads.
+/// Requesters that adopted a publication before their destination get `StaleMembership` with
+/// nothing newer to refresh to.
 #[test]
 fn requesters_ahead_of_their_destination_skip_it() {
     for (retained, seed) in [(0, 2), (2, 1)] {
@@ -163,12 +158,7 @@ fn requesters_ahead_of_their_destination_skip_it() {
     }
 }
 
-/// Known issue 19: with a long adoption lag, requesters often adopt a
-/// version before the page's owners. Without the stale fallback, each owner
-/// behind costs a funded probe and walks run out on them; with it, a
-/// non-owner walks the previous membership's owners instead, so fewer walks
-/// end exhausted on stale destinations and fewer reads fail, and only
-/// owners reach the origin (`only_owner_hits_origin`, checked by `run`).
+/// With a long adoption lag, requesters often adopt a version before the page's owners.
 #[test]
 fn stale_owners_send_non_owners_to_the_previous_membership() {
     let with = |fallback: bool, refund: bool| {
@@ -176,12 +166,10 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
         config.request_rate = 40.0;
         config.node.membership_lag_ns = config.node.membership_batch_ns;
         config.node.stale_fallback = fallback;
-        // Measure the fallback alone: without it, readers would wait for the
-        // stale owners instead (Known issue 26).
+        // Measure the fallback alone: without it, readers would wait for the stale owners instead.
         config.node.stale_wait = false;
-        // The links a stale answer returns (Known issues 47 and 49) let a
-        // walk reach the other owners even without the fallback, so most
-        // of the failed reads it saved are measured with that refund off.
+        // The links a stale answer returns let a walk reach the other owners even without the
+        // fallback, so most of the failed reads it saved are measured with that refund off.
         config.node.stale_link_refund = refund;
         run(config, 3).1
     };
@@ -197,11 +185,11 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
         exhausted(&on),
         exhausted(&off)
     );
-    // Seed 3, refund off: 1,028 such walks and 40 failed reads without the
-    // fallback, 6 and 3 with it.
+    // Seed 3, refund off: 1,028 such walks and 40 failed reads without the fallback, 6 and 3 with
+    // it.
     assert!(counter(&on, "reads_failed") * 4 <= counter(&off, "reads_failed"));
-    // With the refund (the default) the fallback still ends far fewer walks
-    // exhausted (597 to 1) and fails no more reads (2 and 2).
+    // With the refund (the default) the fallback still ends far fewer walks exhausted (597 to 1)
+    // and fails no more reads (2 and 2).
     let (off, on) = (with(false, true), with(true, true));
     assert!(
         exhausted(&on) * 10 <= exhausted(&off),
@@ -212,11 +200,8 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
     assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
 }
 
-/// Known issue 26: a node that rejoins in version N is not a member of
-/// N - 1, so it cannot walk the previous membership when the page's owners
-/// are behind. Without the wait it skips each of them and its walk ends
-/// exhausted; with it, it waits once and asks the same owner again after it
-/// adopted N.
+/// A node that rejoins in version N is not a member of N - 1, so it cannot walk the previous
+/// membership when the page's owners are behind.
 #[test]
 fn readers_that_cannot_fall_back_wait_for_owners_that_are_behind() {
     let with = |wait: bool| {
@@ -264,9 +249,8 @@ fn origin_errors_follow_the_fill_plan() {
     assert!(counter(&report, "error_origin_forbidden") > 0);
 }
 
-/// A 403 fails only the leader that received it; a waiter on the same flight
-/// is re-elected and fills with its own budget (Known issue 8, matching
-/// production `Flights::fail(OriginForbidden)`).
+/// A 403 fails only the leader that received it; a waiter on the same flight is re-elected and
+/// fills with its own budget (matching production `Flights::fail(OriginForbidden)`).
 #[test]
 fn origin_forbidden_reelects_a_waiter() {
     let mut config = quiet(64);
@@ -301,8 +285,8 @@ fn tight_quotas_reject_by_class() {
         window_ns: MILLIS,
     }];
     let (_, report) = run(config, 9);
-    // The flight table's own entry cap rejects before the Flight quota, as
-    // in production `Flights::join_prepared`; relays hit the Relay quota.
+    // The flight table's own entry cap rejects before the Flight quota, as in production
+    // `Flights::join_prepared`; relays hit the Relay quota.
     let r = &report["rejections"];
     assert!(r["relay"].as_u64().unwrap() > 0, "{r}");
     assert!(counter(&report, "flight_join_rejected") > 0);
@@ -353,8 +337,8 @@ fn client_read(node: u32, page: u64, at: crate::engine::Nanos) -> super::world::
     })
 }
 
-/// Retention observes every client read, including memory hits: a non-owner
-/// persists a page on its second read (second sight), not at publication.
+/// Retention observes every client read, including memory hits: a non-owner persists a page on its
+/// second read (second sight), not at publication.
 #[test]
 fn retention_observes_client_reads_including_memory_hits() {
     let config = quiet(64);
@@ -399,9 +383,9 @@ fn retention_observes_client_reads_including_memory_hits() {
     assert_eq!(world.invariants.to_json()["hard_failures"], 0);
 }
 
-/// Rankings and route searches yield between CPU slices and hold their
-/// placement pin or search slot meanwhile, so production's concurrency
-/// limits reject concurrent work with `Overloaded` (without a search queue).
+/// Rankings and route searches yield between CPU slices and hold their placement pin or search slot
+/// meanwhile, so production's concurrency limits reject concurrent work with `Overloaded` (without
+/// a search queue).
 #[test]
 fn yielding_searches_hit_production_concurrency_limits() {
     let mut config = quiet(600);
@@ -428,9 +412,9 @@ fn yielding_searches_hit_production_concurrency_limits() {
     assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
 }
 
-/// Known issue 10: with the production search queue, searches beyond the
-/// slot limit wait (parked, no CPU) and are woken when a slot frees, so the
-/// same storm rejects far fewer searches, and none at the default limits.
+/// With the production search queue, searches beyond the slot limit wait (parked, no CPU) and are
+/// woken when a slot frees, so the same storm rejects far fewer searches, and none at the default
+/// limits.
 #[test]
 fn queued_searches_wait_instead_of_failing() {
     let mut config = quiet(600);
@@ -462,9 +446,8 @@ fn queued_searches_wait_instead_of_failing() {
     assert_eq!(counter(&report, "route_search_overloaded"), 0, "{report}");
 }
 
-/// Runs the hedge scenario: every ranked owner of object 4 warms its pages,
-/// then each rank 0 owner becomes 255 times slower and non-owner readers
-/// (never slow) read every page.
+/// Runs the hedge scenario: every ranked owner of object 4 warms its pages, then each rank 0 owner
+/// becomes 255 times slower and non-owner readers (never slow) read every page.
 fn hedge_scenario(slots: u32) -> (NodeWorld, Value) {
     use crate::faults::Fault;
     let mut config = quiet(64);
@@ -508,10 +491,9 @@ fn hedge_scenario(slots: u32) -> (NodeWorld, Value) {
     (world, report)
 }
 
-/// Production default (no slots) never races; with slots, a slow rank 0
-/// owner loses to the copy-only duplicate at the second owner: lower peer
-/// read latency, duplicate bytes counted per started hedge, and the split
-/// budgets never grow (checked by `budget_never_grows`).
+/// Production default (no slots) never races; with slots, a slow rank 0 owner loses to the
+/// copy-only duplicate at the second owner: lower peer read latency, duplicate bytes counted per
+/// started hedge, and the split budgets never grow (checked by `budget_never_grows`).
 #[test]
 fn hedging_beats_a_slow_primary() {
     let (_, off) = hedge_scenario(0);
@@ -548,9 +530,9 @@ fn hedging_beats_a_slow_primary() {
     );
 }
 
-/// A duplicate publish of a resident page does not refresh its recency, as in
-/// production `MemoryCache::publish` (Known issue 9): inserting 0, 1, 0, 2
-/// into a two-page worker cache evicts 0, the oldest insert.
+/// A duplicate publish of a resident page does not refresh its recency, as in production
+/// `MemoryCache::publish`: inserting 0, 1, 0, 2 into a two-page worker cache evicts 0, the oldest
+/// insert.
 #[test]
 fn duplicate_memory_publish_does_not_touch() {
     let mut config = quiet(4);
@@ -564,9 +546,9 @@ fn duplicate_memory_publish_does_not_touch() {
     assert!(world.in_memory(0, 0, 2));
 }
 
-/// Ownership moves when nodes join: an owner that adopted the new membership
-/// asks the page's previous owners copy-only before origin (Known issue 6),
-/// so a page read before the join is not fetched again after it.
+/// Ownership moves when nodes join: an owner that adopted the new membership asks the page's
+/// previous owners copy-only before origin, so a page read before the join is not fetched again
+/// after it.
 #[test]
 fn joined_owners_copy_from_previous_owners() {
     let mut config = quiet(64);
@@ -635,15 +617,9 @@ fn held(report: &Value, cause: &str) -> u64 {
         .unwrap()
 }
 
-/// Known issue 12: under churn, an owner whose predecessor has not adopted
-/// the current membership yet used to get `StaleMembership`, record it as
-/// missing, and fetch the page itself while the predecessor (usually rank 0)
-/// held it. Owners now ask predecessors that held the same rank under the
-/// previous membership under that membership, so the lagging predecessor
-/// serves. Before the fix these runs had 48 to 52 owner skips and 40 to 48
-/// repeat fetches whose previous fetcher still held the page. Since the
-/// simulator debits the origin attempt like production (round 4, repeat),
-/// one run has 3 owner skips (a fill without credits fails and is retried).
+/// Under churn, an owner whose predecessor has not adopted the current membership yet used to get
+/// `StaleMembership`, record it as missing, and fetch the page itself while the predecessor
+/// (usually rank 0) held it.
 #[test]
 fn owners_ask_lagging_predecessors_under_the_previous_membership() {
     for (nodes, seed) in [(120, 1), (120, 2), (300, 1)] {
@@ -663,19 +639,13 @@ fn owners_ask_lagging_predecessors_under_the_previous_membership() {
             report["origin_per_page"]
         );
     }
-    // Without retained versions peers cannot resolve the previous
-    // membership, so owners never use it (production: no grace retention).
+    // Without retained versions peers cannot resolve the previous membership, so owners never use
+    // it (production: no grace retention).
     let (_, report) = run(churny(120, 0), 2);
     assert_eq!(counter(&report, "previous_membership_probes"), 0);
 }
 
-/// Known issues 6 and 13: repeated origin fetches of a page are bounded.
-/// Each one is classified against the previous fetch (`classify_repeat`):
-/// after an ownership move (allowed, at most one per move), after the copy
-/// was lost (unavoidable), or while the previous fetcher still held it. The
-/// last kind needs a transient failure, a concurrent cold miss, or a walk
-/// without credits for the delegation; it stays under 2% of origin requests
-/// under churn, and every repeat falls in exactly one class.
+/// Repeated origin fetches of a page are bounded.
 #[test]
 fn repeat_origin_fetches_are_classified_and_bounded() {
     for (nodes, seed) in [(120, 1), (300, 1), (300, 2)] {
@@ -709,12 +679,7 @@ fn repeat_origin_fetches_are_classified_and_bounded() {
     }
 }
 
-/// Known issue 24: with origin slower than the read deadline, leaders expire
-/// while their fills wait on origin. The fill stays a retained flight
-/// operation (production `Flights::retain_operation`), so later readers of
-/// the page wait for it instead of starting a concurrent fill, and the
-/// expired leader's outcome is dropped as stale rather than failing
-/// `flight_leader_valid` (checked by `run`).
+/// With origin slower than the read deadline, leaders expire while their fills wait on origin.
 #[test]
 fn expired_leaders_drain_before_a_new_fill() {
     let mut config = quiet(64);
@@ -735,10 +700,8 @@ fn expired_leaders_drain_before_a_new_fill() {
     assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
 }
 
-/// Known issue 29: production cancels an expired fill's origin exchange at
-/// the leader's deadline, which frees the origin connection and bandwidth.
-/// The simulator cancels it too, so no origin answer arrives after a fill's
-/// scope, and the canceled bodies leave bandwidth to later requests.
+/// Production cancels an expired fill's origin exchange at the leader's deadline, which frees the
+/// origin connection and bandwidth.
 #[test]
 fn expired_fills_cancel_their_origin_request() {
     let mut config = quiet(64);
@@ -760,12 +723,8 @@ fn expired_fills_cancel_their_origin_request() {
     assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
 }
 
-/// Known issue 30: with origin slower than the read deadline and readers
-/// arriving throughout, an expired leader's fill continues for a later
-/// waiter instead of being canceled and restarted. Compared with the same
-/// run without handover, origin requests and the most requests for one page
-/// fall, and no origin answer reaches a fill without a live waiter
-/// (`origin_for_live_waiter`, checked by `run`).
+/// With origin slower than the read deadline and readers arriving throughout, an expired leader's
+/// fill continues for a later waiter instead of being canceled and restarted.
 #[test]
 fn expired_leaders_hand_their_fill_to_later_waiters() {
     let report = |handover: bool| {
@@ -812,9 +771,8 @@ fn expired_leaders_hand_their_fill_to_later_waiters() {
     assert_eq!(counter(&after, "flight_unexpected_lead"), 0);
 }
 
-/// Known issue 36: a reader that owned the page under the previous
-/// membership may not walk it (no fallback), and ranks it there before it
-/// skips a destination that is behind, so it waits for that destination
+/// A reader that owned the page under the previous membership may not walk it (no fallback), and
+/// ranks it there before it skips a destination that is behind, so it waits for that destination
 /// like a reader that joined in the current membership.
 #[test]
 fn previous_owners_wait_instead_of_skipping_owners_that_are_behind() {
@@ -831,9 +789,8 @@ fn previous_owners_wait_instead_of_skipping_owners_that_are_behind() {
     assert_eq!(counter(&r, "walk_exhausted_stale"), 0, "{r}");
 }
 
-/// Known issues 47 and 49: a verified `StaleMembership` returns the links
-/// past its answerer, so a reader that waited for, or fell back past, a
-/// stale owner can still fund its later owners.
+/// A verified `StaleMembership` returns the links past its answerer, so a reader that waited for,
+/// or fell back past, a stale owner can still fund its later owners.
 #[test]
 fn stale_answers_return_unused_links() {
     let config = |refund: bool| {
