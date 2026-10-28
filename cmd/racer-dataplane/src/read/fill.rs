@@ -2051,6 +2051,8 @@ impl Fill {
         result
     }
 
+    /// Drive the racer-core [`FillPlan`]: the plan decides each step and this
+    /// loop performs its I/O. Errors raised by the I/O itself return directly.
     pub(super) async fn acquire_once(
         &self,
         page: &PageId,
@@ -2060,255 +2062,291 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
     ) -> Result<AcquiredPage> {
-        if let Some(result) = self.acquire_local_copy(page, scope, want_plaintext).await? {
-            return Ok(result);
-        }
-        let candidates = self
-            .timed(
-                Event::FillCandidatesCount,
-                Event::FillCandidatesNs,
-                self.call(
-                    DriverStage::CandidateCompositeCall,
-                    self.dependencies.candidates.candidates_scoped(
-                        membership,
-                        &page.version.object,
-                        page.number,
-                        scope,
-                    ),
-                ),
-            )
-            .await?;
+        use racer_core::read::fill::{FillPlan, FillStep, Source, WalkResult};
+        use racer_core::read::walk::RemainingEnd;
+        let mut plan = FillPlan::new(want_plaintext);
+        let mut acquired = None;
+        let mut candidates = None;
         // Cipher-only acquisitions reserve no plaintext until origin actually
         // supplies a page. Requester consumers still authenticate before acceptance.
-        let mut plaintext = if want_plaintext {
-            Some(
-                self.call(
-                    DriverStage::PlaintextReclaim,
-                    self.reserve_network_plaintext(scope, page),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        let mut plaintext = None;
+        let mut hedge_continuation = super::candidates::HedgeContinuation::default();
+        let mut authority = None;
         let operation = PeerOperation::Page {
             page: page.clone(),
             mode: FetchMode::Acquire,
         };
-        let mut hedge_continuation = super::candidates::HedgeContinuation::default();
-        let hedge_start = uring_runtime::environment::now();
-        if want_plaintext
-            && let Some(result) = self
-                .timed(
-                    Event::FillHedgeCount,
-                    Event::FillHedgeNs,
-                    self.call(
-                        DriverStage::CandidateCompositeCall,
-                        self.dependencies.candidates.hedge_page(
-                            &candidates,
-                            context,
-                            &operation,
-                            scope,
-                            budget,
-                            &self.dependencies.admission,
-                            &mut hedge_continuation,
-                            |response, child| {
-                                Box::pin(async move {
-                                    self.metrics.record_duration(
-                                        Event::FillPeerResponseCount,
-                                        Event::FillPeerResponseNs,
-                                        hedge_start,
-                                    );
-                                    let copy = response_copy(response.response(), page)?;
-                                    if let Some(existing) =
-                                        self.retained_metadata(&page.version, &child).await?
-                                        && !existing.compatible(&copy.metadata.immutable())
-                                    {
-                                        return Err(Error::CorruptRecord);
-                                    }
-                                    let result = self
-                                        .timed(
-                                            Event::FillPeerDecryptCount,
-                                            Event::FillPeerDecryptNs,
-                                            self.decrypt_response(page, response, None, &child),
-                                        )
-                                        .await?;
-                                    // A sibling may publish while crypto runs. Recheck before
-                                    // election, not only after a winner has canceled its peer.
-                                    if let Some(existing) =
-                                        self.retained_metadata(&page.version, &child).await?
-                                        && !existing.compatible(&result.metadata.immutable())
-                                    {
-                                        return Err(Error::CorruptRecord);
-                                    }
-                                    Ok(result)
-                                })
-                            },
-                        ),
-                    ),
-                )
-                .await?
-        {
-            result.validate_for(page)?;
-            scope.check()?;
-            self.call(
-                DriverStage::PublishCall,
-                self.publish(result.clone(), None, scope),
-            )
-            .await?;
-            self.metrics.record(Event::PeerHit, 1);
-            return Ok(result.into());
-        }
-        // Keep the accepted ranking to probe later cached copies on an origin 412.
-        let resolution = self
-            .call(
-                DriverStage::CandidateCompositeCall,
-                self.dependencies.candidates.resolve_after_hedge(
-                    crate::topology::Candidates {
-                        membership: candidates.membership.clone(),
-                        ordered: candidates.ordered.clone(),
-                    },
-                    context,
-                    operation,
-                    scope,
-                    budget,
-                    |response| {
-                        let reserved = plaintext.take();
-                        Box::pin(async move {
-                            if want_plaintext {
-                                self.decrypt_response(page, response, reserved, scope)
-                                    .await
-                                    .map(AcquiredPage::from)
-                            } else {
-                                Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                                    copy: response_copy(response.response(), page)?,
-                                    disk_token: None,
-                                }))
-                            }
-                        })
-                    },
-                    hedge_continuation,
-                ),
-            )
-            .await?;
-        let mut source = Event::PeerHit;
-        let result = match resolution {
-            CandidateResolution::Copy(result) => result,
-            CandidateResolution::Origin(authority) => {
-                authority.validate(&context.object, page.number)?;
-                budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
-                scope.check()?;
-                // Peer reception owns its ciphertext allocation. Reserve encryption
-                // output only when this candidate actually needs an origin fill.
-                let ciphertext = self.observe_reservation(
-                    scope,
-                    page,
-                    FillAdmissionSite::OriginCiphertext,
-                    || {
-                        self.reserve_with_reclamation(
-                            &context.object.cache,
-                            ResourceClass::Ciphertext,
-                            PAGE_BYTES as usize + 16,
-                        )
-                    },
-                )?;
-                let plaintext = match plaintext.take() {
-                    Some(reserved) => reserved,
-                    None => self.observe_reservation(
-                        scope,
-                        page,
-                        FillAdmissionSite::OriginPlaintext,
-                        || self.reserve_bootstrap(&context.object.cache),
-                    )?,
-                };
-                match self
-                    .call(
-                        DriverStage::OriginCall,
-                        self.dependencies
-                            .origin
-                            .page_reserved(&authority, context, page, plaintext, scope),
-                    )
-                    .await
-                {
-                    Ok(origin) => {
-                        source = Event::OriginFill;
-                        // An owner after rank 0 holds a copy rank 0 may not
-                        // know of: offer it later (Known issue 37). The
-                        // authority's owners, not `candidates`: a walk that
-                        // refreshed its membership ranks under the newer one.
-                        if self.dependencies.candidates.note_orphan(
-                            page,
-                            authority.owners(),
-                            authority.rank(),
-                            authority.predecessor_evidence(),
-                        ) {
-                            self.metrics.record(Event::OrphanNotice, 1);
-                        }
-                        self.encrypt_origin_page(page, origin, ciphertext, scope)
-                            .await?
-                            .into()
-                    }
-                    Err(Error::VersionUnavailable) => {
-                        let operation = PeerOperation::Page {
-                            page: page.clone(),
-                            mode: FetchMode::CopyOnly,
-                        };
-                        self.call(
-                            DriverStage::CandidateCompositeCall,
-                            self.dependencies.candidates.remaining_validated_copy(
-                                &candidates,
-                                context,
-                                &operation,
-                                scope,
-                                budget,
-                                |response| {
-                                    Box::pin(async move {
-                                        if want_plaintext {
-                                            self.decrypt_response(page, response, None, scope)
-                                                .await
-                                                .map(AcquiredPage::from)
-                                        } else {
-                                            Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                                                copy: response_copy(response.response(), page)?,
-                                                disk_token: None,
-                                            }))
-                                        }
-                                    })
-                                },
-                            ),
-                        )
-                        .await?
-                        .ok_or_else(|| {
-                            self.dependencies
-                                .candidates
-                                .final_origin_miss(&authority, &operation, scope, budget)
-                        })?
-                    }
-                    Err(error) => {
-                        self.dependencies.candidates.note_origin_failure(
-                            page,
-                            authority.owners(),
-                            authority.rank(),
-                            &error,
+        let copy_only = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        let peer_page = |response, reserved| {
+            Box::pin(async move {
+                if want_plaintext {
+                    self.decrypt_response(page, response, reserved, scope)
+                        .await
+                        .map(AcquiredPage::from)
+                } else {
+                    Ok(AcquiredPage::Ciphertext(UnverifiedPage {
+                        copy: response_copy(response.response(), page)?,
+                        disk_token: None,
+                    }))
+                }
+            }) as Operation<'_, AcquiredPage>
+        };
+        loop {
+            match plan.step().clone() {
+                FillStep::LocalCopy => {
+                    acquired = self.acquire_local_copy(page, scope, want_plaintext).await?;
+                    plan.local(acquired.is_some());
+                    if acquired.is_none() {
+                        candidates = Some(
+                            self.timed(
+                                Event::FillCandidatesCount,
+                                Event::FillCandidatesNs,
+                                self.call(
+                                    DriverStage::CandidateCompositeCall,
+                                    self.dependencies.candidates.candidates_scoped(
+                                        membership.clone(),
+                                        &page.version.object,
+                                        page.number,
+                                        scope,
+                                    ),
+                                ),
+                            )
+                            .await?,
                         );
-                        return Err(error);
+                        if want_plaintext {
+                            plaintext = Some(
+                                self.call(
+                                    DriverStage::PlaintextReclaim,
+                                    self.reserve_network_plaintext(scope, page),
+                                )
+                                .await?,
+                            );
+                        }
                     }
                 }
+                FillStep::Hedge => {
+                    let candidates = candidates.as_ref().expect("candidates resolved");
+                    let hedge_start = uring_runtime::environment::now();
+                    let result = self
+                        .timed(
+                            Event::FillHedgeCount,
+                            Event::FillHedgeNs,
+                            self.call(
+                                DriverStage::CandidateCompositeCall,
+                                self.dependencies.candidates.hedge_page(
+                                    candidates,
+                                    context,
+                                    &operation,
+                                    scope,
+                                    budget,
+                                    &self.dependencies.admission,
+                                    &mut hedge_continuation,
+                                    |response, child| {
+                                        Box::pin(async move {
+                                            self.metrics.record_duration(
+                                                Event::FillPeerResponseCount,
+                                                Event::FillPeerResponseNs,
+                                                hedge_start,
+                                            );
+                                            let copy = response_copy(response.response(), page)?;
+                                            if let Some(existing) = self
+                                                .retained_metadata(&page.version, &child)
+                                                .await?
+                                                && !existing.compatible(&copy.metadata.immutable())
+                                            {
+                                                return Err(Error::CorruptRecord);
+                                            }
+                                            let result = self
+                                                .timed(
+                                                    Event::FillPeerDecryptCount,
+                                                    Event::FillPeerDecryptNs,
+                                                    self.decrypt_response(
+                                                        page, response, None, &child,
+                                                    ),
+                                                )
+                                                .await?;
+                                            // A sibling may publish while crypto runs. Recheck before
+                                            // election, not only after a winner has canceled its peer.
+                                            if let Some(existing) = self
+                                                .retained_metadata(&page.version, &child)
+                                                .await?
+                                                && !existing
+                                                    .compatible(&result.metadata.immutable())
+                                            {
+                                                return Err(Error::CorruptRecord);
+                                            }
+                                            Ok(result)
+                                        })
+                                    },
+                                ),
+                            ),
+                        )
+                        .await?;
+                    plan.hedge(result.is_some());
+                    acquired = result.map(AcquiredPage::from);
+                }
+                FillStep::Walk => {
+                    let candidates = candidates.as_ref().expect("candidates resolved");
+                    // Keep the accepted ranking to probe later cached copies on an origin 412.
+                    let resolution = self
+                        .call(
+                            DriverStage::CandidateCompositeCall,
+                            self.dependencies.candidates.resolve_after_hedge(
+                                crate::topology::Candidates {
+                                    membership: candidates.membership.clone(),
+                                    ordered: candidates.ordered.clone(),
+                                },
+                                context,
+                                PeerOperation::Page {
+                                    page: page.clone(),
+                                    mode: FetchMode::Acquire,
+                                },
+                                scope,
+                                budget,
+                                |response| peer_page(response, plaintext.take()),
+                                std::mem::take(&mut hedge_continuation),
+                            ),
+                        )
+                        .await?;
+                    match resolution {
+                        CandidateResolution::Copy(result) => {
+                            acquired = Some(result);
+                            plan.walk(WalkResult::Copy);
+                        }
+                        CandidateResolution::Origin(origin) => {
+                            plan.walk(WalkResult::Origin {
+                                evidence: origin.predecessor_evidence().to_vec(),
+                            });
+                            authority = Some(origin);
+                        }
+                    }
+                }
+                FillStep::Origin => {
+                    let authority = authority.as_ref().expect("origin authority");
+                    authority.validate(&context.object, page.number)?;
+                    budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+                    scope.check()?;
+                    // Peer reception owns its ciphertext allocation. Reserve encryption
+                    // output only when this candidate actually needs an origin fill.
+                    let ciphertext = self.observe_reservation(
+                        scope,
+                        page,
+                        FillAdmissionSite::OriginCiphertext,
+                        || {
+                            self.reserve_with_reclamation(
+                                &context.object.cache,
+                                ResourceClass::Ciphertext,
+                                PAGE_BYTES as usize + 16,
+                            )
+                        },
+                    )?;
+                    let plaintext = match plaintext.take() {
+                        Some(reserved) => reserved,
+                        None => self.observe_reservation(
+                            scope,
+                            page,
+                            FillAdmissionSite::OriginPlaintext,
+                            || self.reserve_bootstrap(&context.object.cache),
+                        )?,
+                    };
+                    match self
+                        .call(
+                            DriverStage::OriginCall,
+                            self.dependencies
+                                .origin
+                                .page_reserved(authority, context, page, plaintext, scope),
+                        )
+                        .await
+                    {
+                        Ok(origin) => {
+                            // An owner after rank 0 holds a copy rank 0 may not
+                            // know of: offer it later (Known issue 37). The
+                            // authority's owners, not `candidates`: a walk that
+                            // refreshed its membership ranks under the newer one.
+                            if self.dependencies.candidates.note_orphan(
+                                page,
+                                authority.owners(),
+                                authority.rank(),
+                                authority.predecessor_evidence(),
+                            ) {
+                                self.metrics.record(Event::OrphanNotice, 1);
+                            }
+                            acquired = Some(
+                                self.encrypt_origin_page(page, origin, ciphertext, scope)
+                                    .await?
+                                    .into(),
+                            );
+                            plan.origin(Ok(()));
+                        }
+                        Err(error) => {
+                            if error != Error::VersionUnavailable {
+                                self.dependencies.candidates.note_origin_failure(
+                                    page,
+                                    authority.owners(),
+                                    authority.rank(),
+                                    &error,
+                                );
+                            }
+                            plan.origin(Err(error.try_into()?));
+                        }
+                    }
+                }
+                FillStep::RemainingCopy => {
+                    let result = self
+                        .call(
+                            DriverStage::CandidateCompositeCall,
+                            self.dependencies.candidates.remaining_validated_copy(
+                                candidates.as_ref().expect("candidates resolved"),
+                                context,
+                                &copy_only,
+                                scope,
+                                budget,
+                                |response| peer_page(response, None),
+                            ),
+                        )
+                        .await?;
+                    if result.is_none() {
+                        // Record the miss diagnostic; the plan classifies it.
+                        let authority = authority.as_ref().expect("origin authority");
+                        self.dependencies
+                            .candidates
+                            .final_origin_miss(authority, &copy_only, scope, budget);
+                    }
+                    plan.remaining(Ok(match result {
+                        Some(_) => RemainingEnd::Copy,
+                        None => RemainingEnd::None,
+                    }));
+                    acquired = result;
+                }
+                FillStep::Publish(_) => {
+                    let result = acquired.as_ref().expect("acquired page");
+                    result.validate_for(page)?;
+                    scope.check()?;
+                    if let AcquiredPage::Plaintext(page) = result {
+                        // Origin encryption already produced a verified whole page. Preserve
+                        // that evidence even when the supplier requested only ciphertext.
+                        self.call(
+                            DriverStage::PublishCall,
+                            self.publish(page.clone(), None, scope),
+                        )
+                        .await?;
+                    }
+                    plan.published(Ok(()));
+                }
+                FillStep::Done(source) => {
+                    match source {
+                        Source::Local => {}
+                        Source::Origin => self.metrics.record(Event::OriginFill, 1),
+                        Source::Hedge | Source::Peer => self.metrics.record(Event::PeerHit, 1),
+                    }
+                    return Ok(acquired.expect("acquired page"));
+                }
+                FillStep::Failed(error) => return Err(error.into()),
             }
-        };
-        result.validate_for(page)?;
-        scope.check()?;
-        if let AcquiredPage::Plaintext(page) = &result {
-            // Origin encryption already produced a verified whole page. Preserve
-            // that evidence even when the supplier requested only ciphertext.
-            self.call(
-                DriverStage::PublishCall,
-                self.publish(page.clone(), None, scope),
-            )
-            .await?;
         }
-        self.metrics.record(source, 1);
-        Ok(result)
     }
 
     async fn encrypt_origin_page(

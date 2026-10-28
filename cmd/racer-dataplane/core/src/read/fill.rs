@@ -1,11 +1,9 @@
 //! Sans-IO page fill plan: local tiers, then the candidate walk, then origin,
 //! then publication.
 //!
-//! Production `Fill` drives the same order with async I/O (see
-//! `src/read/fill.rs` `acquire_with_prefetch`, `drive_elected_acquisition`,
-//! and `acquire_once`) and calls [`leader_source`], [`acquisition_failure`],
-//! and [`ciphertext_publish_tolerated`] here. The simulator drives
-//! [`FillPlan`] directly.
+//! Production `Fill::acquire_once` (`src/read/fill.rs`) and the simulator both
+//! drive [`FillPlan`]; production also calls [`leader_source`],
+//! [`acquisition_failure`], and [`ciphertext_publish_tolerated`].
 
 use super::candidates::{ProbeOutcome, origin_miss_error};
 use super::error::Error;
