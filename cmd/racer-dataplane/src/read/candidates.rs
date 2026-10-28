@@ -1449,7 +1449,7 @@ impl CandidatePolicy {
                 // Arrivals at generation 0 are unknown: present since this
                 // node's chain began (Known issue 46).
                 let demoted = self.placement.demoted(membership, object, page);
-                for (i, node) in demoted.iter().enumerate() {
+                for node in demoted.iter() {
                     let Ok(p) = membership.position(node) else {
                         continue;
                     };
@@ -1457,7 +1457,6 @@ impl CandidatePolicy {
                     if ranked.demoted.push(p as u32) {
                         ranked.demoted_since[index] = membership.since(node);
                     }
-                    let _ = i;
                 }
                 ranked.oldest = Some(0);
             }
