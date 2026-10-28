@@ -776,17 +776,32 @@ impl Server {
                     .filter(|i| after.is_none_or(|a| i.record.sequence > a))
             })
             .await;
-        if !self.shared.is_primary.get() || !self.shared.ready() {
+        if !self.shared.ready() {
             return Err(ProtocolFailure::Unavailable);
         }
+        require_primary(self.shared.is_primary.get())?;
         let reply = match found {
             None => Reply::no_content(),
-            Some(i) => Reply::ok(
-                i.encoded.clone(),
-                self.queued_write_slot(deadline, expires).await?,
-            ),
+            Some(i) => {
+                let slot = self.queued_write_slot(deadline, expires).await?;
+                // The primary term can end while this reply waits for a
+                // slot, and a follower seat stays ready, so recheck the role
+                // before serving an image from a former primary.
+                require_primary(self.shared.is_primary.get())?;
+                Reply::ok(i.encoded.clone(), slot)
+            }
         };
         Ok(reply.until(expires))
+    }
+}
+
+/// Replica images are served only while this process holds the primary
+/// term.
+fn require_primary(is_primary: bool) -> Result<(), ProtocolFailure> {
+    if is_primary {
+        Ok(())
+    } else {
+        Err(ProtocolFailure::Unavailable)
     }
 }
 
@@ -1939,6 +1954,12 @@ mod tests {
             assert!(server.write_slot().is_ok());
             shared.stopping.set(true);
         });
+    }
+
+    #[test]
+    fn replica_requires_the_primary_term() {
+        assert_eq!(require_primary(true), Ok(()));
+        assert_eq!(require_primary(false), Err(ProtocolFailure::Unavailable));
     }
 
     #[test]
