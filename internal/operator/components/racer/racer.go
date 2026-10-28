@@ -73,6 +73,22 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 			return nil, component.Result{}, err
 		}
 
+		renamed, err := planRenamedContainment(ctx, env)
+		if err != nil {
+			return nil, component.Result{}, err
+		}
+
+		// Pre-rename grants retained here are guarded the same way. The rename
+		// cleanup itself waits for a ClusterCache, consistent with retaining
+		// the existing installation.
+		if renamed != nil {
+			if containment == nil {
+				containment = component.NewPlan()
+			}
+
+			containment.Merge(renamed)
+		}
+
 		if containment != nil {
 			return containment, component.NotReadyAfter(reasonGuards, "revoking Racer dataplane permissions until its admission policies are restored", pendingRequeue), nil
 		}
@@ -97,6 +113,19 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 	containment, err := planContainment(ctx, env, policies)
 	if err != nil {
 		return nil, component.Result{}, err
+	}
+
+	renamed, err := planRenamedContainment(ctx, env)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if renamed != nil {
+		if containment == nil {
+			containment = component.NewPlan()
+		}
+
+		containment.Merge(renamed)
 	}
 
 	if containment != nil {

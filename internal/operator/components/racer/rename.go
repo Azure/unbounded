@@ -185,3 +185,77 @@ func planRenamedDeletes(ctx context.Context, env *component.Env, plan *component
 func isRenamedManaged(obj client.Object) bool {
 	return obj.GetAnnotations()[managerAnnotation] == component.FieldOwner || obj.GetLabels()[managerLabel] == component.FieldOwner
 }
+
+// planRenamedContainment revokes the operator-owned pre-rename grants when any
+// pre-rename admission policy or binding that restricted them is missing,
+// terminating, or no longer managed by this operator. planContainment covers
+// only the renamed guards, and planRenamedCleanup waits for a live
+// replacement and never runs without a ClusterCache, so without this the old
+// identity could keep write access with no admission limits. The pre-rename
+// manifests are no longer shipped, so specs cannot be compared; drift is
+// detected by presence and ownership only. The old guards are never
+// recreated: revoking the grants is enough, and planRenamedCleanup removes
+// the guards once the grants are gone. It returns nil when nothing is
+// revoked.
+func planRenamedContainment(ctx context.Context, env *component.Env) (*component.Plan, error) {
+	rbac := rbacv1.SchemeGroupVersion
+	grants := []legacyObject{
+		legacy(&rbacv1.RoleBinding{ObjectMeta: objectMeta(renamedDataplane)}, rbac.WithKind("RoleBinding")),
+		legacy(&rbacv1.ClusterRoleBinding{ObjectMeta: objectMeta(renamedDataplane)}, rbac.WithKind("ClusterRoleBinding")),
+	}
+
+	var owned []legacyObject
+
+	for _, grant := range grants {
+		live, err := getLegacy(ctx, env, grant)
+		if err != nil {
+			return nil, err
+		}
+
+		if live == nil || live.GetDeletionTimestamp() != nil {
+			continue
+		}
+
+		ok, err := adoptable(ctx, env, live)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok {
+			owned = append(owned, grant)
+		}
+	}
+
+	if len(owned) == 0 {
+		return nil, nil
+	}
+
+	healthy := true
+
+	for _, guardName := range renamedPolicies {
+		for _, guard := range []legacyObject{
+			legacy(&admissionv1.ValidatingAdmissionPolicy{ObjectMeta: objectMeta(guardName)}, admissionv1.SchemeGroupVersion.WithKind("ValidatingAdmissionPolicy")),
+			legacy(&admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: objectMeta(guardName)}, admissionv1.SchemeGroupVersion.WithKind("ValidatingAdmissionPolicyBinding")),
+		} {
+			live, err := getLegacy(ctx, env, guard)
+			if err != nil {
+				return nil, err
+			}
+
+			if live == nil || live.GetDeletionTimestamp() != nil || !isRenamedManaged(live) {
+				healthy = false
+			}
+		}
+	}
+
+	if healthy {
+		return nil, nil
+	}
+
+	plan := component.NewPlan()
+	for _, grant := range owned {
+		plan.Add(deleteOp(grant.obj, grant.gvk))
+	}
+
+	return plan, nil
+}

@@ -173,3 +173,172 @@ func TestRenamedCleanupRequiresLiveReplacement(t *testing.T) {
 		})
 	}
 }
+
+// renamedGrantDeletes returns the names of the pre-rename grants plan deletes.
+func renamedGrantDeletes(plan *component.Plan) []string {
+	var deleted []string
+
+	for _, op := range plan.Operations {
+		if op.Kind == component.OpDelete && op.Object.GetName() == renamedDataplane {
+			deleted = append(deleted, op.Object.GetKind())
+		}
+	}
+
+	return deleted
+}
+
+func TestRenamedContainment(t *testing.T) {
+	ns := "custom-system"
+	now := metav1.Now()
+
+	without := func(kind, name string) func([]client.Object) []client.Object {
+		return func(objects []client.Object) []client.Object {
+			var kept []client.Object
+
+			for _, obj := range objects {
+				if obj.GetName() == name && objectKind(obj) == kind {
+					continue
+				}
+
+				kept = append(kept, obj)
+			}
+
+			return kept
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		mutate  func([]client.Object) []client.Object
+		revokes bool
+	}{
+		{name: "guards intact", mutate: func(o []client.Object) []client.Object { return o }},
+		{name: "policy deleted", mutate: without("ValidatingAdmissionPolicy", renamedPolicies[0]), revokes: true},
+		{name: "binding deleted", mutate: without("ValidatingAdmissionPolicyBinding", renamedPolicies[1]), revokes: true},
+		{
+			name: "policy terminating",
+			mutate: func(objects []client.Object) []client.Object {
+				for _, obj := range objects {
+					if p, ok := obj.(*admissionv1.ValidatingAdmissionPolicy); ok && p.Name == renamedPolicies[2] {
+						p.DeletionTimestamp = &now
+						p.Finalizers = []string{"test/hold"}
+					}
+				}
+
+				return objects
+			},
+			revokes: true,
+		},
+		{
+			name: "policy no longer managed",
+			mutate: func(objects []client.Object) []client.Object {
+				for _, obj := range objects {
+					if p, ok := obj.(*admissionv1.ValidatingAdmissionPolicy); ok && p.Name == renamedPolicies[3] {
+						p.Annotations = nil
+					}
+				}
+
+				return objects
+			},
+			revokes: true,
+		},
+		{
+			name: "no grants",
+			mutate: func(objects []client.Object) []client.Object {
+				objects = without("RoleBinding", renamedDataplane)(objects)
+				objects = without("ClusterRoleBinding", renamedDataplane)(objects)
+
+				return without("ValidatingAdmissionPolicy", renamedPolicies[0])(objects)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv(t, tc.mutate(renamedObjects(ns, managed))...)
+
+			plan, err := planRenamedContainment(t.Context(), env)
+			require.NoError(t, err)
+
+			if !tc.revokes {
+				require.Nil(t, plan)
+				return
+			}
+
+			require.NotNil(t, plan)
+			require.ElementsMatch(t, []string{"RoleBinding", "ClusterRoleBinding"}, renamedGrantDeletes(plan))
+			require.Len(t, plan.Operations, 2, "only the grants are touched")
+		})
+	}
+}
+
+func TestRenamedContainmentKeepsUnmanagedGrants(t *testing.T) {
+	ns := "custom-system"
+	objects := renamedObjects(ns, func() map[string]string { return nil })
+	env := testEnv(t, objects[:6]...) // No guards at all.
+
+	plan, err := planRenamedContainment(t.Context(), env)
+	require.NoError(t, err)
+	require.Nil(t, plan, "grants the operator does not own are not revoked")
+}
+
+func TestRenamedContainmentWithoutClusterCache(t *testing.T) {
+	ns := "custom-system"
+	objects := withoutRenamedPolicy(renamedObjects(ns, managed), renamedPolicies[0])
+	env := testEnv(t, objects...)
+
+	plan, result := planResult(t, env)
+	require.Equal(t, reasonGuards, result.Reason)
+	require.ElementsMatch(t, []string{"RoleBinding", "ClusterRoleBinding"}, renamedGrantDeletes(plan))
+
+	for _, op := range plan.Operations {
+		if op.Kind == component.OpDelete {
+			require.Equal(t, renamedDataplane, op.Object.GetName())
+			require.Contains(t, []string{"RoleBinding", "ClusterRoleBinding"}, op.Object.GetKind(), "the retained installation is not removed")
+		}
+	}
+
+	// With the guards intact, the retained installation is left alone.
+	env = testEnv(t, renamedObjects(ns, managed)...)
+	plan, result = planResult(t, env)
+	require.Empty(t, renamedGrantDeletes(plan))
+	require.NotEqual(t, reasonGuards, result.Reason)
+}
+
+func TestRenamedContainmentWithClusterCache(t *testing.T) {
+	ns := "custom-system"
+	objects := append(withoutRenamedPolicy(renamedObjects(ns, managed), renamedPolicies[0]), cacheObject("cache"))
+	env := testEnv(t, objects...)
+
+	plan, result := planResult(t, env)
+	require.Equal(t, reasonGuards, result.Reason)
+	require.ElementsMatch(t, []string{"RoleBinding", "ClusterRoleBinding"}, renamedGrantDeletes(plan))
+}
+
+// withoutRenamedPolicy drops the pre-rename policy named policy.
+func withoutRenamedPolicy(objects []client.Object, policy string) []client.Object {
+	var kept []client.Object
+
+	for _, obj := range objects {
+		if p, ok := obj.(*admissionv1.ValidatingAdmissionPolicy); ok && p.Name == policy {
+			continue
+		}
+
+		kept = append(kept, obj)
+	}
+
+	return kept
+}
+
+func objectKind(obj client.Object) string {
+	switch obj.(type) {
+	case *admissionv1.ValidatingAdmissionPolicy:
+		return "ValidatingAdmissionPolicy"
+	case *admissionv1.ValidatingAdmissionPolicyBinding:
+		return "ValidatingAdmissionPolicyBinding"
+	case *rbacv1.RoleBinding:
+		return "RoleBinding"
+	case *rbacv1.ClusterRoleBinding:
+		return "ClusterRoleBinding"
+	}
+
+	return ""
+}
