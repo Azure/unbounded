@@ -1,6 +1,5 @@
 //! Real `Fill` persistence against the core `persist` rule the simulator uses
-//! (`sim/src/node/world.rs`, `publish_page`). Replaces the dirty-pressure
-//! oracle of the retired `src/contention.rs` `fidelity` module.
+//! (`sim/src/node/world.rs`, `publish_page`).
 
 use super::fill::Fixture;
 use super::fill::drive;
@@ -92,7 +91,6 @@ fn fill_persistence_matches_core_policy() {
     }
 }
 
-/// Old: `dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds`.
 /// A real bootstrap read of an owned page succeeds whether or not dirty
 /// ciphertext is exhausted; persistence is skipped exactly when it is.
 #[test]
@@ -138,5 +136,44 @@ fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
         assert_eq!(writer.pending_count(), usize::from(!full), "full={full}");
         assert_eq!(writer.discarded_count(), 0);
         drop(held);
+    }
+}
+
+/// The optional headroom boundary of `persist`: a non-owned eligible page is
+/// persisted only within the optional ceiling. Production
+/// `Fill::persist_verified` (`src/read/fill.rs`) re-exports and calls the same
+/// `optional_headroom`; this pins the boundary both use.
+#[test]
+fn non_owned_persistence_uses_optional_headroom() {
+    let limit = 4 * CIPHER;
+    for (used, expected) in [
+        (0, Persist::Write),
+        (CIPHER, Persist::Write),
+        (2 * CIPHER - 19, Persist::Write),
+        (2 * CIPHER - 18, Persist::NoHeadroom),
+        (3 * CIPHER, Persist::NoHeadroom),
+    ] {
+        let facts = PersistFacts {
+            eligible: true,
+            metadata_valid: true,
+            resident: false,
+            owned: false,
+            dirty_limit: limit,
+            dirty_used: used,
+            amount: 19,
+            one_page: CIPHER,
+        };
+        assert_eq!(racer_core::read::persist(facts), expected, "{used}");
+        assert_eq!(
+            crate::read::fill::optional_headroom(limit, used, 19, CIPHER),
+            expected == Persist::Write
+        );
+        assert_eq!(
+            racer_core::read::persist(PersistFacts {
+                owned: true,
+                ..facts
+            }),
+            Persist::Write
+        );
     }
 }

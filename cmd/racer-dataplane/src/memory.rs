@@ -1718,6 +1718,274 @@ pub(crate) mod tests {
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
     use uring_runtime::reactor::IoBuffer;
+    /// Owner and reclamation contracts over real allocations.
+    mod owners {
+        use super::*;
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::RequestId;
+        use crate::model::StrongEtag;
+        use crate::model::WorkerId;
+        use crate::runtime::RequestScope;
+        use crate::security;
+        use crate::security::CryptoClient;
+        use crate::security::PageCrypto;
+        use crate::security::PageCryptoEngine;
+        use crate::worker::CryptoRuntime;
+        use std::num::NonZeroUsize;
+        use std::task::Context;
+        use std::time::Duration;
+        use std::time::Instant;
+        use uring_runtime::group::Service;
+
+        const PLAIN: usize = PAGE_BYTES as usize;
+        const CIPHER: usize = PLAIN + 16;
+
+        fn admission(pages: usize, dirty: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.plaintext_bytes = NonZeroUsize::new(pages * PLAIN).unwrap();
+            limits.ciphertext_bytes = NonZeroUsize::new(pages * CIPHER).unwrap();
+            limits.dirty_bytes = NonZeroUsize::new(dirty).unwrap();
+            limits.metadata_entries = NonZeroUsize::new(16).unwrap();
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
+        }
+
+        fn descriptor(cache: &CacheId, version: &str, length: usize) -> VersionMetadata {
+            VersionMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([0; 32]),
+                    },
+                    etag: StrongEtag::test_value(version),
+                },
+                length: length as u64,
+            }
+        }
+
+        fn page_id(metadata: &VersionMetadata) -> PageId {
+            PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            }
+        }
+
+        fn allocated_page(
+            admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+            cache: &CacheId,
+            version: &str,
+            length: usize,
+        ) -> PageResult {
+            let metadata = descriptor(cache, version, length);
+            let id = page_id(&metadata);
+            let reserved = crate::admission::reserve_fill(admission, cache, false).unwrap();
+            let pool = BufferPool::new(admission.clone());
+            let mut plaintext = pool.plaintext(reserved.plaintext, length).unwrap();
+            plaintext.bytes_mut().unwrap().fill(7);
+            let (bytes, reservation) = plaintext.into_parts();
+            // Structural fixture only: production allocation and owner layout, not an
+            // authentication oracle (security/aead.rs performs this transfer).
+            let plaintext = VerifiedPage {
+                inner: Arc::new(VerifiedBytes {
+                    page: id.clone(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: bytes.into_vec(),
+                        reservation,
+                    },
+                }),
+            };
+            let ciphertext = pool
+                .ciphertext(
+                    reserved.ciphertext,
+                    PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
+                        page: id,
+                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: length as u32,
+                        ciphertext_length: (length + 16) as u32,
+                    },
+                    vec![9; length + 16],
+                )
+                .unwrap();
+            PageResult {
+                metadata: metadata.for_pin(),
+                plaintext,
+                ciphertext,
+            }
+        }
+
+        fn occupancy(admission: &flow_control::Quotas<AdmissionPolicy>) -> [usize; 3] {
+            admission.reclaim_buffers();
+            [
+                ResourceClass::Plaintext,
+                ResourceClass::Ciphertext,
+                ResourceClass::DirtyCiphertext,
+            ]
+            .map(|class| admission.used(class))
+        }
+
+        /// Duplicate readers charge once; the cache retains ciphertext and holds
+        /// plaintext weakly, so a plaintext-only reader does not pin cached
+        /// ciphertext; lookup removal is not a completion fence.
+        #[test]
+        fn duplicate_owners_charge_once_until_each_last_owner() {
+            let real = admission(2, CIPHER);
+            let cache = CacheId(crate::test_support::security::CACHE.into());
+            let memory = MemoryCache::new(
+                BufferPool::new(real.clone()),
+                crate::test_support::availability(),
+            );
+            let page = allocated_page(&real, &cache, "v1", PLAIN);
+            let id = page.plaintext.page().clone();
+            let delivered = page.plaintext.clone();
+            memory.publish(page).unwrap();
+            assert_eq!(occupancy(&real), [PLAIN, CIPHER, 0], "publish");
+
+            let read = memory.get(&id).unwrap().unwrap();
+            let again = memory.get(&id).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&read.plaintext.inner, &again.plaintext.inner));
+            assert!(Arc::ptr_eq(&read.ciphertext.inner, &again.ciphertext.inner));
+            drop(again);
+            assert_eq!(occupancy(&real), [PLAIN, CIPHER, 0], "duplicate reader");
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
+            drop(read.plaintext);
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(0), "ciphertext reader");
+            drop(read.ciphertext);
+            let plain = memory.get(&id).unwrap().unwrap().plaintext;
+            assert!(Arc::ptr_eq(&plain.inner, &delivered.inner));
+            // A plaintext reader does not pin the cached ciphertext.
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(CIPHER));
+            assert_eq!(occupancy(&real), [PLAIN, 0, 0], "plaintext-only reader");
+            drop(delivered);
+            memory.remove_cache(&cache).unwrap();
+            assert!(memory.get(&id).unwrap().is_none());
+            assert_eq!(occupancy(&real), [PLAIN, 0, 0], "lookup removal");
+            assert_eq!(plain.bytes().len(), PLAIN);
+            assert_eq!(plain.bytes()[PLAIN - 1], 7);
+            drop(plain);
+            assert_eq!(occupancy(&real), [0, 0, 0], "last owner released");
+        }
+
+        /// Cache A over its fair share cannot reserve by evicting cache B: the local
+        /// deficit wins over global room, busy A pages survive, and once idle only
+        /// A's oldest ciphertext is reclaimed. Plaintext pressure cannot be relieved
+        /// by the cache, which holds plaintext weakly.
+        #[test]
+        fn fair_reclamation_keeps_other_cache() {
+            for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
+                let real = admission(4, CIPHER);
+                let a = CacheId(crate::test_support::security::CACHE.into());
+                let b = CacheId("44444444-4444-4444-8444-444444444444".into());
+                let memory = MemoryCache::new(
+                    BufferPool::new(real.clone()),
+                    crate::test_support::availability_for(vec![a.clone(), b.clone()]),
+                );
+                let mut ids = Vec::new();
+                for (cache, version) in [(&b, "other"), (&a, "old"), (&a, "new")] {
+                    let page = allocated_page(&real, cache, version, PLAIN);
+                    ids.push(page.plaintext.page().clone());
+                    memory.publish(page).unwrap();
+                }
+                let cipher = matches!(class, ResourceClass::Ciphertext);
+                assert_eq!(occupancy(&real), [0, 3 * CIPHER, 0]);
+                let amount = if cipher { CIPHER } else { PLAIN };
+                if cipher {
+                    assert!(matches!(
+                        real.reserve(Some(&a), class, amount),
+                        Err(flow_control::Error::Overloaded)
+                    ));
+                    let (owner, deficit) = real.reclamation(&a, class, amount).unwrap();
+                    assert_eq!(owner, Some(a.clone()));
+                    assert!(deficit > 0 && deficit <= amount);
+                }
+                // Readers of A's pages hold ciphertext and pin them.
+                let reads: Vec<_> = ids[1..]
+                    .iter()
+                    .map(|id| memory.ciphertext(id).unwrap().unwrap())
+                    .collect();
+                assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_, _| 0), 0);
+                assert_eq!(occupancy(&real), [0, 3 * CIPHER, 0], "busy pages survive");
+                drop(reads);
+                let retained = if cipher {
+                    assert_eq!(
+                        memory.reclaim_idle(class, Some(&a), amount, |_, _| 0),
+                        amount
+                    );
+                    assert!(memory.ciphertext(&ids[1]).unwrap().is_none());
+                    2
+                } else {
+                    assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_, _| 0), 0);
+                    assert!(memory.ciphertext(&ids[1]).unwrap().is_some());
+                    3
+                };
+                assert!(memory.ciphertext(&ids[0]).unwrap().is_some(), "other cache");
+                assert!(memory.ciphertext(&ids[2]).unwrap().is_some());
+                assert_eq!(occupancy(&real), [0, retained * CIPHER, 0]);
+                let next = real.reserve(Some(&a), class, amount).unwrap();
+                drop(next);
+                assert_eq!(memory.evict_idle(usize::MAX), Ok(retained * CIPHER));
+                assert_eq!(occupancy(&real), [0, 0, 0], "drained");
+            }
+        }
+
+        fn scope() -> RequestScope {
+            RequestScope::new(
+                RequestId([1; 16]),
+                Instant::now() + Duration::from_secs(600),
+            )
+            .unwrap()
+        }
+
+        /// A canceled caller is not a completion fence: page charges stay held after
+        /// the caller drops its work and until the crypto completion is reaped, even
+        /// after admission stops.
+        #[test]
+        fn canceled_crypto_holds_owners_until_completion_reap() {
+            let real = admission(1, CIPHER);
+            let cache = CacheId(crate::test_support::security::CACHE.into());
+            let reserved = crate::admission::reserve_fill(&real, &cache, false).unwrap();
+            let buffers = BufferPool::new(real.clone());
+            let plaintext = buffers.plaintext(reserved.plaintext, 3).unwrap();
+            let (port, engine_port) = security::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+            let client = Rc::new(CryptoClient::new(port));
+            let crypto = PageCrypto::new(
+                Rc::new(crate::test_support::security::keys()),
+                client.clone(),
+            );
+            let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
+            let scope = scope();
+            let mut work = crypto.encrypt(
+                page_id(&descriptor(&cache, "v1", 3)),
+                plaintext,
+                reserved.ciphertext,
+                &scope,
+            );
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(client.outstanding(), 1);
+            assert_eq!(occupancy(&real), [3, CIPHER, 0], "accepted crypto");
+            scope.cancel().unwrap();
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            drop(work);
+            real.stop();
+            client.poll_budgeted(1).unwrap();
+            assert_eq!(occupancy(&real), [3, CIPHER, 0], "canceled caller");
+            assert_eq!(client.outstanding(), 1);
+            engine.poll_budgeted(&mut cx, 1).unwrap();
+            assert_eq!(occupancy(&real), [3, CIPHER, 0], "published, not reaped");
+            assert_eq!(client.outstanding(), 1);
+            client.poll_budgeted(1).unwrap();
+            assert_eq!(client.outstanding(), 0);
+            assert_eq!(occupancy(&real), [0, 0, 0], "reaped");
+            assert!(
+                ResourceClass::ALL
+                    .iter()
+                    .all(|class| real.used(*class) == 0)
+            );
+        }
+    }
     mod cache {
         use super::*;
         use crate::model::ExpiresAt;
