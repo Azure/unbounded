@@ -736,6 +736,28 @@ def test_fetch_pins_sharded_state_files(server, uri, tmp_path):
     assert sorted(etags) == ["config.json", "model-pp-0-tp-0-part-0.safetensors", "model-pp-1-tp-0-part-0.safetensors"]
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "model-rank-{rank:02d}-part-{part:02d}.safetensors",
+        "model-pp-{pp_rank:02d}-tp-{tp_rank:02d}-part-{part}.safetensors",
+    ],
+)
+def test_fetch_pins_sharded_state_files_with_format_specs(server, uri, tmp_path, pattern):
+    put(server, uri, "config.json", b"{}")
+    pp = "pp_rank" in pattern
+    names = []
+    for pp_rank in (0, 1) if pp else (0,):
+        for tp_rank in (0, 1):
+            ranks = {"pp_rank": pp_rank, "tp_rank": tp_rank, "rank": tp_rank}
+            name = pattern.format(part=0, **ranks)
+            put(server, uri, name, b"x")
+            names.append(name)
+    rv.fetch(uri, str(tmp_path), client=client(server), pattern=pattern)
+    etags = json.loads((tmp_path / rv.MARKER).read_text())["etags"]
+    assert sorted(etags) == sorted(["config.json", *names])
+
+
 @pytest.mark.parametrize("change", ["none", "new part", "deleted part", "replaced"])
 def test_loader_sharded_state_uses_pins(server, uri, torch, monkeypatch, tmp_path, change):
     put(server, uri, "config.json", b"{}")

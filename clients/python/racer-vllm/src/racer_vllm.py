@@ -540,11 +540,16 @@ def summary(stats: dict, seconds: float, uri) -> str:
 # each tensor/pipeline parallel rank has its own files, already split.
 
 
+def pattern_fields(pattern) -> set:
+    """Placeholder names in a pattern, ignoring format specs such as {rank:02d}."""
+    return {f for _, f, _, _ in string.Formatter().parse(pattern) if f is not None}
+
+
 def render_pattern(pattern, part: int, tp_rank=0, tp_size=1, pp_rank=0, pp_size=1) -> str:
     """File name of one part, with vLLM's pattern checks."""
     if pattern is None:
         pattern = PP_AND_TP_PATTERN if pp_size > 1 else TP_ONLY_PATTERN
-    fields = {f for _, f, _, _ in string.Formatter().parse(pattern) if f is not None}
+    fields = pattern_fields(pattern)
     unsupported = fields - {"pp_rank", "tp_rank", "rank", "part"}
     if unsupported:
         raise ValueError(f"pattern {pattern!r} uses unsupported placeholders {sorted(unsupported)}")
@@ -581,8 +586,9 @@ def rank_files(client, uri: ModelURI, pattern, ranks: dict) -> list:
 def sharded_files(client, uri: ModelURI, pattern=None) -> list:
     """Every rank's sharded_state files, probing rank 0, 1, ... until one has no part 0."""
     for pat in [pattern] if pattern else [TP_ONLY_PATTERN, PP_AND_TP_PATTERN]:
-        pp = "{pp_rank}" in pat
-        tp = "{tp_rank}" in pat or "{rank}" in pat
+        fields = pattern_fields(pat)
+        pp = "pp_rank" in fields
+        tp = bool(fields & {"tp_rank", "rank"})
         files = []
         for pp_rank in range(MAX_PARTS if pp else 1):
             n = len(files)
