@@ -42,6 +42,23 @@ fn transient(error: Error) -> bool {
     )
 }
 
+/// Waits until `until` between resolve attempts. A failed timer (for
+/// example an overloaded reactor) must not fail the device, so the wait falls
+/// back to yielding to the worker until the deadline passes. Cancellation is
+/// by dropping the resolve future.
+async fn pause<F, Fut>(until: std::time::Instant, mut sleep: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    while uring_runtime::environment::now() < until {
+        if sleep().await.is_ok() {
+            return;
+        }
+        uring_runtime::drivers::yield_now().await;
+    }
+}
+
 impl DirectoryBackend {
     /// One lookup attempt.
     async fn resolve_once(&self, device: &UblkDeviceConfig) -> Result<Resolved> {
@@ -110,10 +127,12 @@ impl Backend for DirectoryBackend {
                                 device.cache
                             );
                         }
-                        let scope = request_scope(RESOLVE_RETRY * 2)?;
-                        timer
-                            .sleep(uring_runtime::environment::now() + RESOLVE_RETRY, &scope)
-                            .await?;
+                        let until = uring_runtime::environment::now() + RESOLVE_RETRY;
+                        pause(until, || async {
+                            let scope = request_scope(RESOLVE_RETRY * 2)?;
+                            timer.sleep(until, &scope).await
+                        })
+                        .await;
                     }
                     result => return result,
                 }
@@ -348,6 +367,32 @@ pub(super) mod tests {
         ] {
             assert!(!transient(error), "{error:?}");
         }
+    }
+
+    #[test]
+    fn failed_retry_timer_still_waits_and_returns() {
+        let fixture = Fixture::new();
+        // A timer that fails a few times, then works.
+        let calls = std::cell::Cell::new(0);
+        let until = uring_runtime::environment::now() + Duration::from_secs(5);
+        let flaky = pause(until, || {
+            calls.set(calls.get() + 1);
+            let result = if calls.get() < 4 {
+                Err(Error::Overloaded)
+            } else {
+                Ok(())
+            };
+            async move { result }
+        });
+        fixture.run(Box::pin(flaky));
+        assert_eq!(calls.get(), 4);
+        // A timer that never works still ends the wait at the deadline
+        // instead of failing.
+        let started = Instant::now();
+        let until = uring_runtime::environment::now() + Duration::from_millis(50);
+        let broken = pause(until, || async { Err(Error::Overloaded) });
+        fixture.run(Box::pin(broken));
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]

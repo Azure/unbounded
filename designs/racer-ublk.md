@@ -231,7 +231,9 @@ Code lives in `cmd/racer/src/ublk/`.
 - `directory.rs`: `DirectoryBackend` and `DirectorySource`. They resolve metadata with
   `WorkerDirectory::resolve_with_budget` and read pages with `WorkerDirectory::acquire`,
   pinned to the resolved version. A version lookup retries every second while the cache is
-  missing from the snapshot or the read path is unavailable.
+  missing from the snapshot or the read path is unavailable, overloaded, timed out, or
+  cancelled. If the retry timer itself fails, the lookup yields to the worker until the
+  second has passed and tries again, so a busy reactor cannot fail the device.
 - `manager.rs`: `Manager`, the node-level device table shared by workers and the
   `ublk-control` thread, and the control loop. `DeviceControl` abstracts the control
   commands for tests.
