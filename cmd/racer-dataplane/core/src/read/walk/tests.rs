@@ -356,11 +356,10 @@ fn rank_zero_owner_gets_origin_without_probes() {
 
 #[test]
 fn owner_with_tight_links_partitions_predecessor_routes() {
-    // Two predecessors, seven inherited links after a failure route. The
-    // Acquire to rank 0 (two attempts: the exchange and rank 0's origin
-    // credit) comes first: it gets a full failure route and leaves one link
-    // for rank 1's copy-only probe, which matters only if rank 0 fails
-    // (Known issue 13: an equal split left it too few links to reach rank 0).
+    // Two predecessors, seven inherited links after a failure route. The Acquire to rank 0 (two
+    // attempts: the exchange and rank 0's origin credit) comes first: it gets a full failure route
+    // and leaves one link for rank 1's copy-only probe, which matters only if rank 0 fails (an
+    // equal split left it too few links to reach rank 0).
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
     let mut b = budget(4, 7);
     b.note_route_failure();
@@ -483,8 +482,8 @@ fn stale_membership_ends_and_returns_child_credits() {
     assert_eq!(stale_action(false, 2, Some(3)), Ok(StaleAction::Refresh));
 }
 
-/// Known issue 3: a requester ahead of its destination skips the stale owner
-/// and reaches the next one instead of failing the read.
+/// A requester ahead of its destination skips the stale owner and reaches the next one instead of
+/// failing the read.
 #[test]
 fn stale_destination_moves_to_the_next_owner() {
     let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
@@ -704,16 +703,16 @@ fn hedge_rules() {
     );
     assert_eq!(transport_outcome(Error::Unauthorized), None);
     assert_eq!(transport_outcome(Error::DeadlineExceeded), None);
-    // Known issue 5: a local hop budget shortfall is evidence, not terminal.
+    // A local hop budget shortfall is evidence, not terminal.
     assert_eq!(
         transport_outcome(Error::HopBudgetExhausted),
         Some(ProbeOutcome::Unreachable)
     );
 }
 
-/// Known issue 5: once the links are spent, each later probe fails locally in
-/// `plan_attempt` and is recorded as unreachable; the walk ends `Exhausted`
-/// (recoverable) instead of abandoning with `HopBudgetExhausted`.
+/// Once the links are spent, each later probe fails locally in `plan_attempt` and is recorded as
+/// unreachable; the walk ends `Exhausted` (recoverable) instead of abandoning with
+/// `HopBudgetExhausted`.
 #[test]
 fn spent_links_end_the_walk_exhausted() {
     let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
@@ -794,9 +793,8 @@ fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
     );
 }
 
-/// Known issue 13: handoff probes are opportunistic, so they must not
-/// reserve credits that make an owner skip the delegation to rank 0 and fetch
-/// the page itself.
+/// Handoff probes are opportunistic, so they must not reserve credits that make an owner skip the
+/// delegation to rank 0 and fetch the page itself.
 #[test]
 fn handoff_targets_do_not_block_delegation() {
     for (rank, attempts) in [(1, 3), (2, 4)] {
@@ -820,10 +818,9 @@ fn handoff_targets_do_not_block_delegation() {
     }
 }
 
-/// Known issue 13: rank 0 reached by an owner's delegation asks previous
-/// owners only with credits the delegation carries. An owner that sees an
-/// ownership change forwards its spare credits (up to [`MAX_HANDOFF`]); an
-/// owner that sees none forwards exactly the exchange and the origin credit.
+/// Rank 0 reached by an owner's delegation asks previous owners only with credits the delegation
+/// carries. An owner that sees an ownership change forwards its spare credits (up to
+/// [`MAX_HANDOFF`]); an owner that sees none forwards exactly the exchange and the origin credit.
 #[test]
 fn delegation_forwards_spare_credits_for_rank_zero_handoff() {
     for (handoff, attempts, child) in [(0, 8, 2), (1, 3, 2), (1, 4, 3), (2, 6, 5), (3, 16, 5)] {
@@ -847,10 +844,9 @@ fn delegation_forwards_spare_credits_for_rank_zero_handoff() {
     }
 }
 
-/// Known issue 13: the delegation route comes first. Rank 2 with five
-/// inherited links (a failure route) gives the Acquire four and keeps one
-/// for rank 1's copy-only probe instead of splitting them evenly (two each,
-/// too few to reach rank 0 in most topologies).
+/// The delegation route comes first. Rank 2 with five inherited links (a failure route) gives the
+/// Acquire four and keeps one for rank 1's copy-only probe instead of splitting them evenly (two
+/// each, too few to reach rank 0 in most topologies).
 #[test]
 fn delegation_route_takes_priority_over_later_predecessors() {
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
@@ -895,9 +891,8 @@ fn same_rank_previous_marks_unchanged_predecessors() {
     assert_eq!(same_rank_previous::<i32>(&[], &[1, 2], 1), 0);
 }
 
-/// Known issue 12: predecessors that held the same rank under the previous
-/// membership are asked under it, so one that has not adopted the current
-/// version yet serves instead of answering `StaleMembership`.
+/// Predecessors that held the same rank under the previous membership are asked under it, so one
+/// that has not adopted the current version yet serves instead of answering `StaleMembership`.
 #[test]
 fn predecessors_with_unchanged_rank_are_asked_under_the_previous_membership() {
     let mut cfg = config(Some(2), 3, VisitOrder::canonical(3));
@@ -1027,10 +1022,9 @@ fn overloaded_owner_sends_the_reader_to_its_helper_once() {
 
 #[test]
 fn helper_probe_forwards_its_full_funded_envelope() {
-    // Known issue 60: without a route failure the reader routes with four
-    // links per attempt, and a helper reached by such a route keeps two or
-    // three links, too few to reach rank 0 through a relay. The helper's
-    // envelope is every link it is funded with, as for a funded owner.
+    // Without a route failure the reader routes with four links per attempt, and a helper reached
+    // by such a route keeps two or three links, too few to reach rank 0 through a relay. The
+    // helper's envelope is every link it is funded with, as for a funded owner.
     for links in [HELPER_FLOOR_LINKS, HELPER_LINKS, 16] {
         let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
         let mut b = budget(8, links);
@@ -1190,10 +1184,9 @@ fn destination_shed_is_evidence_but_not_a_route_failure() {
     }
 }
 
-/// Known issue 31: an owner whose probe of rank 0 (a delegated `Acquire`, or
-/// copy-only when it cannot fund one) is sent but unanswered within the
-/// attempt does not fetch origin: rank 0 is most likely still fetching, and
-/// this owner's request would queue behind it at the same origin.
+/// An owner whose probe of rank 0 (a delegated `Acquire`, or copy-only when it cannot fund one) is
+/// sent but unanswered within the attempt does not fetch origin: rank 0 is most likely still
+/// fetching, and this owner's request would queue behind it at the same origin.
 #[test]
 fn owner_leaves_the_fetch_to_rank_zero_after_a_timeout() {
     // Delegated Acquire (rank 1, enough credits).
@@ -1313,11 +1306,10 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
     assert_eq!(remaining.next_probe(), Err(RemainingEnd::Unavailable));
 }
 
-/// Known issue 39: the rank 0 watch bounds the timeout rule. Once rank 0
-/// stayed silent for a request timeout (`Overdue`), a timeout gives
-/// authority; `Fetching` keeps the rule and changes nothing else (a route
-/// failure, `Overloaded`, shed or miss from rank 0 still gives authority,
-/// Known issue 40). Probes are planned the same in every state.
+/// The rank 0 watch bounds the timeout rule. Once rank 0 stayed silent for a request timeout
+/// (`Overdue`), a timeout gives authority; `Fetching` keeps the rule and changes nothing else (a
+/// route failure, `Overloaded`, shed or miss from rank 0 still gives authority, Known issue 40).
+/// Probes are planned the same in every state.
 #[test]
 fn rank_zero_watch_bounds_the_timeout_rule() {
     let with = |rank: usize, state: Rank0State| WalkConfig {
@@ -1385,8 +1377,8 @@ fn rank_zero_watch_bounds_the_timeout_rule() {
     }
 }
 
-/// Known issue 25: later owners that arrived before an owner are its lineage
-/// targets; equal or unknown arrivals never are.
+/// Later owners that arrived before an owner are its lineage targets; equal or unknown arrivals
+/// never are.
 #[test]
 fn lineage_targets_are_later_owners_that_arrived_earlier() {
     let owners = ["a", "b", "c"];
@@ -1425,9 +1417,8 @@ fn merge_handoff_keeps_lineage_targets_first_without_duplicates() {
     assert!(merge_handoff::<&str>(&[], &[]).is_empty());
 }
 
-/// Known issue 25: a delegation to rank 0 forwards spare credits for rank 0's
-/// lineage targets even when this owner has no handoff targets of its own;
-/// never the owner's own origin credit.
+/// A delegation to rank 0 forwards spare credits for rank 0's lineage targets even when this owner
+/// has no handoff targets of its own; never the owner's own origin credit.
 #[test]
 fn delegation_forwards_spare_credits_for_rank_zero_lineage() {
     for (lineage, attempts, child) in [(0, 8, 2), (1, 3, 2), (1, 4, 3), (2, 8, 4), (2, 4, 3)] {
@@ -1449,9 +1440,8 @@ fn delegation_forwards_spare_credits_for_rank_zero_lineage() {
     }
 }
 
-/// Known issue 25: a non-owner's out-of-order Acquire carries one more
-/// credit per lineage target of the destination and of rank 0, only from
-/// slack.
+/// A non-owner's out-of-order Acquire carries one more credit per lineage target of the destination
+/// and of rank 0, only from slack.
 #[test]
 fn non_owner_funds_destination_lineage_from_slack_only() {
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
@@ -1488,9 +1478,8 @@ fn non_owner_funds_destination_lineage_from_slack_only() {
     assert_eq!(first(8, [0, 0, 0]), (1, owner_funding(1)));
 }
 
-/// Known issue 26: a reader waiting for a destination that is behind asks
-/// the same destination again, with the credits its verified
-/// `StaleMembership` returned, and then walks on as before.
+/// A reader waiting for a destination that is behind asks the same destination again, with the
+/// credits its verified `StaleMembership` returned, and then walks on as before.
 #[test]
 fn retry_pending_plans_the_same_destination_again() {
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
@@ -1662,11 +1651,10 @@ fn owner_above_rank_zero_asks_successors_after_its_delegation() {
     assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
 }
 
-/// Wave 4 merge: rank 0 asks a successor (own grant) and then a lineage
-/// target before origin. A `StaleMembership` refund of the successor's
-/// remote credits lands in the grant, which is dropped, so the walk's budget
-/// never grows; and neither probe timing out is a rank 0 timeout, so rank 0
-/// keeps origin authority (Known issues 21, 25, 26, 31).
+/// Wave 4 merge: rank 0 asks a successor (own grant) and then a lineage target before origin. A
+/// `StaleMembership` refund of the successor's remote credits lands in the grant, which is dropped,
+/// so the walk's budget never grows; and neither probe timing out is a rank 0 timeout, so rank 0
+/// keeps origin authority.
 #[test]
 fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
@@ -1780,9 +1768,8 @@ fn granted_prefix_counts_leading_successor_and_lineage_targets() {
 
 #[test]
 fn delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit() {
-    // Known issue 35: rank 0 reached by a delegation has one credit. Its two
-    // lineage targets are granted; the version - 1 target after them is
-    // funded from the walk and stops before the origin credit.
+    // Rank 0 reached by a delegation has one credit. Its two lineage targets are granted; the
+    // version - 1 target after them is funded from the walk and stops before the origin credit.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 3;
     cfg.granted = 2;
@@ -1807,9 +1794,8 @@ fn delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit() {
     assert_eq!(end, End::Copy);
 }
 
-/// Known issue 36: a further ask of a destination that is behind must leave
-/// attempts for every later visit's minimum and a full route share of links
-/// for each.
+/// A further ask of a destination that is behind must leave attempts for every later visit's
+/// minimum and a full route share of links for each.
 #[test]
 fn retry_affordable_keeps_later_visits_funded() {
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
@@ -1852,19 +1838,15 @@ fn retry_affordable_keeps_later_visits_funded() {
     );
 }
 
-/// Known issue 49: the bound on a read's second stale wait. Every exchange
-/// reserves its route's links (`plan_attempt`; a funded first visit takes
-/// eight), and transport never returns them. Before a verified
-/// `StaleMembership` returned the links past its answerer
-/// (`stale_unused_links`), a default read (`PAGE_ATTEMPTS`, `PAGE_LINKS`)
-/// that waited once at a funded first owner had spent every link on that
-/// owner: it never reached the other two (Known issue 47), let alone
-/// afforded a second wait. With the refund, a reader whose three owners are
-/// all behind asks each of them and waits once at its first visit. The
-/// second wait is a fifth exchange: affordable only at its last visit, where
-/// no later owner needs the links, and only when that visit is rank 0 or 1
-/// (four attempts left must cover one exchange plus the visit's minimum,
-/// canonical + 2); with fewer owners, at every visit.
+/// The bound on a read's second stale wait. Every exchange reserves its route's links
+/// (`plan_attempt`; a funded first visit takes eight), and transport never returns them. Before a
+/// verified `StaleMembership` returned the links past its answerer (`stale_unused_links`), a
+/// default read (`PAGE_ATTEMPTS`, `PAGE_LINKS`) that waited once at a funded first owner had spent
+/// every link on that owner: it never reached the other two, let alone afforded a second wait. With
+/// the refund, a reader whose three owners are all behind asks each of them and waits once at its
+/// first visit. The second wait is a fifth exchange: affordable only at its last visit, where no
+/// later owner needs the links, and only when that visit is rank 0 or 1 (four attempts left must
+/// cover one exchange plus the visit's minimum, canonical + 2); with fewer owners, at every visit.
 #[test]
 fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
     use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
@@ -1943,11 +1925,10 @@ fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
     }
 }
 
-/// Wave 5 interplay of the lineage grants (Known issues 34 and 35) with the
-/// rank 0 timeout rule (Known issues 31, 39 and 40): an owner above rank 0
-/// whose granted targets time out keeps origin authority, since only its
-/// probe of rank 0 decides it; a timeout of rank 0 still withholds it after
-/// granted probes; and the grants never draw on the walk's budget.
+/// Wave 5 interplay of the lineage grants with the rank 0 timeout rule: an owner above rank 0 whose
+/// granted targets time out keeps origin authority, since only its probe of rank 0 decides it; a
+/// timeout of rank 0 still withholds it after granted probes; and the grants never draw on the
+/// walk's budget.
 #[test]
 fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
     let with = |state: Rank0State| WalkConfig {
@@ -1989,9 +1970,8 @@ fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
     }
 }
 
-/// Known issue 46: lineage targets past the third are kept, up to
-/// `MAX_LINEAGE`, while version - 1 targets are still only added below
-/// `MAX_HANDOFF` targets (the walk funds those).
+/// Lineage targets past the third are kept, up to `MAX_LINEAGE`, while version - 1 targets are
+/// still only added below `MAX_HANDOFF` targets (the walk funds those).
 #[test]
 fn lineage_targets_go_past_three_and_version_one_targets_do_not() {
     // Owners arrived in 10, 11, 12; seven demoted members each arrived
@@ -2035,9 +2015,8 @@ fn lineage_targets_go_past_three_and_version_one_targets_do_not() {
     assert_eq!(merge_handoff(&[90, 91], &[3, 4, 5, 6]), [3, 4, 5, 6]);
 }
 
-/// Known issue 45: granted probes go out at once, each on its own grant and
-/// one shared time share; misses leave the walk exactly as the sequential
-/// walk leaves it, and any copy ends it.
+/// Granted probes go out at once, each on its own grant and one shared time share; misses leave the
+/// walk exactly as the sequential walk leaves it, and any copy ends it.
 #[test]
 fn parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk() {
     for rank in [0, 1, 2] {
@@ -2115,9 +2094,8 @@ fn parallel_granted_probes_must_be_reported_before_the_next_step() {
     let _ = walk.next(&mut b);
 }
 
-/// Known issue 46: members whose arrival is the chain's start have an
-/// unknown age, tied with the owners above them, so the arrival rule never
-/// names them; with `oldest` they qualify in rank order when this owner
+/// Members whose arrival is the chain's start have an unknown age, tied with the owners above them,
+/// so the arrival rule never names them; with `oldest` they qualify in rank order when this owner
 /// arrived later, within `MAX_LINEAGE`.
 #[test]
 fn unknown_age_demoted_members_are_targets_when_the_owner_arrived_later() {
@@ -2202,12 +2180,10 @@ fn relay_overload_on_the_route_to_rank_zero_gives_authority_without_a_retry() {
     assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
 }
 
-/// Known issue 52: rank 0 itself answering an owner's probe that its own
-/// acquisition failed (`Outcome::Failed`) withholds origin authority only
-/// while this owner's own origin request for the page failed recently
-/// (`Failed`); otherwise (a failure local to rank 0) the owner fetches as
-/// before. The walk's probes and budgets are the same as for
-/// `Probe(Unreachable)`.
+/// Rank 0 itself answering an owner's probe that its own acquisition failed (`Outcome::Failed`)
+/// withholds origin authority only while this owner's own origin request for the page failed
+/// recently (`Failed`); otherwise (a failure local to rank 0) the owner fetches as before. The
+/// walk's probes and budgets are the same as for `Probe(Unreachable)`.
 #[test]
 fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
     let with = |rank: usize, state: Rank0State| WalkConfig {
@@ -2298,10 +2274,9 @@ fn remaining_walk_treats_a_failure_as_transient() {
 
 #[test]
 fn forwarded_non_owner_funds_an_out_of_order_owner_with_its_route_links() {
-    // A non-owner reached by a funded route (Known issue 57): it inherits
-    // `owner_funding_min(2)` attempts and seven links, which is never a full
-    // failure route. It must still fund rank 2 with the attempts rank 2
-    // needs, not send a shared route that grants one credit.
+    // A non-owner reached by a funded route: it inherits `owner_funding_min(2)` attempts and seven
+    // links, which is never a full failure route. It must still fund rank 2 with the attempts rank
+    // 2 needs, not send a shared route that grants one credit.
     let now = Instant::now();
     let deadline = now + Duration::from_secs(60);
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
@@ -2392,8 +2367,8 @@ fn charge(walk: &mut CandidateWalk, b: &mut AcquisitionBudget, probe: &Probe) ->
 
 #[test]
 fn in_order_owner_gets_the_credits_it_needs_when_a_share_is_short() {
-    // Known issue 57: a non-owner with three attempts at rank 1 (in visit
-    // order) shared one remote credit, which rank 1 spent probing rank 0.
+    // A non-owner with three attempts at rank 1 (in visit order) shared one remote credit, which
+    // rank 1 spent probing rank 0.
     let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
     let mut b = budget(6, 16);
     let Step::Probe(first) = walk.next(&mut b).unwrap() else {
@@ -2546,15 +2521,12 @@ fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
     }
 }
 
-/// Known issue 59, the bound: an owner funded at its minimum
-/// ([`shared_share_short`]: `owner_funding_min(c) - 1` remote credits)
-/// asks each predecessor copy-only, never delegates, and ends with at most
-/// one origin attempt, only under the authority rules every owner follows:
-/// no origin after a copy, after rank 0 left it unanswered while presumed
-/// fetching (Known issue 31), or after rank 0 failed while this owner's own
-/// origin request failed recently (Known issue 52). The funding adds origin
-/// requests only where such an owner had authority and previously no credit
-/// to use it.
+/// The bound: an owner funded at its minimum ([`shared_share_short`]: `owner_funding_min(c) - 1`
+/// remote credits) asks each predecessor copy-only, never delegates, and ends with at most one
+/// origin attempt, only under the authority rules every owner follows: no origin after a copy,
+/// after rank 0 left it unanswered while presumed fetching, or after rank 0 failed while this
+/// owner's own origin request failed recently. The funding adds origin requests only where such an
+/// owner had authority and previously no credit to use it.
 #[test]
 fn a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority() {
     for rank in [1usize, 2] {

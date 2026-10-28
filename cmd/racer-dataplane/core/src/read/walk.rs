@@ -55,27 +55,24 @@ pub(crate) struct WalkConfig {
     /// Previous-membership owners asked copy-only before origin; a probe of
     /// target `i` reports `canonical = owners + i`.
     pub handoff: usize,
-    /// Predecessors (bit `c` for rank `c`) asked under version - 1, where
-    /// they held the same rank, so one that has not adopted the current
-    /// version still serves (Known issue 12).
+    /// Predecessors (bit `c` for rank `c`) asked under version - 1, where they held the same rank,
+    /// so one that has not adopted the current version still serves.
     pub previous: u8,
     /// A non-owner page walk may ask an overflow helper (`canonical =
     /// owners`) once, right after an owner itself sheds the probe. A relay's
     /// `Overloaded` or a timeout says the route is congested, not the page.
     pub helper: bool,
-    /// Lineage targets per owner rank (Known issue 25), funded from slack
-    /// only: without slack the walk funds exactly as before.
+    /// Lineage targets per owner rank, funded from slack only: without slack the walk funds exactly
+    /// as before.
     pub lineage: [u8; MAX_HANDOFF],
-    /// The first `granted` handoff targets (successors, then lineage) are
-    /// asked copy-only on their own grant, never the walk's budget, so a
-    /// delegated rank 0 keeps its origin credit (Known issues 21, 34, 35).
+    /// The first `granted` handoff targets (successors, then lineage) are asked copy-only on their
+    /// own grant, never the walk's budget, so a delegated rank 0 keeps its origin credit.
     pub granted: usize,
     /// Send a run of granted probes at once ([`Step::Granted`], Known issue
     /// 45). Only a copy changes the walk, so their order cannot matter.
     pub parallel_granted: bool,
-    /// What this owner knows about rank 0's acquisition (Known issues 39,
-    /// 52): `Overdue` makes a rank 0 timeout grant authority, `Failed` makes
-    /// [`Outcome::Failed`] withhold it.
+    /// What this owner knows about rank 0's acquisition: `Overdue` makes a rank 0 timeout grant
+    /// authority, `Failed` makes [`Outcome::Failed`] withhold it.
     pub rank0: Rank0State,
 }
 
@@ -91,8 +88,8 @@ pub const SUCCESSOR_GRANT_LINKS: u8 = 8;
 /// Most previous-membership owners one walk asks (the replica count).
 pub const MAX_HANDOFF: usize = 3;
 
-/// Most lineage targets one owner walk asks (Known issue 46). Granted probes
-/// go out at once, so more targets add exchanges, not latency.
+/// Most lineage targets one owner walk asks. Granted probes go out at once, so more targets add
+/// exchanges, not latency.
 pub const MAX_LINEAGE: usize = 6;
 
 /// Most handoff targets: successor targets plus lineage targets.
@@ -121,10 +118,9 @@ pub fn owner_funding(canonical: usize) -> u32 {
 /// Fewest links of a funded Acquire: the owner keeps one to reach rank 0.
 pub(crate) const FUNDED_MIN_LINKS: u8 = 2;
 
-/// Links a non-owner funds an out-of-order Acquire with: a full route when
-/// available, else what a shared route would charge, if that leaves the
-/// owner a link. Requiring a full route left forwarded owners with one
-/// credit (Known issue 57).
+/// Links a non-owner funds an out-of-order Acquire with: a full route when available, else what a
+/// shared route would charge, if that leaves the owner a link. Requiring a full route left
+/// forwarded owners with one credit.
 pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
     if budget.remaining_links() >= MAX_ROUTE_LINKS {
         Some(MAX_ROUTE_LINKS)
@@ -134,12 +130,10 @@ pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
     }
 }
 
-/// Whether a shared route would give the owner at `canonical` fewer remote
-/// credits than it needs to probe its predecessors and still fetch (Known
-/// issue 57). The walk then funds the owner instead, unless an earlier owner
-/// was busy: it is likely fetching, and funding the next one would only
-/// overlap its origin request (Known issue 31). The cost is bounded: a
-/// funded owner sends at most one origin request (Known issue 59).
+/// Whether a shared route would give the owner at `canonical` fewer remote credits than it needs to
+/// probe its predecessors and still fetch. The walk then funds the owner instead, unless an earlier
+/// owner was busy: it is likely fetching, and funding the next one would only overlap its origin
+/// request. The cost is bounded: a funded owner sends at most one origin request.
 pub fn shared_share_short(
     budget: &AcquisitionBudget,
     canonical: usize,
@@ -223,8 +217,8 @@ impl<T: PartialEq, const N: usize> PartialEq<Vec<T>> for List<T, N> {
     }
 }
 
-/// Predecessors an owner at `rank` may ask under the previous membership:
-/// bit `c` is set when rank `c` names the same node in both (Known issue 12).
+/// Predecessors an owner at `rank` may ask under the previous membership: bit `c` is set when rank
+/// `c` names the same node in both.
 fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usize) -> u8 {
     (0..rank.min(current.len()).min(8))
         .filter(|c| previous.get(*c).is_some_and(|p| *p == current[*c]))
@@ -251,9 +245,9 @@ fn handoff_targets<N: PartialEq + Copy + Default>(
         .collect()
 }
 
-/// Later owners that arrived before the owner at `rank` (Known issue 25).
-/// Under rendezvous hashing they could only have outranked it, and fetched
-/// the page, before it arrived. Equal or unknown arrivals never qualify.
+/// Later owners that arrived before the owner at `rank`. Under rendezvous hashing they could only
+/// have outranked it, and fetched the page, before it arrived. Equal or unknown arrivals never
+/// qualify.
 fn lineage_targets<N: Copy + Default>(
     owners: &[N],
     since: &[Option<u32>],
@@ -271,12 +265,10 @@ fn lineage_targets<N: Copy + Default>(
         .collect()
 }
 
-/// Demoted members (ranked just below the owners) that arrived before the
-/// owner at `rank` and were owners then (Known issue 34): fewer than
-/// [`MAX_HANDOFF`] members above them had arrived. Unknown arrivals count as
-/// present, so they never add a target. Members whose arrival is `oldest`
-/// (the start of this node's membership chain) always qualify, since no rule
-/// can tell (Known issue 46).
+/// Demoted members (ranked just below the owners) that arrived before the owner at `rank` and were
+/// owners then: fewer than [`MAX_HANDOFF`] members above them had arrived. Unknown arrivals count
+/// as present, so they never add a target. Members whose arrival is `oldest` (the start of this
+/// node's membership chain) always qualify, since no rule can tell.
 fn demoted_targets<N: Copy + Default>(
     since: &[Option<u32>],
     demoted: &[N],
@@ -381,14 +373,12 @@ pub enum Outcome {
     /// The destination itself (not a relay) answered `Overloaded`. Like
     /// `Probe(Overloaded)` without a route failure; asks a reader's helper.
     Shed,
-    /// Unanswered within the attempt's time bound. Like
-    /// `Transport(Unreachable)`, except that an owner's probe of rank 0
-    /// withholds origin authority: rank 0 is most likely still fetching
-    /// (Known issue 31), unless it is `Overdue` (Known issue 39).
+    /// Unanswered within the attempt's time bound. Like `Transport(Unreachable)`, except that an
+    /// owner's probe of rank 0 withholds origin authority: rank 0 is most likely still fetching,
+    /// unless it is `Overdue`.
     TimedOut,
-    /// Rank 0 itself answered an owner's probe `Unavailable`. Like
-    /// `Probe(Unreachable)`, except that it withholds authority when this
-    /// owner's own origin request failed recently (Known issue 52).
+    /// Rank 0 itself answered an owner's probe `Unavailable`. Like `Probe(Unreachable)`, except
+    /// that it withholds authority when this owner's own origin request failed recently.
     Failed,
 }
 
@@ -541,8 +531,7 @@ impl CandidateWalk {
         let attempts = budget.remaining_attempts().min(HELPER_ATTEMPTS);
         let links = budget.remaining_links().min(HELPER_LINKS);
         let mut child = budget.partition(attempts, links)?;
-        // Forward every funded link: fewer cannot reach rank 0 through a
-        // relay (Known issue 60).
+        // Forward every funded link: fewer cannot reach rank 0 through a relay.
         child.note_route_failure();
         self.pending = Some(Pending {
             bounded: Some(child),
@@ -572,8 +561,7 @@ impl CandidateWalk {
             .sum()
     }
 
-    /// What every later visit needs to still reach origin; lineage credits
-    /// are slack beyond this (Known issue 25).
+    /// What every later visit needs to still reach origin; lineage credits are slack beyond this.
     fn later_reserve(&self, index: usize) -> u32 {
         (index + 1..self.count)
             .filter_map(|later| self.target(later))
@@ -613,7 +601,7 @@ impl CandidateWalk {
             let handoff = canonical >= self.config.owners;
             let granted = handoff && canonical - self.config.owners < self.config.granted;
             if granted && self.config.parallel_granted {
-                // Every granted target from here on, at once (Known issue 45).
+                // Every granted target from here on, at once.
                 let remaining_opportunities =
                     (self.count - index + 1) as u32 + SUCCESSOR_SHARE_DIVISOR;
                 let mut probes = Vec::new();
@@ -661,15 +649,14 @@ impl CandidateWalk {
                     previous: false,
                 }));
             }
-            // The delegation leaves one credit per later predecessor and one
-            // for this owner's origin; handoff probes reserve none (Known
-            // issue 13).
+            // The delegation leaves one credit per later predecessor and one for this owner's
+            // origin; handoff probes reserve none.
             let left = rank.map_or(0, |rank| rank.min(2).saturating_sub(index)) as u32;
             if handoff && (budget.remaining_attempts() < 2 || budget.remaining_links() == 0) {
                 break;
             }
-            // A predecessor that held the same rank under the previous
-            // membership is asked under it (Known issue 12).
+            // A predecessor that held the same rank under the previous membership is asked under
+            // it.
             let previous = !handoff
                 && rank.is_some()
                 && self.config.page_operation
@@ -705,8 +692,8 @@ impl CandidateWalk {
                 Mode::Acquire
             };
             let count = self.count;
-            // A delegating owner with handoff or lineage targets forwards
-            // spare credits so rank 0 can ask them too (Known issues 13, 25).
+            // A delegating owner with handoff or lineage targets forwards spare credits so rank 0
+            // can ask them too.
             let spare_for = if self.config.handoff > 0 {
                 MAX_HANDOFF as u32
             } else {
@@ -728,9 +715,8 @@ impl CandidateWalk {
                     .max(1)
             };
             let bounded = if delegated {
-                // The delegation decides whether rank 0 fetches for everyone,
-                // so its route comes first; later predecessors keep one link
-                // each (Known issue 13).
+                // The delegation decides whether rank 0 fetches for everyone, so its route comes
+                // first; later predecessors keep one link each.
                 let links = budget
                     .route_links()
                     .min(budget.remaining_links().saturating_sub(sharing as u8 - 1))
@@ -745,9 +731,8 @@ impl CandidateWalk {
                 // eight-link envelope selected failure routing.
                 let remaining = sharing as u8;
                 let links = if canonical == 0 && !handoff && self.config.page_operation {
-                    // Like a delegation, this decides whether rank 0 fetches;
-                    // later predecessors keep one link each (Known issues 31,
-                    // 40).
+                    // Like a delegation, this decides whether rank 0 fetches; later predecessors
+                    // keep one link each.
                     budget
                         .route_links()
                         .min(budget.remaining_links().saturating_sub(remaining - 1))
@@ -765,10 +750,9 @@ impl CandidateWalk {
                     && budget.remaining_attempts() >= owner_funding_min(canonical)
                     && funded_links(budget).is_some())
             {
-                // Fund by the destination's canonical rank, preferring the
-                // funding that lets it delegate (plus lineage credits), but
-                // only from slack so later visits keep their credits (Known
-                // issue 25).
+                // Fund by the destination's canonical rank, preferring the funding that lets it
+                // delegate (plus lineage credits), but only from slack so later visits keep their
+                // credits.
                 let lineage = self
                     .config
                     .lineage
@@ -1045,9 +1029,8 @@ impl CandidateWalk {
 
     fn finish(&mut self) -> End {
         if self.config.rank.is_some() && self.rank0_unanswered {
-            // Rank 0 has not answered this owner's probe within the
-            // attempt: leave the fetch to it (Known issue 31). Callers retry
-            // and join rank 0's acquisition.
+            // Rank 0 has not answered this owner's probe within the attempt: leave the fetch to it.
+            // Callers retry and join rank 0's acquisition.
             End::Exhausted { funding: false }
         } else if let Some(rank) = self.config.rank {
             End::Origin {
@@ -1312,16 +1295,15 @@ pub fn hedge_fallback(error: Error) -> bool {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests;
 
-// Stale destinations (Known issues 19, 26, 36). A non-owner whose destination
-// is behind walks the page's owners under N - 1 instead, once
-// ([`previous_fallback`]), unless it owns the page there. A reader that cannot
-// fall back waits for the destination to adopt N ([`stale_wait`]).
+// Stale destinations. A non-owner whose destination is behind walks the page's owners under N - 1
+// instead, once ([`previous_fallback`]), unless it owns the page there. A reader that cannot fall
+// back waits for the destination to adopt N ([`stale_wait`]).
 
 /// Most time one wait for a destination that is behind may take.
 pub const MAX_STALE_WAIT: Duration = Duration::from_secs(4);
 
-/// Most waits one read makes: a membership reaches every client within about
-/// 5 s (Known issue 36), and two waits of a third cover that.
+/// Most waits one read makes: a membership reaches every client within about 5 s, and two waits of
+/// a third cover that.
 pub const MAX_STALE_WAITS: u8 = 2;
 
 /// Shortest wait worth making.
@@ -1367,10 +1349,10 @@ mod stale_tests {
     fn a_reader_that_cannot_fall_back_waits_twice() {
         let secs = Duration::from_secs;
         assert_eq!(stale_wait(0, true, secs(9)), Some(secs(3)));
-        // The first wait does not depend on funding (Known issue 26).
+        // The first wait does not depend on funding.
         assert_eq!(stale_wait(0, false, secs(9)), Some(secs(3)));
-        // Known issue 36: a second wait, a third of what is left, covers
-        // the 50k propagation window (about 5 s) within a 10 s deadline.
+        // A second wait, a third of what is left, covers the 50k propagation window (about 5 s)
+        // within a 10 s deadline.
         let deadline = secs(10);
         let first = stale_wait(0, true, deadline).unwrap();
         let second = stale_wait(1, true, deadline - first).unwrap();
@@ -1425,7 +1407,7 @@ pub struct Features {
 }
 
 impl Features {
-    /// Lineage targets are asked on their own grant (Known issue 35).
+    /// Lineage targets are asked on their own grant.
     pub const LINEAGE_GRANTS: u32 = 1;
     /// With [`Self::LINEAGE_GRANTS`], readers still fund lineage probes from
     /// slack ([`WalkConfig::lineage`]).
@@ -1435,12 +1417,11 @@ impl Features {
     /// A non-owner page walk may ask an overflow helper
     /// ([`WalkConfig::helper`]).
     pub const HELPER: u32 = 1 << 3;
-    /// A non-owner walks the previous membership at a destination that is
-    /// behind (Known issue 19).
+    /// A non-owner walks the previous membership at a destination that is behind.
     pub const STALE_FALLBACK: u32 = 1 << 4;
-    /// A non-owner waits for a destination that is behind (Known issue 26).
+    /// A non-owner waits for a destination that is behind.
     pub const STALE_WAIT: u32 = 1 << 5;
-    /// Rank 0's own `Unavailable` is [`Outcome::Failed`] (Known issue 52).
+    /// Rank 0's own `Unavailable` is [`Outcome::Failed`].
     pub const RANK0_FAILED: u32 = 1 << 6;
 
     /// Every rule production runs.
@@ -1992,8 +1973,7 @@ impl Fill {
                             bounded_routes: true,
                         };
                         if stale {
-                            // Refresh, or walk this epoch with bounded routes
-                            // (Known issue 3).
+                            // Refresh, or walk this epoch with bounded routes.
                             self.hedge_refresh = true;
                             return Ok(Action::Refresh);
                         }
@@ -2074,8 +2054,7 @@ impl Fill {
         } else {
             ranked.order
         };
-        // Owners may ask later owners that arrived before them (Known issue
-        // 25).
+        // Owners may ask later owners that arrived before them.
         self.lineage = if !page
             || (self.has(Features::LINEAGE_GRANTS) && !self.has(Features::LINEAGE_SLACK))
         {
@@ -2083,8 +2062,8 @@ impl Fill {
         } else {
             lineage_counts(since)
         };
-        // Later owners that arrived earlier, then demoted members that were
-        // owners when they arrived (Known issues 34, 35).
+        // Later owners that arrived earlier, then demoted members that were owners when they
+        // arrived.
         self.lineage_targets = List::default();
         self.demoted = List::default();
         if let (Some(rank), true) = (ranked.rank, page) {
@@ -2169,8 +2148,8 @@ impl Fill {
             continuation,
             handoff: self.handoff.len(),
             previous: self.previous,
-            // A non-owner page walk may ask the page's overflow helper
-            // (Known issue 16), chosen when the walk asks for it.
+            // A non-owner page walk may ask the page's overflow helper, chosen when the walk asks
+            // for it.
             helper: self.rank.is_none()
                 && page
                 && self.has(Features::HELPER)
@@ -2220,9 +2199,8 @@ impl Fill {
             Reply::Answer { kind, signed } => {
                 self.signed = signed;
                 if signed {
-                    // The destination answered this node: it is not hung
-                    // (Known issue 41). One that shed the request is busy
-                    // (Known issue 54).
+                    // The destination answered this node: it is not hung. One that shed the request
+                    // is busy.
                     self.out.silence = Some(if kind == ResponseKind::Overloaded && page {
                         SilenceNote::Shed
                     } else {
@@ -2230,9 +2208,8 @@ impl Fill {
                     });
                 }
                 match kind {
-                    // The destination itself, not a relay, shed the request
-                    // (for example a hot-page owner): the walk may ask the
-                    // page's helper (Known issue 16).
+                    // The destination itself, not a relay, shed the request (for example a hot-page
+                    // owner): the walk may ask the page's helper.
                     ResponseKind::Overloaded if signed => Outcome::Shed,
                     ResponseKind::StaleMembership if remaining => {
                         self.out.outcome = Some(Err(Error::IncompatibleMembership));
@@ -2245,8 +2222,8 @@ impl Fill {
                         self.hedge_refresh = false;
                         return Ok(Action::Refresh);
                     }
-                    // Rank 0 itself answered that its own acquisition failed:
-                    // leave the next attempt to it (Known issue 52).
+                    // Rank 0 itself answered that its own acquisition failed: leave the next
+                    // attempt to it.
                     ResponseKind::Unavailable
                         if signed && self.out.rank0_probe && self.has(Features::RANK0_FAILED) =>
                     {
@@ -2272,8 +2249,7 @@ impl Fill {
                     },
                 }
             }
-            // Unanswered: a probe of rank 0 asks a ping (Known issue 43);
-            // others only demote the destination (Known issue 41).
+            // Unanswered: a probe of rank 0 asks a ping; others only demote the destination.
             Reply::TimedOut => {
                 if page {
                     let rank0 = self.out.rank0_probe
@@ -2342,8 +2318,7 @@ impl Fill {
     fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
         self.pending();
         self.out.outcome = Some(Ok(outcome));
-        // Only rank 0's own answer (or its silence) says anything about
-        // rank 0 (Known issue 39).
+        // Only rank 0's own answer (or its silence) says anything about rank 0.
         if self.out.rank0_probe && (self.signed || outcome == Outcome::TimedOut) {
             self.out.rank0 = match outcome {
                 Outcome::TimedOut => Some(Rank0Note::TimedOut),
@@ -2431,9 +2406,8 @@ impl Fill {
             }
             (false, StaleAction::Skip) => {
                 let owner = self.rank.is_some();
-                // Fall back to version - 1 once (Known issue 19), ranking it
-                // first: a node that owns the page there may not walk it, and
-                // keeps its wait (Known issue 36).
+                // Fall back to version - 1 once, ranking it first: a node that owns the page there
+                // may not walk it, and keeps its wait.
                 if self.has(Features::STALE_FALLBACK)
                     && !self.fallback_denied
                     && previous_fallback(
@@ -2453,13 +2427,13 @@ impl Fill {
         }
     }
 
-    /// The destination is behind this node and no newer membership exists
-    /// locally: try the next owner (Known issue 3).
+    /// The destination is behind this node and no newer membership exists locally: try the next
+    /// owner.
     fn skip(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
         self.stale += 1;
         self.note(Notes::STALE_SKIP);
         if self.rank.is_some() {
-            // An owner's predecessor is behind (Known issue 12).
+            // An owner's predecessor is behind.
             self.note(Notes::OWNER_STALE_SKIP);
         }
         self.pending();
@@ -2471,9 +2445,8 @@ impl Fill {
         self.after(end, true, budget)
     }
 
-    /// A non-owner that cannot walk the previous membership waits for a
-    /// destination that is behind, then asks it again (Known issues 26 and
-    /// 36). The outstanding probe's credits return to the read's budget.
+    /// A non-owner that cannot walk the previous membership waits for a destination that is behind,
+    /// then asks it again. The outstanding probe's credits return to the read's budget.
     fn wait(&mut self, budget: &mut AcquisitionBudget, now: Instant) -> Result<Option<Duration>> {
         if !self.has(Features::STALE_WAIT) {
             return Ok(None);
@@ -2545,8 +2518,8 @@ impl Fill {
         if let Walking::Candidates(walk) = &self.walk {
             self.funding = walk.funding;
             if walk.rank0_unanswered {
-                // Known issue 31: rank 0 has not answered this owner's probe
-                // within the attempt; the owner does not fetch origin too.
+                // Rank 0 has not answered this owner's probe within the attempt; the owner does not
+                // fetch origin too.
                 self.out.notes |= Notes::RANK0_LEFT;
             }
         }

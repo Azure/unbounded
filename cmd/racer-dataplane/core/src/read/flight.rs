@@ -356,11 +356,10 @@ pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<E
     settle(state, idle, split, wakes);
 }
 
-/// Hard ceiling of a fill that may be handed over (Known issue 30): the
-/// leader's deadline plus `HANDOVER_SPANS` times its remaining span. The fill
-/// normally ends earlier, when no live waiter remains to adopt it; the
-/// ceiling only bounds the owned scope's timers. Without handover the
-/// ceiling is the leader's deadline.
+/// Hard ceiling of a fill that may be handed over: the leader's deadline plus `HANDOVER_SPANS`
+/// times its remaining span. The fill normally ends earlier, when no live waiter remains to adopt
+/// it; the ceiling only bounds the owned scope's timers. Without handover the ceiling is the
+/// leader's deadline.
 pub fn handover_ceiling(now: Instant, leader_deadline: Instant, handover: bool) -> Instant {
     if !handover {
         return leader_deadline;

@@ -50,11 +50,10 @@ impl AcquisitionBudget {
         Ok(attempts)
     }
 
-    /// Return remote credits that a verified `StaleMembership` answer shows
-    /// were never used: the answering node could not resolve the request's
-    /// membership, so neither it nor the destination behind it acted on the
-    /// request (Known issue 26). Never more than was sent, so a refund
-    /// cannot mint credits; lost or unverified answers are not refunded.
+    /// Return remote credits that a verified `StaleMembership` answer shows were never used: the
+    /// answering node could not resolve the request's membership, so neither it nor the destination
+    /// behind it acted on the request. Never more than was sent, so a refund cannot mint credits;
+    /// lost or unverified answers are not refunded.
     pub fn refund_remote(&mut self, attempts: u32) -> Result<()> {
         let sent = self
             .remote_sent
@@ -198,13 +197,12 @@ impl AcquisitionBudget {
     }
 }
 
-/// Links a verified `StaleMembership` answer shows were never used: the
-/// answering node could not resolve the request's membership, so it neither
-/// served the request nor forwarded it, and every link past the `hops` the
-/// request travelled to it (`forwarders + 1` on the verified answer) was
-/// left unspent ([`AcquisitionBudget::refund_links`]). Like the remote
-/// credits ([`AcquisitionBudget::refund_remote`]), never more than was
-/// charged, so a refund cannot mint links (Known issues 47 and 49).
+/// Links a verified `StaleMembership` answer shows were never used: the answering node could not
+/// resolve the request's membership, so it neither served the request nor forwarded it, and every
+/// link past the `hops` the request travelled to it (`forwarders + 1` on the verified answer) was
+/// left unspent ([`AcquisitionBudget::refund_links`]). Like the remote credits
+/// ([`AcquisitionBudget::refund_remote`]), never more than was charged, so a refund cannot mint
+/// links.
 pub fn stale_unused_links(charged: u8, hops: usize) -> u8 {
     charged.saturating_sub(u8::try_from(hops).unwrap_or(u8::MAX))
 }
@@ -404,7 +402,7 @@ mod budget_tests {
     }
 }
 
-// Overflow fan-out for hot pages (Known issue 16).
+// Overflow fan-out for hot pages.
 //
 // Only a page's ranked owners (at most `REPLICAS`) are candidates, so a page
 // that every node reads at once can be sent no faster than `REPLICAS` NICs

@@ -1478,14 +1478,12 @@ impl Fill {
         // abandonment must cancel only this work.
         let caller_scope = acquisition.scope.clone();
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
-        // Known issue 30: unless the caller fences on this work (warm
-        // gates), the running fill continues for another live acquisition
-        // waiter when the leader expires or is canceled, instead of being
-        // canceled and restarted from scratch by the next leader. The owned
-        // scope then runs to a hard ceiling; the driver cancels it as soon as
-        // no live waiter remains (`FlightOperation::poll_cancellation`).
-        // Attempts and links stay charged to the leader's budget; the extra
-        // time is within the adopting waiter's own deadline and budget.
+        // Unless the caller fences on this work (warm gates), the running fill continues for
+        // another live acquisition waiter when the leader expires or is canceled, instead of being
+        // canceled and restarted from scratch by the next leader. The owned scope then runs to a
+        // hard ceiling; the driver cancels it as soon as no live waiter remains
+        // (`FlightOperation::poll_cancellation`). Attempts and links stay charged to the leader's
+        // budget; the extra time is within the adopting waiter's own deadline and budget.
         let handover = !self.fence_acquisition;
         let ceiling = racer_core::read::flight::handover_ceiling(
             uring_runtime::environment::now(),
@@ -1745,8 +1743,8 @@ impl Fill {
         self.copy_only_joining(page, scope, true)
     }
 
-    /// [`Self::copy_only`]; without `join` a running acquisition of the page
-    /// is a miss instead of something to wait on (Known issue 44).
+    /// [`Self::copy_only`]; without `join` a running acquisition of the page is a miss instead of
+    /// something to wait on.
     pub fn copy_only_joining<'a>(
         &'a self,
         page: &'a PageId,
@@ -2238,10 +2236,9 @@ impl Fill {
                         .await
                     {
                         Ok(origin) => {
-                            // An owner after rank 0 holds a copy rank 0 may not
-                            // know of: offer it later (Known issue 37). The
-                            // authority's owners: a walk that refreshed its
-                            // membership ranks under the newer one.
+                            // An owner after rank 0 holds a copy rank 0 may not know of: offer it
+                            // later. The authority's owners: a walk that refreshed its membership
+                            // ranks under the newer one.
                             if policy.note_orphan(
                                 page,
                                 authority.owners(),

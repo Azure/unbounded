@@ -388,15 +388,13 @@ pub fn serve_deadline(scope: Instant, route: Instant) -> Instant {
 /// node's (`local`) running acquisition of the page, given the page's
 /// `owners` (canonical order) under the request's membership.
 ///
-/// Waiting is right when the requester is a reader, or an owner ranked
-/// after this node asking a predecessor that is fetching for everyone (Known
-/// issue 31). It is wrong when the requester is an owner ranked before this
-/// node, or this node is not an owner: owners delegate a cold fetch to rank 0
-/// through their predecessors and readers walk the owners, so this node's
-/// acquisition most likely waits on the requester itself, which waits on
-/// this answer until its time share runs out (Known issue 44). Owners ask
-/// such nodes only as handoff, lineage or successor targets, which look for a
-/// copy fetched earlier, so a local copy or a miss is the whole answer.
+/// Waiting is right when the requester is a reader, or an owner ranked after this node asking a
+/// predecessor that is fetching for everyone. It is wrong when the requester is an owner ranked
+/// before this node, or this node is not an owner: owners delegate a cold fetch to rank 0 through
+/// their predecessors and readers walk the owners, so this node's acquisition most likely waits on
+/// the requester itself, which waits on this answer until its time share runs out. Owners ask such
+/// nodes only as handoff, lineage or successor targets, which look for a copy fetched earlier, so a
+/// local copy or a miss is the whole answer.
 pub fn copy_join_allowed<N: PartialEq>(owners: &[N], local: &N, requester: &N) -> bool {
     let Some(theirs) = owners.iter().position(|n| n == requester) else {
         return true;
@@ -478,7 +476,7 @@ mod serve_tests {
         // A reader may wait on any node's acquisition.
         assert!(copy_join_allowed(&owners, &"r0", &"reader"));
         assert!(copy_join_allowed(&owners, &"other", &"reader"));
-        // A later owner asking a predecessor that is fetching (Known issue 31).
+        // A later owner asking a predecessor that is fetching.
         assert!(copy_join_allowed(&owners, &"r0", &"r2"));
         assert!(copy_join_allowed(&owners, &"r1", &"r2"));
         // An earlier owner asking a later owner, or an owner asking a
@@ -1171,16 +1169,14 @@ pub fn visit_order(
     order
 }
 
-/// Known issue 25: when the owner a non-owner would visit first arrived after
-/// a later owner (`since`, see [`crate::read::walk::lineage_targets`]), visit that
-/// later owner first. Placement is rendezvous hashing, so the later owner
-/// was above the first one before it arrived and may hold a copy fetched
-/// then; asking the newer owner first made it fetch the page from origin
-/// again, and its own copy-only probes of the older owner carry only the
-/// credits and links the reader forwarded (too few to route to a
-/// non-neighbor). The rest of the order is unchanged. Members with equal or
-/// unknown arrival never move, so a cluster whose members arrived together
-/// visits exactly as before.
+/// When the owner a non-owner would visit first arrived after a later owner (`since`, see
+/// [`crate::read::walk::lineage_targets`]), visit that later owner first. Placement is rendezvous
+/// hashing, so the later owner was above the first one before it arrived and may hold a copy
+/// fetched then; asking the newer owner first made it fetch the page from origin again, and its own
+/// copy-only probes of the older owner carry only the credits and links the reader forwarded (too
+/// few to route to a non-neighbor). The rest of the order is unchanged. Members with equal or
+/// unknown arrival never move, so a cluster whose members arrived together visits exactly as
+/// before.
 ///
 /// A non-neighbor never moves ahead of a direct `neighbor` visited first: its
 /// funded route spends most of the reader's links, so when it misses (for
@@ -1229,17 +1225,14 @@ pub enum Answering {
     Silent,
 }
 
-/// Visit owners that recently left one of this node's requests unanswered
-/// after the others, and silent owners last, keeping the order within each
-/// group (Known issue 41). A reader's out-of-order `Acquire` carries most of
-/// its attempt's credits, so an owner that hangs costs the whole attempt;
-/// without this, every retry of the read visited the same hung owner first
-/// (`Spread` is deterministic per requester and page) and the read failed
-/// with healthy owners left. A reader pings the page's rank 0 when its probe
-/// of rank 0 goes unanswered, so a busy rank 0 (whose acquisition the probe
-/// joined) answers the ping and keeps its place, while a hung one becomes
-/// silent and goes last: the owners above it, which also find it silent,
-/// fetch the page.
+/// Visit owners that recently left one of this node's requests unanswered after the others, and
+/// silent owners last, keeping the order within each group. A reader's out-of-order `Acquire`
+/// carries most of its attempt's credits, so an owner that hangs costs the whole attempt; without
+/// this, every retry of the read visited the same hung owner first (`Spread` is deterministic per
+/// requester and page) and the read failed with healthy owners left. A reader pings the page's rank
+/// 0 when its probe of rank 0 goes unanswered, so a busy rank 0 (whose acquisition the probe
+/// joined) answers the ping and keeps its place, while a hung one becomes silent and goes last: the
+/// owners above it, which also find it silent, fetch the page.
 pub fn demote_unanswered(order: VisitOrder, answering: impl Fn(usize) -> Answering) -> VisitOrder {
     let len = usize::from(order.len);
     let mut ranks = [0u8; 3];
@@ -1500,9 +1493,8 @@ mod candidates_tests {
         assert_eq!(visit(Spread, 5, &[0, 1, 2], [1, 2, 3]), vec![2, 1, 0]);
     }
 
-    /// Known issue 41: owners that left this node's request unanswered go
-    /// after the others, silent owners last, each group in its previous
-    /// order; nothing changes without them.
+    /// Owners that left this node's request unanswered go after the others, silent owners last,
+    /// each group in its previous order; nothing changes without them.
     #[test]
     fn demote_unanswered_moves_unanswered_then_silent_owners_last() {
         use Answering::*;

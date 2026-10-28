@@ -91,12 +91,11 @@ pub(crate) struct Acquisition {
     initial: Option<Candidates>,
     /// The ranking the walk probes.
     current: Option<Candidates>,
-    /// The previous membership's ranking a stale fallback walks, until the
-    /// walk takes it (Known issue 19).
+    /// The previous membership's ranking a stale fallback walks, until the walk takes it.
     fallback: Option<Candidates>,
     /// The membership a refresh adopts.
     latest: Option<std::sync::Arc<crate::topology::Membership>>,
-    /// Version - 1, which predecessors are asked under (Known issue 12).
+    /// Version - 1, which predecessors are asked under.
     previous: Option<std::sync::Arc<crate::topology::Membership>>,
     /// Version - 1 for a stale fallback, when peers still resolve it.
     stale_previous: Option<std::sync::Arc<crate::topology::Membership>>,
@@ -167,26 +166,24 @@ pub struct CandidatePolicy {
     published: Arc<controlplane::Published<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
     single_flight: RefCell<SingleFlightPeers>,
-    /// Timer for waiting on a destination that is behind (Known issue 26).
-    /// Without one, the walk skips it as before.
+    /// Timer for waiting on a destination that is behind. Without one, the walk skips it as before.
     reactor: Option<Rc<crate::runtime::Reactor>>,
     /// Test only: wait without a timer, returning at once.
     #[cfg(test)]
     pub(crate) instant_stale_wait: std::cell::Cell<bool>,
-    /// Owners this node answered a page probe without a copy, by page
-    /// (Known issue 21; see `racer_core::read::hints`). The coordinator
-    /// notes and defers on them; an owner walk asks them before origin.
+    /// Owners this node answered a page probe without a copy, by page (see
+    /// `racer_core::read::hints`). The coordinator notes and defers on them; an owner walk asks
+    /// them before origin.
     pub(crate) successors: RefCell<Successors>,
-    /// Pages this node fetched from origin as an owner after rank 0, to offer
-    /// to rank 0 later (Known issue 37; see `racer_core::read::hints`).
+    /// Pages this node fetched from origin as an owner after rank 0, to offer to rank 0 later (see
+    /// `racer_core::read::hints`).
     pub(crate) notices: RefCell<Notices>,
     /// Copy offers in flight ([`MAX_OFFERS_IN_FLIGHT`]).
     offers: Rc<std::cell::Cell<usize>>,
     /// Silence pings in flight ([`MAX_PINGS_IN_FLIGHT`]).
     pub(crate) pings: Rc<std::cell::Cell<usize>>,
-    /// Pages whose rank 0 this node, as an owner above it, found fetching
-    /// (a probe timed out) or overdue (it missed that request's deadline);
-    /// see `racer_core::liveness` (Known issue 39).
+    /// Pages whose rank 0 this node, as an owner above it, found fetching (a probe timed out) or
+    /// overdue (it missed that request's deadline); see `racer_core::liveness`.
     pub(crate) rank0_watch: RefCell<Rank0Watch>,
 }
 
@@ -206,20 +203,18 @@ impl Drop for OfferFlight {
     }
 }
 
-/// Orphan notices grouped by their target's site (Known issue 50).
-/// Keyed by page and the target's owner rank (Known issue 51).
+/// Orphan notices grouped by their target's site. Keyed by page and the target's owner rank.
 pub(crate) type Notices =
     racer_core::read::hints::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
 
 /// Copy offers a node sends at once; more due offers wait for a later turn.
 pub(crate) const MAX_OFFERS_IN_FLIGHT: usize = 4;
 
-/// Silence pings a worker sends at once (Known issues 41 and 43); more due
-/// pings wait for a later turn.
+/// Silence pings a worker sends at once; more due pings wait for a later turn.
 pub(crate) const MAX_PINGS_IN_FLIGHT: usize = 16;
 
-/// When each of the page's owners arrived in this node's membership chain
-/// (`Membership::since`), for lineage targets (Known issue 25).
+/// When each of the page's owners arrived in this node's membership chain (`Membership::since`),
+/// for lineage targets.
 fn owner_arrivals(candidates: &Candidates) -> Vec<Option<u32>> {
     candidates
         .ordered
@@ -714,10 +709,9 @@ impl CandidatePolicy {
         }
     }
 
-    /// Feed a walk probe's route evidence to the orphan notices' cut groups
-    /// (Known issue 50): a transport failure or timeout toward
-    /// `destination` holds offers to its site, an answer signed by it
-    /// releases them. Answers that a relay may have signed say nothing.
+    /// Feed a walk probe's route evidence to the orphan notices' cut groups: a transport failure or
+    /// timeout toward `destination` holds offers to its site, an answer signed by it releases them.
+    /// Answers that a relay may have signed say nothing.
     fn observe_route(
         &self,
         membership: &crate::topology::Membership,
@@ -752,8 +746,8 @@ impl CandidatePolicy {
         self.reactor.is_some()
     }
 
-    /// Let readers wait for a destination that is behind this node's
-    /// membership instead of skipping it (Known issue 26).
+    /// Let readers wait for a destination that is behind this node's membership instead of skipping
+    /// it.
     pub(crate) fn with_reactor(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
         self.reactor = Some(reactor);
         self
@@ -820,15 +814,14 @@ impl CandidatePolicy {
         if self.replica_selection != ReplicaSelection::Spread {
             return order;
         }
-        // Visit an older later owner before the newer owner that displaced
-        // it, which would fetch the page again (Known issue 25).
+        // Visit an older later owner before the newer owner that displaced it, which would fetch
+        // the page again.
         let order = racer_core::read::lineage_first(order, &owner_arrivals(candidates), |rank| {
             candidates
                 .membership
                 .is_neighbor(&self.node, &ordered[rank])
         });
-        // Owners that left this node's request unanswered go after the
-        // others, silent ones last (Known issue 41).
+        // Owners that left this node's request unanswered go after the others, silent ones last.
         let health = self.peers.link_health();
         racer_core::read::demote_unanswered(order, |rank| health.answering(&ordered[rank]))
     }
@@ -1087,8 +1080,7 @@ impl CandidatePolicy {
         hedge: bool,
         walk_only: bool,
     ) -> Acquisition {
-        // Without a timer, the walk skips a destination that is behind
-        // instead of waiting for it (Known issue 26).
+        // Without a timer, the walk skips a destination that is behind instead of waiting for it.
         let features = Features::PRODUCTION.with(Features::STALE_WAIT, self.can_wait());
         Acquisition {
             fill: Fill::new(FillConfig {
@@ -1140,7 +1132,7 @@ impl CandidatePolicy {
             if !matches!(action, Action::Done(Err(_))) {
                 a.error = None;
             }
-            // The walk took the previous membership's ranking (Known issue 19).
+            // The walk took the previous membership's ranking.
             if a.fallback
                 .as_ref()
                 .is_some_and(|c| c.membership.version.0 == a.fill.version)
@@ -1436,18 +1428,16 @@ impl CandidatePolicy {
             .position(|node| node == &self.node);
         let mut ranked = Ranked::new(membership.version.0, &positions(candidates), rank);
         ranked.members = membership.members().len();
-        // Arrival order of the page's owners in this node's membership chain
-        // (Known issue 25).
+        // Arrival order of the page's owners in this node's membership chain.
         for (since, node) in ranked.since.iter_mut().zip(&candidates.ordered) {
             *since = membership.since(node);
         }
         match rank {
             None => ranked.order = self.visit_order(candidates, object, page),
             Some(_) if page_operation => {
-                // Members ranked just below the owners that were owners when
-                // they arrived (Known issue 34, from the cached ranking only).
-                // Arrivals at generation 0 are unknown: present since this
-                // node's chain began (Known issue 46).
+                // Members ranked just below the owners that were owners when they arrived (from the
+                // cached ranking only). Arrivals at generation 0 are unknown: present since this
+                // node's chain began.
                 let demoted = self.placement.demoted(membership, object, page);
                 for node in demoted.iter() {
                     let Ok(p) = membership.position(node) else {
@@ -1574,25 +1564,20 @@ impl CandidatePolicy {
             _ => None,
         };
         match (evidence.silence, page) {
-            // The destination answered this node: it is not hung (Known issue
-            // 41).
+            // The destination answered this node: it is not hung.
             (Some(SilenceNote::Answered), _) => health.silence_answered(destination),
-            // It shed the request: busy, not hung. A reader's later walks
-            // visit it after the page's other owners for a while (Known
-            // issue 54).
+            // It shed the request: busy, not hung. A reader's later walks visit it after the page's
+            // other owners for a while.
             (Some(SilenceNote::Shed), Some(id)) => health.silence_shed(destination, id.clone()),
-            // A probe of the page's rank 0 asks whether rank 0 answers at all
-            // (Known issue 43): `poll_pings` sends the ping. Any other timeout
-            // only demotes the owner in this node's visit order (Known issue
-            // 41).
+            // A probe of the page's rank 0 asks whether rank 0 answers at all: `poll_pings` sends
+            // the ping. Any other timeout only demotes the owner in this node's visit order.
             (Some(SilenceNote::TimedOut { needed }), Some(id)) => {
                 health.silence_timed_out(destination, id.clone(), a.sent, needed);
             }
             _ => {}
         }
-        // Update the rank 0 watch from this owner's page probe of rank 0
-        // (Known issue 39): a timeout notes the page with the request's
-        // deadline, an answer signed by rank 0 itself forgets it.
+        // Update the rank 0 watch from this owner's page probe of rank 0: a timeout notes the page
+        // with the request's deadline, an answer signed by rank 0 itself forgets it.
         if let (Some(note), Some(id)) = (evidence.rank0, page) {
             let mut watch = self.rank0_watch.borrow_mut();
             match note {
@@ -1743,9 +1728,8 @@ impl CandidatePolicy {
             },
         ))
         .await;
-        // Silence evidence as for a sequential granted probe (Known issues
-        // 41 and 45): the destination's own answer clears it, a timeout
-        // only demotes (a granted target is never rank 0).
+        // Silence evidence as for a sequential granted probe: the destination's own answer clears
+        // it, a timeout only demotes (a granted target is never rank 0).
         if let PeerOperation::Page { page: id, .. } = operation {
             for ((target, (_, timed_out)), response) in targets.iter().zip(&grants).zip(&responses)
             {
@@ -2096,8 +2080,8 @@ impl CandidatePolicy {
         };
         let result = async {
             check_budget(scope, budget)?;
-            // A destination this node holds silent fails at once, before any
-            // credit is spent (Known issues 41 and 43); its own pings go out.
+            // A destination this node holds silent fails at once, before any credit is spent; its
+            // own pings go out.
             if !matches!(mode, FetchMode::Ping) && self.peers.link_health().silent(destination) {
                 return Err(Error::Unavailable);
             }
@@ -2259,11 +2243,9 @@ impl CandidatePolicy {
                     }
                 }
             }
-            // A verified `StaleMembership` comes from a node that could not
-            // resolve this request's membership, so the remote credits it
-            // carried were never used: return them (Known issue 26), and the
-            // links past the hops that carried it to that node (Known issues
-            // 47 and 49).
+            // A verified `StaleMembership` comes from a node that could not resolve this request's
+            // membership, so the remote credits it carried were never used: return them, and the
+            // links past the hops that carried it to that node.
             if let Ok(Delivered::Response(response)) = &response
                 && matches!(response.response(), PeerResponse::StaleMembership)
             {
@@ -2305,10 +2287,9 @@ impl CandidatePolicy {
         result
     }
 
-    /// This node fetched `page` from origin at `rank` among `owners`: when
-    /// that is after rank 0, remember to offer rank 0 the copy later
-    /// (Known issue 37, `racer_core::read::hints`). Returns whether a notice
-    /// was noted.
+    /// This node fetched `page` from origin at `rank` among `owners`: when that is after rank 0,
+    /// remember to offer rank 0 the copy later (`racer_core::read::hints`). Returns whether a
+    /// notice was noted.
     pub(crate) fn note_orphan(
         &self,
         page: &crate::model::PageId,
@@ -2322,8 +2303,7 @@ impl CandidatePolicy {
         }
         let now = uring_runtime::environment::now();
         let mut noted = false;
-        // Rank 0 and, for a holder at rank 2, rank 1 unless it answered
-        // this owner's walk (Known issue 51).
+        // Rank 0 and, for a holder at rank 2, rank 1 unless it answered this owner's walk.
         for index in notice_indexes(Some(rank), evidence) {
             let Some(target) = owners.get(usize::from(index)) else {
                 continue;
@@ -2339,12 +2319,10 @@ impl CandidatePolicy {
         noted
     }
 
-    /// This node's own origin request for `page`, made with authority at
-    /// `rank` among `owners`, failed with `error`: above rank 0, leave
-    /// retries after rank 0's own failures to rank 0 for a while (Known
-    /// issue 52, `racer_core::liveness`). Terminal origin answers (a
-    /// missing version, rejected or forbidden credentials) are not
-    /// failures of origin and are ignored.
+    /// This node's own origin request for `page`, made with authority at `rank` among `owners`,
+    /// failed with `error`: above rank 0, leave retries after rank 0's own failures to rank 0 for a
+    /// while (`racer_core::liveness`). Terminal origin answers (a missing version, rejected or
+    /// forbidden credentials) are not failures of origin and are ignored.
     pub(crate) fn note_origin_failure(
         &self,
         page: &crate::model::PageId,
@@ -2374,13 +2352,11 @@ impl CandidatePolicy {
         );
     }
 
-    /// Send due copy offers (Known issue 37), at most
-    /// [`MAX_OFFERS_IN_FLIGHT`] at a time, each on its own detached driver
-    /// task and fixed route grant (never a reader's budget). `holds` reports
-    /// whether this node still holds a page; a page it lost is dropped. Best
-    /// effort: an offer that is not answered `Miss` by its destination is
-    /// tried again on the notice's schedule or expires, and never reaches a
-    /// reader. Call once per worker service turn.
+    /// Send due copy offers, at most [`MAX_OFFERS_IN_FLIGHT`] at a time, each on its own detached
+    /// driver task and fixed route grant (never a reader's budget). `holds` reports whether this
+    /// node still holds a page; a page it lost is dropped. Best effort: an offer that is not
+    /// answered `Miss` by its destination is tried again on the notice's schedule or expires, and
+    /// never reaches a reader. Call once per worker service turn.
     pub(crate) fn poll_offers(
         self: &Rc<Self>,
         now: std::time::Instant,
@@ -2393,8 +2369,8 @@ impl CandidatePolicy {
             .ok()
             .flatten()
             .map(|published| published.membership.clone());
-        // Offers are held per target site while a cut lasts (Known issue
-        // 50); members without a site, or unknown, share one group.
+        // Offers are held per target site while a cut lasts; members without a site, or unknown,
+        // share one group.
         let site = move |node: &NodeId| -> String {
             membership
                 .as_ref()
@@ -2450,10 +2426,9 @@ impl CandidatePolicy {
         self.peers.link_health()
     }
 
-    /// Send due silence pings (Known issues 41 and 43,
-    /// `racer_core::liveness`), at most [`MAX_PINGS_IN_FLIGHT`] at a
-    /// time, each on its own detached driver task and fixed route grant
-    /// (never a reader's budget). Call once per worker service turn.
+    /// Send due silence pings (`racer_core::liveness`), at most [`MAX_PINGS_IN_FLIGHT`] at a time,
+    /// each on its own detached driver task and fixed route grant (never a reader's budget). Call
+    /// once per worker service turn.
     pub(crate) fn poll_pings(self: &Rc<Self>, now: std::time::Instant, metrics: &Metrics) {
         let health = self.peers.link_health();
         let room = MAX_PINGS_IN_FLIGHT.saturating_sub(self.pings.get());
@@ -3358,10 +3333,9 @@ pub(super) mod tests {
         );
     }
 
-    /// Known issue 25: a reader whose first choice arrived in the membership
-    /// chain after a later owner visits that older owner first, which may
-    /// hold the copy it fetched while it ranked higher. Primary keeps the
-    /// canonical order; with no arrivals in the chain nothing changes.
+    /// A reader whose first choice arrived in the membership chain after a later owner visits that
+    /// older owner first, which may hold the copy it fetched while it ranked higher. Primary keeps
+    /// the canonical order; with no arrivals in the chain nothing changes.
     #[test]
     fn spread_visits_an_older_later_owner_before_a_newer_owner() {
         use crate::topology::Membership;
@@ -3631,11 +3605,10 @@ pub(super) mod tests {
         }
     }
 
-    /// Known issue 16: a non-owner whose owner itself sheds it (a signed
-    /// `Overloaded` from the destination) asks the page's overflow helper
-    /// once, with an Acquire funded from what is left (too little for the
-    /// helper to ask another helper), then the remaining owners. A transport
-    /// `Overloaded` (no signed answer, as from a congested route) does not.
+    /// A non-owner whose owner itself sheds it (a signed `Overloaded` from the destination) asks
+    /// the page's overflow helper once, with an Acquire funded from what is left (too little for
+    /// the helper to ask another helper), then the remaining owners. A transport `Overloaded` (no
+    /// signed answer, as from a congested route) does not.
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};
@@ -3751,9 +3724,8 @@ pub(super) mod tests {
                 assert!(!copy);
                 assert!(*attempts >= 1);
                 assert!(*attempts < racer_core::read::budget::HELPER_MIN_ATTEMPTS);
-                // It carries its whole funded envelope, not a normal
-                // four-link route, so the helper can still reach rank 0
-                // through a relay (Known issue 60).
+                // It carries its whole funded envelope, not a normal four-link route, so the helper
+                // can still reach rank 0 through a relay.
                 assert!(
                     *links > racer_core::read::budget::NORMAL_ROUTE_LINKS,
                     "{links}"

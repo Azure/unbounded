@@ -1,5 +1,5 @@
-//! Orphan notices: an owner above rank 0 that fetched a page from origin
-//! tells rank 0 later that it holds the page (Known issue 37).
+//! Orphan notices: an owner above rank 0 that fetched a page from origin tells rank 0 later that it
+//! holds the page.
 //!
 //! An owner above rank 0 reaches origin only after its probe of rank 0 ended
 //! without a copy. When that probe reached rank 0, rank 0 noted the owner as a
@@ -20,16 +20,13 @@
 //! shed) is tried again after the next delay, at most [`NOTICE_TRIES`] times
 //! over about 155 s (longer than the simulator's 90 s partitions).
 //!
-//! Every predecessor (Known issue 51). A holder at rank 2 also offers the
-//! copy to rank 1: when rank 1 later cannot reach rank 0 it fetches the page
-//! itself, and it asks only later owners it has a hint for (its successor
-//! targets). Without the offer it had none whenever the holder's own walk
-//! did not reach it, and fetched again although the holder was its own
-//! successor (5k `full-failover`, seeds 1 to 3: 9 of 43 orphan repeats, all
-//! minutes after the holder's fetch). So a fetch notes one notice per owner
-//! ranked before the holder that did not answer its walk ([`notice_indexes`]),
-//! keyed by the page and that rank, each scheduled and bounded like the rank
-//! 0 notice.
+//! Every predecessor. A holder at rank 2 also offers the copy to rank 1: when rank 1 later cannot
+//! reach rank 0 it fetches the page itself, and it asks only later owners it has a hint for (its
+//! successor targets). Without the offer it had none whenever the holder's own walk did not reach
+//! it, and fetched again although the holder was its own successor (5k `full-failover`, seeds 1 to
+//! 3: 9 of 43 orphan repeats, all minutes after the holder's fetch). So a fetch notes one notice
+//! per owner ranked before the holder that did not answer its walk ([`notice_indexes`]), keyed by
+//! the page and that rank, each scheduled and bounded like the rank 0 notice.
 //!
 //! Bounds: one notice per origin fetch by an owner above rank 0 and owner
 //! ranked before it (at most two); each sends
@@ -41,29 +38,23 @@
 //! holder that no longer holds the page, or is no longer an owner above
 //! rank 0, drops the notice instead of sending it ([`notice_target`]).
 //!
-//! Cut groups (Known issue 50). Offers exist because a partition or a
-//! route failure cut the holder off from rank 0, and while the cut lasts
-//! every offer across it fails in transport and counts as a link failure
-//! (in the simulator, 5k `full-failover` seed 1: each of the 283 failed
-//! offers out of 728 was a partition link failure). So each target belongs
-//! to a group (its site): an offer that fails with cut evidence (a
-//! transport failure, or an answer signed by a relay rather than the
-//! target) blocks its group ([`OrphanNotices::cut`]) until that notice's
-//! next offer is due. Offers that come due for a blocked group are deferred
-//! to the end of the block without spending a try. When a block ends, one
-//! offer goes out as the group's probe and the group stays held for
-//! [`PROBE_HOLD`] or until that offer is reported; a delivered offer
-//! ([`OrphanNotices::reached`]) releases the group for new offers (those
-//! deferred behind the probe go when its hold ends), another cut blocks it
-//! again. The node's other exchanges feed the same table
-//! ([`OrphanNotices::observe`]): a read probe that fails in transport toward
-//! a group holds its offers, and one answered by a member of the group
-//! releases them, so offers wait out a cut the node's reads already see.
-//! While a cut lasts, a holder sends at most one offer per
-//! group per retry interval instead of one per notice. Tries are spent only
-//! by offers actually sent, so the bounds above hold. Blocked groups are
-//! bounded by the notice capacity. Members without a site share one group,
-//! which then holds all of this node's offers during a cut.
+//! Cut groups. Offers exist because a partition or a route failure cut the holder off from rank 0,
+//! and while the cut lasts every offer across it fails in transport and counts as a link failure
+//! (in the simulator, 5k `full-failover` seed 1: each of the 283 failed offers out of 728 was a
+//! partition link failure). So each target belongs to a group (its site): an offer that fails with
+//! cut evidence (a transport failure, or an answer signed by a relay rather than the target) blocks
+//! its group ([`OrphanNotices::cut`]) until that notice's next offer is due. Offers that come due
+//! for a blocked group are deferred to the end of the block without spending a try. When a block
+//! ends, one offer goes out as the group's probe and the group stays held for [`PROBE_HOLD`] or
+//! until that offer is reported; a delivered offer ([`OrphanNotices::reached`]) releases the group
+//! for new offers (those deferred behind the probe go when its hold ends), another cut blocks it
+//! again. The node's other exchanges feed the same table ([`OrphanNotices::observe`]): a read probe
+//! that fails in transport toward a group holds its offers, and one answered by a member of the
+//! group releases them, so offers wait out a cut the node's reads already see. While a cut lasts, a
+//! holder sends at most one offer per group per retry interval instead of one per notice. Tries are
+//! spent only by offers actually sent, so the bounds above hold. Blocked groups are bounded by the
+//! notice capacity. Members without a site share one group, which then holds all of this node's
+//! offers during a cut.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -432,7 +423,7 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
     }
 }
 
-/// How a copy offer ended (Known issue 50).
+/// How a copy offer ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OfferEnd {
     /// Not sent: this node is no longer an owner after rank 0.
@@ -464,14 +455,12 @@ pub fn should_notice(rank: Option<usize>) -> bool {
     rank.is_some_and(|r| r > 0)
 }
 
-/// The owner ranks an origin fetch at `rank` notices (Known issue 51): rank
-/// 0, and each later owner ranked before this one that did not answer this
-/// owner's walk without a copy (`evidence[i]`, the walk's predecessor
-/// evidence in rank order, is not `CopyMiss` or `VersionUnavailable`). An
-/// owner that did answer noted this one as a successor hint then, so an
-/// offer would only repeat that. Rank 0 is always noticed (its offer also
-/// re-arms a hint its successor probe may have spent before this fetch
-/// ended, Known issue 37). Empty unless [`should_notice`].
+/// The owner ranks an origin fetch at `rank` notices: rank 0, and each later owner ranked before
+/// this one that did not answer this owner's walk without a copy (`evidence[i]`, the walk's
+/// predecessor evidence in rank order, is not `CopyMiss` or `VersionUnavailable`). An owner that
+/// did answer noted this one as a successor hint then, so an offer would only repeat that. Rank 0
+/// is always noticed (its offer also re-arms a hint its successor probe may have spent before this
+/// fetch ended, Known issue 37). Empty unless [`should_notice`].
 pub fn notice_indexes(rank: Option<usize>, evidence: &[crate::read::ProbeOutcome]) -> Vec<u8> {
     use crate::read::ProbeOutcome;
     (0..rank.map_or(0, |r| r.min(2)))
@@ -649,8 +638,7 @@ mod notice_tests {
         assert_eq!(notice_target(&7, &owners, false, 0), None);
         assert_eq!(notice_target(&5, &owners, true, 0), None);
         assert_eq!(notice_target(&8, &owners, true, 0), None);
-        // Known issue 51: rank 2 also offers to rank 1; rank 1 does not
-        // offer to itself or to a later owner.
+        // Rank 2 also offers to rank 1; rank 1 does not offer to itself or to a later owner.
         assert_eq!(notice_target(&9, &owners, true, 1), Some(7));
         assert_eq!(notice_target(&7, &owners, true, 1), None);
         assert_eq!(notice_target(&9, &owners, true, 2), None);
@@ -686,9 +674,8 @@ mod notice_tests {
         assert_eq!(h.len(), 1);
     }
 
-    /// Known issue 50: a cut blocks the target's group until the failed
-    /// notice's next offer; other notices of that group come due meanwhile
-    /// and are deferred without spending a try; after the block one probe
+    /// A cut blocks the target's group until the failed notice's next offer; other notices of that
+    /// group come due meanwhile and are deferred without spending a try; after the block one probe
     /// offer goes out, holding the group until it is reported.
     #[test]
     fn a_cut_holds_the_group_and_sends_one_probe_after_it() {
@@ -858,9 +845,8 @@ mod notice_tests {
     }
 }
 
-// Successor hints: an owner remembering which other owner fetched a page it
-// answered without a copy, so readers ask that owner instead of making it
-// fetch the page again (Known issue 21).
+// Successor hints: an owner remembering which other owner fetched a page it answered without a
+// copy, so readers ask that owner instead of making it fetch the page again.
 //
 // An owner above rank 0 reaches origin only after its probe of rank 0 ended
 // without a copy: rank 0 missed a copy-only probe (the owner could not fund
@@ -933,13 +919,11 @@ pub const PROBE_AFTER: Duration = Duration::from_secs(2);
 /// Default bound on remembered pages per node.
 pub const HINT_CAPACITY: usize = 4096;
 
-/// How long a requester deferred to an offer's sender is remembered
-/// ([`SuccessorHints::peek_for`]): a requester that comes back for the page
-/// within this window lost the deferral (the sender failed it, for example
-/// because it crashed), so this node acquires instead of deferring it again.
-/// Twice the default request timeout (30 s): it covers a read's retries,
-/// while a new read of the page minutes later is deferred as usual (Known
-/// issue 58).
+/// How long a requester deferred to an offer's sender is remembered ([`SuccessorHints::peek_for`]):
+/// a requester that comes back for the page within this window lost the deferral (the sender failed
+/// it, for example because it crashed), so this node acquires instead of deferring it again. Twice
+/// the default request timeout (30 s): it covers a read's retries, while a new read of the page
+/// minutes later is deferred as usual.
 pub const RETURN_WITHIN: Duration = Duration::from_secs(60);
 
 struct HintEntry<N> {
@@ -951,8 +935,8 @@ struct HintEntry<N> {
     max: u32,
     /// Already returned by [`SuccessorHints::probe`].
     probed: bool,
-    /// The newest node was noted from an offer: it holds the copy, so
-    /// [`PROBE_AFTER`] does not apply (Known issue 51).
+    /// The newest node was noted from an offer: it holds the copy, so [`PROBE_AFTER`] does not
+    /// apply.
     offered: bool,
     /// The nodes in `nodes` noted by an offer ([`SuccessorHints::note_offer`])
     /// and not since by [`SuccessorHints::note`].
@@ -1080,14 +1064,12 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
             .unwrap_or_default()
     }
 
-    /// The hints for `key` not older than [`PROBE_TTL`] (or the deferral
-    /// TTL, if longer), oldest first, for this node's own walk to ask before
-    /// origin ([`successor_targets`]). Each noted hint is returned once, so
-    /// one hint funds at most one granted probe per node it names; a renewed
-    /// note returns it again. A hint younger than [`PROBE_AFTER`] is held
-    /// back unless an offer noted it: an offer's sender holds the copy, and
-    /// waiting let rank 0 refetch pages offered a second earlier (Known
-    /// issue 51).
+    /// The hints for `key` not older than [`PROBE_TTL`] (or the deferral TTL, if longer), oldest
+    /// first, for this node's own walk to ask before origin ([`successor_targets`]). Each noted
+    /// hint is returned once, so one hint funds at most one granted probe per node it names; a
+    /// renewed note returns it again. A hint younger than [`PROBE_AFTER`] is held back unless an
+    /// offer noted it: an offer's sender holds the copy, and waiting let rank 0 refetch pages
+    /// offered a second earlier.
     pub fn probe(&mut self, key: &K, now: Instant) -> Vec<N> {
         let ttl = self.ttl.max(PROBE_TTL);
         match self.entries.get_mut(key) {
@@ -1111,14 +1093,12 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
             .is_some_and(|e| e.nodes.contains(node))
     }
 
-    /// [`Self::peek`] for a deferral of `requester`: nothing if this node
-    /// deferred `requester` for `key` to an offer's sender within
-    /// [`RETURN_WITHIN`] (Known issue 58). A deferral answers `Miss` and the
-    /// requester asks the hinted owner next; a requester that comes back did
-    /// not get the page there. An offer's sender (Known issue 51) may have
-    /// crashed since it offered, while this node, reached because rank 0
-    /// failed the reader, is the one owner left that would fetch; deferring
-    /// the returning requester again failed every retry of its read.
+    /// [`Self::peek`] for a deferral of `requester`: nothing if this node deferred `requester` for
+    /// `key` to an offer's sender within [`RETURN_WITHIN`]. A deferral answers `Miss` and the
+    /// requester asks the hinted owner next; a requester that comes back did not get the page
+    /// there. An offer's sender may have crashed since it offered, while this node, reached because
+    /// rank 0 failed the reader, is the one owner left that would fetch; deferring the returning
+    /// requester again failed every retry of its read.
     ///
     /// Deferrals to an owner noted from its own miss are not remembered: it
     /// asked this node moments before and is fetching, and a requester that
@@ -1209,13 +1189,11 @@ pub fn successor_deferral<N: PartialEq>(
         .find(|n| n != requester && owners.iter().position(|o| o == n).is_some_and(|r| r > me))
 }
 
-/// Whether a deferral may be considered at all. While this node's own
-/// acquisition of the page runs, the requester joins it instead: a hint only
-/// says that another owner asked for the page and got no copy, not that it
-/// got one, and under origin overload the hinted owner's fetch often fails
-/// or has not finished. Deferring then sent readers away from a fill they
-/// could have joined (5k `zipf` at 16 MiB pages: 78% of deferrals, failed
-/// reads 54 to 1,003; Known issue 21, wave 3 merge).
+/// Whether a deferral may be considered at all. While this node's own acquisition of the page runs,
+/// the requester joins it instead: a hint only says that another owner asked for the page and got
+/// no copy, not that it got one, and under origin overload the hinted owner's fetch often fails or
+/// has not finished. Deferring then sent readers away from a fill they could have joined (5k `zipf`
+/// at 16 MiB pages: 78% of deferrals, failed reads 54 to 1,003; wave 3 merge).
 pub fn defer_allowed(acquiring: bool) -> bool {
     !acquiring
 }
@@ -1223,18 +1201,16 @@ pub fn defer_allowed(acquiring: bool) -> bool {
 /// Hinted owners an owner walk at `rank` asks copy-only before origin
 /// ([`crate::read::walk::WalkConfig::successors`]), newest first.
 ///
-/// A hint names an owner that asked this node for the page and got no copy,
-/// after which it usually fetched the page itself (an orphan copy). Asking it
-/// before origin turns this owner's refetch into a peer copy (Known issue
-/// 21). Only current owners ranked after this node qualify: predecessors are
-/// asked anyway.
+/// A hint names an owner that asked this node for the page and got no copy, after which it usually
+/// fetched the page itself (an orphan copy). Asking it before origin turns this owner's refetch
+/// into a peer copy. Only current owners ranked after this node qualify: predecessors are asked
+/// anyway.
 ///
-/// A hinted owner that is also a handoff or lineage target stays a successor
-/// target: [`with_successors`] moves it to the front on its own grant.
-/// Excluding it (round 4, orphan2) left it an opportunistic handoff probe
-/// that rank 0, holding the single credit of a delegation, never sends: in
-/// 5k `full-failover` most rank 0 refetches of a holder rank 0 had noted were
-/// such lineage targets (Known issue 37).
+/// A hinted owner that is also a handoff or lineage target stays a successor target:
+/// [`with_successors`] moves it to the front on its own grant. Excluding it (round 4, orphan2) left
+/// it an opportunistic handoff probe that rank 0, holding the single credit of a delegation, never
+/// sends: in 5k `full-failover` most rank 0 refetches of a holder rank 0 had noted were such
+/// lineage targets.
 pub(crate) fn successor_targets<N: PartialEq + Copy + Default>(
     hints: &[N],
     owners: &[N],
@@ -1294,8 +1270,7 @@ mod successor_tests {
         assert!(h.peek(&1, now + Duration::from_secs(2)).is_empty());
     }
 
-    /// Known issue 37: a hint too old for deferrals still funds this
-    /// node's successor probe, up to [`PROBE_TTL`].
+    /// A hint too old for deferrals still funds this node's successor probe, up to [`PROBE_TTL`].
     #[test]
     fn probe_outlives_the_deferral_ttl() {
         let now = Instant::now();
@@ -1311,8 +1286,8 @@ mod successor_tests {
         );
     }
 
-    /// Known issue 37: an offer arms this node's probe but defers no
-    /// readers, and leaves an existing hint's deferral count alone.
+    /// An offer arms this node's probe but defers no readers, and leaves an existing hint's
+    /// deferral count alone.
     #[test]
     fn offers_arm_probes_without_deferrals() {
         let now = Instant::now();
@@ -1329,8 +1304,8 @@ mod successor_tests {
         assert_eq!(h.probe(&2, now + PROBE_AFTER), [8, 9]);
     }
 
-    /// Known issue 51: an offered hint is probed at once; a miss-noted one
-    /// waits `PROBE_AFTER`, and a later miss note restores the wait.
+    /// An offered hint is probed at once; a miss-noted one waits `PROBE_AFTER`, and a later miss
+    /// note restores the wait.
     #[test]
     fn offered_hints_skip_the_probe_delay() {
         let now = Instant::now();
@@ -1378,11 +1353,10 @@ mod successor_tests {
         assert_eq!(h.len(), 1);
     }
 
-    /// Known issue 58: a requester this node deferred to an offer's sender
-    /// that comes back within [`RETURN_WITHIN`] is not deferred again (the
-    /// sender failed it); other requesters still are, renewals keep the
-    /// memory, and it lapses after the window. Deferrals to an owner noted
-    /// from its own miss are not remembered.
+    /// A requester this node deferred to an offer's sender that comes back within [`RETURN_WITHIN`]
+    /// is not deferred again (the sender failed it); other requesters still are, renewals keep the
+    /// memory, and it lapses after the window. Deferrals to an owner noted from its own miss are
+    /// not remembered.
     #[test]
     fn returning_requesters_are_not_deferred_again() {
         let now = Instant::now();
@@ -1460,9 +1434,8 @@ mod successor_tests {
         assert!(successor_targets(&[], &owners, 0).is_empty());
     }
 
-    /// Known issue 37: a hinted owner that is also a handoff (lineage)
-    /// target is asked first on its own grant, not left as an unfunded
-    /// handoff probe, and is not asked twice.
+    /// A hinted owner that is also a handoff (lineage) target is asked first on its own grant, not
+    /// left as an unfunded handoff probe, and is not asked twice.
     #[test]
     fn hinted_handoff_target_moves_to_the_granted_front() {
         let owners = [1u32, 2, 3];
@@ -1480,8 +1453,7 @@ mod successor_tests {
         assert_eq!((all.to_vec(), n), (vec![7, 8], 0));
         let (all, n) = with_successors(&[1, 2, 3, 4], &[7]);
         assert_eq!((all.to_vec(), n), (vec![1, 2, 3, 7], 3));
-        // Lineage targets are no longer cut at three (Known issue 46), but
-        // the list stays within `MAX_TARGETS`.
+        // Lineage targets are no longer cut at three, but the list stays within `MAX_TARGETS`.
         let lineage: Vec<u32> = (10..30).collect();
         let (all, n) = with_successors(&[1, 2], &lineage);
         assert_eq!(n, 2);

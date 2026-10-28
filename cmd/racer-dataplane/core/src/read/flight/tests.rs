@@ -440,13 +440,11 @@ fn budget_gates() {
     assert_eq!(entry_cap_gate(1024, &limits), Err(Error::Overloaded));
 }
 
-/// Known issue 24: a leader whose deadline passes while its fill still runs
-/// is revoked. With the fill retained as an operation (production
-/// `Flights::retain_operation`), the flight keeps draining: the expired
-/// leader's detach does not remove it, a new caller waits instead of starting
-/// a second concurrent fill, the stale leader's finish is rejected
-/// (`Internal`, production `StaleFlight`), and only completing the operation
-/// elects the new caller.
+/// A leader whose deadline passes while its fill still runs is revoked. With the fill retained as
+/// an operation (production `Flights::retain_operation`), the flight keeps draining: the expired
+/// leader's detach does not remove it, a new caller waits instead of starting a second concurrent
+/// fill, the stale leader's finish is rejected (`Internal`, production `StaleFlight`), and only
+/// completing the operation elects the new caller.
 #[test]
 fn expired_leader_with_retained_operation_blocks_reelection_until_complete() {
     let now = Instant::now();
@@ -605,10 +603,9 @@ fn deadline_takes_precedence_over_recorded_rejection() {
     );
 }
 
-/// Known issue 30: with handover allowed, an expired leader's running fill
-/// continues for the live waiter with the latest deadline. That waiter is not
-/// re-elected (no second fill), the elected capability still publishes, and
-/// every remaining waiter completes from the one fill.
+/// With handover allowed, an expired leader's running fill continues for the live waiter with the
+/// latest deadline. That waiter is not re-elected (no second fill), the elected capability still
+/// publishes, and every remaining waiter completes from the one fill.
 #[test]
 fn expired_leader_hands_running_fill_to_latest_waiter() {
     let now = Instant::now();
@@ -771,8 +768,8 @@ fn copy_waiter(joined: Result<Joined<u32, u32>>) -> u64 {
     }
 }
 
-/// Known issue 31: a copy-only request joins the running acquisition like
-/// production `Flights::join_copy`, waits for its result, and never leads.
+/// A copy-only request joins the running acquisition like production `Flights::join_copy`, waits
+/// for its result, and never leads.
 #[test]
 fn copy_join_waits_for_the_running_acquisition_and_never_leads() {
     let now = Instant::now();
