@@ -1466,8 +1466,8 @@ pub const NOT_MEMBER: u32 = u32::MAX;
 /// Members ranked just below the owners ([`Ranked::demoted`]).
 pub const DEMOTED: usize = topology::RETAINED_DEPTH - topology::REPLICAS;
 
-/// Optional rules: production runs [`Features::PRODUCTION`]; `SIM_*` bits
-/// mark where the simulator still differs.
+/// Optional rules: production runs [`Features::PRODUCTION`]; the simulator
+/// clears bits to ablate them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Features {
     bits: u32,
@@ -1493,17 +1493,6 @@ impl Features {
     pub const STALE_WAIT: u32 = 1 << 5;
     /// Rank 0's own `Unavailable` is [`Outcome::Failed`] (Known issue 52).
     pub const RANK0_FAILED: u32 = 1 << 6;
-    /// Simulator only: a stale wait measures the time left from the
-    /// budget's deadline alone, not the earlier of it and the scope's.
-    pub const SIM_WAIT_BUDGET_DEADLINE: u32 = 1 << 16;
-    /// Simulator only: a membership refresh drops the epoch's bounded routes.
-    pub const SIM_REFRESH_DROPS_BOUNDED: u32 = 1 << 17;
-    /// Simulator only: a failed or empty ranking under the previous
-    /// membership denies the stale fallback for the rest of the read.
-    pub const SIM_FALLBACK_RANK_DENIES: u32 = 1 << 18;
-    /// Simulator only: a remaining-copy probe answered `StaleMembership` is
-    /// a refresh or a skip, not a terminal error.
-    pub const SIM_REMAINING_STALE: u32 = 1 << 19;
 
     /// Every rule production runs.
     pub const PRODUCTION: Self = Self {
@@ -1817,21 +1806,14 @@ enum Walking {
     Remaining(RemainingWalk),
 }
 
-/// Why [`Action::Refresh`] was asked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Refresh {
-    Hedge,
-    Probe,
-    Remaining,
-}
-
 /// Sans-IO state of one read's acquisition ([`Action`], [`Event`]).
 pub struct Fill {
     config: FillConfig,
     /// The plan still races a hedge before the first walk.
     hedge: bool,
     ranking: Ranking,
-    refresh: Refresh,
+    /// The pending [`Action::Refresh`] follows a lost hedge, not a probe.
+    hedge_refresh: bool,
     /// The walked ranking. Public fields are read-only to callers.
     pub version: u64,
     pub owners: List<u32, MAX_HANDOFF>,
@@ -1877,7 +1859,7 @@ impl Fill {
             config,
             hedge: config.hedge && !config.walk_only,
             ranking: Ranking::Current,
-            refresh: Refresh::Probe,
+            hedge_refresh: false,
             version: 0,
             owners: List::default(),
             rank: None,
@@ -2063,7 +2045,7 @@ impl Fill {
                         if stale {
                             // Refresh, or walk this epoch with bounded routes
                             // (Known issue 3).
-                            self.refresh = Refresh::Hedge;
+                            self.hedge_refresh = true;
                             return Ok(Action::Refresh);
                         }
                         self.start_walk(budget)
@@ -2306,9 +2288,7 @@ impl Fill {
                     // (for example a hot-page owner): the walk may ask the
                     // page's helper (Known issue 16).
                     ResponseKind::Overloaded if signed => Outcome::Shed,
-                    ResponseKind::StaleMembership
-                        if remaining && !self.has(Features::SIM_REMAINING_STALE) =>
-                    {
+                    ResponseKind::StaleMembership if remaining => {
                         self.out.outcome = Some(Err(Error::IncompatibleMembership));
                         return Err(Error::IncompatibleMembership);
                     }
@@ -2316,11 +2296,7 @@ impl Fill {
                     // previous membership never refreshes.
                     ResponseKind::StaleMembership if no_refresh => Outcome::StaleMembership,
                     ResponseKind::StaleMembership => {
-                        self.refresh = if remaining {
-                            Refresh::Remaining
-                        } else {
-                            Refresh::Probe
-                        };
+                        self.hedge_refresh = false;
                         return Ok(Action::Refresh);
                     }
                     // Rank 0 itself answered that its own acquisition failed:
@@ -2484,7 +2460,7 @@ impl Fill {
         let action = match stale_action(self.retried, self.version, latest) {
             Ok(action) => action,
             Err(error) => {
-                if self.refresh != Refresh::Hedge {
+                if !self.hedge_refresh {
                     self.pending();
                     self.out.outcome = Some(Err(error));
                 }
@@ -2492,21 +2468,21 @@ impl Fill {
             }
         };
         let latest = latest.unwrap_or_default();
-        match (self.refresh, action) {
-            (Refresh::Hedge, StaleAction::Refresh) => {
+        match (self.hedge_refresh, action) {
+            (true, StaleAction::Refresh) => {
                 self.note(Notes::REFRESH);
                 self.retried = true;
                 Ok(self.rank_next(Ranking::Current, Some(latest)))
             }
-            (Refresh::Hedge, StaleAction::Skip) => {
+            (true, StaleAction::Skip) => {
                 self.note(Notes::STALE_SKIP);
                 self.start_walk(budget)
             }
-            (Refresh::Probe, StaleAction::Refresh) => {
+            (false, StaleAction::Refresh) => {
                 self.latest = latest;
                 self.complete(Outcome::StaleMembership, budget)
             }
-            (Refresh::Probe, StaleAction::Skip) => {
+            (false, StaleAction::Skip) => {
                 let owner = self.rank.is_some();
                 // Fall back to version - 1 once (Known issue 19), ranking it
                 // first: a node that owns the page there may not walk it, and
@@ -2526,14 +2502,6 @@ impl Fill {
                     return Ok(Action::Wait(wait));
                 }
                 self.skip(budget)
-            }
-            (Refresh::Remaining, StaleAction::Refresh) => {
-                self.complete(Outcome::StaleMembership, budget)
-            }
-            (Refresh::Remaining, StaleAction::Skip) => {
-                self.stale += 1;
-                self.note(Notes::STALE_SKIP | Notes::OWNER_STALE_SKIP);
-                self.complete(Outcome::StaleDestination, budget)
             }
         }
     }
@@ -2563,11 +2531,7 @@ impl Fill {
         if !self.has(Features::STALE_WAIT) {
             return Ok(None);
         }
-        let deadline = if self.has(Features::SIM_WAIT_BUDGET_DEADLINE) {
-            budget.deadline()
-        } else {
-            budget.deadline().min(self.config.scope)
-        };
+        let deadline = budget.deadline().min(self.config.scope);
         let Walking::Candidates(walk) = &mut self.walk else {
             return Ok(None);
         };
@@ -2614,7 +2578,7 @@ impl Fill {
             self.continuation = Continuation::default();
             return self.ranked(ranked, budget);
         }
-        let denied = ranked.is_ok() || self.has(Features::SIM_FALLBACK_RANK_DENIES);
+        let denied = ranked.is_ok();
         if denied {
             self.note(Notes::FALLBACK_DENIED);
             self.fallback_denied = true;
@@ -2651,7 +2615,7 @@ impl Fill {
                 self.note(Notes::REFRESH);
                 self.retried = true;
                 self.continuation = Continuation {
-                    bounded_routes: self.bounded && !self.has(Features::SIM_REFRESH_DROPS_BOUNDED),
+                    bounded_routes: self.bounded,
                     ..Continuation::default()
                 };
                 Ok(self.rank_next(Ranking::Current, Some(self.latest)))

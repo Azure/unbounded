@@ -3003,14 +3003,8 @@ fn fill_stale_membership_refreshes_falls_back_waits_or_skips() {
 
 #[test]
 fn fill_remaining_stale_answer_is_terminal_in_production() {
-    for (features, refresh) in [
-        (Features::PRODUCTION, false),
-        (
-            Features::PRODUCTION.with(Features::SIM_REMAINING_STALE, true),
-            true,
-        ),
-    ] {
-        let mut f = fill(false, features);
+    {
+        let mut f = fill(false, Features::PRODUCTION);
         let mut b = budget(8, 16);
         owner_walk(&mut f, &mut b, 0);
         let (actions, _) = script(
@@ -3022,14 +3016,7 @@ fn fill_remaining_stale_answer_is_terminal_in_production() {
                 answer(ResponseKind::StaleMembership),
             ],
         );
-        assert_eq!(
-            actions[2],
-            if refresh {
-                Action::Refresh
-            } else {
-                Action::Done(Err(Error::IncompatibleMembership))
-            }
-        );
+        assert_eq!(actions[2], Action::Done(Err(Error::IncompatibleMembership)));
     }
 }
 

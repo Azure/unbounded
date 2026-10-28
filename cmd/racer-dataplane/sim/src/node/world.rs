@@ -80,14 +80,6 @@ use crate::workload::{Poisson, Reads, page_id};
 /// Maximum read attempts before a read fails.
 const MAX_ATTEMPTS: u8 = 4;
 
-/// Where the simulator's acquisition still differs from production
-/// (`racer_core::read::walk::Features`). Temporary: each goes in its own
-/// behavior change.
-const SIM_DIVERGENCES: u32 = Features::SIM_WAIT_BUDGET_DEADLINE
-    | Features::SIM_REFRESH_DROPS_BOUNDED
-    | Features::SIM_FALLBACK_RANK_DENIES
-    | Features::SIM_REMAINING_STALE;
-
 /// Where a resolved page came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Got {
@@ -1933,7 +1925,7 @@ impl NodeWorld {
         ]
         .into_iter()
         .fold(
-            Features::new(SIM_DIVERGENCES, node_config.lineage_cap),
+            Features::new(0, node_config.lineage_cap),
             |features, (bit, on)| features.with(bit, on),
         );
         let core = racer_core::read::walk::Fill::new(FillConfig {
