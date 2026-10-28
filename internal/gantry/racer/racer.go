@@ -7,12 +7,13 @@ package racer
 
 import (
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -417,15 +418,39 @@ type Handler struct {
 	auth        authenticationChallenger
 	logger      *slog.Logger
 	diagnostics racerFailureDiagnostics
+	retry       retryPolicy
+}
+
+// HandlerOption configures optional Handler behavior.
+type HandlerOption func(*Handler)
+
+// WithRetryBudget bounds the total time one request may spend backing off
+// between retries of transient Racer failures. Zero disables retries.
+func WithRetryBudget(budget time.Duration) HandlerOption {
+	return func(h *Handler) { h.retry.budget = max(budget, 0) }
+}
+
+// WithRetryObserver reports each retry by stage (stat, get, or write_body).
+// observe must be concurrency-safe and must not block.
+func WithRetryObserver(observe func(stage string)) HandlerOption {
+	return func(h *Handler) { h.retry.observe = observe }
 }
 
 // NewHandler preserves the mirror's logging context and optional auth challenges.
-func NewHandler(client Client, auth authenticationChallenger, logger *slog.Logger) *Handler {
+func NewHandler(client Client, auth authenticationChallenger, logger *slog.Logger, opts ...HandlerOption) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	return &Handler{client: client, auth: auth, logger: logger.With(slog.String("subsystem", "mirror"))}
+	h := &Handler{
+		client: client, auth: auth, logger: logger.With(slog.String("subsystem", "mirror")),
+		retry: retryPolicy{budget: handlerDefaultRetryBudget, base: defaultRetryBase, cap: defaultRetryCap},
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	return h
 }
 
 // ServeContent serves a validated reference. Positive blob offsets select a
@@ -435,7 +460,7 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 	writeRacerDownloadHeaders(w)
 
 	// Fresh opaque correlation, including for aborts after headers are committed.
-	id := rand.Text()
+	id := crand.Text()
 	w.Header().Set("Gantry-Racer-Request-ID", id)
 
 	if s.client == nil {
@@ -467,7 +492,9 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
-	value, err := s.client.Get(r.Context(), request, options...)
+	retry := s.retry.start()
+
+	value, err := s.getWithRetry(r.Context(), retry, request, options...)
 	if err != nil {
 		expected := int64(-1)
 		if ranged {
@@ -480,7 +507,7 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
-	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close
+	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close of the first read; resumes close their own
 
 	actual := value.Metadata()
 	// The manifest route also serves indexes, so an absent media type is ambiguous.
@@ -504,7 +531,8 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 		actual = metadata
 	}
 
-	s.streamContent(w, id, ref, actual, offset, value)
+	smallObject := len(options) != 0 && options[0].SmallObject
+	s.streamContent(r.Context(), w, id, ref, request, actual, offset, value, retry, smallObject)
 }
 
 // prepareResponse handles HEAD and validates the snapshot needed for blob resume.
@@ -519,7 +547,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 		return racersdk.Metadata{}, nil, false
 	}
 
-	metadata, err := s.client.Stat(r.Context(), request)
+	metadata, err := s.statWithRetry(r.Context(), s.retry.start(), request)
 	if err != nil {
 		s.logRacerFailure(id, "stat", err, -1, 0)
 		s.racerError(w, r, ref, err)
@@ -554,7 +582,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 	return metadata, options, false
 }
 
-func (s *Handler) streamContent(w http.ResponseWriter, id string, ref ifaces.OriginRef, metadata racersdk.Metadata, offset int64, value *racersdk.Object) {
+func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id string, ref ifaces.OriginRef, request racersdk.Request, metadata racersdk.Metadata, offset int64, value *racersdk.Object, retry *retryState, smallObject bool) {
 	size := int64(metadata.Size)
 	writeRacerHeaders(w, ref.Digest, metadata, ref.Kind)
 
@@ -578,12 +606,151 @@ func (s *Handler) streamContent(w http.ResponseWriter, id string, ref ifaces.Ori
 		}
 	}
 	// The SDK gates the final byte on Complete, including for resumed ranges.
-	// Earlier incomplete page prefixes may already be visible on failure: abort
-	// rather than append an error body or let net/http complete the response.
+	// Earlier incomplete page prefixes may already be visible on failure.
+	// Transient Racer failures resume the same response from the exact count
+	// of bytes accepted by w, pinned to the same version; every resumed read
+	// again gates its final byte on Complete. Otherwise abort rather than
+	// append an error body or let net/http complete the response.
 	// OCI digest verification belongs to the consumer's assembled object.
-	if n, err := value.WriteTo(w); err != nil || n != remaining {
-		s.logRacerFailure(id, "write_body", err, remaining, n)
-		panic(http.ErrAbortHandler)
+	var written int64
+
+	current := value
+
+	defer func() {
+		if current != nil && current != value {
+			_ = current.Close() //nolint:errcheck // best-effort close of a resumed read
+		}
+	}()
+
+	for {
+		n, err := current.WriteTo(w)
+		written += n
+
+		if err == nil && written == remaining {
+			return
+		}
+
+		if err == nil || written > remaining || !retryable(ctx, err) || !retry.wait(ctx, "write_body") {
+			s.logRacerFailure(id, "write_body", err, remaining, written)
+			panic(http.ErrAbortHandler)
+		}
+
+		// WriteTo may leave an interrupt deadline behind; clear it before
+		// resuming into the same response.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			s.logRacerFailure(id, "write_body", err, remaining, written)
+			panic(http.ErrAbortHandler)
+		}
+
+		if current != value {
+			_ = current.Close() //nolint:errcheck // best-effort close before resume
+		}
+
+		current = nil
+		options := racersdk.ReadOptions{Offset: offset + written, ETag: metadata.ETag, SmallObject: smallObject}
+
+		next, err := s.getWithRetry(ctx, retry, request, options)
+		if err != nil {
+			s.logRacerFailure(id, "resume_get", err, remaining, written)
+			panic(http.ErrAbortHandler)
+		}
+
+		current = next
+
+		if actual := next.Metadata(); actual.Size != metadata.Size || actual.ETag != metadata.ETag || actual.ContentType != metadata.ContentType {
+			s.logRacerFailure(id, "resume_metadata", errors.New("invalid metadata"), remaining, written)
+			panic(http.ErrAbortHandler)
+		}
+	}
+}
+
+// Bounded retry of transient Racer failures.
+
+const (
+	// DefaultRetryBudget bounds per-request backoff when no budget is configured.
+	DefaultRetryBudget = 30 * time.Second
+	defaultRetryBase   = 150 * time.Millisecond
+	defaultRetryCap    = 2 * time.Second
+)
+
+// handlerDefaultRetryBudget is a variable only so tests of single-attempt
+// failure paths can disable retries package-wide.
+var handlerDefaultRetryBudget = DefaultRetryBudget
+
+type retryPolicy struct {
+	budget, base, cap time.Duration
+	observe           func(stage string)
+}
+
+// retryState tracks one request's retry budget across all stages.
+type retryState struct {
+	policy   retryPolicy
+	deadline time.Time
+	attempt  int
+}
+
+func (p retryPolicy) start() *retryState {
+	return &retryState{policy: p, deadline: time.Now().Add(p.budget)}
+}
+
+// wait sleeps for a jittered exponential backoff and reports whether the
+// caller should retry. It refuses when the sleep would exceed the budget or
+// the request context ends.
+func (r *retryState) wait(ctx context.Context, stage string) bool {
+	if r.policy.budget <= 0 || ctx.Err() != nil {
+		return false
+	}
+
+	backoff := r.policy.cap
+	if r.attempt < 30 {
+		backoff = min(r.policy.base<<r.attempt, r.policy.cap)
+	}
+
+	r.attempt++
+	// Equal jitter keeps a floor while spreading synchronized retries.
+	delay := backoff/2 + rand.N(backoff/2+1) //nolint:gosec // jitter, not security
+
+	if time.Now().Add(delay).After(r.deadline) {
+		return false
+	}
+
+	if r.policy.observe != nil {
+		r.policy.observe(stage)
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// retryable reports whether err is a transient Racer failure worth retrying.
+// Destination failures and ambiguous write timeouts are not: the downstream
+// client may be at fault. Caller cancellation always stops retries.
+func retryable(ctx context.Context, err error) bool {
+	return ctx.Err() == nil && !errors.Is(err, racersdk.ErrDestination) && errors.Is(err, racersdk.ErrUnavailable)
+}
+
+func (s *Handler) getWithRetry(ctx context.Context, retry *retryState, request racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Object, error) {
+	for {
+		value, err := s.client.Get(ctx, request, options...)
+		if err == nil || !retryable(ctx, err) || !retry.wait(ctx, "get") {
+			return value, err
+		}
+	}
+}
+
+func (s *Handler) statWithRetry(ctx context.Context, retry *retryState, request racersdk.Request) (racersdk.Metadata, error) {
+	for {
+		metadata, err := s.client.Stat(ctx, request)
+		if err == nil || !retryable(ctx, err) || !retry.wait(ctx, "stat") {
+			return metadata, err
+		}
 	}
 }
 
@@ -1115,6 +1282,7 @@ type Metrics struct {
 	durations       *prometheus.HistogramVec
 	originRequests  *prometheus.CounterVec
 	originBodyBytes *prometheus.CounterVec
+	retries         *prometheus.CounterVec
 }
 
 // NewMetrics registers mirror and origin metrics.
@@ -1125,6 +1293,7 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 		durations:       reg.NewHistogramVec("racer", prometheus.HistogramOpts{Name: "gantry_racer_mirror_duration_seconds", Help: "Racer mirror handler duration including downstream writes.", Buckets: prometheus.ExponentialBuckets(0.001, 4, 11)}, []string{"method"}),
 		originRequests:  reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_origin_requests_total", Help: "Upstream HTTP round trips, including HEAD, GET, and authentication; status zero denotes transport failure."}, []string{"method", "status"}),
 		originBodyBytes: reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_origin_bytes_total", Help: "Upstream GET body bytes read, including partial transfers."}, []string{"kind"}),
+		retries:         reg.NewCounterVec("racer", prometheus.CounterOpts{Name: "gantry_racer_mirror_retries_total", Help: "Racer mirror retries of transient failures by stage (stat, get, write_body)."}, []string{"stage"}),
 	}
 
 	return m
@@ -1161,4 +1330,15 @@ func (m *Metrics) OriginRequest(method string, status int) {
 // OriginBytes records upstream bytes, including partial transfers.
 func (m *Metrics) OriginBytes(kind string, bytes int64) {
 	m.originBodyBytes.WithLabelValues(kind).Add(float64(bytes))
+}
+
+// MirrorRetry records one retry of a transient Racer failure.
+func (m *Metrics) MirrorRetry(stage string) {
+	switch stage {
+	case "stat", "get", "write_body":
+	default:
+		stage = "other"
+	}
+
+	m.retries.WithLabelValues(stage).Inc()
 }
