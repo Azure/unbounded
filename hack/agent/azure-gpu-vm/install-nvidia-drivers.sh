@@ -319,7 +319,12 @@ install_gds() {
     dpkg -i "${tmpdir}/cuda-keyring.deb"
     rm -rf "${tmpdir}"
 
-    write_cuda_pin /etc/apt/preferences.d/unbounded-cuda-gds
+    # cuda-keyring ships /etc/apt/preferences.d/cuda-repository-pin-600, which
+    # pins every "NVIDIA CUDA" package to 600. APT takes the maximum of
+    # matching generic-form pins (apt_preferences(5)), so a separate lower pin
+    # cannot override it. Replace that file with our policy instead. It is a
+    # dpkg conffile, so later cuda-keyring upgrades keep our edit.
+    write_cuda_pin /etc/apt/preferences.d/cuda-repository-pin-600
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nvidia-fs-dkms
 
