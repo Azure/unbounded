@@ -371,6 +371,14 @@ else
     esac
 fi
 
+# Install nvidia-fs after the driver so DKMS builds it against the driver's
+# sources and the new nv-p2p interface. Run it before Fabric Manager:
+# install_fabric_manager uses dpkg --force-depends, which leaves unmet
+# dependencies that make any later apt-get install abort.
+if [[ "${INSTALL_GDS}" == "yes" ]]; then
+    install_gds
+fi
+
 # Install Fabric Manager for NVSwitch-based multi-GPU systems (H100, H200,
 # ND A100). Without it, CUDA initialization fails with error 802.
 if [[ "${NEEDS_FABRIC}" == "yes" ]]; then
@@ -381,12 +389,6 @@ fi
 # no GPU processes are running, which avoids cold-start latency and is required
 # for some multi-GPU configurations.
 install_persistence_mode_service
-
-# Install nvidia-fs after the driver so DKMS builds it against the driver's
-# sources and the new nv-p2p interface.
-if [[ "${INSTALL_GDS}" == "yes" ]]; then
-    install_gds
-fi
 
 log "Driver installation complete."
 log ""
