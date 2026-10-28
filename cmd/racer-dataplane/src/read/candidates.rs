@@ -2592,11 +2592,8 @@ impl CandidatePolicy {
         }
     }
 
-    /// Ping `peer` about `page` (mode `ping`, answered `Miss` at once).
-    /// `Some(true)`: `peer` signed an answer. `Some(false)`: unanswered
-    /// within the attempt, or a relay answered `Unavailable` (it holds `peer`
-    /// silent, or cannot reach it). `None`: anything else (a relay's
-    /// overload, a local failure) proves nothing.
+    /// Ping `peer` about `page` (mode `ping`, answered `Miss` at once), and
+    /// classify the result (`racer_core::liveness::ping_verdict`).
     async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
         use racer_core::read::hints::NOTICE_LINKS;
         let deadline = uring_runtime::environment::now() + self.attempt_timeout;

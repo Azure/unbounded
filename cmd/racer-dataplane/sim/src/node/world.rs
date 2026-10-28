@@ -66,9 +66,7 @@ use racer_core::read::{
 use racer_core::read::{ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline};
 use racer_core::route::Fault;
 use racer_core::route::MAX_LINKS;
-use racer_core::route::{
-    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure,
-};
+use racer_core::route::{Hop, RelayFailure, RelayPlan, Response, decide_hop, relay_failure};
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 use topology::{PathQuery, Placement};
@@ -3464,10 +3462,7 @@ impl NodeWorld {
     }
 
     /// A ping ended with `reply`, or unanswered within its time bound
-    /// (`None`). Any answer the destination signed means it is alive; a
-    /// relay's `Unavailable` (it holds the destination silent, or cannot
-    /// reach it) or no answer at all means silent; anything else (a relay's
-    /// overload, a transport failure here) proves nothing.
+    /// (`None`), classified by `ping_verdict`.
     fn ping_done(&mut self, ping: SimPing, reply: Option<Reply>) {
         let n = &self.nodes[ping.node as usize];
         if n.down || n.incarnation != ping.incarnation {
@@ -3482,19 +3477,12 @@ impl NodeWorld {
             Some(Reply::Response(kind)) => Ok((!ping.relayed, kind == ResponseKind::Unavailable)),
             Some(Reply::Transport) => Err(false),
         });
-        match answered {
-            None => {
-                self.metrics.incr("silence_pings_inconclusive");
-                return;
-            }
-            Some(true) => {
-                if silence.silent(&to, at) {
-                    self.metrics.incr("silence_recoveries");
-                }
-                silence.ping_result(&to, answered, at);
-                return;
-            }
-            Some(false) => {}
+        let Some(alive) = answered else {
+            self.metrics.incr("silence_pings_inconclusive");
+            return;
+        };
+        if alive && silence.silent(&to, at) {
+            self.metrics.incr("silence_recoveries");
         }
         if silence.ping_result(&to, answered, at) {
             self.metrics.incr("silence_marks");
@@ -3772,15 +3760,7 @@ impl NodeWorld {
         self.adopt(at);
         let m = self.msgs.get(&mid).expect("message");
         let known = self.versions.known(at, m.version, now);
-        let hop = decide_hop(
-            &at,
-            HopRoute {
-                visited: &m.path,
-                destination: &m.dest,
-                links: m.links,
-            },
-            known,
-        );
+        let hop = decide_hop(&at, &m.path, &m.dest, m.links, known);
         match hop {
             Hop::StaleMembership => {
                 self.metrics.incr("stale_membership_replies");
@@ -3799,7 +3779,7 @@ impl NodeWorld {
                 self.serve(mid);
             }
             Hop::Relay(plan) => {
-                let valid = !plan.invalid();
+                let valid = plan.outbound != Err(racer_core::route::RouteFault::Invalid);
                 self.invariants
                     .check("relay_route_valid", valid, now, Some(at), || {
                         "relay received a route that revisits it".to_owned()
@@ -4227,9 +4207,7 @@ impl NodeWorld {
             return self.ping_done(ping, Some(reply));
         }
         if let Some((node, incarnation, due)) = self.offers.remove(&pid) {
-            // Only the destination answers an offer `Miss`; anything else
-            // (transport, a relay's answer, shed, behind) tries again. A
-            // relay's answer is cut evidence (Known issue 50).
+            // A relay's answer is cut evidence (Known issue 50).
             let relayed = self.offers_relayed.remove(&pid);
             let end = OfferEnd::of(
                 (!relayed && reply != Reply::Transport)

@@ -109,15 +109,12 @@ struct SilenceEntry<P> {
     seq: u64,
 }
 
-/// Classify how a silence ping ended, for [`Silence::ping_result`].
-///
-/// `Ok((by_peer, unavailable))`: a signed answer, signed by the pinged peer
-/// itself (`by_peer`) or by a relay, and whether it is `Unavailable`.
-/// `Err(timed_out)`: no signed answer; `timed_out` when the ping's time
-/// bound passed. Any answer the peer signed means it is alive; a relay's
-/// `Unavailable` (it holds the peer silent, or cannot reach it) or no answer
-/// in time means silent; anything else (a relay's overload, a local or
-/// transport failure) proves nothing.
+/// Classify how a silence ping ended, for [`Silence::ping_result`]:
+/// `Ok((by_peer, unavailable))` for a signed answer (by the peer itself or
+/// a relay; `Unavailable` or not), `Err(timed_out)` for none. An answer the
+/// peer signed means alive; a relay's `Unavailable` (it holds the peer
+/// silent, or cannot reach it) or no answer in time means silent; anything
+/// else proves nothing.
 pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
     match answer {
         Ok((true, _)) => Some(true),
@@ -314,32 +311,21 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
     /// silent.
     pub fn ping_result(&mut self, peer: &N, answered: Option<bool>, now: Instant) -> bool {
         let (hold, quiet) = (self.hold(), self.quiet());
-        let Some(entry) = self.entries.get_mut(peer) else {
+        let (Some(entry), Some(answered)) = (self.entries.get_mut(peer), answered) else {
             return false;
         };
-        match answered {
-            Some(true) => {
-                entry.timeouts = 0;
-                entry.pinging = None;
-                entry.silent = false;
-                entry.next = now + quiet;
-            }
-            Some(false) => {
-                if entry.pinging.take().is_none() {
-                    return false;
-                }
-                let became = !entry.silent;
-                entry.silent = true;
-                entry.next = now + hold;
-                entry.want = false;
-                entry.last = entry.last.max(now);
-                return became;
-            }
-            None => return false,
+        if entry.pinging.take().is_none() && !answered {
+            return false;
         }
+        let became = !answered && !entry.silent;
+        if answered {
+            entry.timeouts = 0;
+        }
+        entry.silent = !answered;
         entry.want = false;
+        entry.next = now + if answered { quiet } else { hold };
         entry.last = entry.last.max(now);
-        false
+        became
     }
 
     /// `peer` answered an exchange at `now` (a response it signed or
@@ -423,12 +409,16 @@ mod silence_tests {
 
     #[test]
     fn ping_verdicts() {
-        assert_eq!(ping_verdict(Ok((true, true))), Some(true));
-        assert_eq!(ping_verdict(Ok((true, false))), Some(true));
-        assert_eq!(ping_verdict(Ok((false, true))), Some(false));
-        assert_eq!(ping_verdict(Err(true)), Some(false));
-        assert_eq!(ping_verdict(Ok((false, false))), None);
-        assert_eq!(ping_verdict(Err(false)), None);
+        for (answer, verdict) in [
+            (Ok((true, true)), Some(true)),
+            (Ok((true, false)), Some(true)),
+            (Ok((false, true)), Some(false)),
+            (Err(true), Some(false)),
+            (Ok((false, false)), None),
+            (Err(false), None),
+        ] {
+            assert_eq!(ping_verdict(answer), verdict, "{answer:?}");
+        }
     }
 
     const S: Duration = Duration::from_secs(1);

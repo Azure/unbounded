@@ -815,11 +815,9 @@ impl PeerServer {
         let route = &request.request().route;
         racer_core::route::decide_hop(
             &self.relay.network.local,
-            racer_core::route::HopRoute {
-                visited: &route.visited,
-                destination: &route.destination,
-                links: route.remaining_links,
-            },
+            &route.visited,
+            &route.destination,
+            route.remaining_links,
             membership_known,
         )
     }

@@ -328,15 +328,6 @@ pub enum Fault {
 // (`src/peer/server.rs`), `Relay::forward_inner` and `Requester::exchange`
 // (`src/peer.rs`), and `LinkHealth::run` (`src/topology.rs`).
 
-/// The fields of a received route that a hop decision reads.
-#[derive(Clone, Copy, Debug)]
-pub struct HopRoute<'a, N> {
-    /// Wire form: includes the sender.
-    pub visited: &'a [N],
-    pub destination: &'a N,
-    pub links: u8,
-}
-
 /// What a node does with a verified request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hop {
@@ -359,27 +350,27 @@ pub struct RelayPlan {
     pub outbound: Result<u8, RouteFault>,
 }
 
-impl RelayPlan {
-    /// The route itself is malformed for a relay at this node.
-    pub fn invalid(&self) -> bool {
-        self.outbound == Err(RouteFault::Invalid)
-    }
-}
-
-/// Decide the hop for a verified request at `local`.
+/// Decide the hop at `local` for a verified request whose route has
+/// `visited` (wire form: includes the sender), `destination`, and `links`.
 ///
 /// `membership_known` is false when the signed membership version cannot be
 /// resolved (`Error::IncompatibleMembership` from `PeerNetwork::membership`).
-pub fn decide_hop<N: PartialEq>(local: &N, route: HopRoute<'_, N>, membership_known: bool) -> Hop {
+pub fn decide_hop<N: PartialEq>(
+    local: &N,
+    visited: &[N],
+    destination: &N,
+    links: u8,
+    membership_known: bool,
+) -> Hop {
     if !membership_known {
         return Hop::StaleMembership;
     }
-    if route.destination == local {
+    if destination == local {
         return Hop::Serve;
     }
     Hop::Relay(RelayPlan {
-        search: search_budget(route.visited, route.links, local),
-        outbound: relay(route.visited, route.destination, route.links, local),
+        search: search_budget(visited, links, local),
+        outbound: relay(visited, destination, links, local),
     })
 }
 
@@ -485,17 +476,14 @@ pub enum Exchange {
     Failed { fault: Fault, socket_failure: bool },
 }
 
-/// What one exchange (`Requester::exchange`) is evidence of: link evidence
-/// against the immediate peer, adaptive admission evidence, and silence
-/// evidence (`crate::liveness`) for the exchange's destination.
-///
-/// Link: without adaptive admission (`admitted`), only a socket failure
-/// blames the immediate peer; downstream errors are not evidence against
-/// it. Admission: a downstream overload is not attributable to the
-/// immediate peer. Silence: `Some(true)` when the destination answered (a
-/// response or a body), `Some(false)` when the exchange ended unanswered by
-/// a time bound or the upstream's cancellation without a socket failure,
-/// and `None` otherwise (a failed connection is link health's evidence).
+/// What one exchange (`Requester::exchange`) is evidence of:
+/// - link evidence against the immediate peer: without adaptive admission
+///   (`admitted`) only a socket failure blames it, never a downstream error;
+/// - adaptive admission evidence: a downstream overload is not its fault;
+/// - silence evidence (`crate::liveness`) for the destination: `Some(true)`
+///   when it answered (a response or a body), `Some(false)` when the
+///   exchange ended unanswered by a time bound or the upstream's
+///   cancellation without a socket failure (that is link health's).
 pub fn exchange_evidence(
     exchange: Exchange,
     admitted: bool,
@@ -506,25 +494,21 @@ pub fn exchange_evidence(
 ) {
     use flow_control::AdaptiveOutcome as Outcome;
     match exchange {
-        Exchange::Complete { overloaded } => (
-            Some(LinkOutcome::Success),
-            if overloaded {
-                Outcome::Neutral
-            } else {
-                Outcome::Verified
-            },
-            Some(true),
-        ),
+        Exchange::Complete { overloaded: true } => {
+            (Some(LinkOutcome::Success), Outcome::Neutral, Some(true))
+        }
+        Exchange::Complete { overloaded: false } => {
+            (Some(LinkOutcome::Success), Outcome::Verified, Some(true))
+        }
         Exchange::Streaming => (None, Outcome::Neutral, Some(true)),
         Exchange::Failed {
             fault,
             socket_failure,
         } => (
             (socket_failure && !admitted).then_some(LinkOutcome::Refused),
-            if fault == Fault::Overloaded {
-                Outcome::LocalPressure
-            } else {
-                Outcome::Neutral
+            match fault {
+                Fault::Overloaded => Outcome::LocalPressure,
+                _ => Outcome::Neutral,
             },
             (!socket_failure && matches!(fault, Fault::DeadlineExceeded | Fault::Cancelled))
                 .then_some(false),
@@ -537,26 +521,13 @@ mod hop_tests {
     use super::*;
 
     fn route(visited: &[u32], destination: &u32, links: u8) -> Hop {
-        decide_hop(
-            &5,
-            HopRoute {
-                visited,
-                destination,
-                links,
-            },
-            true,
-        )
+        decide_hop(&5, visited, destination, links, true)
     }
 
     #[test]
     fn decide_hop_serves_relays_or_reports_stale() {
-        let r = HopRoute {
-            visited: &[1u32],
-            destination: &5,
-            links: 4,
-        };
-        assert_eq!(decide_hop(&5, r, false), Hop::StaleMembership);
-        assert_eq!(decide_hop(&5, r, true), Hop::Serve);
+        assert_eq!(decide_hop(&5, &[1u32], &5, 4, false), Hop::StaleMembership);
+        assert_eq!(decide_hop(&5, &[1u32], &5, 4, true), Hop::Serve);
         assert_eq!(
             route(&[1], &9, 4),
             Hop::Relay(RelayPlan {
@@ -568,14 +539,14 @@ mod hop_tests {
         let Hop::Relay(plan) = route(&[1], &9, 0) else {
             panic!()
         };
-        assert!(!plan.invalid());
+        assert_ne!(plan.outbound, Err(RouteFault::Invalid));
         assert_eq!(plan.search, Err(RouteFault::HopBudgetExhausted));
         assert_eq!(plan.outbound, Err(RouteFault::HopBudgetExhausted));
         // A cycle through this node is invalid before any budget is spent.
         let Hop::Relay(plan) = route(&[1, 5], &9, 4) else {
             panic!()
         };
-        assert!(plan.invalid());
+        assert_eq!(plan.outbound, Err(RouteFault::Invalid));
     }
 
     #[test]

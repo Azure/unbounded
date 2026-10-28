@@ -212,28 +212,13 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
         self.blocked.remove(group);
     }
 
-    /// `due`'s offer to a target in `group` failed with cut evidence (a
-    /// transport failure, or an answer a relay signed): schedule the next
-    /// offer as [`Self::failed`] does and block the group until it is due
-    /// (or for the next retry delay, when the notice is done).
-    fn cut(&mut self, due: Due<K, N>, group: G, now: Instant) -> Option<Instant> {
-        let delay = NOTICE_DELAYS[(due.tries + 1).min(NOTICE_TRIES - 1)];
-        let next = self.failed(due, now);
-        self.block(group, next.unwrap_or(now + delay), now);
-        next
-    }
-
-    /// A failure that says nothing about the route (the target itself
-    /// refused): release the group's probe hold and schedule the next offer
-    /// as [`Self::failed`] does.
-    fn refused(&mut self, due: Due<K, N>, group: &G, now: Instant) -> Option<Instant> {
-        self.blocked.remove(group);
-        self.failed(due, now)
-    }
-
-    /// `due`'s offer to a target in `group` ended with `end`. Returns when
-    /// the next offer for it is due (`None`: delivered, dropped, or out of
-    /// tries).
+    /// `due`'s offer to a target in `group` ended with `end`; returns when
+    /// the next offer for it is due. Delivered or dropped: release the
+    /// group's probe hold. Refused (says nothing about the route): release
+    /// it and schedule the next offer as [`Self::failed`] does. Cut (a
+    /// transport failure, or an answer a relay signed): schedule the same
+    /// way and block the group until it is due (or for the next retry delay,
+    /// when the notice is done).
     pub fn offer_result(
         &mut self,
         due: Due<K, N>,
@@ -241,14 +226,18 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
         group: G,
         now: Instant,
     ) -> Option<Instant> {
-        match end {
-            OfferEnd::Dropped | OfferEnd::Delivered => {
-                self.release(&group);
+        if end != OfferEnd::Cut {
+            self.blocked.remove(&group);
+            return if end == OfferEnd::Refused {
+                self.failed(due, now)
+            } else {
                 None
-            }
-            OfferEnd::Refused => self.refused(due, &group, now),
-            OfferEnd::Cut => self.cut(due, group, now),
+            };
         }
+        let delay = NOTICE_DELAYS[(due.tries + 1).min(NOTICE_TRIES - 1)];
+        let next = self.failed(due, now);
+        self.block(group, next.unwrap_or(now + delay), now);
+        next
     }
 
     fn block(&mut self, group: G, until: Instant, now: Instant) {
@@ -715,7 +704,10 @@ mod notice_tests {
         // No cut seen yet: offers to the group are not held.
         assert_eq!(n.blocked(&1, at(now, 5)), None);
         // Cut at 7 s: next offer of 1 at 22 s; group 1 blocked until then.
-        assert_eq!(n.cut(first, 1, at(now, 7)), Some(at(now, 22)));
+        assert_eq!(
+            n.offer_result(first, OfferEnd::Cut, 1, at(now, 7)),
+            Some(at(now, 22))
+        );
         assert_eq!(n.blocked(&1, at(now, 7)), Some(at(now, 22)));
         // 2 and 3 come due and are deferred; another group is unaffected.
         assert_eq!(n.pop_open(at(now, 10), site).map(|d| d.key), Some(4));
@@ -750,32 +742,15 @@ mod notice_tests {
         assert_eq!(OfferEnd::of(Some(true)), OfferEnd::Delivered);
         assert_eq!(OfferEnd::of(Some(false)), OfferEnd::Refused);
         assert_eq!(OfferEnd::of(None), OfferEnd::Cut);
+        // Delivered and dropped offers release the group; nothing is due.
         let now = Instant::now();
         let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(8);
-        n.note(1, 10, now);
-        let due = n.pop_open(at(now, 5), |_| 1).expect("due");
-        // A cut blocks the group until the next offer.
-        let next = n.offer_result(due, OfferEnd::Cut, 1, at(now, 5));
-        assert!(next.is_some());
-        assert_eq!(n.blocked(&1, at(now, 5)), next);
-        let due = n.pop_open(next.expect("next"), |_| 1).expect("due");
-        // Delivered and dropped offers release the group, nothing is due.
-        assert_eq!(
-            n.offer_result(due, OfferEnd::Delivered, 1, at(now, 30)),
-            None
-        );
-        assert_eq!(n.blocked(&1, at(now, 30)), None);
-        n.note(2, 10, at(now, 30));
-        let due = n.pop_open(at(now, 35), |_| 1).expect("due");
-        assert_eq!(n.offer_result(due, OfferEnd::Dropped, 1, at(now, 35)), None);
-        n.note(3, 10, at(now, 40));
-        let due = n.pop_open(at(now, 45), |_| 1).expect("due");
-        // A refusal spends a try without blocking the group.
-        assert!(
-            n.offer_result(due, OfferEnd::Refused, 1, at(now, 45))
-                .is_some()
-        );
-        assert_eq!(n.blocked(&1, at(now, 45)), None);
+        for (key, end) in [(1, OfferEnd::Delivered), (2, OfferEnd::Dropped)] {
+            n.note(key, 10, now);
+            let due = n.pop_open(at(now, 5), |_| 1).expect("due");
+            assert_eq!(n.offer_result(due, end, 1, at(now, 5)), None);
+        }
+        assert!(n.is_empty());
     }
 
     #[test]
@@ -785,14 +760,14 @@ mod notice_tests {
         n.note(1, 10, now);
         n.note(2, 11, now);
         let due = n.pop_open(at(now, 5), |_| 1).expect("due");
-        n.cut(due, 1, at(now, 5));
+        n.offer_result(due, OfferEnd::Cut, 1, at(now, 5));
         // After the block, one probe; a refusal releases the group.
         let due = n.pop_open(at(now, 20), |_| 1).expect("probe");
         assert!(n.blocked(&1, at(now, 20)).is_some());
         let other = 3 - due.key;
         let tries = due.tries;
         assert_eq!(
-            n.refused(due, &1, at(now, 20)),
+            n.offer_result(due, OfferEnd::Refused, 1, at(now, 20)),
             Some(at(now, 20) + NOTICE_DELAYS[tries + 1])
         );
         assert_eq!(n.blocked(&1, at(now, 20)), None);
@@ -802,7 +777,7 @@ mod notice_tests {
         n.note(3, 10, at(now, 20));
         n.note(4, 10, at(now, 20));
         let due = n.pop_open(at(now, 25), |_| 1).expect("due");
-        n.cut(due, 1, at(now, 25));
+        n.offer_result(due, OfferEnd::Cut, 1, at(now, 25));
         let _probe = n.pop_open(at(now, 40), |_| 1).expect("probe");
         assert_eq!(n.pop_open(at(now, 40), |_| 1), None);
         assert!(n.blocked(&1, at(now, 40)).is_some());
@@ -818,10 +793,10 @@ mod notice_tests {
         let mut t = at(now, 5);
         for _ in 0..NOTICE_TRIES - 1 {
             let due = n.pop_open(t, |_| 1).expect("due");
-            t = n.cut(due, 1, t).expect("next");
+            t = n.offer_result(due, OfferEnd::Cut, 1, t).expect("next");
         }
         let due = n.pop_open(t, |_| 1).expect("last");
-        assert_eq!(n.cut(due, 1, t), None);
+        assert_eq!(n.offer_result(due, OfferEnd::Cut, 1, t), None);
         assert!(n.is_empty());
         assert_eq!(n.blocked(&1, t), Some(t + NOTICE_DELAYS[NOTICE_TRIES - 1]));
     }
@@ -834,7 +809,7 @@ mod notice_tests {
             n.note(k, 10, now);
         }
         let due = n.pop_open(at(now, 5), |_| 1).expect("due");
-        n.cut(due, 1, at(now, 5));
+        n.offer_result(due, OfferEnd::Cut, 1, at(now, 5));
         assert_eq!(n.pop_open(at(now, 5), |_| 1), None);
         assert_eq!(n.len(), 4);
         // A renewed note wins over the deferral; a forgotten one is gone.
@@ -875,7 +850,9 @@ mod notice_tests {
         let due = n.pop_open(at(now, 4) + PROBE_HOLD, |_| 1).expect("due");
         assert_eq!(due.tries, 0);
         // A read failure does not shorten a cut's longer block.
-        let next = n.cut(due, 1, at(now, 15)).expect("next");
+        let next = n
+            .offer_result(due, OfferEnd::Cut, 1, at(now, 15))
+            .expect("next");
         n.observe(1, true, at(now, 16));
         assert_eq!(n.blocked(&1, at(now, 16)), Some(next));
     }
