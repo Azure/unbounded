@@ -15,8 +15,8 @@
     // Compatibility mode does a POSIX read into a bounce buffer and a copy on
     // the GPU helper thread. Racer's host read path does that work on I/O
     // threads instead, so cuFile must fail rather than fall back. The CUDA
-    // shim also turns this off at runtime unless CUFILE_ALLOW_COMPAT_MODE is
-    // set (gpu/native/gpu_cuda.c).
+    // shim also sets it at runtime: off, or on when CUFILE_ALLOW_COMPAT_MODE
+    // is true (cmd/racer-dataplane/gpu/native/gpu_cuda.c).
     "allow_compat_mode": false
   }
 }

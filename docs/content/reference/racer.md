@@ -1179,8 +1179,8 @@ cuFile fails instead of copying through host memory and Racer uses its own
 host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
 cuFile settings keep their built-in defaults. To use your own file, build an
 image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
-in `racer-dataplane-config`. `CUFILE_ALLOW_COMPAT_MODE` still turns
-compatibility mode back on.
+in `racer-dataplane-config`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
+turns compatibility mode back on.
 
 On nodes set up by the unbounded agent, the NVIDIA runtime is the default
 containerd runtime and runs in CDI mode, so `env` is enough there. These env

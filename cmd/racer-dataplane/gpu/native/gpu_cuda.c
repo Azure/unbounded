@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #ifdef RACER_GPU_PTX
@@ -673,13 +674,19 @@ int racer_gpu_file_open(uint32_t flags) {
         /* Without nvidia-fs or P2PDMA, cuFile's compatibility mode does a
          * POSIX read into a bounce buffer and a copy on this helper thread,
          * so every GPU job waits behind the disk. Racer's own host path does
-         * that work on I/O threads. Turn it off unless the operator chose a
-         * value with CUFILE_ALLOW_COMPAT_MODE; cuFileDriverOpen then fails
-         * without GPUDirect Storage and Racer uses its host path. */
+         * that work on I/O threads. Turn it off unless CUFILE_ALLOW_COMPAT_MODE
+         * is true, 1 or yes; then turn it on, since cufile.json turns it off.
+         * With it off, cuFileDriverOpen fails without GPUDirect Storage and
+         * Racer uses its host path. */
         cuFileSetParameterBool_fn set_bool =
             (cuFileSetParameterBool_fn)dlsym(table.lib, "cuFileSetParameterBool");
-        if (set_bool && !getenv("CUFILE_ALLOW_COMPAT_MODE"))
-            set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, false);
+        if (set_bool) {
+            const char *compat = getenv("CUFILE_ALLOW_COMPAT_MODE");
+            bool allow = compat && (!strcasecmp(compat, "true") ||
+                                    !strcmp(compat, "1") ||
+                                    !strcasecmp(compat, "yes"));
+            set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, allow);
+        }
         /* PCI P2PDMA (cuFile 1.13+) reads NVMe into GPU memory without
          * nvidia-fs. Only turn it on: leave cufile.json's value otherwise.
          * Without cuFileSetParameterBool, or if cuFile rejects the value,
