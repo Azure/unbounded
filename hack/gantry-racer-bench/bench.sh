@@ -36,13 +36,20 @@ origin_ips() {
 	kubectl -n "$NS" get pod -l app=origin -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
 }
 
-# origin_tx sums network egress over all origin replicas.
+# origin_tx sums network egress over all origin replicas. It fails if any
+# replica cannot be scraped, rather than printing a partial total. Callers use
+# command substitution, where errexit does not apply, so failures are explicit.
 origin_tx() {
-	local tools ip
-	tools=$(tools_pod)
+	local tools ip metrics=""
+	tools=$(tools_pod) || return 1
 	for ip in $(origin_ips); do
-		kubectl -n "$NS" exec "$tools" -- wget -qO- "http://$ip:5001/metrics"
-	done | awk '$1 == "process_network_transmit_bytes_total" {s += $2} END {printf "%.0f\n", s}'
+		if ! metrics+=$(kubectl -n "$NS" exec "$tools" -- wget -qO- "http://$ip:5001/metrics"); then
+			echo "origin metrics scrape failed for $ip" >&2
+			return 1
+		fi
+		metrics+=$'\n'
+	done
+	printf '%s' "$metrics" | awk '$1 == "process_network_transmit_bytes_total" {s += $2} END {printf "%.0f\n", s}'
 }
 
 tools_pod() {
@@ -458,8 +465,11 @@ EOF
 
 	mv "$results.tmp" "$results"
 	local tx1
-	tx1=$(origin_tx)
-	echo "ORIGIN_TX $((tx1 - tx0))" >>"$results"
+	if tx1=$(origin_tx); then
+		echo "ORIGIN_TX $((tx1 - tx0))" >>"$results"
+	else
+		echo "origin egress unavailable; omitting ORIGIN_TX" >&2
+	fi
 	late=$(awk -v s="$start_at" '$1 == "READY" && $3 > s' "$results" | wc -l)
 	echo "pods ready after start: $late" >&2
 	kubectl -n "$NS" delete ds "$name" --wait=false >/dev/null
