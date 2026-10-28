@@ -5456,3 +5456,104 @@ fn a_ping_is_answered_miss_at_once_without_a_body() {
     };
     assert!(crate::peer::protocol::request_head(&metadata).is_err());
 }
+
+/// An owner whose walk refreshed to a newer membership after a
+/// `StaleMembership` answer gets origin authority at its rank under the
+/// newer ranking. Its orphan notice (Known issue 37) and rank 0 failure hold
+/// (Known issue 52) must use that ranking, not the caller's: indexing the
+/// caller's owners with the new rank names another node (or none), and the
+/// bookkeeping was skipped or aimed at the wrong rank 0.
+#[test]
+fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    // (origin fails) -> notice noted, failure hold set on the new rank 0.
+    for fail in [false, true] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(1));
+        let local = node(peers.local);
+        let placement = Placement::new(16);
+        // A version 2 that ranks the page differently and still makes this
+        // node an owner after rank 0, at a rank naming another node in the
+        // version 1 order.
+        let (latest, next) = (1..64u32)
+            .flat_map(|seed| {
+                let members = f.membership.members().to_vec();
+                (0..members.len()).map(move |drop| (seed, drop, members.clone()))
+            })
+            .find_map(|(seed, drop, members)| {
+                let members: Vec<_> = members
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, m)| *i != drop || m.node == local)
+                    .map(|(i, mut m)| {
+                        m.shares = NonZeroU32::new(1 + (seed * (i as u32 + 3)) % 7).unwrap();
+                        m
+                    })
+                    .collect();
+                let latest = Arc::new(
+                    Membership::validate(racer_control_wire::MembershipVersion(2), members).ok()?,
+                );
+                let next = placement
+                    .rank(latest.clone(), &f.context.object, f.page.number)
+                    .ordered;
+                let rank = next.iter().position(|n| n == &local)?;
+                (rank > 0 && ordered.get(rank) != Some(&local) && next[0] != ordered[0])
+                    .then_some((latest, next))
+            })
+            .expect("a version 2 that reorders this page's owners");
+        let rank = next.iter().position(|n| n == &local).unwrap();
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            local.clone(),
+            Rc::new(Placement::new(16)),
+            peers.requester(),
+            deps.credentials.clone(),
+            crate::test_support::published_membership(latest.clone()),
+        ));
+        f.fill = Fill::new(deps);
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| true));
+        f.origin.fail_once.set(fail);
+        // Rank 0 under version 1 is behind; every version 2 predecessor
+        // misses, so this node fetches from origin at `rank`.
+        peers
+            .replies
+            .borrow_mut()
+            .push_back((ordered[0].clone(), Reply::Stale));
+        peers
+            .replies
+            .borrow_mut()
+            .extend(next[..rank].iter().map(|n| (n.clone(), Reply::Miss)));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
+        let result = acquire(&mut f, &mut budget);
+        assert_eq!(result.is_err(), fail, "{:?}", result.err());
+        assert_eq!(f.origin.calls.get(), 1);
+        assert_eq!(peers.calls.borrow().len(), 1 + rank);
+        let candidates = &f.fill.dependencies.candidates;
+        let now = uring_runtime::environment::now();
+        if fail {
+            assert!(candidates.notices.borrow().is_empty());
+            // The hold names the version 2 rank 0, not the version 1 one.
+            assert_eq!(
+                candidates
+                    .rank0_watch
+                    .borrow()
+                    .state(&f.page, &next[0], now),
+                racer_core::read::rank0::Rank0State::Failed
+            );
+            assert_ne!(
+                candidates
+                    .rank0_watch
+                    .borrow()
+                    .state(&f.page, &ordered[0], now),
+                racer_core::read::rank0::Rank0State::Failed
+            );
+        } else {
+            assert!(!candidates.notices.borrow().is_empty());
+        }
+    }
+}

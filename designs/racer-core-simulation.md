@@ -7079,3 +7079,16 @@ match wave 8 in every simulated result. The only changes are host timings and ac
 memory per node: `node_struct` +64 bytes, `memory_lru` +48 bytes, and `quotas` +32 bytes.
 These come from the larger index and quota structs, which now include the lane fields and
 PR #994's flow-control weight state. The rebase added no new Known issues.
+
+## Refreshed owner order for origin bookkeeping
+
+A walk that refreshes to a newer membership after a `StaleMembership` answer
+grants origin authority at this node's rank under the newer ranking, but the
+page fill indexed the caller's (older) owner list with that rank when noting an
+orphan notice (Known issue 37) and a rank 0 failure hold (Known issue 52). When
+the two rankings differ, the guard `owners[rank] == self` failed and the
+bookkeeping was skipped, or the hold named the old rank 0. `OriginAuthority`
+now carries the owners it was ranked under, and the fill uses them. The
+simulator already resets `fill.cands` with `fill.rank` on every walk, so it
+needed no change. Test:
+`refreshed_owner_order_keys_orphan_notice_and_failure_hold`.

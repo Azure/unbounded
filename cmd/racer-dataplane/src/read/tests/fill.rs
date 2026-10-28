@@ -3017,6 +3017,8 @@ pub(super) struct TestOrigin {
     pub(super) calls: Cell<usize>,
     pub(super) metadata: ObjectMetadata,
     pub(super) reject_once: Cell<bool>,
+    /// Fail the next page fetch with a retryable `Unavailable`.
+    pub(super) fail_once: Cell<bool>,
     pub(super) version_unavailable: Cell<bool>,
     pub(super) blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
     pub(super) started_pages: RefCell<Vec<u64>>,
@@ -3075,6 +3077,9 @@ impl Origin for TestOrigin {
             .await;
             if self.reject_once.replace(false) {
                 return Err(Error::OriginForbidden);
+            }
+            if self.fail_once.replace(false) {
+                return Err(Error::Unavailable);
             }
             if self.version_unavailable.get() {
                 return Err(Error::VersionUnavailable);
@@ -3387,6 +3392,7 @@ fn fixture_with_caches(
         calls: Cell::new(0),
         metadata,
         reject_once: Cell::new(false),
+        fail_once: Cell::new(false),
         version_unavailable: Cell::new(false),
         blocked_pages: RefCell::new(Default::default()),
         started_pages: RefCell::new(Vec::new()),

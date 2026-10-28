@@ -2233,10 +2233,12 @@ impl Fill {
                     Ok(origin) => {
                         source = Event::OriginFill;
                         // An owner after rank 0 holds a copy rank 0 may not
-                        // know of: offer it later (Known issue 37).
+                        // know of: offer it later (Known issue 37). The
+                        // authority's owners, not `candidates`: a walk that
+                        // refreshed its membership ranks under the newer one.
                         if self.dependencies.candidates.note_orphan(
                             page,
-                            &candidates.ordered,
+                            authority.owners(),
                             authority.rank(),
                             authority.predecessor_evidence(),
                         ) {
@@ -2285,7 +2287,7 @@ impl Fill {
                     Err(error) => {
                         self.dependencies.candidates.note_origin_failure(
                             page,
-                            &candidates.ordered,
+                            authority.owners(),
                             authority.rank(),
                             &error,
                         );

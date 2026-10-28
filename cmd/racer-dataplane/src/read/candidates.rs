@@ -71,6 +71,10 @@ pub struct OriginAuthority {
     membership: std::sync::Arc<crate::topology::Membership>,
     node: NodeId,
     object: ObjectId,
+    /// The page's ranked owners under `membership`, which `rank` indexes.
+    /// A walk that refreshed its membership grants authority under the
+    /// newer ranking, not the caller's.
+    owners: Vec<NodeId>,
     page: PageNumber,
     predecessor_evidence: Vec<ProbeOutcome>,
     rank: usize,
@@ -1674,6 +1678,7 @@ impl CandidatePolicy {
                         membership: candidates.membership,
                         node: self.node.clone(),
                         object: object.clone(),
+                        owners: candidates.ordered,
                         page,
                         predecessor_evidence: evidence,
                         rank,
@@ -2898,6 +2903,12 @@ impl OriginAuthority {
     /// The canonical rank this authority was granted at.
     pub(crate) fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// The page's ranked owners `rank` indexes: those of the membership the
+    /// walk ended under, which may be newer than the caller's.
+    pub(crate) fn owners(&self) -> &[NodeId] {
+        &self.owners
     }
 
     /// The predecessors' answers this authority rests on, in rank order.
@@ -4665,6 +4676,7 @@ pub(super) mod tests {
             membership,
             node: ranked.ordered[1].clone(),
             object: object(),
+            owners: ranked.ordered.clone(),
             page: PageNumber(0),
             predecessor_evidence: vec![ProbeOutcome::Unreachable],
             rank: 1,
