@@ -1178,61 +1178,6 @@ use racer_core::cache::Visit;
 type CiphertextEntries =
     racer_core::cache::OrderedLru<PageId, UnverifiedPage, std::hash::RandomState, ByCache>;
 
-/// Entries nobody inserted or hit for this long are released by
-/// [`MemoryCache::expire_idle`], so a worker that served a burst does not keep
-/// its cached pages (and their pooled buffers) forever. Busy workers keep hot
-/// pages because every hit renews them.
-pub(crate) const CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-/// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
-const CACHE_EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
-/// Upper bound of entries examined per class by one `expire_idle` call.
-pub(crate) const CACHE_EXPIRY_BATCH: usize = 32;
-
-/// Time-to-tick checkpoints and resumable expiry cursors. Between checkpoints
-/// with no pass in progress, `expire_idle` does constant work.
-#[derive(Default)]
-struct Expiry {
-    /// `(time, verified clock, unverified clock)`, oldest first. The front is
-    /// kept as the newest checkpoint at least `CACHE_IDLE_TTL` old.
-    checkpoints: std::collections::VecDeque<(std::time::Instant, u64, u64)>,
-    /// Last examined tick of an in-progress pass; `None` when no pass is due.
-    verified: Option<u64>,
-    ciphertext: Option<u64>,
-}
-impl Expiry {
-    /// Record a checkpoint at most once per interval and return the tick
-    /// cutoffs, if any checkpoint is at least `CACHE_IDLE_TTL` old.
-    fn advance(
-        &mut self,
-        now: std::time::Instant,
-        verified: u64,
-        ciphertext: u64,
-    ) -> Option<(u64, u64)> {
-        if self
-            .checkpoints
-            .back()
-            .is_none_or(|(at, _, _)| now.saturating_duration_since(*at) >= CACHE_EXPIRY_CHECKPOINT)
-        {
-            self.checkpoints.push_back((now, verified, ciphertext));
-            // Each new checkpoint may move the cutoff: start a fresh pass that
-            // also revisits entries that were busy last time. An unfinished
-            // pass keeps its cursor so a long busy prefix cannot starve later
-            // entries; it adopts the newer cutoff, which is safe because a
-            // touched entry moves to a tick above every aged checkpoint.
-            self.verified.get_or_insert(0);
-            self.ciphertext.get_or_insert(0);
-        }
-        let old = |at: &std::time::Instant| now.saturating_duration_since(*at) >= CACHE_IDLE_TTL;
-        while self.checkpoints.get(1).is_some_and(|(at, _, _)| old(at)) {
-            self.checkpoints.pop_front();
-        }
-        self.checkpoints
-            .front()
-            .filter(|(at, _, _)| old(at))
-            .map(|(_, verified, ciphertext)| (*verified, *ciphertext))
-    }
-}
-
 /// Worker-local original ciphertext, both authenticated (with a weak handle to
 /// any live plaintext) and not yet authenticated; independent of disk clock.
 /// Plaintext is never retained here: a local hit decrypts the cached ciphertext
@@ -1246,7 +1191,7 @@ pub struct MemoryCache {
     /// Last cache examined by a global reclaim's over-share window.
     pressure_cursor: RefCell<Option<CacheId>>,
     availability: Rc<crate::control::Availability>,
-    expiry: RefCell<Expiry>,
+    expiry: RefCell<racer_core::cache::Expiry>,
 }
 
 impl MemoryCache {
@@ -1267,7 +1212,7 @@ impl MemoryCache {
             ciphertext_cursor: RefCell::new(None),
             pressure_cursor: RefCell::new(None),
             availability,
-            expiry: RefCell::new(Expiry::default()),
+            expiry: RefCell::new(racer_core::cache::Expiry::default()),
         }
     }
     fn available(&self, page: &CachedPage) -> bool {
@@ -1553,9 +1498,9 @@ impl MemoryCache {
         }
         Ok(())
     }
-    /// Release entries not inserted or hit for at least `CACHE_IDLE_TTL`,
+    /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`,
     /// skipping any still referenced elsewhere (retried on the next pass).
-    /// Examines at most `CACHE_EXPIRY_BATCH` entries per class per call and
+    /// Examines at most `racer_core::cache::EXPIRY_BATCH` entries per class per call and
     /// returns the number of entries released. Freed buffers return to the
     /// pools, whose own maintenance decays them.
     pub(crate) fn expire_idle(&self, now: std::time::Instant) -> usize {
@@ -1570,7 +1515,8 @@ impl MemoryCache {
         let mut released = 0;
         if let Some(after) = expiry.verified {
             let mut entries = self.entries.borrow_mut();
-            let (selected, next) = entries.expiring(after, verified_cutoff, CACHE_EXPIRY_BATCH);
+            let (selected, next) =
+                entries.expiring(after, verified_cutoff, racer_core::cache::EXPIRY_BATCH);
             expiry.verified = next;
             for (_, id) in selected {
                 if idle(&entries.pages[&id].1) {
@@ -1581,7 +1527,8 @@ impl MemoryCache {
         }
         if let Some(after) = expiry.ciphertext {
             let mut entries = self.ciphertext_entries.borrow_mut();
-            let (selected, next) = entries.expiring(after, ciphertext_cutoff, CACHE_EXPIRY_BATCH);
+            let (selected, next) =
+                entries.expiring(after, ciphertext_cutoff, racer_core::cache::EXPIRY_BATCH);
             expiry.ciphertext = next;
             for (_, id) in selected {
                 if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
@@ -2626,7 +2573,7 @@ pub(crate) mod tests {
                 let mut at = std::time::Duration::ZERO;
                 while at <= until {
                     released += cache.expire_idle(start + at);
-                    at += CACHE_EXPIRY_CHECKPOINT;
+                    at += racer_core::cache::EXPIRY_CHECKPOINT;
                 }
                 released
             }
@@ -2644,19 +2591,29 @@ pub(crate) mod tests {
                 let cipher = publish_ciphertext(&cache, &admission, "cipher");
                 let touched = publish_ciphertext(&cache, &admission, "touched");
                 // Nothing is old enough yet.
-                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL / 2), 0);
+                assert_eq!(
+                    expire_through(&cache, start, racer_core::cache::IDLE_TTL / 2),
+                    0
+                );
                 // Hits halfway through renew both classes.
                 assert!(cache.ciphertext(&hot).unwrap().is_some());
                 assert!(cache.unverified(&touched).unwrap().is_some());
-                let half = start + CACHE_IDLE_TTL / 2;
-                assert_eq!(expire_through(&cache, half, CACHE_IDLE_TTL / 2), 2);
+                let half = start + racer_core::cache::IDLE_TTL / 2;
+                assert_eq!(
+                    expire_through(&cache, half, racer_core::cache::IDLE_TTL / 2),
+                    2
+                );
                 assert!(!cache.entries.borrow().pages.contains_key(&cold));
                 assert!(cache.entries.borrow().pages.contains_key(&hot));
                 assert!(!cache.ciphertext_entries.borrow().contains_key(&cipher));
                 assert!(cache.ciphertext_entries.borrow().contains_key(&touched));
                 // Without further hits the renewed entries expire one TTL later.
                 assert_eq!(
-                    expire_through(&cache, start + CACHE_IDLE_TTL, CACHE_IDLE_TTL),
+                    expire_through(
+                        &cache,
+                        start + racer_core::cache::IDLE_TTL,
+                        racer_core::cache::IDLE_TTL
+                    ),
                     2
                 );
                 assert_eq!(cache.entries.borrow().len(), 0);
@@ -2683,9 +2640,13 @@ pub(crate) mod tests {
                 assert!(cache.ciphertext_entries.borrow().is_empty());
                 assert_eq!(cache.entries.borrow().len(), 1);
                 // Still held externally, so not idle yet.
-                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                assert_eq!(
+                    expire_through(&cache, start, racer_core::cache::IDLE_TTL * 2),
+                    0
+                );
                 drop(copy);
-                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                let later =
+                    start + racer_core::cache::IDLE_TTL * 2 + racer_core::cache::EXPIRY_CHECKPOINT;
                 assert_eq!(cache.expire_idle(later), 1);
                 assert_eq!(cache.entries.borrow().len(), 0);
                 assert!(cache.ciphertext_entries.borrow().is_empty());
@@ -2720,12 +2681,16 @@ pub(crate) mod tests {
                     .copy
                     .ciphertext
                     .clone();
-                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                assert_eq!(
+                    expire_through(&cache, start, racer_core::cache::IDLE_TTL * 2),
+                    0
+                );
                 assert_eq!(cache.entries.borrow().len(), 1);
                 assert_eq!(cache.ciphertext_entries.borrow().len(), 1);
                 drop((held, held_cipher));
                 // The next checkpoint pass revisits and releases them.
-                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                let later =
+                    start + racer_core::cache::IDLE_TTL * 2 + racer_core::cache::EXPIRY_CHECKPOINT;
                 assert_eq!(cache.expire_idle(later), 2);
                 assert_eq!(cache.entries.borrow().len(), 0);
                 assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
@@ -2733,7 +2698,7 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_bounds_work_per_call() {
-                let count = CACHE_EXPIRY_BATCH * 2 + 3;
+                let count = racer_core::cache::EXPIRY_BATCH * 2 + 3;
                 let admission = admission(count * 2 + 8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
@@ -2745,9 +2710,15 @@ pub(crate) mod tests {
                 }
                 let start = std::time::Instant::now();
                 assert_eq!(cache.expire_idle(start), 0);
-                let expired = start + CACHE_IDLE_TTL;
-                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
-                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
+                let expired = start + racer_core::cache::IDLE_TTL;
+                assert_eq!(
+                    cache.expire_idle(expired),
+                    racer_core::cache::EXPIRY_BATCH * 2
+                );
+                assert_eq!(
+                    cache.expire_idle(expired),
+                    racer_core::cache::EXPIRY_BATCH * 2
+                );
                 assert_eq!(cache.expire_idle(expired), 6);
                 // The pass is finished: further calls in this interval do no work.
                 assert_eq!(cache.expire_idle(expired), 0);
@@ -2759,7 +2730,7 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_resumes_past_busy_prefix_across_checkpoints() {
-                let busy = CACHE_EXPIRY_BATCH + 1;
+                let busy = racer_core::cache::EXPIRY_BATCH + 1;
                 let idle = 3;
                 let admission = admission((busy + idle) * 2 + 8);
                 let cache = MemoryCache::new(
@@ -2787,8 +2758,11 @@ pub(crate) mod tests {
                 // One call per checkpoint: each call starts a new interval.
                 let mut released = 0;
                 for step in 0..4u32 {
-                    released +=
-                        cache.expire_idle(start + CACHE_IDLE_TTL + CACHE_EXPIRY_CHECKPOINT * step);
+                    released += cache.expire_idle(
+                        start
+                            + racer_core::cache::IDLE_TTL
+                            + racer_core::cache::EXPIRY_CHECKPOINT * step,
+                    );
                 }
                 assert_eq!(released, idle * 2);
                 assert_eq!(cache.entries.borrow().len(), busy);
@@ -2804,13 +2778,15 @@ pub(crate) mod tests {
                     crate::test_support::availability(),
                 );
                 let start = std::time::Instant::now();
-                expire_through(&cache, start, CACHE_IDLE_TTL * 10);
+                expire_through(&cache, start, racer_core::cache::IDLE_TTL * 10);
                 // Calls within one interval do not add checkpoints.
                 for _ in 0..10 {
-                    cache.expire_idle(start + CACHE_IDLE_TTL * 10);
+                    cache.expire_idle(start + racer_core::cache::IDLE_TTL * 10);
                 }
-                let limit =
-                    (CACHE_IDLE_TTL.as_secs() / CACHE_EXPIRY_CHECKPOINT.as_secs()) as usize + 2;
+                let limit = (racer_core::cache::IDLE_TTL.as_secs()
+                    / racer_core::cache::EXPIRY_CHECKPOINT.as_secs())
+                    as usize
+                    + 2;
                 assert!(cache.expiry.borrow().checkpoints.len() <= limit);
             }
 
@@ -3137,7 +3113,7 @@ pub(crate) mod tests {
             let start = std::time::Instant::now();
             assert_eq!(cache.expire_idle(start), 0);
             // Held plaintext is the reader's; it does not pin the entry.
-            assert_eq!(cache.expire_idle(start + CACHE_IDLE_TTL), 1);
+            assert_eq!(cache.expire_idle(start + racer_core::cache::IDLE_TTL), 1);
             assert!(cache.ciphertext(&id).unwrap().is_none());
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
             assert_eq!(held.bytes(), &[1; 3]);

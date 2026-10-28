@@ -409,6 +409,61 @@ impl<K: Ord + Eq + Hash + Clone, V, H: BuildHasher, G: Grouping<K>> OrderedLru<K
     }
 }
 
+/// Entries nobody inserted or hit for this long are released by
+/// the dataplane memory cache, so a worker that served a burst does not keep
+/// its cached pages (and their pooled buffers) forever. Busy workers keep hot
+/// pages because every hit renews them.
+pub const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
+pub const EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound of entries examined per class by one idle expiry call.
+pub const EXPIRY_BATCH: usize = 32;
+
+/// Time-to-tick checkpoints and resumable expiry cursors. Between checkpoints
+/// with no pass in progress, idle expiry does constant work.
+#[derive(Default)]
+pub struct Expiry {
+    /// `(time, verified clock, unverified clock)`, oldest first. The front is
+    /// kept as the newest checkpoint at least `IDLE_TTL` old.
+    pub checkpoints: std::collections::VecDeque<(std::time::Instant, u64, u64)>,
+    /// Last examined tick of an in-progress pass; `None` when no pass is due.
+    pub verified: Option<u64>,
+    pub ciphertext: Option<u64>,
+}
+impl Expiry {
+    /// Record a checkpoint at most once per interval and return the tick
+    /// cutoffs, if any checkpoint is at least `IDLE_TTL` old.
+    pub fn advance(
+        &mut self,
+        now: std::time::Instant,
+        verified: u64,
+        ciphertext: u64,
+    ) -> Option<(u64, u64)> {
+        if self
+            .checkpoints
+            .back()
+            .is_none_or(|(at, _, _)| now.saturating_duration_since(*at) >= EXPIRY_CHECKPOINT)
+        {
+            self.checkpoints.push_back((now, verified, ciphertext));
+            // Each new checkpoint may move the cutoff: start a fresh pass that
+            // also revisits entries that were busy last time. An unfinished
+            // pass keeps its cursor so a long busy prefix cannot starve later
+            // entries; it adopts the newer cutoff, which is safe because a
+            // touched entry moves to a tick above every aged checkpoint.
+            self.verified.get_or_insert(0);
+            self.ciphertext.get_or_insert(0);
+        }
+        let old = |at: &std::time::Instant| now.saturating_duration_since(*at) >= IDLE_TTL;
+        while self.checkpoints.get(1).is_some_and(|(at, _, _)| old(at)) {
+            self.checkpoints.pop_front();
+        }
+        self.checkpoints
+            .front()
+            .filter(|(at, _, _)| old(at))
+            .map(|(_, verified, ciphertext)| (*verified, *ciphertext))
+    }
+}
+
 #[cfg(test)]
 mod lru_tests {
     use super::*;
