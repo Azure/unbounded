@@ -1421,21 +1421,12 @@ fn lineage_targets_are_later_owners_that_arrived_earlier() {
 
 #[test]
 fn merge_handoff_keeps_lineage_targets_first_without_duplicates() {
-    assert_eq!(
-        merge_handoff(vec!["x"], vec!["b", "x", "c"]),
-        vec!["b", "x", "c"]
-    );
-    assert_eq!(
-        merge_handoff(vec!["x", "y", "z"], vec!["b"]),
-        vec!["b", "x", "y"]
-    );
-    assert_eq!(merge_handoff(Vec::<&str>::new(), vec!["b"]), vec!["b"]);
-    assert_eq!(merge_handoff(vec!["x", "y"], Vec::new()), vec!["x", "y"]);
-    assert_eq!(
-        merge_handoff(vec!["x", "y"], vec!["b", "c"]),
-        vec!["b", "c", "x"]
-    );
-    assert!(merge_handoff(Vec::<&str>::new(), Vec::new()).is_empty());
+    assert_eq!(merge_handoff(&["x"], &["b", "x", "c"]), vec!["b", "x", "c"]);
+    assert_eq!(merge_handoff(&["x", "y", "z"], &["b"]), vec!["b", "x", "y"]);
+    assert_eq!(merge_handoff::<&str>(&[], &["b"]), vec!["b"]);
+    assert_eq!(merge_handoff(&["x", "y"], &[]), vec!["x", "y"]);
+    assert_eq!(merge_handoff(&["x", "y"], &["b", "c"]), vec!["b", "c", "x"]);
+    assert!(merge_handoff::<&str>(&[], &[]).is_empty());
 }
 
 /// Known issue 25: a delegation to rank 0 forwards spare credits for rank 0's
@@ -1726,44 +1717,59 @@ fn demoted_targets_are_members_that_were_owners_when_they_arrived() {
     let since = [Some(5), Some(6), Some(7)];
     let demoted = ["d3", "d4"];
     assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 0),
+        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 0, None),
         ["d3", "d4"]
     );
     // Rank 2 is the newest owner: same targets.
     assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 2),
+        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 2, None),
         ["d3", "d4"]
     );
     // An owner that arrived before a demoted member never displaced it.
     assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(5), Some(1)], 0),
+        demoted_targets(&since, &demoted, &[Some(5), Some(1)], 0, None),
         ["d4"]
     );
     // Three members ranked above d4 were present when it arrived (owners 1
     // and 2 at generation 2, d3 at 0): d4 never was an owner.
     let since = [Some(9), Some(2), Some(2)];
     assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(0), Some(3)], 0),
+        demoted_targets(&since, &demoted, &[Some(0), Some(3)], 0, None),
         ["d3"]
     );
     // Unknown arrivals never add a target and count as present above.
     assert!(
-        demoted_targets(&[None, Some(1), Some(1)], &demoted, &[Some(0), Some(0)], 0).is_empty()
+        demoted_targets(
+            &[None, Some(1), Some(1)],
+            &demoted,
+            &[Some(0), Some(0)],
+            0,
+            None
+        )
+        .is_empty()
     );
     assert_eq!(
-        demoted_targets(&[Some(9), None, None], &demoted, &[Some(0), None], 0),
+        demoted_targets(&[Some(9), None, None], &demoted, &[Some(0), None], 0, None),
         ["d3"]
     );
     assert_eq!(
-        demoted_targets(&[Some(9), None, None], &demoted, &[Some(0), Some(0)], 0),
+        demoted_targets(
+            &[Some(9), None, None],
+            &demoted,
+            &[Some(0), Some(0)],
+            0,
+            None
+        ),
         ["d3"],
         "d4 had three members above it"
     );
     // A cluster whose members arrived together pays nothing.
-    assert!(demoted_targets(&[Some(0); 3], &demoted, &[Some(0); 2], 0).is_empty());
+    assert!(demoted_targets(&[Some(0); 3], &demoted, &[Some(0); 2], 0, None).is_empty());
     // No demoted members or an unknown own arrival: nothing.
-    assert!(demoted_targets::<&str>(&[Some(3); 3], &[], &[], 0).is_empty());
-    assert!(demoted_targets(&[None, Some(3), Some(3)], &demoted, &[Some(0); 2], 0).is_empty());
+    assert!(demoted_targets::<&str>(&[Some(3); 3], &[], &[], 0, None).is_empty());
+    assert!(
+        demoted_targets(&[None, Some(3), Some(3)], &demoted, &[Some(0); 2], 0, None).is_empty()
+    );
 }
 
 #[test]
@@ -1771,7 +1777,7 @@ fn granted_prefix_counts_leading_successor_and_lineage_targets() {
     assert_eq!(granted_prefix(&["s", "l", "p"], &["s", "l"]), 2);
     assert_eq!(granted_prefix(&["p", "l"], &["l"]), 0);
     assert_eq!(granted_prefix::<&str>(&[], &["l"]), 0);
-    let handoff = merge_handoff(vec!["p1", "p2"], vec!["l1", "d3"]);
+    let handoff = merge_handoff(&["p1", "p2"], &["l1", "d3"]);
     assert_eq!(handoff, ["l1", "d3", "p1"]);
     assert_eq!(granted_prefix(&handoff, &["l1", "d3"]), 2);
 }
@@ -2008,7 +2014,7 @@ fn lineage_targets_go_past_three_and_version_one_targets_do_not() {
     // d3 at 0 (none above), d4 at 1 (d3), d5 at 2 (d3, d4); d6 at 3 has
     // d3, d4, d5 above: never an owner, and so on for the rest.
     assert_eq!(
-        demoted_targets(&since, &demoted, &demoted_since, 0),
+        demoted_targets(&since, &demoted, &demoted_since, 0, None),
         [3, 4, 5]
     );
     // Arrivals in reverse: each deeper member arrived first, so every one
@@ -2022,15 +2028,15 @@ fn lineage_targets_go_past_three_and_version_one_targets_do_not() {
         Some(1),
         Some(0),
     ];
-    let targets = demoted_targets(&since, &demoted, &reverse, 0);
+    let targets = demoted_targets(&since, &demoted, &reverse, 0, None);
     assert_eq!(targets.len(), MAX_LINEAGE);
-    assert_eq!(targets, demoted[..MAX_LINEAGE]);
+    assert_eq!(*targets, demoted[..MAX_LINEAGE]);
     // Lineage up to `MAX_LINEAGE`, then no version - 1 target.
-    let handoff = merge_handoff(vec![90, 91], targets.clone());
-    assert_eq!(handoff, targets);
+    let handoff = merge_handoff(&[90, 91], &targets);
+    assert_eq!(*handoff, *targets);
     // Fewer lineage targets than `MAX_HANDOFF`: version - 1 fills to it.
-    assert_eq!(merge_handoff(vec![90, 91], vec![3]), [3, 90, 91]);
-    assert_eq!(merge_handoff(vec![90, 91], vec![3, 4, 5, 6]), [3, 4, 5, 6]);
+    assert_eq!(merge_handoff(&[90, 91], &[3]), [3, 90, 91]);
+    assert_eq!(merge_handoff(&[90, 91], &[3, 4, 5, 6]), [3, 4, 5, 6]);
 }
 
 /// Known issue 45: granted probes go out at once, each on its own grant and
@@ -2125,26 +2131,29 @@ fn unknown_age_demoted_members_are_targets_when_the_owner_arrived_later() {
     let demoted_since = [Some(5); 9];
     // The arrival rule: owners 1 and 2 and every demoted member above
     // arrived "together": only the first demoted member qualifies.
-    assert_eq!(demoted_targets(&since, &demoted, &demoted_since, 0), [3]);
+    assert_eq!(
+        demoted_targets(&since, &demoted, &demoted_since, 0, None),
+        [3]
+    );
     // Unknown age: all qualify, best ranked first, at most `MAX_LINEAGE`.
-    let targets = demoted_targets_from(&since, &demoted, &demoted_since, 0, Some(5));
-    assert_eq!(targets, demoted[..MAX_LINEAGE]);
+    let targets = demoted_targets(&since, &demoted, &demoted_since, 0, Some(5));
+    assert_eq!(*targets, demoted[..MAX_LINEAGE]);
     // A known arrival keeps the arrival rule; the chain start must match.
     let mixed = [Some(6), Some(6), Some(6), Some(5), Some(5)];
     assert_eq!(
-        demoted_targets_from(&since, &demoted[..5], &mixed, 0, Some(5)),
+        demoted_targets(&since, &demoted[..5], &mixed, 0, Some(5)),
         [3, 6, 7]
     );
     assert_eq!(
-        demoted_targets_from(&since, &demoted, &demoted_since, 0, Some(4)),
+        demoted_targets(&since, &demoted, &demoted_since, 0, Some(4)),
         [3]
     );
     // An owner that is itself as old as the chain knows of no one it
     // displaced: no targets.
     let old = [Some(5), Some(5), Some(5)];
-    assert!(demoted_targets_from(&old, &demoted, &demoted_since, 0, Some(5)).is_empty());
+    assert!(demoted_targets(&old, &demoted, &demoted_since, 0, Some(5)).is_empty());
     // Rank 1 arrived at the chain start: nothing either.
-    assert!(demoted_targets_from(&since, &demoted, &demoted_since, 1, Some(5)).is_empty());
+    assert!(demoted_targets(&since, &demoted, &demoted_since, 1, Some(5)).is_empty());
 }
 
 /// Known issue 42 (round 4, hang2): an `Overloaded` signed by a relay on an
@@ -2622,4 +2631,479 @@ fn a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority() {
             }
         }
     }
+}
+
+// ---- Fill: the acquisition as one state machine ----
+
+fn fill(hedge: bool, features: Features) -> Fill {
+    Fill::new(FillConfig {
+        operation: OperationKind::Page,
+        hedge,
+        walk_only: false,
+        scope: Instant::now() + Duration::from_secs(60),
+        features,
+    })
+}
+
+/// Owners 10, 11, 12 under membership `version`, ranked at `rank`.
+fn owners(version: u64, rank: Option<usize>) -> Ranked {
+    Ranked {
+        members: 3,
+        ..Ranked::new(version, &[10, 11, 12], rank)
+    }
+}
+
+fn answer(kind: ResponseKind) -> Event<'static> {
+    Event::Reply(Reply::Answer { kind, signed: true })
+}
+
+/// Feed `events` in order; return every action and the merged notes.
+fn script(
+    fill: &mut Fill,
+    budget: &mut AcquisitionBudget,
+    events: Vec<Event<'_>>,
+) -> (Vec<Action>, u16) {
+    let now = Instant::now();
+    let (mut actions, mut notes) = (Vec::new(), 0);
+    for event in events {
+        let (action, evidence) = fill.on(event, budget, now);
+        notes |= evidence.notes;
+        actions.push(action);
+    }
+    (actions, notes)
+}
+
+#[test]
+fn fill_plan_local_hit_hedge_and_walk() {
+    let mut b = budget(8, 16);
+    // A local hit finishes at once.
+    let (actions, _) = script(
+        &mut fill(true, Features::PRODUCTION),
+        &mut b,
+        vec![Event::Start { local_hit: true }],
+    );
+    assert_eq!(actions, [Action::Done(Ok(Source::Local))]);
+    // A plaintext fill offers a hedge before the walk; a winner is published.
+    let (actions, _) = script(
+        &mut fill(true, Features::PRODUCTION),
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, None))),
+            Event::Hedge(HedgeEnd::Won),
+            Event::Published(Ok(())),
+        ],
+    );
+    assert_eq!(
+        actions[0],
+        Action::Rank {
+            ranking: Ranking::Current,
+            version: None
+        }
+    );
+    assert!(matches!(
+        actions[1],
+        Action::Hedge {
+            eligible: true,
+            first: 0,
+            second: 1
+        }
+    ));
+    assert_eq!(actions[2], Action::Publish(Source::Hedge));
+    assert_eq!(actions[3], Action::Done(Ok(Source::Hedge)));
+    // A ciphertext fill walks at once.
+    let (actions, _) = script(
+        &mut fill(false, Features::PRODUCTION),
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, None))),
+        ],
+    );
+    assert!(matches!(actions[1], Action::Probe(p) if p.canonical == 0));
+}
+
+/// An owner at `rank` of 10, 11, 12 under version 5, through its
+/// previous-membership ranking and hints, to its first walk action.
+fn owner_walk(f: &mut Fill, b: &mut AcquisitionBudget, rank: usize) -> Action {
+    let (actions, _) = script(
+        f,
+        b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, Some(rank)))),
+            Event::Ranked(Err(Error::Unavailable)),
+            Event::Hints {
+                hints: &[],
+                rank0: Rank0State::Unknown,
+            },
+        ],
+    );
+    assert_eq!(
+        actions[1],
+        Action::Rank {
+            ranking: Ranking::Previous,
+            version: Some(4)
+        }
+    );
+    assert_eq!(actions[2], Action::Hints);
+    actions[3]
+}
+
+#[test]
+fn fill_origin_then_publish_or_fail() {
+    for (origin, published, end) in [
+        (Ok(()), Ok(()), Ok(Source::Origin)),
+        (Ok(()), Err(Error::Overloaded), Err(Error::Overloaded)),
+        (
+            Err(Error::OriginForbidden),
+            Ok(()),
+            Err(Error::OriginForbidden),
+        ),
+    ] {
+        let mut f = fill(false, Features::PRODUCTION);
+        let mut b = budget(8, 16);
+        // Rank 0 has no predecessor: origin authority at once, after
+        // ranking again.
+        assert_eq!(
+            owner_walk(&mut f, &mut b, 0),
+            Action::Rank {
+                ranking: Ranking::Authority,
+                version: Some(5)
+            }
+        );
+        let (actions, _) = script(
+            &mut f,
+            &mut b,
+            vec![Event::Ranked(Ok(owners(5, Some(0)))), Event::Origin(origin)],
+        );
+        assert_eq!(actions[0], Action::Origin { rank: 0 });
+        if origin.is_err() {
+            assert_eq!(actions[1], Action::Done(end));
+            continue;
+        }
+        assert_eq!(actions[1], Action::Publish(Source::Origin));
+        let (actions, _) = script(&mut f, &mut b, vec![Event::Published(published)]);
+        assert_eq!(actions[0], Action::Done(end));
+    }
+    // A ranking that changed before origin gives no authority.
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 16);
+    owner_walk(&mut f, &mut b, 0);
+    let (actions, _) = script(
+        &mut f,
+        &mut b,
+        vec![Event::Ranked(Ok(Ranked::new(5, &[11, 10, 12], Some(1))))],
+    );
+    assert_eq!(actions[0], Action::Done(Err(Error::IncompatibleMembership)));
+}
+
+#[test]
+#[should_panic(expected = "out of order")]
+fn fill_origin_without_a_request_panics() {
+    fill(false, Features::PRODUCTION).on(Event::Origin(Ok(())), &mut budget(8, 16), Instant::now());
+}
+
+#[test]
+fn fill_version_miss_probes_remaining_copies_then_classifies() {
+    // Rank 1 delegates to rank 0 (`delegated`); `rank0` is what that probe
+    // ends with, the remaining copy-only probe of rank 2 ends with `last`.
+    let unreachable = Event::Reply(Reply::Failed {
+        error: Error::Unavailable,
+        sent: true,
+        scope_live: true,
+    });
+    for (rank0, last, end) in [
+        (
+            unreachable,
+            Some(answer(ResponseKind::Page)),
+            Ok(Source::Peer),
+        ),
+        (
+            unreachable,
+            Some(answer(ResponseKind::Miss)),
+            Err(Error::Unavailable),
+        ),
+        (unreachable, Some(unreachable), Err(Error::Unavailable)),
+        (unreachable, None, Err(Error::Cancelled)),
+        (
+            answer(ResponseKind::Miss),
+            Some(answer(ResponseKind::Miss)),
+            Err(Error::VersionUnavailable),
+        ),
+    ] {
+        let mut f = fill(false, Features::PRODUCTION);
+        let mut b = budget(8, 16);
+        assert!(matches!(owner_walk(&mut f, &mut b, 1), Action::Probe(p) if p.canonical == 0));
+        let (actions, _) = script(&mut f, &mut b, vec![rank0]);
+        assert_eq!(
+            actions[0],
+            Action::Rank {
+                ranking: Ranking::Authority,
+                version: Some(5)
+            }
+        );
+        let (actions, notes) = script(
+            &mut f,
+            &mut b,
+            vec![
+                Event::Ranked(Ok(owners(5, Some(1)))),
+                Event::Origin(Err(Error::VersionUnavailable)),
+            ],
+        );
+        assert_eq!(actions[0], Action::Origin { rank: 1 });
+        assert!(
+            matches!(actions[1], Action::Probe(p) if p.canonical == 2 && p.mode == Mode::CopyOnly)
+        );
+        assert_ne!(notes & Notes::REMAINING, 0);
+        let mut events = vec![last.unwrap_or(Event::Abort(Error::Cancelled))];
+        if matches!(
+            last,
+            Some(Event::Reply(Reply::Answer {
+                kind: ResponseKind::Page,
+                ..
+            }))
+        ) {
+            events.push(Event::Validated(Ok(None)));
+            events.push(Event::Published(Ok(())));
+        }
+        let (actions, _) = script(&mut f, &mut b, events);
+        assert_eq!(*actions.last().unwrap(), Action::Done(end));
+    }
+}
+
+#[test]
+fn fill_walk_failures() {
+    // Every owner of a reader unreachable: the walk is exhausted.
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 16);
+    let unreachable = Event::Reply(Reply::Failed {
+        error: Error::Io,
+        sent: true,
+        scope_live: true,
+    });
+    let (actions, notes) = script(
+        &mut f,
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, None))),
+            unreachable,
+            unreachable,
+            unreachable,
+        ],
+    );
+    assert_eq!(actions[4], Action::Done(Err(Error::Unavailable)));
+    assert_ne!(notes & Notes::EXHAUSTED, 0);
+    // An empty ranking, and a terminal transport error.
+    let (actions, _) = script(
+        &mut fill(false, Features::PRODUCTION),
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(Ranked::new(5, &[], None))),
+        ],
+    );
+    assert_eq!(actions[1], Action::Done(Err(Error::Unavailable)));
+    let (actions, _) = script(
+        &mut fill(false, Features::PRODUCTION),
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, None))),
+            Event::Reply(Reply::Failed {
+                error: Error::Unauthorized,
+                sent: true,
+                scope_live: true,
+            }),
+        ],
+    );
+    assert_eq!(actions[2], Action::Done(Err(Error::Unauthorized)));
+}
+
+/// A reader's first probe answered `StaleMembership`, with `latest` the
+/// newest membership and `previous_recent_member` the fallback's facts.
+fn stale(features: Features, latest: u64, previous_recent_member: bool) -> (Fill, Action, u16) {
+    let mut f = fill(false, features);
+    let mut b = budget(8, 16);
+    let (actions, notes) = script(
+        &mut f,
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, None))),
+            answer(ResponseKind::StaleMembership),
+            Event::Membership {
+                latest: Some(latest),
+                previous_recent_member,
+            },
+        ],
+    );
+    assert_eq!(actions[2], Action::Refresh);
+    (f, actions[3], notes)
+}
+
+#[test]
+fn fill_stale_membership_refreshes_falls_back_waits_or_skips() {
+    // A newer membership: rank under it.
+    let (_, action, notes) = stale(Features::PRODUCTION, 6, false);
+    assert_eq!(
+        action,
+        Action::Rank {
+            ranking: Ranking::Current,
+            version: Some(6)
+        }
+    );
+    assert_ne!(notes & Notes::REFRESH, 0);
+    // Behind, and a recent member of version - 1: rank the page there.
+    let (mut f, action, _) = stale(Features::PRODUCTION, 5, true);
+    assert_eq!(
+        action,
+        Action::Rank {
+            ranking: Ranking::Fallback,
+            version: Some(4)
+        }
+    );
+    let (actions, notes) = script(
+        &mut f,
+        &mut budget(8, 16),
+        vec![Event::Ranked(Ok(owners(4, None)))],
+    );
+    assert!(matches!(actions[0], Action::Probe(_)));
+    assert_eq!(f.version(), 4);
+    assert_ne!(notes & Notes::FALLBACK, 0);
+    // This node owns the page under version - 1: no fallback; it waits.
+    let (mut f, _, _) = stale(Features::PRODUCTION, 5, true);
+    let (actions, notes) = script(
+        &mut f,
+        &mut budget(8, 16),
+        vec![Event::Ranked(Ok(owners(4, Some(2)))), Event::Timer],
+    );
+    assert!(matches!(actions[0], Action::Wait(_)));
+    assert_ne!(notes & (Notes::FALLBACK_DENIED | Notes::WAIT_DENIED), 0);
+    assert!(matches!(actions[1], Action::Probe(p) if p.canonical == 0));
+    assert_eq!(f.waits(), 1);
+    // Not a member of version - 1: wait, and without waits skip.
+    let (_, action, _) = stale(Features::PRODUCTION, 5, false);
+    assert!(matches!(action, Action::Wait(_)));
+    let (_, action, notes) = stale(
+        Features::PRODUCTION.with(Features::STALE_WAIT, false),
+        5,
+        false,
+    );
+    assert!(matches!(action, Action::Probe(p) if p.canonical == 1));
+    assert_ne!(notes & (Notes::STALE_SKIP | Notes::FALLBACK_BLOCKED), 0);
+}
+
+#[test]
+fn fill_remaining_stale_answer_is_terminal_in_production() {
+    for (features, refresh) in [
+        (Features::PRODUCTION, false),
+        (
+            Features::PRODUCTION.with(Features::SIM_REMAINING_STALE, true),
+            true,
+        ),
+    ] {
+        let mut f = fill(false, features);
+        let mut b = budget(8, 16);
+        owner_walk(&mut f, &mut b, 0);
+        let (actions, _) = script(
+            &mut f,
+            &mut b,
+            vec![
+                Event::Ranked(Ok(owners(5, Some(0)))),
+                Event::Origin(Err(Error::VersionUnavailable)),
+                answer(ResponseKind::StaleMembership),
+            ],
+        );
+        assert_eq!(
+            actions[2],
+            if refresh {
+                Action::Refresh
+            } else {
+                Action::Done(Err(Error::IncompatibleMembership))
+            }
+        );
+    }
+}
+
+#[test]
+fn fill_evidence_names_shed_timeouts_and_rank_zero() {
+    let now = Instant::now();
+    // A reader's probe of rank 0 that times out asks a ping.
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 16);
+    script(
+        &mut f,
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, None))),
+        ],
+    );
+    let (_, evidence) = f.on(Event::Reply(Reply::TimedOut), &mut b, now);
+    assert_eq!(
+        evidence.silence,
+        Some(SilenceNote::TimedOut {
+            needed: crate::liveness::RANK0_TIMEOUTS
+        })
+    );
+    // The next owner sheds the reader itself: busy, not hung.
+    let (action, evidence) = f.on(answer(ResponseKind::Overloaded), &mut b, now);
+    assert_eq!(evidence.silence, Some(SilenceNote::Shed));
+    assert_eq!(evidence.outcome, Some(Ok(Outcome::Shed)));
+    assert!(matches!(action, Action::Probe(p) if p.canonical == 2));
+    // A relay's `Overloaded` is no silence evidence.
+    let (_, evidence) = f.on(
+        Event::Reply(Reply::Answer {
+            kind: ResponseKind::Overloaded,
+            signed: false,
+        }),
+        &mut b,
+        now,
+    );
+    assert_eq!(evidence.silence, None);
+    assert_eq!(
+        evidence.outcome,
+        Some(Ok(Outcome::Probe(ProbeOutcome::Overloaded)))
+    );
+    // Rank 0 answers an owner's delegation that its own acquisition failed.
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 16);
+    owner_walk(&mut f, &mut b, 1);
+    let (_, evidence) = f.on(answer(ResponseKind::Unavailable), &mut b, now);
+    assert!(evidence.rank0_probe);
+    assert_eq!(evidence.outcome, Some(Ok(Outcome::Failed)));
+    assert_eq!(evidence.rank0, Some(Rank0Note::Failed));
+}
+
+#[test]
+fn fill_successor_hints_become_a_granted_batch() {
+    let mut f = fill(false, Features::PRODUCTION);
+    let mut b = budget(8, 16);
+    let (actions, _) = script(
+        &mut f,
+        &mut b,
+        vec![
+            Event::Start { local_hit: false },
+            Event::Ranked(Ok(owners(5, Some(0)))),
+            Event::Ranked(Err(Error::Unavailable)),
+            Event::Hints {
+                hints: &[12, 99],
+                rank0: Rank0State::Unknown,
+            },
+            Event::BatchDone { copy: true },
+        ],
+    );
+    assert_eq!(
+        actions[3],
+        Action::Batch {
+            first: 0,
+            count: 1,
+            remaining_opportunities: 2 + SUCCESSOR_SHARE_DIVISOR,
+        }
+    );
+    assert_eq!(f.handoff(), [12]);
+    assert_eq!(f.target_kind(0), TargetKind::Successor);
+    assert_eq!(actions[4], Action::Publish(Source::Peer));
 }

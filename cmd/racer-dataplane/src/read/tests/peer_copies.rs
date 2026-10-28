@@ -1126,17 +1126,23 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             page: f.page.clone(),
             mode: FetchMode::Acquire,
         };
+        // racer-core finds five attempts and nine links too few to hedge
+        // (`walk::tests::hedge_rules`).
+        let eligible = reason != "credits";
         let result = futures::executor::block_on(f.fill.dependencies.candidates.hedge_page(
             &candidates,
+            (0, 1, eligible),
             &f.context,
             &operation,
             &f.scope,
             &mut budget,
             admission,
-            &mut crate::read::candidates::HedgeContinuation::default(),
             |_, _| Box::pin(async { panic!("suppressed hedge validation") }),
         ));
-        assert!(matches!(result, Ok(None)));
+        assert!(matches!(
+            result,
+            Ok((None, racer_core::read::walk::HedgeEnd::NotStarted))
+        ));
         assert_eq!(
             before,
             (
@@ -2050,17 +2056,16 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         mode: FetchMode::Acquire,
     };
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
-    let mut continuation = crate::read::candidates::HedgeContinuation::default();
     let scopes = RefCell::new(Vec::<RequestScope>::new());
     let primary_canceled = Cell::new(false);
     let mut pair = Box::pin(f.fill.dependencies.candidates.hedge_page(
         &candidates,
+        (0, 1, true),
         &f.context,
         &operation,
         &f.scope,
         &mut budget,
         &f.fill.dependencies.admission,
-        &mut continuation,
         |response, child| {
             let first = scopes.borrow().is_empty();
             scopes.borrow_mut().push(child.clone());
@@ -2105,7 +2110,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
     f.crypto.poll_budgeted(8).unwrap();
     assert!(matches!(
         pair.as_mut().poll(&mut cx),
-        Poll::Ready(Ok(Some(page))) if page.plaintext.bytes() == [2]
+        Poll::Ready(Ok((Some(page), _))) if page.plaintext.bytes() == [2]
     ));
     assert!(primary_canceled.get());
     assert_eq!(f.crypto.outstanding(), 0);
@@ -4235,8 +4240,13 @@ fn owner_with_handoff_targets_delegates_with_spare_credits() {
         let previous = placement
             .rank(old.clone(), &f.context.object, f.page.number)
             .ordered;
-        let handoff = racer_core::read::walk::handoff_targets(&previous, &ordered, 1);
-        assert!(!handoff.is_empty());
+        // The owner set changed, and a previous owner is neither this node
+        // nor its predecessor: it is a handoff target.
+        assert!(
+            previous
+                .iter()
+                .any(|n| !ordered.contains(n) && n != &ordered[0] && n != &ordered[1])
+        );
         let mut deps = f.fill.dependencies.clone();
         deps.candidates = Rc::new(CandidatePolicy::new(
             ordered[1].clone(),

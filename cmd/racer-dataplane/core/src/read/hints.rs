@@ -1235,12 +1235,16 @@ pub fn defer_allowed(acquiring: bool) -> bool {
 /// that rank 0, holding the single credit of a delegation, never sends: in
 /// 5k `full-failover` most rank 0 refetches of a holder rank 0 had noted were
 /// such lineage targets (Known issue 37).
-pub fn successor_targets<N: PartialEq + Clone>(hints: &[N], owners: &[N], rank: usize) -> Vec<N> {
-    let mut out: Vec<N> = Vec::new();
+pub(crate) fn successor_targets<N: PartialEq + Copy + Default>(
+    hints: &[N],
+    owners: &[N],
+    rank: usize,
+) -> crate::read::walk::List<N, { crate::read::walk::MAX_HANDOFF }> {
+    let mut out = crate::read::walk::List::default();
     for n in hints.iter().rev() {
         let later = owners.iter().position(|o| o == n).is_some_and(|r| r > rank);
         if later && !out.contains(n) {
-            out.push(n.clone());
+            out.push(*n);
         }
     }
     out
@@ -1249,20 +1253,26 @@ pub fn successor_targets<N: PartialEq + Clone>(hints: &[N], owners: &[N], rank: 
 /// The handoff targets of an owner walk with `successors` first (at most
 /// [`crate::read::walk::MAX_HANDOFF`] of them), at most
 /// [`crate::read::walk::MAX_TARGETS`] in all, and how many of them are
-/// successor targets ([`crate::read::walk::WalkConfig::successors`]).
+/// successor targets ([`crate::read::walk::WalkConfig::granted`]).
 /// Successors come first: they are funded by their own grant, while
 /// previous-membership targets stop when the walk's credits run short.
-pub fn with_successors<N: PartialEq + Clone>(successors: Vec<N>, handoff: &[N]) -> (Vec<N>, usize) {
-    let mut out: Vec<N> = Vec::new();
+pub(crate) fn with_successors<N: PartialEq + Copy + Default>(
+    successors: &[N],
+    handoff: &[N],
+) -> (
+    crate::read::walk::List<N, { crate::read::walk::MAX_TARGETS }>,
+    usize,
+) {
+    let mut out = crate::read::walk::List::default();
     for n in successors {
-        if out.len() < crate::read::walk::MAX_HANDOFF && !out.contains(&n) {
-            out.push(n);
+        if out.len() < crate::read::walk::MAX_HANDOFF && !out.contains(n) {
+            out.push(*n);
         }
     }
     let count = out.len();
     for n in handoff {
-        if out.len() < crate::read::walk::MAX_TARGETS && !out.contains(n) {
-            out.push(n.clone());
+        if !out.contains(n) {
+            out.push(*n);
         }
     }
     (out, count)
@@ -1458,27 +1468,27 @@ mod successor_tests {
         let owners = [1u32, 2, 3];
         let targets = successor_targets(&[2], &owners, 0);
         assert_eq!(targets, [2]);
-        let (all, n) = with_successors(targets, &[7, 2]);
-        assert_eq!((all, n), (vec![2, 7], 1));
+        let (all, n) = with_successors(&targets, &[7, 2]);
+        assert_eq!((all.to_vec(), n), (vec![2, 7], 1));
     }
 
     #[test]
     fn successors_come_first_within_the_handoff_cap() {
-        let (all, n) = with_successors(vec![3, 2], &[7, 8]);
-        assert_eq!((all, n), (vec![3, 2, 7, 8], 2));
-        let (all, n) = with_successors(Vec::new(), &[7, 8]);
-        assert_eq!((all, n), (vec![7, 8], 0));
-        let (all, n) = with_successors(vec![1, 2, 3, 4], &[7]);
-        assert_eq!((all, n), (vec![1, 2, 3, 7], 3));
+        let (all, n) = with_successors(&[3, 2], &[7, 8]);
+        assert_eq!((all.to_vec(), n), (vec![3, 2, 7, 8], 2));
+        let (all, n) = with_successors(&[], &[7, 8]);
+        assert_eq!((all.to_vec(), n), (vec![7, 8], 0));
+        let (all, n) = with_successors(&[1, 2, 3, 4], &[7]);
+        assert_eq!((all.to_vec(), n), (vec![1, 2, 3, 7], 3));
         // Lineage targets are no longer cut at three (Known issue 46), but
         // the list stays within `MAX_TARGETS`.
         let lineage: Vec<u32> = (10..30).collect();
-        let (all, n) = with_successors(vec![1, 2], &lineage);
+        let (all, n) = with_successors(&[1, 2], &lineage);
         assert_eq!(n, 2);
         assert_eq!(all.len(), crate::read::walk::MAX_TARGETS);
         assert_eq!(all[2..], lineage[..crate::read::walk::MAX_TARGETS - 2]);
-        let (all, n) = with_successors(vec![2], &[2, 7]);
-        assert_eq!((all, n), (vec![2, 7], 1));
+        let (all, n) = with_successors(&[2], &[2, 7]);
+        assert_eq!((all.to_vec(), n), (vec![2, 7], 1));
     }
 
     #[test]

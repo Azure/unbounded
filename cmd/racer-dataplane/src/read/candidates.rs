@@ -74,11 +74,86 @@ pub struct OriginAuthority {
     rank: usize,
 }
 use racer_core::read::walk::{
-    CandidateWalk, Continuation, End as WalkEnd, Mode as WalkMode, Outcome as WalkOutcome,
-    RemainingEnd, RemainingWalk, RouteMode, Step, WalkConfig,
+    Action, Event as FillEvent, Evidence, Features, Fill, FillConfig, HedgeEnd, List, MAX_HANDOFF,
+    Mode as WalkMode, NOT_MEMBER, Notes, Outcome as WalkOutcome, Probe, Rank0Note, Ranked, Ranking,
+    RemainingEnd, RemainingWalk, Reply as FillReply, RouteMode, SilenceNote,
 };
 pub use racer_core::read::{ProbeOutcome, ReplicaSelection};
 pub(crate) use racer_core::read::{VisitOrder, replica_score, visit_order};
+
+/// One read's acquisition (`CandidatePolicy::drive`): the racer-core
+/// [`Fill`] and the rankings its member positions refer to.
+pub(crate) struct Acquisition {
+    fill: Fill,
+    /// The caller's membership version (diagnostics).
+    membership: u64,
+    /// The caller's ranking, for the first `Ranking::Current`.
+    initial: Option<Candidates>,
+    /// The ranking the walk probes.
+    current: Option<Candidates>,
+    /// The previous membership's ranking a stale fallback walks, until the
+    /// walk takes it (Known issue 19).
+    fallback: Option<Candidates>,
+    /// The membership a refresh adopts.
+    latest: Option<std::sync::Arc<crate::topology::Membership>>,
+    /// Version - 1, which predecessors are asked under (Known issue 12).
+    previous: Option<std::sync::Arc<crate::topology::Membership>>,
+    /// Version - 1 for a stale fallback, when peers still resolve it.
+    stale_previous: Option<std::sync::Arc<crate::topology::Membership>>,
+    /// The answer awaiting validation, and the outstanding probe's
+    /// destination, mode, and send time.
+    answer: Option<VerifiedResponse>,
+    dest: Option<ProbeDest>,
+    acquire: bool,
+    sent: std::time::Instant,
+    /// A dataplane error racer-core cannot represent, for its failure.
+    error: Option<Error>,
+    phase: Phase,
+    authority: Option<OriginAuthority>,
+    pub(crate) trail: CandidateTrail,
+}
+
+impl Acquisition {
+    /// `error` as racer-core sees it; the dataplane error is kept for the
+    /// read's failure.
+    fn core_error(&mut self, error: Error) -> racer_core::read::Error {
+        racer_core::read::Error::try_from(error).unwrap_or_else(|_| {
+            self.error = Some(error);
+            racer_core::read::Error::Internal
+        })
+    }
+
+    /// The ranking the walk probes.
+    pub(crate) fn candidates(&self) -> &Candidates {
+        self.current.as_ref().expect("ranked")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    Walk,
+    Origin,
+    Remaining,
+}
+
+enum ProbeDest {
+    Member(u32),
+    Helper(NodeId),
+}
+
+/// The owners of `candidates` as member positions.
+fn positions(candidates: &Candidates) -> List<u32, MAX_HANDOFF> {
+    candidates
+        .ordered
+        .iter()
+        .map(|node| {
+            candidates
+                .membership
+                .position(node)
+                .map_or(NOT_MEMBER, |p| p as u32)
+        })
+        .collect()
+}
 
 pub struct CandidatePolicy {
     hedge: Option<Arc<Hedges>>,
@@ -232,30 +307,6 @@ enum RequestMode {
     FundedRoute,
     DirectHedge,
 }
-/// What an owner's walk uses from the previous membership
-/// (`CandidatePolicy::previous_owners`).
-#[derive(Default)]
-struct PreviousOwners {
-    /// Previous owners to ask copy-only before origin (`WalkConfig::handoff`).
-    handoff: Vec<NodeId>,
-    /// Predecessors to ask under the previous membership
-    /// (`WalkConfig::previous`).
-    same_rank: u8,
-    /// The previous membership, when `same_rank` is not empty.
-    membership: Option<std::sync::Arc<crate::topology::Membership>>,
-}
-
-#[derive(Default, Clone, Copy)]
-pub(crate) struct HedgeContinuation {
-    // This is local acquisition progress, never placement/origin authority.
-    pub primary_consumed: bool,
-    pub primary_outcome: Option<ProbeOutcome>,
-    pub stale: bool,
-    pub bounded_routes: bool,
-    /// Waits this read already made for destinations that are behind
-    /// (`racer_core::read::walk::stale_wait`, Known issues 26 and 36).
-    pub waits: u8,
-}
 impl CandidatePolicy {
     #[cfg(test)]
     pub(crate) fn hedge_owner(&self) -> Option<&Arc<Hedges>> {
@@ -268,42 +319,29 @@ impl CandidatePolicy {
     pub(crate) async fn hedge_page<'a>(
         &'a self,
         candidates: &Candidates,
+        (first, second, eligible): (usize, usize, bool),
         context: &'a OriginContext,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         admission: &Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
-        continuation: &mut HedgeContinuation,
         validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, crate::memory::PageResult>,
-    ) -> Result<Option<crate::memory::PageResult>> {
+    ) -> Result<(Option<crate::memory::PageResult>, HedgeEnd)> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
-            return Ok(None);
+            return Ok((None, HedgeEnd::NotStarted));
         };
-        // The hedge primary and duplicate are the first two owners in the same
-        // visiting order the serial fallback uses, so `primary_consumed` skips
-        // exactly the owner the hedge already asked.
-        let (object, page) = operation_identity(operation);
-        let order = self.visit_order(candidates, object, page);
-        let (first, second) = (order.get(0).unwrap_or(0), order.get(1).unwrap_or(0));
-        // A pinned direct exchange carries one link, so its receiver cannot
+        // The hedge primary and duplicate are the first two owners in the
+        // visit order the walk uses (`HedgeEnd::Lost` skips the primary). A
+        // pinned direct exchange carries one link, so its receiver cannot
         // probe predecessors; racer-core keeps one cold fallback fundable.
-        let eligible = racer_core::read::walk::hedge_eligible(racer_core::read::walk::HedgeFacts {
-            page_operation: matches!(operation, PeerOperation::Page { .. }),
-            is_candidate: self.is_candidate(candidates),
-            owners: candidates.ordered.len(),
-            first,
-            second,
-            distinct: candidates.ordered.len() >= 2
-                && candidates.ordered[first] != candidates.ordered[second],
-            remaining_attempts: budget.remaining_attempts(),
-            remaining_links: budget.remaining_links(),
-        }) && [first, second].iter().all(|rank| {
-            self.peers
-                .direct_hedge_available(&candidates.membership, &candidates.ordered[*rank])
-        });
+        let eligible = eligible
+            && [first, second].iter().all(|rank| {
+                self.peers
+                    .direct_hedge_available(&candidates.membership, &candidates.ordered[*rank])
+            });
         if !eligible {
             hedges.suppressed();
-            return Ok(None);
+            return Ok((None, HedgeEnd::NotStarted));
         }
         check_budget(scope, budget)?;
         let reservation = (|| {
@@ -318,7 +356,7 @@ impl CandidatePolicy {
         })();
         let Ok((slot, _escrow)) = reservation else {
             hedges.suppressed();
-            return Ok(None);
+            return Ok((None, HedgeEnd::NotStarted));
         };
         // Pinned direct exchanges consume exactly one link each. Reserve the
         // remaining original links for serial candidates or one epoch refresh.
@@ -329,8 +367,6 @@ impl CandidatePolicy {
         let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
         let stale = std::cell::Cell::new(false);
         let primary_outcome = std::cell::Cell::new(None);
-        continuation.primary_consumed = true;
-        continuation.bounded_routes = true;
         let primary = async {
             let response = self
                 .request_mode(
@@ -413,16 +449,19 @@ impl CandidatePolicy {
         .await;
         budget.reunite(primary_budget)?;
         budget.reunite(secondary_budget)?;
-        continuation.stale = stale.get();
-        continuation.primary_outcome = primary_outcome.get().or(Some(ProbeOutcome::Unreachable));
         check_budget(scope, budget)?;
+        let lost = HedgeEnd::Lost {
+            stale: stale.get(),
+            primary: primary_outcome.get(),
+            error: None,
+        };
         match result {
-            Ok(result) => Ok(Some(result)),
+            Ok(result) => Ok((Some(result), HedgeEnd::Won)),
             Err(error)
                 if racer_core::read::Error::try_from(error)
                     .is_ok_and(racer_core::read::walk::hedge_fallback) =>
             {
-                Ok(None)
+                Ok((None, lost))
             }
             Err(error) => Err(error),
         }
@@ -672,39 +711,6 @@ impl CandidatePolicy {
                 racer_core::liveness::WATCH_TTL,
                 racer_core::liveness::HANG_AFTER,
             )),
-        }
-    }
-
-    /// Update the rank 0 watch from the outcome of this owner's page probe
-    /// of rank 0 (`CandidateWalk::pending_rank0`, Known issue 39):
-    /// a timeout notes the page with the request's deadline, an answer
-    /// signed by rank 0 itself forgets it.
-    fn note_rank0(
-        &self,
-        rank0: &NodeId,
-        operation: &PeerOperation,
-        outcome: &WalkOutcome,
-        deadline: std::time::Instant,
-    ) {
-        let PeerOperation::Page { page, .. } = operation else {
-            return;
-        };
-        let mut watch = self.rank0_watch.borrow_mut();
-        match outcome {
-            WalkOutcome::TimedOut => watch.timed_out(
-                page.clone(),
-                rank0.clone(),
-                uring_runtime::environment::now(),
-                deadline,
-            ),
-            WalkOutcome::Failed => watch.answered_failure(page, rank0),
-            WalkOutcome::Copy
-            | WalkOutcome::Probe(
-                ProbeOutcome::CopyMiss
-                | ProbeOutcome::VersionUnavailable
-                | ProbeOutcome::Unreachable,
-            ) => watch.answered(page, rank0),
-            _ => {}
         }
     }
 
@@ -1026,44 +1032,12 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, CandidateResolution> {
-        self.resolve_epoch(
-            candidates,
-            context,
-            operation,
-            scope,
-            budget,
-            |response| Box::pin(async move { Ok(response) }),
-            false,
-            HedgeContinuation::default(),
-        )
+        self.resolve_epoch(candidates, context, operation, scope, budget, |response| {
+            Box::pin(async move { Ok(response) })
+        })
     }
 
-    /// Continue candidate resolution using the completed hedge's evidence.
-    #[allow(clippy::too_many_arguments)] // Preserve the shared budget and continuation boundary.
-    pub(crate) fn resolve_after_hedge<'a>(
-        &'a self,
-        candidates: Candidates,
-        context: &'a OriginContext,
-        operation: PeerOperation,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, crate::memory::AcquiredPage> + 'a,
-        continuation: HedgeContinuation,
-    ) -> Operation<'a, CandidateResolution<crate::memory::AcquiredPage>> {
-        self.resolve_epoch(
-            candidates,
-            context,
-            operation,
-            scope,
-            budget,
-            validate,
-            false,
-            continuation,
-        )
-    }
-
-    /// Resolve candidates within one membership epoch.
-    #[allow(clippy::too_many_arguments)] // Forward explicit acquisition inputs without repackaging.
+    /// Resolve candidates with the walk alone.
     fn resolve_epoch<'a, T: 'a>(
         &'a self,
         candidates: Candidates,
@@ -1071,609 +1045,657 @@ impl CandidatePolicy {
         operation: PeerOperation,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
-        retried: bool,
-        continuation: HedgeContinuation,
+        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
     ) -> Operation<'a, CandidateResolution<T>> {
         Box::pin(async move {
-            let mut trail = CandidateTrail {
-                hedge_history_unavailable: continuation.primary_consumed || continuation.stale,
-                ..Default::default()
-            };
-            let page = operation_identity(&operation).1.0;
-            let kind = match &operation {
-                PeerOperation::Page { .. } => CandidateOperation::Page,
-                PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
-                PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
-                PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
-                PeerOperation::Warm { .. } => CandidateOperation::Page,
-            };
-            let membership = candidates.membership.version.0;
-            let result = self
-                .resolve_epoch_traced(
-                    candidates,
+            let mut a = self.acquisition(candidates, &operation, scope, false, true);
+            let mut copy = None;
+            let action = self
+                .drive(
+                    &mut a,
+                    FillEvent::Start { local_hit: false },
                     context,
-                    operation,
+                    &operation,
                     scope,
                     budget,
-                    validate,
-                    retried,
-                    continuation,
-                    &mut trail,
+                    &mut validate,
+                    &mut copy,
                 )
-                .await;
-            if let Err(error) = &result {
-                self.observer.candidate_final(CandidateFinal {
-                    failure: Failure::new(Stage::CandidateExhausted, *error)
+                .await?;
+            match action {
+                Action::Done(Ok(_)) => {
+                    Ok(CandidateResolution::Copy(copy.expect("a validated copy")))
+                }
+                Action::Origin { rank } => {
+                    self.authority(&mut a, rank, &operation);
+                    Ok(CandidateResolution::Origin(
+                        a.authority.take().expect("origin authority"),
+                    ))
+                }
+                action => unreachable!("a walk-only acquisition asked for {action:?}"),
+            }
+        })
+    }
+
+    /// A read's acquisition over the caller's ranking `candidates`: the walk
+    /// alone (`walk_only`), or the whole fill with a hedge when `hedge`.
+    pub(crate) fn acquisition(
+        &self,
+        candidates: Candidates,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        hedge: bool,
+        walk_only: bool,
+    ) -> Acquisition {
+        // Without a timer, the walk skips a destination that is behind
+        // instead of waiting for it (Known issue 26).
+        let features = Features::PRODUCTION.with(Features::STALE_WAIT, self.can_wait());
+        Acquisition {
+            fill: Fill::new(FillConfig {
+                operation: operation_kind(operation),
+                hedge,
+                walk_only,
+                scope: scope.deadline.0,
+                features,
+            }),
+            membership: candidates.membership.version.0,
+            initial: Some(candidates),
+            current: None,
+            fallback: None,
+            latest: None,
+            previous: None,
+            stale_previous: None,
+            answer: None,
+            dest: None,
+            acquire: false,
+            sent: uring_runtime::environment::now(),
+            error: None,
+            phase: Phase::Walk,
+            authority: None,
+            trail: CandidateTrail::default(),
+        }
+    }
+
+    /// Run `acquisition` from `event` until it needs what only the caller
+    /// performs: a hedge, an origin fetch, a publication, or the end. A
+    /// validated copy lands in `copy`. racer-core owns every decision; this
+    /// loop performs the rankings and exchanges it plans.
+    #[allow(clippy::too_many_arguments)] // The driver borrows the read's distinct inputs.
+    pub(crate) async fn drive<'a, T: 'a>(
+        &'a self,
+        a: &mut Acquisition,
+        event: FillEvent<'_>,
+        context: &'a OriginContext,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+        copy: &mut Option<T>,
+    ) -> Result<Action> {
+        let (object, page) = operation_identity(operation);
+        let now = uring_runtime::environment::now;
+        let mut next = a.fill.on(event, budget, now());
+        loop {
+            let (action, evidence) = next;
+            if !matches!(action, Action::Done(Err(_))) {
+                a.error = None;
+            }
+            // The walk took the previous membership's ranking (Known issue 19).
+            if a.fallback
+                .as_ref()
+                .is_some_and(|c| c.membership.version.0 == a.fill.version())
+            {
+                a.current = a.fallback.take();
+            }
+            self.apply(a, &evidence, operation, scope, budget);
+            if evidence.notes & Notes::REMAINING != 0 {
+                a.phase = Phase::Remaining;
+                a.trail = CandidateTrail {
+                    site: CandidateSite::RemainingCopy,
+                    ..Default::default()
+                };
+            }
+            let event = match action {
+                Action::Rank { ranking, version } => {
+                    let ranked = self
+                        .rank_for(
+                            a, ranking, version, context, object, page, operation, scope, budget,
+                        )
+                        .await;
+                    FillEvent::Ranked(ranked.map_err(|error| a.core_error(error)))
+                }
+                Action::Hints => {
+                    let PeerOperation::Page { page: id, .. } = operation else {
+                        unreachable!("only page owners ask for hints");
+                    };
+                    let current = a.current.as_ref().expect("ranked");
+                    let membership = &current.membership;
+                    let hints: Vec<u32> = self
+                        .successors
+                        .borrow_mut()
+                        .probe(id, now())
+                        .iter()
+                        .filter_map(|node| membership.position(node).ok())
+                        .map(|p| p as u32)
+                        .collect();
+                    let rank0 = match a.fill.rank() {
+                        Some(rank) if rank > 0 => {
+                            self.rank0_watch
+                                .borrow()
+                                .state(id, &current.ordered[0], now())
+                        }
+                        _ => racer_core::liveness::Rank0State::Unknown,
+                    };
+                    next = a.fill.on(
+                        FillEvent::Hints {
+                            hints: &hints,
+                            rank0,
+                        },
+                        budget,
+                        now(),
+                    );
+                    continue;
+                }
+                Action::Refresh => {
+                    let latest = match self.published.current() {
+                        Ok(latest) => latest.map(|published| published.membership.clone()),
+                        Err(error) => {
+                            let error = a.core_error(Error::from(error));
+                            next = a.fill.on(FillEvent::Abort(error), budget, now());
+                            continue;
+                        }
+                    };
+                    let version = latest.as_ref().map(|latest| latest.version.0);
+                    a.latest = latest;
+                    // Version - 1, when still resolvable by peers that adopted
+                    // the current one (replaced within
+                    // `PREVIOUS_MEMBERSHIP_WITHIN`) and listing this node.
+                    let current = a.current.as_ref().expect("ranked");
+                    a.stale_previous = current
+                        .membership
+                        .version
+                        .0
+                        .checked_sub(1)
+                        .and_then(|previous| {
+                            self.published
+                                .resolve_recent(
+                                    previous,
+                                    now(),
+                                    racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                        .filter(|previous| previous.member(&self.node).is_ok());
+                    FillEvent::Membership {
+                        latest: version,
+                        previous_recent_member: a.stale_previous.is_some(),
+                    }
+                }
+                Action::Probe(probe) => {
+                    self.probe(a, probe, context, object, page, operation, scope, budget)
+                        .await
+                }
+                Action::Validate => {
+                    let response = a.answer.take().expect("an answer to validate");
+                    let validated = validated_copy(response, operation, a.acquire, validate).await;
+                    note_validation(&mut a.trail, &validated);
+                    FillEvent::Validated(match validated {
+                        Ok(Ok(validated)) => {
+                            *copy = Some(validated);
+                            Ok(None)
+                        }
+                        Ok(Err(outcome)) => Ok(Some(outcome)),
+                        Err(error) => Err(a.core_error(error)),
+                    })
+                }
+                Action::Batch {
+                    first,
+                    count,
+                    remaining_opportunities,
+                } => {
+                    let current = a.current.as_ref().expect("ranked");
+                    let membership = current.membership.clone();
+                    let targets = &a.fill.handoff()[first..first + count];
+                    match self
+                        .granted_batch(
+                            &membership,
+                            targets,
+                            remaining_opportunities,
+                            context,
+                            operation,
+                            scope,
+                            budget.deadline(),
+                            validate,
+                            &mut a.trail,
+                        )
+                        .await
+                    {
+                        Ok(Some(validated)) => {
+                            *copy = Some(validated);
+                            FillEvent::BatchDone { copy: true }
+                        }
+                        Ok(None) => FillEvent::BatchDone { copy: false },
+                        Err(error) => FillEvent::Abort(a.core_error(error)),
+                    }
+                }
+                Action::Wait(wait) => {
+                    if let Err(error) = self.stale_sleep(now() + wait, scope).await {
+                        return Err(self.failed(a, error, &evidence, operation, scope, budget));
+                    }
+                    FillEvent::Timer
+                }
+                Action::Done(Err(error)) => {
+                    let error = match (a.error.take(), error) {
+                        (Some(error), racer_core::read::Error::Internal) => error,
+                        (_, error) => Error::from(error),
+                    };
+                    return Err(self.failed(a, error, &evidence, operation, scope, budget));
+                }
+                Action::Origin { .. } => {
+                    a.phase = Phase::Origin;
+                    return Ok(action);
+                }
+                Action::Idle => unreachable!("one probe is outstanding at a time"),
+                action => return Ok(action),
+            };
+            next = a.fill.on(event, budget, now());
+        }
+    }
+
+    /// A ranking the walk asked for, as member positions of its membership.
+    #[allow(clippy::too_many_arguments)] // The ranking borrows the read's distinct inputs.
+    async fn rank_for(
+        &self,
+        a: &mut Acquisition,
+        ranking: Ranking,
+        version: Option<u64>,
+        context: &OriginContext,
+        object: &ObjectId,
+        page: PageNumber,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) -> Result<Ranked> {
+        let page_operation = matches!(operation, PeerOperation::Page { .. });
+        match ranking {
+            Ranking::Current => {
+                check_budget(scope, budget)?;
+                let candidates = match (version, a.initial.take()) {
+                    (None, Some(candidates)) => {
+                        if object != &context.object {
+                            return Err(Error::InvalidRequest);
+                        }
+                        // Public Candidates values are not authority.
+                        // Recompute before origin.
+                        let expected = self
+                            .candidates_scoped(candidates.membership.clone(), object, page, scope)
+                            .await?;
+                        if expected.ordered != candidates.ordered {
+                            return Err(Error::IncompatibleMembership);
+                        }
+                        candidates
+                    }
+                    _ => {
+                        let latest = a.latest.take().ok_or(Error::Unavailable)?;
+                        self.candidates_scoped(latest, object, page, scope).await?
+                    }
+                };
+                if candidates.ordered.is_empty() || candidates.ordered.len() > 3 {
+                    return Err(Error::IncompatibleMembership);
+                }
+                let ranked = self.ranked(&candidates, object, page, page_operation);
+                a.current = Some(candidates);
+                a.previous = None;
+                Ok(ranked)
+            }
+            Ranking::Previous => {
+                // Ranking failures are not errors; the walk just goes without.
+                let version = version.expect("a previous version");
+                let current = a.current.as_ref().expect("ranked");
+                let now = uring_runtime::environment::now();
+                let previous = self
+                    .published
+                    .resolve(version, now)
+                    .ok()
+                    .flatten()
+                    .ok_or(Error::Unavailable)?;
+                // Ask predecessors under the previous membership only while
+                // peers that adopted the current one still hold it in grace
+                // (`PREVIOUS_MEMBERSHIP_WITHIN`); a lease held only here says
+                // nothing about a peer.
+                let recent = self
+                    .published
+                    .resolve_recent(
+                        version,
+                        now,
+                        racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+                    )
+                    .ok()
+                    .flatten()
+                    .filter(|recent| recent.member(&self.node).is_ok());
+                let previous = self
+                    .candidates_scoped(previous, object, page, scope)
+                    .await?;
+                // Previous owners that are no longer members are not asked.
+                let owners: List<u32, MAX_HANDOFF> = previous
+                    .ordered
+                    .iter()
+                    .map(|node| {
+                        current
+                            .membership
+                            .position(node)
+                            .map_or(NOT_MEMBER, |p| p as u32)
+                    })
+                    .collect();
+                let recent_member = recent.is_some();
+                a.previous = recent;
+                Ok(Ranked {
+                    recent_member,
+                    ..Ranked::new(version, &owners, None)
+                })
+            }
+            Ranking::Fallback => {
+                let previous = a.stale_previous.take().ok_or(Error::Unavailable)?;
+                let previous = self
+                    .candidates_scoped(previous, object, page, scope)
+                    .await?;
+                if previous.ordered.is_empty() || previous.ordered.len() > 3 {
+                    return Err(Error::IncompatibleMembership);
+                }
+                let ranked = self.ranked(&previous, object, page, page_operation);
+                a.fallback = Some(previous);
+                Ok(ranked)
+            }
+            Ranking::Authority => {
+                check_budget(scope, budget)?;
+                if a.fill.funding_stopped() {
+                    a.trail.site = CandidateSite::Funding;
+                }
+                let current = a.current.as_ref().expect("ranked");
+                let owners = positions(current);
+                let rank = current.ordered.iter().position(|node| node == &self.node);
+                Ok(Ranked::new(current.membership.version.0, &owners, rank))
+            }
+        }
+    }
+
+    /// What the walk needs from `candidates`: the owners as member
+    /// positions, arrivals, the visit order, and the demoted members.
+    fn ranked(
+        &self,
+        candidates: &Candidates,
+        object: &ObjectId,
+        page: PageNumber,
+        page_operation: bool,
+    ) -> Ranked {
+        let membership = &candidates.membership;
+        let rank = candidates
+            .ordered
+            .iter()
+            .position(|node| node == &self.node);
+        let mut ranked = Ranked::new(membership.version.0, &positions(candidates), rank);
+        ranked.members = membership.members().len();
+        // Arrival order of the page's owners in this node's membership chain
+        // (Known issue 25).
+        for (since, node) in ranked.since.iter_mut().zip(&candidates.ordered) {
+            *since = membership.since(node);
+        }
+        match rank {
+            None => ranked.order = self.visit_order(candidates, object, page),
+            Some(_) if page_operation => {
+                // Members ranked just below the owners that were owners when
+                // they arrived (Known issue 34, from the cached ranking only).
+                // Arrivals at generation 0 are unknown: present since this
+                // node's chain began (Known issue 46).
+                let demoted = self.placement.demoted(membership, object, page);
+                for (i, node) in demoted.iter().enumerate() {
+                    let Ok(p) = membership.position(node) else {
+                        continue;
+                    };
+                    let index = ranked.demoted.len();
+                    if ranked.demoted.push(p as u32) {
+                        ranked.demoted_since[index] = membership.since(node);
+                    }
+                    let _ = i;
+                }
+                ranked.oldest = Some(0);
+            }
+            Some(_) => {}
+        }
+        ranked
+    }
+
+    /// Send one probe the walk planned and report how it ended.
+    #[allow(clippy::too_many_arguments)] // The probe borrows the read's distinct inputs.
+    async fn probe(
+        &self,
+        a: &mut Acquisition,
+        probe: Probe,
+        context: &OriginContext,
+        object: &ObjectId,
+        page: PageNumber,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> FillEvent<'static> {
+        let current = a.current.as_ref().expect("ranked");
+        let membership = current.membership.clone();
+        // Canonical ranks past the owners address handoff targets or, for a
+        // non-owner, the overflow helper.
+        let helper;
+        let destination = match a.fill.dest(&probe) {
+            Some(p) => {
+                a.dest = Some(ProbeDest::Member(p));
+                &membership.members()[p as usize].node
+            }
+            None => match self.fanout_helper(current, object, page) {
+                Some(node) => {
+                    helper = node;
+                    a.dest = Some(ProbeDest::Helper(helper.clone()));
+                    &helper
+                }
+                // Every candidate helper is excluded: a miss.
+                None => return FillEvent::NoHelper,
+            },
+        };
+        let request_membership = match (&a.previous, probe.previous) {
+            (Some(previous), true) => previous.clone(),
+            _ => membership.clone(),
+        };
+        let remaining = a.fill.remaining();
+        a.acquire = probe.mode == WalkMode::Acquire;
+        a.sent = uring_runtime::environment::now();
+        let mut timed_out = false;
+        let response = self
+            .request_traced(
+                &request_membership,
+                destination,
+                context,
+                operation,
+                if a.acquire {
+                    FetchMode::Acquire
+                } else {
+                    FetchMode::CopyOnly
+                },
+                scope,
+                a.fill.request_budget(budget),
+                probe.remaining_opportunities,
+                if probe.route == RouteMode::FundedRoute {
+                    RequestMode::FundedRoute
+                } else {
+                    RequestMode::SharedRoute
+                },
+                Some((&mut a.trail, probe.canonical as u8)),
+                &mut timed_out,
+            )
+            .await;
+        FillEvent::Reply(match response {
+            Ok(response) => {
+                let signed = response.origin().node() == destination;
+                let kind = response.response().kind();
+                if kind.has_payload() {
+                    a.answer = Some(response);
+                }
+                FillReply::Answer { kind, signed }
+            }
+            // Sent but unanswered within the attempt's own bound.
+            Err(_) if timed_out && !remaining => FillReply::TimedOut,
+            Err(error) => FillReply::Failed {
+                error: a.core_error(error),
+                sent: true,
+                scope_live: scope.check().is_ok(),
+            },
+        })
+    }
+
+    /// Apply what one event showed: silence, rank 0 and route evidence.
+    fn apply(
+        &self,
+        a: &Acquisition,
+        evidence: &Evidence,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) {
+        // The remaining-copy walk records no evidence.
+        if evidence.remaining {
+            return;
+        }
+        let (Some(dest), Some(current)) = (&a.dest, &a.current) else {
+            return;
+        };
+        let destination = match dest {
+            ProbeDest::Member(p) => &current.membership.members()[*p as usize].node,
+            ProbeDest::Helper(node) => node,
+        };
+        let health = self.peers.link_health();
+        let page = match operation {
+            PeerOperation::Page { page, .. } => Some(page),
+            _ => None,
+        };
+        match (evidence.silence, page) {
+            // The destination answered this node: it is not hung (Known issue
+            // 41).
+            (Some(SilenceNote::Answered), _) => health.silence_answered(destination),
+            // It shed the request: busy, not hung. A reader's later walks
+            // visit it after the page's other owners for a while (Known
+            // issue 54).
+            (Some(SilenceNote::Shed), Some(id)) => health.silence_shed(destination, id.clone()),
+            // A probe of the page's rank 0 asks whether rank 0 answers at all
+            // (Known issue 43): `poll_pings` sends the ping. Any other timeout
+            // only demotes the owner in this node's visit order (Known issue
+            // 41).
+            (Some(SilenceNote::TimedOut { needed }), Some(id)) => {
+                health.silence_timed_out(destination, id.clone(), a.sent, needed);
+            }
+            _ => {}
+        }
+        // Update the rank 0 watch from this owner's page probe of rank 0
+        // (Known issue 39): a timeout notes the page with the request's
+        // deadline, an answer signed by rank 0 itself forgets it.
+        if let (Some(note), Some(id)) = (evidence.rank0, page) {
+            let mut watch = self.rank0_watch.borrow_mut();
+            match note {
+                Rank0Note::TimedOut => watch.timed_out(
+                    id.clone(),
+                    destination.clone(),
+                    uring_runtime::environment::now(),
+                    budget.deadline().min(scope.deadline.0),
+                ),
+                Rank0Note::Failed => watch.answered_failure(id, destination),
+                Rank0Note::Answered => watch.answered(id, destination),
+            }
+        }
+        if let Some(Ok(outcome)) = &evidence.outcome {
+            self.observe_route(&current.membership, destination, outcome);
+        }
+    }
+
+    /// Record why the read failed and return the dataplane error.
+    fn failed(
+        &self,
+        a: &mut Acquisition,
+        mut error: Error,
+        evidence: &Evidence,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) -> Error {
+        if a.phase == Phase::Walk && a.fill.funding_stopped() {
+            a.trail.site = CandidateSite::Funding;
+        }
+        if evidence.notes & (Notes::EXHAUSTED | Notes::EXHAUSTED_FUNDING) != 0
+            || (a.phase == Phase::Walk && error == Error::VersionUnavailable)
+        {
+            if let Err(stop) = check_budget(scope, budget) {
+                error = stop;
+            } else if error == Error::Unavailable {
+                if evidence.notes & Notes::EXHAUSTED != 0 {
+                    a.trail.site = CandidateSite::Exhausted;
+                }
+                self.observer.record(
+                    Failure::new(Stage::CandidateExhausted, Error::Unavailable)
                         .request(scope)
                         .detail(Detail::Budget {
                             attempts: budget.remaining_attempts(),
                             links: budget.remaining_links(),
                         }),
-                    operation: kind,
-                    page,
-                    membership,
-                    trail,
-                });
+                );
             }
-            result
-        })
-    }
-
-    /// Resolve one membership epoch while recording candidate evidence.
-    #[allow(clippy::too_many_arguments)] // Keep the borrowed trace separate from acquisition state.
-    fn resolve_epoch_traced<'a, 't, T: 'a>(
-        &'a self,
-        candidates: Candidates,
-        context: &'a OriginContext,
-        operation: PeerOperation,
-        scope: &'a RequestScope,
-        budget: &'t mut AcquisitionBudget,
-        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
-        retried: bool,
-        continuation: HedgeContinuation,
-        trail: &'t mut CandidateTrail,
-    ) -> Operation<'t, CandidateResolution<T>>
-    where
-        'a: 't,
-    {
-        Box::pin(async move {
-            check_budget(scope, budget)?;
-            let (object, page) = operation_identity(&operation);
-            if object != &context.object {
-                return Err(Error::InvalidRequest);
-            }
-            if continuation.stale {
-                // A stale hedge refreshes to a newer membership when one is
-                // available. Otherwise the stale contender is behind this node
-                // (Known issue 3): walk this epoch's owners with bounded routes.
-                let (next, retried) = match self.refresh_membership(&candidates, retried)? {
-                    Some(latest) => (
-                        self.candidates_scoped(latest, object, page, scope).await?,
-                        true,
-                    ),
-                    None => (candidates, retried),
-                };
-                return self
-                    .resolve_epoch_traced(
-                        next,
-                        context,
+        }
+        match a.phase {
+            Phase::Walk => self.record_final(
+                operation,
+                a.membership,
+                scope,
+                budget,
+                error,
+                std::mem::take(&mut a.trail),
+            ),
+            Phase::Remaining => match (a.fill.remaining_end(), &a.authority) {
+                (Some(RemainingEnd::None), Some(authority)) => {
+                    // Record the miss diagnostic; the walk classifies it.
+                    self.final_origin_miss(authority, operation, scope, budget);
+                }
+                _ => {
+                    let membership = a
+                        .current
+                        .as_ref()
+                        .map_or(a.membership, |c| c.membership.version.0);
+                    self.record_final(
                         operation,
+                        membership,
                         scope,
                         budget,
-                        validate,
-                        retried,
-                        HedgeContinuation {
-                            bounded_routes: true,
-                            waits: continuation.waits,
-                            ..Default::default()
-                        },
-                        trail,
-                    )
-                    .await;
-            }
-            // Public Candidates values are not authority. Recompute before origin.
-            let expected = self
-                .candidates_scoped(candidates.membership.clone(), object, page, scope)
-                .await?;
-            if expected.ordered != candidates.ordered
-                || candidates.ordered.is_empty()
-                || candidates.ordered.len() > 3
-            {
-                return Err(Error::IncompatibleMembership);
-            }
-            let rank = candidates
-                .ordered
-                .iter()
-                .position(|node| node == &self.node);
-            let page_operation = matches!(operation, PeerOperation::Page { .. });
-            let previous = match rank {
-                Some(rank) if page_operation => self
-                    .previous_owners(&candidates, object, page, rank, scope)
-                    .await
-                    .unwrap_or_default(),
-                _ => PreviousOwners::default(),
-            };
-            // Arrival order of the page's owners in this node's membership
-            // chain: an owner may ask later owners that arrived before it,
-            // which it may have displaced however many versions ago (Known
-            // issue 25), and readers and delegations fund those probes.
-            let since = owner_arrivals(&candidates);
-            let lineage = if page_operation {
-                racer_core::read::walk::lineage_counts(&since)
-            } else {
-                [0; racer_core::read::walk::MAX_HANDOFF]
-            };
-            // Lineage targets: later owners that arrived before this owner,
-            // then members ranked just below the owners that were owners
-            // when they arrived (Known issue 34, from the cached ranking
-            // only). All are asked on their own grant, so a rank 0 reached
-            // by a delegation with one credit asks them too (Known issue 35).
-            let lineage_nodes = match rank {
-                Some(rank) if page_operation => {
-                    let mut targets =
-                        racer_core::read::walk::lineage_targets(&candidates.ordered, &since, rank);
-                    let demoted = self.placement.demoted(&candidates.membership, object, page);
-                    let demoted_since: Vec<_> = demoted
-                        .iter()
-                        .map(|node| candidates.membership.since(node))
-                        .collect();
-                    // Arrivals at generation 0 are unknown: present since
-                    // this node's chain began (Known issue 46).
-                    for node in racer_core::read::walk::demoted_targets_from(
-                        &since,
-                        &demoted,
-                        &demoted_since,
-                        rank,
-                        Some(0),
-                    ) {
-                        if targets.len() < racer_core::read::walk::MAX_LINEAGE
-                            && !targets.contains(&node)
-                        {
-                            targets.push(node);
-                        }
-                    }
-                    targets
-                }
-                _ => Vec::new(),
-            };
-            let mut handoff = match rank {
-                Some(_) if page_operation => racer_core::read::walk::merge_handoff(
-                    previous.handoff.clone(),
-                    lineage_nodes.clone(),
-                ),
-                Some(_) => previous.handoff.clone(),
-                None => Vec::new(),
-            };
-            // Later owners that asked this node for the page and got no copy
-            // likely fetched it themselves: ask them copy-only before origin,
-            // each on its own grant (Known issue 21, round 4 orphan2).
-            let mut successors = 0;
-            if let (Some(rank), PeerOperation::Page { page: id, .. }) = (rank, &operation) {
-                let hints = self
-                    .successors
-                    .borrow_mut()
-                    .probe(id, uring_runtime::environment::now());
-                let targets =
-                    racer_core::read::hints::successor_targets(&hints, &candidates.ordered, rank);
-                if !targets.is_empty() {
-                    (handoff, successors) =
-                        racer_core::read::hints::with_successors(targets, &handoff);
-                }
-            }
-            // Successor targets first, then lineage targets, each on its own
-            // grant; version - 1 targets after them spend the walk's credits.
-            let granted = successors
-                + racer_core::read::walk::granted_prefix(&handoff[successors..], &lineage_nodes);
-            // A non-owner page walk may ask the page's overflow helper (Known
-            // issue 16). It is chosen only when the walk asks for it.
-            let helper = rank.is_none()
-                && page_operation
-                && candidates.membership.members().len() > candidates.ordered.len() + 1;
-            // racer-core owns the visit order, funding, and evidence rules;
-            // this loop performs the exchanges it plans.
-            let mut walk = CandidateWalk::new(WalkConfig {
-                rank,
-                owners: candidates.ordered.len(),
-                order: if rank.is_some() {
-                    VisitOrder::canonical(0)
-                } else {
-                    self.visit_order(&candidates, object, page)
-                },
-                page_operation: matches!(operation, PeerOperation::Page { .. }),
-                continuation: Continuation {
-                    primary_consumed: continuation.primary_consumed,
-                    primary_outcome: continuation.primary_outcome,
-                    bounded_routes: continuation.bounded_routes,
-                },
-                handoff: handoff.len(),
-                previous: previous.same_rank,
-                helper,
-                lineage,
-                granted,
-                // Granted probes go out at once (Known issue 45).
-                parallel_granted: true,
-                rank0: match (rank, &operation) {
-                    (Some(rank), PeerOperation::Page { page: id, .. }) if rank > 0 => {
-                        self.rank0_watch.borrow().state(
-                            id,
-                            &candidates.ordered[0],
-                            uring_runtime::environment::now(),
-                        )
-                    }
-                    _ => racer_core::liveness::Rank0State::Unknown,
-                },
-            });
-            // This node owns the page under version - 1, so the stale
-            // fallback (Known issue 19) is not available to this walk.
-            let mut fallback_denied = false;
-            // Waits this walk made for destinations that are behind (Known
-            // issues 26 and 36).
-            let mut waits = 0u8;
-            let end = loop {
-                let probe = match walk.next(budget)? {
-                    Step::Probe(probe) => probe,
-                    Step::Granted(probes) => {
-                        // Every granted target at once, copy-only, each on
-                        // its own grant and sharing one time share (Known
-                        // issue 45). Only a validated copy matters; every
-                        // other answer is a miss.
-                        match self
-                            .granted_batch(
-                                &candidates,
-                                &handoff,
-                                &probes,
-                                context,
-                                &operation,
-                                scope,
-                                budget.deadline(),
-                                &mut validate,
-                                trail,
-                            )
-                            .await
-                        {
-                            Ok(Some(copy)) => {
-                                walk.complete_granted(true);
-                                return Ok(CandidateResolution::Copy(copy));
-                            }
-                            Ok(None) => {
-                                walk.complete_granted(false);
-                                continue;
-                            }
-                            Err(error) => {
-                                walk.abandon(budget)?;
-                                return Err(error);
-                            }
-                        }
-                    }
-                    Step::End(end) => break end,
-                };
-                let copy_only = probe.mode == WalkMode::CopyOnly;
-                let membership = match (&previous.membership, probe.previous) {
-                    (Some(previous), true) => previous,
-                    _ => &candidates.membership,
-                };
-                // Canonical ranks past the owners address handoff targets
-                // (`WalkConfig::handoff`) or, for a non-owner, the overflow
-                // helper (`WalkConfig::helper`).
-                let chosen;
-                let destination = match probe.canonical.checked_sub(candidates.ordered.len()) {
-                    Some(i) if rank.is_some() => &handoff[i],
-                    Some(_) => match self.fanout_helper(&candidates, object, page) {
-                        Some(helper) => {
-                            chosen = helper;
-                            &chosen
-                        }
-                        None => {
-                            // Every candidate helper is excluded: a miss.
-                            walk.complete(budget, WalkOutcome::Probe(ProbeOutcome::CopyMiss))?;
-                            continue;
-                        }
-                    },
-                    None => &candidates.ordered[probe.canonical],
-                };
-                let mut timed_out = false;
-                // A relay, not the destination, signed the answer.
-                let mut relayed = false;
-                let sent = uring_runtime::environment::now();
-                let response = self
-                    .request_traced(
-                        membership,
-                        destination,
-                        context,
-                        &operation,
-                        if copy_only {
-                            FetchMode::CopyOnly
-                        } else {
-                            FetchMode::Acquire
-                        },
-                        scope,
-                        walk.request_budget(budget),
-                        probe.remaining_opportunities,
-                        if probe.route == RouteMode::FundedRoute {
-                            RequestMode::FundedRoute
-                        } else {
-                            RequestMode::SharedRoute
-                        },
-                        Some((trail, probe.canonical as u8)),
-                        &mut timed_out,
-                    )
-                    .await;
-                let outcome = match response {
-                    Ok(response)
-                        if matches!(response.response(), PeerResponse::Overloaded)
-                            && response.origin().node() == destination =>
-                    {
-                        // The destination itself, not a relay, shed the
-                        // request (for example a hot-page owner): the walk
-                        // may ask the page's helper (Known issue 16). It is
-                        // busy, not hung: a reader's later walks visit it
-                        // after the page's other owners for a while, so a
-                        // retry does not repeat the shed walk (Known issue
-                        // 54).
-                        if let PeerOperation::Page { page: id, .. } = &operation {
-                            self.peers
-                                .link_health()
-                                .silence_shed(destination, id.clone());
-                        } else {
-                            self.peers.link_health().silence_answered(destination);
-                        }
-                        WalkOutcome::Shed
-                    }
-                    Ok(response)
-                        if walk.pending_rank0()
-                            && matches!(response.response(), PeerResponse::Unavailable)
-                            && response.origin().node() == destination =>
-                    {
-                        // Rank 0 itself, not a relay, answered that its own
-                        // acquisition failed: leave the next attempt to it
-                        // (Known issue 52). It answered: it is not hung.
-                        self.peers.link_health().silence_answered(destination);
-                        WalkOutcome::Failed
-                    }
-                    Ok(response) => {
-                        relayed = response.origin().node() != destination;
-                        if !relayed {
-                            // The destination answered this node: it is not
-                            // hung (Known issue 41).
-                            self.peers.link_health().silence_answered(destination);
-                        }
-                        if matches!(response.response(), PeerResponse::StaleMembership) {
-                            if walk.pending_handoff() || walk.pending_previous() {
-                                // A stale handoff target is only a miss, and
-                                // a predecessor asked under the previous
-                                // membership no longer resolves it: neither
-                                // refreshes this walk's membership.
-                                walk.complete(budget, WalkOutcome::StaleMembership)?;
-                                continue;
-                            }
-                            let refresh = match self.refresh_membership(&candidates, retried) {
-                                Ok(refresh) => refresh,
-                                Err(error) => {
-                                    walk.abandon(budget)?;
-                                    return Err(error);
-                                }
-                            };
-                            let Some(refresh) = refresh else {
-                                // The destination is behind this node and no
-                                // newer membership exists locally: try the
-                                // next owner (Known issue 3). A non-owner
-                                // that recently replaced the previous
-                                // membership walks the page's owners under it
-                                // instead, once (Known issue 19).
-                                let fallback = self
-                                    .stale_fallback(&candidates, rank.is_some(), retried)
-                                    .filter(|_| !fallback_denied);
-                                // Rank the page under version - 1 before
-                                // deciding: a node that owns it there may not
-                                // walk it (that would give it origin
-                                // authority), and must not lose the wait it
-                                // would otherwise have had for this
-                                // destination (Known issue 36).
-                                let mut ranked = None;
-                                if let Some(previous) = fallback
-                                    && let Ok(previous) =
-                                        self.candidates_scoped(previous, object, page, scope).await
-                                {
-                                    fallback_denied =
-                                        !racer_core::read::walk::fallback_rank_allowed(
-                                            previous
-                                                .ordered
-                                                .iter()
-                                                .position(|node| node == &self.node),
-                                        );
-                                    if !fallback_denied {
-                                        ranked = Some(previous);
-                                    }
-                                }
-                                // One that cannot (it joined in this
-                                // membership, or owns the page under version
-                                // - 1) waits for the destination to adopt it
-                                // and asks again, at most `MAX_STALE_WAITS`
-                                // times (Known issues 26 and 36).
-                                let now = uring_runtime::environment::now();
-                                if let Some(wait) = racer_core::read::walk::stale_wait(
-                                    racer_core::read::walk::StaleWaitFacts {
-                                        owner: rank.is_some(),
-                                        fallback: ranked.is_some(),
-                                        waits: continuation.waits.saturating_add(waits),
-                                        affordable: walk.retry_affordable(budget),
-                                        remaining: budget
-                                            .deadline()
-                                            .min(scope.deadline.0)
-                                            .saturating_duration_since(now),
-                                    },
-                                ) && self.can_wait()
-                                {
-                                    walk.retry_pending(budget)?;
-                                    waits = waits.saturating_add(1);
-                                    self.stale_sleep(now + wait, scope).await?;
-                                    continue;
-                                }
-                                walk.complete(budget, WalkOutcome::StaleDestination)?;
-                                if let Some(previous) = ranked {
-                                    walk.abandon(budget)?;
-                                    return self
-                                        .resolve_epoch_traced(
-                                            previous,
-                                            context,
-                                            operation,
-                                            scope,
-                                            budget,
-                                            validate,
-                                            true,
-                                            HedgeContinuation {
-                                                waits: continuation.waits.saturating_add(waits),
-                                                ..Default::default()
-                                            },
-                                            trail,
-                                        )
-                                        .await;
-                                }
-                                continue;
-                            };
-                            walk.complete(budget, WalkOutcome::StaleMembership)?;
-                            let next = self.candidates_scoped(refresh, object, page, scope).await?;
-                            // Preserve the original operation (including ETag),
-                            // cancellation/deadline and already spent link/attempt credits.
-                            return self
-                                .resolve_epoch_traced(
-                                    next,
-                                    context,
-                                    operation,
-                                    scope,
-                                    budget,
-                                    validate,
-                                    true,
-                                    HedgeContinuation {
-                                        bounded_routes: continuation.bounded_routes,
-                                        waits: continuation.waits.saturating_add(waits),
-                                        ..Default::default()
-                                    },
-                                    trail,
-                                )
-                                .await;
-                        }
-                        // Validation never spends credits, so returning the
-                        // child budget afterward is equivalent to before.
-                        let validated =
-                            validated_copy(response, &operation, !copy_only, &mut validate).await;
-                        note_validation(trail, &validated);
-                        match validated {
-                            Ok(Ok(copy)) => {
-                                self.observe_route(
-                                    &candidates.membership,
-                                    destination,
-                                    &WalkOutcome::Copy,
-                                );
-                                if walk.pending_rank0() {
-                                    self.note_rank0(
-                                        destination,
-                                        &operation,
-                                        &WalkOutcome::Copy,
-                                        budget.deadline().min(scope.deadline.0),
-                                    );
-                                }
-                                walk.complete(budget, WalkOutcome::Copy)?;
-                                return Ok(CandidateResolution::Copy(copy));
-                            }
-                            Ok(Err(outcome)) => WalkOutcome::Probe(outcome),
-                            Err(error) => {
-                                walk.abandon(budget)?;
-                                return Err(error);
-                            }
-                        }
-                    }
-                    // Sent but unanswered within the attempt: an owner does
-                    // not take origin authority from rank 0 for this.
-                    Err(_) if timed_out => WalkOutcome::TimedOut,
-                    Err(error) => match racer_core::read::Error::try_from(error)
-                        .ok()
-                        .and_then(racer_core::read::walk::transport_outcome)
-                    {
-                        Some(outcome) => WalkOutcome::Transport(outcome),
-                        // A successor probe is opportunistic and runs on its
-                        // own grant: any failure of it is only a miss, unless
-                        // this request itself is over.
-                        None if walk.pending_successor() && scope.check().is_ok() => {
-                            WalkOutcome::Transport(ProbeOutcome::Unreachable)
-                        }
-                        None => {
-                            walk.abandon(budget)?;
-                            return Err(error);
-                        }
-                    },
-                };
-                self.observe_route(&candidates.membership, destination, &outcome);
-                if walk.pending_rank0() && !relayed {
-                    // Only rank 0's own answer (or its silence) says anything
-                    // about rank 0.
-                    self.note_rank0(
-                        destination,
-                        &operation,
-                        &outcome,
-                        budget.deadline().min(scope.deadline.0),
+                        error,
+                        std::mem::take(&mut a.trail),
                     );
                 }
-                if outcome == WalkOutcome::TimedOut
-                    && let PeerOperation::Page { page: id, .. } = &operation
-                {
-                    use racer_core::liveness::{NO_PING, RANK0_TIMEOUTS};
-                    // A probe of the page's rank 0 (an owner's, or a
-                    // reader's) asks whether rank 0 answers at all (Known
-                    // issue 43): `poll_pings` sends the ping, and a silent
-                    // rank 0 then fails the next probe at once, which gives
-                    // an owner above it origin authority without another
-                    // wait and sends a reader to the other owners. Any other
-                    // timeout only demotes the owner in this node's visit
-                    // order (Known issue 41).
-                    let rank0 = walk.pending_rank0()
-                        || (rank.is_none() && candidates.ordered.first() == Some(destination));
-                    self.peers.link_health().silence_timed_out(
-                        destination,
-                        id.clone(),
-                        sent,
-                        if rank0 { RANK0_TIMEOUTS } else { NO_PING },
-                    );
-                }
-                walk.complete(budget, outcome)?;
-            };
-            if walk.funding_stopped() {
-                trail.site = CandidateSite::Funding;
-            }
-            check_budget(scope, budget)?;
-            match end {
-                WalkEnd::Origin { rank, evidence } => {
-                    Ok(CandidateResolution::Origin(OriginAuthority {
-                        diagnostic: trail.clone(),
-                        membership: candidates.membership,
-                        node: self.node.clone(),
-                        object: object.clone(),
-                        owners: candidates.ordered,
-                        page,
-                        predecessor_evidence: evidence,
-                        rank,
-                    }))
-                }
-                WalkEnd::VersionUnavailable => Err(Error::VersionUnavailable),
-                WalkEnd::Exhausted { funding } => {
-                    if !funding {
-                        trail.site = CandidateSite::Exhausted;
-                    }
-                    self.observer.record(
-                        Failure::new(Stage::CandidateExhausted, Error::Unavailable)
-                            .request(scope)
-                            .detail(Detail::Budget {
-                                attempts: budget.remaining_attempts(),
-                                links: budget.remaining_links(),
-                            }),
-                    );
-                    Err(Error::Unavailable)
-                }
-                WalkEnd::Copy | WalkEnd::StaleMembership => {
-                    unreachable!("handled while probing")
-                }
-            }
+            },
+            Phase::Origin => {}
+        }
+        error
+    }
+
+    /// The origin authority the walk ended with at `rank`.
+    pub(crate) fn authority<'a>(
+        &self,
+        a: &'a mut Acquisition,
+        rank: usize,
+        operation: &PeerOperation,
+    ) -> &'a OriginAuthority {
+        let (object, page) = operation_identity(operation);
+        let current = a.current.as_ref().expect("ranked");
+        a.authority.insert(OriginAuthority {
+            diagnostic: a.trail.clone(),
+            membership: current.membership.clone(),
+            node: self.node.clone(),
+            object: object.clone(),
+            owners: current.ordered.clone(),
+            page,
+            predecessor_evidence: a.fill.origin_evidence().to_vec(),
+            rank,
         })
     }
 
@@ -1688,9 +1710,9 @@ impl CandidatePolicy {
     #[allow(clippy::too_many_arguments)] // The batch borrows the walk's distinct inputs.
     async fn granted_batch<'a, T>(
         &'a self,
-        candidates: &Candidates,
-        handoff: &[NodeId],
-        probes: &[racer_core::read::walk::Probe],
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        targets: &[u32],
+        remaining_opportunities: u32,
         context: &'a OriginContext,
         operation: &PeerOperation,
         scope: &RequestScope,
@@ -1698,23 +1720,23 @@ impl CandidatePolicy {
         validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
         trail: &mut CandidateTrail,
     ) -> Result<Option<T>> {
-        let mut grants: Vec<(AcquisitionBudget, bool)> = probes
+        let mut grants: Vec<(AcquisitionBudget, bool)> = targets
             .iter()
             .map(|_| (racer_core::read::walk::granted_budget(deadline), false))
             .collect();
-        let owners = candidates.ordered.len();
+        let node = |p: &u32| &membership.members()[*p as usize].node;
         let sent = uring_runtime::environment::now();
-        let responses = futures::future::join_all(probes.iter().zip(grants.iter_mut()).map(
-            |(probe, (grant, timed_out))| {
+        let responses = futures::future::join_all(targets.iter().zip(grants.iter_mut()).map(
+            |(target, (grant, timed_out))| {
                 self.request_traced(
-                    &candidates.membership,
-                    &handoff[probe.canonical - owners],
+                    membership,
+                    node(target),
                     context,
                     operation,
                     FetchMode::CopyOnly,
                     scope,
                     grant,
-                    probe.remaining_opportunities,
+                    remaining_opportunities,
                     RequestMode::FundedRoute,
                     None,
                     timed_out,
@@ -1726,8 +1748,9 @@ impl CandidatePolicy {
         // 41 and 45): the destination's own answer clears it, a timeout
         // only demotes (a granted target is never rank 0).
         if let PeerOperation::Page { page: id, .. } = operation {
-            for ((probe, (_, timed_out)), response) in probes.iter().zip(&grants).zip(&responses) {
-                let destination = &handoff[probe.canonical - owners];
+            for ((target, (_, timed_out)), response) in targets.iter().zip(&grants).zip(&responses)
+            {
+                let destination = node(target);
                 match response {
                     Ok(response) if response.origin().node() == destination => {
                         self.peers.link_health().silence_answered(destination);
@@ -1796,76 +1819,6 @@ impl CandidatePolicy {
             |p| membership.is_neighbor(&self.node, &members[p].node),
         )
         .map(|p| members[p].node.clone())
-    }
-
-    /// What an owner at `rank` uses from the membership published just
-    /// before `candidates.membership`, if still retained:
-    ///
-    /// - handoff targets it asks copy-only before origin (Known issue 6):
-    ///   previous owners that are current members, without this node and its
-    ///   current predecessors; empty when the owner set did not change;
-    /// - predecessors that held the same rank there, which it asks under that
-    ///   membership so one that has not adopted the current version yet still
-    ///   serves (Known issue 12), when this node replaced it at most
-    ///   `PREVIOUS_MEMBERSHIP_WITHIN` ago and is a member of it.
-    ///
-    /// Ranking failures are not errors; the walk just goes without.
-    fn previous_owners<'a>(
-        &'a self,
-        candidates: &'a Candidates,
-        object: &'a ObjectId,
-        page: PageNumber,
-        rank: usize,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, PreviousOwners> {
-        Box::pin(async move {
-            let Some(version) = candidates.membership.version.0.checked_sub(1) else {
-                return Ok(PreviousOwners::default());
-            };
-            let now = uring_runtime::environment::now();
-            let Ok(Some(previous)) = self.published.resolve(version, now) else {
-                return Ok(PreviousOwners::default());
-            };
-            // Ask predecessors under the previous membership only while
-            // peers that adopted the current one still hold it in grace
-            // (`PREVIOUS_MEMBERSHIP_WITHIN`); a lease held only here says
-            // nothing about a peer.
-            let recent = self
-                .published
-                .resolve_recent(
-                    version,
-                    now,
-                    racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
-                )
-                .ok()
-                .flatten()
-                .filter(|recent| recent.member(&self.node).is_ok());
-            let Ok(previous) = self.candidates_scoped(previous, object, page, scope).await else {
-                return Ok(PreviousOwners::default());
-            };
-            let handoff = racer_core::read::walk::handoff_targets(
-                &previous.ordered,
-                &candidates.ordered,
-                rank,
-            )
-            .into_iter()
-            .filter(|node| candidates.membership.member(node).is_ok())
-            .collect();
-            let same_rank = if recent.is_some() {
-                racer_core::read::walk::same_rank_previous(
-                    &previous.ordered,
-                    &candidates.ordered,
-                    rank,
-                )
-            } else {
-                0
-            };
-            Ok(PreviousOwners {
-                handoff,
-                same_rank,
-                membership: recent.filter(|_| same_rank != 0),
-            })
-        })
     }
 
     /// After an origin version miss, old copies on later candidates remain useful.
@@ -1964,67 +1917,6 @@ impl CandidatePolicy {
                 );
             }
             result
-        })
-    }
-
-    /// After a `StaleMembership` answer, decide with
-    /// `racer_core::read::walk::stale_action` whether to refresh. `Some` is the
-    /// strictly newer membership to rank again; `None` means the destination
-    /// is behind and the caller moves to the next owner.
-    /// After a destination under `candidates` was behind this node, the
-    /// previous membership to walk the page's owners under instead, when
-    /// `racer_core::read::walk` allows it: this node does not own the page,
-    /// has not refreshed or fallen back yet, and holds version - 1, replaced
-    /// within `PREVIOUS_MEMBERSHIP_WITHIN` (peers still resolve it) and
-    /// listing this node (peers reject non-members).
-    fn stale_fallback(
-        &self,
-        candidates: &Candidates,
-        owner: bool,
-        retried: bool,
-    ) -> Option<std::sync::Arc<crate::topology::Membership>> {
-        let mut facts = racer_core::read::walk::StaleSkip {
-            owner,
-            retried,
-            previous_recent_member: true,
-        };
-        if !racer_core::read::walk::previous_fallback(facts) {
-            return None;
-        }
-        let version = candidates.membership.version.0.checked_sub(1)?;
-        let previous = self
-            .published
-            .resolve_recent(
-                version,
-                uring_runtime::environment::now(),
-                racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
-            )
-            .ok()
-            .flatten()
-            .filter(|previous| previous.member(&self.node).is_ok());
-        facts.previous_recent_member = previous.is_some();
-        racer_core::read::walk::previous_fallback(facts)
-            .then_some(previous)
-            .flatten()
-    }
-
-    fn refresh_membership(
-        &self,
-        previous: &Candidates,
-        retried: bool,
-    ) -> Result<Option<std::sync::Arc<crate::topology::Membership>>> {
-        let latest = self
-            .published
-            .current()?
-            .map(|published| published.membership.clone());
-        let action = racer_core::read::walk::stale_action(
-            retried,
-            previous.membership.version.0,
-            latest.as_ref().map(|latest| latest.version.0),
-        )?;
-        Ok(match action {
-            racer_core::read::walk::StaleAction::Refresh => latest,
-            racer_core::read::walk::StaleAction::Skip => None,
         })
     }
 
@@ -3389,53 +3281,6 @@ pub(super) mod tests {
             Rc::new(CredentialCrypto::new(keys, admission)),
         )
     }
-    fn visit(
-        selection: ReplicaSelection,
-        len: usize,
-        neighbors: &[usize],
-        scores: [u64; 3],
-    ) -> Vec<usize> {
-        super::visit_order(selection, len, |r| neighbors.contains(&r), |r| scores[r])
-            .ranks()
-            .collect()
-    }
-
-    #[test]
-    fn visit_order_primary_is_canonical_regardless_of_neighbors_or_scores() {
-        for len in 0..=4 {
-            let expected: Vec<_> = (0..len.min(3)).collect();
-            assert_eq!(
-                visit(ReplicaSelection::Primary, len, &[2], [1, 2, 3]),
-                expected
-            );
-            assert_eq!(
-                visit(ReplicaSelection::Primary, len, &[], [9, 0, 5]),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn visit_order_spread_prefers_neighbors_then_highest_score() {
-        use ReplicaSelection::Spread;
-        // All neighbors: pure rendezvous order by descending score.
-        assert_eq!(visit(Spread, 3, &[0, 1, 2], [1, 3, 2]), vec![1, 2, 0]);
-        // Neighbors first even with lower scores; non-neighbors last.
-        assert_eq!(visit(Spread, 3, &[2], [9, 8, 1]), vec![2, 0, 1]);
-        assert_eq!(visit(Spread, 3, &[0, 2], [1, 9, 2]), vec![2, 0, 1]);
-        // No neighbors: rendezvous order over all owners.
-        assert_eq!(visit(Spread, 3, &[], [1, 3, 2]), vec![1, 2, 0]);
-        // Equal scores keep canonical order within a group.
-        assert_eq!(visit(Spread, 3, &[0, 1, 2], [5, 5, 5]), vec![0, 1, 2]);
-        // Two candidates and fewer.
-        assert_eq!(visit(Spread, 2, &[1], [9, 1, 0]), vec![1, 0]);
-        assert_eq!(visit(Spread, 2, &[0, 1], [1, 9, 0]), vec![1, 0]);
-        assert_eq!(visit(Spread, 1, &[], [0, 9, 9]), vec![0]);
-        assert!(visit(Spread, 0, &[0], [0, 0, 0]).is_empty());
-        // Never more than three ranks.
-        assert_eq!(visit(Spread, 5, &[0, 1, 2], [1, 2, 3]), vec![2, 1, 0]);
-    }
-
     fn spread_membership(count: usize) -> std::sync::Arc<crate::topology::Membership> {
         use crate::topology::Member;
         use crate::topology::Membership;

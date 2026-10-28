@@ -5,9 +5,10 @@
 //! 1. Dispatch to the worker `WorkerMap::select` picks; CPU `request_ns`.
 //! 2. Memory index (`TickLru`), then disk index (`PhantomEntries`).
 //! 3. Miss: join the worker's `PageFlights`. A waiter sleeps on a token; the
-//!    leader runs a [`FillPlan`]: the placement ranking (phantom
-//!    `Placement::rank_async`, polled to completion, one CPU ranking chunk per
-//!    poll), then a [`CandidateWalk`]. Each walk `Probe` becomes a peer
+//!    leader drives the production acquisition machine
+//!    (`racer_core::read::walk::Fill`): each placement ranking it asks for is
+//!    a phantom `Placement::rank_async`, polled to completion, one CPU ranking
+//!    chunk per poll. Each walk `Probe` becomes a peer
 //!    request sized by `plan_attempt`, routed hop by hop: every holder runs
 //!    `decide_hop`, relays search their own route (`Paths<SharedRoutes>`) with
 //!    the budget `search_budget`/`relay` allow, take a `Relay` quota, sign, and
@@ -16,8 +17,8 @@
 //!    tiers; acquire probes get `inherited_budget` and run the same flight and
 //!    fill logic. Replies travel the reverse route; pages are cut-through
 //!    transfers on the [`Fabric`].
-//! 5. Only a walk that ends in `End::Origin` with validated authority reaches
-//!    the origin. 412 continues with `RemainingWalk`; publication inserts the
+//! 5. Only a walk that ends with origin authority, validated, reaches the
+//!    origin. 412 continues with the remaining-copy walk; publication inserts the
 //!    page into memory and applies the `persist` rule to write it to disk,
 //!    reclaiming with the scored segment CLOCK.
 
@@ -31,35 +32,28 @@ use std::time::{Duration, Instant};
 use crate::phantom::{Phantom, SharedRoutes};
 use page_alloc::SegmentId;
 use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
-use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS, ping_verdict};
+use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, ping_verdict};
 use racer_core::read::Error;
+use racer_core::read::Source;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
 use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
     Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, should_notice,
 };
-use racer_core::read::hints::{
-    MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets,
-    with_successors,
-};
+use racer_core::read::hints::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral};
 use racer_core::read::walk::{
-    AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
-    Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, Rank0State, RemainingWalk, RouteMode, StaleAction,
-    Step, WalkConfig, demoted_targets_from, granted_budget, granted_prefix, handoff_targets,
-    hedge_budgets, hedge_eligible, hedge_fallback, lineage_counts, lineage_targets, merge_handoff,
-    owner_funding_min, plan_attempt, same_rank_previous, stale_action, transport_outcome,
-};
-use racer_core::read::walk::{
-    StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
+    Action, AttemptInputs, AttemptPlan, Event as FillEvent, Evidence, Features, FillConfig,
+    HedgeEnd, List, Mode, NOT_MEMBER, Notes, Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, Rank0Note,
+    Rank0State, Ranked, Ranking, Reply as FillReply, RouteMode, SilenceNote, TargetKind,
+    granted_budget, hedge_budgets, hedge_fallback, owner_funding_min, plan_attempt,
 };
 use racer_core::read::{
     Answering, AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind,
-    VisitOrder, classify, demote_unanswered, lineage_first, replica_score,
-    validate_origin_authority, visit_order,
+    classify, demote_unanswered, lineage_first, replica_score, validate_origin_authority,
+    visit_order,
 };
 use racer_core::read::{DIRECT_AHEAD, PageBudget, SlotKind, direct_fills, first_failure};
-use racer_core::read::{FillPlan, FillStep, Source, WalkResult};
 use racer_core::read::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
@@ -85,6 +79,14 @@ use crate::workload::{Poisson, Reads, page_id};
 
 /// Maximum read attempts before a read fails.
 const MAX_ATTEMPTS: u8 = 4;
+
+/// Where the simulator's acquisition still differs from production
+/// (`racer_core::read::walk::Features`). Temporary: each goes in its own
+/// behavior change.
+const SIM_DIVERGENCES: u32 = Features::SIM_WAIT_BUDGET_DEADLINE
+    | Features::SIM_REFRESH_DROPS_BOUNDED
+    | Features::SIM_FALLBACK_RANK_DENIES
+    | Features::SIM_REMAINING_STALE;
 
 /// Where a resolved page came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,19 +272,13 @@ type TaskFuture = Pin<Box<dyn Future<Output = Result<Vec<usize>, topology::Error
 
 /// What to do with a finished ranking or route search.
 enum Then {
-    /// Placement ranking for a fill's candidate walk.
-    Walk { fill: u64, version: u64 },
-    /// An owner's ranking of the page under its previous membership, for
-    /// copy-only handoff probes before origin.
-    Handoff { fill: u64 },
-    /// Ranking under membership `version` (the previous one) for the stale
-    /// fallback (`NodeWorld::stale_fallback`).
-    Fallback { fill: u64, version: u64 },
-    /// Re-ranking before origin (production `resolve_epoch_traced`).
-    Origin {
+    /// A ranking a fill's acquisition asked for (`Action::Rank`) under
+    /// membership `version`; `recent` for `Ranking::Previous`.
+    Ranked {
         fill: u64,
-        rank: usize,
-        evidence: Vec<ProbeOutcome>,
+        ranking: Ranking,
+        version: u64,
+        recent: bool,
     },
     /// Route search for a message at `holder`.
     Route {
@@ -296,9 +292,6 @@ enum Then {
 /// A yielding ranking or route search: the real future, polled once per
 /// simulated CPU slice on its worker's CPU FIFO (see the design doc,
 /// "Round 2: fidelity").
-/// A page ranked under a membership version: version, members, owners.
-type Ranked = (u64, Rc<Members>, Result<Vec<u32>, Error>);
-
 struct Task {
     node: u32,
     worker: u8,
@@ -335,12 +328,6 @@ impl std::task::Wake for TaskWaker {
     }
 }
 
-enum Walking {
-    None,
-    Candidates(CandidateWalk),
-    Remaining(RemainingWalk),
-}
-
 struct Fill {
     /// Attempts the fill started with (inherited, for a peer's Acquire).
     initial_attempts: u32,
@@ -350,61 +337,16 @@ struct Fill {
     page: u64,
     leader: u64,
     token: u64,
-    plan: FillPlan,
+    /// The acquisition's decisions (`racer_core::read::walk::Fill`).
+    core: racer_core::read::walk::Fill,
     budget: AcquisitionBudget,
     scope: Instant,
-    walk: Walking,
-    cands: Vec<u32>,
-    /// Previous-membership owners to ask before origin (owners), or the
-    /// page's overflow helper (non-owners); probe canonical `cands.len() + i`
-    /// addresses `handoff[i]`.
-    handoff: Vec<u32>,
-    /// Lineage targets per canonical owner rank (`WalkConfig::lineage`).
-    lineage: [u8; MAX_HANDOFF],
-    /// This owner's lineage targets (`lineage_targets`), merged into
-    /// `handoff` (Known issue 25).
-    lineage_targets: Vec<u32>,
-    /// Of `lineage_targets`, the ones ranked below the owners
-    /// (`demoted_targets`, Known issue 34).
-    demoted: Vec<u32>,
-    /// The first `successors` entries of `handoff` are successor targets.
-    successors: usize,
-    /// The first `granted` entries of `handoff` are asked on their own
-    /// grant (`WalkConfig::granted`): the successor targets, then the
-    /// lineage targets when `node.lineage_grants` (Known issue 35).
-    granted: usize,
     /// Kind of the pending granted probe, for counters: `successor`,
     /// `lineage` or `demoted`.
     granted_kind: Option<&'static str>,
-    /// This owner is a member of membership version - 1, which is still
-    /// retained and was replaced within `PREVIOUS_MEMBERSHIP_WITHIN`.
-    previous_member: bool,
-    /// Predecessors to ask under membership version - 1
-    /// (`WalkConfig::previous`).
-    previous: u8,
-    version: u64,
-    rank: Option<usize>,
-    retried: bool,
-    /// Owners this walk skipped as stale destinations (behind this node).
-    stale: u32,
-    /// This fill is ranking, or already walked, the previous membership
-    /// after a destination under the current one was behind
-    /// (`stale_fallback`).
-    fell_back: bool,
-    /// Waits this read made for destinations that are behind
-    /// (`racer_core::read::walk::stale_wait`, Known issue 26).
-    waits: u8,
-    /// The walk is paused in that wait (`Event::StaleWait`).
-    stale_waiting: bool,
-    /// This node owns the page under the previous membership, so this walk
-    /// keeps the current one.
-    fallback_denied: bool,
-    /// The reply of a destination that is behind waits for the ranking
-    /// under the previous membership before it is skipped or waited for
-    /// (production ranks first, Known issue 36).
-    deferred_skip: bool,
-    /// The ranking allowed the fallback: walk it once the skip completes.
-    fallback_ready: Option<Ranked>,
+    /// The outstanding walk probe's answer and mode, for `Action::Validate`.
+    kind: ResponseKind,
+    acquire: bool,
     probe: Option<u64>,
     /// Granted probes sent at once (`Step::Granted`), and whether one of
     /// them returned a copy.
@@ -412,14 +354,13 @@ struct Fill {
     batch_copy: bool,
     /// The leader's retention observation, used at publication.
     eligible: bool,
-    order: VisitOrder,
-    continuation: Continuation,
     hedge: Option<Box<Race>>,
     _reservation: Vec<SimCharge>,
     /// When the fill started (repeat classification).
     started: Nanos,
-    /// Destination of the outstanding walk probe.
+    /// Destination of the outstanding walk probe, and when it was sent.
     asking: Option<u32>,
+    sent: Nanos,
     /// Why the outstanding walk probe failed in transport, if it did.
     cut: Option<Cut>,
     /// The outstanding walk probe's answer was signed by a relay on the
@@ -1126,21 +1067,10 @@ impl NodeWorld {
                         // Sent, but unanswered within the attempt's own bound
                         // (production `request_traced`, attempt scope).
                         None => {
-                            // An owner's probe of rank 0, or a reader's probe
-                            // of the page's rank 0, asks a ping; any other
-                            // only demotes the owner in this node's visit
-                            // order (Known issues 41 and 43).
-                            let needed = match self.fills.get(&p.fill) {
-                                Some(f) if matches!(&f.walk, Walking::Candidates(w) if w.pending_rank0()) => {
-                                    RANK0_TIMEOUTS
-                                }
-                                Some(f) if f.rank.is_none() && f.cands.first() == Some(&p.dest) => {
-                                    RANK0_TIMEOUTS
-                                }
-                                _ => NO_PING,
-                            };
-                            self.requester_timeout(p.fill, p.dest, p.sent, needed);
-                            self.complete_probe(p.fill, Ok(Outcome::TimedOut))
+                            if let Some(fill) = self.fills.get_mut(&p.fill) {
+                                fill.probe = None;
+                            }
+                            self.drive(p.fill, FillEvent::Reply(FillReply::TimedOut));
                         }
                     }
                 }
@@ -1184,7 +1114,7 @@ impl NodeWorld {
             }
             Event::Slice { task } => self.slice(task),
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
-            Event::StaleWait { fill } => self.stale_wait_done(fill),
+            Event::StaleWait { fill } => self.drive(fill, FillEvent::Timer),
             Event::Notice { node } => self.send_notices(node),
             Event::LastHop { msg } => self.last_hop_timeout(msg),
             Event::SilenceRecheck { from, .. } => self.silence_recheck(from),
@@ -1988,8 +1918,31 @@ impl NodeWorld {
             budget.deadline(),
             handover,
         );
-        let mut plan = FillPlan::new(plaintext);
-        plan.local(false);
+        let node_config = &self.config.node;
+        let features = [
+            (Features::LINEAGE_GRANTS, node_config.lineage_grants),
+            (Features::LINEAGE_SLACK, node_config.lineage_slack),
+            (Features::PARALLEL_GRANTED, node_config.parallel_granted),
+            (Features::HELPER, node_config.fanout),
+            (Features::STALE_FALLBACK, node_config.stale_fallback),
+            (Features::STALE_WAIT, node_config.stale_wait),
+            (
+                Features::RANK0_FAILED,
+                node_config.rank0_watch && node_config.rank0_failure_hold,
+            ),
+        ]
+        .into_iter()
+        .fold(
+            Features::new(SIM_DIVERGENCES, node_config.lineage_cap),
+            |features, (bit, on)| features.with(bit, on),
+        );
+        let core = racer_core::read::walk::Fill::new(FillConfig {
+            operation: OperationKind::Page,
+            hedge: plaintext,
+            walk_only: false,
+            scope,
+            features,
+        });
         self.fills.insert(
             id,
             Fill {
@@ -2000,40 +1953,21 @@ impl NodeWorld {
                 page,
                 leader,
                 token,
-                plan,
+                core,
                 budget,
                 scope,
-                walk: Walking::None,
-                cands: Vec::new(),
-                handoff: Vec::new(),
-                lineage: [0; MAX_HANDOFF],
-                lineage_targets: Vec::new(),
-                demoted: Vec::new(),
-                successors: 0,
-                granted: 0,
                 granted_kind: None,
+                kind: ResponseKind::Miss,
+                acquire: false,
                 batch: Vec::new(),
                 batch_copy: false,
-                previous_member: false,
-                previous: 0,
-                version: 0,
-                rank: None,
-                retried: false,
-                stale: 0,
-                fell_back: false,
-                fallback_denied: false,
-                deferred_skip: false,
-                fallback_ready: None,
-                waits: 0,
-                stale_waiting: false,
                 probe: None,
                 eligible,
-                order: VisitOrder::canonical(0),
-                continuation: Continuation::default(),
                 hedge: None,
                 _reservation: reservation,
                 started: self.engine.now(),
                 asking: None,
+                sent: 0,
                 cut: None,
                 relayed: false,
                 asked: Vec::new(),
@@ -2046,7 +1980,7 @@ impl NodeWorld {
         self.metrics.incr("fills");
         match failed {
             Some(e) => self.finish_fill(id, Err(e)),
-            None => self.begin_walk(id),
+            None => self.drive(id, FillEvent::Start { local_hit: false }),
         }
         for token in wakes {
             self.wake(token);
@@ -2201,25 +2135,14 @@ impl NodeWorld {
             });
         }
         match then {
-            Then::Walk { fill, version } => {
-                let cands = Self::to_nodes(&members, result);
-                self.walk_ranked(fill, version, members, cands);
-            }
-            Then::Handoff { fill } => {
-                let previous = Self::to_nodes(&members, result);
-                self.handoff_ranked(fill, previous);
-            }
-            Then::Fallback { fill, version } => {
-                let cands = Self::to_nodes(&members, result);
-                self.fallback_ranked(fill, version, members, cands);
-            }
-            Then::Origin {
+            Then::Ranked {
                 fill,
-                rank,
-                evidence,
+                ranking,
+                version,
+                recent,
             } => {
-                let expected = Self::to_nodes(&members, result);
-                self.origin_ranked(fill, rank, evidence, members, expected);
+                let cands = Self::to_nodes(&members, result);
+                self.ranked(fill, ranking, version, recent, members, cands);
             }
             Then::Route {
                 msg,
@@ -2255,244 +2178,283 @@ impl NodeWorld {
         self.spawn(node, w, future, members, false, then);
     }
 
-    fn begin_walk(&mut self, id: u64) {
-        let Some(fill) = self.fills.get(&id) else {
-            return;
-        };
-        let (node, w, page) = (fill.node, fill.worker, fill.page);
-        let version = self.adopt(node);
-        let members = self
-            .versions
-            .get(version)
-            .expect("adopted version retained")
-            .members
-            .clone();
-        self.rank(node, w, members, page, Then::Walk { fill: id, version });
+    /// Feed `event` to fill `id`'s acquisition and perform the actions it
+    /// asks for until one waits on a scheduled event (production
+    /// `CandidatePolicy::drive`).
+    fn drive(&mut self, id: u64, mut event: FillEvent<'_>) {
+        loop {
+            let now = self.instant(self.now());
+            let Some(fill) = self.fills.get_mut(&id) else {
+                return;
+            };
+            let (action, evidence) = fill.core.on(event, &mut fill.budget, now);
+            self.apply(id, evidence);
+            event = match action {
+                Action::Rank { ranking, version } => match self.rank_for(id, ranking, version) {
+                    Some(ranked) => FillEvent::Ranked(ranked),
+                    None => return,
+                },
+                Action::Hints => return self.hints(id),
+                Action::Hedge {
+                    eligible,
+                    first,
+                    second,
+                } => {
+                    if self.try_hedge(id, eligible, first, second) {
+                        return;
+                    }
+                    FillEvent::Hedge(HedgeEnd::NotStarted)
+                }
+                Action::Refresh => {
+                    let node = self.fills[&id].node;
+                    let latest = self.adopt(node);
+                    let (member, recent) = self.previous_facts(id);
+                    FillEvent::Membership {
+                        latest: Some(latest),
+                        previous_recent_member: member && recent,
+                    }
+                }
+                Action::Probe(probe) => match self.send_probe(id, probe) {
+                    None => return,
+                    Some(event) => event,
+                },
+                Action::Validate => {
+                    // A phantom page claims the page it was asked for; the
+                    // identity check is the same callback production runs.
+                    let fill = &self.fills[&id];
+                    let (expected, claimed) = (self.ids.page(fill.page), self.ids.page(fill.page));
+                    FillEvent::Validated(classify(
+                        fill.kind,
+                        OperationKind::Page,
+                        fill.acquire,
+                        || {
+                            if claimed == expected {
+                                Ok(())
+                            } else {
+                                Err(Error::CorruptRecord)
+                            }
+                        },
+                    ))
+                }
+                Action::Batch {
+                    first,
+                    count,
+                    remaining_opportunities,
+                } => return self.send_granted(id, first, count, remaining_opportunities),
+                Action::Wait(wait) => {
+                    let fill = self.fills.get_mut(&id).expect("present");
+                    if fill.core.waits() > 1 {
+                        // A further wait (Known issue 36).
+                        self.metrics.incr("stale_waits_again");
+                    }
+                    fill.asking = None;
+                    self.metrics.incr("stale_waits");
+                    self.engine
+                        .after(wait.as_nanos() as Nanos, Event::StaleWait { fill: id });
+                    return;
+                }
+                Action::Origin { rank } => match self.origin_authority(id, rank) {
+                    Ok(()) => return self.issue_origin(id),
+                    Err(e) => FillEvent::Abort(e),
+                },
+                Action::Publish(_) => {
+                    let fill = &self.fills[&id];
+                    let (node, w, page, eligible) =
+                        (fill.node, fill.worker, fill.page, fill.eligible);
+                    self.memory_insert(node, w, page);
+                    self.persist_page(node, w, page, eligible);
+                    FillEvent::Published(Ok(()))
+                }
+                Action::Done(result) => return self.finish_fill(id, result),
+                Action::Idle => return,
+            };
+        }
     }
 
-    fn walk_ranked(
+    /// Rank the page for fill `id` as a yielding task, or answer at once
+    /// when there is nothing to rank.
+    fn rank_for(
         &mut self,
         id: u64,
+        ranking: Ranking,
+        version: Option<u64>,
+    ) -> Option<Result<Ranked, Error>> {
+        let fill = &self.fills[&id];
+        let (node, w, page) = (fill.node, fill.worker, fill.page);
+        let version = match ranking {
+            Ranking::Current => self.adopt(node),
+            _ => version.expect("a version to rank"),
+        };
+        let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
+            return Some(Err(Error::IncompatibleMembership));
+        };
+        // Production asks predecessors under the previous membership only
+        // within `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only with
+        // grace retention on (`Published::resolve_recent`), so peers still
+        // resolve it. The simulator measures from the version's publication,
+        // which is no later than this node's adoption, so it is the stricter
+        // of the two; peers resolve older versions only with
+        // `retained_versions` of at least 1.
+        let recent = ranking == Ranking::Previous && {
+            let (member, recent) = self.previous_facts(id);
+            member && recent
+        };
+        self.rank(
+            node,
+            w,
+            members,
+            page,
+            Then::Ranked {
+                fill: id,
+                ranking,
+                version,
+                recent,
+            },
+        );
+        None
+    }
+
+    /// A ranking for fill `id` finished.
+    fn ranked(
+        &mut self,
+        id: u64,
+        ranking: Ranking,
         version: u64,
+        recent: bool,
         members: Rc<Members>,
         cands: Result<Vec<u32>, Error>,
     ) {
         let Some(fill) = self.fills.get(&id) else {
             return;
         };
-        let (node, page) = (fill.node, fill.page);
-        let cands = match cands {
-            Ok(cands) if !cands.is_empty() => cands,
-            Ok(_) => return self.hard_fail(id, Error::Unavailable),
-            Err(e) => return self.hard_fail(id, e),
-        };
+        let node = fill.node;
+        let ranked = cands.map(|cands| match ranking {
+            Ranking::Current | Ranking::Fallback => {
+                self.walk_ranking(id, version, &members, &cands)
+            }
+            Ranking::Previous => {
+                // Previous owners that are no longer members are not asked.
+                let current = self
+                    .versions
+                    .get(fill.core.version())
+                    .map(|v| v.members.clone());
+                let owners: Vec<u32> = cands
+                    .iter()
+                    .map(|n| {
+                        if current.as_ref().is_some_and(|m| position(m, *n).is_some()) {
+                            *n
+                        } else {
+                            NOT_MEMBER
+                        }
+                    })
+                    .collect();
+                Ranked {
+                    recent_member: recent,
+                    ..Ranked::new(version, &owners, None)
+                }
+            }
+            Ranking::Authority => {
+                Ranked::new(version, &cands, cands.iter().position(|c| *c == node))
+            }
+        });
+        self.drive(id, FillEvent::Ranked(ranked));
+    }
+
+    /// What fill `id` walks under `members`: production
+    /// `CandidatePolicy::visit_order` and the arrivals and demoted members
+    /// `CandidatePolicy::ranked` collects.
+    fn walk_ranking(&self, id: u64, version: u64, members: &Members, cands: &[u32]) -> Ranked {
+        let fill = &self.fills[&id];
+        let (node, w, page) = (fill.node, fill.worker, fill.page);
         let rank = cands.iter().position(|c| *c == node);
-        let order = if rank.is_some() {
-            VisitOrder::canonical(0)
-        } else {
-            let me = position(&members, node);
-            let positions: Vec<Option<usize>> =
-                cands.iter().map(|c| position(&members, *c)).collect();
-            let object = self.ids.object(page);
-            let number = self.ids.number(page);
-            let requester = self.ids.node(node);
-            visit_order(
-                ReplicaSelection::Spread,
-                cands.len(),
-                |r| matches!((me, positions[r]), (Some(a), Some(b)) if members.is_neighbor(a, b)),
-                |r| replica_score(requester, &object, number, self.ids.node(cands[r])),
-            )
-        };
+        let me = position(members, node);
+        let neighbor = |r: usize| matches!((me, position(members, cands[r])), (Some(a), Some(b)) if members.is_neighbor(a, b));
         // Arrival order of the owners in this node's chain (production
         // `Membership::since`, Known issue 25): the shared chain clamped to
         // the generation this node's process started from.
-        let since = self.since_of(node, &members, &cands);
-        // A non-owner visits an older later owner before the newer owner
-        // that displaced it (production `visit_order`, Known issue 25).
-        let order = if rank.is_none() {
-            let me = position(&members, node);
-            lineage_first(
-                order,
-                &since,
-                |r| matches!((me, position(&members, cands[r])), (Some(a), Some(b)) if members.is_neighbor(a, b)),
-            )
-        } else {
-            order
-        };
-        // Owners that left this node's request unanswered go last
-        // (production `CandidatePolicy::visit_order`, Known issue 41).
-        let order = if rank.is_none() && self.config.node.silence {
-            let at = self.instant(self.now());
-            let silence = &self.nodes[node as usize].silence;
-            demote_unanswered(order, |r| {
-                if silence.silent(&cands[r], at) {
-                    Answering::Silent
-                } else if silence.unanswered(&cands[r], at) {
-                    Answering::Unanswered
-                } else {
-                    Answering::Answers
-                }
-            })
-        } else {
-            order
-        };
-        // Members ranked just below the owners that were owners when they
-        // arrived (production `CandidatePolicy::resolve_epoch_traced`,
-        // `Placement::demoted`, Known issue 34).
-        let demoted = match rank {
-            Some(rank) if self.config.node.demoted_targets => {
-                let w = self.fills[&id].worker;
-                let below: Vec<u32> = self.nodes[node as usize].workers[w as usize]
-                    .placement
-                    .demoted(&*members, &page.to_be_bytes())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| members.members()[p].node)
-                    .collect();
-                let below_since = self.since_of(node, &members, &below);
-                // Arrivals at the chain's start are unknown (production
-                // `Membership::since` 0, Known issue 46).
-                let oldest = self
-                    .config
-                    .node
-                    .unknown_age_targets
-                    .then(|| self.chain_base(node));
-                demoted_targets_from(&since, &below, &below_since, rank, oldest)
-            }
-            _ => Vec::new(),
-        };
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.lineage = if self.config.node.lineage_grants && !self.config.node.lineage_slack {
-            [0; MAX_HANDOFF]
-        } else {
-            lineage_counts(&since)
-        };
-        fill.lineage_targets = match rank {
-            Some(rank) => lineage_targets(&cands, &since, rank),
-            None => Vec::new(),
-        };
-        for n in &demoted {
-            if !fill.lineage_targets.contains(n)
-                && fill.lineage_targets.len() < self.config.node.lineage_cap
-            {
-                fill.lineage_targets.push(*n);
-            }
+        let since = self.since_of(node, members, cands);
+        let mut ranked = Ranked::new(version, cands, rank);
+        ranked.members = members.members().len();
+        for (s, c) in ranked.since.iter_mut().zip(&since) {
+            *s = *c;
         }
-        fill.demoted = demoted;
-        fill.cands = cands;
-        fill.stale = 0;
-        fill.handoff = fill.lineage_targets.clone();
-        fill.successors = 0;
-        fill.previous_member = false;
-        fill.previous = 0;
-        fill.version = version;
-        fill.rank = rank;
-        fill.order = order;
-        // An owner also ranks the page under membership version - 1, when
-        // still retained (production `CandidatePolicy::handoff_targets`).
-        if rank.is_some()
-            && let Some(old) = version.checked_sub(1).and_then(|v| self.versions.get(v))
-        {
-            let old = old.members.clone();
-            // Production asks predecessors under the previous membership only
-            // within `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only
-            // with grace retention on (`Published::resolve_recent`), so peers
-            // still resolve it. The simulator measures from the version's
-            // publication, which is no later than this node's adoption, so
-            // it is the stricter of the two; peers resolve older versions
-            // only with `retained_versions` of at least 1.
-            let recent = self.config.node.retained_versions >= 1
-                && self.versions.get(version).is_some_and(|v| {
-                    self.now().saturating_sub(v.published)
-                        <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
-                });
-            let fill = self.fills.get_mut(&id).expect("present");
-            fill.previous_member = recent && position(&old, node).is_some();
-            let w = fill.worker;
-            self.rank(node, w, old, page, Then::Handoff { fill: id });
-            return;
-        }
-        self.walk_owners(id);
-    }
-
-    /// Previous-membership owners are ranked: keep those that are still
-    /// members and that the walk does not ask anyway, then walk.
-    fn handoff_ranked(&mut self, id: u64, previous: Result<Vec<u32>, Error>) {
-        let Some(fill) = self.fills.get(&id) else {
-            return;
-        };
-        if let (Ok(previous), Some(rank)) = (previous, fill.rank) {
-            let current = self.versions.get(fill.version).map(|v| v.members.clone());
-            let targets = handoff_targets(&previous, &fill.cands, rank);
-            let same = same_rank_previous(&previous, &fill.cands, rank);
-            let fill = self.fills.get_mut(&id).expect("present");
-            if fill.previous_member {
-                fill.previous = same;
-            }
-            let targets = targets
+        if rank.is_none() {
+            let requester = self.ids.node(node);
+            let (object, number) = (self.ids.object(page), self.ids.number(page));
+            let order = visit_order(ReplicaSelection::Spread, cands.len(), neighbor, |r| {
+                replica_score(requester, &object, number, self.ids.node(cands[r]))
+            });
+            // A non-owner visits an older later owner before the newer owner
+            // that displaced it (Known issue 25).
+            let order = lineage_first(order, &since, neighbor);
+            // Owners that left this node's request unanswered go last
+            // (Known issue 41).
+            ranked.order = if self.config.node.silence {
+                let at = self.instant(self.now());
+                let silence = &self.nodes[node as usize].silence;
+                demote_unanswered(order, |r| {
+                    if silence.silent(&cands[r], at) {
+                        Answering::Silent
+                    } else if silence.unanswered(&cands[r], at) {
+                        Answering::Unanswered
+                    } else {
+                        Answering::Answers
+                    }
+                })
+            } else {
+                order
+            };
+        } else if self.config.node.demoted_targets {
+            // Members ranked just below the owners that were owners when
+            // they arrived (production `Placement::demoted`, Known issue 34).
+            let below: Vec<u32> = self.nodes[node as usize].workers[w as usize]
+                .placement
+                .demoted(members, &page.to_be_bytes())
+                .unwrap_or_default()
                 .into_iter()
-                .filter(|n| current.as_ref().is_some_and(|m| position(m, *n).is_some()))
+                .map(|p| members.members()[p].node)
                 .collect();
-            fill.handoff = merge_handoff(targets, fill.lineage_targets.clone());
-        }
-        self.walk_owners(id);
-    }
-
-    fn walk_owners(&mut self, id: u64) {
-        self.add_successor_targets(id);
-        let fill = self.fills.get_mut(&id).expect("present");
-        if *fill.plan.step() == FillStep::Hedge && self.try_hedge(id) {
-            return;
-        }
-        self.start_candidates(id);
-    }
-
-    /// Production `CandidatePolicy::resolve_epoch_traced` successor targets
-    /// (Known issue 21): an owner holding a hint that a later owner asked it
-    /// for the page without getting a copy asks that owner copy-only before
-    /// origin, on its own grant. Each hint funds one such probe.
-    fn add_successor_targets(&mut self, id: u64) {
-        if !self.config.node.successor_targets || !self.config.node.successor_hints {
-            return;
-        }
-        let fill = &self.fills[&id];
-        let Some(rank) = fill.rank else {
-            return;
-        };
-        let (node, page) = (fill.node, fill.page);
-        if self.nodes[node as usize].hints.is_empty() {
-            return;
-        }
-        let instant = self.instant(self.now());
-        let hints = self.nodes[node as usize].hints.probe(&page, instant);
-        let fill = &self.fills[&id];
-        let targets = successor_targets(&hints, &fill.cands, rank);
-        if targets.is_empty() {
-            return;
-        }
-        let fill = self.fills.get_mut(&id).expect("present");
-        let (handoff, successors) = with_successors(targets, &fill.handoff);
-        fill.handoff = handoff;
-        fill.successors = successors;
-    }
-
-    /// Build the candidate walk from the fill's ranking and the carried
-    /// continuation, then step it.
-    fn start_candidates(&mut self, id: u64) {
-        let fill = &self.fills[&id];
-        let helpers_possible = self
-            .versions
-            .get(fill.version)
-            .is_some_and(|v| v.members.members().len() > fill.cands.len() + 1);
-        // Known issue 39: what this owner last learned about rank
-        // 0's acquisition of the page.
-        let rank0 = match (fill.rank, fill.cands.first()) {
-            (Some(r), Some(first)) if r > 0 && self.config.node.rank0_watch => {
-                let instant = self.instant(self.now());
-                self.nodes[fill.node as usize]
-                    .rank0
-                    .state(&fill.page, first, instant)
+            let below_since = self.since_of(node, members, &below);
+            ranked.demoted = List::from_slice(&below);
+            for (s, c) in ranked.demoted_since.iter_mut().zip(&below_since) {
+                *s = *c;
             }
+            // Arrivals at the chain's start are unknown (production
+            // `Membership::since` 0, Known issue 46).
+            ranked.oldest = self
+                .config
+                .node
+                .unknown_age_targets
+                .then(|| self.chain_base(node));
+        }
+        ranked
+    }
+
+    /// Production `CandidatePolicy::drive` hints (Known issues 21 and 39): an
+    /// owner's successor hints for the page, and what it last learned about
+    /// rank 0's acquisition of it.
+    fn hints(&mut self, id: u64) {
+        let fill = &self.fills[&id];
+        let (node, page, rank, rank0) = (
+            fill.node,
+            fill.page,
+            fill.core.rank(),
+            fill.core.owners().first().copied(),
+        );
+        let instant = self.instant(self.now());
+        let hints = if self.config.node.successor_targets
+            && self.config.node.successor_hints
+            && !self.nodes[node as usize].hints.is_empty()
+        {
+            self.nodes[node as usize].hints.probe(&page, instant)
+        } else {
+            Vec::new()
+        };
+        let rank0 = match (rank, rank0) {
+            (Some(r), Some(first)) if r > 0 && self.config.node.rank0_watch => self.nodes
+                [node as usize]
+                .rank0
+                .state(&page, &first, instant),
             _ => Rank0State::Unknown,
         };
         match rank0 {
@@ -2501,34 +2463,106 @@ impl NodeWorld {
             Rank0State::Failed => self.metrics.incr("rank0_watch_failed_walks"),
             Rank0State::Unknown => {}
         }
-        let fill = self.fills.get_mut(&id).expect("present");
-        // Successor targets come first in `handoff`, then lineage targets
-        // (`merge_handoff`); with `lineage_grants` both are granted.
-        fill.granted = fill.successors
-            + if self.config.node.lineage_grants && fill.rank.is_some() {
-                granted_prefix(&fill.handoff[fill.successors..], &fill.lineage_targets)
+        self.drive(
+            id,
+            FillEvent::Hints {
+                hints: &hints,
+                rank0,
+            },
+        );
+    }
+
+    /// Fill `id`'s membership version - 1: whether this node is a member of
+    /// it, and whether it was replaced recently enough that peers still
+    /// resolve it (`PREVIOUS_MEMBERSHIP_WITHIN`, measured from the
+    /// publication).
+    fn previous_facts(&self, id: u64) -> (bool, bool) {
+        let now = self.now();
+        let fill = &self.fills[&id];
+        let (node, version) = (fill.node, fill.core.version());
+        let member = version
+            .checked_sub(1)
+            .and_then(|v| self.versions.get(v))
+            .is_some_and(|v| position(&v.members, node).is_some());
+        let recent = self.config.node.retained_versions >= 1
+            && self.versions.get(version).is_some_and(|v| {
+                now.saturating_sub(v.published) <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
+            });
+        (member, recent)
+    }
+
+    /// Apply what one event showed: silence, rank 0 and route evidence, and
+    /// counters (production `CandidatePolicy::apply`).
+    fn apply(&mut self, id: u64, evidence: Evidence) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let (node, page) = (fill.node, fill.page);
+        let at = self.instant(self.now());
+        match (evidence.silence, fill.asking) {
+            (Some(SilenceNote::TimedOut { needed }), Some(dest)) => {
+                let sent = fill.sent;
+                self.requester_timeout(id, dest, sent, needed);
+            }
+            (Some(note), Some(dest)) => {
+                let silence = &mut self.nodes[node as usize].silence;
+                if note == SilenceNote::Shed && self.config.node.shed_busy {
+                    // The destination itself shed the request: busy, not
+                    // hung (Known issue 54).
+                    silence.shed(dest, page, at);
+                } else {
+                    silence.answered(&dest, at);
+                }
+            }
+            _ => {}
+        }
+        if let Some(outcome) = evidence.outcome {
+            self.complete_probe(id, outcome, &evidence);
+        }
+        let notes = evidence.notes;
+        for (note, counter) in [
+            (Notes::STALE_SKIP, "stale_destination_skips"),
+            (Notes::OWNER_STALE_SKIP, "owner_stale_destination_skips"),
+            (Notes::REFRESH, "walk_membership_refreshes"),
+            (Notes::FALLBACK, "stale_fallbacks"),
+            (Notes::FALLBACK_DENIED, "stale_fallback_denied"),
+            (Notes::WAIT_DENIED, "stale_waits_denied"),
+            (Notes::RANK0_LEFT, "origin_left_to_rank0"),
+            (Notes::WALK_COPY, "walk_copies"),
+            (Notes::EXHAUSTED, "walk_exhausted"),
+            (Notes::EXHAUSTED_FUNDING, "walk_exhausted_funding"),
+            (Notes::EXHAUSTED_STALE, "walk_exhausted_stale"),
+            (Notes::REMAINING, "remaining_walks"),
+        ] {
+            if notes & note != 0 {
+                self.metrics.incr(counter);
+            }
+        }
+        if notes & Notes::FALLBACK_BLOCKED != 0 {
+            // Why a non-owner could not fall back (Known issue 19).
+            let (member, recent) = self.previous_facts(id);
+            self.metrics.incr(if !member {
+                "stale_fallback_not_member"
+            } else if !recent {
+                "stale_fallback_not_recent"
             } else {
-                0
-            };
-        let continuation = std::mem::take(&mut fill.continuation);
-        fill.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
-            rank: fill.rank,
-            owners: fill.cands.len(),
-            order: fill.order,
-            page_operation: true,
-            continuation,
-            handoff: fill.handoff.len(),
-            previous: fill.previous,
-            // A non-owner may ask the page's overflow helper when an owner
-            // sheds it (production `resolve_epoch_traced`, Known issue 16);
-            // the helper is chosen when the walk asks for it.
-            helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
-            lineage: fill.lineage,
-            granted: fill.granted,
-            parallel_granted: self.config.node.parallel_granted,
-            rank0,
-        }));
-        self.step_walk(id);
+                "stale_fallback_other"
+            });
+        }
+        if notes & Notes::RANK0_LEFT != 0 {
+            // Known issue 52: rank 0's own acquisition failed.
+            let fill = &self.fills[&id];
+            let rank0 = fill.core.owners().first().copied();
+            if fill
+                .asked
+                .iter()
+                .rev()
+                .find(|(dest, _)| Some(*dest) == rank0)
+                .is_some_and(|(_, a)| *a == Asked::Failed)
+            {
+                self.metrics.incr("origin_left_to_rank0_failed");
+            }
+        }
     }
 
     /// Whether `node` may open a pinned direct exchange to `dest` now
@@ -2540,36 +2574,20 @@ impl NodeWorld {
 
     /// Production `hedge_page` (`src/read/candidates.rs`): start a hedge
     /// race when enabled, eligible, directly reachable, and admitted.
-    /// Otherwise report no hedge to the plan and return false.
-    fn try_hedge(&mut self, id: u64) -> bool {
+    /// Returns whether it started.
+    fn try_hedge(&mut self, id: u64, eligible: bool, first: usize, second: usize) -> bool {
         let now = self.now();
         let instant = self.instant(now);
         let fill = self.fills.get(&id).expect("present");
         let (node, w) = (fill.node, fill.worker);
         let enabled = self.config.node.hedge_slots > 0;
-        let (first, second) = (
-            fill.order.get(0).unwrap_or(0),
-            fill.order.get(1).unwrap_or(0),
-        );
-        let facts = HedgeFacts {
-            page_operation: true,
-            is_candidate: fill.rank.is_some(),
-            owners: fill.cands.len(),
-            first,
-            second,
-            distinct: fill.cands.len() >= 2 && fill.cands[first] != fill.cands[second],
-            remaining_attempts: fill.budget.remaining_attempts(),
-            remaining_links: fill.budget.remaining_links(),
-        };
-        let eligible = hedge_eligible(facts);
         if eligible {
             self.metrics.incr("hedge_eligible");
         }
         if !enabled {
-            self.fills.get_mut(&id).expect("present").plan.hedge(false);
             return false;
         }
-        let (a, b) = (fill.cands[first], fill.cands[second]);
+        let (a, b) = (fill.core.owners()[first], fill.core.owners()[second]);
         let started = eligible && self.direct_available(node, a) && self.direct_available(node, b);
         let reservation = started
             .then(|| {
@@ -2590,7 +2608,6 @@ impl NodeWorld {
             if eligible {
                 self.metrics.incr("hedge_suppressed");
             }
-            self.fills.get_mut(&id).expect("present").plan.hedge(false);
             return false;
         };
         let fill = self.fills.get_mut(&id).expect("present");
@@ -2600,13 +2617,7 @@ impl NodeWorld {
         );
         let Ok((secondary, primary)) = hedge_budgets(&mut fill.budget) else {
             self.metrics.incr("hedge_suppressed");
-            fill.plan.hedge(false);
             return false;
-        };
-        fill.continuation = Continuation {
-            primary_consumed: true,
-            primary_outcome: None,
-            bounded_routes: true,
         };
         fill.hedge = Some(Box::new(Race {
             primary_budget: primary,
@@ -2673,8 +2684,8 @@ impl NodeWorld {
             Some(node),
             || format!("hedge plan {} links {} attempts from {before_links} links {before_attempts} attempts", plan.links, plan.remote_attempts),
         );
-        let dest = fill.cands[canonical];
-        let version = self.fills[&id].version;
+        let dest = fill.core.owners()[canonical];
+        let version = self.fills[&id].core.version();
         let pid = self.launch(
             id,
             dest,
@@ -2711,7 +2722,7 @@ impl NodeWorld {
         if race.launched || race.secondary_done || race.winner.is_some() || race.fatal.is_some() {
             return;
         }
-        let (node, w, dest) = (fill.node, fill.worker, fill.cands[race.second]);
+        let (node, w, dest) = (fill.node, fill.worker, fill.core.owners()[race.second]);
         // Recheck the link and local headroom after the delay.
         let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
         let ok = self.direct_available(node, dest) && hedge_pages(quotas, 1).is_ok();
@@ -2798,8 +2809,7 @@ impl NodeWorld {
         }
     }
 
-    /// Both contenders are fenced: reunite budgets and either publish the
-    /// winner or fall back to the serial walk.
+    /// Both contenders are fenced: reunite budgets and report the race.
     fn finish_race(&mut self, id: u64) {
         let now = self.now();
         let fill = self.fills.get_mut(&id).expect("present");
@@ -2821,149 +2831,39 @@ impl NodeWorld {
             Some(node),
             || format!("hedge reunited {links} links {attempts} attempts from {before_links} links {before_attempts} attempts"),
         );
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.continuation.primary_outcome =
-            Some(race.primary_outcome.unwrap_or(ProbeOutcome::Unreachable));
         if let Err(e) = reunited {
-            return self.finish_fill(id, Err(e));
+            return self.drive(id, FillEvent::Abort(e));
         }
-        if let Some(primary) = race.winner {
-            self.metrics.incr(if primary {
-                "hedge_primary_won"
-            } else {
-                "hedge_won"
-            });
-            fill.continuation = Continuation::default();
-            fill.plan.hedge(true);
-            return self.continue_plan(id);
-        }
-        if let Some(e) = race.fatal
-            && !hedge_fallback(e)
-        {
-            return self.finish_fill(id, Err(e));
-        }
-        fill.plan.hedge(false);
-        self.metrics.incr("hedge_fallbacks");
-        if race.stale {
-            // Production `resolve_epoch_traced`: a stale hedge refreshes the
-            // candidates and walks the new epoch with bounded routes.
-            fill.continuation = Continuation {
-                bounded_routes: true,
-                ..Continuation::default()
-            };
-            let (retried, previous) = (fill.retried, fill.version);
-            let latest = self.adopt(node);
-            return match stale_action(retried, previous, Some(latest)) {
-                Ok(StaleAction::Refresh) => {
-                    self.metrics.incr("walk_membership_refreshes");
-                    self.fills.get_mut(&id).expect("present").retried = true;
-                    self.begin_walk(id)
-                }
-                // The stale contender is behind this node (Known issue 3):
-                // walk this epoch with bounded routes.
-                Ok(StaleAction::Skip) => {
-                    self.metrics.incr("stale_destination_skips");
-                    self.start_candidates(id)
-                }
-                Err(e) => self.fail_walk(id, e),
-            };
-        }
-        self.start_candidates(id);
-    }
-
-    fn step_walk(&mut self, id: u64) {
-        loop {
-            let Some(fill) = self.fills.get_mut(&id) else {
-                return;
-            };
-            let Walking::Candidates(walk) = &mut fill.walk else {
-                return;
-            };
-            match walk.next(&mut fill.budget) {
-                Err(e) => return self.hard_fail(id, e),
-                Ok(Step::End(end)) => return self.on_end(id, end),
-                Ok(Step::Granted(probes)) => return self.send_granted(id, probes),
-                Ok(Step::Probe(probe)) => match self.send_probe(id, probe) {
-                    Ok(()) | Err(None) => return,
-                    Err(Some(outcome)) => {
-                        let fill = self.fills.get_mut(&id).expect("present");
-                        let Walking::Candidates(walk) = &mut fill.walk else {
-                            return;
-                        };
-                        match walk.complete(&mut fill.budget, Outcome::Transport(outcome)) {
-                            Err(e) => return self.hard_fail(id, e),
-                            Ok(Some(end)) => return self.on_end(id, end),
-                            Ok(None) => {}
-                        }
-                    }
-                },
+        let end = match race.winner {
+            Some(primary) => {
+                self.metrics.incr(if primary {
+                    "hedge_primary_won"
+                } else {
+                    "hedge_won"
+                });
+                HedgeEnd::Won
             }
-        }
-    }
-
-    fn step_remaining(&mut self, id: u64) {
-        loop {
-            let Some(fill) = self.fills.get_mut(&id) else {
-                return;
-            };
-            let Walking::Remaining(walk) = &mut fill.walk else {
-                return;
-            };
-            match walk.next_probe() {
-                Err(end) => {
-                    fill.plan.remaining(Ok(end));
-                    return self.continue_plan(id);
+            None => {
+                if race.fatal.is_none_or(hedge_fallback) {
+                    self.metrics.incr("hedge_fallbacks");
                 }
-                Ok(probe) => match self.send_probe(id, probe) {
-                    Ok(()) | Err(None) => return,
-                    Err(Some(outcome)) => {
-                        let fill = self.fills.get_mut(&id).expect("present");
-                        let Walking::Remaining(walk) = &mut fill.walk else {
-                            return;
-                        };
-                        if let Some(end) =
-                            walk.complete(&mut fill.budget, Outcome::Transport(outcome))
-                        {
-                            fill.plan.remaining(Ok(end));
-                            return self.continue_plan(id);
-                        }
-                    }
-                },
+                HedgeEnd::Lost {
+                    stale: race.stale,
+                    primary: race.primary_outcome,
+                    error: race.fatal,
+                }
             }
-        }
-    }
-
-    /// Fail the current walk step with `e` through the fill plan.
-    fn hard_fail(&mut self, id: u64, e: Error) {
-        let Some(fill) = self.fills.get_mut(&id) else {
-            return;
         };
-        match std::mem::replace(&mut fill.walk, Walking::None) {
-            Walking::Candidates(mut walk) => {
-                let _ = walk.abandon(&mut fill.budget);
-                fill.plan.walk(WalkResult::Failed(e));
-            }
-            Walking::Remaining(_) => fill.plan.remaining(Err(e)),
-            Walking::None => match fill.plan.step() {
-                FillStep::Walk => fill.plan.walk(WalkResult::Failed(e)),
-                _ => return self.finish_fill(id, Err(e)),
-            },
-        }
-        self.continue_plan(id);
+        self.drive(id, FillEvent::Hedge(end));
     }
 
     /// Counter kind of handoff target `i` of fill `id`, and count the probe.
     fn handoff_kind(&mut self, id: u64, i: usize) -> Option<&'static str> {
-        let fill = &self.fills[&id];
-        let dest = fill.handoff[i];
-        let kind = if i < fill.successors {
-            Some("successor")
-        } else if i < fill.granted && fill.demoted.contains(&dest) {
-            Some("demoted")
-        } else if i < fill.granted {
-            Some("lineage")
-        } else {
-            None
+        let kind = match self.fills[&id].core.target_kind(i) {
+            TargetKind::Successor => Some("successor"),
+            TargetKind::Demoted => Some("demoted"),
+            TargetKind::Lineage => Some("lineage"),
+            TargetKind::Handoff => None,
         };
         self.metrics.incr(match kind {
             Some("successor") => "successor_probes",
@@ -2974,24 +2874,23 @@ impl NodeWorld {
         kind
     }
 
-    /// Production `resolve_epoch_traced` (Known issue 45): send a run of
-    /// granted probes at once, each copy-only on its own grant, and report
-    /// them together once all have answered (`batch_done`).
-    fn send_granted(&mut self, id: u64, probes: Vec<Probe>) {
+    /// Production `CandidatePolicy::granted_batch` (Known issue 45): send
+    /// handoff targets `first..first + count` at once, each copy-only on its
+    /// own grant, and report them together once all have answered
+    /// (`batch_maybe_done`).
+    fn send_granted(&mut self, id: u64, first: usize, count: usize, remaining_opportunities: u32) {
         let now = self.now();
         let instant = self.instant(now);
         let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
         self.metrics.incr("granted_batches");
-        self.metrics
-            .observe("granted_batch_probes", probes.len() as u64);
+        self.metrics.observe("granted_batch_probes", count as u64);
         let fill = self.fills.get_mut(&id).expect("present");
         fill.batch.clear();
         fill.batch_copy = false;
-        for probe in probes {
-            let i = probe.canonical - self.fills[&id].cands.len();
+        for i in first..first + count {
             let kind = self.handoff_kind(id, i).unwrap_or("successor");
             let fill = self.fills.get_mut(&id).expect("present");
-            let dest = fill.handoff[i];
+            let dest = fill.core.handoff()[i];
             let scope = fill.scope.min(fill.budget.deadline());
             let mut grant = granted_budget(fill.budget.deadline());
             let (before_attempts, before_links) =
@@ -3001,9 +2900,9 @@ impl NodeWorld {
                 AttemptInputs {
                     now: instant,
                     caller_deadline: scope,
-                    remaining_opportunities: probe.remaining_opportunities,
-                    route: probe.route,
-                    mode: probe.mode,
+                    remaining_opportunities,
+                    route: RouteMode::FundedRoute,
+                    mode: Mode::CopyOnly,
                     attempt_timeout,
                     failure_links: MAX_LINKS,
                 },
@@ -3028,7 +2927,7 @@ impl NodeWorld {
                     )
                 },
             );
-            let version = fill.version;
+            let version = fill.core.version();
             let index = fill.batch.len();
             fill.batch.push(BatchProbe {
                 pid: 0,
@@ -3104,47 +3003,41 @@ impl NodeWorld {
         }
         let copy = std::mem::take(&mut fill.batch_copy);
         fill.batch.clear();
-        let Walking::Candidates(walk) = &mut fill.walk else {
-            return;
-        };
-        match walk.complete_granted(copy) {
-            Some(end) => self.on_end(id, end),
-            None => self.step_walk(id),
-        }
+        self.drive(id, FillEvent::BatchDone { copy });
     }
 
-    /// Plan and send one probe. `Err(Some)` is a transport outcome the caller
-    /// completes; `Err(None)` means the fill already failed.
-    fn send_probe(&mut self, id: u64, probe: Probe) -> Result<(), Option<ProbeOutcome>> {
+    /// Plan and send one probe. `Some` is the event that answers it at once:
+    /// no helper to ask, or a probe that could not be planned.
+    fn send_probe(&mut self, id: u64, probe: Probe) -> Option<FillEvent<'static>> {
         let now = self.now();
         let instant = self.instant(now);
         let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
         let fill = &self.fills[&id];
-        let dest = match probe.canonical.checked_sub(fill.cands.len()) {
-            Some(i) if fill.rank.is_some() => {
-                let dest = fill.handoff[i];
-                let kind = self.handoff_kind(id, i);
-                self.fills.get_mut(&id).expect("present").granted_kind = kind;
+        let owners = fill.core.owners().len();
+        let dest = match fill.core.dest(&probe) {
+            Some(dest) => {
+                if let Some(i) = probe.canonical.checked_sub(owners) {
+                    let kind = self.handoff_kind(id, i);
+                    self.fills.get_mut(&id).expect("present").granted_kind = kind;
+                }
                 dest
             }
-            Some(_) => match self.fanout_helper(id) {
+            None => match self.fanout_helper(id) {
                 Some(helper) => {
                     self.metrics.incr("helper_probes");
                     helper
                 }
                 // Every candidate helper is excluded: a miss.
-                None => return Err(Some(ProbeOutcome::CopyMiss)),
+                None => return Some(FillEvent::NoHelper),
             },
-            None => fill.cands[probe.canonical],
         };
         let fill = self.fills.get_mut(&id).expect("present");
         // Peer exchanges stay within the leader's own budget deadline
         // (`src/read/candidates.rs`, `scope.deadline.0.min(budget.deadline())`).
         let scope = fill.scope.min(fill.budget.deadline());
-        let budget = match &mut fill.walk {
-            Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),
-            _ => &mut fill.budget,
-        };
+        let rank = fill.core.rank();
+        let version = fill.core.version() - u64::from(probe.previous);
+        let budget = fill.core.request_budget(&mut fill.budget);
         let (before_attempts, before_links) =
             (budget.remaining_attempts(), budget.remaining_links());
         let plan = plan_attempt(
@@ -3161,7 +3054,7 @@ impl NodeWorld {
         );
         let plan = match plan {
             Ok(plan) => {
-                if fill.rank.is_none()
+                if rank.is_none()
                     && probe.route == RouteMode::FundedRoute
                     && probe.mode == Mode::Acquire
                     && plan.links < MAX_LINKS
@@ -3173,15 +3066,13 @@ impl NodeWorld {
                 }
                 plan
             }
-            Err(e) => {
+            Err(error) => {
                 fill.asked.push((dest, Asked::Unfunded));
-                return match transport_outcome(e) {
-                    Some(outcome) => Err(Some(outcome)),
-                    None => {
-                        self.hard_fail(id, e);
-                        Err(None)
-                    }
-                };
+                return Some(FillEvent::Reply(FillReply::Failed {
+                    error,
+                    sent: false,
+                    scope_live: false,
+                }));
             }
         };
         self.invariants.check(
@@ -3199,7 +3090,6 @@ impl NodeWorld {
             },
         );
         let acquire = probe.mode == Mode::Acquire;
-        let version = fill.version - u64::from(probe.previous);
         // Predecessors that held the same rank under the previous membership
         // are asked under it (`Probe::previous`, Known issue 12).
         if probe.previous {
@@ -3207,11 +3097,12 @@ impl NodeWorld {
         }
         // Set before launching: the first hop may fail synchronously.
         fill.asking = Some(dest);
+        fill.sent = now;
         fill.cut = None;
         let pid = self.launch(id, dest, version, acquire, &plan, false, None);
         let fill = self.fills.get_mut(&id).expect("present");
         fill.probe = Some(pid);
-        Ok(())
+        None
     }
 
     /// Send one planned probe for fill `id` to `dest`. Returns the probe id.
@@ -3812,7 +3703,7 @@ impl NodeWorld {
     fn fanout_helper(&self, id: u64) -> Option<u32> {
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
-        let members = &self.versions.get(fill.version)?.members;
+        let members = &self.versions.get(fill.core.version())?.members;
         let me = position(members, node);
         let at = |p: usize| members.members()[p].node;
         fanout_helper(
@@ -3820,7 +3711,7 @@ impl NodeWorld {
             self.ids.number(page),
             self.ids.node(node),
             members.members().len(),
-            |p| at(p) == node || fill.cands.contains(&at(p)),
+            |p| at(p) == node || fill.core.owners().contains(&at(p)),
             |p| me.is_some_and(|me| members.is_neighbor(me, p)),
         )
         .map(at)
@@ -4231,122 +4122,34 @@ impl NodeWorld {
         let now = self.now();
         self.fabric
             .crypto(now, fill.node, self.fabric.costs.verify_ns);
-        let page = fill.page;
+        let (node, page) = (fill.node, fill.page);
         let relayed = match probe.granted {
             Some(i) => fill.batch.get(i).is_some_and(|b| b.relayed),
             None => fill.relayed,
         };
-        if probe.hedge.is_none() && !relayed && reply != Reply::Transport {
-            // The destination answered this node: it is not hung
-            // (production `resolve_epoch_traced`, Known issue 41).
-            let node = fill.node;
-            let at = self.instant(now);
-            let shed = reply == Reply::Shed && self.config.node.shed_busy;
-            if reply == Reply::Shed {
-                // The same owner shed this node's request for the page
-                // within half a request timeout before (Known issue 54;
-                // measurement only, the last few sheds per node).
-                let window = self.config.node.read_timeout_ns / 2;
-                let recent = &mut self.nodes[node as usize].recent_sheds;
-                recent.retain(|&(.., t)| now.saturating_sub(t) < window);
-                if recent.iter().any(|&(d, p, _)| d == probe.dest && p == page) {
-                    self.metrics.incr("shed_repeats");
-                }
-                if recent.len() >= super::state::RECENT_SHEDS {
-                    recent.remove(0);
-                }
-                recent.push((probe.dest, page, now));
+        if probe.hedge.is_none() && !relayed && reply == Reply::Shed {
+            // The same owner shed this node's request for the page within
+            // half a request timeout before (Known issue 54; measurement
+            // only, the last few sheds per node).
+            let window = self.config.node.read_timeout_ns / 2;
+            let recent = &mut self.nodes[node as usize].recent_sheds;
+            recent.retain(|&(.., t)| now.saturating_sub(t) < window);
+            if recent.iter().any(|&(d, p, _)| d == probe.dest && p == page) {
+                self.metrics.incr("shed_repeats");
             }
-            let silence = &mut self.nodes[node as usize].silence;
-            if shed {
-                // The destination itself shed the request: busy, not hung
-                // (production `resolve_epoch_traced`, Known issue 54).
-                silence.shed(probe.dest, page, at);
-            } else {
-                silence.answered(&probe.dest, at);
+            if recent.len() >= super::state::RECENT_SHEDS {
+                recent.remove(0);
             }
+            recent.push((probe.dest, page, now));
         }
-        if reply == Reply::Response(ResponseKind::StaleMembership)
-            && probe.hedge.is_none()
-            && probe.granted.is_none()
-        {
-            // The answering node could not resolve the request's membership,
-            // so the credits it carried were never used (production
-            // `request_traced`, Known issue 26).
-            let fill = self.fills.get_mut(&probe.fill).expect("present");
-            let budget = match &mut fill.walk {
-                Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),
-                _ => &mut fill.budget,
-            };
-            // And the links past the answering node (Known issues 47, 49).
-            let unused = if self.config.node.stale_link_refund {
-                stale_unused_links(probe.links, probe.hops)
-            } else {
-                0
-            };
-            let refunded = budget
-                .refund_remote(probe.remote)
-                .and_then(|()| budget.refund_links(unused));
-            self.metrics.add("stale_links_refunded", u64::from(unused));
-            self.invariants.check(
-                "budget_never_grows",
-                refunded.is_ok(),
-                now,
-                Some(fill.node),
-                || format!("refund {} remote credits: {refunded:?}", probe.remote),
-            );
-        }
-        let Some(fill) = self.fills.get(&probe.fill) else {
-            return;
-        };
-        let outcome = match reply {
+        // A phantom page claims the page it was asked for; the identity
+        // check is the same callback production runs.
+        let outcome = || match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
             Reply::Shed => Ok(Outcome::Shed),
-            Reply::Response(ResponseKind::StaleMembership)
-                if probe.hedge.is_none()
-                    && (probe.granted.is_some() || self.pending_no_refresh(probe.fill)) =>
-            {
-                // A stale handoff target is only a miss, and a predecessor
-                // asked under the previous membership no longer resolves it
-                // (no adopt, no skip).
-                Ok(Outcome::StaleMembership)
-            }
-            Reply::Response(ResponseKind::StaleMembership) if probe.hedge.is_none() => {
-                // Production `resolve_epoch_traced`: refresh only to a strictly
-                // newer membership, once; otherwise the destination is behind
-                // and the walk moves on (Known issue 3).
-                let (node, retried, previous) = (fill.node, fill.retried, fill.version);
-                let owner = fill.rank.is_some();
-                let latest = self.adopt(node);
-                match stale_action(retried, previous, Some(latest)) {
-                    Ok(StaleAction::Refresh) => Ok(Outcome::StaleMembership),
-                    Ok(StaleAction::Skip) if !owner && self.stale_rank_first(probe.fill) => {
-                        // Ranking the page under the previous membership
-                        // first (`fallback_ranked` decides).
-                        return;
-                    }
-                    Ok(StaleAction::Skip) if !owner && self.stale_wait(probe.fill) => {
-                        // Waiting for the destination to adopt this
-                        // membership, then asking it again (Known issue 26).
-                        return;
-                    }
-                    Ok(StaleAction::Skip) => {
-                        self.count_stale_skip(probe.fill);
-                        if owner {
-                            // An owner's predecessor is behind (Known issue 12).
-                            self.metrics.incr("owner_stale_destination_skips");
-                        }
-                        Ok(Outcome::StaleDestination)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
             Reply::Response(ResponseKind::StaleMembership) => Ok(Outcome::StaleMembership),
             Reply::Response(kind) => {
-                // A phantom page claims the page it was asked for; the
-                // identity check is the same callback production runs.
-                let expected = self.ids.page(page);
-                let claimed = self.ids.page(page);
+                let (expected, claimed) = (self.ids.page(page), self.ids.page(page));
                 classify(kind, OperationKind::Page, probe.acquire, || {
                     if claimed == expected {
                         Ok(())
@@ -4354,23 +4157,78 @@ impl NodeWorld {
                         Err(Error::CorruptRecord)
                     }
                 })
-                .map(|outcome| match outcome {
-                    None => Outcome::Copy,
-                    Some(outcome) => Outcome::Probe(outcome),
-                })
+                .map(|outcome| outcome.map_or(Outcome::Copy, Outcome::Probe))
             }
         };
         match probe.hedge {
             None if let Some(index) = probe.granted => {
+                if !relayed && reply != Reply::Transport {
+                    // The destination answered this node: it is not hung
+                    // (Known issue 41).
+                    let at = self.instant(now);
+                    let silence = &mut self.nodes[node as usize].silence;
+                    if reply == Reply::Shed && self.config.node.shed_busy {
+                        silence.shed(probe.dest, page, at);
+                    } else {
+                        silence.answered(&probe.dest, at);
+                    }
+                }
+                let outcome = outcome();
                 self.complete_batch_probe(probe.fill, index, outcome)
             }
-            None => self.complete_probe(probe.fill, outcome),
+            None => {
+                let fill = self.fills.get_mut(&probe.fill).expect("present");
+                fill.probe = None;
+                if reply == Reply::Response(ResponseKind::StaleMembership) {
+                    // The answering node could not resolve the request's
+                    // membership, so the credits it carried were never used
+                    // (production `request_traced`, Known issue 26), and
+                    // neither were the links past it (Known issues 47, 49).
+                    let budget = fill.core.request_budget(&mut fill.budget);
+                    let unused = if self.config.node.stale_link_refund {
+                        stale_unused_links(probe.links, probe.hops)
+                    } else {
+                        0
+                    };
+                    let refunded = budget
+                        .refund_remote(probe.remote)
+                        .and_then(|()| budget.refund_links(unused));
+                    self.metrics.add("stale_links_refunded", u64::from(unused));
+                    self.invariants.check(
+                        "budget_never_grows",
+                        refunded.is_ok(),
+                        now,
+                        Some(node),
+                        || format!("refund {} remote credits: {refunded:?}", probe.remote),
+                    );
+                }
+                let reply = match reply {
+                    Reply::Transport => FillReply::Failed {
+                        error: Error::Unavailable,
+                        sent: true,
+                        scope_live: true,
+                    },
+                    Reply::Shed => FillReply::Answer {
+                        kind: ResponseKind::Overloaded,
+                        signed: true,
+                    },
+                    Reply::Response(kind) => {
+                        let fill = self.fills.get_mut(&probe.fill).expect("present");
+                        (fill.kind, fill.acquire) = (kind, probe.acquire);
+                        FillReply::Answer {
+                            kind,
+                            signed: !relayed,
+                        }
+                    }
+                };
+                self.drive(probe.fill, FillEvent::Reply(reply));
+            }
             Some(primary) => {
                 // Production `hedge_page` contenders: a page wins, a stale
                 // reply marks the race stale, any other answer is a
                 // recoverable `Unavailable` (the primary's is kept as the
                 // walk's first evidence).
-                let result = match outcome {
+                let result = match outcome() {
                     Ok(Outcome::Copy) => Ok(()),
                     Ok(Outcome::StaleMembership) => {
                         self.set_race(probe.fill, |r| r.stale = true);
@@ -4409,34 +4267,11 @@ impl NodeWorld {
         }
     }
 
-    /// Whether a `StaleMembership` answer to `fill`'s pending candidate probe
-    /// must not refresh membership: a handoff target, or a predecessor asked
-    /// under the previous membership.
-    fn pending_no_refresh(&self, fill: u64) -> bool {
-        self.fills.get(&fill).is_some_and(|f| {
-            matches!(&f.walk, Walking::Candidates(walk)
-                if walk.pending_handoff() || walk.pending_previous())
-        })
-    }
-
-    fn complete_probe(&mut self, id: u64, mut outcome: Result<Outcome, Error>) {
-        let Some(fill) = self.fills.get_mut(&id) else {
-            return;
-        };
-        fill.probe = None;
-        // Production `resolve_epoch_traced`: rank 0 itself, not a relay,
-        // answered an owner's probe `Unavailable` (Known issue 52).
-        if outcome == Ok(Outcome::Probe(ProbeOutcome::Unreachable))
-            && !fill.relayed
-            && self.config.node.rank0_watch
-            && self.config.node.rank0_failure_hold
-            && matches!(&fill.walk, Walking::Candidates(walk) if walk.pending_rank0())
-        {
-            outcome = Ok(Outcome::Failed);
-        }
-        if let Walking::Candidates(walk) = &fill.walk
-            && walk.pending_helper()
-        {
+    /// Record how fill `id`'s walk probe ended: rank 0 watch, repeat
+    /// classification, and route evidence (production
+    /// `CandidatePolicy::apply`).
+    fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>, evidence: &Evidence) {
+        if evidence.helper {
             let label = match &outcome {
                 Ok(Outcome::Copy) => "helper_copies",
                 Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
@@ -4451,9 +4286,10 @@ impl NodeWorld {
             };
             self.metrics.incr(label);
         }
-        if let Walking::Candidates(walk) = &fill.walk
-            && walk.pending_successor()
-        {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        if evidence.granted {
             let kind = fill.granted_kind.unwrap_or("successor");
             let what = match &outcome {
                 Ok(Outcome::Copy) => "copies",
@@ -4462,30 +4298,18 @@ impl NodeWorld {
             };
             self.metrics.incr(granted_counter(kind, what));
         }
-        if let Walking::Candidates(walk) = &fill.walk
-            && walk.pending_rank0()
+        if let Some(note) = evidence.rank0
             && self.config.node.rank0_watch
-            // Only rank 0's own answer (or its silence) says anything about
-            // rank 0: a relay's `Unavailable` does not forget the page.
-            && !fill.relayed
         {
-            // Production `CandidatePolicy::note_rank0` (Known issue 39).
+            // Production `CandidatePolicy::apply` (Known issue 39).
             let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
-            let rank0 = fill.cands[0];
+            let rank0 = fill.core.owners()[0];
             let instant = self.instant(self.now());
             let watch = &mut self.nodes[node as usize].rank0;
-            match &outcome {
-                Ok(Outcome::TimedOut) => watch.timed_out(page, rank0, instant, deadline),
-                Ok(Outcome::Failed) => watch.answered_failure(&page, &rank0),
-                Ok(
-                    Outcome::Copy
-                    | Outcome::Probe(
-                        ProbeOutcome::CopyMiss
-                        | ProbeOutcome::VersionUnavailable
-                        | ProbeOutcome::Unreachable,
-                    ),
-                ) => watch.answered(&page, &rank0),
-                _ => {}
+            match note {
+                Rank0Note::TimedOut => watch.timed_out(page, rank0, instant, deadline),
+                Rank0Note::Failed => watch.answered_failure(&page, &rank0),
+                Rank0Note::Answered => watch.answered(&page, &rank0),
             }
         }
         let now_ms = self.now() / MILLIS;
@@ -4497,421 +4321,69 @@ impl NodeWorld {
         // leak into the next probe's classification.
         let cut = fill.cut.take();
         let relayed = std::mem::take(&mut fill.relayed);
-        let mut observed = None;
-        if let Some(dest) = fill.asking.take() {
-            let asked = match &outcome {
-                Ok(Outcome::Copy) => Asked::Copy,
-                Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
-                    Asked::Miss
-                }
-                Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
-                    Asked::Unreachable(cut.unwrap_or(Cut::Other))
-                }
-                Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
-                Ok(Outcome::Probe(ProbeOutcome::Unreachable) | Outcome::Failed) => Asked::Failed,
-                Ok(_) => Asked::Busy,
-                Err(_) => Asked::Unfunded,
-            };
-            fill.asked.push((dest, asked));
-            if tracing {
-                let mode = match &fill.walk {
-                    Walking::Candidates(_) => "walk",
-                    Walking::Remaining(_) => "remaining",
-                    Walking::None => "none",
-                };
-                fill.outcomes.push(format!(
-                    "{dest}:{outcome:?}@{}ms {mode} left {}a/{}l",
-                    now_ms,
-                    fill.budget.remaining_attempts(),
-                    fill.budget.remaining_links()
-                ));
+        let Some(dest) = fill.asking.take() else {
+            return;
+        };
+        let asked = match &outcome {
+            Ok(Outcome::Copy) => Asked::Copy,
+            Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
+                Asked::Miss
             }
-            // Known issue 50: this node's reads see cuts its offers would
-            // cross.
-            // Production `CandidatePolicy::observe_route`: answers a relay
-            // may have signed say nothing.
-            let cut = match asked {
-                Asked::Unreachable(_) => Some(true),
-                Asked::Copy | Asked::Miss | Asked::Failed => Some(false),
-                Asked::Relayed | Asked::Busy | Asked::Unfunded => None,
+            Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
+                Asked::Unreachable(cut.unwrap_or(Cut::Other))
+            }
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable) | Outcome::Failed) => Asked::Failed,
+            Ok(_) => Asked::Busy,
+            Err(_) => Asked::Unfunded,
+        };
+        fill.asked.push((dest, asked));
+        if tracing {
+            let mode = if evidence.remaining {
+                "remaining"
+            } else {
+                "walk"
             };
-            observed = cut.map(|cut| (fill.node, dest, cut));
+            fill.outcomes.push(format!(
+                "{dest}:{outcome:?}@{}ms {mode} left {}a/{}l",
+                now_ms,
+                fill.budget.remaining_attempts(),
+                fill.budget.remaining_links()
+            ));
         }
-        if let Some((node, dest, cut)) = observed
+        // Known issue 50: this node's reads see cuts its offers would cross.
+        // Production `CandidatePolicy::apply`: answers a relay may have
+        // signed say nothing.
+        let cut = match asked {
+            Asked::Unreachable(_) => Some(true),
+            Asked::Copy | Asked::Miss | Asked::Failed => Some(false),
+            Asked::Relayed | Asked::Busy | Asked::Unfunded => None,
+        };
+        if let Some(cut) = cut
             && self.config.node.offer_cut_groups
         {
+            let node = fill.node;
             let site = self.fabric.site[dest as usize];
             let instant = self.instant(self.now());
             self.nodes[node as usize]
                 .notices
                 .observe(site, cut, instant);
         }
-        let Some(fill) = self.fills.get_mut(&id) else {
-            return;
-        };
-        // `reply` counted a skipped destination that is behind this node.
-        let skipped = outcome == Ok(Outcome::StaleDestination) && fill.stale > 0;
-        match &mut fill.walk {
-            Walking::Candidates(walk) => match outcome {
-                Err(e) => self.hard_fail(id, e),
-                Ok(outcome) => match walk.complete(&mut fill.budget, outcome) {
-                    Err(e) => self.hard_fail(id, e),
-                    Ok(Some(end)) => self.on_end(id, end),
-                    Ok(None) if skipped && self.stale_fallback(id) => {}
-                    Ok(None) => self.step_walk(id),
-                },
-            },
-            Walking::Remaining(walk) => match outcome {
-                Err(e) => self.hard_fail(id, e),
-                Ok(outcome) => match walk.complete(&mut fill.budget, outcome) {
-                    Some(end) => {
-                        fill.plan.remaining(Ok(end));
-                        self.continue_plan(id);
-                    }
-                    None => self.step_remaining(id),
-                },
-            },
-            Walking::None => {}
-        }
     }
 
-    /// Whether fill `id` may walk the previous membership at a destination
-    /// that is behind (`racer_core::read::walk::previous_fallback`), with
-    /// the previous membership, whether this node is a member of it, and
-    /// whether it was replaced recently.
-    fn fallback_facts(&self, id: u64) -> (bool, Option<Rc<Members>>, bool, bool) {
+    /// Validate origin authority before fill `id`'s owner at `rank` fetches
+    /// (production `OriginAuthority::validate` and `begin_attempt` in
+    /// `src/read/fill.rs`), and check that only a ranked owner reaches the
+    /// origin.
+    fn origin_authority(&mut self, id: u64, rank: usize) -> Result<(), Error> {
         let now = self.now();
         let fill = &self.fills[&id];
-        let (node, version) = (fill.node, fill.version);
-        let old = version
-            .checked_sub(1)
-            .and_then(|v| self.versions.get(v))
-            .map(|v| v.members.clone());
-        // As for owners' previous probes (`walk_ranked`): replaced within
-        // `PREVIOUS_MEMBERSHIP_WITHIN`, measured from the publication.
-        let recent = self.config.node.retained_versions >= 1
-            && self.versions.get(version).is_some_and(|v| {
-                now.saturating_sub(v.published) <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
-            });
-        let member = old.as_ref().is_some_and(|m| position(m, node).is_some());
-        let go = previous_fallback(StaleSkip {
-            owner: fill.rank.is_some(),
-            retried: fill.retried || fill.fell_back,
-            previous_recent_member: recent && member,
-        }) && !fill.fallback_denied
-            && self.config.node.stale_fallback;
-        (go, old, member, recent)
-    }
-
-    /// A destination is behind this node: count the skip.
-    fn count_stale_skip(&mut self, id: u64) {
-        self.metrics.incr("stale_destination_skips");
-        if let Some(fill) = self.fills.get_mut(&id) {
-            fill.stale += 1;
-        }
-    }
-
-    /// Production `resolve_epoch_traced`: a non-owner that may walk the
-    /// previous membership ranks the page there before it decides between
-    /// the fallback, a wait and a skip, so a node that owns the page under
-    /// the previous membership (no fallback) still waits for this
-    /// destination (Known issue 36). The probe stays uncompleted until
-    /// `fallback_ranked`. Returns whether it ranks.
-    fn stale_rank_first(&mut self, id: u64) -> bool {
-        let fill = &self.fills[&id];
-        if !matches!(fill.walk, Walking::Candidates(_)) {
-            return false;
-        }
-        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
-        let (go, old, ..) = self.fallback_facts(id);
-        let (true, Some(old)) = (go, old) else {
-            return false;
-        };
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.fell_back = true;
-        fill.deferred_skip = true;
-        self.rank(
-            node,
-            w,
-            old,
-            page,
-            Then::Fallback {
-                fill: id,
-                version: version - 1,
-            },
-        );
-        true
-    }
-
-    /// Production `resolve_epoch_traced` (Known issues 26 and 36): a non-owner that
-    /// cannot walk the previous membership waits (at most `MAX_STALE_WAITS` times) for a destination
-    /// that is behind, then asks it again (`racer_core::read::walk::stale_wait`).
-    /// The pending probe's credits are back in the fill's budget. Returns
-    /// whether it waits.
-    fn stale_wait(&mut self, id: u64) -> bool {
-        if !self.config.node.stale_wait {
-            return false;
-        }
-        let now = self.instant(self.now());
-        let (fallback, ..) = self.fallback_facts(id);
-        let fill = self.fills.get_mut(&id).expect("present");
-        let affordable = match &fill.walk {
-            Walking::Candidates(walk) => walk.retry_affordable(&fill.budget),
-            _ => false,
-        };
-        let Some(wait) = stale_wait(StaleWaitFacts {
-            owner: fill.rank.is_some(),
-            fallback,
-            waits: fill.waits,
-            affordable,
-            remaining: fill.budget.deadline().saturating_duration_since(now),
-        }) else {
-            return false;
-        };
-        let Walking::Candidates(walk) = &mut fill.walk else {
-            return false;
-        };
-        if walk.retry_pending(&mut fill.budget).is_err() {
-            return false;
-        }
-        if fill.waits > 0 {
-            // A further wait (Known issue 36).
-            self.metrics.incr("stale_waits_again");
-        }
-        fill.waits = fill.waits.saturating_add(1);
-        fill.stale_waiting = true;
-        fill.asking = None;
-        self.metrics.incr("stale_waits");
-        self.engine
-            .after(wait.as_nanos() as Nanos, Event::StaleWait { fill: id });
-        true
-    }
-
-    /// A stale wait ended: ask the same destination again.
-    fn stale_wait_done(&mut self, id: u64) {
-        let Some(fill) = self.fills.get_mut(&id) else {
-            return;
-        };
-        if std::mem::take(&mut fill.stale_waiting) {
-            self.step_walk(id);
-        }
-    }
-
-    /// Production `resolve_epoch_traced`: at a destination behind this
-    /// node, a non-owner stops its walk and walks the page's owners under
-    /// membership version - 1 instead, once (`racer_core::read::walk`,
-    /// Known issue 19). Returns whether it did.
-    fn stale_fallback(&mut self, id: u64) -> bool {
-        if let Some((version, members, cands)) = self
-            .fills
-            .get_mut(&id)
-            .and_then(|f| f.fallback_ready.take())
-        {
-            // Ranked before the skip (`stale_rank_first`).
-            self.fallback_walk(id, version, members, cands);
-            return true;
-        }
-        let fill = &self.fills[&id];
-        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
-        let first = fill.rank.is_none() && !fill.retried && !fill.fell_back;
-        let (go, old, member, recent) = self.fallback_facts(id);
-        let (true, Some(old)) = (go, old) else {
-            // Why a non-owner could not fall back (Known issue 19).
-            if first {
-                self.metrics.incr(if !member {
-                    "stale_fallback_not_member"
-                } else if !recent {
-                    "stale_fallback_not_recent"
-                } else {
-                    "stale_fallback_other"
-                });
-            }
-            return false;
-        };
-        // The skipped probe completed, so nothing is pending; the walk
-        // under the current membership waits for the ranking.
-        self.fills.get_mut(&id).expect("present").fell_back = true;
-        self.rank(
-            node,
-            w,
-            old,
-            page,
-            Then::Fallback {
-                fill: id,
-                version: version - 1,
-            },
-        );
-        true
-    }
-
-    /// The page is ranked under the previous membership: walk it there, or,
-    /// when this node owns it there, keep walking the current membership.
-    fn fallback_ranked(
-        &mut self,
-        id: u64,
-        version: u64,
-        members: Rc<Members>,
-        cands: Result<Vec<u32>, Error>,
-    ) {
-        let Some(fill) = self.fills.get_mut(&id) else {
-            return;
-        };
-        let allowed = match &cands {
-            Ok(c) if !c.is_empty() => fallback_rank_allowed(c.iter().position(|n| *n == fill.node)),
-            _ => false,
-        };
-        if std::mem::take(&mut fill.deferred_skip) {
-            // The destination's reply waited for this ranking.
-            if allowed {
-                fill.fallback_ready = Some((version, members, cands));
-            } else {
-                self.metrics.incr("stale_fallback_denied");
-                fill.fell_back = false;
-                fill.fallback_denied = true;
-                if self.stale_wait(id) {
-                    self.metrics.incr("stale_waits_denied");
-                    return;
-                }
-            }
-            self.count_stale_skip(id);
-            return self.complete_probe(id, Ok(Outcome::StaleDestination));
-        }
-        if !allowed {
-            self.metrics.incr("stale_fallback_denied");
-            fill.fell_back = false;
-            fill.fallback_denied = true;
-            return self.step_walk(id);
-        }
-        self.fallback_walk(id, version, members, cands);
-    }
-
-    /// Walk the page's owners under the previous membership instead.
-    fn fallback_walk(
-        &mut self,
-        id: u64,
-        version: u64,
-        members: Rc<Members>,
-        cands: Result<Vec<u32>, Error>,
-    ) {
-        let fill = self.fills.get_mut(&id).expect("present");
-        self.metrics.incr("stale_fallbacks");
-        fill.walk = Walking::None;
-        fill.retried = true;
-        // A fresh walk: the previous membership's owners were not asked.
-        fill.continuation = Continuation::default();
-        self.walk_ranked(id, version, members, cands);
-    }
-
-    fn on_end(&mut self, id: u64, end: End) {
-        let fill = self.fills.get_mut(&id).expect("present");
-        if let Walking::Candidates(walk) = &fill.walk
-            && walk.rank0_unanswered()
-        {
-            // Known issue 31: rank 0 has not answered this owner's probe
-            // within the attempt; the owner does not fetch origin too.
-            self.metrics.incr("origin_left_to_rank0");
-            // Known issue 52: rank 0's own acquisition failed.
-            let rank0 = fill.cands.first().copied();
-            if fill
-                .asked
-                .iter()
-                .rev()
-                .find(|(dest, _)| Some(*dest) == rank0)
-                .is_some_and(|(_, a)| *a == Asked::Failed)
-            {
-                self.metrics.incr("origin_left_to_rank0_failed");
-            }
-        }
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.walk = Walking::None;
-        match end {
-            End::Copy => {
-                self.metrics.incr("walk_copies");
-                fill.plan.walk(WalkResult::Copy);
-            }
-            End::StaleMembership => {
-                let (node, retried, previous) = (fill.node, fill.retried, fill.version);
-                let latest = self.adopt(node);
-                match stale_action(retried, previous, Some(latest)) {
-                    Ok(StaleAction::Refresh) => {
-                        self.metrics.incr("walk_membership_refreshes");
-                        self.fills.get_mut(&id).expect("present").retried = true;
-                        return self.begin_walk(id);
-                    }
-                    // `reply` already turned a skip into `StaleDestination`.
-                    Ok(StaleAction::Skip) => {
-                        let fill = self.fills.get_mut(&id).expect("present");
-                        fill.plan
-                            .walk(WalkResult::Failed(Error::IncompatibleMembership));
-                    }
-                    Err(e) => {
-                        let fill = self.fills.get_mut(&id).expect("present");
-                        fill.plan.walk(WalkResult::Failed(e));
-                    }
-                }
-            }
-            End::Origin { rank, evidence } => return self.origin_authority(id, rank, evidence),
-            End::VersionUnavailable => fill
-                .plan
-                .walk(WalkResult::Failed(Error::VersionUnavailable)),
-            End::Exhausted { funding } => {
-                if fill.stale > 0 {
-                    self.metrics.incr("walk_exhausted_stale");
-                }
-                self.metrics.incr(if funding {
-                    "walk_exhausted_funding"
-                } else {
-                    "walk_exhausted"
-                });
-                fill.plan.walk(WalkResult::Failed(Error::Unavailable));
-            }
-        }
-        self.continue_plan(id);
-    }
-
-    /// Recompute the candidates before origin (production
-    /// `resolve_epoch_traced`), validate origin authority, and check that only
-    /// a ranked owner reaches the origin.
-    fn origin_authority(&mut self, id: u64, rank: usize, evidence: Vec<ProbeOutcome>) {
-        let fill = self.fills.get(&id).expect("present");
-        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
-        let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
-            return self.fail_walk(id, Error::IncompatibleMembership);
-        };
-        self.rank(
-            node,
-            w,
-            members,
-            page,
-            Then::Origin {
-                fill: id,
-                rank,
-                evidence,
-            },
-        );
-    }
-
-    fn origin_ranked(
-        &mut self,
-        id: u64,
-        rank: usize,
-        evidence: Vec<ProbeOutcome>,
-        members: Rc<Members>,
-        expected: Result<Vec<u32>, Error>,
-    ) {
-        let now = self.now();
-        let Some(fill) = self.fills.get(&id) else {
-            return;
-        };
-        let (node, page, version) = (fill.node, fill.page, fill.version);
-        let cands = fill.cands.clone();
-        let expected = match expected {
-            Ok(expected) => expected,
-            Err(e) => return self.fail_walk(id, e),
-        };
-        if expected != cands {
-            return self.fail_walk(id, Error::IncompatibleMembership);
-        }
+        let (node, page, version) = (fill.node, fill.page, fill.core.version());
+        let members = self
+            .versions
+            .get(version)
+            .map(|v| v.members.clone())
+            .ok_or(Error::IncompatibleMembership)?;
         let object = self.ids.object(page);
         let number = self.ids.number(page);
         let authority = validate_origin_authority(
@@ -4919,20 +4391,23 @@ impl NodeWorld {
                 object: &object,
                 page: number,
                 rank,
-                predecessor_evidence: evidence.len(),
+                predecessor_evidence: fill.core.origin_evidence().len(),
                 member: position(&members, node).is_some(),
             },
             &object,
             number,
         );
-        let owner = cands.get(rank) == Some(&node);
+        let owner = fill.core.owners().get(rank) == Some(&node);
         let ok = owner && authority.is_ok();
         self.invariants
             .check("only_owner_hits_origin", ok, now, Some(node), || {
-                format!("page {page} rank {rank} owners {cands:?} authority {authority:?}")
+                format!(
+                    "page {page} rank {rank} owners {:?} authority {authority:?}",
+                    self.fills[&id].core.owners()
+                )
             });
         if !ok {
-            return self.fail_walk(id, Error::Unauthorized);
+            return Err(Error::Unauthorized);
         }
         if version < self.versions.latest_number() {
             self.metrics.incr("origin_on_older_membership");
@@ -4953,17 +4428,9 @@ impl NodeWorld {
                 } else {
                     "origin_unfunded_spent"
                 });
-            return self.fail_walk(id, e);
+            return Err(e);
         }
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.plan.walk(WalkResult::Origin { evidence });
-        self.issue_origin(id);
-    }
-
-    fn fail_walk(&mut self, id: u64, e: Error) {
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.plan.walk(WalkResult::Failed(e));
-        self.continue_plan(id);
+        Ok(())
     }
 
     fn issue_origin(&mut self, id: u64) {
@@ -5044,7 +4511,6 @@ impl NodeWorld {
         fill.origin = None;
         fill.canceled = true;
         let (node, page) = (fill.node, fill.page);
-        fill.plan.origin(Err(Error::DeadlineExceeded));
         self.metrics.incr("origin_canceled");
         self.note_origin_failure(id);
         self.cancel_origin(handle);
@@ -5055,7 +4521,7 @@ impl NodeWorld {
             last.ok = Some(false);
             last.done = now;
         }
-        self.continue_plan(id);
+        self.drive(id, FillEvent::Origin(Err(Error::DeadlineExceeded)));
     }
 
     /// When the fill's origin request must next be checked: the deadline of
@@ -5112,7 +4578,11 @@ impl NodeWorld {
     /// owner (so a lineage rule could have named it): Known issue 46.
     fn holder_rank_bucket(&self, id: u64, holder: u32) -> &'static str {
         let fill = &self.fills[&id];
-        let Some(members) = self.versions.get(fill.version).map(|v| v.members.clone()) else {
+        let Some(members) = self
+            .versions
+            .get(fill.core.version())
+            .map(|v| v.members.clone())
+        else {
             return "moved_unasked_holder_rank_unknown";
         };
         let Some(at) = position(&members, holder) else {
@@ -5172,11 +4642,11 @@ impl NodeWorld {
         let now = self.now();
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
-        let rank0 = fill.cands.first().copied().unwrap_or(node);
+        let rank0 = fill.core.owners().first().copied().unwrap_or(node);
         // An owner above rank 0 reaches origin only with transient evidence
         // against rank 0: record why rank 0 did not serve (the last probe of
         // rank 0 decides).
-        let skip = (fill.rank.is_some_and(|r| r > 0)).then(|| {
+        let skip = (fill.core.rank().is_some_and(|r| r > 0)).then(|| {
             let last = fill
                 .asked
                 .iter()
@@ -5209,7 +4679,7 @@ impl NodeWorld {
             ok: None,
             done: now,
             skip,
-            version: fill.version,
+            version: fill.core.version(),
         };
         let Some(last) = self.last_origin.insert(page, next) else {
             return;
@@ -5244,15 +4714,19 @@ impl NodeWorld {
                     Asked::Busy => "origin_repeats_after_move_held_asked_busy",
                     Asked::Unfunded => "origin_repeats_after_move_held_asked_unfunded",
                 }
-            } else if fill.version == last.version + 1 && fill.handoff.contains(&last.node) {
+            } else if fill.core.version() == last.version + 1
+                && fill.core.handoff().contains(&last.node)
+            {
                 "origin_repeats_after_move_held_unasked_target"
-            } else if fill.version == last.version + 1 && fill.cands.contains(&last.node) {
+            } else if fill.core.version() == last.version + 1
+                && fill.core.owners().contains(&last.node)
+            {
                 "origin_repeats_after_move_held_unasked_owner"
-            } else if fill.version == last.version {
+            } else if fill.core.version() == last.version {
                 "origin_repeats_after_move_held_unasked_same"
-            } else if fill.version > last.version + 2 {
+            } else if fill.core.version() > last.version + 2 {
                 "origin_repeats_after_move_held_unasked_older"
-            } else if fill.version == last.version + 2 {
+            } else if fill.core.version() == last.version + 2 {
                 "origin_repeats_after_move_held_unasked_two"
             } else {
                 "origin_repeats_after_move_held_unasked"
@@ -5323,7 +4797,7 @@ impl NodeWorld {
                 // owner's rank is still scheduled (not yet due, or held by
                 // a cut); `noted`: this owner knew of the holder; `other`:
                 // none of these.
-                let index = fill.cands.iter().position(|c| *c == node);
+                let index = fill.core.owners().iter().position(|c| *c == node);
                 let pending = index.is_some_and(|i| {
                     self.nodes[last.node as usize]
                         .notices
@@ -5431,13 +4905,14 @@ impl NodeWorld {
         let (node, page) = (fill.node, fill.page);
         let ok = result.is_ok();
         let failed = matches!(result, Err(Error::Unavailable));
-        let notice = ok && should_notice(fill.rank);
+        let notice = ok && should_notice(fill.core.rank());
         // The walk's predecessor evidence in rank order (the last answer of
         // each predecessor; production `OriginAuthority`).
         let evidence: Vec<ProbeOutcome> = fill
-            .cands
+            .core
+            .owners()
             .iter()
-            .take(fill.rank.unwrap_or(0))
+            .take(fill.core.rank().unwrap_or(0))
             .map(|c| {
                 match fill
                     .asked
@@ -5451,11 +4926,10 @@ impl NodeWorld {
                 }
             })
             .collect();
-        let targets: Vec<(u8, u32)> = notice_indexes(fill.rank, &evidence)
+        let targets: Vec<(u8, u32)> = notice_indexes(fill.core.rank(), &evidence)
             .into_iter()
-            .filter_map(|i| fill.cands.get(usize::from(i)).map(|t| (i, *t)))
+            .filter_map(|i| fill.core.owners().get(usize::from(i)).map(|t| (i, *t)))
             .collect();
-        fill.plan.origin(result);
         if failed {
             self.note_origin_failure(id);
         }
@@ -5470,7 +4944,7 @@ impl NodeWorld {
             last.ok = Some(ok);
             last.done = now;
         }
-        self.continue_plan(id);
+        self.drive(id, FillEvent::Origin(result));
     }
 
     /// Production `CandidatePolicy::note_origin_failure` (Known issue 52):
@@ -5481,7 +4955,8 @@ impl NodeWorld {
             return;
         }
         let fill = &self.fills[&id];
-        let (Some(rank), Some(rank0)) = (fill.rank, fill.cands.first().copied()) else {
+        let (Some(rank), Some(rank0)) = (fill.core.rank(), fill.core.owners().first().copied())
+        else {
             return;
         };
         if rank == 0 {
@@ -5663,39 +5138,6 @@ impl NodeWorld {
         self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
     }
 
-    fn continue_plan(&mut self, id: u64) {
-        let Some(fill) = self.fills.get_mut(&id) else {
-            return;
-        };
-        match fill.plan.step().clone() {
-            FillStep::Publish(source) => self.publish_page(id, source),
-            FillStep::RemainingCopy => {
-                self.metrics.incr("remaining_walks");
-                let rank = fill.rank.unwrap_or(0);
-                fill.walk = Walking::Remaining(RemainingWalk::new(rank, fill.cands.len()));
-                self.step_remaining(id);
-            }
-            FillStep::Failed(e) => self.finish_fill(id, Err(e)),
-            FillStep::Done(source) => self.finish_fill(id, Ok(source)),
-            step => {
-                self.metrics.incr("fill_plan_stalled");
-                debug_assert!(false, "fill plan stalled at {step:?}");
-                self.finish_fill(id, Err(Error::Internal));
-            }
-        }
-    }
-
-    fn publish_page(&mut self, id: u64, source: Source) {
-        let fill = self.fills.get(&id).expect("present");
-        let (node, w, page, eligible) = (fill.node, fill.worker, fill.page, fill.eligible);
-        self.memory_insert(node, w, page);
-        self.persist_page(node, w, page, eligible);
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.plan.published(Ok(()));
-        let _ = source;
-        self.continue_plan(id);
-    }
-
     /// Whether `node` owns `page` in its current published snapshot, from
     /// the worker's cached ranking only (production `Retention::is_owned`:
     /// missing or partial rankings are not owned).
@@ -5856,22 +5298,22 @@ impl NodeWorld {
             .iter()
             .map(|(d, a)| format!("{}:{a:?}", state(*d)))
             .collect();
-        let cands: Vec<String> = fill.cands.iter().map(|c| state(*c)).collect();
+        let cands: Vec<String> = fill.core.owners().iter().map(|c| state(*c)).collect();
         format!(
             "fill@{}..{} err {e:?} self {} v{} rank {:?} cands {cands:?} handoff {:?} asked {asked:?} outcomes {:?} \
              stale {} waits {} fell_back {} denied {} retried {} attempts_left {} deadline_in {:?} canceled {}",
             fill.started,
             now,
             state(fill.node),
-            fill.version,
-            fill.rank,
-            fill.handoff,
+            fill.core.version(),
+            fill.core.rank(),
+            fill.core.handoff(),
             fill.outcomes,
-            fill.stale,
-            fill.waits,
-            fill.fell_back,
-            fill.fallback_denied,
-            fill.retried,
+            fill.core.stale(),
+            fill.core.waits(),
+            fill.core.fell_back(),
+            fill.core.fallback_denied(),
+            fill.core.retried(),
             fill.budget.remaining_attempts(),
             fill.budget
                 .deadline()

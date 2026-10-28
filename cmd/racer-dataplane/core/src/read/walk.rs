@@ -26,7 +26,10 @@ use crate::read::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
 use crate::read::budget::{
     HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
 };
-use crate::read::{Error, ProbeOutcome, Result, VisitOrder};
+use crate::read::{
+    Error, OperationKind, ProbeOutcome, ResponseKind, Result, Source, VisitOrder, classify,
+    origin_miss_error, unusable_copy,
+};
 use std::time::{Duration, Instant};
 
 /// Whether a probe may start acquisition at its destination.
@@ -59,7 +62,7 @@ pub struct Continuation {
 
 /// Inputs fixed for one epoch.
 #[derive(Clone, Copy, Debug)]
-pub struct WalkConfig {
+pub(crate) struct WalkConfig {
     /// This node's canonical rank among the owners, if it is one.
     pub rank: Option<usize>,
     /// Number of ranked owners (1..=3).
@@ -267,6 +270,73 @@ pub fn shared_share_short(
 /// `StaleMembership` and the probe would be wasted.
 pub const PREVIOUS_MEMBERSHIP_WITHIN: Duration = Duration::from_secs(10);
 
+/// A short list of node identities in a fixed array: the target lists of one
+/// walk never allocate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct List<T, const N: usize> {
+    items: [T; N],
+    len: u8,
+}
+
+impl<T: Copy + Default, const N: usize> Default for List<T, N> {
+    fn default() -> Self {
+        Self {
+            items: [T::default(); N],
+            len: 0,
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> List<T, N> {
+    /// The first `N` of `items`.
+    pub fn from_slice(items: &[T]) -> Self {
+        items.iter().copied().collect()
+    }
+
+    /// Append `item`; `false` when the list is full.
+    pub fn push(&mut self, item: T) -> bool {
+        let len = usize::from(self.len);
+        if len >= N {
+            return false;
+        }
+        self.items[len] = item;
+        self.len += 1;
+        true
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for List<T, N> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.items[..usize::from(self.len)]
+    }
+}
+
+impl<T: Copy + Default, const N: usize> FromIterator<T> for List<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut list = Self::default();
+        for item in iter {
+            if !list.push(item) {
+                break;
+            }
+        }
+        list
+    }
+}
+
+impl<T: PartialEq, const N: usize, const K: usize> PartialEq<[T; K]> for List<T, N> {
+    fn eq(&self, other: &[T; K]) -> bool {
+        **self == other[..]
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq<Vec<T>> for List<T, N> {
+    fn eq(&self, other: &Vec<T>) -> bool {
+        **self == other[..]
+    }
+}
+
 /// Predecessors an owner at `rank` may ask under the previous membership
 /// ([`WalkConfig::previous`]): bit `c` is set when canonical rank `c` <
 /// `rank` names the same node in `previous` and `current`. Such a request
@@ -274,9 +344,9 @@ pub const PREVIOUS_MEMBERSHIP_WITHIN: Duration = Duration::from_secs(10);
 /// has not adopted the current version yet still resolves the previous one,
 /// so it serves (or, at rank 0, fetches for everyone) instead of answering
 /// `StaleMembership` and leaving the page to this owner (Known issue 12).
-/// The caller sets nothing unless it replaced the previous membership at
-/// most [`PREVIOUS_MEMBERSHIP_WITHIN`] ago and is a member of it.
-pub fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usize) -> u8 {
+/// [`Fill`] sets nothing unless the caller replaced the previous membership
+/// at most [`PREVIOUS_MEMBERSHIP_WITHIN`] ago and is a member of it.
+fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usize) -> u8 {
     (0..rank.min(current.len()).min(8))
         .filter(|c| previous.get(*c).is_some_and(|p| *p == current[*c]))
         .fold(0, |bits, c| bits | (1 << c))
@@ -289,17 +359,20 @@ pub fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usi
 /// previous owners in previous rank order, without this node and without the
 /// current predecessors (the walk asks those anyway). Empty when the owner
 /// set did not change, so a steady cold miss pays no extra probe.
-pub fn handoff_targets<N: PartialEq + Clone>(previous: &[N], current: &[N], rank: usize) -> Vec<N> {
+fn handoff_targets<N: PartialEq + Copy + Default>(
+    previous: &[N],
+    current: &[N],
+    rank: usize,
+) -> List<N, MAX_HANDOFF> {
     let same = previous.len() == current.len() && previous.iter().all(|n| current.contains(n));
     if same {
-        return Vec::new();
+        return List::default();
     }
     let me = current.get(rank);
     previous
         .iter()
         .filter(|n| Some(*n) != me && !current[..rank.min(current.len())].contains(n))
-        .take(MAX_HANDOFF)
-        .cloned()
+        .copied()
         .collect()
 }
 
@@ -317,17 +390,20 @@ pub fn handoff_targets<N: PartialEq + Clone>(previous: &[N], current: &[N], rank
 /// arrived together pays nothing. A target can only miss, so it costs one
 /// copy-only probe at most, funded opportunistically like other handoff
 /// probes.
-pub fn lineage_targets<N: Clone>(owners: &[N], since: &[Option<u32>], rank: usize) -> Vec<N> {
+fn lineage_targets<N: Copy + Default>(
+    owners: &[N],
+    since: &[Option<u32>],
+    rank: usize,
+) -> List<N, MAX_HANDOFF> {
     let Some(Some(mine)) = since.get(rank).copied() else {
-        return Vec::new();
+        return List::default();
     };
     owners
         .iter()
         .zip(since)
         .skip(rank + 1)
         .filter(|(_, s)| s.is_some_and(|s| s < mine))
-        .map(|(n, _)| n.clone())
-        .take(MAX_HANDOFF)
+        .map(|(n, _)| *n)
         .collect()
 }
 
@@ -345,35 +421,27 @@ pub fn lineage_targets<N: Clone>(owners: &[N], since: &[Option<u32>], rank: usiz
 /// adds a target. Members that left since are not seen, which can only
 /// make a member look like it was an owner when it was not: the probe then
 /// misses, costing one granted copy-only exchange.
-pub fn demoted_targets<N: Clone>(
-    since: &[Option<u32>],
-    demoted: &[N],
-    demoted_since: &[Option<u32>],
-    rank: usize,
-) -> Vec<N> {
-    demoted_targets_from(since, demoted, demoted_since, rank, None)
-}
-
-/// [`demoted_targets`], plus members whose arrival is `oldest`, the
-/// generation this node's membership chain began at (production
-/// `Membership::since` 0): their arrival is unknown, only that they are at
-/// least as old as the chain, so no arrival rule can tell whether one of
-/// them was an owner before the chain began (Known issue 46). In 5k
-/// `full-churn` most holders left unasked by [`demoted_targets`] were such
-/// members, tied at the chain's start with the owners above them. When this
-/// owner arrived after the chain began, they qualify too, in rank order:
-/// a member ranked higher is an owner whenever fewer members above it are
-/// present, so it is the likelier holder. At most [`MAX_LINEAGE`] in all,
-/// each a granted copy-only probe that can only miss.
-pub fn demoted_targets_from<N: Clone>(
+///
+/// Members whose arrival is `oldest`, the generation this node's membership
+/// chain began at (production `Membership::since` 0), qualify too: their
+/// arrival is unknown, only that they are at least as old as the chain, so
+/// no arrival rule can tell whether one of them was an owner before the
+/// chain began (Known issue 46). In 5k `full-churn` most holders left
+/// unasked without them were such members, tied at the chain's start with
+/// the owners above them. When this owner arrived after the chain began,
+/// they qualify in rank order: a member ranked higher is an owner whenever
+/// fewer members above it are present, so it is the likelier holder. At
+/// most [`MAX_LINEAGE`] in all, each a granted copy-only probe that can only
+/// miss.
+fn demoted_targets<N: Copy + Default>(
     since: &[Option<u32>],
     demoted: &[N],
     demoted_since: &[Option<u32>],
     rank: usize,
     oldest: Option<u32>,
-) -> Vec<N> {
+) -> List<N, MAX_LINEAGE> {
     let Some(Some(mine)) = since.get(rank).copied() else {
-        return Vec::new();
+        return List::default();
     };
     let above = |k: usize, arrival: u32| {
         since
@@ -389,24 +457,23 @@ pub fn demoted_targets_from<N: Clone>(
         .filter_map(|(k, (n, s))| {
             let arrival = (*s)?;
             let unknown = oldest == Some(arrival);
-            (arrival < mine && (unknown || above(k, arrival) < MAX_HANDOFF)).then(|| n.clone())
+            (arrival < mine && (unknown || above(k, arrival) < MAX_HANDOFF)).then_some(*n)
         })
-        .take(MAX_LINEAGE)
         .collect()
 }
 
 /// How many leading `handoff` targets are in `granted` (successor and
-/// lineage targets), for [`WalkConfig::granted`]. Callers order the
+/// lineage targets), for [`WalkConfig::granted`]. [`Fill`] orders the
 /// handoff targets so these come first ([`merge_handoff`],
-/// [`crate::read::hints::with_successors`]); version - 1 targets after
-/// them stay funded from the walk's budget.
-pub fn granted_prefix<N: PartialEq>(handoff: &[N], granted: &[N]) -> usize {
+/// [`crate::read::hints::with_successors`]); version - 1 targets after them
+/// stay funded from the walk's budget.
+fn granted_prefix<N: PartialEq>(handoff: &[N], granted: &[N]) -> usize {
     handoff.iter().take_while(|n| granted.contains(n)).count()
 }
 
 /// [`lineage_targets`] counts for every canonical owner rank, for
 /// [`WalkConfig::lineage`].
-pub fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
+fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
     let mut counts = [0; MAX_HANDOFF];
     for (rank, count) in counts.iter_mut().enumerate() {
         if let Some(Some(mine)) = since.get(rank) {
@@ -424,19 +491,21 @@ pub fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
 /// [`demoted_targets`], at most [`MAX_LINEAGE`]) first, then the version - 1
 /// targets ([`handoff_targets`]) not already listed while fewer than
 /// [`MAX_HANDOFF`] targets are listed (the walk funds those from its own
-/// budget, so their number does not grow with the lineage cap). Lineage targets come first: each was an
-/// owner above this one before it arrived, so it fetched the page if anyone
-/// read it then, while a version - 1 owner that was displaced since may
-/// never have been asked for it.
-pub fn merge_handoff<N: PartialEq + Clone>(previous: Vec<N>, lineage: Vec<N>) -> Vec<N> {
-    let mut targets = lineage;
-    targets.truncate(MAX_LINEAGE);
+/// budget, so their number does not grow with the lineage cap). Lineage
+/// targets come first: each was an owner above this one before it arrived,
+/// so it fetched the page if anyone read it then, while a version - 1 owner
+/// that was displaced since may never have been asked for it.
+fn merge_handoff<N: PartialEq + Copy + Default>(
+    previous: &[N],
+    lineage: &[N],
+) -> List<N, MAX_TARGETS> {
+    let mut targets: List<N, MAX_TARGETS> = lineage.iter().take(MAX_LINEAGE).copied().collect();
     for n in previous {
         if targets.len() >= MAX_HANDOFF {
             break;
         }
-        if !targets.contains(&n) {
-            targets.push(n);
+        if !targets.contains(n) {
+            targets.push(*n);
         }
     }
     targets
@@ -539,7 +608,7 @@ pub enum End {
 
 /// One step of the walk.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Step {
+pub(crate) enum Step {
     Probe(Probe),
     /// Granted probes to send at once ([`WalkConfig::parallel_granted`]),
     /// each copy-only on its own [`granted_budget`]. Report them together
@@ -550,7 +619,7 @@ pub enum Step {
 }
 
 /// Sans-IO candidate walk state.
-pub struct CandidateWalk {
+pub(crate) struct CandidateWalk {
     config: WalkConfig,
     order: VisitOrder,
     /// Owner walks: predecessors then handoff targets (`owners + i`).
@@ -779,7 +848,8 @@ impl CandidateWalk {
     }
 
     /// Evidence collected so far, in probe order.
-    pub fn evidence(&self) -> &[ProbeOutcome] {
+    #[cfg(test)]
+    fn evidence(&self) -> &[ProbeOutcome] {
         &self.evidence
     }
 
@@ -1108,7 +1178,7 @@ impl CandidateWalk {
     }
 
     /// The pending probe's destination is behind this node and the caller
-    /// waits for it ([`crate::read::walk::stale_wait`], Known issue 26): return
+    /// waits for it ([`stale_wait`], Known issue 26): return
     /// the child credits and plan the same destination again on the next
     /// [`Self::next`], instead of recording an outcome and moving on.
     pub fn retry_pending(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
@@ -1402,7 +1472,7 @@ pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
 
 /// What to do after a peer answered `StaleMembership`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StaleAction {
+enum StaleAction {
     /// Refresh to the strictly newer local membership and start a new walk
     /// (complete the probe with [`Outcome::StaleMembership`]).
     Refresh,
@@ -1416,7 +1486,7 @@ pub enum StaleAction {
 /// at most once, and only to a strictly newer membership; otherwise the stale
 /// destination is skipped like an unreachable one, so a requester that adopted
 /// a publication before its destination still reaches the other owners.
-pub fn stale_action(retried: bool, previous: u64, latest: Option<u64>) -> Result<StaleAction> {
+fn stale_action(retried: bool, previous: u64, latest: Option<u64>) -> Result<StaleAction> {
     let latest = latest.ok_or(Error::Unavailable)?;
     Ok(if !retried && latest > previous {
         StaleAction::Refresh
@@ -1521,7 +1591,7 @@ pub fn plan_attempt(budget: &mut AcquisitionBudget, inputs: AttemptInputs) -> Re
 
 /// Inputs to the speculative page hedge decision.
 #[derive(Clone, Copy, Debug)]
-pub struct HedgeFacts {
+struct HedgeFacts {
     pub page_operation: bool,
     pub is_candidate: bool,
     pub owners: usize,
@@ -1538,7 +1608,7 @@ pub struct HedgeFacts {
 /// serve as hedge primary, and one cold fallback must remain fundable:
 /// primary(2) + duplicate(1) + the second visited owner at rank r
 /// ([`owner_funding_min`]), with links 1 + 1 + 8.
-pub fn hedge_eligible(facts: HedgeFacts) -> bool {
+fn hedge_eligible(facts: HedgeFacts) -> bool {
     facts.page_operation
         && !facts.is_candidate
         && facts.owners >= 2
@@ -1618,7 +1688,7 @@ pub const MIN_STALE_WAIT: Duration = Duration::from_millis(250);
 /// Facts about a destination that answered `StaleMembership` because it is
 /// behind this node, for a reader that cannot walk the previous membership.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct StaleWaitFacts {
+struct StaleWaitFacts {
     /// This node owns the page (owners go on to their own fetch).
     pub owner: bool,
     /// [`previous_fallback`] walks the previous membership instead.
@@ -1649,7 +1719,7 @@ pub struct StaleWaitFacts {
 /// `StaleMembership` returns the credits it was sent
 /// ([`crate::read::budget::AcquisitionBudget::refund_remote`]), so the second ask
 /// costs one exchange and its links, like any probe; budgets never grow.
-pub fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
+fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
     if facts.owner
         || facts.fallback
         || facts.waits >= MAX_STALE_WAITS
@@ -1663,7 +1733,7 @@ pub fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
 
 /// Facts about a walk under membership N whose destination was behind.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct StaleSkip {
+struct StaleSkip {
     /// This node owns the page under N (owners have their own
     /// previous-membership probes, `WalkConfig::previous` and handoff
     /// targets, and their origin authority comes from N).
@@ -1678,14 +1748,14 @@ pub struct StaleSkip {
 
 /// Whether to walk the page's owners under N - 1 instead of skipping a
 /// destination that is behind.
-pub fn previous_fallback(s: StaleSkip) -> bool {
+fn previous_fallback(s: StaleSkip) -> bool {
     !s.owner && !s.retried && s.previous_recent_member
 }
 
 /// Whether the fallback walk may proceed with this node at `rank` under
 /// N - 1. A page owner under N - 1 that is not one under N would gain
 /// origin authority it no longer has, so the walk ends instead.
-pub fn fallback_rank_allowed(rank: Option<usize>) -> bool {
+fn fallback_rank_allowed(rank: Option<usize>) -> bool {
     rank.is_none()
 }
 
@@ -1826,5 +1896,1358 @@ mod stale_tests {
         for rank in 0..3 {
             assert!(!fallback_rank_allowed(Some(rank)));
         }
+    }
+}
+
+// One read's acquisition: the walk, the stale-membership tree, and the fill
+// plan, as a single sans-IO state machine.
+//
+// [`Fill`] owns every decision of an acquisition after the local tiers
+// missed: which ranking to compute, which targets an owner asks before
+// origin, the candidate walk and its funding, what a peer's answer means,
+// whether to refresh membership, fall back to the previous one, or wait for
+// a destination that is behind, and how the walk's end becomes an origin
+// fetch, a publication, or a failure. The caller performs the I/O each
+// [`Action`] names and feeds the result back as an [`Event`]:
+//
+// ```text
+// let mut event = Event::Start { local_hit };
+// loop {
+//     let (action, evidence) = fill.on(event, &mut budget, now());
+//     apply(evidence);
+//     event = match action { /* perform it */ };
+// }
+// ```
+//
+// Production drives it with async I/O (`src/read/candidates.rs`,
+// `src/read/fill.rs`), the simulator with scheduled events
+// (`sim/src/node/world.rs`). Node identities are `u32`s the caller chooses
+// (production: membership positions; simulator: node numbers).
+
+/// Previous owners that are not current members ([`Ranking::Previous`]).
+pub const NOT_MEMBER: u32 = u32::MAX;
+
+/// Members ranked just below the owners ([`Ranked::demoted`]).
+pub const DEMOTED: usize = topology::RETAINED_DEPTH - topology::REPLICAS;
+
+/// Optional rules. Production runs [`Features::PRODUCTION`]; the simulator
+/// switches rules off to measure them, and keeps a few temporary `SIM_*`
+/// bits where it still differs from production.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Features {
+    bits: u32,
+    /// Most lineage targets per owner walk (at most [`MAX_LINEAGE`]).
+    lineage_cap: u8,
+}
+
+impl Features {
+    /// Lineage targets are asked on their own grant (Known issue 35).
+    pub const LINEAGE_GRANTS: u32 = 1;
+    /// With [`Self::LINEAGE_GRANTS`], readers still fund lineage probes from
+    /// slack ([`WalkConfig::lineage`]).
+    pub const LINEAGE_SLACK: u32 = 1 << 1;
+    /// Granted probes go out at once ([`WalkConfig::parallel_granted`]).
+    pub const PARALLEL_GRANTED: u32 = 1 << 2;
+    /// A non-owner page walk may ask an overflow helper
+    /// ([`WalkConfig::helper`]).
+    pub const HELPER: u32 = 1 << 3;
+    /// A non-owner walks the previous membership at a destination that is
+    /// behind (Known issue 19).
+    pub const STALE_FALLBACK: u32 = 1 << 4;
+    /// A non-owner waits for a destination that is behind (Known issue 26).
+    pub const STALE_WAIT: u32 = 1 << 5;
+    /// Rank 0's own `Unavailable` is [`Outcome::Failed`] (Known issue 52).
+    pub const RANK0_FAILED: u32 = 1 << 6;
+    /// Simulator only: a stale wait measures the time left from the
+    /// budget's deadline alone, not the earlier of it and the scope's.
+    pub const SIM_WAIT_BUDGET_DEADLINE: u32 = 1 << 16;
+    /// Simulator only: a membership refresh drops the epoch's bounded routes.
+    pub const SIM_REFRESH_DROPS_BOUNDED: u32 = 1 << 17;
+    /// Simulator only: a failed or empty ranking under the previous
+    /// membership denies the stale fallback for the rest of the read.
+    pub const SIM_FALLBACK_RANK_DENIES: u32 = 1 << 18;
+    /// Simulator only: a remaining-copy probe answered `StaleMembership` is
+    /// a refresh or a skip, not a terminal error.
+    pub const SIM_REMAINING_STALE: u32 = 1 << 19;
+
+    /// Every rule production runs.
+    pub const PRODUCTION: Self = Self {
+        bits: 0x7f,
+        lineage_cap: MAX_LINEAGE as u8,
+    };
+
+    /// `bits` with at most `lineage_cap` lineage targets per owner walk.
+    pub const fn new(bits: u32, lineage_cap: usize) -> Self {
+        Self {
+            bits,
+            lineage_cap: if lineage_cap < MAX_LINEAGE {
+                lineage_cap as u8
+            } else {
+                MAX_LINEAGE as u8
+            },
+        }
+    }
+
+    /// These features with `bit` set or cleared.
+    pub const fn with(self, bit: u32, on: bool) -> Self {
+        Self {
+            bits: if on {
+                self.bits | bit
+            } else {
+                self.bits & !bit
+            },
+            ..self
+        }
+    }
+
+    #[inline]
+    fn has(self, bit: u32) -> bool {
+        self.bits & bit != 0
+    }
+}
+
+/// Inputs fixed for one [`Fill`].
+#[derive(Clone, Copy, Debug)]
+pub struct FillConfig {
+    pub operation: OperationKind,
+    /// The fill races a hedge before its first walk (plaintext page fills).
+    pub hedge: bool,
+    /// Stop after the walk: a copy is [`Action::Done`], origin authority is
+    /// [`Action::Origin`], with no origin, remaining-copy or publish steps.
+    pub walk_only: bool,
+    /// The request's deadline (a stale wait never outlasts it).
+    pub scope: Instant,
+    pub features: Features,
+}
+
+/// Which ranking of the page [`Action::Rank`] asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ranking {
+    /// The membership this read walks: the caller's own (`version: None`),
+    /// or the newer one a refresh adopted.
+    Current,
+    /// An owner's version - 1 ranking, for handoff targets and predecessors
+    /// asked under it. Owners that are not current members are
+    /// [`NOT_MEMBER`]; [`Ranked::recent_member`] says whether the caller
+    /// replaced that membership within [`PREVIOUS_MEMBERSHIP_WITHIN`] and is
+    /// a member of it.
+    Previous,
+    /// The previous membership a non-owner walks instead when the current
+    /// one's destination is behind (Known issue 19).
+    Fallback,
+    /// The walk's own ranking again, before origin: only a ranked owner may
+    /// fetch.
+    Authority,
+}
+
+/// One ranking of the page under membership `version` ([`Event::Ranked`]).
+/// The caller computes what needs its membership: arrivals, the visit
+/// order, and the members ranked just below the owners.
+#[derive(Clone, Copy, Debug)]
+pub struct Ranked {
+    pub version: u64,
+    pub owners: List<u32, MAX_HANDOFF>,
+    /// This node's canonical rank among `owners`, if it is one.
+    pub rank: Option<usize>,
+    /// When each owner arrived in this node's membership chain.
+    pub since: [Option<u32>; MAX_HANDOFF],
+    /// A non-owner's visit order (`visit_order`, `lineage_first`,
+    /// `demote_unanswered`); ignored for owners.
+    pub order: VisitOrder,
+    /// For an owner: members ranked just below the owners, and their
+    /// arrivals (empty without [`demoted_targets`]).
+    pub demoted: List<u32, DEMOTED>,
+    pub demoted_since: [Option<u32>; DEMOTED],
+    /// The generation this node's membership chain began at
+    /// ([`demoted_targets`]).
+    pub oldest: Option<u32>,
+    /// Members of `version`.
+    pub members: usize,
+    /// [`Ranking::Previous`]: this node may ask predecessors under it.
+    pub recent_member: bool,
+}
+
+impl Ranked {
+    /// A ranking with only its owners known.
+    pub fn new(version: u64, owners: &[u32], rank: Option<usize>) -> Self {
+        Self {
+            version,
+            owners: List::from_slice(owners),
+            rank,
+            since: [None; MAX_HANDOFF],
+            order: VisitOrder::canonical(owners.len()),
+            demoted: List::default(),
+            demoted_since: [None; DEMOTED],
+            oldest: None,
+            members: 0,
+            recent_member: false,
+        }
+    }
+}
+
+/// How a speculative hedge ended ([`Event::Hedge`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HedgeEnd {
+    /// Not raced (disabled, ineligible, or not admitted).
+    NotStarted,
+    /// A contender returned a validated page.
+    Won,
+    /// Neither won. `primary` is the primary's own outcome, `stale` whether
+    /// a contender answered `StaleMembership`, `error` the race's terminal
+    /// error, if any.
+    Lost {
+        stale: bool,
+        primary: Option<ProbeOutcome>,
+        error: Option<Error>,
+    },
+}
+
+/// A peer's answer to [`Action::Probe`], before payload validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reply {
+    /// An authenticated response; `signed` when the destination itself, not
+    /// a relay in front of it, signed it.
+    Answer { kind: ResponseKind, signed: bool },
+    /// Sent, but unanswered within the attempt's own time bound while the
+    /// request's scope still runs.
+    TimedOut,
+    /// The exchange failed without a response. `sent` is false when it
+    /// never left this node (the probe could not be planned); `scope_live`
+    /// when the request's own scope still runs.
+    Failed {
+        error: Error,
+        sent: bool,
+        scope_live: bool,
+    },
+}
+
+/// What the caller learned, for [`Fill::on`].
+#[derive(Clone, Copy, Debug)]
+pub enum Event<'a> {
+    /// The local tiers were checked.
+    Start {
+        local_hit: bool,
+    },
+    /// The ranking [`Action::Rank`] asked for.
+    Ranked(Result<Ranked, Error>),
+    /// [`Action::Hints`]: successor hints for the page (oldest first) and
+    /// what this owner knows about rank 0's acquisition of it.
+    Hints {
+        hints: &'a [u32],
+        rank0: Rank0State,
+    },
+    Hedge(HedgeEnd),
+    Reply(Reply),
+    /// [`Action::Validate`]: `Ok(None)` for a usable copy.
+    Validated(Result<Option<ProbeOutcome>, Error>),
+    /// [`Action::Probe`] asked the helper, but every candidate helper is
+    /// excluded.
+    NoHelper,
+    /// Every probe of [`Action::Batch`] answered; `copy` when one returned a
+    /// validated copy.
+    BatchDone {
+        copy: bool,
+    },
+    /// [`Action::Wait`] elapsed.
+    Timer,
+    /// [`Action::Refresh`]: the newest membership this node adopted, and
+    /// whether its predecessor is still resolvable by peers, was replaced
+    /// within [`PREVIOUS_MEMBERSHIP_WITHIN`], and lists this node.
+    Membership {
+        latest: Option<u64>,
+        previous_recent_member: bool,
+    },
+    Origin(Result<(), Error>),
+    Published(Result<(), Error>),
+    /// The caller failed the read (for example an origin attempt it could
+    /// not fund).
+    Abort(Error),
+}
+
+/// What the caller does next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Action {
+    /// Rank the page; answer [`Event::Ranked`].
+    Rank {
+        ranking: Ranking,
+        version: Option<u64>,
+    },
+    /// Answer [`Event::Hints`].
+    Hints,
+    /// Race a hedge if enabled, `eligible`, and admitted: the primary is
+    /// canonical owner `first`, the duplicate `second`; answer
+    /// [`Event::Hedge`].
+    Hedge {
+        eligible: bool,
+        first: usize,
+        second: usize,
+    },
+    /// Report the newest adopted membership; answer [`Event::Membership`].
+    Refresh,
+    /// Send this probe to [`Fill::dest`] (the helper when `None`) with
+    /// [`Fill::request_budget`]; answer [`Event::Reply`] or
+    /// [`Event::NoHelper`].
+    Probe(Probe),
+    /// Validate the payload of the last answer; answer [`Event::Validated`].
+    Validate,
+    /// Send copy-only probes to handoff targets `first..first + count` at
+    /// once, each on its own [`granted_budget`]; answer
+    /// [`Event::BatchDone`].
+    Batch {
+        first: usize,
+        count: usize,
+        remaining_opportunities: u32,
+    },
+    /// Wait this long for a destination that is behind; answer
+    /// [`Event::Timer`].
+    Wait(Duration),
+    /// This owner at `rank` fetches from origin; answer [`Event::Origin`].
+    Origin {
+        rank: usize,
+    },
+    /// Publish the page; answer [`Event::Published`].
+    Publish(Source),
+    Done(Result<Source, Error>),
+    /// Nothing to do until the next event.
+    Idle,
+}
+
+/// What a destination's answer, or its silence, says about it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SilenceNote {
+    Answered,
+    /// It shed the request: busy, not hung.
+    Shed,
+    /// Unanswered; `needed` timeouts ask a ping
+    /// ([`crate::liveness::RANK0_TIMEOUTS`], [`crate::liveness::NO_PING`]).
+    TimedOut {
+        needed: u32,
+    },
+}
+
+/// What a probe of rank 0 says about its acquisition
+/// ([`crate::liveness::Rank0Watch`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rank0Note {
+    Answered,
+    Failed,
+    TimedOut,
+}
+
+/// Facts from one [`Fill::on`] call for the caller's own state and counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Evidence {
+    /// How the probe the event answered ended, when it was sent.
+    pub outcome: Option<Result<Outcome, Error>>,
+    /// That probe asked the overflow helper, a granted target, or rank 0
+    /// (an owner's page probe), or belonged to the remaining-copy walk.
+    pub helper: bool,
+    pub granted: bool,
+    pub rank0_probe: bool,
+    pub remaining: bool,
+    pub silence: Option<SilenceNote>,
+    pub rank0: Option<Rank0Note>,
+    /// [`Notes`] bits.
+    pub notes: u16,
+}
+
+/// Decisions [`Evidence::notes`] reports, for counters.
+pub struct Notes;
+
+impl Notes {
+    /// A destination behind this node was skipped.
+    pub const STALE_SKIP: u16 = 1;
+    /// ... and this node owns the page.
+    pub const OWNER_STALE_SKIP: u16 = 1 << 1;
+    /// The read refreshed to a newer membership.
+    pub const REFRESH: u16 = 1 << 2;
+    /// The read walks the previous membership instead.
+    pub const FALLBACK: u16 = 1 << 3;
+    /// This node owns the page under the previous membership: no fallback.
+    pub const FALLBACK_DENIED: u16 = 1 << 4;
+    /// ... and it waits for the destination instead.
+    pub const WAIT_DENIED: u16 = 1 << 5;
+    /// A non-owner's first skip found no previous membership to walk.
+    pub const FALLBACK_BLOCKED: u16 = 1 << 6;
+    /// Rank 0 left this owner's probe unanswered, so it does not fetch.
+    pub const RANK0_LEFT: u16 = 1 << 7;
+    pub const WALK_COPY: u16 = 1 << 8;
+    pub const EXHAUSTED: u16 = 1 << 9;
+    pub const EXHAUSTED_FUNDING: u16 = 1 << 10;
+    /// The exhausted walk skipped a destination that was behind.
+    pub const EXHAUSTED_STALE: u16 = 1 << 11;
+    /// An origin version miss starts the remaining-copy walk.
+    pub const REMAINING: u16 = 1 << 12;
+}
+
+/// A handoff target's kind ([`Fill::target_kind`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TargetKind {
+    Successor,
+    Lineage,
+    Demoted,
+    Handoff,
+}
+
+enum Walking {
+    None,
+    Candidates(CandidateWalk),
+    Remaining(RemainingWalk),
+}
+
+/// Why [`Action::Refresh`] was asked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Refresh {
+    Hedge,
+    Probe,
+    Remaining,
+}
+
+/// Sans-IO state of one read's acquisition ([`Action`], [`Event`]).
+pub struct Fill {
+    config: FillConfig,
+    /// The plan still races a hedge before the first walk.
+    hedge: bool,
+    ranking: Ranking,
+    refresh: Refresh,
+    // The walked ranking.
+    version: u64,
+    owners: List<u32, MAX_HANDOFF>,
+    rank: Option<usize>,
+    order: VisitOrder,
+    members: usize,
+    lineage: [u8; MAX_HANDOFF],
+    lineage_targets: List<u32, MAX_LINEAGE>,
+    demoted: List<u32, MAX_LINEAGE>,
+    handoff: List<u32, MAX_TARGETS>,
+    successors: usize,
+    granted: usize,
+    previous: u8,
+    rank0: Rank0State,
+    /// This epoch's walk funds every probe on a bounded route.
+    bounded: bool,
+    continuation: Continuation,
+    walk: Walking,
+    probe: Option<Probe>,
+    /// The last answer was signed by its destination.
+    signed: bool,
+    // Across epochs.
+    retried: bool,
+    fell_back: bool,
+    fallback_denied: bool,
+    waits: u8,
+    waiting: bool,
+    stale: u32,
+    latest: u64,
+    evidence: Vec<ProbeOutcome>,
+    origin_rank: usize,
+    /// [`Action::Origin`] awaits [`Event::Origin`].
+    origin_pending: bool,
+    source: Source,
+    funding: bool,
+    remaining_end: Option<RemainingEnd>,
+    out: Evidence,
+}
+
+impl Fill {
+    pub fn new(config: FillConfig) -> Self {
+        Self {
+            config,
+            hedge: config.hedge && !config.walk_only,
+            ranking: Ranking::Current,
+            refresh: Refresh::Probe,
+            version: 0,
+            owners: List::default(),
+            rank: None,
+            order: VisitOrder::canonical(0),
+            members: 0,
+            lineage: [0; MAX_HANDOFF],
+            lineage_targets: List::default(),
+            demoted: List::default(),
+            handoff: List::default(),
+            successors: 0,
+            granted: 0,
+            previous: 0,
+            rank0: Rank0State::Unknown,
+            bounded: false,
+            continuation: Continuation::default(),
+            walk: Walking::None,
+            probe: None,
+            signed: false,
+            retried: false,
+            fell_back: false,
+            fallback_denied: false,
+            waits: 0,
+            waiting: false,
+            stale: 0,
+            latest: 0,
+            evidence: Vec::new(),
+            origin_rank: 0,
+            origin_pending: false,
+            source: Source::Peer,
+            funding: false,
+            remaining_end: None,
+            out: Evidence::default(),
+        }
+    }
+
+    /// Feed one event; returns the next action and what the event showed.
+    #[inline]
+    pub fn on(
+        &mut self,
+        event: Event<'_>,
+        budget: &mut AcquisitionBudget,
+        now: Instant,
+    ) -> (Action, Evidence) {
+        let action = match self.handle(event, budget, now) {
+            Ok(action) => action,
+            Err(error) => {
+                if let Walking::Candidates(walk) = &mut self.walk {
+                    let _ = walk.abandon(budget);
+                }
+                self.walk = Walking::None;
+                Action::Done(Err(error))
+            }
+        };
+        (action, std::mem::take(&mut self.out))
+    }
+
+    /// Budget the outstanding probe spends: its bounded child, or the read's.
+    pub fn request_budget<'a>(
+        &'a mut self,
+        budget: &'a mut AcquisitionBudget,
+    ) -> &'a mut AcquisitionBudget {
+        match &mut self.walk {
+            Walking::Candidates(walk) => walk.request_budget(budget),
+            _ => budget,
+        }
+    }
+
+    /// Where `probe` goes: an owner or handoff target, or `None` for the
+    /// overflow helper the caller chooses ([`crate::read::budget::fanout_helper`]).
+    pub fn dest(&self, probe: &Probe) -> Option<u32> {
+        match probe.canonical.checked_sub(self.owners.len()) {
+            Some(i) if self.rank.is_some() => Some(self.handoff[i]),
+            Some(_) => None,
+            None => Some(self.owners[probe.canonical]),
+        }
+    }
+
+    /// The kind of handoff target `i`.
+    pub fn target_kind(&self, i: usize) -> TargetKind {
+        if i < self.successors {
+            TargetKind::Successor
+        } else if i < self.granted && self.demoted.contains(&self.handoff[i]) {
+            TargetKind::Demoted
+        } else if i < self.granted {
+            TargetKind::Lineage
+        } else {
+            TargetKind::Handoff
+        }
+    }
+
+    /// The walked ranking's membership version, owners, and this node's rank.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn owners(&self) -> &[u32] {
+        &self.owners
+    }
+
+    pub fn rank(&self) -> Option<usize> {
+        self.rank
+    }
+
+    pub fn handoff(&self) -> &[u32] {
+        &self.handoff
+    }
+
+    /// Waits this read made for destinations that are behind.
+    pub fn waits(&self) -> u8 {
+        self.waits
+    }
+
+    /// Destinations this walk skipped as behind this node, and whether the
+    /// read refreshed or fell back, is falling back, or may not fall back.
+    pub fn stale(&self) -> u32 {
+        self.stale
+    }
+
+    pub fn retried(&self) -> bool {
+        self.retried
+    }
+
+    pub fn fell_back(&self) -> bool {
+        self.fell_back
+    }
+
+    pub fn fallback_denied(&self) -> bool {
+        self.fallback_denied
+    }
+
+    /// The remaining-copy walk runs, and how it ended.
+    pub fn remaining(&self) -> bool {
+        matches!(self.walk, Walking::Remaining(_))
+    }
+
+    pub fn remaining_end(&self) -> Option<RemainingEnd> {
+        self.remaining_end
+    }
+
+    /// The last walk stopped because a probe could not be funded.
+    pub fn funding_stopped(&self) -> bool {
+        self.funding
+    }
+
+    /// The origin authority's predecessor evidence ([`Action::Origin`]).
+    pub fn origin_evidence(&self) -> &[ProbeOutcome] {
+        &self.evidence
+    }
+
+    fn page(&self) -> bool {
+        self.config.operation == OperationKind::Page
+    }
+
+    fn has(&self, bit: u32) -> bool {
+        self.config.features.has(bit)
+    }
+
+    fn note(&mut self, note: u16) {
+        self.out.notes |= note;
+    }
+
+    fn rank_next(&mut self, ranking: Ranking, version: Option<u64>) -> Action {
+        self.ranking = ranking;
+        Action::Rank { ranking, version }
+    }
+
+    fn handle(
+        &mut self,
+        event: Event<'_>,
+        budget: &mut AcquisitionBudget,
+        now: Instant,
+    ) -> Result<Action> {
+        match event {
+            Event::Start { local_hit: true } => Ok(Action::Done(Ok(Source::Local))),
+            Event::Start { .. } => Ok(self.rank_next(Ranking::Current, None)),
+            Event::Ranked(ranked) => match self.ranking {
+                Ranking::Current => self.ranked(ranked?, budget),
+                Ranking::Previous => {
+                    if let (Ok(previous), Some(rank)) = (ranked, self.rank) {
+                        let targets = handoff_targets(&previous.owners, &self.owners, rank);
+                        let targets: List<u32, MAX_HANDOFF> = targets
+                            .iter()
+                            .copied()
+                            .filter(|n| *n != NOT_MEMBER)
+                            .collect();
+                        if previous.recent_member {
+                            self.previous =
+                                same_rank_previous(&previous.owners, &self.owners, rank);
+                        }
+                        self.handoff = merge_handoff(&targets, &self.lineage_targets);
+                    }
+                    self.targets(budget)
+                }
+                Ranking::Fallback => self.fallback_ranked(ranked, budget, now),
+                Ranking::Authority => {
+                    if *ranked?.owners != *self.owners {
+                        return Err(Error::IncompatibleMembership);
+                    }
+                    self.origin_pending = !self.config.walk_only;
+                    Ok(Action::Origin {
+                        rank: self.origin_rank,
+                    })
+                }
+            },
+            Event::Hints { hints, rank0 } => {
+                if let Some(rank) = self.rank {
+                    let targets = crate::read::hints::successor_targets(hints, &self.owners, rank);
+                    if !targets.is_empty() {
+                        (self.handoff, self.successors) =
+                            crate::read::hints::with_successors(&targets, &self.handoff);
+                    }
+                }
+                self.rank0 = rank0;
+                self.walk_or_hedge(budget)
+            }
+            Event::Hedge(end) => {
+                self.hedge = false;
+                match end {
+                    HedgeEnd::NotStarted => self.start_walk(budget),
+                    HedgeEnd::Won => Ok(self.walked(Source::Hedge)),
+                    HedgeEnd::Lost {
+                        stale,
+                        primary,
+                        error,
+                    } => {
+                        if let Some(error) = error
+                            && !hedge_fallback(error)
+                        {
+                            return Err(error);
+                        }
+                        self.continuation = Continuation {
+                            primary_consumed: !stale,
+                            primary_outcome: (!stale)
+                                .then(|| primary.unwrap_or(ProbeOutcome::Unreachable)),
+                            bounded_routes: true,
+                        };
+                        if stale {
+                            // A stale hedge refreshes to a newer membership when
+                            // one is available. Otherwise the stale contender is
+                            // behind this node (Known issue 3): walk this epoch's
+                            // owners with bounded routes.
+                            self.refresh = Refresh::Hedge;
+                            return Ok(Action::Refresh);
+                        }
+                        self.start_walk(budget)
+                    }
+                }
+            }
+            Event::Reply(reply) => self.reply(reply, budget),
+            Event::Validated(result) => match result {
+                Ok(None) => self.complete(Outcome::Copy, budget),
+                Ok(Some(outcome)) => self.complete(Outcome::Probe(outcome), budget),
+                Err(error) => {
+                    self.pending();
+                    self.out.outcome = Some(Err(error));
+                    Err(error)
+                }
+            },
+            Event::NoHelper => {
+                let Walking::Candidates(walk) = &mut self.walk else {
+                    return Ok(Action::Idle);
+                };
+                let end = walk.complete(budget, Outcome::Probe(ProbeOutcome::CopyMiss))?;
+                self.after(end, false, budget)
+            }
+            Event::BatchDone { copy } => {
+                let Walking::Candidates(walk) = &mut self.walk else {
+                    return Ok(Action::Idle);
+                };
+                match walk.complete_granted(copy) {
+                    Some(end) => self.end(end),
+                    None => self.next(budget),
+                }
+            }
+            Event::Timer if self.waiting => {
+                self.waiting = false;
+                self.next(budget)
+            }
+            Event::Timer => Ok(Action::Idle),
+            Event::Membership {
+                latest,
+                previous_recent_member,
+            } => self.membership(latest, previous_recent_member, budget, now),
+            Event::Origin(_) if !std::mem::take(&mut self.origin_pending) => {
+                panic!("fill out of order: no origin request")
+            }
+            Event::Origin(Ok(())) => Ok(self.publish(Source::Origin)),
+            Event::Origin(Err(Error::VersionUnavailable)) => {
+                // After an origin version miss, old copies on later owners
+                // remain useful.
+                self.note(Notes::REMAINING);
+                self.walk = Walking::Remaining(RemainingWalk::new(
+                    self.rank.unwrap_or(0),
+                    self.owners.len(),
+                ));
+                self.next(budget)
+            }
+            Event::Origin(Err(error)) | Event::Published(Err(error)) | Event::Abort(error) => {
+                Err(error)
+            }
+            Event::Published(Ok(())) => Ok(Action::Done(Ok(self.source))),
+        }
+    }
+
+    /// The page is ranked under the membership this read walks: build the
+    /// owner's targets, then walk.
+    fn ranked(&mut self, ranked: Ranked, budget: &mut AcquisitionBudget) -> Result<Action> {
+        if ranked.owners.is_empty() {
+            return Err(Error::Unavailable);
+        }
+        let page = self.page();
+        let since = &ranked.since[..ranked.owners.len()];
+        self.version = ranked.version;
+        self.owners = ranked.owners;
+        self.rank = ranked.rank;
+        self.members = ranked.members;
+        self.order = if ranked.rank.is_some() {
+            VisitOrder::canonical(0)
+        } else {
+            ranked.order
+        };
+        // Arrival order of the page's owners in this node's membership
+        // chain: an owner may ask later owners that arrived before it, which
+        // it may have displaced however many versions ago (Known issue 25),
+        // and readers and delegations fund those probes.
+        self.lineage = if !page
+            || (self.has(Features::LINEAGE_GRANTS) && !self.has(Features::LINEAGE_SLACK))
+        {
+            [0; MAX_HANDOFF]
+        } else {
+            lineage_counts(since)
+        };
+        // Lineage targets: later owners that arrived before this owner, then
+        // members ranked just below the owners that were owners when they
+        // arrived (Known issue 34). All are asked on their own grant, so a
+        // rank 0 reached by a delegation with one credit asks them too
+        // (Known issue 35).
+        self.lineage_targets = List::default();
+        self.demoted = List::default();
+        if let (Some(rank), true) = (ranked.rank, page) {
+            self.lineage_targets = List::from_slice(&lineage_targets(&ranked.owners, since, rank));
+            self.demoted = demoted_targets(
+                since,
+                &ranked.demoted,
+                &ranked.demoted_since[..ranked.demoted.len()],
+                rank,
+                ranked.oldest,
+            );
+            for n in self.demoted.iter() {
+                if !self.lineage_targets.contains(n)
+                    && self.lineage_targets.len() < usize::from(self.config.features.lineage_cap)
+                {
+                    self.lineage_targets.push(*n);
+                }
+            }
+        }
+        self.handoff = List::from_slice(&self.lineage_targets);
+        self.successors = 0;
+        self.previous = 0;
+        self.stale = 0;
+        self.rank0 = Rank0State::Unknown;
+        // An owner also ranks the page under membership version - 1.
+        if let (Some(_), true, Some(previous)) = (ranked.rank, page, ranked.version.checked_sub(1))
+        {
+            return Ok(self.rank_next(Ranking::Previous, Some(previous)));
+        }
+        self.targets(budget)
+    }
+
+    /// The handoff targets are known: an owner adds its successor targets.
+    fn targets(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
+        if self.rank.is_some() && self.page() {
+            return Ok(Action::Hints);
+        }
+        self.walk_or_hedge(budget)
+    }
+
+    fn walk_or_hedge(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
+        if !self.hedge {
+            return self.start_walk(budget);
+        }
+        // The hedge primary and duplicate are the first two owners in the
+        // visit order the walk uses, so `primary_consumed` skips exactly the
+        // owner the hedge already asked.
+        let (first, second) = (
+            self.order.get(0).unwrap_or(0),
+            self.order.get(1).unwrap_or(0),
+        );
+        let owners = self.owners.len();
+        Ok(Action::Hedge {
+            eligible: hedge_eligible(HedgeFacts {
+                page_operation: self.page(),
+                is_candidate: self.rank.is_some(),
+                owners,
+                first,
+                second,
+                distinct: owners >= 2 && self.owners[first] != self.owners[second],
+                remaining_attempts: budget.remaining_attempts(),
+                remaining_links: budget.remaining_links(),
+            }),
+            first,
+            second,
+        })
+    }
+
+    fn start_walk(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
+        let page = self.page();
+        // Successor targets come first, then lineage targets, each on its own
+        // grant; version - 1 targets after them spend the walk's credits.
+        self.granted = self.successors
+            + if self.has(Features::LINEAGE_GRANTS) && self.rank.is_some() {
+                granted_prefix(&self.handoff[self.successors..], &self.lineage_targets)
+            } else {
+                0
+            };
+        let continuation = std::mem::take(&mut self.continuation);
+        self.bounded = continuation.bounded_routes;
+        self.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
+            rank: self.rank,
+            owners: self.owners.len(),
+            order: self.order,
+            page_operation: page,
+            continuation,
+            handoff: self.handoff.len(),
+            previous: self.previous,
+            // A non-owner page walk may ask the page's overflow helper
+            // (Known issue 16), chosen when the walk asks for it.
+            helper: self.rank.is_none()
+                && page
+                && self.has(Features::HELPER)
+                && self.members > self.owners.len() + 1,
+            lineage: self.lineage,
+            granted: self.granted,
+            parallel_granted: self.has(Features::PARALLEL_GRANTED),
+            rank0: self.rank0,
+        }));
+        self.next(budget)
+    }
+
+    /// Plan the next probe of the current walk.
+    fn next(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
+        match &mut self.walk {
+            Walking::Candidates(walk) => match walk.next(budget)? {
+                Step::Probe(probe) => {
+                    self.probe = Some(probe);
+                    Ok(Action::Probe(probe))
+                }
+                Step::Granted(probes) => Ok(Action::Batch {
+                    first: probes[0].canonical - self.owners.len(),
+                    count: probes.len(),
+                    remaining_opportunities: probes[0].remaining_opportunities,
+                }),
+                Step::End(end) => self.end(end),
+            },
+            Walking::Remaining(walk) => match walk.next_probe() {
+                Ok(probe) => {
+                    self.probe = Some(probe);
+                    Ok(Action::Probe(probe))
+                }
+                Err(end) => self.remaining_ended(end),
+            },
+            Walking::None => Ok(Action::Idle),
+        }
+    }
+
+    /// Map a peer's answer to the walk's outcome.
+    fn reply(&mut self, reply: Reply, budget: &mut AcquisitionBudget) -> Result<Action> {
+        let probe = self.probe.expect("no probe outstanding");
+        let page = self.page();
+        let no_refresh = self.pending();
+        let remaining = self.out.remaining;
+        self.signed = false;
+        let outcome = match reply {
+            Reply::Answer { kind, signed } => {
+                self.signed = signed;
+                if signed {
+                    // The destination answered this node: it is not hung
+                    // (Known issue 41). One that shed the request is busy
+                    // (Known issue 54).
+                    self.out.silence = Some(if kind == ResponseKind::Overloaded && page {
+                        SilenceNote::Shed
+                    } else {
+                        SilenceNote::Answered
+                    });
+                }
+                match kind {
+                    // The destination itself, not a relay, shed the request
+                    // (for example a hot-page owner): the walk may ask the
+                    // page's helper (Known issue 16).
+                    ResponseKind::Overloaded if signed => Outcome::Shed,
+                    ResponseKind::StaleMembership
+                        if remaining && !self.has(Features::SIM_REMAINING_STALE) =>
+                    {
+                        self.out.outcome = Some(Err(Error::IncompatibleMembership));
+                        return Err(Error::IncompatibleMembership);
+                    }
+                    // A stale handoff target is only a miss, and a
+                    // predecessor asked under the previous membership no
+                    // longer resolves it: neither refreshes this walk's
+                    // membership.
+                    ResponseKind::StaleMembership if no_refresh => Outcome::StaleMembership,
+                    ResponseKind::StaleMembership => {
+                        self.refresh = if remaining {
+                            Refresh::Remaining
+                        } else {
+                            Refresh::Probe
+                        };
+                        return Ok(Action::Refresh);
+                    }
+                    // Rank 0 itself answered that its own acquisition failed:
+                    // leave the next attempt to it (Known issue 52).
+                    ResponseKind::Unavailable
+                        if signed && self.out.rank0_probe && self.has(Features::RANK0_FAILED) =>
+                    {
+                        Outcome::Failed
+                    }
+                    kind if kind.has_payload() => return Ok(Action::Validate),
+                    kind => match classify(
+                        kind,
+                        self.config.operation,
+                        probe.mode == Mode::Acquire,
+                        || Ok::<(), Error>(()),
+                    ) {
+                        Ok(outcome) => {
+                            Outcome::Probe(outcome.unwrap_or(ProbeOutcome::UnusableCopy))
+                        }
+                        Err(error) => match unusable_copy(error, self.config.operation) {
+                            Some(outcome) => Outcome::Probe(outcome),
+                            None => {
+                                self.out.outcome = Some(Err(error));
+                                return Err(error);
+                            }
+                        },
+                    },
+                }
+            }
+            // Sent but unanswered within the attempt: an owner does not take
+            // origin authority from rank 0 for this. A probe of the page's
+            // rank 0 (an owner's, or a reader's) asks whether rank 0 answers
+            // at all (Known issue 43); any other timeout only demotes the
+            // destination in this node's visit order (Known issue 41).
+            Reply::TimedOut => {
+                if page {
+                    let rank0 = self.out.rank0_probe
+                        || (self.rank.is_none() && probe.canonical == 0 && !self.out.helper);
+                    self.out.silence = Some(SilenceNote::TimedOut {
+                        needed: if rank0 {
+                            crate::liveness::RANK0_TIMEOUTS
+                        } else {
+                            crate::liveness::NO_PING
+                        },
+                    });
+                }
+                Outcome::TimedOut
+            }
+            Reply::Failed {
+                error,
+                sent,
+                scope_live,
+            } => {
+                let outcome = match transport_outcome(error) {
+                    Some(outcome) => outcome,
+                    // A successor probe is opportunistic and runs on its own
+                    // grant: any failure of it is only a miss, unless this
+                    // request itself is over.
+                    None if self.out.granted && scope_live => ProbeOutcome::Unreachable,
+                    None => {
+                        if sent {
+                            self.out.outcome = Some(Err(error));
+                        }
+                        return Err(error);
+                    }
+                };
+                if !sent {
+                    // Never sent: no evidence about the destination.
+                    self.out = Evidence {
+                        notes: self.out.notes,
+                        ..Evidence::default()
+                    };
+                    return self.walk_complete(Outcome::Transport(outcome), budget);
+                }
+                Outcome::Transport(outcome)
+            }
+        };
+        self.complete(outcome, budget)
+    }
+
+    /// Report what the outstanding probe asked; whether a `StaleMembership`
+    /// answer to it must not refresh membership (a handoff target, or a
+    /// predecessor asked under the previous membership).
+    fn pending(&mut self) -> bool {
+        match &self.walk {
+            Walking::Candidates(walk) => {
+                self.out.helper = walk.pending_helper();
+                self.out.granted = walk.pending_successor();
+                self.out.rank0_probe = walk.pending_rank0();
+                walk.pending_handoff() || walk.pending_previous()
+            }
+            _ => {
+                self.out.remaining = true;
+                false
+            }
+        }
+    }
+
+    /// Record the outstanding probe's outcome and its evidence.
+    fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
+        self.pending();
+        self.out.outcome = Some(Ok(outcome));
+        // Only rank 0's own answer (or its silence) says anything about
+        // rank 0 (Known issue 39).
+        if self.out.rank0_probe && (self.signed || outcome == Outcome::TimedOut) {
+            self.out.rank0 = match outcome {
+                Outcome::TimedOut => Some(Rank0Note::TimedOut),
+                Outcome::Failed => Some(Rank0Note::Failed),
+                Outcome::Copy
+                | Outcome::Probe(
+                    ProbeOutcome::CopyMiss
+                    | ProbeOutcome::VersionUnavailable
+                    | ProbeOutcome::Unreachable,
+                ) => Some(Rank0Note::Answered),
+                _ => None,
+            };
+        }
+        self.walk_complete(outcome, budget)
+    }
+
+    fn walk_complete(
+        &mut self,
+        outcome: Outcome,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<Action> {
+        match &mut self.walk {
+            Walking::Candidates(walk) => {
+                let end = walk.complete(budget, outcome)?;
+                self.after(end, false, budget)
+            }
+            Walking::Remaining(walk) => match walk.complete(budget, outcome) {
+                Some(end) => self.remaining_ended(end),
+                None => self.next(budget),
+            },
+            Walking::None => Ok(Action::Idle),
+        }
+    }
+
+    /// After a probe completed: end the walk, or plan the next probe.
+    fn after(
+        &mut self,
+        end: Option<End>,
+        skipped: bool,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<Action> {
+        if let Some(end) = end {
+            return self.end(end);
+        }
+        if skipped && self.rank.is_none() && !self.retried && !self.fell_back {
+            self.note(Notes::FALLBACK_BLOCKED);
+        }
+        self.next(budget)
+    }
+
+    /// The newest adopted membership after a `StaleMembership` answer.
+    fn membership(
+        &mut self,
+        latest: Option<u64>,
+        previous_recent_member: bool,
+        budget: &mut AcquisitionBudget,
+        now: Instant,
+    ) -> Result<Action> {
+        // Each epoch walk refreshes at most once, and only to a strictly
+        // newer membership; otherwise the stale destination is skipped like
+        // an unreachable one, so a requester that adopted a publication
+        // before its destination still reaches the other owners.
+        let action = match stale_action(self.retried, self.version, latest) {
+            Ok(action) => action,
+            Err(error) => {
+                if self.refresh != Refresh::Hedge {
+                    self.pending();
+                    self.out.outcome = Some(Err(error));
+                }
+                return Err(error);
+            }
+        };
+        let latest = latest.unwrap_or_default();
+        match (self.refresh, action) {
+            (Refresh::Hedge, StaleAction::Refresh) => {
+                self.note(Notes::REFRESH);
+                self.retried = true;
+                Ok(self.rank_next(Ranking::Current, Some(latest)))
+            }
+            (Refresh::Hedge, StaleAction::Skip) => {
+                self.note(Notes::STALE_SKIP);
+                self.start_walk(budget)
+            }
+            (Refresh::Probe, StaleAction::Refresh) => {
+                self.latest = latest;
+                self.complete(Outcome::StaleMembership, budget)
+            }
+            (Refresh::Probe, StaleAction::Skip) => {
+                let owner = self.rank.is_some();
+                // A non-owner that recently replaced the previous membership
+                // walks the page's owners under it instead, once (Known issue
+                // 19). It ranks the page there before deciding: a node that
+                // owns it there may not walk it (that would give it origin
+                // authority), and must not lose the wait it would otherwise
+                // have had for this destination (Known issue 36).
+                if self.has(Features::STALE_FALLBACK)
+                    && !self.fallback_denied
+                    && previous_fallback(StaleSkip {
+                        owner,
+                        retried: self.retried || self.fell_back,
+                        previous_recent_member,
+                    })
+                {
+                    self.fell_back = true;
+                    return Ok(self.rank_next(Ranking::Fallback, Some(self.version - 1)));
+                }
+                if !owner && let Some(wait) = self.wait(budget, now)? {
+                    return Ok(Action::Wait(wait));
+                }
+                self.skip(budget)
+            }
+            (Refresh::Remaining, StaleAction::Refresh) => {
+                self.complete(Outcome::StaleMembership, budget)
+            }
+            (Refresh::Remaining, StaleAction::Skip) => {
+                self.stale += 1;
+                self.note(Notes::STALE_SKIP | Notes::OWNER_STALE_SKIP);
+                self.complete(Outcome::StaleDestination, budget)
+            }
+        }
+    }
+
+    /// The destination is behind this node and no newer membership exists
+    /// locally: try the next owner (Known issue 3).
+    fn skip(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
+        self.stale += 1;
+        self.note(Notes::STALE_SKIP);
+        if self.rank.is_some() {
+            // An owner's predecessor is behind (Known issue 12).
+            self.note(Notes::OWNER_STALE_SKIP);
+        }
+        self.pending();
+        self.out.outcome = Some(Ok(Outcome::StaleDestination));
+        let Walking::Candidates(walk) = &mut self.walk else {
+            return Ok(Action::Idle);
+        };
+        let end = walk.complete(budget, Outcome::StaleDestination)?;
+        self.after(end, true, budget)
+    }
+
+    /// A non-owner that cannot walk the previous membership waits for a
+    /// destination that is behind, then asks it again (Known issues 26 and
+    /// 36). The outstanding probe's credits return to the read's budget.
+    fn wait(&mut self, budget: &mut AcquisitionBudget, now: Instant) -> Result<Option<Duration>> {
+        if !self.has(Features::STALE_WAIT) {
+            return Ok(None);
+        }
+        let deadline = if self.has(Features::SIM_WAIT_BUDGET_DEADLINE) {
+            budget.deadline()
+        } else {
+            budget.deadline().min(self.config.scope)
+        };
+        let Walking::Candidates(walk) = &mut self.walk else {
+            return Ok(None);
+        };
+        let Some(wait) = stale_wait(StaleWaitFacts {
+            owner: self.rank.is_some(),
+            fallback: false,
+            waits: self.waits,
+            affordable: walk.retry_affordable(budget),
+            remaining: deadline.saturating_duration_since(now),
+        }) else {
+            return Ok(None);
+        };
+        walk.retry_pending(budget)?;
+        self.waits = self.waits.saturating_add(1);
+        self.waiting = true;
+        Ok(Some(wait))
+    }
+
+    /// The page is ranked under the previous membership: walk it there, or,
+    /// when this node owns it there, keep walking the current membership.
+    fn fallback_ranked(
+        &mut self,
+        ranked: Result<Ranked>,
+        budget: &mut AcquisitionBudget,
+        now: Instant,
+    ) -> Result<Action> {
+        let allowed = match &ranked {
+            Ok(r) if !r.owners.is_empty() => fallback_rank_allowed(r.rank),
+            _ => false,
+        };
+        if allowed {
+            let ranked = ranked.expect("allowed");
+            self.stale += 1;
+            self.note(Notes::STALE_SKIP | Notes::FALLBACK);
+            self.pending();
+            self.out.outcome = Some(Ok(Outcome::StaleDestination));
+            if let Walking::Candidates(walk) = &mut self.walk {
+                walk.complete(budget, Outcome::StaleDestination)?;
+                walk.abandon(budget)?;
+            }
+            // A fresh walk: the previous membership's owners were not asked.
+            self.walk = Walking::None;
+            self.retried = true;
+            self.continuation = Continuation::default();
+            return self.ranked(ranked, budget);
+        }
+        let denied = ranked.is_ok() || self.has(Features::SIM_FALLBACK_RANK_DENIES);
+        if denied {
+            self.note(Notes::FALLBACK_DENIED);
+            self.fallback_denied = true;
+        }
+        self.fell_back = false;
+        if let Some(wait) = self.wait(budget, now)? {
+            if denied {
+                self.note(Notes::WAIT_DENIED);
+            }
+            return Ok(Action::Wait(wait));
+        }
+        self.skip(budget)
+    }
+
+    /// The candidate walk ended.
+    fn end(&mut self, end: End) -> Result<Action> {
+        if let Walking::Candidates(walk) = &self.walk {
+            self.funding = walk.funding_stopped();
+            if walk.rank0_unanswered() {
+                // Known issue 31: rank 0 has not answered this owner's probe
+                // within the attempt; the owner does not fetch origin too.
+                self.out.notes |= Notes::RANK0_LEFT;
+            }
+        }
+        self.walk = Walking::None;
+        match end {
+            End::Copy => {
+                self.note(Notes::WALK_COPY);
+                Ok(self.walked(Source::Peer))
+            }
+            End::StaleMembership => {
+                // Preserve the original operation, deadline, and spent
+                // credits; walk the newer membership.
+                self.note(Notes::REFRESH);
+                self.retried = true;
+                self.continuation = Continuation {
+                    bounded_routes: self.bounded && !self.has(Features::SIM_REFRESH_DROPS_BOUNDED),
+                    ..Continuation::default()
+                };
+                Ok(self.rank_next(Ranking::Current, Some(self.latest)))
+            }
+            End::Origin { rank, evidence } => {
+                // Only a ranked owner may fetch: rank again before origin.
+                self.evidence = evidence;
+                self.origin_rank = rank;
+                Ok(self.rank_next(Ranking::Authority, Some(self.version)))
+            }
+            End::VersionUnavailable => Err(Error::VersionUnavailable),
+            End::Exhausted { funding } => {
+                self.note(if funding {
+                    Notes::EXHAUSTED_FUNDING
+                } else {
+                    Notes::EXHAUSTED
+                });
+                if self.stale > 0 {
+                    self.note(Notes::EXHAUSTED_STALE);
+                }
+                Err(Error::Unavailable)
+            }
+        }
+    }
+
+    fn remaining_ended(&mut self, end: RemainingEnd) -> Result<Action> {
+        self.walk = Walking::None;
+        self.remaining_end = Some(end);
+        match end {
+            RemainingEnd::Copy => Ok(self.publish(Source::Peer)),
+            RemainingEnd::None => Err(origin_miss_error(&self.evidence)),
+            RemainingEnd::Unavailable => Err(Error::Unavailable),
+        }
+    }
+
+    fn walked(&mut self, source: Source) -> Action {
+        if self.config.walk_only {
+            Action::Done(Ok(source))
+        } else {
+            self.publish(source)
+        }
+    }
+
+    fn publish(&mut self, source: Source) -> Action {
+        self.source = source;
+        Action::Publish(source)
     }
 }
