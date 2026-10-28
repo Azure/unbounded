@@ -70,8 +70,11 @@ func renamedConfigData(ctx context.Context, env *component.Env) (map[string]stri
 }
 
 // planRenamedCleanup deletes the operator-owned objects left under the
-// pre-rename names. It runs after the new DaemonSet is planned, so the old
-// and new Pods may overlap briefly. Only objects that pass validateAdoptable
+// pre-rename names. Nothing is deleted until the new DaemonSet is observed
+// live and owned by this operator (see replacementLive): a pass runs removals
+// before writes, and an override can withhold the new DaemonSet, so a planned
+// replacement is no proof that one will exist. The old and new Pods may
+// overlap briefly. Only objects that pass validateAdoptable
 // are deleted, each with UID and resourceVersion preconditions; look-alikes
 // the operator does not own are left alone. Deletion is ordered over passes:
 //
@@ -83,6 +86,11 @@ func renamedConfigData(ctx context.Context, env *component.Env) (map[string]stri
 //
 // It reports whether any pre-rename object is still being removed.
 func planRenamedCleanup(ctx context.Context, env *component.Env, plan *component.Plan, settingsExist bool) (bool, error) {
+	live, err := replacementLive(ctx, env)
+	if err != nil || !live {
+		return true, err
+	}
+
 	core, rbac := corev1.SchemeGroupVersion, rbacv1.SchemeGroupVersion
 	first := []legacyObject{
 		legacy(&appsv1.DaemonSet{ObjectMeta: objectMeta(renamedDataplane)}, appsv1.SchemeGroupVersion.WithKind("DaemonSet")),
@@ -122,6 +130,20 @@ func planRenamedCleanup(ctx context.Context, env *component.Env, plan *component
 	}
 
 	return planRenamedDeletes(ctx, env, plan, guards)
+}
+
+// replacementLive reports whether the new DaemonSet exists, is not being
+// deleted, and is owned by this operator. It deliberately does not wait for
+// the rollout to become ready: the old Pods may hold resources, such as host
+// ports, that the new Pods need, so waiting on readiness could deadlock. A
+// written, owned replacement is enough to keep a workload scheduled.
+func replacementLive(ctx context.Context, env *component.Env) (bool, error) {
+	live, err := getLegacy(ctx, env, legacy(&appsv1.DaemonSet{ObjectMeta: objectMeta(dataplaneName)}, appsv1.SchemeGroupVersion.WithKind("DaemonSet")))
+	if err != nil || live == nil || live.GetDeletionTimestamp() != nil {
+		return false, err
+	}
+
+	return adoptable(ctx, env, live)
 }
 
 // planRenamedDeletes adds a delete for each candidate the operator owns and

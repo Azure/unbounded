@@ -115,3 +115,61 @@ func TestRenamedCleanupKeepsUnboundLegacyStamp(t *testing.T) {
 
 	require.True(t, exists(t, env, ds), "a stamp not bound to a marker is not proof of ownership")
 }
+
+func TestRenamedCleanupRequiresLiveReplacement(t *testing.T) {
+	ns := "custom-system"
+	now := metav1.Now()
+
+	for _, tc := range []struct {
+		name        string
+		replacement *appsv1.DaemonSet
+		deletes     bool
+	}{
+		{name: "missing"},
+		{
+			name:        "live and owned",
+			replacement: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns, UID: "new", Annotations: managed()}},
+			deletes:     true,
+		},
+		{
+			name: "terminating",
+			replacement: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+				Name: dataplaneName, Namespace: ns, UID: "new", Annotations: managed(),
+				DeletionTimestamp: &now, Finalizers: []string{"test/hold"},
+			}},
+		},
+		{
+			name:        "not owned",
+			replacement: &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns, UID: "new"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := renamedObjects(ns, managed)
+			if tc.replacement != nil {
+				objects = append(objects, tc.replacement)
+			}
+
+			env := testEnv(t, objects...)
+			plan := &component.Plan{}
+
+			pending, err := planRenamedCleanup(t.Context(), env, plan, true)
+			require.NoError(t, err)
+			require.True(t, pending)
+
+			deletes := 0
+
+			for _, op := range plan.Operations {
+				if op.Kind == component.OpDelete {
+					deletes++
+				}
+			}
+
+			if tc.deletes {
+				// The DaemonSet, ServiceAccount, RBAC, and ConfigMap.
+				require.Equal(t, 7, deletes)
+			} else {
+				require.Zero(t, deletes, "pre-rename objects deleted without a live replacement")
+			}
+		})
+	}
+}

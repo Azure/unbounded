@@ -172,7 +172,8 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 	}
 
 	// Remove what this operator applied under the pre-rename names once the
-	// new DaemonSet is planned. A config with a UID was read live.
+	// new DaemonSet is observed live; its creation event requeues this
+	// component. A config with a UID was read live.
 	if _, err := planRenamedCleanup(ctx, env, plan, config.UID != ""); err != nil {
 		return nil, component.Result{}, err
 	}
