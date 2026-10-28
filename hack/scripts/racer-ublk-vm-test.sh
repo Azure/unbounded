@@ -78,13 +78,20 @@ WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 
 # fetch_kernel downloads and unpacks the kernel image and modules for RELEASE
 # with a private APT configuration that reads no host APT state. The unpacked
-# tree is reused while its version file exists.
+# tree is reused only while its version file names a GUEST_KERNEL kernel whose
+# vmlinuz is present; any other cache is discarded and refetched.
 fetch_kernel() {
 	local apt="$WORK_DIR/apt" root="$WORK_DIR/kernel-root" pkgs="$WORK_DIR/pkgs"
 	local suite deps image version deb
 	if [[ -f "$WORK_DIR/version" && -d "$root" ]]; then
-		cat "$WORK_DIR/version"
-		return
+		version="$(<"$WORK_DIR/version")"
+		if [[ ("$version" == "$GUEST_KERNEL".* || "$version" == "$GUEST_KERNEL"-*) &&
+			-f "$root/boot/vmlinuz-$version" ]]; then
+			echo "$version"
+			return
+		fi
+		log "discarding cached kernel ${version:-<empty>}: not a usable Linux $GUEST_KERNEL kernel"
+		rm -f "$WORK_DIR/version"
 	fi
 	rm -rf "$apt" "$root" "$pkgs"
 	mkdir -p "$apt"/etc/{apt.conf.d,preferences.d,trusted.gpg.d,sources.list.d} \
