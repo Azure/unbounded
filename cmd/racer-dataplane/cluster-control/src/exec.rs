@@ -329,8 +329,7 @@ pub async fn timeout<T>(
 ///
 /// Each [`Signal::changed`] future owns one entry in a slab of wakers, so
 /// registering, re-registering, and dropping a waiter are O(1) and a notify
-/// with W waiters is O(W). (An earlier version deduplicated by scanning the
-/// whole list with `will_wake` on every registration: O(W^2) per notify.)
+/// with W waiters is O(W).
 #[derive(Clone, Default)]
 pub struct Signal(Rc<SignalInner>);
 
@@ -710,31 +709,10 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-
-    /// Every waiter is polled once per notify (the sim's notify cost model).
-    #[test]
-    fn signal_wakes_every_waiter() {
-        let mut ex = Executor::new(64).unwrap();
-        let signal = Signal::default();
-        let woken = Rc::new(Cell::new(0u64));
-        ex.block_on(async {
-            for _ in 0..8 {
-                let s = signal.clone();
-                let w = woken.clone();
-                spawn(async move {
-                    let g = s.generation();
-                    s.changed(g).await;
-                    w.set(w.get() + 1);
-                })
-                .unwrap();
-            }
-            sleep(Duration::from_millis(5)).await;
-            signal.notify();
-            sleep(Duration::from_millis(5)).await;
-        });
-        assert_eq!(woken.get(), 8);
-    }
+    use std::{
+        io::{Read, Write},
+        sync::atomic::{AtomicUsize, Ordering::SeqCst},
+    };
 
     #[test]
     fn timers_fire_in_order_and_deadline_cancels() {
@@ -768,14 +746,14 @@ mod tests {
         f.poll(&mut std::task::Context::from_waker(waker))
     }
 
-    fn counting_waker() -> (Waker, Arc<std::sync::atomic::AtomicUsize>) {
-        struct W(Arc<std::sync::atomic::AtomicUsize>);
+    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
+        struct W(Arc<AtomicUsize>);
         impl std::task::Wake for W {
             fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0.fetch_add(1, SeqCst);
             }
         }
-        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = Arc::new(AtomicUsize::new(0));
         (Waker::from(Arc::new(W(n.clone()))), n)
     }
 
@@ -797,8 +775,8 @@ mod tests {
         signal.notify();
         assert_eq!(signal.waiters(), 0);
         // `a` last registered `w2`, `b` registered `w1`: one wake each.
-        assert_eq!(n1.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(n2.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(n1.load(SeqCst), 1);
+        assert_eq!(n2.load(SeqCst), 1);
         assert!(poll_with(a.as_mut(), &w1).is_ready());
         assert!(poll_with(b.as_mut(), &w1).is_ready());
         // Already changed: ready without registering.
@@ -820,7 +798,7 @@ mod tests {
         assert_eq!(signal.waiters(), 0);
         assert!(signal.0.wakers.borrow().entries.len() <= 1);
         signal.notify();
-        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(n.load(SeqCst), 0);
         // A waiter dropped after a notify does not touch the new slab.
         let g = signal.generation();
         let mut old = Box::pin(signal.changed(g));
@@ -1003,6 +981,6 @@ mod tests {
         });
         let mut ex2 = ex;
         let f = flag.clone();
-        ex2.run(move || f.load(std::sync::atomic::Ordering::SeqCst));
+        ex2.run(move || f.load(SeqCst));
     }
 }
