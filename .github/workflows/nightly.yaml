@@ -268,8 +268,6 @@ jobs:
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : injected sidecars and per-ClusterCache
   #                                     origin DaemonSets from the racer component
-  #   - racer-dataplane-cuda          : racer dataplane with GPU reads, selected
-  #                                     by RACER_DATAPLANE_CUDA=true
   #   - racer-vllm                    : vLLM with the Racer loader; not deployed
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
@@ -297,8 +295,6 @@ jobs:
           - name: gantry
             file: images/gantry/Containerfile
           - name: racer-dataplane
-            file: images/racer-dataplane/Containerfile
-          - name: racer-dataplane-cuda
             file: images/racer-dataplane/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
@@ -346,9 +342,6 @@ jobs:
         # it needs that arg (images/metalman/Containerfile declares it and feeds
         # it to make). REGISTRY is lowercased by the step above.
         #
-        # racer-dataplane-cuda is the racer-dataplane Containerfile with the
-        # CUDA build enabled.
-        #
         # Nothing else needs one. Which component images the operator deploys is
         # decided at reconcile time from its own compiled version, so VERSION,
         # passed to every build below, is what selects them.
@@ -359,9 +352,6 @@ jobs:
             case "${{ matrix.component.name }}" in
               metalman)
                 echo "CONTAINER_REGISTRY=${REGISTRY}"
-                ;;
-              racer-dataplane-cuda)
-                echo "RACER_NATIVE_CUDA=true"
                 ;;
             esac
             echo 'EOF'

@@ -7,10 +7,13 @@ ARG RUNTIME_IMAGE=ubuntu:noble
 # Build on the target platform: both Rust and the verbs adapter use its ABI.
 FROM ${RUST_IMAGE} AS builder
 ARG RACER_NATIVE_RDMA=true
-# Build the CUDA shim (libracer_gpu_cuda.so.1) and the `cuda` feature. The
-# shim dlopens the driver at runtime, so only nvcc (for the decrypt kernel PTX)
-# is installed here; the runtime image gets the driver from the NVIDIA runtime.
-ARG RACER_NATIVE_CUDA=false
+# Build the CUDA shim (libracer_gpu_cuda.so.1) and the `cuda` feature. On by
+# default so one image serves GPU and CPU nodes. The shim dlopens the driver at
+# runtime, so only nvcc (for the decrypt kernel PTX) is installed here; the
+# runtime image gets the driver from the NVIDIA runtime. With no usable GPU,
+# RACER_ENABLE_GPU=auto (the default) turns GPU reads off at startup. Set false
+# for a smaller image without GPU reads.
+ARG RACER_NATIVE_CUDA=true
 ARG CUDA_NVCC_PACKAGE=cuda-nvcc-12-9
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
 WORKDIR /src
@@ -107,7 +110,7 @@ RUN set -eu; \
 # symbol versions, so the binary and verbs adapter run on noble's newer ones.
 FROM ${RUNTIME_IMAGE}
 ARG RACER_NATIVE_RDMA=true
-ARG RACER_NATIVE_CUDA=false
+ARG RACER_NATIVE_CUDA=true
 # cuFile user-space library for GPUDirect Storage. The NVIDIA container runtime
 # injects driver libraries only, not the toolkit's libcufile.so.0, so the CUDA
 # image ships it. The repo matches RUNTIME_IMAGE (ubuntu:noble). cuFile loads
