@@ -69,13 +69,14 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
 
 A phantom cache makes the same decisions as the real cache but stores no payload.
 
-- Placement: `Placement<R: Rankings>` (`topology/src/placement.rs:62`). The simulator uses a phantom
-  ranking backed by a shared memo keyed by membership and slot. CLOCK, pinning, and `Overloaded`
-  behavior are the real code.
-- Disk: real `Segments` and `SegmentClock` from `page-alloc` (built with its `simulation` feature)
-  over a phantom entry index.
+- Placement: `Placement<R: Rankings>` (`topology/src/placement.rs`). The simulator plugs in
+  `Phantom` (`sim/src/phantom.rs`), a ranking backed by a shared memo keyed by membership and slot.
+  CLOCK, pinning, and `Overloaded` behavior are the real code.
+- Disk: real `Segments` and `SegmentClock` from `page-alloc` over `PhantomEntries`, a phantom entry
+  index that exists only with the `simulation` feature.
 - Memory: `TickLru` with a small value type and `Ungrouped` lanes.
-- Routes: `Paths` with a shared route memo.
+- Routes: `Paths<S: Searches>` with `SharedRoutes` (`sim/src/phantom.rs`), a shared route memo.
+- `sim/tests/phantom_memory.rs` measures the per-node heap cost of all three phantom caches.
 
 ## racer-sim
 
@@ -87,6 +88,8 @@ Path: `cmd/racer-dataplane/sim`, crate and binary `racer-sim`.
 | `resources` | FIFO servers for NIC send and receive (cut-through per chunk), disk, CPU workers, crypto helper, site RTT matrix, origin |
 | `workload`, `faults` | Poisson, Zipf, range reads, cold-start storms, churn; partitions, crashes, slow nodes, hung peers, origin 412, 403, 5xx |
 | `node` | Real node logic for every node (below) |
+| `phantom` | Shared-memo `Phantom` rankings and `SharedRoutes` searches for every node's caches |
+| `config` | One `Config` (with its `node` knobs) parsed from `--config` JSON and validated in one place |
 | `control` | `ControlSim`: the real `cluster-control` model plus a client model |
 | `combined` | Control plane and data plane on one timeline |
 | `report` | Histograms, counters, invariants, memory accounting, JSON output |
