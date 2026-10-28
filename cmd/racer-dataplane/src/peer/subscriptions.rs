@@ -186,7 +186,8 @@ impl Subscriptions {
         })
     }
 
-    /// Run one core transition, then invoke the wakers it readied after releasing the mutex.
+    /// Run one core transition, then invoke the wakers it readied after
+    /// releasing the mutex.
     fn with_state<T>(&self, f: impl FnOnce(&mut Core) -> T) -> T {
         self.with_wakers(|state| f(&mut state.core))
     }

@@ -395,7 +395,9 @@ impl PeerServer {
 
     /// Whether to answer a page request with `Overloaded` because this node owns the page and is
     /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
-    /// all the bodies it is writing (Known issue 16).
+    /// all the bodies it is writing. The requester then asks one of the page's helpers, which,
+    /// like the page's owners, is never shed. The ranking is only computed for a page that is
+    /// already hot, and stays in this server's placement cache.
     fn shed_hot_page(
         &self,
         page: &crate::model::PageId,
@@ -866,7 +868,8 @@ impl PeerServer {
                 };
             }
             let binding = request.binding().clone();
-            // A copy offer or a silence ping carries no body, so hot-page shedding does not apply.
+            // A copy offer or a silence ping carries no body, so hot-page
+            // shedding does not apply.
             if let super::protocol::Operation::Page { page, mode } = &request.request().operation
                 && !matches!(
                     mode,

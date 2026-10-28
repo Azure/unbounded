@@ -300,8 +300,10 @@ impl FlightOperation {
         self.flights.complete_operation(&self.fence, self.id)
     }
 
-    /// Allows a completion owner to observe revoked leadership and request actual transport
-    /// cancellation. Cancellation is not itself a completion fence.
+    /// Allows a completion owner to observe revoked leadership and request actual
+    /// transport cancellation. Cancellation is not itself a completion fence.
+    /// Refreshes the entry first, so an expired leader of a handover-enabled
+    /// acquisition passes to another live waiter rather than ending the work.
     pub fn cancellation_requested(&self) -> bool {
         self.leader_deadline(None).is_none()
     }
@@ -1576,8 +1578,13 @@ impl Flights {
         })
     }
 
-    /// Retain the operation a fill driver is about to submit, first enabling handover when
-    /// requested.
+    /// Retain the operation a fill driver is about to submit, first enabling
+    /// handover when requested. Handover is enabled before the operation is
+    /// retained so that no fallible step runs while an unsubmitted
+    /// `FlightOperation` is held: dropping one keeps its table slot and
+    /// admission charge (see `FlightOperation`), which would leave the flight
+    /// fenced and block `drain`. Enabling handover without a running
+    /// operation is inert, so a failed retain leaves nothing behind.
     pub(crate) fn retain_driver_operation(
         self: &Rc<Self>,
         leader: &FlightLeader,

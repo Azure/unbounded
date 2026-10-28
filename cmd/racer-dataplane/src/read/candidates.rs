@@ -65,8 +65,9 @@ pub struct OriginAuthority {
     membership: std::sync::Arc<crate::topology::Membership>,
     node: NodeId,
     object: ObjectId,
-    /// The page's ranked owners under `membership`, which `rank` indexes. A walk that refreshed its
-    /// membership grants authority under the newer ranking, not the caller's.
+    /// The page's ranked owners under `membership`, which `rank` indexes.
+    /// A walk that refreshed its membership grants authority under the
+    /// newer ranking, not the caller's.
     owners: Vec<NodeId>,
     page: PageNumber,
     predecessor_evidence: Vec<ProbeOutcome>,
@@ -112,7 +113,8 @@ pub(crate) struct Acquisition {
 }
 
 impl Acquisition {
-    /// `error` as racer-core sees it; the dataplane error is kept for the read's failure.
+    /// `error` as racer-core sees it; the dataplane error is kept for the
+    /// read's failure.
     fn core_error(&mut self, error: Error) -> racer_core::read::Error {
         racer_core::read::Error::try_from(error).unwrap_or_else(|_| {
             self.error = Some(error);
@@ -170,7 +172,8 @@ pub struct CandidatePolicy {
     #[cfg(test)]
     pub(crate) instant_stale_wait: std::cell::Cell<bool>,
     /// Owners this node answered a page probe without a copy, by page (see
-    /// `racer_core::read::hints`).
+    /// `racer_core::read::hints`). The coordinator notes and defers on them; an owner walk asks
+    /// them before origin.
     pub(crate) successors: RefCell<Successors>,
     /// Pages this node fetched from origin as an owner after rank 0, to offer to rank 0 later (see
     /// `racer_core::read::hints`).
@@ -310,8 +313,10 @@ impl CandidatePolicy {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
             return Ok((None, HedgeEnd::NotStarted));
         };
-        // The hedge primary and duplicate are the first two owners in the visit order the walk uses
-        // (`HedgeEnd::Lost` skips the primary).
+        // The hedge primary and duplicate are the first two owners in the
+        // visit order the walk uses (`HedgeEnd::Lost` skips the primary). A
+        // pinned direct exchange carries one link, so its receiver cannot
+        // probe predecessors; racer-core keeps one cold fallback fundable.
         let eligible = eligible
             && [first, second].iter().all(|rank| {
                 self.peers
@@ -694,6 +699,7 @@ impl CandidatePolicy {
 
     /// Feed a walk probe's route evidence to the orphan notices' cut groups: a transport failure or
     /// timeout toward `destination` holds offers to its site, an answer signed by it releases them.
+    /// Answers that a relay may have signed say nothing.
     fn observe_route(
         &self,
         membership: &crate::topology::Membership,
@@ -735,7 +741,8 @@ impl CandidatePolicy {
         self
     }
 
-    /// Sleep until `until` under the request's scope. `false` without a timer.
+    /// Sleep until `until` under the request's scope. `false` without a
+    /// timer.
     async fn stale_sleep(&self, until: std::time::Instant, scope: &RequestScope) -> Result<bool> {
         use uring_runtime::reactor::timer::SleepMode;
         #[cfg(test)]
@@ -821,8 +828,9 @@ impl CandidatePolicy {
         self
     }
 
-    /// How long rank 0 may stay silent on a page after an owner's probe of it timed out before the
-    /// owner presumes it hung (half the client request timeout; see `racer_core::liveness`).
+    /// How long rank 0 may stay silent on a page after an owner's probe of
+    /// it timed out before the owner presumes it hung (half the client
+    /// request timeout; see `racer_core::liveness`).
     pub(crate) fn with_rank0_hang_after(self, hang_after: std::time::Duration) -> Self {
         *self.rank0_watch.borrow_mut() = Rank0Watch::new(
             racer_core::liveness::WATCH_CAPACITY,
@@ -1096,8 +1104,10 @@ impl CandidatePolicy {
         }
     }
 
-    /// Run `acquisition` from `event` until it needs what only the caller performs: a hedge, an
-    /// origin fetch, a publication, or the end. A validated copy lands in `copy`.
+    /// Run `acquisition` from `event` until it needs what only the caller
+    /// performs: a hedge, an origin fetch, a publication, or the end. A
+    /// validated copy lands in `copy`. racer-core owns every decision; this
+    /// loop performs the rankings and exchanges it plans.
     #[allow(clippy::too_many_arguments)] // The driver borrows the read's distinct inputs.
     pub(crate) async fn drive<'a, T: 'a>(
         &'a self,
@@ -1185,8 +1195,9 @@ impl CandidatePolicy {
                     };
                     let version = latest.as_ref().map(|latest| latest.version.0);
                     a.latest = latest;
-                    // Version - 1, when still resolvable by peers that adopted the current one
-                    // (replaced within `PREVIOUS_MEMBERSHIP_WITHIN`) and listing this node.
+                    // Version - 1, when still resolvable by peers that adopted
+                    // the current one (replaced within
+                    // `PREVIOUS_MEMBERSHIP_WITHIN`) and listing this node.
                     let current = a.current.as_ref().expect("ranked");
                     a.stale_previous = current
                         .membership
@@ -1303,7 +1314,8 @@ impl CandidatePolicy {
                         if object != &context.object {
                             return Err(Error::InvalidRequest);
                         }
-                        // Public Candidates values are not authority. Recompute before origin.
+                        // Public Candidates values are not authority.
+                        // Recompute before origin.
                         let expected = self
                             .candidates_scoped(candidates.membership.clone(), object, page, scope)
                             .await?;
@@ -1336,9 +1348,10 @@ impl CandidatePolicy {
                     .ok()
                     .flatten()
                     .ok_or(Error::Unavailable)?;
-                // Ask predecessors under the previous membership only while peers that adopted the
-                // current one still hold it in grace (`PREVIOUS_MEMBERSHIP_WITHIN`); a lease held
-                // only here says nothing about a peer.
+                // Ask predecessors under the previous membership only while
+                // peers that adopted the current one still hold it in grace
+                // (`PREVIOUS_MEMBERSHIP_WITHIN`); a lease held only here says
+                // nothing about a peer.
                 let recent = self
                     .published
                     .resolve_recent(
@@ -1419,7 +1432,8 @@ impl CandidatePolicy {
             None => ranked.order = self.visit_order(candidates, object, page),
             Some(_) if page_operation => {
                 // Members ranked just below the owners that were owners when they arrived (from the
-                // cached ranking only).
+                // cached ranking only). Arrivals at generation 0 are unknown: present since this
+                // node's chain began.
                 let demoted = self.placement.demoted(membership, object, page);
                 for node in demoted.iter() {
                     let Ok(p) = membership.position(node) else {
@@ -1666,8 +1680,12 @@ impl CandidatePolicy {
     }
 
     /// Send a run of granted probes at once (`Step::Granted`): copy-only, each on its own grant
-    /// (`racer_core::read::walk::granted_budget`), all sharing the first probe's time share, so the
-    /// run costs one round trip instead of one per target.
+    /// (`racer_core::read::walk::granted_budget`), all sharing the first
+    /// probe's time share, so the run costs one round trip instead of one per
+    /// target. Waits for every answer before validating, so no exchange is
+    /// left running; returns the first validated copy in probe order. Any
+    /// other answer, and any transport failure while `scope` still runs, is
+    /// a miss, as for a sequential granted probe.
     #[allow(clippy::too_many_arguments)] // The batch borrows the walk's distinct inputs.
     async fn granted_batch<'a, T>(
         &'a self,
@@ -2062,8 +2080,9 @@ impl CandidatePolicy {
             if !matches!(mode, FetchMode::Ping) && self.peers.link_health().silent(destination) {
                 return Err(Error::Unavailable);
             }
-            // racer-core reserves the complete route and remote credits before sending and derives
-            // the share, local cap, and body budget.
+            // racer-core reserves the complete route and remote credits before
+            // sending and derives the share, local cap, and body budget. Lost
+            // responses cannot refund forwarded links; no retry gets fresh credits.
             let now = uring_runtime::environment::now();
             let plan = racer_core::read::walk::plan_attempt(
                 budget,
@@ -2234,8 +2253,9 @@ impl CandidatePolicy {
             check_budget(scope, budget)?;
             let stop = stopped.or_else(|| attempt_scope.check().err());
             facts.stop = stop;
-            // The caller's scope and budget still hold here, so a deadline is the attempt's own
-            // bound: the request was sent and is unanswered (`WalkOutcome::TimedOut`).
+            // The caller's scope and budget still hold here, so a deadline is
+            // the attempt's own bound: the request was sent and is unanswered
+            // (`WalkOutcome::TimedOut`).
             match stop {
                 Some(Error::DeadlineExceeded) => {
                     *timed_out = true;
@@ -2263,7 +2283,8 @@ impl CandidatePolicy {
     }
 
     /// This node fetched `page` from origin at `rank` among `owners`: when that is after rank 0,
-    /// remember to offer rank 0 the copy later (`racer_core::read::hints`).
+    /// remember to offer rank 0 the copy later (`racer_core::read::hints`). Returns whether a
+    /// notice was noted.
     pub(crate) fn note_orphan(
         &self,
         page: &crate::model::PageId,
@@ -2295,7 +2316,8 @@ impl CandidatePolicy {
 
     /// This node's own origin request for `page`, made with authority at `rank` among `owners`,
     /// failed with `error`: above rank 0, leave retries after rank 0's own failures to rank 0 for a
-    /// while (`racer_core::liveness`).
+    /// while (`racer_core::liveness`). Terminal origin answers (a missing version, rejected or
+    /// forbidden credentials) are not failures of origin and are ignored.
     pub(crate) fn note_origin_failure(
         &self,
         page: &crate::model::PageId,
@@ -2361,7 +2383,8 @@ impl CandidatePolicy {
                 continue;
             }
             let Ok(permit) = uring_runtime::drivers::reserve() else {
-                // No driver slot this turn: count it as a failed offer (local, so not a cut).
+                // No driver slot this turn: count it as a failed offer
+                // (local, so not a cut).
                 let _ = self
                     .notices
                     .borrow_mut()
@@ -2448,7 +2471,8 @@ impl CandidatePolicy {
             page: page.clone(),
             mode: FetchMode::Ping,
         };
-        // A fresh grant: one local exchange, no remote attempts, and `NOTICE_LINKS` route links.
+        // A fresh grant: one local exchange, no remote attempts, and
+        // `NOTICE_LINKS` route links.
         let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
         let mut timed_out = false;
         let response = self
@@ -2475,8 +2499,9 @@ impl CandidatePolicy {
         })
     }
 
-    /// Send one copy offer for `due` to the page's current rank 0, and classify how it ended.
-    /// Errors before sending are cut evidence too (membership or route lookup).
+    /// Send one copy offer for `due` to the page's current rank 0, and
+    /// classify how it ended. Errors before sending are cut evidence too
+    /// (membership or route lookup).
     async fn offer(
         &self,
         due: &racer_core::read::hints::Due<(crate::model::PageId, u8), NodeId>,
@@ -2515,7 +2540,8 @@ impl CandidatePolicy {
             page: page.clone(),
             mode: FetchMode::Offer,
         };
-        // A fresh grant: one local exchange, no remote attempts, and `NOTICE_LINKS` route links.
+        // A fresh grant: one local exchange, no remote attempts, and
+        // `NOTICE_LINKS` route links.
         let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
         let response = self
             .request_mode(
@@ -2800,8 +2826,9 @@ pub(crate) fn operation_kind(operation: &PeerOperation) -> racer_core::read::Ope
     }
 }
 
-// `acquire` describes the actual probe, which may be CopyOnly even when the caller's operation
-// requests acquisition (predecessors and remaining copies).
+// `acquire` describes the actual probe, which may be CopyOnly even when the
+// caller's operation requests acquisition (predecessors and remaining copies).
+// racer-core owns the outcome table; this supplies payload identity checks.
 fn classify(
     response: &PeerResponse,
     operation: &PeerOperation,
@@ -2880,7 +2907,11 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
 
 // Opt-in, node-shared speculative page hedging (`RACER_PAGE_HEDGE_SLOTS=0` disables it;
 // `RACER_PAGE_HEDGE_DELAY_MS` defaults to 100, `RACER_PAGE_HEDGE_BYTES` to one duplicate
-// plaintext+ciphertext pair).
+// plaintext+ciphertext pair). Only non-owner plaintext page reads with two direct healthy owners
+// race, over pinned first hops. Credits are partitioned, never replenished; duplicate escrow is held
+// on top of buffer quota, and admission preflights both contender buffers before spending credits,
+// so low quotas fall back to the serial walk. The serial continuation skips the consumed primary.
+// A winner waits for the loser's exchange and crypto fence before returning.
 
 pub const DUPLICATE_BYTES: usize =
     racer_core::read::duplicate_bytes(crate::model::PAGE_BYTES as usize);
@@ -3283,7 +3314,8 @@ pub(super) mod tests {
     }
 
     /// A reader whose first choice arrived in the membership chain after a later owner visits that
-    /// older owner first, which may hold the copy it fetched while it ranked higher.
+    /// older owner first, which may hold the copy it fetched while it ranked higher. Primary keeps
+    /// the canonical order; with no arrivals in the chain nothing changes.
     #[test]
     fn spread_visits_an_older_later_owner_before_a_newer_owner() {
         use crate::topology::Membership;
@@ -3555,7 +3587,8 @@ pub(super) mod tests {
 
     /// A non-owner whose owner itself sheds it (a signed `Overloaded` from the destination) asks
     /// the page's overflow helper once, with an Acquire funded from what is left (too little for
-    /// the helper to ask another helper), then the remaining owners.
+    /// the helper to ask another helper), then the remaining owners. A transport `Overloaded` (no
+    /// signed answer, as from a congested route) does not.
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
         use crate::test_support::security::{network, node};

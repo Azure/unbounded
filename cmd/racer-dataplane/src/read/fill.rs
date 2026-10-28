@@ -1432,7 +1432,10 @@ impl Fill {
 
         let mut shared_local = false;
         let retained = self.dependencies.flights.ciphertext_for(&leader)?;
-        // racer-core orders the local sources.
+        // racer-core orders the local sources. Cached pages retain only
+        // ciphertext; a plaintext acquisition decrypts it through the shared
+        // local plaintext job, so range probes and warm readers of the same
+        // page share one reservation and one decrypt in either arrival order.
         let local_job = || self.local_plaintext.get(page).is_some();
         let unverified =
             || -> Result<bool> { Ok(self.dependencies.memory.unverified(page)?.is_some()) };
@@ -1477,7 +1480,10 @@ impl Fill {
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
         // Unless the caller fences on this work (warm gates), the running fill continues for
         // another live acquisition waiter when the leader expires or is canceled, instead of being
-        // canceled and restarted from scratch by the next leader.
+        // canceled and restarted from scratch by the next leader. The owned scope then runs to a
+        // hard ceiling; the driver cancels it as soon as no live waiter remains
+        // (`FlightOperation::poll_cancellation`). Attempts and links stay charged to the leader's
+        // budget; the extra time is within the adopting waiter's own deadline and budget.
         let handover = !self.fence_acquisition;
         let ceiling = racer_core::read::flight::handover_ceiling(
             uring_runtime::environment::now(),
@@ -1716,8 +1722,9 @@ impl Fill {
         self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
-    /// Whether this node holds a copy of `page` in memory, pending write, or the disk index,
-    /// without reading it (orphan notices and copy offers). Lookup errors count as not held.
+    /// Whether this node holds a copy of `page` in memory, pending write, or
+    /// the disk index, without reading it (orphan notices and copy offers).
+    /// Lookup errors count as not held.
     pub(crate) fn holds(&self, page: &PageId) -> bool {
         let deps = &self.dependencies;
         deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
@@ -2040,8 +2047,10 @@ impl Fill {
         result
     }
 
-    /// Drive the read's racer-core acquisition ([`super::candidates::CandidatePolicy::drive`]): it
-    /// decides each step, and this loop performs the hedge, origin fetch, and publication.
+    /// Drive the read's racer-core acquisition
+    /// ([`super::candidates::CandidatePolicy::drive`]): it decides each step,
+    /// and this loop performs the hedge, origin fetch, and publication.
+    /// Errors raised by the I/O itself return directly.
     pub(super) async fn acquire_once(
         &self,
         page: &PageId,
@@ -2228,7 +2237,8 @@ impl Fill {
                     {
                         Ok(origin) => {
                             // An owner after rank 0 holds a copy rank 0 may not know of: offer it
-                            // later.
+                            // later. The authority's owners: a walk that refreshed its membership
+                            // ranks under the newer one.
                             if policy.note_orphan(
                                 page,
                                 authority.owners(),

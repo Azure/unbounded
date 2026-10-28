@@ -151,8 +151,11 @@ impl Coordinator {
         Some(owners)
     }
 
-    /// This node answered `requester`'s page probe without a copy: remember that `requester` is
-    /// likely to fetch the page itself.
+    /// This node answered `requester`'s page probe without a copy: remember
+    /// that `requester` is likely to fetch the page itself. A copy-only miss
+    /// is noted without ranking (deferral checks ownership); a failed
+    /// acquisition is noted when the ranking this node's own walk cached
+    /// shows both as owners. Neither path ranks a page.
     fn note_successor(
         &self,
         page: &crate::model::PageId,
@@ -184,8 +187,9 @@ impl Coordinator {
             .record(crate::telemetry::Event::SuccessorHint, 1);
     }
 
-    /// Whether to answer a non-owner's page `Acquire` with `Miss` because another owner fetched the
-    /// page after this node answered it without a copy. Free when no hint names the page.
+    /// Whether to answer a non-owner's page `Acquire` with `Miss` because
+    /// another owner fetched the page after this node answered it without a
+    /// copy. Free when no hint names the page.
     async fn defer_to_successor(
         &self,
         page: &crate::model::PageId,
@@ -232,8 +236,10 @@ impl Coordinator {
         true
     }
 
-    /// Whether a copy-only page request from `requester` may wait on this node's running
-    /// acquisition of the page (`racer_core::read::copy_join_allowed`).
+    /// Whether a copy-only page request from `requester` may wait on this
+    /// node's running acquisition of the page
+    /// (`racer_core::read::copy_join_allowed`). Ranks
+    /// the page only while an acquisition runs.
     async fn copy_join_allowed(
         &self,
         page: &crate::model::PageId,
@@ -257,7 +263,8 @@ impl Coordinator {
         allowed
     }
 
-    /// Send this node's due copy offers; call once per worker service turn.
+    /// Send this node's due copy offers; call once per
+    /// worker service turn.
     pub(crate) fn poll_offers(&self, now: std::time::Instant) {
         let fill = &self.fill;
         fill.dependencies
@@ -267,8 +274,12 @@ impl Coordinator {
         fill.dependencies.candidates.poll_pings(now, &fill.metrics);
     }
 
-    /// Answer a copy offer: `requester` fetched `page` from origin as an owner ranked after this
-    /// node.
+    /// Answer a copy offer: `requester` fetched `page` from
+    /// origin as an owner ranked after this node. Note it as a successor
+    /// hint for this node's own next acquisition (it defers no readers,
+    /// `SuccessorHints::note_offer`), unless this node holds the page or is
+    /// fetching it. Never opens credentials, acquires, or sends a
+    /// body.
     fn serve_offer(
         &self,
         page: &crate::model::PageId,
@@ -560,9 +571,10 @@ impl LocalPageService for Coordinator {
             effective.deadline.0 =
                 racer_core::read::serve_deadline(effective.deadline.0, request.route.deadline.0);
             effective.check()?;
-            // A non-owner's Acquire for a page another owner fetched after this node answered it
-            // without a copy is served copy-only: the reader asks that owner next instead of this
-            // node fetching the page again.
+            // A non-owner's Acquire for a page another owner fetched after
+            // this node answered it without a copy is served copy-only: the
+            // reader asks that owner next instead of this node fetching the
+            // page again.
             if let PeerOperation::Page {
                 page,
                 mode: FetchMode::Acquire,
