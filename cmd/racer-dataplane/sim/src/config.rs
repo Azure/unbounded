@@ -196,99 +196,59 @@ pub struct NodeConfig {
     /// Speculative bytes per node (production `page_hedge_bytes`, default
     /// one `DUPLICATE_BYTES`).
     pub hedge_bytes: u64,
-    /// Overflow fan-out to page helpers (production: always on; set 0 to
-    /// measure without it, Known issue 16).
+    // Ablation switches: production always has these on (except
+    // `lineage_slack`); set false to measure without the fix for the Known
+    // issue named.
+    /// Overflow fan-out to page helpers (16).
     pub fanout: bool,
-    /// Bodies of one page an owner streams before it sheds readers of the
-    /// page; 0 (default) derives it from the page size like production
-    /// (`racer_core::read::budget::hot_page_bodies`).
+    /// Bodies of one page an owner streams before shedding its readers; 0
+    /// derives it from the page size like production.
     pub hot_page_bodies: u32,
-    /// A running fill continues for another live waiter when its leader
-    /// expires (production: on for every fill except warm gates; set 0 to
-    /// measure without it, Known issue 30).
+    /// Fill handover to a live waiter when the leader expires (30).
     pub flight_handover: bool,
-    /// Rank 0 asks a successor that recently missed it before origin
-    /// (production: always on; set 0 to measure without it, Known issue 21).
+    /// Rank 0 asks a successor that recently missed it before origin (21).
     pub successor_hints: bool,
-    /// Owners ask hinted later owners copy-only before origin, each probe on
-    /// its own grant (production: always on; set 0 to measure without it,
-    /// Known issue 21, round 4 orphan2). Needs `successor_hints`.
+    /// Owners ask hinted later owners copy-only first (21). Needs
+    /// `successor_hints`.
     pub successor_targets: bool,
-    /// Non-owners walk the recent previous membership at a destination that
-    /// is behind (production: always on; set 0 to measure without it, Known
-    /// issue 19).
+    /// Non-owners walk the previous membership at a lagging destination (19).
     pub stale_fallback: bool,
-    /// Owners ask, readers visit first, and walks fund later owners that
-    /// arrived before an owner (production `lineage_targets`,
-    /// `lineage_first`: always on; set 0 to measure without it, Known issue
-    /// 25).
+    /// Lineage targets and lineage-first visit order (25).
     pub lineage: bool,
-    /// A non-owner that cannot walk the previous membership waits once for
-    /// a destination that is behind (production `stale_wait`: always on;
-    /// set 0 to measure without it, Known issue 26).
+    /// A non-owner that cannot fall back waits once (26).
     pub stale_wait: bool,
-    /// A verified `StaleMembership` also returns the links past the
-    /// answering node (production: always on; Known issues 47 and 49).
+    /// `StaleMembership` refunds the links past the answerer (47, 49).
     pub stale_link_refund: bool,
-    /// Owners also ask, before origin, members ranked just below the owners
-    /// that were owners when they arrived (production `demoted_targets`:
-    /// always on; set 0 to measure without it, Known issue 34). Needs
-    /// `lineage`.
+    /// Owners also ask members just below past owners (34). Needs `lineage`.
     pub demoted_targets: bool,
-    /// Lineage targets are asked on their own grant, like successor targets
-    /// (production: always on; set 0 to fund them from the walk's slack
-    /// only, Known issue 35).
+    /// Lineage targets get their own grant (35).
     pub lineage_grants: bool,
-    /// With `lineage_grants`, readers and delegations still fund lineage
-    /// probes from slack (`WalkConfig::lineage`) (production: off; Known
-    /// issue 35). Without `lineage_grants` slack funding is always on.
+    /// With `lineage_grants`, still fund lineage probes from slack (35;
+    /// production off).
     pub lineage_slack: bool,
-    /// A copy-only request from an owner ranked before the destination does
-    /// not wait on the destination's acquisition (production
-    /// `copy_join_allowed`: always on; set 0 to measure without it, Known
-    /// issue 44).
+    /// Copy-only requests from earlier-ranked owners do not join (44).
     pub copy_join_rank: bool,
-    /// An owner above rank 0 that fetched a page from origin offers it to
-    /// rank 0 later (production `orphan_notices`: always on; set 0 to
-    /// measure without it, Known issue 37). Needs `successor_hints`.
+    /// Owners above rank 0 offer origin copies to rank 0 (37). Needs
+    /// `successor_hints`.
     pub orphan_notices: bool,
-    /// Owners above rank 0 remember rank 0 found fetching or overdue per
-    /// page (production `Rank0Watch`: always on; set 0 to measure without
-    /// it, Known issue 39).
+    /// Owners above rank 0 track rank 0 per page (39).
     pub rank0_watch: bool,
-    /// Granted probes (successor and lineage targets) go out at once
-    /// (production `WalkConfig::parallel_granted`: always on; set 0 to send
-    /// them one after the other, Known issue 45).
+    /// Granted probes go out at once (45).
     pub parallel_granted: bool,
-    /// Most lineage targets per owner walk (production
-    /// `walk::MAX_LINEAGE`; set lower to measure, 3 is the wave 5 cap, Known
-    /// issue 46).
+    /// Most lineage targets per owner walk (46; production `walk::MAX_LINEAGE`).
     pub lineage_cap: usize,
-    /// Demoted members whose arrival is the chain's start (unknown age) are
-    /// lineage targets too when the owner arrived later (production
-    /// `demoted_targets_from` with `oldest` 0: always on; set 0 to measure
-    /// without, Known issue 46).
+    /// Unknown-age demoted members are lineage targets too (46).
     pub unknown_age_targets: bool,
-    /// Senders hold next hops that leave exchanges unanswered silent and
-    /// fail requests for them at once (Known issues 41 and 43).
+    /// Hold unanswering next hops silent (41, 43).
     pub silence: bool,
-    /// Readers visit an owner that itself shed them (a signed
-    /// `Overloaded`) after the page's other owners for half a request
-    /// timeout (production `Silence::shed`: always on; set 0 to measure
-    /// without it, Known issue 54). Needs `silence`.
+    /// Visit owners that shed us last (54). Needs `silence`.
     pub shed_busy: bool,
-    /// Owners above rank 0 leave the next attempt to rank 0 after rank 0's
-    /// own acquisition failed (production `Outcome::Failed`: always on;
-    /// set 0 to measure without it, Known issue 52). Needs `rank0_watch`.
+    /// Leave the retry to rank 0 after its own failure (52). Needs
+    /// `rank0_watch`.
     pub rank0_failure_hold: bool,
-    /// Copy offers wait out a cut toward their target's site, seen by an
-    /// offer or by this node's reads (production
-    /// `racer_core::read::hints` cut groups: always on; set 0 to measure
-    /// without it, Known issue 50).
+    /// Copy offers wait out a cut toward their target's site (50).
     pub offer_cut_groups: bool,
-    /// A rank 2 holder also offers its origin copy to rank 1 (production
-    /// `racer_core::read::hints::notice_indexes`: always on; set 0 to
-    /// measure without it, Known issue 51).
+    /// Rank 2 holders also offer origin copies to rank 1 (51).
     pub offer_predecessors: bool,
 }
 
