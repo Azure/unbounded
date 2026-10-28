@@ -75,9 +75,7 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
             })?;
             let concrete = Arc::new(Embedded(handle));
             let embedded: Arc<dyn ClusterControl> = concrete.clone();
-            match racer::control::managed::start(&mut config, embedded, &|| {
-                signals.requested()
-            }) {
+            match racer::control::managed::start(&mut config, embedded, &|| signals.requested()) {
                 Ok(()) => {}
                 // A requested stop during bootstrap is a clean exit; dropping the
                 // handle stops embedded control boundedly.
@@ -161,9 +159,7 @@ fn tune_allocator() {
     if applied == 1 {
         eprintln!("racer: malloc mmap threshold set bytes={MMAP_THRESHOLD_BYTES}");
     } else {
-        eprintln!(
-            "racer: malloc mmap threshold not applied bytes={MMAP_THRESHOLD_BYTES}"
-        );
+        eprintln!("racer: malloc mmap threshold not applied bytes={MMAP_THRESHOLD_BYTES}");
     }
 }
 

@@ -1093,9 +1093,7 @@ fn enrolled_identity(
         ClusterId(CLUSTER.into()),
         scratch.0.join("token"),
         scratch.0.join("identity"),
-        std::rc::Rc::new(racer::control::ReactorControlIo::new(
-            reactor.clone(),
-        )),
+        std::rc::Rc::new(racer::control::ReactorControlIo::new(reactor.clone())),
     );
     let bundle = racer_control_wire::decode_bundle(&control.bundle).unwrap();
     enrollment

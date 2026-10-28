@@ -1339,9 +1339,7 @@ impl Helper {
                 .find(|context| context.ordinal() == ordinal)
                 .ok_or(Error::Unavailable)?;
             let buffer = context.staging(length).map_err(|error| {
-                eprintln!(
-                    "racer: stage=gpu ordinal={ordinal} state=landing-failed reason={error}"
-                );
+                eprintln!("racer: stage=gpu ordinal={ordinal} state=landing-failed reason={error}");
                 Error::Overloaded
             })?;
             self.landing.insert(id, buffer);
@@ -1441,9 +1439,7 @@ impl Helper {
                 .ok_or(Error::Internal)?;
             let size = self.state.slots.max(SCRATCH_SLOTS) * SLOT_BYTES;
             let buffer = context.staging(size).map_err(|error| {
-                eprintln!(
-                    "racer: stage=gpu ordinal={ordinal} state=staging-failed reason={error}"
-                );
+                eprintln!("racer: stage=gpu ordinal={ordinal} state=staging-failed reason={error}");
                 Error::Overloaded
             })?;
             self.staging.insert(ordinal, buffer);

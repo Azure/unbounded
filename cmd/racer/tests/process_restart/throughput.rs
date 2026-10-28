@@ -734,7 +734,6 @@ fn production_blocked_control_progress() {
 }
 
 fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
-    use racer_control_wire::CacheId;
     use racer::model::CacheKey;
     use racer::model::ObjectId;
     use racer::model::ObjectVersion;
@@ -743,6 +742,7 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
     use racer::model::StrongEtag;
     use racer::model::WorkerId;
     use racer::read::dispatch::WorkerMap;
+    use racer_control_wire::CacheId;
     let map = WorkerMap::new((0..4).map(WorkerId).collect()).unwrap();
     (0..10000)
         .find(|key| {
@@ -891,15 +891,15 @@ fn production_multicache_disk_baseline() {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; two actual Applications with authenticated TCP peers"]
 fn production_peer_and_failed_neighbor_progress() {
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
     use racer::model::CacheKey;
     use racer::model::ObjectId;
     use racer::model::PageNumber;
     use racer::topology::Member;
     use racer::topology::Membership;
     use racer::topology::Placement;
+    use racer_control_wire::CacheId;
+    use racer_control_wire::MembershipVersion;
+    use racer_control_wire::NodeId;
     const OTHER: &str = "33333333-3333-4333-8333-333333333333";
     for pairs in [1, 2, 4] {
         let first_root = Scratch::new();
@@ -1030,15 +1030,15 @@ fn production_peer_and_failed_neighbor_progress() {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate subscription"]
 fn production_remote_bootstrap_one_get_and_empty() {
-    use racer_control_wire::CacheId;
-    use racer_control_wire::MembershipVersion;
-    use racer_control_wire::NodeId;
     use racer::model::CacheKey;
     use racer::model::ObjectId;
     use racer::model::PageNumber;
     use racer::topology::Member;
     use racer::topology::Membership;
     use racer::topology::Placement;
+    use racer_control_wire::CacheId;
+    use racer_control_wire::MembershipVersion;
+    use racer_control_wire::NodeId;
     for length in [0, 113] {
         let roots: Vec<_> = (0..4).map(|_| Scratch::new()).collect();
         let profile = Profile::new(1, length, 1);

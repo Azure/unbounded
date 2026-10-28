@@ -683,10 +683,7 @@ fn listener_completion(
 ) -> Result<()> {
     if !stopping {
         if let Err(error) = &result {
-            eprintln!(
-                "racer: worker={} stage={stage} error={error:?}",
-                worker.0
-            );
+            eprintln!("racer: worker={} stage={stage} error={error:?}", worker.0);
         }
         result?;
         eprintln!(

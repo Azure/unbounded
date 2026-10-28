@@ -173,10 +173,7 @@ fn open_with_busy_wait<C: Candidate>(
             Ok(()) => {}
             Err(error) if is_busy(&error) && !wait.is_zero() => busy.push(candidate),
             Err(error) => {
-                eprintln!(
-                    "racer: skipping block device {:?}: {error}",
-                    candidate.id()
-                );
+                eprintln!("racer: skipping block device {:?}: {error}", candidate.id());
             }
         }
     }
@@ -201,10 +198,7 @@ fn open_with_busy_wait<C: Candidate>(
                 Ok(()) => {}
                 Err(error) if is_busy(&error) => still.push(candidate),
                 Err(error) => {
-                    eprintln!(
-                        "racer: skipping block device {:?}: {error}",
-                        candidate.id()
-                    );
+                    eprintln!("racer: skipping block device {:?}: {error}", candidate.id());
                 }
             }
         }

@@ -592,9 +592,7 @@ impl Links {
         };
         let slots = (bytes / BUFFER_LEN as u64) as usize;
         if slots == 0 {
-            eprintln!(
-                "racer: stage=gpu-landing state=disabled reason=too-small bytes={bytes}"
-            );
+            eprintln!("racer: stage=gpu-landing state=disabled reason=too-small bytes={bytes}");
             return;
         }
         let gpus: Vec<(i32, Option<usize>)> = helper

@@ -5,9 +5,6 @@
 #[allow(dead_code)]
 mod fixture_io;
 
-use racer_control_wire as wire;
-use racer_control_wire::*;
-use racer_crypto::identity::BundleInstaller;
 use racer as dataplane;
 use racer::admission::AdmissionPolicy;
 use racer::admission::ResourceClass;
@@ -27,11 +24,14 @@ use racer::security::CryptoClient;
 use racer::security::CryptoInput;
 use racer::security::CryptoOutput;
 use racer::worker::CryptoRuntime;
+use racer_control_wire as wire;
+use racer_control_wire::*;
+use racer_crypto::identity::BundleInstaller;
 
+use racer::security::PageCryptoEngine;
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
-use racer::security::PageCryptoEngine;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;

@@ -2,12 +2,6 @@
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
 use controlplane::Published;
-use racer_control_wire as wire;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::Publication;
-use racer_control_wire::PublicationSequence;
-use racer_control_wire::canonical_socket_paths;
-use racer_control_wire::{CacheId, ClusterId, MembershipVersion, NodeId};
 use racer::admission::AdmissionPolicy;
 use racer::admission::ResourceClass;
 use racer::client::RequestParser;
@@ -52,6 +46,12 @@ use racer::security;
 use racer::security::CryptoClient;
 use racer::security::{Authorization, OpaqueMetadata, OriginContext};
 use racer::worker::CryptoRuntime;
+use racer_control_wire as wire;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::Publication;
+use racer_control_wire::PublicationSequence;
+use racer_control_wire::canonical_socket_paths;
+use racer_control_wire::{CacheId, ClusterId, MembershipVersion, NodeId};
 
 use racer::peer::forwarding::Forwarding;
 use racer::peer::protocol::Signatures;
@@ -65,13 +65,13 @@ use racer::store::catalog::Index;
 use racer::store::catalog::SegmentClock;
 use racer::topology::LinkHealth;
 
+use racer::topology::Paths;
+use racer::topology::Placement;
+use racer::topology::RouteBudget;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::Keyring;
 use racer_crypto::identity::PendingIdentity;
-use racer::topology::Paths;
-use racer::topology::Placement;
-use racer::topology::RouteBudget;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
@@ -491,11 +491,7 @@ impl Rig {
             admission.clone(),
             P + 16,
         ));
-        let http = Rc::new(racer::http::new_pool(
-            reactor.clone(),
-            admission.clone(),
-            8,
-        ));
+        let http = Rc::new(racer::http::new_pool(reactor.clone(), admission.clone(), 8));
         let buffers = BufferPool::new(admission.clone());
         let (keys, sender_keys) = fixture_keys();
         let published = Arc::new(Published::new(Snapshot::retention(4)));
@@ -631,10 +627,7 @@ impl Rig {
             coordinator.clone(),
             snapshot.membership.clone(),
         );
-        let client_io = Rc::new(racer::http::client_io(
-            reactor.clone(),
-            admission.clone(),
-        ));
+        let client_io = Rc::new(racer::http::client_io(reactor.clone(), admission.clone()));
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {
             bootstrap,

@@ -4,8 +4,6 @@
 #[allow(dead_code)]
 mod fixture_io;
 
-use racer_control_wire::CacheId;
-use racer_control_wire::KeyId;
 use racer as dataplane;
 use racer::admission::AdmissionPolicy;
 use racer::admission::ResourceClass;
@@ -19,6 +17,8 @@ use racer::model::PageEnvelope;
 use racer::model::PageId;
 use racer::model::PageNumber;
 use racer::model::StrongEtag;
+use racer_control_wire::CacheId;
+use racer_control_wire::KeyId;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
@@ -34,8 +34,7 @@ static WATCH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static FREED: AtomicBool = AtomicBool::new(false);
 static ZEROED: AtomicBool = AtomicBool::new(false);
 static NEXT_SIZE: AtomicUsize = AtomicUsize::new(0);
-static CANCEL_AT_ALLOCATION: Mutex<Option<racer::runtime::RequestScope>> =
-    Mutex::new(None);
+static CANCEL_AT_ALLOCATION: Mutex<Option<racer::runtime::RequestScope>> = Mutex::new(None);
 
 // SAFETY: All allocation operations delegate to System with the original layout.
 unsafe impl GlobalAlloc for InspectAllocator {
@@ -206,12 +205,6 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
 
 fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
-    use racer_control_wire::ClusterId;
-    use racer_control_wire::NodeId;
-    use racer_crypto::identity::KeyEpochs;
-    use racer_crypto::identity::KeyPurpose;
-    use racer_crypto::identity::Keyring;
-    use racer_crypto::{TAG_LEN, seal};
     use racer::model::RequestId;
     use racer::model::WorkerId;
     use racer::runtime::RequestScope;
@@ -220,6 +213,12 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use racer::security::PageCryptoEngine;
     use racer::security::page_aad;
     use racer::security::pair;
+    use racer_control_wire::ClusterId;
+    use racer_control_wire::NodeId;
+    use racer_crypto::identity::KeyEpochs;
+    use racer_crypto::identity::KeyPurpose;
+    use racer_crypto::identity::Keyring;
+    use racer_crypto::{TAG_LEN, seal};
     use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;

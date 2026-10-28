@@ -4,7 +4,6 @@
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire::CacheId;
 use racer::admission::AdmissionPolicy;
 use racer::client::ClientRequest;
 use racer::client::ReadKind;
@@ -34,6 +33,7 @@ use racer::read::ReadPayload;
 use racer::read::ReadResponse;
 use racer::runtime::Reactor;
 use racer::runtime::RequestScope;
+use racer_control_wire::CacheId;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -1027,9 +1027,7 @@ mod sdk {
                 assert!(matches!(parsed.kind, ReadKind::HeadPinned { .. }));
                 assert_eq!(parsed.kind.pin().unwrap().as_bytes(), b"\"v\"");
                 let metadata = ObjectMetadata {
-                    content_type: Some(
-                        racer::model::ContentType::parse(b"text/plain").unwrap(),
-                    ),
+                    content_type: Some(racer::model::ContentType::parse(b"text/plain").unwrap()),
                     version: ObjectVersion {
                         object: object(),
                         etag: StrongEtag::parse(b"\"v\"").unwrap(),
