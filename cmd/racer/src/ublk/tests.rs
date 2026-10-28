@@ -265,6 +265,11 @@ fn wait_gone(path: &Path) -> bool {
     false
 }
 
+/// While set, reads of [`STALLED_PAGE`] never finish.
+static STALL: AtomicBool = AtomicBool::new(false);
+/// A page the partition scan at start does not read.
+const STALLED_PAGE: u64 = 1;
+
 /// Stub backend: the object is the `pattern` bytes, one version, no cache.
 struct StubBackend;
 
@@ -288,6 +293,10 @@ impl super::service::PageSource for StubSource {
     type Page = StubPage;
 
     fn page(&self, number: u64) -> super::service::Local<'_, crate::error::Result<StubPage>> {
+        if number == STALLED_PAGE && STALL.load(Ordering::Relaxed) {
+            // A read that never finishes, like a hung origin fetch.
+            return Box::pin(std::future::pending());
+        }
         let page = self
             .pages
             .borrow_mut()
@@ -330,6 +339,17 @@ impl super::worker::Backend for StubBackend {
 /// Runs one worker: a real reactor serving queue `q` until `done`.
 /// Returns the reactor operations still in flight at the end.
 fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBool>) -> usize {
+    run_draining_worker(q, manager, done, None)
+}
+
+/// Like [`run_worker`], but abandons its queues once `abandon_at` holds a
+/// time that has passed, as the dataplane does at its drain deadline.
+fn run_draining_worker(
+    q: u16,
+    manager: Arc<super::manager::Manager>,
+    done: Arc<AtomicBool>,
+    abandon_at: Option<Arc<std::sync::Mutex<Option<Instant>>>>,
+) -> usize {
     let reactor = crate::test_support::enrollment::reactor().expect("io_uring");
     let mut worker = super::worker::UblkWorker::new(
         q,
@@ -339,7 +359,15 @@ fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBoo
         None,
     );
     let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    let mut abandoned = false;
     while !(done.load(Ordering::Relaxed) && worker.is_idle()) {
+        if !abandoned
+            && let Some(at) = &abandon_at
+            && at.lock().unwrap().is_some_and(|at| Instant::now() >= at)
+        {
+            abandoned = true;
+            worker.abandon();
+        }
         worker.poll(&mut cx);
         reactor.poll_budgeted(64).expect("reactor poll");
         reactor
@@ -574,6 +602,80 @@ fn ublk_worker_queues_serve_reads() {
         wait_gone(&char_path),
         "{} still present",
         char_path.display()
+    );
+}
+
+/// A read stuck at shutdown is answered with EIO at the workers' drain
+/// deadline, before STOP_DEV gives up. STOP_DEV then succeeds and the
+/// device is deleted, rather than left behind by a poisoned channel. One
+/// worker starts its drain a little after the stop, as a busy worker can.
+#[test]
+fn ublk_stuck_read_at_shutdown_still_deletes_the_device() {
+    if !enabled() {
+        return;
+    }
+    let shutdown = Duration::from_secs(1);
+    let manager = Arc::new(super::manager::Manager::new(
+        &stub_config(),
+        2,
+        Path::new("/dev"),
+        shutdown,
+        Duration::from_secs(10),
+    ));
+    let done = Arc::new(AtomicBool::new(false));
+    let abandon_at = Arc::new(std::sync::Mutex::new(None));
+    let workers: Vec<_> = (0..2)
+        .map(|q| {
+            let (manager, done, at) = (manager.clone(), done.clone(), abandon_at.clone());
+            thread::spawn(move || run_draining_worker(q, manager, done, Some(at)))
+        })
+        .collect();
+    let control = {
+        let manager = manager.clone();
+        thread::spawn(move || manager.run())
+    };
+    let id = wait_dev_id(&manager);
+    let block_path = Path::new("/dev").join(format!("ublkb{id}"));
+    assert!(
+        wait_for(&block_path),
+        "{} did not appear",
+        block_path.display()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let block = loop {
+        match File::open(&block_path) {
+            Ok(block) => break block,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("open {}: {error}", block_path.display()),
+        }
+    };
+    STALL.store(true, Ordering::Relaxed);
+    let reader = thread::spawn(move || {
+        let mut buf = vec![0_u8; 4096];
+        block.read_at(&mut buf, STALLED_PAGE * PAGE_BYTES)
+    });
+    // Let the read reach a worker.
+    thread::sleep(Duration::from_millis(300));
+    assert!(!reader.is_finished(), "the read should be stuck");
+    manager.request_stop();
+    *abandon_at.lock().unwrap() = Some(Instant::now() + shutdown + Duration::from_millis(300));
+    let result = reader.join().expect("reader thread");
+    STALL.store(false, Ordering::Relaxed);
+    control.join().expect("control thread");
+    done.store(true, Ordering::Relaxed);
+    for worker in workers {
+        assert_eq!(worker.join().expect("worker thread"), 0);
+    }
+    let char_path = Path::new("/dev").join(format!("ublkc{id}"));
+    assert!(
+        wait_gone(&char_path),
+        "{} still present: the delete was skipped",
+        char_path.display()
+    );
+    // EIO, or end of file once the disk is gone; never the data.
+    assert!(
+        result.as_ref().is_err() || result.as_ref().is_ok_and(|n| *n == 0),
+        "the stuck read must not succeed: {result:?}"
     );
 }
 

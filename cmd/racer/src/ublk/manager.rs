@@ -112,6 +112,24 @@ pub(crate) trait DeviceControl {
 /// Shortest bound on one control command.
 const MIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How much longer than the drain budget a control command may wait.
+const STOP_MARGIN: Duration = Duration::from_secs(5);
+
+/// The bound on each control command for a given drain budget.
+///
+/// STOP_DEV waits until every request the kernel handed out is answered.
+/// A stuck read is answered with EIO only when its worker's drain deadline,
+/// `shutdown_timeout` after that worker started draining, passes. STOP_DEV
+/// is sent when the first worker starts draining, so it must outlast that
+/// deadline, with room for workers that start draining a little later.
+/// Otherwise it times out just as the reads are answered, the channel is
+/// poisoned, and the devices are left undeleted.
+fn command_timeout(shutdown_timeout: Duration) -> Duration {
+    shutdown_timeout
+        .saturating_add(STOP_MARGIN)
+        .max(MIN_COMMAND_TIMEOUT)
+}
+
 /// How long to retry opening `/dev/ublkcN` after ADD_DEV. The node is
 /// normally there at once, but a host `/dev` mount can lag.
 const OPEN_RETRY: Duration = Duration::from_secs(5);
@@ -479,7 +497,7 @@ impl Manager {
     /// the kernel abort them.
     pub(crate) fn run(&self) {
         let directory = self.device_directory.clone();
-        let timeout = self.shutdown_timeout.max(MIN_COMMAND_TIMEOUT);
+        let timeout = command_timeout(self.shutdown_timeout);
         let settled = self.run_guarded(
             |manager| {
                 let open = move |directory: &Path| -> Result<Box<dyn DeviceControl>, UblkError> {
@@ -1187,6 +1205,21 @@ mod tests {
         let mut fake = fake.clone();
         *fake.manager.lock().unwrap() = Some(manager.clone());
         std::thread::spawn(move || manager.run_with(&mut fake))
+    }
+
+    #[test]
+    fn command_timeout_outlasts_the_worker_drain_deadline() {
+        for shutdown in [
+            Duration::ZERO,
+            Duration::from_millis(10),
+            Duration::from_secs(30),
+            Duration::from_secs(3600),
+        ] {
+            let timeout = command_timeout(shutdown);
+            assert!(timeout >= shutdown + STOP_MARGIN, "{shutdown:?}");
+            assert!(timeout >= MIN_COMMAND_TIMEOUT);
+        }
+        assert_eq!(command_timeout(Duration::MAX), Duration::MAX);
     }
 
     #[test]

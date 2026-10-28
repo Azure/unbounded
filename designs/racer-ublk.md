@@ -188,6 +188,10 @@ the process exits. So the control thread, and the process, always finish.
 
 If queues are still attached after the timeout, the control thread tells workers to
 abandon them. A worker also abandons its queues when its own drain deadline passes.
+Each control command, `STOP_DEV` included, waits the drain budget plus a 5 second margin.
+`STOP_DEV` is sent when the first worker starts draining, so a stuck read is answered at
+the workers' drain deadlines, well before `STOP_DEV` gives up. `STOP_DEV` then succeeds
+and the device is deleted, instead of timing out and leaving the device behind.
 Abandoning does not drop the queues. Dropping a pending `uring_cmd` makes the reactor send
 `ASYNC_CANCEL`, which cannot cancel it: the kernel completes it with `-ENOENT` (checked by a
 root test). Instead, an abandoned queue answers every request it holds, or is handed later,
