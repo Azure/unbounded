@@ -208,14 +208,6 @@ pub(crate) use racer_core::liveness::{MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT}
 
 /// When each of the page's owners arrived in this node's membership chain (`Membership::since`),
 /// for lineage targets.
-fn owner_arrivals(candidates: &Candidates) -> Vec<Option<u32>> {
-    candidates
-        .ordered
-        .iter()
-        .map(|node| candidates.membership.since(node))
-        .collect()
-}
-
 pub(crate) type Rank0Watch = racer_core::liveness::Rank0Watch<crate::model::PageId, NodeId>;
 
 pub(crate) type Successors = racer_core::read::hints::SuccessorHints<crate::model::PageId, NodeId>;
@@ -770,11 +762,19 @@ impl CandidatePolicy {
         }
         // Visit an older later owner before the newer owner that displaced it, which would fetch
         // the page again.
-        let order = racer_core::read::lineage_first(order, &owner_arrivals(candidates), |rank| {
-            candidates
-                .membership
-                .is_neighbor(&self.node, &ordered[rank])
-        });
+        let order = racer_core::read::lineage_first(
+            order,
+            &candidates
+                .ordered
+                .iter()
+                .map(|node| candidates.membership.since(node))
+                .collect::<Vec<_>>(),
+            |rank| {
+                candidates
+                    .membership
+                    .is_neighbor(&self.node, &ordered[rank])
+            },
+        );
         // Owners that left this node's request unanswered go after the others, silent ones last.
         let health = self.peers.link_health();
         racer_core::read::demote_unanswered(order, |rank| health.answering(&ordered[rank]))
