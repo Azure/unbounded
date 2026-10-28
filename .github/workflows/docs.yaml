@@ -3,28 +3,145 @@
 
 name: unbounded docs
 
+# ---------------------------------------------------------------------------
+# Publishes the production docs site from the latest published stable release
+# only. Pushes to main never deploy: the site must describe what users can
+# install, not what has merged since.
+#
+# Three ways in:
+#
+#   release: published   a release published by a human. GitHub suppresses
+#                        this event for releases published with GITHUB_TOKEN,
+#                        so the automated publish path cannot rely on it.
+#   workflow_call        release-upgrade.yaml after it publishes a Latest
+#                        release. A reusable call rather than a dispatch, so
+#                        the caller needs no actions: write and older tags
+#                        never need to know about this workflow's inputs.
+#   workflow_dispatch    manual retry for a given tag, from main only.
+#
+# Whatever the trigger, `resolve` checks the tag against the repository's
+# latest published release before anything is checked out. Drafts and
+# prereleases are never returned by releases/latest, so they cannot pass.
+# ---------------------------------------------------------------------------
+
 on:
-  push:
-    branches: [main]
-    paths:
-      - "docs/**"
-      - ".github/workflows/docs.yaml"
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish docs from; must be the latest published stable release"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to publish docs from; must be the latest published stable release"
+        required: true
+        type: string
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
-  build:
+  resolve:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      sha: ${{ steps.validate.outputs.sha }}
+    steps:
+      # Inputs reach the shell only through env vars, never through expression
+      # interpolation into the script, so a crafted tag cannot inject commands.
+      #
+      # In a reusable workflow github.event_name and github.ref are the
+      # caller's, so only the release event is treated specially: every other
+      # event, including release-upgrade's workflow_run, must supply a tag and
+      # run on main.
+      - name: Validate tag
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          # Ineligible human-published releases (prereleases, old-series
+          # patches) are skipped quietly; an explicit request that cannot be
+          # honored fails, so a broken retry or automation is visible.
+          reject() {
+            if [ "$EVENT_NAME" = "release" ]; then
+              echo "::notice::Skipping docs: $1"
+              exit 0
+            fi
+            echo "::error::$1"
+            exit 1
+          }
+
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$EVENT_TAG"
+          else
+            TAG="$INPUT_TAG"
+            if [ "$RUN_REF" != "refs/heads/main" ]; then
+              echo "::error::docs must be requested from refs/heads/main, not ${RUN_REF}"
+              exit 1
+            fi
+          fi
+
+          # Stable semver only: no prerelease suffix, no shell metacharacters.
+          if ! printf '%s' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'; then
+            reject "'${TAG}' is not a stable release tag"
+          fi
+
+          # releases/latest returns only published, non-prerelease releases.
+          LATEST_TAG="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" \
+            || reject "could not look up the latest release"
+          if [ "$TAG" != "$LATEST_TAG" ]; then
+            reject "${TAG} is not the latest published release (${LATEST_TAG})"
+          fi
+
+          # Pin the commit now so build cannot pick up a tag moved after
+          # validation.
+          SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/refs/tags/${TAG}" --jq .sha)" \
+            || reject "could not resolve ${TAG} to a commit"
+          if ! printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'; then
+            reject "${TAG} resolved to an invalid commit '${SHA}'"
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Publishing docs from ${TAG} (${SHA})."
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Verify checkout matches the validated commit
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::checked out ${ACTUAL_SHA}, validated ${EXPECTED_SHA}"
+            exit 1
+          fi
 
       - uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78 # v3.2.1
         with:
@@ -46,6 +163,9 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

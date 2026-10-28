@@ -1148,6 +1148,33 @@ jobs:
             echo "- Artifact signatures and BOM: verified"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ---------------------------------------------------------------------------
+  # Publish the production docs site from the release that just became Latest.
+  #
+  # Releases published with GITHUB_TOKEN do not emit the `release` event, so
+  # docs.yaml's own trigger never fires for this path. A reusable call keeps the
+  # caller free of actions: write and works no matter which tag is deployed,
+  # since the called workflow comes from this run's commit, not the tag.
+  #
+  # Either publish path counts; they are mutually exclusive. Non-Latest
+  # releases (prereleases, older-series patches) never replace the site.
+  # docs.yaml re-validates the tag against releases/latest regardless.
+  # ---------------------------------------------------------------------------
+  docs:
+    needs: [resolve, publish, publish-forced]
+    if: >
+      !cancelled() &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.latest == 'true' &&
+      (needs.publish.result == 'success' || needs.publish-forced.result == 'success')
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/docs.yaml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+
 
   # ---------------------------------------------------------------------------
   # CUSTOMIZE: Teams notification (NOT YET ENABLED)
