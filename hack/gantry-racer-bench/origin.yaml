@@ -1,0 +1,101 @@
+# In-cluster origin registry for the Gantry vs Gantry+Racer benchmark.
+# Plain HTTP distribution registry pinned to one system node, backed by the
+# node's local disk, so origin bandwidth is the same for every run.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gantry-bench
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: origin
+  namespace: gantry-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: origin
+  template:
+    metadata:
+      labels:
+        app: origin
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: aks-system-36530849-vmss000002
+      containers:
+        - name: registry
+          image: ghcr.io/distribution/distribution:3.0.0
+          env:
+            - name: REGISTRY_HTTP_ADDR
+              value: ":5000"
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
+            - name: REGISTRY_LOG_LEVEL
+              value: warn
+            - name: OTEL_TRACES_EXPORTER
+              value: none
+            - name: REGISTRY_HTTP_DEBUG_ADDR
+              value: ":5001"
+            - name: REGISTRY_HTTP_DEBUG_PROMETHEUS_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 5000
+              name: http
+            - containerPort: 5001
+              name: debug
+          resources:
+            requests:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+      volumes:
+        - name: data
+          hostPath:
+            path: /mnt/gantry-bench-origin
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: origin
+  namespace: gantry-bench
+spec:
+  selector:
+    app: origin
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+    - name: debug
+      port: 5001
+      targetPort: 5001
+---
+# Tool pod next to the origin: runs genimage and scrapes fleet metrics.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tools
+  namespace: gantry-bench
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tools
+  template:
+    metadata:
+      labels:
+        app: tools
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: aks-system-36530849-vmss000002
+      containers:
+        - name: tools
+          image: mcr.microsoft.com/azurelinux/busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "4"
+              memory: 2Gi
