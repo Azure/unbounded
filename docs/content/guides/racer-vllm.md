@@ -91,9 +91,36 @@ Release and nightly builds publish the image `racer-vllm` next to the other
 images, at the same registry and tag. It is `vllm/vllm-openai:v0.25.1` with
 both packages installed, so it needs no changes.
 
-To use another vLLM image, install both Python packages into it. Each release
-attaches their wheels and sdists (`racer_client-*` and `racer_vllm-*`) to the
-GitHub release. From a checkout:
+To use another vLLM image, install both Python packages into it. They are not
+on PyPI. GitHub releases include their wheels and sdists (`racer_client-*` and
+`racer_vllm-*`) as assets. Releases made before the packages were added do not.
+Set `VERSION` to a release tag and point pip at it:
+
+```bash
+VERSION=vX.Y.Z
+pip install --no-index \
+  --find-links "https://github.com/Azure/unbounded/releases/expanded_assets/${VERSION}" \
+  racer-vllm
+```
+
+`--find-links` reads the asset links from the release page. `--no-index` keeps
+pip off PyPI, so a package there with the same name cannot be installed by
+mistake. This works because `racer-vllm` needs only `racer-client`, and
+`racer-client` needs nothing else.
+
+You can also install the wheels by URL. The file names carry the package
+version, not the release tag:
+
+```bash
+pip install --no-index \
+  "https://github.com/Azure/unbounded/releases/download/${VERSION}/racer_client-0.2.0-py3-none-any.whl" \
+  "https://github.com/Azure/unbounded/releases/download/${VERSION}/racer_vllm-0.2.0-py3-none-any.whl"
+```
+
+To build an image without network access, download the wheels first and use
+`--find-links <dir>`.
+
+From a checkout:
 
 ```bash
 pip install ./clients/python/racer ./clients/python/racer-vllm

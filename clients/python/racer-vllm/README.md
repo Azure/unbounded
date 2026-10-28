@@ -5,11 +5,22 @@ format `racer`. It uses the `racer-client` package.
 
 ## Install
 
+The packages are not on PyPI. Each GitHub release has their wheels and sdists
+as assets. To install from a release:
+
+```
+pip install --no-index \
+  --find-links https://github.com/Azure/unbounded/releases/expanded_assets/<tag> \
+  racer-vllm
+```
+
+From a checkout:
+
 ```
 pip install ./clients/python/racer ./clients/python/racer-vllm
 ```
 
-To build sdists and wheels for publishing, run `make racer-python-dist` from
+To build sdists and wheels, run `make racer-python-dist` from
 the repository root (output in `tmp/racer-python-dist`), or
 `python -m build clients/python/racer` and
 `python -m build clients/python/racer-vllm`. Both packages share one version;
