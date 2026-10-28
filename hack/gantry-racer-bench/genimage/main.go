@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 // Command genimage pushes an OCI image made of random, incompressible layers
 // to a plain HTTP registry. Every run uses a different seed so each benchmark
 // round starts from content that no cache has seen.
@@ -65,6 +68,7 @@ func main() {
 			defer wg.Done()
 
 			sem <- struct{}{}
+
 			defer func() { <-sem }()
 
 			results[i], errs[i] = pushLayer(*registry, *repo, i, *layerBytes, *seed)
@@ -210,7 +214,9 @@ func writeLayer(w io.Writer, diff hash.Hash, index int, size int64, seed uint64)
 			n = remaining
 		}
 
-		_, _ = rng.Read(buf[:n])
+		if _, err := rng.Read(buf[:n]); err != nil {
+			return err
+		}
 
 		if _, err := tw.Write(buf[:n]); err != nil {
 			return err
@@ -233,7 +239,7 @@ func pushBlob(registry, repo string, body io.Reader, _ http.Header) (string, err
 		return "", err
 	}
 
-	_ = resp.Body.Close()
+	_ = resp.Body.Close() //nolint:errcheck // best-effort close of an empty response body
 
 	if resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("start upload: %s", resp.Status)
@@ -258,7 +264,7 @@ func pushBlob(registry, repo string, body io.Reader, _ http.Header) (string, err
 		return "", err
 	}
 
-	_ = resp.Body.Close()
+	_ = resp.Body.Close() //nolint:errcheck // best-effort close of an empty response body
 
 	if resp.StatusCode != http.StatusAccepted {
 		return "", fmt.Errorf("patch upload: %s", resp.Status)
@@ -306,10 +312,15 @@ func expect(resp *http.Response, err error) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
 
 	if resp.StatusCode/100 != 2 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err != nil {
+			return fmt.Errorf("%s: read error body: %w", resp.Status, err)
+		}
+
 		return fmt.Errorf("%s: %s", resp.Status, msg)
 	}
 
