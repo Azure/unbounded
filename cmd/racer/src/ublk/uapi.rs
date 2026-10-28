@@ -204,7 +204,34 @@ pub(crate) struct Params {
     pub discard: ParamDiscard,
     pub devt: ParamDevt,
     pub zoned: ParamZoned,
+    /// Explicit tail padding. The C struct ends at byte 108 and the compiler
+    /// pads it to 112 for `u64` alignment; naming the bytes keeps them
+    /// initialized (zero via `Default`) so `to_bytes` never reads padding.
+    pub pad: u32,
 }
+
+/// Compile-time proof that every struct viewed as bytes has no implicit
+/// (interior or tail) padding: its size equals the sum of its field sizes.
+const _: () = {
+    use std::mem::size_of;
+    assert!(size_of::<CtrlCmd>() == 4 + 2 + 2 + 8 + 8 + 2 + 2 + 4);
+    assert!(size_of::<DevInfo>() == 2 * 4 + 4 * 4 + 8 * 2 + 4 * 2 + 8 * 2);
+    assert!(size_of::<ParamBasic>() == 4 + 4 + 4 + 4 + 8 + 8);
+    assert!(size_of::<ParamDiscard>() == 4 * 4 + 2 + 2);
+    assert!(size_of::<ParamDevt>() == 4 * 4);
+    assert!(size_of::<ParamZoned>() == 4 * 3 + 20);
+    assert!(
+        size_of::<Params>()
+            == 4 + 4
+                + size_of::<ParamBasic>()
+                + size_of::<ParamDiscard>()
+                + size_of::<ParamDevt>()
+                + size_of::<ParamZoned>()
+                + 4
+    );
+    assert!(size_of::<IoDesc>() == 4 + 4 + 8 + 8);
+    assert!(size_of::<IoCmd>() == 2 + 2 + 4 + 8);
+};
 
 /// `struct ublksrv_io_desc`: one tag's request, in the mmapped array.
 #[repr(C)]
@@ -396,12 +423,19 @@ mod tests {
         assert_eq!(offset_of!(Params, discard), 40);
         assert_eq!(offset_of!(Params, devt), 60);
         assert_eq!(offset_of!(Params, zoned), 76);
+        assert_eq!(offset_of!(Params, pad), 108);
         assert_eq!(offset_of!(ParamBasic, max_sectors), 8);
         assert_eq!(offset_of!(ParamBasic, dev_sectors), 16);
         assert_eq!(offset_of!(IoDesc, start_sector), 8);
         assert_eq!(offset_of!(IoDesc, addr), 16);
         assert_eq!(offset_of!(IoCmd, result), 4);
         assert_eq!(offset_of!(IoCmd, addr), 8);
+    }
+
+    #[test]
+    fn params_tail_padding_serializes_as_zero() {
+        let bytes = Params::read_only_basic(1 << 30, 1 << 20).to_bytes();
+        assert_eq!(&bytes[108..], &[0u8; 4]);
     }
 
     #[test]
