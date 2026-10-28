@@ -1328,64 +1328,6 @@ fn previous_fallback(owner: bool, retried: bool, previous_recent_member: bool) -
     !owner && !retried && previous_recent_member
 }
 
-#[cfg(test)]
-mod stale_tests {
-    use super::*;
-
-    #[test]
-    fn a_reader_falls_back_once_with_a_usable_previous_membership() {
-        assert!(previous_fallback(false, false, true));
-        for (owner, retried, recent) in [
-            (false, true, true),
-            (false, false, false),
-            (true, false, true),
-        ] {
-            assert!(!previous_fallback(owner, retried, recent));
-        }
-    }
-
-    #[test]
-    fn a_reader_that_cannot_fall_back_waits_twice() {
-        let secs = Duration::from_secs;
-        assert_eq!(stale_wait(0, true, secs(9)), Some(secs(3)));
-        // The first wait does not depend on funding.
-        assert_eq!(stale_wait(0, false, secs(9)), Some(secs(3)));
-        // A second wait, a third of what is left, covers the 50k propagation window (about 5 s)
-        // within a 10 s deadline.
-        let deadline = secs(10);
-        let first = stale_wait(0, true, deadline).unwrap();
-        let second = stale_wait(1, true, deadline - first).unwrap();
-        assert!(
-            first + second >= Duration::from_millis(5500),
-            "{first:?} {second:?}"
-        );
-        assert_eq!(stale_wait(2, true, deadline - first - second), None);
-        // Capped, and a third of what is left.
-        assert_eq!(stale_wait(0, true, secs(60)), Some(MAX_STALE_WAIT));
-        assert_eq!(
-            stale_wait(0, true, Duration::from_millis(900)),
-            Some(Duration::from_millis(300))
-        );
-    }
-
-    #[test]
-    fn no_wait_for_repeats_unfunded_retries_or_short_deadlines() {
-        for (waits, affordable, remaining) in [
-            (MAX_STALE_WAITS, true, Duration::from_secs(9)),
-            // A further wait must leave the later visits funded.
-            (1, false, Duration::from_secs(9)),
-            (0, true, Duration::from_millis(749)),
-            (0, false, Duration::ZERO),
-        ] {
-            assert_eq!(stale_wait(waits, affordable, remaining), None);
-        }
-        assert_eq!(
-            stale_wait(0, true, Duration::from_millis(750)),
-            Some(MIN_STALE_WAIT)
-        );
-    }
-}
-
 // [`Fill`]: one read's acquisition as a sans-IO state machine. Production
 // drives it from `src/read/candidates.rs`, the simulator from
 // `sim/src/node/world.rs`. Node identities are caller-chosen `u32`s.

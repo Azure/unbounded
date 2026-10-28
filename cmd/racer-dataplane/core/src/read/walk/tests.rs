@@ -1,13 +1,15 @@
 //! Probe sequences for owners, non-owners, stale membership, version misses,
-//! and budget exhaustion.
+//! and budget exhaustion. Most walks are rows of [`walks`]: a configuration,
+//! a budget, scripted outcomes, and the expected [`trace`].
 
 // The attribute below also marks this file as test-only for tests/purity.rs.
 #[cfg(test)]
 use super::*;
 use crate::read::budget::{
-    HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
+    HELPER_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS, inherited_budget,
 };
 use crate::read::{Answering, ReplicaSelection, demote_unanswered, visit_order};
+use std::fmt::Write;
 
 fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
     WalkConfig {
@@ -26,26 +28,59 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
     }
 }
 
+/// An owner at `rank` of three, in canonical order.
+fn owner(rank: usize) -> WalkConfig {
+    config(Some(rank), 3, VisitOrder::canonical(3))
+}
+
+/// A reader of `owners` owners, in canonical order.
+fn reader(owners: usize) -> WalkConfig {
+    config(None, owners, VisitOrder::canonical(owners))
+}
+
+/// A reader that visits rank `first` first.
+fn first(first: usize) -> WalkConfig {
+    config(
+        None,
+        3,
+        visit_order(ReplicaSelection::Spread, 3, |r| r == first, |_| 0),
+    )
+}
+
+/// A reader that visits ranks 1, 2, 0.
+fn order_120() -> VisitOrder {
+    visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64)
+}
+
 fn budget(attempts: u32, links: u8) -> AcquisitionBudget {
     AcquisitionBudget::new(Instant::now() + Duration::from_secs(60), attempts, links)
 }
 
-/// Drive a walk with scripted outcomes; return probes and the end.
+/// Drive a walk with scripted outcomes; return probes, with the request
+/// budget's attempts, links and route links and the pending handoff and
+/// granted flags, and the end.
 fn drive(
     walk: &mut CandidateWalk,
     budget: &mut AcquisitionBudget,
     mut outcome: impl FnMut(&Probe, &mut AcquisitionBudget) -> Outcome,
-) -> (Vec<(Probe, u32, u8)>, End) {
+) -> (Vec<(Probe, u32, u8, String)>, End) {
     let mut probes = Vec::new();
     loop {
         match walk.next(budget).unwrap() {
             Step::Probe(probe) => {
+                let p = walk.pending.as_ref().unwrap();
+                let flags = format!(
+                    "{}{}",
+                    if p.handoff { "h" } else { "" },
+                    if p.granted { "g" } else { "" }
+                );
                 let request = walk.request_budget(budget);
-                probes.push((
-                    probe,
+                let (a, l, r) = (
                     request.remaining_attempts(),
                     request.remaining_links(),
-                ));
+                    request.route_links(),
+                );
+                probes.push((probe, a, l, format!("{flags}:{a}/{l}/{r}")));
                 let result = outcome(&probe, request);
                 if let Some(end) = walk.complete(budget, result).unwrap() {
                     return (probes, end);
@@ -55,7 +90,8 @@ fn drive(
                 let mut copy = false;
                 for probe in batch {
                     let mut grant = granted_budget(budget.deadline());
-                    probes.push((probe, grant.remaining_attempts(), grant.remaining_links()));
+                    let (a, l) = (grant.remaining_attempts(), grant.remaining_links());
+                    probes.push((probe, a, l, format!("b:{a}/{l}/{}", grant.route_links())));
                     copy |= outcome(&probe, &mut grant) == Outcome::Copy;
                 }
                 if let Some(end) = walk.complete_granted(copy) {
@@ -83,519 +119,666 @@ fn plan(request: &mut AcquisitionBudget, deadline: Instant, probe: &Probe) -> Re
     )
 }
 
-/// Walk `cfg` with a fresh budget and scripted outcomes.
-fn run(
-    cfg: WalkConfig,
-    attempts: u32,
-    links: u8,
-    outcome: impl FnMut(&Probe, &mut AcquisitionBudget) -> Outcome,
-) -> (Vec<(Probe, u32, u8)>, End) {
-    drive(
-        &mut CandidateWalk::new(cfg),
-        &mut budget(attempts, links),
-        outcome,
+fn charge(walk: &mut CandidateWalk, b: &mut AcquisitionBudget, probe: &Probe) -> AttemptPlan {
+    let deadline = b.deadline();
+    plan(walk.request_budget(b), deadline, probe).unwrap()
+}
+
+/// What a scripted probe spends of its request budget before it answers.
+#[derive(Clone, Copy)]
+enum Spend {
+    Nothing,
+    /// Every attempt, as a forwarded funded route does.
+    All,
+    One,
+    /// Every credit, as an exchange that forwards its whole budget.
+    Transfer,
+}
+
+const COPY: Outcome = Outcome::Copy;
+const MISS: Outcome = Outcome::Probe(ProbeOutcome::CopyMiss);
+const VU: Outcome = Outcome::Probe(ProbeOutcome::VersionUnavailable);
+const OVL: Outcome = Outcome::Probe(ProbeOutcome::Overloaded);
+const UNR: Outcome = Outcome::Probe(ProbeOutcome::Unreachable);
+const T_UNR: Outcome = Outcome::Transport(ProbeOutcome::Unreachable);
+const T_OVL: Outcome = Outcome::Transport(ProbeOutcome::Overloaded);
+const SHED: Outcome = Outcome::Shed;
+const TIMEOUT: Outcome = Outcome::TimedOut;
+const FAILED: Outcome = Outcome::Failed;
+const STALE: Outcome = Outcome::StaleMembership;
+const BEHIND: Outcome = Outcome::StaleDestination;
+
+/// Walk `cfg` on `b`; each probe answers `script[canonical]` (the last entry
+/// for later ranks; no entry: no probe expected). The trace lists each probe
+/// as `{canonical}{A|C}{opportunities}{F|S|D}{p}` with its request budget,
+/// then the end, the walk's budget after, and `r0` when rank 0 left an owner
+/// unanswered.
+fn trace(cfg: WalkConfig, mut b: AcquisitionBudget, spend: Spend, script: &[Outcome]) -> String {
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, end) = drive(&mut walk, &mut b, |p, request| {
+        match spend {
+            Spend::Nothing => {}
+            Spend::All => drop(request.partition(request.remaining_attempts(), 0).unwrap()),
+            Spend::One => drop(request.partition(1, 0).unwrap()),
+            Spend::Transfer => drop(request.transfer()),
+        }
+        *script
+            .get(p.canonical)
+            .or(script.last())
+            .expect("no probe expected")
+    });
+    let mut s = String::new();
+    for (p, _, _, budget) in &probes {
+        let mode = if p.mode == Mode::Acquire { 'A' } else { 'C' };
+        let route = match p.route {
+            RouteMode::FundedRoute => 'F',
+            RouteMode::SharedRoute => 'S',
+            RouteMode::DirectHedge => 'D',
+        };
+        let previous = if p.previous { "p" } else { "" };
+        let (c, o) = (p.canonical, p.remaining_opportunities);
+        write!(s, "{c}{mode}{o}{route}{previous}{budget} ").unwrap();
+    }
+    let r0 = if walk.rank0_unanswered { " r0" } else { "" };
+    let (a, l, r) = (b.remaining_attempts(), b.remaining_links(), b.route_links());
+    write!(s, "=> {end:?} {a}/{l}/{r}{r0}").unwrap();
+    s
+}
+
+#[test]
+fn walks() {
+    let failure = |attempts, links| {
+        let mut b = budget(attempts, links);
+        b.note_route_failure();
+        b
+    };
+    let helper = |order| WalkConfig {
+        helper: true,
+        ..config(None, 3, order)
+    };
+    let canonical = VisitOrder::canonical(3);
+    let with = |cfg: WalkConfig, f: &dyn Fn(&mut WalkConfig)| {
+        let mut cfg = cfg;
+        f(&mut cfg);
+        cfg
+    };
+    let rank0 = |rank, state| WalkConfig {
+        rank0: state,
+        ..owner(rank)
+    };
+    let nothing = Spend::Nothing;
+    #[rustfmt::skip]
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(&str, WalkConfig, AcquisitionBudget, Spend, &[Outcome], &str)> = vec![
+        // An owner asks rank 0 to acquire, the rest copy-only, then gets origin. The Acquire
+        // carries exactly the exchange and one origin credit.
+        ("owner", owner(2), budget(32, 96), nothing, &[MISS], "0A3F:2/4/4 1C2S:32/96/4 => Origin { rank: 2, evidence: [CopyMiss, CopyMiss] } 32/96/4"),
+        ("rank 0 owner: origin at once", owner(0), budget(1, 1), nothing, &[], "=> Origin { rank: 0, evidence: [] } 1/1/1"),
+        // An owner delegates only with credit left for its own origin: rank 1 needs three, rank 2
+        // four (the Acquire, rank 1's probe, and its origin).
+        ("rank 1, 2 credits", owner(1), budget(2, 16), nothing, &[MISS], "0C2S:2/16/4 => Origin { rank: 1, evidence: [CopyMiss] } 2/16/4"),
+        ("rank 1, 3 credits", owner(1), budget(3, 16), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 3/16/4"),
+        ("rank 2, 3 credits", owner(2), budget(3, 16), nothing, &[MISS], "0C3S:3/16/4 1C2S:3/16/4 => Origin { rank: 2, evidence: [CopyMiss, CopyMiss] } 3/16/4"),
+        ("rank 2, 4 credits", owner(2), budget(4, 16), nothing, &[MISS], "0A3F:2/4/4 1C2S:4/16/4 => Origin { rank: 2, evidence: [CopyMiss, CopyMiss] } 4/16/4"),
+        // A non-owner visiting 1, 2, 0 funds rank 1 fully while rank 2's minimum still fits.
+        ("reader slack", config(None, 3, order_120()), budget(8, 16), Spend::All, &[MISS], "1A3F:4/8/8 2A2F:4/8/8 0A1S:0/16/8 => Exhausted { funding: false } 0/16/8"),
+        // A delegated version miss ends without origin; a copy-only one is only evidence.
+        ("delegated version miss", owner(2), budget(8, 16), nothing, &[VU], "0A3F:2/4/4 => VersionUnavailable 8/16/4"),
+        ("copy-only version miss", owner(2), budget(8, 16), nothing, &[MISS, VU], "0A3F:2/4/4 1C2S:8/16/4 => Origin { rank: 2, evidence: [CopyMiss, VersionUnavailable] } 8/16/4"),
+        ("metadata never delegates", with(owner(1), &|c| c.page_operation = false), budget(8, 16), nothing, &[MISS], "0C2S:8/16/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/16/4"),
+        // Handoff targets: copy-only after predecessors, never predecessor evidence; a stale one
+        // is only a miss; a copy wins; non-page walks ignore them.
+        ("handoff", with(owner(1), &|c| c.handoff = 2), budget(8, 32), nothing, &[OVL, MISS], "0A4F:5/4/4 3C3Sh:8/32/8 4C2Sh:8/32/8 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("stale handoff", with(owner(0), &|c| c.handoff = 1), budget(8, 32), nothing, &[STALE], "3C2Sh:8/32/4 => Origin { rank: 0, evidence: [] } 8/32/4"),
+        ("handoff copy", with(owner(0), &|c| c.handoff = 3), budget(8, 32), nothing, &[MISS, MISS, MISS, MISS, COPY], "3C4Sh:8/32/4 4C3Sh:8/32/4 => Copy 8/32/4"),
+        ("metadata handoff", with(owner(0), &|c| { c.handoff = 3; c.page_operation = false; }), budget(8, 32), nothing, &[], "=> Origin { rank: 0, evidence: [] } 8/32/4"),
+        // Handoff probes never spend the origin credit, nor go out without links.
+        ("handoff, 3 credits", with(owner(0), &|c| c.handoff = 3), budget(3, 32), Spend::One, &[MISS], "3C4Sh:3/32/4 4C3Sh:2/32/4 => Origin { rank: 0, evidence: [] } 1/32/4"),
+        ("handoff, 1 credit", with(owner(0), &|c| c.handoff = 3), budget(1, 32), nothing, &[], "=> Origin { rank: 0, evidence: [] } 1/32/4"),
+        ("handoff, no links", with(owner(0), &|c| c.handoff = 1), budget(8, 0), nothing, &[], "=> Origin { rank: 0, evidence: [] } 8/0/0"),
+        // A stale handoff target is a miss, never walk evidence.
+        ("behind handoff", with(owner(1), &|c| c.handoff = 1), budget(8, 32), nothing, &[MISS, MISS, MISS, BEHIND], "0A3F:5/4/4 3C2Sh:8/32/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        // Tight links: the first probe of rank 0 (Acquire or copy-only) gets a full failure route
+        // and leaves one link for rank 1; the last predecessor may use the whole pool. Without a
+        // failure route the first route is capped at four links.
+        ("tight links, delegated", owner(2), failure(4, 7), nothing, &[MISS], "0A3F:2/6/6 1C2S:4/7/7 => Origin { rank: 2, evidence: [CopyMiss, CopyMiss] } 4/7/7"),
+        ("tight links, copy-only", owner(2), failure(3, 7), nothing, &[MISS], "0C3S:1/6/6 1C2S:3/7/7 => Origin { rank: 2, evidence: [CopyMiss, CopyMiss] } 3/7/7"),
+        ("tight links, no failure", owner(2), budget(3, 4), nothing, &[MISS], "0C3S:1/3/3 1C2S:3/4/4 => Origin { rank: 2, evidence: [CopyMiss, CopyMiss] } 3/4/4"),
+        // A non-owner funds an out-of-order owner (8 links), at least its minimum.
+        ("out of order", first(1), budget(32, 96), nothing, &[VU], "1A3F:4/8/8 0A2S:32/96/8 2A1S:32/96/8 => VersionUnavailable 32/96/8"),
+        ("out of order, minimum", first(1), budget(3, 96), nothing, &[VU], "1A3F:3/8/8 0A2S:3/96/8 2A1S:3/96/8 => VersionUnavailable 3/96/8"),
+        // Transient evidence exhausts a reader and notes a route failure.
+        ("transient", reader(2), budget(32, 96), nothing, &[T_UNR, VU], "0A2S:32/96/4 1A1S:32/96/8 => Exhausted { funding: false } 32/96/8"),
+        ("last attempt is copy-only", reader(1), budget(1, 8), nothing, &[COPY], "0C1S:1/8/4 => Copy 1/8/4"),
+        // A bounded route that cannot be funded stops with the funding site.
+        ("unfundable bounded", with(reader(3), &|c| c.continuation.bounded_routes = true), budget(2, 16), nothing, &[MISS], "0A3F:2/8/8 => Exhausted { funding: true } 2/16/8"),
+        // `StaleMembership` ends the epoch and returns the child's credits.
+        ("stale membership", first(2), budget(32, 96), nothing, &[STALE], "2A3F:5/8/8 => StaleMembership 32/96/8"),
+        // A destination that is behind is skipped, without a route failure.
+        ("behind, next owner", reader(3), budget(32, 96), nothing, &[BEHIND, COPY], "0A3S:32/96/4 1A2S:32/96/4 => Copy 32/96/4"),
+        ("behind everywhere", reader(2), budget(32, 96), nothing, &[BEHIND], "0A2S:32/96/4 1A1S:32/96/4 => Exhausted { funding: false } 32/96/4"),
+        // An owner keeps its authority, with transient evidence.
+        ("owner behind", config(Some(1), 2, VisitOrder::canonical(2)), budget(32, 96), nothing, &[BEHIND], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 32/96/4"),
+        // A hedge continuation skips the primary and carries its outcome.
+        ("hedge continuation", with(reader(2), &|c| { c.continuation = Continuation { primary_consumed: true, primary_outcome: Some(ProbeOutcome::VersionUnavailable), bounded_routes: true } }), budget(32, 96), nothing, &[VU], "1A1F:4/8/8 => VersionUnavailable 32/96/8"),
+        ("hedge continuation, no outcome", with(reader(2), &|c| c.continuation.primary_consumed = true), budget(32, 96), nothing, &[VU], "1A1S:32/96/4 => Exhausted { funding: false } 32/96/4"),
+        // Predecessors that held the same rank under the previous membership are asked under it;
+        // handoff targets never are; a copy from one wins; readers and metadata ignore the bits.
+        ("previous", with(owner(2), &|c| { c.previous = 0b01; c.handoff = 1; }), budget(8, 32), nothing, &[OVL, MISS], "0A4Fp:5/4/4 1C3S:8/32/8 3C2Sh:8/32/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 8/32/8"),
+        ("previous copy", with(owner(1), &|c| c.previous = 0b01), budget(8, 32), nothing, &[COPY], "0A2Fp:2/4/4 => Copy 8/32/4"),
+        ("previous, reader", with(reader(3), &|c| c.previous = 0b111), budget(8, 32), nothing, &[MISS], "0A3S:8/32/4 1A2S:8/32/4 2A1S:8/32/4 => Exhausted { funding: false } 8/32/4"),
+        ("previous, metadata", with(owner(1), &|c| { c.previous = 0b01; c.page_operation = false; }), budget(8, 32), nothing, &[MISS], "0C2S:8/32/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        // A stale answer under the previous membership is transient evidence, never a refresh.
+        ("previous stale", with(owner(2), &|c| c.previous = 0b11), budget(8, 32), nothing, &[STALE, MISS], "0A3Fp:2/4/4 1C2Sp:8/32/4 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 8/32/4"),
+        ("previous behind", with(owner(2), &|c| c.previous = 0b11), budget(8, 32), nothing, &[BEHIND, MISS], "0A3Fp:2/4/4 1C2Sp:8/32/4 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 8/32/4"),
+        // An owner that sheds the reader sends it to its helper once, funded from what is left,
+        // with the helper's full funded envelope; a helper miss falls back to the other owners.
+        ("helper copy", helper(canonical), budget(8, 16), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/16/4 3A3Fh:4/8/8 => Copy 8/16/8"),
+        ("helper, floor links", helper(canonical), budget(8, HELPER_FLOOR_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/4/4 3A3Fh:4/4/4 => Copy 8/4/4"),
+        ("helper, helper links", helper(canonical), budget(8, HELPER_LINKS), nothing, &[SHED, SHED, SHED, COPY], "0A3S:8/8/4 3A3Fh:4/8/8 => Copy 8/8/8"),
+        ("helper miss", helper(canonical), budget(32, 64), nothing, &[SHED], "0A3S:32/64/4 3A3Fh:4/8/8 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        // Only a destination's own shed asks the helper.
+        ("relay overload, no helper", helper(canonical), budget(32, 64), nothing, &[OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("transport overload, no helper", helper(canonical), budget(32, 64), nothing, &[T_OVL], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("unreachable, no helper", helper(canonical), budget(32, 64), nothing, &[T_UNR], "0A3S:32/64/4 1A2S:32/64/8 2A1S:32/64/8 => Exhausted { funding: false } 32/64/8"),
+        ("miss, no helper", helper(canonical), budget(32, 64), nothing, &[MISS], "0A3S:32/64/4 1A2S:32/64/4 2A1S:32/64/4 => Exhausted { funding: false } 32/64/4"),
+        // Without overflow the helper changes nothing (same trace with and without).
+        ("first 0, helper", helper(first(0).order), budget(8, 16), nothing, &[MISS], "0A3S:8/16/4 1A2S:8/16/4 2A1S:8/16/4 => Exhausted { funding: false } 8/16/4"),
+        ("first 0", first(0), budget(8, 16), nothing, &[MISS], "0A3S:8/16/4 1A2S:8/16/4 2A1S:8/16/4 => Exhausted { funding: false } 8/16/4"),
+        ("first 1, helper", helper(first(1).order), budget(8, 16), nothing, &[MISS], "1A3F:4/8/8 0A2S:8/16/8 2A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
+        ("first 1", first(1), budget(8, 16), nothing, &[MISS], "1A3F:4/8/8 0A2S:8/16/8 2A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
+        ("first 2, helper", helper(first(2).order), budget(8, 16), nothing, &[MISS], "2A3F:5/8/8 0A2S:8/16/8 1A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
+        ("first 2", first(2), budget(8, 16), nothing, &[MISS], "2A3F:5/8/8 0A2S:8/16/8 1A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
+        // A helper never chains; owners never use helpers; too little left skips it.
+        ("helper budget", helper(canonical), budget(HELPER_ATTEMPTS, 8), nothing, &[SHED], "0A3S:4/8/4 1A2S:4/8/4 2A1S:4/8/4 => Exhausted { funding: false } 4/8/4"),
+        ("owner ignores helper", with(owner(2), &|c| c.helper = true), budget(8, 16), nothing, &[SHED], "0A3F:2/4/4 1C2S:8/16/4 => Origin { rank: 2, evidence: [Overloaded, Overloaded] } 8/16/4"),
+        ("helper unaffordable", helper(first(2).order), budget(HELPER_MIN_ATTEMPTS + 1, 16), Spend::Transfer, &[SHED], "2A3F:5/8/8 0C2S:1/8/8 1A1S:0/0/0 => Exhausted { funding: false } 0/0/0"),
+        // A small budget visits rank 0 first instead of failing to fund rank 2.
+        ("small budget", first(2), budget(HELPER_ATTEMPTS - 1, 7), nothing, &[COPY, MISS], "0A3S:3/7/4 => Copy 3/7/4"),
+        // A hedge reports only `Overloaded`, never a destination shed.
+        ("hedged overload", with(helper(canonical), &|c| { c.continuation.primary_consumed = true; c.continuation.primary_outcome = Some(ProbeOutcome::Overloaded); }), budget(8, 16), nothing, &[COPY], "1A2S:8/16/4 => Copy 8/16/4"),
+        // An owner whose probe of rank 0 (delegated or copy-only) is unanswered leaves the fetch to
+        // rank 0; a later predecessor's copy still wins.
+        ("rank 0 silent", owner(1), budget(8, 32), nothing, &[TIMEOUT], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
+        ("rank 0 silent, copy-only", owner(1), budget(2, 16), nothing, &[TIMEOUT], "0C2S:2/16/4 => Exhausted { funding: false } 2/16/8 r0"),
+        ("rank 0 silent, copy", owner(2), budget(8, 32), nothing, &[TIMEOUT, COPY], "0A3F:2/4/4 1C2S:8/32/8 => Copy 8/32/8 r0"),
+        ("rank 0 silent, miss", owner(2), budget(8, 32), nothing, &[TIMEOUT, MISS], "0A3F:2/4/4 1C2S:8/32/8 => Exhausted { funding: false } 8/32/8 r0"),
+        // Only an owner's probe of rank 0 timing out withholds origin.
+        ("rank 0 unreachable", owner(1), budget(8, 32), nothing, &[T_UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("rank 0 overloaded", owner(1), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("rank 0 miss", owner(1), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        ("rank 0 shed", owner(1), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
+        ("rank 1 silent", owner(2), budget(8, 32), nothing, &[MISS, TIMEOUT], "0A3F:2/4/4 1C2S:8/32/4 => Origin { rank: 2, evidence: [CopyMiss, Unreachable] } 8/32/8"),
+        ("metadata silent", with(owner(1), &|c| c.page_operation = false), budget(8, 32), nothing, &[TIMEOUT], "0C2S:8/32/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("handoff silent", with(owner(0), &|c| c.handoff = 1), budget(8, 32), nothing, &[TIMEOUT], "3C2Sh:8/32/4 => Origin { rank: 0, evidence: [] } 8/32/8"),
+        // For a reader a timeout is `Transport(Unreachable)` (same trace).
+        ("reader silent", reader(2), budget(32, 96), nothing, &[TIMEOUT], "0A2S:32/96/4 1A1S:32/96/8 => Exhausted { funding: false } 32/96/8"),
+        ("reader unreachable", reader(2), budget(32, 96), nothing, &[T_UNR], "0A2S:32/96/4 1A1S:32/96/8 => Exhausted { funding: false } 32/96/8"),
+        // The rank 0 watch: `Fetching` keeps the timeout rule and nothing else changes; `Overdue`
+        // gives authority after a timeout. Probes are planned the same in every state, and
+        // readers and rank 0 ignore it.
+        ("fetching, silent", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[TIMEOUT], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
+        ("fetching, unreachable", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[T_UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("fetching, transport overload", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[T_OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("fetching, overloaded", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("fetching, shed", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
+        ("fetching, miss", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        ("fetching, relay unreachable", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("overdue, silent", rank0(1, Rank0State::Overdue), budget(8, 32), nothing, &[TIMEOUT], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("overdue, rank 2", rank0(2, Rank0State::Overdue), budget(8, 32), nothing, &[TIMEOUT, MISS], "0A3F:2/4/4 1C2S:8/32/8 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 8/32/8"),
+        ("reader, fetching", with(reader(3), &|c| c.rank0 = Rank0State::Fetching), budget(8, 32), nothing, &[TIMEOUT], "0A3S:8/32/4 1A2S:8/32/8 2A1S:8/32/8 => Exhausted { funding: false } 8/32/8"),
+        ("reader, overdue", with(reader(3), &|c| c.rank0 = Rank0State::Overdue), budget(8, 32), nothing, &[TIMEOUT], "0A3S:8/32/4 1A2S:8/32/8 2A1S:8/32/8 => Exhausted { funding: false } 8/32/8"),
+        ("reader, unknown", reader(3), budget(8, 32), nothing, &[TIMEOUT], "0A3S:8/32/4 1A2S:8/32/8 2A1S:8/32/8 => Exhausted { funding: false } 8/32/8"),
+        ("rank 0, fetching", rank0(0, Rank0State::Fetching), budget(8, 32), nothing, &[TIMEOUT], "=> Origin { rank: 0, evidence: [] } 8/32/4"),
+        ("rank 0, overdue", rank0(0, Rank0State::Overdue), budget(8, 32), nothing, &[TIMEOUT], "=> Origin { rank: 0, evidence: [] } 8/32/4"),
+        ("rank 0, unknown", owner(0), budget(8, 32), nothing, &[TIMEOUT], "=> Origin { rank: 0, evidence: [] } 8/32/4"),
+        // Successors: on their own grant, before a delegated rank 0's origin; an unreachable one
+        // is a miss without a route failure; a copy ends the walk; the walk's budget never grows.
+        ("successor", with(owner(0), &|c| { c.handoff = 2; c.granted = 1; }), budget(1, 1), nothing, &[MISS], "3C7Fhg:1/8/4 => Origin { rank: 0, evidence: [] } 1/1/1"),
+        ("successor copy", with(owner(0), &|c| { c.handoff = 1; c.granted = 1; }), budget(1, 1), nothing, &[COPY], "3C6Fhg:1/8/4 => Copy 1/1/1"),
+        ("successor unreachable", with(owner(0), &|c| { c.handoff = 2; c.granted = 2; }), budget(1, 10), nothing, &[STALE, STALE, STALE, T_UNR, STALE], "3C7Fhg:1/8/4 4C6Fhg:1/8/4 => Origin { rank: 0, evidence: [] } 1/10/4"),
+        ("successor after delegation", with(owner(1), &|c| { c.handoff = 1; c.granted = 1; }), budget(3, 8), nothing, &[UNR, MISS], "0A3F:2/4/4 3C6Fhg:1/8/4 => Origin { rank: 1, evidence: [Unreachable] } 3/8/8"),
+        ("reader, no successors", with(reader(3), &|c| c.granted = 1), budget(32, 96), nothing, &[MISS], "0A3S:32/96/4 1A2S:32/96/4 2A1S:32/96/4 => Exhausted { funding: false } 32/96/4"),
+        // Granted lineage targets of a delegated rank 0 keep the origin credit.
+        ("granted lineage", with(owner(0), &|c| { c.handoff = 3; c.granted = 2; }), budget(1, 1), nothing, &[MISS], "3C8Fhg:1/8/4 4C7Fhg:1/8/4 => Origin { rank: 0, evidence: [] } 1/1/1"),
+        ("granted lineage copy", with(owner(0), &|c| { c.handoff = 3; c.granted = 2; }), budget(1, 1), nothing, &[MISS, MISS, MISS, MISS, COPY], "3C8Fhg:1/8/4 4C7Fhg:1/8/4 => Copy 1/1/1"),
+        // Granted targets timing out never withhold origin; rank 0's timeout still does.
+        ("granted silent", with(owner(1), &|c| { c.handoff = 2; c.granted = 2; }), budget(8, 32), nothing, &[MISS, TIMEOUT], "0A4F:5/4/4 3C7Fhg:1/8/4 4C6Fhg:1/8/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        ("granted silent, fetching", with(rank0(1, Rank0State::Fetching), &|c| { c.handoff = 2; c.granted = 2; }), budget(8, 32), nothing, &[MISS, TIMEOUT], "0A4F:5/4/4 3C7Fhg:1/8/4 4C6Fhg:1/8/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        ("granted, rank 0 silent", with(owner(1), &|c| { c.handoff = 2; c.granted = 2; }), budget(8, 32), nothing, &[TIMEOUT, MISS], "0A4F:5/4/4 3C7Fhg:1/8/4 4C6Fhg:1/8/4 => Exhausted { funding: false } 8/32/8 r0"),
+        ("granted, rank 0 silent, fetching", with(rank0(1, Rank0State::Fetching), &|c| { c.handoff = 2; c.granted = 2; }), budget(8, 32), nothing, &[TIMEOUT, MISS], "0A4F:5/4/4 3C7Fhg:1/8/4 4C6Fhg:1/8/4 => Exhausted { funding: false } 8/32/8 r0"),
+        // A relay's `Overloaded` on an owner's route to rank 0 gives authority after one probe,
+        // without a retry; never a reader's.
+        ("relay overload, rank 1", owner(1), budget(owner_funding_min(1), 8), nothing, &[OVL, MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 3/8/8"),
+        ("relay overload, rank 2", owner(2), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 4/8/8"),
+        ("relay overload, rank 1, fetching", rank0(1, Rank0State::Fetching), budget(owner_funding_min(1), 8), nothing, &[OVL, MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 3/8/8"),
+        ("relay overload, rank 2, fetching", rank0(2, Rank0State::Fetching), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 4/8/8"),
+        ("relay overload, reader", reader(3), budget(8, 16), nothing, &[OVL], "0A3S:8/16/4 1A2S:8/16/8 2A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
+        // Rank 0 answering that its own acquisition failed withholds origin only while this
+        // owner's own origin request failed recently; probes match `Probe(Unreachable)`.
+        ("rank 0 failed", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[FAILED], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
+        ("rank 0 failed, copy", rank0(2, Rank0State::Failed), budget(8, 32), nothing, &[FAILED, COPY], "0A3F:2/4/4 1C2S:8/32/8 => Copy 8/32/8 r0"),
+        ("rank 0 failed, copy-only", rank0(1, Rank0State::Failed), budget(2, 16), nothing, &[FAILED], "0C2S:2/16/4 => Exhausted { funding: false } 2/16/8 r0"),
+        ("rank 0 failed, unknown", rank0(1, Rank0State::Unknown), budget(8, 32), nothing, &[FAILED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("rank 0 failed, fetching", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[FAILED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("rank 0 failed, overdue", rank0(1, Rank0State::Overdue), budget(8, 32), nothing, &[FAILED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("failed state, unreachable", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[T_UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("failed state, relay unreachable", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
+        ("failed state, miss", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
+        ("failed state, shed", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
+        ("rank 2 failed", rank0(2, Rank0State::Failed), budget(8, 32), nothing, &[FAILED, MISS], "0A3F:2/4/4 1C2S:8/32/8 => Exhausted { funding: false } 8/32/8 r0"),
+        ("rank 2 relay unreachable", rank0(2, Rank0State::Failed), budget(8, 32), nothing, &[UNR, MISS], "0A3F:2/4/4 1C2S:8/32/8 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 8/32/8"),
+        ("reader failed", with(reader(3), &|c| c.rank0 = Rank0State::Failed), budget(16, 64), nothing, &[FAILED], "0A3S:16/64/4 1A2S:16/64/8 2A1S:16/64/8 => Exhausted { funding: false } 16/64/8"),
+        // Rank 2 with inherited credits: rank 0 behind, rank 1 misses; the origin credit is left.
+        ("inherited owner", owner(2), { let deadline = Instant::now() + Duration::from_secs(60); inherited_budget(deadline, deadline, 3, 7, 1).unwrap() }, nothing, &[BEHIND, MISS], "0C3S:1/5/5 1C2S:3/6/6 => Origin { rank: 2, evidence: [Unreachable, CopyMiss] } 3/6/6"),
+    ];
+    let mut wrong = String::new();
+    for (name, cfg, b, spend, script, expected) in rows {
+        let actual = trace(cfg, b, spend, script);
+        if actual != expected {
+            writeln!(wrong, "        // {name}\n        \"{actual}\",").unwrap();
+        }
+    }
+    assert!(wrong.is_empty(), "\n{wrong}");
+}
+
+/// The first probe of a walk: `{canonical}{mode}{route}`, what the walk
+/// kept, and the probe's request budget.
+fn first_probe(cfg: WalkConfig, mut b: AcquisitionBudget) -> String {
+    let mut walk = CandidateWalk::new(cfg);
+    let Step::Probe(p) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    let kept = (b.remaining_attempts(), b.remaining_links());
+    let request = walk.request_budget(&mut b);
+    let (a, l) = (request.remaining_attempts(), request.remaining_links());
+    format!(
+        "{}{:?}{:?} kept {}/{} child {a}/{l}",
+        p.canonical, p.mode, p.route, kept.0, kept.1
     )
 }
 
-/// Every probe answers `outcome`.
-fn always(outcome: ProbeOutcome) -> impl FnMut(&Probe, &mut AcquisitionBudget) -> Outcome {
-    move |_, _| Outcome::Probe(outcome.clone())
-}
-
 #[test]
-fn owner_asks_rank_zero_to_acquire_then_probes_copy_only_then_gets_origin() {
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let mut b = budget(32, 96);
-    let (probes, end) = drive(&mut walk, &mut b, always(ProbeOutcome::CopyMiss));
+fn first_probes() {
+    let with = |cfg: WalkConfig, handoff: usize, lineage: [u8; 3]| WalkConfig {
+        handoff,
+        lineage,
+        ..cfg
+    };
+    let failure = {
+        let mut b = budget(6, 5);
+        b.note_route_failure();
+        b
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let inherited = inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
     assert_eq!(
-        probes
-            .iter()
-            .map(|(p, ..)| (p.canonical, p.mode, p.remaining_opportunities, p.route))
-            .collect::<Vec<_>>(),
-        [
-            (0, Mode::Acquire, 3, RouteMode::FundedRoute),
-            (1, Mode::CopyOnly, 2, RouteMode::SharedRoute)
-        ]
+        (inherited.remaining_attempts(), inherited.remaining_links()),
+        (4, 7)
     );
-    // The Acquire to rank 0 carries exactly the exchange and one origin
-    // credit over a normal route (remote credits stay spent, so no more).
-    assert_eq!((probes[0].1, probes[0].2), (2, 4));
+    // Readers fund rank 1 visited first by `owner_funding(1) + 1` per lineage target with slack:
+    // 11 = 4 + 1 + 4 + 2 keeps the later visits' minimums.
     assert_eq!(
-        end,
-        End::Origin {
-            rank: 2,
-            evidence: vec![ProbeOutcome::CopyMiss, ProbeOutcome::CopyMiss]
+        owner_funding(1) + 1 + owner_funding_min(2) + owner_funding_min(0),
+        11
+    );
+    let slack = |lineage| with(config(None, 3, order_120()), 0, lineage);
+    #[rustfmt::skip]
+    let rows = [
+        // Handoff targets never block the delegation: the owner keeps one credit per later
+        // predecessor and one for its origin.
+        (with(owner(1), 0, [0; 3]), budget(3, 16), "0AcquireFundedRoute kept 1/12 child 2/4"),
+        (with(owner(1), 1, [0; 3]), budget(3, 16), "0AcquireFundedRoute kept 1/12 child 2/4"),
+        (with(owner(1), 2, [0; 3]), budget(3, 16), "0AcquireFundedRoute kept 1/12 child 2/4"),
+        (with(owner(1), 3, [0; 3]), budget(3, 16), "0AcquireFundedRoute kept 1/12 child 2/4"),
+        (with(owner(2), 0, [0; 3]), budget(4, 16), "0AcquireFundedRoute kept 2/12 child 2/4"),
+        (with(owner(2), 1, [0; 3]), budget(4, 16), "0AcquireFundedRoute kept 2/12 child 2/4"),
+        (with(owner(2), 2, [0; 3]), budget(4, 16), "0AcquireFundedRoute kept 2/12 child 2/4"),
+        (with(owner(2), 3, [0; 3]), budget(4, 16), "0AcquireFundedRoute kept 2/12 child 2/4"),
+        // A delegation forwards spare credits (up to `MAX_HANDOFF`) for rank 0's handoff or
+        // lineage targets, never this owner's origin credit.
+        (with(owner(1), 0, [0; 3]), budget(8, 16), "0AcquireFundedRoute kept 6/12 child 2/4"),
+        (with(owner(1), 1, [0; 3]), budget(4, 16), "0AcquireFundedRoute kept 1/12 child 3/4"),
+        (with(owner(1), 2, [0; 3]), budget(6, 16), "0AcquireFundedRoute kept 1/12 child 5/4"),
+        (with(owner(1), 3, [0; 3]), budget(16, 16), "0AcquireFundedRoute kept 11/12 child 5/4"),
+        (with(owner(1), 0, [1, 0, 0]), budget(3, 16), "0AcquireFundedRoute kept 1/12 child 2/4"),
+        (with(owner(1), 0, [1, 0, 0]), budget(4, 16), "0AcquireFundedRoute kept 1/12 child 3/4"),
+        (with(owner(1), 0, [2, 0, 0]), budget(8, 16), "0AcquireFundedRoute kept 4/12 child 4/4"),
+        (with(owner(1), 0, [2, 0, 0]), budget(4, 16), "0AcquireFundedRoute kept 1/12 child 3/4"),
+        // A reader's out-of-order Acquire carries one more credit per lineage target of the
+        // destination and of rank 0 (not of another later rank), only from slack.
+        (slack([0, 1, 0]), budget(32, 16), "1AcquireFundedRoute kept 27/8 child 5/8"),
+        (slack([2, 0, 1]), budget(32, 16), "1AcquireFundedRoute kept 26/8 child 6/8"),
+        (slack([1, 1, 0]), budget(32, 16), "1AcquireFundedRoute kept 26/8 child 6/8"),
+        (slack([0, 0, 1]), budget(32, 16), "1AcquireFundedRoute kept 28/8 child 4/8"),
+        (slack([0, 1, 0]), budget(11, 16), "1AcquireFundedRoute kept 6/8 child 5/8"),
+        (slack([0, 1, 0]), budget(10, 16), "1AcquireFundedRoute kept 6/8 child 4/8"),
+        (slack([0, 1, 0]), budget(8, 16), "1AcquireFundedRoute kept 4/8 child 4/8"),
+        (slack([0, 0, 0]), budget(8, 16), "1AcquireFundedRoute kept 4/8 child 4/8"),
+        // The delegation route comes first: four of five failure-route links, one for rank 1.
+        (owner(2), failure, "0AcquireFundedRoute kept 4/1 child 2/4"),
+        // Handoff targets take the remaining links in order.
+        (with(owner(0), 3, [0; 3]), budget(8, 3), "3CopyOnlySharedRoute kept 8/3 child 8/3"),
+        // A reader reached by a funded route funds an out-of-order rank 2 with the attempts it
+        // needs and a shared route's links; budgets never grow.
+        (first(2), inherited, "2AcquireFundedRoute kept 0/0 child 4/7"),
+    ];
+    let mut wrong = String::new();
+    for (cfg, b, expected) in rows {
+        let actual = first_probe(cfg, b);
+        if actual != expected {
+            writeln!(wrong, "        {actual:?},").unwrap();
         }
-    );
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
-}
-
-#[test]
-fn owner_funding_covers_delegation_and_origin() {
-    // Rank 0: the exchange and its origin attempt.
-    assert_eq!(owner_funding(0), 2);
-    assert_eq!(owner_funding_min(0), 2);
-    // Without delegation: one copy-only probe per predecessor instead.
-    assert_eq!(owner_funding_min(1), 3);
-    assert_eq!(owner_funding_min(2), 4);
-    // Rank r > 0: the exchange, an Acquire to rank 0 (two credits), r - 1
-    // copy-only probes, and its own origin attempt.
-    assert_eq!(owner_funding(1), 4);
-    assert_eq!(owner_funding(2), 5);
-}
-
-#[test]
-fn owner_delegates_only_with_credit_left_for_its_own_origin() {
-    // Rank 1 holding two credits cannot fund the Acquire to rank 0 (two) and
-    // keep one for its own origin attempt, so it probes copy-only as before.
-    let (probes, end) = run(
-        config(Some(1), 3, VisitOrder::canonical(3)),
-        2,
-        16,
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert_eq!(probes.len(), 1);
-    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
-    assert!(matches!(end, End::Origin { rank: 1, .. }));
-    // With three it delegates.
-    let (probes, _) = run(
-        config(Some(1), 3, VisitOrder::canonical(3)),
-        3,
-        16,
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert_eq!(probes[0].0.mode, Mode::Acquire);
-    // Rank 2 needs four: the Acquire, rank 1's probe, and its own origin.
-    let (probes, _) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        3,
-        16,
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert!(probes.iter().all(|(p, ..)| p.mode == Mode::CopyOnly));
-    let (probes, _) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        4,
-        16,
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert_eq!(probes[0].0.mode, Mode::Acquire);
-    assert_eq!(probes[1].0.mode, Mode::CopyOnly);
-}
-
-#[test]
-fn non_owner_funds_delegation_from_slack_only() {
-    // Default page budget, visit order [1, 2, 0]: rank 1 gets `owner_funding`
-    // because rank 2's minimum (4) still fits; rank 2 then gets its minimum.
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
-    let (probes, end) = run(config(None, 3, order), 8, 16, |_, request| {
-        // Spend the child entirely, as a forwarded funded route does.
-        let _ = request.partition(request.remaining_attempts(), 0).unwrap();
-        Outcome::Probe(ProbeOutcome::CopyMiss)
-    });
-    assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
-    assert_eq!(order.ranks().collect::<Vec<_>>(), [1, 2, 0]);
-    let seen: Vec<_> = probes
-        .iter()
-        .map(|(p, attempts, _)| (p.canonical, *attempts))
-        .collect();
-    assert_eq!(
-        seen[..2],
-        [(1, owner_funding(1)), (2, owner_funding_min(2))]
-    );
-}
-
-#[test]
-fn delegated_version_miss_ends_without_origin() {
-    let (probes, end) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        8,
-        16,
-        always(ProbeOutcome::VersionUnavailable),
-    );
-    assert_eq!(probes.len(), 1);
-    assert_eq!(end, End::VersionUnavailable);
-    // A copy-only predecessor's version miss is only evidence.
-    let (probes, end) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        8,
-        16,
-        |p, _| {
-            Outcome::Probe(if p.canonical == 0 {
-                ProbeOutcome::CopyMiss
-            } else {
-                ProbeOutcome::VersionUnavailable
-            })
-        },
-    );
-    assert_eq!(probes.len(), 2);
-    assert!(matches!(end, End::Origin { rank: 2, .. }));
-    // Metadata and other non-page walks never delegate.
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.page_operation = false;
-    let (probes, _) = run(cfg, 8, 16, always(ProbeOutcome::CopyMiss));
-    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
-}
-
-#[test]
-fn owner_asks_handoff_targets_copy_only_after_predecessors() {
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.handoff = 2;
-    let (probes, end) = run(cfg, 8, 32, |p, _| {
-        Outcome::Probe(if p.canonical == 0 {
-            ProbeOutcome::Overloaded
-        } else {
-            ProbeOutcome::CopyMiss
-        })
-    });
-    assert_eq!(
-        probes
-            .iter()
-            .map(|(p, ..)| (p.canonical, p.mode, p.remaining_opportunities))
-            .collect::<Vec<_>>(),
-        [
-            (0, Mode::Acquire, 4),
-            (3, Mode::CopyOnly, 3),
-            (4, Mode::CopyOnly, 2)
-        ]
-    );
-    // Handoff outcomes are not predecessor evidence.
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 1,
-            evidence: vec![ProbeOutcome::Overloaded]
-        }
-    );
-    // A stale handoff target is only a miss.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    let (probes, end) = run(cfg, 8, 32, |_, _| Outcome::StaleMembership);
-    assert_eq!(probes.len(), 1);
-    assert!(matches!(end, End::Origin { rank: 0, .. }));
-    // A handoff target's copy wins.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 3;
-    let (probes, end) = run(cfg, 8, 32, |p, _| {
-        if p.canonical == 4 {
-            Outcome::Copy
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Copy);
-    // Non-page walks and non-owners ignore handoff targets.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 3;
-    cfg.page_operation = false;
-    let (probes, _) = run(cfg, 8, 32, |_, _| unreachable!());
-    assert!(probes.is_empty());
-}
-
-#[test]
-fn handoff_probes_never_spend_the_origin_credit() {
-    // Rank 0 with three credits asks two handoff targets (each exchange
-    // spends one) and keeps one credit for origin.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 3;
-    let mut b = budget(3, 32);
-    let (probes, end) = drive(&mut CandidateWalk::new(cfg), &mut b, |_, request| {
-        let _ = request.partition(1, 0).unwrap();
-        Outcome::Probe(ProbeOutcome::CopyMiss)
-    });
-    assert_eq!(probes.len(), 2);
-    assert_eq!(b.remaining_attempts(), 1);
-    assert!(matches!(end, End::Origin { rank: 0, .. }));
-    // One credit: straight to origin.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 3;
-    let (probes, _) = run(cfg, 1, 32, |_, _| unreachable!());
-    assert!(probes.is_empty());
-    // No links left for a route: straight to origin.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    let (probes, _) = run(cfg, 8, 0, |_, _| unreachable!());
-    assert!(probes.is_empty());
-}
-
-#[test]
-fn handoff_targets_skip_self_predecessors_and_unchanged_sets() {
-    // Unchanged owner set (any order): nothing to ask.
-    assert!(handoff_targets(&[1, 2, 3], &[2, 1, 3], 0).is_empty());
-    // A join put 9 at rank 0: the old owners, in old rank order.
-    assert_eq!(handoff_targets(&[1, 2, 3], &[9, 1, 2], 0), [1, 2, 3]);
-    // At rank 1 (node 1), its predecessor 9 is probed anyway; itself skipped.
-    assert_eq!(handoff_targets(&[1, 2, 3], &[9, 1, 2], 1), [2, 3]);
-    // A removal: the previous owner 1 is gone from the current set.
-    assert_eq!(handoff_targets(&[1, 2, 3], &[2, 3, 4], 2), [1]);
-    // Fewer owners before.
-    assert_eq!(handoff_targets(&[1], &[1, 2], 1), Vec::<i32>::new());
-    assert_eq!(handoff_targets::<i32>(&[], &[1], 0), Vec::<i32>::new());
-}
-
-#[test]
-fn rank_zero_owner_gets_origin_without_probes() {
-    let (probes, end) = run(
-        config(Some(0), 3, VisitOrder::canonical(3)),
-        1,
-        1,
-        |_, _| unreachable!(),
-    );
-    assert!(probes.is_empty());
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 0,
-            evidence: vec![]
-        }
-    );
-}
-
-#[test]
-fn owner_with_tight_links_partitions_predecessor_routes() {
-    // Two predecessors, seven inherited links after a failure route. The Acquire to rank 0 (two
-    // attempts: the exchange and rank 0's origin credit) comes first: it gets a full failure route
-    // and leaves one link for rank 1's copy-only probe, which matters only if rank 0 fails (an
-    // equal split left it too few links to reach rank 0).
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let mut b = budget(4, 7);
-    b.note_route_failure();
-    let (probes, _) = drive(&mut walk, &mut b, always(ProbeOutcome::CopyMiss));
-    assert_eq!(probes[0].0.mode, Mode::Acquire);
-    assert_eq!((probes[0].1, probes[0].2), (2, 6));
-    // Without a delegation (too few attempts), the copy-only probe of rank
-    // 0 comes first the same way: it decides whether this owner leaves the
-    // fetch to rank 0 (a route failure gives origin authority; an equal
-    // split left rank 2 two links and made it fetch pages rank 0 was
-    // fetching).
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let mut b = budget(3, 7);
-    b.note_route_failure();
-    let (probes, _) = drive(&mut walk, &mut b, always(ProbeOutcome::CopyMiss));
-    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
-    assert_eq!((probes[0].1, probes[0].2), (1, 6));
-    // The last predecessor may use the whole remaining pool.
-    assert_eq!((probes[1].1, probes[1].2), (3, 7));
-    // Without a failure route the first route is capped at four links, and
-    // the later predecessor keeps the rest.
-    let (probes, _) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        3,
-        4,
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert_eq!((probes[0].0.canonical, probes[0].2), (0, 3));
-    assert_eq!(probes[1].0.canonical, 1);
-    assert!(probes[1].2 >= 1);
-}
-
-#[test]
-fn non_owner_funds_out_of_order_owner_and_reports_version_unavailable() {
-    // Visit rank 1 first: it is funded with `owner_funding(1)` attempts and 8 links.
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 1, |_| 0);
-    assert_eq!(order.get(0), Some(1));
-    let (probes, end) = run(
-        config(None, 3, order),
-        32,
-        96,
-        always(ProbeOutcome::VersionUnavailable),
-    );
-    assert_eq!(probes.len(), 3);
-    assert_eq!(probes[0].0.route, RouteMode::FundedRoute);
-    assert_eq!((probes[0].1, probes[0].2), (owner_funding(1), 8));
-    assert_eq!(owner_funding(1), 4);
-    // With fewer credits it still funds the minimum, so reach is unchanged.
-    let (probes, _) = run(
-        config(None, 3, order),
-        3,
-        96,
-        always(ProbeOutcome::VersionUnavailable),
-    );
-    assert_eq!(probes[0].0.route, RouteMode::FundedRoute);
-    assert_eq!((probes[0].1, probes[0].2), (owner_funding_min(1), 8));
-    assert_eq!(probes[1].0.route, RouteMode::SharedRoute);
-    assert!(probes.iter().all(|(p, ..)| p.mode == Mode::Acquire));
-    assert_eq!(end, End::VersionUnavailable);
-}
-
-#[test]
-fn non_owner_transient_evidence_exhausts_and_notes_route_failure() {
-    let mut walk = CandidateWalk::new(config(None, 2, VisitOrder::canonical(2)));
-    let mut b = budget(32, 96);
-    assert_eq!(b.route_links(), 4);
-    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
-        if p.index == 0 {
-            Outcome::Transport(ProbeOutcome::Unreachable)
-        } else {
-            Outcome::Probe(ProbeOutcome::VersionUnavailable)
-        }
-    });
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Exhausted { funding: false });
-    assert_eq!(b.route_links(), 8);
-}
-
-#[test]
-fn last_attempt_page_probe_becomes_copy_only() {
-    let mut walk = CandidateWalk::new(config(None, 1, VisitOrder::canonical(1)));
-    let mut b = budget(1, 8);
+    }
+    assert!(wrong.is_empty(), "\n{wrong}");
+    let mut b = inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
+    let mut walk = CandidateWalk::new(first(2));
     let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
         panic!()
     };
-    assert_eq!(probe.mode, Mode::CopyOnly);
+    let plan = plan(walk.request_budget(&mut b), deadline, &probe).unwrap();
+    assert_eq!((plan.links, plan.remote_attempts), (7, 3));
+}
+
+#[test]
+fn pure_rules() {
+    // Owner funding: rank 0 the exchange and its origin; rank r > 0 the exchange, an Acquire to
+    // rank 0 (two), r - 1 copy-only probes and its origin; without delegation one copy-only probe
+    // per predecessor.
     assert_eq!(
-        walk.complete(&mut b, Outcome::Copy).unwrap(),
-        Some(End::Copy)
+        [owner_funding(0), owner_funding(1), owner_funding(2)],
+        [2, 4, 5]
     );
+    assert_eq!(
+        [
+            owner_funding_min(0),
+            owner_funding_min(1),
+            owner_funding_min(2)
+        ],
+        [2, 3, 4]
+    );
+    assert_eq!(order_120().ranks().collect::<Vec<_>>(), [1, 2, 0]);
+    assert_eq!(first(1).order.get(0), Some(1));
+    assert_eq!(first(2).order.get(0), Some(2));
+    assert_eq!(budget(32, 96).route_links(), 4);
+    const { assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS) };
+    // Handoff targets skip this node, its predecessors and unchanged sets.
+    assert!(handoff_targets(&[1, 2, 3], &[2, 1, 3], 0).is_empty());
+    assert_eq!(handoff_targets(&[1, 2, 3], &[9, 1, 2], 0), [1, 2, 3]);
+    assert_eq!(handoff_targets(&[1, 2, 3], &[9, 1, 2], 1), [2, 3]);
+    assert_eq!(handoff_targets(&[1, 2, 3], &[2, 3, 4], 2), [1]);
+    assert_eq!(handoff_targets(&[1], &[1, 2], 1), Vec::<i32>::new());
+    assert_eq!(handoff_targets::<i32>(&[], &[1], 0), Vec::<i32>::new());
+    // Predecessors that held the same rank.
+    for (previous, current, rank, bits) in [
+        (&[1, 2, 3][..], &[1, 2, 3][..], 2, 0b11),
+        (&[1, 2, 3], &[1, 2, 3], 0, 0),
+        (&[1, 2, 3], &[9, 1, 2], 2, 0),
+        (&[1, 2, 3], &[1, 3, 4], 2, 0b01),
+        (&[1], &[1, 2, 3], 2, 0b01),
+        (&[], &[1, 2], 1, 0),
+    ] {
+        assert_eq!(same_rank_previous(previous, current, rank), bits);
+    }
+    // Each epoch refreshes at most once, and only to a strictly newer membership.
+    for (retried, previous, latest, action) in [
+        (true, 1, Some(2), Ok(StaleAction::Skip)),
+        (false, 2, Some(2), Ok(StaleAction::Skip)),
+        (false, 3, Some(2), Ok(StaleAction::Skip)),
+        (false, 2, None, Err(Error::Unavailable)),
+        (false, 2, Some(3), Ok(StaleAction::Refresh)),
+    ] {
+        assert_eq!(stale_action(retried, previous, latest), action);
+    }
+    // A reader falls back once, with a recent previous membership that lists it.
+    for (owner, retried, recent, fallback) in [
+        (false, false, true, true),
+        (false, true, true, false),
+        (false, false, false, false),
+        (true, false, true, false),
+    ] {
+        assert_eq!(previous_fallback(owner, retried, recent), fallback);
+    }
+    // A reader that cannot fall back waits a third of what is left, within bounds, twice; a
+    // second wait must be affordable. Two waits cover the 5 s propagation window of a 10 s read.
+    let (secs, ms) = (Duration::from_secs, Duration::from_millis);
+    for (waits, affordable, remaining, wait) in [
+        (0, true, secs(9), Some(secs(3))),
+        (0, false, secs(9), Some(secs(3))),
+        (2, true, secs(5), None),
+        (0, true, secs(60), Some(MAX_STALE_WAIT)),
+        (0, true, ms(900), Some(ms(300))),
+        (MAX_STALE_WAITS, true, secs(9), None),
+        (1, false, secs(9), None),
+        (0, true, ms(749), None),
+        (0, false, Duration::ZERO, None),
+        (0, true, ms(750), Some(MIN_STALE_WAIT)),
+    ] {
+        assert_eq!(
+            stale_wait(waits, affordable, remaining),
+            wait,
+            "{waits} {remaining:?}"
+        );
+    }
+    let first_wait = stale_wait(0, true, secs(10)).unwrap();
+    let second = stale_wait(1, true, secs(10) - first_wait).unwrap();
+    assert!(first_wait + second >= ms(5500));
+    // Hedge eligibility: (page, owner, owners, first, second, attempts, links).
+    for (page, owner, owners, first, second, attempts, links, eligible) in [
+        (true, false, &[1, 2, 3][..], 0, 1, 6, 10, true),
+        (true, false, &[1, 2, 3], 0, 1, 5, 10, false),
+        (true, false, &[1, 2, 3], 0, 1, 6, 9, false),
+        (true, false, &[1, 2, 3], 1, 1, 6, 10, false),
+        (true, true, &[1, 2, 3], 0, 1, 6, 10, false),
+        (true, false, &[1], 0, 0, 6, 10, false),
+        (true, false, &[1, 1, 3], 0, 1, 6, 10, false),
+        (false, false, &[1, 2, 3], 0, 1, 6, 10, false),
+    ] {
+        let b = budget(attempts, links);
+        assert_eq!(
+            hedge_eligible(page, owner, owners, first, second, &b),
+            eligible
+        );
+    }
+    let mut b = budget(6, 10);
+    let (secondary, primary) = hedge_budgets(&mut b).unwrap();
+    for (b, expected) in [(secondary, (1, 1)), (primary, (2, 1)), (b, (3, 8))] {
+        assert_eq!((b.remaining_attempts(), b.remaining_links()), expected);
+    }
+    assert!(hedge_fallback(Error::CorruptRecord));
+    assert!(!hedge_fallback(Error::Unauthorized));
+    assert!(!hedge_fallback(Error::Cancelled));
+    // A local hop budget shortfall is evidence, not terminal.
+    for (error, outcome) in [
+        (Error::Os(1), Some(ProbeOutcome::Unreachable)),
+        (Error::Overloaded, Some(ProbeOutcome::Overloaded)),
+        (Error::Unauthorized, None),
+        (Error::DeadlineExceeded, None),
+        (Error::HopBudgetExhausted, Some(ProbeOutcome::Unreachable)),
+    ] {
+        assert_eq!(transport_outcome(error), outcome);
+    }
+    // Funded links: a full route, else a shared route's four, never the owner's last link;
+    // failure routing (inherited from a funded route) takes all.
+    for (links, funded) in [
+        (16, Some(MAX_ROUTE_LINKS)),
+        (8, Some(MAX_ROUTE_LINKS)),
+        (7, Some(4)),
+        (3, Some(3)),
+        (2, Some(2)),
+        (1, None),
+        (0, None),
+    ] {
+        assert_eq!(funded_links(&budget(4, links)), funded, "{links}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let b = inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
+    assert_eq!(funded_links(&b), Some(7));
+    // A shared share is short only below an owner's minimum.
+    for (attempts, canonical, visits, short) in [
+        (2, 0, 3, false),
+        (4, 1, 2, false),
+        (3, 1, 2, true),
+        (4, 2, 1, false),
+        (3, 2, 1, true),
+    ] {
+        assert_eq!(
+            shared_share_short(&budget(attempts, 8), canonical, visits),
+            short
+        );
+    }
 }
 
 #[test]
-fn unfundable_bounded_route_stops_with_funding_site() {
-    let mut cfg = config(None, 3, VisitOrder::canonical(3));
-    cfg.continuation.bounded_routes = true;
-    let mut walk = CandidateWalk::new(cfg);
-    // rank 0 needs 2 attempts + 8 links; rank 1 needs 3 attempts.
-    let mut b = budget(2, 16);
-    let (probes, end) = drive(&mut walk, &mut b, always(ProbeOutcome::CopyMiss));
-    assert_eq!(probes.len(), 1);
-    assert_eq!(probes[0].0.route, RouteMode::FundedRoute);
-    assert_eq!(end, End::Exhausted { funding: true });
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (2, 16));
+fn target_rules() {
+    let owners = ["a", "b", "c"];
+    // Later owners that arrived earlier are lineage targets; equal or unknown arrivals never are.
+    // `a` joined in generation 5 above `b` (0) and `c` (3).
+    let since = [Some(5), Some(0), Some(3)];
+    let together = [Some(0); 3];
+    for (owners, since, rank, targets) in [
+        (&owners[..], &since[..], 0, &["b", "c"][..]),
+        (&owners, &since, 1, &[]),
+        (&owners, &since, 2, &[]),
+        (&owners, &since, 3, &[]),
+        (&owners, &together, 0, &[]),
+        (&owners, &[None, Some(0), Some(0)], 0, &[]),
+        (&owners, &[Some(2), None, Some(1)], 0, &["c"]),
+        (&owners[..2], &since[..2], 0, &["b"]),
+    ] {
+        assert_eq!(*lineage_targets(owners, since, rank), *targets);
+    }
+    for (since, counts) in [
+        (&since[..], [2, 0, 0]),
+        (&together, [0; 3]),
+        (&[Some(2), None, Some(1)], [1, 0, 0]),
+        (&since[..1], [0; 3]),
+        (&[], [0; 3]),
+    ] {
+        assert_eq!(lineage_counts(since), counts);
+    }
+    // Lineage targets first, without duplicates, version - 1 targets only below `MAX_HANDOFF`.
+    for (previous, lineage, merged) in [
+        (&["x"][..], &["b", "x", "c"][..], &["b", "x", "c"][..]),
+        (&["x", "y", "z"], &["b"], &["b", "x", "y"]),
+        (&[], &["b"], &["b"]),
+        (&["x", "y"], &[], &["x", "y"]),
+        (&["x", "y"], &["b", "c"], &["b", "c", "x"]),
+        (&[], &[], &[]),
+        (
+            &["x", "y"],
+            &["l1", "d3", "l2", "l3"],
+            &["l1", "d3", "l2", "l3"],
+        ),
+    ] {
+        assert_eq!(*merge_handoff(previous, lineage), *merged);
+    }
+    let handoff = merge_handoff(&["p1", "p2"], &["l1", "d3"]);
+    assert_eq!(handoff, ["l1", "d3", "p1"]);
+    for (handoff, granted, prefix) in [
+        (&["s", "l", "p"][..], &["s", "l"][..], 2),
+        (&["p", "l"], &["l"], 0),
+        (&[], &["l"], 0),
+        (&handoff, &["l1", "d3"], 2),
+    ] {
+        assert_eq!(granted_prefix(handoff, granted), prefix);
+    }
+    // Demoted members that were owners when they arrived. Owners arrived in 5, 6, 7.
+    let d = ["d3", "d4"];
+    let new = [Some(5), Some(6), Some(7)];
+    for (since, demoted_since, rank, targets) in [
+        (&new[..], &[Some(0), Some(1)][..], 0, &["d3", "d4"][..]),
+        // Rank 2 is the newest owner: same targets.
+        (&new, &[Some(0), Some(1)], 2, &["d3", "d4"]),
+        // An owner that arrived before a demoted member never displaced it.
+        (&new, &[Some(5), Some(1)], 0, &["d4"]),
+        // Three members above d4 were present when it arrived.
+        (
+            &[Some(9), Some(2), Some(2)],
+            &[Some(0), Some(3)],
+            0,
+            &["d3"],
+        ),
+        // Unknown arrivals never add a target and count as present above.
+        (&[None, Some(1), Some(1)], &[Some(0), Some(0)], 0, &[]),
+        (&[Some(9), None, None], &[Some(0), None], 0, &["d3"]),
+        (&[Some(9), None, None], &[Some(0), Some(0)], 0, &["d3"]),
+        // Members that arrived together pay nothing; nor does an unknown own arrival.
+        (&[Some(0); 3], &[Some(0); 2], 0, &[]),
+        (&[None, Some(3), Some(3)], &[Some(0); 2], 0, &[]),
+    ] {
+        assert_eq!(
+            *demoted_targets(since, &d, demoted_since, rank, None),
+            *targets
+        );
+    }
+    assert!(demoted_targets::<&str>(&[Some(3); 3], &[], &[], 0, None).is_empty());
+    // Past the third target, up to `MAX_LINEAGE`: owners arrived in 10, 11, 12; d3 at 0, d4 at 1,
+    // d5 at 2 qualify, d6 at 3 had three members above. In reverse every one qualifies.
+    let since = [Some(10), Some(11), Some(12)];
+    let demoted: Vec<u32> = (3..12).collect();
+    let forward: Vec<_> = (0..7).map(Some).collect();
+    let reverse: Vec<_> = (0..7).rev().map(Some).collect();
+    assert_eq!(
+        demoted_targets(&since, &demoted[..7], &forward, 0, None),
+        [3, 4, 5]
+    );
+    let targets = demoted_targets(&since, &demoted[..7], &reverse, 0, None);
+    assert_eq!(*targets, demoted[..MAX_LINEAGE]);
+    assert_eq!(*merge_handoff(&[90, 91], &targets), *targets);
+    assert_eq!(merge_handoff(&[90, 91], &[3]), [3, 90, 91]);
+    assert_eq!(merge_handoff(&[90, 91], &[3, 4, 5, 6]), [3, 4, 5, 6]);
+    // Unknown ages (the chain's start, 5) qualify in rank order when this owner arrived later,
+    // within `MAX_LINEAGE`; a known arrival keeps the arrival rule; the chain start must match;
+    // an owner as old as the chain displaced no one.
+    let since = [Some(8), Some(5), Some(5)];
+    let start = [Some(5); 9];
+    let mixed = [Some(6), Some(6), Some(6), Some(5), Some(5)];
+    assert_eq!(demoted_targets(&since, &demoted, &start, 0, None), [3]);
+    let targets = demoted_targets(&since, &demoted, &start, 0, Some(5));
+    assert_eq!(*targets, demoted[..MAX_LINEAGE]);
+    assert_eq!(
+        demoted_targets(&since, &demoted[..5], &mixed, 0, Some(5)),
+        [3, 6, 7]
+    );
+    assert_eq!(demoted_targets(&since, &demoted, &start, 0, Some(4)), [3]);
+    assert!(demoted_targets(&[Some(5); 3], &demoted, &start, 0, Some(5)).is_empty());
+    assert!(demoted_targets(&since, &demoted, &start, 1, Some(5)).is_empty());
 }
 
 #[test]
-fn stale_membership_ends_and_returns_child_credits() {
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
-    let mut walk = CandidateWalk::new(config(None, 3, order));
-    let mut b = budget(32, 96);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::StaleMembership);
-    assert_eq!(probes.len(), 1);
-    assert_eq!(end, End::StaleMembership);
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
-    assert_eq!(stale_action(true, 1, Some(2)), Ok(StaleAction::Skip));
-    assert_eq!(stale_action(false, 2, Some(2)), Ok(StaleAction::Skip));
-    assert_eq!(stale_action(false, 3, Some(2)), Ok(StaleAction::Skip));
-    assert_eq!(stale_action(false, 2, None), Err(Error::Unavailable));
-    assert_eq!(stale_action(false, 2, Some(3)), Ok(StaleAction::Refresh));
-}
-
-/// A requester ahead of its destination skips the stale owner and reaches the next one instead of
-/// failing the read.
-#[test]
-fn stale_destination_moves_to_the_next_owner() {
-    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
-    let mut b = budget(32, 96);
-    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
-        if p.canonical == 0 {
-            Outcome::StaleDestination
-        } else {
-            Outcome::Copy
+fn remaining_walk() {
+    // (rank, owners, outcomes, probes `(canonical, opportunities)`, end, route links after)
+    for (rank, owners, outcomes, probes, end, route) in [
+        (
+            0,
+            3,
+            &[T_OVL, MISS][..],
+            &[(1, 2), (2, 1)][..],
+            RemainingEnd::Unavailable,
+            8,
+        ),
+        (1, 3, &[VU], &[(2, 1)], RemainingEnd::None, 4),
+        (0, 2, &[COPY], &[(1, 1)], RemainingEnd::Copy, 4),
+        (2, 3, &[], &[], RemainingEnd::None, 4),
+        (0, 2, &[BEHIND], &[(1, 1)], RemainingEnd::Unavailable, 4),
+        (0, 2, &[TIMEOUT], &[(1, 1)], RemainingEnd::Unavailable, 8),
+        (0, 2, &[FAILED], &[(1, 1)], RemainingEnd::Unavailable, 4),
+    ] {
+        let mut walk = RemainingWalk::new(rank, owners);
+        let mut b = budget(8, 16);
+        let mut seen = Vec::new();
+        let mut last = None;
+        for outcome in outcomes {
+            let p = walk.next_probe().unwrap();
+            assert_eq!(p.mode, Mode::CopyOnly);
+            seen.push((p.canonical, p.remaining_opportunities));
+            last = walk.complete(&mut b, *outcome);
         }
-    });
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Copy);
-    // A stale answer is not a route failure: the next probe keeps the normal
-    // per-attempt route ceiling.
-    assert_eq!(b.route_links(), 4);
-}
-
-#[test]
-fn stale_destinations_everywhere_end_exhausted_or_at_origin() {
-    let mut walk = CandidateWalk::new(config(None, 2, VisitOrder::canonical(2)));
-    let mut b = budget(32, 96);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::StaleDestination);
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Exhausted { funding: false });
-    // An owner keeps its origin authority, with transient evidence for the
-    // stale predecessor.
-    let mut walk = CandidateWalk::new(config(Some(1), 2, VisitOrder::canonical(2)));
-    let (_, end) = drive(&mut walk, &mut b, |_, _| Outcome::StaleDestination);
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 1,
-            evidence: vec![ProbeOutcome::Unreachable]
-        }
-    );
-}
-
-#[test]
-fn remaining_walk_treats_a_stale_destination_as_unavailable() {
-    let mut walk = RemainingWalk::new(0, 2);
-    let mut b = budget(4, 8);
-    walk.next_probe().unwrap();
-    assert_eq!(walk.complete(&mut b, Outcome::StaleDestination), None);
-    assert_eq!(walk.next_probe(), Err(RemainingEnd::Unavailable));
-}
-
-#[test]
-fn hedge_continuation_skips_primary_and_carries_its_outcome() {
-    let mut cfg = config(None, 2, VisitOrder::canonical(2));
-    cfg.continuation = Continuation {
-        primary_consumed: true,
-        primary_outcome: Some(ProbeOutcome::VersionUnavailable),
-        bounded_routes: true,
-    };
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(32, 96);
-    let (probes, end) = drive(&mut walk, &mut b, always(ProbeOutcome::VersionUnavailable));
-    assert_eq!(probes.len(), 1);
-    assert_eq!(probes[0].0.canonical, 1);
-    assert_eq!(end, End::VersionUnavailable);
-    let mut cfg = config(None, 2, VisitOrder::canonical(2));
-    cfg.continuation.primary_consumed = true;
-    let mut walk = CandidateWalk::new(cfg);
-    let (_, end) = drive(&mut walk, &mut b, always(ProbeOutcome::VersionUnavailable));
-    assert_eq!(end, End::Exhausted { funding: false });
-}
-
-#[test]
-fn abandon_returns_child_credits() {
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
-    let mut walk = CandidateWalk::new(config(None, 3, order));
-    let mut b = budget(32, 96);
-    assert!(matches!(walk.next(&mut b).unwrap(), Step::Probe(_)));
-    assert_eq!(b.remaining_attempts(), 32 - owner_funding(2));
-    walk.abandon(&mut b).unwrap();
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
-}
-
-#[test]
-fn remaining_walk_probes_later_owners_copy_only() {
-    let mut walk = RemainingWalk::new(0, 3);
-    let mut b = budget(8, 16);
-    let p = walk.next_probe().unwrap();
-    assert_eq!(
-        (p.canonical, p.mode, p.remaining_opportunities),
-        (1, Mode::CopyOnly, 2)
-    );
-    assert_eq!(
-        walk.complete(&mut b, Outcome::Transport(ProbeOutcome::Overloaded)),
-        None
-    );
-    assert_eq!(b.route_links(), 8);
-    let p = walk.next_probe().unwrap();
-    assert_eq!(p.canonical, 2);
-    assert_eq!(
-        walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss)),
-        None
-    );
-    assert_eq!(walk.next_probe(), Err(RemainingEnd::Unavailable));
-    let mut walk = RemainingWalk::new(1, 3);
-    walk.next_probe().unwrap();
-    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::VersionUnavailable));
-    assert_eq!(walk.next_probe(), Err(RemainingEnd::None));
-    let mut walk = RemainingWalk::new(0, 2);
-    walk.next_probe().unwrap();
-    assert_eq!(
-        walk.complete(&mut b, Outcome::Copy),
-        Some(RemainingEnd::Copy)
-    );
-    assert_eq!(
-        RemainingWalk::new(2, 3).next_probe(),
-        Err(RemainingEnd::None)
-    );
+        assert_eq!(seen, probes);
+        assert_eq!(last.unwrap_or_else(|| walk.next_probe().unwrap_err()), end);
+        assert_eq!(b.route_links(), route);
+    }
 }
 
 #[test]
@@ -623,28 +806,21 @@ fn attempt_plan_shares_deadline_and_reserves_credits() {
     // Reserve min(share, (overall - share) / 2) = 4s for fallback.
     assert_eq!(plan.complete_by, deadline - Duration::from_secs(4));
     assert_eq!(plan.observation, Duration::from_secs(4));
-    let hedge = plan_attempt(
-        &mut b,
-        AttemptInputs {
-            route: RouteMode::DirectHedge,
-            mode: Mode::CopyOnly,
-            remaining_opportunities: 1,
-            ..inputs
-        },
-    )
-    .unwrap();
+    let hedge = AttemptInputs {
+        route: RouteMode::DirectHedge,
+        mode: Mode::CopyOnly,
+        remaining_opportunities: 1,
+        ..inputs
+    };
+    let hedge = plan_attempt(&mut b, hedge).unwrap();
     assert_eq!(hedge.attempt_end, now + Duration::from_secs(4));
     assert_eq!(hedge.remote_attempts, 0);
     assert_eq!(hedge.complete_by, hedge.attempt_end);
-    let funded = plan_attempt(
-        &mut b,
-        AttemptInputs {
-            route: RouteMode::FundedRoute,
-            ..inputs
-        },
-    )
-    .unwrap();
-    assert_eq!(funded.remote_attempts, 3);
+    let funded = AttemptInputs {
+        route: RouteMode::FundedRoute,
+        ..inputs
+    };
+    assert_eq!(plan_attempt(&mut b, funded).unwrap().remote_attempts, 3);
     assert_eq!(b.remaining_attempts(), 0);
     let mut empty = AcquisitionBudget::new(deadline, 1, 0);
     assert_eq!(
@@ -658,62 +834,11 @@ fn attempt_plan_shares_deadline_and_reserves_credits() {
     );
 }
 
-#[test]
-fn hedge_rules() {
-    // (page, owner, owners, first, second, attempts, links) -> eligible
-    for (page, owner, owners, first, second, attempts, links, eligible) in [
-        (true, false, &[1, 2, 3][..], 0, 1, 6, 10, true),
-        (true, false, &[1, 2, 3], 0, 1, 5, 10, false),
-        (true, false, &[1, 2, 3], 0, 1, 6, 9, false),
-        (true, false, &[1, 2, 3], 1, 1, 6, 10, false),
-        (true, true, &[1, 2, 3], 0, 1, 6, 10, false),
-        (true, false, &[1], 0, 0, 6, 10, false),
-        (true, false, &[1, 1, 3], 0, 1, 6, 10, false),
-        (false, false, &[1, 2, 3], 0, 1, 6, 10, false),
-    ] {
-        let b = budget(attempts, links);
-        assert_eq!(
-            hedge_eligible(page, owner, owners, first, second, &b),
-            eligible
-        );
-    }
-    let mut b = budget(6, 10);
-    let (secondary, primary) = hedge_budgets(&mut b).unwrap();
-    assert_eq!(
-        (secondary.remaining_attempts(), secondary.remaining_links()),
-        (1, 1)
-    );
-    assert_eq!(
-        (primary.remaining_attempts(), primary.remaining_links()),
-        (2, 1)
-    );
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (3, 8));
-    assert!(hedge_fallback(Error::CorruptRecord));
-    assert!(!hedge_fallback(Error::Unauthorized));
-    assert!(!hedge_fallback(Error::Cancelled));
-    assert_eq!(
-        transport_outcome(Error::Os(1)),
-        Some(ProbeOutcome::Unreachable)
-    );
-    assert_eq!(
-        transport_outcome(Error::Overloaded),
-        Some(ProbeOutcome::Overloaded)
-    );
-    assert_eq!(transport_outcome(Error::Unauthorized), None);
-    assert_eq!(transport_outcome(Error::DeadlineExceeded), None);
-    // A local hop budget shortfall is evidence, not terminal.
-    assert_eq!(
-        transport_outcome(Error::HopBudgetExhausted),
-        Some(ProbeOutcome::Unreachable)
-    );
-}
-
 /// Once the links are spent, each later probe fails locally in `plan_attempt` and is recorded as
-/// unreachable; the walk ends `Exhausted` (recoverable) instead of abandoning with
-/// `HopBudgetExhausted`.
+/// unreachable; the walk ends `Exhausted` (recoverable) instead of abandoning.
 #[test]
 fn spent_links_end_the_walk_exhausted() {
-    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    let mut walk = CandidateWalk::new(reader(3));
     let mut b = budget(32, 16);
     b.note_route_failure();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -733,763 +858,66 @@ fn spent_links_end_the_walk_exhausted() {
     assert_eq!(b.remaining_links(), 0);
 }
 
-/// A pending handoff probe tells callers a
-/// stale answer comes from a handoff target (a miss, no refresh), and a
-/// `StaleDestination` from one is also only a miss, never walk evidence.
+/// Abandoning returns a pending child's credits, and drops a pending successor's grant.
 #[test]
-fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(8, 32);
-    assert!(!walk.pending.as_ref().is_some_and(|p| p.handoff));
-    let mut seen = Vec::new();
-    let end = loop {
-        match walk.next(&mut b).unwrap() {
-            Step::Granted(_) => unreachable!("grants are sequential here"),
-            Step::Probe(p) => {
-                seen.push((
-                    p.canonical,
-                    walk.pending.as_ref().is_some_and(|p| p.handoff),
-                ));
-                let outcome = if walk.pending.as_ref().is_some_and(|p| p.handoff) {
-                    Outcome::StaleDestination
-                } else {
-                    Outcome::Probe(ProbeOutcome::CopyMiss)
-                };
-                if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
-                    break end;
-                }
-                assert!(!walk.pending.as_ref().is_some_and(|p| p.handoff));
-            }
-            Step::End(end) => break end,
-        }
+fn abandon_returns_credits() {
+    let mut walk = CandidateWalk::new(first(2));
+    let mut b = budget(32, 96);
+    assert!(matches!(walk.next(&mut b).unwrap(), Step::Probe(_)));
+    assert_eq!(b.remaining_attempts(), 32 - owner_funding(2));
+    walk.abandon(&mut b).unwrap();
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
+    let mut walk = CandidateWalk::new(WalkConfig {
+        handoff: 1,
+        granted: 1,
+        ..owner(0)
+    });
+    let mut b = budget(2, 3);
+    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+        panic!("expected a successor probe");
     };
-    assert_eq!(seen, [(0, false), (3, true)]);
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 1,
-            evidence: vec![ProbeOutcome::CopyMiss]
-        }
+    assert!(
+        walk.pending
+            .as_ref()
+            .is_some_and(|p| p.granted && p.handoff)
     );
-}
-
-/// Handoff probes are opportunistic, so they must not reserve credits that make an owner skip the
-/// delegation to rank 0 and fetch the page itself.
-#[test]
-fn handoff_targets_do_not_block_delegation() {
-    for (rank, attempts) in [(1, 3), (2, 4)] {
-        for handoff in 0..=MAX_HANDOFF {
-            let mut cfg = config(Some(rank), 3, VisitOrder::canonical(3));
-            cfg.handoff = handoff;
-            let mut walk = CandidateWalk::new(cfg);
-            let mut b = budget(attempts, 16);
-            let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-                panic!("expected a probe");
-            };
-            assert_eq!(
-                (probe.canonical, probe.mode),
-                (0, Mode::Acquire),
-                "rank {rank} handoff {handoff}"
-            );
-            // The owner keeps one credit per later predecessor and one for
-            // its own origin attempt.
-            assert_eq!(b.remaining_attempts(), rank as u32);
-        }
-    }
-}
-
-/// Rank 0 reached by an owner's delegation asks previous owners only with credits the delegation
-/// carries. An owner that sees an ownership change forwards its spare credits (up to
-/// [`MAX_HANDOFF`]); an owner that sees none forwards exactly the exchange and the origin credit.
-#[test]
-fn delegation_forwards_spare_credits_for_rank_zero_handoff() {
-    for (handoff, attempts, child) in [(0, 8, 2), (1, 3, 2), (1, 4, 3), (2, 6, 5), (3, 16, 5)] {
-        let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-        cfg.handoff = handoff;
-        let mut walk = CandidateWalk::new(cfg);
-        let mut b = budget(attempts, 16);
-        let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-            panic!("expected a probe");
-        };
-        assert_eq!(probe.mode, Mode::Acquire);
-        assert_eq!(probe.route, RouteMode::FundedRoute);
-        assert_eq!(
-            walk.request_budget(&mut b).remaining_attempts(),
-            child,
-            "handoff {handoff} attempts {attempts}"
-        );
-        // The owner keeps its origin credit, never less.
-        assert!(b.remaining_attempts() >= 1);
-        assert_eq!(b.remaining_attempts() + child, attempts);
-    }
-}
-
-/// The delegation route comes first. Rank 2 with five inherited links (a failure route) gives the
-/// Acquire four and keeps one for rank 1's copy-only probe instead of splitting them evenly (two
-/// each, too few to reach rank 0 in most topologies).
-#[test]
-fn delegation_route_takes_priority_over_later_predecessors() {
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let mut b = budget(6, 5);
-    b.note_route_failure();
-    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-        panic!("expected a probe");
-    };
-    assert_eq!(probe.mode, Mode::Acquire);
-    assert_eq!(walk.request_budget(&mut b).remaining_links(), 4);
-    assert_eq!(b.remaining_links(), 1);
-}
-
-/// Handoff targets are asked in previous rank order, each with whatever
-/// links the earlier ones left, so the first (most likely holder) gets a
-/// usable route rather than an even share of a small pool.
-#[test]
-fn handoff_probes_take_remaining_links_in_order() {
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 3;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(8, 3);
-    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-        panic!("expected a probe");
-    };
     assert_eq!(probe.canonical, 3);
-    assert_eq!(walk.request_budget(&mut b).remaining_links(), 3);
+    walk.abandon(&mut b).unwrap();
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (2, 3));
 }
 
-#[test]
-fn same_rank_previous_marks_unchanged_predecessors() {
-    // Unchanged owners: every predecessor of rank 2.
-    assert_eq!(same_rank_previous(&[1, 2, 3], &[1, 2, 3], 2), 0b11);
-    // Rank 0 has no predecessors.
-    assert_eq!(same_rank_previous(&[1, 2, 3], &[1, 2, 3], 0), 0);
-    // A join at rank 0 shifts everyone: nothing held the same rank.
-    assert_eq!(same_rank_previous(&[1, 2, 3], &[9, 1, 2], 2), 0);
-    // A removal at rank 1 keeps rank 0.
-    assert_eq!(same_rank_previous(&[1, 2, 3], &[1, 3, 4], 2), 0b01);
-    // Fewer owners before.
-    assert_eq!(same_rank_previous(&[1], &[1, 2, 3], 2), 0b01);
-    assert_eq!(same_rank_previous::<i32>(&[], &[1, 2], 1), 0);
-}
-
-/// Predecessors that held the same rank under the previous membership are asked under it, so one
-/// that has not adopted the current version yet serves instead of answering `StaleMembership`.
-#[test]
-fn predecessors_with_unchanged_rank_are_asked_under_the_previous_membership() {
-    let mut cfg = config(Some(2), 3, VisitOrder::canonical(3));
-    cfg.previous = 0b01;
-    cfg.handoff = 1;
-    let (probes, end) = run(cfg, 8, 32, |p, _| {
-        Outcome::Probe(if p.canonical == 0 {
-            ProbeOutcome::Overloaded
-        } else {
-            ProbeOutcome::CopyMiss
-        })
-    });
-    assert_eq!(
-        probes
-            .iter()
-            .map(|(p, ..)| (p.canonical, p.mode, p.previous))
-            .collect::<Vec<_>>(),
-        [
-            (0, Mode::Acquire, true),
-            (1, Mode::CopyOnly, false),
-            // Handoff targets are never asked under the previous membership.
-            (3, Mode::CopyOnly, false)
-        ]
-    );
-    assert!(matches!(end, End::Origin { rank: 2, .. }));
-    // A copy from the predecessor asked under the previous membership wins.
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.previous = 0b01;
-    let (probes, end) = run(cfg, 8, 32, |_, _| Outcome::Copy);
-    assert!(probes[0].0.previous);
-    assert_eq!(end, End::Copy);
-    // Non-owners and non-page walks ignore the bits.
-    let mut cfg = config(None, 3, VisitOrder::canonical(3));
-    cfg.previous = 0b111;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, _) = drive(
-        &mut walk,
-        &mut budget(8, 32),
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert!(probes.iter().all(|(p, ..)| !p.previous));
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.previous = 0b01;
-    cfg.page_operation = false;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, _) = drive(
-        &mut walk,
-        &mut budget(8, 32),
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert!(!probes[0].0.previous);
-}
-
-/// A `StaleMembership` (or `StaleDestination`) answer to a probe sent under
-/// the previous membership means the destination no longer resolves it: the
-/// walk records transient evidence and moves on; it never refreshes.
-#[test]
-fn stale_answer_under_the_previous_membership_is_transient_evidence() {
-    for stale in [Outcome::StaleMembership, Outcome::StaleDestination] {
-        let mut cfg = config(Some(2), 3, VisitOrder::canonical(3));
-        cfg.previous = 0b11;
-        let mut walk = CandidateWalk::new(cfg);
-        let mut b = budget(8, 32);
-        let mut seen = Vec::new();
-        let (probes, end) = drive(&mut walk, &mut b, |p, _| {
-            seen.push(p.previous);
-            if p.canonical == 0 {
-                stale
-            } else {
-                Outcome::Probe(ProbeOutcome::CopyMiss)
-            }
-        });
-        assert_eq!(probes.len(), 2);
-        assert_eq!(seen, [true, true]);
-        assert_eq!(
-            end,
-            End::Origin {
-                rank: 2,
-                evidence: vec![ProbeOutcome::Unreachable, ProbeOutcome::CopyMiss]
-            }
-        );
-        assert_eq!((b.remaining_attempts(), b.remaining_links()), (8, 32));
-    }
-}
-fn helper_config(order: VisitOrder) -> WalkConfig {
-    WalkConfig {
-        helper: true,
-        ..config(None, 3, order)
-    }
-}
-
-fn shapes(probes: &[(Probe, u32, u8)]) -> Vec<(usize, Mode, RouteMode)> {
-    probes
-        .iter()
-        .map(|(p, ..)| (p.canonical, p.mode, p.route))
-        .collect()
-}
-
-#[test]
-fn overloaded_owner_sends_the_reader_to_its_helper_once() {
-    let (probes, end) = run(helper_config(VisitOrder::canonical(3)), 8, 16, |p, _| {
-        if p.canonical == 3 {
-            Outcome::Copy
-        } else {
-            Outcome::Shed
-        }
-    });
-    assert_eq!(end, End::Copy);
-    assert_eq!(
-        shapes(&probes),
-        vec![
-            (0, Mode::Acquire, RouteMode::SharedRoute),
-            (3, Mode::Acquire, RouteMode::FundedRoute),
-        ]
-    );
-    // The helper probe is funded from what the owner probe left, capped.
-    let (_, attempts, links) = probes[1];
-    assert!(
-        (HELPER_FLOOR_ATTEMPTS..=HELPER_ATTEMPTS).contains(&attempts),
-        "{attempts}"
-    );
-    assert!(
-        (HELPER_FLOOR_LINKS..=HELPER_LINKS).contains(&links),
-        "{links}"
-    );
-}
-
-#[test]
-fn helper_probe_forwards_its_full_funded_envelope() {
-    // Without a route failure the reader routes with four links per attempt, and a helper reached
-    // by such a route keeps two or three links, too few to reach rank 0 through a relay. The
-    // helper's envelope is every link it is funded with, as for a funded owner.
-    for links in [HELPER_FLOOR_LINKS, HELPER_LINKS, 16] {
-        let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
-        let mut b = budget(8, links);
-        let mut seen = None;
-        let (_, end) = drive(&mut walk, &mut b, |p, request| {
-            if p.canonical == 3 {
-                seen = Some((request.route_links(), request.remaining_links()));
-                Outcome::Copy
-            } else {
-                Outcome::Shed
-            }
-        });
-        assert_eq!(end, End::Copy);
-        let (route, funded) = seen.expect("helper asked");
-        assert_eq!(route, funded, "links {links}");
-        assert_eq!(funded, links.min(HELPER_LINKS), "links {links}");
-    }
-}
-
-#[test]
-fn helper_miss_falls_back_to_remaining_owners_and_never_repeats() {
-    let (probes, end) = run(helper_config(VisitOrder::canonical(3)), 32, 64, |_, _| {
-        Outcome::Shed
-    });
-    let canon: Vec<_> = probes.iter().map(|(p, ..)| p.canonical).collect();
-    assert_eq!(canon, vec![0, 3, 1, 2]);
-    assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
-}
-
-#[test]
-fn only_a_destination_shed_asks_the_helper() {
-    // Relay overload and timeouts say the route is congested, not the page.
-    for outcome in [
-        Outcome::Probe(ProbeOutcome::Overloaded),
-        Outcome::Transport(ProbeOutcome::Overloaded),
-        Outcome::Transport(ProbeOutcome::Unreachable),
-        Outcome::Probe(ProbeOutcome::CopyMiss),
-    ] {
-        let (probes, _) = run(helper_config(VisitOrder::canonical(3)), 32, 64, |_, _| {
-            outcome
-        });
-        assert!(probes.iter().all(|(p, ..)| p.canonical < 3), "{outcome:?}");
-    }
-}
-
-#[test]
-fn owner_probes_are_planned_exactly_as_without_a_helper() {
-    // Without overflow the helper changes nothing, for every visit order.
-    for first in 0..3 {
-        let order = visit_order(ReplicaSelection::Spread, 3, |r| r == first, |_| 0);
-        let run = |helper: bool| {
-            let mut walk = CandidateWalk::new(WalkConfig {
-                helper,
-                ..config(None, 3, order)
-            });
-            let mut b = budget(8, 16);
-            let (probes, end) = drive(&mut walk, &mut b, always(ProbeOutcome::CopyMiss));
-            (probes, end, b.remaining_attempts(), b.remaining_links())
-        };
-        assert_eq!(run(true), run(false), "first {first}");
-    }
-}
-
-#[test]
-fn helper_never_chains_and_owners_never_use_helpers() {
-    // A helper inherits at most HELPER_ATTEMPTS - 1: too few to be eligible.
-    const { assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS) };
-    let (probes, _) = run(
-        helper_config(VisitOrder::canonical(3)),
-        HELPER_ATTEMPTS,
-        8,
-        |_, _| Outcome::Shed,
-    );
-    assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
-    // Owners ignore the helper flag.
-    let (probes, end) = run(
-        WalkConfig {
-            helper: true,
-            ..config(Some(2), 3, VisitOrder::canonical(3))
-        },
-        8,
-        16,
-        |_, _| Outcome::Shed,
-    );
-    assert!(probes.iter().all(|(p, ..)| p.canonical < 2));
-    assert!(matches!(end, End::Origin { rank: 2, .. }));
-}
-
-#[test]
-fn helper_is_skipped_when_too_little_is_left() {
-    // Rank 2 first is funded with `owner_funding(2)` = 5 of 6 and spends it
-    // all (forwarded credits never come back), leaving 1 < the floor.
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
-    let (probes, _) = run(
-        helper_config(order),
-        HELPER_MIN_ATTEMPTS + 1,
-        16,
-        |_, request| {
-            // The exchange forwards every credit of its budget.
-            let _ = request.transfer();
-            Outcome::Shed
-        },
-    );
-    let canon: Vec<_> = probes.iter().map(|(p, ..)| p.canonical).collect();
-    assert_eq!(canon[0], 2);
-    assert!(canon.iter().all(|c| *c < 3), "{canon:?}");
-}
-
-#[test]
-fn small_budget_non_owner_visits_rank_zero_first() {
-    // A helper's inherited budget cannot fund rank 2 out of order at all; it
-    // asks rank 0 (the origin authority) first instead of ending the walk on
-    // funding before any probe.
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
-    assert_eq!(order.get(0), Some(2));
-    let (probes, end) = run(config(None, 3, order), HELPER_ATTEMPTS - 1, 7, |p, _| {
-        if p.canonical == 0 {
-            Outcome::Copy
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
-    assert_eq!(
-        shapes(&probes)[0],
-        (0, Mode::Acquire, RouteMode::SharedRoute)
-    );
-    assert_eq!(end, End::Copy);
-}
-
-#[test]
-fn hedged_primary_overload_does_not_ask_the_helper() {
-    // A hedge reports only `ProbeOutcome::Overloaded`, without who signed it,
-    // so it never counts as a destination shed.
-    let mut cfg = helper_config(VisitOrder::canonical(3));
-    cfg.continuation.primary_consumed = true;
-    cfg.continuation.primary_outcome = Some(ProbeOutcome::Overloaded);
-    let (probes, end) = run(cfg, 8, 16, |_, _| Outcome::Copy);
-    assert_eq!(probes[0].0.canonical, 1);
-    assert_eq!(end, End::Copy);
-}
-
+/// A destination's own shed is evidence but not a route failure; a transport overload is both.
 #[test]
 fn destination_shed_is_evidence_but_not_a_route_failure() {
-    for (outcome, failed) in [
-        (Outcome::Shed, false),
-        (Outcome::Transport(ProbeOutcome::Overloaded), true),
-    ] {
-        let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    for (outcome, route) in [(SHED, 4), (T_OVL, 8)] {
+        let mut walk = CandidateWalk::new(reader(3));
         let mut b = budget(32, 64);
         let Step::Probe(_) = walk.next(&mut b).unwrap() else {
             panic!("probe")
         };
         assert_eq!(walk.complete(&mut b, outcome).unwrap(), None);
         assert_eq!(&walk.evidence[..], &[ProbeOutcome::Overloaded]);
-        assert_eq!(b.route_links(), if failed { 8 } else { 4 }, "{outcome:?}");
+        assert_eq!(b.route_links(), route, "{outcome:?}");
     }
-}
-
-/// An owner whose probe of rank 0 (a delegated `Acquire`, or copy-only when it cannot fund one) is
-/// sent but unanswered within the attempt does not fetch origin: rank 0 is most likely still
-/// fetching, and this owner's request would queue behind it at the same origin.
-#[test]
-fn owner_leaves_the_fetch_to_rank_zero_after_a_timeout() {
-    // Delegated Acquire (rank 1, enough credits).
-    let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
-    let mut b = budget(8, 32);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::TimedOut);
-    assert_eq!(probes.len(), 1);
-    assert_eq!(probes[0].0.mode, Mode::Acquire);
-    assert_eq!(end, End::Exhausted { funding: false });
-    assert!(walk.rank0_unanswered);
-    // Copy-only probe of rank 0 (too few credits to delegate): it joined
-    // rank 0's running acquisition, so the same holds.
-    let (probes, end) = run(
-        config(Some(1), 3, VisitOrder::canonical(3)),
-        2,
-        16,
-        |_, _| Outcome::TimedOut,
-    );
-    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
-    assert_eq!(end, End::Exhausted { funding: false });
-    // Rank 2: rank 0 timed out, rank 1 still asked copy-only; its copy wins.
-    let (probes, end) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        8,
-        32,
-        |p, _| {
-            if p.canonical == 0 {
-                Outcome::TimedOut
-            } else {
-                Outcome::Copy
-            }
-        },
-    );
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Copy);
-    // Rank 2: rank 0 timed out and rank 1 missed: still no origin.
-    let (_, end) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        8,
-        32,
-        |p, _| {
-            if p.canonical == 0 {
-                Outcome::TimedOut
-            } else {
-                Outcome::Probe(ProbeOutcome::CopyMiss)
-            }
-        },
-    );
-    assert_eq!(end, End::Exhausted { funding: false });
-}
-
-/// The rule covers only an owner's probe of rank 0. A transport failure or a
-/// miss from rank 0 still gives an owner origin authority, a timeout of a
-/// later predecessor or a handoff target does not block it, and for a
-/// non-owner a timeout is the same evidence as `Transport(Unreachable)`.
-#[test]
-fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
-    for outcome in [
-        Outcome::Transport(ProbeOutcome::Unreachable),
-        Outcome::Probe(ProbeOutcome::Overloaded),
-        Outcome::Probe(ProbeOutcome::CopyMiss),
-        Outcome::Shed,
-    ] {
-        let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
-        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
-        assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
-        assert!(!walk.rank0_unanswered);
-    }
-    // Rank 2: rank 1 timing out (copy-only) does not withhold origin.
-    let (_, end) = run(
-        config(Some(2), 3, VisitOrder::canonical(3)),
-        8,
-        32,
-        |p, _| {
-            if p.canonical == 0 {
-                Outcome::Probe(ProbeOutcome::CopyMiss)
-            } else {
-                Outcome::TimedOut
-            }
-        },
-    );
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 2,
-            evidence: vec![ProbeOutcome::CopyMiss, ProbeOutcome::Unreachable]
-        }
-    );
-    // Non-page walks (metadata) keep the timeout as transient evidence.
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.page_operation = false;
-    let (_, end) = run(cfg, 8, 32, |_, _| Outcome::TimedOut);
-    assert!(matches!(end, End::Origin { rank: 1, .. }));
-    // A handoff target timing out is only a miss.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    let (probes, end) = run(cfg, 8, 32, |_, _| Outcome::TimedOut);
-    assert_eq!(probes.len(), 1);
-    assert!(matches!(end, End::Origin { rank: 0, .. }));
-    // Non-owner: identical to an unreachable owner, including the route
-    // failure it notes.
-    let run = |outcome: Outcome| {
-        let mut walk = CandidateWalk::new(config(None, 2, VisitOrder::canonical(2)));
-        let mut b = budget(32, 96);
-        let (probes, end) = drive(&mut walk, &mut b, |_, _| outcome);
-        (probes.len(), end, b.route_links(), walk.rank0_unanswered)
-    };
-    assert_eq!(
-        run(Outcome::TimedOut),
-        run(Outcome::Transport(ProbeOutcome::Unreachable))
-    );
-    // The remaining walk treats a timeout as unavailable.
-    let mut remaining = RemainingWalk::new(0, 2);
-    let mut b = budget(8, 32);
-    remaining.next_probe().unwrap();
-    assert_eq!(remaining.complete(&mut b, Outcome::TimedOut), None);
-    assert_eq!(remaining.next_probe(), Err(RemainingEnd::Unavailable));
-}
-
-/// The rank 0 watch bounds the timeout rule. Once rank 0 stayed silent for a request timeout
-/// (`Overdue`), a timeout gives authority; `Fetching` keeps the rule and changes nothing else (a
-/// route failure, `Overloaded`, shed or miss from rank 0 still gives authority).
-/// Probes are planned the same in every state.
-#[test]
-fn rank_zero_watch_bounds_the_timeout_rule() {
-    let with = |rank: usize, state: Rank0State| WalkConfig {
-        rank0: state,
-        ..config(Some(rank), 3, VisitOrder::canonical(3))
-    };
-    let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
-    assert_eq!(end, End::Exhausted { funding: false });
-    assert!(walk.rank0_unanswered);
-    for outcome in [
-        Outcome::Transport(ProbeOutcome::Unreachable),
-        Outcome::Transport(ProbeOutcome::Overloaded),
-        Outcome::Probe(ProbeOutcome::Overloaded),
-        Outcome::Shed,
-        Outcome::Probe(ProbeOutcome::CopyMiss),
-        Outcome::Probe(ProbeOutcome::Unreachable),
-    ] {
-        let (_, end) = run(with(1, Rank0State::Fetching), 8, 32, |_, _| outcome);
-        assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
-    }
-    // Overdue: a timeout is a transport failure again, at rank 1 and 2.
-    let mut walk = CandidateWalk::new(with(1, Rank0State::Overdue));
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
-    assert!(matches!(end, End::Origin { rank: 1, .. }));
-    assert!(!walk.rank0_unanswered);
-    let (_, end) = run(with(2, Rank0State::Overdue), 8, 32, |p, _| {
-        if p.canonical == 0 {
-            Outcome::TimedOut
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
-    assert!(matches!(end, End::Origin { rank: 2, .. }));
-    // Non-owners and rank 0 ignore the state; probes and budgets match.
-    for state in [Rank0State::Fetching, Rank0State::Overdue] {
-        let run = |cfg: WalkConfig| {
-            let mut walk = CandidateWalk::new(cfg);
-            let mut b = budget(8, 32);
-            let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::TimedOut);
-            (
-                shapes(&probes),
-                end,
-                b.remaining_attempts(),
-                b.remaining_links(),
-            )
-        };
-        for rank in [None, Some(0)] {
-            let base = config(rank, 3, VisitOrder::canonical(3));
-            assert_eq!(
-                run(WalkConfig {
-                    rank0: state,
-                    ..base
-                }),
-                run(base)
-            );
-        }
-        let probes = |cfg: WalkConfig| {
-            let mut walk = CandidateWalk::new(cfg);
-            let mut b = budget(8, 32);
-            let (probes, _) = drive(&mut walk, &mut b, |_, _| Outcome::TimedOut);
-            (shapes(&probes), b.remaining_attempts(), b.remaining_links())
-        };
-        assert_eq!(probes(with(1, state)), probes(with(1, Rank0State::Unknown)));
-    }
-}
-
-/// Later owners that arrived before an owner are its lineage targets; equal or unknown arrivals
-/// never are.
-#[test]
-fn lineage_targets_are_later_owners_that_arrived_earlier() {
-    let owners = ["a", "b", "c"];
-    // `a` joined in generation 5 above `b` (0) and `c` (3).
-    let since = [Some(5), Some(0), Some(3)];
-    assert_eq!(lineage_targets(&owners, &since, 0), vec!["b", "c"]);
-    // `b` is older than `c`: `c` never ranked above it.
-    assert!(lineage_targets(&owners, &since, 1).is_empty());
-    assert!(lineage_targets(&owners, &since, 2).is_empty());
-    assert_eq!(lineage_counts(&since), [2, 0, 0]);
-    // Members that arrived together (a fresh chain) pay nothing.
-    let together = [Some(0); 3];
-    assert!(lineage_targets(&owners, &together, 0).is_empty());
-    assert_eq!(lineage_counts(&together), [0; 3]);
-    // Unknown arrivals (not ranked in this chain) never qualify.
-    assert!(lineage_targets(&owners, &[None, Some(0), Some(0)], 0).is_empty());
-    assert_eq!(
-        lineage_targets(&owners, &[Some(2), None, Some(1)], 0),
-        vec!["c"]
-    );
-    assert_eq!(lineage_counts(&[Some(2), None, Some(1)]), [1, 0, 0]);
-    // Out of range or short rankings.
-    assert!(lineage_targets(&owners, &since, 3).is_empty());
-    assert_eq!(lineage_targets(&owners[..2], &since[..2], 0), vec!["b"]);
-    assert_eq!(lineage_counts(&since[..1]), [0; 3]);
-    assert_eq!(lineage_counts(&[]), [0; 3]);
-}
-
-#[test]
-fn merge_handoff_keeps_lineage_targets_first_without_duplicates() {
-    assert_eq!(merge_handoff(&["x"], &["b", "x", "c"]), vec!["b", "x", "c"]);
-    assert_eq!(merge_handoff(&["x", "y", "z"], &["b"]), vec!["b", "x", "y"]);
-    assert_eq!(merge_handoff::<&str>(&[], &["b"]), vec!["b"]);
-    assert_eq!(merge_handoff(&["x", "y"], &[]), vec!["x", "y"]);
-    assert_eq!(merge_handoff(&["x", "y"], &["b", "c"]), vec!["b", "c", "x"]);
-    assert!(merge_handoff::<&str>(&[], &[]).is_empty());
-}
-
-/// A delegation to rank 0 forwards spare credits for rank 0's lineage targets even when this owner
-/// has no handoff targets of its own; never the owner's own origin credit.
-#[test]
-fn delegation_forwards_spare_credits_for_rank_zero_lineage() {
-    for (lineage, attempts, child) in [(0, 8, 2), (1, 3, 2), (1, 4, 3), (2, 8, 4), (2, 4, 3)] {
-        let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-        cfg.lineage = [lineage, 0, 0];
-        let mut walk = CandidateWalk::new(cfg);
-        let mut b = budget(attempts, 16);
-        let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-            panic!("expected a probe");
-        };
-        assert_eq!(probe.mode, Mode::Acquire);
-        assert_eq!(
-            walk.request_budget(&mut b).remaining_attempts(),
-            child,
-            "lineage {lineage} attempts {attempts}"
-        );
-        assert!(b.remaining_attempts() >= 1);
-        assert_eq!(b.remaining_attempts() + child, attempts);
-    }
-}
-
-/// A non-owner's out-of-order Acquire carries one more credit per lineage target of the destination
-/// and of rank 0, only from slack.
-#[test]
-fn non_owner_funds_destination_lineage_from_slack_only() {
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
-    assert_eq!(order.ranks().collect::<Vec<_>>(), [1, 2, 0]);
-    let first = |attempts: u32, lineage: [u8; 3]| {
-        let mut cfg = config(None, 3, order);
-        cfg.lineage = lineage;
-        let mut walk = CandidateWalk::new(cfg);
-        let mut b = budget(attempts, 16);
-        let Step::Probe(p) = walk.next(&mut b).unwrap() else {
-            panic!("expected a probe");
-        };
-        (
-            p.canonical,
-            walk.request_budget(&mut b).remaining_attempts(),
-        )
-    };
-    // Plenty of slack: rank 1 gets its funding plus its one target.
-    assert_eq!(first(32, [0, 1, 0]), (1, owner_funding(1) + 1));
-    // And for rank 0's, which rank 1 forwards when it delegates.
-    assert_eq!(first(32, [2, 0, 1]), (1, owner_funding(1) + 2));
-    assert_eq!(first(32, [1, 1, 0]), (1, owner_funding(1) + 2));
-    // Not for another later rank's targets.
-    assert_eq!(first(32, [0, 0, 1]), (1, owner_funding(1)));
-    // Without slack for the extra credit, funding is as before: the later
-    // visits of ranks 2 and 0 keep `owner_funding_min` each (4 + 2).
-    assert_eq!(
-        owner_funding(1) + 1 + owner_funding_min(2) + owner_funding_min(0),
-        11
-    );
-    assert_eq!(first(11, [0, 1, 0]), (1, owner_funding(1) + 1));
-    assert_eq!(first(10, [0, 1, 0]), (1, owner_funding(1)));
-    assert_eq!(first(8, [0, 1, 0]), (1, owner_funding(1)));
-    assert_eq!(first(8, [0, 0, 0]), (1, owner_funding(1)));
 }
 
 /// A reader waiting for a destination that is behind asks the same destination again, with the
-/// credits its verified `StaleMembership` returned, and then walks on as before.
+/// credits its verified `StaleMembership` returned, and then walks on.
 #[test]
 fn retry_pending_plans_the_same_destination_again() {
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
-    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let mut walk = CandidateWalk::new(config(None, 3, order_120()));
     let mut b = budget(8, 16);
     let Step::Probe(first) = walk.next(&mut b).unwrap() else {
         panic!("expected a probe");
     };
     assert_eq!(first.canonical, 1);
-    let request = walk.request_budget(&mut b);
-    let plan = |request: &mut AcquisitionBudget, mode| {
-        plan_attempt(
-            request,
-            AttemptInputs {
-                now: Instant::now(),
-                caller_deadline: Instant::now() + Duration::from_secs(30),
-                attempt_timeout: Duration::from_secs(2),
-                remaining_opportunities: 3,
-                mode,
-                route: RouteMode::FundedRoute,
-                failure_links: 8,
-            },
-        )
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let sent = plan(walk.request_budget(&mut b), deadline, &first)
         .unwrap()
-    };
-    let sent = plan(request, first.mode).remote_attempts;
+        .remote_attempts;
     assert_eq!(sent, owner_funding(1) - 1);
     // The destination was behind: its credits come back, the exchange not.
-    request.refund_remote(sent).unwrap();
+    walk.request_budget(&mut b).refund_remote(sent).unwrap();
     walk.retry_pending(&mut b).unwrap();
     assert_eq!(b.remaining_attempts(), 7);
     let Step::Probe(again) = walk.next(&mut b).unwrap() else {
@@ -1503,146 +931,114 @@ fn retry_pending_plans_the_same_destination_again() {
         walk.request_budget(&mut b).remaining_attempts(),
         owner_funding_min(1)
     );
-    // Then the walk goes on as usual.
-    walk.complete(&mut b, Outcome::StaleDestination).unwrap();
+    walk.complete(&mut b, BEHIND).unwrap();
     let Step::Probe(next) = walk.next(&mut b).unwrap() else {
         panic!("expected a probe");
     };
     assert_eq!(next.canonical, 2);
 }
 
+/// A further ask of a destination that is behind must leave attempts for every later visit's
+/// minimum and a full route share of links for each; the last visit needs nothing after it.
 #[test]
-fn delegated_rank_zero_asks_successors_on_their_own_grant() {
-    // Rank 0 reached by a delegation: one origin credit, one link. The
-    // successor probe is funded by its grant; the previous-membership target
-    // after it is not (it would spend the origin credit).
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 2;
-    cfg.granted = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(1, 1);
-    let mut granted = Vec::new();
-    let (probes, end) = drive(&mut walk, &mut b, |_, request| {
-        granted.push((request.remaining_attempts(), request.remaining_links()));
-        Outcome::Probe(ProbeOutcome::CopyMiss)
-    });
-    assert_eq!(
-        probes
-            .iter()
-            .map(|(p, ..)| (p.canonical, p.mode, p.route))
-            .collect::<Vec<_>>(),
-        [(3, Mode::CopyOnly, RouteMode::FundedRoute)]
-    );
-    assert_eq!(granted, [(SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)]);
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 0,
-            evidence: Vec::new()
-        }
-    );
-    // The walk's own credits are untouched: the origin attempt remains.
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
-
-    // A successor's copy ends the walk.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    cfg.granted = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(1, 1);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Copy);
-    assert_eq!(probes.len(), 1);
-    assert_eq!(end, End::Copy);
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
-}
-
-#[test]
-fn successor_grant_never_grows_the_walk_budget() {
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 2;
-    cfg.granted = 2;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(1, 10);
-    // An unreachable successor is a miss and does not mark this walk's
-    // route as failed (the grant's route is not this walk's).
-    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
-        if p.canonical == 3 {
-            Outcome::Transport(ProbeOutcome::Unreachable)
-        } else {
-            Outcome::StaleMembership
-        }
-    });
-    assert_eq!(probes.len(), 2);
-    assert!(probes.iter().all(|(p, ..)| p.mode == Mode::CopyOnly));
-    assert!(matches!(end, End::Origin { rank: 0, .. }));
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 10));
-    assert_eq!(b.route_links(), 4);
-
-    // Abandoning a pending successor probe drops its grant.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    cfg.granted = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(2, 3);
-    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-        panic!("expected a successor probe");
+fn retry_affordable_keeps_later_visits_funded() {
+    for (attempts, links, affordable) in [
+        (8, 16, false),
+        (16, 32, true),
+        (16, 8, false),
+        (6, 32, false),
+    ] {
+        let mut walk = CandidateWalk::new(config(None, 3, order_120()));
+        let mut b = budget(attempts, links);
+        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        assert_eq!(walk.retry_affordable(&b), affordable, "{attempts} {links}");
+    }
+    let mut walk = CandidateWalk::new(config(None, 3, order_120()));
+    let mut b = budget(8, 16);
+    for _ in 0..2 {
+        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        walk.complete(&mut b, BEHIND).unwrap();
+    }
+    let Step::Probe(last) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
     };
-    assert!(walk.pending.as_ref().is_some_and(|p| p.granted));
-    assert!(walk.pending.as_ref().is_some_and(|p| p.handoff));
-    assert_eq!(probe.canonical, 3);
-    walk.abandon(&mut b).unwrap();
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (2, 3));
+    assert_eq!(last.index, 2);
+    assert!(walk.retry_affordable(&b));
 }
 
+/// The bound on a read's second stale wait. Every exchange reserves its route's links and
+/// transport never returns them. With the `stale_unused_links` refund, a default read whose owners
+/// are all behind asks each of them and waits once at its first visit; the second wait (a fifth
+/// exchange) is affordable only at its last visit, and only when that visit is rank 0 or 1.
 #[test]
-fn owner_above_rank_zero_asks_successors_after_its_delegation() {
-    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
-    cfg.handoff = 1;
-    cfg.granted = 1;
-    let (probes, end) = run(cfg, 3, 8, |p, _| {
-        Outcome::Probe(if p.canonical == 0 {
-            ProbeOutcome::Unreachable
-        } else {
-            ProbeOutcome::CopyMiss
-        })
-    });
-    assert_eq!(
-        probes
-            .iter()
-            .map(|(p, ..)| (p.canonical, p.mode))
-            .collect::<Vec<_>>(),
-        [(0, Mode::Acquire), (3, Mode::CopyOnly)]
-    );
-    assert_eq!(
-        end,
-        End::Origin {
-            rank: 1,
-            evidence: vec![ProbeOutcome::Unreachable]
+fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
+    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
+    // Per visit after the first wait, whether a second wait was affordable there.
+    let run_with = |owners: usize, attempts: u32, links: u8, hops: Option<usize>, rev: bool| {
+        let score = |r: usize| if rev { (owners - r) as u64 } else { r as u64 };
+        let order = visit_order(ReplicaSelection::Spread, owners, |_| true, score);
+        let mut walk = CandidateWalk::new(config(None, owners, order));
+        let mut b = budget(attempts, links);
+        let mut waited = false;
+        let mut affordable = Vec::new();
+        loop {
+            let Ok(Step::Probe(probe)) = walk.next(&mut b) else {
+                return affordable;
+            };
+            let deadline = b.deadline();
+            let request = walk.request_budget(&mut b);
+            let Ok(plan) = plan(request, deadline, &probe) else {
+                return affordable;
+            };
+            request.refund_remote(plan.remote_attempts).unwrap();
+            if let Some(hops) = hops {
+                let unused = crate::read::budget::stale_unused_links(plan.links, hops);
+                request.refund_links(unused).unwrap();
+            }
+            if !waited {
+                waited = true;
+                walk.retry_pending(&mut b).unwrap();
+                continue;
+            }
+            affordable.push(walk.retry_affordable(&b));
+            if walk.complete(&mut b, BEHIND).unwrap().is_some() {
+                return affordable;
+            }
         }
-    );
-    // Without successors nothing changes for a non-owner.
-    let mut cfg = config(None, 3, VisitOrder::canonical(3));
-    cfg.granted = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, _) = drive(
-        &mut walk,
-        &mut budget(32, 96),
-        always(ProbeOutcome::CopyMiss),
-    );
-    assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
+    };
+    let run = |owners, attempts, links, hops| run_with(owners, attempts, links, hops, false);
+    assert_eq!(run(3, PAGE_ATTEMPTS, PAGE_LINKS, None), [false]);
+    for hops in 1..=3 {
+        let h = Some(hops);
+        assert_eq!(run(3, PAGE_ATTEMPTS, PAGE_LINKS, h), [false, false, true]);
+        assert_eq!(run(2, PAGE_ATTEMPTS, PAGE_LINKS, h), [true, true]);
+        assert_eq!(run(1, PAGE_ATTEMPTS, PAGE_LINKS, h), [true]);
+        assert_eq!(
+            run_with(3, PAGE_ATTEMPTS, PAGE_LINKS, h, true),
+            [false, false, false]
+        );
+        assert_eq!(
+            run(3, 2 * PAGE_ATTEMPTS, 2 * PAGE_LINKS, h),
+            [true, true, true]
+        );
+    }
 }
 
-/// Rank 0 asks a successor (own grant) and then a lineage target before origin. A
-/// `StaleMembership` refund of the successor's remote credits lands in the grant, which is dropped,
-/// so the walk's budget never grows; and neither probe timing out is a rank 0 timeout, so rank 0
-/// keeps origin authority.
+/// Rank 0 asks a successor (own grant), then a lineage target. A `StaleMembership` refund of the
+/// successor's remote credits lands in the dropped grant, so the walk's budget never grows; and
+/// neither timing out withholds origin.
 #[test]
 fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 2;
-    cfg.granted = 1;
-    cfg.lineage = [1, 0, 0];
-    let mut walk = CandidateWalk::new(cfg);
+    let mut walk = CandidateWalk::new(WalkConfig {
+        handoff: 2,
+        granted: 1,
+        lineage: [1, 0, 0],
+        ..owner(0)
+    });
     let mut b = budget(4, 32);
     let start = (b.remaining_attempts(), b.remaining_links());
     let mut probes = Vec::new();
@@ -1656,9 +1052,9 @@ fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
                 let outcome = if successor {
                     let sent = request.send_remote(1).unwrap();
                     request.refund_remote(sent).unwrap();
-                    Outcome::StaleDestination
+                    BEHIND
                 } else {
-                    Outcome::TimedOut
+                    TIMEOUT
                 };
                 if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
                     break end;
@@ -1672,371 +1068,63 @@ fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
     assert_eq!(probes, [3, 4]);
     assert!(matches!(end, End::Origin { rank: 0, .. }), "{end:?}");
     assert!(!walk.rank0_unanswered);
-    assert!(b.remaining_attempts() <= start.0 && b.remaining_links() <= start.1);
 }
 
-#[test]
-fn demoted_targets_are_members_that_were_owners_when_they_arrived() {
-    // Owners arrived in generations 5, 6, 7; the members ranked fourth and
-    // fifth arrived in 0 and 1, before any owner: each was an owner then.
-    let since = [Some(5), Some(6), Some(7)];
-    let demoted = ["d3", "d4"];
-    assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 0, None),
-        ["d3", "d4"]
-    );
-    // Rank 2 is the newest owner: same targets.
-    assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 2, None),
-        ["d3", "d4"]
-    );
-    // An owner that arrived before a demoted member never displaced it.
-    assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(5), Some(1)], 0, None),
-        ["d4"]
-    );
-    // Three members ranked above d4 were present when it arrived (owners 1
-    // and 2 at generation 2, d3 at 0): d4 never was an owner.
-    let since = [Some(9), Some(2), Some(2)];
-    assert_eq!(
-        demoted_targets(&since, &demoted, &[Some(0), Some(3)], 0, None),
-        ["d3"]
-    );
-    // Unknown arrivals never add a target and count as present above.
-    assert!(
-        demoted_targets(
-            &[None, Some(1), Some(1)],
-            &demoted,
-            &[Some(0), Some(0)],
-            0,
-            None
-        )
-        .is_empty()
-    );
-    assert_eq!(
-        demoted_targets(&[Some(9), None, None], &demoted, &[Some(0), None], 0, None),
-        ["d3"]
-    );
-    assert_eq!(
-        demoted_targets(
-            &[Some(9), None, None],
-            &demoted,
-            &[Some(0), Some(0)],
-            0,
-            None
-        ),
-        ["d3"],
-        "d4 had three members above it"
-    );
-    // A cluster whose members arrived together pays nothing.
-    assert!(demoted_targets(&[Some(0); 3], &demoted, &[Some(0); 2], 0, None).is_empty());
-    // No demoted members or an unknown own arrival: nothing.
-    assert!(demoted_targets::<&str>(&[Some(3); 3], &[], &[], 0, None).is_empty());
-    assert!(
-        demoted_targets(&[None, Some(3), Some(3)], &demoted, &[Some(0); 2], 0, None).is_empty()
-    );
-}
-
-#[test]
-fn granted_prefix_counts_leading_successor_and_lineage_targets() {
-    assert_eq!(granted_prefix(&["s", "l", "p"], &["s", "l"]), 2);
-    assert_eq!(granted_prefix(&["p", "l"], &["l"]), 0);
-    assert_eq!(granted_prefix::<&str>(&[], &["l"]), 0);
-    let handoff = merge_handoff(&["p1", "p2"], &["l1", "d3"]);
-    assert_eq!(handoff, ["l1", "d3", "p1"]);
-    assert_eq!(granted_prefix(&handoff, &["l1", "d3"]), 2);
-}
-
-#[test]
-fn delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit() {
-    // Rank 0 reached by a delegation has one credit. Its two lineage targets are granted; the
-    // version - 1 target after them is funded from the walk and stops before the origin credit.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 3;
-    cfg.granted = 2;
-    let mut walk = CandidateWalk::new(cfg);
-    let mut b = budget(1, 1);
-    let (probes, end) = drive(&mut walk, &mut b, always(ProbeOutcome::CopyMiss));
-    assert_eq!(
-        probes.iter().map(|(p, ..)| p.canonical).collect::<Vec<_>>(),
-        [3, 4]
-    );
-    assert!(matches!(end, End::Origin { rank: 0, .. }));
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
-    // The second target holds the page: copy, no origin.
-    let (probes, end) = run(cfg, 1, 1, |p, _| {
-        if p.canonical == 4 {
-            Outcome::Copy
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Copy);
-}
-
-/// A further ask of a destination that is behind must leave attempts for every later visit's
-/// minimum and a full route share of links for each.
-#[test]
-fn retry_affordable_keeps_later_visits_funded() {
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
-    for (attempts, links, affordable) in [
-        (8, 16, false),
-        (16, 32, true),
-        // Attempts enough, links not.
-        (16, 8, false),
-        // Links enough, attempts not.
-        (6, 32, false),
-    ] {
-        let mut walk = CandidateWalk::new(config(None, 3, order));
-        let mut b = budget(attempts, links);
-        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
-            panic!("expected a probe");
-        };
-        assert_eq!(
-            walk.retry_affordable(&b),
-            affordable,
-            "{attempts} attempts, {links} links"
-        );
-    }
-    // The last visit needs nothing after it.
-    let mut walk = CandidateWalk::new(config(None, 3, order));
-    let mut b = budget(8, 16);
-    for _ in 0..2 {
-        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
-            panic!("expected a probe");
-        };
-        walk.complete(&mut b, Outcome::StaleDestination).unwrap();
-    }
-    let Step::Probe(last) = walk.next(&mut b).unwrap() else {
-        panic!("expected a probe");
-    };
-    assert_eq!(last.index, 2);
-    assert!(
-        walk.retry_affordable(&b),
-        "{} attempts",
-        b.remaining_attempts()
-    );
-}
-
-/// The bound on a read's second stale wait. Every exchange reserves its route's links
-/// (`plan_attempt`; a funded first visit takes eight), and transport never returns them. Before a
-/// verified `StaleMembership` returned the links past its answerer (`stale_unused_links`), a
-/// default read (`PAGE_ATTEMPTS`, `PAGE_LINKS`) that waited once at a funded first owner had spent
-/// every link on that owner: it never reached the other two, let alone afforded a second wait. With
-/// the refund, a reader whose three owners are all behind asks each of them and waits once at its
-/// first visit. The second wait is a fifth exchange: affordable only at its last visit, where no
-/// later owner needs the links, and only when that visit is rank 0 or 1 (four attempts left must
-/// cover one exchange plus the visit's minimum, canonical + 2); with fewer owners, at every visit.
-#[test]
-fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
-    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
-    // Walk `owners` owners that are all behind; wait once at the first.
-    // Returns, per visit, whether a second wait was affordable there.
-    let run_with = |owners: usize, attempts: u32, links: u8, hops: Option<usize>, rev: bool| {
-        let score = |r: usize| if rev { (owners - r) as u64 } else { r as u64 };
-        let order = visit_order(ReplicaSelection::Spread, owners, |_| true, score);
-        let mut walk = CandidateWalk::new(config(None, owners, order));
-        let mut b = budget(attempts, links);
-        let mut waited = false;
-        let mut affordable = Vec::new();
-        loop {
-            let probe = match walk.next(&mut b) {
-                Ok(Step::Probe(probe)) => probe,
-                Ok(Step::Granted(_)) => unreachable!("readers have no grants"),
-                Ok(Step::End(_)) | Err(_) => return affordable,
-            };
-            let deadline = b.deadline();
-            let request = walk.request_budget(&mut b);
-            let Ok(plan) = plan(request, deadline, &probe) else {
-                return affordable;
-            };
-            // A verified `StaleMembership` returns the remote credits.
-            request.refund_remote(plan.remote_attempts).unwrap();
-            if let Some(hops) = hops {
-                request
-                    .refund_links(crate::read::budget::stale_unused_links(plan.links, hops))
-                    .unwrap();
-            }
-            if !waited {
-                waited = true;
-                walk.retry_pending(&mut b).unwrap();
-                continue;
-            }
-            affordable.push(walk.retry_affordable(&b));
-            if walk
-                .complete(&mut b, Outcome::StaleDestination)
-                .unwrap()
-                .is_some()
-            {
-                return affordable;
-            }
-        }
-    };
-    let run = |owners, attempts, links, hops| run_with(owners, attempts, links, hops, false);
-    // Without the refund: the first owner takes the whole budget.
-    assert_eq!(run(3, PAGE_ATTEMPTS, PAGE_LINKS, None), [false]);
-    for hops in 1..=3 {
-        let h = Some(hops);
-        assert_eq!(run(3, PAGE_ATTEMPTS, PAGE_LINKS, h), [false, false, true]);
-        assert_eq!(run(2, PAGE_ATTEMPTS, PAGE_LINKS, h), [true, true]);
-        assert_eq!(run(1, PAGE_ATTEMPTS, PAGE_LINKS, h), [true]);
-        // Four exchanges leave four attempts: the last visit's minimum
-        // (`owner_funding_min`, canonical + 2) plus one more exchange fits
-        // only for rank 0 or 1 there.
-        assert_eq!(
-            run_with(3, PAGE_ATTEMPTS, PAGE_LINKS, h, true),
-            [false, false, false]
-        );
-        assert_eq!(
-            run(3, 2 * PAGE_ATTEMPTS, 2 * PAGE_LINKS, h),
-            [true, true, true]
-        );
-    }
-}
-
-/// Interplay of the lineage grants with the rank 0 timeout rule: an owner above rank 0 whose
-/// granted targets time out keeps origin authority, since only its probe of rank 0 decides it; a
-/// timeout of rank 0 still withholds it after granted probes; and the grants never draw on the
-/// walk's budget.
-#[test]
-fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
-    let with = |state: Rank0State| WalkConfig {
-        handoff: 2,
-        granted: 2,
-        rank0: state,
-        ..config(Some(1), 3, VisitOrder::canonical(3))
-    };
-    for state in [Rank0State::Unknown, Rank0State::Fetching] {
-        // Granted targets time out, rank 0 answers a miss: origin.
-        let mut walk = CandidateWalk::new(with(state));
-        let mut b = budget(8, 32);
-        let (probes, end) = drive(&mut walk, &mut b, |p, _| {
-            if p.canonical == 0 {
-                Outcome::Probe(ProbeOutcome::CopyMiss)
-            } else {
-                Outcome::TimedOut
-            }
-        });
-        assert!(probes.iter().any(|(p, ..)| p.canonical == 0), "{state:?}");
-        assert!(
-            probes.iter().filter(|(p, ..)| p.canonical >= 3).count() == 2,
-            "{state:?}: both granted targets asked"
-        );
-        assert!(matches!(end, End::Origin { rank: 1, .. }), "{state:?}");
-        assert!(!walk.rank0_unanswered, "{state:?}");
-        assert!(b.remaining_attempts() <= 8 && b.remaining_links() <= 32);
-        // Rank 0 times out after the granted targets missed: withheld.
-        let mut walk = CandidateWalk::new(with(state));
-        let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
-            if p.canonical == 0 {
-                Outcome::TimedOut
-            } else {
-                Outcome::Probe(ProbeOutcome::CopyMiss)
-            }
-        });
-        assert_eq!(end, End::Exhausted { funding: false }, "{state:?}");
-        assert!(walk.rank0_unanswered, "{state:?}");
-    }
-}
-
-/// Lineage targets past the third are kept, up to `MAX_LINEAGE`, while version - 1 targets are
-/// still only added below `MAX_HANDOFF` targets (the walk funds those).
-#[test]
-fn lineage_targets_go_past_three_and_version_one_targets_do_not() {
-    // Owners arrived in 10, 11, 12; seven demoted members each arrived
-    // before them with at most two members above present at its arrival.
-    let since = [Some(10), Some(11), Some(12)];
-    let demoted: Vec<u32> = (3..10).collect();
-    let demoted_since = [
-        Some(0),
-        Some(1),
-        Some(2),
-        Some(3),
-        Some(4),
-        Some(5),
-        Some(6),
-    ];
-    // d3 at 0 (none above), d4 at 1 (d3), d5 at 2 (d3, d4); d6 at 3 has
-    // d3, d4, d5 above: never an owner, and so on for the rest.
-    assert_eq!(
-        demoted_targets(&since, &demoted, &demoted_since, 0, None),
-        [3, 4, 5]
-    );
-    // Arrivals in reverse: each deeper member arrived first, so every one
-    // had at most two members above it present when it arrived.
-    let reverse = [
-        Some(6),
-        Some(5),
-        Some(4),
-        Some(3),
-        Some(2),
-        Some(1),
-        Some(0),
-    ];
-    let targets = demoted_targets(&since, &demoted, &reverse, 0, None);
-    assert_eq!(targets.len(), MAX_LINEAGE);
-    assert_eq!(*targets, demoted[..MAX_LINEAGE]);
-    // Lineage up to `MAX_LINEAGE`, then no version - 1 target.
-    let handoff = merge_handoff(&[90, 91], &targets);
-    assert_eq!(*handoff, *targets);
-    // Fewer lineage targets than `MAX_HANDOFF`: version - 1 fills to it.
-    assert_eq!(merge_handoff(&[90, 91], &[3]), [3, 90, 91]);
-    assert_eq!(merge_handoff(&[90, 91], &[3, 4, 5, 6]), [3, 4, 5, 6]);
-}
-
-/// Granted probes go out at once, each on its own grant and one shared time share; misses leave the
-/// walk exactly as the sequential walk leaves it, and any copy ends it.
+/// Granted probes go out at once, each on its own grant and one shared time share; misses leave
+/// the walk exactly as the sequential walk leaves it, and any copy ends it.
 #[test]
 fn parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk() {
     for rank in [0, 1, 2] {
         for granted in 1..=MAX_TARGETS - 1 {
-            let mut cfg = config(Some(rank), 3, VisitOrder::canonical(3));
-            cfg.handoff = granted + 1;
-            cfg.granted = granted;
-            let script = |p: &Probe, _: &mut AcquisitionBudget| {
-                if p.canonical < 3 {
-                    Outcome::Transport(ProbeOutcome::Unreachable)
-                } else {
-                    Outcome::Probe(ProbeOutcome::CopyMiss)
-                }
+            let cfg = WalkConfig {
+                handoff: granted + 1,
+                granted,
+                ..owner(rank)
             };
-            let (mut seq, mut par) = (CandidateWalk::new(cfg), {
-                cfg.parallel_granted = true;
-                CandidateWalk::new(cfg)
-            });
-            let (mut bs, mut bp) = (budget(8, 16), budget(8, 16));
-            let (ps, es) = drive(&mut seq, &mut bs, script);
-            let (pp, ep) = drive(&mut par, &mut bp, script);
-            assert_eq!(es, ep, "rank {rank}, {granted} granted");
-            let canon =
-                |v: &[(Probe, u32, u8)]| v.iter().map(|(p, ..)| p.canonical).collect::<Vec<_>>();
-            assert_eq!(canon(&ps), canon(&pp));
+            let script =
+                |p: &Probe, _: &mut AcquisitionBudget| if p.canonical < 3 { T_UNR } else { MISS };
+            let run = |parallel_granted| {
+                let mut walk = CandidateWalk::new(WalkConfig {
+                    parallel_granted,
+                    ..cfg
+                });
+                let mut b = budget(8, 16);
+                let (probes, end) = drive(&mut walk, &mut b, script);
+                let canonical: Vec<_> = probes.iter().map(|(p, ..)| p.canonical).collect();
+                (
+                    end,
+                    canonical,
+                    b.remaining_attempts(),
+                    b.remaining_links(),
+                    probes,
+                )
+            };
+            let (seq, par) = (run(false), run(true));
             assert_eq!(
-                (bs.remaining_attempts(), bs.remaining_links()),
-                (bp.remaining_attempts(), bp.remaining_links())
+                (&seq.0, &seq.1, seq.2, seq.3),
+                (&par.0, &par.1, par.2, par.3),
+                "rank {rank}, {granted} granted"
             );
-            // The batch shares the first granted probe's time share, and
-            // each has the grant's credits.
-            let batch: Vec<_> = pp
+            // The batch shares the first granted probe's time share; each has the grant's credits.
+            let batch: Vec<_> = par
+                .4
                 .iter()
                 .filter(|(p, ..)| p.canonical >= 3)
                 .take(granted)
                 .collect();
-            assert!(batch.iter().all(|(p, a, l)| {
+            assert!(batch.iter().all(|(p, a, l, _)| {
                 p.remaining_opportunities == batch[0].0.remaining_opportunities
                     && p.mode == Mode::CopyOnly
                     && (*a, *l) == (SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)
             }));
         }
     }
-    // One step returns the whole run of granted targets; the walk refuses
-    // to plan more until they are reported; a copy ends it.
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 4;
-    cfg.granted = 3;
-    cfg.parallel_granted = true;
-    let mut walk = CandidateWalk::new(cfg);
+    let mut walk = CandidateWalk::new(WalkConfig {
+        handoff: 4,
+        granted: 3,
+        parallel_granted: true,
+        ..owner(0)
+    });
     let mut b = budget(1, 1);
     let Step::Granted(batch) = walk.next(&mut b).unwrap() else {
         panic!("expected granted probes");
@@ -2045,6 +1133,8 @@ fn parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk() {
         batch.iter().map(|p| p.canonical).collect::<Vec<_>>(),
         [3, 4, 5]
     );
+    assert!(batch.iter().all(|p| p.mode == Mode::CopyOnly
+        && p.remaining_opportunities == batch[0].remaining_opportunities));
     assert_eq!(walk.complete_granted(true), Some(End::Copy));
     assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
 }
@@ -2052,11 +1142,12 @@ fn parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk() {
 #[test]
 #[should_panic(expected = "complete the granted probes first")]
 fn parallel_granted_probes_must_be_reported_before_the_next_step() {
-    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
-    cfg.handoff = 2;
-    cfg.granted = 2;
-    cfg.parallel_granted = true;
-    let mut walk = CandidateWalk::new(cfg);
+    let mut walk = CandidateWalk::new(WalkConfig {
+        handoff: 2,
+        granted: 2,
+        parallel_granted: true,
+        ..owner(0)
+    });
     let mut b = budget(4, 8);
     let Step::Granted(_) = walk.next(&mut b).unwrap() else {
         panic!("expected granted probes");
@@ -2064,351 +1155,55 @@ fn parallel_granted_probes_must_be_reported_before_the_next_step() {
     let _ = walk.next(&mut b);
 }
 
-/// Members whose arrival is the chain's start have an unknown age, tied with the owners above them,
-/// so the arrival rule never names them; with `oldest` they qualify in rank order when this owner
-/// arrived later, within `MAX_LINEAGE`.
+/// A reader at rank 1 in visit order after rank 0 failed gets the credits rank 1 needs when its
+/// share is short; a busy rank 0 (shed, silent, overloaded) keeps rank 1 on its share.
 #[test]
-fn unknown_age_demoted_members_are_targets_when_the_owner_arrived_later() {
-    // Every member but rank 0 has been present since the chain began (5).
-    let since = [Some(8), Some(5), Some(5)];
-    let demoted: Vec<u32> = (3..12).collect();
-    let demoted_since = [Some(5); 9];
-    // The arrival rule: owners 1 and 2 and every demoted member above
-    // arrived "together": only the first demoted member qualifies.
-    assert_eq!(
-        demoted_targets(&since, &demoted, &demoted_since, 0, None),
-        [3]
-    );
-    // Unknown age: all qualify, best ranked first, at most `MAX_LINEAGE`.
-    let targets = demoted_targets(&since, &demoted, &demoted_since, 0, Some(5));
-    assert_eq!(*targets, demoted[..MAX_LINEAGE]);
-    // A known arrival keeps the arrival rule; the chain start must match.
-    let mixed = [Some(6), Some(6), Some(6), Some(5), Some(5)];
-    assert_eq!(
-        demoted_targets(&since, &demoted[..5], &mixed, 0, Some(5)),
-        [3, 6, 7]
-    );
-    assert_eq!(
-        demoted_targets(&since, &demoted, &demoted_since, 0, Some(4)),
-        [3]
-    );
-    // An owner that is itself as old as the chain knows of no one it
-    // displaced: no targets.
-    let old = [Some(5), Some(5), Some(5)];
-    assert!(demoted_targets(&old, &demoted, &demoted_since, 0, Some(5)).is_empty());
-    // Rank 1 arrived at the chain start: nothing either.
-    assert!(demoted_targets(&since, &demoted, &demoted_since, 1, Some(5)).is_empty());
-}
-
-/// An `Overloaded` signed by a relay on an
-/// owner's route to rank 0 (`Outcome::Probe(Overloaded)`; rank 0's own is
-/// `Outcome::Shed`) gives an owner above rank 0 origin authority after one
-/// probe of rank 0, without a retry, and never gives a non-owner authority.
-/// The walk has nothing to retry with: the probe of rank 0 got every link
-/// but one per later predecessor, and the relay keeps the links it was sent
-/// (only a verified `StaleMembership` refunds anything), so what is left is
-/// exactly one credit per later predecessor and the owner's own origin
-/// attempt. Budgets never grow, so each such owner walk costs at most one
-/// overlapping origin request, at most two per page and membership version
-/// (ranks 1 and 2).
-#[test]
-fn relay_overload_on_the_route_to_rank_zero_gives_authority_without_a_retry() {
-    for rank in [1, 2] {
-        for state in [Rank0State::Unknown, Rank0State::Fetching] {
-            let mut walk = CandidateWalk::new(WalkConfig {
-                rank0: state,
-                ..config(Some(rank), 3, VisitOrder::canonical(3))
-            });
-            let mut b = budget(owner_funding_min(rank), 8);
-            let (probes, end) = drive(&mut walk, &mut b, |p, _| {
-                if p.canonical == 0 {
-                    Outcome::Probe(ProbeOutcome::Overloaded)
-                } else {
-                    Outcome::Probe(ProbeOutcome::CopyMiss)
-                }
-            });
-            assert_eq!(
-                probes.iter().filter(|(p, ..)| p.canonical == 0).count(),
-                1,
-                "rank {rank} {state:?}"
-            );
-            assert!(
-                matches!(end, End::Origin { rank: r, .. } if r == rank),
-                "rank {rank} {state:?}: {end:?}"
-            );
-            // The owner's own origin credit is left, and nothing more grew.
-            assert!(b.remaining_attempts() >= 1);
-            assert!(b.remaining_attempts() <= owner_funding_min(rank));
-        }
-    }
-    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
-    let (_, end) = drive(
-        &mut walk,
-        &mut budget(8, 16),
-        always(ProbeOutcome::Overloaded),
-    );
-    assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
-}
-
-/// Rank 0 itself answering an owner's probe that its own acquisition failed (`Outcome::Failed`)
-/// withholds origin authority only while this owner's own origin request for the page failed
-/// recently (`Failed`); otherwise (a failure local to rank 0) the owner fetches as before. The
-/// walk's probes and budgets are the same as for `Probe(Unreachable)`.
-#[test]
-fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
-    let with = |rank: usize, state: Rank0State| WalkConfig {
-        rank0: state,
-        ..config(Some(rank), 3, VisitOrder::canonical(3))
-    };
-    // Delegated Acquire at rank 1.
-    let mut walk = CandidateWalk::new(with(1, Rank0State::Failed));
-    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Failed);
-    assert_eq!(probes[0].0.mode, Mode::Acquire);
-    assert_eq!(end, End::Exhausted { funding: false });
-    assert!(walk.rank0_unanswered);
-    // Rank 2: rank 1 is still asked copy-only and its copy wins.
-    let (probes, end) = run(with(2, Rank0State::Failed), 8, 32, |p, _| {
-        if p.canonical == 0 {
-            Outcome::Failed
-        } else {
-            Outcome::Copy
-        }
-    });
-    assert_eq!(probes.len(), 2);
-    assert_eq!(end, End::Copy);
-    // Copy-only probe of rank 0 (too few credits to delegate).
-    let (probes, end) = run(with(1, Rank0State::Failed), 2, 16, |_, _| Outcome::Failed);
-    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
-    assert_eq!(end, End::Exhausted { funding: false });
-    // Without an own failure the owner fetches.
-    for state in [
-        Rank0State::Unknown,
-        Rank0State::Fetching,
-        Rank0State::Overdue,
+fn in_order_owner_funding_after_rank_zero() {
+    for (outcome, route, remote) in [
+        (UNR, RouteMode::FundedRoute, owner_funding_min(1) - 1),
+        (FAILED, RouteMode::FundedRoute, owner_funding_min(1) - 1),
+        (T_UNR, RouteMode::FundedRoute, owner_funding_min(1) - 1),
+        (SHED, RouteMode::SharedRoute, 1),
+        (TIMEOUT, RouteMode::SharedRoute, 1),
+        (OVL, RouteMode::SharedRoute, 1),
+        (T_OVL, RouteMode::SharedRoute, 1),
     ] {
-        let mut walk = CandidateWalk::new(with(1, state));
-        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Failed);
-        assert!(
-            matches!(end, End::Origin { rank: 1, ref evidence } if evidence == &[ProbeOutcome::Unreachable]),
-            "{state:?}"
-        );
-        assert!(!walk.rank0_unanswered);
-    }
-    // Other failures of rank 0 still give authority while `Failed`.
-    for outcome in [
-        Outcome::Transport(ProbeOutcome::Unreachable),
-        Outcome::Probe(ProbeOutcome::Unreachable),
-        Outcome::Probe(ProbeOutcome::CopyMiss),
-        Outcome::Shed,
-    ] {
-        let (_, end) = run(with(1, Rank0State::Failed), 8, 32, |_, _| outcome);
-        assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
-    }
-    // Same probes and budget as an Unavailable signed by a relay.
-    let run = |outcome: Outcome| {
-        let mut walk = CandidateWalk::new(with(2, Rank0State::Failed));
-        let mut b = budget(8, 32);
-        let (probes, _) = drive(&mut walk, &mut b, |p, _| {
-            if p.canonical == 0 {
-                outcome
-            } else {
-                Outcome::Probe(ProbeOutcome::CopyMiss)
-            }
-        });
-        (shapes(&probes), b.remaining_attempts(), b.remaining_links())
-    };
-    assert_eq!(
-        run(Outcome::Failed),
-        run(Outcome::Probe(ProbeOutcome::Unreachable))
-    );
-    // A non-owner reporting it is only a failure.
-    let mut walk = CandidateWalk::new(WalkConfig {
-        rank0: Rank0State::Failed,
-        ..config(None, 3, VisitOrder::canonical(3))
-    });
-    let (_, end) = drive(&mut walk, &mut budget(16, 64), |_, _| Outcome::Failed);
-    assert_eq!(end, End::Exhausted { funding: false });
-    assert!(!walk.rank0_unanswered);
-}
-
-/// A remaining walk (after an origin version miss) treats `Failed` as a
-/// transient failure.
-#[test]
-fn remaining_walk_treats_a_failure_as_transient() {
-    let mut walk = RemainingWalk::new(0, 2);
-    let mut b = budget(4, 16);
-    walk.next_probe().unwrap();
-    assert_eq!(walk.complete(&mut b, Outcome::Failed), None);
-    assert_eq!(walk.next_probe(), Err(RemainingEnd::Unavailable));
-}
-
-#[test]
-fn forwarded_non_owner_funds_an_out_of_order_owner_with_its_route_links() {
-    // A non-owner reached by a funded route: it inherits `owner_funding_min(2)` attempts and seven
-    // links, which is never a full failure route. It must still fund rank 2 with the attempts rank
-    // 2 needs, not send a shared route that grants one credit.
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(60);
-    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
-    assert_eq!(order.get(0), Some(2));
-    let mut b = super::super::budget::inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (4, 7));
-    let mut walk = CandidateWalk::new(config(None, 3, order));
-    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
-        panic!()
-    };
-    assert_eq!((probe.canonical, probe.mode), (2, Mode::Acquire));
-    assert_eq!(probe.route, RouteMode::FundedRoute);
-    let request = walk.request_budget(&mut b);
-    // The same links a shared route charges, all the attempts rank 2 needs.
-    assert_eq!(
-        (request.remaining_attempts(), request.remaining_links()),
-        (owner_funding_min(2), 7)
-    );
-    let plan = plan(request, deadline, &probe).unwrap();
-    assert_eq!((plan.links, plan.remote_attempts), (7, 3));
-    // Budgets never grow: the walk kept nothing it did not have.
-    assert_eq!((b.remaining_attempts(), b.remaining_links()), (0, 0));
-
-    // Rank 2 with those three credits: rank 0 is behind on membership, rank
-    // 1 misses, and it still has the origin credit.
-    let mut owner = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let mut b = super::super::budget::inherited_budget(deadline, deadline, 3, 7, 1).unwrap();
-    let (probes, end) = drive(&mut owner, &mut b, |p, _| {
-        if p.canonical == 0 {
-            Outcome::StaleDestination
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
-    assert_eq!(probes.len(), 2);
-    assert!(matches!(end, End::Origin { rank: 2, .. }));
-    // `drive` does not charge exchanges: two copy-only probes spend two of
-    // the three credits, leaving the origin attempt.
-    assert_eq!(b.remaining_attempts() as usize - probes.len(), 1);
-}
-
-#[test]
-fn funded_links_match_a_shared_route_below_a_full_route() {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    assert_eq!(funded_links(&budget(4, 16)), Some(MAX_ROUTE_LINKS));
-    assert_eq!(funded_links(&budget(4, 8)), Some(MAX_ROUTE_LINKS));
-    // Normal routing: a shared route charges four.
-    assert_eq!(funded_links(&budget(4, 7)), Some(4));
-    assert_eq!(funded_links(&budget(4, 3)), Some(3));
-    assert_eq!(funded_links(&budget(4, 2)), Some(2));
-    // One link would leave the owner none.
-    assert_eq!(funded_links(&budget(4, 1)), None);
-    assert_eq!(funded_links(&budget(4, 0)), None);
-    // Failure routing (inherited from a funded route): all of them.
-    let b = super::super::budget::inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
-    assert_eq!(funded_links(&b), Some(7));
-}
-
-fn charge(walk: &mut CandidateWalk, b: &mut AcquisitionBudget, probe: &Probe) -> AttemptPlan {
-    let deadline = b.deadline();
-    plan(walk.request_budget(b), deadline, probe).unwrap()
-}
-
-#[test]
-fn in_order_owner_gets_the_credits_it_needs_when_a_share_is_short() {
-    // A non-owner with three attempts at rank 1 (in visit order) shared one remote credit, which
-    // rank 1 spent probing rank 0.
-    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
-    let mut b = budget(6, 16);
-    let Step::Probe(first) = walk.next(&mut b).unwrap() else {
-        panic!()
-    };
-    assert_eq!((first.canonical, first.route), (0, RouteMode::SharedRoute));
-    // Rank 0's shared credits are unchanged: its share is not short.
-    assert_eq!(charge(&mut walk, &mut b, &first).remote_attempts, 2);
-    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::Unreachable))
-        .unwrap();
-    assert_eq!(b.remaining_attempts(), 3);
-    assert!(shared_share_short(&b, 1, 2));
-    let Step::Probe(second) = walk.next(&mut b).unwrap() else {
-        panic!()
-    };
-    assert_eq!(
-        (second.canonical, second.mode, second.route),
-        (1, Mode::Acquire, RouteMode::FundedRoute)
-    );
-    let plan = charge(&mut walk, &mut b, &second);
-    // Rank 1 can probe rank 0 and still fetch; the links are a shared
-    // route's (failure routing after the route failure above).
-    assert_eq!(plan.remote_attempts, owner_funding_min(1) - 1);
-    assert_eq!(plan.links, 8);
-    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::Unreachable))
-        .unwrap();
-    // Budgets never grow: nothing is left for rank 2, whose share (one
-    // credit) would only have bought the same probe of rank 0.
-    assert_eq!(b.remaining_attempts(), 0);
-    assert!(matches!(
-        walk.next(&mut b).unwrap(),
-        Step::Probe(_) | Step::End(_)
-    ));
-}
-
-#[test]
-fn shared_share_short_only_below_an_owners_minimum() {
-    // Rank 0 needs one remote credit: never short.
-    assert!(!shared_share_short(&budget(2, 8), 0, 3));
-    // Rank 1 needs two: after the exchange, three or more attempts over two
-    // visits share two; two share one.
-    assert!(!shared_share_short(&budget(4, 8), 1, 2));
-    assert!(shared_share_short(&budget(3, 8), 1, 2));
-    // Rank 2 needs three: as the last visit with four attempts it gets three.
-    assert!(!shared_share_short(&budget(4, 8), 2, 1));
-    assert!(shared_share_short(&budget(3, 8), 2, 1));
-}
-
-#[test]
-fn a_busy_owner_keeps_the_next_in_order_owner_on_its_share() {
-    // After rank 0 shed the reader, left it unanswered, or was overloaded
-    // (itself or a relay in front of it), rank 1 gets only its shared
-    // credits: it can still find rank 0's copy, but is not funded to fetch
-    // beside it. A route failure or a refusal still funds rank 1.
-    for (busy, outcome) in [
-        (true, Outcome::Shed),
-        (true, Outcome::TimedOut),
-        (true, Outcome::Probe(ProbeOutcome::Overloaded)),
-        (true, Outcome::Transport(ProbeOutcome::Overloaded)),
-        (false, Outcome::Failed),
-        (false, Outcome::Probe(ProbeOutcome::Unreachable)),
-        (false, Outcome::Transport(ProbeOutcome::Unreachable)),
-    ] {
-        let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+        let mut walk = CandidateWalk::new(reader(3));
         let mut b = budget(6, 16);
         let Step::Probe(first) = walk.next(&mut b).unwrap() else {
             panic!()
         };
-        charge(&mut walk, &mut b, &first);
+        assert_eq!((first.canonical, first.route), (0, RouteMode::SharedRoute));
+        // Rank 0's share is not short.
+        assert_eq!(charge(&mut walk, &mut b, &first).remote_attempts, 2);
         walk.complete(&mut b, outcome).unwrap();
+        assert_eq!(b.remaining_attempts(), 3);
         assert!(shared_share_short(&b, 1, 2));
         let Step::Probe(second) = walk.next(&mut b).unwrap() else {
             panic!()
         };
-        let (route, remote) = if busy {
-            (RouteMode::SharedRoute, 1)
-        } else {
-            (RouteMode::FundedRoute, owner_funding_min(1) - 1)
-        };
         assert_eq!((second.canonical, second.route), (1, route), "{outcome:?}");
-        assert_eq!(
-            charge(&mut walk, &mut b, &second).remote_attempts,
-            remote,
-            "{outcome:?}"
-        );
+        let plan = charge(&mut walk, &mut b, &second);
+        assert_eq!(plan.remote_attempts, remote, "{outcome:?}");
+        if outcome == UNR {
+            assert_eq!(second.mode, Mode::Acquire);
+            // Failure routing after the route failure above.
+            assert_eq!(plan.links, 8);
+            walk.complete(&mut b, UNR).unwrap();
+            // Budgets never grow: nothing is left for rank 2.
+            assert_eq!(b.remaining_attempts(), 0);
+            assert!(matches!(
+                walk.next(&mut b).unwrap(),
+                Step::Probe(_) | Step::End(_)
+            ));
+        }
     }
 }
 
+/// An owner that shed this node is visited after the others; no hop ever carries more than its
+/// sender had, and with enough attempts to fund rank 1 the demoted rank 0 is not asked first.
 #[test]
 fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
-    // Silence demotes an owner that shed this node
-    // (`Silence::shed`) behind the other owners, so ranks 1 and 2 are
-    // visited first, out of order, and funded by their canonical rank.
-    // In-order funding never applies to them there
-    // (canonical > index), and no hop carries more than its sender had.
     let answering = |r: usize| {
         if r == 0 {
             Answering::Unanswered
@@ -2418,35 +1213,29 @@ fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
     };
     for links in [7, 16] {
         for attempts in 1..=8 {
-            for outcome in [Outcome::Shed, Outcome::Failed, Outcome::TimedOut] {
+            for outcome in [SHED, FAILED, TIMEOUT] {
                 let order = demote_unanswered(VisitOrder::canonical(3), answering);
                 let mut walk = CandidateWalk::new(config(None, 3, order));
                 let mut b = budget(attempts, links);
                 let mut visited = Vec::new();
                 loop {
-                    let (before_attempts, before_links) =
-                        (b.remaining_attempts(), b.remaining_links());
+                    let before = (b.remaining_attempts(), b.remaining_links());
                     let Ok(Step::Probe(probe)) = walk.next(&mut b) else {
                         break;
                     };
                     let deadline = b.deadline();
                     let Ok(plan) = plan(walk.request_budget(&mut b), deadline, &probe) else {
-                        // Not affordable: nothing is sent.
                         break;
                     };
-                    assert!(
-                        plan.remote_attempts < before_attempts,
-                        "{attempts} {outcome:?}"
-                    );
-                    assert!(plan.links <= before_links, "{attempts} {outcome:?}");
-                    assert!(b.remaining_attempts() < before_attempts);
+                    let what = format!("{attempts} {outcome:?}");
+                    assert!(plan.remote_attempts < before.0, "{what}");
+                    assert!(plan.links <= before.1, "{what}");
+                    assert!(b.remaining_attempts() < before.0);
                     visited.push(probe.canonical);
                     if walk.complete(&mut b, outcome).is_err() {
                         break;
                     }
                 }
-                // With too few attempts to fund rank 1, the walk may ask the
-                // demoted rank 0 first (a copy probe); otherwise it does not.
                 if attempts >= owner_funding(1) {
                     assert_ne!(visited.first(), Some(&0), "{attempts} {links} {outcome:?}");
                 }
@@ -2455,58 +1244,38 @@ fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
     }
 }
 
-/// The bound: an owner funded at its minimum ([`shared_share_short`]: `owner_funding_min(c) - 1`
-/// remote credits) asks each predecessor copy-only, never delegates, and ends with at most one
-/// origin attempt, only under the authority rules every owner follows: no origin after a copy,
-/// after rank 0 left it unanswered while presumed fetching, or after rank 0 failed while this
-/// owner's own origin request failed recently. The funding adds origin requests only where such an
-/// owner had authority and previously no credit to use it.
+/// An owner funded at its minimum asks each predecessor copy-only, never delegates, and ends with
+/// at most one origin attempt, only with authority: not after a copy, rank 0 left it unanswered,
+/// or rank 0 failed while this owner's own origin request failed recently.
 #[test]
 fn a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority() {
     for rank in [1usize, 2] {
-        let credits = owner_funding_min(rank) - 1;
-        let cases = [
-            (Rank0State::Unknown, Outcome::Copy, false),
-            (
-                Rank0State::Unknown,
-                Outcome::Probe(ProbeOutcome::CopyMiss),
-                true,
-            ),
-            (
-                Rank0State::Unknown,
-                Outcome::Transport(ProbeOutcome::Unreachable),
-                true,
-            ),
-            (
-                Rank0State::Unknown,
-                Outcome::Probe(ProbeOutcome::Unreachable),
-                true,
-            ),
-            (Rank0State::Unknown, Outcome::Failed, true),
-            (Rank0State::Failed, Outcome::Failed, false),
-            (Rank0State::Unknown, Outcome::TimedOut, false),
-            (Rank0State::Fetching, Outcome::TimedOut, false),
-        ];
-        for (state, rank0, origin) in cases {
+        for (state, rank0, origin) in [
+            (Rank0State::Unknown, COPY, false),
+            (Rank0State::Unknown, MISS, true),
+            (Rank0State::Unknown, T_UNR, true),
+            (Rank0State::Unknown, UNR, true),
+            (Rank0State::Unknown, FAILED, true),
+            (Rank0State::Failed, FAILED, false),
+            (Rank0State::Unknown, TIMEOUT, false),
+            (Rank0State::Fetching, TIMEOUT, false),
+        ] {
             let mut walk = CandidateWalk::new(WalkConfig {
                 rank0: state,
-                ..config(Some(rank), 3, VisitOrder::canonical(3))
+                ..owner(rank)
             });
-            let mut b = budget(credits, 7);
+            let mut b = budget(owner_funding_min(rank) - 1, 7);
             let deadline = b.deadline();
             let (probes, end) = drive(&mut walk, &mut b, |p, request| {
                 // Spend each probe's exchange as the caller would.
                 plan(request, deadline, p).unwrap();
-                if p.canonical == 0 {
-                    rank0
-                } else {
-                    Outcome::Probe(ProbeOutcome::CopyMiss)
-                }
+                if p.canonical == 0 { rank0 } else { MISS }
             });
-            let probes: Vec<Probe> = probes.into_iter().map(|(p, ..)| p).collect();
             let what = format!("rank {rank} {state:?} {rank0:?}: {end:?}");
-            // One copy-only probe per predecessor asked, never a delegation.
-            assert!(probes.iter().all(|p| p.mode == Mode::CopyOnly), "{what}");
+            assert!(
+                probes.iter().all(|(p, ..)| p.mode == Mode::CopyOnly),
+                "{what}"
+            );
             assert!(probes.len() <= rank, "{what}");
             if origin {
                 assert!(
@@ -2547,440 +1316,174 @@ fn answer(kind: ResponseKind) -> Event<'static> {
     Event::Reply(Reply::Answer { kind, signed: true })
 }
 
-/// Feed `events` in order; return every action and the merged notes.
-fn script(
-    fill: &mut Fill,
-    budget: &mut AcquisitionBudget,
-    events: Vec<Event<'_>>,
-) -> (Vec<Action>, u16) {
-    let now = Instant::now();
-    let (mut actions, mut notes) = (Vec::new(), 0);
+const START: Event<'static> = Event::Start { local_hit: false };
+const NO_HINTS: Event<'static> = Event::Hints {
+    hints: &[],
+    rank0: Rank0State::Unknown,
+};
+const UNAVAILABLE: Event<'static> = Event::Reply(Reply::Failed {
+    error: Error::Unavailable,
+    sent: true,
+    scope_live: true,
+});
+
+/// Feed `events`; one line per event: the action, then the evidence that is
+/// set, then the fill's walked version, waits and handoff targets.
+fn script(f: &mut Fill, b: &mut AcquisitionBudget, events: &[Event<'_>]) -> String {
+    let mut s = String::new();
     for event in events {
-        let (action, evidence) = fill.on(event, budget, now);
-        notes |= evidence.notes;
-        actions.push(action);
+        let (action, e) = f.on(*event, b, Instant::now());
+        write!(s, "{action:?}").unwrap();
+        if let Some(outcome) = e.outcome {
+            write!(s, " outcome={outcome:?}").unwrap();
+        }
+        if let Some(silence) = e.silence {
+            write!(s, " silence={silence:?}").unwrap();
+        }
+        if let Some(rank0) = e.rank0 {
+            write!(s, " rank0={rank0:?}").unwrap();
+        }
+        for (set, flag) in [
+            (e.helper, "helper"),
+            (e.granted, "granted"),
+            (e.rank0_probe, "rank0_probe"),
+        ] {
+            if set {
+                write!(s, " {flag}").unwrap();
+            }
+        }
+        if e.notes != 0 {
+            write!(s, " notes={:#x}", e.notes).unwrap();
+        }
+        s.push('\n');
     }
-    (actions, notes)
+    write!(
+        s,
+        "v{} waits={} handoff={:?}",
+        f.version, f.waits, &*f.handoff
+    )
+    .unwrap();
+    s
 }
 
 #[test]
-fn fill_plan_local_hit_hedge_and_walk() {
-    let mut b = budget(8, 16);
-    // A local hit finishes at once.
-    let (actions, _) = script(
-        &mut fill(true, Features::PRODUCTION),
-        &mut b,
-        vec![Event::Start { local_hit: true }],
-    );
-    assert_eq!(actions, [Action::Done(Ok(Source::Local))]);
-    // A plaintext fill offers a hedge before the walk; a winner is published.
-    let (actions, _) = script(
-        &mut fill(true, Features::PRODUCTION),
-        &mut b,
+fn fills() {
+    let owner_walk = |rank| {
         vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(owners(5, None))),
-            Event::Hedge(HedgeEnd::Won),
-            Event::Published(Ok(())),
-        ],
-    );
-    assert_eq!(
-        actions[0],
-        Action::Rank {
-            ranking: Ranking::Current,
-            version: None
-        }
-    );
-    assert!(matches!(
-        actions[1],
-        Action::Hedge {
-            eligible: true,
-            first: 0,
-            second: 1
-        }
-    ));
-    assert_eq!(actions[2], Action::Publish(Source::Hedge));
-    assert_eq!(actions[3], Action::Done(Ok(Source::Hedge)));
-    // A ciphertext fill walks at once.
-    let (actions, _) = script(
-        &mut fill(false, Features::PRODUCTION),
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(owners(5, None))),
-        ],
-    );
-    assert!(matches!(actions[1], Action::Probe(p) if p.canonical == 0));
-}
-
-/// An owner at `rank` of 10, 11, 12 under version 5, through its
-/// previous-membership ranking and hints, to its first walk action.
-fn owner_walk(f: &mut Fill, b: &mut AcquisitionBudget, rank: usize) -> Action {
-    let (actions, _) = script(
-        f,
-        b,
-        vec![
-            Event::Start { local_hit: false },
+            START,
             Event::Ranked(Ok(owners(5, Some(rank)))),
             Event::Ranked(Err(Error::Unavailable)),
-            Event::Hints {
-                hints: &[],
-                rank0: Rank0State::Unknown,
-            },
-        ],
-    );
-    assert_eq!(
-        actions[1],
-        Action::Rank {
-            ranking: Ranking::Previous,
-            version: Some(4)
-        }
-    );
-    assert_eq!(actions[2], Action::Hints);
-    actions[3]
-}
-
-#[test]
-fn fill_origin_then_publish_or_fail() {
-    for (origin, published, end) in [
-        (Ok(()), Ok(()), Ok(Source::Origin)),
-        (Ok(()), Err(Error::Overloaded), Err(Error::Overloaded)),
-        (
-            Err(Error::OriginForbidden),
-            Ok(()),
-            Err(Error::OriginForbidden),
-        ),
-    ] {
-        let mut f = fill(false, Features::PRODUCTION);
-        let mut b = budget(8, 16);
-        // Rank 0 has no predecessor: origin authority at once, after
-        // ranking again.
-        assert_eq!(
-            owner_walk(&mut f, &mut b, 0),
-            Action::Rank {
-                ranking: Ranking::Authority,
-                version: Some(5)
-            }
-        );
-        let (actions, _) = script(
-            &mut f,
-            &mut b,
-            vec![Event::Ranked(Ok(owners(5, Some(0)))), Event::Origin(origin)],
-        );
-        assert_eq!(actions[0], Action::Origin { rank: 0 });
-        if origin.is_err() {
-            assert_eq!(actions[1], Action::Done(end));
-            continue;
-        }
-        assert_eq!(actions[1], Action::Publish(Source::Origin));
-        let (actions, _) = script(&mut f, &mut b, vec![Event::Published(published)]);
-        assert_eq!(actions[0], Action::Done(end));
-    }
-    // A ranking that changed before origin gives no authority.
-    let mut f = fill(false, Features::PRODUCTION);
-    let mut b = budget(8, 16);
-    owner_walk(&mut f, &mut b, 0);
-    let (actions, _) = script(
-        &mut f,
-        &mut b,
-        vec![Event::Ranked(Ok(Ranked::new(5, &[11, 10, 12], Some(1))))],
-    );
-    assert_eq!(actions[0], Action::Done(Err(Error::IncompatibleMembership)));
-}
-
-#[test]
-#[should_panic(expected = "out of order")]
-fn fill_origin_without_a_request_panics() {
-    fill(false, Features::PRODUCTION).on(Event::Origin(Ok(())), &mut budget(8, 16), Instant::now());
-}
-
-#[test]
-fn fill_version_miss_probes_remaining_copies_then_classifies() {
-    // Rank 1 delegates to rank 0 (`delegated`); `rank0` is what that probe
-    // ends with, the remaining copy-only probe of rank 2 ends with `last`.
-    let unreachable = Event::Reply(Reply::Failed {
-        error: Error::Unavailable,
-        sent: true,
-        scope_live: true,
-    });
-    for (rank0, last, end) in [
-        (
-            unreachable,
-            Some(answer(ResponseKind::Page)),
-            Ok(Source::Peer),
-        ),
-        (
-            unreachable,
-            Some(answer(ResponseKind::Miss)),
-            Err(Error::Unavailable),
-        ),
-        (unreachable, Some(unreachable), Err(Error::Unavailable)),
-        (unreachable, None, Err(Error::Cancelled)),
-        (
-            answer(ResponseKind::Miss),
-            Some(answer(ResponseKind::Miss)),
-            Err(Error::VersionUnavailable),
-        ),
-    ] {
-        let mut f = fill(false, Features::PRODUCTION);
-        let mut b = budget(8, 16);
-        assert!(matches!(owner_walk(&mut f, &mut b, 1), Action::Probe(p) if p.canonical == 0));
-        let (actions, _) = script(&mut f, &mut b, vec![rank0]);
-        assert_eq!(
-            actions[0],
-            Action::Rank {
-                ranking: Ranking::Authority,
-                version: Some(5)
-            }
-        );
-        let (actions, notes) = script(
-            &mut f,
-            &mut b,
+            NO_HINTS,
+        ]
+    };
+    let then = |mut prefix: Vec<Event<'static>>, rest: &[Event<'static>]| {
+        prefix.extend_from_slice(rest);
+        prefix
+    };
+    let reader =
+        |rest: &[Event<'static>]| then(vec![START, Event::Ranked(Ok(owners(5, None)))], rest);
+    let stale = |latest, previous_recent_member, rest: &[Event<'static>]| {
+        reader(&then(
             vec![
-                Event::Ranked(Ok(owners(5, Some(1)))),
-                Event::Origin(Err(Error::VersionUnavailable)),
-            ],
-        );
-        assert_eq!(actions[0], Action::Origin { rank: 1 });
-        assert!(
-            matches!(actions[1], Action::Probe(p) if p.canonical == 2 && p.mode == Mode::CopyOnly)
-        );
-        assert_ne!(notes & Notes::REMAINING, 0);
-        let mut events = vec![last.unwrap_or(Event::Abort(Error::Cancelled))];
-        if matches!(
-            last,
-            Some(Event::Reply(Reply::Answer {
-                kind: ResponseKind::Page,
-                ..
-            }))
-        ) {
-            events.push(Event::Validated(Ok(None)));
-            events.push(Event::Published(Ok(())));
-        }
-        let (actions, _) = script(&mut f, &mut b, events);
-        assert_eq!(*actions.last().unwrap(), Action::Done(end));
-    }
-}
-
-#[test]
-fn fill_walk_failures() {
-    // Every owner of a reader unreachable: the walk is exhausted.
-    let mut f = fill(false, Features::PRODUCTION);
-    let mut b = budget(8, 16);
-    let unreachable = Event::Reply(Reply::Failed {
-        error: Error::Io,
-        sent: true,
-        scope_live: true,
-    });
-    let (actions, notes) = script(
-        &mut f,
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(owners(5, None))),
-            unreachable,
-            unreachable,
-            unreachable,
-        ],
-    );
-    assert_eq!(actions[4], Action::Done(Err(Error::Unavailable)));
-    assert_ne!(notes & Notes::EXHAUSTED, 0);
-    // An empty ranking, and a terminal transport error.
-    let (actions, _) = script(
-        &mut fill(false, Features::PRODUCTION),
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(Ranked::new(5, &[], None))),
-        ],
-    );
-    assert_eq!(actions[1], Action::Done(Err(Error::Unavailable)));
-    let (actions, _) = script(
-        &mut fill(false, Features::PRODUCTION),
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(owners(5, None))),
-            Event::Reply(Reply::Failed {
-                error: Error::Unauthorized,
-                sent: true,
-                scope_live: true,
-            }),
-        ],
-    );
-    assert_eq!(actions[2], Action::Done(Err(Error::Unauthorized)));
-}
-
-/// A reader's first probe answered `StaleMembership`, with `latest` the
-/// newest membership and `previous_recent_member` the fallback's facts.
-fn stale(features: Features, latest: u64, previous_recent_member: bool) -> (Fill, Action, u16) {
-    let mut f = fill(false, features);
-    let mut b = budget(8, 16);
-    let (actions, notes) = script(
-        &mut f,
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(owners(5, None))),
-            answer(ResponseKind::StaleMembership),
-            Event::Membership {
-                latest: Some(latest),
-                previous_recent_member,
-            },
-        ],
-    );
-    assert_eq!(actions[2], Action::Refresh);
-    (f, actions[3], notes)
-}
-
-#[test]
-fn fill_stale_membership_refreshes_falls_back_waits_or_skips() {
-    // A newer membership: rank under it.
-    let (_, action, notes) = stale(Features::PRODUCTION, 6, false);
-    assert_eq!(
-        action,
-        Action::Rank {
-            ranking: Ranking::Current,
-            version: Some(6)
-        }
-    );
-    assert_ne!(notes & Notes::REFRESH, 0);
-    // Behind, and a recent member of version - 1: rank the page there.
-    let (mut f, action, _) = stale(Features::PRODUCTION, 5, true);
-    assert_eq!(
-        action,
-        Action::Rank {
-            ranking: Ranking::Fallback,
-            version: Some(4)
-        }
-    );
-    let (actions, notes) = script(
-        &mut f,
-        &mut budget(8, 16),
-        vec![Event::Ranked(Ok(owners(4, None)))],
-    );
-    assert!(matches!(actions[0], Action::Probe(_)));
-    assert_eq!(f.version, 4);
-    assert_ne!(notes & Notes::FALLBACK, 0);
-    // This node owns the page under version - 1: no fallback; it waits.
-    let (mut f, _, _) = stale(Features::PRODUCTION, 5, true);
-    let (actions, notes) = script(
-        &mut f,
-        &mut budget(8, 16),
-        vec![Event::Ranked(Ok(owners(4, Some(2)))), Event::Timer],
-    );
-    assert!(matches!(actions[0], Action::Wait(_)));
-    assert_ne!(notes & (Notes::FALLBACK_DENIED | Notes::WAIT_DENIED), 0);
-    assert!(matches!(actions[1], Action::Probe(p) if p.canonical == 0));
-    assert_eq!(f.waits, 1);
-    // Not a member of version - 1: wait, and without waits skip.
-    let (_, action, _) = stale(Features::PRODUCTION, 5, false);
-    assert!(matches!(action, Action::Wait(_)));
-    let (_, action, notes) = stale(
-        Features::PRODUCTION.with(Features::STALE_WAIT, false),
-        5,
-        false,
-    );
-    assert!(matches!(action, Action::Probe(p) if p.canonical == 1));
-    assert_ne!(notes & (Notes::STALE_SKIP | Notes::FALLBACK_BLOCKED), 0);
-}
-
-#[test]
-fn fill_remaining_stale_answer_is_terminal_in_production() {
-    {
-        let mut f = fill(false, Features::PRODUCTION);
-        let mut b = budget(8, 16);
-        owner_walk(&mut f, &mut b, 0);
-        let (actions, _) = script(
-            &mut f,
-            &mut b,
-            vec![
-                Event::Ranked(Ok(owners(5, Some(0)))),
-                Event::Origin(Err(Error::VersionUnavailable)),
                 answer(ResponseKind::StaleMembership),
+                Event::Membership {
+                    latest: Some(latest),
+                    previous_recent_member,
+                },
             ],
-        );
-        assert_eq!(actions[2], Action::Done(Err(Error::IncompatibleMembership)));
+            rest,
+        ))
+    };
+    let origin = |rest: &[Event<'static>]| {
+        then(
+            owner_walk(0),
+            &then(vec![Event::Ranked(Ok(owners(5, Some(0))))], rest),
+        )
+    };
+    // Rank 1 delegates to rank 0, which ends with `rank0`; after an origin version miss the
+    // remaining copy-only probe of rank 2 ends with `last`.
+    let remaining = |rank0, last: &[Event<'static>]| {
+        then(
+            owner_walk(1),
+            &then(
+                vec![
+                    rank0,
+                    Event::Ranked(Ok(owners(5, Some(1)))),
+                    Event::Origin(Err(Error::VersionUnavailable)),
+                ],
+                last,
+            ),
+        )
+    };
+    let production = Features::PRODUCTION;
+    let no_wait = Features::PRODUCTION.with(Features::STALE_WAIT, false);
+    #[rustfmt::skip]
+    let rows: Vec<(&str, bool, Features, Vec<Event<'static>>, &str)> = vec![
+        ("local hit", true, production, vec![Event::Start { local_hit: true }], "Done(Ok(Local))\nv0 waits=0 handoff=[]"),
+        // A plaintext fill offers a hedge before the walk; a winner is published.
+        ("hedge won", true, production, reader(&[Event::Hedge(HedgeEnd::Won), Event::Published(Ok(()))]), "Rank { ranking: Current, version: None }\nHedge { eligible: true, first: 0, second: 1 }\nPublish(Hedge)\nDone(Ok(Hedge))\nv5 waits=0 handoff=[]"),
+        ("ciphertext walks at once", false, production, reader(&[]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nv5 waits=0 handoff=[]"),
+        // Rank 0 has no predecessor: origin authority after ranking again, then publish or fail.
+        ("origin", false, production, origin(&[Event::Origin(Ok(())), Event::Published(Ok(()))]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nRank { ranking: Authority, version: Some(5) }\nOrigin { rank: 0 }\nPublish(Origin)\nDone(Ok(Origin))\nv5 waits=0 handoff=[]"),
+        ("publish fails", false, production, origin(&[Event::Origin(Ok(())), Event::Published(Err(Error::Overloaded))]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nRank { ranking: Authority, version: Some(5) }\nOrigin { rank: 0 }\nPublish(Origin)\nDone(Err(Overloaded))\nv5 waits=0 handoff=[]"),
+        ("origin fails", false, production, origin(&[Event::Origin(Err(Error::OriginForbidden))]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nRank { ranking: Authority, version: Some(5) }\nOrigin { rank: 0 }\nDone(Err(OriginForbidden))\nv5 waits=0 handoff=[]"),
+        // A ranking that changed before origin gives no authority.
+        ("ranking changed", false, production, then(owner_walk(0), &[Event::Ranked(Ok(Ranked::new(5, &[11, 10, 12], Some(1))))]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nRank { ranking: Authority, version: Some(5) }\nDone(Err(IncompatibleMembership))\nv5 waits=0 handoff=[]"),
+        ("remaining copy", false, production, remaining(UNAVAILABLE, &[answer(ResponseKind::Page), Event::Validated(Ok(None)), Event::Published(Ok(()))]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nValidate silence=Answered\nPublish(Peer) outcome=Ok(Copy)\nDone(Ok(Peer))\nv5 waits=0 handoff=[]"),
+        ("remaining miss", false, production, remaining(UNAVAILABLE, &[answer(ResponseKind::Miss)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Unavailable)) outcome=Ok(Probe(CopyMiss)) silence=Answered\nv5 waits=0 handoff=[]"),
+        ("remaining unreachable", false, production, remaining(UNAVAILABLE, &[UNAVAILABLE]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Unavailable)) outcome=Ok(Transport(Unreachable))\nv5 waits=0 handoff=[]"),
+        ("remaining aborted", false, production, remaining(UNAVAILABLE, &[Event::Abort(Error::Cancelled)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Transport(Unreachable)) rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(Cancelled))\nv5 waits=0 handoff=[]"),
+        ("version unavailable", false, production, remaining(answer(ResponseKind::Miss), &[answer(ResponseKind::Miss)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Probe(CopyMiss)) silence=Answered rank0=Answered rank0_probe\nOrigin { rank: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: CopyOnly, remaining_opportunities: 1, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(VersionUnavailable)) outcome=Ok(Probe(CopyMiss)) silence=Answered\nv5 waits=0 handoff=[]"),
+        // A stale answer to the remaining-copy walk is terminal.
+        ("remaining stale", false, production, origin(&[Event::Origin(Err(Error::VersionUnavailable)), answer(ResponseKind::StaleMembership)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nRank { ranking: Authority, version: Some(5) }\nOrigin { rank: 0 }\nProbe(Probe { index: 1, canonical: 1, mode: CopyOnly, remaining_opportunities: 2, route: SharedRoute, previous: false }) notes=0x1000\nDone(Err(IncompatibleMembership)) outcome=Err(IncompatibleMembership) silence=Answered\nv5 waits=0 handoff=[]"),
+        // Every owner of a reader unreachable: exhausted. An empty ranking; a terminal error.
+        ("exhausted", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true }), Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true }), Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(Transport(Unreachable))\nProbe(Probe { index: 2, canonical: 2, mode: Acquire, remaining_opportunities: 1, route: SharedRoute, previous: false }) outcome=Ok(Transport(Unreachable))\nDone(Err(Unavailable)) outcome=Ok(Transport(Unreachable)) notes=0x200\nv5 waits=0 handoff=[]"),
+        ("empty ranking", false, production, vec![START, Event::Ranked(Ok(Ranked::new(5, &[], None)))], "Rank { ranking: Current, version: None }\nDone(Err(Unavailable))\nv0 waits=0 handoff=[]"),
+        ("terminal", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Unauthorized, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nDone(Err(Unauthorized)) outcome=Err(Unauthorized)\nv5 waits=0 handoff=[]"),
+        // A stale reader refreshes to a newer membership; behind and a recent member of version
+        // - 1 it walks there; owning the page there it waits instead; not a member it waits, and
+        // without waits it skips.
+        ("refresh", false, production, stale(6, false, &[]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nRefresh silence=Answered\nRank { ranking: Current, version: Some(6) } outcome=Ok(StaleMembership) notes=0x4\nv5 waits=0 handoff=[]"),
+        ("fallback", false, production, stale(5, true, &[Event::Ranked(Ok(owners(4, None)))]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nRefresh silence=Answered\nRank { ranking: Fallback, version: Some(4) }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false }) outcome=Ok(StaleDestination) notes=0x9\nv4 waits=0 handoff=[]"),
+        ("fallback denied", false, production, stale(5, true, &[Event::Ranked(Ok(owners(4, Some(2)))), Event::Timer]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nRefresh silence=Answered\nRank { ranking: Fallback, version: Some(4) }\nWait(4s) notes=0x30\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nv5 waits=1 handoff=[]"),
+        ("wait", false, production, stale(5, false, &[]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nRefresh silence=Answered\nWait(4s)\nv5 waits=1 handoff=[]"),
+        ("skip", false, no_wait, stale(5, false, &[]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nRefresh silence=Answered\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(StaleDestination) notes=0x41\nv5 waits=0 handoff=[]"),
+        // A reader's probe of rank 0 timing out asks a ping; the next owner's own shed is busy,
+        // not hung; a relay's `Overloaded` is no silence evidence.
+        ("silence", false, production, reader(&[Event::Reply(Reply::TimedOut), answer(ResponseKind::Overloaded), Event::Reply(Reply::Answer { kind: ResponseKind::Overloaded, signed: false })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(TimedOut) silence=TimedOut { needed: 1 }\nProbe(Probe { index: 2, canonical: 2, mode: Acquire, remaining_opportunities: 1, route: SharedRoute, previous: false }) outcome=Ok(Shed) silence=Shed\nDone(Err(Unavailable)) outcome=Ok(Probe(Overloaded)) notes=0x200\nv5 waits=0 handoff=[]"),
+        // Rank 0 answers an owner's delegation that its own acquisition failed.
+        ("rank 0 failed", false, production, then(owner_walk(1), &[answer(ResponseKind::Unavailable)]), "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 2, route: FundedRoute, previous: false })\nRank { ranking: Authority, version: Some(5) } outcome=Ok(Failed) silence=Answered rank0=Failed rank0_probe\nv5 waits=0 handoff=[]"),
+        // Successor hints become a granted batch.
+        ("successors", false, production, vec![START, Event::Ranked(Ok(owners(5, Some(0)))), Event::Ranked(Err(Error::Unavailable)), Event::Hints { hints: &[12, 99], rank0: Rank0State::Unknown }, Event::BatchDone { copy: true }], "Rank { ranking: Current, version: None }\nRank { ranking: Previous, version: Some(4) }\nHints\nBatch { first: 0, count: 1, remaining_opportunities: 6 }\nPublish(Peer) notes=0x100\nv5 waits=0 handoff=[12]"),
+    ];
+    let mut wrong = String::new();
+    for (name, hedge, features, events, expected) in rows {
+        let actual = script(&mut fill(hedge, features), &mut budget(8, 16), &events);
+        if actual != expected {
+            writeln!(wrong, "            // {name}\n            {actual:?},").unwrap();
+        }
     }
-}
-
-#[test]
-fn fill_evidence_names_shed_timeouts_and_rank_zero() {
-    let now = Instant::now();
-    // A reader's probe of rank 0 that times out asks a ping.
-    let mut f = fill(false, Features::PRODUCTION);
-    let mut b = budget(8, 16);
+    assert!(wrong.is_empty(), "\n{wrong}");
+    // The batch is the successor target, remaining opportunities past rank 0's share.
+    let mut f = fill(false, production);
     script(
         &mut f,
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
-            Event::Ranked(Ok(owners(5, None))),
-        ],
-    );
-    let (_, evidence) = f.on(Event::Reply(Reply::TimedOut), &mut b, now);
-    assert_eq!(
-        evidence.silence,
-        Some(SilenceNote::TimedOut {
-            needed: crate::liveness::RANK0_TIMEOUTS
-        })
-    );
-    // The next owner sheds the reader itself: busy, not hung.
-    let (action, evidence) = f.on(answer(ResponseKind::Overloaded), &mut b, now);
-    assert_eq!(evidence.silence, Some(SilenceNote::Shed));
-    assert_eq!(evidence.outcome, Some(Ok(Outcome::Shed)));
-    assert!(matches!(action, Action::Probe(p) if p.canonical == 2));
-    // A relay's `Overloaded` is no silence evidence.
-    let (_, evidence) = f.on(
-        Event::Reply(Reply::Answer {
-            kind: ResponseKind::Overloaded,
-            signed: false,
-        }),
-        &mut b,
-        now,
-    );
-    assert_eq!(evidence.silence, None);
-    assert_eq!(
-        evidence.outcome,
-        Some(Ok(Outcome::Probe(ProbeOutcome::Overloaded)))
-    );
-    // Rank 0 answers an owner's delegation that its own acquisition failed.
-    let mut f = fill(false, Features::PRODUCTION);
-    let mut b = budget(8, 16);
-    owner_walk(&mut f, &mut b, 1);
-    let (_, evidence) = f.on(answer(ResponseKind::Unavailable), &mut b, now);
-    assert!(evidence.rank0_probe);
-    assert_eq!(evidence.outcome, Some(Ok(Outcome::Failed)));
-    assert_eq!(evidence.rank0, Some(Rank0Note::Failed));
-}
-
-#[test]
-fn fill_successor_hints_become_a_granted_batch() {
-    let mut f = fill(false, Features::PRODUCTION);
-    let mut b = budget(8, 16);
-    let (actions, _) = script(
-        &mut f,
-        &mut b,
-        vec![
-            Event::Start { local_hit: false },
+        &mut budget(8, 16),
+        &[
+            START,
             Event::Ranked(Ok(owners(5, Some(0)))),
             Event::Ranked(Err(Error::Unavailable)),
             Event::Hints {
                 hints: &[12, 99],
                 rank0: Rank0State::Unknown,
             },
-            Event::BatchDone { copy: true },
         ],
     );
-    assert_eq!(
-        actions[3],
-        Action::Batch {
-            first: 0,
-            count: 1,
-            remaining_opportunities: 2 + SUCCESSOR_SHARE_DIVISOR,
-        }
-    );
-    assert_eq!(f.handoff, [12]);
     assert_eq!(f.target_kind(0), TargetKind::Successor);
-    assert_eq!(actions[4], Action::Publish(Source::Peer));
+}
+
+#[test]
+#[should_panic(expected = "out of order")]
+fn fill_origin_without_a_request_panics() {
+    fill(false, Features::PRODUCTION).on(Event::Origin(Ok(())), &mut budget(8, 16), Instant::now());
 }
