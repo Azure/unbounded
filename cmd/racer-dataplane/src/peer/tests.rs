@@ -3638,3 +3638,28 @@ mod explicit_clock {
         drop(health.acquire_at(&node, later).unwrap());
     }
 }
+
+/// Bodyless page modes never select an RDMA rail, so a ping or offer is sent
+/// over HTTP without waiting for a link, window grant, or landing slot.
+#[test]
+fn bodyless_page_modes_have_no_rail_hint() {
+    let page = PageId {
+        version: ObjectVersion {
+            object: crate::topology::tests::fixtures::object(),
+            etag: StrongEtag::test_value("rail"),
+        },
+        number: PageNumber(9),
+    };
+    for (mode, expected) in [
+        (FetchMode::Ping, None),
+        (FetchMode::Offer, None),
+        (FetchMode::CopyOnly, Some(page.clone())),
+        (FetchMode::Acquire, Some(page.clone())),
+    ] {
+        let operation = Operation::Page {
+            page: page.clone(),
+            mode,
+        };
+        assert_eq!(crate::peer::rail_hint(&operation), expected);
+    }
+}

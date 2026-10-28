@@ -261,6 +261,28 @@ impl PeerNetwork {
 
 /// Narrow a caller's scope to the signed route without creating a new cancellation
 /// domain or extending the original deadline.
+/// The page that selects an RDMA rail for `operation`, if any. Bodyless page
+/// modes (ping, offer) have none: they take HTTP and never wait for an RDMA
+/// link, window grant, or landing slot before sending (Known issue 43).
+pub(crate) fn rail_hint(operation: &protocol::Operation) -> Option<crate::model::PageId> {
+    match operation {
+        protocol::Operation::Page {
+            mode: protocol::FetchMode::Ping | protocol::FetchMode::Offer,
+            ..
+        } => None,
+        protocol::Operation::Page { page, .. } => Some(page.clone()),
+        protocol::Operation::Subscribe { subscription, .. } => subscription
+            .demand
+            .intervals()
+            .first()
+            .map(|interval| crate::model::PageId {
+                version: subscription.version.clone(),
+                number: crate::model::PageNumber(interval.start),
+            }),
+        _ => None,
+    }
+}
+
 pub(crate) fn request_scope(
     request: &protocol::PeerRequest,
     scope: &RequestScope,
@@ -998,18 +1020,7 @@ impl Requester {
             // The hint chooses a candidate rail, never the provider's page order.
             // The sender validates the actual selected page against that rail and
             // falls back to HTTP before exporting a window when they disagree.
-            let rail_hint = match &request.request.operation {
-                protocol::Operation::Page { page, .. } => Some(page.clone()),
-                protocol::Operation::Subscribe { subscription, .. } => subscription
-                    .demand
-                    .intervals()
-                    .first()
-                    .map(|interval| crate::model::PageId {
-                        version: subscription.version.clone(),
-                        number: crate::model::PageNumber(interval.start),
-                    }),
-                _ => None,
-            };
+            let rail_hint = rail_hint(&request.request.operation);
             let plan = if direct_http {
                 if next != budget.destination {
                     return Err(Error::InvalidRequest);
