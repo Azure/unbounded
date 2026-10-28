@@ -10,6 +10,7 @@
 #                        mode=crictl: full containerd pull + unpack
 #                        mode=curl:   fetch every layer blob through the local gantry mirror
 #   summarize <results.tsv>
+#   prune                remove unused images (incl. old bench images) on every worker
 set -euo pipefail
 
 NS=gantry-bench
@@ -118,6 +119,74 @@ $(worker_affinity)
             path: /
 EOF
 	kubectl -n "$NS" rollout status ds/prep --timeout=15m
+}
+
+# cmd_prune removes every image that no container uses on every worker, which
+# includes earlier bench images, and prints the 5 fullest root disks. It also
+# drops gantry's content leases. The 40 GB runs need this: content plus
+# snapshot is about 80 GB on a 123 GiB OS disk, and blobs still leased from the
+# previous run can push a node past the kubelet eviction limit.
+cmd_prune() {
+	kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: prune
+  namespace: $NS
+spec:
+  selector:
+    matchLabels:
+      app: prune
+  template:
+    metadata:
+      labels:
+        app: prune
+    spec:
+      terminationGracePeriodSeconds: 1
+$(worker_affinity)
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: prune
+          image: $BUSYBOX
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command:
+            - chroot
+            - /host
+            - bash
+            - -c
+            - |
+              # Gantry P2P leases the blobs it ingests for 60 minutes
+              # (containerd_lease_ttl), which keeps them on disk after the
+              # image is removed. Drop those leases first.
+              ctr -n k8s.io leases ls -q | grep '^gantry-' |
+                xargs -r ctr -n k8s.io leases rm --sync >/dev/null 2>&1 || true
+              crictl rmi --prune >/dev/null 2>&1 || true
+              ctr -n k8s.io content prune references >/dev/null 2>&1 || true
+              echo "PRUNED \$NODE \$(df --output=pcent / | tail -n 1 | tr -d ' %')"
+              exec sleep infinity
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          volumeMounts:
+            - name: host
+              mountPath: /host
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+EOF
+	kubectl -n "$NS" rollout status ds/prune --timeout=15m
+	kubectl -n "$NS" get pods -l app=prune -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' |
+		xargs -P 64 -I{} kubectl -n "$NS" logs {} 2>/dev/null | grep '^PRUNED' | sort -k3 -n | tail -n 5
+	kubectl -n "$NS" delete ds prune --wait=false >/dev/null
 }
 
 # cmd_diskprep frees the Azure resource disk (mounted at /mnt) on every worker
@@ -330,11 +399,20 @@ EOF
 	# Wait for every pod to report a result.
 	while true; do
 		sleep 20
-		collect "$name" >"$results.tmp"
+		# Write to a scratch file first so an interrupted collect does not wipe
+		# the last good snapshot.
+		collect "$name" >"$results.tmp.new" && mv "$results.tmp.new" "$results.tmp"
 		local got
 		got=$(grep -c '^RESULT' "$results.tmp" || true)
 		echo "$(date -u +%T) results $got/$want" >&2
 		if [ "$got" -ge "$want" ]; then
+			break
+		fi
+		# Touch $OUT/<label>.stop to stop waiting and keep the results so far,
+		# for example when some nodes were evicted and will never report.
+		if [ -e "$OUT/$label.stop" ]; then
+			echo "stop file found" >&2
+			rm -f "$OUT/$label.stop"
 			break
 		fi
 		if [ "$(date +%s)" -gt $((start_at + ${MAX_WAIT:-3600})) ]; then
@@ -410,5 +488,6 @@ diskprep) cmd_diskprep ;;
 gen) shift; cmd_gen "$@" ;;
 run) shift; cmd_run "$@" ;;
 summarize) shift; cmd_summarize "$@" ;;
+prune) cmd_prune ;;
 *) sed -n '2,13p' "$0"; exit 1 ;;
 esac
