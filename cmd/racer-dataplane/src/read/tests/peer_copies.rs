@@ -3317,65 +3317,54 @@ fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
     f.fill = Fill::new(deps);
 }
 
-/// A requester that adopted a membership its destination has not
-/// (here: no newer local membership to refresh to) skips the stale owner and
-/// reads from the next one instead of failing with `IncompatibleMembership`.
+/// `StaleMembership` with nothing newer to refresh to, through production's membership refresh:
+/// a reader skips the owner that is behind and reads the next one; with every owner behind it ends
+/// `Unavailable` after one probe each, never at origin; an owner keeps its origin authority.
+/// Without any published membership the stale answer is terminal `Unavailable`.
 #[test]
-fn stale_destination_without_newer_membership_tries_the_next_owner() {
+fn stale_answers_without_a_newer_membership() {
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
-    publish_same_membership(&mut f, &peers);
-    let good = encrypted_copy(&mut f);
-    peers.replies.borrow_mut().extend([
-        (ordered[0].clone(), Reply::Stale),
-        (ordered[1].clone(), Reply::Copy(good)),
-    ]);
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    let result = acquire(&mut f, &mut budget);
-    assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
-    assert_eq!(peers.calls.borrow().len(), 2);
-    assert!(budget.remaining_attempts() < 8 && budget.remaining_links() < 16);
-    assert_eq!(f.origin.calls.get(), 0);
-}
-
-/// Every owner behind: the read ends with a recoverable `Unavailable` (the
-/// client retries) after one probe per owner, never `IncompatibleMembership`,
-/// and never reaches the origin from a non-owner.
-#[test]
-fn all_stale_destinations_end_unavailable_after_one_probe_each() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
-    publish_same_membership(&mut f, &peers);
-    peers
-        .replies
-        .borrow_mut()
-        .extend(ordered.iter().map(|n| (n.clone(), Reply::Stale)));
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    assert!(matches!(
-        acquire(&mut f, &mut budget),
-        Err(Error::Unavailable)
-    ));
-    assert_eq!(peers.calls.borrow().len(), ordered.len());
-    assert_eq!(f.origin.calls.get(), 0);
-    assert_unpublished(&f);
-}
-
-/// An owner whose predecessor is behind keeps its origin authority.
-#[test]
-fn owner_with_stale_predecessor_reaches_origin() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, Some(1));
-    publish_same_membership(&mut f, &peers);
-    own(&f, true);
-    peers.reply(&ordered[0], Reply::Stale);
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    let result = acquire(&mut f, &mut budget);
-    assert!(result.is_ok(), "{:?}", result.err());
-    assert_eq!(peers.calls.borrow().len(), 1);
-    assert_eq!(f.origin.calls.get(), 1);
+    // (this node's rank, a membership is published, stale owners, a copy follows) ->
+    // (probes, origin calls)
+    for (rank, published, stale, copy, probes, origin) in [
+        (None, true, 1, true, 2, 0),
+        (None, true, 3, false, 3, 0),
+        (Some(1), true, 1, false, 1, 1),
+        (None, false, 1, false, 1, 0),
+    ] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, rank);
+        if published {
+            publish_same_membership(&mut f, &peers);
+        }
+        if rank.is_some() {
+            own(&f, true);
+        }
+        for n in &ordered[..stale] {
+            peers.reply(n, Reply::Stale);
+        }
+        if copy {
+            let good = encrypted_copy(&mut f);
+            peers.reply(&ordered[stale], Reply::Copy(good));
+        }
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget);
+        let case = format!("{rank:?} {published} {stale} {copy}");
+        if copy {
+            let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
+        } else if rank.is_some() {
+            assert!(result.is_ok(), "{case}: {:?}", result.err());
+        } else {
+            assert!(matches!(result, Err(Error::Unavailable)), "{case}");
+            assert_unpublished(&f);
+        }
+        assert_eq!(peers.calls.borrow().len(), probes, "{case}");
+        assert_eq!(f.origin.calls.get(), origin, "{case}");
+        if copy {
+            assert!(budget.remaining_attempts() < 8 && budget.remaining_links() < 16);
+        }
+    }
 }
 
 /// An owner of the page is behind this node (it answers
@@ -3815,22 +3804,6 @@ fn stale_fallback_never_makes_a_previous_owner_fetch() {
         assert_eq!(*peers.memberships.borrow(), expected, "wait {wait}");
         assert_eq!(f.origin.calls.get(), 0);
     }
-}
-
-/// Without any published membership the stale answer stays terminal
-/// (`Unavailable` from `stale_action`), and nothing else is probed.
-#[test]
-fn stale_answer_without_published_membership_is_unavailable() {
-    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
-    peers.reply(&ordered[0], Reply::Stale);
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    assert!(matches!(
-        acquire(&mut f, &mut budget),
-        Err(Error::Unavailable)
-    ));
-    assert_eq!(peers.calls.borrow().len(), 1);
 }
 
 /// A page owner whose ranking moved with the last membership
