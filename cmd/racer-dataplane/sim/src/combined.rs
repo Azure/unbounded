@@ -1,22 +1,9 @@
-//! Combined mode: the control plane ([`ControlSim`]) and the data plane
-//! ([`NodeWorld`]) on one deterministic timeline.
-//!
-//! Pods map 1:1 to data-plane nodes (Pod `i` is node `i`). The two queues are
-//! co-stepped: before the data plane processes an event at time `t`, every
-//! control event at or before `t` runs (control first on ties). After each
-//! control step the recorded [`Changes`] are applied to the data plane:
-//!
-//! - a committed membership version becomes a shared `topology::Membership`
-//!   built from the published members (cached by version, with the previous
-//!   version as predecessor, see [`NodeWorld::commit_membership`]);
-//! - each node adopts exactly the version its control client applied, so
-//!   lagging or partitioned clients produce real data-plane membership skew;
-//!   a node whose client has applied nothing (not yet enrolled, or restarted)
-//!   neither reads nor accepts peer links;
-//! - a Pod crash crashes the node (its disk survives), a restart restarts it,
-//!   and a removed Pod stays down.
-//!
-//! The trace hash mixes both timelines' hashes.
+//! Combined mode: [`ControlSim`] and [`NodeWorld`] on one timeline. Pod `i`
+//! is node `i`; control events at or before a data-plane event run first, and
+//! the recorded [`Changes`] then apply: committed memberships become shared
+//! `topology::Membership` versions, each node adopts exactly the version its
+//! client applied (none: it neither reads nor accepts peer links), and Pod
+//! crashes, restarts and removals crash or restart the node.
 
 use serde_json::{Value, json};
 
@@ -223,16 +210,8 @@ pub fn data_schedules(scenario: &str, config: &mut Config) {
 }
 
 /// Arrival window of the `full-cold-start` storm: at least one second, and
-/// long enough that the storm offers at most half of what the object's owners
-/// can send. Every reader wants every page of object 0; without overflow
-/// fan-out only a page's `REPLICAS` owners serve it, so a page's peer
-/// throughput is `REPLICAS * nic_bps` (Known issue 11). With 16 pages on
-/// distinct owners the storm needs `nodes * page_bytes / (REPLICAS *
-/// nic_bps)` seconds of owner egress: about 14 s at 50,000 nodes and 10 Gbit/s.
-/// Overflow fan-out (Known issue 16) lets page helpers serve readers too, so
-/// the one-second storm no longer overloads the system; it stays available
-/// through `storms` in `--config`, and this window keeps the default run
-/// comparable with earlier rounds.
+/// twice the owner egress the storm needs (`nodes * page_bytes / (REPLICAS *
+/// nic_bps)`), so it offers at most half of what a page's owners can send.
 pub fn cold_start_window_ns(config: &Config) -> Nanos {
     let replicas = topology::REPLICAS as u128;
     let egress = u128::from(config.nodes) * u128::from(config.page_bytes) * u128::from(SECONDS)
@@ -396,14 +375,52 @@ pub fn run(
 mod tests {
     use super::*;
 
-    fn quick(scenario: &str, nodes: u32, secs: u64, seed: u64, rate: f64) -> Value {
+    /// Run `scenario` with the combined data defaults at `rate`, tuned by `f`.
+    fn tuned(
+        scenario: &str,
+        nodes: u32,
+        rate: f64,
+        seed: u64,
+        secs: Option<u64>,
+        f: impl FnOnce(&mut Config),
+    ) -> Value {
         let mut config = Config {
             nodes,
             ..Config::default()
         };
         data_defaults(&mut config);
         config.request_rate = rate;
-        run(scenario, config, seed, Some(secs * SECONDS), None).unwrap()
+        f(&mut config);
+        run(scenario, config, seed, secs.map(|s| s * SECONDS), None).unwrap()
+    }
+
+    fn quick(scenario: &str, nodes: u32, secs: u64, seed: u64, rate: f64) -> Value {
+        tuned(scenario, nodes, rate, seed, Some(secs), |_| {})
+    }
+
+    /// Failover, 400 nodes, 300 s, rate 0.2.
+    fn failover(seed: u64, f: impl FnOnce(&mut Config)) -> Value {
+        tuned("full-failover", 400, 0.2, seed, Some(300), f)
+    }
+
+    /// Full churn, 500 nodes, default duration, rate 0.005.
+    fn churn(f: impl FnOnce(&mut Config)) -> Value {
+        tuned("full-churn", 500, 0.005, 1, None, f)
+    }
+
+    fn moved(r: &Value) -> u64 {
+        r["origin_per_page"]["repeats"]["after_owner_move"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// Rank 0 refetches of a successor's copy (`copy_only`, `failed`, `relay`).
+    fn orphans(r: &Value) -> u64 {
+        let o = &r["origin_per_page"]["repeats"]["orphan"];
+        ["copy_only", "failed", "relay"]
+            .iter()
+            .map(|k| o[k].as_u64().unwrap())
+            .sum()
     }
 
     fn counter(r: &Value, k: &str) -> u64 {
@@ -551,24 +568,13 @@ mod tests {
     #[test]
     fn failover_readers_are_deferred_to_orphan_holders() {
         let run_with = |hints: bool| {
-            let mut config = Config {
-                nodes: 400,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.2;
-            config.node.successor_hints = hints;
-            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+            failover(2, |c| {
+                c.node.successor_hints = hints;
+            })
         };
         // 400 nodes, seed 2: 152 such orphans without hints, 104 with.
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
-        let orphans = |r: &Value| {
-            let o = &r["origin_per_page"]["repeats"]["orphan"];
-            o["copy_only"].as_u64().unwrap()
-                + o["failed"].as_u64().unwrap()
-                + o["relay"].as_u64().unwrap()
-        };
         assert_eq!(counter(&off, "successor_deferrals"), 0);
         assert!(counter(&on, "successor_deferrals") > 0, "{}", on["metrics"]);
         assert!(
@@ -586,25 +592,14 @@ mod tests {
     #[test]
     fn failover_owners_copy_orphans_from_successors() {
         let run_with = |targets: bool| {
-            let mut config = Config {
-                nodes: 400,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.2;
-            config.node.successor_targets = targets;
-            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+            failover(2, |c| {
+                c.node.successor_targets = targets;
+            })
         };
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
         assert_eq!(counter(&off, "successor_probes"), 0);
         assert!(counter(&on, "successor_copies") > 0, "{}", on["metrics"]);
-        let orphans = |r: &Value| {
-            let o = &r["origin_per_page"]["repeats"]["orphan"];
-            o["copy_only"].as_u64().unwrap()
-                + o["failed"].as_u64().unwrap()
-                + o["relay"].as_u64().unwrap()
-        };
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
         // A refetch by rank 0 that noted the holder is rare: its one probe
         // missed (the holder's fetch had failed) or failed. Since copy-only
@@ -628,14 +623,9 @@ mod tests {
     fn failover_holders_offer_orphans_to_rank_zero() {
         use racer_core::read::hints::NOTICE_TRIES;
         let run_with = |notices: bool| {
-            let mut config = Config {
-                nodes: 400,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.2;
-            config.node.orphan_notices = notices;
-            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+            failover(2, |c| {
+                c.node.orphan_notices = notices;
+            })
         };
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
@@ -648,16 +638,7 @@ mod tests {
             "{}",
             on["metrics"]
         );
-        let ungrouped = {
-            let mut config = Config {
-                nodes: 400,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.2;
-            config.node.offer_cut_groups = false;
-            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
-        };
+        let ungrouped = failover(2, |c| c.node.offer_cut_groups = false);
         assert!(
             counter(&on, "partition_link_failures_offers")
                 <= counter(&ungrouped, "partition_link_failures_offers"),
@@ -708,15 +689,10 @@ mod tests {
     #[test]
     fn owners_leave_origin_retries_to_a_failing_rank_zero() {
         let run_with = |hold: bool| {
-            let mut config = Config {
-                nodes: 400,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.2;
-            config.combined_faults.p5xx = 1.0;
-            config.node.rank0_failure_hold = hold;
-            run("full-failover", config, 1, Some(300 * SECONDS), None).unwrap()
+            failover(1, |c| {
+                c.combined_faults.p5xx = 1.0;
+                c.node.rank0_failure_hold = hold;
+            })
         };
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
@@ -773,24 +749,14 @@ mod tests {
     #[test]
     fn lineage_targets_find_copies_of_pages_that_moved() {
         let run_with = |lineage: bool| {
-            let mut config = Config {
-                nodes: 500,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.005;
-            config.node.lineage = lineage;
-            run("full-churn", config, 1, None, None).unwrap()
+            churn(|c| {
+                c.node.lineage = lineage;
+            })
         };
         let off = run_with(false);
         let on = run_with(true);
         assert_clean(&off);
         assert_clean(&on);
-        let moved = |r: &Value| {
-            r["origin_per_page"]["repeats"]["after_owner_move"]
-                .as_u64()
-                .unwrap()
-        };
         let origin = |r: &Value| r["origin_per_page"]["requests"].as_u64().unwrap();
         // Seed 1: 91 and 82 repeats after a move, 2,178 and 2,169 requests.
         assert!(moved(&off) > 0);
@@ -813,16 +779,11 @@ mod tests {
     #[test]
     fn demoted_targets_and_lineage_grants_find_more_moved_copies() {
         let run_with = |grants: bool, demoted: bool, join_rank: bool| {
-            let mut config = Config {
-                nodes: 500,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.005;
-            config.node.lineage_grants = grants;
-            config.node.demoted_targets = demoted;
-            config.node.copy_join_rank = join_rank;
-            run("full-churn", config, 1, None, None).unwrap()
+            churn(|c| {
+                c.node.lineage_grants = grants;
+                c.node.demoted_targets = demoted;
+                c.node.copy_join_rank = join_rank;
+            })
         };
         let before = run_with(false, false, false);
         let grants = run_with(true, false, true);
@@ -831,11 +792,6 @@ mod tests {
         for r in [&before, &grants, &all, &cycles] {
             assert_clean(r);
         }
-        let moved = |r: &Value| {
-            r["origin_per_page"]["repeats"]["after_owner_move"]
-                .as_u64()
-                .unwrap()
-        };
         let origin = |r: &Value| r["origin_per_page"]["requests"].as_u64().unwrap();
         assert!(
             moved(&grants) < moved(&before),
@@ -871,16 +827,11 @@ mod tests {
     #[test]
     fn parallel_deep_lineage_probes_find_more_copies_without_more_latency() {
         let run_with = |parallel: bool, cap: usize, unknown: bool| {
-            let mut config = Config {
-                nodes: 500,
-                ..Config::default()
-            };
-            data_defaults(&mut config);
-            config.request_rate = 0.005;
-            config.node.parallel_granted = parallel;
-            config.node.lineage_cap = cap;
-            config.node.unknown_age_targets = unknown;
-            run("full-churn", config, 1, None, None).unwrap()
+            churn(|c| {
+                c.node.parallel_granted = parallel;
+                c.node.lineage_cap = cap;
+                c.node.unknown_age_targets = unknown;
+            })
         };
         let max = racer_core::read::walk::MAX_LINEAGE;
         let narrow = run_with(false, 3, false);
@@ -889,11 +840,6 @@ mod tests {
         for r in [&narrow, &sequential, &parallel] {
             assert_clean(r);
         }
-        let moved = |r: &Value| {
-            r["origin_per_page"]["repeats"]["after_owner_move"]
-                .as_u64()
-                .unwrap()
-        };
         let mean = |r: &Value| {
             r["metrics"]["histograms"]["read_ns"]["mean"]
                 .as_f64()
@@ -932,14 +878,8 @@ mod tests {
             };
             data_defaults(&mut config);
             config.request_rate = 0.05;
-            run(
-                "full-cold-start",
-                config,
-                1,
-                Some(120 * SECONDS),
-                Some(&json!({ "report_at_start": report_at_start })),
-            )
-            .unwrap()
+            let o = json!({ "report_at_start": report_at_start });
+            run("full-cold-start", config, 1, Some(120 * SECONDS), Some(&o)).unwrap()
         };
         let before = run_with(true);
         assert_clean(&before);
