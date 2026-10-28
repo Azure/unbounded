@@ -1,4 +1,20 @@
 //! Worker-owned singleflight keyed exactly by page identity, with bounded waiters.
+//!
+//! Lifecycle contract:
+//! - join/wait elects one acquisition caller; other callers independently wait.
+//! - publish shares a complete, validated PageResult, never a request context.
+//! - origin rejection fails only its supplying caller; another live acquisition
+//!   waiter can be elected with its own context and unreset budget. Copy waiters
+//!   cannot be elected. Other terminal failures wake all current waiters.
+//! - cancellation/drop detaches one caller. Abandoned leadership enters Draining;
+//!   only actual I/O/crypto completion fences permit RetryPending or removal.
+//! - removal requires no waiters AND no retained operations. A replacement entry
+//!   gets a new incarnation; every acquisition/retry gets a new generation.
+//!
+//! The worker table owns operations, reservations, and completion fences,
+//! independently of futures/tokens. Dropping a token must schedule detach/abandon
+//! on that worker, never free live resources. Register/recheck wakeups before
+//! parking. Bound entries, waiters, retry attempts, and retained completions.
 
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
@@ -266,8 +282,11 @@ impl PhaseState for Phase {
     }
 }
 
-/// Transfer this token to the actual completion owner before submitting work. `complete` is called
-/// only after completion (or confirmed non-submission).
+/// Transfer this token to the actual completion owner before submitting work.
+/// `complete` is called only after completion (or confirmed non-submission).
+/// Drop deliberately does NOT release resources or clear the generation fence.
+/// Losing a token retains its slot until the table itself is destroyed; shutdown
+/// must continue owning the table until `drain` succeeds.
 pub struct FlightOperation {
     flights: Rc<Flights>,
     pub(super) fence: Fence,
@@ -336,6 +355,10 @@ impl FlightOperation {
 }
 
 /// Original acquisition budget; the rule lives in racer-core.
+/// ```compile_fail
+/// use racer_dataplane::read::flight::AcquisitionBudget;
+/// fn duplicate(budget: AcquisitionBudget) { let _other = budget.clone(); }
+/// ```
 pub use racer_core::read::AcquisitionBudget;
 
 /// Includes table identity to reject tokens from another worker/table, plus entry
@@ -381,8 +404,15 @@ pub struct FlightLeader {
     pub(super) active: bool,
 }
 
-/// Per-request registration; cannot be stored in a completed flight/cache entry. The non-cloneable
-/// OriginContext stays with its original request.
+/// Per-request registration; cannot be stored in a completed flight/cache entry.
+/// The non-cloneable OriginContext stays with its original request. Only a short
+/// borrow is exposed to the elected driver; owned per-attempt sealing/I/O messages
+/// retain their own admitted allocations until actual completion. Detach drops
+/// these borrows, not another caller's context or outstanding transport owners.
+/// ```compile_fail
+/// use racer_dataplane::read::flight::AcquisitionWaiter;
+/// fn retain(waiter: AcquisitionWaiter<'_>) -> AcquisitionWaiter<'static> { waiter }
+/// ```
 pub struct AcquisitionWaiter<'a> {
     pub(super) registration: Registration,
     context: &'a OriginContext,
@@ -402,6 +432,12 @@ pub(super) struct Registration {
 }
 
 /// No credentials, membership, budget, or API to obtain a leader capability.
+/// ```compile_fail
+/// use racer_dataplane::read::flight::{CopyWaiter, FlightLeader};
+/// fn acquire(mut waiter: CopyWaiter<'_>, leader: &FlightLeader) {
+///     let _context = waiter.acquisition(leader);
+/// }
+/// ```
 pub struct CopyWaiter<'a> {
     registration: Registration,
     scope: &'a RequestScope,
@@ -426,8 +462,9 @@ pub enum AcquisitionEvent {
     Failed(Error),
 }
 
-/// Borrowed only after checking the leader, registration, page/object association, cancellation,
-/// and generation.
+/// Borrowed only after checking the leader, registration, page/object association,
+/// cancellation, and generation. It does not grant origin permission: Fill must
+/// resolve candidates under this membership and obtain a new OriginAuthority.
 pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
@@ -473,8 +510,10 @@ impl AcquisitionWaiter<'_> {
         })
         .await
     }
-    /// Independent deadline/cancellation. Lead is emitted once per election; retry elects only a
-    /// still-live caller with remaining original credits.
+    /// Independent deadline/cancellation. Lead is emitted once per election;
+    /// retry elects only a still-live caller with remaining original credits.
+    /// A rejected caller receives OriginRejected/OriginForbidden and is ineligible
+    /// for this cohort. Peer Unauthorized failures are terminal instead.
     pub fn wait(&mut self) -> Operation<'_, AcquisitionEvent> {
         Box::pin(poll_fn(move |cx| {
             self.registration.cancellation.register(cx.waker());
@@ -554,8 +593,9 @@ impl AcquisitionWaiter<'_> {
         })
     }
 
-    /// Detach only this registration. If supplying an active acquisition, cancel that attempt and
-    /// drain it before electing another caller. Drop has the same required effect.
+    /// Detach only this registration. If supplying an active acquisition, cancel
+    /// that attempt and drain it before electing another caller. Drop has the same
+    /// required effect. A completed entry retains no OriginContext borrows.
     pub fn detach(mut self) -> Result<FlightState> {
         self.registration.detach()
     }
@@ -692,8 +732,9 @@ impl Flights {
         Ok(())
     }
 
-    /// Admit a new follower of shared local plaintext work with the same current cache and
-    /// source-key checks as flight registration.
+    /// Admit a new follower of shared local plaintext work with the same current
+    /// cache and source-key checks as flight registration. Callers admitted
+    /// before a key retirement keep their completion rights.
     pub(super) fn admit_local(
         &self,
         page: &PageId,
@@ -713,8 +754,10 @@ impl Flights {
         coalesce::flight::update(&self.table, f)
     }
 
-    /// Validate context.object against page.version.object before registration. Admit a bounded
-    /// independent waiter.
+    /// Validate context.object against page.version.object before registration.
+    /// Admit a bounded independent waiter. The elected Fill reserves its page
+    /// memory before acquisition; accepted work uses retain_operation to retain
+    /// completion capacity. Context/header differences do not split page identity.
     pub fn join<'a>(
         self: &Rc<Self>,
         page: PageId,
@@ -1393,8 +1436,12 @@ impl Flights {
         })
     }
 
-    /// Accept only once the worker confirms actual completions are reaped; a caller's report alone
-    /// is not a completion fence.
+    /// Accept only once the worker confirms actual completions are reaped; a
+    /// caller's report alone is not a completion fence. OriginRejected
+    /// marks only its caller failed and moves to RetryPending if an eligible caller
+    /// remains; otherwise fail remaining copy waiters with Unavailable. Terminal
+    /// errors fail the cohort. Neither result is cached as evidence about the page.
+    /// Stale fences return StaleFlight without mutating the current generation.
     pub fn fail(
         &self,
         mut leader: FlightLeader,
@@ -1417,6 +1464,9 @@ impl Flights {
     }
 
     /// I/O worker lifecycle hook, called even with no remaining request futures.
+    /// Process detach/abandon notifications and already-reaped runtime completions,
+    /// check their fences, wake/elect live callers, and remove quiescent entries.
+    /// Never substitute a timeout or cancellation request for an actual fence.
     pub fn poll_budgeted(&self, work_budget: usize) -> Result<()> {
         self.poll_with_context(
             &mut Context::from_waker(futures::task::noop_waker_ref()),

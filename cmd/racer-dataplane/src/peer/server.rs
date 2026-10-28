@@ -16,6 +16,17 @@ use std::time::Duration;
 use std::time::Instant;
 
 /// Implemented by the existing read coordinator, never a second acquisition graph.
+/// Ingress must be verified; the local result is unsigned until the server signs
+/// it with a retained clone of the request binding.
+///
+/// ```compile_fail
+/// use racer_dataplane::{peer::{server::LocalPageService, protocol::PeerRequest},
+///     runtime::RequestScope, topology::Membership};
+/// fn unverified(service: &dyn LocalPageService, request: PeerRequest,
+///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
+///     service.serve_peer(request, membership, scope);
+/// }
+/// ```
 pub trait LocalPageService {
     fn serve_peer<'a>(
         &'a self,
@@ -765,7 +776,9 @@ impl PeerServer {
         connection.state_mut().relay.reservation = None;
         Ok(connection)
     }
-    /// Verify the complete ingress envelope before service or relay.
+    /// Verify the complete ingress envelope before service or relay. Sign a local
+    /// result against its binding; return a relayed signed result without replacing
+    /// the responder's original signature or discarding forwarding headers.
     pub fn dispatch<'a>(
         &'a self,
         request: SignedRequest,

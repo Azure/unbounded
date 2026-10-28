@@ -375,8 +375,9 @@ impl Coordinator {
                 )
                 .await?;
             validate_metadata(&metadata, &origin.object, &selector)?;
-            // Direct reads have no client credits. The dataplane paces them with its own window, at
-            // least `range_window_pages`, and releases each page after writing it.
+            // Direct reads have no client credits. The dataplane paces them
+            // with its own window, at least `range_window_pages`, and releases
+            // each page after writing it.
             let direct_window = crate::client::DIRECT_WINDOW_PAGES.max(self.streams.window_pages());
             let kind = match kind {
                 ReadKind::HostRead { range, .. } | ReadKind::GpuRead { range, .. } => {

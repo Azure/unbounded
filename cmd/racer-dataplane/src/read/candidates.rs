@@ -292,8 +292,9 @@ impl CandidatePolicy {
     pub(crate) fn hedge_owner(&self) -> Option<&Arc<Hedges>> {
         self.hedge.as_ref()
     }
-    /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations prove independent
-    /// first hops. Drain both attempts before releasing escrow.
+    /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations
+    /// prove independent first hops. Drain both attempts before releasing escrow.
+    /// Hedge a page request while sharing its acquisition budget and validation.
     #[allow(clippy::too_many_arguments)] // The hedge borrows the caller's distinct policy inputs.
     pub(crate) async fn hedge_page<'a>(
         &'a self,
@@ -324,8 +325,9 @@ impl CandidatePolicy {
         let reservation = (|| {
             let slot = hedges.acquire()?;
             let escrow = reserve_hedge_pages(admission, &context.object.cache, 1)?;
-            // The caller already holds its serial plaintext page. Escrow is additional accounting,
-            // not a buffer consumed by either validator.
+            // The caller already holds its serial plaintext page. Escrow is
+            // additional accounting, not a buffer consumed by either validator.
+            // Fund BOTH contenders before spending credits or changing routing.
             let working = reserve_hedge_pages(admission, &context.object.cache, 2)?;
             drop(working);
             Ok::<_, Error>((slot, escrow))
@@ -442,8 +444,10 @@ impl CandidatePolicy {
             Err(error) => Err(error),
         }
     }
-    /// One admitted selection, one transfer grant. Routing chooses the primary of the oldest
-    /// demanded page; the provider can choose any demanded page for which it is also primary.
+    /// One admitted selection, one transfer grant. Routing chooses the primary of
+    /// the oldest demanded page; the provider can choose any demanded page for
+    /// which it is also primary. Backups are not speculatively contacted.
+    /// Subscribe to candidate copies under the caller's demand and route budget.
     #[allow(clippy::too_many_arguments)] // Keep demand, validation, and budget inputs explicit.
     pub(crate) async fn subscribe(
         &self,
@@ -499,8 +503,38 @@ impl CandidatePolicy {
         })
     }
 
-    /// Request one selection from the provider of `first`, asking it to allow up to `flights`
-    /// selections pending at once on the caller's contract.
+    /// Request one selection from the provider of `first`, asking it to allow
+    /// up to `flights` selections pending at once on the caller's contract.
+    ///
+    /// `contract(provider, flights)` builds the Subscribe for the chosen
+    /// provider; `flights` is what to put in `Subscription::flights` (`None`
+    /// when `flights <= 1` or the provider is known to be single-flight). It
+    /// returns the subscription and the deadline to sign.
+    ///
+    /// Sequencing contract for concurrent selections. The provider keys one
+    /// contract by (membership, receiver node, subscription id) and allows only
+    /// one live contract per (membership, receiver node, version). Callers must:
+    ///
+    /// 1. Use one subscription id per (version, membership, provider) and run
+    ///    every concurrent selection on that contract through this method.
+    /// 2. Allocate each request's sequence and budgets atomically inside
+    ///    `contract`: the sequence strictly greater than every sequence sent
+    ///    on the contract, never reused even if the request fails, and the
+    ///    page and byte budgets debited by one page (`PAGE_BYTES + 16`) per
+    ///    allocation, never raised. The deadline never increases either.
+    /// 3. Keep at most `granted` requests outstanding on the contract, where
+    ///    `granted` starts at 1 and becomes the `flights` of the last
+    ///    `Selected` result. With more outstanding, the provider supersedes
+    ///    the oldest unselected request (a skipped selection) or refuses with
+    ///    Overloaded. Sequences may reach the provider out of order; it accepts
+    ///    a lower one once while it is within `granted` of the highest.
+    /// 4. Send the full current demand on every request. Each request selects
+    ///    only from its own demand, and the provider never selects a page the
+    ///    contract already has in flight or completed, so concurrent requests
+    ///    return distinct pages.
+    /// 5. On `Refused`, drop back to one outstanding request on that provider
+    ///    and retry with a new sequence. The provider may keep the old
+    ///    contract's budgets, so continuing the same contract is valid.
     #[allow(clippy::too_many_arguments)] // Keep demand, validation, and budget inputs explicit.
     pub(crate) async fn subscribe_provider(
         &self,
@@ -587,8 +621,9 @@ impl CandidatePolicy {
                     flights,
                 })
             }
-            // A relay signs `Unavailable` when the next hop drops the exchange, which is how an
-            // older provider behind a relay refuses the field.
+            // A relay signs `Unavailable` when the next hop drops the
+            // exchange, which is how an older provider behind a relay refuses
+            // the field. Downgrade exactly as for a direct transport failure.
             Some(_)
                 if requested.is_some()
                     && matches!(response.response(), PeerResponse::Unavailable) =>
@@ -876,6 +911,11 @@ impl CandidatePolicy {
     }
 
     /// Call once per worker service turn, also when no reads are arriving.
+    /// Walks one indexed resident at a time (including recovered idle pages),
+    /// with at most 256 member scores and 64 ranking-cache CLOCK visits per turn.
+    /// A completed pass returns Idle; schedule another pass on a bounded timer.
+    /// Publication is reloaded every turn, so obsolete partial results cannot
+    /// classify the new topology. Foreground scoped ranking warms the same cache.
     pub fn refresh_ownership(
         &self,
         index: &crate::store::catalog::Index,
@@ -1933,8 +1973,9 @@ impl CandidatePolicy {
         }
     }
 
-    /// One CopyOnly page request for a `gpu-read` on GPU `ordinal`: the page may land in a GPU
-    /// landing buffer (see [`Requester::request_landing`]).
+    /// One CopyOnly page request for a `gpu-read` on GPU `ordinal`: the page
+    /// may land in a GPU landing buffer (see [`Requester::request_landing`]).
+    /// The caller sends it to one provider only.
     #[allow(clippy::too_many_arguments)] // Same route inputs as a plain request.
     pub(crate) async fn request_landing(
         &self,

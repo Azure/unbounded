@@ -1,4 +1,44 @@
 //! Preserve original signatures and bind each signed hop to consumed route state.
+//!
+//! The owned API supports a complete relay round trip without degrading signed
+//! envelopes to logical operations. Each receiver admits only its final envelope;
+//! historical originals and hops are cryptographically verified without readmission.
+//!
+//! ```no_run
+//! use racer_control_wire::NodeId;
+//! use racer_dataplane::{
+//!     error::Result,
+//!     peer::{server::LocalPageService, protocol::PeerRequest},
+//!     runtime::RequestScope,
+//!     peer::forwarding::{Forwarding, VerifiedResponse},
+//!     topology::{Membership, RouteBudget},
+//! };
+//!
+//! async fn round_trip(
+//!     requester: &Forwarding,
+//!     relay: &Forwarding,
+//!     destination: &Forwarding,
+//!     local: &dyn LocalPageService,
+//!     request: PeerRequest,
+//!     next: &NodeId,
+//!     previous: &NodeId,
+//!     budget: RouteBudget,
+//!     membership: std::sync::Arc<Membership>,
+//!     scope: &RequestScope,
+//! ) -> Result<VerifiedResponse> {
+//!     let (outbound, outstanding) = requester.sign_request(request)?;
+//!     let ingress = relay.verify_request(outbound)?;
+//!     let reverse_binding = ingress.binding().clone();
+//!     let forwarded = relay.append_request(ingress, next, budget)?;
+//!     let admitted = destination.verify_request(forwarded)?;
+//!     let reply_binding = admitted.binding().clone();
+//!     let unsigned = local.serve_peer(admitted, membership, scope).await?;
+//!     let response = destination.sign_response(&reply_binding, unsigned)?;
+//!     let verified = relay.verify_response(response, &reverse_binding)?;
+//!     let reverse = relay.append_response(verified, previous)?;
+//!     requester.verify_response(reverse, &outstanding)
+//! }
+//! ```
 use crate::error::Error;
 use crate::error::Result;
 use crate::peer::protocol;
@@ -115,8 +155,17 @@ impl EnvelopeJob {
 }
 pub use peer_wire::ForwardedHead;
 
-/// Opaque outstanding-request context, minted only by request signing or ingress verification.
-/// Retains the exact original head/signature, not just a request ID.
+/// Opaque outstanding-request context, minted only by request signing or ingress
+/// verification. Retains the exact original head/signature, not just a request ID.
+/// Cloning retains ownership for response signing after local service consumes the
+/// request. No credentials are decoded or decrypted here.
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::forwarding::RequestBinding;
+/// fn fabricate_binding() -> RequestBinding {
+///     RequestBinding { original: todo!() }
+/// }
+/// ```
 #[derive(Clone)]
 pub struct RequestBinding {
     original: Arc<SignedHead>,
@@ -135,8 +184,23 @@ impl RequestBinding {
     }
 }
 
-/// Admitted ingress with its original signature and entire forwarding chain. Only this module's
-/// verifier can construct it.
+/// Admitted ingress with its original signature and entire forwarding chain.
+/// Only this module's verifier can construct it. Shared access prevents callers
+/// from modifying signed fields after verification.
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::{protocol::SignedRequest, forwarding::VerifiedRequest};
+/// fn bypass_verification(request: SignedRequest) -> VerifiedRequest {
+///     request.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::forwarding::VerifiedRequest;
+/// fn change_verified_route(request: VerifiedRequest) {
+///     request.request().route.remaining_links = 255;
+/// }
+/// ```
 pub struct VerifiedRequest {
     signed: SignedRequest,
     binding: RequestBinding,
@@ -184,8 +248,22 @@ impl VerifiedRequest {
     }
 }
 
-/// Verified response bound to one original request, retaining every signature. This is distinct
-/// from both an unsigned local result and unverified wire input.
+/// Verified response bound to one original request, retaining every signature.
+/// This is distinct from both an unsigned local result and unverified wire input.
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::{protocol::SignedResponse, forwarding::VerifiedResponse};
+/// fn bypass_verification(response: SignedResponse) -> VerifiedResponse {
+///     response.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use racer_dataplane::peer::{protocol::PeerResponse, forwarding::VerifiedResponse};
+/// fn replace_verified_result(mut response: VerifiedResponse) {
+///     *response.response() = PeerResponse::Miss;
+/// }
+/// ```
 pub struct VerifiedResponse {
     signed: SignedResponse,
     binding: RequestBinding,
@@ -480,8 +558,17 @@ impl Forwarding {
             response,
         })
     }
-    /// Verify original and every historical hop, identity and signed logical fields, then check
-    /// response correlation against the supplied outstanding attempt.
+    /// Verify original and every historical hop, identity and signed logical fields,
+    /// then check response correlation against the supplied outstanding attempt.
+    /// A request ID alone is not sufficient; the original signature binds identity,
+    /// operation, membership, attempt, and freshness without hashing page bytes.
+    ///
+    /// ```compile_fail
+    /// use racer_dataplane::{peer::protocol::SignedResponse, peer::forwarding::Forwarding};
+    /// fn unbound_response(auth: &Forwarding, response: SignedResponse) {
+    ///     auth.verify_response(response);
+    /// }
+    /// ```
     pub fn verify_response(
         &self,
         response: SignedResponse,
@@ -490,8 +577,9 @@ impl Forwarding {
         let (origin, forwarders) = self.verify_response_parts(&response, request)?;
         Ok(Self::finish_response(response, request, origin, forwarders))
     }
-    /// Like [`Self::verify_response`] for a page that landed in GPU memory: verify the signed head
-    /// for `metadata` and `envelope`. The GPU checks the ciphertext itself with the AEAD tag.
+    /// Like [`Self::verify_response`] for a page that landed in GPU memory:
+    /// verify the signed head for `metadata` and `envelope`. The GPU checks
+    /// the ciphertext itself with the AEAD tag.
     pub(crate) fn verify_landed(
         &self,
         authentication: &ForwardedHead,
@@ -667,8 +755,9 @@ impl Forwarding {
         self.append_response_head(&mut auth, request, previous)?;
         Ok(auth)
     }
-    /// Preserve the original and existing hops; append a separately signed header bound to that
-    /// original signature, prior chain, next hop, and consumed route.
+    /// Preserve the original and existing hops; append a separately signed header
+    /// bound to that original signature, prior chain, next hop, and consumed route.
+    /// Only the effective route may change, without extending deadline or budget.
     pub fn append_request(
         &self,
         mut request: VerifiedRequest,

@@ -1,4 +1,11 @@
 //! Per-read fetch window: pages are fetched out of order and delivered in order.
+//!
+//! Each stream owns a window of pages starting at its delivery cursor. Window
+//! pages are probed in local memory, filled directly through their owning worker,
+//! or selected from a peer provider in whatever order they complete. Delivery
+//! stays strictly in page order. A stream pins its version and length once. A
+//! late error terminates that stream; it cannot replace headers or reopen
+//! against a newer version.
 
 use super::dispatch::WorkerDirectory;
 use super::flight::AcquisitionBudget;
@@ -49,8 +56,9 @@ const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCR
 /// Spill fills (hold plus warm fill) a read keeps in flight.
 const SPILL_FILLS: usize = 2;
 
-/// Lifetime of a read's spill hold. Holds are renewed by nothing; a page that expires before
-/// delivery is fetched again.
+/// Lifetime of a read's spill hold. Holds are renewed by nothing; a page that
+/// expires before delivery is fetched again. Short, because a version's hold
+/// lasts until the latest deadline of all its holders.
 const SPILL_HOLD: Duration = Duration::from_secs(60);
 
 /// One open read window registered for selection fan-out.
@@ -75,7 +83,8 @@ struct Contract {
     expires: Instant,
     /// Selections currently using the contract.
     inflight: u16,
-    /// Flights asked of the provider by the latest request (1 when the field was omitted).
+    /// Flights asked of the provider by the latest request (1 when the field
+    /// was omitted).
     requested: u16,
     /// Selections the provider allows pending at once: 1 until a `Selected`
     /// grant raises it, back to 1 after a refusal.
@@ -95,8 +104,10 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    /// Issue the next sequence of the node's contract with `provider` for `selection`, asking for
-    /// `requested` flights.
+    /// Issue the next sequence of the node's contract with `provider` for
+    /// `selection`, asking for `requested` flights. A contract serves at most
+    /// its granted flights at once; one more concurrent selection is refused
+    /// with `Overloaded` until an earlier `Selection` is dropped.
     pub(crate) fn contract(
         &self,
         selection: &Selection,
@@ -329,7 +340,8 @@ impl WindowLease {
         self.scheduler.offer(&page.metadata.version, page);
     }
 
-    /// Pages that other windows of the same version are already selecting or filling directly.
+    /// Pages that other windows of the same version are already selecting or
+    /// filling directly.
     fn busy_elsewhere(&self) -> BTreeSet<u64> {
         let state = self.scheduler.state.lock().unwrap();
         let Some(version) = state.readers.get(&self.id).map(|r| &r.version) else {
@@ -355,7 +367,9 @@ impl Drop for WindowLease {
     }
 }
 
-/// One provider selection over some window pages.
+/// One provider selection over some window pages. The worker running it
+/// offers the selected page to every interested window, then drops it, which
+/// frees its flight on the provider contract for the next selection.
 pub(crate) struct Selection {
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) version: ObjectVersion,
@@ -534,6 +548,11 @@ pub struct RangeStreams {
 }
 
 /// The body stays on the ingress reactor, including its delivery pipe leases.
+/// ```compile_fail
+/// use racer_dataplane::read::range_stream::RangeStream;
+/// fn send<T: Send>() {}
+/// send::<RangeStream>();
+/// ```
 pub struct RangeStream {
     error: Option<Error>,
 
@@ -657,8 +676,9 @@ impl RangeStream {
         self.range
     }
 
-    /// Install exact page/byte release credits once, before delivery. The fetch window is the
-    /// configured `range_window_pages`, further limited by the client's unreleased credits.
+    /// Install exact page/byte release credits once, before delivery. The fetch
+    /// window is the configured `range_window_pages`, further limited by the
+    /// client's unreleased credits.
     pub fn configure_subscription(&mut self, pages: usize, bytes: u64) -> Result<()> {
         if self.lease.is_some() {
             return Err(Error::InvalidRequest);
@@ -709,8 +729,10 @@ impl RangeStream {
         Ok(())
     }
 
-    /// Drive the fetch window while the current slice encounters client backpressure. Completed
-    /// pages leave their acquisition scopes promptly.
+    /// Drive the fetch window while the current slice encounters client
+    /// backpressure. Completed pages leave their acquisition scopes promptly.
+    /// Delivered leases consume client credit, not window slots; their full
+    /// plaintext allocations remain admitted until released.
     pub(crate) fn poll_prefetch(&mut self, cx: &mut Context<'_>) {
         if self.terminated || self.error.is_some() || self.lease.is_none() {
             return;
@@ -763,8 +785,9 @@ impl RangeStream {
                 .as_mut()
                 .and_then(|spill| spill.pages.remove(&number.0));
             self.slots.push_back(Slot::Probing(match spilled {
-                // A sealed read probes live plaintext only. Cached or disk ciphertext is then
-                // fetched sealed, so the GPU rather than the CPU decrypts it.
+                // A sealed read probes live plaintext only. Cached or disk
+                // ciphertext is then fetched sealed, so the GPU rather than
+                // the CPU decrypts it.
                 None if sealed => {
                     Box::pin(async move { directory.cached_page(page, &scope).await })
                 }
@@ -940,7 +963,10 @@ impl RangeStream {
                 }
                 Err(error) => Err(error),
             };
-            // The selected page was already offered.
+            // The selected page was already offered. Pages the provider did not
+            // send may be selected again; after a failure, including the
+            // selection's own deadline, they are only filled directly. The
+            // stream's cancellation and deadline are checked by `step`.
             let select = result.is_ok();
             for number in pending.pages {
                 if let Some(slot) = self.slot_mut(number)
@@ -997,8 +1023,10 @@ impl RangeStream {
         Ok(changed)
     }
 
-    /// Direct fills to keep in flight beyond the head page. Provider selections deliver verified
-    /// plaintext, so a sealed read fills its whole window directly.
+    /// Direct fills to keep in flight beyond the head page. Provider selections
+    /// deliver verified plaintext, so a sealed read fills its whole window
+    /// directly. Its direct fills stage disk pages with cuFile and keep
+    /// ciphertext for the GPU to decrypt.
     fn direct_ahead(&self) -> usize {
         if self.sealed.is_some() {
             self.window_pages.saturating_sub(1).max(DIRECT_AHEAD)
@@ -1069,8 +1097,10 @@ impl RangeStream {
             .collect()
     }
 
-    /// The demand and pages of the next selection, if any. Pages that another window of this
-    /// version is selecting are left to that selection's fan-out.
+    /// The demand and pages of the next selection, if any. Pages that another
+    /// window of this version is selecting are left to that selection's
+    /// fan-out. While a warm job runs for the version, reads only fetch pages
+    /// directly, each waiting for the warm job to finish that page.
     fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
         if self.directory.warm.contains(&self.metadata.version) {
             return Ok(None);
@@ -1081,8 +1111,10 @@ impl RangeStream {
         self.selection_demand(&lease.busy_elsewhere(), self.share())
     }
 
-    /// Select the next share of the remaining holes from a peer provider. Pages that another window
-    /// of this version is selecting are left to that selection's fan-out.
+    /// Select the next share of the remaining holes from a peer provider. Pages that another
+    /// window of this version is selecting are left to that selection's
+    /// fan-out. While a warm job runs for the version, reads only fetch pages
+    /// directly, each waiting for the warm job to finish that page.
     fn start_selection(&mut self, scope: &RequestScope) -> Result<bool> {
         let Some((demand, pages)) = self.plan_selection()? else {
             return Ok(false);
@@ -1127,9 +1159,11 @@ impl RangeStream {
         Ok(true)
     }
 
-    /// Pages the next selection may demand: an even share of the selectable holes over the
-    /// selections the read can start now (its free selection slots, bounded by the version's spare
-    /// granted flights), so concurrent selections cover disjoint parts of the window.
+    /// Pages the next selection may demand: an even share of the selectable
+    /// holes over the selections the read can start now (its free selection
+    /// slots, bounded by the version's spare granted flights), so concurrent
+    /// selections cover disjoint parts of the window. A single-flight read
+    /// demands every selectable hole, as one selection lets the provider choose.
     fn share(&self) -> usize {
         let holes = self
             .slots
@@ -1140,8 +1174,9 @@ impl RangeStream {
         read::share(holes, self.selections.len(), spare)
     }
 
-    /// Up to `limit` selectable holes of the window, excluding pages that another window is
-    /// selecting or filling, as a canonical demand of at most the wire interval limit.
+    /// Up to `limit` selectable holes of the window, excluding pages that
+    /// another window is selecting or filling, as a canonical demand of at
+    /// most the wire interval limit.
     fn selection_demand(
         &self,
         elsewhere: &BTreeSet<u64>,
@@ -1273,8 +1308,10 @@ impl RangeStream {
                     if let Some(epoch) = spill.held.remove(number) {
                         release.push((PageNumber(*number), epoch));
                     }
-                    // A failed spill fill (origin refusal, version change, no disk) would likely
-                    // fail again, and each retry takes a fresh warm budget.
+                    // A failed spill fill (origin refusal, version change, no
+                    // disk) would likely fail again, and each retry takes a
+                    // fresh warm budget. Stop spilling: the page is fetched
+                    // through the window like any other.
                     spill.refused = true;
                     false
                 }
@@ -1363,8 +1400,9 @@ impl RangeStream {
         changed
     }
 
-    /// Only client HTTP delivery may release the initial operation deadline after acquiring the
-    /// first slice.
+    /// Only client HTTP delivery may release the initial operation deadline after
+    /// acquiring the first slice. Already admitted pages retain their original deadlines
+    /// and retry budgets; only newly admitted, distinct pages get child scopes.
     pub(crate) fn enable_progress(&mut self, timeout: Duration) {
         if self.directory.warm.contains(&self.metadata.version) {
             return;
@@ -2010,8 +2048,9 @@ pub(super) mod tests {
     fn client_page_progress_outlives_attempt_and_link_totals_without_refilling_retries() {
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
         let mut budget = RangeBudget::ClientPages { deadline };
-        // Model a healthy remote page that spends a four-link route and transfers acquisition
-        // credits to its destination.
+        // Model a healthy remote page that spends a four-link route and transfers
+        // acquisition credits to its destination. Neither spend can accumulate
+        // into a range-length limit, and unused credits cannot grow later pages.
         for _ in 0..100 {
             let mut page = budget.next_page(false).unwrap().unwrap();
             assert_eq!(page.remaining_attempts(), 8);
@@ -2306,8 +2345,9 @@ pub(super) mod tests {
         ));
         gate.set(true);
         stream.poll_prefetch(&mut cx);
-        // The missed head gets a direct fill despite the later failure (this fixture has no worker,
-        // so starting it may fail at once), and nothing is admitted at or past the failed page.
+        // The missed head gets a direct fill despite the later failure (this
+        // fixture has no worker, so starting it may fail at once), and nothing
+        // is admitted at or past the failed page.
         assert!(
             matches!(stream.slots[0], Slot::Fetching(_) | Slot::Ready(Err(_))),
             "the head must not be left without work"
@@ -2484,7 +2524,8 @@ pub(super) mod tests {
                 pages: BTreeSet::from([1]),
             });
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            // A selection's own failure, even of its child deadline, is not the stream's.
+            // A selection's own failure, even of its child deadline, is not
+            // the stream's.
             assert_eq!(stream.poll_selections(&mut cx), Ok(true));
             assert!(stream.selections.is_empty());
             assert!(matches!(stream.slots[1], Slot::Missing { select: false }));
@@ -2908,8 +2949,13 @@ pub(super) mod tests {
                 reactor.poll_budgeted(128).unwrap();
                 worker.poll(&mut cx);
                 reactor.wait(Duration::from_millis(1)).unwrap();
-                // Pages admitted before the headers keep the original deadline, and with four
-                // credits that is every page of this range.
+                // Pages admitted before the headers keep the original deadline,
+                // and with four credits that is every page of this range. Their
+                // fetches take real time, so simulated time only moves once all of
+                // them have completed: the origin served every page and the worker
+                // replied to every command. The poll above has then made each
+                // window slot ready. Only delivery remains, which must outlive the
+                // original deadline.
                 if !crossed.load(std::sync::atomic::Ordering::Acquire)
                     && headers_sent.load(std::sync::atomic::Ordering::Acquire)
                     && worker
@@ -3062,8 +3108,9 @@ pub(super) mod tests {
             let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
             let (first, one) = issue(&scheduler, 0, "provider", Some(4), deadline);
             let (one, _) = one.unwrap();
-            // Until the provider grants more, a second concurrent selection from the same provider
-            // waits for the first; another provider is independent.
+            // Until the provider grants more, a second concurrent selection
+            // from the same provider waits for the first; another provider is
+            // independent.
             let (_, second) = issue(&scheduler, 5, "provider", Some(4), deadline);
             assert_eq!(second, Err(Error::Overloaded));
             let (_other, other) = issue(&scheduler, 5, "other", Some(4), deadline);
@@ -3103,7 +3150,8 @@ pub(super) mod tests {
             let (first, result) = issue(&scheduler, 0, "provider", Some(3), deadline);
             result.unwrap();
             assert_eq!(scheduler.spare(&version()), 0);
-            // A grant above the request, or from another provider, is clamped or ignored.
+            // A grant above the request, or from another provider, is clamped
+            // or ignored.
             scheduler.granted(&first, &NodeId("other".into()), 3);
             assert_eq!(scheduler.spare(&version()), 0);
             scheduler.granted(&first, &provider, 9);

@@ -273,9 +273,11 @@ impl Transfers {
         }
     }
 
-    /// Sender side of one page: write into the receiver's signed grant with immediate, then send
-    /// one signed response head, `Complete`, or release the grant and fall back to the HTTP body
-    /// (`designs/racer-rdma-sessions.md`, "Per-page protocol").
+    /// Sender side of one page: write into the receiver's signed grant with
+    /// immediate, then send one signed response head, `Complete`, or release
+    /// the grant and fall back to the HTTP body (`designs/racer-rdma-sessions.md`,
+    /// "Per-page protocol"). Every granted tag gets exactly one write or release
+    /// unless the link breaks, which fences everything.
     pub(super) async fn send_native(
         &self,
         connection: ConnectionLease,
@@ -410,8 +412,13 @@ impl Transfers {
                 .any(|rail| links.has_landing(rail.rail, ordinal))
         })
     }
-    /// Receiver: when the hop plan is RDMA and the link is ready, grant a page window in-band and
-    /// sign it into the request's `Accept` control.
+    /// Receiver: when the hop plan is RDMA and the link is ready, grant a page
+    /// window in-band and sign it into the request's `Accept` control. Any
+    /// recoverable failure means a plain HTTP request.
+    ///
+    /// With `landing`, the GPU of a `gpu-read` that asked for this fixed page,
+    /// the grant is over a slot of that GPU's landing buffer when this rail
+    /// has one and a slot is free. Otherwise it is a host grant as usual.
     pub(super) async fn accept_native(
         &self,
         request: &SignedRequest,
@@ -616,7 +623,9 @@ impl Transfers {
             #[cfg(test)]
             self.native_completions
                 .set(self.native_completions.get() + 1);
-            // Only a fixed page request asks for landing.
+            // Only a fixed page request asks for landing. The signed head must
+            // describe exactly this page; the requester verifies the chain
+            // against its binding, and the GPU checks the tag.
             let original = &authentication.original.head;
             if crate::peer::protocol::field(original, "racer-outcome")? != "page" {
                 return Err(Error::Unauthorized);
@@ -730,8 +739,9 @@ fn link_status(status: u16) -> MessageHead {
     }
 }
 
-/// Whether `local` and `peer` may hold a link on `rail`: both are members of the same nonempty Site
-/// and both publish the rail of the rail domain (the `select_hop` membership rules).
+/// Whether `local` and `peer` may hold a link on `rail`: both are members of
+/// the same nonempty Site and both publish the rail of the rail domain (the
+/// `select_hop` membership rules).
 pub(crate) fn link_allowed(
     membership: &crate::topology::Membership,
     local: &NodeId,
@@ -748,8 +758,9 @@ pub(crate) fn link_allowed(
         && theirs.rails.iter().any(|m| m.rail == rail)
 }
 
-/// Initiator side of one link setup on an authenticated connection: open the link, send the signed
-/// `RdmaLink` request, verify the signed response, and connect.
+/// Initiator side of one link setup on an authenticated connection: open the
+/// link, send the signed `RdmaLink` request, verify the signed response, and
+/// connect. Any failure breaks the attempt, which backs the link off.
 pub(crate) async fn link_exchange(
     io: &HttpIo,
     signatures: &Signatures,
@@ -1018,8 +1029,9 @@ unsafe impl IoBuffer for WireBuffer {
 
 type ReclaimCiphertext = dyn Fn(&racer_control_wire::CacheId, usize);
 
-/// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link evidence. Only an
-/// observed orderly EOF is classified here; connect preserves its errno separately in HttpPool.
+/// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link
+/// evidence. Only an observed orderly EOF is classified here; connect preserves
+/// its errno separately in HttpPool.
 fn observe_read(
     result: Result<usize>,
     permit: &Option<std::sync::Arc<super::Permit>>,
@@ -1083,6 +1095,14 @@ pub struct Transfers {
 }
 impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
+    ///
+    /// ```compile_fail
+    /// use racer_dataplane::{http::{HttpIo, HttpPool}, peer::transport::Transfers};
+    /// use std::rc::Rc;
+    /// fn unsigned(pool: Rc<HttpPool>, io: Rc<HttpIo>) {
+    ///     let _ = Transfers::new(pool, io, None);
+    /// }
+    /// ```
     pub fn new(
         http: Rc<HttpPool>,
         io: Rc<HttpIo>,
@@ -2334,9 +2354,10 @@ mod tests {
         }
 
         #[test]
-        /// A landing grant over a ready link: the sender writes into the receiver's GPU landing
-        /// buffer, the receiver checks the signed head for exactly this page and returns it as
-        /// landed, and no host buffer is used on the receiver.
+        /// A landing grant over a ready link: the sender writes into the
+        /// receiver's GPU landing buffer, the receiver checks the signed head
+        /// for exactly this page and returns it as landed, and no host buffer
+        /// is used on the receiver.
         fn simulated_landing_grant_lands_the_page_in_gpu_memory() {
             for reverse in [false, true] {
                 let outcome = page_roundtrip(PageCase {

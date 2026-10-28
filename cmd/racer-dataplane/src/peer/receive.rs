@@ -1,4 +1,8 @@
 //! Optional node-wide FIFO admission for exchanges that can receive a page.
+//!
+//! This gate does not grant routing authority or replenish acquisition credits.
+//! A caller must drive a deadline alarm as well as cancellation while queued.
+//! Active permits belong to transport completion owners, not header futures.
 use crate::admission::{AdmissionPolicy, ResourceClass};
 use crate::error::{Error, Result};
 use crate::runtime::RequestScope;

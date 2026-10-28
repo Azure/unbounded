@@ -151,7 +151,9 @@ pub struct WarmRegistry {
     /// leases; unused capacity is released only after the last lease is gone.
     leases: Mutex<LeaseState>,
 }
-/// Lease table plus a generation fence.
+/// Lease table plus a generation fence. Every grant stamps its version with a
+/// fresh generation; a queued release carries the generation observed when the
+/// last lease was dropped and is discarded if a newer grant has since occurred.
 #[derive(Default)]
 struct LeaseState {
     next: u64,
@@ -202,8 +204,15 @@ impl WarmRegistry {
         }
     }
 
-    /// Record or extend a lease before reserving capacity for it, so a racing release of another
-    /// lease cannot trim this reservation.
+    /// Record or extend a lease before reserving capacity for it, so a racing
+    /// release of another lease cannot trim this reservation.
+    ///
+    /// The same (requester, job) key coalesces into one entry whose expiry only
+    /// grows. A new key is refused with `Overloaded` once its version holds
+    /// [`MAX_LEASES_PER_VERSION`] live leases or the node holds
+    /// [`LEASES_PER_JOB`] times `max_jobs` live leases; expired leases are
+    /// pruned first so only live leases count. Refusal never touches existing
+    /// leases or their generation stamp.
     pub(crate) fn grant_lease(
         &self,
         version: &ObjectVersion,
@@ -307,7 +316,12 @@ impl WarmRegistry {
         last.is_some()
     }
 
-    /// Confirm a lease survived the reservation made for it.
+    /// Confirm a lease survived the reservation made for it. A concurrent
+    /// release can drop the last lease while the reservation is pending, and
+    /// workers run that cleanup before queued reservations, so the cleanup can
+    /// finish first and leave the new reservation orphaned. When the lease is
+    /// gone, queue a fresh fenced release that runs after the reservation and
+    /// return false so the caller refuses the hold.
     pub(crate) fn confirm_lease(
         &self,
         version: &ObjectVersion,
@@ -630,6 +644,8 @@ impl WarmRegistry {
     }
 
     /// Wait even for pages outside the current warm window. A miss permits normal Fill.
+    /// Placement comes from the job that satisfied the wait, not a later lookup,
+    /// because the registry entry may be replaced or removed after completion.
     pub(crate) async fn wait(&self, page: &PageId, scope: &RequestScope) -> Result<WarmWait> {
         let job = self.jobs.lock().unwrap().get(&page.version).cloned();
         let Some(job) = job else {
@@ -1208,8 +1224,9 @@ async fn plan(
     Ok(plan)
 }
 
-/// All-or-nothing hold admission: local primaries reserve through the worker mailboxes and every
-/// remote primary owner must accept a `Hold`.
+/// All-or-nothing hold admission: local primaries reserve through the worker
+/// mailboxes and every remote primary owner must accept a `Hold`. The result is
+/// the earliest expiry any owner promised, so every page is held until then.
 #[allow(clippy::too_many_arguments)] // Explicit admission inputs, no parameter shim.
 async fn reserve(
     directory: &Arc<WorkerDirectory>,
@@ -1227,7 +1244,9 @@ async fn reserve(
     let mut accepted = directory
         .reserve_warm(version, &plan.held, target, scope, fresh)
         .await?;
-    // Local holds may inherit a later deadline from an existing hold.
+    // Local holds may inherit a later deadline from an existing hold. Cover it
+    // so expiry pruning cannot release unfilled capacity before the promised
+    // RetainUntil, whether it is reported alone or as the earliest owner.
     if accepted > target {
         directory.warm.grant_lease(version, &lease, accepted)?;
     }
@@ -1373,6 +1392,9 @@ async fn warm_one(
 }
 
 /// Whether a remote fill error is transient and worth another bounded attempt.
+///
+/// Matches ordinary candidate acquisition, which treats socket failures
+/// (`Error::Os`) like `Unavailable` and `Io`.
 fn remote_fill_retryable(error: &Error) -> bool {
     matches!(
         error,
@@ -2219,7 +2241,8 @@ mod tests {
         let a = (NodeId("a".into()), [1; 16]);
         // Hold grants the lease, then awaits its reservation.
         registry.grant_lease(&v, &a, until).unwrap();
-        // Release drops the last lease; the worker runs cleanup before the queued reservation.
+        // Release drops the last lease; the worker runs cleanup before the
+        // queued reservation.
         assert!(registry.drop_lease(&v, &a, &[worker]));
         assert_eq!(release_all(&registry, worker), vec![v.clone()]);
         // The reservation now lands with no live lease behind it.

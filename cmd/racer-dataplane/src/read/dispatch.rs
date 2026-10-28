@@ -1,5 +1,7 @@
-//! Bounded node-local handoffs. Only owned commands and immutable results cross threads; the
-//! coordinator, futures, delivery leases, and streams stay local.
+//! Bounded node-local handoffs. Only owned commands and immutable results cross
+//! threads; the coordinator, futures, delivery leases, and streams stay local.
+//! Stable local page assignment is independent of cluster placement. Drain flights
+//! before changing the worker map; no live remapping is implied.
 
 use super::Coordinator;
 use super::flight::AcquisitionBudget;
@@ -211,8 +213,9 @@ pub struct WorkerEndpoint {
 pub(super) enum Warmed {
     /// No warm job covers the version, or the job was abandoned.
     Unwarmed,
-    /// Warm has published the page on a remote primary owner. Only this page may be filled; warm
-    /// completes pages in any order, so later pages may still be pending.
+    /// Warm has published the page on a remote primary owner. Only this page
+    /// may be filled; warm completes pages in any order, so later pages may
+    /// still be pending.
     Remote,
     /// Warm has published the page locally and this is its held copy.
     Local(Box<PageResult>),
@@ -352,8 +355,9 @@ impl WorkerDirectory {
             _ => Err(Error::StaleFlight),
         }
     }
-    /// A simulated process loss discards queued messages and their producer permits. Remaining
-    /// receipts observe producer loss, not successful completion fences.
+    /// A simulated process loss discards queued messages and their producer permits.
+    /// Remaining receipts observe producer loss, not successful completion fences.
+    /// Do not execute commands or mark kernel/NIC operations complete here.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&self) {
         for mailbox in &self.mailboxes {
@@ -546,8 +550,11 @@ impl WorkerDirectory {
         Ok(accepted)
     }
 
-    /// Drop one holder from `pages[worker]` on each listed local worker, under the epoch that
-    /// worker's `Work::Hold` returned. Pages whose last holder leaves become evictable.
+    /// Drop one holder from `pages[worker]` on each listed local worker, under
+    /// the epoch that worker's `Work::Hold` returned. Pages whose last holder
+    /// leaves become evictable. Workers absent from `pages` are untouched.
+    /// Pair with one warm `Work::Hold` per page set, as [`Self::reserve_warm`]
+    /// takes; the release drops warm holders only.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "used by the per-read fetch job in a later change")
@@ -580,8 +587,9 @@ impl WorkerDirectory {
         Ok(())
     }
 
-    /// Add one holder to `page` on its owning worker only, until `until`. Pair every success with
-    /// one `release_read_pages` of the same page and the returned epoch.
+    /// Add one holder to `page` on its owning worker only, until `until`.
+    /// Pair every success with one `release_read_pages` of the same page and
+    /// the returned epoch.
     pub(super) async fn hold_read_page(
         &self,
         page: &PageId,
@@ -605,7 +613,9 @@ impl WorkerDirectory {
         }
     }
 
-    /// Drop one holder from each page without waiting.
+    /// Drop one holder from each page without waiting. Releases run on their
+    /// owning workers under a fresh short scope, so a canceled read still
+    /// returns its holds; hold expiry is the backstop if this cannot submit.
     pub(super) fn release_read_pages(
         &self,
         version: &ObjectVersion,
@@ -873,8 +883,9 @@ impl WorkerDirectory {
             _ => Err(Error::StaleFlight),
         }
     }
-    /// Fetch one read window page on its owner. Always enqueue, including local ingress, so the
-    /// owner's worker keeps accepted work fenced after the caller detaches.
+    /// Fetch one read window page on its owner. Always enqueue, including local
+    /// ingress, so the owner's worker keeps accepted work fenced after the
+    /// caller detaches.
     pub(crate) fn start_page(
         &self,
         page: PageId,
@@ -953,7 +964,9 @@ impl WorkerDirectory {
             }
             return;
         }
-        // A failed verdict must reach the owner, or the corrupt copy stays eligible.
+        // A failed verdict must reach the owner, or the corrupt copy stays
+        // eligible. When the driver queue or mailbox cannot take it, retain
+        // it on the owner's mailbox for the owner's next poll.
         let retain = |report: super::sealed::SealedReport| {
             if !passed && let Ok(mailbox) = self.mailbox(owner) {
                 mailbox.retain_failed_verdict(report);
