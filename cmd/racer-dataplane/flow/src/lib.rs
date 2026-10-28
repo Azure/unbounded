@@ -46,10 +46,9 @@ pub mod subscriptions;
 mod pipe;
 
 pub use admission::{
-    Adaptive, Admitted, Circuits, Clock as AdaptiveClock, Config as AdaptiveConfig,
-    Event as AdaptiveEvent, Handoff, HandoffAdmission, HedgePermit, Hedges,
-    Observer as AdaptiveObserver, Offer, Outcome as AdaptiveOutcome, Permit as AdaptivePermit,
-    Probe,
+    Adaptive, Admitted, Circuits, Config as AdaptiveConfig, Event as AdaptiveEvent, Handoff,
+    HandoffAdmission, HedgePermit, Hedges, Observer as AdaptiveObserver, Offer,
+    Outcome as AdaptiveOutcome, Permit as AdaptivePermit, Probe,
 };
 pub use page_alloc::{PoolDemand, PoolStats};
 pub use pipe::{MAX_PIPE_BYTES, PipeLease, PipePool, splice_unsupported};

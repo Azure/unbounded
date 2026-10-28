@@ -117,28 +117,15 @@ pub trait Observer {
     fn limit(&self, limit: usize);
 }
 
-/// Time source for [`Adaptive`]. Production passes `fn() -> Instant`; simulators
-/// pass a closure or object reading virtual time.
-pub trait Clock {
-    /// Current instant on this clock.
-    fn now(&self) -> Instant;
-}
-
-impl<F: Fn() -> Instant> Clock for F {
-    fn now(&self) -> Instant {
-        self()
-    }
-}
-
 /// Shared total and per-key admission with generation-fenced peer recovery.
-pub struct Adaptive<K, O, C = fn() -> Instant> {
+pub struct Adaptive<K, O> {
     config: Config,
 
     state: Mutex<State<K>>,
 
     observer: O,
 
-    now: C,
+    now: fn() -> Instant,
 }
 
 /// Mutex-protected aggregate admission and bounded peer records.
@@ -172,8 +159,8 @@ struct Peer {
 }
 
 /// An admitted operation; the final shared owner releases capacity.
-pub struct Permit<K: Ord + Clone, O: Observer, C: Clock = fn() -> Instant> {
-    owner: Arc<Adaptive<K, O, C>>,
+pub struct Permit<K: Ord + Clone, O: Observer> {
+    owner: Arc<Adaptive<K, O>>,
 
     key: K,
 
@@ -186,13 +173,6 @@ pub struct Permit<K: Ord + Clone, O: Observer, C: Clock = fn() -> Instant> {
 impl<K: Ord + Clone, O: Observer> Adaptive<K, O> {
     /// Validate positive limits and publish the initial aggregate ceiling.
     pub fn new(config: Config, observer: O, now: fn() -> Instant) -> Result<Arc<Self>> {
-        Self::with_clock(config, observer, now)
-    }
-}
-
-impl<K: Ord + Clone, O: Observer, C: Clock> Adaptive<K, O, C> {
-    /// Like [`Adaptive::new`] with an arbitrary [`Clock`], such as simulated time.
-    pub fn with_clock(config: Config, observer: O, now: C) -> Result<Arc<Self>> {
         if config.total == 0
             || config.per_key == 0
             || config.per_key > config.total
@@ -201,7 +181,6 @@ impl<K: Ord + Clone, O: Observer, C: Clock> Adaptive<K, O, C> {
             return Err(Error::InvalidInput);
         }
         observer.limit(config.total);
-        let updated = now.now();
         Ok(Arc::new(Self {
             config,
             observer,
@@ -209,7 +188,7 @@ impl<K: Ord + Clone, O: Observer, C: Clock> Adaptive<K, O, C> {
             state: Mutex::new(State {
                 active: 0,
                 limit: config.total,
-                updated,
+                updated: now(),
                 peers: BTreeMap::new(),
             }),
         }))
@@ -231,7 +210,7 @@ impl<K: Ord + Clone, O: Observer, C: Clock> Adaptive<K, O, C> {
 
     /// Hint whether peer backoff permits an attempt; this does not reserve capacity.
     pub fn available(&self, key: &K) -> bool {
-        let now = self.now.now();
+        let now = (self.now)();
         self.state.lock().is_ok_and(|s| {
             s.peers.get(key).is_none_or(|p| {
                 p.generation.is_some() && !p.probe && p.retry.is_none_or(|at| at.elapsed(now))
@@ -240,13 +219,13 @@ impl<K: Ord + Clone, O: Observer, C: Clock> Adaptive<K, O, C> {
     }
 
     /// Admit work or one exclusive recovery probe without waiting.
-    pub fn acquire(self: &Arc<Self>, key: &K) -> Result<Arc<Permit<K, O, C>>> {
+    pub fn acquire(self: &Arc<Self>, key: &K) -> Result<Arc<Permit<K, O>>> {
         self.acquire_on(key, 0)
     }
 
     /// Retain the caller's observer shard through completion.
-    pub fn acquire_on(self: &Arc<Self>, key: &K, shard: usize) -> Result<Arc<Permit<K, O, C>>> {
-        let now = self.now.now();
+    pub fn acquire_on(self: &Arc<Self>, key: &K, shard: usize) -> Result<Arc<Permit<K, O>>> {
+        let now = (self.now)();
         // Drop retired keys after the guard on every exit, since Drop may reenter.
         let retired;
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
@@ -312,10 +291,10 @@ impl<K: Ord + Clone, O: Observer, C: Clock> Adaptive<K, O, C> {
     }
 }
 
-impl<K: Ord + Clone, O: Observer, C: Clock> Permit<K, O, C> {
+impl<K: Ord + Clone, O: Observer> Permit<K, O> {
     /// Apply caller evidence while retaining admission through completion.
     pub fn observe(&self, outcome: Outcome) {
-        let now = self.owner.now.now();
+        let now = (self.owner.now)();
         let Ok(mut state) = self.owner.state.lock() else {
             return;
         };
@@ -375,13 +354,13 @@ impl<K: Ord + Clone, O: Observer, C: Clock> Permit<K, O, C> {
     }
 }
 
-impl<K: Ord + Clone, O: Observer, C: Clock> Drop for Permit<K, O, C> {
+impl<K: Ord + Clone, O: Observer> Drop for Permit<K, O> {
     /// Release final ownership and renew backoff for an unsuccessful probe.
     fn drop(&mut self) {
         let Ok(mut state) = self.owner.state.lock() else {
             return;
         };
-        let now = self.owner.now.now();
+        let now = (self.owner.now)();
         let peer = state
             .peers
             .get_mut(&self.key)
@@ -2094,20 +2073,21 @@ mod tests {
     /// A caller-owned clock drives backoff without reading wall time.
     #[test]
     fn explicit_clock_drives_peer_backoff() {
-        let base = Instant::now();
-        let offset = Arc::new(Mutex::new(Duration::ZERO));
-        let clock = {
-            let offset = offset.clone();
-            move || base + *offset.lock().unwrap()
-        };
-        let owner = Adaptive::with_clock(config(), Counts::default(), clock).unwrap();
+        thread_local! {
+            static BASE: Instant = Instant::now();
+            static OFFSET: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+        }
+        fn clock() -> Instant {
+            BASE.with(|base| *base + OFFSET.get())
+        }
+        let owner = Adaptive::new(config(), Counts::default(), clock).unwrap();
         let failed = owner.acquire(&1).unwrap();
         failed.observe(Outcome::PeerFailure);
         drop(failed);
         assert!(!owner.available(&1));
-        *offset.lock().unwrap() = config().backoff - Duration::from_millis(1);
+        OFFSET.set(config().backoff - Duration::from_millis(1));
         assert!(!owner.available(&1));
-        *offset.lock().unwrap() = config().backoff;
+        OFFSET.set(config().backoff);
         assert!(owner.available(&1));
         let probe = owner.acquire(&1).unwrap();
         probe.observe(Outcome::PeerFailure);
