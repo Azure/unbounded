@@ -563,16 +563,6 @@ impl CandidateWalk {
         }))
     }
 
-    /// Whether the pending probe is a granted successor probe.
-    pub fn pending_successor(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.granted)
-    }
-
-    /// Whether the pending probe asks the overflow helper.
-    pub fn pending_helper(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.helper)
-    }
-
     /// Minimum credits the funded visits after `index` need.
     fn later_minimum(&self, index: usize) -> u32 {
         (index + 1..self.count)
@@ -598,39 +588,6 @@ impl CandidateWalk {
         } else {
             self.order.get(index)
         }
-    }
-
-    /// The pending probe asks a handoff target: a `StaleMembership` answer
-    /// is only a miss.
-    pub fn pending_handoff(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.handoff)
-    }
-
-    /// The pending probe is sent under the previous membership: a
-    /// `StaleMembership` answer is transient evidence, not a refresh.
-    pub fn pending_previous(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.previous)
-    }
-
-    /// Rank 0 timed out or failed this owner's probe: no origin authority.
-    pub fn rank0_unanswered(&self) -> bool {
-        self.rank0_unanswered
-    }
-
-    /// The pending probe is this owner's page probe of rank 0.
-    pub fn pending_rank0(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.rank0)
-    }
-
-    /// Whether the walk stopped because a probe could not be funded.
-    pub fn funding_stopped(&self) -> bool {
-        self.funding
-    }
-
-    /// Evidence collected so far, in probe order.
-    #[cfg(test)]
-    fn evidence(&self) -> &[ProbeOutcome] {
-        &self.evidence
     }
 
     /// Plan the next probe, partitioning a bounded child budget when needed.
@@ -1309,30 +1266,22 @@ pub fn plan_attempt(budget: &mut AcquisitionBudget, inputs: AttemptInputs) -> Re
     })
 }
 
-/// Inputs to the speculative page hedge decision.
-#[derive(Clone, Copy, Debug)]
-struct HedgeFacts {
-    pub page_operation: bool,
-    pub is_candidate: bool,
-    pub owners: usize,
-    /// First two canonical ranks in visit order.
-    pub first: usize,
-    pub second: usize,
-    /// The first two visited owners are distinct nodes.
-    pub distinct: bool,
-    pub remaining_attempts: u32,
-    pub remaining_links: u8,
-}
-
-/// Whether to hedge before direct-link availability is checked.
-fn hedge_eligible(facts: HedgeFacts) -> bool {
-    facts.page_operation
-        && !facts.is_candidate
-        && facts.owners >= 2
-        && facts.first == 0
-        && facts.distinct
-        && facts.remaining_attempts >= 3 + owner_funding_min(facts.second)
-        && facts.remaining_links >= 10
+/// Whether to hedge before direct-link availability is checked: a reader's
+/// page fill with two distinct owners visited first, and credits to spare.
+fn hedge_eligible(
+    page: bool,
+    owner: bool,
+    owners: &[u32],
+    first: usize,
+    second: usize,
+    budget: &AcquisitionBudget,
+) -> bool {
+    page && !owner
+        && owners.len() >= 2
+        && first == 0
+        && owners[first] != owners[second]
+        && budget.remaining_attempts() >= 3 + owner_funding_min(second)
+        && budget.remaining_links() >= 10
 }
 
 /// Split the hedge's pinned direct budgets: (secondary, primary).
@@ -2186,18 +2135,15 @@ impl Fill {
             self.order.get(0).unwrap_or(0),
             self.order.get(1).unwrap_or(0),
         );
-        let owners = self.owners.len();
         Ok(Action::Hedge {
-            eligible: hedge_eligible(HedgeFacts {
-                page_operation: self.page(),
-                is_candidate: self.rank.is_some(),
-                owners,
+            eligible: hedge_eligible(
+                self.page(),
+                self.rank.is_some(),
+                &self.owners,
                 first,
                 second,
-                distinct: owners >= 2 && self.owners[first] != self.owners[second],
-                remaining_attempts: budget.remaining_attempts(),
-                remaining_links: budget.remaining_links(),
-            }),
+                budget,
+            ),
             first,
             second,
         })
@@ -2379,10 +2325,11 @@ impl Fill {
     fn pending(&mut self) -> bool {
         match &self.walk {
             Walking::Candidates(walk) => {
-                self.out.helper = walk.pending_helper();
-                self.out.granted = walk.pending_successor();
-                self.out.rank0_probe = walk.pending_rank0();
-                walk.pending_handoff() || walk.pending_previous()
+                let p = walk.pending.as_ref();
+                self.out.helper = p.is_some_and(|p| p.helper);
+                self.out.granted = p.is_some_and(|p| p.granted);
+                self.out.rank0_probe = p.is_some_and(|p| p.rank0);
+                p.is_some_and(|p| p.handoff || p.previous)
             }
             _ => {
                 self.out.remaining = true;
@@ -2596,8 +2543,8 @@ impl Fill {
     /// The candidate walk ended.
     fn end(&mut self, end: End) -> Result<Action> {
         if let Walking::Candidates(walk) = &self.walk {
-            self.funding = walk.funding_stopped();
-            if walk.rank0_unanswered() {
+            self.funding = walk.funding;
+            if walk.rank0_unanswered {
                 // Known issue 31: rank 0 has not answered this owner's probe
                 // within the attempt; the owner does not fetch origin too.
                 self.out.notes |= Notes::RANK0_LEFT;

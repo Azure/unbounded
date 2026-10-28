@@ -663,39 +663,23 @@ fn attempt_plan_shares_deadline_and_reserves_credits() {
 
 #[test]
 fn hedge_rules() {
-    let facts = HedgeFacts {
-        page_operation: true,
-        is_candidate: false,
-        owners: 3,
-        first: 0,
-        second: 1,
-        distinct: true,
-        remaining_attempts: 6,
-        remaining_links: 10,
-    };
-    assert!(hedge_eligible(facts));
-    assert!(!hedge_eligible(HedgeFacts {
-        remaining_attempts: 5,
-        ..facts
-    }));
-    assert!(!hedge_eligible(HedgeFacts {
-        remaining_links: 9,
-        ..facts
-    }));
-    assert!(!hedge_eligible(HedgeFacts { first: 1, ..facts }));
-    assert!(!hedge_eligible(HedgeFacts {
-        is_candidate: true,
-        ..facts
-    }));
-    assert!(!hedge_eligible(HedgeFacts { owners: 1, ..facts }));
-    assert!(!hedge_eligible(HedgeFacts {
-        distinct: false,
-        ..facts
-    }));
-    assert!(!hedge_eligible(HedgeFacts {
-        page_operation: false,
-        ..facts
-    }));
+    // (page, owner, owners, first, second, attempts, links) -> eligible
+    for (page, owner, owners, first, second, attempts, links, eligible) in [
+        (true, false, &[1, 2, 3][..], 0, 1, 6, 10, true),
+        (true, false, &[1, 2, 3], 0, 1, 5, 10, false),
+        (true, false, &[1, 2, 3], 0, 1, 6, 9, false),
+        (true, false, &[1, 2, 3], 1, 1, 6, 10, false),
+        (true, true, &[1, 2, 3], 0, 1, 6, 10, false),
+        (true, false, &[1], 0, 0, 6, 10, false),
+        (true, false, &[1, 1, 3], 0, 1, 6, 10, false),
+        (false, false, &[1, 2, 3], 0, 1, 6, 10, false),
+    ] {
+        let b = budget(attempts, links);
+        assert_eq!(
+            hedge_eligible(page, owner, owners, first, second, &b),
+            eligible
+        );
+    }
     let mut b = budget(6, 10);
     let (secondary, primary) = hedge_budgets(&mut b).unwrap();
     assert_eq!(
@@ -777,14 +761,17 @@ fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
     cfg.handoff = 1;
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(8, 32);
-    assert!(!walk.pending_handoff());
+    assert!(!walk.pending.as_ref().is_some_and(|p| p.handoff));
     let mut seen = Vec::new();
     let end = loop {
         match walk.next(&mut b).unwrap() {
             Step::Granted(_) => unreachable!("grants are sequential here"),
             Step::Probe(p) => {
-                seen.push((p.canonical, walk.pending_handoff()));
-                let outcome = if walk.pending_handoff() {
+                seen.push((
+                    p.canonical,
+                    walk.pending.as_ref().is_some_and(|p| p.handoff),
+                ));
+                let outcome = if walk.pending.as_ref().is_some_and(|p| p.handoff) {
                     Outcome::StaleDestination
                 } else {
                     Outcome::Probe(ProbeOutcome::CopyMiss)
@@ -792,7 +779,7 @@ fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
                 if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
                     break end;
                 }
-                assert!(!walk.pending_handoff());
+                assert!(!walk.pending.as_ref().is_some_and(|p| p.handoff));
             }
             Step::End(end) => break end,
         }
@@ -1198,7 +1185,7 @@ fn destination_shed_is_evidence_but_not_a_route_failure() {
             panic!("probe")
         };
         assert_eq!(walk.complete(&mut b, outcome).unwrap(), None);
-        assert_eq!(walk.evidence(), &[ProbeOutcome::Overloaded]);
+        assert_eq!(&walk.evidence[..], &[ProbeOutcome::Overloaded]);
         assert_eq!(b.route_links(), if failed { 8 } else { 4 }, "{outcome:?}");
     }
 }
@@ -1216,7 +1203,7 @@ fn owner_leaves_the_fetch_to_rank_zero_after_a_timeout() {
     assert_eq!(probes.len(), 1);
     assert_eq!(probes[0].0.mode, Mode::Acquire);
     assert_eq!(end, End::Exhausted { funding: false });
-    assert!(walk.rank0_unanswered());
+    assert!(walk.rank0_unanswered);
     // Copy-only probe of rank 0 (too few credits to delegate): it joined
     // rank 0's running acquisition, so the same holds.
     let (probes, end) = run(
@@ -1273,7 +1260,7 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
         let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
         let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
         assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
-        assert!(!walk.rank0_unanswered());
+        assert!(!walk.rank0_unanswered);
     }
     // Rank 2: rank 1 timing out (copy-only) does not withhold origin.
     let (_, end) = run(
@@ -1312,7 +1299,7 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
         let mut walk = CandidateWalk::new(config(None, 2, VisitOrder::canonical(2)));
         let mut b = budget(32, 96);
         let (probes, end) = drive(&mut walk, &mut b, |_, _| outcome);
-        (probes.len(), end, b.route_links(), walk.rank0_unanswered())
+        (probes.len(), end, b.route_links(), walk.rank0_unanswered)
     };
     assert_eq!(
         run(Outcome::TimedOut),
@@ -1340,7 +1327,7 @@ fn rank_zero_watch_bounds_the_timeout_rule() {
     let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
     let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
     assert_eq!(end, End::Exhausted { funding: false });
-    assert!(walk.rank0_unanswered());
+    assert!(walk.rank0_unanswered);
     for outcome in [
         Outcome::Transport(ProbeOutcome::Unreachable),
         Outcome::Transport(ProbeOutcome::Overloaded),
@@ -1356,7 +1343,7 @@ fn rank_zero_watch_bounds_the_timeout_rule() {
     let mut walk = CandidateWalk::new(with(1, Rank0State::Overdue));
     let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
     assert!(matches!(end, End::Origin { rank: 1, .. }));
-    assert!(!walk.rank0_unanswered());
+    assert!(!walk.rank0_unanswered);
     let (_, end) = run(with(2, Rank0State::Overdue), 8, 32, |p, _| {
         if p.canonical == 0 {
             Outcome::TimedOut
@@ -1630,8 +1617,8 @@ fn successor_grant_never_grows_the_walk_budget() {
     let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
         panic!("expected a successor probe");
     };
-    assert!(walk.pending_successor());
-    assert!(walk.pending_handoff());
+    assert!(walk.pending.as_ref().is_some_and(|p| p.granted));
+    assert!(walk.pending.as_ref().is_some_and(|p| p.handoff));
     assert_eq!(probe.canonical, 3);
     walk.abandon(&mut b).unwrap();
     assert_eq!((b.remaining_attempts(), b.remaining_links()), (2, 3));
@@ -1695,7 +1682,7 @@ fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
             Step::Granted(_) => unreachable!("grants are sequential here"),
             Step::Probe(probe) => {
                 probes.push(probe.canonical);
-                let successor = walk.pending_successor();
+                let successor = walk.pending.as_ref().is_some_and(|p| p.granted);
                 let request = walk.request_budget(&mut b);
                 let outcome = if successor {
                     let sent = request.send_remote(1).unwrap();
@@ -1715,7 +1702,7 @@ fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
     };
     assert_eq!(probes, [3, 4]);
     assert!(matches!(end, End::Origin { rank: 0, .. }), "{end:?}");
-    assert!(!walk.rank0_unanswered());
+    assert!(!walk.rank0_unanswered);
     assert!(b.remaining_attempts() <= start.0 && b.remaining_links() <= start.1);
 }
 
@@ -1986,7 +1973,7 @@ fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
             "{state:?}: both granted targets asked"
         );
         assert!(matches!(end, End::Origin { rank: 1, .. }), "{state:?}");
-        assert!(!walk.rank0_unanswered(), "{state:?}");
+        assert!(!walk.rank0_unanswered, "{state:?}");
         assert!(b.remaining_attempts() <= 8 && b.remaining_links() <= 32);
         // Rank 0 times out after the granted targets missed: withheld.
         let mut walk = CandidateWalk::new(with(state));
@@ -1998,7 +1985,7 @@ fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
             }
         });
         assert_eq!(end, End::Exhausted { funding: false }, "{state:?}");
-        assert!(walk.rank0_unanswered(), "{state:?}");
+        assert!(walk.rank0_unanswered, "{state:?}");
     }
 }
 
@@ -2232,7 +2219,7 @@ fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
     let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Failed);
     assert_eq!(probes[0].0.mode, Mode::Acquire);
     assert_eq!(end, End::Exhausted { funding: false });
-    assert!(walk.rank0_unanswered());
+    assert!(walk.rank0_unanswered);
     // Rank 2: rank 1 is still asked copy-only and its copy wins.
     let (probes, end) = run(with(2, Rank0State::Failed), 8, 32, |p, _| {
         if p.canonical == 0 {
@@ -2259,7 +2246,7 @@ fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
             matches!(end, End::Origin { rank: 1, ref evidence } if evidence == &[ProbeOutcome::Unreachable]),
             "{state:?}"
         );
-        assert!(!walk.rank0_unanswered());
+        assert!(!walk.rank0_unanswered);
     }
     // Other failures of rank 0 still give authority while `Failed`.
     for outcome in [
@@ -2295,7 +2282,7 @@ fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
     });
     let (_, end) = drive(&mut walk, &mut budget(16, 64), |_, _| Outcome::Failed);
     assert_eq!(end, End::Exhausted { funding: false });
-    assert!(!walk.rank0_unanswered());
+    assert!(!walk.rank0_unanswered);
 }
 
 /// A remaining walk (after an origin version miss) treats `Failed` as a
