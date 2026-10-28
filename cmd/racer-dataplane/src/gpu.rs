@@ -488,18 +488,31 @@ pub struct GpuHelper {
 impl GpuHelper {
     /// Resolve `mode` against hardware. Returns `None` when GPU mode is off.
     pub fn start(mode: GpuMode, staging_bytes: u64, pci_p2pdma: bool) -> Result<Option<Arc<Self>>> {
+        Self::start_built(
+            mode,
+            cfg!(feature = "cuda"),
+            staging_bytes,
+            pci_p2pdma,
+            Box::new(racer_gpu::Gpu::load),
+        )
+    }
+
+    /// [`Self::start`] with `built` standing in for the `cuda` feature and a
+    /// custom backend loader. `loader` is not called when GPU mode is off.
+    pub fn start_built(
+        mode: GpuMode,
+        built: bool,
+        staging_bytes: u64,
+        pci_p2pdma: bool,
+        loader: Loader,
+    ) -> Result<Option<Arc<Self>>> {
         match mode {
             GpuMode::Disabled => Ok(None),
-            GpuMode::Auto if !cfg!(feature = "cuda") => {
+            GpuMode::Auto if !built => {
                 eprintln!("racer-dataplane: stage=gpu state=disabled reason=not-built");
                 Ok(None)
             }
-            _ => Self::start_with_options(
-                mode,
-                staging_bytes,
-                pci_p2pdma,
-                Box::new(racer_gpu::Gpu::load),
-            ),
+            _ => Self::start_with_options(mode, staging_bytes, pci_p2pdma, loader),
         }
     }
 
