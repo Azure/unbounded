@@ -10,8 +10,9 @@ ARG RACER_NATIVE_RDMA=true
 # Build the CUDA shim (libracer_gpu_cuda.so.1) and the `cuda` feature. On by
 # default so one image serves GPU and CPU nodes. The shim dlopens the driver at
 # runtime, so only nvcc (for the decrypt kernel PTX) is installed here; the
-# runtime image gets the driver from the NVIDIA runtime. With no usable GPU,
-# RACER_ENABLE_GPU=auto (the default) turns GPU reads off at startup. Set false
+# runtime image gets the driver from the NVIDIA runtime. With
+# RACER_ENABLE_GPU=auto (the default), the dataplane touches no GPU until the
+# first gpu-read, and turns GPU reads off then if no GPU is usable. Set false
 # for a smaller image without GPU reads.
 ARG RACER_NATIVE_CUDA=true
 ARG CUDA_NVCC_PACKAGE=cuda-nvcc-12-9

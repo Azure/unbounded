@@ -25,17 +25,19 @@ client falls back to host memory, then to a plain stream.
 ## 1. Check GPU Mode
 
 GPU mode is on by default. The `racer-dataplane` image is built with CUDA, and
-`RACER_ENABLE_GPU` is `auto`, so the dataplane turns GPU mode on when it finds
-a usable GPU. Check a dataplane log on a GPU node:
+`RACER_ENABLE_GPU` is `auto`. The dataplane does not touch the GPUs until the
+first GPU read, so vLLM's first load turns GPU mode on. After a load, check a
+dataplane log on the GPU node:
 
 ```bash
 kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu state='
 ```
 
 `state=enabled` means GPU mode is on. `state=disabled` gives the reason.
+`state=standby` means no GPU read has come in yet.
 
-To make the dataplane fail when it finds no GPU, so a broken setup is not
-silent, set `RACER_ENABLE_GPU` to `true`:
+To make the dataplane set up the GPUs at startup and fail when it finds none,
+so a broken setup is not silent, set `RACER_ENABLE_GPU` to `true`:
 
 ```bash
 kubectl -n unbounded-system patch configmap racer-dataplane-config \

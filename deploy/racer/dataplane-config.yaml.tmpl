@@ -22,9 +22,10 @@ data:
   # containerd then fails the Pod on any node without an NVIDIA CDI spec.
   # The operator reads this key and changes the DaemonSet accordingly.
   # RACER_DATAPLANE_NVIDIA: "env"
-  # GPU reads. The racer-dataplane image is built with CUDA. auto turns GPU
-  # mode on when a usable GPU is found and off otherwise; true fails startup
-  # when none is found; false turns it off.
+  # GPU reads. The racer-dataplane image is built with CUDA. auto touches no
+  # GPU until the first gpu-read, then turns GPU mode on if a usable GPU is
+  # found; true sets up the GPUs at startup and fails startup when none is
+  # found; false turns it off.
   # RACER_ENABLE_GPU: "auto"
   # Cap on ciphertext staging memory per GPU, in bytes: a nonzero multiple of
   # 2 MiB, default 256 MiB. GPU reads stage ciphertext here for decryption.

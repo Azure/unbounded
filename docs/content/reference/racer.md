@@ -932,12 +932,13 @@ Persist scrape configuration on workload templates or supported overrides, not o
 ### GPU metrics
 
 `/metrics` also reports `gpu-read` state. Labels have fixed values or come
-from the GPUs found at startup and the active RDMA rails.
+from the GPUs the dataplane found and the active RDMA rails.
 
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
 | `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
+| `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
 
 The rest are reported only when `racer_gpu_enabled` is 1:
 
@@ -1085,11 +1086,14 @@ GPU memory. They need:
   `--build-arg RACER_NATIVE_CUDA=false` has no GPU reads.
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
-- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto`, the default, turns
-  GPU mode on when the dataplane finds a usable GPU and off otherwise. `true`
-  makes startup fail when there is no usable GPU. `false` turns it off.
+- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto`, the default, does
+  not touch any GPU until a client sends the first `gpu-read`. Only then does
+  the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
+  finds no usable GPU. It does not try again until the pod restarts. `true`
+  sets up the GPUs at startup and makes startup fail when there is no usable
+  GPU. `false` turns it off.
 
-At startup the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
+When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in
 `EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
 for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
@@ -1136,10 +1140,10 @@ into a free slot of that GPU's share on the link's rail. The GPU then checks
 and decrypts it. Such a page is used only by that read: it is not kept in
 memory, written to disk, or shared with other reads, because the host never
 has its bytes. When no slot is free or anything fails, the page comes through
-host memory as before. Landing buffers are registered at each RDMA
-activation and freed when the RDMA node closes or when no rail could register
+host memory as before. Landing buffers are registered when GPU mode turns
+on and at each RDMA activation, and freed when the RDMA node closes or when no rail could register
 them. They are not resized at runtime; changing the setting restarts the
-pods. The dataplane logs `stage=gpu-landing` lines at RDMA activation, and
+pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for

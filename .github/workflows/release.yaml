@@ -869,8 +869,8 @@ jobs:
             file: images/gantry/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
-          # Includes GPU reads (CUDA shim and cuFile). They turn on only on
-          # nodes with a usable GPU.
+          # Includes GPU reads (CUDA shim and cuFile). The dataplane touches no
+          # GPU until a client sends the first gpu-read.
           - name: racer-dataplane
             file: images/racer-dataplane/Containerfile
             platforms: linux/amd64,linux/arm64

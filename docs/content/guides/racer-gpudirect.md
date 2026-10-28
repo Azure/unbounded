@@ -141,8 +141,13 @@ Racer exports GPU memory as a dma-buf and registers it with
 ## 2. Configure the Dataplane
 
 The released `racer-dataplane` image has the GPU decrypt kernels, cuFile, and a
-`cufile.json`. GPU mode turns on by itself on nodes with a usable GPU, so you
-do not need to build an image or change any setting.
+`cufile.json`. You do not need to build an image or change any setting.
+
+The dataplane does not touch the GPUs until a client asks for a GPU read. With
+the default `RACER_ENABLE_GPU=auto`, the first `gpu-read` makes the dataplane
+load CUDA, find the GPUs, and turn GPU mode on. That first read waits for this
+setup. If no GPU is usable, GPU reads stay off until the pod restarts, and
+clients fall back to host reads.
 
 To tune GPU mode, set the GPU keys in `racer-dataplane-config`. For example:
 
@@ -160,7 +165,7 @@ The operator rolls the dataplane pods when this ConfigMap changes.
 
 | Key | Default | Use |
 |-----|---------|-----|
-| `RACER_ENABLE_GPU` | `auto` | `auto` turns GPU mode on when the dataplane finds a usable GPU. `true` makes startup fail when GPU mode cannot start, so a broken setup is not silent. `false` turns it off |
+| `RACER_ENABLE_GPU` | `auto` | `auto` touches no GPU until the first `gpu-read`, then turns GPU mode on if it finds a usable GPU. `true` sets up the GPUs at startup and makes startup fail when GPU mode cannot start, so a broken setup is not silent. `false` turns it off |
 | `RACER_GPU_STAGING_BYTES` | 256 MiB | GPU memory per GPU for encrypted pages, in slots of 16 MiB plus 4 KiB. Two slots are for decryption, the rest for cuFile reads. When all slots are busy, pages go through host memory |
 | `RACER_GPU_LANDING_BYTES` | 256 MiB | GPU memory per GPU that peers' NICs write into. It is split across the rails. `0` turns GPUDirect RDMA off |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` tells cuFile to use PCIe P2PDMA for NVMe instead of `nvidia-fs` |
@@ -249,6 +254,7 @@ kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu'
 
 | Line | Meaning |
 |------|---------|
+| `stage=gpu state=standby start=first-gpu-read` | `auto` mode. No GPU is touched until the first `gpu-read`. The lines below appear after it |
 | `stage=gpu ordinal=0 uuid=... usable=true` | One line per GPU found |
 | `stage=gpu state=enabled usable=N decrypt=M staging_slots=S pci_p2pdma=B` | GPU mode is on. `decrypt=0` means the CPU decrypts every page. `pci_p2pdma` shows the `RACER_GPU_PCI_P2PDMA` setting |
 | `stage=gpu state=disabled reason=not-built` | A custom image was built with `RACER_NATIVE_CUDA=false` |
@@ -272,7 +278,8 @@ kubectl get --raw "/api/v1/namespaces/unbounded-system/pods/<dataplane-pod>:9090
 
 | Metric | What to look for |
 |--------|------------------|
-| `racer_gpu_enabled` | 1 when GPU mode is on |
+| `racer_gpu_standby` | 1 until the first `gpu-read` in `auto` mode |
+| `racer_gpu_enabled` | 1 when GPU mode is on. 0 during standby |
 | `racer_gpu_cufile_enabled` | 1 while cuFile reads are on |
 | `racer_gpu_read_requests_total{outcome}` | `gpu` should grow. `wrong_device` means the client's GPU is not one the dataplane can use |
 | `racer_gpu_read_pages_total{decrypt}` | Pages written to GPU memory. `decrypt="gpu"` should grow |
@@ -307,7 +314,7 @@ with cuda.GpuAllocation(meta.size) as alloc:
 |---------|-------|-----|
 | Dataplane fails to start with `RACER_ENABLE_GPU=true` | No usable GPU, or a custom image built without CUDA | Check the `stage=gpu` lines. Use the released `racer-dataplane` image. Set the GPUs to `Default` compute mode |
 | `decrypt=0` | The GPU is older than compute capability 8.0 | Use a newer GPU |
-| `cufile-disabled` at startup | GPUDirect Storage is missing on the host, or cuFile could not turn on P2PDMA | Load `nvidia-fs` or set up P2PDMA, then restart the machine. With `RACER_GPU_PCI_P2PDMA=true`, check that the host meets the P2PDMA needs |
+| `cufile-disabled` when GPU mode turns on | GPUDirect Storage is missing on the host, or cuFile could not turn on P2PDMA | Load `nvidia-fs` or set up P2PDMA, then restart the machine. With `RACER_GPU_PCI_P2PDMA=true`, check that the host meets the P2PDMA needs |
 | `cufile-disabled` later | A cuFile driver error turned cuFile off | Read `/var/log/cufile/cufile.log` in the dataplane pod. Fix the cause, then restart the dataplane |
 | `cufile-unsupported` | The device or filesystem is not one cuFile supports, or ext4 is not mounted with `data=ordered` | Use file slabs on ext4 or xfs, as in [Slab Storage](#slab-storage) |
 | `racer_gpu_direct_disk_reads_total` stays at 0 | Pages came from the origin, from peers, or from memory. Pages are stored in record format v1. All staging slots were busy | Load the model a second time. If `racer_gpu_staging_exhausted_total` grows, raise `RACER_GPU_STAGING_BYTES` |
