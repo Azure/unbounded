@@ -407,10 +407,6 @@ where
         })
     }
 
-    pub fn limits(&self) -> &SubscriptionLimits {
-        &self.limits
-    }
-
     /// Tokens of parked response slots made ready since the last call.
     pub fn take_wakes(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.wake)

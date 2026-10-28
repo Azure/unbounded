@@ -1,60 +1,13 @@
 //! Peer silence: a neighbor that accepts requests and never answers them
-//! (Known issues 41 and 43).
+//! (Known issues 41, 43, 53, 54).
 //!
-//! A peer server can hang without failing its connections: requests are
-//! accepted and never answered or forwarded. Transport circuits never see a
-//! failure, so without more evidence every node keeps sending to it, and
-//! each request costs its sender a whole attempt. Owners above a hung rank 0
-//! learn it page by page ([`crate::liveness::Rank0Watch`]), each on its own
-//! (Known issue 43), and readers never learn it (Known issue 41).
-//!
-//! A timeout alone cannot tell a hung peer from a busy one: a request that
-//! joined a running acquisition, or queued behind origin, also ends
-//! unanswered within the attempt. Taking every timeout as evidence (the
-//! first version of this rule, two timeouts and half a request timeout
-//! without an answer) marked thousands of busy owners in the simulator's
-//! 5k `zipf` at 16 MiB pages and quintupled overlapping origin requests. So a
-//! timeout only raises a question, and a ping answers it: a page request in
-//! mode `ping`, which the receiver answers `Miss` at once without looking at
-//! its cache or flights, so it never waits on work. A peer that answers the
-//! ping (anything, even `Overloaded`) is alive; one that leaves the ping
-//! unanswered within its own time bound is silent.
-//!
-//! The node on the other end of the last link to a destination is the one
-//! that asks: every request for the destination reaches it over one of the
-//! destination's links, sent either by the requester itself or by the relay
-//! before it, so that sender can ping it over one link without blaming a
-//! relay. It notes, per next hop that is also the destination, the exchanges
-//! that ended unanswered (the attempt's time bound or the upstream's
-//! cancellation, after at least [`Silence::min_wait`]), sends at most one
-//! ping at a time per peer ([`Silence::timed_out`] says when), and forgets
-//! the peer on any answer from it.
-//!
-//! A node that holds a peer silent fails requests for that destination at
-//! once (`Unavailable`, signed when it is a relay) instead of sending them,
-//! and routes around the peer. Because every request for the destination
-//! crosses one of its links, the knowledge is shared: once the neighbors on
-//! the common routes have it, every requester's probe fails fast, which a
-//! reader treats as an unreachable owner (it moves on at once) and an owner
-//! above rank 0 as a transport failure (origin authority) without its own
-//! wait. A hung relay is routed around by the nodes that hold it silent.
-//!
-//! A silent peer stays silent until it answers anything; it is pinged again
-//! every [`Silence::hold`], so one that recovers is used again within `hold`
-//! plus a round trip, and one that stays hung costs one ping per `hold`. A
-//! peer that answered a ping is not pinged again for a ping timeout. Entries
-//! expire [`SILENCE_TTL`] after the last event and are bounded by `capacity`
-//! (the sender's neighbors and direct peers); the oldest entry is evicted.
-//! No reader's budget pays for a ping, and the rule only fails, earlier, a
-//! request that would have timed out.
-//!
-//! Busy is not hung (Known issues 53 and 54). Any answer from a peer quiets
-//! it for [`Silence::quiet`], as an answered ping does, so a busy peer that
-//! answers some exchanges and leaves others (that joined its running work)
-//! unanswered is pinged at most once per sender per `quiet`. A peer that
-//! itself sheds an exchange (a signed `Overloaded`, such as a hot page's
-//! owner) is busy: [`Silence::shed`] marks it so readers visit it after the
-//! page's other owners for `quiet`, without a ping.
+//! A timeout alone cannot tell a hung peer from a busy one, so a timeout only
+//! raises a question and a ping (answered `Miss` at once, never waiting on
+//! work) answers it. The sender over the last link to a destination asks, so
+//! no relay is blamed. A silent peer fails its requests at once and is routed
+//! around until it answers anything; it is pinged again every
+//! [`Silence::hold`]. Any answer, or a signed shed ([`Silence::shed`]), quiets
+//! a peer for [`Silence::quiet`].
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -66,55 +19,36 @@ pub const SILENCE_CAPACITY: usize = 256;
 /// How long an entry outlives its last event.
 pub(crate) const SILENCE_TTL: Duration = Duration::from_secs(60);
 
-/// Unanswered exchanges over the last link before its sender pings: two, so
-/// that a busy neighbor, which answers something between two timeouts, is
-/// rarely pinged.
+/// Unanswered exchanges over the last link before its sender pings.
 pub const LINK_TIMEOUTS: u32 = 2;
 
-/// Unanswered probes of a page's rank 0 before the prober pings rank 0:
-/// one. An owner above rank 0 withholds origin after it
-/// ([`crate::liveness`]); a reader would otherwise visit a hung rank 0
-/// again on its next try (waiting for a second timeout failed ten times as
-/// many reads with 50 of 5,000 members hung in the simulator).
+/// Unanswered probes of a page's rank 0 before the prober pings it. Two
+/// failed ten times as many reads with 50 of 5,000 members hung in the sim.
 pub const RANK0_TIMEOUTS: u32 = 1;
 
-/// A reader's unanswered probe of an owner above rank 0 never asks a ping:
-/// such an owner usually waited on rank 0. It only demotes the owner in this
-/// node's visit order ([`Silence::unanswered`]).
+/// Never ping: an owner above rank 0 usually waited on rank 0, so its timeout
+/// only demotes it ([`Silence::unanswered`]).
 pub const NO_PING: u32 = u32::MAX;
 
 #[derive(Clone, Debug)]
 struct SilenceEntry<P> {
-    /// What the last unanswered exchange asked for (a ping asks about it:
-    /// production pings carry a page the destination ignores).
+    /// What the last unanswered exchange asked for; a ping carries it.
     subject: P,
-    /// A timeout raised the question: ping at the next chance.
     want: bool,
-    /// Exchanges left unanswered since the peer last answered.
     timeouts: u32,
-    /// A ping is outstanding since then.
     pinging: Option<Instant>,
-    /// The peer left a ping unanswered and has answered nothing since.
     silent: bool,
-    /// When a silent peer is pinged again, or until when a peer that
-    /// answered a ping is not pinged again.
+    /// Next ping for a silent peer, or end of quiet for an answered one.
     next: Instant,
-    /// The peer itself shed one of this node's requests (a signed
-    /// `Overloaded`): it is busy, not hung, and readers visit it after the
-    /// page's other owners until then (Known issue 54).
     busy_until: Option<Instant>,
-    /// Last event (expiry and eviction stamp).
     last: Instant,
     /// Insertion order, to evict deterministically among equal stamps.
     seq: u64,
 }
 
-/// Classify how a silence ping ended, for [`Silence::ping_result`]:
-/// `Ok((by_peer, unavailable))` for a signed answer (by the peer itself or
-/// a relay; `Unavailable` or not), `Err(timed_out)` for none. An answer the
-/// peer signed means alive; a relay's `Unavailable` (it holds the peer
-/// silent, or cannot reach it) or no answer in time means silent; anything
-/// else proves nothing.
+/// Classify a ping: `Ok((by_peer, unavailable))` for a signed answer,
+/// `Err(timed_out)` for none. `Some(true)` alive, `Some(false)` silent (a
+/// relay's `Unavailable` or a timeout), `None` proves nothing.
 pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
     match answer {
         Ok((true, _)) => Some(true),
@@ -124,7 +58,7 @@ pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
 }
 
 /// Bounded, expiring map from a destination to its silence. `P` is what a
-/// ping for it carries.
+/// ping carries.
 pub struct Silence<N, P = ()> {
     capacity: usize,
     hang_after: Duration,
@@ -134,9 +68,7 @@ pub struct Silence<N, P = ()> {
 }
 
 impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
-    /// `hang_after` is half the client request timeout (it scales
-    /// [`Self::min_wait`] and [`Self::hold`]); `ping_timeout` bounds one
-    /// ping (the peer attempt timeout).
+    /// `hang_after` is half the client request timeout.
     pub fn new(capacity: usize, hang_after: Duration, ping_timeout: Duration) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -147,27 +79,22 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         }
     }
 
-    /// Exchanges that ended sooner than this after their send are not
-    /// evidence (a hedge loser or a canceled read): a tenth of `hang_after`.
+    /// Shorter exchanges (hedge losers, canceled reads) are not evidence.
     pub fn min_wait(&self) -> Duration {
         self.hang_after / 10
     }
 
-    /// How often a silent peer is pinged again: twice `hang_after`.
+    /// How often a silent peer is pinged again.
     pub fn hold(&self) -> Duration {
         self.hang_after.saturating_mul(2)
     }
 
-    /// How long a ping may stay unanswered.
     pub fn ping_timeout(&self) -> Duration {
         self.ping_timeout
     }
 
-    /// How long a peer that answered a ping is not pinged again:
-    /// `hang_after`, the time [`crate::liveness::Rank0Watch`] gives a
-    /// rank 0 that may still be fetching. A peer that hangs right after
-    /// answering is found at most this much later; a busy peer costs at most
-    /// one ping per sender per `quiet`.
+    /// How long a peer that answered is not pinged again (matches the time
+    /// [`Rank0Watch`] gives a rank 0 that may still be fetching).
     pub fn quiet(&self) -> Duration {
         self.hang_after
     }
@@ -180,13 +107,8 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         self.entries.is_empty()
     }
 
-    /// An exchange sent to `peer` (the destination, over the last link) at
-    /// `sent` ended at `now` without an answer: the attempt's time bound or
-    /// the upstream's cancellation. Once `needed` such exchanges went
-    /// unanswered since the peer last answered, a ping is wanted. Returns
-    /// whether a ping is wanted now;
-    /// [`Self::due_pings`] or [`Self::start_ping`] sends it, and the caller
-    /// then reports [`Self::ping_result`].
+    /// An exchange sent to `peer` at `sent` ended unanswered at `now`.
+    /// Returns whether a ping is wanted now (after `needed` such exchanges).
     pub fn timed_out(
         &mut self,
         peer: N,
@@ -229,14 +151,9 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         needed <= 1
     }
 
-    /// `peer` itself shed an exchange of this node at `now` (an
-    /// `Overloaded` it signed, such as a hot page's owner shedding a
-    /// reader): it answered, so it is alive ([`Self::answered`]), and busy.
-    /// Readers visit it after the page's other owners for [`Self::quiet`]
-    /// ([`Self::unanswered`]), unless it answers something else first (Known
-    /// issue 54): a read retried after a shed otherwise repeated the same
-    /// walk (`Spread` is deterministic per requester and page) and was shed
-    /// again. No ping: the shed is the answer.
+    /// `peer` signed an `Overloaded`: alive but busy, so readers visit it
+    /// last for [`Self::quiet`]. Otherwise a retried read repeats the same
+    /// deterministic walk and is shed again.
     pub fn shed(&mut self, peer: N, subject: P, now: Instant) {
         let quiet = self.quiet();
         if !self.entries.contains_key(&peer) {
@@ -263,7 +180,6 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         }
     }
 
-    /// Send the ping a timeout asked for now (see [`Self::timed_out`]).
     pub fn start_ping(&mut self, peer: &N, now: Instant) {
         if let Some(entry) = self.entries.get_mut(peer) {
             entry.want = false;
@@ -271,10 +187,7 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         }
     }
 
-    /// Peers to ping now: those a timeout asked about, and silent peers
-    /// whose [`Self::hold`] has passed (to learn that they recovered), at
-    /// most `max`, oldest first. Each is marked as pinging; at most one ping
-    /// per peer is outstanding. Peers past `max` stay due.
+    /// Up to `max` peers to ping now, oldest first, marked as pinging.
     pub fn due_pings(&mut self, now: Instant, max: usize) -> Vec<(N, P)> {
         let stale = self.ping_timeout.saturating_mul(2);
         let mut due: Vec<(u64, N)> = Vec::new();
@@ -301,14 +214,7 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
             .collect()
     }
 
-    /// The outcome of the ping sent for `peer` (see [`ping_verdict`]).
-    ///
-    /// `Some(true)`: `peer` answered, so it is alive, and is not pinged again
-    /// for [`Self::quiet`] whatever times out meanwhile (it is busy, not hung).
-    /// `Some(false)`: unanswered within [`Self::ping_timeout`], so it is
-    /// silent until it answers anything, and pinged again every
-    /// [`Self::hold`]. `None` proves nothing. Returns whether `peer` became
-    /// silent.
+    /// Record a [`ping_verdict`]. Returns whether `peer` became silent.
     pub fn ping_result(&mut self, peer: &N, answered: Option<bool>, now: Instant) -> bool {
         let (hold, quiet) = (self.hold(), self.quiet());
         let (Some(entry), Some(answered)) = (self.entries.get_mut(peer), answered) else {
@@ -328,15 +234,8 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         became
     }
 
-    /// `peer` answered an exchange at `now` (a response it signed or
-    /// relayed): it is not hung. An outstanding ping's outcome is then
-    /// ignored, and the peer is not pinged for [`Self::quiet`] after the
-    /// answer, as after an answered ping (Known issue 53): a busy peer
-    /// answers this node between the probes that join its running work and
-    /// time out, and each answer used to forget the peer, so the next such
-    /// timeout pinged it again. A peer that hangs right after answering is
-    /// found at most `quiet` later, the bound an answered ping already has.
-    /// Only a peer already tracked is kept (no entry per answer).
+    /// `peer` answered: clear its evidence and quiet it (Known issue 53).
+    /// Untracked peers get no entry.
     pub fn answered(&mut self, peer: &N, now: Instant) {
         let quiet = self.quiet();
         if let Some(entry) = self.entries.get_mut(peer) {
@@ -350,10 +249,7 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         }
     }
 
-    /// Whether `peer` left an exchange of this node unanswered and has
-    /// answered nothing since (or is silent), within [`SILENCE_TTL`], or
-    /// shed this node within [`Self::quiet`] ([`Self::shed`]): readers visit
-    /// it after the page's other owners (Known issues 41 and 54).
+    /// Whether readers should visit `peer` after a page's other owners.
     pub fn unanswered(&self, peer: &N, now: Instant) -> bool {
         self.entries.get(peer).is_some_and(|e| {
             ((e.silent || e.timeouts > 0) && now.saturating_duration_since(e.last) <= SILENCE_TTL)
@@ -361,12 +257,10 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         })
     }
 
-    /// Whether `peer` is silent at `now`: requests for it fail at once.
     pub fn silent(&self, peer: &N, now: Instant) -> bool {
         self.entries.get(peer).is_some_and(|e| holds(e, now))
     }
 
-    /// Peers silent at `now` (routing avoids their links).
     pub fn silent_peers(&self, now: Instant) -> impl Iterator<Item = &N> {
         self.entries
             .iter()
@@ -374,8 +268,6 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
             .map(|(n, _)| n)
     }
 
-    /// Keep only peers `keep` accepts (the current neighbors and direct
-    /// peers).
     pub fn retain(&mut self, mut keep: impl FnMut(&N) -> bool) {
         self.entries.retain(|n, _| keep(n));
     }
@@ -652,92 +544,22 @@ mod silence_tests {
     }
 }
 
-// Rank 0 watch: what an owner above rank 0 last learned about rank 0's
-// acquisition of a page, so that it does not wait forever on a rank 0 that
-// hangs (Known issue 39).
+// Rank 0 watch (Known issues 39, 52): what an owner above rank 0 last
+// learned about rank 0's acquisition of a page.
 //
-// An owner above rank 0 asks rank 0 for the page before origin. When rank 0
-// accepts the request but does not answer within the attempt, rank 0 is most
-// likely still fetching (its origin request queued behind others), and the
-// owner leaves the fetch to it ([`crate::read::walk::Outcome::TimedOut`],
-// Known issue 31). Without memory, a rank 0 (or a relay on the route) that
-// accepts requests and never answers, without failing the connection,
-// blocks the page for as long as it stays a member: every owner walk ends
-// without origin authority.
-//
-// The owner therefore notes a page when its probe of rank 0 timed out
-// ([`Rank0Watch::timed_out`]). For [`Rank0Watch::hang_after`] (half the
-// node's client request timeout) after that, or until the request's own deadline
-// if later, the page is [`Rank0State::Fetching`] and the timeout rule
-// holds. After it the page is [`Rank0State::Overdue`]: a further timeout
-// gives authority like a transport failure, and the page stays overdue
-// while timeouts keep coming. Any answer signed by rank 0
-// ([`Rank0Watch::answered`]) forgets the page.
-//
-// `Fetching` does not withhold origin after other failures of rank 0. The
-// simulator measured that variant (a route failure, `Overloaded` or shed
-// from a rank 0 found fetching withheld origin like a timeout): in 5k
-// `zipf` at 16 MiB pages it removed 71 to 80 of about 110 overlapping
-// origin requests but failed 29 to 55 more reads (seeds 1 and 2). Nearly
-// all of those `Overloaded` answers are signed by a relay on the route
-// whose relay quota is full, not by rank 0, so they say nothing about rank
-// 0, and an owner that does not fetch leaves its readers unserved (Known
-// issue 40).
-//
-// Why a fixed allowance and not the request's deadline: rank 0's
-// acquisition outlives the request that started it while other waiters
-// join it (flight handover), and an owner's request often carries a short
-// deadline (a reader's attempt share). In the simulator an owner's first
-// deadline was about 3 s after the timeout while rank 0's origin request
-// stayed queued for longer, and taking authority then overlapped it. Why
-// half the request timeout: a read that met the first timeout still has
-// time to retry once rank 0 is presumed hung. In the simulator (10 s read
-// timeout) 5 s added no overlapping origin request in 5k `zipf` at 16 MiB
-// pages (3 s added 44), and with 50 of 5,000 members hung it failed 136
-// reads where 10 s failed 188 and no watch 371.
-//
-// A hung peer server hangs for every page, so a timeout on a page that is
-// already overdue also marks rank 0 itself silent: its other pages are
-// overdue at once, until it answers any probe from this owner or the mark
-// expires. Without it each page rank 0 owns would fail its readers for
-// another `hang_after`.
-//
-// Rank 0's own failures (Known issue 52). When rank 0 itself answers an
-// owner's probe `Unavailable` ([`crate::read::walk::Outcome::Failed`]),
-// its acquisition of the page failed, usually at origin, and the owner
-// takes origin authority and asks the same origin right away; the reader's
-// next retry then sends rank 0 to origin again, so during an origin error
-// burst each reader retry cost two origin requests. The cause is not
-// visible in the answer (rank 0 also answers `Unavailable` when it fails
-// for reasons of its own, and then the owner's fetch is what serves the
-// page). So the owner learns it from its own fetch: when its own origin
-// request for the page fails after it took authority
-// ([`Rank0Watch::failed`]), origin is failing for the page, and for
-// [`Rank0Watch::hang_after`] after that the page is
-// [`Rank0State::Failed`]: a further `Failed` answer from rank 0 leaves the
-// retry to rank 0 (the walk withholds authority, as for a timeout). Past
-// it the page is `Unknown` again, so the owner fetches once more after
-// rank 0's next failure, and a failure of that fetch starts the next
-// interval. While origin keeps failing a page, the owner adds at most one
-// origin request per `hang_after` (plus the first) to rank 0's, which
-// follow the reader retries; a failure local to rank 0 is never withheld
-// unless the owner's own fetch failed too. In the simulator (5k
-// `full-failover` with every origin request failing for 30 s twice) this
-// cut origin requests 17,114 to 15,179.
-//
-// Costs: one entry per page an owner deferred to rank 0, bounded by
-// [`WATCH_CAPACITY`] and expiring [`WATCH_TTL`] after the last timeout.
-// No message is added and no budget grows: the rule only changes whether a
-// walk that already ended ends with origin authority. A hung rank 0 blocks
-// a page for at most `hang_after` after the first timeout; a rank 0
-// that is down or partitioned fails at the transport level, which gives
-// authority as before.
+// A probe timeout marks the page `Fetching` for `hang_after` (or until the
+// request deadline, if later); the owner leaves the fetch to rank 0. Past
+// that it is `Overdue` and a further timeout gives origin authority and marks
+// rank 0 silent for all its pages. A failure of the owner's own origin fetch
+// marks the page `Failed` for `hang_after`, so a later `Unavailable` from
+// rank 0 does not cost a second origin request. Any answer signed by rank 0
+// forgets the page. Only timeouts withhold origin: in the sim, withholding it
+// after relay `Overloaded` too failed 29 to 55 more reads (Known issue 40).
 
 /// Default bound on watched pages per node.
 pub const WATCH_CAPACITY: usize = 4096;
 
-/// Default [`Rank0Watch::hang_after`]: half the dataplane's default client
-/// request timeout.
+/// Half the dataplane's default client request timeout.
 pub const HANG_AFTER: Duration = Duration::from_secs(15);
 
 /// How long an entry outlives the last timeout that renewed it.
@@ -746,31 +568,20 @@ pub const WATCH_TTL: Duration = Duration::from_secs(60);
 /// What this owner knows about rank 0's acquisition of a page.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Rank0State {
-    /// Nothing recent: rules as without the watch.
     #[default]
     Unknown,
-    /// A probe of rank 0 timed out less than [`Rank0Watch::hang_after`]
-    /// ago (or before its request's deadline, if later) and rank 0 has not
-    /// answered since: rank 0 is presumed to be fetching.
+    /// A probe timed out recently: rank 0 is presumed to be fetching.
     Fetching,
-    /// Rank 0 has not answered this owner since a timeout that long ago, or
-    /// is marked silent: rank 0 is presumed hung.
+    /// Rank 0 is presumed hung.
     Overdue,
-    /// This owner's own origin request for the page failed less than
-    /// [`Rank0Watch::hang_after`] ago ([`Rank0Watch::failed`]): leave the
-    /// retry after a failure of rank 0 to rank 0.
+    /// This owner's own origin fetch failed recently: leave retries to rank 0.
     Failed,
 }
 
 struct Rank0Entry<N> {
-    /// Rank 0 when the page was noted.
     node: N,
-    /// Deadline of the first unanswered request: rank 0 must have answered
-    /// or failed it by then.
     until: Instant,
-    /// Last timeout or failure seen (expiry and eviction stamp).
     last: Instant,
-    /// Noted by [`Rank0Watch::failed`], not by a timeout.
     failed: bool,
 }
 
@@ -780,17 +591,13 @@ pub struct Rank0Watch<K, N> {
     ttl: Duration,
     hang_after: Duration,
     entries: HashMap<K, Rank0Entry<N>>,
-    /// Ranks 0 that stayed silent past a request deadline, with when that
-    /// was last confirmed (at most `capacity`).
+    /// Ranks 0 silent past a deadline, with last confirmation.
     silent: HashMap<N, Instant>,
     /// Insertion order for eviction; stale stamps are skipped.
     order: VecDeque<(K, Instant)>,
 }
 
 impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
-    /// `hang_after` is how long rank 0 may stay silent on a page after the
-    /// first timeout before it is presumed hung (half the node's client
-    /// request timeout); `ttl` should exceed it.
     pub fn new(capacity: usize, ttl: Duration, hang_after: Duration) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -814,7 +621,6 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         self.entries.is_empty()
     }
 
-    /// The presumed state of `rank0`'s acquisition of `key` at `now`.
     pub fn state(&self, key: &K, rank0: &N, now: Instant) -> Rank0State {
         let silent = self
             .silent
@@ -841,11 +647,8 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         }
     }
 
-    /// This owner's probe of rank 0 for `key` was sent and not answered
-    /// within its attempt; the request carried `deadline`. The first
-    /// timeout's bound stands while the entry lives, so repeated timeouts
-    /// cannot postpone [`Rank0State::Overdue`].
-    /// A timeout on a page that is already overdue marks `rank0` silent.
+    /// A probe for `key` timed out. Repeated timeouts cannot postpone
+    /// [`Rank0State::Overdue`].
     pub fn timed_out(&mut self, key: K, rank0: N, now: Instant, deadline: Instant) {
         let live = self.entries.get(&key).is_some_and(|e| {
             e.node == rank0 && !e.failed && now.saturating_duration_since(e.last) <= self.ttl
@@ -878,12 +681,8 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         self.compact();
     }
 
-    /// This owner's own origin request for `key`, made with authority
-    /// while `rank0` was the page's rank 0, failed (origin error or
-    /// deadline; Known issue 52). The first failure starts an interval of
-    /// [`Rank0Watch::hang_after`] during which the page is
-    /// [`Rank0State::Failed`]; further failures inside it do not extend it.
-    /// A failure after it starts the next interval.
+    /// This owner's own origin fetch for `key` failed. Failures inside the
+    /// interval do not extend it.
     pub fn failed(&mut self, key: K, rank0: N, now: Instant) {
         let live = self.entries.get(&key).is_some_and(|e| {
             e.node == rank0
@@ -923,18 +722,13 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         self.entries.insert(key, entry);
     }
 
-    /// `rank0` itself answered this owner's probe for `key` (a copy, a
-    /// miss, or a failure of its own): it is not hung, forget the page and
-    /// the silent mark.
     pub fn answered(&mut self, key: &K, rank0: &N) {
         self.entries.remove(key);
         self.silent.remove(rank0);
     }
 
-    /// `rank0` itself answered this owner's probe for `key` that its own
-    /// acquisition failed ([`crate::read::walk::Outcome::Failed`]): it is
-    /// not hung (forget a timeout and the silent mark), but a recent origin
-    /// failure of this owner's stays (Known issue 52).
+    /// Rank 0 answered `Unavailable`: forget a timeout but keep this
+    /// owner's own recent origin failure.
     pub fn answered_failure(&mut self, key: &K, rank0: &N) {
         if self.entries.get(key).is_some_and(|e| !e.failed) {
             self.entries.remove(key);
