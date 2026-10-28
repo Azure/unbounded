@@ -13,21 +13,6 @@ pub struct EntropyError;
 /// A source of random bytes.
 pub trait Entropy {
     fn fill(&mut self, out: &mut [u8]) -> Result<(), EntropyError>;
-
-    /// Random `u32`; 0 when entropy fails, matching the previous
-    /// `let _ = getrandom(..)` jitter call sites.
-    fn u32_or_zero(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        let _ = self.fill(&mut b);
-        u32::from_ne_bytes(b)
-    }
-
-    /// Random `u16`; 0 when entropy fails.
-    fn u16_or_zero(&mut self) -> u16 {
-        let mut b = [0u8; 2];
-        let _ = self.fill(&mut b);
-        u16::from_ne_bytes(b)
-    }
 }
 
 /// Operating system entropy.
@@ -69,18 +54,7 @@ mod tests {
         Entropy::fill(&mut b, &mut y).unwrap();
         assert_eq!(x, y);
         assert_ne!(x, [0u8; 13]);
-        assert_ne!(
-            SplitMix64::new(1).u32_or_zero(),
-            SplitMix64::new(2).u32_or_zero()
-        );
-    }
-
-    #[test]
-    fn failing_yields_zero_jitter() {
         assert!(Failing.fill(&mut [0u8; 1]).is_err());
-        assert_eq!(Failing.u32_or_zero(), 0);
-        assert_eq!(Failing.u16_or_zero(), 0);
-        let mut os = OsEntropy;
-        os.fill(&mut [0u8; 8]).unwrap();
+        OsEntropy.fill(&mut [0u8; 8]).unwrap();
     }
 }

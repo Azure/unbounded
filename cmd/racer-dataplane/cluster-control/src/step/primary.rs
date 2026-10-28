@@ -385,7 +385,10 @@ impl Contend {
 
     /// Delay before the next read.
     pub fn wait(rng: &mut dyn Entropy) -> Duration {
-        limits::LEASE_RENEW + Duration::from_millis(u64::from(rng.u16_or_zero()) % 3000)
+        // Failed entropy leaves zeros: no jitter.
+        let mut b = [0u8; 2];
+        let _ = rng.fill(&mut b);
+        limits::LEASE_RENEW + Duration::from_millis(u64::from(u16::from_ne_bytes(b)) % 3000)
     }
 }
 

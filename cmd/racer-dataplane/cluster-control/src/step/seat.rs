@@ -162,13 +162,12 @@ pub fn claim_views(
         .collect()
 }
 
-/// Pseudo-random delay below `max`, spread by Pod UID, `stream`, and `rng`.
-///
-/// `stream` separates independent delays drawn for the same Pod; it is not a
-/// cryptographic input.
+/// Pseudo-random delay below `max`, spread by Pod UID, `stream` (separates
+/// delays drawn for one Pod), and `rng` (zeros if it fails).
 pub fn jitter(pod_uid: &str, rng: &mut dyn Entropy, stream: u32, max: Duration) -> Duration {
-    let r = rng.u32_or_zero();
-    election::claim_delay(pod_uid, stream ^ r, max)
+    let mut b = [0u8; 4];
+    let _ = rng.fill(&mut b);
+    election::claim_delay(pod_uid, stream ^ u32::from_ne_bytes(b), max)
 }
 
 /// Retry delay after a failed renew.
@@ -309,9 +308,6 @@ impl SeatRenew {
     }
 }
 
-/// Least time between state Secret reads.
-pub const MIN_READ_INTERVAL: Duration = Duration::from_secs(1);
-
 /// What a seat read from the state Secret.
 #[derive(Clone, Copy, Debug)]
 pub struct SecretRead<'a> {
@@ -362,12 +358,9 @@ pub fn read(r: &SecretRead<'_>) -> Read {
 }
 
 /// Whether a state read is older news rather than a rollback: another
-/// installer (the primary's own commit, `primary.rs` `reconcile`) raised the
-/// high water mark while the read was in flight, and the read is older
-/// than it (the same sequence is installed as usual, so a seat still
-/// learns it serves that sequence). The read may have been answered before that commit; it is
-/// dropped instead of failing closed. A genuine rollback is still refused by
-/// the next read, which starts after the installation (Known issue 56).
+/// installer (the primary's own commit) raised the high water mark past it
+/// while the read was in flight. It is dropped instead of failing closed; a
+/// genuine rollback is still refused by the next read.
 pub fn superseded(
     installed_during_read: bool,
     high_water: Option<&StateRecord>,
@@ -456,13 +449,13 @@ impl Follower {
 }
 
 #[cfg(test)]
-mod lottery_tests {
+mod tests {
     use super::*;
+    use crate::{annotations, authority::election::LeaseSpec, entropy::Failing, limits};
     use racer_core::time::SplitMix64;
 
     #[test]
     fn jitter_is_bounded_and_seeded() {
-        use crate::entropy::Failing;
         let max = Duration::from_secs(5);
         let a = jitter("u", &mut SplitMix64::new(1), 0, max);
         assert!(a < max);
@@ -472,7 +465,6 @@ mod lottery_tests {
             election::claim_delay("u", 3, max)
         );
     }
-    use crate::{annotations, authority::election::LeaseSpec, entropy::Failing, limits};
 
     fn view(desired: usize, nodes: &[&str]) -> PrimaryView {
         PrimaryView {
@@ -607,11 +599,6 @@ mod lottery_tests {
         // Once it expires by the local clock, the claim proceeds.
         assert!(l.observe(index, &held, now + limits::LEASE_DURATION, "me", "me/1"));
     }
-}
-
-#[cfg(test)]
-mod renew_tests {
-    use super::*;
 
     #[test]
     fn release_reasons_win() {
@@ -693,11 +680,6 @@ mod renew_tests {
         };
         assert!(!RenewInputs::from_view(&none, 5, "x", false, false, false, false).shrink);
     }
-}
-
-#[cfg(test)]
-mod follower_tests {
-    use super::*;
 
     const C: &str = "c1c1c1c1-0000-4000-8000-000000000001";
 
