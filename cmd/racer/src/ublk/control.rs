@@ -30,6 +30,12 @@ const START_RETRIES: usize = 16;
 /// How long START_DEV waits between `should_stop` checks.
 const START_POLL: Duration = Duration::from_millis(100);
 
+/// The least time START_DEV may take. START_DEV does not return until the
+/// kernel has scanned the disk for partitions, and those reads are served by
+/// workers that may have to fetch from the origin, each bounded by the
+/// request timeout. A few such reads must fit.
+pub(crate) const MIN_START_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Default bound on waiting for one control command.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -403,12 +409,18 @@ impl Control {
     /// 100 ms and, once it returns true, cancels the command and returns
     /// [`UblkError::Canceled`] (or the command's own result if it finished
     /// first). Interrupted waits are retried a bounded number of times.
+    ///
+    /// The whole call, retries included, is bounded by the channel timeout
+    /// or [`MIN_START_TIMEOUT`], whichever is longer. Running out of time
+    /// leaves START_DEV outstanding with an unknown fate, so the channel is
+    /// poisoned and [`UblkError::TimedOut`] is returned.
     pub(crate) fn start_dev(
         &mut self,
         id: u32,
         pid: i32,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<()> {
+        let deadline = Instant::now() + self.timeout.max(MIN_START_TIMEOUT);
         for _ in 0..START_RETRIES {
             if self.poisoned {
                 return Err(UblkError::Poisoned);
@@ -418,7 +430,7 @@ impl Control {
             }
             let entry = self.sqe(U_CMD_START_DEV, id, pid as u64, 0);
             self.push(&entry)?;
-            let (res, canceled) = self.wait_cancellable(should_stop)?;
+            let (res, canceled) = self.wait_cancellable(should_stop, deadline)?;
             if res == -libc::EINTR || res == -ERESTARTSYS || res == -libc::ECANCELED {
                 if canceled {
                     return Err(UblkError::Canceled);
@@ -432,11 +444,25 @@ impl Control {
 
     /// Waits for the outstanding command, canceling it once `should_stop`
     /// is true. Returns its result and whether a cancel was sent. On return
-    /// nothing is in flight; on error the channel is poisoned.
-    fn wait_cancellable(&mut self, should_stop: &dyn Fn() -> bool) -> Result<(i32, bool)> {
+    /// nothing is in flight; on error the channel is poisoned. Waiting past
+    /// `deadline` without a cancel poisons the channel and returns
+    /// [`UblkError::TimedOut`].
+    fn wait_cancellable(
+        &mut self,
+        should_stop: &dyn Fn() -> bool,
+        deadline: Instant,
+    ) -> Result<(i32, bool)> {
         let mut canceled = false;
         loop {
-            if let Some((user_data, res)) = self.wait_timeout(START_POLL)? {
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some((CMD_USER_DATA, res)) = self.pop() {
+                    return Ok((res, canceled));
+                }
+                self.poisoned = true;
+                return Err(UblkError::TimedOut { op: "START_DEV" });
+            }
+            if let Some((user_data, res)) = self.wait_timeout(START_POLL.min(deadline - now))? {
                 if user_data == CMD_USER_DATA {
                     return Ok((res, canceled));
                 }
@@ -707,6 +733,80 @@ impl Drop for Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel over `/dev/null`, enough to drive the wait loops.
+    fn null_control() -> Control {
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        Control {
+            ring: IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+                .build(4)
+                .unwrap(),
+            fd,
+            payload: Some(Payload::new().unwrap()),
+            poisoned: false,
+            timeout: Duration::from_millis(10),
+        }
+    }
+
+    fn push_nop(control: &mut Control, user_data: u64) {
+        let nop = squeue::Entry128::from(opcode::Nop::new().build()).user_data(user_data);
+        control.push(&nop).unwrap();
+    }
+
+    #[test]
+    fn start_wait_times_out_and_poisons() {
+        let mut control = null_control();
+        let begin = Instant::now();
+        let err = control
+            .wait_cancellable(&|| false, begin + Duration::from_millis(150))
+            .expect_err("no completion arrives");
+        assert!(
+            matches!(err, UblkError::TimedOut { op: "START_DEV" }),
+            "{err}"
+        );
+        assert!(begin.elapsed() >= Duration::from_millis(150));
+        assert!(begin.elapsed() < Duration::from_secs(5));
+        assert!(control.is_poisoned());
+        assert!(matches!(
+            control.start_dev(1, 1, &|| false),
+            Err(UblkError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn start_wait_returns_a_completion_before_the_deadline() {
+        let mut control = null_control();
+        push_nop(&mut control, CMD_USER_DATA);
+        let (res, canceled) = control
+            .wait_cancellable(&|| false, Instant::now() + Duration::from_secs(5))
+            .expect("completes");
+        assert_eq!((res, canceled), (0, false));
+        assert!(!control.is_poisoned());
+    }
+
+    #[test]
+    fn start_wait_prefers_a_ready_completion_at_the_deadline() {
+        let mut control = null_control();
+        push_nop(&mut control, CMD_USER_DATA);
+        // Let the NOP complete before the deadline check.
+        control.ring.submit_and_wait(1).unwrap();
+        let (res, _) = control
+            .wait_cancellable(&|| false, Instant::now())
+            .expect("ready completion wins");
+        assert_eq!(res, 0);
+        assert!(!control.is_poisoned());
+    }
+
+    #[test]
+    fn start_wait_ignores_other_completions_until_the_deadline() {
+        let mut control = null_control();
+        push_nop(&mut control, CANCEL_USER_DATA);
+        let err = control
+            .wait_cancellable(&|| false, Instant::now() + Duration::from_millis(50))
+            .expect_err("only a stray completion");
+        assert!(matches!(err, UblkError::TimedOut { .. }));
+        assert!(control.is_poisoned());
+    }
 
     #[test]
     fn open_missing_directory_fails() {

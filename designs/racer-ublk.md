@@ -100,7 +100,15 @@ itself.
    `FETCH_REQ` for every tag.
 4. The control thread sends `START_DEV`. The kernel waits until every tag has a fetch
    outstanding, then adds the disk. Workers are already serving, so the partition scan reads
-   complete.
+   complete. The wait is bounded by the control timeout, or 5 minutes if that is longer,
+   since scan reads may need origin fetches.
+
+If `START_DEV` runs out of time, its outcome is unknown and the control channel is not used
+again. It is leaked, not closed, because the kernel may still own the command. The control
+thread tells the device's queues to fail every read, which lets a stuck `START_DEV` finish,
+then stops and deletes the device over a fresh control channel. Later devices use the fresh
+channel too. Any control command that leaves its channel in this state is handled the same
+way.
 
 A device that fails to start is logged and torn down. It does not stop the dataplane.
 

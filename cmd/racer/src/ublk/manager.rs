@@ -171,6 +171,84 @@ impl DeviceControl for Control {
     }
 }
 
+/// A control channel that replaces itself once poisoned.
+///
+/// A poisoned channel may still have a command in the kernel, so it is
+/// leaked, not closed, and the next command goes over a fresh channel from
+/// `reopen`. This keeps one stuck command, such as a START_DEV that timed
+/// out, from failing every later device. If reopening fails, the poisoned
+/// channel stays and commands fail with [`UblkError::Poisoned`].
+pub(super) struct Reopening<'a> {
+    current: Box<dyn DeviceControl + 'a>,
+    reopen: Box<Reopen<'a>>,
+}
+
+impl<'a> Reopening<'a> {
+    pub(super) fn new(current: Box<dyn DeviceControl + 'a>, reopen: Box<Reopen<'a>>) -> Self {
+        Self { current, reopen }
+    }
+
+    /// The channel to use, replacing a poisoned one if possible.
+    fn channel(&mut self) -> &mut dyn DeviceControl {
+        if self.current.is_poisoned() {
+            match (self.reopen)() {
+                Ok(fresh) => {
+                    log(None, "control", "state=reopened reason=poisoned");
+                    std::mem::forget(std::mem::replace(&mut self.current, fresh));
+                }
+                Err(error) => log(
+                    None,
+                    "control",
+                    &format!("state=reopen_failed error=\"{error}\""),
+                ),
+            }
+        }
+        &mut *self.current
+    }
+}
+
+impl DeviceControl for Reopening<'_> {
+    fn add_dev(&mut self, spec: &DevSpec) -> Result<DevInfo, UblkError> {
+        self.channel().add_dev(spec)
+    }
+
+    fn set_params(&mut self, id: u32, params: &Params) -> Result<(), UblkError> {
+        self.channel().set_params(id, params)
+    }
+
+    fn start_dev(
+        &mut self,
+        id: u32,
+        pid: i32,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<(), UblkError> {
+        self.channel().start_dev(id, pid, should_stop)
+    }
+
+    fn stop_dev(&mut self, id: u32) -> Result<(), UblkError> {
+        self.channel().stop_dev(id)
+    }
+
+    fn get_dev_info(&mut self, id: u32) -> Result<DevInfo, UblkError> {
+        self.channel().get_dev_info(id)
+    }
+
+    fn del_dev(&mut self, id: u32) -> Result<(), UblkError> {
+        self.channel().del_dev(id)
+    }
+
+    /// Whether the current channel is poisoned. It is replaced only when
+    /// the next command is sent, so a caller can still see that the last
+    /// command's outcome is unknown.
+    fn is_poisoned(&self) -> bool {
+        self.current.is_poisoned()
+    }
+
+    fn open_char(&mut self, directory: &Path, id: u32) -> std::io::Result<OwnedFd> {
+        self.current.open_char(directory, id)
+    }
+}
+
 /// Where a device is in the control thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -385,12 +463,21 @@ impl Manager {
         let directory = self.device_directory.clone();
         let timeout = self.shutdown_timeout.max(MIN_COMMAND_TIMEOUT);
         let settled = self.run_guarded(
-            |manager| match Control::open(&manager.device_directory) {
-                Ok(mut control) => {
+            |manager| {
+                let open = move |directory: &Path| -> Result<Box<dyn DeviceControl>, UblkError> {
+                    let mut control = Control::open(directory)?;
                     control.set_timeout(timeout);
-                    manager.run_with(&mut control);
+                    Ok(Box::new(control))
+                };
+                match open(&manager.device_directory) {
+                    Ok(control) => {
+                        let directory = manager.device_directory.clone();
+                        let mut control =
+                            Reopening::new(control, Box::new(move || open(&directory)));
+                        manager.run_with(&mut control);
+                    }
+                    Err(error) => log(None, "open", &format!("error=\"{error}\"")),
                 }
-                Err(error) => log(None, "open", &format!("error=\"{error}\"")),
             },
             &mut || {
                 let mut control = Control::open(&directory)?;
@@ -675,6 +762,13 @@ impl Manager {
                 "start",
                 &format!("state=failed id={id} error=\"{error}\""),
             );
+            if control.is_poisoned() {
+                // START_DEV may still be in the kernel, waiting on reads
+                // from its partition scan while holding the device lock.
+                // Failing every read lets it finish, so STOP_DEV over a
+                // fresh channel can proceed.
+                self.update(|shared| shared.devices[index].abandon = true);
+            }
             self.teardown(control, &[(index, id)]);
             return Phase::Failed;
         }
@@ -901,6 +995,8 @@ mod tests {
     struct Fake {
         ops: Arc<Mutex<Vec<String>>>,
         fail_start: bool,
+        /// START_DEV times out with an unknown outcome and poisons the channel.
+        start_timeout: bool,
         /// A device with the fixed id already exists.
         stale: bool,
         /// ADD_DEV grants this depth and buffer size instead.
@@ -927,6 +1023,9 @@ mod tests {
 
     impl DeviceControl for Fake {
         fn add_dev(&mut self, spec: &DevSpec) -> Result<DevInfo, UblkError> {
+            if self.is_poisoned() {
+                return Err(UblkError::Poisoned);
+            }
             self.push(format!(
                 "add id={:?} queues={} depth={} max={} flags={:#x}",
                 spec.id, spec.queues, spec.depth, spec.max_io_bytes, spec.flags
@@ -956,6 +1055,10 @@ mod tests {
             _should_stop: &dyn Fn() -> bool,
         ) -> Result<(), UblkError> {
             self.push(format!("start {id}"));
+            if self.start_timeout {
+                *self.poisoned.lock().unwrap() = true;
+                return Err(UblkError::TimedOut { op: "START_DEV" });
+            }
             if self.fail_start {
                 return Err(UblkError::Kernel {
                     op: "START_DEV",
@@ -966,6 +1069,10 @@ mod tests {
         }
 
         fn stop_dev(&mut self, id: u32) -> Result<(), UblkError> {
+            if self.is_poisoned() {
+                self.push(format!("stop {id} poisoned"));
+                return Err(UblkError::Poisoned);
+            }
             self.push(format!("stop {id}"));
             match *self.stop_errno.lock().unwrap() {
                 Some(errno) => Err(UblkError::Kernel {
@@ -1423,6 +1530,138 @@ mod tests {
         eventually("del", || fake.ops().contains(&format!("del {DEV_ID}")));
         manager.request_stop();
         thread.join().unwrap();
+    }
+
+    /// Run the control loop over a [`Reopening`] channel whose first
+    /// channel is `first`. Each reopen yields a healthy channel that shares
+    /// the op log, or fails when `reopen_fails` is set.
+    fn spawn_reopening(
+        manager: &Arc<Manager>,
+        first: &Fake,
+        reopen_fails: bool,
+    ) -> std::thread::JoinHandle<()> {
+        let manager = manager.clone();
+        let first = first.clone();
+        *first.manager.lock().unwrap() = Some(manager.clone());
+        std::thread::spawn(move || {
+            let fresh = Fake {
+                ops: first.ops.clone(),
+                manager: first.manager.clone(),
+                ..Default::default()
+            };
+            let log = first.ops.clone();
+            let mut control = Reopening::new(
+                Box::new(first),
+                Box::new(move || {
+                    log.lock().unwrap().push("reopen".into());
+                    if reopen_fails {
+                        return Err(UblkError::Poisoned);
+                    }
+                    Ok(Box::new(fresh.clone()) as Box<dyn DeviceControl>)
+                }),
+            );
+            manager.run_with(&mut control);
+        })
+    }
+
+    #[test]
+    fn start_timeout_tears_down_over_a_fresh_channel() {
+        let manager = manager(None);
+        let fake = Fake {
+            start_timeout: true,
+            ..Default::default()
+        };
+        let thread = spawn_reopening(&manager, &fake, false);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        manager.report_queue(0, 1, QueueReport::Attached);
+        eventually("stop", || fake.ops().contains(&format!("stop {DEV_ID}")));
+        assert!(
+            view(&manager, 0).abandon,
+            "reads of a stuck START_DEV fail so it can finish"
+        );
+        manager.report_queue(0, 0, QueueReport::Closed);
+        manager.report_queue(0, 1, QueueReport::Closed);
+        eventually("del", || fake.ops().contains(&format!("del {DEV_ID}")));
+        manager.request_stop();
+        thread.join().unwrap();
+        let ops = fake.ops();
+        let start = ops.iter().position(|op| op.starts_with("start")).unwrap();
+        assert_eq!(
+            ops[start..start + 3],
+            [
+                format!("start {DEV_ID}"),
+                "reopen".to_string(),
+                format!("stop {DEV_ID}")
+            ]
+        );
+        assert_eq!(ops.iter().filter(|op| *op == "reopen").count(), 1);
+    }
+
+    #[test]
+    fn start_timeout_without_a_fresh_channel_leaves_the_device() {
+        let manager = manager(None);
+        let fake = Fake {
+            start_timeout: true,
+            ..Default::default()
+        };
+        let thread = spawn_reopening(&manager, &fake, true);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        manager.report_queue(0, 1, QueueReport::Attached);
+        eventually("stop", || {
+            fake.ops().contains(&format!("stop {DEV_ID} poisoned"))
+        });
+        manager.report_queue(0, 0, QueueReport::Closed);
+        manager.report_queue(0, 1, QueueReport::Closed);
+        manager.request_stop();
+        thread.join().unwrap();
+        assert!(
+            !fake.ops().iter().any(|op| op.starts_with("del")),
+            "no delete over a poisoned channel"
+        );
+    }
+
+    #[test]
+    fn reopening_keeps_a_healthy_channel() {
+        let fake = Fake::default();
+        let mut control = Reopening::new(
+            Box::new(fake.clone()),
+            Box::new(|| panic!("a healthy channel is not reopened")),
+        );
+        control.stop_dev(DEV_ID).unwrap();
+        control.stop_dev(DEV_ID).unwrap();
+        assert!(!control.is_poisoned());
+        assert_eq!(
+            fake.ops(),
+            [format!("stop {DEV_ID}"), format!("stop {DEV_ID}")]
+        );
+    }
+
+    #[test]
+    fn reopening_reports_poison_until_the_next_command() {
+        let first = Fake {
+            del_unknown: true,
+            ..Default::default()
+        };
+        let fresh = Fake {
+            ops: first.ops.clone(),
+            ..Default::default()
+        };
+        let mut control = Reopening::new(
+            Box::new(first.clone()),
+            Box::new(move || Ok(Box::new(fresh.clone()) as Box<dyn DeviceControl>)),
+        );
+        assert!(control.del_dev(DEV_ID).is_err());
+        assert!(control.is_poisoned(), "the caller sees the unknown outcome");
+        control.stop_dev(DEV_ID).unwrap();
+        assert!(!control.is_poisoned());
+        assert_eq!(
+            first.ops(),
+            [format!("del {DEV_ID}"), format!("stop {DEV_ID}")]
+        );
     }
 
     #[test]
