@@ -1646,7 +1646,7 @@ pub(crate) mod testing {
 
     /// Live simulated staging and landing buffers. Run on the helper thread.
     pub(crate) fn live_staging() -> usize {
-        simulation().live().staging as usize
+        simulation().live().staging
     }
 
     /// A test scope with a few seconds on the real clock.
