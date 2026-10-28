@@ -710,7 +710,11 @@ int racer_gpu_file(int fd, void **out) {
     memset(&descr, 0, sizeof(descr));
     descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
     descr.handle.fd = fd;
-    int rc = file_error(cf.cuFileHandleRegister(&f->handle, &descr));
+    CUfileError_t e = cf.cuFileHandleRegister(&f->handle, &descr);
+    int rc = file_error(e);
+    if (rc && (e.err == CU_FILE_IO_NOT_SUPPORTED || e.err == CU_FILE_DEVICE_NOT_SUPPORTED ||
+               e.err == CU_FILE_INVALID_FILE_TYPE))
+        rc = RACER_GPU_EUNSUPPORTED;
     if (rc) {
         free(f);
         return rc;

@@ -363,6 +363,26 @@ fn failed_frees_leak_and_count() {
 }
 
 #[test]
+/// A file cuFile does not support fails with its cuFile status, apart from
+/// driver failures.
+fn unsupported_file_is_its_own_error() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    sim.fault(Operation::File, -11);
+    assert_eq!(
+        gpu.open_file(file_with(&[1; 16])).err(),
+        Some(Error::Unsupported(5008))
+    );
+    sim.fault(Operation::File, -5);
+    assert_eq!(
+        gpu.open_file(file_with(&[1; 16])).err(),
+        Some(Error::Driver(999))
+    );
+    assert!(gpu.open_file(file_with(&[1; 16])).is_ok());
+}
+
+#[test]
 /// cuFile reads land in staging, respect bounds, and wait for streams.
 fn cufile_reads_into_staging() {
     let sim = simulation();

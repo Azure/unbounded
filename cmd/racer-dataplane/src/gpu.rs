@@ -952,6 +952,9 @@ struct Helper {
     /// Registered files by id, including retired ones that reads still use.
     open: HashMap<u64, OpenFile>,
     next_file: u64,
+    /// Devices (`st_dev`) whose files cuFile rejected as unsupported. Reads
+    /// of files on them use the host path without asking cuFile again.
+    unsupported: std::collections::HashSet<u64>,
     /// Reads for the reader threads. `None` once they are told to stop.
     reads: Option<mpsc::Sender<FileJob>>,
     /// Reads the reader threads finished, so their files can be released.
@@ -1008,6 +1011,7 @@ fn helper_main(
                 files: HashMap::new(),
                 open: HashMap::new(),
                 next_file: 0,
+                unsupported: std::collections::HashSet::new(),
                 reads: (!readers.is_empty()).then_some(reads),
                 done,
                 readers,
@@ -1378,6 +1382,9 @@ impl Helper {
             Ok(identity) => identity,
             Err(error) => return Err((error, reply)),
         };
+        if self.unsupported.contains(&identity.0) {
+            return Err((Error::Unavailable, reply));
+        }
         if let Err(error) = self.staging(staged.ordinal) {
             return Err((error, reply));
         }
@@ -1420,6 +1427,10 @@ impl Helper {
                             .counters
                             .file_failures
                             .fetch_add(1, Ordering::Relaxed);
+                        if let racer_gpu::Error::Unsupported(_) = error {
+                            self.unsupported_device(identity.0, error);
+                            return Err((Error::Unavailable, reply));
+                        }
                         self.disable_cufile(error);
                         return Err((Error::Unavailable, reply));
                     }
@@ -1487,6 +1498,17 @@ impl Helper {
             .is_some_and(|open| open.retired && open.reads == 0)
         {
             self.open.remove(&id);
+        }
+    }
+
+    /// Stop trying cuFile for files on `device` after cuFile rejected one of
+    /// them. Other devices keep using cuFile.
+    fn unsupported_device(&mut self, device: u64, error: racer_gpu::Error) {
+        if self.unsupported.insert(device) {
+            let (major, minor) = (libc::major(device), libc::minor(device));
+            eprintln!(
+                "racer-dataplane: stage=gpu state=cufile-unsupported dev={major}:{minor} reason={error}"
+            );
         }
     }
 
@@ -1994,6 +2016,48 @@ mod tests {
         assert_eq!(operations(&helper, Operation::FileFree), 1);
         assert_eq!(helper.run(|| simulation().live().files), 1);
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    /// cuFile rejecting one file as unsupported keeps cuFile on, remembers
+    /// the file's device so it is not registered again, and leaves files on
+    /// other devices on cuFile.
+    fn unsupported_file_skips_its_device_only() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let fd = slab(&[7; 8192]);
+        helper.run(|| simulation().fault(Operation::File, -11));
+        assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
+        assert!(helper.cufile());
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(operations(&helper, Operation::File), 1);
+        // Same device: no second registration, still the host path.
+        let other = slab(&[8; 4096]);
+        assert_eq!(
+            stage(&helper, &other, 0, 4096).err(),
+            Some(Error::Unavailable)
+        );
+        assert_eq!(operations(&helper, Operation::File), 1);
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        // A file on another device still goes through cuFile.
+        let elsewhere: OwnedFd = std::fs::File::open("/proc/self/exe").unwrap().into();
+        stage(&helper, &elsewhere, 0, 4096).unwrap();
+        assert_eq!(operations(&helper, Operation::File), 2);
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
+        assert!(helper.cufile());
+    }
+
+    #[test]
+    /// A driver failure while registering a file still turns cuFile off for
+    /// the whole node.
+    fn driver_failure_on_register_turns_cufile_off() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let fd = slab(&[7; 4096]);
+        helper.run(|| simulation().fault(Operation::File, -5));
+        assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
+        assert!(!helper.cufile());
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
     }
 
     /// Wait for the helper's background work to reach `done`.

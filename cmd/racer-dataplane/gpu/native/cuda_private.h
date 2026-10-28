@@ -170,6 +170,11 @@ typedef struct {
 } CUfileDescr_t;
 
 #define CU_FILE_SUCCESS 0
+/* CUfileOpError values that mean cuFile cannot use one file, its
+ * filesystem, or its device. Other files may still work. */
+#define CU_FILE_IO_NOT_SUPPORTED 5008
+#define CU_FILE_DEVICE_NOT_SUPPORTED 5009
+#define CU_FILE_INVALID_FILE_TYPE 5018
 #define CU_FILE_HANDLE_TYPE_OPAQUE_FD 1
 
 _Static_assert(sizeof(CUfileError_t) == 8, "CUfileError_t layout");

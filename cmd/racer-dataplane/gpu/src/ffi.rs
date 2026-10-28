@@ -32,6 +32,7 @@ pub(crate) mod code {
     pub const EIO: c_int = -8;
     pub const EBUSY: c_int = -9;
     pub const ELEAKED: c_int = -10;
+    pub const EUNSUPPORTED: c_int = -11;
 }
 
 /// Device capability bits (`RACER_GPU_FLAG_*`).
@@ -283,6 +284,7 @@ pub(crate) fn check(rc: c_int, last_driver_error: unsafe extern "C" fn() -> i32)
         code::EIO => Err(Error::Io),
         code::EBUSY => Err(Error::Busy),
         code::ELEAKED => Err(Error::Leaked),
+        code::EUNSUPPORTED => Err(Error::Unsupported(unsafe { last_driver_error() })),
         _ => Err(Error::Driver(rc)),
     }
 }

@@ -372,6 +372,9 @@ fn with<R: Into<i64> + Copy + From<i32>>(
             if rc == code::EDRIVER {
                 world.last_error = 999;
             }
+            if rc == code::EUNSUPPORTED {
+                world.last_error = 5008; // CU_FILE_IO_NOT_SUPPORTED
+            }
             (R::from(rc), 0)
         }
         None => f(&mut world),

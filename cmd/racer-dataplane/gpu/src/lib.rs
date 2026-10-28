@@ -90,6 +90,10 @@ pub enum Error {
 
     /// The call failed and a resource was leaked on purpose.
     Leaked,
+
+    /// cuFile does not support this file, its filesystem, or its device,
+    /// with this cuFile status. Files on other devices may still work.
+    Unsupported(i32),
 }
 
 impl std::fmt::Display for Error {
@@ -97,6 +101,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Driver(code) => write!(f, "GPU driver call failed with status {code}"),
+            Self::Unsupported(code) => {
+                write!(f, "cuFile does not support the file (status {code})")
+            }
             other => write!(f, "{other:?}"),
         }
     }

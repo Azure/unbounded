@@ -29,6 +29,7 @@
 #define RACER_GPU_EIO (-8)          /* cuFile read failed or was short */
 #define RACER_GPU_EBUSY (-9)        /* wrong state, for example no verdict to read */
 #define RACER_GPU_ELEAKED (-10)     /* failed, and cleanup leaked an internal resource */
+#define RACER_GPU_EUNSUPPORTED (-11) /* cuFile does not support this file or its device */
 
 /* Device capability bits in racer_gpu_device.flags. */
 #define RACER_GPU_FLAG_VMM 1u      /* virtual memory management */
