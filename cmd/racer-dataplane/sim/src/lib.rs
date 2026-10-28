@@ -177,13 +177,15 @@ impl Options {
     /// then `--nodes` and `--duration`, then scenario-generated schedules
     /// (only when the config left them empty).
     pub fn build_config(&self) -> Result<Config, String> {
-        let text = match &self.config {
-            Some(path) => {
-                Some(std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?)
-            }
-            None => None,
-        };
-        self.build_config_with(text.as_deref())
+        self.build_config_with(self.read_config()?.as_deref())
+    }
+
+    /// Contents of the `--config` file, if one was given.
+    fn read_config(&self) -> Result<Option<String>, String> {
+        self.config
+            .as_deref()
+            .map(|path| std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}")))
+            .transpose()
     }
 
     /// [`Self::build_config`] with the `--config` file contents given.
@@ -270,70 +272,52 @@ fn scenario_schedules(scenario: &str, config: &mut Config, seed: u64) {
     }
 }
 
-/// Build the real-logic world for `options` without running it.
-pub fn build_node(options: &Options) -> Result<NodeWorld, String> {
-    Ok(NodeWorld::new(options.build_config()?, options.seed))
-}
-
-/// Run a scenario and return its JSON report.
+/// Run a scenario and return its JSON report. A control-plane or combined
+/// scenario's `--config` may carry a `"control"` object of
+/// [`control::Settings`] overrides; other keys go to [`Config`].
 pub fn run(options: &Options) -> Result<Value, String> {
-    if control::SCENARIOS.contains(&options.scenario.as_str()) {
-        return run_control(options);
-    }
-    if combined::SCENARIOS.contains(&options.scenario.as_str()) {
-        #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
-        let started = std::time::Instant::now();
-        let (config, overrides) = split_control(options)?;
-        let mut report = combined::run(
-            &options.scenario,
-            config,
+    let scenario = options.scenario.as_str();
+    let mut json = options
+        .read_config()?
+        .map(|text| serde_json::from_str::<Value>(&text))
+        .transpose()
+        .map_err(|e| format!("parse config: {e}"))?;
+    let control = (control::SCENARIOS.contains(&scenario)
+        || combined::SCENARIOS.contains(&scenario))
+    .then(|| {
+        json.as_mut()
+            .and_then(Value::as_object_mut)?
+            .remove("control")
+    })
+    .flatten();
+    let config = options.build_config_with(json.map(|v| v.to_string()).as_deref())?;
+    if control::SCENARIOS.contains(&scenario) {
+        return control::run(
+            scenario,
+            config.nodes,
             options.seed,
             options.duration_ns,
-            overrides.as_ref(),
-        )?;
-        report["wall_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
-        return Ok(report);
+            control.as_ref(),
+        );
     }
     #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
     let started = std::time::Instant::now();
-    let mut world = build_node(options)?;
-    let end = world.config.duration_ns;
-    world.run(end);
-    let mut report = world.report(&options.scenario, options.seed);
+    let mut report = if combined::SCENARIOS.contains(&scenario) {
+        combined::run(
+            scenario,
+            config,
+            options.seed,
+            options.duration_ns,
+            control.as_ref(),
+        )?
+    } else {
+        let mut world = NodeWorld::new(config, options.seed);
+        let end = world.config.duration_ns;
+        world.run(end);
+        world.report(scenario, options.seed)
+    };
     report["wall_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
     Ok(report)
-}
-
-/// Run a control-plane scenario. `--config` may carry a `"control"` object
-/// of [`control::Settings`] overrides; other keys go to [`Config`].
-fn run_control(options: &Options) -> Result<Value, String> {
-    let (config, overrides) = split_control(options)?;
-    control::run(
-        &options.scenario,
-        config.nodes,
-        options.seed,
-        options.duration_ns,
-        overrides.as_ref(),
-    )
-}
-
-/// Split `--config` into the `"control"` overrides and the rest, which
-/// builds the [`Config`].
-fn split_control(options: &Options) -> Result<(Config, Option<Value>), String> {
-    let mut json: Option<Value> = match &options.config {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-            Some(serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?)
-        }
-        None => None,
-    };
-    let overrides = json
-        .as_mut()
-        .and_then(Value::as_object_mut)
-        .and_then(|o| o.remove("control"));
-    let rest = json.map(|v| v.to_string());
-    let config = options.build_config_with(rest.as_deref())?;
-    Ok((config, overrides))
 }
 
 #[cfg(test)]
