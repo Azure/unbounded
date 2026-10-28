@@ -650,7 +650,7 @@ impl Server {
         let current = self.shared.image().map(|i| i.record.sequence);
         let poll = admit_poll(&self.polls, &id.node, after, current)?;
         let deadline = self.poll_deadline(id.expires)?;
-        let newer = |i: &Image| crate::step::admission::newer(after, i.record.sequence);
+        let newer = |i: &Image| after.is_none_or(|a| i.record.sequence > a);
         let found = self
             .wait_until(deadline, || self.shared.image().filter(newer))
             .await;

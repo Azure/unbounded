@@ -24,23 +24,14 @@ impl Gate {
 
     /// Take a slot. Fails when full.
     pub fn try_take(&mut self) -> bool {
-        match take(self.used, self.capacity) {
-            Some(n) => {
-                self.used = n;
-                true
-            }
-            None => false,
-        }
+        let free = self.used < self.capacity;
+        self.used += usize::from(free);
+        free
     }
 
     pub fn put(&mut self) {
         self.used = self.used.saturating_sub(1);
     }
-}
-
-/// `used + 1` when below `capacity`.
-pub fn take(used: usize, capacity: usize) -> Option<usize> {
-    (used < capacity).then_some(used + 1)
 }
 
 /// Outcome of [`WriteQueue::admit`].
@@ -137,11 +128,6 @@ pub fn check_ahead(after: Option<u64>, current: u64) -> Result<(), ProtocolFailu
     Ok(())
 }
 
-/// Whether `current` is newer than the client's cursor.
-pub fn newer(after: Option<u64>, current: u64) -> bool {
-    after.is_none_or(|a| current > a)
-}
-
 /// Body a snapshot reply carries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Body {
@@ -183,7 +169,7 @@ pub fn start_poll<K: Eq + std::hash::Hash + Clone>(
     let result = match current {
         None => Err(ProtocolFailure::Unavailable),
         Some(c) => check_ahead(after, c).map(|()| {
-            if newer(after, c) {
+            if after.is_none_or(|a| c > a) {
                 Poll::Reply
             } else {
                 Poll::Wait
@@ -207,8 +193,7 @@ mod tests {
         assert!(!g.try_take());
         g.put();
         assert!(g.try_take());
-        assert_eq!(take(63, 64), Some(64));
-        assert_eq!(take(64, 64), None);
+        assert_eq!(g.used, 2);
     }
 
     #[test]
@@ -264,7 +249,6 @@ mod tests {
         assert_eq!(check_ahead(None, 5), Ok(()));
         assert_eq!(check_ahead(Some(5), 5), Ok(()));
         assert_eq!(check_ahead(Some(6), 5), Err(ProtocolFailure::Unavailable));
-        assert!(newer(None, 1) && newer(Some(1), 2) && !newer(Some(2), 2));
     }
 
     #[test]

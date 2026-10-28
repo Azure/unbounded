@@ -733,13 +733,6 @@ pub fn install_record(
         s.roots = record.keyring.root_ders();
         shared.verifier.set_roots(&s.roots);
     }
-    if s.image
-        .as_ref()
-        .is_some_and(|i| i.record.sequence != record.sequence)
-        && shared.is_primary.get()
-    {
-        // The primary installs images itself on commit.
-    }
     s.high_water = Some(record.clone());
     s.record = Some(record);
     s.confirmed = Some(confirmed);

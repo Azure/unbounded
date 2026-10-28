@@ -63,11 +63,6 @@ pub struct Lottery {
 }
 
 impl Lottery {
-    /// Attempts since the last win or vacancy-free round.
-    pub fn attempt(&self) -> u32 {
-        self.attempt
-    }
-
     /// Plan one round.
     pub fn plan(&mut self, i: &LotteryInputs<'_>, now: Instant, rng: &mut dyn Entropy) -> Plan {
         if i.holds_seat || !i.cluster_known {
@@ -533,7 +528,7 @@ mod tests {
             l.plan(&inputs(&seated, Some(now)), now, &mut Failing),
             Plan::NoVacancy(d) if d >= Duration::from_secs(10)
         ));
-        assert_eq!(l.attempt(), 0);
+        assert_eq!(l.attempt, 0);
         // Full: no vacancy.
         let full = view(2, &["a", "b"]);
         assert!(matches!(
@@ -558,7 +553,7 @@ mod tests {
             }
             l.begin();
         }
-        assert_eq!(l.attempt(), 20);
+        assert_eq!(l.attempt, 20);
         // Expired primary view (changed long ago) is also cold.
         let old = view(5, &[]);
         let later = now + limits::LEASE_DURATION;
@@ -584,7 +579,7 @@ mod tests {
         let name = annotations::seat_lease(index);
         assert!(l.observe(index, &vacant(&name), now, "me", "me/1"));
         l.won();
-        assert_eq!(l.attempt(), 0);
+        assert_eq!(l.attempt, 0);
         // A live holder blocks the claim.
         let mut held = vacant(&name);
         held.resource_version = "2".into();

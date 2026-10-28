@@ -566,8 +566,7 @@ pub(crate) mod tests {
                 authorize(&shared, Some(&header), 1).await.err(),
                 Some(ProtocolFailure::Overloaded)
             );
-            assert_eq!(shared.auth_budget.borrow().stats.cuts, 1);
-            assert!(shared.auth_budget.borrow().qps() < limits::AUTH_API_QPS);
+            assert_eq!(shared.auth_budget.borrow().qps, limits::AUTH_API_QPS / 2.0);
             // Out of budget: Overloaded before any API call.
             *shared.auth_budget.borrow_mut() = authz::ApiBudget::new(1e-6, 5.0);
             authorize(&shared, Some(&header), 1).await.unwrap();

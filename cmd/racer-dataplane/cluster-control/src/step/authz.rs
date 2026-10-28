@@ -213,11 +213,11 @@ impl<C: Clone> AuthCache<C> {
 pub struct ApiBudget {
     pub max_qps: f64,
     pub burst: f64,
-    qps: f64,
+    /// Current sustained rate.
+    pub qps: f64,
     tokens: f64,
     at: Option<Instant>,
     cut_at: Option<Instant>,
-    pub stats: BudgetStats,
 }
 
 /// Minimum time between two rate cuts.
@@ -225,13 +225,6 @@ pub const CUT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Time to grow from the floor back to the configured rate.
 pub const RECOVERY: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BudgetStats {
-    pub reserved: u64,
-    pub refused: u64,
-    pub cuts: u64,
-}
 
 impl Default for ApiBudget {
     fn default() -> Self {
@@ -248,13 +241,7 @@ impl ApiBudget {
             tokens: burst,
             at: None,
             cut_at: None,
-            stats: BudgetStats::default(),
         }
-    }
-
-    /// Current sustained rate.
-    pub fn qps(&self) -> f64 {
-        self.qps
     }
 
     fn refill(&mut self, now: Instant) {
@@ -264,11 +251,6 @@ impl ApiBudget {
             self.qps = (self.qps + dt * self.max_qps / RECOVERY.as_secs_f64()).min(self.max_qps);
         }
         self.at = Some(self.at.map_or(now, |a| a.max(now)));
-    }
-
-    /// Reserve `calls` tokens at `now`. Fails, taking nothing, when short.
-    pub fn try_reserve(&mut self, calls: u32, now: Instant) -> bool {
-        self.reserve(calls, now, Duration::ZERO).is_some()
     }
 
     /// Reserve `calls` tokens at `now`, borrowing against future refill:
@@ -284,11 +266,9 @@ impl ApiBudget {
             Duration::from_secs_f64(short / self.qps)
         };
         if wait > max_wait {
-            self.stats.refused += 1;
             return None;
         }
         self.tokens -= n;
-        self.stats.reserved += u64::from(calls);
         Some(wait)
     }
 
@@ -309,13 +289,18 @@ impl ApiBudget {
         self.cut_at = Some(now);
         self.qps = (self.qps / 2.0).max(self.max_qps / 16.0);
         self.tokens = self.tokens.min(0.0);
-        self.stats.cuts += 1;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ApiBudget {
+        fn try_reserve(&mut self, calls: u32, now: Instant) -> bool {
+            self.reserve(calls, now, Duration::ZERO).is_some()
+        }
+    }
 
     fn reviewed(pod: &str) -> Reviewed {
         Reviewed {
@@ -430,7 +415,6 @@ mod tests {
         );
         assert!(b.try_reserve(5, t0 + Duration::from_secs(100)));
         assert!(!b.try_reserve(1, t0 + Duration::from_secs(100)));
-        assert_eq!(b.stats.refused, 5);
     }
 
     #[test]
@@ -446,8 +430,8 @@ mod tests {
         assert_eq!(b.reserve(10, t0, Duration::from_secs(1)), None);
         let w = b.reserve(5, t0, Duration::from_secs(1)).unwrap();
         assert!((w.as_secs_f64() - 1.0).abs() < 1e-6, "{w:?}");
-        assert_eq!(b.stats.refused, 1);
-        assert_eq!(b.stats.reserved, 15);
+        // 15 tokens reserved against a burst of 5 and no refill.
+        assert!((b.tokens + 10.0).abs() < 1e-9, "{}", b.tokens);
     }
 
     #[test]
@@ -457,20 +441,20 @@ mod tests {
         let mut b = ApiBudget::new(160.0, 160.0);
         assert!(b.try_reserve(5, t0));
         b.throttled(s(10));
-        assert_eq!(b.qps(), 80.0);
+        assert_eq!(b.qps, 80.0);
         // Saved burst is dropped.
         assert!(!b.try_reserve(5, s(10)));
         // 429s within CUT_INTERVAL count once.
         b.throttled(s(500));
-        assert_eq!(b.stats.cuts, 1);
+        assert_eq!(b.qps, 80.0);
         for i in 0..10 {
             b.throttled(s(1100 + i * 1000));
         }
         // Never below 1/16 of the configured rate.
-        assert!(b.qps() >= 10.0, "{}", b.qps());
-        assert!(b.qps() < 12.0, "{}", b.qps());
+        assert!(b.qps >= 10.0, "{}", b.qps);
+        assert!(b.qps < 12.0, "{}", b.qps);
         // Linear recovery to the configured rate.
         b.try_reserve(0, s(10_100 + RECOVERY.as_millis() as u64));
-        assert_eq!(b.qps(), 160.0);
+        assert_eq!(b.qps, 160.0);
     }
 }
