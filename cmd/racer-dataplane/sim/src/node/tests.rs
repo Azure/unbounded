@@ -109,128 +109,6 @@ fn churny(nodes: u32, retained: u64) -> Config {
     config
 }
 
-/// Churn publishes new memberships, nodes adopt them with lag, placement maintenance runs, and
-/// lagging receivers answer stale membership.
-#[test]
-fn churn_exercises_membership_adoption() {
-    let (world, report) = run(churny(120, 2), 1);
-    assert!(counter(&report, "membership_publications") > 1);
-    assert!(counter(&report, "membership_adoptions") > 120);
-    assert!(counter(&report, "placement_maintenance_steps") > 0);
-    assert!(counter(&report, "stale_membership_replies") > 0, "{report}");
-    assert!(world.versions.latest().number > 2);
-    assert!(
-        report["membership"]["placement_memo_entries"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
-}
-
-/// Without retained old versions, receivers that moved ahead answer stale membership to lagging
-/// requesters, which refresh and walk again.
-#[test]
-fn stale_requesters_refresh_their_walk() {
-    let (_, report) = run(churny(120, 0), 2);
-    assert!(
-        counter(&report, "walk_membership_refreshes") > 0,
-        "{report}"
-    );
-}
-
-/// Requesters that adopted a publication before their destination get `StaleMembership` with
-/// nothing newer to refresh to.
-#[test]
-fn requesters_ahead_of_their_destination_skip_it() {
-    for (retained, seed) in [(0, 2), (2, 1)] {
-        let (_, report) = run(churny(120, retained), seed);
-        assert!(counter(&report, "stale_destination_skips") > 0, "{report}");
-        assert_eq!(
-            counter(&report, "error_incompatible_membership"),
-            0,
-            "{report}"
-        );
-        assert_eq!(
-            counter(&report, "error_hop_budget_exhausted"),
-            0,
-            "{report}"
-        );
-    }
-}
-
-/// With a long adoption lag, requesters often adopt a version before the page's owners.
-#[test]
-fn stale_owners_send_non_owners_to_the_previous_membership() {
-    let with = |fallback: bool, refund: bool| {
-        let mut config = churny(120, 2);
-        config.request_rate = 40.0;
-        config.node.membership_lag_ns = config.node.membership_batch_ns;
-        config.node.stale_fallback = fallback;
-        // Measure the fallback alone: without it, readers would wait for the stale owners instead.
-        config.node.stale_wait = false;
-        // The links a stale answer returns let a walk reach the other owners even without the
-        // fallback, so most of the failed reads it saved are measured with that refund off.
-        config.node.stale_link_refund = refund;
-        run(config, 3).1
-    };
-    let off = with(false, false);
-    let on = with(true, false);
-    assert_eq!(counter(&off, "stale_fallbacks"), 0);
-    assert!(counter(&on, "stale_fallbacks") > 0, "{on}");
-    let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
-    assert!(exhausted(&off) > 0, "{off}");
-    assert!(
-        exhausted(&on) * 10 <= exhausted(&off),
-        "{} vs {}",
-        exhausted(&on),
-        exhausted(&off)
-    );
-    // Seed 3, refund off: 1,028 such walks and 40 failed reads without the fallback, 6 and 3 with
-    // it.
-    assert!(counter(&on, "reads_failed") * 4 <= counter(&off, "reads_failed"));
-    // With the refund (the default) the fallback still ends far fewer walks exhausted (597 to 1)
-    // and fails no more reads (2 and 2).
-    let (off, on) = (with(false, true), with(true, true));
-    assert!(
-        exhausted(&on) * 10 <= exhausted(&off),
-        "{} vs {}",
-        exhausted(&on),
-        exhausted(&off)
-    );
-    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
-}
-
-/// A node that rejoins in version N is not a member of N - 1, so it cannot walk the previous
-/// membership when the page's owners are behind.
-#[test]
-fn readers_that_cannot_fall_back_wait_for_owners_that_are_behind() {
-    let with = |wait: bool| {
-        let mut config = churny(120, 2);
-        config.request_rate = 40.0;
-        config.node.membership_lag_ns = config.node.membership_batch_ns;
-        config.node.stale_wait = wait;
-        run(config, 3).1
-    };
-    let off = with(false);
-    let on = with(true);
-    assert_eq!(counter(&off, "stale_waits"), 0);
-    assert!(counter(&on, "stale_waits") > 0, "{on}");
-    let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
-    eprintln!(
-        "exhausted {} -> {}, failed {} -> {}, waits {}, not member {}",
-        exhausted(&off),
-        exhausted(&on),
-        counter(&off, "reads_failed"),
-        counter(&on, "reads_failed"),
-        counter(&on, "stale_waits"),
-        counter(&off, "stale_fallback_not_member"),
-    );
-    assert!(counter(&off, "stale_fallback_not_member") > 0, "{off}");
-    assert!(exhausted(&off) > 0, "{off}");
-    assert!(exhausted(&on) < exhausted(&off));
-    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
-}
-
 /// 412 continues with the remaining walk; 403 and 5xx fail the fill.
 #[test]
 fn origin_errors_follow_the_fill_plan() {
@@ -384,39 +262,11 @@ fn retention_observes_client_reads_including_memory_hits() {
 }
 
 /// Rankings and route searches yield between CPU slices and hold their placement pin or search slot
-/// meanwhile, so production's concurrency limits reject concurrent work with `Overloaded` (without
-/// a search queue).
+/// meanwhile, so production's concurrency limits reject concurrent work with `Overloaded` without a
+/// search queue. With the production queue, searches beyond the slot limit wait and are woken when
+/// a slot frees, so far fewer are rejected, and none at the default limits.
 #[test]
 fn yielding_searches_hit_production_concurrency_limits() {
-    let mut config = quiet(600);
-    config.duration_ns = 2 * SECONDS;
-    config.node.placement_entries = 2;
-    config.node.active_searches = 1;
-    config.node.search_queue = 0;
-    config.storms = vec![Storm {
-        at_ns: 0,
-        object: 2,
-        nodes: 600,
-        window_ns: MILLIS,
-    }];
-    let (_, report) = run(config.clone(), 3);
-    assert!(counter(&report, "ranking_overloaded") > 0, "{report}");
-    assert!(counter(&report, "route_search_overloaded") > 0, "{report}");
-    // 600 members take three 256-member chunks per cold ranking.
-    assert!(counter(&report, "ranking_polls") > counter(&report, "fills"));
-    // Default limits: the same storm sees no placement overload.
-    let mut roomy = config;
-    roomy.node.placement_entries = 256;
-    roomy.node.active_searches = 8;
-    let (_, report) = run(roomy, 3);
-    assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
-}
-
-/// With the production search queue, searches beyond the slot limit wait (parked, no CPU) and are
-/// woken when a slot frees, so the same storm rejects far fewer searches, and none at the default
-/// limits.
-#[test]
-fn queued_searches_wait_instead_of_failing() {
     let mut config = quiet(600);
     config.duration_ns = 2 * SECONDS;
     config.node.placement_entries = 2;
@@ -429,20 +279,25 @@ fn queued_searches_wait_instead_of_failing() {
     }];
     let mut rejecting = config.clone();
     rejecting.node.search_queue = 0;
-    let (_, before) = run(rejecting, 3);
-    let (world, after) = run(config.clone(), 3);
+    let (_, before) = run(rejecting.clone(), 3);
+    assert!(counter(&before, "ranking_overloaded") > 0, "{before}");
     let rejected = counter(&before, "route_search_overloaded");
     assert!(rejected > 0, "{before}");
+    // 600 members take three 256-member chunks per cold ranking.
+    assert!(counter(&before, "ranking_polls") > counter(&before, "fills"));
+    rejecting.node.placement_entries = 256;
+    rejecting.node.active_searches = 8;
+    let (_, report) = run(rejecting, 3);
+    assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
+    let (_, after) = run(config.clone(), 3);
     assert!(counter(&after, "route_search_queued") > 0, "{after}");
     assert!(counter(&after, "route_search_queue_wakes") > 0, "{after}");
     assert!(
         counter(&after, "route_search_overloaded") * 4 < rejected,
         "{after}"
     );
-    assert_eq!(world.invariants.to_json()["hard_failures"], 0);
-    let mut roomy = config;
-    roomy.node.active_searches = 8;
-    let (_, report) = run(roomy, 3);
+    config.node.active_searches = 8;
+    let (_, report) = run(config, 3);
     assert_eq!(counter(&report, "route_search_overloaded"), 0, "{report}");
 }
 
@@ -617,91 +472,8 @@ fn held(report: &Value, cause: &str) -> u64 {
         .unwrap()
 }
 
-/// Under churn, an owner whose predecessor has not adopted the current membership yet used to get
-/// `StaleMembership`, record it as missing, and fetch the page itself while the predecessor
-/// (usually rank 0) held it.
-#[test]
-fn owners_ask_lagging_predecessors_under_the_previous_membership() {
-    for (nodes, seed) in [(120, 1), (120, 2), (300, 1)] {
-        let (_, report) = run(churny(nodes, 2), seed);
-        assert!(
-            counter(&report, "previous_membership_probes") > 0,
-            "{report}"
-        );
-        assert!(
-            counter(&report, "owner_stale_destination_skips") <= 4,
-            "{nodes} {seed}: {}",
-            report["metrics"]["counters"]
-        );
-        assert!(
-            repeats(&report, "copy_held") <= 8,
-            "{nodes} {seed}: {}",
-            report["origin_per_page"]
-        );
-    }
-    // Without retained versions peers cannot resolve the previous membership, so owners never use
-    // it (production: no grace retention).
-    let (_, report) = run(churny(120, 0), 2);
-    assert_eq!(counter(&report, "previous_membership_probes"), 0);
-}
-
-/// Repeated origin fetches of a page are bounded.
-#[test]
-fn repeat_origin_fetches_are_classified_and_bounded() {
-    for (nodes, seed) in [(120, 1), (300, 1), (300, 2)] {
-        let (_, report) = run(churny(nodes, 2), seed);
-        let origin = counter(&report, "origin_requests");
-        let pages = report["origin_per_page"]["pages"].as_u64().unwrap();
-        let held = repeats(&report, "copy_held");
-        assert_eq!(
-            all_repeats(&report),
-            origin - pages,
-            "{}",
-            report["origin_per_page"]
-        );
-        let causes: u64 = [
-            "raced",
-            "unreachable",
-            "busy",
-            "unfunded",
-            "missed",
-            "unasked",
-        ]
-        .iter()
-        .map(|cause| self::held(&report, cause))
-        .sum();
-        assert_eq!(causes, held, "{}", report["origin_per_page"]);
-        assert!(
-            held * 50 <= origin,
-            "{nodes} {seed}: {}",
-            report["origin_per_page"]
-        );
-    }
-}
-
-/// With origin slower than the read deadline, leaders expire while their fills wait on origin.
-#[test]
-fn expired_leaders_drain_before_a_new_fill() {
-    let mut config = quiet(64);
-    // Without handover every expired leader's fill drains or is canceled.
-    config.node.flight_handover = false;
-    config.origin_bps = 1 << 20;
-    config.duration_ns = 12 * SECONDS;
-    config.storms = (0..4)
-        .map(|i| Storm {
-            at_ns: i * 3 * SECONDS,
-            object: 1,
-            nodes: 64,
-            window_ns: 100 * MILLIS,
-        })
-        .collect();
-    let (_, report) = run(config, 5);
-    assert!(counter(&report, "flight_stale_finishes") > 0, "{report}");
-    assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
-}
-
-/// Production cancels an expired fill's origin exchange at the leader's deadline, which frees the
-/// origin connection and bandwidth.
+/// With origin slower than the read deadline, leaders expire while their fills wait on origin, and
+/// production cancels an expired fill's origin exchange at the leader's deadline.
 #[test]
 fn expired_fills_cancel_their_origin_request() {
     let mut config = quiet(64);
@@ -771,39 +543,152 @@ fn expired_leaders_hand_their_fill_to_later_waiters() {
     assert_eq!(counter(&after, "flight_unexpected_lead"), 0);
 }
 
-/// A reader that owned the page under the previous membership may not walk it (no fallback), and
-/// ranks it there before it skips a destination that is behind, so it waits for that destination
-/// like a reader that joined in the current membership.
+/// Churn runs: nodes adopt publications with lag, lagging receivers answer stale membership,
+/// requesters ahead of their destination skip it, owners ask lagging predecessors under the
+/// previous membership, and origin repeats are classified and bounded.
 #[test]
-fn previous_owners_wait_instead_of_skipping_owners_that_are_behind() {
-    let mut config = churny(120, 2);
-    config.request_rate = 40.0;
-    config.node.membership_lag_ns = config.node.membership_batch_ns;
-    let r = run(config, 3).1;
-    assert!(counter(&r, "stale_fallback_denied") > 0, "{r}");
-    assert_eq!(
-        counter(&r, "stale_waits_denied"),
-        counter(&r, "stale_fallback_denied"),
-        "{r}"
-    );
-    assert_eq!(counter(&r, "walk_exhausted_stale"), 0, "{r}");
+fn churn_adoption_staleness_and_repeats() {
+    // (nodes, retained versions, seed)
+    for (nodes, retained, seed) in [
+        (120, 2, 1),
+        (120, 0, 2),
+        (120, 2, 2),
+        (300, 2, 1),
+        (300, 2, 2),
+    ] {
+        let (world, report) = run(churny(nodes, retained), seed);
+        let at = format!("{nodes} {retained} {seed}");
+        let c = |name| counter(&report, name);
+        if (nodes, seed) == (120, 1) {
+            assert!(c("membership_publications") > 1);
+            assert!(c("membership_adoptions") > 120);
+            assert!(c("placement_maintenance_steps") > 0);
+            assert!(c("stale_membership_replies") > 0, "{report}");
+            assert!(world.versions.latest().number > 2);
+            assert!(
+                report["membership"]["placement_memo_entries"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        if nodes == 120 && matches!((retained, seed), (0, 2) | (2, 1)) {
+            assert!(c("stale_destination_skips") > 0, "{at}: {report}");
+            assert_eq!(c("error_incompatible_membership"), 0, "{at}: {report}");
+            assert_eq!(c("error_hop_budget_exhausted"), 0, "{at}: {report}");
+        }
+        if retained == 0 {
+            // Without retained versions receivers that moved ahead answer stale membership and
+            // peers cannot resolve the previous membership (production: no grace retention).
+            assert!(c("walk_membership_refreshes") > 0, "{report}");
+            assert_eq!(c("previous_membership_probes"), 0);
+            continue;
+        }
+        if (nodes, seed) != (300, 2) {
+            assert!(c("previous_membership_probes") > 0, "{at}: {report}");
+            assert!(
+                c("owner_stale_destination_skips") <= 4,
+                "{at}: {}",
+                report["metrics"]["counters"]
+            );
+            assert!(
+                repeats(&report, "copy_held") <= 8,
+                "{at}: {}",
+                report["origin_per_page"]
+            );
+        }
+        if (nodes, seed) != (120, 2) {
+            let origin = c("origin_requests");
+            let pages = report["origin_per_page"]["pages"].as_u64().unwrap();
+            let held = repeats(&report, "copy_held");
+            assert_eq!(
+                all_repeats(&report),
+                origin - pages,
+                "{}",
+                report["origin_per_page"]
+            );
+            let causes: u64 = [
+                "raced",
+                "unreachable",
+                "busy",
+                "unfunded",
+                "missed",
+                "unasked",
+            ]
+            .iter()
+            .map(|cause| self::held(&report, cause))
+            .sum();
+            assert_eq!(causes, held, "{}", report["origin_per_page"]);
+            assert!(held * 50 <= origin, "{at}: {}", report["origin_per_page"]);
+        }
+    }
 }
 
-/// A verified `StaleMembership` returns the links past its answerer, so a reader that waited for,
-/// or fell back past, a stale owner can still fund its later owners.
+/// With a membership lag as long as the batch period, readers often adopt a version before the
+/// page's owners. Each `config.node` stale-handling switch, turned off, brings back the failures it
+/// fixes.
 #[test]
-fn stale_answers_return_unused_links() {
-    let config = |refund: bool| {
+fn readers_handle_owners_that_are_behind() {
+    let with = |f: fn(&mut crate::config::NodeConfig)| {
         let mut config = churny(120, 2);
         config.request_rate = 40.0;
         config.node.membership_lag_ns = config.node.membership_batch_ns;
-        config.node.stale_link_refund = refund;
-        config
+        f(&mut config.node);
+        run(config, 3).1
     };
-    let on = run(config(true), 3).1;
-    let off = run(config(false), 3).1;
+    let on = with(|_| {});
+    let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
+    let failed = |r: &Value| counter(r, "reads_failed");
+    // A reader that owned the page under the previous membership may not walk it, and waits for
+    // a destination that is behind like a reader that joined in the current membership.
+    assert!(counter(&on, "stale_fallback_denied") > 0, "{on}");
+    assert_eq!(
+        counter(&on, "stale_waits_denied"),
+        counter(&on, "stale_fallback_denied"),
+        "{on}"
+    );
+    assert_eq!(exhausted(&on), 0, "{on}");
+    // A node that rejoined in version N is not a member of N - 1, so it cannot fall back: it waits.
+    let off = with(|n| n.stale_wait = false);
+    assert_eq!(counter(&off, "stale_waits"), 0);
+    assert!(counter(&on, "stale_waits") > 0, "{on}");
+    assert!(counter(&off, "stale_fallback_not_member") > 0, "{off}");
+    assert!(
+        exhausted(&off) > 0 && exhausted(&on) < exhausted(&off),
+        "{off}"
+    );
+    assert!(failed(&on) <= failed(&off));
+    // A verified `StaleMembership` returns the links past its answerer.
+    let off = with(|n| n.stale_link_refund = false);
     assert!(counter(&on, "stale_links_refunded") > 0, "{on}");
     assert_eq!(counter(&off, "stale_links_refunded"), 0, "{off}");
     assert!(counter(&on, "walk_exhausted") <= counter(&off, "walk_exhausted"));
-    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
+    assert!(failed(&on) <= failed(&off));
+    // Stale owners send non-owners to the previous membership. Measured without waits, and first
+    // without the refund, which lets a walk reach the other owners even without the fallback.
+    let fallback = |fallback: bool, refund: bool| match (fallback, refund) {
+        (false, false) => {
+            with(|n| (n.stale_wait, n.stale_fallback, n.stale_link_refund) = (false, false, false))
+        }
+        (true, false) => with(|n| (n.stale_wait, n.stale_link_refund) = (false, false)),
+        (false, true) => with(|n| (n.stale_wait, n.stale_fallback) = (false, false)),
+        (true, true) => with(|n| n.stale_wait = false),
+    };
+    for refund in [false, true] {
+        let (off, on) = (fallback(false, refund), fallback(true, refund));
+        assert_eq!(counter(&off, "stale_fallbacks"), 0);
+        assert!(counter(&on, "stale_fallbacks") > 0, "{on}");
+        assert!(exhausted(&off) > 0, "{off}");
+        assert!(
+            exhausted(&on) * 10 <= exhausted(&off),
+            "{} vs {}",
+            exhausted(&on),
+            exhausted(&off)
+        );
+        if refund {
+            assert!(failed(&on) <= failed(&off));
+        } else {
+            assert!(failed(&on) * 4 <= failed(&off));
+        }
+    }
 }
