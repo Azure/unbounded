@@ -174,6 +174,16 @@ impl PageSource for DirectorySource {
             Ok(result.plaintext)
         })
     }
+
+    /// Only pages this worker owns: their plaintext is charged to this
+    /// worker's quota, which sizes the window. A remote owner's page would
+    /// hold that owner's quota where its own overload retry cannot free it.
+    fn retainable(&self, number: u64) -> bool {
+        self.directory.owns_page(&PageId {
+            version: self.version.clone(),
+            number: PageNumber(number),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -432,5 +442,26 @@ pub(super) mod tests {
             assert_eq!(PageBytes::bytes(&page), &body()[..]);
         }
         assert_eq!(fixture.worker.cpu_decrypts() - before, 1);
+    }
+
+    #[test]
+    fn only_pages_this_worker_owns_are_retainable() {
+        let fixture = Fixture::new();
+        let config = device(NAME, None);
+        let resolved = fixture.resolve(&config).unwrap();
+        let source = fixture.backend.source(&config, &resolved).unwrap();
+        // The fixture's one worker owns every page.
+        assert!(source.retainable(0));
+        assert!(source.retainable(1));
+        // A thread that is not that worker owns none of them.
+        let directory = source.directory.clone();
+        let page = PageId {
+            version: source.version.clone(),
+            number: PageNumber(0),
+        };
+        let owned = std::thread::spawn(move || directory.owns_page(&page))
+            .join()
+            .unwrap();
+        assert!(!owned);
     }
 }

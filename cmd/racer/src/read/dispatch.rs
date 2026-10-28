@@ -488,6 +488,13 @@ impl WorkerDirectory {
     pub fn page_owner(&self, page: &PageId) -> Result<WorkerId> {
         self.map.owner(page)
     }
+    /// Whether the calling worker owns `page`. Its plaintext is then charged
+    /// to this worker's quota; a page acquired from another owner is charged
+    /// to that owner's quota.
+    pub(crate) fn owns_page(&self, page: &PageId) -> bool {
+        self.page_owner(page)
+            .is_ok_and(|owner| self.is_local(owner))
+    }
 
     /// Largest object page count this node admits for warm planning or holds.
     pub(super) fn max_warm_pages(&self) -> u64 {

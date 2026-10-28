@@ -76,6 +76,14 @@ pub(crate) trait PageSource: 'static {
 
     /// Get cache page `number` of the pinned version.
     fn page(&self, number: u64) -> Local<'_, Result<Self::Page>>;
+
+    /// Whether the worker's page window may keep page `number`. A kept page
+    /// holds its plaintext charge, so a source whose page is charged to
+    /// another worker's quota says no: keeping it could starve that worker,
+    /// and only this worker can drop it.
+    fn retainable(&self, _number: u64) -> bool {
+        true
+    }
 }
 
 /// The kernel side of one queue.
@@ -479,9 +487,12 @@ impl<S: PageSource> PageSource for Windowed<S> {
             if let Some(page) = self.window.get(self.id, number) {
                 return Ok(page);
             }
+            let keep = !self.released.get() && self.source.retainable(number);
             // Free the page keeping this one would evict before the fetch
             // charges new plaintext.
-            self.window.make_room(self.id);
+            if keep {
+                self.window.make_room(self.id);
+            }
             let page = match self.source.page(number).await {
                 // Pages the window keeps must never starve a read: drop them
                 // all and try once more.
@@ -491,7 +502,7 @@ impl<S: PageSource> PageSource for Windowed<S> {
                 }
                 result => result?,
             };
-            if !self.released.get() {
+            if keep && !self.released.get() {
                 self.window.insert(self.id, number, page.clone());
             }
             Ok(page)
@@ -1156,6 +1167,8 @@ mod tests {
         quota: usize,
         live: RefCell<Vec<std::rc::Weak<Vec<u8>>>>,
         refused: Cell<u32>,
+        /// Pages from this number on are charged to another worker.
+        remote_from: Cell<u64>,
     }
 
     impl QuotaSource {
@@ -1164,6 +1177,7 @@ mod tests {
                 quota,
                 live: RefCell::default(),
                 refused: Cell::new(0),
+                remote_from: Cell::new(u64::MAX),
             }
         }
 
@@ -1188,6 +1202,49 @@ mod tests {
                 Ok(TestPage(page))
             })
         }
+
+        fn retainable(&self, number: u64) -> bool {
+            number < self.remote_from.get()
+        }
+    }
+
+    #[test]
+    fn pages_charged_to_another_worker_are_served_but_not_kept() {
+        let source = Rc::new(QuotaSource::new(4));
+        source.remote_from.set(10);
+        let window = Rc::new(PageWindow::new(2, 4));
+        let a = Windowed::new(source.clone(), window.clone());
+        fetch(&a, 0).unwrap();
+        fetch(&a, 1).unwrap();
+        // A remote page is served, kept by no one once the read ends, and
+        // does not evict the local pages.
+        let remote = fetch(&a, 10).unwrap();
+        assert_eq!(PageBytes::bytes(&remote), &[10; 8]);
+        assert_eq!(source.charged(), 3);
+        drop(remote);
+        assert_eq!(source.charged(), 2);
+        assert_eq!(window.held(a.id), 2);
+        assert!(window.get(a.id, 0).is_some());
+        // Each read of a remote page fetches it again.
+        let calls = source.live.borrow().len();
+        drop(fetch(&a, 10).unwrap());
+        assert_eq!(source.live.borrow().len(), calls + 1);
+        assert_eq!(window.get(a.id, 10).map(|_| ()), None);
+        assert_eq!(source.refused.get(), 0);
+    }
+
+    #[test]
+    fn overload_on_a_remote_page_still_retries_after_clearing() {
+        // Local kept pages fill the quota shared with the remote page's read.
+        let source = Rc::new(QuotaSource::new(2));
+        source.remote_from.set(10);
+        let window = Rc::new(PageWindow::new(2, 4));
+        let a = Windowed::new(source.clone(), window.clone());
+        fetch(&a, 0).unwrap();
+        fetch(&a, 1).unwrap();
+        assert_eq!(PageBytes::bytes(&fetch(&a, 10).unwrap()), &[10; 8]);
+        assert_eq!(source.refused.get(), 1);
+        assert!(window.is_empty());
     }
 
     fn fetch<S: PageSource>(source: &Windowed<S>, number: u64) -> Result<S::Page> {

@@ -148,7 +148,11 @@ pages are normal quota-charged plaintext owners, so they must never starve a rea
 worker bound is lowered to what the per-worker plaintext quota has left after
 `range_window_pages + 1` pages in flight, which is zero at the minimum valid quota. A miss
 first drops the page that keeping the new one would evict, and if the fetch is still
-refused as overloaded the worker drops every kept page and retries once. A queue drops them when it is abandoned or
+refused as overloaded the worker drops every kept page and retries once. A worker keeps
+only pages it owns. A page read from another worker's owner is charged to that owner's
+quota, and only the reading worker could drop it, so it is served and then released. A
+read error fails only that request with `EIO`; the device keeps serving. A queue drops
+kept pages when it is abandoned or
 finishes, and every queue drops them once the control thread is done, so they never hold up
 shutdown or the runtime fence. Pages are not dropped on idle; the bound caps the cost.
 
