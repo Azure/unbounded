@@ -109,7 +109,7 @@ var (
 	}
 )
 
-// validateDataplaneConfig reports every racer-dataplane-config value the
+// validateDataplaneConfig reports every racer-settings value the
 // dataplane or operator would reject, sorted by key, in one error.
 func validateDataplaneConfig(data map[string]string) error {
 	var problems []string

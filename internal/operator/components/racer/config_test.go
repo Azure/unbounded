@@ -195,7 +195,7 @@ func TestDataplaneImage(t *testing.T) {
 	initialize(t, env)
 
 	image := func() string { return liveDataplane(t, env).Spec.Template.Spec.Containers[0].Image }
-	require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", image())
+	require.Equal(t, "mirror.test/unbounded/racer:v1", image())
 
 	for _, value := range []string{"true", "false", "yes"} {
 		config := &corev1.ConfigMap{}
@@ -204,6 +204,6 @@ func TestDataplaneImage(t *testing.T) {
 		require.NoError(t, env.Client.Update(t.Context(), config))
 
 		persist(t, env, planPass(t, env))
-		require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", image(), "value %q", value)
+		require.Equal(t, "mirror.test/unbounded/racer:v1", image(), "value %q", value)
 	}
 }

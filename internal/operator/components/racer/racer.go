@@ -171,6 +171,12 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 		return nil, component.Result{}, err
 	}
 
+	// Remove what this operator applied under the pre-rename names once the
+	// new DaemonSet is planned. A config with a UID was read live.
+	if _, err := planRenamedCleanup(ctx, env, plan, config.UID != ""); err != nil {
+		return nil, component.Result{}, err
+	}
+
 	invalid, waiting, err := planOrigins(ctx, env, plan)
 	if err != nil {
 		return nil, component.Result{}, err
@@ -181,7 +187,7 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 	}
 
 	if waiting {
-		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer-dataplane DaemonSet placement", 30*time.Second), nil
+		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer DaemonSet placement", 30*time.Second), nil
 	}
 
 	return plan, component.ReconciledAfter("Racer dataplane installation reconciled", time.Hour), nil

@@ -23,19 +23,19 @@ import (
 
 const (
 	dataplaneName          = workload.DataplaneDaemonSetName
-	dataplaneConfigName    = "racer-dataplane-config"
-	dataplaneImageName     = "racer-dataplane"
+	dataplaneConfigName    = "racer-settings"
+	dataplaneImageName     = "racer"
 	objectImageName        = "racer-object"
 	dataplaneContainerName = workload.ContainerName
-	dataplaneConfigHash    = "unbounded-cloud.io/racer-dataplane-config-hash"
+	dataplaneConfigHash    = "unbounded-cloud.io/racer-settings-hash"
 
 	// minThreads covers one I/O worker, one crypto helper, and the
 	// dedicated control plane thread.
 	minThreads = 3
 )
 
-// planDataplaneConfig creates racer-dataplane-config with defaults when it is
-// absent and otherwise reads it. Every key is administrator payload; its
+// planDataplaneConfig creates racer-settings when it is absent, seeded
+// from the owned pre-rename racer-dataplane-config or else with defaults, and otherwise reads it. Every key is administrator payload; its
 // hash rolls the DaemonSet.
 func planDataplaneConfig(ctx context.Context, env *component.Env, plan *component.Plan) (*corev1.ConfigMap, error) {
 	decoded, err := env.DecodeManifestFiles(manifests.Manifests, []string{"dataplane-config.yaml"}, nil)
@@ -57,6 +57,16 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 
 		config.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
 		markManaged(config)
+
+		// Carry settings over from the pre-rename ConfigMap the operator owns.
+		renamed, err := renamedConfigData(ctx, env)
+		if err != nil {
+			return nil, err
+		}
+
+		if renamed != nil {
+			config.Data = renamed
+		}
 
 		plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(config), Component: name})
 

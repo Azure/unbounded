@@ -288,6 +288,16 @@ func planLegacyRestamp(ctx context.Context, env *component.Env, plan *component.
 		legacy(&admissionv1.MutatingWebhookConfiguration{ObjectMeta: objectMeta(webhookConfigName)}, admissionv1.SchemeGroupVersion.WithKind("MutatingWebhookConfiguration")),
 	}
 
+	// The retired installation applied its dataplane under the pre-rename
+	// names. planRenamedCleanup removes those; keep the anchors until it has.
+	for _, candidate := range named[:6] {
+		renamed := candidate.obj.DeepCopyObject().(client.Object)
+		renamed.SetName(renamedDataplane)
+		named = append(named, legacy(renamed, candidate.gvk))
+	}
+
+	named = append(named, legacy(&corev1.ConfigMap{ObjectMeta: objectMeta(renamedConfig)}, core.WithKind("ConfigMap")))
+
 	remaining := false
 
 	for _, candidate := range named {
@@ -494,7 +504,7 @@ func checkLegacyConfig(ctx context.Context, env *component.Env) error {
 
 	if value := strings.TrimSpace(config.Data["RACER_HOST_NETWORK"]); value != "" {
 		if enabled, err := strconv.ParseBool(value); err != nil || enabled {
-			unsupported = append(unsupported, "RACER_HOST_NETWORK (set spec.template.spec.hostNetwork through a racer-dataplane DaemonSet override)")
+			unsupported = append(unsupported, "RACER_HOST_NETWORK (set spec.template.spec.hostNetwork through a racer DaemonSet override)")
 		}
 	}
 
