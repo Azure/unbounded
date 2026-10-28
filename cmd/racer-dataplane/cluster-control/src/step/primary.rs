@@ -173,7 +173,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
             && i.membership_changed_unix
                 .is_some_and(|t| i.wall_unix < t.saturating_add(hold_secs)),
     };
-    let members = members::reconcile_at(
+    let members = members::reconcile(
         &nodes,
         &by_node,
         i.ownership,

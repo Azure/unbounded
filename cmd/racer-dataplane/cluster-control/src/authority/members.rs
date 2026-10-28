@@ -35,13 +35,9 @@ pub struct Readiness {
     pub since_unix: Option<u64>,
 }
 
-/// How long a member's Node must report `Ready` other than `True`
-/// before the member is dropped. Kubernetes already waits
-/// `node-monitor-grace-period` (40 s by default) of missed kubelet
-/// heartbeats before it marks a Node and its Pods not ready, so a dead
-/// member leaves the membership about 70 s after it stops; a process that
-/// restarts within that time keeps its place (and its pages) without
-/// membership churn.
+/// How long a member's Node must report `Ready` other than `True` before the
+/// member is dropped. On top of `node-monitor-grace-period` (40 s), a dead
+/// member leaves about 70 s after it stops; a quicker restart keeps its place.
 pub const NOT_READY_GRACE_SECS: u64 = 30;
 
 impl Readiness {
@@ -269,20 +265,13 @@ pub struct Result {
     pub pending: usize,
 }
 
-/// When a Node that is not yet a member (not in `accepted`) may join.
-/// Members already in `accepted` are never held back.
-///
-/// A dataplane Pod accepts peer links only after it enrolled and applied a
-/// publication (`App::start` opens listeners last). A member listed before
-/// that is routable but refuses every link, so peers fail toward it and
-/// reads fail while it enrolls ("Joining members" in
-/// designs/racer-core-simulation.md).
+/// When a Node that is not yet a member (not in `accepted`) may join; members
+/// are never held back. A dataplane accepts peer links only after it applied
+/// a publication, so listing it earlier makes peers fail toward it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Joins {
     /// Admit a new Node only once its selected Pod carries the report
-    /// annotation. The dataplane writes the report after its peer listener
-    /// is open, so the report means "can serve". Dataplanes from before
-    /// this change report before enrollment and so join as before.
+    /// annotation, which the dataplane writes after its peer listener opens.
     pub require_report: bool,
     /// Defer every new Node to a later pass (the join hold-down), so joins
     /// are batched into at most one membership version per hold.
@@ -331,37 +320,14 @@ fn attributes(
 }
 
 /// Build membership. `pods_by_node` groups Pods by `spec.nodeName`.
-/// Readiness is not consulted; see [`reconcile_at`].
-#[cfg(test)]
-pub fn reconcile(
-    nodes: &[NodeInfo],
-    pods_by_node: &BTreeMap<String, Vec<PodInfo>>,
-    ownership: &Ownership,
-    peer_port: u16,
-    accepted: &History,
-) -> std::result::Result<Result, MembersError> {
-    reconcile_at(
-        nodes,
-        pods_by_node,
-        ownership,
-        peer_port,
-        accepted,
-        None,
-        Joins::default(),
-    )
-}
-
-/// Build membership at wall time `now_unix` (Unix seconds). With a time, a
+/// With a wall time `now_unix` (Unix seconds), a
 /// Node whose `Ready` condition has not been `True` for
 /// [`NOT_READY_GRACE_SECS`] is left out (diagnostic `ready`), even if it was
-/// a member: a crashed member otherwise stays routable for as long as its
-/// Node and Pod objects exist. The Node condition is the kubelet heartbeat
-/// as judged by the node lifecycle controller. Pod readiness is not used: an
-/// operator-added readiness probe on `/readyz` depends on membership, so it
-/// would keep a new Pod out forever.
+/// a member. Pod readiness is not used: a `/readyz` probe depends on
+/// membership, so it would keep a new Pod out forever.
 ///
 /// `joins` decides when a Node outside `accepted` may join; see [`Joins`].
-pub fn reconcile_at(
+pub fn reconcile(
     nodes: &[NodeInfo],
     pods_by_node: &BTreeMap<String, Vec<PodInfo>>,
     ownership: &Ownership,
@@ -493,6 +459,35 @@ pub fn eligible_nodes(pods: &[PodInfo], ownership: &Ownership) -> usize {
 mod tests {
     use super::*;
 
+    /// Readiness not consulted, no join gate.
+    fn plain(
+        nodes: &[NodeInfo],
+        pods: &BTreeMap<String, Vec<PodInfo>>,
+        ownership: &Ownership,
+        port: u16,
+        accepted: &History,
+    ) -> std::result::Result<Result, MembersError> {
+        reconcile(
+            nodes,
+            pods,
+            ownership,
+            port,
+            accepted,
+            None,
+            Joins::default(),
+        )
+    }
+
+    fn gated(
+        nodes: &[NodeInfo],
+        pods: &BTreeMap<String, Vec<PodInfo>>,
+        accepted: &History,
+        now: Option<u64>,
+        joins: Joins,
+    ) -> std::result::Result<Result, MembersError> {
+        reconcile(nodes, pods, &own(), 1, accepted, now, joins)
+    }
+
     const DS: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
     fn own() -> Ownership {
@@ -556,7 +551,7 @@ mod tests {
         );
         a.annotations.insert(annotations::SHARES.into(), "2".into());
         a.labels.insert(annotations::SITE.into(), "west".into());
-        let r = reconcile(
+        let r = plain(
             &[a.clone(), b.clone(), node(3)],
             &by_node(vec![pa, pb]),
             &own(),
@@ -584,7 +579,7 @@ mod tests {
             annotations::REPORT.into(),
             rails::encode_report(&report).unwrap(),
         );
-        let r = reconcile(
+        let r = plain(
             std::slice::from_ref(&a),
             &by_node(vec![p]),
             &own(),
@@ -602,7 +597,7 @@ mod tests {
     fn history_survives_gaps_and_bad_input() {
         let a = node(1);
         let p = pod("n1", "10.0.0.1", "t1", "a");
-        let first = reconcile(
+        let first = plain(
             std::slice::from_ref(&a),
             &by_node(vec![p.clone()]),
             &own(),
@@ -611,7 +606,7 @@ mod tests {
         )
         .unwrap();
         // Pod gone: keep previous endpoint.
-        let gap = reconcile(
+        let gap = plain(
             std::slice::from_ref(&a),
             &BTreeMap::new(),
             &own(),
@@ -624,7 +619,7 @@ mod tests {
         let mut bad = pod("n1", "10.0.0.9", "t2", "b");
         bad.annotations
             .insert(annotations::REPORT.into(), "{".into());
-        let r = reconcile(
+        let r = plain(
             std::slice::from_ref(&a),
             &by_node(vec![bad.clone()]),
             &own(),
@@ -635,7 +630,7 @@ mod tests {
         assert_eq!(r.members[&a.uid].shares.get(), wire::DEFAULT_SHARES);
         assert_eq!(r.members[&a.uid].peer_endpoint, "10.0.0.9:1");
         // Never admitted with bad input: omitted.
-        let r = reconcile(&[a], &by_node(vec![bad]), &own(), 1, &History::new()).unwrap();
+        let r = plain(&[a], &by_node(vec![bad]), &own(), 1, &History::new()).unwrap();
         assert!(r.members.is_empty());
     }
 
@@ -651,7 +646,7 @@ mod tests {
         let mut wrong_sa = pod("n1", "10.0.0.5", "2026-01-01T00:00:00Z", "e");
         wrong_sa.service_account = "x".into();
         let pods = vec![old, new, foreign, dying, wrong_sa];
-        let r = reconcile(
+        let r = plain(
             std::slice::from_ref(&a),
             &by_node(pods.clone()),
             &own(),
@@ -662,7 +657,7 @@ mod tests {
         assert_eq!(r.members[&a.uid].peer_endpoint, "10.0.0.2:1");
         assert_eq!(eligible_nodes(&pods, &own()), 1);
         a.labels.insert(annotations::EXCLUDE.into(), String::new());
-        let r = reconcile(
+        let r = plain(
             std::slice::from_ref(&a),
             &by_node(pods.clone()),
             &own(),
@@ -682,7 +677,7 @@ mod tests {
     fn duplicate_identity_fails() {
         let a = node(1);
         assert_eq!(
-            reconcile(
+            plain(
                 &[a.clone(), a],
                 &BTreeMap::new(),
                 &own(),
@@ -693,7 +688,7 @@ mod tests {
             MembersError::Invalid
         );
         assert_eq!(
-            reconcile(&[], &BTreeMap::new(), &own(), 0, &History::new()).unwrap_err(),
+            plain(&[], &BTreeMap::new(), &own(), 0, &History::new()).unwrap_err(),
             MembersError::Invalid
         );
     }
@@ -801,7 +796,7 @@ mod tests {
             pod("n2", "10.0.0.2", "t", "b"),
         ]);
         let at = |nodes: &[NodeInfo], h: &History, now| {
-            reconcile_at(nodes, &pods, &own(), 1, h, now, Joins::default()).unwrap()
+            gated(nodes, &pods, h, now, Joins::default()).unwrap()
         };
         let first = at(&[a.clone(), b.clone()], &History::new(), Some(1000));
         assert_eq!(first.members.len(), 2);
@@ -853,11 +848,9 @@ mod tests {
             since_unix: Some(1000),
         });
         let pods = by_node(vec![pod("n1", "10.0.0.1", "t", "a")]);
-        let r = reconcile_at(
+        let r = gated(
             std::slice::from_ref(&a),
             &pods,
-            &own(),
-            1,
             &History::new(),
             Some(1001),
             Joins::default(),
@@ -888,7 +881,7 @@ mod tests {
             pod("n2", "10.0.0.2", "t", "b"),
         ]);
         let nodes = [a.clone(), b.clone()];
-        let r = reconcile_at(&nodes, &pods, &own(), 1, &History::new(), None, gate).unwrap();
+        let r = gated(&nodes, &pods, &History::new(), None, gate).unwrap();
         assert_eq!(r.members.keys().collect::<Vec<_>>(), vec![&a.uid]);
         assert_eq!(r.members[&a.uid].shares.get(), 3);
         assert_eq!(r.pending, 1);
@@ -898,32 +891,14 @@ mod tests {
                 .any(|d| d.object == "n2" && d.field == "serving")
         );
         // Without the gate (the old rule) it joins at once.
-        let r = reconcile_at(
-            &nodes,
-            &pods,
-            &own(),
-            1,
-            &History::new(),
-            None,
-            Joins::default(),
-        )
-        .unwrap();
+        let r = gated(&nodes, &pods, &History::new(), None, Joins::default()).unwrap();
         assert_eq!((r.members.len(), r.pending), (2, 0));
         // A member stays one without a report: a new Pod (rollout) or a
         // restarted process must not cause membership churn.
-        let r2 = reconcile_at(&nodes, &pods, &own(), 1, &r.members, None, gate).unwrap();
+        let r2 = gated(&nodes, &pods, &r.members, None, gate).unwrap();
         assert_eq!((r2.members.len(), r2.pending), (2, 0));
         // A Node without an eligible Pod is not pending.
-        let r = reconcile_at(
-            &nodes,
-            &BTreeMap::new(),
-            &own(),
-            1,
-            &History::new(),
-            None,
-            gate,
-        )
-        .unwrap();
+        let r = gated(&nodes, &BTreeMap::new(), &History::new(), None, gate).unwrap();
         assert_eq!((r.members.len(), r.pending), (0, 0));
     }
 
@@ -939,26 +914,15 @@ mod tests {
             require_report: true,
             hold: true,
         };
-        let first = reconcile_at(
+        let first = gated(
             std::slice::from_ref(&a),
             &pods,
-            &own(),
-            1,
             &History::new(),
             None,
             Joins::default(),
         )
         .unwrap();
-        let r = reconcile_at(
-            &[a.clone(), b.clone()],
-            &pods,
-            &own(),
-            1,
-            &first.members,
-            None,
-            hold,
-        )
-        .unwrap();
+        let r = gated(&[a.clone(), b.clone()], &pods, &first.members, None, hold).unwrap();
         assert_eq!((r.members.len(), r.pending), (1, 1));
         assert!(r.members.contains_key(&a.uid));
         // Dead members still leave during a hold.
@@ -967,16 +931,7 @@ mod tests {
             ready: false,
             since_unix: Some(0),
         });
-        let r = reconcile_at(
-            &[dead, b],
-            &pods,
-            &own(),
-            1,
-            &first.members,
-            Some(1000),
-            hold,
-        )
-        .unwrap();
+        let r = gated(&[dead, b], &pods, &first.members, Some(1000), hold).unwrap();
         assert_eq!((r.members.len(), r.pending), (0, 1));
     }
 }
