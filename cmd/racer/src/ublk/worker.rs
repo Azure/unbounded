@@ -401,12 +401,18 @@ impl<B: Backend> UblkWorker<B> {
             length: attach.length,
             page_bytes: PAGE_BYTES,
         };
+        // Nothing has been sent to the kernel yet: FETCH goes out on the
+        // queue's first poll. Claim the queue first, so a device being
+        // stopped, or a control thread that is done, never gets a FETCH it
+        // does not know about.
+        if !manager.claim_queue(index, q) {
+            return;
+        }
         device.queue = Some(QueueService::with_window(
             Rc::new(kernel),
             Rc::new(source),
             shape,
             window.clone(),
         ));
-        manager.report_queue(index, q, QueueReport::Attached);
     }
 }

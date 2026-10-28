@@ -204,6 +204,12 @@ opens a fresh `/dev/ublk-control` and sends `STOP_DEV` to each such device. Succ
 `ENODEV`, means no fetch is left. If that fails too, the process logs an error and exits,
 which makes the kernel abort the fetches. Without this step, shutdown could hang forever.
 
+This only works if the control thread knows every queue that sent a fetch. A worker
+therefore marks its queue attached, under the same lock, before it sends any fetch, and
+only if the device is not being stopped and the control thread is not done. Teardown and
+this step mark the device stopping, or the control thread done, before they look at the
+queues. So a worker that attaches late either is seen, or sends nothing.
+
 A dedicated ring per queue, closed on abandon, was not used. Closing a ring early is unsafe
 in other ways: on 7.0 it does not complete requests already handed out, so `STOP_DEV`
 still hangs, and on 6.8 it aborts them but leaves them owned, so a later commit completes

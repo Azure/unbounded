@@ -412,6 +412,24 @@ impl Manager {
         self.changed.notify_all();
     }
 
+    /// Mark queue `q` of a device attached, unless this process has started
+    /// stopping the device or the control thread is done. Returns whether
+    /// the queue may send its FETCH commands.
+    ///
+    /// The check and the mark happen under one lock. A queue marked here is
+    /// seen by teardown's wait and by [`Manager::settle`], which mark the
+    /// device stopping, or the control thread done, before they look. A
+    /// queue refused here sends nothing the kernel could keep.
+    pub(crate) fn claim_queue(&self, index: usize, q: u16) -> bool {
+        let mut shared = self.lock();
+        if shared.control_done || shared.devices[index].stopping {
+            return false;
+        }
+        shared.devices[index].queues[usize::from(q)] = QueueReport::Attached;
+        self.changed.notify_all();
+        true
+    }
+
     pub(crate) fn report_failure(&self, index: usize, q: u16) {
         let mut shared = self.lock();
         shared.devices[index].failed[usize::from(q)] = true;
@@ -1169,6 +1187,35 @@ mod tests {
         let mut fake = fake.clone();
         *fake.manager.lock().unwrap() = Some(manager.clone());
         std::thread::spawn(move || manager.run_with(&mut fake))
+    }
+
+    #[test]
+    fn late_queue_claims_are_refused_once_stopping_or_done() {
+        let manager = manager(None);
+        let fake = Fake::default();
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        // Queue 1 attaches before the stop; queue 0 is late.
+        assert!(manager.claim_queue(0, 1));
+        manager.request_stop();
+        eventually("stopping", || manager.stopping(0));
+        assert!(
+            !manager.claim_queue(0, 0),
+            "a device being stopped takes no new queue"
+        );
+        assert_ne!(manager.lock().devices[0].queues[0], QueueReport::Attached);
+        manager.report_queue(0, 1, QueueReport::Closed);
+        thread.join().unwrap();
+        assert!(manager.control_done());
+        assert!(!manager.claim_queue(0, 0), "nothing attaches once done");
+        // Nothing attached is left for settle to stop.
+        let mut reopened = false;
+        assert!(manager.settle(&mut || {
+            reopened = true;
+            Err(UblkError::Poisoned)
+        }));
+        assert!(!reopened);
     }
 
     #[test]
