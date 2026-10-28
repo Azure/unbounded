@@ -1135,7 +1135,6 @@ impl CandidatePolicy {
             {
                 a.current = a.fallback.take();
             }
-            self.apply(a, &evidence, operation, scope, budget);
             if evidence.notes & Notes::REMAINING != 0 {
                 a.phase = Phase::Remaining;
                 a.trail = CandidateTrail {
@@ -1143,6 +1142,7 @@ impl CandidatePolicy {
                     ..Default::default()
                 };
             }
+            self.apply(a, &evidence, operation, scope, budget);
             let event = match action {
                 Action::Rank { ranking, version } => {
                     let ranked = self
@@ -1488,7 +1488,7 @@ impl CandidatePolicy {
             (Some(previous), true) => previous.clone(),
             _ => membership.clone(),
         };
-        let remaining = a.fill.remaining();
+        let remaining = a.phase == Phase::Remaining;
         a.acquire = probe.mode == WalkMode::Acquire;
         a.sent = uring_runtime::environment::now();
         let mut timed_out = false;
@@ -1544,7 +1544,7 @@ impl CandidatePolicy {
         budget: &AcquisitionBudget,
     ) {
         // The remaining-copy walk records no evidence.
-        if evidence.remaining {
+        if a.phase == Phase::Remaining {
             return;
         }
         let (Some(dest), Some(current)) = (&a.dest, &a.current) else {

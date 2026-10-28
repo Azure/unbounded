@@ -1622,11 +1622,10 @@ pub struct Evidence {
     /// How the probe the event answered ended, when it was sent.
     pub outcome: Option<Result<Outcome, Error>>,
     /// That probe asked the overflow helper, a granted target, or rank 0
-    /// (an owner's page probe), or belonged to the remaining-copy walk.
+    /// (an owner's page probe).
     pub helper: bool,
     pub granted: bool,
     pub rank0_probe: bool,
-    pub remaining: bool,
     pub silence: Option<SilenceNote>,
     pub rank0: Option<Rank0Note>,
     /// [`Notes`] bits.
@@ -1819,11 +1818,6 @@ impl Fill {
         } else {
             TargetKind::Handoff
         }
-    }
-
-    /// The remaining-copy walk runs.
-    pub fn remaining(&self) -> bool {
-        matches!(self.walk, Walking::Remaining(_))
     }
 
     fn page(&self) -> bool {
@@ -2134,7 +2128,7 @@ impl Fill {
         let probe = self.probe.expect("no probe outstanding");
         let page = self.page();
         let no_refresh = self.pending();
-        let remaining = self.out.remaining;
+        let remaining = matches!(self.walk, Walking::Remaining(_));
         self.signed = false;
         let outcome = match reply {
             Reply::Answer { kind, signed } => {
@@ -2248,10 +2242,7 @@ impl Fill {
                 self.out.rank0_probe = p.is_some_and(|p| p.rank0);
                 p.is_some_and(|p| p.handoff || p.previous)
             }
-            _ => {
-                self.out.remaining = true;
-                false
-            }
+            _ => false,
         }
     }
 
