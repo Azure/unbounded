@@ -138,6 +138,16 @@ which tears the device down, but the tag keeps retrying.
 The first touch of a page fetches the whole 16 MiB page, which acts as readahead. A
 sequential reader also starts the next page early.
 
+The page cache keeps only ciphertext and a weak handle to plaintext. Once no request holds a
+page's plaintext, the next read of that page decrypts all 16 MiB again. So each worker keeps
+a small window of plaintext pages across requests (`ublk/window.rs`). A queue keeps at most
+2 pages, the one it reads and the readahead page. A worker keeps at most 4 pages (64 MiB)
+across all its devices, so two sequential readers per worker share one decrypt per page.
+Past either bound the least recently used page goes first, and a miss decrypts again. Kept
+pages are normal quota-charged plaintext owners. A queue drops them when it is abandoned or
+finishes, and every queue drops them once the control thread is done, so they never hold up
+shutdown or the runtime fence. Pages are not dropped on idle; the bound caps the cost.
+
 ### Shutdown
 
 1. On stop, or when a device fails, the control thread sends `STOP_DEV`. It does this for

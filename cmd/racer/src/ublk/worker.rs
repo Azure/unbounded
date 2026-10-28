@@ -17,6 +17,7 @@ use super::service::{
     Local, PageBytes, PageSource, QueueKernel, QueueService, QueueShape, QueueState,
 };
 use super::uapi::IoDesc;
+use super::window::PageWindow;
 use crate::config::UblkDeviceConfig;
 use crate::error::{Error, Result};
 use crate::model::PAGE_BYTES;
@@ -205,6 +206,8 @@ pub(crate) struct UblkWorker<B: Backend> {
     reactor: Rc<Reactor>,
     commands: Option<Rc<SubmissionCapacity>>,
     devices: Vec<Device<B::Source>>,
+    /// Plaintext pages kept across requests by every queue of this worker.
+    window: Rc<PageWindow<<B::Source as PageSource>::Page>>,
 }
 
 impl<B: Backend> UblkWorker<B> {
@@ -227,6 +230,7 @@ impl<B: Backend> UblkWorker<B> {
             reactor,
             commands,
             devices,
+            window: Rc::new(PageWindow::default()),
         }
     }
 
@@ -241,10 +245,9 @@ impl<B: Backend> UblkWorker<B> {
         let control_done = self.manager.control_done();
         self.devices.iter().all(|device| {
             device.resolving.is_none()
-                && device
-                    .queue
-                    .as_ref()
-                    .is_none_or(|queue| control_done && queue.owned() == 0)
+                && device.queue.as_ref().is_none_or(|queue| {
+                    control_done && queue.owned() == 0 && queue.held_pages() == 0
+                })
         })
     }
 
@@ -265,6 +268,9 @@ impl<B: Backend> UblkWorker<B> {
     /// Advance resolution, attachment, and every attached queue.
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>) {
         let views = self.manager.view(self.q, cx.waker());
+        // Once the control thread is done, no read is coming that a kept
+        // page could serve, and kept pages must not hold up the fence.
+        let control_done = self.manager.control_done();
         let (reactor, commands, q) = (&self.reactor, &self.commands, self.q);
         let open = |fd, depth| ReactorKernel::open(reactor.clone(), commands.clone(), fd, q, depth);
         for (index, view) in views.into_iter().enumerate() {
@@ -299,6 +305,7 @@ impl<B: Backend> UblkWorker<B> {
                     &self.manager,
                     &*self.backend,
                     &open,
+                    &self.window,
                     self.q,
                     index,
                     device,
@@ -306,6 +313,9 @@ impl<B: Backend> UblkWorker<B> {
                 );
             }
             if let Some(queue) = &mut device.queue {
+                if control_done {
+                    queue.release_pages();
+                }
                 match queue.poll(cx) {
                     QueueState::Running => {
                         if queue.failure().is_some() && !device.failure_reported {
@@ -337,10 +347,12 @@ impl<B: Backend> UblkWorker<B> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         manager: &Manager,
         backend: &B,
         open: &dyn Fn(OwnedFd, u16) -> std::io::Result<ReactorKernel>,
+        window: &Rc<PageWindow<<B::Source as PageSource>::Page>>,
         q: u16,
         index: usize,
         device: &mut Device<B::Source>,
@@ -378,7 +390,12 @@ impl<B: Backend> UblkWorker<B> {
             length: attach.length,
             page_bytes: PAGE_BYTES,
         };
-        device.queue = Some(QueueService::new(Rc::new(kernel), Rc::new(source), shape));
+        device.queue = Some(QueueService::with_window(
+            Rc::new(kernel),
+            Rc::new(source),
+            shape,
+            window.clone(),
+        ));
         manager.report_queue(index, q, QueueReport::Attached);
     }
 }

@@ -403,4 +403,34 @@ pub(super) mod tests {
         let result = fixture.run(source.page(0));
         assert_eq!(result.err(), Some(Error::VersionUnavailable));
     }
+
+    #[test]
+    fn kept_pages_spare_small_reads_a_decrypt_each() {
+        use crate::ublk::service::Windowed;
+        use crate::ublk::window::PageWindow;
+
+        let fixture = Fixture::new();
+        // Keep the ciphertext cached, so only plaintext comes and goes.
+        fixture.worker.retain(true);
+        let config = device(NAME, None);
+        let resolved = fixture.resolve(&config).unwrap();
+        let source = Rc::new(fixture.backend.source(&config, &resolved).unwrap());
+        drop(fixture.run(source.page(0)).unwrap());
+        let reads = 4;
+        // Without a window, each read of the cached page decrypts it again.
+        let before = fixture.worker.cpu_decrypts();
+        for _ in 0..reads {
+            let page = fixture.run(source.page(0)).unwrap();
+            assert_eq!(PageBytes::bytes(&page), &body()[..]);
+        }
+        assert_eq!(fixture.worker.cpu_decrypts() - before, reads);
+        // With one, consecutive reads share one decrypt.
+        let windowed = Windowed::new(source, Rc::new(PageWindow::default()));
+        let before = fixture.worker.cpu_decrypts();
+        for _ in 0..reads {
+            let page = fixture.run(windowed.page(0)).unwrap();
+            assert_eq!(PageBytes::bytes(&page), &body()[..]);
+        }
+        assert_eq!(fixture.worker.cpu_decrypts() - before, 1);
+    }
 }

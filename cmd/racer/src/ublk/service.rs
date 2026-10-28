@@ -25,6 +25,7 @@ use super::queue::{Action, Request, Span, io_cmd_bytes, spans};
 use super::uapi::{
     IoDesc, U_IO_COMMIT_AND_FETCH_REQ, U_IO_FETCH_REQ, UBLK_IO_RES_ABORT, UBLK_IO_RES_OK, ublk_pos,
 };
+use super::window::PageWindow;
 use crate::error::{Error, Result};
 
 /// Boxed local future used by the ublk traits.
@@ -445,9 +446,51 @@ pub(crate) enum QueueState {
     },
 }
 
+/// A queue's page source that first looks in the worker's page window.
+pub(crate) struct Windowed<S: PageSource> {
+    source: Rc<S>,
+    window: Rc<PageWindow<S::Page>>,
+    id: u64,
+    /// Set once the queue gave up its pages; later fetches are not kept.
+    released: Cell<bool>,
+}
+
+impl<S: PageSource> Windowed<S> {
+    pub(crate) fn new(source: Rc<S>, window: Rc<PageWindow<S::Page>>) -> Self {
+        Self {
+            id: window.queue_id(),
+            source,
+            window,
+            released: Cell::new(false),
+        }
+    }
+
+    fn release(&self) {
+        self.released.set(true);
+        self.window.release(self.id);
+    }
+}
+
+impl<S: PageSource> PageSource for Windowed<S> {
+    type Page = S::Page;
+
+    fn page(&self, number: u64) -> Local<'_, Result<S::Page>> {
+        Box::pin(async move {
+            if let Some(page) = self.window.get(self.id, number) {
+                return Ok(page);
+            }
+            let page = self.source.page(number).await?;
+            if !self.released.get() {
+                self.window.insert(self.id, number, page.clone());
+            }
+            Ok(page)
+        })
+    }
+}
+
 /// All tag loops of one device queue plus its readahead.
 pub(crate) struct QueueService<K: QueueKernel, S: PageSource> {
-    source: Rc<S>,
+    source: Rc<Windowed<S>>,
     readahead: Rc<Readahead>,
     tags: FuturesUnordered<Local<'static, TagExit>>,
     prefetch: FuturesUnordered<Local<'static, ()>>,
@@ -457,7 +500,20 @@ pub(crate) struct QueueService<K: QueueKernel, S: PageSource> {
 
 impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
     /// Start a loop for every tag. Nothing is sent until the first poll.
+    #[cfg(test)]
     pub(crate) fn new(kernel: Rc<K>, source: Rc<S>, shape: QueueShape) -> Self {
+        Self::with_window(kernel, source, shape, Rc::new(PageWindow::default()))
+    }
+
+    /// Start a loop for every tag, keeping pages in a window shared with
+    /// the worker's other queues. Nothing is sent until the first poll.
+    pub(crate) fn with_window(
+        kernel: Rc<K>,
+        source: Rc<S>,
+        shape: QueueShape,
+        window: Rc<PageWindow<S::Page>>,
+    ) -> Self {
+        let source = Rc::new(Windowed::new(source, window));
         let readahead = Rc::new(Readahead::default());
         let state = Rc::new(TagState::default());
         let tags = FuturesUnordered::new();
@@ -487,6 +543,18 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
     pub(crate) fn abandon(&mut self) {
         self.state.abandon();
         self.prefetch.clear();
+        self.release_pages();
+    }
+
+    /// Drop the pages this queue keeps and keep no more. Reads still work,
+    /// each fetching its page again.
+    pub(crate) fn release_pages(&self) {
+        self.source.release();
+    }
+
+    /// Pages this queue keeps in the window.
+    pub(crate) fn held_pages(&self) -> usize {
+        self.source.window.held(self.source.id)
     }
 
     /// Tags holding a request whose answer the kernel has not accepted.
@@ -503,6 +571,7 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
         }
         if self.tags.is_empty() {
             self.prefetch.clear();
+            self.release_pages();
             return QueueState::Finished {
                 failure: self.state.failure.get(),
             };
@@ -527,6 +596,12 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
     /// Whether any tag has failed so far.
     pub(crate) fn failure(&self) -> Option<Error> {
         self.state.failure.get()
+    }
+}
+
+impl<K: QueueKernel, S: PageSource> Drop for QueueService<K, S> {
+    fn drop(&mut self) {
+        self.release_pages();
     }
 }
 
@@ -1006,14 +1081,60 @@ mod tests {
         // Ends in the first quarter of page 0: no readahead.
         harness.serve(0, UBLK_IO_OP_READ, 0, 1024);
         assert_eq!(*harness.source.calls.borrow(), vec![0]);
-        // Ends in the last quarter of page 0: page 1 is fetched early.
+        // Ends in the last quarter of page 0: page 1 is fetched early. Page
+        // 0 is kept from the first read, so it is not fetched again.
         harness.serve(0, UBLK_IO_OP_READ, 2048, 1024);
-        assert_eq!(*harness.source.calls.borrow(), vec![0, 0, 1]);
+        assert_eq!(*harness.source.calls.borrow(), vec![0, 1]);
         // The same trigger does not fetch page 1 again.
         harness.serve(0, UBLK_IO_OP_READ, 3072, 512);
-        assert_eq!(*harness.source.calls.borrow(), vec![0, 0, 1, 0]);
+        assert_eq!(*harness.source.calls.borrow(), vec![0, 1]);
         // The last page has no successor.
         harness.serve(0, UBLK_IO_OP_READ, 3 * PAGE, 512);
-        assert_eq!(*harness.source.calls.borrow(), vec![0, 0, 1, 0, 3]);
+        assert_eq!(*harness.source.calls.borrow(), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn small_reads_share_one_fetch_and_kept_pages_are_bounded() {
+        let mut harness = Harness::new(1);
+        harness.poll();
+        for offset in (0..PAGE / 2).step_by(512) {
+            harness.serve(0, UBLK_IO_OP_READ, offset, 512);
+            assert_eq!(harness.buffer(0), expected(offset, 512));
+        }
+        assert_eq!(*harness.source.calls.borrow(), vec![0]);
+        for number in 0..4 {
+            harness.serve(0, UBLK_IO_OP_READ, number * PAGE, 512);
+        }
+        assert_eq!(harness.queue.held_pages(), crate::ublk::window::QUEUE_PAGES);
+        // Page 0 was dropped for later pages and is fetched again.
+        harness.serve(0, UBLK_IO_OP_READ, 0, 512);
+        assert_eq!(*harness.source.calls.borrow(), vec![0, 1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn abandon_and_finish_release_kept_pages() {
+        let mut harness = Harness::new(1);
+        harness.poll();
+        harness.serve(0, UBLK_IO_OP_READ, 0, 512);
+        assert_eq!(harness.queue.held_pages(), 1);
+        harness.queue.abandon();
+        assert_eq!(harness.queue.held_pages(), 0);
+        // An abandoned queue keeps nothing new.
+        assert_eq!(harness.serve(0, UBLK_IO_OP_READ, 0, 512), -libc::EIO);
+        assert_eq!(harness.queue.held_pages(), 0);
+
+        let mut harness = Harness::new(1);
+        harness.poll();
+        harness.serve(0, UBLK_IO_OP_READ, 0, 512);
+        assert_eq!(harness.queue.held_pages(), 1);
+        harness
+            .kernel
+            .take(0)
+            .reply
+            .send(Ok(UBLK_IO_RES_ABORT))
+            .ok()
+            .unwrap();
+        assert_eq!(harness.poll(), QueueState::Finished { failure: None });
+        assert_eq!(harness.queue.held_pages(), 0);
     }
 }
