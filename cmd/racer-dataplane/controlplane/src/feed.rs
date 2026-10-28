@@ -60,46 +60,6 @@ pub trait Host: rest::Io {
 
     /// Classify without erasing cancellation or authentication rejection.
     fn classify(&self, error: Self::Error) -> FailureClass;
-
-    /// How preparation closures run. Production keeps the default,
-    /// [`Preparing::Thread`]; a simulated host returns [`Preparing::Inline`]
-    /// so one process can drive many feeds without one thread per prepare.
-    fn preparing(&self) -> Preparing {
-        Preparing::Thread
-    }
-}
-
-/// Where [`Target::prepare`] closures run.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Preparing {
-    /// On a named background thread (`controlplane-prepare`).
-    #[default]
-    Thread,
-    /// Synchronously on the owner, inside the turn that submits it. The
-    /// result is reaped on the next advance, exactly like a finished thread.
-    Inline,
-}
-
-/// A submitted preparation: a thread or an inline result.
-enum Handle<P> {
-    Thread(JoinHandle<P>),
-    Done(P),
-}
-
-impl<P> Handle<P> {
-    fn is_finished(&self) -> bool {
-        match self {
-            Self::Thread(h) => h.is_finished(),
-            Self::Done(_) => true,
-        }
-    }
-
-    fn join(self) -> std::thread::Result<P> {
-        match self {
-            Self::Thread(h) => h.join(),
-            Self::Done(p) => Ok(p),
-        }
-    }
 }
 
 /// Owned credential lease whose bytes remain valid during a TLS checkout.
@@ -533,7 +493,7 @@ struct Rejection<V> {
 struct Job<C: Codec, T: Target<C>> {
     document: Arc<C::Document>,
 
-    handle: Handle<Result<T::Prepared, C::Error>>,
+    handle: JoinHandle<Result<T::Prepared, C::Error>>,
 }
 
 impl<H: Host, C: Codec<Error = H::Error>, S, T: Target<C>> Drop for Sync<H, C, S, T> {
@@ -897,14 +857,10 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                     return Err(error);
                 }
             };
-            let spawned = match host.preparing() {
-                Preparing::Thread => std::thread::Builder::new()
-                    .name("controlplane-prepare".into())
-                    .spawn(work)
-                    .map(Handle::Thread),
-                Preparing::Inline => Ok(Handle::Done(work())),
-            };
-            match spawned {
+            match std::thread::Builder::new()
+                .name("controlplane-prepare".into())
+                .spawn(work)
+            {
                 Ok(handle) => self.job = Some(Job { document, handle }),
                 Err(_) => {
                     self.queued = Some(document);

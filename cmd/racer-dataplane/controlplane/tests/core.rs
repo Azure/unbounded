@@ -1,7 +1,7 @@
 //! Domain-free lifecycle scenarios exercising the public adapter surface.
 
 use controlplane::{
-    Codec, Error, Feed, Generation, Host, Preparing, Published, Retention, Rollout, Sync, Target,
+    Codec, Error, Feed, Generation, Host, Published, Retention, Rollout, Sync, Target,
     feed::{FailureClass, FetchError, Preparation, Schedule, Source},
 };
 use std::{
@@ -398,14 +398,7 @@ impl rest::Scope for Scope {
 }
 
 /// No real transport is used; sleep is an asynchronously delivered test timer.
-#[derive(Default)]
-struct TestHost {
-    /// Run preparation on the owner, as a simulated host does.
-    inline: bool,
-}
-
-/// A thread-preparing host for delegating fixtures.
-const PLAIN_HOST: TestHost = TestHost { inline: false };
+struct TestHost;
 
 impl rest::Io for TestHost {
     type Error = Failure;
@@ -467,14 +460,6 @@ impl Host for TestHost {
             }
             scope.check()
         })
-    }
-
-    fn preparing(&self) -> Preparing {
-        if self.inline {
-            Preparing::Inline
-        } else {
-            Preparing::Thread
-        }
     }
 
     fn classify(&self, error: Failure) -> FailureClass {
@@ -578,7 +563,7 @@ impl Source<TestHost> for Script {
                 }),
                 Reply::Error(error, retry_after) => Err(FetchError { error, retry_after }),
                 Reply::Wait => {
-                    PLAIN_HOST.sleep(scope.deadline, scope).await?;
+                    TestHost.sleep(scope.deadline, scope).await?;
                     Err(Failure::Invalid.into())
                 }
             }
@@ -837,7 +822,7 @@ fn schedule() -> Schedule {
 /// Assemble the public synchronization API around the transport-free fixture.
 fn driver(script: Script, target: Installer) -> Sync<TestHost, Numbers, Script, Installer> {
     Sync::new(
-        Rc::new(TestHost::default()),
+        Rc::new(TestHost),
         Feed::new(Numbers, "/watch".into(), 16).unwrap(),
         script,
         target,
@@ -1294,7 +1279,7 @@ fn capacity_failure_rolls_back_reserved_barrier_before_restaging() {
 #[test]
 fn unrepresentable_schedule_is_rejected_before_starting_work() {
     let result = Sync::new(
-        Rc::new(TestHost::default()),
+        Rc::new(TestHost),
         Feed::new(Numbers, "/watch".into(), 16).unwrap(),
         Script::new([]),
         Installer::new(),
@@ -1397,7 +1382,7 @@ impl rest::Io for ClockHost {
 
     /// Reuse the transport-free lease policy.
     fn lease(&self) -> Result<Option<Rc<()>>, Failure> {
-        PLAIN_HOST.lease()
+        TestHost.lease()
     }
 
     /// Reject real descriptor operations in this virtual timer fixture.
@@ -1409,7 +1394,7 @@ impl rest::Io for ClockHost {
         lease: Option<Rc<()>>,
         scope: &'a Scope,
     ) -> Operation<'a, (), Failure> {
-        PLAIN_HOST.ready(descriptor, read, write, lease, scope)
+        TestHost.ready(descriptor, read, write, lease, scope)
     }
 
     /// Reject real DNS in this virtual timer fixture.
@@ -1419,7 +1404,7 @@ impl rest::Io for ClockHost {
         port: u16,
         scope: &'a Scope,
     ) -> Operation<'a, Vec<std::net::SocketAddr>, Failure> {
-        PLAIN_HOST.resolve(host, port, scope)
+        TestHost.resolve(host, port, scope)
     }
 
     /// Reject real file reads in this virtual timer fixture.
@@ -1429,7 +1414,7 @@ impl rest::Io for ClockHost {
         limit: usize,
         scope: &'a Scope,
     ) -> Operation<'a, Vec<u8>, Failure> {
-        PLAIN_HOST.read_file(path, limit, scope)
+        TestHost.read_file(path, limit, scope)
     }
 }
 
@@ -1450,7 +1435,7 @@ impl Host for ClockHost {
 
     /// Preserve the same error policy as real-clock lifecycle tests.
     fn classify(&self, error: Failure) -> FailureClass {
-        PLAIN_HOST.classify(error)
+        TestHost.classify(error)
     }
 }
 
@@ -1611,32 +1596,4 @@ fn candidate_rejection_backoff_survives_successful_receipts_and_newer_recovers()
         assert_eq!(script.requests.borrow().last().unwrap().0, "/watch?after=3");
         futures::executor::block_on(sync.shutdown(&scope)).unwrap();
     }
-}
-
-/// A simulated host prepares inline on the owner thread with identical results.
-#[test]
-fn inline_preparation_runs_on_the_owner_and_installs() {
-    futures::executor::block_on(async {
-        let target = Installer::new();
-        let script = Script::new([full(1), full(2)]);
-        let mut sync = Sync::new(
-            Rc::new(TestHost { inline: true }),
-            Feed::new(Numbers, "/watch".into(), 16).unwrap(),
-            script.clone(),
-            target.clone(),
-            schedule(),
-        )
-        .unwrap();
-        sync.turn(&Scope::new()).await.unwrap();
-        sync.settle(&Scope::new()).await.unwrap();
-        sync.turn(&Scope::new()).await.unwrap();
-        sync.settle(&Scope::new()).await.unwrap();
-        assert_eq!(*target.installed.borrow(), vec![1, 2]);
-        assert_eq!(sync.status().accepted, Some(2));
-        for id in target.threads.lock().unwrap().iter() {
-            assert_eq!(*id, std::thread::current().id());
-        }
-        assert_eq!(target.started.load(Ordering::Acquire), 2);
-        sync.shutdown(&Scope::new()).await.unwrap();
-    });
 }
