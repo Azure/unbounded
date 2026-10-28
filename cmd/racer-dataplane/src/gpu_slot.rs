@@ -123,6 +123,9 @@ impl GpuSlot {
                     self.spawn(start, on_start);
                 }
                 Pending::Starting(mut waiters) => {
+                    // Drop waiters whose request gave up, so a stalled
+                    // start does not grow this without bound.
+                    waiters.retain(|waiter| !waiter.is_canceled());
                     waiters.push(sender);
                     *pending = Pending::Starting(waiters);
                 }
@@ -160,6 +163,7 @@ impl GpuSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -265,6 +269,38 @@ mod tests {
         assert_eq!(hooked.load(Ordering::SeqCst), 1);
         assert!(futures::executor::block_on(slot.get_or_start()).is_some());
         assert_eq!(hooked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    /// Waiters that give up during a stalled start are pruned, and a live
+    /// waiter still gets the result.
+    fn canceled_waiters_are_pruned() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (open, gate) = std::sync::mpsc::channel();
+        let helper = crate::gpu::testing::helper(&[None]);
+        let slot = counted(&calls, gate, Some(helper.clone()));
+        let waiting = |slot: &GpuSlot| match &*slot.inner.lock() {
+            Pending::Starting(waiters) => waiters.len(),
+            _ => panic!("start is not pending"),
+        };
+        for _ in 0..100 {
+            let mut request = Box::pin(slot.get_or_start());
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            // Dropping the request cancels its waiter.
+            drop(request);
+            assert!(waiting(&slot) <= 1);
+        }
+        let mut live = Box::pin(slot.get_or_start());
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(live.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(waiting(&slot), 1);
+        open.send(()).unwrap();
+        let got = futures::executor::block_on(live).unwrap();
+        assert!(Arc::ptr_eq(&got, &helper));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
