@@ -479,7 +479,18 @@ impl<S: PageSource> PageSource for Windowed<S> {
             if let Some(page) = self.window.get(self.id, number) {
                 return Ok(page);
             }
-            let page = self.source.page(number).await?;
+            // Free the page keeping this one would evict before the fetch
+            // charges new plaintext.
+            self.window.make_room(self.id);
+            let page = match self.source.page(number).await {
+                // Pages the window keeps must never starve a read: drop them
+                // all and try once more.
+                Err(Error::Overloaded) if !self.window.is_empty() => {
+                    self.window.clear();
+                    self.source.page(number).await?
+                }
+                result => result?,
+            };
             if !self.released.get() {
                 self.window.insert(self.id, number, page.clone());
             }
@@ -1137,4 +1148,123 @@ mod tests {
         assert_eq!(harness.poll(), QueueState::Finished { failure: None });
         assert_eq!(harness.queue.held_pages(), 0);
     }
+
+    /// Pages charged against a fixed plaintext quota: a page is charged
+    /// while any clone of it lives, and a fetch past the quota is refused
+    /// like plaintext admission refuses it.
+    struct QuotaSource {
+        quota: usize,
+        live: RefCell<Vec<std::rc::Weak<Vec<u8>>>>,
+        refused: Cell<u32>,
+    }
+
+    impl QuotaSource {
+        fn new(quota: usize) -> Self {
+            Self {
+                quota,
+                live: RefCell::default(),
+                refused: Cell::new(0),
+            }
+        }
+
+        fn charged(&self) -> usize {
+            let mut live = self.live.borrow_mut();
+            live.retain(|page| page.strong_count() > 0);
+            live.len()
+        }
+    }
+
+    impl PageSource for QuotaSource {
+        type Page = TestPage;
+
+        fn page(&self, number: u64) -> Local<'_, Result<TestPage>> {
+            Box::pin(async move {
+                if self.charged() >= self.quota {
+                    self.refused.set(self.refused.get() + 1);
+                    return Err(Error::Overloaded);
+                }
+                let page = Rc::new(vec![number as u8; 8]);
+                self.live.borrow_mut().push(Rc::downgrade(&page));
+                Ok(TestPage(page))
+            })
+        }
+    }
+
+    fn fetch<S: PageSource>(source: &Windowed<S>, number: u64) -> Result<S::Page> {
+        use futures::FutureExt;
+        source.page(number).now_or_never().expect("ready")
+    }
+
+    #[test]
+    fn miss_succeeds_when_kept_pages_fill_the_quota() {
+        // The window may keep more than the quota allows, as when queues of
+        // several workers keep pages charged to one owner.
+        let source = Rc::new(QuotaSource::new(2));
+        let window = Rc::new(PageWindow::new(2, 4));
+        let a = Windowed::new(source.clone(), window.clone());
+        let b = Windowed::new(source.clone(), window.clone());
+        fetch(&a, 0).unwrap();
+        fetch(&b, 0).unwrap();
+        assert_eq!(source.charged(), 2);
+        // A miss with the quota exactly filled by kept pages still succeeds.
+        assert_eq!(PageBytes::bytes(&fetch(&a, 1).unwrap()), &[1; 8]);
+        assert_eq!(source.refused.get(), 1);
+        // Only the new page stays charged.
+        assert_eq!(source.charged(), 1);
+        assert_eq!(window.held(a.id), 1);
+        // A read outside the window still gets the other quota page.
+        let other = source.page(9).now_or_never_ready().unwrap();
+        assert_eq!(source.charged(), 2);
+        drop(other);
+    }
+
+    #[test]
+    fn miss_frees_the_evicted_page_before_fetching() {
+        // One queue with a full window and a full quota: making room for the
+        // new page frees the quota it needs, with no refusal.
+        let source = Rc::new(QuotaSource::new(2));
+        let window = Rc::new(PageWindow::new(2, 2));
+        let a = Windowed::new(source.clone(), window);
+        for number in 0..6 {
+            fetch(&a, number).unwrap();
+        }
+        assert_eq!(source.refused.get(), 0);
+        assert_eq!(source.charged(), 2);
+    }
+
+    #[test]
+    fn quota_sized_window_never_blocks_reads_in_flight() {
+        // Minimum quota for a range window of one: two pages, none kept.
+        let page = crate::model::PAGE_BYTES as usize;
+        let source = Rc::new(QuotaSource::new(2));
+        let window = Rc::new(PageWindow::for_quota(2 * page, 1));
+        let a = Windowed::new(source.clone(), window.clone());
+        for number in 0..4 {
+            fetch(&a, number).unwrap();
+            assert_eq!(source.charged(), 0);
+        }
+        // Two pages in flight at once both fit.
+        let first = fetch(&a, 10).unwrap();
+        let second = fetch(&a, 11).unwrap();
+        assert_eq!(source.refused.get(), 0);
+        drop((first, second));
+    }
+
+    #[test]
+    fn refusal_with_nothing_kept_is_returned() {
+        let source = Rc::new(QuotaSource::new(1));
+        let a = Windowed::new(source.clone(), Rc::new(PageWindow::new(2, 4)));
+        let held = source.page(0).now_or_never_ready().unwrap();
+        assert!(matches!(fetch(&a, 1), Err(Error::Overloaded)));
+        assert_eq!(source.refused.get(), 1);
+        drop(held);
+    }
+
+    trait ReadyExt: std::future::Future + Sized {
+        fn now_or_never_ready(self) -> Self::Output {
+            futures::FutureExt::now_or_never(self).expect("ready")
+        }
+    }
+
+    impl<F: std::future::Future> ReadyExt for F {}
 }

@@ -23,7 +23,8 @@ pub(crate) const QUEUE_PAGES: usize = 2;
 /// Pages one worker keeps across all its queues. Two sequential readers on
 /// one worker are served without extra decrypts, at 64 MiB of plaintext per
 /// worker. More readers fall back to decrypting on a miss, which is still
-/// correct.
+/// correct. [`PageWindow::for_quota`] lowers this to fit the worker's
+/// plaintext quota.
 pub(crate) const WORKER_PAGES: usize = 4;
 
 struct Entry<P> {
@@ -56,6 +57,25 @@ impl<P: Clone> PageWindow<P> {
         }
     }
 
+    /// A window that never holds the plaintext a worker needs for reads.
+    ///
+    /// A worker's plaintext quota must fund `range_window_pages + 1` pages
+    /// in flight (see `partition_limits_with_cause` in `app.rs`). The window
+    /// keeps only what is left over, so at the minimum quota it keeps
+    /// nothing and every read can still be admitted.
+    pub(crate) fn for_quota(plaintext_bytes: usize, range_window_pages: usize) -> Self {
+        let pages = plaintext_bytes / crate::model::PAGE_BYTES as usize;
+        let spare = pages.saturating_sub(range_window_pages.saturating_add(1));
+        let worker_pages = spare.min(WORKER_PAGES);
+        Self::new(QUEUE_PAGES.min(worker_pages), worker_pages)
+    }
+
+    /// Pages the worker may keep across all queues.
+    #[cfg(test)]
+    pub(crate) fn worker_pages(&self) -> usize {
+        self.worker_pages
+    }
+
     /// A new id for one queue's pages.
     pub(crate) fn queue_id(&self) -> u64 {
         let id = self.next_queue.get();
@@ -75,6 +95,37 @@ impl<P: Clone> PageWindow<P> {
         Some(page)
     }
 
+    /// Drop the page that keeping one more page of `queue` would evict.
+    /// A miss calls this before fetching, so the evicted page's quota is
+    /// free while the new page is admitted.
+    pub(crate) fn make_room(&self, queue: u64) {
+        let dropped = {
+            let mut entries = self.entries.borrow_mut();
+            Self::evict(&mut entries, queue, self.queue_pages, self.worker_pages)
+        };
+        drop(dropped);
+    }
+
+    fn evict(
+        entries: &mut VecDeque<Entry<P>>,
+        queue: u64,
+        queue_pages: usize,
+        worker_pages: usize,
+    ) -> Vec<Entry<P>> {
+        let mut dropped = Vec::new();
+        while entries.iter().filter(|e| e.queue == queue).count() >= queue_pages.max(1)
+            && let Some(at) = entries.iter().position(|e| e.queue == queue)
+        {
+            dropped.extend(entries.remove(at));
+        }
+        while entries.len() >= worker_pages.max(1)
+            && let Some(entry) = entries.pop_front()
+        {
+            dropped.push(entry);
+        }
+        dropped
+    }
+
     /// Keep `page`, dropping the oldest pages past either bound.
     pub(crate) fn insert(&self, queue: u64, number: u64, page: P) {
         if self.queue_pages == 0 || self.worker_pages == 0 {
@@ -82,19 +133,21 @@ impl<P: Clone> PageWindow<P> {
         }
         let mut entries = self.entries.borrow_mut();
         entries.retain(|e| !(e.queue == queue && e.number == number));
-        if entries.iter().filter(|e| e.queue == queue).count() >= self.queue_pages
-            && let Some(at) = entries.iter().position(|e| e.queue == queue)
-        {
-            entries.remove(at);
-        }
-        if entries.len() >= self.worker_pages {
-            entries.pop_front();
-        }
+        let dropped = Self::evict(&mut entries, queue, self.queue_pages, self.worker_pages);
         entries.push_back(Entry {
             queue,
             number,
             page,
         });
+        drop(entries);
+        drop(dropped);
+    }
+
+    /// Drop every page of every queue, for example when a fetch was refused
+    /// for lack of quota.
+    pub(crate) fn clear(&self) {
+        let dropped = std::mem::take(&mut *self.entries.borrow_mut());
+        drop(dropped);
     }
 
     /// Drop every page of one queue.
@@ -116,6 +169,11 @@ impl<P: Clone> PageWindow<P> {
             .iter()
             .filter(|e| e.queue == queue)
             .count()
+    }
+
+    /// Whether no page is kept.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
     }
 
     /// Pages kept for all queues.
@@ -174,6 +232,58 @@ mod tests {
         window.release(a);
         assert_eq!(Rc::strong_count(&page), 2);
         assert_eq!(window.held(b), 1);
+    }
+
+    const PAGE: usize = crate::model::PAGE_BYTES as usize;
+
+    #[test]
+    fn quota_sizing_leaves_room_for_reads_in_flight() {
+        // Minimum valid quota: range window plus one page. Nothing is kept.
+        let window = PageWindow::<u64>::for_quota(2 * PAGE, 1);
+        assert_eq!(window.worker_pages(), 0);
+        let q = window.queue_id();
+        window.insert(q, 0, 0);
+        assert_eq!(window.len(), 0);
+        // Less than a page past the minimum still keeps nothing.
+        assert_eq!(
+            PageWindow::<u64>::for_quota(4 * PAGE - 1, 2).worker_pages(),
+            0
+        );
+        // One spare page: one page kept, one per queue.
+        let window = PageWindow::<u64>::for_quota(3 * PAGE, 1);
+        assert_eq!(window.worker_pages(), 1);
+        let q = window.queue_id();
+        window.insert(q, 0, 0);
+        window.insert(q, 1, 1);
+        assert_eq!(window.len(), 1);
+        assert_eq!(window.get(q, 1), Some(1));
+        // A large quota is capped at the default bounds.
+        let window = PageWindow::<u64>::for_quota(64 * PAGE, 2);
+        assert_eq!(window.worker_pages(), WORKER_PAGES);
+        // Tiny or zero quotas do not underflow.
+        assert_eq!(PageWindow::<u64>::for_quota(0, 64).worker_pages(), 0);
+        assert_eq!(
+            PageWindow::<u64>::for_quota(usize::MAX, usize::MAX).worker_pages(),
+            0
+        );
+    }
+
+    #[test]
+    fn make_room_drops_what_insert_would_evict() {
+        let window = PageWindow::default();
+        let (a, b) = (window.queue_id(), window.queue_id());
+        window.insert(a, 0, 0);
+        window.insert(a, 1, 1);
+        window.make_room(a);
+        assert_eq!(window.held(a), QUEUE_PAGES - 1);
+        assert_eq!(window.get(a, 0), None);
+        window.insert(b, 0, 2);
+        window.insert(b, 1, 3);
+        window.insert(a, 2, 4);
+        window.make_room(b);
+        assert_eq!(window.len(), WORKER_PAGES - 1);
+        window.clear();
+        assert_eq!(window.len(), 0);
     }
 
     #[test]

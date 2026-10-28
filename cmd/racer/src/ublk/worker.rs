@@ -234,6 +234,17 @@ impl<B: Backend> UblkWorker<B> {
         }
     }
 
+    /// Size the page window to the worker's plaintext quota; see
+    /// [`PageWindow::for_quota`]. Call before any device attaches.
+    pub(crate) fn with_window_quota(
+        mut self,
+        plaintext_bytes: usize,
+        range_window_pages: usize,
+    ) -> Self {
+        self.window = Rc::new(PageWindow::for_quota(plaintext_bytes, range_window_pages));
+        self
+    }
+
     /// Nothing here can still hold up a device. Either no queue is
     /// attached, or the control thread has finished and no queue holds a
     /// request the kernel waits on. A queue left in the second case only

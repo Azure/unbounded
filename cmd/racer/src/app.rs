@@ -1589,13 +1589,21 @@ impl WorkerApplication {
             .checked_mul(usize::from(config.ublk.queue_depth))
             .ok_or(Error::InvalidConfiguration)?;
         let commands = runtime.reactor.reserve_commands(commands)?;
-        Ok(Some(crate::ublk::worker::UblkWorker::new(
-            q,
-            manager.clone(),
-            backend,
-            runtime.reactor.clone(),
-            Some(commands),
-        )))
+        // Per-worker quotas: retained pages must leave room for reads.
+        let limits = runtime.admission.policy().limits();
+        Ok(Some(
+            crate::ublk::worker::UblkWorker::new(
+                q,
+                manager.clone(),
+                backend,
+                runtime.reactor.clone(),
+                Some(commands),
+            )
+            .with_window_quota(
+                limits.plaintext_bytes.get(),
+                limits.range_window_pages.get(),
+            ),
+        ))
     }
 
     /// Connect shared publication state to worker-local read and metadata services.

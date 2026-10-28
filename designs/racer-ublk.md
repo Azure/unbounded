@@ -144,7 +144,11 @@ a small window of plaintext pages across requests (`ublk/window.rs`). A queue ke
 2 pages, the one it reads and the readahead page. A worker keeps at most 4 pages (64 MiB)
 across all its devices, so two sequential readers per worker share one decrypt per page.
 Past either bound the least recently used page goes first, and a miss decrypts again. Kept
-pages are normal quota-charged plaintext owners. A queue drops them when it is abandoned or
+pages are normal quota-charged plaintext owners, so they must never starve a read. The
+worker bound is lowered to what the per-worker plaintext quota has left after
+`range_window_pages + 1` pages in flight, which is zero at the minimum valid quota. A miss
+first drops the page that keeping the new one would evict, and if the fetch is still
+refused as overloaded the worker drops every kept page and retries once. A queue drops them when it is abandoned or
 finishes, and every queue drops them once the control thread is done, so they never hold up
 shutdown or the runtime fence. Pages are not dropped on idle; the bound caps the cost.
 
