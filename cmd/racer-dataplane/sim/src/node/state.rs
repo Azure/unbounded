@@ -169,6 +169,9 @@ pub struct Node {
     pub rank0: Rank0Watch<u64, u32>,
     /// Next hops that left exchanges unanswered (production `LinkHealth::silence`).
     pub silence: Silence<u32, u64>,
+    /// Silence pings and copy offers in flight.
+    pub pings: u8,
+    pub offers: u8,
     /// The last few owners that shed this node's page requests, with the page and when (measurement
     /// only: `shed_repeats`).
     pub recent_sheds: Vec<(u32, u64, crate::engine::Nanos)>,
@@ -233,6 +236,8 @@ impl Node {
                 Duration::from_nanos(config.attempt_timeout_ns),
             ),
             recent_sheds: Vec::new(),
+            pings: 0,
+            offers: 0,
         }
     }
 

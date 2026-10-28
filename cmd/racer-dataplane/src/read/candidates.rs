@@ -207,11 +207,7 @@ impl Drop for OfferFlight {
 pub(crate) type Notices =
     racer_core::read::hints::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
 
-/// Copy offers a node sends at once; more due offers wait for a later turn.
-pub(crate) const MAX_OFFERS_IN_FLIGHT: usize = 4;
-
-/// Silence pings a worker sends at once; more due pings wait for a later turn.
-pub(crate) const MAX_PINGS_IN_FLIGHT: usize = 16;
+pub(crate) use racer_core::liveness::{MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT};
 
 /// When each of the page's owners arrived in this node's membership chain (`Membership::since`),
 /// for lineage targets.

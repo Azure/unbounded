@@ -32,7 +32,9 @@ use std::time::{Duration, Instant};
 use crate::phantom::{Phantom, SharedRoutes};
 use page_alloc::SegmentId;
 use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
-use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, ping_verdict};
+use racer_core::liveness::{
+    LINK_TIMEOUTS, MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT, NO_PING, ping_verdict,
+};
 use racer_core::read::Error;
 use racer_core::read::Source;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
@@ -1079,7 +1081,7 @@ impl NodeWorld {
             Event::StaleWait { fill } => self.drive(fill, FillEvent::Timer),
             Event::Notice { node } => self.send_notices(node),
             Event::LastHop { msg } => self.last_hop_timeout(msg),
-            Event::SilenceRecheck { from, .. } => self.silence_recheck(from),
+            Event::SilenceRecheck { from, .. } => self.poll_pings(from),
             Event::OriginCancel { fill } => self.origin_cancel(fill),
             Event::OriginWake => self.origin_wake(),
             Event::Release { id } => {
@@ -3242,15 +3244,31 @@ impl NodeWorld {
         }
     }
 
-    /// `node`'s exchange with `dest`, sent at `sent`, timed out: ping `dest` at once when the
-    /// timeout asks for it (production instead drains `Silence::due_pings` each turn, capped by
-    /// `MAX_PINGS_IN_FLIGHT`).
+    /// `node`'s exchange with `dest`, sent at `sent`, timed out.
     fn silence_timeout(&mut self, node: u32, dest: u32, page: u64, sent: Nanos, needed: u32) {
         let (sent, at) = (self.instant(sent), self.instant(self.now()));
-        let silence = &mut self.nodes[node as usize].silence;
-        if silence.timed_out(dest, page, sent, at, needed) {
-            silence.start_ping(&dest, at);
-            self.launch_ping(node, dest, page);
+        if self.nodes[node as usize]
+            .silence
+            .timed_out(dest, page, sent, at, needed)
+        {
+            self.poll_pings(node);
+        }
+    }
+
+    /// Send `node`'s due silence pings, at most [`MAX_PINGS_IN_FLIGHT`] at once (production
+    /// `CandidatePolicy::poll_pings`).
+    fn poll_pings(&mut self, node: u32) {
+        let at = self.instant(self.now());
+        let n = &mut self.nodes[node as usize];
+        let room = MAX_PINGS_IN_FLIGHT.saturating_sub(n.pings.into());
+        if n.down || room == 0 {
+            return;
+        }
+        for (to, page) in n.silence.due_pings(at, room) {
+            if self.nodes[node as usize].silence.silent(&to, at) {
+                self.metrics.incr("silence_rechecks");
+            }
+            self.launch_ping(node, to, page);
         }
     }
 
@@ -3262,6 +3280,7 @@ impl NodeWorld {
         let timeout = now + self.config.node.attempt_timeout_ns;
         let version = self.nodes[node as usize].version;
         let incarnation = self.nodes[node as usize].incarnation;
+        self.nodes[node as usize].pings += 1;
         let pid = self.fresh();
         let mid = self.fresh();
         let msg = Msg {
@@ -3305,6 +3324,7 @@ impl NodeWorld {
         if n.down || n.incarnation != ping.incarnation {
             return;
         }
+        self.nodes[ping.node as usize].pings -= 1;
         let at = self.instant(self.now());
         let (from, to) = (ping.node, ping.dest);
         let silence = &mut self.nodes[from as usize].silence;
@@ -3316,7 +3336,7 @@ impl NodeWorld {
         });
         let Some(alive) = answered else {
             self.metrics.incr("silence_pings_inconclusive");
-            return;
+            return self.poll_pings(from);
         };
         if alive && silence.silent(&to, at) {
             self.metrics.incr("silence_recoveries");
@@ -3329,16 +3349,7 @@ impl NodeWorld {
             let hold = silence.hold().as_nanos() as Nanos;
             self.engine.after(hold, Event::SilenceRecheck { from, to });
         }
-    }
-
-    /// Re-ping silent next hops of `from` that are due (production `CandidatePolicy::poll_pings`).
-    fn silence_recheck(&mut self, from: u32) {
-        let at = self.instant(self.now());
-        let due = self.nodes[from as usize].silence.due_pings(at, usize::MAX);
-        for (to, page) in due {
-            self.metrics.incr("silence_rechecks");
-            self.launch_ping(from, to, page);
-        }
+        self.poll_pings(from);
     }
 
     /// A route search for `mid` at `holder` finished.
@@ -4897,14 +4908,12 @@ impl NodeWorld {
             return;
         }
         let instant = self.instant(self.now());
-        let sites = self.fabric.site.clone();
         let grouped = self.config.node.offer_cut_groups;
-        let group = |t: &u32| sites[*t as usize];
-        loop {
+        while usize::from(self.nodes[node as usize].offers) < MAX_OFFERS_IN_FLIGHT {
             let notices = &mut self.nodes[node as usize].notices;
-            // Without cut groups (`node.offer_cut_groups` 0) offers go as before.
+            let sites = &self.fabric.site;
             let next = if grouped {
-                notices.pop_open(instant, group)
+                notices.pop_open(instant, |t| sites[*t as usize])
             } else {
                 notices.pop_due(instant)
             };
@@ -4921,9 +4930,8 @@ impl NodeWorld {
                 Some(target) => self.launch_offer(node, Due { target, ..due }),
                 None => {
                     self.metrics.incr("orphan_notices_dropped");
-                    self.nodes[node as usize]
-                        .notices
-                        .release(&group(&due.target));
+                    let group = self.fabric.site[due.target as usize];
+                    self.nodes[node as usize].notices.release(&group);
                 }
             }
         }
@@ -4964,6 +4972,7 @@ impl NodeWorld {
             offer: true,
             ping: false,
         };
+        self.nodes[node as usize].offers += 1;
         self.offers.insert(pid, (node, incarnation, due));
         self.msgs.insert(mid, msg);
         self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
@@ -4983,8 +4992,12 @@ impl NodeWorld {
         } else {
             "orphan_offers_failed"
         });
-        if !live || (delivered && !grouped) {
+        if !live {
             return;
+        }
+        self.nodes[node as usize].offers -= 1;
+        if delivered && !grouped {
+            return self.send_notices(node);
         }
         let instant = self.instant(self.now());
         let notices = &mut self.nodes[node as usize].notices;
@@ -4996,13 +5009,12 @@ impl NodeWorld {
         } else {
             notices.failed(due, instant)
         };
-        if delivered {
-            return;
-        }
         match next {
+            _ if delivered => {}
             Some(next) => self.engine.at(self.nanos(next), Event::Notice { node }),
             None => self.metrics.incr("orphan_notices_expired"),
         }
+        self.send_notices(node);
     }
 
     /// Answer a copy offer `Miss`, noting the requester as a successor hint when this node neither

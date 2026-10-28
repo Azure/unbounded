@@ -16,6 +16,12 @@ use std::time::{Duration, Instant};
 /// Default bound on tracked peers per sender (neighbors and direct peers).
 pub const SILENCE_CAPACITY: usize = 256;
 
+/// Silence pings a worker sends at once; more due pings wait for a later turn.
+pub const MAX_PINGS_IN_FLIGHT: usize = 16;
+
+/// Orphan copy offers a worker sends at once.
+pub const MAX_OFFERS_IN_FLIGHT: usize = 4;
+
 /// How long an entry outlives its last event.
 pub(crate) const SILENCE_TTL: Duration = Duration::from_secs(60);
 
