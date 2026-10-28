@@ -201,9 +201,12 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 	}
 
 	// Remove what this operator applied under the pre-rename names once the
-	// new DaemonSet is observed live; its creation event requeues this
-	// component. A config with a UID was read live.
-	if _, err := planRenamedCleanup(ctx, env, plan, config.UID != ""); err != nil {
+	// new DaemonSet is observed live. A config with a UID was read live. The
+	// cleanup is staged across passes and the old objects are not watched, so
+	// a pending cleanup requeues shortly rather than waiting for the hourly
+	// resync.
+	cleaning, err := planRenamedCleanup(ctx, env, plan, config.UID != "")
+	if err != nil {
 		return nil, component.Result{}, err
 	}
 
@@ -218,6 +221,12 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	if waiting {
 		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer DaemonSet placement", 30*time.Second), nil
+	}
+
+	if cleaning {
+		// The new installation is in place; only pre-rename leftovers remain,
+		// so this stays ready and just re-checks soon.
+		return plan, component.ReconciledAfter("Racer dataplane installation reconciled; removing pre-rename objects", pendingRequeue), nil
 	}
 
 	return plan, component.ReconciledAfter("Racer dataplane installation reconciled", time.Hour), nil

@@ -5,6 +5,7 @@ package racer
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -71,6 +72,24 @@ func TestRenamedObjectsAreRemoved(t *testing.T) {
 	require.NotContains(t, config.Data, "RACER_DATAPLANE_NVIDIA")
 
 	require.True(t, exists(t, env, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}}))
+}
+
+func TestRenamedCleanupRequeuesUntilDone(t *testing.T) {
+	ns := "custom-system"
+	env := testEnv(t, append(renamedObjects(ns, managed), cacheObject("cache"))...)
+	initialize(t, env)
+
+	// Old objects remain after the replacement is live: re-check soon.
+	plan, result := planResult(t, env)
+	require.True(t, result.Ready)
+	require.Equal(t, pendingRequeue, result.RequeueAfter)
+	persist(t, env, plan)
+
+	settle(t, env)
+
+	_, result = planResult(t, env)
+	require.True(t, result.Ready)
+	require.Equal(t, time.Hour, result.RequeueAfter)
 }
 
 func TestRenamedCleanupWaitsForNewDaemonSet(t *testing.T) {
