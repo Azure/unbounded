@@ -25,7 +25,7 @@ use racer_cluster_control::{
     },
     limits,
     step::{
-        admission::{Admit, Body, Gate, Poll, WriteQueue, body_for, start_poll},
+        admission::{Admit, Body, Poll, WriteQueue, body_for, start_poll},
         authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
         primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
         seat::{self as rules, Follower, Lottery, SeatRenew},
@@ -368,7 +368,7 @@ struct Seat {
     /// Last sequence the holder's follower installed and served.
     lease_served: Option<u64>,
     writes: WriteQueue<WriteWaiter>,
-    bootstraps: Gate,
+    bootstraps: WriteQueue<()>,
     polls: HashSet<u32>,
     /// `lease_served` while the holder is alive and holds the seat, as the
     /// clients last saw it.
@@ -568,7 +568,7 @@ impl ControlSim {
                     },
                     lease_served: None,
                     writes: WriteQueue::new(limits::MAX_WRITES, limits::MAX_WRITE_WAITERS),
-                    bootstraps: Gate::new(limits::MAX_BOOTSTRAPS),
+                    bootstraps: WriteQueue::new(limits::MAX_BOOTSTRAPS, 0),
                     polls: HashSet::new(),
                     served: None,
                     waiters: Vec::new(),
@@ -868,7 +868,7 @@ impl ControlSim {
             }
             Ev::Enroll(c, e) if self.live(c, e) => self.enroll(c, e, now),
             Ev::Enrolled(c, e, s) if self.live(c, e) => {
-                self.seats[s as usize].bootstraps.put();
+                self.seats[s as usize].bootstraps.release(|_| true);
                 self.state[c as usize] = State::Polling;
                 self.seat[c as usize] = s;
                 self.attempts[c as usize] = 0;
@@ -885,7 +885,9 @@ impl ControlSim {
                 }
                 self.poll(c, e, now);
             }
-            Ev::Enrolled(_, _, s) => self.seats[s as usize].bootstraps.put(),
+            Ev::Enrolled(_, _, s) => {
+                self.seats[s as usize].bootstraps.release(|_| true);
+            }
             Ev::Poll(c, e) if self.live(c, e) => self.poll(c, e, now),
             Ev::Delivered(c, e, s, seq, mv, hash) => {
                 self.release_write(s, now);
@@ -946,7 +948,7 @@ impl ControlSim {
             return;
         };
         self.state[c as usize] = State::Enrolling;
-        if !self.seats[s as usize].bootstraps.try_take() {
+        if !self.seats[s as usize].bootstraps.try_take(|_| true) {
             let d = self.backoff(c);
             self.engine.after(d, Ev::Enroll(c, e));
             return;
@@ -957,7 +959,7 @@ impl ControlSim {
             if self.authorize(c, s, now, &mut latency) {
                 self.authorized[c as usize] += 1;
             } else {
-                self.seats[s as usize].bootstraps.put();
+                self.seats[s as usize].bootstraps.release(|_| true);
                 let d = self.backoff(c);
                 self.engine.after(d, Ev::Enroll(c, e));
                 return;

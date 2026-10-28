@@ -446,7 +446,8 @@ mod tests {
         assert!(!b.try_reserve(5, s(10)));
         // 429s within CUT_INTERVAL count once.
         b.throttled(s(500));
-        assert_eq!(b.qps, 80.0);
+        // Not halved again (80 plus 0.49 s of recovery).
+        assert!((80.0..85.0).contains(&b.qps), "{}", b.qps);
         for i in 0..10 {
             b.throttled(s(1100 + i * 1000));
         }

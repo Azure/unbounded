@@ -10,30 +10,6 @@
 use racer_control_wire::ProtocolFailure;
 use std::collections::{HashSet, VecDeque};
 
-/// A counting gate without queuing, the pure core of `exec::Slots`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Gate {
-    pub used: usize,
-    pub capacity: usize,
-}
-
-impl Gate {
-    pub const fn new(capacity: usize) -> Self {
-        Self { used: 0, capacity }
-    }
-
-    /// Take a slot. Fails when full.
-    pub fn try_take(&mut self) -> bool {
-        let free = self.used < self.capacity;
-        self.used += usize::from(free);
-        free
-    }
-
-    pub fn put(&mut self) {
-        self.used = self.used.saturating_sub(1);
-    }
-}
-
 /// Outcome of [`WriteQueue::admit`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admit {
@@ -45,9 +21,9 @@ pub enum Admit {
     Full,
 }
 
-/// A [`Gate`] with a bounded FIFO of waiters, the pure core of the queued
+/// A counting gate with a bounded FIFO of waiters, the pure core of
 /// `exec::Slots`. A released slot passes straight to the oldest live waiter,
-/// so the gate count does not drop and a newcomer cannot jump the queue.
+/// so the count does not drop and a newcomer cannot jump the queue.
 ///
 /// Waiters that give up (deadline, disconnect) are not removed eagerly:
 /// `live` filters them at [`WriteQueue::release`] and
@@ -56,7 +32,9 @@ pub enum Admit {
 /// even when every waiter gives up.
 #[derive(Clone, Debug)]
 pub struct WriteQueue<T> {
-    pub gate: Gate,
+    /// Slots held.
+    pub used: usize,
+    pub capacity: usize,
     pub max_waiting: usize,
     waiting: VecDeque<T>,
 }
@@ -64,7 +42,8 @@ pub struct WriteQueue<T> {
 impl<T> WriteQueue<T> {
     pub fn new(capacity: usize, max_waiting: usize) -> Self {
         Self {
-            gate: Gate::new(capacity),
+            used: 0,
+            capacity,
             max_waiting,
             waiting: VecDeque::new(),
         }
@@ -80,7 +59,9 @@ impl<T> WriteQueue<T> {
     /// are queued (FIFO fairness).
     pub fn try_take(&mut self, mut live: impl FnMut(&T) -> bool) -> bool {
         self.trim(&mut live);
-        self.waiting.is_empty() && self.gate.try_take()
+        let free = self.waiting.is_empty() && self.used < self.capacity;
+        self.used += usize::from(free);
+        free
     }
 
     /// Take a slot now, or queue `waiter` when the queue has room.
@@ -103,7 +84,7 @@ impl<T> WriteQueue<T> {
                 return Some(w);
             }
         }
-        self.gate.put();
+        self.used = self.used.saturating_sub(1);
         None
     }
 
@@ -187,12 +168,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gates_bound_and_release() {
-        let mut g = Gate::new(2);
-        assert!(g.try_take() && g.try_take());
-        assert!(!g.try_take());
-        g.put();
-        assert!(g.try_take());
+    fn unqueued_gate_bounds_and_releases() {
+        let all = |_: &u32| true;
+        let mut g = WriteQueue::new(2, 0);
+        assert!(g.try_take(all) && g.try_take(all));
+        assert!(!g.try_take(all));
+        assert_eq!(g.release(all), None);
+        assert!(g.try_take(all));
         assert_eq!(g.used, 2);
     }
 
@@ -211,12 +193,12 @@ mod tests {
         assert!(!q.try_take(all));
         // Handoff keeps the gate full and goes oldest first.
         assert_eq!(q.release(all), Some(3));
-        assert_eq!(q.gate.used, 2);
+        assert_eq!(q.used, 2);
         // Dead waiters are skipped.
         assert_eq!(q.release(|w| *w != 4), Some(5));
         assert_eq!(q.waiting(), 0);
         assert_eq!(q.release(all), None);
-        assert_eq!(q.gate.used, 1);
+        assert_eq!(q.used, 1);
         assert_eq!(q.admit(7, all), Admit::Take);
         assert_eq!(q.admit(8, all), Admit::Wait);
         assert_eq!(q.take_waiting(), vec![8]);
@@ -237,7 +219,7 @@ mod tests {
         assert_eq!(q.admit(4, |w| *w != 2), Admit::Wait);
         // All gave up: release frees the gate, try_take then succeeds.
         assert_eq!(q.release(|_| false), None);
-        assert_eq!(q.gate.used, 0);
+        assert_eq!(q.used, 0);
         assert!(q.try_take(|_| false));
         // A zero-length queue never waits.
         let mut z = WriteQueue::new(0, 0);

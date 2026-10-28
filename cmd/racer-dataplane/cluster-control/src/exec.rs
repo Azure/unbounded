@@ -516,7 +516,7 @@ impl Slots {
     /// Slots held.
     #[cfg(test)]
     pub fn used(&self) -> usize {
-        self.0.borrow().gate.used
+        self.0.borrow().used
     }
 
     /// Take a slot, waiting in FIFO order until `at`. `None` when the queue
