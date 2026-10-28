@@ -95,15 +95,24 @@ fn direct_request(suffix: &str, fields: &str) -> Vec<u8> {
 
 /// A fixture whose fake origin serves `body` as version "v1".
 fn direct_fixture(body: Vec<u8>, gpu: Option<Rc<dyn GpuService>>) -> Fixture {
+    direct_fixture_with(body, |responses| match gpu {
+        Some(gpu) => responses.with_gpu(gpu),
+        None => responses,
+    })
+}
+
+/// A fixture whose fake origin serves `body`, with `setup` applied to the
+/// worker's responses.
+fn direct_fixture_with(body: Vec<u8>, setup: impl FnOnce(Responses) -> Responses) -> Fixture {
     let mut fixture = Fixture::new();
     let delivery = Rc::new(Delivery::new(
         fixture.reactor.clone(),
         Duration::from_secs(2),
     ));
-    let mut responses = Responses::new(fixture.listeners.io.clone(), delivery.clone());
-    if let Some(gpu) = gpu {
-        responses = responses.with_gpu(gpu);
-    }
+    let responses = setup(Responses::new(
+        fixture.listeners.io.clone(),
+        delivery.clone(),
+    ));
     fixture.listeners.responses = Rc::new(responses);
     let worker = ReadWorker::new(
         definition(),

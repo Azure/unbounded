@@ -734,3 +734,263 @@ fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
     assert_eq!(counter(&helper.counters().decrypted), 0);
     assert_idle(&fixture, &helper, default_slots());
 }
+
+/// A loader on `count` simulated GPUs that counts its calls.
+fn counted_loader(count: u8, calls: &Arc<std::sync::atomic::AtomicUsize>) -> crate::gpu::Loader {
+    let calls = calls.clone();
+    Box::new(move || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let devices: Vec<SimDevice> = (0..count).map(SimDevice::new).collect();
+        let simulation = Simulation::new(devices);
+        let environment = simulation.enter();
+        SIM.with(|sim| *sim.borrow_mut() = Some((simulation, environment)));
+        racer_gpu::Gpu::load()
+    })
+}
+
+/// The process GPU slot for `mode` in a `cuda` build, as the app makes it.
+fn slot(
+    mode: GpuMode,
+    loader: crate::gpu::Loader,
+    telemetry: Arc<crate::gpu_telemetry::GpuTelemetry>,
+    links: Option<Arc<crate::rdma::LinkNode>>,
+) -> crate::error::Result<Arc<crate::gpu_slot::GpuSlot>> {
+    let mut config = crate::test_support::cluster::config(links.is_some());
+    config.enable_gpu = mode;
+    crate::app::gpu_slot(&config, true, telemetry, links, loader)
+}
+
+fn lazy_fixture(body: Vec<u8>, slot: &Arc<crate::gpu_slot::GpuSlot>) -> Fixture {
+    let slot = slot.clone();
+    direct_fixture_with(body, move |responses| responses.with_lazy_gpu(slot))
+}
+
+fn render(telemetry: &crate::gpu_telemetry::GpuTelemetry) -> String {
+    let mut out = String::new();
+    telemetry.write(&mut out).unwrap();
+    out
+}
+
+fn calls_now(calls: &std::sync::atomic::AtomicUsize) -> usize {
+    calls.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+/// `auto` touches no GPU at startup, for host reads, or for metrics. The
+/// first `gpu-read` starts the helper once, and later reads reuse it.
+fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
+    let links = Arc::new(crate::rdma::LinkNode::default());
+    let slot = slot(
+        GpuMode::Auto,
+        counted_loader(1, &calls),
+        telemetry.clone(),
+        Some(links.clone()),
+    )
+    .unwrap();
+    telemetry.attach_slot(slot.clone());
+    assert!(slot.standby());
+    assert!(slot.get().is_none());
+    let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+    // A host read, and a metrics scrape, never start it.
+    let memfd = Memfd::new();
+    let output = exchange(
+        &fixture,
+        &direct_request(
+            "host-read",
+            "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\nRacer-Page-Credits: 1\r\n",
+        ),
+        &[memfd.file.as_raw_fd()],
+    );
+    assert!(split(&output).0.starts_with("http/1.1 200"));
+    settle(&fixture);
+    let text = render(&telemetry);
+    assert!(text.contains("racer_gpu_standby 1\n"), "{text}");
+    assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");
+    assert_eq!(calls_now(&calls), 0);
+    assert!(!links.gpu_landing_configured());
+    // The first gpu-read starts it. A host buffer is not a GPU allocation,
+    // so the import rejects this one as invalid.
+    let output = exchange(
+        &fixture,
+        &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+        &[memfd.file.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+    settle(&fixture);
+    assert_eq!(calls_now(&calls), 1);
+    assert!(!slot.standby());
+    let helper = slot.get().unwrap().clone();
+    let text = render(&telemetry);
+    assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
+    assert!(text.contains("racer_gpu_enabled 1\n"), "{text}");
+    // RDMA landing was configured for the rails, and marked pending.
+    assert!(links.gpu_landing_configured());
+    assert!(links.take_landing_pending());
+    use crate::gpu_telemetry::GpuReadOutcome;
+    let gpu = fixture.listeners.metrics.gpu();
+    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 1);
+    // Later reads use the started helper.
+    let allocation = allocate(&helper, 0, GRANULE);
+    let output = exchange(
+        &fixture,
+        &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+        &[allocation.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(read_allocation(&allocation, 0, 5), b"hello");
+    settle(&fixture);
+    assert_released(&helper);
+    assert_eq!(calls_now(&calls), 1);
+    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 1);
+}
+
+#[test]
+/// Concurrent first `gpu-read` requests share one start.
+fn concurrent_first_gpu_reads_start_the_gpu_once() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let slot = slot(
+        GpuMode::Auto,
+        counted_loader(1, &calls),
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+    let memfd = Memfd::new();
+    let request = direct_request("gpu-read", &fields("", 0, 5, GRANULE));
+    let mut sockets: Vec<_> = (0..4)
+        .map(|_| {
+            let socket = fixture.connect();
+            send_with_fds(&socket, &request, &[memfd.file.as_raw_fd()]);
+            socket
+        })
+        .collect();
+    for socket in &mut sockets {
+        let output = fixture.receive(socket, true);
+        let (head, _) = split(&output);
+        // A host buffer is not a GPU allocation; the helper did start.
+        assert!(head.starts_with("http/1.1 400"), "{head}");
+    }
+    drop(sockets);
+    settle(&fixture);
+    assert_eq!(calls_now(&calls), 1);
+    assert!(slot.get().is_some());
+}
+
+#[test]
+/// A failed start or a node with no usable GPU leaves `gpu-read` off (501)
+/// for good, so clients use host reads, and it is never retried.
+fn auto_start_failure_is_501_and_not_retried() {
+    let failing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = failing.clone();
+    let failed: crate::gpu::Loader = Box::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(racer_gpu::Error::Unavailable)
+    });
+    let empty = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (loader, calls) in [(failed, &failing), (counted_loader(0, &empty), &empty)] {
+        let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
+        let links = Arc::new(crate::rdma::LinkNode::default());
+        let slot = slot(
+            GpuMode::Auto,
+            loader,
+            telemetry.clone(),
+            Some(links.clone()),
+        )
+        .unwrap();
+        telemetry.attach_slot(slot.clone());
+        let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+        let memfd = Memfd::new();
+        for _ in 0..3 {
+            let output = exchange(
+                &fixture,
+                &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+                &[memfd.file.as_raw_fd()],
+            );
+            let (head, _) = split(&output);
+            assert!(head.starts_with("http/1.1 501"), "{head}");
+            settle(&fixture);
+        }
+        assert_eq!(calls_now(calls), 1);
+        assert!(!slot.standby());
+        assert!(slot.get().is_none());
+        assert!(!links.gpu_landing_configured());
+        use crate::gpu_telemetry::GpuReadOutcome;
+        let gpu = fixture.listeners.metrics.gpu();
+        assert_eq!(gpu.requests(GpuReadOutcome::NotEnabled), 3);
+        let text = render(&telemetry);
+        assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
+        assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");
+    }
+}
+
+#[test]
+/// `true` starts eagerly and fails startup without a usable GPU; `false`
+/// and an `auto` build without `cuda` never load a driver.
+fn required_starts_eagerly_and_off_modes_never_load() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let links = Arc::new(crate::rdma::LinkNode::default());
+    let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
+    let required = slot(
+        GpuMode::Required,
+        counted_loader(1, &calls),
+        telemetry.clone(),
+        Some(links.clone()),
+    )
+    .unwrap();
+    assert_eq!(calls_now(&calls), 1);
+    assert!(!required.standby());
+    assert!(required.get().is_some());
+    assert!(links.gpu_landing_configured());
+    assert!(render(&telemetry).contains("racer_gpu_enabled 1\n"));
+    {
+        let count = 0;
+        let none = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert!(
+            slot(
+                GpuMode::Required,
+                counted_loader(count, &none),
+                Default::default(),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(calls_now(&none), 1);
+    }
+    assert!(
+        slot(
+            GpuMode::Required,
+            Box::new(|| Err(racer_gpu::Error::Unavailable)),
+            Default::default(),
+            None
+        )
+        .is_err()
+    );
+    let off = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let disabled = slot(
+        GpuMode::Disabled,
+        counted_loader(1, &off),
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    assert!(!disabled.standby());
+    assert!(disabled.get().is_none());
+    let mut config = crate::test_support::cluster::config(false);
+    config.enable_gpu = GpuMode::Auto;
+    let unbuilt = crate::app::gpu_slot(
+        &config,
+        false,
+        Default::default(),
+        None,
+        counted_loader(1, &off),
+    )
+    .unwrap();
+    assert!(!unbuilt.standby());
+    assert!(futures::executor::block_on(unbuilt.get_or_start()).is_none());
+    assert_eq!(calls_now(&off), 0);
+}
