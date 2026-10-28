@@ -1839,7 +1839,7 @@ impl ControlSim {
         self.primary.rv += 1;
         self.primary.spec = election::claim(&obs.spec, &format!("p{pod}"), &self.wall_micro());
         self.primary.holder = Some(pod);
-        let transitions = u64::from(self.primary.spec.transitions);
+        let transitions = self.primary.spec.transitions;
         let last = self.last_terms;
         self.invariants.check(
             "ctl_terms_monotonic",

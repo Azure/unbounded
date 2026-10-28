@@ -183,7 +183,7 @@ pub struct NodeConfig {
     pub hedge_delay_ns: Nanos,
     /// Speculative bytes per node (production `page_hedge_bytes`, default one `DUPLICATE_BYTES`).
     pub hedge_bytes: u64,
-    // Ablation switches: production always has these on (except `lineage_slack`); set false to
+    // Ablation switches: production always has these on; set false to
     // measure without the fix.
     /// Overflow fan-out to page helpers.
     pub fanout: bool,
