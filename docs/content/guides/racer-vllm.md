@@ -24,31 +24,22 @@ client falls back to host memory, then to a plain stream.
 
 ## 1. Turn On GPU Mode
 
-Build the dataplane image with CUDA support and push it to the registry the
-operator uses:
-
-```bash
-podman build --build-arg RACER_NATIVE_CUDA=true \
-  -t <registry>/racer-dataplane:<tag> -f images/racer-dataplane/Containerfile .
-```
-
-The CUDA image also installs NVIDIA's cuFile library (`libcufile-12-9`) for
-GPUDirect Storage reads, because the NVIDIA container runtime injects only the
-driver libraries. cuFile uses its packaged default configuration, except that
-Racer turns off cuFile's compatibility mode: without GPUDirect Storage
-(`nvidia-fs` or PCIe P2PDMA) on the host, disk reads use Racer's own host
-memory path instead of cuFile's slower POSIX fallback. Set
-`CUFILE_ALLOW_COMPAT_MODE=true` on the dataplane to keep cuFile's fallback.
-cuFile reads the filesystem type from udev, so the dataplane mounts the host's
-`/run/udev` read-only.
-
-GPU mode is `auto` by default. To make the dataplane fail when it finds no GPU,
-set it to `true`:
+Run the CUDA dataplane image and turn GPU mode on. Release and nightly builds
+publish `racer-dataplane-cuda` next to `racer-dataplane`. With
+`RACER_DATAPLANE_CUDA` set, the operator runs
+`<registry>/racer-dataplane-cuda:<tag>`:
 
 ```bash
 kubectl -n unbounded-system patch configmap racer-dataplane-config \
-  --type merge -p '{"data":{"RACER_ENABLE_GPU":"true"}}'
+  --type merge -p '{"data":{"RACER_DATAPLANE_CUDA":"true","RACER_ENABLE_GPU":"true"}}'
 ```
+
+`RACER_ENABLE_GPU` is `auto` by default. `true` makes the dataplane fail when
+it finds no GPU, so a broken setup is not silent.
+
+The CUDA image also has NVIDIA's cuFile library and a `cufile.json` for
+GPUDirect Storage. Without GPUDirect Storage on the host, disk reads go through
+host memory.
 
 The dataplane gets the NVIDIA driver libraries without requesting a GPU. This
 is on by default (`RACER_DATAPLANE_NVIDIA: env` in `racer-dataplane-config`). See
@@ -70,7 +61,7 @@ metadata:
 spec:
   containers:
     - name: vllm
-      image: <your vLLM image with racer-vllm installed>
+      image: <registry>/racer-vllm:<tag>
       command:
         - sh
         - -c
