@@ -487,12 +487,13 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 		return
 	}
 
-	metadata, options, done := s.prepareResponse(w, r, id, ref, request, offset)
+	// One retry budget covers Stat, Get, and body resumption for this request.
+	retry := s.retry.start()
+
+	metadata, options, done := s.prepareResponse(w, r, id, ref, request, offset, retry)
 	if done {
 		return
 	}
-
-	retry := s.retry.start()
 
 	value, err := s.getWithRetry(r.Context(), retry, request, options...)
 	if err != nil {
@@ -538,7 +539,7 @@ func (s *Handler) ServeContent(w http.ResponseWriter, r *http.Request, ref iface
 // prepareResponse handles HEAD and validates the snapshot needed for blob resume.
 // A true done result means it already wrote a final response; no Object is open.
 // Full GETs get metadata from Get instead of issuing a redundant Stat.
-func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id string, ref ifaces.OriginRef, request racersdk.Request, offset int64) (racersdk.Metadata, []racersdk.ReadOptions, bool) {
+func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id string, ref ifaces.OriginRef, request racersdk.Request, offset int64, retry *retryState) (racersdk.Metadata, []racersdk.ReadOptions, bool) {
 	if r.Method != http.MethodHead && offset == 0 {
 		if ref.Kind == ifaces.KindManifest {
 			return racersdk.Metadata{}, []racersdk.ReadOptions{{SmallObject: true}}, false
@@ -547,7 +548,7 @@ func (s *Handler) prepareResponse(w http.ResponseWriter, r *http.Request, id str
 		return racersdk.Metadata{}, nil, false
 	}
 
-	metadata, err := s.statWithRetry(r.Context(), s.retry.start(), request)
+	metadata, err := s.statWithRetry(r.Context(), retry, request)
 	if err != nil {
 		s.logRacerFailure(id, "stat", err, -1, 0)
 		s.racerError(w, r, ref, err)

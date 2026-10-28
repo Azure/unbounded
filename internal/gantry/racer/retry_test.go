@@ -205,6 +205,42 @@ func TestRacerRetryStatTransientThenSuccess(t *testing.T) {
 	}
 }
 
+// A ranged GET retries Stat and Get against one shared budget, so the Stat
+// retry leaves no room for a Get retry.
+func TestRacerRetryRangedGetSharesBudget(t *testing.T) {
+	data := []byte("abc")
+	client := &retryClient{
+		Client: racerFakeClient(t, staticOrigin(t, data)),
+		statErr: func(call int) error {
+			if call == 1 {
+				return unavailable()
+			}
+
+			return nil
+		},
+		getErr: func(int, []racersdk.ReadOptions) error { return unavailable() },
+	}
+
+	var stages retryStages
+
+	// Each delay is in [1ms, 2ms], so one retry fits the budget and two do not.
+	h := retryHandler(client, 2*time.Millisecond, &stages)
+	h.retry.base = 2 * time.Millisecond
+	h.retry.cap = 2 * time.Millisecond
+
+	ref := retryRef(racerDigest(data))
+	ref.Offset = 1
+
+	rec, aborted := serveRetry(h, httptest.NewRequest(http.MethodGet, "/", nil), ref)
+	if aborted || rec.Code == http.StatusOK || rec.Code == http.StatusPartialContent {
+		t.Fatalf("aborted=%v status=%d", aborted, rec.Code)
+	}
+
+	if client.stats != 2 || stages.count("stat") != 1 || client.gets != 1 || stages.count("get") != 0 {
+		t.Fatalf("stats=%d stat retries=%d gets=%d get retries=%d", client.stats, stages.count("stat"), client.gets, stages.count("get"))
+	}
+}
+
 func TestRacerRetryGivesUpAfterBudget(t *testing.T) {
 	data := []byte("abc")
 	client := &retryClient{
