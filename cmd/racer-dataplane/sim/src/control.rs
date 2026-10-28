@@ -20,15 +20,15 @@ use racer_cluster_control::{
         election::{self, LeaseObservation, LeaseSpec},
         keyring::Policy,
         members::{NodeInfo, Owner, Ownership, PodInfo, Readiness},
-        publication::Image,
-        state::{self, StateRecord, Term, Writer},
+        publication::{Image, Record},
+        state::{self, StateError, StateRecord, Term, Writer},
     },
     limits,
     step::{
         admission::{Admit, Body, Poll, WriteQueue, body_for, start_poll},
         authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
         primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
-        seat::{self as rules, Follower, Lottery, SeatRenew},
+        seat::{self as rules, Lottery, SeatRenew},
     },
 };
 use racer_control_wire::ProtocolFailure;
@@ -399,6 +399,59 @@ struct Pod {
     woken_during_read: bool,
     lease_fresh_until: Option<u64>,
     primary: Option<Writer>,
+}
+
+/// Committed state as a seat follower holds it, the fields production
+/// keeps in `shared::Serving` without payloads.
+#[derive(Clone, Debug, Default)]
+struct Follower {
+    high_water: Option<StateRecord>,
+    record: Option<StateRecord>,
+    confirmed: Option<Instant>,
+    image: Option<Record>,
+    /// Records installed so far (see `rules::superseded`).
+    installs: u64,
+}
+
+impl Follower {
+    /// Install a record confirmed at `confirmed` (`seat::install_record`).
+    /// A rollback fails closed and keeps the high water mark.
+    fn install(&mut self, record: StateRecord, confirmed: Instant) -> Result<(), StateError> {
+        if let Err(e) = rules::admit(self.high_water.as_ref(), &record) {
+            (self.record, self.confirmed, self.image) = (None, None, None);
+            return Err(e);
+        }
+        self.high_water = Some(record.clone());
+        self.record = Some(record);
+        self.confirmed = Some(confirmed);
+        self.installs += 1;
+        Ok(())
+    }
+
+    /// Install the image for the current record, if it matches.
+    fn install_image(&mut self, image: Record) -> bool {
+        let ok = self
+            .record
+            .as_ref()
+            .is_some_and(|r| r.sequence == image.sequence && r.content_hash == image.content_hash);
+        if ok {
+            self.image = Some(image);
+        }
+        ok
+    }
+
+    /// Serving: fresh committed state and a matching image.
+    fn ready(&self, now: Instant) -> bool {
+        self.confirmed
+            .is_some_and(|c| now.duration_since(c) < limits::STATE_FRESHNESS)
+            && self.record.as_ref().is_some_and(|r| {
+                !rules::need_image(r, self.image.as_ref(), false)
+                    && self
+                        .image
+                        .as_ref()
+                        .is_some_and(|i| i.sequence == r.sequence)
+            })
+    }
 }
 
 impl Pod {
@@ -2436,6 +2489,43 @@ mod tests {
             &[("ctl_base_hash_mismatches", 1), ("ctl_delta_replies", 1)],
         );
         assert_eq!(r["invariants"]["hard_failures"], 0);
+    }
+
+    /// A rollback fails closed and is not an install; the high water mark
+    /// stays. Serving needs fresh state and the matching image.
+    #[test]
+    fn follower_installs_and_serves() {
+        let record = |sequence: u64| StateRecord {
+            version: state::VERSION,
+            cluster: "c".into(),
+            sequence,
+            membership_version: sequence,
+            content_hash: "a".repeat(64),
+            membership_hash: "b".repeat(64),
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let mut f = Follower::default();
+        f.install(record(4), t).unwrap();
+        f.install(record(5), t).unwrap();
+        assert_eq!(f.installs, 2);
+        assert!(f.install(record(4), t).is_err());
+        assert_eq!(f.installs, 2, "a refused record is not an install");
+        assert!(f.record.is_none());
+        assert_eq!(f.high_water.as_ref().unwrap().sequence, 5);
+        let r = record(6);
+        let img = Record {
+            sequence: 6,
+            membership_version: 6,
+            content_hash: r.content_hash.clone(),
+            membership_hash: r.membership_hash.clone(),
+        };
+        assert!(!f.install_image(img.clone()));
+        f.install(r, t).unwrap();
+        assert!(!f.ready(t));
+        assert!(f.install_image(img));
+        assert!(f.ready(t));
+        assert!(!f.ready(t + limits::STATE_FRESHNESS));
     }
 
     #[test]

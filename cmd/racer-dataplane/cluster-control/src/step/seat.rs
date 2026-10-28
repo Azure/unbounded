@@ -381,68 +381,6 @@ pub fn need_image(record: &StateRecord, image: Option<&Record>, is_primary: bool
             .is_none_or(|i| i.sequence != record.sequence || i.content_hash != record.content_hash)
 }
 
-/// Committed state as a seat holds it, without payloads. The simulator uses
-/// it directly; production keeps the same fields in `shared::Serving`.
-#[derive(Clone, Debug, Default)]
-pub struct Follower {
-    pub high_water: Option<StateRecord>,
-    pub record: Option<StateRecord>,
-    pub confirmed: Option<Instant>,
-    pub image: Option<Record>,
-    /// Records installed so far (see [`superseded`]).
-    pub installs: u64,
-}
-
-impl Follower {
-    /// Install a record confirmed at `confirmed`.
-    pub fn install(&mut self, record: StateRecord, confirmed: Instant) -> Result<(), StateError> {
-        if let Err(e) = admit(self.high_water.as_ref(), &record) {
-            self.fail_closed();
-            return Err(e);
-        }
-        self.high_water = Some(record.clone());
-        self.record = Some(record);
-        self.confirmed = Some(confirmed);
-        self.installs += 1;
-        Ok(())
-    }
-
-    /// Stop serving. The high water mark is kept.
-    pub fn fail_closed(&mut self) {
-        self.record = None;
-        self.confirmed = None;
-        self.image = None;
-    }
-
-    /// Install a verified image for the current record. Returns false when
-    /// it does not match.
-    pub fn install_image(&mut self, image: Record) -> bool {
-        let ok = self
-            .record
-            .as_ref()
-            .is_some_and(|r| r.sequence == image.sequence && r.content_hash == image.content_hash);
-        if ok {
-            self.image = Some(image);
-        }
-        ok
-    }
-
-    /// Serving: fresh committed state and a matching image.
-    pub fn ready(&self, now: Instant) -> bool {
-        let fresh = self
-            .confirmed
-            .is_some_and(|c| now.duration_since(c) < crate::limits::STATE_FRESHNESS);
-        fresh
-            && self.record.as_ref().is_some_and(|r| {
-                !need_image(r, self.image.as_ref(), false)
-                    && self
-                        .image
-                        .as_ref()
-                        .is_some_and(|i| i.sequence == r.sequence)
-            })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,13 +664,6 @@ mod tests {
         // Nothing installed during the read: a rollback is a rollback.
         assert!(!superseded(false, Some(&high), &record(4)));
         assert!(!superseded(true, None, &record(4)));
-        let mut f = Follower::default();
-        let now = Instant::now();
-        f.install(record(4), now).unwrap();
-        f.install(record(5), now).unwrap();
-        assert_eq!(f.installs, 2);
-        assert!(f.install(record(4), now).is_err());
-        assert_eq!(f.installs, 2, "a refused record is not an install");
     }
 
     #[test]
@@ -757,19 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn install_refuses_rollback_and_keeps_high_water() {
-        let t = Instant::now();
-        let mut f = Follower::default();
-        f.install(record(5), t).unwrap();
-        assert!(f.install(record(4), t).is_err());
-        assert!(f.record.is_none());
-        assert_eq!(f.high_water.as_ref().unwrap().sequence, 5);
-        f.install(record(6), t).unwrap();
-    }
-
-    #[test]
     fn image_rules() {
-        let t = Instant::now();
         let r = record(2);
         let img = Record {
             sequence: 2,
@@ -781,12 +700,8 @@ mod tests {
         assert!(!need_image(&r, None, true));
         assert!(!need_image(&record(0), None, false));
         assert!(!need_image(&r, Some(&img), false));
-        let mut f = Follower::default();
-        assert!(!f.install_image(img.clone()));
-        f.install(r, t).unwrap();
-        assert!(!f.ready(t));
-        assert!(f.install_image(img));
-        assert!(f.ready(t));
-        assert!(!f.ready(t + crate::limits::STATE_FRESHNESS));
+        assert!(admit(None, &r).is_ok());
+        assert!(admit(Some(&r), &record(3)).is_ok());
+        assert_eq!(admit(Some(&r), &record(1)), Err(StateError::Rollback));
     }
 }
