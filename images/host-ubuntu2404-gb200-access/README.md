@@ -28,6 +28,7 @@ target-hardware canary. The build verifies:
 - the source and package checksums;
 - Ubuntu `24.04` and kernel `6.14.0-1003-azure-nvidia` package versions;
 - the boot kernel symlink and rebuilt NVIDIA DKMS module;
+- NVIDIA module loading and device-node initialization before cloud-final;
 - the cloud-init user fragment schema;
 - the installed `ssh-import-id` package version;
 - the EFI GRUB entries and exact target-kernel boot, reaching userspace when

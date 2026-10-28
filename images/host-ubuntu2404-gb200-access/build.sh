@@ -80,6 +80,13 @@ customize_disk() {
     fi
     cmp "${script_dir}/assets/90-gb200-access-users.cfg" \
         "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
+    grep -qx nvidia_uvm "${root}/etc/modules-load.d/nvidia.conf"
+    grep -qx 'Before=cloud-final.service' \
+        "${root}/etc/systemd/system/nvidia-persistence-mode.service"
+    grep -qx 'ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0' \
+        "${root}/etc/systemd/system/nvidia-persistence-mode.service"
+    test -L \
+        "${root}/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
     test ! -s "${root}/etc/machine-id"
     if find "${root}/etc/ssh" -maxdepth 1 -name 'ssh_host_*_key' \
         -print -quit | grep -q .; then

@@ -55,6 +55,33 @@ find "/lib/modules/${kernel_release}/updates/dkms" \
     -name 'nvidia.ko*' -print -quit | grep -q .
 cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
 
+cat > /etc/modules-load.d/nvidia.conf <<'EOF'
+nvidia
+nvidia_modeset
+nvidia_uvm
+nvidia_drm
+EOF
+cat > /etc/systemd/system/nvidia-persistence-mode.service <<'EOF'
+[Unit]
+Description=Initialize NVIDIA devices and enable persistence mode
+After=systemd-modules-load.service
+Before=cloud-final.service
+ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
+ExecStartPre=/usr/bin/nvidia-modprobe -m
+ExecStart=/usr/bin/nvidia-smi -pm 1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+test -x /usr/bin/nvidia-modprobe
+test -x /usr/bin/nvidia-smi
+systemctl enable nvidia-persistence-mode.service
+
 rm -rf /tmp/packages /var/lib/cloud/*
 rm -f /etc/ssh/ssh_host_*
 : > /etc/machine-id
