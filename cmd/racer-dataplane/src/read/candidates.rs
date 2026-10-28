@@ -33,6 +33,7 @@ use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
 use racer_control_wire::NodeId;
+use racer_core::read::hints::OfferEnd;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -134,19 +135,6 @@ impl Drop for OfferFlight {
 /// Keyed by page and the target's owner rank (Known issue 51).
 pub(crate) type Notices =
     racer_core::read::hints::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
-
-/// How a copy offer ended (Known issue 50).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OfferEnd {
-    /// Not sent: this node is no longer an owner after rank 0.
-    Dropped,
-    /// The target answered `Miss`.
-    Delivered,
-    /// The target itself answered something else.
-    Refused,
-    /// A transport failure or a relay's answer: the route is cut.
-    Cut,
-}
 
 /// Copy offers a node sends at once; more due offers wait for a later turn.
 pub(crate) const MAX_OFFERS_IN_FLIGHT: usize = 4;
@@ -2535,7 +2523,10 @@ impl CandidatePolicy {
             let Ok(permit) = uring_runtime::drivers::reserve() else {
                 // No driver slot this turn: count it as a failed offer
                 // (local, so not a cut).
-                let _ = self.notices.borrow_mut().refused(due, &group, now);
+                let _ = self
+                    .notices
+                    .borrow_mut()
+                    .offer_result(due, OfferEnd::Refused, group, now);
                 return;
             };
             let flight = OfferFlight::new(self.offers.clone());
@@ -2546,22 +2537,17 @@ impl CandidatePolicy {
                 metrics.record(Event::OrphanOfferSent, 1);
                 let end = policy.offer(&due).await.unwrap_or(OfferEnd::Cut);
                 let now = uring_runtime::environment::now();
-                let mut notices = policy.notices.borrow_mut();
                 match end {
-                    OfferEnd::Dropped => notices.release(&group),
-                    OfferEnd::Delivered => {
-                        metrics.record(Event::OrphanOfferDelivered, 1);
-                        notices.reached(&group);
-                    }
-                    OfferEnd::Refused => {
+                    OfferEnd::Dropped => {}
+                    OfferEnd::Delivered => metrics.record(Event::OrphanOfferDelivered, 1),
+                    OfferEnd::Refused | OfferEnd::Cut => {
                         metrics.record(Event::OrphanOfferFailed, 1);
-                        let _ = notices.refused(due, &group, now);
-                    }
-                    OfferEnd::Cut => {
-                        metrics.record(Event::OrphanOfferFailed, 1);
-                        let _ = notices.cut(due, group, now);
                     }
                 }
+                let _ = policy
+                    .notices
+                    .borrow_mut()
+                    .offer_result(due, end, group, now);
                 Ok::<(), Error>(())
             }));
         }
@@ -2646,14 +2632,13 @@ impl CandidatePolicy {
                 &mut timed_out,
             )
             .await;
-        match response {
-            Ok(response) if response.origin().node() == peer => Some(true),
-            Ok(response) if matches!(response.response(), PeerResponse::Unavailable) => Some(false),
-            Ok(_) => None,
-            Err(_) if timed_out => Some(false),
-            Err(Error::DeadlineExceeded) => Some(false),
-            Err(_) => None,
-        }
+        racer_core::liveness::ping_verdict(match response {
+            Ok(response) => Ok((
+                response.origin().node() == peer,
+                matches!(response.response(), PeerResponse::Unavailable),
+            )),
+            Err(error) => Err(timed_out || matches!(error, Error::DeadlineExceeded)),
+        })
     }
 
     /// Send one copy offer for `due` to the page's current rank 0, and
@@ -2713,14 +2698,10 @@ impl CandidatePolicy {
                 RequestMode::FundedRoute,
             )
             .await;
-        Ok(match response {
-            Ok(response) if response.origin().node() != &target => OfferEnd::Cut,
-            Ok(response) if matches!(response.response(), PeerResponse::Miss) => {
-                OfferEnd::Delivered
-            }
-            Ok(_) => OfferEnd::Refused,
-            Err(_) => OfferEnd::Cut,
-        })
+        Ok(OfferEnd::of(response.ok().and_then(|response| {
+            (response.origin().node() == &target)
+                .then(|| matches!(response.response(), PeerResponse::Miss))
+        })))
     }
 
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {

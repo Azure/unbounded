@@ -187,12 +187,6 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
         }
     }
 
-    /// An offer to a target in `group` was delivered: the route works,
-    /// release the group.
-    pub fn reached(&mut self, group: &G) {
-        self.blocked.remove(group);
-    }
-
     /// Another exchange of this node with a member of `group` ended: a
     /// route failure (`cut`: a transport failure or a relay's answer)
     /// holds the group's offers for [`PROBE_HOLD`] (never shortening a
@@ -212,8 +206,8 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
         }
     }
 
-    /// A popped offer was not sent (the notice was dropped): release the
-    /// group's probe hold.
+    /// A popped offer was not sent (the notice was dropped), or was
+    /// delivered (the route works): release the group's probe hold.
     pub fn release(&mut self, group: &G) {
         self.blocked.remove(group);
     }
@@ -222,7 +216,7 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
     /// transport failure, or an answer a relay signed): schedule the next
     /// offer as [`Self::failed`] does and block the group until it is due
     /// (or for the next retry delay, when the notice is done).
-    pub fn cut(&mut self, due: Due<K, N>, group: G, now: Instant) -> Option<Instant> {
+    fn cut(&mut self, due: Due<K, N>, group: G, now: Instant) -> Option<Instant> {
         let delay = NOTICE_DELAYS[(due.tries + 1).min(NOTICE_TRIES - 1)];
         let next = self.failed(due, now);
         self.block(group, next.unwrap_or(now + delay), now);
@@ -232,9 +226,29 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
     /// A failure that says nothing about the route (the target itself
     /// refused): release the group's probe hold and schedule the next offer
     /// as [`Self::failed`] does.
-    pub fn refused(&mut self, due: Due<K, N>, group: &G, now: Instant) -> Option<Instant> {
+    fn refused(&mut self, due: Due<K, N>, group: &G, now: Instant) -> Option<Instant> {
         self.blocked.remove(group);
         self.failed(due, now)
+    }
+
+    /// `due`'s offer to a target in `group` ended with `end`. Returns when
+    /// the next offer for it is due (`None`: delivered, dropped, or out of
+    /// tries).
+    pub fn offer_result(
+        &mut self,
+        due: Due<K, N>,
+        end: OfferEnd,
+        group: G,
+        now: Instant,
+    ) -> Option<Instant> {
+        match end {
+            OfferEnd::Dropped | OfferEnd::Delivered => {
+                self.release(&group);
+                None
+            }
+            OfferEnd::Refused => self.refused(due, &group, now),
+            OfferEnd::Cut => self.cut(due, group, now),
+        }
     }
 
     fn block(&mut self, group: G, until: Instant, now: Instant) {
@@ -425,6 +439,32 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
         }
         for (level, queue) in self.queues.iter_mut().enumerate() {
             queue.retain(|item| Self::live(entries, level, item));
+        }
+    }
+}
+
+/// How a copy offer ended (Known issue 50).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfferEnd {
+    /// Not sent: this node is no longer an owner after rank 0.
+    Dropped,
+    /// The target answered `Miss`.
+    Delivered,
+    /// The target itself answered something else (shed, behind).
+    Refused,
+    /// A transport failure or timeout, or a relay's answer: the route is cut.
+    Cut,
+}
+
+impl OfferEnd {
+    /// Classify an offer's answer: `Some(miss)` when the target itself
+    /// signed it (`miss`: it answered `Miss`), `None` for a transport
+    /// failure, a timeout, or a relay's answer.
+    pub fn of(answer: Option<bool>) -> Self {
+        match answer {
+            Some(true) => Self::Delivered,
+            Some(false) => Self::Refused,
+            None => Self::Cut,
         }
     }
 }
@@ -690,12 +730,12 @@ mod notice_tests {
         assert_eq!(n.pop_open(at(now, 22), site), None);
         // Delivered: the group opens; the deferred ones, held behind the
         // probe, go with their tries once the probe hold ends.
-        n.reached(&1);
+        n.release(&1);
         assert_eq!(n.next_due(), Some(at(now, 22) + PROBE_HOLD));
         let later = at(now, 22) + PROBE_HOLD;
         let mut rest: Vec<(u64, usize)> = std::iter::from_fn(|| {
             n.pop_open(later, site).map(|d| {
-                n.reached(&1);
+                n.release(&1);
                 (d.key, d.tries)
             })
         })
@@ -706,6 +746,39 @@ mod notice_tests {
         all.sort();
         assert_eq!(all, vec![(1, 1), (2, 0), (3, 0)]);
         assert!(n.is_empty());
+    }
+
+    #[test]
+    fn offer_results() {
+        assert_eq!(OfferEnd::of(Some(true)), OfferEnd::Delivered);
+        assert_eq!(OfferEnd::of(Some(false)), OfferEnd::Refused);
+        assert_eq!(OfferEnd::of(None), OfferEnd::Cut);
+        let now = Instant::now();
+        let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(8);
+        n.note(1, 10, now);
+        let due = n.pop_open(at(now, 5), |_| 1).expect("due");
+        // A cut blocks the group until the next offer.
+        let next = n.offer_result(due, OfferEnd::Cut, 1, at(now, 5));
+        assert!(next.is_some());
+        assert_eq!(n.blocked(&1, at(now, 5)), next);
+        let due = n.pop_open(next.expect("next"), |_| 1).expect("due");
+        // Delivered and dropped offers release the group, nothing is due.
+        assert_eq!(
+            n.offer_result(due, OfferEnd::Delivered, 1, at(now, 30)),
+            None
+        );
+        assert_eq!(n.blocked(&1, at(now, 30)), None);
+        n.note(2, 10, at(now, 30));
+        let due = n.pop_open(at(now, 35), |_| 1).expect("due");
+        assert_eq!(n.offer_result(due, OfferEnd::Dropped, 1, at(now, 35)), None);
+        n.note(3, 10, at(now, 40));
+        let due = n.pop_open(at(now, 45), |_| 1).expect("due");
+        // A refusal spends a try without blocking the group.
+        assert!(
+            n.offer_result(due, OfferEnd::Refused, 1, at(now, 45))
+                .is_some()
+        );
+        assert_eq!(n.blocked(&1, at(now, 45)), None);
     }
 
     #[test]

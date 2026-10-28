@@ -31,13 +31,13 @@ use std::time::{Duration, Instant};
 use crate::phantom::{Phantom, SharedRoutes};
 use page_alloc::SegmentId;
 use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
-use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
+use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS, ping_verdict};
 use racer_core::read::Error;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
 use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
-    Due, NOTICE_LINKS, notice_indexes, notice_target, offer_noted, should_notice,
+    Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, offer_noted, should_notice,
 };
 use racer_core::read::hints::{
     MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets,
@@ -444,17 +444,6 @@ struct Fill {
 /// A due copy offer: keyed by page and the target's owner rank (Known issue
 /// 51).
 type OfferDue = Due<(u64, u8), u32>;
-
-/// How a copy offer ended (Known issue 50).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OfferEnd {
-    /// The target answered `Miss`.
-    Delivered,
-    /// The target itself answered otherwise (shed, behind).
-    Refused,
-    /// Transport failure or timeout, or a relay's answer: the route is cut.
-    Cut,
-}
 
 /// How one walk probe ended, for repeat classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3490,24 +3479,27 @@ impl NodeWorld {
         let at = self.instant(self.now());
         let (from, to) = (ping.node, ping.dest);
         let silence = &mut self.nodes[from as usize].silence;
-        let failed = match reply {
-            None => true,
-            Some(Reply::Shed) => false,
-            Some(Reply::Response(_)) if !ping.relayed => false,
-            Some(Reply::Response(ResponseKind::Unavailable)) => true,
-            Some(_) => {
+        let answered = ping_verdict(match reply {
+            None => Err(true),
+            Some(Reply::Shed) => Ok((true, false)),
+            Some(Reply::Response(kind)) => Ok((!ping.relayed, kind == ResponseKind::Unavailable)),
+            Some(Reply::Transport) => Err(false),
+        });
+        match answered {
+            None => {
                 self.metrics.incr("silence_pings_inconclusive");
                 return;
             }
-        };
-        if !failed {
-            if silence.silent(&to, at) {
-                self.metrics.incr("silence_recoveries");
+            Some(true) => {
+                if silence.silent(&to, at) {
+                    self.metrics.incr("silence_recoveries");
+                }
+                silence.ping_result(&to, answered, at);
+                return;
             }
-            silence.ping_answered(&to, at);
-            return;
+            Some(false) => {}
         }
-        if silence.ping_failed(&to, at) {
+        if silence.ping_result(&to, answered, at) {
             self.metrics.incr("silence_marks");
         }
         if silence.silent(&to, at) {
@@ -4242,13 +4234,10 @@ impl NodeWorld {
             // (transport, a relay's answer, shed, behind) tries again. A
             // relay's answer is cut evidence (Known issue 50).
             let relayed = self.offers_relayed.remove(&pid);
-            let end = if relayed || reply == Reply::Transport {
-                OfferEnd::Cut
-            } else if reply == Reply::Response(ResponseKind::Miss) {
-                OfferEnd::Delivered
-            } else {
-                OfferEnd::Refused
-            };
+            let end = OfferEnd::of(
+                (!relayed && reply != Reply::Transport)
+                    .then_some(reply == Reply::Response(ResponseKind::Miss)),
+            );
             self.offer_done(node, incarnation, due, end);
             return;
         }
@@ -5641,27 +5630,28 @@ impl NodeWorld {
         let live = !n.down && n.incarnation == incarnation;
         let group = self.fabric.site[due.target as usize];
         let grouped = self.config.node.offer_cut_groups;
-        if end == OfferEnd::Delivered {
-            self.metrics.incr("orphan_offers_delivered");
-            if live && grouped {
-                self.nodes[node as usize].notices.reached(&group);
-            }
-            return;
-        }
-        self.metrics.incr("orphan_offers_failed");
-        if !live {
+        let delivered = end == OfferEnd::Delivered;
+        self.metrics.incr(if delivered {
+            "orphan_offers_delivered"
+        } else {
+            "orphan_offers_failed"
+        });
+        if !live || (delivered && !grouped) {
             return;
         }
         let instant = self.instant(self.now());
         let notices = &mut self.nodes[node as usize].notices;
-        let next = if !grouped {
-            notices.failed(due, instant)
-        } else if end == OfferEnd::Cut {
-            self.metrics.incr("orphan_offers_cut");
-            notices.cut(due, group, instant)
+        let next = if grouped {
+            if end == OfferEnd::Cut {
+                self.metrics.incr("orphan_offers_cut");
+            }
+            notices.offer_result(due, end, group, instant)
         } else {
-            notices.refused(due, &group, instant)
+            notices.failed(due, instant)
         };
+        if delivered {
+            return;
+        }
         match next {
             Some(next) => self.engine.at(self.nanos(next), Event::Notice { node }),
             None => self.metrics.incr("orphan_notices_expired"),

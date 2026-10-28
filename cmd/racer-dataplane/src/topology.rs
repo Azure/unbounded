@@ -138,20 +138,10 @@ impl LinkHealth {
     pub fn due_pings(&self, now: Instant, max: usize) -> Vec<(NodeId, crate::model::PageId)> {
         self.silence.borrow_mut().due_pings(now, max)
     }
-    /// Outcome of a ping sent for `peer`: answered by it (`Some(true)`),
-    /// left unanswered or refused by a relay that cannot reach it
-    /// (`Some(false)`), or inconclusive (`None`). Returns whether `peer`
-    /// became silent.
+    /// Outcome of a ping sent for `peer` (`Silence::ping_result`).
+    /// Returns whether `peer` became silent.
     pub fn ping_outcome(&self, peer: &NodeId, answered: Option<bool>, now: Instant) -> bool {
-        let mut silence = self.silence.borrow_mut();
-        match answered {
-            Some(true) => {
-                silence.ping_answered(peer, now);
-                false
-            }
-            Some(false) => silence.ping_failed(peer, now),
-            None => false,
-        }
+        self.silence.borrow_mut().ping_result(peer, answered, now)
     }
     /// What this worker last learned about `peer`'s answers (readers'
     /// visit order).

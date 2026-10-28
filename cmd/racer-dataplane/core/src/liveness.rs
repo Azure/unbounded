@@ -109,6 +109,23 @@ struct SilenceEntry<P> {
     seq: u64,
 }
 
+/// Classify how a silence ping ended, for [`Silence::ping_result`].
+///
+/// `Ok((by_peer, unavailable))`: a signed answer, signed by the pinged peer
+/// itself (`by_peer`) or by a relay, and whether it is `Unavailable`.
+/// `Err(timed_out)`: no signed answer; `timed_out` when the ping's time
+/// bound passed. Any answer the peer signed means it is alive; a relay's
+/// `Unavailable` (it holds the peer silent, or cannot reach it) or no answer
+/// in time means silent; anything else (a relay's overload, a local or
+/// transport failure) proves nothing.
+pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
+    match answer {
+        Ok((true, _)) => Some(true),
+        Ok((false, true)) | Err(true) => Some(false),
+        Ok((false, false)) | Err(false) => None,
+    }
+}
+
 /// Bounded, expiring map from a destination to its silence. `P` is what a
 /// ping for it carries.
 pub struct Silence<N, P = ()> {
@@ -287,37 +304,42 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
             .collect()
     }
 
-    /// `peer` left the ping sent for it unanswered within
-    /// [`Self::ping_timeout`]: it is silent until it answers anything, and
-    /// pinged again every [`Self::hold`]. Returns whether it became silent.
-    pub fn ping_failed(&mut self, peer: &N, now: Instant) -> bool {
-        let hold = self.hold();
+    /// The outcome of the ping sent for `peer` (see [`ping_verdict`]).
+    ///
+    /// `Some(true)`: `peer` answered, so it is alive, and is not pinged again
+    /// for [`Self::quiet`] whatever times out meanwhile (it is busy, not hung).
+    /// `Some(false)`: unanswered within [`Self::ping_timeout`], so it is
+    /// silent until it answers anything, and pinged again every
+    /// [`Self::hold`]. `None` proves nothing. Returns whether `peer` became
+    /// silent.
+    pub fn ping_result(&mut self, peer: &N, answered: Option<bool>, now: Instant) -> bool {
+        let (hold, quiet) = (self.hold(), self.quiet());
         let Some(entry) = self.entries.get_mut(peer) else {
             return false;
         };
-        if entry.pinging.take().is_none() {
-            return false;
+        match answered {
+            Some(true) => {
+                entry.timeouts = 0;
+                entry.pinging = None;
+                entry.silent = false;
+                entry.next = now + quiet;
+            }
+            Some(false) => {
+                if entry.pinging.take().is_none() {
+                    return false;
+                }
+                let became = !entry.silent;
+                entry.silent = true;
+                entry.next = now + hold;
+                entry.want = false;
+                entry.last = entry.last.max(now);
+                return became;
+            }
+            None => return false,
         }
-        let became = !entry.silent;
-        entry.silent = true;
         entry.want = false;
-        entry.next = now + hold;
         entry.last = entry.last.max(now);
-        became
-    }
-
-    /// `peer` answered a ping: it is alive, and is not pinged again for
-    /// [`Self::quiet`] whatever times out meanwhile (it is busy, not hung).
-    pub fn ping_answered(&mut self, peer: &N, now: Instant) {
-        let quiet = self.quiet();
-        if let Some(entry) = self.entries.get_mut(peer) {
-            entry.want = false;
-            entry.timeouts = 0;
-            entry.pinging = None;
-            entry.silent = false;
-            entry.next = now + quiet;
-            entry.last = entry.last.max(now);
-        }
+        false
     }
 
     /// `peer` answered an exchange at `now` (a response it signed or
@@ -399,6 +421,16 @@ fn holds<P>(e: &SilenceEntry<P>, now: Instant) -> bool {
 mod silence_tests {
     use super::*;
 
+    #[test]
+    fn ping_verdicts() {
+        assert_eq!(ping_verdict(Ok((true, true))), Some(true));
+        assert_eq!(ping_verdict(Ok((true, false))), Some(true));
+        assert_eq!(ping_verdict(Ok((false, true))), Some(false));
+        assert_eq!(ping_verdict(Err(true)), Some(false));
+        assert_eq!(ping_verdict(Ok((false, false))), None);
+        assert_eq!(ping_verdict(Err(false)), None);
+    }
+
     const S: Duration = Duration::from_secs(1);
 
     fn silence() -> Silence<u8> {
@@ -420,12 +452,12 @@ mod silence_tests {
         assert!(!s.timed_out(1, (), t + S, t + 3 * S, 1));
         assert!(s.due_pings(t + 3 * S, 16).is_empty());
         // The ping went unanswered: silent until it answers anything.
-        assert!(s.ping_failed(&1, t + 4 * S));
+        assert!(s.ping_result(&1, Some(false), t + 4 * S));
         assert!(s.silent(&1, t + 4 * S));
         assert!(s.silent_peers(t + 4 * S).eq([&1]));
         assert!(!s.silent(&2, t + 4 * S));
         // A second report of the same ping changes nothing.
-        assert!(!s.ping_failed(&1, t + 5 * S));
+        assert!(!s.ping_result(&1, Some(false), t + 5 * S));
         assert!(s.silent(&1, t + 30 * S));
     }
 
@@ -435,17 +467,17 @@ mod silence_tests {
         let mut s = silence();
         assert!(s.timed_out(1, (), t, t + 2 * S, 1));
         s.start_ping(&1, t + 2 * S);
-        assert!(s.ping_failed(&1, t + 4 * S));
+        assert!(s.ping_result(&1, Some(false), t + 4 * S));
         // While silent, late timeouts ask nothing.
         assert!(!s.timed_out(1, (), t + 3 * S, t + 5 * S, 1));
         assert!(s.due_pings(t + 13 * S, 16).is_empty());
         assert_eq!(s.due_pings(t + 14 * S, 16), vec![(1, ())]);
         // Still hung: silent, renewed for another hold.
-        assert!(!s.ping_failed(&1, t + 16 * S));
+        assert!(!s.ping_result(&1, Some(false), t + 16 * S));
         assert!(s.silent(&1, t + 16 * S + SILENCE_TTL));
         assert_eq!(s.due_pings(t + 26 * S, 16), vec![(1, ())]);
         // Recovered: the ping is answered.
-        s.ping_answered(&1, t + 26 * S);
+        s.ping_result(&1, Some(true), t + 26 * S);
         assert!(!s.silent(&1, t + 26 * S));
         // Not pinged again for `quiet`, whatever times out.
         assert_eq!(s.quiet(), 5 * S);
@@ -454,7 +486,7 @@ mod silence_tests {
         assert!(s.timed_out(1, (), t + 26 * S, t + 31 * S, 1));
         // A silent verdict expires SILENCE_TTL after its last event.
         s.start_ping(&1, t + 31 * S);
-        assert!(s.ping_failed(&1, t + 33 * S));
+        assert!(s.ping_result(&1, Some(false), t + 33 * S));
         assert!(!s.silent(&1, t + 34 * S + SILENCE_TTL));
     }
 
@@ -469,13 +501,13 @@ mod silence_tests {
         s.start_ping(&1, t + 2 * S);
         s.answered(&1, t + 3 * S);
         // The peer answered meanwhile: a lost ping proves nothing.
-        assert!(!s.ping_failed(&1, t + 4 * S));
+        assert!(!s.ping_result(&1, Some(false), t + 4 * S));
         assert!(!s.silent(&1, t + 4 * S));
         assert!(!s.unanswered(&1, t + 4 * S));
         // Past the quiet time after the answer, a timeout asks again.
         assert!(s.timed_out(1, (), t + 6 * S, t + 8 * S, 1));
         s.start_ping(&1, t + 8 * S);
-        assert!(s.ping_failed(&1, t + 10 * S));
+        assert!(s.ping_result(&1, Some(false), t + 10 * S));
         // An answer clears a silent peer.
         s.answered(&1, t + 10 * S);
         assert!(!s.silent(&1, t + 10 * S));
@@ -492,7 +524,7 @@ mod silence_tests {
         let mut s = silence();
         assert!(s.timed_out(1, (), t, t + 2 * S, RANK0_TIMEOUTS));
         s.start_ping(&1, t + 2 * S);
-        s.ping_answered(&1, t + 3 * S);
+        s.ping_result(&1, Some(true), t + 3 * S);
         // It answers an exchange at 7 s: quiet until 12 s.
         s.answered(&1, t + 7 * S);
         assert!(!s.timed_out(1, (), t + 8 * S, t + 10 * S, RANK0_TIMEOUTS));
@@ -503,10 +535,10 @@ mod silence_tests {
         // time has passed, and found silent.
         assert!(s.timed_out(1, (), t + 10 * S, t + 12 * S, RANK0_TIMEOUTS));
         s.start_ping(&1, t + 12 * S);
-        assert!(s.ping_failed(&1, t + 14 * S));
+        assert!(s.ping_result(&1, Some(false), t + 14 * S));
         assert!(s.silent(&1, t + 14 * S));
         // An answer never shortens a quiet time already set.
-        s.ping_answered(&1, t + 20 * S);
+        s.ping_result(&1, Some(true), t + 20 * S);
         s.answered(&1, t + 16 * S);
         assert!(!s.timed_out(1, (), t + 22 * S, t + 24 * S, RANK0_TIMEOUTS));
         assert!(s.timed_out(1, (), t + 23 * S, t + 25 * S, RANK0_TIMEOUTS));
@@ -535,16 +567,16 @@ mod silence_tests {
         s.shed(1, (), t + 20 * S);
         assert!(s.timed_out(2, (), t + 18 * S, t + 21 * S, RANK0_TIMEOUTS));
         s.start_ping(&2, t + 21 * S);
-        s.ping_answered(&1, t + 22 * S);
+        s.ping_result(&1, Some(true), t + 22 * S);
         assert!(s.unanswered(&1, t + 22 * S));
         // A shed clears a silent verdict (the peer answered) and voids an
         // outstanding ping.
-        assert!(s.ping_failed(&2, t + 23 * S));
+        assert!(s.ping_result(&2, Some(false), t + 23 * S));
         assert!(s.silent(&2, t + 23 * S));
         s.shed(2, (), t + 24 * S);
         assert!(!s.silent(&2, t + 24 * S));
         assert!(s.unanswered(&2, t + 24 * S));
-        assert!(!s.ping_failed(&2, t + 25 * S));
+        assert!(!s.ping_result(&2, Some(false), t + 25 * S));
         // Bounded like any entry.
         for i in 10..20u8 {
             s.shed(i, (), t + 30 * S);
@@ -564,7 +596,7 @@ mod silence_tests {
         assert!(s.timed_out(1, (), t + 5 * S, t + 7 * S, LINK_TIMEOUTS));
         assert_eq!(s.due_pings(t + 7 * S, 16), vec![(1, ())]);
         // An answered ping also starts it again (after the quiet time).
-        s.ping_answered(&1, t + 7 * S);
+        s.ping_result(&1, Some(true), t + 7 * S);
         assert!(!s.timed_out(1, (), t + 12 * S, t + 13 * S, LINK_TIMEOUTS));
         assert!(s.timed_out(1, (), t + 12 * S, t + 14 * S, LINK_TIMEOUTS));
         assert_eq!(RANK0_TIMEOUTS, 1);
@@ -592,7 +624,7 @@ mod silence_tests {
         assert!(s.timed_out(2, (), t, t + 2 * S, 1));
         s.start_ping(&2, t + 2 * S);
         assert!(s.unanswered(&2, t + 2 * S));
-        s.ping_answered(&2, t + 3 * S);
+        s.ping_result(&2, Some(true), t + 3 * S);
         assert!(!s.unanswered(&2, t + 3 * S));
     }
 
