@@ -655,7 +655,7 @@ static int file_error(CUfileError_t e) {
  * for P2PDMA, which can take most of a second, so a failure is not retried. */
 static int cf_failed;
 
-int racer_gpu_file_open(void) {
+int racer_gpu_file_open(uint32_t flags) {
     int rc = RACER_GPU_OK;
     pthread_mutex_lock(&load_lock);
     if (cf_failed) {
@@ -680,6 +680,25 @@ int racer_gpu_file_open(void) {
             (cuFileSetParameterBool_fn)dlsym(table.lib, "cuFileSetParameterBool");
         if (set_bool && !getenv("CUFILE_ALLOW_COMPAT_MODE"))
             set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, false);
+        /* PCI P2PDMA (cuFile 1.13+) reads NVMe into GPU memory without
+         * nvidia-fs. Only turn it on: leave cufile.json's value otherwise.
+         * Without cuFileSetParameterBool, or if cuFile rejects the value,
+         * fail the open so Racer reports cuFile off and uses its host path
+         * rather than run without the path the operator asked for. */
+        if (flags & RACER_GPU_FILE_PCI_P2PDMA) {
+            if (!set_bool) {
+                dlclose(table.lib);
+                cf_failed = 1;
+                rc = RACER_GPU_EUNAVAILABLE;
+                goto out;
+            }
+            if (file_error(set_bool(CUFILE_PARAM_USE_PCIP2PDMA, true))) {
+                dlclose(table.lib);
+                cf_failed = 1;
+                rc = RACER_GPU_EUNAVAILABLE;
+                goto out;
+            }
+        }
         if (file_error(table.cuFileDriverOpen())) {
             dlclose(table.lib);
             cf_failed = 1;

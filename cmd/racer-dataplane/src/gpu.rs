@@ -445,14 +445,19 @@ pub struct GpuHelper {
 
 impl GpuHelper {
     /// Resolve `mode` against hardware. Returns `None` when GPU mode is off.
-    pub fn start(mode: GpuMode, staging_bytes: u64) -> Result<Option<Arc<Self>>> {
+    pub fn start(mode: GpuMode, staging_bytes: u64, pci_p2pdma: bool) -> Result<Option<Arc<Self>>> {
         match mode {
             GpuMode::Disabled => Ok(None),
             GpuMode::Auto if !cfg!(feature = "cuda") => {
                 eprintln!("racer-dataplane: stage=gpu state=disabled reason=not-built");
                 Ok(None)
             }
-            _ => Self::start_with_staging(mode, staging_bytes, Box::new(racer_gpu::Gpu::load)),
+            _ => Self::start_with_options(
+                mode,
+                staging_bytes,
+                pci_p2pdma,
+                Box::new(racer_gpu::Gpu::load),
+            ),
         }
     }
 
@@ -465,6 +470,17 @@ impl GpuHelper {
     pub fn start_with_staging(
         mode: GpuMode,
         staging_bytes: u64,
+        loader: Loader,
+    ) -> Result<Option<Arc<Self>>> {
+        Self::start_with_options(mode, staging_bytes, false, loader)
+    }
+
+    /// Start the helper with a custom backend loader, a per-GPU staging cap,
+    /// and whether cuFile should use PCI P2PDMA.
+    pub fn start_with_options(
+        mode: GpuMode,
+        staging_bytes: u64,
+        pci_p2pdma: bool,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
         if mode == GpuMode::Disabled {
@@ -483,6 +499,7 @@ impl GpuHelper {
             counters: counters.clone(),
             kernels_off: kernels_off.clone(),
             slots,
+            pci_p2pdma,
         };
         std::thread::Builder::new()
             .name("racer-gpu".into())
@@ -518,10 +535,11 @@ impl GpuHelper {
             })
             .collect::<Vec<_>>();
         eprintln!(
-            "racer-dataplane: stage=gpu state=enabled usable={} decrypt={} staging_slots={}",
+            "racer-dataplane: stage=gpu state=enabled usable={} decrypt={} staging_slots={} pci_p2pdma={}",
             devices.len(),
             shared.iter().filter(|device| device.decrypt).count(),
             slots,
+            pci_p2pdma,
         );
         Ok(Some(Arc::new(Self {
             jobs,
@@ -878,6 +896,8 @@ struct HelperState {
     kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
     /// Staging slots per GPU.
     slots: u64,
+    /// Ask cuFile to use PCI P2PDMA.
+    pci_p2pdma: bool,
 }
 
 /// A registered cuFile handle and the reads using it.
@@ -980,6 +1000,9 @@ fn helper_main(
 ) {
     let mut helper = match discover(loader) {
         Ok((gpu, contexts, usable)) => {
+            // Before any reader or open: the flag applies only to the open
+            // that loads cuFile.
+            gpu.set_pci_p2pdma(state.pci_p2pdma);
             let decrypt = contexts.iter().map(probe_decrypt).collect();
             let (reads, queue) = mpsc::channel();
             let queue = Arc::new(Mutex::new(queue));
@@ -1757,6 +1780,15 @@ pub(crate) mod testing {
         numa: &[Option<u32>],
         setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
     ) -> Arc<GpuHelper> {
+        helper_with_options(numa, false, setup)
+    }
+
+    /// A helper as [`helper_with`] makes, with cuFile PCI P2PDMA set.
+    pub(crate) fn helper_with_options(
+        numa: &[Option<u32>],
+        pci_p2pdma: bool,
+        setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
+    ) -> Arc<GpuHelper> {
         let devices: Vec<racer_gpu::simulation::SimDevice> = numa
             .iter()
             .enumerate()
@@ -1766,8 +1798,10 @@ pub(crate) mod testing {
                 device
             })
             .collect();
-        GpuHelper::start_with(
+        GpuHelper::start_with_options(
             GpuMode::Required,
+            crate::config::DEFAULT_GPU_STAGING_BYTES,
+            pci_p2pdma,
             Box::new(move || {
                 let simulation = racer_gpu::simulation::Simulation::new(devices);
                 setup(&simulation);
@@ -2079,6 +2113,32 @@ mod tests {
         let fd = slab(&[3; 4096]);
         stage(&helper, &fd, 0, 4096).unwrap();
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    /// `RACER_GPU_PCI_P2PDMA` reaches the startup cuFile driver open, and is
+    /// off by default.
+    fn cufile_driver_opens_with_pci_p2pdma_setting() {
+        use racer_gpu::simulation::Operation;
+        for enabled in [false, true] {
+            let helper = helper_with_options(&[None], enabled, |_| {});
+            eventually(|| operations(&helper, Operation::FileOpen) == 1);
+            assert_eq!(helper.run(|| simulation().pci_p2pdma()), Some(enabled));
+            assert!(helper.cufile());
+        }
+    }
+
+    #[test]
+    /// A driver open with PCI P2PDMA that fails turns cuFile off, so pages
+    /// use the host path.
+    fn cufile_pci_p2pdma_open_failure_turns_cufile_off() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper_with_options(&[None], true, |simulation| {
+            simulation.fault(Operation::FileOpen, -3)
+        });
+        eventually(|| !helper.cufile());
+        assert_eq!(helper.run(|| simulation().pci_p2pdma()), None);
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 0);
     }
 
     #[test]

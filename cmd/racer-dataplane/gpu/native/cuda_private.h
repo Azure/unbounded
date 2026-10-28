@@ -183,6 +183,7 @@ _Static_assert(offsetof(CUfileDescr_t, handle) == 8, "CUfileDescr_t layout");
 
 /* cuFileSetParameterBool (cuFile 1.10+); resolved optionally. */
 #define CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE 1
+#define CUFILE_PARAM_USE_PCIP2PDMA 7
 typedef CUfileError_t (*cuFileSetParameterBool_fn)(int param, bool value);
 
 #define RACER_CUFILE_FUNCTIONS(X) \
