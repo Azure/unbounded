@@ -47,9 +47,6 @@ const (
 
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
-	// DaemonHostOSRebootSignalPath records a pending HostOSReboot. It
-	// lives under /etc so it survives the reboot it describes.
-	DaemonHostOSRebootSignalPath = AgentConfigDir + "/host-os-reboot-signal"
 
 	EnvDaemonBinary                 = "UNBOUNDED_AGENT_DAEMON_BINARY"
 	EnvDaemonBinaryBlue             = "UNBOUNDED_AGENT_DAEMON_BINARY_BLUE"
@@ -57,7 +54,6 @@ const (
 	EnvDaemonBinaryCurrent          = "UNBOUNDED_AGENT_DAEMON_BINARY_CURRENT"
 	EnvDaemonBinaryLastGood         = "UNBOUNDED_AGENT_DAEMON_BINARY_LAST_GOOD"
 	EnvDaemonAgentUpgradeSignalPath = "UNBOUNDED_AGENT_DAEMON_AGENT_UPGRADE_SIGNAL_PATH"
-	EnvDaemonHostOSRebootSignalPath = "UNBOUNDED_AGENT_DAEMON_HOST_OS_REBOOT_SIGNAL_PATH"
 )
 
 // NSpawn machine names used for alternating in-place upgrades.

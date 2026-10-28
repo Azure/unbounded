@@ -223,7 +223,9 @@ type MachineOperationStore[TGeneration comparable] interface {
 
 `FinishMachineOperation(ctx, client, op, result)` is also exported for delayed
 completion paths. The Unbounded `AgentUpgrade` flow uses it after the restarted
-daemon publishes success or failure from the signal file.
+daemon publishes success or failure from the signal file, and `SetMachineOperationResult`
+applies the same result to an object in memory. `HostOSReboot` uses it to finish the
+operation and its target in one status write.
 
 Status condition `ObservedGeneration` is the `MachineOperation` object
 generation. `status.observedMachineGeneration` is separate and records the

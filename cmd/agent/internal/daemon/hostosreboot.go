@@ -5,7 +5,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -20,71 +22,11 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/executil"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
-	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 const bootIDPath = "/proc/sys/kernel/random/boot_id"
 
-// hostOSRebootSignal records a HostOSReboot the daemon has issued. The
-// daemon that starts after the reboot reports the operation from it.
-type hostOSRebootSignal struct {
-	OperationName             string `json:"operationName"`
-	ObservedMachineGeneration int64  `json:"observedMachineGeneration,omitempty"`
-	// BootID is the kernel boot ID observed before the reboot was issued.
-	BootID string `json:"bootID"`
-}
-
-type hostOSRebootSignalStore struct {
-	path string
-}
-
-func newHostOSRebootSignalStore() hostOSRebootSignalStore {
-	return hostOSRebootSignalStore{path: goalstates.ResolvedHostOSRebootSignalPath()}
-}
-
-func (s hostOSRebootSignalStore) Write(signal hostOSRebootSignal) error {
-	data, err := json.Marshal(signal)
-	if err != nil {
-		return err
-	}
-
-	return writeFile(s.path, append(data, '\n'), 0o600)
-}
-
-// Read returns the recorded signal, or nil if there is none or it is unusable.
-func (s hostOSRebootSignalStore) Read() (*hostOSRebootSignal, error) {
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-
-		return nil, err
-	}
-
-	var signal hostOSRebootSignal
-	if err := json.Unmarshal(data, &signal); err != nil {
-		return nil, fmt.Errorf("decode HostOSReboot signal %s: %w", s.path, err)
-	}
-
-	signal.OperationName = strings.TrimSpace(signal.OperationName)
-	signal.BootID = strings.TrimSpace(signal.BootID)
-
-	if signal.OperationName == "" {
-		slog.Warn("HostOSReboot signal missing operation name; ignoring signal", "path", s.path)
-		return nil, nil
-	}
-
-	return &signal, nil
-}
-
-func (s hostOSRebootSignalStore) Clear() error {
-	if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	return nil
-}
+const hostOSRebootMessage = "rebooting host operating system"
 
 func readBootID() (string, error) {
 	data, err := os.ReadFile(bootIDPath)
@@ -147,10 +89,6 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 
 	defer releaseInstallationLock(t.log, lock)
 
-	if err := store.MarkInProgress(ctx, op, "rebooting host operating system"); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	machine, err := getLocalMachine(ctx, t.Client, t.machineName)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -161,24 +99,20 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 		return finishFailedMachineOperation(ctx, store, op, err)
 	}
 
-	signals := newHostOSRebootSignalStore()
-	if err := signals.Write(hostOSRebootSignal{
-		OperationName:             op.Name,
-		ObservedMachineGeneration: machine.Generation,
-		BootID:                    bootID,
-	}); err != nil {
-		return finishFailedMachineOperation(ctx, store, op, fmt.Errorf("record HostOSReboot signal: %w", err))
+	// The boot ID must be on the operation before the reboot is issued: the
+	// daemon that starts after the reboot reports the operation from it.
+	started, err := startHostOSReboot(ctx, t.Client, op.Name, t.machineName, machine.Generation, bootID)
+	if err != nil || !started {
+		return ctrl.Result{}, err
 	}
 
-	// The operation stays InProgress. The daemon that starts after the reboot
-	// reports it from the signal.
 	t.log.Info("rebooting host for HostOSReboot", "operation", op.Name, "bootID", bootID)
 	t.rebootRequested.Store(true)
 
 	if err := t.nodeOperator.RebootHost(ctx, t.log); err != nil {
 		// A canceled context means this daemon is stopping, possibly because
-		// the reboot has started. Keep the signal so the next daemon decides
-		// from the boot ID whether the reboot happened.
+		// the reboot has started. Leave the operation InProgress so the next
+		// daemon decides from the boot ID whether the reboot happened.
 		if ctx.Err() != nil {
 			t.log.Warn("daemon stopping while rebooting host; the next daemon reports HostOSReboot",
 				"operation", op.Name, "error", err)
@@ -188,61 +122,168 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 
 		t.rebootRequested.Store(false)
 
-		if clearErr := signals.Clear(); clearErr != nil {
-			t.log.Warn("failed to clear HostOSReboot signal", "error", clearErr)
-		}
-
-		return finishFailedMachineOperation(ctx, store, op, err)
+		return ctrl.Result{}, finishHostOSReboot(ctx, t.Client, op.Name, t.machineName, daemon.MachineOperationResult[int64]{
+			Phase:   v1alpha3.OperationPhaseFailed,
+			Reason:  "Failed",
+			Message: err.Error(),
+		})
 	}
 
+	// The operation stays InProgress until the daemon that starts after the
+	// reboot reports it.
 	return ctrl.Result{}, nil
 }
 
-// publishAndClearHostOSRebootSignal reports a HostOSReboot issued by an
-// earlier daemon. The operation completes if the host has booted since the
-// reboot was issued and fails otherwise, so it never stays InProgress.
-func publishAndClearHostOSRebootSignal(ctx context.Context, log *slog.Logger, c client.Client, currentBootID func() (string, error)) error {
-	signals := newHostOSRebootSignalStore()
+// startHostOSReboot marks the operation InProgress and records bootID in the
+// status of the target for machineName. It returns false, without error, if
+// the operation is already terminal.
+func startHostOSReboot(ctx context.Context, c client.Client, opName, machineName string, generation int64, bootID string) (bool, error) {
+	started := false
 
-	signal, err := signals.Read()
-	if err != nil {
-		return fmt.Errorf("read HostOSReboot signal: %w", err)
-	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest v1alpha3.MachineOperation
+		if err := c.Get(ctx, client.ObjectKey{Name: opName}, &latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
 
-	if signal == nil {
+		if latest.Status.IsTerminal() {
+			started = false
+			return nil
+		}
+
+		now := metav1.Now()
+
+		latest.Status.Phase = v1alpha3.OperationPhaseInProgress
+		latest.Status.Message = hostOSRebootMessage
+		latest.Status.ObservedMachineGeneration = generation
+
+		if latest.Status.StartedAt == nil {
+			latest.Status.StartedAt = &now
+		}
+
+		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:               "Completed",
+			Status:             metav1.ConditionFalse,
+			Reason:             "InProgress",
+			Message:            hostOSRebootMessage,
+			ObservedGeneration: latest.Generation,
+		})
+
+		target := hostOSRebootTarget(&latest.Status, machineName)
+		if target == nil {
+			latest.Status.Targets = append(latest.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: machineName})
+			target = &latest.Status.Targets[len(latest.Status.Targets)-1]
+		}
+
+		target.Phase = v1alpha3.OperationPhaseInProgress
+		target.Message = hostOSRebootMessage
+		target.StartedAt = &now
+		target.CompletedAt = nil
+		target.ObservedGeneration = generation
+		target.BootID = bootID
+
+		if err := c.Status().Update(ctx, &latest); err != nil {
+			return err
+		}
+
+		started = true
+
 		return nil
-	}
-
-	bootID, err := currentBootID()
+	})
 	if err != nil {
-		return err
+		return false, fmt.Errorf("record HostOSReboot boot ID: %w", err)
 	}
 
-	op := daemon.MachineOperation{Name: signal.OperationName}
+	return started, nil
+}
 
-	result := daemon.MachineOperationResult[int64]{
-		Phase:                     v1alpha3.OperationPhaseComplete,
-		Reason:                    "Succeeded",
-		Message:                   "HostOSReboot completed",
-		ObservedMachineGeneration: signal.ObservedMachineGeneration,
-	}
-	if signal.BootID == "" || signal.BootID == bootID {
-		result = daemon.MachineOperationResult[int64]{
-			Phase:   v1alpha3.OperationPhaseFailed,
-			Reason:  "RebootNotObserved",
-			Message: "host did not reboot after HostOSReboot was issued",
+// finishHostOSReboot records result on the operation and on its target for
+// machineName.
+func finishHostOSReboot(ctx context.Context, c client.Client, opName, machineName string, result daemon.MachineOperationResult[int64]) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest v1alpha3.MachineOperation
+		if err := c.Get(ctx, client.ObjectKey{Name: opName}, &latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+
+		now := metav1.Now()
+		daemon.SetMachineOperationResult(&latest, result, now)
+
+		if target := hostOSRebootTarget(&latest.Status, machineName); target != nil {
+			target.Phase = result.Phase
+			target.Message = result.Message
+			target.CompletedAt = &now
+		}
+
+		return c.Status().Update(ctx, &latest)
+	})
+}
+
+func hostOSRebootTarget(status *v1alpha3.MachineOperationStatus, machineName string) *v1alpha3.MachineOperationTargetStatus {
+	for i := range status.Targets {
+		if status.Targets[i].MachineRef == machineName {
+			return &status.Targets[i]
 		}
 	}
 
-	if err := daemon.FinishMachineOperation(ctx, c, op, result); err != nil {
-		return err
-	}
-
-	if err := signals.Clear(); err != nil {
-		return fmt.Errorf("remove HostOSReboot signal: %w", err)
-	}
-
-	log.Info("published HostOSReboot signal", "operation", signal.OperationName, "phase", result.Phase)
-
 	return nil
+}
+
+// publishHostOSReboots reports HostOSReboot operations that an earlier daemon
+// on this machine issued. Each completes if the host has booted since its
+// reboot was issued and fails otherwise, so none stays InProgress.
+func publishHostOSReboots(ctx context.Context, log *slog.Logger, c client.Client, machineName string, currentBootID func() (string, error)) error {
+	var ops v1alpha3.MachineOperationList
+	if err := c.List(ctx, &ops); err != nil {
+		return fmt.Errorf("list MachineOperations: %w", err)
+	}
+
+	var (
+		bootID string
+		errs   []error
+	)
+
+	for i := range ops.Items {
+		op := &ops.Items[i]
+		if op.Spec.OperationKind.Canonical() != v1alpha3.OperationHostOSReboot {
+			continue
+		}
+
+		target := hostOSRebootTarget(&op.Status, machineName)
+		if target == nil || target.Phase != v1alpha3.OperationPhaseInProgress || target.BootID == "" {
+			continue
+		}
+
+		if bootID == "" {
+			id, err := currentBootID()
+			if err != nil {
+				return err
+			}
+
+			bootID = id
+		}
+
+		result := daemon.MachineOperationResult[int64]{
+			Phase:                     v1alpha3.OperationPhaseComplete,
+			Reason:                    "Succeeded",
+			Message:                   "HostOSReboot completed",
+			ObservedMachineGeneration: target.ObservedGeneration,
+		}
+		if target.BootID == bootID {
+			result = daemon.MachineOperationResult[int64]{
+				Phase:   v1alpha3.OperationPhaseFailed,
+				Reason:  "RebootNotObserved",
+				Message: "host did not reboot after HostOSReboot was issued",
+			}
+		}
+
+		if err := finishHostOSReboot(ctx, c, op.Name, machineName, result); err != nil {
+			errs = append(errs, fmt.Errorf("report HostOSReboot %s: %w", op.Name, err))
+			continue
+		}
+
+		log.Info("reported HostOSReboot", "operation", op.Name, "phase", result.Phase)
+	}
+
+	return errors.Join(errs...)
 }

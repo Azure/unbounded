@@ -246,6 +246,7 @@ after a controller restart. Each entry includes:
 | `startedAt` | time | Target start timestamp. |
 | `completedAt` | time | Target terminal timestamp. |
 | `observedGeneration` | int64 | Machine generation acted on. |
+| `bootID` | string | Host kernel boot ID the agent observed before issuing a `HostOSReboot`. |
 | `input.providerRef` | ProviderMachineSnapshot | Provider resource group, kind, name, UID, and generation frozen before execution. |
 | `input.hostImage` | string | Resolved provider-interpreted image frozen for `HostReplace`; empty means preserve the current image. |
 | `attempts` | int32 | External action attempts for retryable Redfish operations. |

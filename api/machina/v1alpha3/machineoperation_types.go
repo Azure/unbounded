@@ -336,6 +336,12 @@ type MachineOperationTargetStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// BootID is the host kernel boot ID the agent observed before it issued
+	// a HostOSReboot. The agent that starts after the reboot compares it with
+	// the current boot ID to decide whether the reboot happened.
+	// +optional
+	BootID string `json:"bootID,omitempty"`
+
 	// Input is the immutable provider input resolved before execution begins.
 	// +optional
 	Input *MachineOperationTargetInput `json:"input,omitempty"`

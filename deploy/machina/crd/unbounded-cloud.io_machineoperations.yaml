@@ -255,6 +255,12 @@ spec:
                         Polling expected state changes does not increment this field.
                       format: int32
                       type: integer
+                    bootID:
+                      description: |-
+                        BootID is the host kernel boot ID the agent observed before it issued
+                        a HostOSReboot. The agent that starts after the reboot compares it with
+                        the current boot ID to decide whether the reboot happened.
+                      type: string
                     bootMedia:
                       description: BootMedia records immutable media ownership and
                         cleanup progress.

@@ -104,9 +104,9 @@ kubectl unbounded machine host-os-reboot worker-01
 ```
 
 The agent marks the operation `InProgress` and records the current kernel boot
-ID before it issues the reboot. When the agent starts again, it marks the
-operation `Complete` if the boot ID changed, or `Failed` if the host did not
-reboot. The operation is reported only after the host comes back and the agent
+ID in `status.targets[].bootID` before it issues the reboot. When the agent
+starts again, it marks the operation `Complete` if the boot ID changed, or
+`Failed` if the host did not reboot. The operation is reported only after the host comes back and the agent
 reconnects to the cluster.
 
 ## HostPowerOff
