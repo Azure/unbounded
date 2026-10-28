@@ -22,11 +22,13 @@ const (
 	logKeys     = 64
 )
 
-// permanent errors are returned without retrying.
+// permanent errors are returned without retrying. context.DeadlineExceeded is
+// absent because the SDK's own dial timeout matches it while the backend
+// context is still live; fetch stops retrying once that context ends.
 var permanent = []error{
 	racersdk.ErrVersionMismatch, racersdk.ErrNotFound, racersdk.ErrForbidden,
 	racersdk.ErrUnauthorized, racersdk.ErrRangeNotSatisfiable, racersdk.ErrInvalidRequest,
-	context.Canceled, context.DeadlineExceeded, net.ErrClosed,
+	context.Canceled, net.ErrClosed,
 }
 
 // retryable reports whether a fetch error may succeed on retry. Besides

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -852,9 +854,32 @@ func TestRetryable(t *testing.T) {
 		{racersdk.ErrNotFound, false},
 		{context.Canceled, false},
 		{fmt.Errorf("x: %w", racersdk.ErrVersionMismatch), false},
+		{expiredDialError(t), true},
 	} {
 		if got := retryable(tc.err); got != tc.want {
 			t.Errorf("retryable(%v)=%v", tc.err, got)
 		}
 	}
+}
+
+// expiredDialError returns the error net.Dialer reports when its timeout
+// expires, which matches context.DeadlineExceeded while no caller context has
+// ended.
+func expiredDialError(t *testing.T) error {
+	t.Helper()
+
+	d := net.Dialer{Deadline: time.Now().Add(-time.Second)}
+
+	conn, err := d.DialContext(t.Context(), "unix", filepath.Join(t.TempDir(), "racer.sock"))
+	if err == nil {
+		_ = conn.Close()
+
+		t.Fatal("dial with an expired deadline succeeded")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired dial error %v does not match context.DeadlineExceeded", err)
+	}
+
+	return fmt.Errorf("%w: %w", racersdk.ErrUnavailable, err)
 }
