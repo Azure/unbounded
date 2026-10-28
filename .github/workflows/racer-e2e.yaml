@@ -10,14 +10,14 @@ on:
   pull_request:
     paths:
       - api/racer/**
-      - cmd/racer-dataplane/**
+      - cmd/racer/**
       - cmd/racer-object/**
       - internal/racer/**
       - internal/racerobject/**
       - internal/operator/components/racer/**
       - pkg/racersdk/**
       - deploy/racer/**
-      - images/racer-dataplane/**
+      - images/racer/**
       - images/racer-object/**
       - cmd/gantry/**
       - internal/gantry/**
@@ -38,14 +38,14 @@ on:
       - release-*
     paths:
       - api/racer/**
-      - cmd/racer-dataplane/**
+      - cmd/racer/**
       - cmd/racer-object/**
       - internal/racer/**
       - internal/racerobject/**
       - internal/operator/components/racer/**
       - pkg/racersdk/**
       - deploy/racer/**
-      - images/racer-dataplane/**
+      - images/racer/**
       - images/racer-object/**
       - cmd/gantry/**
       - internal/gantry/**

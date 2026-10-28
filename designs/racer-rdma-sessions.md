@@ -2,7 +2,7 @@
 
 Status: implemented. This file describes Racer's link setup, page protocol,
 memory ownership, and configuration. [racer-verbs.md](racer-verbs.md) covers
-the verbs crate. Paths below are relative to `cmd/racer-dataplane/`.
+the verbs crate. Paths below are relative to `cmd/racer/`.
 
 ## Design
 

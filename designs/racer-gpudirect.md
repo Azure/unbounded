@@ -171,7 +171,7 @@ plaintext slice from the `VerifiedPage` into the client's file with io_uring
 
 ### GPU mode
 
-A new crate, `cmd/racer-dataplane/gpu`, follows the `verbs` pattern:
+A new crate, `cmd/racer/gpu`, follows the `verbs` pattern:
 
 - A small C shim, `libracer_gpu_cuda.so.1`, wraps the CUDA driver API, NVML and
   cuFile. Racer loads it with `dlopen` and checks `racer_gpu_abi()`.
@@ -353,7 +353,7 @@ provider, and GPU decryption from a landing buffer.
 ### Disk layout v2
 
 The store already writes format version 2 records (see
-`cmd/racer-dataplane/src/store.rs`): the header and its SHA-256 digest, then zero
+`cmd/racer/src/store.rs`): the header and its SHA-256 digest, then zero
 padding up to `header_len`, then the ciphertext, then zero padding up to the
 extent. `header_len` and the ciphertext body are rounded up to the record unit.
 Readers treat other versions, including the old unpadded v1 layout, as cold
@@ -377,7 +377,7 @@ not aligned.
   NVIDIA runtime to inject them without requesting `nvidia.com/gpu`:
   `NVIDIA_VISIBLE_DEVICES=all` and
   `NVIDIA_DRIVER_CAPABILITIES=compute,utility`. The operator knob
-  `RACER_DATAPLANE_NVIDIA=off|env|cdi` (default `env`) controls this. `cdi`
+  `RACER_NVIDIA=off|env|cdi` (default `env`) controls this. `cdi`
   also adds the CDI annotation for `nvidia.com/gpu=all`. It is opt-in because
   containerd fails pod creation when a CDI device cannot be resolved, which
   would break the DaemonSet on nodes without NVIDIA GPUs. On other nodes the

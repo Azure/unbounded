@@ -145,7 +145,7 @@ registers cleanup with the test. These tests are not evidence of real Racer
 compatibility or performance.
 
 Use a dedicated cache, not a cache whose origin socket Gantry already owns. The
-racer-dataplane creates the origin directory owned by UID/GID 65532 with mode
+racer creates the origin directory owned by UID/GID 65532 with mode
 `0700`, and the loadgen image runs as that user. Loadgen creates no directories
 and changes no permissions: it fails at startup if the origin directory is
 missing, is not owned by its effective UID, or is group/world writable. The SDK provides exclusive ownership, stale-socket

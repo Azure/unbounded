@@ -16,7 +16,7 @@ func TestValidateDataplaneConfigAccepts(t *testing.T) {
 		"empty": {},
 		"gpu": {
 			"RACER_ENABLE_GPU": "true", "RACER_GPU_STAGING_BYTES": "2097152",
-			"RACER_GPU_LANDING_BYTES": "0", "RACER_DATAPLANE_NVIDIA": "cdi",
+			"RACER_GPU_LANDING_BYTES": "0", "RACER_NVIDIA": "cdi",
 			"RACER_GPU_PCI_P2PDMA": "true",
 		},
 		"gpu pci p2pdma off":          {"RACER_GPU_PCI_P2PDMA": "false"},
@@ -77,7 +77,7 @@ func TestValidateDataplaneConfigRejects(t *testing.T) {
 		{"RACER_GPU_LANDING_BYTES", "1048576"},
 		{"RACER_GPU_LANDING_BYTES", "-2097152"},
 		{"RACER_GPU_LANDING_BYTES", "+2097152"},
-		{"RACER_DATAPLANE_NVIDIA", "on"},
+		{"RACER_NVIDIA", "on"},
 		{"RACER_ALLOW_SMT", "1"},
 		{"RACER_GPU_PCI_P2PDMA", "TRUE"},
 		{"RACER_GPU_PCI_P2PDMA", "1"},
@@ -188,7 +188,8 @@ func TestInvalidDataplaneConfigKeepsDaemonSet(t *testing.T) {
 }
 
 // One image serves GPU and CPU nodes, so no ConfigMap key selects another
-// image. An unknown key such as RACER_DATAPLANE_CUDA is ignored.
+// image. An unknown key such as RACER_CUDA, the renamed RACER_DATAPLANE_CUDA,
+// is ignored.
 func TestDataplaneImage(t *testing.T) {
 	env := testEnv(t, cacheObject("cache"))
 	initialize(t, env)
@@ -199,7 +200,7 @@ func TestDataplaneImage(t *testing.T) {
 	for _, value := range []string{"true", "false", "yes"} {
 		config := &corev1.ConfigMap{}
 		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
-		config.Data["RACER_DATAPLANE_CUDA"] = value
+		config.Data["RACER_CUDA"] = value
 		require.NoError(t, env.Client.Update(t.Context(), config))
 
 		persist(t, env, planPass(t, env))

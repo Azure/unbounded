@@ -41,7 +41,7 @@ var releaseImageNames = []string{
 	"netboot",
 	"netboot-azurelinux",
 	"orca",
-	"racer-dataplane",
+	"racer",
 	"racer-object",
 	"racer-vllm",
 	"token-refresher",

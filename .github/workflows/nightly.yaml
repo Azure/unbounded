@@ -294,8 +294,8 @@ jobs:
             file: images/unbounded-operator/Containerfile
           - name: gantry
             file: images/gantry/Containerfile
-          - name: racer-dataplane
-            file: images/racer-dataplane/Containerfile
+          - name: racer
+            file: images/racer/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
           - name: racer-vllm

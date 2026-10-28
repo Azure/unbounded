@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	dataplaneServiceAccount   = "racer-dataplane"
+	dataplaneServiceAccount   = "racer"
 	dataplaneReportAnnotation = "racer.unbounded-cloud.io/report"
 	// tokenAuthzProbeKey is an annotation no Racer component owns.
 	tokenAuthzProbeKey = "e2e.unbounded-cloud.io/token-authz-probe"
@@ -97,7 +97,7 @@ func (h *harness) podTokenClient(ctx context.Context, admin kubernetes.Interface
 	return client, redact
 }
 
-// TestDataplaneTokenAuthorization checks what a racer-dataplane pod's own
+// TestDataplaneTokenAuthorization checks what a racer pod's own
 // bound token may write. The token comes from TokenRequest bound to a live
 // pod, so the API server attaches the pod and node extras that admission
 // policies match on; impersonation would drop them. Every write is a server
@@ -124,7 +124,7 @@ func TestDataplaneTokenAuthorization(t *testing.T) {
 
 	var pods []corev1.Pod
 
-	h.waitFor("two running racer-dataplane pods with reports", 5*time.Minute, func() (bool, string) {
+	h.waitFor("two running racer pods with reports", 5*time.Minute, func() (bool, string) {
 		list, err := admin.CoreV1().Pods(operatorNamespace).List(ctx, metav1.ListOptions{LabelSelector: dataplaneLabel})
 		if err != nil {
 			return false, err.Error()

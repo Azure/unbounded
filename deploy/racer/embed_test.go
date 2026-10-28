@@ -192,15 +192,15 @@ func TestRBACGrantsExactly(t *testing.T) {
 		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "update"}},
 		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: []string{"racer-state"}, Verbs: []string{"get", "update"}},
 		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list", "watch", "patch"}},
-		{APIGroups: []string{"apps"}, Resources: []string{"daemonsets"}, ResourceNames: []string{"racer-dataplane"}, Verbs: []string{"get"}},
-		{APIGroups: []string{""}, Resources: []string{"serviceaccounts"}, ResourceNames: []string{"racer-dataplane"}, Verbs: []string{"get"}},
+		{APIGroups: []string{"apps"}, Resources: []string{"daemonsets"}, ResourceNames: []string{"racer"}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"serviceaccounts"}, ResourceNames: []string{"racer"}, Verbs: []string{"get"}},
 		{APIGroups: []string{"discovery.k8s.io"}, Resources: []string{"endpointslices"}, ResourceNames: []string{"racer-webhook"}, Verbs: []string{"get", "update"}},
 	}, role.Rules)
 
 	for _, obj := range []*unstructured.Unstructured{objects[1], objects[3]} {
 		subjects, _, err := unstructured.NestedSlice(obj.Object, "subjects")
 		require.NoError(t, err)
-		require.Equal(t, []any{map[string]any{"kind": "ServiceAccount", "name": "racer-dataplane", "namespace": "unbounded-system"}}, subjects)
+		require.Equal(t, []any{map[string]any{"kind": "ServiceAccount", "name": "racer", "namespace": "unbounded-system"}}, subjects)
 	}
 }
 
@@ -217,7 +217,7 @@ func TestPoliciesBindEachPolicy(t *testing.T) {
 		require.Equal(t, []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny}, binding.Spec.ValidationActions)
 		require.Equal(t, admissionregistrationv1.Fail, *policy.Spec.FailurePolicy)
 		require.Len(t, policy.Spec.MatchConditions, 1)
-		require.Equal(t, `request.userInfo.username == "system:serviceaccount:unbounded-system:racer-dataplane"`, policy.Spec.MatchConditions[0].Expression)
+		require.Equal(t, `request.userInfo.username == "system:serviceaccount:unbounded-system:racer"`, policy.Spec.MatchConditions[0].Expression)
 	}
 }
 

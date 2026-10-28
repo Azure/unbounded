@@ -124,7 +124,7 @@ Unset optional fields use the `racer-object` defaults.
 
 The operator names the DaemonSet and its ServiceAccount `racer-origin-<cache>`
 in the Racer namespace. It copies node affinity, node selector, tolerations, and
-image pull secrets from the `racer-dataplane` DaemonSet, and waits until that
+image pull secrets from the `racer` DaemonSet, and waits until that
 DaemonSet exists. The origin runs as UID and GID 65532 and serves
 `/run/racer/<cache>/origin/socket`, which the dataplane creates.
 
@@ -193,7 +193,7 @@ Site uses current labels. Invalid `block-devices` selectors instead fall back to
 
 ## Dataplane configuration
 
-Tune `racer-dataplane-config` in the installation namespace (normally `unbounded-system`).
+Tune `racer-settings` in the installation namespace (normally `unbounded-system`).
 The operator preserves administrator data and hashes edits into managed rollouts.
 Explicit workload environment wiring takes precedence over ConfigMap imports.
 Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
@@ -735,7 +735,7 @@ quiesce traffic until all dataplanes run the same version.**
 
 ## Elected control plane
 
-`racer-dataplane` is both the cache daemon and the control-plane binary. There is
+`racer` is both the cache daemon and the control-plane binary. There is
 no `racer-controller` Deployment, image, or control Service. Pods elect control
 seats with Leases named `racer-seat-0` through `racer-seat-15`. One seat also
 holds `racer-primary` and commits membership, catalog, keyring, and trust changes.
@@ -752,7 +752,7 @@ how long startup can wait for the control plane. SIGTERM stops startup.
 
 ```bash
 kubectl -n unbounded-system get leases -l racer.unbounded-cloud.io/control=true
-kubectl -n unbounded-system get daemonset racer-dataplane
+kubectl -n unbounded-system get daemonset racer
 kubectl -n unbounded-system get endpointslice racer-webhook
 ```
 
@@ -785,9 +785,9 @@ limits, not process memory limits.
 
 ### Operator-managed dataplane
 
-When any `ClusterCache` exists, the operator installs DaemonSet `racer-dataplane`
+When any `ClusterCache` exists, the operator installs DaemonSet `racer`
 with its ServiceAccount, restricted RBAC, election Leases, initial state Secret,
-webhook resources, and ConfigMap `racer-dataplane-config`. The ConfigMap is seeded
+webhook resources, and ConfigMap `racer-settings`. The ConfigMap is seeded
 only when absent. The DaemonSet uses the operator's registry and tag and imports
 the ConfigMap with `envFrom`. A pod-template annotation carries its payload hash,
 so edits roll out.
@@ -798,17 +798,25 @@ The operator still checks the admission guards. If they drift or disappear, it
 revokes dataplane permissions and repairs the guards. It restores permissions
 only when a cache exists again.
 
-| Setting in `racer-dataplane-config` | Default | Purpose |
+Earlier releases named these objects `racer-dataplane`, with ConfigMap
+`racer-dataplane-config`. On upgrade the operator seeds `racer-settings` from
+`racer-dataplane-config`, renaming `RACER_DATAPLANE_NVIDIA` to `RACER_NVIDIA`.
+Once the new DaemonSet is applied, it deletes the old objects it created: the
+DaemonSet, ServiceAccount, RBAC, and ConfigMap first, then the old admission
+policies. Old and new Pods may run side by side briefly. It leaves alone any
+old-named object it did not create.
+
+| Setting in `racer-settings` | Default | Purpose |
 |------------------------------------|---------|---------|
 | `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
-| `RACER_DATAPLANE_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
+| `RACER_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
 
-Set `RACER_CONTROL_SEATS` in `racer-dataplane-config` to `auto` (the default) or
+Set `RACER_CONTROL_SEATS` in `racer-settings` to `auto` (the default) or
 an integer from 1 to 16. The active count cannot exceed the eligible node count.
 For example, to request three seats:
 
 ```bash
-kubectl -n unbounded-system patch configmap racer-dataplane-config \
+kubectl -n unbounded-system patch configmap racer-settings \
   --type merge -p '{"data":{"RACER_CONTROL_SEATS":"3"}}'
 ```
 
@@ -907,7 +915,7 @@ For a standalone listener, save and inspect a profile with the matching binary:
 
 ```sh
 curl --fail --max-time 75 'http://127.0.0.1:9090/debug/pprof/profile?seconds=30' -o profile.pb
-go tool pprof -top ./racer-dataplane profile.pb
+go tool pprof -top ./racer profile.pb
 ```
 
 Keep the exact binary and its debug information for symbol resolution. Userspace
@@ -986,10 +994,10 @@ this upgrade.
 
 The operator refuses migration if the old `racer-config` requests a non-default
 peer port, a diagnostics port, host networking, a pod-network node split, or a
-non-default `RACER_DATAPLANE_NVIDIA`. Managed ports are now fixed at 8082 and
+non-default `RACER_NVIDIA`. Managed ports are now fixed at 8082 and
 9090. Review and remove these old settings before migration; use a DaemonSet
-override for host networking and set `RACER_DATAPLANE_NVIDIA` in
-`racer-dataplane-config`. The operator does
+override for host networking and set `RACER_NVIDIA` in
+`racer-config`. The operator does
 not silently discard them or stop the old controller first.
 
 Expect a cold cache after changing device layout,
@@ -1081,12 +1089,12 @@ container already sets `RACER_SOCKET` or mounts that path.
 GPU reads let a client on the node read an object straight into its own NVIDIA
 GPU memory. They need:
 
-- A dataplane image built with CUDA. The released `racer-dataplane` image is,
+- A dataplane image built with CUDA. The released `racer` image is,
   so no setup is needed. It runs on nodes without GPUs too. An image built with
   `--build-arg RACER_NATIVE_CUDA=false` has no GPU reads.
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
-- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto`, the default, does
+- `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
   not touch any GPU until a client sends the first `gpu-read`. Only then does
   the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
   finds no usable GPU. It does not try again until the pod restarts. `true`
@@ -1164,13 +1172,13 @@ against 2.44 seconds with the defaults. That is close to the drive's speed.
 
 The dataplane does not request `nvidia.com/gpu`. It is privileged, so it
 already sees `/dev/nvidia*`. It only needs the host driver libraries.
-`RACER_DATAPLANE_NVIDIA` in `racer-dataplane-config` controls how it asks for them.
+`RACER_NVIDIA` in `racer-settings` controls how it asks for them.
 The operator reads it and changes the DaemonSet:
 
-| `RACER_DATAPLANE_NVIDIA` | Behavior |
+| `RACER_NVIDIA` | Behavior |
 |--------------------------|----------|
 | `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container, mounts the host `/run/udev` read-only at `/run/udev` (cuFile reads each slab device's filesystem type from the udev database), and mounts a 64 MiB `emptyDir` at `/var/log/cufile` for the cuFile log. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
-| `cdi` | Everything `env` adds, plus the Pod annotation `cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
+| `cdi` | Everything `env` adds, plus the Pod annotation `cdi.k8s.io/racer: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
 | `off` | Adds none of these: no NVIDIA variables, no CDI annotation, no `/run/udev` mount, and no cuFile log volume. Without driver libraries there is no GPU, so cuFile is not used |
 
 The dataplane image ships `/etc/racer/cufile.json` and sets
@@ -1179,7 +1187,7 @@ cuFile fails instead of copying through host memory and Racer uses its own
 host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
 cuFile settings keep their built-in defaults. To use your own file, build an
 image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
-in `racer-dataplane-config`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
+in `racer-settings`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
 turns compatibility mode back on.
 
 On nodes set up by the unbounded agent, the NVIDIA runtime is the default
@@ -1197,7 +1205,7 @@ make racer-gpu-test
 ```
 
 This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
-tests in `cmd/racer-dataplane/gpu/tests/hardware.rs`: shim load, device
+tests in `cmd/racer/gpu/tests/hardware.rs`: shim load, device
 discovery, import of an exported client allocation, GPU decrypt checked
 against the CPU, and cuFile reads. It fails when no GPU is found; pass
 `RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open

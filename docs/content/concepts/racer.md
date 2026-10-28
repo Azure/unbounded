@@ -26,7 +26,7 @@ another fetch.
 
 ## Architecture
 
-Racer runs as one **DaemonSet**, `racer-dataplane`. Each pod runs the same Rust
+Racer runs as one **DaemonSet**, `racer`. Each pod runs the same Rust
 binary. It:
 
 - Serves app reads on per-cache Unix sockets under `/run/racer/<cache>/`.

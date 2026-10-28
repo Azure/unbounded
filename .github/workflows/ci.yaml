@@ -158,25 +158,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+            racer-workspace-lint-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-
 
       - name: Check Rust formatting
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer/Cargo.toml --all --check
 
       - name: Strict runtime Clippy
         run: |
-          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
-          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p uring-runtime --all-targets --all-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p uring-runtime --all-targets --no-default-features -- -D warnings
 
       # Keep allocator invocations separate from runtime/workspace builds:
       # runtime test features must not enable simulation in the production
       # allocator gate. Clippy also type-checks every allocator target.
       - name: Strict allocator Clippy
         run: |
-          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
-          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --all-targets --no-default-features --features simulation -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --all-targets --no-default-features -- -D warnings
+          timeout --signal=TERM --kill-after=10s 600s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --all-targets --no-default-features --features simulation -- -D warnings
 
   racer-rust:
     name: Racer Rust Workspace (${{ matrix.suite }})
@@ -214,20 +214,20 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+            racer-workspace-${{ matrix.key }}-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-
 
       - name: Check
-        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace --all-targets $FEATURES
+        run: timeout --signal=TERM --kill-after=10s 1200s cargo +1.96.0 check --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets $FEATURES
 
       # Compile test binaries separately: a cold build of the dataplane test
       # targets takes far longer than running any single step's tests.
       - name: Build tests
-        run: timeout --signal=TERM --kill-after=10s 1800s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace $FEATURES --no-run
+        run: timeout --signal=TERM --kill-after=10s 1800s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml --workspace $FEATURES --no-run
 
       - name: Test
-        run: timeout --signal=TERM --kill-after=10s 1500s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace $FEATURES
+        run: timeout --signal=TERM --kill-after=10s 1500s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml --workspace $FEATURES
 
   racer-rust-gates:
     name: Racer Rust Production Gates
@@ -254,24 +254,24 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-${{ github.sha }}
+          key: racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/**/Cargo.toml') }}-
+            racer-workspace-gates-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer/Cargo.lock', 'cmd/racer/**/Cargo.toml') }}-
 
       - name: Runtime production real I/O (no simulation)
         env:
           RUNTIME_REQUIRE_IO_URING: "1"
-        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p uring-runtime --no-default-features
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p uring-runtime --no-default-features
 
       # Keep allocator invocations separate from runtime/workspace tests: runtime
       # test features must not enable simulation in the production allocator gate.
       - name: Allocator production real I/O (no simulation)
         env:
           PAGE_ALLOC_REQUIRE_REAL_IO: "1"
-        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --no-default-features
 
       - name: Test allocator simulation
-        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p page-alloc --no-default-features --features simulation
+        run: timeout --signal=TERM --kill-after=10s 900s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p page-alloc --no-default-features --features simulation
 
   racer-verbs:
     name: Racer Verbs (${{ matrix.configuration }})
@@ -318,34 +318,34 @@ jobs:
       # Rust loads the adapter dynamically, so Cargo cannot compile-check its C ABI.
       - name: Compile native C adapter (not hardware validation)
         if: matrix.native
-        run: timeout --signal=TERM --kill-after=10s 300s sh images/racer-dataplane/build-native.sh cmd/racer-dataplane/verbs/native/verbs.c bin/racer-verbs-native/librdma_verbs.so.1
+        run: timeout --signal=TERM --kill-after=10s 300s sh images/racer/build-native.sh cmd/racer/verbs/native/verbs.c bin/racer-verbs-native/librdma_verbs.so.1
 
       - name: Require native adapter ABI and symbols (no hardware)
         if: matrix.native
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::tests::required_native_adapter_loads_abi_and_symbols -- --exact --ignored
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::tests::required_native_adapter_loads_abi_and_symbols -- --exact --ignored
 
       - name: Test C discovery and open cleanup faults (no hardware)
         if: matrix.native
         run: |
-          timeout --signal=TERM --kill-after=10s 300s sh images/racer-dataplane/build-native.sh cmd/racer-dataplane/verbs/native/discovery_faults.c bin/racer-verbs-faults/librdma_verbs.so.1
-          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::internal_close_failures_keep_admission_and_adapter -- --exact --ignored
-          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::open_cleanup_failures_keep_admission_and_adapter -- --exact --ignored
-          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::bind_is_signaled_and_fenced -- --exact --ignored
+          timeout --signal=TERM --kill-after=10s 300s sh images/racer/build-native.sh cmd/racer/verbs/native/discovery_faults.c bin/racer-verbs-faults/librdma_verbs.so.1
+          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::internal_close_failures_keep_admission_and_adapter -- --exact --ignored
+          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::open_cleanup_failures_keep_admission_and_adapter -- --exact --ignored
+          timeout --signal=TERM --kill-after=10s 300s env LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bin/racer-verbs-faults" cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --no-default-features --features "$VERBS_FEATURES" --lib ffi::discovery_fault_tests::bind_is_signaled_and_fenced -- --exact --ignored
 
       - name: Check verbs formatting
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --check
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --check
 
       - name: Check verbs feature configuration
         run: |
           features=()
           if [ -n "$VERBS_FEATURES" ]; then features=(--features "$VERBS_FEATURES"); fi
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --all-targets --no-default-features "${features[@]}"
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 check --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --all-targets --no-default-features "${features[@]}"
 
       - name: Strict verbs Clippy
         run: |
           features=()
           if [ -n "$VERBS_FEATURES" ]; then features=(--features "$VERBS_FEATURES"); fi
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --all-targets --no-default-features "${features[@]}" -- -D warnings
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --all-targets --no-default-features "${features[@]}" -- -D warnings
 
       # Explicit zero-port and active-provider tests remain ignored. A hosted
       # runner does not establish RDMA hardware or DMA/fencing correctness.
@@ -353,7 +353,7 @@ jobs:
         run: |
           features=()
           if [ -n "$VERBS_FEATURES" ]; then features=(--features "$VERBS_FEATURES"); fi
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p rdma-verbs --no-default-features "${features[@]}"
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p rdma-verbs --no-default-features "${features[@]}"
 
   racer-gpu:
     name: Racer GPU (${{ matrix.configuration }})
@@ -407,35 +407,35 @@ jobs:
 
       - name: Compile CUDA shim with kernels (not hardware validation)
         if: matrix.kernels
-        run: RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 300s sh images/racer-dataplane/build-native-cuda.sh cmd/racer-dataplane/gpu/native bin/racer-gpu-native/libracer_gpu_cuda.so.1
+        run: RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 300s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native bin/racer-gpu-native/libracer_gpu_cuda.so.1
 
       - name: Compile CUDA shim without kernels (not hardware validation)
         if: matrix.native && !matrix.kernels
-        run: timeout --signal=TERM --kill-after=10s 300s sh images/racer-dataplane/build-native-cuda.sh cmd/racer-dataplane/gpu/native bin/racer-gpu-native/libracer_gpu_cuda.so.1
+        run: timeout --signal=TERM --kill-after=10s 300s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native bin/racer-gpu-native/libracer_gpu_cuda.so.1
 
       - name: Require CUDA shim ABI and symbols (no hardware)
         if: matrix.native
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --no-default-features --features "$GPU_FEATURES" --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features "$GPU_FEATURES" --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
 
       - name: Run decrypt kernels on the CPU (kernel emulation)
         if: matrix.native
-        run: timeout --signal=TERM --kill-after=10s 300s sh cmd/racer-dataplane/gpu/native/run-kernel-emulation.sh bin/racer-gpu-emulation
+        run: timeout --signal=TERM --kill-after=10s 300s sh cmd/racer/gpu/native/run-kernel-emulation.sh bin/racer-gpu-emulation
 
       - name: Check GPU formatting
-        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --check
+        run: timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fmt --manifest-path cmd/racer/Cargo.toml -p racer-gpu --check
 
       - name: Strict GPU Clippy
         run: |
           features=()
           if [ -n "$GPU_FEATURES" ]; then features=(--features "$GPU_FEATURES"); fi
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --all-targets --no-default-features "${features[@]}" -- -D warnings
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 clippy --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --all-targets --no-default-features "${features[@]}" -- -D warnings
 
       # Includes the C AES-GCM/CRC core check against racer-crypto (16 MiB pages).
       - name: Test GPU crate without requiring GPU hardware
         run: |
           features=()
           if [ -n "$GPU_FEATURES" ]; then features=(--features "$GPU_FEATURES"); fi
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --no-default-features "${features[@]}"
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features "${features[@]}"
 
   runtime-miri:
     name: Runtime Miri (${{ matrix.group }})
@@ -681,7 +681,7 @@ jobs:
       - name: Provision locked Cargo sources for NOTICE
         run: |
           timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
-          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 300s cargo +1.96.0 fetch --locked --manifest-path cmd/racer/Cargo.toml
 
       - name: Verify NOTICE
         run: timeout --signal=TERM --kill-after=10s 300s make notice-check

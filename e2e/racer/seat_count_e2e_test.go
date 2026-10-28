@@ -92,11 +92,11 @@ func TestControlPlaneConfiguredSeatCount(t *testing.T) {
 
 func (h *harness) setSeatCount(count string) {
 	h.t.Helper()
-	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-dataplane-config",
+	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-settings",
 		"--type=merge", "-p", fmt.Sprintf(`{"data":{"RACER_CONTROL_SEATS":%q}}`, count))
 
 	var config corev1.ConfigMap
-	if !h.getJSON(&config, "-n", operatorNamespace, "get", "configmap", "racer-dataplane-config") {
+	if !h.getJSON(&config, "-n", operatorNamespace, "get", "configmap", "racer-settings") {
 		h.t.Fatal("dataplane configuration could not be read after changing the seat count")
 	}
 
@@ -104,12 +104,12 @@ func (h *harness) setSeatCount(count string) {
 
 	h.waitFor("DaemonSet to use seat count "+count, time.Minute, func() (bool, string) {
 		var ds appsv1.DaemonSet
-		if !h.getJSON(&ds, "-n", operatorNamespace, "get", "daemonset", "racer-dataplane") {
+		if !h.getJSON(&ds, "-n", operatorNamespace, "get", "daemonset", "racer") {
 			return false, "DaemonSet could not be read"
 		}
 
-		return ds.Spec.Template.Annotations["unbounded-cloud.io/racer-dataplane-config-hash"] == expected,
+		return ds.Spec.Template.Annotations["unbounded-cloud.io/racer-settings-hash"] == expected,
 			"configuration hash not yet applied"
 	})
-	h.rollout("daemonset", "racer-dataplane", 5*time.Minute)
+	h.rollout("daemonset", "racer", 5*time.Minute)
 }

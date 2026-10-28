@@ -3,7 +3,7 @@
 ## Summary
 
 `page-alloc` is the storage layer under the Racer dataplane. It lives in
-`cmd/racer-dataplane/alloc/`. It gives one worker thread three things:
+`cmd/racer/alloc/`. It gives one worker thread three things:
 
 1. Memory buffers aligned for direct I/O, with caller-selected wiping rules.
 2. A table of fixed-size segments in a sparse cache file or caller-opened files

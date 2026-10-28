@@ -16,7 +16,7 @@ import (
 type NodePlacement struct {
 	// Affinity carries only node affinity. Pod affinity and anti-affinity
 	// are relative to dataplane Pods, so a rule such as hostname
-	// anti-affinity against racer-dataplane would otherwise exclude the
+	// anti-affinity against racer would otherwise exclude the
 	// copying workload from every dataplane node.
 	Affinity     *corev1.Affinity
 	NodeSelector map[string]string

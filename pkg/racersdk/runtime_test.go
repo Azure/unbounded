@@ -22,7 +22,7 @@ import (
 )
 
 // The tests in this file are driven by opt-in Rust dataplane fixtures in
-// cmd/racer-dataplane/tests. They skip unless those fixtures run them.
+// cmd/racer/tests. They skip unless those fixtures run them.
 
 // TestRealRuntimeConnectionAgeLoad is driven by the real_sdk_connection_age_sustained
 // Rust executable fixture. Only socket paths and the connection age differ from
@@ -288,7 +288,7 @@ func TestRustSubscriptionInterop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 240*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "test", "--locked", "--manifest-path", filepath.Join(root, "cmd/racer-dataplane/Cargo.toml"), "--features", "subscription-interop", "--test", "subscription_interop", "go_sdk_subscription_server", "--", "--exact", "--ignored", "--nocapture")
+	cmd := exec.CommandContext(ctx, "timeout", "--signal=TERM", "--kill-after=10s", "230s", "cargo", "test", "--locked", "--manifest-path", filepath.Join(root, "cmd/racer/Cargo.toml"), "--features", "subscription-interop", "--test", "subscription_interop", "go_sdk_subscription_server", "--", "--exact", "--ignored", "--nocapture")
 
 	cmd.Env = append(os.Environ(), "RACER_SUBSCRIPTION_INTEROP_DIR="+directory)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr

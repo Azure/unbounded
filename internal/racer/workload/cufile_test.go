@@ -12,7 +12,7 @@ import (
 
 // The image's cufile.json must parse and agree with the workload wiring.
 func TestImageCUFileConfig(t *testing.T) {
-	raw, err := os.ReadFile("../../../images/racer-dataplane/cufile.json")
+	raw, err := os.ReadFile("../../../images/racer/cufile.json")
 	if err != nil {
 		t.Fatal(err)
 	}
