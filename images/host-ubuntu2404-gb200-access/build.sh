@@ -102,9 +102,9 @@ WantedBy=multi-user.target
 EOF
     ) "${root}/etc/systemd/system/nvidia-persistence-mode.service"
     test "$(
-        readlink -f \
-            "${root}/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
-    )" = "${root}/etc/systemd/system/nvidia-persistence-mode.service"
+        chroot "${root}" readlink -f \
+            /etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service
+    )" = /etc/systemd/system/nvidia-persistence-mode.service
     test ! -s "${root}/etc/machine-id"
     if find "${root}/etc/ssh" -maxdepth 1 -name 'ssh_host_*_key' \
         -print -quit | grep -q .; then
