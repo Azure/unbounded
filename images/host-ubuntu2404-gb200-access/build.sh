@@ -72,21 +72,39 @@ customize_disk() {
         "linux-image-${kernel_release}" |
         grep -qx "${kernel_version}"
     test "$(readlink "${root}/boot/vmlinuz")" = "vmlinuz-${kernel_release}"
-    find "${root}/lib/modules/${kernel_release}/updates/dkms" \
-        -name 'nvidia.ko*' -print -quit | grep -q .
+    for module in nvidia nvidia_modeset nvidia_uvm nvidia_drm; do
+        chroot "${root}" modinfo -k "${kernel_release}" "${module}" >/dev/null
+    done
     if find "${root}/boot" "${root}/lib/modules" "${root}/usr/lib/modules" \
         -maxdepth 2 -name '*7.0.0-1019*' -print -quit | grep -q .; then
         exit 1
     fi
     cmp "${script_dir}/assets/90-gb200-access-users.cfg" \
         "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
-    grep -qx nvidia_uvm "${root}/etc/modules-load.d/nvidia.conf"
-    grep -qx 'Before=cloud-final.service' \
-        "${root}/etc/systemd/system/nvidia-persistence-mode.service"
-    grep -qx 'ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0' \
-        "${root}/etc/systemd/system/nvidia-persistence-mode.service"
-    test -L \
-        "${root}/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
+    diff -u <(printf '%s\n' nvidia nvidia_modeset nvidia_uvm nvidia_drm) \
+        "${root}/etc/modules-load.d/nvidia.conf"
+    diff -u <(cat <<'EOF'
+[Unit]
+Description=Initialize NVIDIA devices and enable persistence mode
+After=systemd-modules-load.service
+Before=cloud-final.service
+ConditionPathExistsGlob=/sys/bus/pci/drivers/nvidia/0*
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
+ExecStartPre=/usr/bin/nvidia-modprobe -m
+ExecStart=/usr/bin/nvidia-smi -pm 1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ) "${root}/etc/systemd/system/nvidia-persistence-mode.service"
+    test "$(
+        readlink -f \
+            "${root}/etc/systemd/system/multi-user.target.wants/nvidia-persistence-mode.service"
+    )" = "${root}/etc/systemd/system/nvidia-persistence-mode.service"
     test ! -s "${root}/etc/machine-id"
     if find "${root}/etc/ssh" -maxdepth 1 -name 'ssh_host_*_key' \
         -print -quit | grep -q .; then

@@ -80,6 +80,7 @@ WantedBy=multi-user.target
 EOF
 test -x /usr/bin/nvidia-modprobe
 test -x /usr/bin/nvidia-smi
+systemd-analyze verify /etc/systemd/system/nvidia-persistence-mode.service
 systemctl enable nvidia-persistence-mode.service
 
 rm -rf /tmp/packages /var/lib/cloud/*
