@@ -22,24 +22,29 @@ client falls back to host memory, then to a plain stream.
   prefix `Llama-3.1-8B-Instruct`.
 - NVIDIA nodes set up by the unbounded agent.
 
-## 1. Turn On GPU Mode
+## 1. Check GPU Mode
 
-Run the CUDA dataplane image and turn GPU mode on. Release and nightly builds
-publish `racer-dataplane-cuda` next to `racer-dataplane`. With
-`RACER_DATAPLANE_CUDA` set, the operator runs
-`<registry>/racer-dataplane-cuda:<tag>`:
+GPU mode is on by default. The `racer-dataplane` image is built with CUDA, and
+`RACER_ENABLE_GPU` is `auto`, so the dataplane turns GPU mode on when it finds
+a usable GPU. Check a dataplane log on a GPU node:
+
+```bash
+kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu state='
+```
+
+`state=enabled` means GPU mode is on. `state=disabled` gives the reason.
+
+To make the dataplane fail when it finds no GPU, so a broken setup is not
+silent, set `RACER_ENABLE_GPU` to `true`:
 
 ```bash
 kubectl -n unbounded-system patch configmap racer-dataplane-config \
-  --type merge -p '{"data":{"RACER_DATAPLANE_CUDA":"true","RACER_ENABLE_GPU":"true"}}'
+  --type merge -p '{"data":{"RACER_ENABLE_GPU":"true"}}'
 ```
 
-`RACER_ENABLE_GPU` is `auto` by default. `true` makes the dataplane fail when
-it finds no GPU, so a broken setup is not silent.
-
-The CUDA image also has NVIDIA's cuFile library and a `cufile.json` for
-GPUDirect Storage. Without GPUDirect Storage on the host, disk reads go through
-host memory.
+The image also has NVIDIA's cuFile library and a `cufile.json` for GPUDirect
+Storage. Without GPUDirect Storage on the host, disk reads go through host
+memory.
 
 The dataplane gets the NVIDIA driver libraries without requesting a GPU. This
 is on by default (`RACER_DATAPLANE_NVIDIA: env` in `racer-dataplane-config`). See

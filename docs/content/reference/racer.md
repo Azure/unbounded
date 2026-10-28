@@ -801,7 +801,6 @@ only when a cache exists again.
 | Setting in `racer-dataplane-config` | Default | Purpose |
 |------------------------------------|---------|---------|
 | `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
-| `RACER_DATAPLANE_CUDA` | `false` | `true` runs image `racer-dataplane-cuda` instead of `racer-dataplane`; see [GPU reads](#gpu-reads) |
 | `RACER_DATAPLANE_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
 
 Set `RACER_CONTROL_SEATS` in `racer-dataplane-config` to `auto` (the default) or
@@ -1081,18 +1080,14 @@ container already sets `RACER_SOCKET` or mounts that path.
 GPU reads let a client on the node read an object straight into its own NVIDIA
 GPU memory. They need:
 
-- The CUDA dataplane image. Release and nightly builds publish
-  `racer-dataplane-cuda` next to `racer-dataplane`, built with
-  `--build-arg RACER_NATIVE_CUDA=true`. Set `RACER_DATAPLANE_CUDA: "true"` in
-  `racer-dataplane-config` and the operator runs
-  `<registry>/racer-dataplane-cuda:<tag>`, with the same registry and tag as
-  its other images. To run your own build, push it as `racer-dataplane-cuda`
-  to the operator's registry, or override the DaemonSet container image.
+- A dataplane image built with CUDA. The released `racer-dataplane` image is,
+  so no setup is needed. It runs on nodes without GPUs too. An image built with
+  `--build-arg RACER_NATIVE_CUDA=false` has no GPU reads.
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
-- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto` turns GPU mode off
-  when no usable GPU is found, or when the image was built without CUDA. `true`
-  makes startup fail instead. `false` turns it off.
+- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto`, the default, turns
+  GPU mode on when the dataplane finds a usable GPU and off otherwise. `true`
+  makes startup fail when there is no usable GPU. `false` turns it off.
 
 At startup the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in

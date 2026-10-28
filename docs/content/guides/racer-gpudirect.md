@@ -35,7 +35,7 @@ Each fast path has its own needs:
 
 | Path | Needs |
 |------|-------|
-| GPU decryption | The CUDA dataplane image. A GPU with compute capability 8.0 (Ampere) or newer. `RACER_GPU_STAGING_BYTES` of at least 34 MiB |
+| GPU decryption | A GPU with compute capability 8.0 (Ampere) or newer. `RACER_GPU_STAGING_BYTES` of at least 34 MiB |
 | GPUDirect Storage | GPU decryption. GPUDirect Storage on the host (`nvidia-fs` or PCIe P2PDMA). Slabs on a local NVMe filesystem cuFile supports. Pages stored in record format v2 |
 | GPUDirect RDMA | GPU decryption. Racer RDMA working between the two nodes. A NIC driver and GPU driver that support dma-buf. `RACER_GPU_LANDING_BYTES` of at least one page slot |
 
@@ -140,12 +140,15 @@ Racer exports GPU memory as a dma-buf and registers it with
 
 ## 2. Configure the Dataplane
 
-Set the GPU keys in `racer-dataplane-config`:
+The released `racer-dataplane` image has the GPU decrypt kernels, cuFile, and a
+`cufile.json`. GPU mode turns on by itself on nodes with a usable GPU, so you
+do not need to build an image or change any setting.
+
+To tune GPU mode, set the GPU keys in `racer-dataplane-config`. For example:
 
 ```bash
 kubectl -n unbounded-system patch configmap racer-dataplane-config --type merge -p '{
   "data": {
-    "RACER_DATAPLANE_CUDA": "true",
     "RACER_ENABLE_GPU": "true",
     "RACER_GPU_STAGING_BYTES": "1073741824",
     "RACER_GPU_LANDING_BYTES": "268435456"
@@ -157,8 +160,7 @@ The operator rolls the dataplane pods when this ConfigMap changes.
 
 | Key | Default | Use |
 |-----|---------|-----|
-| `RACER_DATAPLANE_CUDA` | `false` | `true` runs `<registry>/racer-dataplane-cuda:<tag>`. Release and nightly builds publish it. It has the GPU decrypt kernels, cuFile, and a `cufile.json` |
-| `RACER_ENABLE_GPU` | `auto` | `true` makes startup fail when GPU mode cannot start. Use it so a broken setup is not silent |
+| `RACER_ENABLE_GPU` | `auto` | `auto` turns GPU mode on when the dataplane finds a usable GPU. `true` makes startup fail when GPU mode cannot start, so a broken setup is not silent. `false` turns it off |
 | `RACER_GPU_STAGING_BYTES` | 256 MiB | GPU memory per GPU for encrypted pages, in slots of 16 MiB plus 4 KiB. Two slots are for decryption, the rest for cuFile reads. When all slots are busy, pages go through host memory |
 | `RACER_GPU_LANDING_BYTES` | 256 MiB | GPU memory per GPU that peers' NICs write into. It is split across the rails. `0` turns GPUDirect RDMA off |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` tells cuFile to use PCIe P2PDMA for NVMe instead of `nvidia-fs` |
@@ -249,7 +251,7 @@ kubectl -n unbounded-system logs <dataplane-pod> | grep 'stage=gpu'
 |------|---------|
 | `stage=gpu ordinal=0 uuid=... usable=true` | One line per GPU found |
 | `stage=gpu state=enabled usable=N decrypt=M staging_slots=S pci_p2pdma=B` | GPU mode is on. `decrypt=0` means the CPU decrypts every page. `pci_p2pdma` shows the `RACER_GPU_PCI_P2PDMA` setting |
-| `stage=gpu state=disabled reason=not-built` | The image was built without CUDA |
+| `stage=gpu state=disabled reason=not-built` | A custom image was built with `RACER_NATIVE_CUDA=false` |
 | `stage=gpu state=disabled reason=...` | No usable GPU, or the CUDA library failed to load |
 | `stage=gpu ordinal=N decrypt=unavailable` | The GPU cannot run the decrypt kernels |
 | `stage=gpu state=cufile-disabled reason=...` | cuFile is off until the dataplane restarts. Disk pages go through host memory |
@@ -303,7 +305,7 @@ with cuda.GpuAllocation(meta.size) as alloc:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Dataplane fails to start with `RACER_ENABLE_GPU=true` | No usable GPU, or the image has no CUDA | Check the `stage=gpu` lines. Set `RACER_DATAPLANE_CUDA=true`. Set the GPUs to `Default` compute mode |
+| Dataplane fails to start with `RACER_ENABLE_GPU=true` | No usable GPU, or a custom image built without CUDA | Check the `stage=gpu` lines. Use the released `racer-dataplane` image. Set the GPUs to `Default` compute mode |
 | `decrypt=0` | The GPU is older than compute capability 8.0 | Use a newer GPU |
 | `cufile-disabled` at startup | GPUDirect Storage is missing on the host, or cuFile could not turn on P2PDMA | Load `nvidia-fs` or set up P2PDMA, then restart the machine. With `RACER_GPU_PCI_P2PDMA=true`, check that the host meets the P2PDMA needs |
 | `cufile-disabled` later | A cuFile driver error turned cuFile off | Read `/var/log/cufile/cufile.log` in the dataplane pod. Fix the cause, then restart the dataplane |
