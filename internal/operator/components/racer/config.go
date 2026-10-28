@@ -14,14 +14,6 @@ import (
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
-// CUDAKey selects the CUDA dataplane image, read from racer-dataplane-config
-// by the operator. "true" runs racer-dataplane-cuda; "false" or unset runs
-// racer-dataplane.
-const CUDAKey = "RACER_DATAPLANE_CUDA"
-
-// cudaImageName is the dataplane image built with RACER_NATIVE_CUDA=true.
-const cudaImageName = "racer-dataplane-cuda"
-
 // gpuStagingUnit mirrors GPU_STAGING_UNIT in cmd/racer-dataplane/src/config.rs.
 const gpuStagingUnit = 2 << 20
 
@@ -36,7 +28,6 @@ var (
 		"RACER_ENABLE_GPU":        {"auto", "true", "false"},
 		"RACER_REPLICA_SELECTION": {"primary", "spread"},
 		"RACER_ADMISSION_MODE":    {"disabled", "second-sight"},
-		CUDAKey:                   {"true", "false"},
 	}
 
 	// Booleans parse with Rust's bool FromStr, which accepts only true and false.
@@ -187,13 +178,4 @@ func dataplaneDecimal(value string) (uint64, bool) {
 	n, err := strconv.ParseUint(trimmed, 10, 64)
 
 	return n, err == nil
-}
-
-// dataplaneImage returns the dataplane image ConfigMap data selects.
-func dataplaneImage(imageFor func(string) string, data map[string]string) string {
-	if data[CUDAKey] == "true" {
-		return imageFor(cudaImageName)
-	}
-
-	return imageFor(dataplaneImageName)
 }
