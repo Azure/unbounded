@@ -1,13 +1,12 @@
-//! Seat server admission, lifted from `server.rs`.
+//! Seat server admission rules (`server.rs`).
 //!
-//! A seat admits at most [`limits::MAX_WRITES`] concurrent responses with a
-//! body and [`limits::MAX_BOOTSTRAPS`] concurrent enrollments or bearer
+//! A seat admits at most [`crate::limits::MAX_WRITES`] concurrent responses with a
+//! body and [`crate::limits::MAX_BOOTSTRAPS`] concurrent enrollments or bearer
 //! authorizations; beyond that it answers 429 (`Overloaded`). Each Node may
 //! hold one snapshot and one keyring long poll per seat. A cursor ahead of
 //! what the seat serves answers 503 (`Unavailable`). A snapshot reply is a
 //! delta when the client names the exact base, else the full image.
 
-use crate::limits;
 use racer_control_wire::ProtocolFailure;
 use std::collections::{HashSet, VecDeque};
 
@@ -197,78 +196,6 @@ pub fn start_poll<K: Eq + std::hash::Hash + Clone>(
     result
 }
 
-/// A long poll queued for a write slot, in simulator terms: the client,
-/// its connection epoch, and the clock (ns) after which it gives up.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WriteWaiter {
-    pub node: u32,
-    pub epoch: u32,
-    pub deadline_ns: u64,
-}
-
-/// Admission state of one seat server, without sockets. The simulator uses
-/// it to model 429s and long poll occupancy; production keeps the same
-/// counters in `server::Server` (`Slots` and poll sets).
-pub struct SeatAdmission {
-    pub writes: WriteQueue<WriteWaiter>,
-    pub bootstraps: Gate,
-    polls: HashSet<u32>,
-    keyring_polls: HashSet<u32>,
-}
-
-impl Default for SeatAdmission {
-    fn default() -> Self {
-        Self::new(limits::MAX_WRITES, limits::MAX_BOOTSTRAPS)
-    }
-}
-
-impl SeatAdmission {
-    pub fn new(writes: usize, bootstraps: usize) -> Self {
-        Self {
-            writes: WriteQueue::new(writes, limits::MAX_WRITE_WAITERS),
-            bootstraps: Gate::new(bootstraps),
-            polls: HashSet::new(),
-            keyring_polls: HashSet::new(),
-        }
-    }
-
-    /// Start a snapshot long poll for `node` against `current` (`None` when
-    /// the seat is not ready). On `Ok`, the poll is held until
-    /// [`SeatAdmission::end_poll`].
-    pub fn snapshot(
-        &mut self,
-        node: u32,
-        after: Option<u64>,
-        current: Option<u64>,
-    ) -> Result<Poll, ProtocolFailure> {
-        start_poll(&mut self.polls, &node, after, current)
-    }
-
-    /// Start a keyring long poll, like [`SeatAdmission::snapshot`].
-    pub fn keyring(
-        &mut self,
-        node: u32,
-        after: Option<u64>,
-        generation: Option<u64>,
-    ) -> Result<Poll, ProtocolFailure> {
-        start_poll(&mut self.keyring_polls, &node, after, generation)
-    }
-
-    /// The poll of `node` finished (reply written or 204).
-    pub fn end_poll(&mut self, node: u32, keyring: bool) {
-        if keyring {
-            self.keyring_polls.remove(&node);
-        } else {
-            self.polls.remove(&node);
-        }
-    }
-
-    /// Concurrent snapshot and keyring polls held.
-    pub fn polls(&self) -> (usize, usize) {
-        (self.polls.len(), self.keyring_polls.len())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,10 +209,6 @@ mod tests {
         assert!(g.try_take());
         assert_eq!(take(63, 64), Some(64));
         assert_eq!(take(64, 64), None);
-        let a = SeatAdmission::default();
-        assert_eq!(a.writes.gate.capacity, 64);
-        assert_eq!(a.writes.max_waiting, limits::MAX_WRITE_WAITERS);
-        assert_eq!(a.bootstraps.capacity, 32);
     }
 
     #[test]
@@ -356,23 +279,28 @@ mod tests {
 
     #[test]
     fn one_poll_per_node() {
-        let mut a = SeatAdmission::default();
-        assert_eq!(a.snapshot(1, Some(5), Some(5)), Ok(Poll::Wait));
+        let (mut polls, mut keyring) = (HashSet::new(), HashSet::new());
+        assert_eq!(start_poll(&mut polls, &1, Some(5), Some(5)), Ok(Poll::Wait));
         assert_eq!(
-            a.snapshot(1, Some(5), Some(5)),
+            start_poll(&mut polls, &1, Some(5), Some(5)),
             Err(ProtocolFailure::Overloaded)
         );
-        // Keyring polls are separate.
-        assert_eq!(a.keyring(1, None, Some(2)), Ok(Poll::Reply));
-        assert_eq!(a.polls(), (1, 1));
-        a.end_poll(1, false);
-        assert_eq!(a.snapshot(1, Some(4), Some(5)), Ok(Poll::Reply));
+        // Keyring polls are a separate set.
+        assert_eq!(start_poll(&mut keyring, &1, None, Some(2)), Ok(Poll::Reply));
+        polls.remove(&1);
+        assert_eq!(
+            start_poll(&mut polls, &1, Some(4), Some(5)),
+            Ok(Poll::Reply)
+        );
         // Errors do not hold the poll.
         assert_eq!(
-            a.snapshot(2, Some(9), Some(5)),
+            start_poll(&mut polls, &2, Some(9), Some(5)),
             Err(ProtocolFailure::Unavailable)
         );
-        assert_eq!(a.snapshot(3, None, None), Err(ProtocolFailure::Unavailable));
-        assert_eq!(a.polls(), (1, 1));
+        assert_eq!(
+            start_poll(&mut polls, &3, None, None),
+            Err(ProtocolFailure::Unavailable)
+        );
+        assert_eq!((polls.len(), keyring.len()), (1, 1));
     }
 }

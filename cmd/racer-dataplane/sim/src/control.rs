@@ -10,7 +10,7 @@
 //! committed membership exactly as their clients do.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -26,7 +26,7 @@ use racer_cluster_control::{
     },
     limits,
     step::{
-        admission::{Admit, Body, Poll, SeatAdmission, WriteWaiter, body_for},
+        admission::{Admit, Body, Gate, Poll, WriteQueue, body_for, start_poll},
         authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
         primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
         seat::{self as rules, Follower, Lottery, SeatRenew},
@@ -356,11 +356,24 @@ struct Lease {
     ready: Option<u64>,
 }
 
+/// A long poll queued for a write slot: the client, its connection epoch,
+/// and the time after which it gives up.
+#[derive(Clone, Copy, Debug)]
+struct WriteWaiter {
+    node: u32,
+    epoch: u32,
+    deadline_ns: u64,
+}
+
+/// One seat: its Lease and the seat server's admission state, as
+/// `server::Server` keeps it (`Slots`, poll sets).
 struct Seat {
     lease: Lease,
     /// Last sequence the holder's follower installed and served.
     lease_served: Option<u64>,
-    admission: SeatAdmission,
+    writes: WriteQueue<WriteWaiter>,
+    bootstraps: Gate,
+    polls: HashSet<u32>,
     /// `lease_served` while the holder is alive and holds the seat, as the
     /// clients last saw it.
     served: Option<u64>,
@@ -548,7 +561,9 @@ impl ControlSim {
                         ..Default::default()
                     },
                     lease_served: None,
-                    admission: SeatAdmission::default(),
+                    writes: WriteQueue::new(limits::MAX_WRITES, limits::MAX_WRITE_WAITERS),
+                    bootstraps: Gate::new(limits::MAX_BOOTSTRAPS),
+                    polls: HashSet::new(),
                     served: None,
                     waiters: Vec::new(),
                     auth: AuthCache::default(),
@@ -789,12 +804,12 @@ impl ControlSim {
             let seat = &mut self.seats[i];
             seat.auth = AuthCache::default();
             seat.budget = ApiBudget::new(self.settings.auth_qps, self.settings.auth_burst);
-            let queued = seat.admission.writes.take_waiting();
+            let queued = seat.writes.take_waiting();
             let waiters = waiters
                 .into_iter()
                 .chain(queued.into_iter().map(|w| (w.node, w.epoch)));
             for (c, e) in waiters {
-                self.seats[i].admission.end_poll(c, false);
+                self.seats[i].polls.remove(&c);
                 if self.epoch[c as usize] == e {
                     self.engine.at(at, Ev::Poll(c, e));
                 }
@@ -881,7 +896,7 @@ impl ControlSim {
             }
             Ev::Enroll(c, e) if self.live(c, e) => self.enroll(c, e, now),
             Ev::Enrolled(c, e, s) if self.live(c, e) => {
-                self.seats[s as usize].admission.bootstraps.put();
+                self.seats[s as usize].bootstraps.put();
                 self.state[c as usize] = State::Polling;
                 self.seat[c as usize] = s;
                 self.attempts[c as usize] = 0;
@@ -898,14 +913,14 @@ impl ControlSim {
                 }
                 self.poll(c, e, now);
             }
-            Ev::Enrolled(_, _, s) => self.seats[s as usize].admission.bootstraps.put(),
+            Ev::Enrolled(_, _, s) => self.seats[s as usize].bootstraps.put(),
             Ev::Poll(c, e) if self.live(c, e) => self.poll(c, e, now),
             Ev::Delivered(c, e, s, seq, mv, hash) => {
                 self.release_write(s, now);
                 if !self.live(c, e) {
                     return;
                 }
-                self.seats[s as usize].admission.end_poll(c, false);
+                self.seats[s as usize].polls.remove(&c);
                 self.apply(c, seq, mv, hash, now);
                 let delay = if self.slow[c as usize] {
                     self.settings.slow_delay_ns
@@ -961,7 +976,7 @@ impl ControlSim {
             return;
         };
         self.state[c as usize] = State::Enrolling;
-        if !self.seats[s as usize].admission.bootstraps.try_take() {
+        if !self.seats[s as usize].bootstraps.try_take() {
             self.metrics.incr("ctl_bootstrap_overloaded");
             let d = self.backoff(c);
             self.engine.after(d, Ev::Enroll(c, e));
@@ -973,7 +988,7 @@ impl ControlSim {
             if self.authorize(c, s, now, &mut latency) {
                 self.authorized[c as usize] += 1;
             } else {
-                self.seats[s as usize].admission.bootstraps.put();
+                self.seats[s as usize].bootstraps.put();
                 let d = self.backoff(c);
                 self.engine.after(d, Ev::Enroll(c, e));
                 return;
@@ -1090,7 +1105,7 @@ impl ControlSim {
         let after = Some(self.applied_seq[c as usize]).filter(|a| *a > 0);
         let current = self.seats[s as usize].served;
         self.poll_ns[c as usize] = now;
-        match self.seats[s as usize].admission.snapshot(c, after, current) {
+        match start_poll(&mut self.seats[s as usize].polls, &c, after, current) {
             Ok(Poll::Reply) => self.reply(c, s, now),
             Ok(Poll::Wait) => self.seats[s as usize].waiters.push((c, e)),
             Err(ProtocolFailure::Unavailable) => {
@@ -1123,7 +1138,7 @@ impl ControlSim {
             + limits::WRITE_QUEUE_GRACE.as_nanos() as Nanos;
         let seat = &mut self.seats[s as usize];
         if seat.served.is_none() {
-            seat.admission.end_poll(c, false);
+            seat.polls.remove(&c);
             self.engine.at(now, Ev::Poll(c, e));
             return;
         }
@@ -1135,7 +1150,6 @@ impl ControlSim {
         let mut expired = Vec::new();
         let (epoch, state) = (&self.epoch, &self.state);
         let admit = seat
-            .admission
             .writes
             .admit(waiter, |w| expire(epoch, state, w, now, &mut expired));
         for x in expired {
@@ -1151,7 +1165,7 @@ impl ControlSim {
     /// No write slot within the queue bound or deadline: 429 and retry.
     fn reject_write(&mut self, c: u32, s: u8) {
         let e = self.epoch[c as usize];
-        self.seats[s as usize].admission.end_poll(c, false);
+        self.seats[s as usize].polls.remove(&c);
         self.metrics.incr("ctl_write_429");
         let d = self.backoff(c);
         self.engine.after(d, Ev::Poll(c, e));
@@ -1164,7 +1178,6 @@ impl ControlSim {
         let mut expired = Vec::new();
         let (epoch, state) = (&self.epoch, &self.state);
         let next = self.seats[s as usize]
-            .admission
             .writes
             .release(|w| expire(epoch, state, w, now, &mut expired));
         for c in expired {
@@ -1181,7 +1194,7 @@ impl ControlSim {
         let e = self.epoch[c as usize];
         let Some(seq) = self.seats[s as usize].served else {
             self.release_write(s, now);
-            self.seats[s as usize].admission.end_poll(c, false);
+            self.seats[s as usize].polls.remove(&c);
             self.engine.at(now, Ev::Poll(c, e));
             return;
         };
@@ -1405,9 +1418,7 @@ impl ControlSim {
             self.live_clients -= 1;
         }
         if self.seat[c] != NO_SEAT {
-            self.seats[self.seat[c] as usize]
-                .admission
-                .end_poll(p, false);
+            self.seats[self.seat[c] as usize].polls.remove(&p);
         }
         self.epoch[c] += 1;
         self.seat[c] = NO_SEAT;
@@ -1478,7 +1489,7 @@ impl ControlSim {
         let seats: usize = self
             .seats
             .iter()
-            .map(|s| s.waiters.capacity() * 8 + s.admission.polls().0 * 16 + s.auth.len() * 200)
+            .map(|s| s.waiters.capacity() * 8 + s.polls.len() * 16 + s.auth.len() * 200)
             .sum();
         let inventory = self.inventory.nodes.len() * 256 + self.inventory.pods.len() * 512;
         let image = self
