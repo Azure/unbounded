@@ -646,10 +646,10 @@ fn relay_fails_a_request_for_a_silent_destination_at_once() {
 #[test]
 fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     use crate::topology::LinkHealth;
-    use crate::topology::LinkOutcome;
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
+    use racer_core::route::LinkOutcome;
     let signers = signers();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,

@@ -3589,8 +3589,8 @@ mod explicit_clock {
     use crate::peer::Outcome;
     use crate::telemetry::Metrics;
     use crate::topology::LinkHealth;
-    use crate::topology::LinkOutcome;
     use racer_control_wire::NodeId;
+    use racer_core::route::LinkOutcome;
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;

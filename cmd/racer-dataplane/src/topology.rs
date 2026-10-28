@@ -11,6 +11,8 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailMapping;
+use racer_core::liveness::Silence;
+use racer_core::route::LinkOutcome;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
@@ -41,12 +43,11 @@ const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
     inner: flow_control::Circuits<NodeId>,
-    /// Destinations that accept requests and never answer them (Known
-    /// issues 41 and 43, `racer_core::liveness`). A ping carries the
+    /// Destinations that accept requests and never answer them
+    /// (`racer_core::liveness`). A ping carries the
     /// page of the last unanswered exchange.
     silence: std::cell::RefCell<Silence<NodeId, crate::model::PageId>>,
 }
-type Silence<N, P> = racer_core::liveness::Silence<N, P>;
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
     /// Construct independent worker-local circuit state for all possible neighbors.
@@ -54,7 +55,6 @@ impl Default for LinkHealth {
         Self::new(MAX_DEGREE)
     }
 }
-pub use racer_core::route::LinkOutcome;
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
         self.acquire_at(node, uring_runtime::environment::now())
@@ -383,8 +383,7 @@ impl Membership {
     }
     /// The local generation in which `node` arrived in this node's
     /// membership chain (`topology::Membership::since`); `None` for a
-    /// non-member. Placement uses it for lineage handoff targets (Known
-    /// issue 25).
+    /// non-member. Placement uses it for lineage handoff targets.
     pub fn since(&self, node: &NodeId) -> Option<u32> {
         self.inner.since(self.inner.position(node.0.as_bytes())?)
     }
@@ -1641,8 +1640,8 @@ pub(crate) mod tests {
 
     pub(crate) mod scenarios {
         use super::*;
-        use crate::topology::LinkOutcome;
         use crate::topology::tests::fixtures::membership;
+        use racer_core::route::LinkOutcome;
         use std::time::Duration;
         fn budget(
             members: &std::sync::Arc<crate::topology::Membership>,

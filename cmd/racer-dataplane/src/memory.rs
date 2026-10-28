@@ -1101,16 +1101,6 @@ impl CachedPage {
     }
 }
 
-/// Most entries one bounded reclaim pass examines, per cache or overall.
-#[cfg(test)]
-const RECLAIM_SCAN: usize = racer_core::cache::RECLAIM_WINDOW;
-/// Most caches one global reclaim checks for over-share bytes. The window
-/// rotates and resumes after the last examined cache. When every call
-/// examines a full window, each cache with retained entries is checked within
-/// `ceil(caches / PRESSURE_WINDOW)` global reclaims; calls that end early
-/// advance by fewer caches but never skip one.
-pub(crate) const PRESSURE_WINDOW: usize = racer_core::cache::PRESSURE_WINDOW;
-
 /// Memory cache lanes: one per cache, so one cache's entries are reclaimed
 /// without scanning the others.
 struct ByCache;
@@ -1551,8 +1541,8 @@ impl MemoryCache {
     /// released. Plaintext is never retained, so plaintext pressure releases
     /// nothing.
     ///
-    /// Work is bounded: at most `PRESSURE_WINDOW` caches, each with at most
-    /// `RECLAIM_SCAN` entries per kind, plus the existing unweighted pass.
+    /// Work is bounded: at most `racer_core::cache::PRESSURE_WINDOW` caches, each with at most
+    /// `racer_core::cache::RECLAIM_WINDOW` entries per kind, plus the existing unweighted pass.
     /// The window rotates instead of ranking all caches. The next call
     /// resumes after the last cache this call examined, so a pass that ends
     /// early does not skip the rest of its window. Busy or held entries are
@@ -1606,9 +1596,9 @@ impl MemoryCache {
         }
         released
     }
-    /// Up to `PRESSURE_WINDOW` caches with retained entries after the cursor,
+    /// Up to `racer_core::cache::PRESSURE_WINDOW` caches with retained entries after the cursor,
     /// in rotating order. Does not move the cursor; `reclaim` moves it as it
-    /// examines each cache. Cost is O(PRESSURE_WINDOW * log caches),
+    /// examines each cache. Cost is O(racer_core::cache::PRESSURE_WINDOW * log caches),
     /// independent of entry count.
     fn pressure_window(&self) -> Vec<CacheId> {
         let cursor = self.pressure_cursor.borrow();
@@ -1623,7 +1613,7 @@ impl MemoryCache {
         let wrapped = |cache: &CacheId| cursor.as_ref().is_some_and(|cursor| cache <= cursor);
         caches.sort_by(|a, b| (wrapped(a), a).cmp(&(wrapped(b), b)));
         caches.dedup();
-        caches.truncate(PRESSURE_WINDOW);
+        caches.truncate(racer_core::cache::PRESSURE_WINDOW);
         caches
     }
     /// One bounded pass over a single cache's idle ciphertext, oldest first.
@@ -2502,7 +2492,7 @@ pub(crate) mod tests {
                     all.push("target");
                     let cache = memory(&all, 4 * CACHES);
                     // Older busy entries of other caches fill a whole scan window.
-                    let busy: Vec<_> = (0..RECLAIM_SCAN + 44)
+                    let busy: Vec<_> = (0..racer_core::cache::RECLAIM_WINDOW + 44)
                         .map(|i| {
                             let page = verified_in(&cache, &names[i % 4], &format!("busy{i}"));
                             cache.ciphertext(&page).unwrap().unwrap()
@@ -2539,10 +2529,10 @@ pub(crate) mod tests {
                         ),
                         CIPHER
                     );
-                    // Each global reclaim weighs at most PRESSURE_WINDOW caches,
+                    // Each global reclaim weighs at most racer_core::cache::PRESSURE_WINDOW caches,
                     // and rotation reaches every cache within ceil(C / W) calls.
                     let seen = RefCell::new(std::collections::BTreeSet::new());
-                    let rounds = CACHES.div_ceil(PRESSURE_WINDOW);
+                    let rounds = CACHES.div_ceil(racer_core::cache::PRESSURE_WINDOW);
                     for _ in 0..rounds {
                         let calls = Cell::new(0);
                         let queued = Cell::new(0);
@@ -2561,9 +2551,9 @@ pub(crate) mod tests {
                             },
                             |_, _| 0,
                         );
-                        assert!(calls.get() <= PRESSURE_WINDOW);
+                        assert!(calls.get() <= racer_core::cache::PRESSURE_WINDOW);
                         // Only the unweighted fallback examines verified entries.
-                        assert!(queued.get() <= RECLAIM_SCAN);
+                        assert!(queued.get() <= racer_core::cache::RECLAIM_WINDOW);
                     }
                     assert_eq!(seen.borrow().len(), CACHES);
                     assert_lanes(&cache);
@@ -2574,7 +2564,7 @@ pub(crate) mod tests {
                 fn early_success_rotation_reaches_every_cache() {
                     // A multiple of the window, so a cursor that jumped to the
                     // last prefetched cache would revisit only every eighth.
-                    const CACHES: usize = 2 * PRESSURE_WINDOW;
+                    const CACHES: usize = 2 * racer_core::cache::PRESSURE_WINDOW;
                     let names: Vec<_> = (0..CACHES).map(|i| format!("r{i:02}")).collect();
                     let all: Vec<&str> = names.iter().map(String::as_str).collect();
                     let cache = memory(&all, 8 * CACHES);
