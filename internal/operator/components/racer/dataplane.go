@@ -65,6 +65,12 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 		}
 
 		if renamed != nil {
+			// Reject bad carried-over values before the new DaemonSet rolls
+			// out, as for an existing racer-settings.
+			if err := validateDataplaneConfig(renamed); err != nil {
+				return nil, err
+			}
+
 			config.Data = renamed
 		}
 

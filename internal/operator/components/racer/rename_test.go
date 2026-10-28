@@ -74,6 +74,42 @@ func TestRenamedObjectsAreRemoved(t *testing.T) {
 	require.True(t, exists(t, env, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}}))
 }
 
+// An invalid pre-rename setting fails the plan before racer-settings or the
+// new DaemonSet exists, so the old installation keeps running.
+func TestRenamedInvalidConfigBlocksRollout(t *testing.T) {
+	ns := "custom-system"
+	objects := renamedObjects(ns, managed)
+
+	for _, obj := range objects {
+		if config, ok := obj.(*corev1.ConfigMap); ok {
+			config.Data["RACER_DATAPLANE_GPU_STAGING_BYTES"] = "1048576"
+		}
+	}
+
+	env := testEnv(t, append(objects, cacheObject("cache"))...)
+
+	var err error
+
+	for range 5 {
+		var plan *component.Plan
+
+		plan, _, err = (Component{}).Plan(t.Context(), env, nil)
+		if err != nil {
+			break
+		}
+
+		persist(t, env, plan)
+	}
+
+	require.ErrorContains(t, err, "RACER_GPU_STAGING_BYTES")
+	require.False(t, exists(t, env, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: dataplaneConfigName, Namespace: ns}}))
+	require.False(t, exists(t, env, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}}))
+
+	for _, obj := range renamedObjects(ns, managed) {
+		require.True(t, exists(t, env, obj), "%T %s removed", obj, obj.GetName())
+	}
+}
+
 func TestRenamedCleanupRequeuesUntilDone(t *testing.T) {
 	ns := "custom-system"
 	env := testEnv(t, append(renamedObjects(ns, managed), cacheObject("cache"))...)
