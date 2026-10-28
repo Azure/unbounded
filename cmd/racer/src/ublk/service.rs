@@ -31,11 +31,23 @@ use crate::error::{Error, Result};
 pub(crate) type Local<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Immutable page bytes that can be written into a request.
-pub(crate) trait PageBytes: Clone + 'static {
+///
+/// The worker hands these bytes to the reactor as a `SendBuffer`, so every
+/// implementation carries that trait's backing-storage contract.
+///
+/// # Safety
+/// `bytes` must return the same initialized allocation, at the same address
+/// and length, for the owner and every clone, across moves of any of them.
+/// Inline storage such as `[u8; N]` cannot qualify. No alias may mutate,
+/// resize, or free the bytes while any owner or clone is alive.
+pub(crate) unsafe trait PageBytes: Clone + 'static {
     fn bytes(&self) -> &[u8];
 }
 
-impl PageBytes for crate::memory::VerifiedPage {
+// SAFETY: the payload lives behind an `Arc` shared by all clones; moving the
+// handle moves only the pointer, and verified payloads are never mutated or
+// recycled while a handle holds the `Arc`.
+unsafe impl PageBytes for crate::memory::VerifiedPage {
     fn bytes(&self) -> &[u8] {
         crate::memory::VerifiedPage::bytes(self)
     }
@@ -50,7 +62,8 @@ pub(crate) const ZERO_BYTES: usize = 1 << 20;
 
 static ZERO_BUFFER: [u8; ZERO_BYTES] = [0; ZERO_BYTES];
 
-impl PageBytes for Zeros {
+// SAFETY: every value returns the same immutable `static` buffer.
+unsafe impl PageBytes for Zeros {
     fn bytes(&self) -> &[u8] {
         &ZERO_BUFFER
     }
@@ -512,10 +525,27 @@ mod tests {
     #[derive(Clone)]
     struct TestPage(Rc<Vec<u8>>);
 
-    impl PageBytes for TestPage {
+    // SAFETY: bytes live in a heap `Vec` behind an `Rc` that is never
+    // mutated after construction, so moves and clones keep the address.
+    unsafe impl PageBytes for TestPage {
         fn bytes(&self) -> &[u8] {
             &self.0
         }
+    }
+
+    #[test]
+    fn page_bytes_stable_across_moves() {
+        let page = TestPage(Rc::new(vec![7; 64]));
+        let before = PageBytes::bytes(&page).as_ptr();
+        let clone = page.clone();
+        let moved = Box::new(page);
+        assert_eq!(PageBytes::bytes(&*moved).as_ptr(), before);
+        assert_eq!(PageBytes::bytes(&clone).as_ptr(), before);
+        let zeros = Box::new(Zeros);
+        assert_eq!(
+            PageBytes::bytes(&*zeros).as_ptr(),
+            PageBytes::bytes(&Zeros).as_ptr()
+        );
     }
 
     #[derive(Default)]

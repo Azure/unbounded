@@ -271,7 +271,9 @@ struct StubBackend;
 #[derive(Clone)]
 struct StubPage(std::rc::Rc<Vec<u8>>);
 
-impl super::service::PageBytes for StubPage {
+// SAFETY: bytes live in a heap `Vec` behind an `Rc` that is never mutated
+// after construction, so moves and clones keep the address.
+unsafe impl super::service::PageBytes for StubPage {
     fn bytes(&self) -> &[u8] {
         &self.0
     }

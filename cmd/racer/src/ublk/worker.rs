@@ -39,8 +39,9 @@ struct Slice<P: PageBytes> {
     range: Range<usize>,
 }
 
-// SAFETY: `PageBytes` owners keep their bytes at a fixed address and never
-// mutate them while any clone is alive, and this value retains its owner
+// SAFETY: the `unsafe trait PageBytes` contract guarantees owners keep their
+// bytes at a fixed address across moves and never mutate them while any clone
+// is alive, and this value retains its owner
 // until the reactor's completion fence.
 unsafe impl<P: PageBytes> SendBuffer for Slice<P> {
     type Error = Error;
