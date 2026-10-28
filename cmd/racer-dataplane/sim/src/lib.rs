@@ -46,9 +46,6 @@ pub mod node {
     pub mod world;
 
     pub use world::NodeWorld;
-
-    #[cfg(test)]
-    mod tests;
 }
 pub mod phantom;
 pub mod report;
@@ -204,12 +201,9 @@ fn scenario_schedules(scenario: &str, config: &mut Config, seed: u64) {
     let d = config.duration_ns;
     match scenario {
         "storm" if config.storms.is_empty() => {
-            config.storms.push(Storm {
-                at_ns: d / 4,
-                object: 0,
-                nodes: config.nodes,
-                window_ns: 10 * MILLIS,
-            });
+            config
+                .storms
+                .push(Storm::new(d / 4, 0, config.nodes, 10 * MILLIS));
         }
         "churn" if config.churn.is_empty() => {
             config.churn = Churn::random(

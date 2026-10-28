@@ -1676,7 +1676,7 @@ impl NodeWorld {
             .note(page, requester, instant);
     }
 
-    pub(super) fn memory_insert(&mut self, node: u32, w: u8, page: u64) {
+    pub fn memory_insert(&mut self, node: u32, w: u8, page: u64) {
         let cap = (self.config.memory_pages / u32::from(self.fabric.workers)).max(1) as usize;
         let memory = &mut self.nodes[node as usize].workers[w as usize].memory;
         // Production `MemoryCache::publish` keeps a resident page's position: a duplicate publish

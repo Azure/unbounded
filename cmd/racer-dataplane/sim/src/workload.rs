@@ -135,6 +135,15 @@ pub struct Storm {
 }
 
 impl Storm {
+    pub const fn new(at_ns: Nanos, object: u64, nodes: u32, window_ns: Nanos) -> Self {
+        Self {
+            at_ns,
+            object,
+            nodes,
+            window_ns,
+        }
+    }
+
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let o = spec(v, &["at_ns", "object", "nodes", "window_ns"])?;
         Ok(Self {

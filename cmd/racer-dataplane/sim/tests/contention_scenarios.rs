@@ -9,21 +9,26 @@ use racer_sim::config::Config;
 use racer_sim::engine::{MILLIS, SECONDS};
 use racer_sim::faults::Fault;
 use racer_sim::node::NodeWorld;
-use racer_sim::workload::Storm;
+use racer_sim::resources::OriginErrors;
+use racer_sim::workload::{Churn, Storm};
 use racer_sim::{Options, run as run_cli};
 use serde_json::Value;
 
-fn run(config: Config, seed: u64) -> Value {
+fn run_world(config: Config, seed: u64) -> (NodeWorld, Value) {
     let mut world = NodeWorld::new(config, seed);
     let end = world.config.duration_ns;
     world.run(end);
-    let report = world.report("contention", seed);
+    let report = world.report("test", seed);
     assert_eq!(
         report["invariants"]["hard_failures"], 0,
         "{}",
         report["invariants"]
     );
-    report
+    (world, report)
+}
+
+fn run(config: Config, seed: u64) -> Value {
+    run_world(config, seed).1
 }
 
 fn counter(report: &Value, name: &str) -> u64 {
@@ -46,12 +51,10 @@ fn quiet(nodes: u32) -> Config {
     }
 }
 
-fn storm(at_ns: u64, object: u64, nodes: u32, window_ns: u64) -> Storm {
-    Storm {
-        at_ns,
-        object,
-        nodes,
-        window_ns,
+fn quiet3(nodes: u32) -> Config {
+    Config {
+        duration_ns: 3 * SECONDS,
+        ..quiet(nodes)
     }
 }
 
@@ -71,7 +74,7 @@ fn cold_nodes_contend_for_one_global_origin() {
         config.origin_bps = origin_bps;
         config.duration_ns = 20 * SECONDS;
         config.storms = (0..u64::from(nodes))
-            .map(|object| storm(0, object, 1, 1))
+            .map(|object| Storm::new(0, object, 1, 1))
             .collect();
         config
     };
@@ -109,7 +112,10 @@ fn warm_peer_fanout_is_limited_by_source_node_network() {
         config.pages_per_object = 1;
         config.nic_bps = 64 << 20;
         config.duration_ns = 30 * SECONDS;
-        config.storms = vec![storm(0, 0, 1, 1), storm(2 * SECONDS, 0, readers, 1)];
+        config.storms = vec![
+            Storm::new(0, 0, 1, 1),
+            Storm::new(2 * SECONDS, 0, readers, 1),
+        ];
         config
     };
     let one = run(build(1), 3);
@@ -150,7 +156,7 @@ fn workers_share_node_network_bandwidth() {
         config.pages_per_object = 4;
         config.nic_bps = 64 << 20;
         config.duration_ns = 30 * SECONDS;
-        config.storms = vec![storm(0, 0, 1, 1), storm(2 * SECONDS, 0, 9, 1)];
+        config.storms = vec![Storm::new(0, 0, 1, 1), Storm::new(2 * SECONDS, 0, 9, 1)];
         config
     };
     let one = run(build(1), 5);
@@ -169,7 +175,7 @@ fn workers_share_node_network_bandwidth() {
 #[test]
 fn concurrent_cold_readers_join_flights() {
     let mut config = quiet(64);
-    config.storms = vec![storm(0, 0, 64, MILLIS)];
+    config.storms = vec![Storm::new(0, 0, 64, MILLIS)];
     let report = run(config.clone(), 2);
     assert_eq!(counter(&report, "reads_completed"), 64 * pages(&config));
     assert!(counter(&report, "flight_joins") > 0, "{report}");
@@ -232,7 +238,10 @@ fn reads_recover_after_partition_heals() {
         site_a: 0,
         site_b: 1,
     }];
-    config.storms = vec![storm(0, 0, 32, MILLIS), storm(4 * SECONDS, 1, 32, MILLIS)];
+    config.storms = vec![
+        Storm::new(0, 0, 32, MILLIS),
+        Storm::new(4 * SECONDS, 1, 32, MILLIS),
+    ];
     let report = run(config.clone(), 6);
     let completed = counter(&report, "reads_completed");
     assert!(completed >= 32 * pages(&config), "{report}");
@@ -265,7 +274,7 @@ fn cold_start(nodes: u32) {
     let mut config = quiet(nodes);
     // Long enough for every read to end (read timeout is 10 s).
     config.duration_ns = 30 * SECONDS;
-    config.storms = vec![storm(0, 0, nodes, 10 * MILLIS)];
+    config.storms = vec![Storm::new(0, 0, nodes, 10 * MILLIS)];
     let report = run(config.clone(), 8);
     let total = u64::from(nodes) * pages(&config);
     let completed = counter(&report, "reads_completed");
@@ -342,7 +351,10 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     config.pages_per_object = 1;
     config.nic_bps = 4 << 20;
     config.duration_ns = 40 * SECONDS;
-    config.storms = vec![storm(0, 0, 1, 1), storm(5 * SECONDS, 0, nodes, MILLIS)];
+    config.storms = vec![
+        Storm::new(0, 0, 1, 1),
+        Storm::new(5 * SECONDS, 0, nodes, MILLIS),
+    ];
     let report = run(config.clone(), 5);
     let completed = counter(&report, "reads_completed");
     let failed = counter(&report, "reads_failed");
@@ -376,7 +388,10 @@ fn hot_page_readers_fan_out_through_helpers() {
     config.pages_per_object = 1;
     config.nic_bps = 32 << 20;
     config.duration_ns = 40 * SECONDS;
-    config.storms = vec![storm(0, 0, 1, 1), storm(5 * SECONDS, 0, nodes, MILLIS)];
+    config.storms = vec![
+        Storm::new(0, 0, 1, 1),
+        Storm::new(5 * SECONDS, 0, nodes, MILLIS),
+    ];
     let on = run(config.clone(), 5);
     config.node.fanout = false;
     // Without fan-out, owners whose flight is full shed readers too; since a shed reader's retry
@@ -413,7 +428,7 @@ fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
     // Few enough readers, and room for every waiter, that rank 0's flight never refuses a waiter
     // (an `Overloaded` rank 0 is still transient evidence).
     config.node.waiters_per_flight = 128;
-    config.storms = vec![storm(0, 0, 48, 100 * MILLIS)];
+    config.storms = vec![Storm::new(0, 0, 48, 100 * MILLIS)];
     let report = run(config, 3);
     assert!(counter(&report, "origin_left_to_rank0") > 0, "{report}");
     assert_eq!(
@@ -484,8 +499,8 @@ fn hang(watch: bool, silence: bool, until_ns: u64) -> (u64, u64, Value) {
         })
         .collect();
     config.storms = vec![
-        storm(0, 0, 100, 100 * MILLIS),
-        storm(30 * SECONDS, 0, 100, 100 * MILLIS),
+        Storm::new(0, 0, 100, 100 * MILLIS),
+        Storm::new(30 * SECONDS, 0, 100, 100 * MILLIS),
     ];
     let mut world = NodeWorld::new(config, 5);
     world.run(29 * SECONDS);
@@ -552,9 +567,9 @@ fn readers_do_not_return_first_to_an_owner_that_shed_them() {
     config.nic_bps = 32 << 20;
     config.duration_ns = 40 * SECONDS;
     config.storms = vec![
-        storm(0, 0, 1, 1),
-        storm(5 * SECONDS, 0, nodes, MILLIS),
-        storm(7 * SECONDS, 0, nodes, MILLIS),
+        Storm::new(0, 0, 1, 1),
+        Storm::new(5 * SECONDS, 0, nodes, MILLIS),
+        Storm::new(7 * SECONDS, 0, nodes, MILLIS),
     ];
     let on = run(config.clone(), 5);
     config.node.shed_busy = false;
@@ -570,4 +585,618 @@ fn readers_do_not_return_first_to_an_owner_that_shed_them() {
     assert_eq!(counter(&on, "origin_requests"), 1, "{on}");
     // Busy, not hung: nobody is marked silent for a shed.
     assert_eq!(counter(&on, "silence_marks"), 0, "{on}");
+}
+
+/// One reader fetches an object, then every node reads it.
+#[test]
+fn single_reader_then_storm_reuses_copies() {
+    let mut config = quiet3(64);
+    config.storms = vec![
+        Storm::new(0, 3, 1, 1),
+        Storm::new(SECONDS, 3, 64, 100 * MILLIS),
+    ];
+    let (world, report) = run_world(config, 7);
+    let pages = u64::from(world.config.pages_per_object);
+    assert_eq!(counter(&report, "reads_completed"), pages * 65);
+    let origin = counter(&report, "origin_requests");
+    let per_page: Vec<u32> = (0..pages)
+        .map(|p| world.origin_requests(3 * pages + p))
+        .collect();
+    // Before owners delegated to rank 0 this was 33.
+    assert_eq!(origin, pages, "{per_page:?}");
+    assert!(counter(&report, "peer_bytes") > 0);
+    assert!(counter(&report, "flight_joins") + counter(&report, "peer_memory_hits") > 0);
+    assert!(
+        report["metrics"]["histograms"]["hops"]["count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+}
+
+/// Cold-start storm: origin traffic per page is bounded by the replica count.
+#[test]
+fn cold_storm_bounds_origin_per_page() {
+    let mut config = quiet3(300);
+    config.duration_ns = 4 * SECONDS;
+    config.storms = vec![Storm::new(0, 0, 300, 10 * MILLIS)];
+    let (_, report) = run_world(config, 3);
+    let max = report["origin_per_page"]["max_requests_per_page"]
+        .as_u64()
+        .unwrap();
+    assert!(max <= topology::REPLICAS as u64, "{max}");
+    assert_eq!(report["origin_per_page"]["pages"], 16);
+    assert!(counter(&report, "flight_joins") > 0);
+}
+
+fn churny(nodes: u32, retained: u64) -> Config {
+    let mut config = Config {
+        nodes,
+        duration_ns: 2 * SECONDS,
+        objects: 32,
+        ..Config::default()
+    };
+    config.node.retained_versions = retained;
+    config.churn = Churn::random(
+        nodes,
+        nodes / 8,
+        config.duration_ns,
+        SECONDS / 2,
+        &mut racer_core::time::SplitMix64::new(5),
+    );
+    config
+}
+
+/// 412 continues with the remaining walk; 403 and 5xx fail the fill.
+#[test]
+fn origin_errors_follow_the_fill_plan() {
+    let mut config = quiet3(32);
+    config.request_rate = 20.0;
+    config.origin_errors = OriginErrors {
+        p412: 0.2,
+        p403: 0.05,
+        p5xx: 0.1,
+    };
+    let (_, report) = run_world(config, 4);
+    assert!(counter(&report, "remaining_walks") > 0);
+    assert!(counter(&report, "origin_403") > 0);
+    assert!(counter(&report, "origin_5xx") > 0);
+    assert!(counter(&report, "fills_failed") > 0);
+    assert!(counter(&report, "error_origin_forbidden") > 0);
+}
+
+/// A 403 fails only the leader that received it; a waiter on the same flight is re-elected and
+/// fills with its own budget (matching production `Flights::fail(OriginForbidden)`).
+#[test]
+fn origin_forbidden_reelects_a_waiter() {
+    let mut config = quiet3(64);
+    config.storms = vec![Storm::new(0, 1, 64, MILLIS)];
+    config.origin_errors = OriginErrors {
+        p412: 0.0,
+        p403: 0.5,
+        p5xx: 0.0,
+    };
+    let (_, report) = run_world(config, 11);
+    assert!(counter(&report, "origin_403") > 0);
+    assert!(counter(&report, "flight_reelected") > 0);
+    assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
+    assert!(counter(&report, "error_origin_forbidden") > 0);
+}
+
+/// Tight quotas reject work per resource class.
+#[test]
+fn tight_quotas_reject_by_class() {
+    let mut config = quiet3(100);
+    config.node.relay_transfers = 1;
+    config.node.flights = 1;
+    config.storms = vec![Storm::new(0, 1, 100, MILLIS)];
+    let (_, report) = run_world(config, 9);
+    // The flight table's own entry cap rejects before the Flight quota, as in production
+    // `Flights::join_prepared`; relays hit the Relay quota.
+    let r = &report["rejections"];
+    assert!(r["relay"].as_u64().unwrap() > 0, "{r}");
+    assert!(counter(&report, "flight_join_rejected") > 0);
+}
+
+#[test]
+fn same_seed_replays_and_seeds_differ() {
+    let a = run_world(churny(60, 2), 11).1;
+    let b = run_world(churny(60, 2), 11).1;
+    assert_eq!(a["trace_hash"], b["trace_hash"]);
+    assert_eq!(a["metrics"], b["metrics"]);
+    let c = run_world(churny(60, 2), 12).1;
+    assert_ne!(a["trace_hash"], c["trace_hash"]);
+}
+
+#[test]
+fn memory_accounting_is_per_component() {
+    let (_, report) = run_world(churny(100, 2), 1);
+    let components = report["memory"]["components"].as_object().unwrap();
+    for name in [
+        "placement",
+        "paths",
+        "memory_lru",
+        "disk_index",
+        "flights",
+        "quotas",
+        "placement_memo",
+        "route_memo",
+    ] {
+        assert!(components.contains_key(name), "{name}");
+    }
+    assert!(components["placement"].as_u64().unwrap() > 0);
+    let per_node = report["memory"]["accounted_bytes_per_node"]
+        .as_u64()
+        .unwrap();
+    assert!(per_node < 640 << 10, "{per_node}");
+}
+
+fn client_read(
+    node: u32,
+    page: u64,
+    at: racer_sim::engine::Nanos,
+) -> racer_sim::node::world::Event {
+    racer_sim::node::world::Event::Read(racer_sim::node::world::ClientRead {
+        node,
+        incarnation: 0,
+        page,
+        start: at,
+        attempt: 0,
+        range: 0,
+        slot: 0,
+    })
+}
+
+/// Retention observes every client read, including memory hits: a non-owner persists a page on its
+/// second read (second sight), not at publication.
+#[test]
+fn retention_observes_client_reads_including_memory_hits() {
+    let config = quiet3(64);
+    let mut world = NodeWorld::new(config, 5);
+    let pages = u64::from(world.config.pages_per_object);
+    let reader = 9;
+    let foreign: Vec<u64> = (3 * pages..4 * pages)
+        .filter(|p| !world.owners(*p).contains(&reader))
+        .collect();
+    assert!(!foreign.is_empty());
+    for p in &foreign {
+        world.engine.at(0, client_read(reader, *p, 0));
+    }
+    world.run(SECONDS);
+    let after_first = world.metrics.get("retention_observations");
+    assert_eq!(after_first, foreign.len() as u64);
+    for p in &foreign {
+        assert!(
+            !world.on_disk(reader, *p),
+            "page {p} persisted on first sight"
+        );
+    }
+    let hits = world.metrics.get("memory_hits");
+    for p in &foreign {
+        world.engine.at(SECONDS, client_read(reader, *p, SECONDS));
+    }
+    world.run(2 * SECONDS);
+    assert_eq!(
+        world.metrics.get("memory_hits") - hits,
+        foreign.len() as u64
+    );
+    assert_eq!(
+        world.metrics.get("retention_observations"),
+        2 * foreign.len() as u64
+    );
+    for p in &foreign {
+        assert!(
+            world.on_disk(reader, *p),
+            "page {p} not persisted on second sight"
+        );
+    }
+    assert_eq!(world.invariants.to_json()["hard_failures"], 0);
+}
+
+/// Rankings and route searches yield between CPU slices and hold their placement pin or search slot
+/// meanwhile, so production's concurrency limits reject concurrent work with `Overloaded` without a
+/// search queue. With the production queue, searches beyond the slot limit wait and are woken when
+/// a slot frees, so far fewer are rejected, and none at the default limits.
+#[test]
+fn yielding_searches_hit_production_concurrency_limits() {
+    let mut config = quiet3(600);
+    config.duration_ns = 2 * SECONDS;
+    config.node.placement_entries = 2;
+    config.node.active_searches = 1;
+    config.storms = vec![Storm::new(0, 2, 600, MILLIS)];
+    let mut rejecting = config.clone();
+    rejecting.node.search_queue = 0;
+    let (_, before) = run_world(rejecting.clone(), 3);
+    assert!(counter(&before, "ranking_overloaded") > 0, "{before}");
+    let rejected = counter(&before, "route_search_overloaded");
+    assert!(rejected > 0, "{before}");
+    // 600 members take three 256-member chunks per cold ranking.
+    assert!(counter(&before, "ranking_polls") > counter(&before, "fills"));
+    rejecting.node.placement_entries = 256;
+    rejecting.node.active_searches = 8;
+    let (_, report) = run_world(rejecting, 3);
+    assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
+    let (_, after) = run_world(config.clone(), 3);
+    assert!(counter(&after, "route_search_queued") > 0, "{after}");
+    assert!(counter(&after, "route_search_queue_wakes") > 0, "{after}");
+    assert!(
+        counter(&after, "route_search_overloaded") * 4 < rejected,
+        "{after}"
+    );
+    config.node.active_searches = 8;
+    let (_, report) = run_world(config, 3);
+    assert_eq!(counter(&report, "route_search_overloaded"), 0, "{report}");
+}
+
+/// Runs the hedge scenario: every ranked owner of object 4 warms its pages, then each rank 0 owner
+/// becomes 255 times slower and non-owner readers (never slow) read every page.
+fn hedge_scenario(slots: u32) -> (NodeWorld, Value) {
+    use racer_sim::faults::Fault;
+    let mut config = quiet3(64);
+    config.node.hedge_slots = slots;
+    config.node.hedge_delay_ns = 5 * MILLIS;
+    config.node.hedge_bytes =
+        u64::from(slots.max(1)) * racer_sim::node::world::DUPLICATE_BYTES as u64;
+    config.duration_ns = 8 * SECONDS;
+    let probe = NodeWorld::new(config.clone(), 21);
+    let pages = u64::from(probe.config.pages_per_object);
+    let range: Vec<u64> = (4 * pages..5 * pages).collect();
+    let owners: Vec<Vec<u32>> = range.iter().map(|p| probe.owners(*p)).collect();
+    let slow: std::collections::BTreeSet<u32> = owners.iter().map(|o| o[0]).collect();
+    for node in &slow {
+        config.faults.push(Fault::Slow {
+            node: *node,
+            factor: 255,
+            from_ns: SECONDS,
+            until_ns: 3 * SECONDS,
+        });
+    }
+    let mut world = NodeWorld::new(config, 21);
+    for (p, o) in range.iter().zip(&owners) {
+        for node in o {
+            world.engine.at(0, client_read(*node, *p, 0));
+        }
+        let readers = (0..64u32)
+            .filter(|n| !o.contains(n) && !slow.contains(n))
+            .take(4);
+        for (i, node) in readers.enumerate() {
+            let at = SECONDS + 100 * MILLIS + i as u64 * MILLIS;
+            world.engine.at(at, client_read(node, *p, at));
+        }
+    }
+    world.run(8 * SECONDS);
+    let report = world.report("hedge", 21);
+    assert_eq!(
+        report["invariants"]["hard_failures"], 0,
+        "{}",
+        report["invariants"]
+    );
+    (world, report)
+}
+
+/// Production default (no slots) never races; with slots, a slow rank 0 owner loses to the
+/// copy-only duplicate at the second owner: lower peer read latency, duplicate bytes counted per
+/// started hedge, and the split budgets never grow (checked by `budget_never_grows`).
+#[test]
+fn hedging_beats_a_slow_primary() {
+    let (_, off) = hedge_scenario(0);
+    let (_, on) = hedge_scenario(4);
+    assert_eq!(counter(&off, "hedge_races"), 0);
+    assert!(counter(&off, "hedge_eligible") > 0, "{off}");
+    assert!(counter(&on, "hedge_races") > 0, "{on}");
+    let started = counter(&on, "hedge_started");
+    assert!(started > 0, "{on}");
+    // The duplicate at the fast second owner wins most races.
+    assert!(2 * counter(&on, "hedge_won") > started, "{on}");
+    assert!(counter(&on, "hedge_losers_canceled") > 0, "{on}");
+    assert_eq!(
+        counter(&on, "hedge_duplicate_bytes"),
+        started * racer_sim::node::world::DUPLICATE_BYTES as u64
+    );
+    assert_eq!(
+        counter(&on, "reads_completed"),
+        counter(&off, "reads_completed"),
+        "on {}\noff {}",
+        on["metrics"]["counters"],
+        off["metrics"]["counters"]
+    );
+    let mean = |r: &Value| {
+        r["metrics"]["histograms"]["read_ns"]["mean"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(
+        mean(&on) < mean(&off),
+        "on {} off {}",
+        mean(&on),
+        mean(&off)
+    );
+}
+
+/// A duplicate publish of a resident page does not refresh its recency, as in production
+/// `MemoryCache::publish`: inserting 0, 1, 0, 2 into a two-page worker cache evicts 0, the oldest
+/// insert.
+#[test]
+fn duplicate_memory_publish_does_not_touch() {
+    let mut config = quiet3(4);
+    config.memory_pages = 2 * u32::from(config.workers);
+    let mut world = NodeWorld::new(config, 1);
+    for page in [0, 1, 0, 2] {
+        world.memory_insert(0, 0, page);
+    }
+    assert!(!world.in_memory(0, 0, 0));
+    assert!(world.in_memory(0, 0, 1));
+    assert!(world.in_memory(0, 0, 2));
+}
+
+/// Ownership moves when nodes join: an owner that adopted the new membership asks the page's
+/// previous owners copy-only before origin, so a page read before the join is not fetched again
+/// after it.
+#[test]
+fn joined_owners_copy_from_previous_owners() {
+    let mut config = quiet3(64);
+    config.duration_ns = 4 * SECONDS;
+    let mut churn = Vec::new();
+    for node in 48..64 {
+        churn.push(Churn {
+            at_ns: MILLIS,
+            node,
+            join: false,
+        });
+        churn.push(Churn {
+            at_ns: SECONDS + SECONDS / 2,
+            node,
+            join: true,
+        });
+    }
+    config.churn = churn;
+    config.storms = vec![
+        Storm::new(SECONDS, 3, 1, 1),
+        Storm::new(3 * SECONDS, 3, 48, 100 * MILLIS),
+    ];
+    let (world, report) = run_world(config, 7);
+    let pages = u64::from(world.config.pages_per_object);
+    let per_page: Vec<u32> = (0..pages)
+        .map(|p| world.origin_requests(3 * pages + p))
+        .collect();
+    // Without handoff probes this was 19 (three pages fetched twice).
+    assert!(counter(&report, "handoff_probes") > 0, "{report}");
+    assert_eq!(counter(&report, "origin_requests"), pages, "{per_page:?}");
+    assert_eq!(all_repeats(&report), 0, "{}", report["origin_per_page"]);
+}
+
+fn repeats(report: &Value, kind: &str) -> u64 {
+    report["origin_per_page"]["repeats"][kind].as_u64().unwrap()
+}
+
+/// Repeated origin requests over every class (`NodeWorld::classify_repeat`).
+fn all_repeats(report: &Value) -> u64 {
+    [
+        "after_owner_move",
+        "after_failure",
+        "concurrent",
+        "copy_lost",
+        "copy_held",
+    ]
+    .iter()
+    .map(|kind| repeats(report, kind))
+    .sum()
+}
+
+/// `copy_held` repeats with cause `cause` (`origin_repeats_held_*`).
+fn held(report: &Value, cause: &str) -> u64 {
+    report["origin_per_page"]["repeats"]["held"][cause]
+        .as_u64()
+        .unwrap()
+}
+
+/// With origin slower than the read deadline, leaders expire while their fills wait on origin, and
+/// production cancels an expired fill's origin exchange at the leader's deadline.
+#[test]
+fn expired_fills_cancel_their_origin_request() {
+    let mut config = quiet3(64);
+    // Without handover every expired leader's fill drains or is canceled.
+    config.node.flight_handover = false;
+    config.origin_bps = 1 << 20;
+    config.duration_ns = 12 * SECONDS;
+    config.storms = (0..4)
+        .map(|i| Storm::new(i * 3 * SECONDS, 1, 64, 100 * MILLIS))
+        .collect();
+    let (_, report) = run_world(config, 5);
+    assert!(counter(&report, "flight_stale_finishes") > 0, "{report}");
+    assert!(counter(&report, "origin_canceled") > 0, "{report}");
+    assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
+}
+
+/// With origin slower than the read deadline and readers arriving throughout, an expired leader's
+/// fill continues for a later waiter instead of being canceled and restarted.
+#[test]
+fn expired_leaders_hand_their_fill_to_later_waiters() {
+    let report = |handover: bool| {
+        let mut config = quiet3(64);
+        config.origin_bps = 1 << 20;
+        config.duration_ns = 16 * SECONDS;
+        config.node.flight_handover = handover;
+        config.storms = (0..12)
+            .map(|i| Storm::new(i * SECONDS, 1, 16, 500 * MILLIS))
+            .collect();
+        run_world(config, 7).1
+    };
+    let (before, after) = (report(false), report(true));
+    assert_eq!(counter(&before, "flight_handovers"), 0);
+    assert!(counter(&after, "flight_handovers") > 0, "{after}");
+    assert!(
+        counter(&after, "origin_canceled") < counter(&before, "origin_canceled"),
+        "before {} after {}",
+        before["metrics"]["counters"],
+        after["metrics"]["counters"]
+    );
+    assert!(
+        counter(&after, "origin_requests") < counter(&before, "origin_requests"),
+        "before {} after {}",
+        before["metrics"]["counters"],
+        after["metrics"]["counters"]
+    );
+    let max = |r: &Value| {
+        r["origin_per_page"]["max_requests_per_page"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(
+        max(&after) <= max(&before),
+        "{} {}",
+        max(&before),
+        max(&after)
+    );
+    assert_eq!(counter(&after, "flight_unexpected_lead"), 0);
+}
+
+/// Churn runs: nodes adopt publications with lag, lagging receivers answer stale membership,
+/// requesters ahead of their destination skip it, owners ask lagging predecessors under the
+/// previous membership, and origin repeats are classified and bounded.
+#[test]
+fn churn_adoption_staleness_and_repeats() {
+    // (nodes, retained versions, seed)
+    for (nodes, retained, seed) in [
+        (120, 2, 1),
+        (120, 0, 2),
+        (120, 2, 2),
+        (300, 2, 1),
+        (300, 2, 2),
+    ] {
+        let (world, report) = run_world(churny(nodes, retained), seed);
+        let at = format!("{nodes} {retained} {seed}");
+        let c = |name| counter(&report, name);
+        if (nodes, seed) == (120, 1) {
+            assert!(c("membership_publications") > 1);
+            assert!(c("membership_adoptions") > 120);
+            assert!(c("placement_maintenance_steps") > 0);
+            assert!(c("stale_membership_replies") > 0, "{report}");
+            assert!(world.versions.latest().number > 2);
+            assert!(
+                report["membership"]["placement_memo_entries"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        if nodes == 120 && matches!((retained, seed), (0, 2) | (2, 1)) {
+            assert!(c("stale_destination_skips") > 0, "{at}: {report}");
+            assert_eq!(c("error_incompatible_membership"), 0, "{at}: {report}");
+            assert_eq!(c("error_hop_budget_exhausted"), 0, "{at}: {report}");
+        }
+        if retained == 0 {
+            // Without retained versions receivers that moved ahead answer stale membership and
+            // peers cannot resolve the previous membership (production: no grace retention).
+            assert!(c("walk_membership_refreshes") > 0, "{report}");
+            assert_eq!(c("previous_membership_probes"), 0);
+            continue;
+        }
+        if (nodes, seed) != (300, 2) {
+            assert!(c("previous_membership_probes") > 0, "{at}: {report}");
+            assert!(
+                c("owner_stale_destination_skips") <= 4,
+                "{at}: {}",
+                report["metrics"]["counters"]
+            );
+            assert!(
+                repeats(&report, "copy_held") <= 8,
+                "{at}: {}",
+                report["origin_per_page"]
+            );
+        }
+        if (nodes, seed) != (120, 2) {
+            let origin = c("origin_requests");
+            let pages = report["origin_per_page"]["pages"].as_u64().unwrap();
+            let held = repeats(&report, "copy_held");
+            assert_eq!(
+                all_repeats(&report),
+                origin - pages,
+                "{}",
+                report["origin_per_page"]
+            );
+            let causes: u64 = [
+                "raced",
+                "unreachable",
+                "busy",
+                "unfunded",
+                "missed",
+                "unasked",
+            ]
+            .iter()
+            .map(|cause| self::held(&report, cause))
+            .sum();
+            assert_eq!(causes, held, "{}", report["origin_per_page"]);
+            assert!(held * 50 <= origin, "{at}: {}", report["origin_per_page"]);
+        }
+    }
+}
+
+/// With a membership lag as long as the batch period, readers often adopt a version before the
+/// page's owners. Each `config.node` stale-handling switch, turned off, brings back the failures it
+/// fixes.
+#[test]
+fn readers_handle_owners_that_are_behind() {
+    let with = |f: fn(&mut racer_sim::config::NodeConfig)| {
+        let mut config = churny(120, 2);
+        config.request_rate = 40.0;
+        config.node.membership_lag_ns = config.node.membership_batch_ns;
+        f(&mut config.node);
+        run_world(config, 3).1
+    };
+    let on = with(|_| {});
+    let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
+    let failed = |r: &Value| counter(r, "reads_failed");
+    // A reader that owned the page under the previous membership may not walk it, and waits for
+    // a destination that is behind like a reader that joined in the current membership.
+    assert!(counter(&on, "stale_fallback_denied") > 0, "{on}");
+    assert_eq!(
+        counter(&on, "stale_waits_denied"),
+        counter(&on, "stale_fallback_denied"),
+        "{on}"
+    );
+    assert_eq!(exhausted(&on), 0, "{on}");
+    // A node that rejoined in version N is not a member of N - 1, so it cannot fall back: it waits.
+    let off = with(|n| n.stale_wait = false);
+    assert_eq!(counter(&off, "stale_waits"), 0);
+    assert!(counter(&on, "stale_waits") > 0, "{on}");
+    assert!(counter(&off, "stale_fallback_not_member") > 0, "{off}");
+    assert!(
+        exhausted(&off) > 0 && exhausted(&on) < exhausted(&off),
+        "{off}"
+    );
+    assert!(failed(&on) <= failed(&off));
+    // A verified `StaleMembership` returns the links past its answerer.
+    let off = with(|n| n.stale_link_refund = false);
+    assert!(counter(&on, "stale_links_refunded") > 0, "{on}");
+    assert_eq!(counter(&off, "stale_links_refunded"), 0, "{off}");
+    assert!(counter(&on, "walk_exhausted") <= counter(&off, "walk_exhausted"));
+    assert!(failed(&on) <= failed(&off));
+    // Stale owners send non-owners to the previous membership. Measured without waits, and first
+    // without the refund, which lets a walk reach the other owners even without the fallback.
+    let fallback = |fallback: bool, refund: bool| match (fallback, refund) {
+        (false, false) => {
+            with(|n| (n.stale_wait, n.stale_fallback, n.stale_link_refund) = (false, false, false))
+        }
+        (true, false) => with(|n| (n.stale_wait, n.stale_link_refund) = (false, false)),
+        (false, true) => with(|n| (n.stale_wait, n.stale_fallback) = (false, false)),
+        (true, true) => with(|n| n.stale_wait = false),
+    };
+    for refund in [false, true] {
+        let (off, on) = (fallback(false, refund), fallback(true, refund));
+        assert_eq!(counter(&off, "stale_fallbacks"), 0);
+        assert!(counter(&on, "stale_fallbacks") > 0, "{on}");
+        assert!(exhausted(&off) > 0, "{off}");
+        assert!(
+            exhausted(&on) * 10 <= exhausted(&off),
+            "{} vs {}",
+            exhausted(&on),
+            exhausted(&off)
+        );
+        if refund {
+            assert!(failed(&on) <= failed(&off));
+        } else {
+            assert!(failed(&on) * 4 <= failed(&off));
+        }
+    }
 }
