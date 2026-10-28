@@ -1378,195 +1378,81 @@ pub const MAX_STALE_WAITS: u8 = 2;
 /// Shortest wait worth making.
 pub const MIN_STALE_WAIT: Duration = Duration::from_millis(250);
 
-/// A destination behind this node, for a reader that cannot fall back.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct StaleWaitFacts {
-    /// This node owns the page (owners go on to their own fetch).
-    pub owner: bool,
-    /// [`previous_fallback`] walks the previous membership instead.
-    pub fallback: bool,
-    /// Waits this read already made for destinations that are behind.
-    pub waits: u8,
-    /// Asking again leaves later visits funded (required after the first).
-    pub affordable: bool,
-    /// Time left until the read's deadline.
-    pub remaining: Duration,
-}
-
-/// How long a non-owner waits before asking a destination that is behind
-/// again: a third of the time left, within [`MIN_STALE_WAIT`] and
-/// [`MAX_STALE_WAIT`], at most [`MAX_STALE_WAITS`] times. The verified
-/// `StaleMembership` refunds the probe's credits, so budgets never grow.
-fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
-    if facts.owner
-        || facts.fallback
-        || facts.waits >= MAX_STALE_WAITS
-        || (facts.waits > 0 && !facts.affordable)
-    {
+/// How long a non-owner that cannot fall back waits before asking a
+/// destination that is behind again: a third of the `remaining` time, within
+/// [`MIN_STALE_WAIT`] and [`MAX_STALE_WAIT`], at most [`MAX_STALE_WAITS`]
+/// times. A wait after the first must be `affordable` (later visits stay
+/// funded). The verified `StaleMembership` refunds the probe's credits.
+fn stale_wait(waits: u8, affordable: bool, remaining: Duration) -> Option<Duration> {
+    if waits >= MAX_STALE_WAITS || (waits > 0 && !affordable) {
         return None;
     }
-    let wait = (facts.remaining / 3).min(MAX_STALE_WAIT);
+    let wait = (remaining / 3).min(MAX_STALE_WAIT);
     (wait >= MIN_STALE_WAIT).then_some(wait)
 }
 
-/// Facts about a walk under membership N whose destination was behind.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct StaleSkip {
-    /// This node owns the page under N.
-    pub owner: bool,
-    /// This read already refreshed its membership or fell back once.
-    pub retried: bool,
-    /// N - 1 is resolvable here, recent, and lists this node.
-    pub previous_recent_member: bool,
-}
-
-/// Whether to walk the page's owners under N - 1 instead of skipping.
-fn previous_fallback(s: StaleSkip) -> bool {
-    !s.owner && !s.retried && s.previous_recent_member
-}
-
-/// A page owner under N - 1 would gain origin authority it no longer has.
-fn fallback_rank_allowed(rank: Option<usize>) -> bool {
-    rank.is_none()
+/// Whether a reader walks the page's owners under N - 1 instead of skipping
+/// a destination that is behind: once, and only when N - 1 is recent and
+/// lists this node.
+fn previous_fallback(owner: bool, retried: bool, previous_recent_member: bool) -> bool {
+    !owner && !retried && previous_recent_member
 }
 
 #[cfg(test)]
 mod stale_tests {
     use super::*;
 
-    fn skip() -> StaleSkip {
-        StaleSkip {
-            owner: false,
-            retried: false,
-            previous_recent_member: true,
-        }
-    }
-
     #[test]
-    fn non_owner_falls_back_once() {
-        assert!(previous_fallback(skip()));
-    }
-
-    #[test]
-    fn no_fallback_without_a_usable_previous_membership() {
-        // Already retried (refreshed or fell back): at most one more walk.
-        assert!(!previous_fallback(StaleSkip {
-            retried: true,
-            ..skip()
-        }));
-        // Peers may no longer resolve N - 1, or would reject this node.
-        assert!(!previous_fallback(StaleSkip {
-            previous_recent_member: false,
-            ..skip()
-        }));
-        // Owners keep their walk under N.
-        assert!(!previous_fallback(StaleSkip {
-            owner: true,
-            ..skip()
-        }));
-        assert!(!previous_fallback(StaleSkip::default()));
-    }
-
-    fn waiting() -> StaleWaitFacts {
-        StaleWaitFacts {
-            remaining: Duration::from_secs(9),
-            affordable: true,
-            ..StaleWaitFacts::default()
+    fn a_reader_falls_back_once_with_a_usable_previous_membership() {
+        assert!(previous_fallback(false, false, true));
+        for (owner, retried, recent) in [
+            (false, true, true),
+            (false, false, false),
+            (true, false, true),
+        ] {
+            assert!(!previous_fallback(owner, retried, recent));
         }
     }
 
     #[test]
     fn a_reader_that_cannot_fall_back_waits_twice() {
-        assert_eq!(stale_wait(waiting()), Some(Duration::from_secs(3)));
+        let secs = Duration::from_secs;
+        assert_eq!(stale_wait(0, true, secs(9)), Some(secs(3)));
         // The first wait does not depend on funding (Known issue 26).
-        assert_eq!(
-            stale_wait(StaleWaitFacts {
-                affordable: false,
-                ..waiting()
-            }),
-            Some(Duration::from_secs(3))
-        );
+        assert_eq!(stale_wait(0, false, secs(9)), Some(secs(3)));
         // Known issue 36: a second wait, a third of what is left, covers
         // the 50k propagation window (about 5 s) within a 10 s deadline.
-        let deadline = Duration::from_secs(10);
-        let first = stale_wait(StaleWaitFacts {
-            remaining: deadline,
-            ..waiting()
-        })
-        .unwrap();
-        let second = stale_wait(StaleWaitFacts {
-            remaining: deadline - first,
-            waits: 1,
-            ..waiting()
-        })
-        .unwrap();
+        let deadline = secs(10);
+        let first = stale_wait(0, true, deadline).unwrap();
+        let second = stale_wait(1, true, deadline - first).unwrap();
         assert!(
             first + second >= Duration::from_millis(5500),
             "{first:?} {second:?}"
         );
-        assert_eq!(
-            stale_wait(StaleWaitFacts {
-                remaining: deadline - first - second,
-                waits: 2,
-                ..waiting()
-            }),
-            None
-        );
+        assert_eq!(stale_wait(2, true, deadline - first - second), None);
         // Capped, and a third of what is left.
-        let long = StaleWaitFacts {
-            remaining: Duration::from_secs(60),
-            ..waiting()
-        };
-        assert_eq!(stale_wait(long), Some(MAX_STALE_WAIT));
-        let short = StaleWaitFacts {
-            remaining: Duration::from_millis(900),
-            ..waiting()
-        };
-        assert_eq!(stale_wait(short), Some(Duration::from_millis(300)));
+        assert_eq!(stale_wait(0, true, secs(60)), Some(MAX_STALE_WAIT));
+        assert_eq!(
+            stale_wait(0, true, Duration::from_millis(900)),
+            Some(Duration::from_millis(300))
+        );
     }
 
     #[test]
-    fn no_wait_for_owners_fallbacks_repeats_or_short_deadlines() {
-        for facts in [
-            StaleWaitFacts {
-                owner: true,
-                ..waiting()
-            },
-            StaleWaitFacts {
-                fallback: true,
-                ..waiting()
-            },
-            StaleWaitFacts {
-                waits: MAX_STALE_WAITS,
-                ..waiting()
-            },
+    fn no_wait_for_repeats_unfunded_retries_or_short_deadlines() {
+        for (waits, affordable, remaining) in [
+            (MAX_STALE_WAITS, true, Duration::from_secs(9)),
             // A further wait must leave the later visits funded.
-            StaleWaitFacts {
-                waits: 1,
-                affordable: false,
-                ..waiting()
-            },
-            StaleWaitFacts {
-                remaining: Duration::from_millis(749),
-                ..waiting()
-            },
-            StaleWaitFacts::default(),
+            (1, false, Duration::from_secs(9)),
+            (0, true, Duration::from_millis(749)),
+            (0, false, Duration::ZERO),
         ] {
-            assert_eq!(stale_wait(facts), None, "{facts:?}");
+            assert_eq!(stale_wait(waits, affordable, remaining), None);
         }
-        let edge = StaleWaitFacts {
-            remaining: Duration::from_millis(750),
-            ..waiting()
-        };
-        assert_eq!(stale_wait(edge), Some(MIN_STALE_WAIT));
-    }
-
-    #[test]
-    fn fallback_never_gives_origin_authority() {
-        assert!(fallback_rank_allowed(None));
-        for rank in 0..3 {
-            assert!(!fallback_rank_allowed(Some(rank)));
-        }
+        assert_eq!(
+            stale_wait(0, true, Duration::from_millis(750)),
+            Some(MIN_STALE_WAIT)
+        );
     }
 }
 
@@ -2627,11 +2513,11 @@ impl Fill {
                 // keeps its wait (Known issue 36).
                 if self.has(Features::STALE_FALLBACK)
                     && !self.fallback_denied
-                    && previous_fallback(StaleSkip {
+                    && previous_fallback(
                         owner,
-                        retried: self.retried || self.fell_back,
+                        self.retried || self.fell_back,
                         previous_recent_member,
-                    })
+                    )
                 {
                     self.fell_back = true;
                     return Ok(self.rank_next(Ranking::Fallback, Some(self.version - 1)));
@@ -2685,13 +2571,12 @@ impl Fill {
         let Walking::Candidates(walk) = &mut self.walk else {
             return Ok(None);
         };
-        let Some(wait) = stale_wait(StaleWaitFacts {
-            owner: self.rank.is_some(),
-            fallback: false,
-            waits: self.waits,
-            affordable: walk.retry_affordable(budget),
-            remaining: deadline.saturating_duration_since(now),
-        }) else {
+        // Only readers wait: owners never reach here.
+        let Some(wait) = stale_wait(
+            self.waits,
+            walk.retry_affordable(budget),
+            deadline.saturating_duration_since(now),
+        ) else {
             return Ok(None);
         };
         walk.retry_pending(budget)?;
@@ -2709,7 +2594,8 @@ impl Fill {
         now: Instant,
     ) -> Result<Action> {
         let allowed = match &ranked {
-            Ok(r) if !r.owners.is_empty() => fallback_rank_allowed(r.rank),
+            // A page owner under N - 1 would gain authority it no longer has.
+            Ok(r) if !r.owners.is_empty() => r.rank.is_none(),
             _ => false,
         };
         if allowed {
