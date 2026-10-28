@@ -5,6 +5,7 @@ package racer
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -16,6 +17,19 @@ import (
 
 // gpuStagingUnit mirrors GPU_STAGING_UNIT in cmd/racer-dataplane/src/config.rs.
 const gpuStagingUnit = 2 << 20
+
+// Constants mirrored from cmd/racer-dataplane/src: MIB, MAX_BYTES, and
+// MAX_ENTRIES in config.rs, PAGE_BYTES in model, DUPLICATE_BYTES in
+// read/candidates.rs, and the storage record size checked in config.rs
+// (a page, a 16-byte tag, and MAX_HEADER_BYTES from store.rs).
+const (
+	mib            = 1 << 20
+	maxBytes       = 64 << 30
+	maxEntries     = 1 << 20
+	pageBytes      = 16 * mib
+	duplicateBytes = 2*pageBytes + 16
+	recordBytes    = pageBytes + 16 + 16384 + 4096
+)
 
 // The checks below mirror the startup parsing in
 // cmd/racer-dataplane/src/config.rs so that a value the dataplane would refuse
@@ -36,37 +50,62 @@ var (
 		"RACER_MEMORY_PRESSURE", "RACER_PPROF_ENABLED", "RACER_GPU_PCI_P2PDMA",
 	}
 
-	// Unsigned decimal keys that may be zero.
-	dataplaneDecimalKeys = []string{
-		"RACER_GPU_LANDING_BYTES", "RACER_IO_WORKERS", "RACER_CRYPTO_HELPERS",
-		"RACER_RANGE_SPILL_PAGES", "RACER_PAGE_HEDGE_DELAY_MS", "RACER_PAGE_HEDGE_SLOTS",
-		"RACER_PAGE_HEDGE_BYTES", "RACER_PEER_INFLIGHT_MAX", "RACER_PEER_PER_NEIGHBOR_MAX",
-		"RACER_PEER_RECEIVE_MAX", "RACER_PEER_RECEIVE_QUEUE_MAX", "RACER_PEER_RECEIVE_WAIT_MS",
-		"RACER_SLAB_BYTES", "RACER_SEGMENT_BYTES", "RACER_FREE_SEGMENT_RESERVE",
-		"RACER_REQUEST_TIMEOUT_MS", "RACER_PEER_ATTEMPT_TIMEOUT_MS", "RACER_READER_STALL_TIMEOUT_MS",
-		"RACER_SHUTDOWN_TIMEOUT_MS", "RACER_ADMISSION_PERIOD_SECS", "RACER_DEVICE_BUSY_WAIT_SECS",
-	}
-
-	// Unsigned decimal keys that must be nonzero.
-	dataplaneNonzeroKeys = []string{
-		"RACER_SHARES", "RACER_DISK_PAGE_ENTRIES", "RACER_ADMISSION_HISTORY_BYTES",
-		"RACER_CHECKPOINT_BYTES", "RACER_PLAINTEXT_BYTES", "RACER_CIPHERTEXT_BYTES",
-		"RACER_DIRTY_BYTES", "RACER_REGISTERED_BYTES", "RACER_REQUEST_CONTEXT_BYTES",
-		"RACER_FLIGHTS", "RACER_WAITERS_PER_FLIGHT", "RACER_QUEUE_ENTRIES",
-		"RACER_CONNECTIONS_PER_NEIGHBOR", "RACER_CLIENT_CONNECTIONS", "RACER_PIPES",
-		"RACER_RANGE_WINDOW_PAGES", "RACER_HEADER_BYTES", "RACER_PLACEMENT_CACHE_BYTES",
-		"RACER_CACHED_PATHS", "RACER_PATH_CACHE_BYTES", "RACER_ACTIVE_PATH_SEARCHES",
-		"RACER_RETAINED_SNAPSHOTS", "RACER_METADATA_ENTRIES", "RACER_RELAY_TRANSFERS",
-		"RACER_ORIGIN_CONNECTIONS_PER_CACHE",
-	}
-
-	// Inclusive ranges enforced by the dataplane's warm read validation.
+	// Inclusive single-key ranges from Config::from_lookup and the validate
+	// methods it calls. Cross-key rules, such as RACER_CRYPTO_HELPERS at most
+	// RACER_IO_WORKERS or plaintext budgets that must fit the range window,
+	// are left to the dataplane.
 	dataplaneRangeKeys = map[string][2]uint64{
-		"RACER_WARM_MAX_TTL_SECS":        {1, 86400},
-		"RACER_WARM_FILL_TIMEOUT_SECS":   {1, 86400},
-		"RACER_WARM_MAX_JOBS":            {1, 1024},
-		"RACER_WARM_WINDOW_PAGES":        {1, 64},
-		"RACER_RETAINED_SEGMENT_PERCENT": {1, 100},
+		"RACER_GPU_LANDING_BYTES":            {0, math.MaxUint64},
+		"RACER_IO_WORKERS":                   {1, 65536},
+		"RACER_CRYPTO_HELPERS":               {1, 65536},
+		"RACER_SHARES":                       {1, math.MaxUint32},
+		"RACER_DISK_PAGE_ENTRIES":            {1, maxEntries},
+		"RACER_ADMISSION_HISTORY_BYTES":      {32, 512 * mib},
+		"RACER_ADMISSION_PERIOD_SECS":        {1, 86400},
+		"RACER_CHECKPOINT_BYTES":             {1, 512 * mib},
+		"RACER_DEVICE_BUSY_WAIT_SECS":        {0, 3600},
+		"RACER_WARM_MAX_TTL_SECS":            {1, 86400},
+		"RACER_WARM_FILL_TIMEOUT_SECS":       {1, 86400},
+		"RACER_WARM_MAX_JOBS":                {1, 1024},
+		"RACER_WARM_WINDOW_PAGES":            {1, 64},
+		"RACER_RETAINED_SEGMENT_PERCENT":     {1, 100},
+		"RACER_RANGE_SPILL_PAGES":            {0, 1024},
+		"RACER_PAGE_HEDGE_DELAY_MS":          {1, 30000},
+		"RACER_PAGE_HEDGE_SLOTS":             {0, 32},
+		"RACER_PAGE_HEDGE_BYTES":             {0, 32 * duplicateBytes},
+		"RACER_PEER_INFLIGHT_MAX":            {1, 65536},
+		"RACER_PEER_PER_NEIGHBOR_MAX":        {1, 65536},
+		"RACER_PEER_RECEIVE_MAX":             {0, 65536},
+		"RACER_PEER_RECEIVE_QUEUE_MAX":       {1, 65536},
+		"RACER_PEER_RECEIVE_WAIT_MS":         {1, 30000},
+		"RACER_SLAB_BYTES":                   {1, math.MaxInt64},
+		"RACER_SEGMENT_BYTES":                {recordBytes, math.MaxInt64},
+		"RACER_FREE_SEGMENT_RESERVE":         {1, maxEntries - 1},
+		"RACER_PLAINTEXT_BYTES":              {1, maxBytes},
+		"RACER_CIPHERTEXT_BYTES":             {1, maxBytes},
+		"RACER_DIRTY_BYTES":                  {pageBytes + 16, maxBytes},
+		"RACER_REGISTERED_BYTES":             {1, maxBytes},
+		"RACER_REQUEST_CONTEXT_BYTES":        {128 * 1024, maxBytes},
+		"RACER_FLIGHTS":                      {1, 65536},
+		"RACER_WAITERS_PER_FLIGHT":           {1, 4096},
+		"RACER_QUEUE_ENTRIES":                {2, 65536},
+		"RACER_CONNECTIONS_PER_NEIGHBOR":     {1, 1024},
+		"RACER_CLIENT_CONNECTIONS":           {1, 65536},
+		"RACER_PIPES":                        {1, 65536},
+		"RACER_RANGE_WINDOW_PAGES":           {1, 64},
+		"RACER_HEADER_BYTES":                 {1024, 32 * 1024},
+		"RACER_PLACEMENT_CACHE_BYTES":        {1024, 512 * mib},
+		"RACER_CACHED_PATHS":                 {1, maxEntries},
+		"RACER_PATH_CACHE_BYTES":             {1, 512 * mib},
+		"RACER_ACTIVE_PATH_SEARCHES":         {1, 64},
+		"RACER_RETAINED_SNAPSHOTS":           {2, 64},
+		"RACER_METADATA_ENTRIES":             {1, maxEntries},
+		"RACER_RELAY_TRANSFERS":              {1, 65536},
+		"RACER_ORIGIN_CONNECTIONS_PER_CACHE": {1, 1024},
+		"RACER_REQUEST_TIMEOUT_MS":           {1, 86400000},
+		"RACER_PEER_ATTEMPT_TIMEOUT_MS":      {1, 86400000},
+		"RACER_READER_STALL_TIMEOUT_MS":      {1, 86400000},
+		"RACER_SHUTDOWN_TIMEOUT_MS":          {1, 3600000},
 	}
 )
 
@@ -88,22 +127,6 @@ func validateDataplaneConfig(data map[string]string) error {
 	for _, key := range dataplaneBoolKeys {
 		if value, ok := data[key]; ok && value != "true" && value != "false" {
 			add(key, "must be true or false")
-		}
-	}
-
-	for _, key := range dataplaneDecimalKeys {
-		if value, ok := data[key]; ok {
-			if _, valid := dataplaneDecimal(value); !valid {
-				add(key, "must be an unsigned decimal integer")
-			}
-		}
-	}
-
-	for _, key := range dataplaneNonzeroKeys {
-		if value, ok := data[key]; ok {
-			if n, valid := dataplaneDecimal(value); !valid || n == 0 {
-				add(key, "must be a positive decimal integer")
-			}
 		}
 	}
 

@@ -208,7 +208,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
 | `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, and managed control threads; managed deployments need at least 3 |
-| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count; requires `RACER_CRYPTO_HELPERS` |
+| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count, 1..65,536; requires `RACER_CRYPTO_HELPERS` |
 | `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
@@ -216,7 +216,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
-| `RACER_SHARES` | `4` | Reported shares; explicit Node `shares` wins |
+| `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
 | `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
@@ -235,14 +235,14 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
-| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
-| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments |
+| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead (at least 16,797,712 bytes) |
+| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments (at most 1,048,575) |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
-| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
-| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
+| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps; each 1..65,536, and the per-neighbor cap at most the in-flight cap |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
