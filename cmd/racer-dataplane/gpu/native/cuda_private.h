@@ -170,6 +170,11 @@ typedef struct {
 } CUfileDescr_t;
 
 #define CU_FILE_SUCCESS 0
+/* CUfileOpError values that mean cuFile cannot use one file, its
+ * filesystem, or its device. Other files may still work. */
+#define CU_FILE_IO_NOT_SUPPORTED 5008
+#define CU_FILE_DEVICE_NOT_SUPPORTED 5009
+#define CU_FILE_INVALID_FILE_TYPE 5018
 #define CU_FILE_HANDLE_TYPE_OPAQUE_FD 1
 
 _Static_assert(sizeof(CUfileError_t) == 8, "CUfileError_t layout");
@@ -178,6 +183,7 @@ _Static_assert(offsetof(CUfileDescr_t, handle) == 8, "CUfileDescr_t layout");
 
 /* cuFileSetParameterBool (cuFile 1.10+); resolved optionally. */
 #define CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE 1
+#define CUFILE_PARAM_USE_PCIP2PDMA 7
 typedef CUfileError_t (*cuFileSetParameterBool_fn)(int param, bool value);
 
 #define RACER_CUFILE_FUNCTIONS(X) \

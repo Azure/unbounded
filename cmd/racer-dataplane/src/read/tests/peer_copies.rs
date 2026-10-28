@@ -2994,6 +2994,12 @@ mod landing {
     /// the landing buffer, as a NIC would; otherwise the request goes to the
     /// usual peer script.
     fn landing(ordinal: i32, lands: bool) -> Landing {
+        landing_on(ordinal, lands.then_some(1))
+    }
+
+    /// Like [`landing`], but only the `call`th landing request (1-based)
+    /// lands; the others go to the usual peer script.
+    fn landing_on(ordinal: i32, call: Option<usize>) -> Landing {
         let mut f = fixture();
         let copy = encrypted_copy(&mut f);
         let (peers, ordered) = install_peers(&mut f, None);
@@ -3007,6 +3013,7 @@ mod landing {
         let seen = asked.clone();
         let land: crate::peer::ScriptedLanding = Box::new(move |request| {
             seen.set(seen.get() + 1);
+            let lands = call == Some(seen.get());
             assert!(matches!(
                 request.operation,
                 PeerOperation::Page {
@@ -3201,14 +3208,63 @@ mod landing {
         {
             let mut replies = l.peers.replies.borrow_mut();
             replies.push_back((l.ordered[0].clone(), Reply::Unauthorized));
+            replies.push_back((l.ordered[1].clone(), Reply::Copy(l.copy.clone())));
+        }
+        let fetched = acquire_sealed(&mut l);
+        assert!(fetched.is_ok(), "{:?}", fetched.err());
+        // The failed first provider is followed by a landing request to the
+        // second, whose host answer is used once.
+        assert_eq!(l.asked.get(), 2);
+        assert_eq!(l.peers.calls.borrow().len(), 2);
+        assert_eq!(landed_count(&l.helper), 0);
+    }
+
+    #[test]
+    /// The first provider misses: the next provider in visit order is asked
+    /// to land the page, and its page lands in GPU memory.
+    fn next_provider_lands_after_a_miss() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_on(0, Some(2));
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Miss));
+        let Fetched::Sealed(sealed) = acquire_sealed(&mut l).unwrap() else {
+            panic!("expected a sealed page");
+        };
+        assert!(matches!(sealed.source, SealedSource::Landed(_)));
+        assert_eq!(l.asked.get(), 2);
+        assert_eq!(
+            l.peers.calls.borrow().len(),
+            1,
+            "only the miss went to the script"
+        );
+        let fd = crate::gpu::testing::import(&l.helper, 1, 0);
+        crate::gpu::testing::write(&l.helper, 1, sealed, 0..3).unwrap();
+        assert_eq!(racer_gpu::simulation::read_allocation(&fd, 0, 3), b"abc");
+        assert_eq!(landed_count(&l.helper), 1);
+    }
+
+    #[test]
+    /// Landing asks at most `LANDING_PROVIDERS` providers; after that the
+    /// usual path runs.
+    fn landing_stops_after_its_provider_limit() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_on(0, None);
+        {
+            let mut replies = l.peers.replies.borrow_mut();
+            replies.push_back((l.ordered[0].clone(), Reply::Miss));
+            replies.push_back((l.ordered[1].clone(), Reply::Miss));
             for node in &l.ordered {
                 replies.push_back((node.clone(), Reply::Copy(l.copy.clone())));
             }
         }
         let fetched = acquire_sealed(&mut l);
         assert!(fetched.is_ok(), "{:?}", fetched.err());
-        assert_eq!(l.asked.get(), 1);
-        assert!(l.peers.calls.borrow().len() >= 2);
+        assert_eq!(l.asked.get(), 2);
+        assert!(l.peers.calls.borrow().len() >= 3);
         assert_eq!(landed_count(&l.helper), 0);
     }
 }

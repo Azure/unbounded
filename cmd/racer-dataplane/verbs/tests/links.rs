@@ -838,14 +838,17 @@ fn device_grants_land_in_dmabuf_memory() {
     let mut w = world();
     let (ea, eb) = link_up(&mut w);
     let memory = device_memory();
-    let attached = w.a.clients[0].attach_device(7, memory.clone());
+    let attached = w.a.clients[0].attach_device(7, 0, memory.clone());
     assert_eq!(wait(&mut w, &attached), Ok(2));
-    assert_eq!(w.a.clients[0].device_buffers(7, BufferState::Free), Some(2));
-    assert_eq!(w.b.clients[0].device_buffers(7, BufferState::Free), None);
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, 0, BufferState::Free),
+        Some(2)
+    );
+    assert_eq!(w.b.clients[0].device_buffers(7, 0, BufferState::Free), None);
     let deadline = now() + 5 * SECOND;
     let mut held = Vec::new();
     for round in 0..2u8 {
-        let granted = w.a.clients[0].grant_device(TO_B, ea, [round; 16], 100, deadline);
+        let granted = w.a.clients[0].grant_device(TO_B, ea, 0, [round; 16], 100, deadline);
         let granted = wait(&mut w, &granted).unwrap();
         let data = vec![0xa0 | round; 100];
         let written = w.b.clients[1].write(TO_A, eb, granted.tag, bytes(data.clone()), deadline);
@@ -861,12 +864,12 @@ fn device_grants_land_in_dmabuf_memory() {
         held.push(page);
     }
     assert_eq!(
-        w.a.clients[0].device_buffers(7, BufferState::Owned),
+        w.a.clients[0].device_buffers(7, 0, BufferState::Owned),
         Some(2)
     );
     // Both device buffers are held: the next device grant is refused, and
     // nothing falls back to host memory.
-    let refused = w.a.clients[0].grant_device(TO_B, ea, [7; 16], 10, deadline);
+    let refused = w.a.clients[0].grant_device(TO_B, ea, 0, [7; 16], 10, deadline);
     assert_eq!(wait(&mut w, &refused).err(), Some(Error::Overloaded));
     assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
     // Host grants still use the host pool.
@@ -880,12 +883,15 @@ fn device_grants_land_in_dmabuf_memory() {
     let page = held.pop().unwrap();
     std::thread::spawn(move || drop(page)).join().unwrap();
     pump(&mut w);
-    let granted = w.a.clients[0].grant_device(TO_B, ea, [9; 16], 10, deadline);
+    let granted = w.a.clients[0].grant_device(TO_B, ea, 0, [9; 16], 10, deadline);
     let granted = wait(&mut w, &granted).unwrap();
     let released = w.b.clients[0].release(TO_A, eb, granted.tag);
     assert_eq!(wait(&mut w, &released), Ok(()));
     assert!(matches!(ready(&granted.arrival), Ok(Arrival::Released)));
-    assert_eq!(w.a.clients[0].device_buffers(7, BufferState::Free), Some(1));
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, 0, BufferState::Free),
+        Some(1)
+    );
     // Shutdown waits for the held device page.
     w.a.clients[0].close();
     pump(&mut w);
@@ -902,6 +908,59 @@ fn device_grants_land_in_dmabuf_memory() {
 }
 
 #[test]
+/// One rail holds several device pools (one per GPU, say). Each grant names
+/// its pool: the write lands in that pool's memory only, one full pool does
+/// not refuse grants on another, and an unknown pool id is unavailable.
+fn device_pools_on_one_rail_are_independent() {
+    let mut w = world();
+    let (ea, eb) = link_up(&mut w);
+    let first = MemfdMemory::new(LEN, 0x7000_0000).unwrap();
+    let second = MemfdMemory::new(LEN, 0x7100_0000).unwrap();
+    let attached = w.a.clients[0].attach_device(7, 0, first.clone());
+    assert_eq!(wait(&mut w, &attached), Ok(1));
+    let attached = w.a.clients[0].attach_device(7, 1, second.clone());
+    assert_eq!(wait(&mut w, &attached), Ok(1));
+    let deadline = now() + 5 * SECOND;
+    let mut held = Vec::new();
+    for (id, memory, fill) in [(0u32, &first, 0x11u8), (1, &second, 0x22)] {
+        let granted = w.a.clients[0].grant_device(TO_B, ea, id, [fill; 16], 50, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![fill; 50]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let page = device_page(ready(&granted.arrival));
+        assert!(Arc::ptr_eq(
+            page.memory(),
+            &(memory.clone() as rdma_verbs::DeviceMemory)
+        ));
+        assert_eq!(memory.read(0, 50), vec![fill; 50]);
+        held.push(page);
+    }
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, 0, BufferState::Owned),
+        Some(1)
+    );
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, 1, BufferState::Owned),
+        Some(1)
+    );
+    let full = w.a.clients[0].grant_device(TO_B, ea, 0, [3; 16], 10, deadline);
+    assert_eq!(wait(&mut w, &full).err(), Some(Error::Overloaded));
+    let unknown = w.a.clients[0].grant_device(TO_B, ea, 9, [3; 16], 10, deadline);
+    assert_eq!(wait(&mut w, &unknown).err(), Some(Error::Unavailable));
+    // Freeing pool 1's page lets pool 1 grant again; pool 0 stays full.
+    drop(held.pop());
+    pump(&mut w);
+    let again = w.a.clients[0].grant_device(TO_B, ea, 1, [4; 16], 10, deadline);
+    let again = wait(&mut w, &again).unwrap();
+    let released = w.b.clients[0].release(TO_A, eb, again.tag);
+    assert_eq!(wait(&mut w, &released), Ok(()));
+    drop(held);
+    shutdown(w);
+    assert_eq!(Arc::strong_count(&first), 1);
+    assert_eq!(Arc::strong_count(&second), 1);
+}
+
+#[test]
 /// Attach is once per activated rail; a device grant without a device pool
 /// is unavailable; a failed registration leaves nothing behind and can be
 /// retried.
@@ -909,26 +968,26 @@ fn device_attach_rules_and_registration_faults() {
     let mut w = world();
     let (ea, _) = link_up(&mut w);
     let deadline = now() + 5 * SECOND;
-    let missing = w.a.clients[0].grant_device(TO_B, ea, [1; 16], 10, deadline);
+    let missing = w.a.clients[0].grant_device(TO_B, ea, 0, [1; 16], 10, deadline);
     assert_eq!(wait(&mut w, &missing).err(), Some(Error::Unavailable));
     let memory = device_memory();
-    let wrong_rail = w.a.clients[0].attach_device(3, memory.clone());
+    let wrong_rail = w.a.clients[0].attach_device(3, 0, memory.clone());
     assert_eq!(wait(&mut w, &wrong_rail), Err(Error::InvalidRequest));
     let live = w.sim.live_resources();
     w.sim.fault(Operation::RegisterDmabuf, Fault::Reject);
-    let failed = w.a.clients[0].attach_device(7, memory.clone());
+    let failed = w.a.clients[0].attach_device(7, 0, memory.clone());
     assert_eq!(wait(&mut w, &failed), Err(Error::Unavailable));
     assert_eq!(w.sim.live_resources(), live, "nothing registered stays");
     assert_eq!(Arc::strong_count(&memory), 1);
     // Memory smaller than one buffer is refused after registration, and
     // the region is deregistered again.
-    let small = w.a.clients[0].attach_device(7, MemfdMemory::new(LEN - 1, 0).unwrap());
+    let small = w.a.clients[0].attach_device(7, 0, MemfdMemory::new(LEN - 1, 0).unwrap());
     assert_eq!(wait(&mut w, &small), Err(Error::InvalidConfiguration));
     assert_eq!(w.sim.live_resources(), live);
-    let attached = w.a.clients[0].attach_device(7, memory.clone());
+    let attached = w.a.clients[0].attach_device(7, 0, memory.clone());
     assert_eq!(wait(&mut w, &attached), Ok(2));
     assert_eq!(w.sim.live_resources(), live + 1);
-    let again = w.a.clients[0].attach_device(7, device_memory());
+    let again = w.a.clients[0].attach_device(7, 0, device_memory());
     assert_eq!(wait(&mut w, &again), Err(Error::InvalidRequest));
     let attempts: Vec<i64> = w
         .sim
@@ -949,13 +1008,13 @@ fn device_attach_rules_and_registration_faults() {
 fn device_grant_break_fences_before_reuse() {
     let mut w = world();
     let (ea, eb) = link_up(&mut w);
-    let attached = w.a.clients[0].attach_device(7, device_memory());
+    let attached = w.a.clients[0].attach_device(7, 0, device_memory());
     assert_eq!(wait(&mut w, &attached), Ok(2));
     let deadline = now() + 5 * SECOND;
-    let granted = w.a.clients[0].grant_device(TO_B, ea, [1; 16], 10, deadline);
+    let granted = w.a.clients[0].grant_device(TO_B, ea, 0, [1; 16], 10, deadline);
     let granted = wait(&mut w, &granted).unwrap();
     assert_eq!(
-        w.a.clients[0].device_buffers(7, BufferState::Exposed),
+        w.a.clients[0].device_buffers(7, 0, BufferState::Exposed),
         Some(1)
     );
     w.sim
@@ -965,7 +1024,10 @@ fn device_grant_break_fences_before_reuse() {
     let _ = ready(&written);
     assert_eq!(ready(&granted.arrival).err(), Some(Error::Unavailable));
     assert!(matches!(w.a.clients[0].link(TO_B), LinkState::Backoff(_)));
-    assert_eq!(w.a.clients[0].device_buffers(7, BufferState::Free), Some(2));
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, 0, BufferState::Free),
+        Some(2)
+    );
     shutdown(w);
 }
 
@@ -976,7 +1038,7 @@ fn failed_deregister_leaks_device_memory_owner() {
     let mut w = world();
     link_up(&mut w);
     let memory = device_memory();
-    let attached = w.a.clients[0].attach_device(7, memory.clone());
+    let attached = w.a.clients[0].attach_device(7, 0, memory.clone());
     assert_eq!(wait(&mut w, &attached), Ok(2));
     w.sim.reject(Operation::Deregister, None, true);
     drop(w.a.owner.take());

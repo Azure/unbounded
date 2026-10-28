@@ -131,8 +131,10 @@ pub struct Application {
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
     devices: Option<devices::Plan>,
-    /// The process-wide GPU helper, when `gpu-read` is enabled.
-    gpu: Option<Arc<crate::gpu::GpuHelper>>,
+    /// The process-wide GPU helper slot. In `RACER_ENABLE_GPU=auto` it
+    /// starts on the first `gpu-read`; read it with `get()`, which never
+    /// starts it.
+    gpu: Arc<crate::gpu_slot::GpuSlot>,
     inventory: Arc<crate::rdma::Inventory>,
 
     /// Startup-fixed selector and claimed disks for `/debug/hardware`.
@@ -211,7 +213,7 @@ impl NodeState {
         Ok(Self {
             peer_admission,
             devices: None,
-            gpu: None,
+            gpu: Default::default(),
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
             hardware: Default::default(),
@@ -286,19 +288,9 @@ impl Application {
             self.config.limits.retained_snapshots.get(),
         )));
         self.node.inventory.update(self.discovered_nics.clone())?;
-        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu =
-            crate::gpu::GpuHelper::start(self.config.enable_gpu, self.config.gpu_staging_bytes)?;
-        // GPU decrypt and RDMA together: peers' NICs may write gpu-read pages
-        // straight into GPU landing buffers (GPUDirect RDMA). Activation
-        // registers them per rail and leaves a rail host-only on any failure.
-        if self.config.enable_rdma
-            && let Some(gpu) = &self.node.gpu
-        {
-            self.node
-                .native
-                .link_node()
-                .set_gpu_landing(gpu.clone(), self.config.gpu_landing_bytes);
-        }
+        let gpu = self.gpu_slot()?;
+        self.node.metrics[0].1.gpu().attach_slot(gpu.clone());
+        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu = gpu;
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
             self.node
@@ -1382,8 +1374,10 @@ impl WorkerApplication {
         ));
         let mut responses = Responses::new(io.clone(), delivery)
             .with_observer(admission.policy().observer().clone());
-        if let Some(gpu) = &node.gpu {
+        if let Some(gpu) = node.gpu.get() {
             responses = responses.with_gpu(Rc::new(crate::gpu::GpuClient::new(gpu.clone())));
+        } else if node.gpu.standby() {
+            responses = responses.with_lazy_gpu(node.gpu.clone());
         }
         let responses = Rc::new(responses);
         let clients = ClientListeners::new(
@@ -2078,6 +2072,20 @@ impl WorkerApplication {
 }
 
 impl Application {
+    /// Resolve `RACER_ENABLE_GPU` into the process GPU slot; see
+    /// [`gpu_slot`].
+    fn gpu_slot(&self) -> Result<Arc<crate::gpu_slot::GpuSlot>> {
+        gpu_slot(
+            &self.config,
+            cfg!(feature = "cuda"),
+            self.node.metrics[0].1.gpu_shared(),
+            self.config
+                .enable_rdma
+                .then(|| self.node.native.link_node()),
+            Box::new(racer_gpu::Gpu::load),
+        )
+    }
+
     /// Allocate paired worker resources once before building service lanes.
     fn prepare_workers(&self) -> Result<()> {
         let resources = crate::worker::Resources::new(
@@ -3414,4 +3422,58 @@ impl WorkerPressure {
             next_memory_sample: uring_runtime::environment::now(),
         }
     }
+}
+
+/// Resolve `RACER_ENABLE_GPU` into the process GPU slot. `built` says
+/// whether the binary has the `cuda` feature; `loader` loads the driver.
+///
+/// - `false`: off; nothing GPU-related runs.
+/// - `true`: an explicit request. Start the helper now and fail startup when
+///   no GPU is usable.
+/// - `auto` with `cuda`: touch no GPU now. The helper (driver load, cuInit,
+///   contexts, decrypt probe, cuFile open) starts on the first `gpu-read`
+///   request head, once per process; if that start fails or finds no usable
+///   GPU, GPU mode stays off (501) and is never retried.
+/// - `auto` without `cuda`: off, logged as `reason=not-built`.
+///
+/// Once a helper exists, metrics report it and, with RDMA on (`links`),
+/// peers' NICs may write `gpu-read` pages into GPU landing buffers
+/// (GPUDirect RDMA): activation registers them per rail, and rails already
+/// active when a lazy start finishes get them on the owner worker's next
+/// turn.
+pub(crate) fn gpu_slot(
+    config: &Config,
+    built: bool,
+    telemetry: Arc<crate::gpu_telemetry::GpuTelemetry>,
+    links: Option<Arc<crate::rdma::LinkNode>>,
+    loader: crate::gpu::Loader,
+) -> Result<Arc<crate::gpu_slot::GpuSlot>> {
+    use crate::config::GpuMode;
+    let landing_bytes = config.gpu_landing_bytes;
+    let on_start = move |gpu: &Arc<crate::gpu::GpuHelper>| {
+        telemetry.attach_helper(gpu.clone());
+        if let Some(links) = links {
+            links.set_gpu_landing(gpu.clone(), landing_bytes);
+            telemetry.attach_links(links);
+        }
+    };
+    let (mode, staging, p2pdma) = (
+        config.enable_gpu,
+        config.gpu_staging_bytes,
+        config.gpu_pci_p2pdma,
+    );
+    if mode == GpuMode::Auto && built {
+        eprintln!("racer-dataplane: stage=gpu state=standby start=first-gpu-read");
+        return Ok(Arc::new(crate::gpu_slot::GpuSlot::lazy(
+            Box::new(move || {
+                crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)
+            }),
+            Box::new(on_start),
+        )));
+    }
+    let gpu = crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)?;
+    if let Some(gpu) = &gpu {
+        on_start(gpu);
+    }
+    Ok(Arc::new(crate::gpu_slot::GpuSlot::ready(gpu)))
 }

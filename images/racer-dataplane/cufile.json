@@ -1,0 +1,22 @@
+{
+  // cuFile configuration for the Racer dataplane. The image sets
+  // CUFILE_ENV_PATH_JSON to this file. Keys left out keep cuFile's built-in
+  // defaults, which suit Racer's 16 MiB page reads (cuFile's default maximum
+  // direct IO size is also 16 MiB). To use another file, build an image on this
+  // one and set CUFILE_ENV_PATH_JSON to it.
+  "logging": {
+    // The dataplane root filesystem is read-only. The operator mounts an
+    // emptyDir here whenever RACER_DATAPLANE_NVIDIA is not off.
+    "dir": "/var/log/cufile",
+    // Errors only. Racer logs its own stage=gpu lines to stderr.
+    "level": "ERROR"
+  },
+  "properties": {
+    // Compatibility mode does a POSIX read into a bounce buffer and a copy on
+    // the GPU helper thread. Racer's host read path does that work on I/O
+    // threads instead, so cuFile must fail rather than fall back. The CUDA
+    // shim also sets it at runtime: off, or on when CUFILE_ALLOW_COMPAT_MODE
+    // is true (cmd/racer-dataplane/gpu/native/gpu_cuda.c).
+    "allow_compat_mode": false
+  }
+}

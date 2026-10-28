@@ -865,11 +865,9 @@ fn client_socket_all_containers() {
     for c in out["spec"]["containers"].as_array().unwrap() {
         assert!(socket_mounted(c, CLIENT_VOLUME_NAME), "{c}");
     }
-    assert_eq!(
-        out["spec"]["initContainers"],
-        json!([{"name": "setup", "image": "app"}]),
-        "init containers must be untouched and no sidecar added"
-    );
+    let init = out["spec"]["initContainers"].as_array().unwrap();
+    assert_eq!(init.len(), 1, "no sidecar added: {init:?}");
+    assert!(socket_mounted(&init[0], CLIENT_VOLUME_NAME), "{init:?}");
     assert_eq!(
         out["spec"]["volumes"],
         json!([{"name": CLIENT_VOLUME_NAME, "hostPath": {"path": CLIENT_DIR, "type": "Directory"}}])
@@ -896,6 +894,49 @@ fn client_socket_selected_containers() {
     let c = out["spec"]["containers"].as_array().unwrap();
     assert!(!socket_mounted(&c[0], CLIENT_VOLUME_NAME));
     assert!(socket_mounted(&c[1], CLIENT_VOLUME_NAME));
+}
+
+#[test]
+fn client_socket_selected_init_container() {
+    let out = run(&client_pod(
+        json!({CLIENT_CONTAINERS_ANNOTATION: "setup, helper"}),
+    ))
+    .unwrap();
+    assert!(socket_mounted(
+        &out["spec"]["initContainers"][0],
+        CLIENT_VOLUME_NAME
+    ));
+    let c = out["spec"]["containers"].as_array().unwrap();
+    assert!(!socket_mounted(&c[0], CLIENT_VOLUME_NAME));
+    assert!(socket_mounted(&c[1], CLIENT_VOLUME_NAME));
+}
+
+#[test]
+fn client_socket_native_sidecar_init_container() {
+    let mut p = client_pod(json!({}));
+    p["spec"]["initContainers"] = json!([
+        {"name": "setup", "image": "app"},
+        {"name": "agent", "image": "app", "restartPolicy": "Always"},
+    ]);
+    let out = run(&p).unwrap();
+    for c in out["spec"]["initContainers"].as_array().unwrap() {
+        assert!(socket_mounted(c, CLIENT_VOLUME_NAME), "{c}");
+        assert_eq!(c["image"], "app");
+    }
+}
+
+#[test]
+fn client_socket_skips_object_sidecar() {
+    let mut p = pod(json!({CLIENT_CACHE_ANNOTATION: CACHE}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    let out = run(&p).unwrap();
+    let sidecar = &out["spec"]["initContainers"][0];
+    assert_eq!(sidecar["name"], CONTAINER_NAME);
+    let env = sidecar["env"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !env.iter().any(|e| e["name"] == SOCKET_ENV),
+        "sidecar must not get {SOCKET_ENV}: {sidecar}"
+    );
 }
 
 #[test]
@@ -964,8 +1005,21 @@ fn client_socket_denials() {
             CLIENT_CONTAINERS_ANNOTATION,
         ),
         (
-            with(json!({CLIENT_CONTAINERS_ANNOTATION: "setup"}), &none),
+            with(json!({CLIENT_CONTAINERS_ANNOTATION: "setup,setup"}), &none),
             CLIENT_CONTAINERS_ANNOTATION,
+        ),
+        (
+            with(
+                json!({CLIENT_CONTAINERS_ANNOTATION: CONTAINER_NAME}),
+                &|p| p["spec"]["initContainers"] = json!([{"name": CONTAINER_NAME, "image": "x"}]),
+            ),
+            CLIENT_CONTAINERS_ANNOTATION,
+        ),
+        (
+            with(json!({}), &|p| {
+                p["spec"]["initContainers"][0]["env"] = json!([{"name": SOCKET_ENV, "value": "x"}])
+            }),
+            SOCKET_ENV,
         ),
         (
             with(json!({CLIENT_CONTAINERS_ANNOTATION: "app,app"}), &none),

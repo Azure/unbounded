@@ -1,0 +1,73 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: racer gpu
+
+# Runs `make racer-gpu-test` on a GPU runner: the CUDA shim with its decrypt
+# kernels, device discovery, client allocation import, GPU decrypt against the
+# CPU result, and cuFile reads. Hosted runners have no GPU, so this runs only
+# when the repository variable RACER_GPU_RUNNER holds the runner labels as a
+# JSON array, for example ["self-hosted", "linux", "gpu"]. Without it the job
+# is skipped instead of queuing forever (forks, repos without GPU runners).
+#
+# The runner needs an NVIDIA driver, gcc, curl and sudo apt access (for nvcc
+# if it is not installed). Set RACER_GPU_CUFILE=require to fail when cuFile
+# cannot open, on runners with GPUDirect Storage.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: racer-gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu:
+    name: Racer GPU hardware tests
+    if: vars.RACER_GPU_RUNNER != ''
+    runs-on: ${{ fromJSON(vars.RACER_GPU_RUNNER || '["ubuntu-24.04"]') }}
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-gpu-cargo
+      RACER_GPU_TESTS_CUFILE: ${{ vars.RACER_GPU_CUFILE }}
+      RACER_GPU_TEST_DIR: ${{ github.workspace }}/tmp/racer-gpu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show GPUs
+        run: timeout --signal=TERM --kill-after=10s 60s nvidia-smi
+
+      - name: Set up pinned Rust
+        run: |
+          if ! command -v rustup >/dev/null; then
+            timeout --signal=TERM --kill-after=10s 300s sh -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none'
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+          rustup override set 1.96.0
+
+      - name: Install nvcc if missing
+        run: |
+          if command -v nvcc >/dev/null || [ -x /usr/local/cuda/bin/nvcc ]; then
+            echo /usr/local/cuda/bin >> "$GITHUB_PATH"
+            exit 0
+          fi
+          . /etc/os-release
+          repo="${ID}${VERSION_ID//./}/$(uname -m | sed 's/aarch64/sbsa/')"
+          timeout --signal=TERM --kill-after=10s 120s curl -fsSL -o "$RUNNER_TEMP/cuda-keyring.deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/$repo/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
+          timeout --signal=TERM --kill-after=10s 600s sudo apt-get install -y --no-install-recommends cuda-nvcc-12-9
+          echo /usr/local/cuda/bin >> "$GITHUB_PATH"
+
+      - name: Run GPU hardware tests
+        run: |
+          mkdir -p "$RACER_GPU_TEST_DIR"
+          timeout --signal=TERM --kill-after=30s 2400s make racer-gpu-test RACER_GPU_TESTS=require

@@ -13,6 +13,8 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod gpu;
+pub mod gpu_slot;
+pub mod gpu_telemetry;
 pub mod hardware;
 pub mod http;
 pub mod memory;

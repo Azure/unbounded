@@ -363,6 +363,66 @@ fn failed_frees_leak_and_count() {
 }
 
 #[test]
+/// A file cuFile does not support fails with its cuFile status, apart from
+/// driver failures.
+fn unsupported_file_is_its_own_error() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    sim.fault(Operation::File, -11);
+    assert_eq!(
+        gpu.open_file(file_with(&[1; 16])).err(),
+        Some(Error::Unsupported(5008))
+    );
+    sim.fault(Operation::File, -5);
+    assert_eq!(
+        gpu.open_file(file_with(&[1; 16])).err(),
+        Some(Error::Driver(999))
+    );
+    assert!(gpu.open_file(file_with(&[1; 16])).is_ok());
+}
+
+#[test]
+/// PCI P2PDMA is off by default and reaches the driver open when set, from
+/// either the helper's own open or a reader's.
+fn pci_p2pdma_reaches_driver_open() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    assert_eq!(sim.pci_p2pdma(), None);
+    assert!(gpu.open_file(file_with(&[1; 16])).is_ok());
+    assert_eq!(sim.pci_p2pdma(), Some(false));
+
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    gpu.set_pci_p2pdma(true);
+    let reader = gpu.file_reader();
+    // Turning it off after the reader is made does not change that reader.
+    gpu.set_pci_p2pdma(false);
+    reader.open_driver().unwrap();
+    assert_eq!(sim.pci_p2pdma(), Some(true));
+    // A later open does not change the driver's setting.
+    assert!(gpu.open_file(file_with(&[1; 16])).is_ok());
+    assert_eq!(sim.pci_p2pdma(), Some(true));
+}
+
+#[test]
+/// A failed open with PCI P2PDMA is reported, as any failed open is.
+fn pci_p2pdma_open_failure_is_reported() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    gpu.set_pci_p2pdma(true);
+    sim.fault(Operation::FileOpen, -3);
+    assert_eq!(
+        gpu.file_reader().open_driver().err(),
+        Some(Error::Unavailable)
+    );
+    assert_eq!(sim.pci_p2pdma(), None);
+}
+
+#[test]
 /// cuFile reads land in staging, respect bounds, and wait for streams.
 fn cufile_reads_into_staging() {
     let sim = simulation();

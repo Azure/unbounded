@@ -267,6 +267,9 @@ struct World {
 
     file_driver: bool,
 
+    /// Whether the open that set `file_driver` asked for PCI P2PDMA.
+    pci_p2pdma: bool,
+
     no_kernels: bool,
 
     last_error: i32,
@@ -290,6 +293,13 @@ impl Simulation {
                 ..World::default()
             })),
         }
+    }
+
+    /// Whether the cuFile driver is open with PCI P2PDMA on. `None` before
+    /// it opens.
+    pub fn pci_p2pdma(&self) -> Option<bool> {
+        let w = self.world();
+        w.file_driver.then_some(w.pci_p2pdma)
     }
 
     /// Make this the simulation [`crate::Gpu::load`] uses on this thread.
@@ -371,6 +381,9 @@ fn with<R: Into<i64> + Copy + From<i32>>(
         Some((_, rc)) => {
             if rc == code::EDRIVER {
                 world.last_error = 999;
+            }
+            if rc == code::EUNSUPPORTED {
+                world.last_error = 5008; // CU_FILE_IO_NOT_SUPPORTED
             }
             (R::from(rc), 0)
         }
@@ -794,8 +807,12 @@ unsafe extern "C" fn verdict(stream: *mut c_void, out: *mut RawVerdict) -> c_int
     })
 }
 
-unsafe extern "C" fn file_open() -> c_int {
+unsafe extern "C" fn file_open(flags: u32) -> c_int {
     with(Operation::FileOpen, |w| {
+        // As in the shim, flags apply only to the open that loads cuFile.
+        if !w.file_driver {
+            w.pci_p2pdma = flags & ffi::file_flag::PCI_P2PDMA != 0;
+        }
         w.file_driver = true;
         (code::OK, 0)
     })

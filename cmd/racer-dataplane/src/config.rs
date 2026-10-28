@@ -131,12 +131,18 @@ pub struct Config {
     /// `gpu-read` support. Resolved against hardware at startup, on the GPU
     /// helper thread, because GPU handles cannot move between threads.
     pub enable_gpu: GpuMode,
-    /// Per-GPU cap on dataplane-owned ciphertext staging memory. Parsed and
-    /// validated now; plaintext `gpu-read` does not allocate staging.
+    /// Per-GPU size of the dataplane-owned staging buffer that `gpu-read`
+    /// decrypts sealed (ciphertext) pages through: two scratch slots plus
+    /// slots for cuFile reads. Allocated on a GPU's first sealed page; pages
+    /// that arrive as plaintext are copied straight to the client and never
+    /// touch it. Below two slots, GPU decrypt is off and the CPU decrypts.
     pub gpu_staging_bytes: u64,
     /// Per-GPU GPU memory that peers' NICs write `gpu-read` ciphertext into
     /// over RDMA (GPUDirect RDMA landing). 0 turns landing off.
     pub gpu_landing_bytes: u64,
+    /// Ask cuFile to read local NVMe into GPU memory over PCI P2PDMA
+    /// (`use_pci_p2pdma`) instead of nvidia-fs. Defaults off.
+    pub gpu_pci_p2pdma: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
     /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
@@ -286,6 +292,7 @@ impl Config {
             enable_gpu,
             gpu_staging_bytes,
             gpu_landing_bytes,
+            gpu_pci_p2pdma: raw.gpu_pci_p2pdma.unwrap_or(false),
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
@@ -719,6 +726,7 @@ const ENV_NAMES: &[&str] = &[
     "ENABLE_GPU",
     "GPU_STAGING_BYTES",
     "GPU_LANDING_BYTES",
+    "GPU_PCI_P2PDMA",
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
@@ -799,6 +807,7 @@ struct RawConfig {
     gpu_staging_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     gpu_landing_bytes: Option<u64>,
+    gpu_pci_p2pdma: Option<bool>,
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
@@ -1096,7 +1105,7 @@ mod tests {
             .map(|name| {
                 let value = match *name {
                     "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "MEMORY_PRESSURE"
-                    | "PPROF_ENABLED" => "true",
+                    | "PPROF_ENABLED" | "GPU_PCI_P2PDMA" => "true",
                     _ => "1",
                 };
                 ((*name).to_owned(), value.to_owned())
@@ -1515,6 +1524,25 @@ mod tests {
         for value in ["1048576", "3145728", "-2097152", "2MiB"] {
             assert!(
                 parse(&[("RACER_GPU_LANDING_BYTES", value)]).is_err(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_pci_p2pdma_parses_and_validates() {
+        assert!(!parse(&[]).unwrap().gpu_pci_p2pdma);
+        for (value, enabled) in [("true", true), ("false", false)] {
+            assert_eq!(
+                parse(&[("RACER_GPU_PCI_P2PDMA", value)])
+                    .unwrap()
+                    .gpu_pci_p2pdma,
+                enabled
+            );
+        }
+        for value in ["TRUE", "1", "yes", "", " true"] {
+            assert!(
+                parse(&[("RACER_GPU_PCI_P2PDMA", value)]).is_err(),
                 "{value:?}"
             );
         }

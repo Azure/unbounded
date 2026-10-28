@@ -38,15 +38,19 @@
 //!
 //! # RDMA landing
 //!
-//! When RDMA is active, each rail may get one GPU's landing buffer
+//! When RDMA is active, each decrypting GPU may get one landing buffer
 //! ([`GpuHelper::landing`]): separate GPU memory, capped by
-//! `RACER_GPU_LANDING_BYTES`, exported once as a dma-buf and registered with
-//! the rail's NIC as an `rdma_verbs` device pool. A peer's NIC writes a
-//! `gpu-read` page's ciphertext straight into it, and the GPU decrypts from
-//! there ([`LandedCiphertext`]). The CPU never reads or copies those bytes.
-//! Landing buffers are never freed while the process runs, and are leaked on
-//! purpose when the helper exits, because a NIC registration may still cover
-//! them.
+//! `RACER_GPU_LANDING_BYTES`, exported once as a dma-buf. Disjoint slices of
+//! it ([`GpuLanding::slice`]) are registered with the rails' NICs as
+//! `rdma_verbs` device pools. A peer's NIC writes a `gpu-read` page's
+//! ciphertext straight into it, and the GPU decrypts from there
+//! ([`LandedCiphertext`]). The CPU never reads or copies those bytes.
+//! The buffer is freed when the last [`GpuLanding`] referring to it drops:
+//! the NIC registrations and received pages hold one, so this happens only
+//! after every registration is gone. A registration `rdma_verbs` leaks on
+//! purpose keeps its reference, so that memory is never freed. Buffers still
+//! referenced when the helper exits are leaked on purpose for the same
+//! reason.
 //!
 //! At startup the helper probes each GPU with a zero-length decrypt. A GPU
 //! whose shim has no decrypt kernels, or whose staging cap cannot hold the two
@@ -73,6 +77,7 @@ use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -204,30 +209,74 @@ impl Drop for StagedCiphertext {
 /// value works: the address is local to the memory registration.
 const LANDING_IOVA: u64 = 1 << 40;
 
-/// One GPU's RDMA landing buffer, shared with `rdma_verbs` as a dma-buf.
-/// See the module docs, "RDMA landing".
-pub struct GpuLanding {
-    /// Export of the whole landing buffer.
-    fd: OwnedFd,
+/// One GPU landing allocation. Dropping the last reference asks the helper
+/// to free the GPU memory.
+struct LandingAllocation {
+    /// Helper-side key of the memory.
+    id: u64,
     ordinal: i32,
+    /// Export of the whole allocation. `None` only during drop.
+    fd: Option<OwnedFd>,
+    jobs: mpsc::Sender<Job>,
+}
+
+impl Drop for LandingAllocation {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd.take() {
+            // The helper closes the export before it frees the memory. If
+            // it is gone, the memory is leaked with it.
+            let _ = self.jobs.send(Job::FreeLanding { id: self.id, fd });
+        }
+    }
+}
+
+/// A slice of one GPU's RDMA landing buffer, shared with `rdma_verbs` as a
+/// dma-buf. See the module docs, "RDMA landing".
+pub struct GpuLanding {
+    allocation: Arc<LandingAllocation>,
+    /// Start of the slice in the allocation.
+    offset: u64,
     length: u64,
 }
 
 impl GpuLanding {
     /// The GPU the memory is on.
     pub fn ordinal(&self) -> i32 {
-        self.ordinal
+        self.allocation.ordinal
+    }
+
+    /// `length` bytes at `offset` of this slice, as their own slice that
+    /// keeps the GPU memory alive. `None` unless both are 4 KiB aligned,
+    /// `length` is nonzero, and the range fits.
+    pub fn slice(&self, offset: u64, length: u64) -> Option<Arc<GpuLanding>> {
+        let aligned = offset.is_multiple_of(4096) && length.is_multiple_of(4096);
+        (aligned && length != 0 && offset.checked_add(length)? <= self.length).then(|| {
+            Arc::new(GpuLanding {
+                allocation: self.allocation.clone(),
+                offset: self.offset + offset,
+                length,
+            })
+        })
+    }
+
+    /// True if `other` is a slice of the same GPU memory.
+    pub fn same_allocation(&self, other: &GpuLanding) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
     }
 }
 
 impl rdma_verbs::DmabufMemory for GpuLanding {
     fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
         use std::os::fd::AsFd;
-        self.fd.as_fd()
+        self.allocation
+            .fd
+            .as_ref()
+            .expect("landing export lives until drop")
+            .as_fd()
     }
 
     fn offset(&self) -> u64 {
-        0
+        self.offset
     }
 
     fn length(&self) -> usize {
@@ -235,7 +284,7 @@ impl rdma_verbs::DmabufMemory for GpuLanding {
     }
 
     fn iova(&self) -> u64 {
-        LANDING_IOVA * (self.ordinal as u64 + 1)
+        LANDING_IOVA * (self.allocation.ordinal as u64 + 1) + self.offset
     }
 }
 
@@ -245,6 +294,9 @@ pub struct LandedCiphertext {
     /// Holds the slot. `None` only for test pages written without a NIC.
     _page: Option<rdma_verbs::DevicePage>,
     ordinal: i32,
+    /// Helper-side key of the landing allocation.
+    allocation: u64,
+    /// Byte offset in the allocation.
     offset: u64,
     length: u64,
 }
@@ -257,8 +309,9 @@ impl LandedCiphertext {
             return Err(Error::Internal);
         }
         Ok(Self {
-            ordinal: landing.ordinal,
-            offset: page.offset(),
+            ordinal: landing.ordinal(),
+            allocation: landing.allocation.id,
+            offset: landing.offset + page.offset(),
             length: page.len() as u64,
             _page: Some(page),
         })
@@ -271,8 +324,9 @@ impl LandedCiphertext {
         assert!(offset + length <= landing.length);
         Self {
             _page: None,
-            ordinal: landing.ordinal,
-            offset,
+            ordinal: landing.ordinal(),
+            allocation: landing.allocation.id,
+            offset: landing.offset + offset,
             length,
         }
     }
@@ -292,7 +346,7 @@ impl LandedCiphertext {
         self.length == 0
     }
 
-    /// Byte offset in the landing buffer.
+    /// Byte offset in the landing allocation.
     pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
@@ -318,6 +372,48 @@ pub struct GpuCounters {
 
     /// Sealed pages decrypted from an RDMA landing buffer.
     pub landed: AtomicU64,
+
+    /// Verified plaintext pages copied from host memory (decrypted by the
+    /// CPU or already plaintext in cache).
+    pub plaintext: AtomicU64,
+
+    /// Devices (`st_dev`) cuFile rejected as unsupported. Each device is
+    /// counted once; cuFile stays on for other devices.
+    pub cufile_unsupported: AtomicU64,
+
+    /// Times cuFile was turned off, indexed by [`CufileDisable`].
+    pub cufile_disabled: [AtomicU64; CufileDisable::ALL.len()],
+}
+
+/// Why cuFile was turned off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CufileDisable {
+    /// The cuFile driver failed to open at startup.
+    DriverOpen,
+    /// A staging buffer could not be registered with cuFile.
+    StagingRegister,
+    /// A file could not be registered with cuFile.
+    FileOpen,
+}
+
+impl CufileDisable {
+    pub const ALL: [Self; 3] = [Self::DriverOpen, Self::StagingRegister, Self::FileOpen];
+
+    /// Metric label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DriverOpen => "driver_open",
+            Self::StagingRegister => "staging_register",
+            Self::FileOpen => "file_open",
+        }
+    }
+}
+
+impl GpuCounters {
+    /// Count one cuFile turn-off.
+    pub(crate) fn cufile_disabled(&self, reason: CufileDisable) {
+        self.cufile_disabled[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Per-GPU state shared with I/O threads.
@@ -337,6 +433,8 @@ enum Job {
         fd: OwnedFd,
         allocation_size: u64,
         window: Range<u64>,
+        /// The client's `Racer-Gpu-Uuid`, when it sent one.
+        gpu_uuid: Option<[u8; 16]>,
         reply: oneshot::Sender<Result<i32>>,
     },
     /// Read ciphertext from a file straight into a staging slot.
@@ -359,10 +457,13 @@ enum Job {
     },
     /// Allocate a GPU's RDMA landing buffer and export it as a dma-buf.
     Landing {
+        id: u64,
         ordinal: i32,
         length: u64,
         reply: oneshot::Sender<Result<OwnedFd>>,
     },
+    /// Close a landing buffer's export, then free it: nothing refers to it.
+    FreeLanding { id: u64, fd: OwnedFd },
     #[cfg(test)]
     Run(Box<dyn FnOnce() + Send>),
 }
@@ -379,20 +480,39 @@ pub struct GpuHelper {
     cufile: Arc<AtomicBool>,
     counters: Arc<GpuCounters>,
     kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
-    /// Landing buffers made so far, one per GPU at most.
-    landings: Mutex<HashMap<i32, Arc<GpuLanding>>>,
+    /// Live landing buffers, one per GPU at most. Weak: a buffer is freed
+    /// once nothing registers or reads it, and made again on demand.
+    landings: Mutex<HashMap<i32, Weak<GpuLanding>>>,
 }
 
 impl GpuHelper {
     /// Resolve `mode` against hardware. Returns `None` when GPU mode is off.
-    pub fn start(mode: GpuMode, staging_bytes: u64) -> Result<Option<Arc<Self>>> {
+    pub fn start(mode: GpuMode, staging_bytes: u64, pci_p2pdma: bool) -> Result<Option<Arc<Self>>> {
+        Self::start_built(
+            mode,
+            cfg!(feature = "cuda"),
+            staging_bytes,
+            pci_p2pdma,
+            Box::new(racer_gpu::Gpu::load),
+        )
+    }
+
+    /// [`Self::start`] with `built` standing in for the `cuda` feature and a
+    /// custom backend loader. `loader` is not called when GPU mode is off.
+    pub fn start_built(
+        mode: GpuMode,
+        built: bool,
+        staging_bytes: u64,
+        pci_p2pdma: bool,
+        loader: Loader,
+    ) -> Result<Option<Arc<Self>>> {
         match mode {
             GpuMode::Disabled => Ok(None),
-            GpuMode::Auto if !cfg!(feature = "cuda") => {
+            GpuMode::Auto if !built => {
                 eprintln!("racer-dataplane: stage=gpu state=disabled reason=not-built");
                 Ok(None)
             }
-            _ => Self::start_with_staging(mode, staging_bytes, Box::new(racer_gpu::Gpu::load)),
+            _ => Self::start_with_options(mode, staging_bytes, pci_p2pdma, loader),
         }
     }
 
@@ -405,6 +525,17 @@ impl GpuHelper {
     pub fn start_with_staging(
         mode: GpuMode,
         staging_bytes: u64,
+        loader: Loader,
+    ) -> Result<Option<Arc<Self>>> {
+        Self::start_with_options(mode, staging_bytes, false, loader)
+    }
+
+    /// Start the helper with a custom backend loader, a per-GPU staging cap,
+    /// and whether cuFile should use PCI P2PDMA.
+    pub fn start_with_options(
+        mode: GpuMode,
+        staging_bytes: u64,
+        pci_p2pdma: bool,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
         if mode == GpuMode::Disabled {
@@ -423,6 +554,7 @@ impl GpuHelper {
             counters: counters.clone(),
             kernels_off: kernels_off.clone(),
             slots,
+            pci_p2pdma,
         };
         std::thread::Builder::new()
             .name("racer-gpu".into())
@@ -458,10 +590,11 @@ impl GpuHelper {
             })
             .collect::<Vec<_>>();
         eprintln!(
-            "racer-dataplane: stage=gpu state=enabled usable={} decrypt={} staging_slots={}",
+            "racer-dataplane: stage=gpu state=enabled usable={} decrypt={} staging_slots={} pci_p2pdma={}",
             devices.len(),
             shared.iter().filter(|device| device.decrypt).count(),
             slots,
+            pci_p2pdma,
         );
         Ok(Some(Arc::new(Self {
             jobs,
@@ -563,28 +696,36 @@ impl GpuHelper {
             .landings
             .lock()
             .ok()
-            .and_then(|l| l.get(&ordinal).cloned())
+            .and_then(|l| l.get(&ordinal).and_then(Weak::upgrade))
         {
             return Ok(landing);
         }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (reply, mut receiver) = oneshot::channel();
         self.send(Job::Landing {
+            id,
             ordinal,
             length,
             reply,
         })?;
-        let fd = answer(&mut receiver, scope).await??;
+        // Dropped on any failure below, which frees the memory again.
+        let made = Arc::new(GpuLanding {
+            allocation: Arc::new(LandingAllocation {
+                id,
+                ordinal,
+                fd: Some(answer(&mut receiver, scope).await??),
+                jobs: self.jobs.clone(),
+            }),
+            offset: 0,
+            length,
+        });
         let mut landings = self.landings.lock().map_err(|_| Error::Internal)?;
-        Ok(landings
-            .entry(ordinal)
-            .or_insert_with(|| {
-                Arc::new(GpuLanding {
-                    fd,
-                    ordinal,
-                    length,
-                })
-            })
-            .clone())
+        // A concurrent caller may have made one first: keep that one.
+        if let Some(landing) = landings.get(&ordinal).and_then(Weak::upgrade) {
+            return Ok(landing);
+        }
+        landings.insert(ordinal, Arc::downgrade(&made));
+        Ok(made)
     }
 
     /// Where a request on GPU `ordinal` should have sealed pages delivered,
@@ -645,6 +786,7 @@ impl GpuService for GpuClient {
         descriptor: OwnedFd,
         destination: Destination,
         allocation_size: u64,
+        gpu_uuid: Option<[u8; 16]>,
     ) -> Result<Box<dyn DirectSink>> {
         let window = destination.offset..destination.end();
         if window.start >= window.end || window.end > allocation_size {
@@ -669,6 +811,7 @@ impl GpuService for GpuClient {
             fd: descriptor,
             allocation_size,
             window,
+            gpu_uuid,
             reply,
         })?;
         sink.import = Some(answer);
@@ -808,6 +951,8 @@ struct HelperState {
     kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
     /// Staging slots per GPU.
     slots: u64,
+    /// Ask cuFile to use PCI P2PDMA.
+    pci_p2pdma: bool,
 }
 
 /// A registered cuFile handle and the reads using it.
@@ -872,6 +1017,8 @@ fn reader_main(
 struct Helper {
     gpu: racer_gpu::Gpu,
     contexts: Vec<racer_gpu::Context>,
+    /// Each context's GPU UUID, in the same order as `contexts`.
+    uuids: Vec<[u8; 16]>,
     /// Each GPU's staging buffer, allocated on first sealed page.
     staging: HashMap<i32, racer_gpu::StagingBuffer>,
     /// Registered files by (device, inode). The slab descriptors are few and
@@ -880,6 +1027,9 @@ struct Helper {
     /// Registered files by id, including retired ones that reads still use.
     open: HashMap<u64, OpenFile>,
     next_file: u64,
+    /// Devices (`st_dev`) whose files cuFile rejected as unsupported. Reads
+    /// of files on them use the host path without asking cuFile again.
+    unsupported: std::collections::HashSet<u64>,
     /// Reads for the reader threads. `None` once they are told to stop.
     reads: Option<mpsc::Sender<FileJob>>,
     /// Reads the reader threads finished, so their files can be released.
@@ -888,9 +1038,10 @@ struct Helper {
     /// Opens the cuFile driver ahead of the first sealed page.
     opener: Option<std::thread::JoinHandle<()>>,
     requests: HashMap<u64, Request>,
-    /// RDMA landing buffers by GPU. Never freed: a NIC may hold a
-    /// registration over them.
-    landing: HashMap<i32, racer_gpu::StagingBuffer>,
+    /// RDMA landing buffers by allocation id. Freed by `FreeLanding` once
+    /// nothing refers to them; leaked if still referenced at exit, because
+    /// a NIC may hold a registration over them.
+    landing: HashMap<u64, racer_gpu::StagingBuffer>,
     state: HelperState,
 }
 
@@ -904,6 +1055,9 @@ fn helper_main(
 ) {
     let mut helper = match discover(loader) {
         Ok((gpu, contexts, usable)) => {
+            // Before any reader or open: the flag applies only to the open
+            // that loads cuFile.
+            gpu.set_pci_p2pdma(state.pci_p2pdma);
             let decrypt = contexts.iter().map(probe_decrypt).collect();
             let (reads, queue) = mpsc::channel();
             let queue = Arc::new(Mutex::new(queue));
@@ -924,15 +1078,18 @@ fn helper_main(
                     readers.push(thread);
                 }
             }
-            let opener = open_cufile(&gpu, &state.cufile);
+            let opener = open_cufile(&gpu, &state.cufile, &state.counters);
+            let uuids = usable.iter().map(|device| device.uuid).collect();
             let _ = ready.send(Ok((usable, decrypt)));
             Helper {
                 gpu,
                 contexts,
+                uuids,
                 staging: HashMap::new(),
                 files: HashMap::new(),
                 open: HashMap::new(),
                 next_file: 0,
+                unsupported: std::collections::HashSet::new(),
                 reads: (!readers.is_empty()).then_some(reads),
                 done,
                 readers,
@@ -978,17 +1135,20 @@ fn helper_main(
 fn open_cufile(
     gpu: &racer_gpu::Gpu,
     cufile: &Arc<AtomicBool>,
+    counters: &Arc<GpuCounters>,
 ) -> Option<std::thread::JoinHandle<()>> {
     if !cufile.load(Ordering::Relaxed) {
         return None;
     }
     let (reader, cufile) = (gpu.file_reader(), cufile.clone());
+    let counters = counters.clone();
     std::thread::Builder::new()
         .name("racer-gpu-cufile".into())
         .spawn(move || {
             if let Err(error) = reader.open_driver()
                 && cufile.swap(false, Ordering::Relaxed)
             {
+                counters.cufile_disabled(CufileDisable::DriverOpen);
                 eprintln!("racer-dataplane: stage=gpu state=cufile-disabled reason={error}");
             }
         })
@@ -1101,9 +1261,10 @@ impl Helper {
                 fd,
                 allocation_size,
                 window,
+                gpu_uuid,
                 reply,
             } => {
-                let result = self.import(id, fd, allocation_size, window);
+                let result = self.import(id, fd, allocation_size, window, gpu_uuid);
                 self.note_leaks();
                 let _ = reply.send(result);
             }
@@ -1140,22 +1301,38 @@ impl Helper {
                 }
             }
             Job::Landing {
+                id,
                 ordinal,
                 length,
                 reply,
             } => {
-                let result = self.landing(ordinal, length);
+                let result = self.landing(id, ordinal, length);
+                if result.is_err() {
+                    self.landing.remove(&id);
+                }
                 self.note_leaks();
-                let _ = reply.send(result);
+                // The caller stopped waiting, so no FreeLanding will come:
+                // close the export and free the memory now.
+                if let Err(Ok(fd)) = reply.send(result) {
+                    drop(fd);
+                    self.landing.remove(&id);
+                }
+            }
+            Job::FreeLanding { id, fd } => {
+                drop(fd);
+                if self.landing.remove(&id).is_some() {
+                    eprintln!("racer-dataplane: stage=gpu-landing allocation={id} state=freed");
+                }
+                self.note_leaks();
             }
             #[cfg(test)]
             Job::Run(f) => f(),
         }
     }
 
-    /// Allocate GPU `ordinal`'s landing buffer, once, and export it.
-    fn landing(&mut self, ordinal: i32, length: u64) -> Result<OwnedFd> {
-        if !self.landing.contains_key(&ordinal) {
+    /// Allocate landing buffer `id` on GPU `ordinal`, and export it.
+    fn landing(&mut self, id: u64, ordinal: i32, length: u64) -> Result<OwnedFd> {
+        if !self.landing.contains_key(&id) {
             let context = self
                 .contexts
                 .iter()
@@ -1167,9 +1344,9 @@ impl Helper {
                 );
                 Error::Overloaded
             })?;
-            self.landing.insert(ordinal, buffer);
+            self.landing.insert(id, buffer);
         }
-        let buffer = self.landing.get(&ordinal).ok_or(Error::Internal)?;
+        let buffer = self.landing.get(&id).ok_or(Error::Internal)?;
         if buffer.size() != length {
             return Err(Error::InvalidConfiguration);
         }
@@ -1181,13 +1358,45 @@ impl Helper {
         })
     }
 
-    /// Try each usable GPU until one owns the allocation.
-    fn import(&mut self, id: u64, fd: OwnedFd, size: u64, window: Range<u64>) -> Result<i32> {
+    /// Import the allocation on the GPU that owns it. With the client's GPU
+    /// UUID, that GPU is tried first: device numbers differ between the
+    /// client's container and the dataplane, but UUIDs do not. An unknown
+    /// UUID is a GPU the dataplane cannot use, so the read falls back to the
+    /// host (501). Without a UUID (older clients), each usable GPU is tried
+    /// until one owns the allocation.
+    fn import(
+        &mut self,
+        id: u64,
+        fd: OwnedFd,
+        size: u64,
+        window: Range<u64>,
+        gpu_uuid: Option<[u8; 16]>,
+    ) -> Result<i32> {
+        let mut order: Vec<usize> = (0..self.contexts.len()).collect();
+        if let Some(uuid) = gpu_uuid {
+            let Some(first) = self.uuids.iter().position(|known| *known == uuid) else {
+                eprintln!(
+                    "racer-dataplane: stage=gpu state=import-skipped reason=unknown-gpu-uuid uuid={}",
+                    racer_gpu::uuid_string(&uuid)
+                );
+                return Err(Error::NotImplemented);
+            };
+            order.retain(|&index| index != first);
+            order.insert(0, first);
+        }
         let mut last = racer_gpu::Error::WrongDevice;
-        for context in &self.contexts {
-            let attempt = fd.try_clone().map_err(|_| Error::Unavailable)?;
-            match context.import(attempt, size, window.clone()) {
+        for (attempt, index) in order.into_iter().enumerate() {
+            let context = &self.contexts[index];
+            let handle = fd.try_clone().map_err(|_| Error::Unavailable)?;
+            match context.import(handle, size, window.clone()) {
                 Ok(import) => {
+                    if attempt > 0 && gpu_uuid.is_some() {
+                        eprintln!(
+                            "racer-dataplane: stage=gpu state=uuid-mismatch ordinal={} uuid={}",
+                            context.ordinal(),
+                            racer_gpu::uuid_string(&self.uuids[index])
+                        );
+                    }
                     let stream = context.stream().map_err(import_error)?;
                     self.requests.insert(id, Request { stream, import });
                     return Ok(context.ordinal());
@@ -1214,7 +1423,12 @@ impl Helper {
             .copy_from_host(destination, offset, plaintext.clone());
         // Synchronize even after a failed queue call: part of it may run.
         let synchronized = request.stream.synchronize();
-        queued.and(synchronized).map_err(gpu_error)
+        queued.and(synchronized).map_err(gpu_error)?;
+        self.state
+            .counters
+            .plaintext
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// This GPU's staging buffer, allocated on first use.
@@ -1254,6 +1468,9 @@ impl Helper {
             Ok(identity) => identity,
             Err(error) => return Err((error, reply)),
         };
+        if self.unsupported.contains(&identity.0) {
+            return Err((Error::Unavailable, reply));
+        }
         if let Err(error) = self.staging(staged.ordinal) {
             return Err((error, reply));
         }
@@ -1265,7 +1482,7 @@ impl Helper {
                 .counters
                 .file_failures
                 .fetch_add(1, Ordering::Relaxed);
-            self.disable_cufile(error);
+            self.disable_cufile(error, CufileDisable::StagingRegister);
             return Err((Error::Unavailable, reply));
         }
         let id = match self.files.get(&identity) {
@@ -1296,7 +1513,11 @@ impl Helper {
                             .counters
                             .file_failures
                             .fetch_add(1, Ordering::Relaxed);
-                        self.disable_cufile(error);
+                        if let racer_gpu::Error::Unsupported(_) = error {
+                            self.unsupported_device(identity.0, error);
+                            return Err((Error::Unavailable, reply));
+                        }
+                        self.disable_cufile(error, CufileDisable::FileOpen);
                         return Err((Error::Unavailable, reply));
                     }
                 }
@@ -1366,9 +1587,25 @@ impl Helper {
         }
     }
 
+    /// Stop trying cuFile for files on `device` after cuFile rejected one of
+    /// them. Other devices keep using cuFile.
+    fn unsupported_device(&mut self, device: u64, error: racer_gpu::Error) {
+        if self.unsupported.insert(device) {
+            self.state
+                .counters
+                .cufile_unsupported
+                .fetch_add(1, Ordering::Relaxed);
+            let (major, minor) = (libc::major(device), libc::minor(device));
+            eprintln!(
+                "racer-dataplane: stage=gpu state=cufile-unsupported dev={major}:{minor} reason={error}"
+            );
+        }
+    }
+
     /// Stop trying cuFile after a failure that is not about one read.
-    fn disable_cufile(&self, error: racer_gpu::Error) {
+    fn disable_cufile(&self, error: racer_gpu::Error, reason: CufileDisable) {
         if self.state.cufile.swap(false, Ordering::Relaxed) {
+            self.state.counters.cufile_disabled(reason);
             eprintln!("racer-dataplane: stage=gpu state=cufile-disabled reason={error}");
         }
     }
@@ -1417,7 +1654,10 @@ impl Helper {
                 if landed.ordinal() != ordinal || landed.len() != length + 16 {
                     return Err(Error::Internal);
                 }
-                let buffer = self.landing.get(&ordinal).ok_or(Error::Internal)?;
+                let buffer = self
+                    .landing
+                    .get(&landed.allocation)
+                    .ok_or(Error::Internal)?;
                 (buffer, landed.offset())
             }
         };
@@ -1517,6 +1757,11 @@ pub(crate) mod testing {
         SIM.with(|sim| sim.borrow().as_ref().unwrap().0.clone())
     }
 
+    /// Live simulated staging and landing buffers. Run on the helper thread.
+    pub(crate) fn live_staging() -> usize {
+        simulation().live().staging
+    }
+
     /// A test scope with a few seconds on the real clock.
     pub(crate) fn scope() -> RequestScope {
         RequestScope::new(
@@ -1539,8 +1784,9 @@ pub(crate) mod testing {
     /// a NIC would.
     pub(crate) fn nic_write(landing: &GpuLanding, at: u64, bytes: &[u8]) {
         use std::os::unix::fs::FileExt;
-        let file = std::fs::File::from(landing.fd.try_clone().unwrap());
-        file.write_all_at(bytes, at).unwrap();
+        let fd = landing.allocation.fd.as_ref().unwrap();
+        let file = std::fs::File::from(fd.try_clone().unwrap());
+        file.write_all_at(bytes, landing.offset + at).unwrap();
     }
 
     /// Import a fresh allocation on GPU `ordinal` as request `id`.
@@ -1554,6 +1800,7 @@ pub(crate) mod testing {
                 fd: fd.try_clone().unwrap(),
                 allocation_size: size,
                 window: 0..size,
+                gpu_uuid: None,
                 reply,
             })
             .unwrap();
@@ -1601,6 +1848,15 @@ pub(crate) mod testing {
         numa: &[Option<u32>],
         setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
     ) -> Arc<GpuHelper> {
+        helper_with_options(numa, false, setup)
+    }
+
+    /// A helper as [`helper_with`] makes, with cuFile PCI P2PDMA set.
+    pub(crate) fn helper_with_options(
+        numa: &[Option<u32>],
+        pci_p2pdma: bool,
+        setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
+    ) -> Arc<GpuHelper> {
         let devices: Vec<racer_gpu::simulation::SimDevice> = numa
             .iter()
             .enumerate()
@@ -1610,8 +1866,10 @@ pub(crate) mod testing {
                 device
             })
             .collect();
-        GpuHelper::start_with(
+        GpuHelper::start_with_options(
             GpuMode::Required,
+            crate::config::DEFAULT_GPU_STAGING_BYTES,
+            pci_p2pdma,
             Box::new(move || {
                 let simulation = racer_gpu::simulation::Simulation::new(devices);
                 setup(&simulation);
@@ -1862,6 +2120,71 @@ mod tests {
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 2);
     }
 
+    #[test]
+    /// cuFile rejecting one file as unsupported keeps cuFile on, remembers
+    /// the file's device so it is not registered again, and leaves files on
+    /// other devices on cuFile.
+    fn unsupported_file_skips_its_device_only() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let fd = slab(&[7; 8192]);
+        helper.run(|| simulation().fault(Operation::File, -11));
+        assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
+        assert!(helper.cufile());
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            helper.counters().cufile_unsupported.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(operations(&helper, Operation::File), 1);
+        // Same device: no second registration, still the host path.
+        let other = slab(&[8; 4096]);
+        assert_eq!(
+            stage(&helper, &other, 0, 4096).err(),
+            Some(Error::Unavailable)
+        );
+        assert_eq!(operations(&helper, Operation::File), 1);
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        // A file on another device still goes through cuFile.
+        let elsewhere: OwnedFd = std::fs::File::open("/proc/self/exe").unwrap().into();
+        stage(&helper, &elsewhere, 0, 4096).unwrap();
+        assert_eq!(operations(&helper, Operation::File), 2);
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
+        assert!(helper.cufile());
+        // The device is counted once, and cuFile was not turned off.
+        assert_eq!(
+            helper.counters().cufile_unsupported.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            helper.counters().cufile_disabled[CufileDisable::FileOpen as usize]
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    /// A driver failure while registering a file still turns cuFile off for
+    /// the whole node.
+    fn driver_failure_on_register_turns_cufile_off() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let fd = slab(&[7; 4096]);
+        helper.run(|| simulation().fault(Operation::File, -5));
+        assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
+        assert!(!helper.cufile());
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            helper.counters().cufile_disabled[CufileDisable::FileOpen as usize]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            helper.counters().cufile_unsupported.load(Ordering::Relaxed),
+            0
+        );
+    }
+
     /// Wait for the helper's background work to reach `done`.
     fn eventually(mut done: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1881,6 +2204,32 @@ mod tests {
         let fd = slab(&[3; 4096]);
         stage(&helper, &fd, 0, 4096).unwrap();
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    /// `RACER_GPU_PCI_P2PDMA` reaches the startup cuFile driver open, and is
+    /// off by default.
+    fn cufile_driver_opens_with_pci_p2pdma_setting() {
+        use racer_gpu::simulation::Operation;
+        for enabled in [false, true] {
+            let helper = helper_with_options(&[None], enabled, |_| {});
+            eventually(|| operations(&helper, Operation::FileOpen) == 1);
+            assert_eq!(helper.run(|| simulation().pci_p2pdma()), Some(enabled));
+            assert!(helper.cufile());
+        }
+    }
+
+    #[test]
+    /// A driver open with PCI P2PDMA that fails turns cuFile off, so pages
+    /// use the host path.
+    fn cufile_pci_p2pdma_open_failure_turns_cufile_off() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper_with_options(&[None], true, |simulation| {
+            simulation.fault(Operation::FileOpen, -3)
+        });
+        eventually(|| !helper.cufile());
+        assert_eq!(helper.run(|| simulation().pci_p2pdma()), None);
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 0);
     }
 
     #[test]

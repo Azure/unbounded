@@ -1,0 +1,33 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# vLLM's OpenAI server with racer-client and racer-vllm installed, so
+# `vllm serve <dir> --load-format racer` and `racer-vllm-fetch` work as is.
+# racer-vllm targets vLLM v0.25.x; keep this tag in that series.
+ARG VLLM_IMAGE=docker.io/vllm/vllm-openai:v0.25.1
+
+# Build stage
+# Both packages are pure Python, so the wheels do not depend on the base image.
+FROM docker.io/library/python:3.12-slim AS builder
+WORKDIR /src
+RUN pip install --no-cache-dir build==1.3.0
+COPY clients/python/racer ./racer
+COPY clients/python/racer-vllm ./racer-vllm
+RUN python -m build --wheel --outdir /wheels ./racer \
+    && python -m build --wheel --outdir /wheels ./racer-vllm
+
+# Runtime stage
+FROM ${VLLM_IMAGE}
+# Install both wheels together so racer-vllm's racer-client dependency comes
+# from them, not from an index. vLLM images install packages with uv; fall
+# back to pip for bases without it.
+RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
+    set -eu; \
+    if command -v uv >/dev/null; then \
+        uv pip install --system --no-cache --no-index --find-links /wheels racer-client racer-vllm; \
+    else \
+        python3 -m pip install --no-cache-dir --no-index --find-links /wheels racer-client racer-vllm; \
+    fi; \
+    python3 -c "import racer, racer_vllm"; \
+    command -v racer-vllm-fetch
+COPY LICENSE NOTICE /unbounded/licenses/

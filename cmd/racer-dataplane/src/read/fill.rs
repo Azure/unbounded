@@ -157,6 +157,12 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
 /// starter's inherited scope.
 const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
 
+/// Providers a `gpu-read` asks, in visit order, to land a page in GPU
+/// memory before it takes the usual path. Each is one CopyOnly request
+/// against the read's acquisition budget; more would add a round trip per
+/// miss before the usual path asks the same providers again.
+const LANDING_PROVIDERS: usize = 2;
+
 impl Fill {
     pub(super) async fn warm_local(
         &self,
@@ -990,12 +996,13 @@ impl Fill {
     /// or create a shared single flight, and a landed page is never published
     /// to memory or persisted, because there are no host bytes to share.
     ///
-    /// Only the first provider in visit order is asked, with one CopyOnly
-    /// request. None means use the usual path: no landing buffer on the
-    /// request's GPU, a local copy exists, this node owns the page, or the
-    /// provider missed or failed. A page the provider sent to host memory
-    /// instead (no free landing slot, or HTTP) is used privately in the same
-    /// way, so it is not fetched twice.
+    /// Up to [`LANDING_PROVIDERS`] providers are asked in visit order, one
+    /// CopyOnly request each; a miss or failure moves on to the next. None
+    /// means use the usual path: no landing buffer on the request's GPU, a
+    /// local copy exists, this node owns the page, or every provider asked
+    /// missed or failed. A page a provider sent to host memory instead (no
+    /// free landing slot, or HTTP) is used privately in the same way, so it
+    /// is not fetched twice.
     async fn land_from_peer(
         &self,
         page: &PageId,
@@ -1033,40 +1040,54 @@ impl Fill {
             return Ok(None);
         }
         let order = resolver.visit_order(&candidates, &page.version.object, page.number);
-        let Some(first) = order.ranks().next() else {
-            return Ok(None);
-        };
-        let destination = candidates.ordered[first].clone();
-        let delivered = resolver
-            .request_landing(
-                &membership,
-                &destination,
-                context,
-                page,
-                scope,
-                budget,
-                target.ordinal,
-            )
-            .await?;
-        let landed = match delivered {
-            crate::peer::Delivered::Landed(landed) => landed,
-            // The provider sent the page to host memory (no free landing
-            // slot, or HTTP): use it privately rather than fetch it again.
-            crate::peer::Delivered::Response(response) => {
-                let Ok(copy) = response_copy(response.response(), page) else {
-                    return Ok(None);
-                };
-                return Ok(self
-                    .seal(
-                        page,
-                        UnverifiedPage {
-                            copy,
-                            disk_token: None,
-                        },
-                    )
-                    .ok()
-                    .map(super::sealed::Fetched::Sealed));
+        let ranks: Vec<usize> = order.ranks().take(LANDING_PROVIDERS).collect();
+        let mut landed = None;
+        for rank in ranks {
+            let destination = candidates.ordered[rank].clone();
+            let delivered = match resolver
+                .request_landing(
+                    &membership,
+                    &destination,
+                    context,
+                    page,
+                    scope,
+                    budget,
+                    target.ordinal,
+                )
+                .await
+            {
+                Ok(delivered) => delivered,
+                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                // A failed provider: ask the next one.
+                Err(_) => continue,
+            };
+            match delivered {
+                crate::peer::Delivered::Landed(answer) => {
+                    landed = Some(answer);
+                    break;
+                }
+                // The provider sent the page to host memory (no free landing
+                // slot, or HTTP): use it privately rather than fetch it again.
+                crate::peer::Delivered::Response(response) => {
+                    // A miss or unusable answer: ask the next provider.
+                    let Ok(copy) = response_copy(response.response(), page) else {
+                        continue;
+                    };
+                    return Ok(self
+                        .seal(
+                            page,
+                            UnverifiedPage {
+                                copy,
+                                disk_token: None,
+                            },
+                        )
+                        .ok()
+                        .map(super::sealed::Fetched::Sealed));
+                }
             }
+        }
+        let Some(landed) = landed else {
+            return Ok(None);
         };
         let crate::peer::transport::LandedResponse {
             metadata,

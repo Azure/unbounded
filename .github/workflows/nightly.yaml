@@ -268,6 +268,7 @@ jobs:
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : injected sidecars and per-ClusterCache
   #                                     origin DaemonSets from the racer component
+  #   - racer-vllm                    : vLLM with the Racer loader; not deployed
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
@@ -297,6 +298,9 @@ jobs:
             file: images/racer-dataplane/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
+          - name: racer-vllm
+            file: images/racer-vllm/Containerfile
+            large: true
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator
@@ -315,6 +319,14 @@ jobs:
 
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Free disk space for large images
+        # The vLLM base image alone is larger than a hosted runner's free disk.
+        if: matrix.component.large
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 

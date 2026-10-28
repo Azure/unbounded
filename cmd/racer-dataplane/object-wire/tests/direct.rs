@@ -91,6 +91,7 @@ fn gpu_read_requires_allocation_that_holds_the_window() {
                 length: 100
             },
             allocation_size: 4196,
+            gpu_uuid: None,
         }
     );
     assert_eq!(parsed.direct(), Some(DirectDelivery::Gpu));
@@ -111,6 +112,83 @@ fn gpu_read_requires_allocation_that_holds_the_window() {
             "{extra:?}"
         );
     }
+}
+
+#[test]
+fn gpu_read_parses_an_optional_gpu_uuid() {
+    let mut expected = [0u8; 16];
+    expected[0] = 0x01;
+    expected[15] = 0xef;
+    for value in [
+        "GPU-01000000-0000-0000-0000-0000000000ef",
+        "gpu-01000000-0000-0000-0000-0000000000EF",
+        "01000000-0000-0000-0000-0000000000ef",
+        " GPU-01000000-0000-0000-0000-0000000000ef ",
+    ] {
+        let parsed = parse(&direct(
+            "POST",
+            "gpu-read",
+            &[
+                DEST[0],
+                DEST[1],
+                ("Racer-Allocation-Size", "4196"),
+                ("Racer-Gpu-Uuid", value),
+            ],
+        ))
+        .unwrap();
+        let ReadKind::GpuRead { gpu_uuid, .. } = parsed else {
+            panic!("{parsed:?}");
+        };
+        assert_eq!(gpu_uuid, Some(expected), "{value}");
+    }
+    for value in [
+        "",
+        "GPU-",
+        "GPU-01000000-0000-0000-0000-0000000000e",
+        "GPU-01000000-0000-0000-0000-0000000000eff",
+        "GPU-0100000000-00-0000-0000-0000000000ef",
+        "GPU-01000000-0000-0000-0000-0000000000eg",
+        "MIG-01000000-0000-0000-0000-0000000000ef",
+    ] {
+        assert_eq!(
+            parse(&direct(
+                "POST",
+                "gpu-read",
+                &[
+                    DEST[0],
+                    DEST[1],
+                    ("Racer-Allocation-Size", "4196"),
+                    ("Racer-Gpu-Uuid", value),
+                ],
+            )),
+            Err(Error::InvalidRequest),
+            "{value:?}"
+        );
+    }
+    let uuid = ("Racer-Gpu-Uuid", "GPU-01000000-0000-0000-0000-0000000000ef");
+    assert_eq!(
+        parse(&direct(
+            "POST",
+            "gpu-read",
+            &[
+                DEST[0],
+                DEST[1],
+                ("Racer-Allocation-Size", "4196"),
+                uuid,
+                uuid
+            ],
+        )),
+        Err(Error::InvalidRequest)
+    );
+    // Ignored on host-read, like the allocation size.
+    assert!(matches!(
+        parse(&direct(
+            "POST",
+            "host-read",
+            &[DEST[0], DEST[1], ("Racer-Gpu-Uuid", "x")]
+        )),
+        Ok(ReadKind::HostRead { .. })
+    ));
 }
 
 #[test]
