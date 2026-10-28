@@ -147,38 +147,110 @@ fn verify_stripe(path: &Path, size: u64, cpu: usize, index: usize, stride: usize
 }
 
 /// Deletes the test's own device if the dataplane did not, for example after
-/// a failed assertion killed it. Only the id the dataplane reported is used.
-struct Leftover(Option<u32>);
+/// a failed assertion killed it. Declared before the process, so it runs
+/// after the dataplane is killed and its character device released.
+///
+/// The device is deleted only if it is provably the dataplane's: the
+/// character device is opened first, which pins the id so it cannot be
+/// freed and reused, then GET_DEV_INFO must report the cookie recorded
+/// while the dataplane was alive and serving it (see [`owned_cookie`]).
+/// Anything else is logged and left alone. Disarmed once the dataplane's
+/// own removal is confirmed.
+struct Leftover(Option<(u32, u64)>);
 impl Drop for Leftover {
     fn drop(&mut self) {
-        let Some(id) = self.0 else { return };
-        if !Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists() {
-            return;
-        }
-        match delete_device(id) {
-            Ok(()) => eprintln!("ublk test cleanup: deleted leftover device {id}"),
-            Err(error) => eprintln!("ublk test cleanup: delete device {id}: {error}"),
+        let Some((id, cookie)) = self.0 else { return };
+        match delete_if_owned(id, cookie) {
+            Ok(true) => eprintln!("ublk test cleanup: deleted leftover device {id}"),
+            Ok(false) => {}
+            Err(error) => eprintln!("ublk test cleanup: left device {id} alone: {error}"),
         }
     }
 }
 
-/// `UBLK_U_CMD_DEL_DEV` for `id` over a fresh `/dev/ublk-control`.
-fn delete_device(id: u32) -> io::Result<()> {
+/// `_IOR('u', 0x02, struct ublksrv_ctrl_cmd)`.
+const U_CMD_GET_DEV_INFO: u32 = 0x8020_7502;
+
+/// `struct ublksrv_ctrl_dev_info` of device `id`.
+fn dev_info(id: u32) -> io::Result<[u8; 64]> {
+    let mut info = [0_u8; 64];
+    control_command(U_CMD_GET_DEV_INFO, id, &mut info)?;
+    Ok(info)
+}
+
+/// The ownership cookie (`ublksrv_flags`) of device `id`, which must be
+/// served by `pid`. Called while the dataplane is alive and holds the
+/// device, so the id cannot have been reused. The kernel clears
+/// `ublksrv_pid` once the server exits, so the pid cannot identify the
+/// device later, but the cookie stays.
+fn owned_cookie(id: u32, pid: i32) -> u64 {
+    let info = dev_info(id).unwrap_or_else(|error| panic!("GET_DEV_INFO {id}: {error}"));
+    let server = i32::from_ne_bytes(info[16..20].try_into().unwrap());
+    assert_eq!(server, pid, "device {id} is served by the dataplane");
+    u64::from_ne_bytes(info[32..40].try_into().unwrap())
+}
+
+/// Deletes device `id` if its cookie is `cookie`, holding its character
+/// device for the whole check and delete. Returns false if it is gone.
+fn delete_if_owned(id: u32, cookie: u64) -> io::Result<bool> {
+    // _IOWR/_IOR('u', nr, struct ublksrv_ctrl_cmd).
+    const U_CMD_STOP_DEV: u32 = 0xc020_7507;
+    const U_CMD_DEL_DEV_ASYNC: u32 = 0x8020_7514;
+    // The open is exclusive, and the killed dataplane's descriptor can take
+    // a moment to be released.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let char = loop {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/dev/ublkc{id}"))
+        {
+            Ok(file) => break file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error)
+                if error.raw_os_error() == Some(libc::EBUSY) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // struct ublksrv_ctrl_dev_info: ublksrv_flags at offset 32.
+    let info = dev_info(id)?;
+    let found = u64::from_ne_bytes(info[32..40].try_into().unwrap());
+    if found != cookie {
+        return Err(io::Error::other(format!(
+            "cookie {found:#x} is not the dataplane's {cookie:#x}"
+        )));
+    }
+    control_command(U_CMD_STOP_DEV, id, &mut [])?;
+    // DEL_DEV_ASYNC does not wait for the id to be freed, so it returns
+    // while the character device is still held. Kernels without it get an
+    // error here and the device is left alone.
+    control_command(U_CMD_DEL_DEV_ASYNC, id, &mut [])?;
+    drop(char);
+    Ok(true)
+}
+
+/// One control command for `id` over a fresh `/dev/ublk-control`, with
+/// `buffer` as its payload.
+fn control_command(op: u32, id: u32, buffer: &mut [u8]) -> io::Result<()> {
     use io_uring::{IoUring, cqueue, opcode, squeue, types};
-    const U_CMD_DEL_DEV: u32 = 0xc020_7505;
     let control = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/ublk-control")?;
     let mut ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder().build(2)?;
-    // struct ublksrv_ctrl_cmd: dev_id, queue_id = -1, then zeros.
+    // struct ublksrv_ctrl_cmd: dev_id, queue_id = -1, len, addr, then zeros.
     let mut cmd = [0_u8; 80];
     cmd[..4].copy_from_slice(&id.to_ne_bytes());
     cmd[4..6].copy_from_slice(&u16::MAX.to_ne_bytes());
-    let entry = opcode::UringCmd80::new(types::Fd(control.as_raw_fd()), U_CMD_DEL_DEV)
+    cmd[6..8].copy_from_slice(&(buffer.len() as u16).to_ne_bytes());
+    cmd[8..16].copy_from_slice(&(buffer.as_mut_ptr() as u64).to_ne_bytes());
+    let entry = opcode::UringCmd80::new(types::Fd(control.as_raw_fd()), op)
         .cmd(cmd)
         .build();
-    // SAFETY: the command carries no pointers.
+    // SAFETY: buffer outlives the command, which completes before return.
     unsafe { ring.submission().push(&entry) }.map_err(io::Error::other)?;
     ring.submit_and_wait(1)?;
     let result = ring
@@ -244,7 +316,7 @@ fn ublk_device_served_by_multiple_workers_and_removed_on_sigterm() {
         id.is_some()
     });
     let id = id.unwrap();
-    leftover.0 = Some(id);
+    leftover.0 = Some((id, owned_cookie(id, process.child.id() as i32)));
     let block = PathBuf::from(format!("/dev/ublkb{id}"));
     let char = PathBuf::from(format!("/dev/ublkc{id}"));
     wait_until("the block node", || block.exists());
@@ -376,4 +448,6 @@ fn ublk_device_served_by_multiple_workers_and_removed_on_sigterm() {
         !Path::new(&format!("/sys/block/ublkb{id}")).exists(),
         "block device still registered"
     );
+    // Removal is confirmed; the id may now belong to someone else.
+    leftover.0 = None;
 }
