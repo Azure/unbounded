@@ -169,13 +169,9 @@ impl Fabric {
     }
 
     /// [`Fabric::transfer`] for an exchange the receiver abandons at
-    /// `cutoff` (its attempt timeout). Production drops the exchange then:
-    /// the requester closes its connection, relays cancel the downstream
-    /// exchange on upstream FIN (`peer/server.rs`,
-    /// `disconnect_fenced_exchange`), and the sender's writes fail. So no
-    /// chunk starts on any link at or after `cutoff`; chunks already started
-    /// keep their reservations. Returns `None` when the last byte does not
-    /// arrive before `cutoff`.
+    /// `cutoff`, as production drops it: no chunk starts at or after
+    /// `cutoff`, started chunks keep their reservations. `None` when the last
+    /// byte does not arrive before `cutoff`.
     pub fn transfer_until(
         &mut self,
         now: Nanos,
@@ -198,15 +194,9 @@ impl Fabric {
                 let (a, b) = (hop[0], hop[1]);
                 let wire = service_ns(chunk, self.nic_bps);
                 let (send, receive) = (self.scale(a, wire), self.scale(b, wire));
-                // Both NICs are work-conserving backlogs of their own service
-                // time from the transfer's issue, not slots at the chunk's
-                // (possibly far future) send time. A relay forwarding a body
-                // that is still queued at the sender upstream must not hold
-                // its own transmit side idle until that body arrives: other
-                // streams use the gap (Known issue 18). A slow sender likewise
-                // trickles its chunks without holding the receiver's NIC.
-                // With every hop ready at issue (one link, or idle upstream
-                // links) this matches a FIFO slot reservation.
+                // NICs are work-conserving backlogs from the transfer's
+                // issue, not slots at a chunk's future send time, so a relay
+                // or slow sender does not idle the other side (Known issue 18).
                 let backlog = self.tx_free[a as usize].max(now);
                 let start = ready.max(backlog);
                 if start >= cutoff {
@@ -313,18 +303,10 @@ pub struct OriginErrors {
 /// The origin: per-cache concurrency cap (a pool of `cap` FIFO slots per
 /// cache), one shared bandwidth FIFO, fixed latency, injected errors.
 ///
-/// Requests issued with [`Origin::request_tracked`] can be canceled
-/// ([`Origin::cancel`]). Production closes the connection of a canceled or
-/// expired origin exchange (`src/origin.rs`; test
-/// `real_uds_canceled_and_expired_reads_release_owned_resources` shows the
-/// `Connection` and `Plaintext` reservations return to zero), which frees the
-/// per-cache concurrency slot and stops the body transfer. The model
-/// therefore truncates the canceled request's slot and bandwidth
-/// reservations at the cancel time and recomputes, in issue order, the
-/// schedule of every later request that has not started yet or has not
-/// begun its body. Without cancellations the schedule is identical to the
-/// plain FIFO model. Do not mix tracked and untracked requests on one
-/// `Origin`.
+/// Canceling a tracked request frees its slot and unsent bandwidth at the
+/// cancel time, as production closing the connection does, and replays later
+/// unstarted requests in issue order. Without cancellations the schedule is
+/// plain FIFO. Do not mix tracked and untracked requests on one `Origin`.
 pub struct Origin {
     slots: Vec<Nanos>,
     cap: u32,
@@ -526,11 +508,8 @@ impl Origin {
         }
     }
 
-    /// Cancel a tracked request at `now`, as production closing the
-    /// connection: its slot frees at `now` and its unsent body no longer
-    /// uses bandwidth. Returns how many other outstanding requests had
-    /// their completion moved (always earlier); [`Origin::pop_moved`]
-    /// delivers those.
+    /// Cancel a tracked request at `now`. Returns how many outstanding
+    /// requests moved earlier; [`Origin::pop_moved`] delivers them.
     pub fn cancel(&mut self, handle: OriginHandle, now: Nanos) -> usize {
         let Some(mut canceled) = self.take(handle) else {
             return 0;
@@ -745,9 +724,7 @@ mod tests {
     }
 
     /// Known issue 18: a relay forwarding a body still queued upstream must
-    /// not keep its own transmit side idle until the body arrives. Before the
-    /// fix the relay's NIC was reserved at the body's far-future send time,
-    /// so every later send from the relay queued behind it.
+    /// not keep its own transmit side idle until the body arrives.
     #[test]
     fn relay_transmit_is_not_held_by_a_body_queued_upstream() {
         let mut f = fabric(3, 1);
