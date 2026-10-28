@@ -15,6 +15,7 @@ title = "Unbounded"
     ordered = false
 
 [params]
+  noindex = false
   description = "Run nodes across multiple cloud providers and bare-metal infrastructure to form a unified Kubernetes cluster, no matter where your infrastructure lives."
   repo = "https://github.com/Azure/unbounded"
 

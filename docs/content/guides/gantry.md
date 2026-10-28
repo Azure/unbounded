@@ -35,7 +35,7 @@ set used 99.2% less ACR Private Endpoint traffic than the direct-origin
 reference set. Mean pod-start P95 was 24.5% lower. Every Gantry run completed
 all 1,000 pods.
 
-See [Gantry Performance at Scale](/guides/gantry-benchmark/) for raw run values,
+See [Gantry Performance at Scale]({{< relref "gantry-benchmark" >}}) for raw run values,
 methodology, calculations, and limitations.
 
 ## Design principles
