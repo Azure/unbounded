@@ -617,7 +617,9 @@ impl Manager {
         self.update(|shared| shared.control_done = true);
     }
 
-    /// The control loop over any [`DeviceControl`].
+    /// The control loop over any [`DeviceControl`]. It does not mark the
+    /// control thread done; [`run_guarded`](Manager::run_guarded) does that
+    /// once every device is settled.
     pub(crate) fn run_with(&self, control: &mut dyn DeviceControl) {
         let mut phases = vec![Phase::Waiting; self.devices.len()];
         loop {
@@ -667,7 +669,6 @@ impl Manager {
             })
             .collect();
         self.teardown(control, &started);
-        self.finish();
     }
 
     /// Add, attach, and start one device. Failures tear it down.
@@ -1214,7 +1215,13 @@ mod tests {
         let manager = manager.clone();
         let mut fake = fake.clone();
         *fake.manager.lock().unwrap() = Some(manager.clone());
-        std::thread::spawn(move || manager.run_with(&mut fake))
+        let reopen_fake = fake.clone();
+        std::thread::spawn(move || {
+            manager.run_guarded(|manager| manager.run_with(&mut fake), &mut || {
+                reopen_fake.push("reopen".into());
+                Ok(Box::new(reopen_fake.clone()))
+            });
+        })
     }
 
     #[test]
@@ -1920,6 +1927,30 @@ mod tests {
                 },
             )
         });
+        assert!(thread.join().unwrap());
+        assert_eq!(*observed.lock().unwrap(), Some((false, false)));
+        assert!(manager.control_done());
+    }
+
+    #[test]
+    fn workers_keep_serving_while_settling_after_failed_teardown() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let (runner, seen) = (manager.clone(), observed.clone());
+        let (mut loop_fake, reopen_fake) = (fake.clone(), fake.clone());
+        let thread = std::thread::spawn(move || {
+            let inner = runner.clone();
+            runner.run_guarded(|manager| manager.run_with(&mut loop_fake), &mut || {
+                // The loop returned without closing the stuck queue.
+                *seen.lock().unwrap() = Some((inner.control_done(), inner.claim_queue(0, 0)));
+                Ok(Box::new(reopen_fake.clone()))
+            })
+        });
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        manager.request_stop();
         assert!(thread.join().unwrap());
         assert_eq!(*observed.lock().unwrap(), Some((false, false)));
         assert!(manager.control_done());
