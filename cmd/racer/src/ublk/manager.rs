@@ -403,11 +403,12 @@ impl Manager {
                 if shared.stop {
                     break;
                 }
-                let ready = (0..phases.len()).find(|&i| match phases[i] {
-                    Phase::Waiting => shared.devices[i].resolved.is_some(),
-                    Phase::Started(_) => shared.devices[i].failed.iter().any(|f| *f),
-                    Phase::Failed => false,
-                });
+                let ready = next_ready(
+                    &phases,
+                    &self.devices,
+                    |i| shared.devices[i].resolved.is_some(),
+                    |i| shared.devices[i].failed.iter().any(|f| *f),
+                );
                 if ready.is_none() {
                     shared = self
                         .changed
@@ -422,7 +423,10 @@ impl Manager {
                 continue;
             };
             phases[index] = match phases[index] {
-                Phase::Waiting => self.bring_up(control, index),
+                Phase::Waiting => {
+                    let owned = owned_ids(&phases);
+                    self.bring_up(control, index, &owned)
+                }
                 Phase::Started(id) => {
                     log(Some(index), "serve", &format!("state=failed id={id}"));
                     self.teardown(control, &[(index, id)]);
@@ -444,7 +448,10 @@ impl Manager {
     }
 
     /// Add, attach, and start one device. Failures tear it down.
-    fn bring_up(&self, control: &mut dyn DeviceControl, index: usize) -> Phase {
+    ///
+    /// `owned` lists the ids of devices this manager holds; a fixed id in it
+    /// is never treated as stale.
+    fn bring_up(&self, control: &mut dyn DeviceControl, index: usize, owned: &[u32]) -> Phase {
         let resolved = self.lock().devices[index].resolved.clone();
         let resolved = match resolved {
             Some(Ok(resolved)) => resolved,
@@ -463,10 +470,22 @@ impl Manager {
             return Phase::Failed;
         }
         let device = &self.devices[index];
-        if let Some(id) = device.id
-            && !self.replace_stale(control, index, id)
-        {
-            return Phase::Failed;
+        if let Some(id) = device.id {
+            if owned.contains(&id) {
+                // Unreachable with fixed ids added first, but never stop or
+                // delete a device this manager serves.
+                log(
+                    Some(index),
+                    "replace",
+                    &format!(
+                        "state=failed id={id} error=\"id is held by another device of this dataplane\""
+                    ),
+                );
+                return Phase::Failed;
+            }
+            if !self.replace_stale(control, index, id) {
+                return Phase::Failed;
+            }
         }
         let spec = DevSpec {
             id: device.id,
@@ -721,6 +740,43 @@ impl Manager {
 
 /// An opaque per-device value stored in the kernel. It helps operators tell
 /// which process created a device.
+/// The next device the control loop should act on.
+///
+/// A started device that reported a failure is torn down. A waiting device
+/// with a resolve result is brought up, but devices with a fixed id go
+/// first: an automatic device waits until no fixed-id device is still
+/// waiting, so the kernel cannot hand one of our automatic devices an id that
+/// a configured fixed-id device is about to claim (which would then look
+/// like a stale device and be stopped). A fixed-id device that has failed no
+/// longer reserves its id.
+fn next_ready(
+    phases: &[Phase],
+    devices: &[UblkDeviceConfig],
+    resolved: impl Fn(usize) -> bool,
+    failed: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let fixed_waiting = phases
+        .iter()
+        .zip(devices)
+        .any(|(phase, device)| matches!(phase, Phase::Waiting) && device.id.is_some());
+    (0..phases.len()).find(|&i| match phases[i] {
+        Phase::Waiting => resolved(i) && (devices[i].id.is_some() || !fixed_waiting),
+        Phase::Started(_) => failed(i),
+        Phase::Failed => false,
+    })
+}
+
+/// Ids of the devices this manager currently holds.
+fn owned_ids(phases: &[Phase]) -> Vec<u32> {
+    phases
+        .iter()
+        .filter_map(|phase| match phase {
+            Phase::Started(id) => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
 fn cookie(index: usize) -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1080,6 +1136,102 @@ mod tests {
         assert_eq!(ops[1], "stop 9");
         assert_eq!(ops[2], "del 9");
         assert!(ops[3].starts_with("add id=Some(9)"));
+    }
+
+    fn device(id: Option<u32>, seed: u8) -> UblkDeviceConfig {
+        UblkDeviceConfig {
+            cache: "models".into(),
+            key: CacheKey([seed; 32]),
+            etag: None,
+            id,
+        }
+    }
+
+    #[test]
+    fn next_ready_puts_fixed_ids_before_automatic_ids() {
+        let devices = [device(None, 1), device(Some(5), 2)];
+        let waiting = [Phase::Waiting, Phase::Waiting];
+        // The automatic device is resolved but waits for the fixed one.
+        assert_eq!(next_ready(&waiting, &devices, |i| i == 0, |_| false), None);
+        assert_eq!(next_ready(&waiting, &devices, |_| true, |_| false), Some(1));
+        // Once the fixed device is started or failed, automatic ones proceed.
+        for done in [Phase::Started(5), Phase::Failed] {
+            let phases = [Phase::Waiting, done];
+            assert_eq!(next_ready(&phases, &devices, |_| true, |_| false), Some(0));
+        }
+    }
+
+    #[test]
+    fn next_ready_handles_failures_and_unresolved_devices() {
+        let devices = [device(None, 1), device(None, 2), device(Some(5), 3)];
+        let phases = [Phase::Started(1), Phase::Waiting, Phase::Failed];
+        assert_eq!(next_ready(&phases, &devices, |_| false, |_| false), None);
+        assert_eq!(next_ready(&phases, &devices, |_| true, |_| false), Some(1));
+        assert_eq!(next_ready(&phases, &devices, |_| true, |i| i == 0), Some(0));
+        assert_eq!(next_ready(&[], &[], |_| true, |_| true), None);
+    }
+
+    #[test]
+    fn owned_ids_lists_started_devices_only() {
+        let phases = [
+            Phase::Started(3),
+            Phase::Waiting,
+            Phase::Failed,
+            Phase::Started(0),
+        ];
+        assert_eq!(owned_ids(&phases), vec![3, 0]);
+        assert!(owned_ids(&[]).is_empty());
+    }
+
+    #[test]
+    fn fixed_id_held_by_this_manager_is_not_replaced() {
+        let manager = manager(Some(9));
+        let mut fake = Fake {
+            stale: true,
+            ..Default::default()
+        };
+        manager.report_resolved(0, Ok(resolved()));
+        assert_eq!(manager.bring_up(&mut fake, 0, &[9]), Phase::Failed);
+        assert!(
+            fake.ops().is_empty(),
+            "touched our own device: {:?}",
+            fake.ops()
+        );
+    }
+
+    #[test]
+    fn fixed_id_device_is_added_before_an_automatic_device() {
+        let config = UblkConfig {
+            devices: vec![device(None, 1), device(Some(9), 2)],
+            queue_depth: 4,
+            max_io_bytes: 1 << 20,
+        };
+        let manager = Arc::new(Manager::new(
+            &config,
+            1,
+            Path::new("/nonexistent"),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ));
+        let fake = Fake::default();
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(fake.ops().is_empty(), "automatic device went first");
+        manager.report_resolved(1, Ok(resolved()));
+        eventually("both added", || {
+            fake.ops().iter().filter(|op| op.starts_with("add")).count() == 2
+        });
+        manager.request_stop();
+        thread.join().unwrap();
+        let adds: Vec<_> = fake
+            .ops()
+            .into_iter()
+            .filter(|op| op.starts_with("add") || op.starts_with("info"))
+            .collect();
+        assert_eq!(adds[0], "info 9");
+        assert!(adds[1].starts_with("add id=Some(9)"), "{adds:?}");
+        assert!(adds[2].starts_with("add id=None"), "{adds:?}");
     }
 
     #[test]

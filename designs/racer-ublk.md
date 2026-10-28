@@ -48,7 +48,12 @@ Each device is an object:
 - `key` is the cache key.
 - `etag` is optional. When unset, the dataplane resolves the current version once and pins it.
 - `id` is optional. When unset, the kernel picks the device id. When set and a stale device
-  with that id exists, the dataplane stops and deletes it first.
+  with that id exists, the dataplane stops and deletes it first. Fixed and automatic ids can be
+  mixed: every device with a fixed id is added before any automatic device, so the kernel cannot
+  give an automatic device of this dataplane a configured id. An automatic device therefore waits
+  until each fixed-id device has resolved and started or failed. The control thread never stops or
+  deletes a device it serves as stale. Another process can still take a configured id first;
+  the fixed-id device then fails if that device is in use, or replaces it as a stale device if not.
 
 Device nodes are opened under `RACER_DEVICE_DIRECTORY` (default `/host/dev`).
 

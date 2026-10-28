@@ -217,7 +217,9 @@ pub struct UblkDeviceConfig {
     pub key: CacheKey,
     /// Pinned version; when absent the current version is resolved once.
     pub etag: Option<StrongEtag>,
-    /// Requested kernel device id; when absent the kernel picks one.
+    /// Requested kernel device id; when absent the kernel picks one. Devices
+    /// with a fixed id are added before automatic ones, so the kernel never
+    /// gives one of this dataplane's automatic devices a configured id.
     pub id: Option<u32>,
 }
 
