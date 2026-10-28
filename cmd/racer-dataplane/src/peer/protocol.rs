@@ -52,13 +52,13 @@ use uring_runtime::environment::Deadline;
 pub enum FetchMode {
     CopyOnly,
     Acquire,
-    /// A copy offer (Known issue 37, `racer_core::read::notice`): the
+    /// A copy offer (Known issue 37, `racer_core::read::hints`): the
     /// requester holds the page and tells its rank 0. Page requests only, with
     /// no origin credentials and no remote attempts; the receiver never sends a
     /// body or acquires, and answers `Miss`. Receivers that predate it reject
     /// the request, which the sender treats as not delivered.
     Offer,
-    /// A silence ping (Known issues 41 and 43, `racer_core::peer::silence`):
+    /// A silence ping (Known issues 41 and 43, `racer_core::liveness`):
     /// the requester asks whether the receiver answers at all. Page requests
     /// only, like [`Self::Offer`]; the receiver answers `Miss` at once
     /// without looking at its cache or flights, so the answer never waits
@@ -322,7 +322,7 @@ pub struct PeerRequest {
 /// Unsigned local result. Transport must sign it against the admitted request.
 /// The payload-generic shape and its `kind` live in racer-core.
 pub type PeerResponse =
-    racer_core::read::response::PeerResponse<CiphertextPage, super::subscriptions::TransferGrant>;
+    racer_core::read::PeerResponse<CiphertextPage, super::subscriptions::TransferGrant>;
 
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.

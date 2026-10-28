@@ -1077,33 +1077,33 @@ impl Requester {
                 Ok(response) => self.verify_exchange(response, &binding, &scope).await,
                 Err(error) => Err(error),
             };
-            use racer_core::peer::hop;
+            use racer_core::route;
             let exchange = match &response {
-                Ok(transport::RelayResponse::Complete(response)) => hop::Exchange::Complete {
+                Ok(transport::RelayResponse::Complete(response)) => route::Exchange::Complete {
                     overloaded: matches!(response.response, protocol::PeerResponse::Overloaded),
                 },
                 // A landed page was verified by the transport, like a complete response.
                 Ok(transport::RelayResponse::Landed(_)) => {
-                    hop::Exchange::Complete { overloaded: false }
+                    route::Exchange::Complete { overloaded: false }
                 }
-                Ok(_) => hop::Exchange::Streaming,
-                Err(error) => hop::Exchange::Failed {
+                Ok(_) => route::Exchange::Streaming,
+                Err(error) => route::Exchange::Failed {
                     fault: error.fault(),
                     socket_failure: socket_failure.get(),
                 },
             };
             // Unavailable/deadline/protocol errors can arise locally or at a
             // downstream node. Do not blame an immediate peer without evidence.
-            if let Some(outcome) = hop::exchange_link_outcome(exchange, permit.is_some()) {
+            if let Some(outcome) = route::exchange_link_outcome(exchange, permit.is_some()) {
                 health.observe(&next, outcome)?;
             }
             if let Some(permit) = permit {
                 // A downstream overload is not attributable to the immediate
                 // peer. It also must not increase its admission or recover a probe.
-                permit.observe(hop::exchange_admission_outcome(exchange));
+                permit.observe(route::exchange_admission_outcome(exchange));
             }
             if let Some(page) = last_page {
-                match hop::silence_evidence(exchange) {
+                match route::silence_evidence(exchange) {
                     Some(true) => health.silence_answered(&next),
                     // `CandidatePolicy::poll_pings` sends the ping.
                     Some(false) => {
@@ -1111,7 +1111,7 @@ impl Requester {
                             &next,
                             page,
                             sent,
-                            racer_core::peer::silence::LINK_TIMEOUTS,
+                            racer_core::liveness::LINK_TIMEOUTS,
                         );
                     }
                     None => {}

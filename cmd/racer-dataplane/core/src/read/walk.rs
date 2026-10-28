@@ -21,13 +21,12 @@
 //! }
 //! ```
 
-use super::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
-use super::candidates::{ProbeOutcome, VisitOrder};
-use super::error::{Error, Result};
-use super::fanout::{
+pub use crate::liveness::Rank0State;
+use crate::read::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
+use crate::read::budget::{
     HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
 };
-pub use super::rank0::Rank0State;
+use crate::read::{Error, ProbeOutcome, Result, VisitOrder};
 use std::time::{Duration, Instant};
 
 /// Whether a probe may start acquisition at its destination.
@@ -86,7 +85,7 @@ pub struct WalkConfig {
     /// handoff targets, and for non-page walks.
     pub previous: u8,
     /// A non-owner page walk has an overflow helper (see
-    /// [`super::fanout`]); a probe of it reports `canonical = owners`.
+    /// [`crate::read::budget`]); a probe of it reports `canonical = owners`.
     /// The walk is eligible only when it starts with at least
     /// [`HELPER_MIN_ATTEMPTS`] attempts (so a helper, which inherits fewer,
     /// never asks another helper). It asks the helper at most once, right
@@ -110,7 +109,7 @@ pub struct WalkConfig {
     /// origin, each with its own grant ([`SUCCESSOR_GRANT_ATTEMPTS`],
     /// [`SUCCESSOR_GRANT_LINKS`]) instead of the walk's budget, whose
     /// credits a delegated rank 0 needs for origin. They are successor
-    /// targets ([`crate::read::successor::successor_targets`]: later owners
+    /// targets ([`crate::read::hints::successor_targets`]: later owners
     /// this owner answered without a copy, which then likely fetched the
     /// page themselves, Known issue 21), then lineage targets
     /// ([`lineage_targets`], [`demoted_targets`]: members that ranked above
@@ -125,10 +124,10 @@ pub struct WalkConfig {
     /// share instead of one per target.
     pub parallel_granted: bool,
     /// What this owner last learned about rank 0's acquisition of the page
-    /// ([`crate::read::rank0::Rank0Watch`], Known issue 39). `Overdue`: a
+    /// ([`crate::liveness::Rank0Watch`], Known issue 39). `Overdue`: a
     /// timeout of rank 0 gives origin authority like a transport failure,
     /// since rank 0 stayed silent too long
-    /// ([`crate::read::rank0::Rank0Watch::hang_after`]). `Fetching` and
+    /// ([`crate::liveness::Rank0Watch::hang_after`]). `Fetching` and
     /// `Unknown` keep the [`Outcome::TimedOut`] rule. `Failed`: this
     /// owner's own origin request for the page failed recently, so
     /// [`Outcome::Failed`] withholds authority too (Known issue 52). Ignored
@@ -187,7 +186,7 @@ pub fn owner_funding(canonical: usize) -> u32 {
 }
 
 /// Fewest links a funded out-of-order Acquire may carry: the owner keeps
-/// `links - 1` ([`super::budget::inherited_budget`]), at least one to reach
+/// `links - 1` ([`crate::read::budget::inherited_budget`]), at least one to reach
 /// its rank 0.
 pub const FUNDED_MIN_LINKS: u8 = 2;
 
@@ -399,7 +398,7 @@ pub fn demoted_targets_from<N: Clone>(
 /// How many leading `handoff` targets are in `granted` (successor and
 /// lineage targets), for [`WalkConfig::granted`]. Callers order the
 /// handoff targets so these come first ([`merge_handoff`],
-/// [`crate::read::successor::with_successors`]); version - 1 targets after
+/// [`crate::read::hints::with_successors`]); version - 1 targets after
 /// them stay funded from the walk's budget.
 pub fn granted_prefix<N: PartialEq>(handoff: &[N], granted: &[N]) -> usize {
     handoff.iter().take_while(|n| granted.contains(n)).count()
@@ -481,7 +480,7 @@ pub enum Outcome {
     /// The destination itself answered `Overloaded` (signed by the
     /// destination, not by a relay in front of it): for example an owner
     /// shedding readers of a hot page
-    /// ([`super::fanout::shed_hot_page`]). Recorded like
+    /// ([`crate::read::budget::shed_hot_page`]). Recorded like
     /// `Probe(Overloaded)` but without charging a route failure (the route
     /// worked); for a non-owner page walk it is also the one signal that asks
     /// the page's overflow helper.
@@ -511,7 +510,7 @@ pub enum Outcome {
     /// Recorded like `Probe(Unreachable)`, except that when this owner's
     /// own origin request for the page failed recently
     /// ([`WalkConfig::rank0`] is `Failed`, see
-    /// [`crate::read::rank0::Rank0Watch::failed`]) it withholds origin
+    /// [`crate::liveness::Rank0Watch::failed`]) it withholds origin
     /// authority like [`Outcome::TimedOut`] (Known issue 52): origin is
     /// failing for the page, this owner's request would go to it right
     /// after rank 0's failed, and the reader's retry sends rank 0 to origin
@@ -769,7 +768,7 @@ impl CandidateWalk {
     }
 
     /// The pending probe is this owner's page probe of rank 0: the caller
-    /// updates its [`crate::read::rank0::Rank0Watch`] from the outcome.
+    /// updates its [`crate::liveness::Rank0Watch`] from the outcome.
     pub fn pending_rank0(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| p.rank0)
     }
@@ -1109,7 +1108,7 @@ impl CandidateWalk {
     }
 
     /// The pending probe's destination is behind this node and the caller
-    /// waits for it ([`super::stale::stale_wait`], Known issue 26): return
+    /// waits for it ([`crate::read::walk::stale_wait`], Known issue 26): return
     /// the child credits and plan the same destination again on the next
     /// [`Self::next`], instead of recording an outcome and moving on.
     pub fn retry_pending(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
@@ -1576,3 +1575,256 @@ pub fn hedge_fallback(error: Error) -> bool {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests;
+
+// Walking the previous membership when the current one's owners are behind.
+//
+// While a membership version propagates, a requester that already adopted
+// version N asks owners that still hold N - 1. They cannot resolve N and
+// answer `StaleMembership`; with nothing newer to refresh to, the requester
+// skipped them as stale destinations ([`crate::read::walk::stale_action`]), each
+// skip spending the credits that funded the probe. When every owner of a
+// page was behind (for example all of them joined in N), the walk was
+// exhausted and the read failed, although the page's owners under N - 1,
+// which every peer still resolves during the grace window, could serve it
+// (Known issue 19).
+//
+// [`previous_fallback`] decides when a non-owner, at its first stale
+// destination, stops walking N and walks the page's owners under N - 1
+// instead, once, with what is left of the same budget. A destination behind
+// N resolves N - 1, and so does one that adopted N (grace retention), so
+// the second walk does not meet the same skips. Budgets never grow, and the
+// walk under N - 1 must not give this node origin authority:
+// [`fallback_rank_allowed`] ends it when this node owns the page there.
+//
+// A reader that cannot fall back (it joined in N, so it is not a member of
+// N - 1) waits for the destination to adopt N instead, at most
+// [`MAX_STALE_WAITS`] times ([`stale_wait`], Known issues 26 and 36).
+
+/// Most time one wait for a destination that is behind may take
+/// ([`stale_wait`]).
+pub const MAX_STALE_WAIT: Duration = Duration::from_secs(4);
+
+/// Most waits one read makes for destinations that are behind
+/// ([`stale_wait`]). A membership reaches every client within the seats'
+/// write window after a commit (about 5 s at 50,000 clients, Known issue
+/// 36): with a 10 s deadline, two waits (a third, then a third of the rest)
+/// cover 5.5 s and leave the rest for the remaining owners.
+pub const MAX_STALE_WAITS: u8 = 2;
+
+/// Shortest wait worth making: below this the destination is unlikely to
+/// have adopted the membership, and the read keeps walking instead.
+pub const MIN_STALE_WAIT: Duration = Duration::from_millis(250);
+
+/// Facts about a destination that answered `StaleMembership` because it is
+/// behind this node, for a reader that cannot walk the previous membership.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StaleWaitFacts {
+    /// This node owns the page (owners go on to their own fetch).
+    pub owner: bool,
+    /// [`previous_fallback`] walks the previous membership instead.
+    pub fallback: bool,
+    /// Waits this read already made for destinations that are behind.
+    pub waits: u8,
+    /// One more exchange with the destination still leaves the walk
+    /// enough attempts for its later visits
+    /// (`crate::read::walk::CandidateWalk::retry_affordable`). Required for every
+    /// wait after the first.
+    pub affordable: bool,
+    /// Time left until the read's deadline.
+    pub remaining: Duration,
+}
+
+/// How long a non-owner waits before asking the same destination again,
+/// instead of skipping it, when the destination is behind this node's
+/// membership and the previous membership is no help (Known issue 26).
+///
+/// A reader that joined in membership N is not a member of N - 1, so peers
+/// would reject it there ([`previous_fallback`] refuses), and an owner still
+/// on N - 1 cannot resolve N. Skipping every such owner exhausted the walk
+/// and failed the read, although the owners adopt N within the propagation
+/// window. Waiting a third of the time left (at most [`MAX_STALE_WAIT`],
+/// at most [`MAX_STALE_WAITS`] times per read, never below
+/// [`MIN_STALE_WAIT`]) leaves the rest of the
+/// deadline for the remaining owners. The destination's verified
+/// `StaleMembership` returns the credits it was sent
+/// ([`crate::read::budget::AcquisitionBudget::refund_remote`]), so the second ask
+/// costs one exchange and its links, like any probe; budgets never grow.
+pub fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
+    if facts.owner
+        || facts.fallback
+        || facts.waits >= MAX_STALE_WAITS
+        || (facts.waits > 0 && !facts.affordable)
+    {
+        return None;
+    }
+    let wait = (facts.remaining / 3).min(MAX_STALE_WAIT);
+    (wait >= MIN_STALE_WAIT).then_some(wait)
+}
+
+/// Facts about a walk under membership N whose destination was behind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StaleSkip {
+    /// This node owns the page under N (owners have their own
+    /// previous-membership probes, `WalkConfig::previous` and handoff
+    /// targets, and their origin authority comes from N).
+    pub owner: bool,
+    /// This read already refreshed its membership or fell back once.
+    pub retried: bool,
+    /// N - 1 is still resolvable here, was replaced within
+    /// [`crate::read::walk::PREVIOUS_MEMBERSHIP_WITHIN`] (so peers that adopted N
+    /// still hold it), and lists this node (peers reject non-members).
+    pub previous_recent_member: bool,
+}
+
+/// Whether to walk the page's owners under N - 1 instead of skipping a
+/// destination that is behind.
+pub fn previous_fallback(s: StaleSkip) -> bool {
+    !s.owner && !s.retried && s.previous_recent_member
+}
+
+/// Whether the fallback walk may proceed with this node at `rank` under
+/// N - 1. A page owner under N - 1 that is not one under N would gain
+/// origin authority it no longer has, so the walk ends instead.
+pub fn fallback_rank_allowed(rank: Option<usize>) -> bool {
+    rank.is_none()
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+
+    fn skip() -> StaleSkip {
+        StaleSkip {
+            owner: false,
+            retried: false,
+            previous_recent_member: true,
+        }
+    }
+
+    #[test]
+    fn non_owner_falls_back_once() {
+        assert!(previous_fallback(skip()));
+    }
+
+    #[test]
+    fn no_fallback_without_a_usable_previous_membership() {
+        // Already retried (refreshed or fell back): at most one more walk.
+        assert!(!previous_fallback(StaleSkip {
+            retried: true,
+            ..skip()
+        }));
+        // Peers may no longer resolve N - 1, or would reject this node.
+        assert!(!previous_fallback(StaleSkip {
+            previous_recent_member: false,
+            ..skip()
+        }));
+        // Owners keep their walk under N.
+        assert!(!previous_fallback(StaleSkip {
+            owner: true,
+            ..skip()
+        }));
+        assert!(!previous_fallback(StaleSkip::default()));
+    }
+
+    fn waiting() -> StaleWaitFacts {
+        StaleWaitFacts {
+            remaining: Duration::from_secs(9),
+            affordable: true,
+            ..StaleWaitFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_reader_that_cannot_fall_back_waits_twice() {
+        assert_eq!(stale_wait(waiting()), Some(Duration::from_secs(3)));
+        // The first wait does not depend on funding (Known issue 26).
+        assert_eq!(
+            stale_wait(StaleWaitFacts {
+                affordable: false,
+                ..waiting()
+            }),
+            Some(Duration::from_secs(3))
+        );
+        // Known issue 36: a second wait, a third of what is left, covers
+        // the 50k propagation window (about 5 s) within a 10 s deadline.
+        let deadline = Duration::from_secs(10);
+        let first = stale_wait(StaleWaitFacts {
+            remaining: deadline,
+            ..waiting()
+        })
+        .unwrap();
+        let second = stale_wait(StaleWaitFacts {
+            remaining: deadline - first,
+            waits: 1,
+            ..waiting()
+        })
+        .unwrap();
+        assert!(
+            first + second >= Duration::from_millis(5500),
+            "{first:?} {second:?}"
+        );
+        assert_eq!(
+            stale_wait(StaleWaitFacts {
+                remaining: deadline - first - second,
+                waits: 2,
+                ..waiting()
+            }),
+            None
+        );
+        // Capped, and a third of what is left.
+        let long = StaleWaitFacts {
+            remaining: Duration::from_secs(60),
+            ..waiting()
+        };
+        assert_eq!(stale_wait(long), Some(MAX_STALE_WAIT));
+        let short = StaleWaitFacts {
+            remaining: Duration::from_millis(900),
+            ..waiting()
+        };
+        assert_eq!(stale_wait(short), Some(Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn no_wait_for_owners_fallbacks_repeats_or_short_deadlines() {
+        for facts in [
+            StaleWaitFacts {
+                owner: true,
+                ..waiting()
+            },
+            StaleWaitFacts {
+                fallback: true,
+                ..waiting()
+            },
+            StaleWaitFacts {
+                waits: MAX_STALE_WAITS,
+                ..waiting()
+            },
+            // A further wait must leave the later visits funded.
+            StaleWaitFacts {
+                waits: 1,
+                affordable: false,
+                ..waiting()
+            },
+            StaleWaitFacts {
+                remaining: Duration::from_millis(749),
+                ..waiting()
+            },
+            StaleWaitFacts::default(),
+        ] {
+            assert_eq!(stale_wait(facts), None, "{facts:?}");
+        }
+        let edge = StaleWaitFacts {
+            remaining: Duration::from_millis(750),
+            ..waiting()
+        };
+        assert_eq!(stale_wait(edge), Some(MIN_STALE_WAIT));
+    }
+
+    #[test]
+    fn fallback_never_gives_origin_authority() {
+        assert!(fallback_rank_allowed(None));
+        for rank in 0..3 {
+            assert!(!fallback_rank_allowed(Some(rank)));
+        }
+    }
+}

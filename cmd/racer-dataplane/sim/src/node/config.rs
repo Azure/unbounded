@@ -69,7 +69,7 @@ pub struct NodeConfig {
     pub fanout: bool,
     /// Bodies of one page an owner streams before it sheds readers of the
     /// page; 0 (default) derives it from the page size like production
-    /// (`racer_core::read::fanout::hot_page_bodies`).
+    /// (`racer_core::read::budget::hot_page_bodies`).
     pub hot_page_bodies: u32,
     /// A running fill continues for another live waiter when its leader
     /// expires (production: on for every fill except warm gates; set 0 to
@@ -151,11 +151,11 @@ pub struct NodeConfig {
     pub rank0_failure_hold: bool,
     /// Copy offers wait out a cut toward their target's site, seen by an
     /// offer or by this node's reads (production
-    /// `racer_core::read::notice` cut groups: always on; set 0 to measure
+    /// `racer_core::read::hints` cut groups: always on; set 0 to measure
     /// without it, Known issue 50).
     pub offer_cut_groups: bool,
     /// A rank 2 holder also offers its origin copy to rank 1 (production
-    /// `racer_core::read::notice::notice_indexes`: always on; set 0 to
+    /// `racer_core::read::hints::notice_indexes`: always on; set 0 to
     /// measure without it, Known issue 51).
     pub offer_predecessors: bool,
 }

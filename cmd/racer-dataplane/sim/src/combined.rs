@@ -629,7 +629,7 @@ mod tests {
     /// skip class, apart from rank 0's own failures.
     #[test]
     fn failover_holders_offer_orphans_to_rank_zero() {
-        use racer_core::read::notice::NOTICE_TRIES;
+        use racer_core::read::hints::NOTICE_TRIES;
         let run_with = |notices: bool| {
             let mut config = Config {
                 nodes: 400,

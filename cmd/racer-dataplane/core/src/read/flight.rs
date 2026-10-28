@@ -7,7 +7,7 @@
 //! `Flights` uses, with plain [`Token`] wakes instead of `Waker`s. The join
 //! gates below are shared with production `Flights::join_prepared`.
 
-use super::error::{Error, Result};
+use crate::read::{Error, Result};
 use flow_control::coalesce::flight::state::{Outcome, Phase, Published, State, WaiterPolicy};
 use racer_object_wire::model::PageId;
 use std::cell::Cell;

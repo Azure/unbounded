@@ -475,8 +475,7 @@ fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
     // recheck; never anything else.
     let pings = counter(&report, "silence_pings");
     let bound = counter(&report, "probe_timeouts")
-        + counter(&report, "silence_timeouts")
-            / u64::from(racer_core::peer::silence::LINK_TIMEOUTS)
+        + counter(&report, "silence_timeouts") / u64::from(racer_core::liveness::LINK_TIMEOUTS)
         + counter(&report, "silence_rechecks");
     assert!(pings <= bound, "{pings} pings, bound {bound}: {report}");
 }

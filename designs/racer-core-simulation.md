@@ -42,27 +42,22 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
 | Module | Contents |
 | --- | --- |
 | `admission` | `ResourceClass`, `Limits`, `Floors`, and `Rules` (progress and weighted admission) |
-| `cache::lru` | `TickLru`, `OrderedLru`, and per-cache reclaim lanes (`Grouping`, `Lanes`) |
-| `cache::segment` | Segment value and retention scoring |
-| `peer::hop` | `decide_hop`, relay plans, exchange outcomes for link health |
-| `peer::silence` | Detects silent peers and pings them |
-| `peer::subscriptions` | Sans-IO subscription scheduler |
-| `peer::validity` | Response validity and grant rules |
-| `read::budget` | `AcquisitionBudget`, `MAX_ROUTE_LINKS` (8) |
-| `read::candidates`, `read::walk` | `CandidateWalk`: probe order, hedges, post-412 walk |
+| `cache` | `TickLru`, `OrderedLru`, per-cache reclaim lanes (`Grouping`, `Lanes`), segment value and retention scoring |
+| `liveness` | `Silence` (silent next hops and pings) and `Rank0Watch` (rank 0 owners that hang or fail) |
+| `route` | Route budget rules shared by app and wire (`forward`, `relay`, `search_budget`, `validate`), `decide_hop`, relay plans, exchange outcomes, and response validity rules |
+| `subscriptions` | Sans-IO subscription scheduler |
+| `read` | Errors, worker map, peer responses, metadata refresh, serve and persist policy, range slots, `FillPlan`, candidate order and response classes |
+| `read::budget` | `AcquisitionBudget`, `MAX_ROUTE_LINKS` (8), hot page shedding to helpers |
+| `read::walk` | `CandidateWalk`: probe order, hedges, post-412 walk, stale membership handling |
+| `read::hints` | Orphan copy notices and successor hints |
 | `read::flight` | `PageFlights` singleflight table |
-| `read::fill` | `FillPlan`: rank, walk, origin, publish |
-| `read::serve`, `read::policy` | Serve action, retention, and persist policy |
-| `read::range` | Range read slot scheduling |
-| `read::fanout`, `read::rank0`, `read::successor`, `read::stale`, `read::notice` | Hot page shedding to helpers, rank 0 and successor rules, stale membership handling, orphan copy notices |
-| `route` | Route budget rules shared by app and wire (`forward`, `relay`, `search_budget`, `validate`) |
 
 ### Production callers
 
 - The dataplane (`cmd/racer-dataplane/src`) calls `racer_core` directly. For example, page fill
-  acquisition drives `racer_core::read::fill::FillPlan` (`src/read/fill.rs:2033`), range reads use
-  `racer_core::read::range` (`src/read/candidates.rs:3909`), and the memory cache uses
-  `racer_core::cache::lru` with `ByCache` grouping (`src/memory.rs`).
+  acquisition drives `racer_core::read::FillPlan` (`src/read/fill.rs:2033`), range reads use
+  `racer_core::read` range slots (`src/read/candidates.rs:3909`), and the memory cache uses
+  `racer_core::cache` with `ByCache` grouping (`src/memory.rs`).
 - The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
   `MAX_HOPS = racer_core::route::MAX_LINKS`.
 - `racer-cluster-control` exposes pure step functions in `cluster-control/src/step/` (lottery,
@@ -220,7 +215,7 @@ during large enrollments instead of falling back to full images.
 
 An owner with more than `HOT_PAGE_QUEUE_BYTES` of queued egress for one page sheds further readers
 with `Overloaded`, and readers fetch from the page's helpers instead
-(`core/src/read/fanout.rs`). The limit is in bytes so it means the same backlog for 1 MiB
+(`core/src/read/budget.rs`). The limit is in bytes so it means the same backlog for 1 MiB
 simulator pages and 16 MiB production pages. A page is sent by at most `REPLICAS` owners plus
 `fanout_width` helpers.
 

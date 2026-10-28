@@ -26,7 +26,7 @@ pub const MAX_DEMAND_INTERVALS: usize = 64;
 
 /// Largest number of selections one subscription may request in flight. The
 /// replay window is a 64-bit map, so no contract may grant more than this.
-pub use racer_core::peer::subscriptions::MAX_SUBSCRIPTION_FLIGHTS;
+pub use racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS;
 
 pub use flow_control::subscriptions::Interval as PageInterval;
 use flow_control::subscriptions::contains;
@@ -108,10 +108,10 @@ pub struct TransferGrant {
     pub flights: Option<u16>,
 }
 
-pub use racer_core::peer::subscriptions::SubscriptionLimits;
+pub use racer_core::subscriptions::SubscriptionLimits;
 
 /// The sans-IO scheduler this module wraps with a mutex, handles and wakers.
-type Core = racer_core::peer::subscriptions::Scheduler<
+type Core = racer_core::subscriptions::Scheduler<
     MembershipVersion,
     NodeId,
     ObjectVersion,
@@ -119,18 +119,18 @@ type Core = racer_core::peer::subscriptions::Scheduler<
     Error,
 >;
 
-type EntryKey = racer_core::peer::subscriptions::EntryKey<MembershipVersion, NodeId>;
+type EntryKey = racer_core::subscriptions::EntryKey<MembershipVersion, NodeId>;
 
-type Delivery = racer_core::peer::subscriptions::Delivery<
+type Delivery = racer_core::subscriptions::Delivery<
     (ObjectMetadata, CiphertextPage),
     MembershipVersion,
     NodeId,
     ObjectVersion,
 >;
 
-impl racer_core::peer::subscriptions::Fault for Error {
-    fn of(kind: racer_core::peer::subscriptions::Kind) -> Self {
-        use racer_core::peer::subscriptions::Kind;
+impl racer_core::subscriptions::Fault for Error {
+    fn of(kind: racer_core::subscriptions::Kind) -> Self {
+        use racer_core::subscriptions::Kind;
         match kind {
             Kind::DeadlineExceeded => Self::DeadlineExceeded,
             Kind::Cancelled => Self::Cancelled,
@@ -347,7 +347,7 @@ impl Subscriptions {
     }
 
     /// Validate the authenticated fields, then admit the request on its
-    /// contract (`racer_core::peer::subscriptions::Scheduler::admit`).
+    /// contract (`racer_core::subscriptions::Scheduler::admit`).
     fn admit(
         &self,
         subscription: Subscription,
@@ -367,7 +367,7 @@ impl Subscriptions {
         {
             return Err(Error::InvalidRequest);
         }
-        let contract = racer_core::peer::subscriptions::Contract {
+        let contract = racer_core::subscriptions::Contract {
             id: subscription.id,
             version: subscription.version,
             demand: subscription.demand.0,
@@ -500,7 +500,7 @@ impl Waiter {
     }
 
     pub fn poll_result(&mut self, cx: &mut Context<'_>, now_ms: u64) -> Poll<Result<Completion>> {
-        use racer_core::peer::subscriptions::Polled;
+        use racer_core::subscriptions::Polled;
         let waker = cx.waker();
         let Some(token) = self.token else {
             return Poll::Ready(Err(Error::StaleFlight));

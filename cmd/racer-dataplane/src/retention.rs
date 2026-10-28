@@ -522,7 +522,7 @@ impl Retention {
         }
         // Disabled second-sight admits only owned pages.
         let observation = Observation {
-            eligible: racer_core::read::policy::retention_eligible(owned, self.enabled, seen),
+            eligible: racer_core::read::retention_eligible(owned, self.enabled, seen),
         };
         *latched = Some((page.clone(), observation));
         self.counters.observations.fetch_add(1, Ordering::Relaxed);
@@ -564,7 +564,7 @@ impl Retention {
     fn score_owned_at(&self, page: &PageId, now: Instant, owned: bool) -> u8 {
         let mut state = self.state.borrow_mut();
         let heat = state.heat.score(page, now);
-        racer_core::read::policy::retention_score(heat, owned, self.enabled)
+        racer_core::read::retention_score(heat, owned, self.enabled)
     }
     pub fn persistence_attempt(&self, accepted: bool) {
         self.counters.attempts.fetch_add(1, Ordering::Relaxed);

@@ -1427,7 +1427,7 @@ impl Flights {
     }
 
     /// Whether `page` has an acquisition running on this worker, so a new
-    /// waiter would join it (successor hints, `racer_core::read::successor`).
+    /// waiter would join it (successor hints, `racer_core::read::hints`).
     pub(crate) fn acquiring(&self, page: &PageId) -> bool {
         self.table
             .borrow()

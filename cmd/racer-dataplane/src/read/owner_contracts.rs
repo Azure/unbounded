@@ -2,7 +2,7 @@
 //! `src/contention.rs` `fidelity` module. That module compared payload-free
 //! owner traces with real allocations; the production halves are kept here
 //! as plain contract tests. The Fill persistence decision is compared with
-//! `racer_core::read::policy::persist` in `src/read/tests/persist_policy.rs`.
+//! `racer_core::read::persist` in `src/read/tests/persist_policy.rs`.
 
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
@@ -30,8 +30,8 @@ use crate::security::PageCrypto;
 use crate::security::PageCryptoEngine;
 use crate::worker::CryptoRuntime;
 use racer_control_wire::CacheId;
-use racer_core::read::policy::Persist;
-use racer_core::read::policy::PersistFacts;
+use racer_core::read::Persist;
+use racer_core::read::PersistFacts;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -280,13 +280,13 @@ fn non_owned_persistence_uses_optional_headroom() {
             amount: 19,
             one_page: CIPHER,
         };
-        assert_eq!(racer_core::read::policy::persist(facts), expected, "{used}");
+        assert_eq!(racer_core::read::persist(facts), expected, "{used}");
         assert_eq!(
             crate::read::fill::optional_headroom(limit, used, 19, CIPHER),
             expected == Persist::Write
         );
         assert_eq!(
-            racer_core::read::policy::persist(PersistFacts {
+            racer_core::read::persist(PersistFacts {
                 owned: true,
                 ..facts
             }),

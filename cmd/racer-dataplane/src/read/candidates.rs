@@ -53,7 +53,7 @@ fn reserve_hedge_pages(
 )> {
     use crate::admission::ResourceClass;
     let (plaintext, ciphertext) =
-        racer_core::read::candidates::hedge_page_charges(crate::model::PAGE_BYTES as usize, pages);
+        racer_core::read::hedge_page_charges(crate::model::PAGE_BYTES as usize, pages);
     let plaintext = admission.reserve(Some(cache), ResourceClass::Plaintext, plaintext)?;
     let ciphertext = admission.reserve(Some(cache), ResourceClass::Ciphertext, ciphertext)?;
     Ok((plaintext, ciphertext))
@@ -72,12 +72,12 @@ pub struct OriginAuthority {
     predecessor_evidence: Vec<ProbeOutcome>,
     rank: usize,
 }
-pub use racer_core::read::candidates::{ProbeOutcome, ReplicaSelection};
-pub(crate) use racer_core::read::candidates::{VisitOrder, replica_score, visit_order};
 use racer_core::read::walk::{
     CandidateWalk, Continuation, End as WalkEnd, Mode as WalkMode, Outcome as WalkOutcome,
     RemainingEnd, RemainingWalk, RouteMode, Step, WalkConfig,
 };
+pub use racer_core::read::{ProbeOutcome, ReplicaSelection};
+pub(crate) use racer_core::read::{VisitOrder, replica_score, visit_order};
 
 pub struct CandidatePolicy {
     hedge: Option<Arc<Hedges>>,
@@ -98,11 +98,11 @@ pub struct CandidatePolicy {
     #[cfg(test)]
     pub(crate) instant_stale_wait: std::cell::Cell<bool>,
     /// Owners this node answered a page probe without a copy, by page
-    /// (Known issue 21; see `racer_core::read::successor`). The coordinator
+    /// (Known issue 21; see `racer_core::read::hints`). The coordinator
     /// notes and defers on them; an owner walk asks them before origin.
     pub(crate) successors: RefCell<Successors>,
     /// Pages this node fetched from origin as an owner after rank 0, to offer
-    /// to rank 0 later (Known issue 37; see `racer_core::read::notice`).
+    /// to rank 0 later (Known issue 37; see `racer_core::read::hints`).
     pub(crate) notices: RefCell<Notices>,
     /// Copy offers in flight ([`MAX_OFFERS_IN_FLIGHT`]).
     offers: Rc<std::cell::Cell<usize>>,
@@ -110,7 +110,7 @@ pub struct CandidatePolicy {
     pub(crate) pings: Rc<std::cell::Cell<usize>>,
     /// Pages whose rank 0 this node, as an owner above it, found fetching
     /// (a probe timed out) or overdue (it missed that request's deadline);
-    /// see `racer_core::read::rank0` (Known issue 39).
+    /// see `racer_core::liveness` (Known issue 39).
     pub(crate) rank0_watch: RefCell<Rank0Watch>,
 }
 
@@ -133,7 +133,7 @@ impl Drop for OfferFlight {
 /// Orphan notices grouped by their target's site (Known issue 50).
 /// Keyed by page and the target's owner rank (Known issue 51).
 pub(crate) type Notices =
-    racer_core::read::notice::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
+    racer_core::read::hints::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
 
 /// How a copy offer ended (Known issue 50).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,10 +165,9 @@ fn owner_arrivals(candidates: &Candidates) -> Vec<Option<u32>> {
         .collect()
 }
 
-pub(crate) type Rank0Watch = racer_core::read::rank0::Rank0Watch<crate::model::PageId, NodeId>;
+pub(crate) type Rank0Watch = racer_core::liveness::Rank0Watch<crate::model::PageId, NodeId>;
 
-pub(crate) type Successors =
-    racer_core::read::successor::SuccessorHints<crate::model::PageId, NodeId>;
+pub(crate) type Successors = racer_core::read::hints::SuccessorHints<crate::model::PageId, NodeId>;
 
 /// How long a provider stays single-flight after a refused multi-flight
 /// Subscribe. An upgraded provider is asked again after this.
@@ -266,7 +265,7 @@ pub(crate) struct HedgeContinuation {
     pub stale: bool,
     pub bounded_routes: bool,
     /// Waits this read already made for destinations that are behind
-    /// (`racer_core::read::stale::stale_wait`, Known issues 26 and 36).
+    /// (`racer_core::read::walk::stale_wait`, Known issues 26 and 36).
     pub waits: u8,
 }
 impl CandidatePolicy {
@@ -674,16 +673,16 @@ impl CandidatePolicy {
             #[cfg(test)]
             instant_stale_wait: std::cell::Cell::new(false),
             successors: RefCell::new(Successors::new(
-                racer_core::read::successor::HINT_CAPACITY,
-                racer_core::read::successor::HINT_TTL,
+                racer_core::read::hints::HINT_CAPACITY,
+                racer_core::read::hints::HINT_TTL,
             )),
-            notices: RefCell::new(Notices::new(racer_core::read::notice::NOTICE_CAPACITY)),
+            notices: RefCell::new(Notices::new(racer_core::read::hints::NOTICE_CAPACITY)),
             offers: Rc::default(),
             pings: Rc::default(),
             rank0_watch: RefCell::new(Rank0Watch::new(
-                racer_core::read::rank0::WATCH_CAPACITY,
-                racer_core::read::rank0::WATCH_TTL,
-                racer_core::read::rank0::HANG_AFTER,
+                racer_core::liveness::WATCH_CAPACITY,
+                racer_core::liveness::WATCH_TTL,
+                racer_core::liveness::HANG_AFTER,
             )),
         }
     }
@@ -829,21 +828,15 @@ impl CandidatePolicy {
         }
         // Visit an older later owner before the newer owner that displaced
         // it, which would fetch the page again (Known issue 25).
-        let order = racer_core::read::candidates::lineage_first(
-            order,
-            &owner_arrivals(candidates),
-            |rank| {
-                candidates
-                    .membership
-                    .is_neighbor(&self.node, &ordered[rank])
-            },
-        );
+        let order = racer_core::read::lineage_first(order, &owner_arrivals(candidates), |rank| {
+            candidates
+                .membership
+                .is_neighbor(&self.node, &ordered[rank])
+        });
         // Owners that left this node's request unanswered go after the
         // others, silent ones last (Known issue 41).
         let health = self.peers.link_health();
-        racer_core::read::candidates::demote_unanswered(order, |rank| {
-            health.answering(&ordered[rank])
-        })
+        racer_core::read::demote_unanswered(order, |rank| health.answering(&ordered[rank]))
     }
 
     /// Bound each local peer exchange independently of the signed operation ceiling.
@@ -854,11 +847,11 @@ impl CandidatePolicy {
 
     /// How long rank 0 may stay silent on a page after an owner's probe of
     /// it timed out before the owner presumes it hung (half the client
-    /// request timeout; see `racer_core::read::rank0`, Known issue 39).
+    /// request timeout; see `racer_core::liveness`, Known issue 39).
     pub(crate) fn with_rank0_hang_after(self, hang_after: std::time::Duration) -> Self {
         *self.rank0_watch.borrow_mut() = Rank0Watch::new(
-            racer_core::read::rank0::WATCH_CAPACITY,
-            racer_core::read::rank0::WATCH_TTL,
+            racer_core::liveness::WATCH_CAPACITY,
+            racer_core::liveness::WATCH_TTL,
             hang_after,
         );
         self
@@ -1273,14 +1266,11 @@ impl CandidatePolicy {
                     .successors
                     .borrow_mut()
                     .probe(id, uring_runtime::environment::now());
-                let targets = racer_core::read::successor::successor_targets(
-                    &hints,
-                    &candidates.ordered,
-                    rank,
-                );
+                let targets =
+                    racer_core::read::hints::successor_targets(&hints, &candidates.ordered, rank);
                 if !targets.is_empty() {
                     (handoff, successors) =
-                        racer_core::read::successor::with_successors(targets, &handoff);
+                        racer_core::read::hints::with_successors(targets, &handoff);
                 }
             }
             // Successor targets first, then lineage targets, each on its own
@@ -1323,7 +1313,7 @@ impl CandidatePolicy {
                             uring_runtime::environment::now(),
                         )
                     }
-                    _ => racer_core::read::rank0::Rank0State::Unknown,
+                    _ => racer_core::liveness::Rank0State::Unknown,
                 },
             });
             // This node owns the page under version - 1, so the stale
@@ -1498,7 +1488,7 @@ impl CandidatePolicy {
                                         self.candidates_scoped(previous, object, page, scope).await
                                 {
                                     fallback_denied =
-                                        !racer_core::read::stale::fallback_rank_allowed(
+                                        !racer_core::read::walk::fallback_rank_allowed(
                                             previous
                                                 .ordered
                                                 .iter()
@@ -1514,8 +1504,8 @@ impl CandidatePolicy {
                                 // and asks again, at most `MAX_STALE_WAITS`
                                 // times (Known issues 26 and 36).
                                 let now = uring_runtime::environment::now();
-                                if let Some(wait) = racer_core::read::stale::stale_wait(
-                                    racer_core::read::stale::StaleWaitFacts {
+                                if let Some(wait) = racer_core::read::walk::stale_wait(
+                                    racer_core::read::walk::StaleWaitFacts {
                                         owner: rank.is_some(),
                                         fallback: ranked.is_some(),
                                         waits: continuation.waits.saturating_add(waits),
@@ -1640,7 +1630,7 @@ impl CandidatePolicy {
                 if outcome == WalkOutcome::TimedOut
                     && let PeerOperation::Page { page: id, .. } = &operation
                 {
-                    use racer_core::peer::silence::{NO_PING, RANK0_TIMEOUTS};
+                    use racer_core::liveness::{NO_PING, RANK0_TIMEOUTS};
                     // A probe of the page's rank 0 (an owner's, or a
                     // reader's) asks whether rank 0 answers at all (Known
                     // issue 43): `poll_pings` sends the ping, and a silent
@@ -1759,7 +1749,7 @@ impl CandidatePolicy {
                             destination,
                             id.clone(),
                             sent,
-                            racer_core::peer::silence::NO_PING,
+                            racer_core::liveness::NO_PING,
                         );
                     }
                     _ => {}
@@ -1795,7 +1785,7 @@ impl CandidatePolicy {
     }
 
     /// The member this non-owner asks to acquire `page` for it when an owner
-    /// sheds the request (`racer_core::read::fanout`): one of the page's
+    /// sheds the request (`racer_core::read::budget`): one of the page's
     /// hash-chosen helpers, never an owner and never this node, preferring a
     /// direct overlay neighbor so the exchange needs no relay.
     pub(crate) fn fanout_helper(
@@ -1806,7 +1796,7 @@ impl CandidatePolicy {
     ) -> Option<NodeId> {
         let membership = &candidates.membership;
         let members = membership.members();
-        racer_core::read::fanout::fanout_helper(
+        racer_core::read::budget::fanout_helper(
             object,
             page,
             &self.node,
@@ -1995,7 +1985,7 @@ impl CandidatePolicy {
     /// is behind and the caller moves to the next owner.
     /// After a destination under `candidates` was behind this node, the
     /// previous membership to walk the page's owners under instead, when
-    /// `racer_core::read::stale` allows it: this node does not own the page,
+    /// `racer_core::read::walk` allows it: this node does not own the page,
     /// has not refreshed or fallen back yet, and holds version - 1, replaced
     /// within `PREVIOUS_MEMBERSHIP_WITHIN` (peers still resolve it) and
     /// listing this node (peers reject non-members).
@@ -2005,12 +1995,12 @@ impl CandidatePolicy {
         owner: bool,
         retried: bool,
     ) -> Option<std::sync::Arc<crate::topology::Membership>> {
-        let mut facts = racer_core::read::stale::StaleSkip {
+        let mut facts = racer_core::read::walk::StaleSkip {
             owner,
             retried,
             previous_recent_member: true,
         };
-        if !racer_core::read::stale::previous_fallback(facts) {
+        if !racer_core::read::walk::previous_fallback(facts) {
             return None;
         }
         let version = candidates.membership.version.0.checked_sub(1)?;
@@ -2025,7 +2015,7 @@ impl CandidatePolicy {
             .flatten()
             .filter(|previous| previous.member(&self.node).is_ok());
         facts.previous_recent_member = previous.is_some();
-        racer_core::read::stale::previous_fallback(facts)
+        racer_core::read::walk::previous_fallback(facts)
             .then_some(previous)
             .flatten()
     }
@@ -2438,7 +2428,7 @@ impl CandidatePolicy {
 
     /// This node fetched `page` from origin at `rank` among `owners`: when
     /// that is after rank 0, remember to offer rank 0 the copy later
-    /// (Known issue 37, `racer_core::read::notice`). Returns whether a notice
+    /// (Known issue 37, `racer_core::read::hints`). Returns whether a notice
     /// was noted.
     pub(crate) fn note_orphan(
         &self,
@@ -2447,7 +2437,7 @@ impl CandidatePolicy {
         rank: usize,
         evidence: &[ProbeOutcome],
     ) -> bool {
-        use racer_core::read::notice::{notice_indexes, should_notice};
+        use racer_core::read::hints::{notice_indexes, should_notice};
         if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) {
             return false;
         }
@@ -2473,7 +2463,7 @@ impl CandidatePolicy {
     /// This node's own origin request for `page`, made with authority at
     /// `rank` among `owners`, failed with `error`: above rank 0, leave
     /// retries after rank 0's own failures to rank 0 for a while (Known
-    /// issue 52, `racer_core::read::rank0`). Terminal origin answers (a
+    /// issue 52, `racer_core::liveness`). Terminal origin answers (a
     /// missing version, rejected or forbidden credentials) are not
     /// failures of origin and are ignored.
     pub(crate) fn note_origin_failure(
@@ -2584,7 +2574,7 @@ impl CandidatePolicy {
     }
 
     /// Send due silence pings (Known issues 41 and 43,
-    /// `racer_core::peer::silence`), at most [`MAX_PINGS_IN_FLIGHT`] at a
+    /// `racer_core::liveness`), at most [`MAX_PINGS_IN_FLIGHT`] at a
     /// time, each on its own detached driver task and fixed route grant
     /// (never a reader's budget). Call once per worker service turn.
     pub(crate) fn poll_pings(self: &Rc<Self>, now: std::time::Instant, metrics: &Metrics) {
@@ -2622,7 +2612,7 @@ impl CandidatePolicy {
     /// silent, or cannot reach it). `None`: anything else (a relay's
     /// overload, a local failure) proves nothing.
     async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
-        use racer_core::read::notice::NOTICE_LINKS;
+        use racer_core::read::hints::NOTICE_LINKS;
         let deadline = uring_runtime::environment::now() + self.attempt_timeout;
         let mut id = [0; 16];
         uring_runtime::environment::fill_random(&mut id).ok()?;
@@ -2671,9 +2661,9 @@ impl CandidatePolicy {
     /// (membership or route lookup).
     async fn offer(
         &self,
-        due: &racer_core::read::notice::Due<(crate::model::PageId, u8), NodeId>,
+        due: &racer_core::read::hints::Due<(crate::model::PageId, u8), NodeId>,
     ) -> Result<OfferEnd> {
-        use racer_core::read::notice::{NOTICE_LINKS, notice_target};
+        use racer_core::read::hints::{NOTICE_LINKS, notice_target};
         let (page, index) = (&due.key.0, due.key.1);
         let deadline = uring_runtime::environment::now() + self.attempt_timeout;
         let mut id = [0; 16];
@@ -2734,7 +2724,7 @@ impl CandidatePolicy {
     }
 
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
-        racer_core::read::candidates::origin_miss_error(&authority.predecessor_evidence).into()
+        racer_core::read::origin_miss_error(&authority.predecessor_evidence).into()
     }
     pub(super) fn final_origin_miss(
         &self,
@@ -2883,8 +2873,7 @@ async fn validated_copy<'a, T>(
         // errors never enter this helper, and Unauthorized remains terminal.
         Err(error)
             if racer_core::read::Error::try_from(error).is_ok_and(|error| {
-                racer_core::read::candidates::unusable_copy(error, operation_kind(operation))
-                    .is_some()
+                racer_core::read::unusable_copy(error, operation_kind(operation)).is_some()
             }) =>
         {
             Ok(Err(ProbeOutcome::UnusableCopy))
@@ -2910,8 +2899,8 @@ impl OriginAuthority {
     }
 
     pub fn validate(&self, object: &ObjectId, page: PageNumber) -> Result<()> {
-        racer_core::read::candidates::validate_origin_authority(
-            racer_core::read::candidates::AuthorityFacts {
+        racer_core::read::validate_origin_authority(
+            racer_core::read::AuthorityFacts {
                 object: &self.object,
                 page: self.page,
                 rank: self.rank,
@@ -2985,10 +2974,8 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
     }
 }
 /// Payload-free shape of `operation` for racer-core classification.
-pub(crate) fn operation_kind(
-    operation: &PeerOperation,
-) -> racer_core::read::candidates::OperationKind {
-    use racer_core::read::candidates::OperationKind;
+pub(crate) fn operation_kind(operation: &PeerOperation) -> racer_core::read::OperationKind {
+    use racer_core::read::OperationKind;
     match operation {
         PeerOperation::Subscribe { .. } => OperationKind::Subscribe,
         PeerOperation::Page { .. } => OperationKind::Page,
@@ -3008,12 +2995,9 @@ fn classify(
     operation: &PeerOperation,
     acquire: bool,
 ) -> Result<Option<ProbeOutcome>> {
-    racer_core::read::candidates::classify(
-        response.kind(),
-        operation_kind(operation),
-        acquire,
-        || validate_payload(response, operation),
-    )
+    racer_core::read::classify(response.kind(), operation_kind(operation), acquire, || {
+        validate_payload(response, operation)
+    })
 }
 
 /// Payload identity and content checks for a response whose kind answers the
@@ -3106,7 +3090,7 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
 // this can limit the latency benefit and is not an early-publication implementation.
 
 pub const DUPLICATE_BYTES: usize =
-    racer_core::read::candidates::duplicate_bytes(crate::model::PAGE_BYTES as usize);
+    racer_core::read::duplicate_bytes(crate::model::PAGE_BYTES as usize);
 #[derive(Clone, Copy)]
 pub struct HedgeConfig {
     pub delay: Duration,
@@ -3237,7 +3221,7 @@ pub(crate) async fn race(
     .await
 }
 fn recoverable(error: Error) -> bool {
-    racer_core::read::Error::try_from(error).is_ok_and(racer_core::read::policy::recoverable)
+    racer_core::read::Error::try_from(error).is_ok_and(racer_core::read::recoverable)
 }
 
 #[cfg(test)]
@@ -3900,8 +3884,8 @@ pub(super) mod tests {
                 let scope = scope();
                 let mut budget = AcquisitionBudget::new(
                     scope.deadline.0,
-                    racer_core::read::range::PAGE_ATTEMPTS,
-                    racer_core::read::range::PAGE_LINKS,
+                    racer_core::read::PAGE_ATTEMPTS,
+                    racer_core::read::PAGE_LINKS,
                 );
                 let operation = PeerOperation::Page {
                     page: crate::model::PageId {
@@ -3944,7 +3928,7 @@ pub(super) mod tests {
                 let (_, copy, attempts, links) = &calls[1];
                 assert!(!copy);
                 assert!(*attempts >= 1);
-                assert!(*attempts < racer_core::read::fanout::HELPER_MIN_ATTEMPTS);
+                assert!(*attempts < racer_core::read::budget::HELPER_MIN_ATTEMPTS);
                 // It carries its whole funded envelope, not a normal
                 // four-link route, so the helper can still reach rank 0
                 // through a relay (Known issue 60).

@@ -1413,12 +1413,12 @@ impl LocalPageService for Arc<WorkerDirectory> {
 }
 
 /// Local worker assignment; the rule lives in racer-core.
-pub struct WorkerMap(racer_core::read::worker::WorkerMap);
+pub struct WorkerMap(racer_core::read::WorkerMap);
 impl WorkerMap {
     /// Canonical worker order makes assignment independent of discovery order.
     /// Changing this set requires draining all flights first.
     pub fn new(workers: Vec<WorkerId>) -> Result<Self> {
-        Ok(Self(racer_core::read::worker::WorkerMap::new(workers)?))
+        Ok(Self(racer_core::read::WorkerMap::new(workers)?))
     }
 
     /// Same owner as this object's page zero, without needing an ETag first.

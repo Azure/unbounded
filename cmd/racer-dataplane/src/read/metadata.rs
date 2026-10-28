@@ -41,7 +41,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 // Cohort bounds and purposes live in racer-core.
-use racer_core::read::metadata::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS, RefreshPurpose};
+use racer_core::read::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS, RefreshPurpose};
 
 /// Peer operation a refresh purpose permits.
 trait PurposeOperation {
@@ -191,8 +191,8 @@ fn caller_budget_failure(error: Error, budget: &AcquisitionBudget) -> bool {
     // racer-core's settlement rule decides whether another waiter retries.
     !matches!(error, Error::OriginRejected | Error::OriginForbidden)
         && racer_core::read::Error::try_from(error).is_ok_and(|error| {
-            racer_core::read::metadata::refresh_settlement(error, budget.remaining_attempts())
-                == racer_core::read::metadata::Settlement::Retry
+            racer_core::read::refresh_settlement(error, budget.remaining_attempts())
+                == racer_core::read::Settlement::Retry
         })
 }
 

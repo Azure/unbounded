@@ -197,7 +197,7 @@ impl Coordinator {
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> bool {
-        use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, successor_deferral};
+        use racer_core::read::hints::{MAX_DEFERRALS, defer_allowed, successor_deferral};
         if !defer_allowed(self.fill.dependencies.flights.acquiring(page)) {
             return false;
         }
@@ -238,7 +238,7 @@ impl Coordinator {
 
     /// Whether a copy-only page request from `requester` may wait on this
     /// node's running acquisition of the page
-    /// (`racer_core::read::serve::copy_join_allowed`, Known issue 44). Ranks
+    /// (`racer_core::read::copy_join_allowed`, Known issue 44). Ranks
     /// the page only while an acquisition runs.
     async fn copy_join_allowed(
         &self,
@@ -254,7 +254,7 @@ impl Coordinator {
             return true;
         };
         let local = &self.fill.dependencies.candidates.node;
-        let allowed = racer_core::read::serve::copy_join_allowed(&owners, local, requester);
+        let allowed = racer_core::read::copy_join_allowed(&owners, local, requester);
         if !allowed {
             self.fill
                 .metrics
@@ -287,7 +287,7 @@ impl Coordinator {
     ) -> Result<PeerResponse> {
         let holds = self.fill.holds(page);
         let acquiring = self.fill.dependencies.flights.acquiring(page);
-        if racer_core::read::notice::offer_noted(holds, acquiring)
+        if racer_core::read::hints::offer_noted(holds, acquiring)
             && &self.fill.dependencies.candidates.node != requester
         {
             self.fill
@@ -525,7 +525,7 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Warm { version, .. } => Some(&version.object),
             };
             let object_matches = object.is_some_and(|object| object == &request.origin.object);
-            use racer_core::read::serve::{ServeAction, ServeFacts, serve_action};
+            use racer_core::read::{ServeAction, ServeFacts, serve_action};
             let facts = |cache_available| ServeFacts {
                 operation: candidates::operation_kind(&request.operation),
                 copy_only: matches!(
@@ -566,10 +566,8 @@ impl LocalPageService for Coordinator {
                 return Ok(PeerResponse::Miss);
             }
             let mut effective = scope.clone();
-            effective.deadline.0 = racer_core::read::serve::serve_deadline(
-                effective.deadline.0,
-                request.route.deadline.0,
-            );
+            effective.deadline.0 =
+                racer_core::read::serve_deadline(effective.deadline.0, request.route.deadline.0);
             effective.check()?;
             // A non-owner's Acquire for a page another owner fetched after
             // this node answered it without a copy is served copy-only: the
@@ -784,10 +782,10 @@ fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
 
 /// Translate expected acquisition failures without masking internal peer errors.
 fn peer_error(error: Error) -> Result<PeerResponse> {
-    use racer_core::read::candidates::ResponseKind;
+    use racer_core::read::ResponseKind;
     let kind = racer_core::read::Error::try_from(error)
         .ok()
-        .and_then(racer_core::read::policy::peer_error);
+        .and_then(racer_core::read::peer_error);
     Ok(match kind {
         Some(ResponseKind::NotFound) => PeerResponse::NotFound,
         Some(ResponseKind::VersionUnavailable) => PeerResponse::VersionUnavailable,

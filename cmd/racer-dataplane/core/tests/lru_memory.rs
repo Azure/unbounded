@@ -1,6 +1,6 @@
 //! Measures the heap cost of payload-free memory cache indexes per entry.
 
-use racer_core::cache::lru::{OrderedLru, TickLru};
+use racer_core::cache::{OrderedLru, TickLru};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicUsize, Ordering},

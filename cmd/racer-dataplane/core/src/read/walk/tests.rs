@@ -4,10 +4,10 @@
 // The attribute below also marks this file as test-only for tests/purity.rs.
 #[cfg(test)]
 use super::*;
-use crate::read::candidates::{Answering, ReplicaSelection, demote_unanswered, visit_order};
-use crate::read::fanout::{
+use crate::read::budget::{
     HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
 };
+use crate::read::{Answering, ReplicaSelection, demote_unanswered, visit_order};
 
 fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
     WalkConfig {
@@ -1860,7 +1860,7 @@ fn retry_affordable_keeps_later_visits_funded() {
 /// canonical + 2); with fewer owners, at every visit.
 #[test]
 fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
-    use crate::read::range::{PAGE_ATTEMPTS, PAGE_LINKS};
+    use crate::read::{PAGE_ATTEMPTS, PAGE_LINKS};
     // Walk `owners` owners that are all behind; wait once at the first.
     // Returns, per visit, whether a second wait was affordable there.
     let run_with = |owners: usize, attempts: u32, links: u8, hops: Option<usize>, rev: bool| {

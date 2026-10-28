@@ -45,8 +45,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(test)]
-use racer_core::read::range::SELECTIONS;
-use racer_core::read::range::{self, DIRECT_AHEAD, SlotKind};
+use racer_core::read::SELECTIONS;
+use racer_core::read::{self, DIRECT_AHEAD, SlotKind};
 
 /// Flights requested per provider contract. A provider grants at most this
 /// many pending selections per contract, or one if it predates multi-flight.
@@ -995,7 +995,7 @@ impl RangeStream {
         // client. Pages before it are still filled, or the stream could never
         // deliver them and so never surface the error.
         let kinds = self.kinds();
-        let failed = range::first_failure(&kinds);
+        let failed = read::first_failure(&kinds);
         // Pages another window is selecting or filling arrive through its
         // fan-out. Only the head is always filled directly, so it never waits
         // on another window; a concurrent fill of the same page joins the
@@ -1005,7 +1005,7 @@ impl RangeStream {
             .as_ref()
             .map(WindowLease::busy_elsewhere)
             .unwrap_or_default();
-        let plan = range::direct_fills(&kinds, self.direct_ahead(), |index| {
+        let plan = read::direct_fills(&kinds, self.direct_ahead(), |index| {
             elsewhere.contains(&self.page_at(index))
         });
         let mut changed = false;
@@ -1076,7 +1076,7 @@ impl RangeStream {
     /// Whether the read may start another selection: its first always, more
     /// only while a contract of the version has an unused granted flight.
     fn may_select(&self) -> bool {
-        range::may_select(
+        read::may_select(
             self.selections.len(),
             self.directory.subscriptions.spare(&self.metadata.version),
         )
@@ -1173,7 +1173,7 @@ impl RangeStream {
             .filter(|slot| matches!(slot, Slot::Missing { select: true }))
             .count();
         let spare = self.directory.subscriptions.spare(&self.metadata.version);
-        range::share(holes, self.selections.len(), spare)
+        read::share(holes, self.selections.len(), spare)
     }
 
     /// Up to `limit` selectable holes of the window, excluding pages that
@@ -1185,7 +1185,7 @@ impl RangeStream {
         limit: usize,
     ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
         use crate::peer::subscriptions::{Demand, MAX_DEMAND_INTERVALS, PageInterval};
-        let Some((intervals, pages)) = range::selection_demand(
+        let Some((intervals, pages)) = read::selection_demand(
             &self.kinds(),
             self.next,
             |number| elsewhere.contains(&number),

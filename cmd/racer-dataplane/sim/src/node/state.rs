@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 use flow_control::Circuits;
 use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
-use racer_core::cache::lru::TickLru;
-use racer_core::peer::silence::{SILENCE_CAPACITY, Silence};
+use racer_core::cache::TickLru;
+use racer_core::liveness::{Rank0Watch, WATCH_CAPACITY, WATCH_TTL};
+use racer_core::liveness::{SILENCE_CAPACITY, Silence};
 use racer_core::read::flight::{FlightLimits, PageFlights};
-use racer_core::read::notice::{NOTICE_CAPACITY, OrphanNotices};
-use racer_core::read::rank0::{Rank0Watch, WATCH_CAPACITY, WATCH_TTL};
-use racer_core::read::successor::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
+use racer_core::read::hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
+use racer_core::read::hints::{NOTICE_CAPACITY, OrphanNotices};
 use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
 
 use super::admission::{PageCharges, Rejections, SimPolicy, SimQuotas};

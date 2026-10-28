@@ -42,11 +42,11 @@ const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 pub struct LinkHealth {
     inner: flow_control::Circuits<NodeId>,
     /// Destinations that accept requests and never answer them (Known
-    /// issues 41 and 43, `racer_core::peer::silence`). A ping carries the
+    /// issues 41 and 43, `racer_core::liveness`). A ping carries the
     /// page of the last unanswered exchange.
     silence: std::cell::RefCell<Silence<NodeId, crate::model::PageId>>,
 }
-type Silence<N, P> = racer_core::peer::silence::Silence<N, P>;
+type Silence<N, P> = racer_core::liveness::Silence<N, P>;
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
     /// Construct independent worker-local circuit state for all possible neighbors.
@@ -54,7 +54,7 @@ impl Default for LinkHealth {
         Self::new(MAX_DEGREE)
     }
 }
-pub use racer_core::peer::hop::LinkOutcome;
+pub use racer_core::route::LinkOutcome;
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
         self.acquire_at(node, uring_runtime::environment::now())
@@ -70,7 +70,7 @@ impl LinkHealth {
     ) -> Result<T> {
         let _probe = self.acquire(endpoint)?;
         let result = operation.await;
-        let outcome = racer_core::peer::hop::operation_link_outcome(
+        let outcome = racer_core::route::operation_link_outcome(
             result.as_ref().map(|_| ()).map_err(Error::fault),
         );
         if let Some(outcome) = outcome {
@@ -82,13 +82,13 @@ impl LinkHealth {
         Self {
             inner: flow_control::Circuits::new(capacity, Duration::from_secs(1)),
             silence: std::cell::RefCell::new(Silence::new(
-                racer_core::peer::silence::SILENCE_CAPACITY,
-                racer_core::read::rank0::HANG_AFTER,
+                racer_core::liveness::SILENCE_CAPACITY,
+                racer_core::liveness::HANG_AFTER,
                 SILENCE_PING_TIMEOUT,
             )),
         }
     }
-    /// Silence timing (`racer_core::peer::silence::Silence::new`):
+    /// Silence timing (`racer_core::liveness::Silence::new`):
     /// `hang_after` is half the client request timeout and `ping_timeout`
     /// the peer attempt timeout.
     pub fn with_silence(self, hang_after: Duration, ping_timeout: Duration) -> Self {
@@ -98,7 +98,7 @@ impl LinkHealth {
     /// [`Self::with_silence`] on a shared handle; forgets every peer.
     pub fn set_silence(&self, hang_after: Duration, ping_timeout: Duration) {
         *self.silence.borrow_mut() = Silence::new(
-            racer_core::peer::silence::SILENCE_CAPACITY,
+            racer_core::liveness::SILENCE_CAPACITY,
             hang_after,
             ping_timeout,
         );
@@ -155,8 +155,8 @@ impl LinkHealth {
     }
     /// What this worker last learned about `peer`'s answers (readers'
     /// visit order, Known issue 41).
-    pub fn answering(&self, peer: &NodeId) -> racer_core::read::candidates::Answering {
-        use racer_core::read::candidates::Answering;
+    pub fn answering(&self, peer: &NodeId) -> racer_core::read::Answering {
+        use racer_core::read::Answering;
         let now = uring_runtime::environment::now();
         let silence = self.silence.borrow();
         if silence.silent(peer, now) {
@@ -634,9 +634,9 @@ impl From<racer_core::route::RouteFault> for Error {
     }
 }
 impl Error {
-    /// The failure class the sans-IO peer decisions (`racer_core::peer`) read.
-    pub fn fault(&self) -> racer_core::peer::Fault {
-        use racer_core::peer::Fault;
+    /// The failure class the sans-IO peer decisions (`racer_core::route`) read.
+    pub fn fault(&self) -> racer_core::route::Fault {
+        use racer_core::route::Fault;
         match self {
             Self::Overloaded => Fault::Overloaded,
             Self::Unavailable => Fault::Unavailable,
@@ -873,13 +873,13 @@ pub(crate) mod tests {
             &peer,
             page.clone(),
             sent,
-            racer_core::peer::silence::LINK_TIMEOUTS
+            racer_core::liveness::LINK_TIMEOUTS
         ));
         assert!(health.silence_timed_out(
             &peer,
             page.clone(),
             sent,
-            racer_core::peer::silence::LINK_TIMEOUTS
+            racer_core::liveness::LINK_TIMEOUTS
         ));
         let now = uring_runtime::environment::now();
         assert_eq!(health.due_pings(now, 8), vec![(peer.clone(), page.clone())]);
@@ -1675,7 +1675,7 @@ pub(crate) mod tests {
                     peer,
                     page.clone(),
                     sent,
-                    racer_core::peer::silence::LINK_TIMEOUTS,
+                    racer_core::liveness::LINK_TIMEOUTS,
                 );
             }
             assert_eq!(health.due_pings(Instant::now(), 8).len(), 1);

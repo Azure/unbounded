@@ -1103,18 +1103,18 @@ impl CachedPage {
 
 /// Most entries one bounded reclaim pass examines, per cache or overall.
 #[cfg(test)]
-const RECLAIM_SCAN: usize = racer_core::cache::lru::RECLAIM_WINDOW;
+const RECLAIM_SCAN: usize = racer_core::cache::RECLAIM_WINDOW;
 /// Most caches one global reclaim checks for over-share bytes. The window
 /// rotates and resumes after the last examined cache. When every call
 /// examines a full window, each cache with retained entries is checked within
 /// `ceil(caches / PRESSURE_WINDOW)` global reclaims; calls that end early
 /// advance by fewer caches but never skip one.
-pub(crate) const PRESSURE_WINDOW: usize = racer_core::cache::lru::PRESSURE_WINDOW;
+pub(crate) const PRESSURE_WINDOW: usize = racer_core::cache::PRESSURE_WINDOW;
 
 /// Memory cache lanes: one per cache, so one cache's entries are reclaimed
 /// without scanning the others.
 struct ByCache;
-impl racer_core::cache::lru::Grouping<PageId> for ByCache {
+impl racer_core::cache::Grouping<PageId> for ByCache {
     type Id = CacheId;
     fn group(key: &PageId) -> Option<CacheId> {
         Some(key.version.object.cache.clone())
@@ -1122,16 +1122,15 @@ impl racer_core::cache::lru::Grouping<PageId> for ByCache {
 }
 
 /// Verified pages in tick order plus a per-version page set. The recency
-/// index and its reclamation rules live in [`racer_core::cache::lru`], which
+/// index and its reclamation rules live in [`racer_core::cache`], which
 /// the simulator drives with payload-free values.
 #[derive(Default)]
 struct Entries {
-    lru: racer_core::cache::lru::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>,
+    lru: racer_core::cache::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>,
     versions: HashMap<ObjectVersion, HashSet<PageId>>,
 }
 impl std::ops::Deref for Entries {
-    type Target =
-        racer_core::cache::lru::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>;
+    type Target = racer_core::cache::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>;
     fn deref(&self) -> &Self::Target {
         &self.lru
     }
@@ -1175,9 +1174,9 @@ impl Entries {
 }
 /// Unverified original ciphertext keyed by page, with a monotonic touch tick
 /// per entry so idle expiry can find the least recently touched entries.
-use racer_core::cache::lru::Visit;
+use racer_core::cache::Visit;
 type CiphertextEntries =
-    racer_core::cache::lru::OrderedLru<PageId, UnverifiedPage, std::hash::RandomState, ByCache>;
+    racer_core::cache::OrderedLru<PageId, UnverifiedPage, std::hash::RandomState, ByCache>;
 
 /// Entries nobody inserted or hit for this long are released by
 /// [`MemoryCache::expire_idle`], so a worker that served a burst does not keep
@@ -2014,7 +2013,7 @@ pub(crate) mod tests {
 
                 fn resident(cache: &MemoryCache, owner: &str) -> usize {
                     let owner = id(owner);
-                    let count = |lanes: &racer_core::cache::lru::Lanes<CacheId, PageId>| {
+                    let count = |lanes: &racer_core::cache::Lanes<CacheId, PageId>| {
                         lanes.0.get(&owner).map_or(0, |l| l.order.len())
                     };
                     count(&cache.entries.borrow().lanes)

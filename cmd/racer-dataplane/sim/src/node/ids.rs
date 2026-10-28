@@ -7,7 +7,7 @@
 //! in node order.
 
 use racer_control_wire::{CacheId, NodeId};
-use racer_core::read::worker::WorkerMap;
+use racer_core::read::WorkerMap;
 use racer_object_wire::model::{
     CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, WorkerId,
 };

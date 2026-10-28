@@ -8,8 +8,8 @@ use super::fill::fixture_with;
 use super::*;
 use crate::origin::OriginPage;
 use crate::read::flight::AcquisitionBudget;
-use racer_core::read::policy::Persist;
-use racer_core::read::policy::PersistFacts;
+use racer_core::read::Persist;
+use racer_core::read::PersistFacts;
 
 const CIPHER: usize = crate::model::PAGE_BYTES as usize + 16;
 
@@ -62,7 +62,7 @@ fn fill_persistence_matches_core_policy() {
                     .unwrap()
             });
             let facts = PersistFacts {
-                eligible: racer_core::read::policy::retention_eligible(owned, true, seen),
+                eligible: racer_core::read::retention_eligible(owned, true, seen),
                 metadata_valid: true,
                 resident: false,
                 owned,
@@ -72,7 +72,7 @@ fn fill_persistence_matches_core_policy() {
                 one_page: CIPHER,
             };
             f.fill.observe_verified(&page, &f.scope);
-            let decision = racer_core::read::policy::persist(facts);
+            let decision = racer_core::read::persist(facts);
             let reservable = facts.dirty_used + facts.amount <= facts.dirty_limit;
             let pending = deps.writer.pending_count();
             assert_eq!(

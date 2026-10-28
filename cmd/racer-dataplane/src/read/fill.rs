@@ -89,8 +89,8 @@ fn host_descriptor(
     descriptor.as_fd().try_clone_to_owned().ok()
 }
 
-use racer_core::read::fill::LeaderSource;
-pub(super) use racer_core::read::policy::optional_headroom;
+use racer_core::read::LeaderSource;
+pub(super) use racer_core::read::optional_headroom;
 #[derive(Clone)]
 pub struct Fill {
     pub(super) dependencies: FillDependencies,
@@ -1440,7 +1440,7 @@ impl Fill {
         let local_job = || self.local_plaintext.get(page).is_some();
         let unverified =
             || -> Result<bool> { Ok(self.dependencies.memory.unverified(page)?.is_some()) };
-        let source = racer_core::read::fill::leader_source(
+        let source = racer_core::read::leader_source(
             retained.is_some(),
             plaintext,
             plaintext && local_job(),
@@ -1621,18 +1621,17 @@ impl Fill {
                         match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
                             Ok(()) => {}
                             Err(error)
-                                if racer_core::read::Error::try_from(error).is_ok_and(
-                                    racer_core::read::fill::ciphertext_publish_tolerated,
-                                ) => {}
+                                if racer_core::read::Error::try_from(error)
+                                    .is_ok_and(racer_core::read::ciphertext_publish_tolerated) => {}
                             Err(error) => return Err(error),
                         }
                     }
                     let _ = flights.publish_acquired(leader, result);
                 }
                 Err(error) => {
-                    use racer_core::read::fill::FailureKind;
+                    use racer_core::read::FailureKind;
                     let failure = match racer_core::read::Error::try_from(error)
-                        .map(racer_core::read::fill::acquisition_failure)
+                        .map(racer_core::read::acquisition_failure)
                     {
                         Ok(FailureKind::OriginRejected) => AcquisitionFailure::OriginRejected,
                         Ok(FailureKind::OriginForbidden) => AcquisitionFailure::OriginForbidden,
@@ -2062,8 +2061,8 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
     ) -> Result<AcquiredPage> {
-        use racer_core::read::fill::{FillPlan, FillStep, Source, WalkResult};
         use racer_core::read::walk::RemainingEnd;
+        use racer_core::read::{FillPlan, FillStep, Source, WalkResult};
         let mut plan = FillPlan::new(want_plaintext);
         let mut acquired = None;
         let mut candidates = None;
@@ -2687,7 +2686,7 @@ impl Fill {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;
         let limit = admission.limit(class);
-        let ceiling = racer_core::read::policy::optional_ceiling(limit, one_page);
+        let ceiling = racer_core::read::optional_ceiling(limit, one_page);
         if amount > ceiling {
             return false;
         }

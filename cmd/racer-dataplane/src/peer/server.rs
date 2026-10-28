@@ -72,14 +72,14 @@ pub struct PeerServer {
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
     /// Page response bodies this server is writing, per page
-    /// (`racer_core::read::fanout::shed_hot_page`).
+    /// (`racer_core::read::budget::shed_hot_page`).
     streaming: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
 }
 
 /// Bodies of one page an owner writes before it may shed readers of that page:
-/// `racer_core::read::fanout::HOT_PAGE_QUEUE_BYTES` of production pages.
+/// `racer_core::read::budget::HOT_PAGE_QUEUE_BYTES` of production pages.
 pub(crate) const fn hot_page_threshold() -> usize {
-    racer_core::read::fanout::hot_page_bodies(crate::model::PAGE_BYTES)
+    racer_core::read::budget::hot_page_bodies(crate::model::PAGE_BYTES)
 }
 
 /// Counts one page body being written until dropped.
@@ -406,7 +406,7 @@ impl PeerServer {
         requester: &racer_control_wire::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        use racer_core::read::fanout::{is_helper, shed_hot_page};
+        use racer_core::read::budget::{is_helper, shed_hot_page};
         let threshold = hot_page_threshold();
         let (streaming, all) = self.streaming(page);
         if streaming < threshold {
@@ -528,7 +528,7 @@ impl PeerServer {
                 Ok(membership)
                     if admitted.is_none()
                         && self.opaque_relay()
-                        && matches!(hop, racer_core::peer::hop::Hop::Relay(_)) =>
+                        && matches!(hop, racer_core::route::Hop::Relay(_)) =>
                 {
                     let network = &self.relay.network;
                     let previous = request
@@ -630,8 +630,8 @@ impl PeerServer {
                             return Err(Error::Internal);
                         }
                         Err(error) => {
-                            use racer_core::peer::hop::{self, RelayFailure};
-                            match hop::relay_failure_for(error.fault(), ping) {
+                            use racer_core::route::{self, RelayFailure};
+                            match route::relay_failure_for(error.fault(), ping) {
                                 RelayFailure::Respond(response) => self
                                     .forwarding
                                     .sign_response(&binding, peer_response(response))?,
@@ -806,16 +806,16 @@ impl PeerServer {
         })
     }
 
-    /// What this node does with a verified request (`racer_core::peer::hop`).
+    /// What this node does with a verified request (`racer_core::route`).
     fn decide_hop(
         &self,
         request: &VerifiedRequest,
         membership_known: bool,
-    ) -> racer_core::peer::hop::Hop {
+    ) -> racer_core::route::Hop {
         let route = &request.request().route;
-        racer_core::peer::hop::decide_hop(
+        racer_core::route::decide_hop(
             &self.relay.network.local,
-            racer_core::peer::hop::HopRoute {
+            racer_core::route::HopRoute {
                 visited: &route.visited,
                 destination: &route.destination,
                 links: route.remaining_links,
@@ -828,11 +828,11 @@ impl PeerServer {
         &'a self,
         request: VerifiedRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
-        hop: racer_core::peer::hop::Hop,
+        hop: racer_core::route::Hop,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
-            use racer_core::peer::hop::{self, Hop, RelayFailure};
+            use racer_core::route::{self, Hop, RelayFailure};
             let scope = super::request_scope(request.request(), scope)?;
             let network = &self.relay.network;
             let previous = request
@@ -854,7 +854,7 @@ impl PeerServer {
                     Ok(response) => return Ok(response),
                     Err(error) => error,
                 };
-                return match hop::relay_failure_for(error.fault(), ping) {
+                return match route::relay_failure_for(error.fault(), ping) {
                     RelayFailure::Respond(response) => self
                         .forwarding
                         .sign_response(&binding, peer_response(response)),
@@ -888,7 +888,7 @@ impl PeerServer {
             let _reservation = match reservation {
                 Ok(reservation) => reservation,
                 Err(error) => {
-                    return match hop::waiter_failure(error.fault()) {
+                    return match route::waiter_failure(error.fault()) {
                         Some(response) => self
                             .forwarding
                             .sign_response(&binding, peer_response(response)),
@@ -904,7 +904,7 @@ impl PeerServer {
             );
             let response = match result {
                 Ok(response) => response,
-                Err(error) => match hop::serve_failure(error.fault()) {
+                Err(error) => match route::serve_failure(error.fault()) {
                     Some(response) => peer_response(response),
                     None => return Err(error),
                 },
@@ -1066,7 +1066,7 @@ fn header_scope(
     );
     Ok(header)
 }
-/// Whether `request` is a silence ping (`hop::relay_failure_for`).
+/// Whether `request` is a silence ping (`route::relay_failure_for`).
 fn is_ping(request: &VerifiedRequest) -> bool {
     matches!(
         request.request().operation,
@@ -1077,9 +1077,9 @@ fn is_ping(request: &VerifiedRequest) -> bool {
     )
 }
 
-/// Signed response for a failure class chosen by `racer_core::peer::hop`.
-fn peer_response(response: racer_core::peer::hop::Response) -> PeerResponse {
-    use racer_core::peer::hop::Response;
+/// Signed response for a failure class chosen by `racer_core::route`.
+fn peer_response(response: racer_core::route::Response) -> PeerResponse {
+    use racer_core::route::Response;
     match response {
         Response::Overloaded => PeerResponse::Overloaded,
         Response::Unavailable => PeerResponse::Unavailable,

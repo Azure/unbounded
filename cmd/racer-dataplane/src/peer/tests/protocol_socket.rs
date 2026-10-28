@@ -1906,7 +1906,7 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use racer_core::read::fanout::is_helper;
+    use racer_core::read::budget::is_helper;
     use std::cell::Cell;
     use std::num::NonZeroU32;
     let hot = crate::peer::server::hot_page_threshold();

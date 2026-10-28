@@ -174,10 +174,10 @@ impl IndexSnapshot {
     }
 }
 /// Per-byte segment value of one page; see
-/// [`racer_core::cache::segment::class_score`].
+/// [`racer_core::cache::class_score`].
 fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId) -> u8 {
     let any = scoring.any_over_share();
-    racer_core::cache::segment::class_score(
+    racer_core::cache::class_score(
         scoring.score(page),
         any,
         any && scoring.over_share(&page.version.object.cache),
@@ -1239,13 +1239,10 @@ impl Index {
         let state = self.state.borrow();
         state.pages.segment_score(
             segment,
-            racer_core::cache::segment::SCAN_BUDGET,
-            racer_core::cache::segment::unseen_value_for(
-                crate::model::PAGE_BYTES,
-                scoring.any_over_share(),
-            ),
+            racer_core::cache::SCAN_BUDGET,
+            racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share()),
             |page, entry| {
-                racer_core::cache::segment::page_value(
+                racer_core::cache::page_value(
                     entry.metadata.page_length(page).ok(),
                     crate::model::PAGE_BYTES as u32,
                     page_value(scoring, page),
@@ -2494,7 +2491,7 @@ mod tests {
     /// eviction decisions as the catalog index when given the same scores.
     #[test]
     fn phantom_segment_entries_match_catalog_reclamation() {
-        use racer_core::cache::segment::{SCAN_BUDGET, page_value, unseen_value};
+        use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
         for seed in 1..=4u64 {
             let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let mut draw = move || {

@@ -3877,7 +3877,7 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
 /// answer's refund stays in the probe's grant.
 #[test]
 fn a_granted_batch_feeds_silence_evidence() {
-    use racer_core::read::candidates::Answering;
+    use racer_core::read::Answering;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -4470,7 +4470,7 @@ impl SuccessorFixture {
 #[test]
 fn rank_zero_defers_readers_to_the_owner_it_missed() {
     use crate::telemetry::Event;
-    use racer_core::read::successor::MAX_DEFERRALS;
+    use racer_core::read::hints::MAX_DEFERRALS;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let clock = uring_runtime::environment::SimulationClock::new(931);
@@ -4507,7 +4507,7 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
     assert_eq!(s.f.origin.calls.get(), 0);
     // The hinted owner's own fetch has had time to finish.
-    clock.advance(racer_core::read::successor::PROBE_AFTER);
+    clock.advance(racer_core::read::hints::PROBE_AFTER);
     // The deferrals are spent: rank 0 acquires for the reader, asking rank
     // 1 copy-only first (it missed: its own fetch failed).
     s.peers
@@ -4541,11 +4541,11 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
 /// that comes back for the page within `RETURN_WITHIN` did not get it
 /// there (the sender may have crashed since it offered), so the deferring
 /// owner acquires for it instead of deferring it again (the window itself:
-/// `racer_core::read::successor::tests::returning_requesters_are_not_deferred_again`).
+/// `racer_core::read::hints::tests::returning_requesters_are_not_deferred_again`).
 #[test]
 fn a_reader_returning_from_an_offer_sender_is_not_deferred_again() {
     use crate::telemetry::Event;
-    use racer_core::read::successor::PROBE_AFTER;
+    use racer_core::read::hints::PROBE_AFTER;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let clock = uring_runtime::environment::SimulationClock::new(932);
@@ -4621,7 +4621,7 @@ fn rank_zero_never_defers_owner_requesters() {
     ));
     assert_eq!(s.count(Event::SuccessorHint), 1);
     // The hinted owner's own fetch has had time to finish.
-    clock.advance(racer_core::read::successor::PROBE_AFTER);
+    clock.advance(racer_core::read::hints::PROBE_AFTER);
     s.peers
         .replies
         .borrow_mut()
@@ -4665,7 +4665,7 @@ fn rank_zero_copies_from_the_owner_it_missed() {
         PeerResponse::Miss
     ));
     // The hinted owner's own fetch has had time to finish.
-    clock.advance(racer_core::read::successor::PROBE_AFTER);
+    clock.advance(racer_core::read::hints::PROBE_AFTER);
     let copy = encrypted_copy(&mut s.f);
     s.peers
         .replies
@@ -4863,7 +4863,7 @@ fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
     assert_eq!(s.count(Event::SuccessorHint), 1);
     assert_eq!(s.f.origin.calls.get(), 0);
     assert!(s.peers.calls.borrow().is_empty());
-    clock.advance(racer_core::read::successor::PROBE_AFTER);
+    clock.advance(racer_core::read::hints::PROBE_AFTER);
     let copy = encrypted_copy(&mut s.f);
     s.peers
         .replies
@@ -4998,7 +4998,7 @@ fn drive_offers(f: &mut Fixture, now: Instant, n: u64) {
 #[test]
 fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     use crate::telemetry::Event;
-    use racer_core::read::notice::{NOTICE_DELAYS, NOTICE_LINKS};
+    use racer_core::read::hints::{NOTICE_DELAYS, NOTICE_LINKS};
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -5071,7 +5071,7 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
 #[test]
 fn offers_wait_out_a_cut_toward_their_site() {
     use crate::telemetry::Event;
-    use racer_core::read::notice::{NOTICE_DELAYS, PROBE_HOLD};
+    use racer_core::read::hints::{NOTICE_DELAYS, PROBE_HOLD};
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -5184,7 +5184,7 @@ fn offers_wait_out_a_cut_toward_their_site() {
 #[test]
 fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
     use crate::telemetry::Event;
-    use racer_core::read::notice::NOTICE_DELAYS;
+    use racer_core::read::hints::NOTICE_DELAYS;
     for answered in [false, true] {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
@@ -5264,7 +5264,7 @@ fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
 #[test]
 fn offers_need_a_held_copy_and_an_owner_after_rank_zero() {
     use crate::telemetry::Event;
-    use racer_core::read::notice::NOTICE_DELAYS;
+    use racer_core::read::hints::NOTICE_DELAYS;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -5325,7 +5325,7 @@ fn drive_pings(f: &mut Fixture, now: Instant, n: u64) {
 #[test]
 fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     use crate::telemetry::Event;
-    use racer_core::read::notice::NOTICE_LINKS;
+    use racer_core::read::hints::NOTICE_LINKS;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -5543,14 +5543,14 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
                     .rank0_watch
                     .borrow()
                     .state(&f.page, &next[0], now),
-                racer_core::read::rank0::Rank0State::Failed
+                racer_core::liveness::Rank0State::Failed
             );
             assert_ne!(
                 candidates
                     .rank0_watch
                     .borrow()
                     .state(&f.page, &ordered[0], now),
-                racer_core::read::rank0::Rank0State::Failed
+                racer_core::liveness::Rank0State::Failed
             );
         } else {
             assert!(!candidates.notices.borrow().is_empty());

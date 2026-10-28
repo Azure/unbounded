@@ -30,36 +30,16 @@ use std::time::{Duration, Instant};
 
 use flow_control::coalesce::flight::state::Outcome as FlightOutcome;
 use page_alloc::SegmentId;
-use racer_core::cache::segment::{SCAN_BUDGET, page_value, unseen_value};
-use racer_core::peer::Fault;
-use racer_core::peer::hop::{
-    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure_for,
-};
-use racer_core::peer::silence::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
+use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
+use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
 use racer_core::read::Error;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
-use racer_core::read::candidates::{
-    Answering, AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind,
-    VisitOrder, classify, demote_unanswered, lineage_first, replica_score,
-    validate_origin_authority, visit_order,
-};
-use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
-use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
+use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::flight::{Event as FlightEvent, Joined, JoinedCopy};
-use racer_core::read::notice::{
+use racer_core::read::hints::{
     Due, NOTICE_LINKS, notice_indexes, notice_target, offer_noted, should_notice,
 };
-use racer_core::read::policy::{
-    Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
-};
-use racer_core::read::range::{DIRECT_AHEAD, PageBudget, SlotKind, direct_fills, first_failure};
-use racer_core::read::serve::{
-    ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline,
-};
-use racer_core::read::stale::{
-    StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
-};
-use racer_core::read::successor::{
+use racer_core::read::hints::{
     MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets,
     with_successors,
 };
@@ -70,7 +50,25 @@ use racer_core::read::walk::{
     hedge_budgets, hedge_eligible, hedge_fallback, lineage_counts, lineage_targets, merge_handoff,
     owner_funding_min, plan_attempt, same_rank_previous, stale_action, transport_outcome,
 };
+use racer_core::read::walk::{
+    StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
+};
+use racer_core::read::{
+    Answering, AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind,
+    VisitOrder, classify, demote_unanswered, lineage_first, replica_score,
+    validate_origin_authority, visit_order,
+};
+use racer_core::read::{DIRECT_AHEAD, PageBudget, SlotKind, direct_fills, first_failure};
+use racer_core::read::{FailureKind, FillPlan, FillStep, Source, WalkResult};
+use racer_core::read::{
+    Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
+};
+use racer_core::read::{ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline};
+use racer_core::route::Fault;
 use racer_core::route::MAX_LINKS;
+use racer_core::route::{
+    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure_for,
+};
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 use topology::{PathQuery, Phantom, Placement, SharedRoutes};
@@ -396,7 +394,7 @@ struct Fill {
     /// (`stale_fallback`).
     fell_back: bool,
     /// Waits this read made for destinations that are behind
-    /// (`racer_core::read::stale::stale_wait`, Known issue 26).
+    /// (`racer_core::read::walk::stale_wait`, Known issue 26).
     waits: u8,
     /// The walk is paused in that wait (`Event::StaleWait`).
     stale_waiting: bool,
@@ -713,15 +711,14 @@ struct Race {
 }
 
 /// Production `DUPLICATE_BYTES` at the simulated page size.
-pub const DUPLICATE_BYTES: usize = racer_core::read::candidates::duplicate_bytes(PAGE_BYTES);
+pub const DUPLICATE_BYTES: usize = racer_core::read::duplicate_bytes(PAGE_BYTES);
 
 /// Production `reserve_hedge_pages`: plaintext and ciphertext for `pages`.
 fn hedge_pages(
     quotas: &super::admission::SimQuotas,
     pages: usize,
 ) -> Result<Vec<SimCharge>, Error> {
-    let (plaintext, ciphertext) =
-        racer_core::read::candidates::hedge_page_charges(PAGE_BYTES, pages);
+    let (plaintext, ciphertext) = racer_core::read::hedge_page_charges(PAGE_BYTES, pages);
     Ok(vec![
         reserve(quotas, ResourceClass::Plaintext, plaintext)?,
         reserve(quotas, ResourceClass::Ciphertext, ciphertext)?,
@@ -3865,7 +3862,7 @@ impl NodeWorld {
         }
     }
 
-    /// Production hot-page shed (`racer_core::read::fanout::shed_hot_page`):
+    /// Production hot-page shed (`racer_core::read::budget::shed_hot_page`):
     /// an owner already streaming [`Self::hot_page_threshold`] bodies of `page`, at
     /// least half of all bodies it streams, answers `Overloaded` to a
     /// requester that is neither an owner nor a helper of the page.
@@ -4610,7 +4607,7 @@ impl NodeWorld {
     }
 
     /// Whether fill `id` may walk the previous membership at a destination
-    /// that is behind (`racer_core::read::stale::previous_fallback`), with
+    /// that is behind (`racer_core::read::walk::previous_fallback`), with
     /// the previous membership, whether this node is a member of it, and
     /// whether it was replaced recently.
     fn fallback_facts(&self, id: u64) -> (bool, Option<Rc<Members>>, bool, bool) {
@@ -4679,7 +4676,7 @@ impl NodeWorld {
 
     /// Production `resolve_epoch_traced` (Known issues 26 and 36): a non-owner that
     /// cannot walk the previous membership waits (at most `MAX_STALE_WAITS` times) for a destination
-    /// that is behind, then asks it again (`racer_core::read::stale::stale_wait`).
+    /// that is behind, then asks it again (`racer_core::read::walk::stale_wait`).
     /// The pending probe's credits are back in the fill's budget. Returns
     /// whether it waits.
     fn stale_wait(&mut self, id: u64) -> bool {
@@ -4733,7 +4730,7 @@ impl NodeWorld {
 
     /// Production `resolve_epoch_traced`: at a destination behind this
     /// node, a non-owner stops its walk and walks the page's owners under
-    /// membership version - 1 instead, once (`racer_core::read::stale`,
+    /// membership version - 1 instead, once (`racer_core::read::walk`,
     /// Known issue 19). Returns whether it did.
     fn stale_fallback(&mut self, id: u64) -> bool {
         if let Some((version, members, cands)) = self
@@ -5972,7 +5969,7 @@ impl NodeWorld {
         }
         // Same leader settlement as production `Fill` (`src/read/fill.rs`):
         // a credential rejection fails only the leader and re-elects.
-        let finished = match result.map_err(racer_core::read::fill::acquisition_failure) {
+        let finished = match result.map_err(racer_core::read::acquisition_failure) {
             _ if !active => Ok(()),
             Ok(_) => worker.flights.finish(
                 &page_id,

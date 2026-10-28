@@ -3111,7 +3111,7 @@ mod timeouts {
         let hung = first[0].clone();
         assert_eq!(
             f.policy.link_health().answering(&hung),
-            racer_core::read::candidates::Answering::Unanswered
+            racer_core::read::Answering::Unanswered
         );
         // The next walk visits it last: everyone else answered.
         let before = f.peers.calls.borrow().len();
@@ -3123,7 +3123,7 @@ mod timeouts {
         // It answered this time: its place is restored.
         assert_eq!(
             f.policy.link_health().answering(&hung),
-            racer_core::read::candidates::Answering::Answers
+            racer_core::read::Answering::Answers
         );
         let before = f.peers.calls.borrow().len();
         f = f.bounded(211, 60, 24);
@@ -3140,7 +3140,7 @@ mod timeouts {
     /// from it, or the quiet time passing, restores its place.
     #[test]
     fn reader_visits_an_owner_that_shed_it_after_the_others() {
-        use racer_core::read::candidates::Answering;
+        use racer_core::read::Answering;
         let clock = uring_runtime::environment::SimulationClock::new(212);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(None, 0, false).bounded(212, 60, 24);
