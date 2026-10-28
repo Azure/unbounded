@@ -641,6 +641,41 @@ fn a_hung_peer_is_found_by_a_ping_and_shared_through_its_links() {
     assert_eq!(counter(&report, "silence_pings"), 0, "{report}");
 }
 
+/// Known issue 43: a recovery ping tests the link to the peer its sender
+/// holds silent. Silent neighbors are routed around, but an origin's own ping
+/// is not, so a direct ping does not detour or find no route. Peers hang for
+/// the first 10 s only; their senders learn that they recovered from a ping
+/// and the second storm reads every page.
+#[test]
+fn a_recovered_peer_answers_its_recovery_ping() {
+    let mut config = quiet(200);
+    config.duration_ns = 45 * SECONDS;
+    config.pages_per_object = 64;
+    config.faults = (0..10)
+        .map(|node| Fault::Hang {
+            node: node * 20,
+            from_ns: 0,
+            until_ns: 10 * SECONDS,
+        })
+        .collect();
+    config.storms = vec![
+        storm(0, 0, 100, 100 * MILLIS),
+        storm(30 * SECONDS, 0, 100, 100 * MILLIS),
+    ];
+    let mut world = NodeWorld::new(config, 5);
+    world.run(29 * SECONDS);
+    let early = world.metrics.get("reads_failed");
+    let end = world.config.duration_ns;
+    world.run(end);
+    let late = world.metrics.get("reads_failed") - early;
+    let report = world.report("contention", 5);
+    assert_eq!(report["invariants"]["hard_failures"], 0, "{report}");
+    assert!(counter(&report, "silence_marks") > 0, "{report}");
+    assert!(counter(&report, "silence_recoveries") > 0, "{report}");
+    assert!(counter(&report, "silence_pings_direct") > 0, "{report}");
+    assert_eq!(late, 0, "{report}");
+}
+
 /// Known issue 54 (round 4, busy): an owner that sheds a reader (a signed
 /// `Overloaded`, here a hot page's owner) is busy, not hung. The reader's
 /// later walks visit it after the page's other owners for half a request

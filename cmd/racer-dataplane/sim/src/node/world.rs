@@ -3326,7 +3326,10 @@ impl NodeWorld {
         let Some(visited) = visited else {
             return self.fail_hop(mid, holder, Fault::Unavailable);
         };
-        let blocked = self.blocked(holder, &members);
+        // Production `shortest_probe_async`: an origin's own ping may use
+        // the link to the destination it holds silent (Known issue 43).
+        let exempt = own_ping.then_some(m.dest);
+        let blocked = self.blocked(holder, &members, exempt);
         let seed = m.probe.to_be_bytes();
         let worker = (m.probe % u64::from(self.fabric.workers)) as u8;
         let paths = self.nodes[holder as usize].paths.clone();
@@ -3359,7 +3362,7 @@ impl NodeWorld {
     }
 
     /// Links from `holder` its circuits currently block (the path hint).
-    fn blocked(&self, holder: u32, members: &Members) -> Vec<usize> {
+    fn blocked(&self, holder: u32, members: &Members, exempt: Option<u32>) -> Vec<usize> {
         let instant = self.instant(self.now());
         let n = &self.nodes[holder as usize];
         let mut blocked: Vec<usize> = n
@@ -3374,6 +3377,7 @@ impl NodeWorld {
         let mut silent: Vec<usize> = n
             .silence
             .silent_peers(instant)
+            .filter(|s| Some(**s) != exempt)
             .filter_map(|s| position(members, *s))
             .filter(|p| me.is_some_and(|me| members.is_neighbor(me, *p)))
             .filter(|p| !blocked.contains(p))
@@ -3490,6 +3494,9 @@ impl NodeWorld {
             }
         };
         if !failed {
+            if silence.silent(&to, at) {
+                self.metrics.incr("silence_recoveries");
+            }
             silence.ping_answered(&to, at);
             return;
         }
@@ -3533,7 +3540,12 @@ impl NodeWorld {
         // Production `Paths::shortest` (`src/topology.rs`): link health may
         // change while the search yields; a changed blocked set fails the
         // attempt with `Unavailable` under the same budget.
-        if self.blocked(holder, &members) != blocked {
+        let exempt = self
+            .msgs
+            .get(&mid)
+            .filter(|m| m.ping && holder == m.requester)
+            .map(|m| m.dest);
+        if self.blocked(holder, &members, exempt) != blocked {
             self.metrics.incr("route_blocked_changed");
             self.note_cut(mid, Cut::Route);
             return self.fail_hop(mid, holder, Fault::Unavailable);
@@ -3550,6 +3562,17 @@ impl NodeWorld {
             }
         };
         let next = members.members()[route[1]].node;
+        let m = &self.msgs[&mid];
+        if m.ping
+            && holder == m.requester
+            && next == m.dest
+            && self.nodes[holder as usize]
+                .silence
+                .silent(&next, self.instant(self.now()))
+        {
+            // Known issue 43: the ping tests the link it holds silent.
+            self.metrics.incr("silence_pings_direct");
+        }
         self.link(mid, holder, plan, next);
     }
 

@@ -194,6 +194,11 @@ impl LinkHealth {
         // A silent neighbor is routed around (Known issue 41).
         Ok(self.inner.available(neighbor, now) && !self.silent_at(neighbor, now))
     }
+    /// Circuit state only: whether `neighbor` may carry a ping meant for
+    /// itself even while this node holds it silent (Known issue 43).
+    pub fn circuit_available_at(&self, neighbor: &NodeId, now: Instant) -> bool {
+        self.inner.available(neighbor, now)
+    }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
         self.try_acquire_at(neighbor, uring_runtime::environment::now())
     }
@@ -721,6 +726,22 @@ impl Paths {
         budget: &'a RouteBudget,
         scope: &'a RequestScope,
     ) -> Operation<'a, Route> {
+        self.shortest_probe_async(membership, from, budget, scope, false)
+    }
+
+    /// Like [`Self::shortest_async`]. With `ping`, the budget's destination
+    /// is not routed around for silence: an origin's recovery ping must be
+    /// able to reach the peer it holds silent (Known issue 43). Circuit
+    /// health and peer admission still apply, and silent intermediate
+    /// neighbors are still routed around.
+    pub fn shortest_probe_async<'a>(
+        &'a self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        from: &'a NodeId,
+        budget: &'a RouteBudget,
+        scope: &'a RequestScope,
+        ping: bool,
+    ) -> Operation<'a, Route> {
         Box::pin(async move {
             scope.check()?;
             budget.validate_at(from, uring_runtime::environment::now())?;
@@ -737,7 +758,8 @@ impl Paths {
                 .iter()
                 .map(|node| membership.position(node))
                 .collect::<Result<Vec<_>>>()?;
-            let blocked = self.blocked(&membership, source)?;
+            let exempt = ping.then_some(&budget.destination);
+            let blocked = self.blocked(&membership, source, exempt)?;
             let mut seed = [0; 32];
             seed[..16].copy_from_slice(&budget.request.0);
             seed[16..].copy_from_slice(&budget.attempt.0);
@@ -768,7 +790,7 @@ impl Paths {
             scope.check()?;
             budget.validate_at(from, uring_runtime::environment::now())?;
             // Health/admission may change while yielded. Retry under the same budget.
-            if self.blocked(&membership, source)? != blocked {
+            if self.blocked(&membership, source, exempt)? != blocked {
                 return Err(Error::Unavailable);
             }
             let nodes = nodes?
@@ -779,7 +801,13 @@ impl Paths {
         })
     }
 
-    fn blocked(&self, membership: &Membership, source: usize) -> Result<Vec<usize>> {
+    fn blocked(
+        &self,
+        membership: &Membership,
+        source: usize,
+        exempt: Option<&NodeId>,
+    ) -> Result<Vec<usize>> {
+        let now = uring_runtime::environment::now();
         let positions = membership.inner.neighbors(source);
         let neighbors: Vec<_> = positions
             .iter()
@@ -788,7 +816,12 @@ impl Paths {
         self.health.retain_neighbors(&neighbors);
         let mut blocked = Vec::new();
         for (position, node) in positions.into_iter().zip(&neighbors) {
-            if !self.health.available(node)?
+            let available = if exempt == Some(node) {
+                self.health.circuit_available_at(node, now)
+            } else {
+                self.health.available_at(node, now)?
+            };
+            if !available
                 || self
                     .peer_admission
                     .as_ref()
@@ -1625,6 +1658,99 @@ pub(crate) mod tests {
                 remaining_attempts: 3,
                 deadline: Deadline(Instant::now() + Duration::from_secs(60)),
             }
+        }
+        /// Hold `peer` silent: two unanswered last links, then a failed ping.
+        fn silence(health: &LinkHealth, peer: &NodeId) {
+            let page = crate::model::PageId {
+                version: crate::model::ObjectVersion {
+                    object: crate::topology::tests::fixtures::object(),
+                    etag: crate::model::StrongEtag::test_value("v"),
+                },
+                number: PageNumber(0),
+            };
+            let sent = Instant::now() - Duration::from_secs(5);
+            for _ in 0..2 {
+                health.silence_timed_out(
+                    peer,
+                    page.clone(),
+                    sent,
+                    racer_core::peer::silence::LINK_TIMEOUTS,
+                );
+            }
+            assert_eq!(health.due_pings(Instant::now(), 8).len(), 1);
+            assert!(health.ping_outcome(peer, Some(false), Instant::now()));
+            assert!(health.silent(peer));
+        }
+        fn probe(
+            paths: &Paths,
+            members: &std::sync::Arc<crate::topology::Membership>,
+            source: &NodeId,
+            request: &RouteBudget,
+            ping: bool,
+        ) -> Result<Route> {
+            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            futures::executor::block_on(paths.shortest_probe_async(
+                members.clone(),
+                source,
+                request,
+                &scope,
+                ping,
+            ))
+        }
+        /// Known issue 43: an origin's recovery ping to a neighbor it holds
+        /// silent goes over the direct link; other requests route around it,
+        /// and an open circuit or a silent intermediate still blocks.
+        #[test]
+        fn a_ping_reaches_the_silent_neighbor_it_tests() {
+            let members = membership(64);
+            let source = &members.members()[0].node;
+            let neighbors = members.neighbors(source).unwrap();
+            let target = neighbors[0].clone();
+            let to = members.position(&target).unwrap();
+            let health = Rc::new(
+                LinkHealth::default().with_silence(Duration::from_secs(1), Duration::from_secs(1)),
+            );
+            let paths = Paths::new(health.clone(), 0);
+            let request = budget(&members, to, 1);
+            // Healthy: both reach it directly.
+            for ping in [false, true] {
+                let route = probe(&paths, &members, source, &request, ping).unwrap();
+                assert_eq!(route.nodes[1], target);
+            }
+            silence(&health, &target);
+            // A one-link budget: only the direct link reaches it.
+            assert_eq!(
+                probe(&paths, &members, source, &request, false).unwrap_err(),
+                Error::Unavailable
+            );
+            let route = probe(&paths, &members, source, &request, true).unwrap();
+            assert_eq!(route.nodes, vec![source.clone(), target.clone()]);
+            // A silent intermediate is still routed around for a ping to a
+            // non-neighbor whose only short path crosses it.
+            let far = members
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .find(|n| n != source && !neighbors.contains(n))
+                .unwrap();
+            let far_request = budget(&members, members.position(&far).unwrap(), 4);
+            for ping in [false, true] {
+                if let Ok(route) = probe(&paths, &members, source, &far_request, ping) {
+                    assert_ne!(route.nodes[1], target);
+                }
+            }
+            // An open circuit blocks even a ping.
+            health
+                .observe_at(
+                    &target,
+                    LinkOutcome::Timeout,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap();
+            assert_eq!(
+                probe(&paths, &members, source, &request, true).unwrap_err(),
+                Error::Unavailable
+            );
         }
         #[test]
         fn path_search_limit_is_independent_of_cache_and_released_on_drop() {

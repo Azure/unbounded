@@ -846,11 +846,26 @@ impl Requester {
             let scope = request_scope(&request, scope)?;
             check_membership(&request, &membership)?;
             let search_budget = search_budget(&request.route, &network.local)?;
+            // An origin's own recovery ping may use the link to the peer it
+            // holds silent; that link is what it tests (Known issue 43).
+            let ping = matches!(
+                request.operation,
+                protocol::Operation::Page {
+                    mode: protocol::FetchMode::Ping,
+                    ..
+                }
+            );
             let route = observer.result(
                 Stage::PeerRoute,
                 &scope,
                 paths
-                    .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
+                    .shortest_probe_async(
+                        membership.clone(),
+                        &network.local,
+                        &search_budget,
+                        &scope,
+                        ping,
+                    )
                     .await,
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;

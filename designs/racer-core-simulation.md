@@ -1454,7 +1454,9 @@ scenarios carry data-plane faults.
    request per such walk, two per page and version (round 4, hang2, wave 6).
 43. Resolved: owners and readers ping a rank 0 that left a probe unanswered, and its neighbors
    share the verdict by failing requests for it at once; 5k `zipf` with 50 hung members, failed
-   reads whose rank 0 hangs 114 to 1 (round 4, hang2, wave 6).
+   reads whose rank 0 hangs 114 to 1 (round 4, hang2, wave 6). A sender's own ping is not routed
+   around the silent peer it tests, so a recovered neighbor answers over the direct link (its
+   circuit still applies).
 44. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
    waited on the prober; the join is now declined (round 4, lineage, wave 5).
 45. Resolved: granted probes go out at once, so they cost one round trip before origin (5k
