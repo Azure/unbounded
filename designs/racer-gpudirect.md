@@ -317,23 +317,21 @@ A `gpu-read` page then takes this path (`Fill::land_from_peer`):
    The GPU checks the tag (there is no CRC: no host bytes were seen) and
    decrypts into the client's allocation.
 
-A landed page is used once. It does not join or create a single flight, is
-not published to memory, and is not persisted, because there are no host
-bytes to share. The slot is held until the GPU job finishes. If the provider
-answers with a host page (no free slot, or HTTP), that page is used once in
-the same way, so it is not fetched twice. If every provider asked misses or
-fails, or the rail has no slice for that GPU, the read takes the usual path.
-Host-only nodes and non-GPU reads do not change. Relays never ask for
-landing.
+A landed page does not join or create the host single flight, is not
+published to memory, and is not persisted, because there are no host bytes.
+Concurrent sealed fetches of the same page share the landed copy on the GPU
+instead (see "Sharing ciphertext between GPUs" below). The slot is held while
+any request still holds the copy. If the provider answers with a host page
+(no free slot, or HTTP), that page is used privately by this request, so it
+is not fetched twice. If every provider asked misses or fails, or the rail
+has no slice for that GPU, the read takes the usual path. Host-only nodes and
+non-GPU reads do not change. Relays never ask for landing.
 
 Not caching landed pages is a design choice, not a gap. The host memory and
 disk tiers are the cache. Putting a landed page there would need a
 device-to-host copy of the ciphertext, which is the cost landing exists to
-avoid. Keeping landed pages in GPU memory would hold scarce slots that peers
-need for new pages, and a page landed on one GPU is not usable by a read on
-another without a GPU-to-GPU copy. Concurrent reads of one page on the same
-GPU each land their own copy; that is rare, since a model's shards are
-usually read once per GPU.
+avoid. Keeping landed pages in GPU memory after the last request releases
+them would hold scarce slots that peers need for new pages.
 
 `racer_rdma_pages_landed_total` counts pages that landed, and the GPU
 helper's `landed` counter counts landed pages it decrypted. A landed page the
@@ -349,6 +347,74 @@ RDMA and a simulated GPU on the client socket. Tests cover each layer
 instead: verbs device pools, landing grants over two simulated nodes, the
 peer transport over a simulated link, the fill path with a scripted
 provider, and GPU decryption from a landing buffer.
+
+### Sharing ciphertext between GPUs
+
+A node with several GPUs often loads the same model weights on all of them,
+so many `gpu-read` requests ask for the same pages at about the same time.
+Without sharing, each GPU fetched each page again from disk or a peer. Now
+GPU-resident ciphertext from a cuFile read or an RDMA landing is shared
+between requests (`src/read/gpu_copies.rs`). Only ciphertext is shared. Each
+GPU still checks the CRC (when known) and the tag, and decrypts by itself.
+
+**Lookup.** `Fill::acquire_sealed` tries, in order:
+
+1. plaintext another reader holds (host-to-GPU copy, as before);
+2. ciphertext in the memory cache (sealed from host memory, as before);
+3. a shared GPU copy: a live copy on the same GPU, then a live copy on a GPU
+   this GPU can copy from; else join a fetch in flight on a reachable GPU;
+   else lead a new fetch that others may join;
+4. the usual path through host memory.
+
+A request's own fetch tries cuFile from local disk, then a peer landing.
+
+**Peer access.** At startup the helper calls `cuDeviceCanAccessPeer` and
+`cuCtxEnablePeerAccess` for every ordered pair of usable GPUs and logs the
+result for each pair. `RACER_GPU_PEER=auto` (default) does this;
+`RACER_GPU_PEER=off` never enables peer access. `GpuHelper::peers(dst, src)`
+reports whether a pair has a working peer path.
+
+**Copy paths.** When a request decrypts shared ciphertext (`write_sealed`):
+
+- Same GPU: decrypt in place.
+- Other GPU with a peer path: `cuMemcpyPeerAsync` into the target GPU's
+  scratch slot, then decrypt.
+- Other GPU without a peer path: copy through host memory (host bounce).
+
+If a peer copy fails, that direction of the pair is turned off until restart
+and the page takes the host bounce. Only the failed direction is turned off.
+Lookups only share across GPUs that have a peer path; others fetch on their
+own.
+
+**Retention.** The table holds weak references. A copy is reusable only while
+some request still holds it; the table never pins GPU memory or landing
+slots. Dead entries are pruned on lookup and insert. The table is per owning
+worker and capped at 4096 pages (`MAX_PAGES`). Past the cap, a new fetch runs
+privately. Each page has at most one fetch in flight.
+
+**Cancellation.** A waiter that is cancelled stops waiting and returns its
+error. If the leader is cancelled or times out, waiters are told the fetch
+was abandoned and look again, up to two times (`GPU_COPY_JOIN_RETRIES`),
+then fetch on their own. If the leader's fetch ends with no GPU copy, waiters
+fetch on their own.
+
+**Verdicts.** Every verdict, including verdicts for landed and joined pages,
+goes to the page's owner (`Fill::sealed_verdict`). A failed verdict drops the
+host and disk copies as before and forgets every shared GPU copy of the page
+(`GpuCopies::forget`), so later requests fetch it again.
+
+**Metrics.** `racer_gpu_direct_joined_total` counts sealed pages served from
+another request's GPU copy. The GPU helper also counts joined pages, peer
+copies and bytes, peer copy failures, and host bounces.
+
+**Limitations and future work.**
+
+- Ciphertext from host memory (memory cache, HTTP, host RDMA) is still copied
+  to each GPU separately. Uploading it once and fanning out to other GPUs is
+  future work.
+- All GPU work, except cuFile reads, still runs on the single `racer-gpu`
+  helper thread, so peer copies and decrypts for all GPUs are serial.
+  Reworking that thread is future work.
 
 ### Disk layout v2
 
