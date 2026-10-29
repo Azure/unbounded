@@ -2986,11 +2986,29 @@ mod landing {
     /// Like [`landing`], but only the `call`th landing request (1-based)
     /// lands; the others go to the usual peer script.
     fn landing_on(ordinal: i32, call: Option<usize>) -> Landing {
-        landing_with(ordinal, call, crate::gpu::testing::helper(&[None, None]))
+        landing_with(
+            ordinal,
+            move |n| call == Some(n),
+            crate::gpu::testing::helper(&[None, None]),
+        )
+    }
+
+    /// Like [`landing`], but every landing request lands.
+    fn landing_every(ordinal: i32) -> Landing {
+        landing_with(
+            ordinal,
+            |_| true,
+            crate::gpu::testing::helper(&[None, None]),
+        )
     }
 
     /// Like [`landing_on`], on the GPUs of `helper`, which has at least two.
-    fn landing_with(ordinal: i32, call: Option<usize>, helper: Arc<GpuHelper>) -> Landing {
+    /// The `n`th landing request (1-based) lands when `lands(n)`.
+    fn landing_with(
+        ordinal: i32,
+        lands: impl Fn(usize) -> bool + 'static,
+        helper: Arc<GpuHelper>,
+    ) -> Landing {
         let mut f = fixture();
         let copy = encrypted_copy(&mut f);
         let (peers, ordered) = install_peers(&mut f, None);
@@ -3003,7 +3021,7 @@ mod landing {
         let seen = asked.clone();
         let land: crate::peer::ScriptedLanding = Box::new(move |request| {
             seen.set(seen.get() + 1);
-            let lands = call == Some(seen.get());
+            let lands = lands(seen.get());
             assert!(matches!(
                 request.operation,
                 PeerOperation::Page {
@@ -3328,7 +3346,11 @@ mod landing {
     fn concurrent_sealed_fetches_on_peer_gpus_share_one_landing() {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let mut l = landing_with(0, Some(1), crate::gpu::testing::helper(&[None, None, None]));
+        let mut l = landing_with(
+            0,
+            |n| n == 1,
+            crate::gpu::testing::helper(&[None, None, None]),
+        );
         let fetched = acquire_sealed_together(&mut l, &[0, 1, 2]);
         let pages: Vec<_> = fetched.into_iter().map(sealed).collect();
         assert_eq!(l.asked.get(), 1, "one landing request");
@@ -3384,7 +3406,7 @@ mod landing {
         let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
             simulation.set_peer(1, 0, false)
         });
-        let mut l = landing_with(0, Some(1), helper);
+        let mut l = landing_with(0, |n| n == 1, helper);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         l.peers
             .replies
@@ -3407,7 +3429,7 @@ mod landing {
     fn shared_copy_lives_only_while_a_request_holds_it() {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let mut l = landing(0, true);
+        let mut l = landing_every(0);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         let second = sealed(acquire_sealed_on(&mut l, 1));
         assert_eq!(l.asked.get(), 1);
@@ -3591,7 +3613,7 @@ mod landing {
     fn failed_verdict_forgets_the_shared_copy() {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
-        let mut l = landing(0, true);
+        let mut l = landing_every(0);
         let first = sealed(acquire_sealed_on(&mut l, 0));
         let report = first.report();
         assert!(report.landed && report.has_owner_state(false) && !report.has_owner_state(true));
