@@ -1349,8 +1349,10 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Fetch(page, membership, envelope) => {
-            if let Warmed::Local(result) =
-                local.streams.directory().warmed_page(&page, scope).await?
+            // Passthrough caches retain nothing, so skip stale warm state.
+            if !local.fill.passthrough(&page.version.object.cache)
+                && let Warmed::Local(result) =
+                    local.streams.directory().warmed_page(&page, scope).await?
             {
                 return Ok(Value::Page(*result));
             }
@@ -1368,8 +1370,10 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::FetchSealed(page, membership, envelope, target) => {
-            if let Warmed::Local(result) =
-                local.streams.directory().warmed_page(&page, scope).await?
+            // Passthrough caches retain nothing, so skip stale warm state.
+            if !local.fill.passthrough(&page.version.object.cache)
+                && let Warmed::Local(result) =
+                    local.streams.directory().warmed_page(&page, scope).await?
             {
                 return Ok(Value::Fetched(super::sealed::Fetched::Page(*result)));
             }

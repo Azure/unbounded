@@ -443,3 +443,77 @@ fn passthrough_refuses_warm_holds() {
         endpoint.uninstall().unwrap();
     }
 }
+
+/// A warm job that completed before the cache switched to passthrough no
+/// longer holds a copy, so reads skip it and fetch from origin, and the
+/// transition forgets the job and its leases.
+#[test]
+fn reads_after_switching_a_warmed_cache_to_passthrough_use_origin() {
+    use crate::test_support::security::network;
+    // The local route reaches origin without peers; the guard is mode-agnostic.
+    for mode in [CacheMode::PassthroughLocal] {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _queue = queue.enter();
+        let signers = network(1);
+        let mut f = fixture();
+        f.reactor.init().unwrap();
+        // The local route only grants origin authority to a member node.
+        let membership = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                vec![Member {
+                    node: signers[0].node().clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:8000".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+            )
+            .unwrap(),
+        );
+        let (_local, mut endpoint, _publication) =
+            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        let directory = f.fill.dependencies.metadata_owner.clone();
+        let version = f.page.version.clone();
+        // The warm job completed page 0 on this node, then the cache switched.
+        let (job, _) = directory.warm.begin(&version).unwrap();
+        crate::read::warm::WarmRegistry::publish_through(&job, 1);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+        crate::read::warm::WarmRegistry::finish(&job, until);
+        let key = (
+            racer_control_wire::NodeId("22222222-2222-4222-8222-000000000007".into()),
+            [1; 16],
+        );
+        directory.warm.grant_lease(&version, &key, until).unwrap();
+        f.set_mode(mode);
+
+        let budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+        let mut work = directory
+            .start_page(
+                f.page.clone(),
+                membership.clone(),
+                &f.context,
+                &f.scope,
+                budget,
+            )
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut output = None;
+        for _ in 0..4096 {
+            if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                output = Some(result);
+                break;
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        drop(work);
+        let result = output.expect("read did not complete").unwrap().0.unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc", "{mode:?}");
+        assert_eq!(f.origin.calls.get(), 1, "{mode:?}");
+
+        assert!(directory.warm.contains(&version));
+        directory.warm.forget_cache(&version.object.cache);
+        assert!(!directory.warm.contains(&version), "{mode:?}");
+        assert_eq!(directory.warm.lease_count(&version), 0, "{mode:?}");
+    }
+}

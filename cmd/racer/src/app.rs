@@ -1848,6 +1848,7 @@ impl WorkerApplication {
             if new.mode.passthrough() && !was_passthrough {
                 self.memory.remove_cache(&new.id)?;
                 self.store.writer.remove_cache(&new.id)?;
+                self.node.workers.warm.forget_cache(&new.id);
             }
         }
         current_scope.check()?;

@@ -380,6 +380,16 @@ impl WarmRegistry {
         job.complete(page, revision).unwrap();
     }
 
+    /// Marks a test job completed and retained until `until`.
+    #[cfg(test)]
+    pub(crate) fn finish(job: &Job, until: SystemTime) {
+        job.update(|progress| {
+            progress.running = false;
+            progress.admissions = 0;
+            progress.until = Some(until);
+        });
+    }
+
     /// Pages a remote primary owner holds are not stored on this node.
     #[cfg(test)]
     pub(crate) fn is_local_page(&self, page: &PageId) -> bool {
@@ -601,6 +611,48 @@ impl WarmRegistry {
         for job in jobs {
             let _ = job.scope.cancel();
         }
+    }
+
+    /// Forget warm state for `cache` once it stops retaining pages. Completed
+    /// jobs are stopped and removed so readers stop waiting on purged copies,
+    /// running jobs are canceled, and its leases are dropped with their unused
+    /// hold capacity queued for release.
+    pub(crate) fn forget_cache(&self, cache: &racer_control_wire::CacheId) {
+        let mut cancel = Vec::new();
+        let mut stopped = Vec::new();
+        self.jobs.lock().unwrap().retain(|version, job| {
+            if version.object.cache != *cache {
+                return true;
+            }
+            let progress = job.progress.lock().unwrap();
+            if progress.running || progress.admissions != 0 {
+                cancel.push(job.clone());
+                true
+            } else {
+                stopped.push(job.clone());
+                false
+            }
+        });
+        for job in stopped {
+            job.stop();
+        }
+        for job in cancel {
+            let _ = job.scope.cancel();
+        }
+        let emptied = {
+            let mut leases = self.leases.lock().unwrap();
+            let generation = leases.next;
+            let mut emptied = Vec::new();
+            leases.versions.retain(|version, _| {
+                let keep = version.object.cache != *cache;
+                if !keep {
+                    emptied.push((version.clone(), generation));
+                }
+                keep
+            });
+            emptied
+        };
+        self.release_expired(emptied);
     }
 
     pub(crate) fn poll_deadlines(&self) {
