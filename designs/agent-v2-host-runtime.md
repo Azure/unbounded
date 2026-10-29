@@ -115,8 +115,8 @@ Without an ownership record, Teardown is conservative (section 9).
 | `/run/containerd` | containerd; gantry hostPath (`deploy/gantry/chart/values.yaml:26`) | Unmount (volatile) | |
 | `/run/unbounded-net` | unbounded-net hostPath (`deploy/net/node/03-daemonset.yaml.tmpl:136-139`) | Unmount (volatile) | IPAM socket |
 | `/run/racer` | racer hostPath (`internal/racer/workload/workload.go:292`) | Unmount (volatile) | |
-| `/run/cdi/nvidia.yaml` | runtime pre-start boot hook | Unmount (volatile) | Regenerated on every start. containerd also reads it as `/var/run/cdi`. |
-| `/var/lib/kubelet` | kubelet, bundle | Wipe (persistent) | Includes kubelet client certificates, so a wipe forces TLS bootstrapping again |
+| `/run/cdi/nvidia.yaml` | runtime pre-start boot hook | Unmount (volatile) | Regenerated on every start. containerd also reads it as `/var/run/cdi` *(inference: containerd's default CDI directories)*. |
+| `/var/lib/kubelet` | kubelet, bundle | Wipe (persistent) | Includes kubelet's client certificates *(inference: kubelet's default certificate directory)*, so a wipe forces TLS bootstrapping again |
 | `/var/lib/containerd` | containerd | Wipe (persistent) | Images and gantry's content cache; see `retainContainerImages` (section 8) |
 | `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | Wipe (persistent) | Rewritten from the bundle on each slot change |
 | `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | Wipe (persistent) | Bundle plugins are installed again after the wipe |
