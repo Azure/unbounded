@@ -40,8 +40,8 @@ runtime has no container, so it has to provide each guarantee itself.
    inside a tree being deleted aborts the deletion. Pod volumes are often bind
    mounts of host data, and deleting through one destroys that data.
 3. **Contain processes in a slice** that can be killed as a unit.
-4. **Every level is idempotent and restartable.** Intent is written durably
-   before acting.
+4. **Every level is idempotent and restartable.** Intent is written and
+   synced to disk before acting.
 5. **Refuse to start on unclean state; clean up as much as possible on
    teardown.** A failed check before starting a fresh node blocks the start.
    Teardown runs every step even if some fail, then reports leftovers.
@@ -51,7 +51,7 @@ runtime has no container, so it has to provide each guarantee itself.
 
 The `host` runtime records every host path it owns in its ownership record,
 `/var/lib/unbounded/agent-v2/host-runtime/owned-paths.json`, mode 0600, written
-durably with a `.sha256` sidecar.
+and synced to disk, with a `.sha256` sidecar.
 
 ```json
 {
@@ -171,9 +171,9 @@ Containment:
 - kubelet gets `cgroupDriver: systemd` and `cgroupRoot: /unboundednode`, so
   pods land under `unboundednode-kubepods.slice` *(inference: kubelet's
   systemd cgroup naming)*.
-- Shims start in `containerd.service`'s cgroup, so they are in the slice even
-  though `KillMode=process` keeps them alive when containerd stops
-  (`pkg/agent/phases/nodestart/assets/containerd.service:10-11`).
+- Shims start in `containerd.service`'s cgroup, so they are in the slice and
+  stop with it, even though `KillMode=process` keeps them alive when only
+  containerd stops (`pkg/agent/phases/nodestart/assets/containerd.service:10-11`).
 - The slice name has no hyphen. systemd treats `-` as the slice hierarchy
   separator, and kubelet escapes `-` in `cgroupRoot` *(inference)*.
 
@@ -200,9 +200,6 @@ sequenceDiagram
   HR->>SD: reset-failed
 ```
 
-- Stopping the slice also stops containerd's shims. They run in the slice even
-  though containerd's `KillMode=process` leaves them running when only
-  containerd stops.
 - `stopGracePeriod` defaults to 30 seconds and `killTimeout` to 15 seconds,
   matching v1's machine stop and terminate waits
   (`pkg/agent/phases/reset/machine.go:66,83`).
@@ -277,7 +274,7 @@ stateDiagram-v2
 
 Wipe:
 
-1. Write `phase: Wiping` durably.
+1. Write `phase: Wiping` and sync it to disk.
 2. Terminate and Unmount, both verified.
 3. Clear every persistent path in the ownership record and every declared
    `cleanup.statePaths` entry. Directories keep their mode and SELinux label;
@@ -337,8 +334,9 @@ flowchart TD
 Without an ownership record, Teardown is conservative:
 
 - It removes only paths and units unique to v2: slot directories,
-  `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`,
-  v2 state, the LocalDNS network unit and `nftables-flush.service`.
+  `unboundednode.slice`, `unbounded-node.target`,
+  `unbounded-node-prestart.service` and v2 state. Host preparation units, such
+  as `nftables-flush.service`, are reversed by the undo log below.
 - Every non-empty standard path in section 4 is reported as a leftover.
 - `v2 reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.
@@ -357,7 +355,7 @@ Without an ownership record, Teardown is conservative:
 | Teardown | None of the runtime's owned resources remain; no ownership record | Leftovers reported; non-zero exit |
 
 Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
-`v2 status`, and through the status sink.
+`v2 status`, and through the status reporter.
 
 ## 11. Crash behavior
 
