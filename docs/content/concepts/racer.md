@@ -94,9 +94,10 @@ scale with the cluster instead of running a separate cache tier.
   The [dataplane settings]({{< relref "reference/racer#dataplane-configuration" >}})
   size it on each node: the thread cap (`RACER_MAX_THREADS`), the
   `RACER_*_BYTES` memory budgets, and the slab files or raw devices it is
-  given. The `shares` annotation, the `exclude` label, and `spec.priority` only
-  choose which nodes hold pages and how capacity is split between caches. They
-  do not limit Racer's use of a node.
+  given. The `exclude` label keeps Racer off a node: no dataplane runs there
+  and the node is not a cache member. The `shares` annotation and
+  `spec.priority` only weight which nodes hold pages and how capacity is split
+  between caches. They do not cap Racer's use of a node.
 - Racer does not fall back to the source on errors, which keeps source load
   predictable. The caller decides what to do. Containerd moves to its next
   mirror host, and apps can retry or read the source directly.
