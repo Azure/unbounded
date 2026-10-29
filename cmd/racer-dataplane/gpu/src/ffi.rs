@@ -15,7 +15,7 @@ pub(crate) use crate::gcm::RawVerdict;
 
 /// `RACER_GPU_ABI_VERSION`.
 #[cfg(all(feature = "native", target_os = "linux"))]
-pub(crate) const ABI_VERSION: u32 = 1;
+pub(crate) const ABI_VERSION: u32 = 2;
 
 /// Result codes from `gpu_cuda.h`.
 pub(crate) mod code {
@@ -32,6 +32,7 @@ pub(crate) mod code {
     pub const EIO: c_int = -8;
     pub const EBUSY: c_int = -9;
     pub const ELEAKED: c_int = -10;
+    pub const EUNSUPPORTED: c_int = -11;
 }
 
 /// Device capability bits (`RACER_GPU_FLAG_*`).
@@ -44,6 +45,12 @@ pub mod flag {
     pub const DMA_BUF: u32 = 4;
     /// GPUDirect RDMA.
     pub const GDR: u32 = 8;
+}
+
+/// `racer_gpu_file_open` flags (`RACER_GPU_FILE_*`).
+pub(crate) mod file_flag {
+    /// Set cuFile's `use_pci_p2pdma` before the driver opens.
+    pub const PCI_P2PDMA: u32 = 1;
 }
 
 /// One device. Matches `struct racer_gpu_device`.
@@ -192,7 +199,7 @@ native_api! {
 
     verdict: unsafe extern "C" fn(*mut c_void, *mut RawVerdict) -> c_int,
 
-    file_open: unsafe extern "C" fn() -> c_int,
+    file_open: unsafe extern "C" fn(u32) -> c_int,
 
     file: unsafe extern "C" fn(c_int, Out) -> c_int,
 
@@ -283,6 +290,7 @@ pub(crate) fn check(rc: c_int, last_driver_error: unsafe extern "C" fn() -> i32)
         code::EIO => Err(Error::Io),
         code::EBUSY => Err(Error::Busy),
         code::ELEAKED => Err(Error::Leaked),
+        code::EUNSUPPORTED => Err(Error::Unsupported(unsafe { last_driver_error() })),
         _ => Err(Error::Driver(rc)),
     }
 }
@@ -292,6 +300,9 @@ pub(crate) struct Shared {
     pub(crate) api: Rc<Api>,
 
     pub(crate) leaks: Cell<u64>,
+
+    /// `racer_gpu_file_open` flags.
+    pub(crate) file_flags: Cell<u32>,
 }
 
 impl Shared {

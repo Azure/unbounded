@@ -18,7 +18,6 @@ use crate::runtime::HashMap;
 use crate::runtime::HashSet;
 use racer_control_wire::CacheId;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -1102,253 +1101,72 @@ impl CachedPage {
     }
 }
 
-/// Most entries one bounded reclaim pass examines, per cache or overall.
-const RECLAIM_SCAN: usize = 256;
-/// Most caches one global reclaim checks for over-share bytes. The window
-/// rotates and resumes after the last examined cache. When every call
-/// examines a full window, each cache with retained entries is checked within
-/// `ceil(caches / PRESSURE_WINDOW)` global reclaims; calls that end early
-/// advance by fewer caches but never skip one.
-pub(crate) const PRESSURE_WINDOW: usize = 8;
-
-/// One cache's entries in touch order, with its own resumable reclaim cursor.
-#[derive(Default)]
-struct Lane {
-    order: BTreeMap<u64, PageId>,
-    after: u64,
-}
-/// Per-cache touch order. Each insert, touch, and remove costs
-/// O(log caches + log entries); nothing here walks all caches or entries.
-#[derive(Default)]
-struct Lanes(BTreeMap<CacheId, Lane>);
-impl Lanes {
-    fn insert(&mut self, tick: u64, id: &PageId) {
-        self.0
-            .entry(id.version.object.cache.clone())
-            .or_default()
-            .order
-            .insert(tick, id.clone());
-    }
-    fn remove(&mut self, tick: u64, id: &PageId) {
-        let cache = &id.version.object.cache;
-        let Some(lane) = self.0.get_mut(cache) else {
-            return;
-        };
-        lane.order.remove(&tick);
-        if lane.order.is_empty() {
-            self.0.remove(cache);
-        }
-    }
-    /// Up to `RECLAIM_SCAN` of one cache's entries, oldest first after its cursor.
-    fn candidates(&self, cache: &CacheId) -> Vec<(u64, PageId)> {
-        let Some(lane) = self.0.get(cache) else {
-            return Vec::new();
-        };
-        lane.order
-            .range((
-                std::ops::Bound::Excluded(lane.after),
-                std::ops::Bound::Unbounded,
-            ))
-            .chain(lane.order.range(..=lane.after))
-            .take(RECLAIM_SCAN)
-            .map(|(tick, id)| (*tick, id.clone()))
-            .collect()
-    }
-    fn advance(&mut self, cache: &CacheId, tick: u64) {
-        if let Some(lane) = self.0.get_mut(cache) {
-            lane.after = tick;
-        }
-    }
-    /// Up to `PRESSURE_WINDOW` caches after `cursor`, wrapping.
-    fn window(&self, cursor: Option<&CacheId>) -> Vec<CacheId> {
-        let keys: Box<dyn Iterator<Item = &CacheId>> = match cursor {
-            Some(cursor) => Box::new(
-                self.0
-                    .range::<CacheId, _>((
-                        std::ops::Bound::Excluded(cursor),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .chain(self.0.range::<CacheId, _>(..=cursor))
-                    .map(|(cache, _)| cache),
-            ),
-            None => Box::new(self.0.keys()),
-        };
-        keys.take(PRESSURE_WINDOW).cloned().collect()
+/// Memory cache lanes: one per cache, so one cache's entries are reclaimed
+/// without scanning the others.
+struct ByCache;
+impl racer_core::cache::Grouping<PageId> for ByCache {
+    type Id = CacheId;
+    fn group(key: &PageId) -> Option<CacheId> {
+        Some(key.version.object.cache.clone())
     }
 }
 
+/// Verified pages in tick order plus a per-version page set. The recency
+/// index and its reclamation rules live in [`racer_core::cache`], which
+/// the simulator drives with payload-free values.
 #[derive(Default)]
 struct Entries {
-    pages: HashMap<PageId, (u64, CachedPage)>,
-    lru: BTreeMap<u64, PageId>,
-    lanes: Lanes,
+    lru: racer_core::cache::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>,
     versions: HashMap<ObjectVersion, HashSet<PageId>>,
-    clock: u64,
-    reclaim_after: u64,
+}
+impl std::ops::Deref for Entries {
+    type Target = racer_core::cache::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>;
+    fn deref(&self) -> &Self::Target {
+        &self.lru
+    }
+}
+impl std::ops::DerefMut for Entries {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lru
+    }
 }
 impl Entries {
-    fn len(&self) -> usize {
-        self.pages.len()
-    }
     fn remove(&mut self, id: &PageId) -> Option<CachedPage> {
-        let (tick, page) = self.pages.remove(id)?;
-        self.lru.remove(&tick);
-        self.lanes.remove(tick, id);
+        let page = self.lru.remove(id)?;
+        self.forget_version(id);
+        Some(page)
+    }
+    /// Drop `id` from its version's page set after the LRU removed it.
+    fn forget_version(&mut self, id: &PageId) {
         if let Some(pages) = self.versions.get_mut(&id.version) {
             pages.remove(id);
             if pages.is_empty() {
                 self.versions.remove(&id.version);
             }
         }
-        Some(page)
     }
     fn insert(&mut self, page: PageResult) -> Result<()> {
-        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
         let id = page.plaintext.page().clone();
         let page = CachedPage::new(page);
-        self.lru.insert(self.clock, id.clone());
-        self.lanes.insert(self.clock, &id);
+        self.lru
+            .insert(id.clone(), page)
+            .map_err(|_| Error::Overloaded)?;
         self.versions
             .entry(id.version.clone())
             .or_default()
-            .insert(id.clone());
-        self.pages.insert(id, (self.clock, page));
+            .insert(id);
         Ok(())
     }
     /// Move `page` to the most recently used tick.
     fn touch(&mut self, page: &PageId) -> Result<()> {
-        let Some((old, _)) = self.pages.get(page) else {
-            return Ok(());
-        };
-        let old = *old;
-        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
-        let tick = self.clock;
-        self.lru.remove(&old);
-        self.lru.insert(tick, page.clone());
-        self.lanes.remove(old, page);
-        self.lanes.insert(tick, page);
-        self.pages.get_mut(page).unwrap().0 = tick;
-        Ok(())
-    }
-    fn candidates(&self) -> Vec<(u64, PageId)> {
-        self.lru
-            .range((
-                std::ops::Bound::Excluded(self.reclaim_after),
-                std::ops::Bound::Unbounded,
-            ))
-            .chain(self.lru.range(..=self.reclaim_after))
-            .take(RECLAIM_SCAN)
-            .map(|(tick, id)| (*tick, id.clone()))
-            .collect()
+        self.lru.touch(page).map_err(|_| Error::Overloaded)
     }
 }
 /// Unverified original ciphertext keyed by page, with a monotonic touch tick
 /// per entry so idle expiry can find the least recently touched entries.
-/// Reads go through `Deref`; every mutation goes through these methods so the
-/// tick index never drifts from the entries.
-#[derive(Default)]
-struct CiphertextEntries {
-    pages: BTreeMap<PageId, UnverifiedPage>,
-    ticks: HashMap<PageId, u64>,
-    order: BTreeMap<u64, PageId>,
-    lanes: Lanes,
-    clock: u64,
-}
-impl std::ops::Deref for CiphertextEntries {
-    type Target = BTreeMap<PageId, UnverifiedPage>;
-    fn deref(&self) -> &Self::Target {
-        &self.pages
-    }
-}
-impl CiphertextEntries {
-    fn touch(&mut self, id: &PageId) {
-        if !self.pages.contains_key(id) {
-            return;
-        }
-        // Wrapping is unreachable in practice (2^64 touches); saturating keeps
-        // the index consistent even then, at worst making order ambiguous.
-        self.clock = self.clock.saturating_add(1);
-        if let Some(old) = self.ticks.insert(id.clone(), self.clock) {
-            self.order.remove(&old);
-            self.lanes.remove(old, id);
-        }
-        self.order.insert(self.clock, id.clone());
-        self.lanes.insert(self.clock, id);
-    }
-    fn insert(&mut self, id: PageId, page: UnverifiedPage) {
-        self.pages.insert(id.clone(), page);
-        self.touch(&id);
-    }
-    fn remove(&mut self, id: &PageId) -> Option<UnverifiedPage> {
-        let page = self.pages.remove(id)?;
-        if let Some(tick) = self.ticks.remove(id) {
-            self.order.remove(&tick);
-            self.lanes.remove(tick, id);
-        }
-        Some(page)
-    }
-    fn retain(&mut self, mut keep: impl FnMut(&PageId) -> bool) {
-        let removed: Vec<_> = self.pages.keys().filter(|id| !keep(id)).cloned().collect();
-        for id in removed {
-            self.remove(&id);
-        }
-    }
-}
-
-/// Entries nobody inserted or hit for this long are released by
-/// [`MemoryCache::expire_idle`], so a worker that served a burst does not keep
-/// its cached pages (and their pooled buffers) forever. Busy workers keep hot
-/// pages because every hit renews them.
-pub(crate) const CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-/// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
-const CACHE_EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
-/// Upper bound of entries examined per class by one `expire_idle` call.
-pub(crate) const CACHE_EXPIRY_BATCH: usize = 32;
-
-/// Time-to-tick checkpoints and resumable expiry cursors. Between checkpoints
-/// with no pass in progress, `expire_idle` does constant work.
-#[derive(Default)]
-struct Expiry {
-    /// `(time, verified clock, unverified clock)`, oldest first. The front is
-    /// kept as the newest checkpoint at least `CACHE_IDLE_TTL` old.
-    checkpoints: std::collections::VecDeque<(std::time::Instant, u64, u64)>,
-    /// Last examined tick of an in-progress pass; `None` when no pass is due.
-    verified: Option<u64>,
-    ciphertext: Option<u64>,
-}
-impl Expiry {
-    /// Record a checkpoint at most once per interval and return the tick
-    /// cutoffs, if any checkpoint is at least `CACHE_IDLE_TTL` old.
-    fn advance(
-        &mut self,
-        now: std::time::Instant,
-        verified: u64,
-        ciphertext: u64,
-    ) -> Option<(u64, u64)> {
-        if self
-            .checkpoints
-            .back()
-            .is_none_or(|(at, _, _)| now.saturating_duration_since(*at) >= CACHE_EXPIRY_CHECKPOINT)
-        {
-            self.checkpoints.push_back((now, verified, ciphertext));
-            // Each new checkpoint may move the cutoff: start a fresh pass that
-            // also revisits entries that were busy last time. An unfinished
-            // pass keeps its cursor so a long busy prefix cannot starve later
-            // entries; it adopts the newer cutoff, which is safe because a
-            // touched entry moves to a tick above every aged checkpoint.
-            self.verified.get_or_insert(0);
-            self.ciphertext.get_or_insert(0);
-        }
-        let old = |at: &std::time::Instant| now.saturating_duration_since(*at) >= CACHE_IDLE_TTL;
-        while self.checkpoints.get(1).is_some_and(|(at, _, _)| old(at)) {
-            self.checkpoints.pop_front();
-        }
-        self.checkpoints
-            .front()
-            .filter(|(at, _, _)| old(at))
-            .map(|(_, verified, ciphertext)| (*verified, *ciphertext))
-    }
-}
+use racer_core::cache::Visit;
+type CiphertextEntries =
+    racer_core::cache::OrderedLru<PageId, UnverifiedPage, std::hash::RandomState, ByCache>;
 
 /// Worker-local original ciphertext, both authenticated (with a weak handle to
 /// any live plaintext) and not yet authenticated; independent of disk clock.
@@ -1363,10 +1181,15 @@ pub struct MemoryCache {
     /// Last cache examined by a global reclaim's over-share window.
     pressure_cursor: RefCell<Option<CacheId>>,
     availability: Rc<crate::control::Availability>,
-    expiry: RefCell<Expiry>,
+    expiry: RefCell<racer_core::cache::Expiry>,
 }
 
 impl MemoryCache {
+    /// Verified pages currently indexed, without touching them.
+    #[cfg(test)]
+    pub(crate) fn resident(&self) -> Vec<PageId> {
+        self.entries.borrow().pages.keys().cloned().collect()
+    }
     /// This worker's allocation front end.
     pub(crate) fn buffers(&self) -> &BufferPool {
         &self.pool
@@ -1379,7 +1202,7 @@ impl MemoryCache {
             ciphertext_cursor: RefCell::new(None),
             pressure_cursor: RefCell::new(None),
             availability,
-            expiry: RefCell::new(Expiry::default()),
+            expiry: RefCell::new(racer_core::cache::Expiry::default()),
         }
     }
     fn available(&self, page: &CachedPage) -> bool {
@@ -1553,14 +1376,7 @@ impl MemoryCache {
             return Ok(());
         }
         if entries.len() + self.ciphertext_entries.borrow().len() >= self.pool.entry_limit() {
-            let id = entries
-                .candidates()
-                .into_iter()
-                .find_map(|(tick, id)| {
-                    entries.reclaim_after = tick;
-                    idle(&entries.pages[&id].1).then_some(id)
-                })
-                .ok_or(Error::Overloaded)?;
+            let id = entries.victim(idle).ok_or(Error::Overloaded)?;
             entries.remove(&id);
         }
         entries.insert(page)
@@ -1599,18 +1415,20 @@ impl MemoryCache {
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
         let mut released = self.reclaim_ciphertext(None, bytes);
         let mut entries = self.entries.borrow_mut();
-        let candidates = entries.candidates();
-        for (tick, id) in candidates {
+        let mut versions = Vec::new();
+        entries.lru.reclaim(|id, entry| {
             if released >= bytes {
-                break;
+                return Visit::Stop;
             }
-            entries.reclaim_after = tick;
-            let entry = &entries.pages[&id].1;
             if !idle(entry) {
-                continue;
+                return Visit::Skip;
             }
             released = released.saturating_add(entry.ciphertext.inner.reservation().amount());
-            entries.remove(&id);
+            versions.push(id.clone());
+            Visit::Remove
+        });
+        for id in versions {
+            entries.forget_version(&id);
         }
         self.pool.reclaim_buffers();
         Ok(released)
@@ -1630,25 +1448,27 @@ impl MemoryCache {
         }
         let mut released = self.reclaim_ciphertext(cache, bytes);
         let mut entries = self.entries.borrow_mut();
-        let candidates = entries.candidates();
-        for (tick, id) in candidates {
+        let mut versions = Vec::new();
+        entries.lru.reclaim(|id, entry| {
             if released >= bytes {
-                break;
+                return Visit::Stop;
             }
-            entries.reclaim_after = tick;
-            let entry = &entries.pages[&id].1;
             if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache) {
-                continue;
+                return Visit::Skip;
             }
-            released = released.saturating_add(release_queued(&id, &entry.ciphertext));
+            released = released.saturating_add(release_queued(id, &entry.ciphertext));
             if released >= bytes {
-                break;
+                return Visit::Last;
             }
             if !idle(entry) {
-                continue;
+                return Visit::Skip;
             }
             released = released.saturating_add(entry.ciphertext.inner.reservation().amount());
-            entries.remove(&id);
+            versions.push(id.clone());
+            Visit::Remove
+        });
+        for id in versions {
+            entries.forget_version(&id);
         }
         released
     }
@@ -1668,9 +1488,9 @@ impl MemoryCache {
         }
         Ok(())
     }
-    /// Release entries not inserted or hit for at least `CACHE_IDLE_TTL`,
+    /// Release entries not inserted or hit for at least `racer_core::cache::IDLE_TTL`,
     /// skipping any still referenced elsewhere (retried on the next pass).
-    /// Examines at most `CACHE_EXPIRY_BATCH` entries per class per call and
+    /// Examines at most `racer_core::cache::EXPIRY_BATCH` entries per class per call and
     /// returns the number of entries released. Freed buffers return to the
     /// pools, whose own maintenance decays them.
     pub(crate) fn expire_idle(&self, now: std::time::Instant) -> usize {
@@ -1685,18 +1505,9 @@ impl MemoryCache {
         let mut released = 0;
         if let Some(after) = expiry.verified {
             let mut entries = self.entries.borrow_mut();
-            let selected: Vec<_> = entries
-                .lru
-                .range((
-                    std::ops::Bound::Excluded(after),
-                    std::ops::Bound::Included(verified_cutoff),
-                ))
-                .take(CACHE_EXPIRY_BATCH)
-                .map(|(tick, id)| (*tick, id.clone()))
-                .collect();
-            expiry.verified = (selected.len() == CACHE_EXPIRY_BATCH)
-                .then(|| selected.last().map(|(tick, _)| *tick))
-                .flatten();
+            let (selected, next) =
+                entries.expiring(after, verified_cutoff, racer_core::cache::EXPIRY_BATCH);
+            expiry.verified = next;
             for (_, id) in selected {
                 if idle(&entries.pages[&id].1) {
                     entries.remove(&id);
@@ -1706,18 +1517,9 @@ impl MemoryCache {
         }
         if let Some(after) = expiry.ciphertext {
             let mut entries = self.ciphertext_entries.borrow_mut();
-            let selected: Vec<_> = entries
-                .order
-                .range((
-                    std::ops::Bound::Excluded(after),
-                    std::ops::Bound::Included(ciphertext_cutoff),
-                ))
-                .take(CACHE_EXPIRY_BATCH)
-                .map(|(tick, id)| (*tick, id.clone()))
-                .collect();
-            expiry.ciphertext = (selected.len() == CACHE_EXPIRY_BATCH)
-                .then(|| selected.last().map(|(tick, _)| *tick))
-                .flatten();
+            let (selected, next) =
+                entries.expiring(after, ciphertext_cutoff, racer_core::cache::EXPIRY_BATCH);
+            expiry.ciphertext = next;
             for (_, id) in selected {
                 if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
                     entries.remove(&id);
@@ -1739,8 +1541,8 @@ impl MemoryCache {
     /// released. Plaintext is never retained, so plaintext pressure releases
     /// nothing.
     ///
-    /// Work is bounded: at most `PRESSURE_WINDOW` caches, each with at most
-    /// `RECLAIM_SCAN` entries per kind, plus the existing unweighted pass.
+    /// Work is bounded: at most `racer_core::cache::PRESSURE_WINDOW` caches, each with at most
+    /// `racer_core::cache::RECLAIM_WINDOW` entries per kind, plus the existing unweighted pass.
     /// The window rotates instead of ranking all caches. The next call
     /// resumes after the last cache this call examined, so a pass that ends
     /// early does not skip the rest of its window. Busy or held entries are
@@ -1794,9 +1596,9 @@ impl MemoryCache {
         }
         released
     }
-    /// Up to `PRESSURE_WINDOW` caches with retained entries after the cursor,
+    /// Up to `racer_core::cache::PRESSURE_WINDOW` caches with retained entries after the cursor,
     /// in rotating order. Does not move the cursor; `reclaim` moves it as it
-    /// examines each cache. Cost is O(PRESSURE_WINDOW * log caches),
+    /// examines each cache. Cost is O(racer_core::cache::PRESSURE_WINDOW * log caches),
     /// independent of entry count.
     fn pressure_window(&self) -> Vec<CacheId> {
         let cursor = self.pressure_cursor.borrow();
@@ -1811,7 +1613,7 @@ impl MemoryCache {
         let wrapped = |cache: &CacheId| cursor.as_ref().is_some_and(|cursor| cache <= cursor);
         caches.sort_by(|a, b| (wrapped(a), a).cmp(&(wrapped(b), b)));
         caches.dedup();
-        caches.truncate(PRESSURE_WINDOW);
+        caches.truncate(racer_core::cache::PRESSURE_WINDOW);
         caches
     }
     /// One bounded pass over a single cache's idle ciphertext, oldest first.
@@ -1906,6 +1708,274 @@ pub(crate) mod tests {
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
     use uring_runtime::reactor::IoBuffer;
+    /// Owner and reclamation contracts over real allocations.
+    mod owners {
+        use super::*;
+        use crate::model::CacheKey;
+        use crate::model::ObjectId;
+        use crate::model::RequestId;
+        use crate::model::StrongEtag;
+        use crate::model::WorkerId;
+        use crate::runtime::RequestScope;
+        use crate::security;
+        use crate::security::CryptoClient;
+        use crate::security::PageCrypto;
+        use crate::security::PageCryptoEngine;
+        use crate::worker::CryptoRuntime;
+        use std::num::NonZeroUsize;
+        use std::task::Context;
+        use std::time::Duration;
+        use std::time::Instant;
+        use uring_runtime::group::Service;
+
+        const PLAIN: usize = PAGE_BYTES as usize;
+        const CIPHER: usize = PLAIN + 16;
+
+        fn admission(pages: usize, dirty: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.plaintext_bytes = NonZeroUsize::new(pages * PLAIN).unwrap();
+            limits.ciphertext_bytes = NonZeroUsize::new(pages * CIPHER).unwrap();
+            limits.dirty_bytes = NonZeroUsize::new(dirty).unwrap();
+            limits.metadata_entries = NonZeroUsize::new(16).unwrap();
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
+        }
+
+        fn descriptor(cache: &CacheId, version: &str, length: usize) -> VersionMetadata {
+            VersionMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([0; 32]),
+                    },
+                    etag: StrongEtag::test_value(version),
+                },
+                length: length as u64,
+            }
+        }
+
+        fn page_id(metadata: &VersionMetadata) -> PageId {
+            PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            }
+        }
+
+        fn allocated_page(
+            admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+            cache: &CacheId,
+            version: &str,
+            length: usize,
+        ) -> PageResult {
+            let metadata = descriptor(cache, version, length);
+            let id = page_id(&metadata);
+            let reserved = crate::admission::reserve_fill(admission, cache, false).unwrap();
+            let pool = BufferPool::new(admission.clone());
+            let mut plaintext = pool.plaintext(reserved.plaintext, length).unwrap();
+            plaintext.bytes_mut().unwrap().fill(7);
+            let (bytes, reservation) = plaintext.into_parts();
+            // Structural fixture only: production allocation and owner layout, not an
+            // authentication oracle (security/aead.rs performs this transfer).
+            let plaintext = VerifiedPage {
+                inner: Arc::new(VerifiedBytes {
+                    page: id.clone(),
+                    storage: flow_control::ChargedBytes {
+                        bytes: bytes.into_vec(),
+                        reservation,
+                    },
+                }),
+            };
+            let ciphertext = pool
+                .ciphertext(
+                    reserved.ciphertext,
+                    PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
+                        page: id,
+                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: length as u32,
+                        ciphertext_length: (length + 16) as u32,
+                    },
+                    vec![9; length + 16],
+                )
+                .unwrap();
+            PageResult {
+                metadata: metadata.for_pin(),
+                plaintext,
+                ciphertext,
+            }
+        }
+
+        fn occupancy(admission: &flow_control::Quotas<AdmissionPolicy>) -> [usize; 3] {
+            admission.reclaim_buffers();
+            [
+                ResourceClass::Plaintext,
+                ResourceClass::Ciphertext,
+                ResourceClass::DirtyCiphertext,
+            ]
+            .map(|class| admission.used(class))
+        }
+
+        /// Duplicate readers charge once; the cache retains ciphertext and holds
+        /// plaintext weakly, so a plaintext-only reader does not pin cached
+        /// ciphertext; lookup removal is not a completion fence.
+        #[test]
+        fn duplicate_owners_charge_once_until_each_last_owner() {
+            let real = admission(2, CIPHER);
+            let cache = CacheId(crate::test_support::security::CACHE.into());
+            let memory = MemoryCache::new(
+                BufferPool::new(real.clone()),
+                crate::test_support::availability(),
+            );
+            let page = allocated_page(&real, &cache, "v1", PLAIN);
+            let id = page.plaintext.page().clone();
+            let delivered = page.plaintext.clone();
+            memory.publish(page).unwrap();
+            assert_eq!(occupancy(&real), [PLAIN, CIPHER, 0], "publish");
+
+            let read = memory.get(&id).unwrap().unwrap();
+            let again = memory.get(&id).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&read.plaintext.inner, &again.plaintext.inner));
+            assert!(Arc::ptr_eq(&read.ciphertext.inner, &again.ciphertext.inner));
+            drop(again);
+            assert_eq!(occupancy(&real), [PLAIN, CIPHER, 0], "duplicate reader");
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
+            drop(read.plaintext);
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(0), "ciphertext reader");
+            drop(read.ciphertext);
+            let plain = memory.get(&id).unwrap().unwrap().plaintext;
+            assert!(Arc::ptr_eq(&plain.inner, &delivered.inner));
+            // A plaintext reader does not pin the cached ciphertext.
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(CIPHER));
+            assert_eq!(occupancy(&real), [PLAIN, 0, 0], "plaintext-only reader");
+            drop(delivered);
+            memory.remove_cache(&cache).unwrap();
+            assert!(memory.get(&id).unwrap().is_none());
+            assert_eq!(occupancy(&real), [PLAIN, 0, 0], "lookup removal");
+            assert_eq!(plain.bytes().len(), PLAIN);
+            assert_eq!(plain.bytes()[PLAIN - 1], 7);
+            drop(plain);
+            assert_eq!(occupancy(&real), [0, 0, 0], "last owner released");
+        }
+
+        /// Cache A over its fair share cannot reserve by evicting cache B: the local
+        /// deficit wins over global room, busy A pages survive, and once idle only
+        /// A's oldest ciphertext is reclaimed. Plaintext pressure cannot be relieved
+        /// by the cache, which holds plaintext weakly.
+        #[test]
+        fn fair_reclamation_keeps_other_cache() {
+            for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
+                let real = admission(4, CIPHER);
+                let a = CacheId(crate::test_support::security::CACHE.into());
+                let b = CacheId("44444444-4444-4444-8444-444444444444".into());
+                let memory = MemoryCache::new(
+                    BufferPool::new(real.clone()),
+                    crate::test_support::availability_for(vec![a.clone(), b.clone()]),
+                );
+                let mut ids = Vec::new();
+                for (cache, version) in [(&b, "other"), (&a, "old"), (&a, "new")] {
+                    let page = allocated_page(&real, cache, version, PLAIN);
+                    ids.push(page.plaintext.page().clone());
+                    memory.publish(page).unwrap();
+                }
+                let cipher = matches!(class, ResourceClass::Ciphertext);
+                assert_eq!(occupancy(&real), [0, 3 * CIPHER, 0]);
+                let amount = if cipher { CIPHER } else { PLAIN };
+                if cipher {
+                    assert!(matches!(
+                        real.reserve(Some(&a), class, amount),
+                        Err(flow_control::Error::Overloaded)
+                    ));
+                    let (owner, deficit) = real.reclamation(&a, class, amount).unwrap();
+                    assert_eq!(owner, Some(a.clone()));
+                    assert!(deficit > 0 && deficit <= amount);
+                }
+                // Readers of A's pages hold ciphertext and pin them.
+                let reads: Vec<_> = ids[1..]
+                    .iter()
+                    .map(|id| memory.ciphertext(id).unwrap().unwrap())
+                    .collect();
+                assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_, _| 0), 0);
+                assert_eq!(occupancy(&real), [0, 3 * CIPHER, 0], "busy pages survive");
+                drop(reads);
+                let retained = if cipher {
+                    assert_eq!(
+                        memory.reclaim_idle(class, Some(&a), amount, |_, _| 0),
+                        amount
+                    );
+                    assert!(memory.ciphertext(&ids[1]).unwrap().is_none());
+                    2
+                } else {
+                    assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_, _| 0), 0);
+                    assert!(memory.ciphertext(&ids[1]).unwrap().is_some());
+                    3
+                };
+                assert!(memory.ciphertext(&ids[0]).unwrap().is_some(), "other cache");
+                assert!(memory.ciphertext(&ids[2]).unwrap().is_some());
+                assert_eq!(occupancy(&real), [0, retained * CIPHER, 0]);
+                let next = real.reserve(Some(&a), class, amount).unwrap();
+                drop(next);
+                assert_eq!(memory.evict_idle(usize::MAX), Ok(retained * CIPHER));
+                assert_eq!(occupancy(&real), [0, 0, 0], "drained");
+            }
+        }
+
+        fn scope() -> RequestScope {
+            RequestScope::new(
+                RequestId([1; 16]),
+                Instant::now() + Duration::from_secs(600),
+            )
+            .unwrap()
+        }
+
+        /// A canceled caller is not a completion fence: page charges stay held after
+        /// the caller drops its work and until the crypto completion is reaped, even
+        /// after admission stops.
+        #[test]
+        fn canceled_crypto_holds_owners_until_completion_reap() {
+            let real = admission(1, CIPHER);
+            let cache = CacheId(crate::test_support::security::CACHE.into());
+            let reserved = crate::admission::reserve_fill(&real, &cache, false).unwrap();
+            let buffers = BufferPool::new(real.clone());
+            let plaintext = buffers.plaintext(reserved.plaintext, 3).unwrap();
+            let (port, engine_port) = security::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+            let client = Rc::new(CryptoClient::new(port));
+            let crypto = PageCrypto::new(
+                Rc::new(crate::test_support::security::keys()),
+                client.clone(),
+            );
+            let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
+            let scope = scope();
+            let mut work = crypto.encrypt(
+                page_id(&descriptor(&cache, "v1", 3)),
+                plaintext,
+                reserved.ciphertext,
+                &scope,
+            );
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(client.outstanding(), 1);
+            assert_eq!(occupancy(&real), [3, CIPHER, 0], "accepted crypto");
+            scope.cancel().unwrap();
+            assert!(work.as_mut().poll(&mut cx).is_pending());
+            drop(work);
+            real.stop();
+            client.poll_budgeted(1).unwrap();
+            assert_eq!(occupancy(&real), [3, CIPHER, 0], "canceled caller");
+            assert_eq!(client.outstanding(), 1);
+            engine.poll_budgeted(&mut cx, 1).unwrap();
+            assert_eq!(occupancy(&real), [3, CIPHER, 0], "published, not reaped");
+            assert_eq!(client.outstanding(), 1);
+            client.poll_budgeted(1).unwrap();
+            assert_eq!(client.outstanding(), 0);
+            assert_eq!(occupancy(&real), [0, 0, 0], "reaped");
+            assert!(
+                ResourceClass::ALL
+                    .iter()
+                    .all(|class| real.used(*class) == 0)
+            );
+        }
+    }
     mod cache {
         use super::*;
         use crate::model::ExpiresAt;
@@ -2148,7 +2218,9 @@ pub(crate) mod tests {
 
                 fn resident(cache: &MemoryCache, owner: &str) -> usize {
                     let owner = id(owner);
-                    let count = |lanes: &Lanes| lanes.0.get(&owner).map_or(0, |l| l.order.len());
+                    let count = |lanes: &racer_core::cache::Lanes<CacheId, PageId>| {
+                        lanes.0.get(&owner).map_or(0, |l| l.order.len())
+                    };
                     count(&cache.entries.borrow().lanes)
                         + count(&cache.ciphertext_entries.borrow().lanes)
                 }
@@ -2163,12 +2235,12 @@ pub(crate) mod tests {
                         for (tick, page) in &lane.order {
                             assert_eq!(&page.version.object.cache, owner);
                             assert_eq!(entries.pages[page].0, *tick);
-                            assert_eq!(entries.lru[tick], *page);
+                            assert_eq!(entries.lru.lru[tick], *page);
                             lane_entries += 1;
                         }
                     }
                     assert_eq!(lane_entries, entries.pages.len());
-                    assert_eq!(entries.lru.len(), entries.pages.len());
+                    assert_eq!(entries.lru.lru.len(), entries.pages.len());
                     let ciphertext = cache.ciphertext_entries.borrow();
                     let mut lane_entries = 0;
                     for (owner, lane) in &ciphertext.lanes.0 {
@@ -2420,7 +2492,7 @@ pub(crate) mod tests {
                     all.push("target");
                     let cache = memory(&all, 4 * CACHES);
                     // Older busy entries of other caches fill a whole scan window.
-                    let busy: Vec<_> = (0..RECLAIM_SCAN + 44)
+                    let busy: Vec<_> = (0..racer_core::cache::RECLAIM_WINDOW + 44)
                         .map(|i| {
                             let page = verified_in(&cache, &names[i % 4], &format!("busy{i}"));
                             cache.ciphertext(&page).unwrap().unwrap()
@@ -2457,10 +2529,10 @@ pub(crate) mod tests {
                         ),
                         CIPHER
                     );
-                    // Each global reclaim weighs at most PRESSURE_WINDOW caches,
+                    // Each global reclaim weighs at most racer_core::cache::PRESSURE_WINDOW caches,
                     // and rotation reaches every cache within ceil(C / W) calls.
                     let seen = RefCell::new(std::collections::BTreeSet::new());
-                    let rounds = CACHES.div_ceil(PRESSURE_WINDOW);
+                    let rounds = CACHES.div_ceil(racer_core::cache::PRESSURE_WINDOW);
                     for _ in 0..rounds {
                         let calls = Cell::new(0);
                         let queued = Cell::new(0);
@@ -2479,9 +2551,9 @@ pub(crate) mod tests {
                             },
                             |_, _| 0,
                         );
-                        assert!(calls.get() <= PRESSURE_WINDOW);
+                        assert!(calls.get() <= racer_core::cache::PRESSURE_WINDOW);
                         // Only the unweighted fallback examines verified entries.
-                        assert!(queued.get() <= RECLAIM_SCAN);
+                        assert!(queued.get() <= racer_core::cache::RECLAIM_WINDOW);
                     }
                     assert_eq!(seen.borrow().len(), CACHES);
                     assert_lanes(&cache);
@@ -2492,7 +2564,7 @@ pub(crate) mod tests {
                 fn early_success_rotation_reaches_every_cache() {
                     // A multiple of the window, so a cursor that jumped to the
                     // last prefetched cache would revisit only every eighth.
-                    const CACHES: usize = 2 * PRESSURE_WINDOW;
+                    const CACHES: usize = 2 * racer_core::cache::PRESSURE_WINDOW;
                     let names: Vec<_> = (0..CACHES).map(|i| format!("r{i:02}")).collect();
                     let all: Vec<&str> = names.iter().map(String::as_str).collect();
                     let cache = memory(&all, 8 * CACHES);
@@ -2759,7 +2831,7 @@ pub(crate) mod tests {
                 let mut at = std::time::Duration::ZERO;
                 while at <= until {
                     released += cache.expire_idle(start + at);
-                    at += CACHE_EXPIRY_CHECKPOINT;
+                    at += racer_core::cache::EXPIRY_CHECKPOINT;
                 }
                 released
             }
@@ -2777,19 +2849,29 @@ pub(crate) mod tests {
                 let cipher = publish_ciphertext(&cache, &admission, "cipher");
                 let touched = publish_ciphertext(&cache, &admission, "touched");
                 // Nothing is old enough yet.
-                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL / 2), 0);
+                assert_eq!(
+                    expire_through(&cache, start, racer_core::cache::IDLE_TTL / 2),
+                    0
+                );
                 // Hits halfway through renew both classes.
                 assert!(cache.ciphertext(&hot).unwrap().is_some());
                 assert!(cache.unverified(&touched).unwrap().is_some());
-                let half = start + CACHE_IDLE_TTL / 2;
-                assert_eq!(expire_through(&cache, half, CACHE_IDLE_TTL / 2), 2);
+                let half = start + racer_core::cache::IDLE_TTL / 2;
+                assert_eq!(
+                    expire_through(&cache, half, racer_core::cache::IDLE_TTL / 2),
+                    2
+                );
                 assert!(!cache.entries.borrow().pages.contains_key(&cold));
                 assert!(cache.entries.borrow().pages.contains_key(&hot));
                 assert!(!cache.ciphertext_entries.borrow().contains_key(&cipher));
                 assert!(cache.ciphertext_entries.borrow().contains_key(&touched));
                 // Without further hits the renewed entries expire one TTL later.
                 assert_eq!(
-                    expire_through(&cache, start + CACHE_IDLE_TTL, CACHE_IDLE_TTL),
+                    expire_through(
+                        &cache,
+                        start + racer_core::cache::IDLE_TTL,
+                        racer_core::cache::IDLE_TTL
+                    ),
                     2
                 );
                 assert_eq!(cache.entries.borrow().len(), 0);
@@ -2816,9 +2898,13 @@ pub(crate) mod tests {
                 assert!(cache.ciphertext_entries.borrow().is_empty());
                 assert_eq!(cache.entries.borrow().len(), 1);
                 // Still held externally, so not idle yet.
-                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                assert_eq!(
+                    expire_through(&cache, start, racer_core::cache::IDLE_TTL * 2),
+                    0
+                );
                 drop(copy);
-                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                let later =
+                    start + racer_core::cache::IDLE_TTL * 2 + racer_core::cache::EXPIRY_CHECKPOINT;
                 assert_eq!(cache.expire_idle(later), 1);
                 assert_eq!(cache.entries.borrow().len(), 0);
                 assert!(cache.ciphertext_entries.borrow().is_empty());
@@ -2853,12 +2939,16 @@ pub(crate) mod tests {
                     .copy
                     .ciphertext
                     .clone();
-                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                assert_eq!(
+                    expire_through(&cache, start, racer_core::cache::IDLE_TTL * 2),
+                    0
+                );
                 assert_eq!(cache.entries.borrow().len(), 1);
                 assert_eq!(cache.ciphertext_entries.borrow().len(), 1);
                 drop((held, held_cipher));
                 // The next checkpoint pass revisits and releases them.
-                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                let later =
+                    start + racer_core::cache::IDLE_TTL * 2 + racer_core::cache::EXPIRY_CHECKPOINT;
                 assert_eq!(cache.expire_idle(later), 2);
                 assert_eq!(cache.entries.borrow().len(), 0);
                 assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
@@ -2866,7 +2956,7 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_bounds_work_per_call() {
-                let count = CACHE_EXPIRY_BATCH * 2 + 3;
+                let count = racer_core::cache::EXPIRY_BATCH * 2 + 3;
                 let admission = admission(count * 2 + 8);
                 let cache = MemoryCache::new(
                     BufferPool::new(admission.clone()),
@@ -2878,9 +2968,15 @@ pub(crate) mod tests {
                 }
                 let start = std::time::Instant::now();
                 assert_eq!(cache.expire_idle(start), 0);
-                let expired = start + CACHE_IDLE_TTL;
-                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
-                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
+                let expired = start + racer_core::cache::IDLE_TTL;
+                assert_eq!(
+                    cache.expire_idle(expired),
+                    racer_core::cache::EXPIRY_BATCH * 2
+                );
+                assert_eq!(
+                    cache.expire_idle(expired),
+                    racer_core::cache::EXPIRY_BATCH * 2
+                );
                 assert_eq!(cache.expire_idle(expired), 6);
                 // The pass is finished: further calls in this interval do no work.
                 assert_eq!(cache.expire_idle(expired), 0);
@@ -2892,7 +2988,7 @@ pub(crate) mod tests {
 
             #[test]
             fn expire_idle_resumes_past_busy_prefix_across_checkpoints() {
-                let busy = CACHE_EXPIRY_BATCH + 1;
+                let busy = racer_core::cache::EXPIRY_BATCH + 1;
                 let idle = 3;
                 let admission = admission((busy + idle) * 2 + 8);
                 let cache = MemoryCache::new(
@@ -2920,8 +3016,11 @@ pub(crate) mod tests {
                 // One call per checkpoint: each call starts a new interval.
                 let mut released = 0;
                 for step in 0..4u32 {
-                    released +=
-                        cache.expire_idle(start + CACHE_IDLE_TTL + CACHE_EXPIRY_CHECKPOINT * step);
+                    released += cache.expire_idle(
+                        start
+                            + racer_core::cache::IDLE_TTL
+                            + racer_core::cache::EXPIRY_CHECKPOINT * step,
+                    );
                 }
                 assert_eq!(released, idle * 2);
                 assert_eq!(cache.entries.borrow().len(), busy);
@@ -2937,13 +3036,15 @@ pub(crate) mod tests {
                     crate::test_support::availability(),
                 );
                 let start = std::time::Instant::now();
-                expire_through(&cache, start, CACHE_IDLE_TTL * 10);
+                expire_through(&cache, start, racer_core::cache::IDLE_TTL * 10);
                 // Calls within one interval do not add checkpoints.
                 for _ in 0..10 {
-                    cache.expire_idle(start + CACHE_IDLE_TTL * 10);
+                    cache.expire_idle(start + racer_core::cache::IDLE_TTL * 10);
                 }
-                let limit =
-                    (CACHE_IDLE_TTL.as_secs() / CACHE_EXPIRY_CHECKPOINT.as_secs()) as usize + 2;
+                let limit = (racer_core::cache::IDLE_TTL.as_secs()
+                    / racer_core::cache::EXPIRY_CHECKPOINT.as_secs())
+                    as usize
+                    + 2;
                 assert!(cache.expiry.borrow().checkpoints.len() <= limit);
             }
 
@@ -3270,7 +3371,7 @@ pub(crate) mod tests {
             let start = std::time::Instant::now();
             assert_eq!(cache.expire_idle(start), 0);
             // Held plaintext is the reader's; it does not pin the entry.
-            assert_eq!(cache.expire_idle(start + CACHE_IDLE_TTL), 1);
+            assert_eq!(cache.expire_idle(start + racer_core::cache::IDLE_TTL), 1);
             assert!(cache.ciphertext(&id).unwrap().is_none());
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
             assert_eq!(held.bytes(), &[1; 3]);
@@ -3376,6 +3477,24 @@ pub(crate) mod tests {
                 Some(copy.metadata.immutable())
             );
             assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+        }
+        /// A duplicate publish is not a use, so the oldest
+        /// insert is still evicted first (the simulator's `memory_insert`
+        /// keeps the same order).
+        #[test]
+        fn duplicate_publish_does_not_touch() {
+            let admission = admission(2);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let id = |v: &str| bundle(&admission, v).plaintext.page().clone();
+            for version in ["v0", "v1", "v0", "v2"] {
+                cache.publish(bundle(&admission, version)).unwrap();
+            }
+            let resident = cache.resident();
+            assert!(!resident.contains(&id("v0")));
+            assert!(resident.contains(&id("v1")) && resident.contains(&id("v2")));
         }
         #[test]
         fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {

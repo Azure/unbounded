@@ -90,6 +90,70 @@ fn gpu_read_writes_the_range_at_the_destination_offset() {
     assert_no_body_leases(&fixture);
 }
 
+/// A UUID header as `nvidia-smi` prints it for simulated GPU `index`.
+fn uuid_field(index: u8) -> String {
+    format!(
+        "Racer-Gpu-Uuid: {}\r\n",
+        racer_gpu::uuid_string(&[index; 16])
+    )
+}
+
+/// Serve a five-byte `gpu-read` into an allocation on GPU `ordinal` of four,
+/// sending `extra` fields. Returns the status line and the import attempts.
+fn read_on_four_gpus(ordinal: i32, extra: &str) -> (String, usize, Vec<u8>) {
+    let helper = start(GpuMode::Required, 4).unwrap();
+    let fixture = gpu_fixture(b"hello".to_vec(), &helper);
+    let allocation = allocate(&helper, ordinal, GRANULE);
+    let from = trace_len(&helper);
+    let output = exchange(
+        &fixture,
+        &direct_request("gpu-read", &format!("{}{extra}", fields("", 0, 5, GRANULE))),
+        &[allocation.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    let status = head.lines().next().unwrap().to_string();
+    let imports = calls(&helper, from, Operation::Import);
+    settle(&fixture);
+    assert_released(&helper);
+    assert_no_body_leases(&fixture);
+    (status, imports, read_allocation(&allocation, 0, 5))
+}
+
+#[test]
+fn gpu_read_uuid_selects_a_nonzero_ordinal_first() {
+    // The client's container sees this GPU as device 0; the dataplane sees it
+    // as device 3. The UUID is the same in both.
+    let (status, imports, written) = read_on_four_gpus(3, &uuid_field(3));
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert_eq!(imports, 1, "only the named GPU is tried");
+    assert_eq!(written, b"hello");
+}
+
+#[test]
+fn gpu_read_without_uuid_tries_each_gpu() {
+    let (status, imports, written) = read_on_four_gpus(3, "");
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert_eq!(imports, 4);
+    assert_eq!(written, b"hello");
+}
+
+#[test]
+fn gpu_read_unknown_uuid_is_501_so_the_client_uses_the_host() {
+    let (status, imports, written) = read_on_four_gpus(3, &uuid_field(9));
+    assert!(status.starts_with("http/1.1 501"), "{status}");
+    assert_eq!(imports, 0, "nothing is imported");
+    assert_eq!(written, [0; 5]);
+}
+
+#[test]
+fn gpu_read_wrong_uuid_still_finds_the_owning_gpu() {
+    let (status, imports, written) = read_on_four_gpus(2, &uuid_field(1));
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    // GPU 1 first, then 0, then 2.
+    assert_eq!(imports, 3);
+    assert_eq!(written, b"hello");
+}
+
 #[test]
 fn gpu_read_spans_pages() {
     let length = 2 * PAGE_BYTES as usize + 7;
@@ -158,6 +222,12 @@ fn gpu_read_errors_before_the_head_release_everything() {
         "nothing written"
     );
     assert_no_body_leases(&fixture);
+    // The 412 comes after the import, so it counts as a GPU open.
+    use crate::gpu_telemetry::GpuReadOutcome;
+    let gpu = fixture.listeners.metrics.gpu();
+    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 1);
+    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 2);
+    assert_eq!(gpu.requests(GpuReadOutcome::WrongDevice), 1);
 }
 
 #[test]
@@ -236,9 +306,13 @@ fn gpu_mode_resolves_against_hardware() {
     // Without the cuda feature, auto never loads a backend.
     if !cfg!(feature = "cuda") {
         assert!(
-            GpuHelper::start(GpuMode::Auto, crate::config::DEFAULT_GPU_STAGING_BYTES)
-                .unwrap()
-                .is_none()
+            GpuHelper::start(
+                GpuMode::Auto,
+                crate::config::DEFAULT_GPU_STAGING_BYTES,
+                false
+            )
+            .unwrap()
+            .is_none()
         );
     }
 }
@@ -648,6 +722,7 @@ fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
     let fixture = gpu_fixture(data.clone(), &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
     let mark = trace_len(&helper);
+    let plaintext = counter(&helper.counters().plaintext);
     let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
     assert!(head.starts_with("http/1.1 200"), "{head}");
     assert_eq!(frames, [(1, 0, 0, 5000), (2, 1, 5000, 0)]);
@@ -655,5 +730,357 @@ fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
     assert_eq!(calls(&helper, mark, Operation::Decrypt), 0);
     assert_eq!(calls(&helper, mark, Operation::FileRead), 0);
     assert_eq!(worker(&fixture).cpu_decrypts(), 1);
+    assert_eq!(counter(&helper.counters().plaintext), plaintext + 1);
+    assert_eq!(counter(&helper.counters().decrypted), 0);
     assert_idle(&fixture, &helper, default_slots());
+}
+
+/// A loader on `count` simulated GPUs that counts its calls.
+fn counted_loader(count: u8, calls: &Arc<std::sync::atomic::AtomicUsize>) -> crate::gpu::Loader {
+    let calls = calls.clone();
+    Box::new(move || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let devices: Vec<SimDevice> = (0..count).map(SimDevice::new).collect();
+        let simulation = Simulation::new(devices);
+        let environment = simulation.enter();
+        SIM.with(|sim| *sim.borrow_mut() = Some((simulation, environment)));
+        racer_gpu::Gpu::load()
+    })
+}
+
+/// The process GPU slot for `mode` in a `cuda` build, as the app makes it.
+fn slot(
+    mode: GpuMode,
+    loader: crate::gpu::Loader,
+    telemetry: Arc<crate::gpu_telemetry::GpuTelemetry>,
+    links: Option<Arc<crate::rdma::LinkNode>>,
+) -> crate::error::Result<Arc<crate::gpu_slot::GpuSlot>> {
+    let mut config = crate::test_support::cluster::config(links.is_some());
+    config.enable_gpu = mode;
+    crate::app::gpu_slot(&config, true, telemetry, links, loader)
+}
+
+fn lazy_fixture(body: Vec<u8>, slot: &Arc<crate::gpu_slot::GpuSlot>) -> Fixture {
+    let slot = slot.clone();
+    direct_fixture_with(body, move |responses| responses.with_lazy_gpu(slot))
+}
+
+fn render(telemetry: &crate::gpu_telemetry::GpuTelemetry) -> String {
+    let mut out = String::new();
+    telemetry.write(&mut out).unwrap();
+    out
+}
+
+fn calls_now(calls: &std::sync::atomic::AtomicUsize) -> usize {
+    calls.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+/// `auto` touches no GPU at startup, for host reads, or for metrics. The
+/// first `gpu-read` starts the helper once, and later reads reuse it.
+fn auto_starts_the_gpu_on_the_first_gpu_read_only() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
+    let links = Arc::new(crate::rdma::LinkNode::default());
+    let slot = slot(
+        GpuMode::Auto,
+        counted_loader(1, &calls),
+        telemetry.clone(),
+        Some(links.clone()),
+    )
+    .unwrap();
+    telemetry.attach_slot(slot.clone());
+    assert!(slot.standby());
+    assert!(slot.get().is_none());
+    let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+    // A host read, and a metrics scrape, never start it.
+    let memfd = Memfd::new();
+    let output = exchange(
+        &fixture,
+        &direct_request(
+            "host-read",
+            "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\nRacer-Page-Credits: 1\r\n",
+        ),
+        &[memfd.file.as_raw_fd()],
+    );
+    assert!(split(&output).0.starts_with("http/1.1 200"));
+    settle(&fixture);
+    let text = render(&telemetry);
+    assert!(text.contains("racer_gpu_standby 1\n"), "{text}");
+    assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");
+    assert_eq!(calls_now(&calls), 0);
+    assert!(!links.gpu_landing_configured());
+    // The first gpu-read starts it. A host buffer is not a GPU allocation,
+    // so the import rejects this one as invalid.
+    let output = exchange(
+        &fixture,
+        &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+        &[memfd.file.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+    settle(&fixture);
+    assert_eq!(calls_now(&calls), 1);
+    assert!(!slot.standby());
+    let helper = slot.get().unwrap().clone();
+    let text = render(&telemetry);
+    assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
+    assert!(text.contains("racer_gpu_enabled 1\n"), "{text}");
+    // RDMA landing was configured for the rails, and marked pending.
+    assert!(links.gpu_landing_configured());
+    assert!(links.take_landing_pending());
+    use crate::gpu_telemetry::GpuReadOutcome;
+    let gpu = fixture.listeners.metrics.gpu();
+    assert_eq!(gpu.requests(GpuReadOutcome::Invalid), 1);
+    // Later reads use the started helper.
+    let allocation = allocate(&helper, 0, GRANULE);
+    let output = exchange(
+        &fixture,
+        &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+        &[allocation.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(read_allocation(&allocation, 0, 5), b"hello");
+    settle(&fixture);
+    assert_released(&helper);
+    assert_eq!(calls_now(&calls), 1);
+    assert_eq!(gpu.requests(GpuReadOutcome::Gpu), 1);
+}
+
+#[test]
+/// Concurrent first `gpu-read` requests share one start.
+fn concurrent_first_gpu_reads_start_the_gpu_once() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let slot = slot(
+        GpuMode::Auto,
+        counted_loader(1, &calls),
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+    let memfd = Memfd::new();
+    let request = direct_request("gpu-read", &fields("", 0, 5, GRANULE));
+    let mut sockets: Vec<_> = (0..4)
+        .map(|_| {
+            let socket = fixture.connect();
+            send_with_fds(&socket, &request, &[memfd.file.as_raw_fd()]);
+            socket
+        })
+        .collect();
+    for socket in &mut sockets {
+        let output = fixture.receive(socket, true);
+        let (head, _) = split(&output);
+        // A host buffer is not a GPU allocation; the helper did start.
+        assert!(head.starts_with("http/1.1 400"), "{head}");
+    }
+    drop(sockets);
+    settle(&fixture);
+    assert_eq!(calls_now(&calls), 1);
+    assert!(slot.get().is_some());
+}
+
+#[test]
+/// A failed start or a node with no usable GPU leaves `gpu-read` off (501)
+/// for good, so clients use host reads, and it is never retried.
+fn auto_start_failure_is_501_and_not_retried() {
+    let failing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = failing.clone();
+    let failed: crate::gpu::Loader = Box::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(racer_gpu::Error::Unavailable)
+    });
+    let empty = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (loader, calls) in [(failed, &failing), (counted_loader(0, &empty), &empty)] {
+        let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
+        let links = Arc::new(crate::rdma::LinkNode::default());
+        let slot = slot(
+            GpuMode::Auto,
+            loader,
+            telemetry.clone(),
+            Some(links.clone()),
+        )
+        .unwrap();
+        telemetry.attach_slot(slot.clone());
+        let fixture = lazy_fixture(b"hello".to_vec(), &slot);
+        let memfd = Memfd::new();
+        for _ in 0..3 {
+            let output = exchange(
+                &fixture,
+                &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+                &[memfd.file.as_raw_fd()],
+            );
+            let (head, _) = split(&output);
+            assert!(head.starts_with("http/1.1 501"), "{head}");
+            settle(&fixture);
+        }
+        assert_eq!(calls_now(calls), 1);
+        assert!(!slot.standby());
+        assert!(slot.get().is_none());
+        assert!(!links.gpu_landing_configured());
+        use crate::gpu_telemetry::GpuReadOutcome;
+        let gpu = fixture.listeners.metrics.gpu();
+        assert_eq!(gpu.requests(GpuReadOutcome::NotEnabled), 3);
+        let text = render(&telemetry);
+        assert!(text.contains("racer_gpu_standby 0\n"), "{text}");
+        assert!(text.contains("racer_gpu_enabled 0\n"), "{text}");
+    }
+}
+
+#[test]
+/// `true` starts eagerly and fails startup without a usable GPU; `false`
+/// and an `auto` build without `cuda` never load a driver.
+fn required_starts_eagerly_and_off_modes_never_load() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let links = Arc::new(crate::rdma::LinkNode::default());
+    let telemetry = Arc::new(crate::gpu_telemetry::GpuTelemetry::default());
+    let required = slot(
+        GpuMode::Required,
+        counted_loader(1, &calls),
+        telemetry.clone(),
+        Some(links.clone()),
+    )
+    .unwrap();
+    assert_eq!(calls_now(&calls), 1);
+    assert!(!required.standby());
+    assert!(required.get().is_some());
+    assert!(links.gpu_landing_configured());
+    assert!(render(&telemetry).contains("racer_gpu_enabled 1\n"));
+    {
+        let count = 0;
+        let none = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        assert!(
+            slot(
+                GpuMode::Required,
+                counted_loader(count, &none),
+                Default::default(),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(calls_now(&none), 1);
+    }
+    assert!(
+        slot(
+            GpuMode::Required,
+            Box::new(|| Err(racer_gpu::Error::Unavailable)),
+            Default::default(),
+            None
+        )
+        .is_err()
+    );
+    let off = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let disabled = slot(
+        GpuMode::Disabled,
+        counted_loader(1, &off),
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    assert!(!disabled.standby());
+    assert!(disabled.get().is_none());
+    let mut config = crate::test_support::cluster::config(false);
+    config.enable_gpu = GpuMode::Auto;
+    let unbuilt = crate::app::gpu_slot(
+        &config,
+        false,
+        Default::default(),
+        None,
+        counted_loader(1, &off),
+    )
+    .unwrap();
+    assert!(!unbuilt.standby());
+    assert!(futures::executor::block_on(unbuilt.get_or_start()).is_none());
+    assert_eq!(calls_now(&off), 0);
+}
+
+/// A loader like [`counted_loader`] on one GPU that first waits for `gate`,
+/// standing in for a CUDA initialization that stalls.
+fn gated_loader(
+    calls: &Arc<std::sync::atomic::AtomicUsize>,
+    gate: std::sync::mpsc::Receiver<()>,
+) -> crate::gpu::Loader {
+    let load = counted_loader(1, calls);
+    Box::new(move || {
+        let _ = gate.recv();
+        load()
+    })
+}
+
+#[test]
+/// A `gpu-read` that expires or is cancelled while the GPU start stalls
+/// stops waiting and releases its connection; the shared start keeps going
+/// and a later `gpu-read` uses the helper it started.
+fn stalled_gpu_start_honors_request_expiry_and_cancellation() {
+    for mode in ["expire", "cancel"] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (open, gate) = std::sync::mpsc::channel();
+        let slot = slot(
+            GpuMode::Auto,
+            gated_loader(&calls, gate),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let mut fixture = lazy_fixture(b"hello".to_vec(), &slot);
+        let timeout = Duration::from_millis(200);
+        if mode == "expire" {
+            fixture.listeners = fixture.listeners.with_request_timeout(timeout);
+        }
+        let memfd = Memfd::new();
+        let mut socket = fixture.connect();
+        send_with_fds(
+            &socket,
+            &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+            &[memfd.file.as_raw_fd()],
+        );
+        let started = Instant::now();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        // The start is pending, so the request is still waiting on it.
+        assert!(slot.standby(), "{mode}");
+        assert_eq!(fixture.listeners.active_connections(), 1, "{mode}");
+        if mode == "expire" {
+            std::thread::sleep(
+                (started + timeout + Duration::from_millis(20))
+                    .saturating_duration_since(Instant::now()),
+            );
+        } else {
+            fixture.listeners.cancel_cache(&definition().id).unwrap();
+        }
+        let output = fixture.receive(&mut socket, true);
+        let (head, _) = split(&output);
+        assert!(head.starts_with("http/1.1 503"), "{mode}: {head}");
+        settle(&fixture);
+        // Giving up did not cancel the shared start.
+        assert!(slot.standby(), "{mode}");
+        open.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slot.standby() {
+            assert!(Instant::now() < deadline, "{mode}: start did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(calls_now(&calls), 1, "{mode}");
+        let helper = slot.get().unwrap().clone();
+        if mode == "expire" {
+            // A later request gets the helper the stalled start produced.
+            fixture.listeners = fixture
+                .listeners
+                .with_request_timeout(Duration::from_secs(30));
+            let allocation = allocate(&helper, 0, GRANULE);
+            let output = exchange(
+                &fixture,
+                &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+                &[allocation.as_raw_fd()],
+            );
+            let (head, _) = split(&output);
+            assert!(head.starts_with("http/1.1 200"), "{head}");
+            assert_eq!(read_allocation(&allocation, 0, 5), b"hello");
+            settle(&fixture);
+            assert_released(&helper);
+            assert_eq!(calls_now(&calls), 1);
+        }
+    }
 }

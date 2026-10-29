@@ -44,20 +44,14 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
-/// Direct fills a read keeps in flight beyond its head page. A sealed read
-/// fills its whole window directly (see `RangeStream::direct_ahead`).
-const DIRECT_AHEAD: usize = 1;
-
-/// Provider selections a read keeps in flight. Beyond the first, a read only
-/// starts another while some contract of its version has an unused granted
-/// flight (see `Scheduler::spare`). Each selection demands a disjoint share of
-/// the read's selectable holes.
-const SELECTIONS: usize = 4;
+#[cfg(test)]
+use racer_core::read::SELECTIONS;
+use racer_core::read::{self, DIRECT_AHEAD, SlotKind};
 
 /// Flights requested per provider contract. A provider grants at most this
 /// many pending selections per contract, or one if it predates multi-flight.
 pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
-const _: () = assert!(REQUESTED_FLIGHTS <= crate::peer::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
+const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
 
 /// Spill fills (hold plus warm fill) a read keeps in flight.
 const SPILL_FILLS: usize = 2;
@@ -379,7 +373,7 @@ impl Drop for WindowLease {
 pub(crate) struct Selection {
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) version: ObjectVersion,
-    pub(crate) demand: crate::peer::subscriptions::Demand,
+    pub(crate) demand: racer_core::subscriptions::Demand,
     /// The contract this selection holds a flight on, once issued.
     contract: Mutex<Option<ContractKey>>,
 }
@@ -402,7 +396,7 @@ impl Selection {
     pub(crate) fn for_test(
         scheduler: &Arc<Scheduler>,
         version: ObjectVersion,
-        demand: crate::peer::subscriptions::Demand,
+        demand: racer_core::subscriptions::Demand,
     ) -> Self {
         Self {
             scheduler: scheduler.clone(),
@@ -468,7 +462,10 @@ impl RangeBudget {
                 if _pending && (attempts == 0 || links < 4) {
                     return Ok(None);
                 }
-                budget.partition(attempts, links).map(Some)
+                budget
+                    .partition(attempts, links)
+                    .map(Some)
+                    .map_err(Into::into)
             }
         }
     }
@@ -476,7 +473,7 @@ impl RangeBudget {
         match self {
             Self::ClientPages { .. } | Self::ProgressingPages { .. } => Ok(()),
             #[cfg(test)]
-            Self::Shared(budget) => budget.reunite(_remaining),
+            Self::Shared(budget) => Ok(budget.reunite(_remaining)?),
         }
     }
 }
@@ -997,29 +994,8 @@ impl RangeStream {
         // A failed page stops admission at and after it until it reaches the
         // client. Pages before it are still filled, or the stream could never
         // deliver them and so never surface the error.
-        let failed = self
-            .slots
-            .iter()
-            .position(|slot| matches!(slot, Slot::Ready(Err(_))));
-        let limit = failed.unwrap_or(self.slots.len());
-        let mut changed = false;
-        if limit > 0
-            && matches!(
-                self.slots.front(),
-                Some(Slot::Missing { .. } | Slot::Selecting)
-            )
-        {
-            if !self.start_fetch(0, scope)? {
-                return Ok(changed);
-            }
-            changed = true;
-        }
-        let mut ahead = self
-            .slots
-            .iter()
-            .skip(1)
-            .filter(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
-            .count();
+        let kinds = self.kinds();
+        let failed = read::first_failure(&kinds);
         // Pages another window is selecting or filling arrive through its
         // fan-out. Only the head is always filled directly, so it never waits
         // on another window; a concurrent fill of the same page joins the
@@ -1029,19 +1005,15 @@ impl RangeStream {
             .as_ref()
             .map(WindowLease::busy_elsewhere)
             .unwrap_or_default();
-        let mut index = 1;
-        let direct_ahead = self.direct_ahead();
-        while ahead < direct_ahead && index < limit {
-            if matches!(self.slots[index], Slot::Missing { .. })
-                && !elsewhere.contains(&self.page_at(index))
-            {
-                if !self.start_fetch(index, scope)? {
-                    return Ok(changed);
-                }
-                changed = true;
-                ahead += 1;
+        let plan = read::direct_fills(&kinds, self.direct_ahead(), |index| {
+            elsewhere.contains(&self.page_at(index))
+        });
+        let mut changed = false;
+        for index in plan {
+            if !self.start_fetch(index, scope)? {
+                return Ok(changed);
             }
-            index += 1;
+            changed = true;
         }
         // Earlier holes behind a failure are filled directly: each becomes the
         // head in turn, so no new selection is needed to reach the error.
@@ -1104,18 +1076,32 @@ impl RangeStream {
     /// Whether the read may start another selection: its first always, more
     /// only while a contract of the version has an unused granted flight.
     fn may_select(&self) -> bool {
-        self.selections.len() < SELECTIONS
-            && (self.selections.is_empty()
-                || self.directory.subscriptions.spare(&self.metadata.version) > 0)
+        read::may_select(
+            self.selections.len(),
+            self.directory.subscriptions.spare(&self.metadata.version),
+        )
+    }
+
+    /// Scheduling state of each window slot, for the core range planner.
+    fn kinds(&self) -> Vec<SlotKind> {
+        self.slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Probing(_) => SlotKind::Probing,
+                Slot::Missing { select } => SlotKind::Missing { select: *select },
+                Slot::Fetching(_) | Slot::FetchingSealed(_) => SlotKind::Fetching,
+                Slot::Selecting => SlotKind::Selecting,
+                Slot::Ready(Err(_)) => SlotKind::Failed,
+                Slot::Ready(Ok(_)) | Slot::Sealed(_) => SlotKind::Ready,
+            })
+            .collect()
     }
 
     /// The demand and pages of the next selection, if any. Pages that another
     /// window of this version is selecting are left to that selection's
     /// fan-out. While a warm job runs for the version, reads only fetch pages
     /// directly, each waiting for the warm job to finish that page.
-    fn plan_selection(
-        &self,
-    ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
+    fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
         if self.directory.warm.contains(&self.metadata.version) {
             return Ok(None);
         }
@@ -1184,15 +1170,8 @@ impl RangeStream {
             .iter()
             .filter(|slot| matches!(slot, Slot::Missing { select: true }))
             .count();
-        let free = SELECTIONS.saturating_sub(self.selections.len());
         let spare = self.directory.subscriptions.spare(&self.metadata.version);
-        // The read's first selection may run before any spare flight exists.
-        let startable = if self.selections.is_empty() {
-            free.min(spare + 1)
-        } else {
-            free.min(spare)
-        };
-        holes.div_ceil(startable.max(1)).max(1)
+        read::share(holes, self.selections.len(), spare)
     }
 
     /// Up to `limit` selectable holes of the window, excluding pages that
@@ -1202,37 +1181,27 @@ impl RangeStream {
         &self,
         elsewhere: &BTreeSet<u64>,
         limit: usize,
-    ) -> Result<Option<(crate::peer::subscriptions::Demand, BTreeSet<u64>)>> {
-        use crate::peer::subscriptions::MAX_DEMAND_INTERVALS;
-        use crate::peer::subscriptions::PageInterval;
-        let mut intervals: Vec<PageInterval> = Vec::new();
-        let mut pages = BTreeSet::new();
-        for index in 0..self.slots.len() {
-            if pages.len() >= limit {
-                break;
-            }
-            let number = self.page_at(index);
-            if !matches!(self.slots[index], Slot::Missing { select: true })
-                || elsewhere.contains(&number)
-            {
-                continue;
-            }
-            let full = intervals.len() == MAX_DEMAND_INTERVALS - 1;
-            match intervals.last_mut() {
-                Some(last) if last.end == number => last.end += 1,
-                _ if full => break,
-                _ => intervals.push(PageInterval {
-                    start: number,
-                    end: number + 1,
-                }),
-            }
-            pages.insert(number);
-        }
-        if pages.is_empty() {
+    ) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
+        use flow_control::subscriptions::Interval;
+        use racer_core::subscriptions::{Demand, MAX_DEMAND_INTERVALS};
+        let Some((intervals, pages)) = read::selection_demand(
+            &self.kinds(),
+            self.next,
+            |number| elsewhere.contains(&number),
+            limit,
+            MAX_DEMAND_INTERVALS,
+        ) else {
             return Ok(None);
-        }
+        };
+        let intervals = intervals
+            .into_iter()
+            .map(|r| Interval {
+                start: r.start,
+                end: r.end,
+            })
+            .collect();
         Ok(Some((
-            crate::peer::subscriptions::Demand::new(intervals)?,
+            Demand::new(intervals).ok_or(Error::InvalidRequest)?,
             pages,
         )))
     }
@@ -1923,8 +1892,8 @@ pub(super) mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             stream.inject(Slot::Selecting);
             stream.sync(&cx);
-            let demand = crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+            let demand = racer_core::subscriptions::Demand::new(vec![
+                flow_control::subscriptions::Interval { start: 0, end: 1 },
             ])
             .unwrap();
             Selection::for_test(&directory.subscriptions, metadata.version.clone(), demand)
@@ -2094,7 +2063,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 remote.begin_attempt(Instant::now(), deadline),
-                Err(Error::Unavailable)
+                Err(racer_core::read::Error::Unavailable)
             );
             budget.complete(page).unwrap();
         }
@@ -2104,13 +2073,16 @@ pub(super) mod tests {
         }
         assert_eq!(
             page.begin_attempt(Instant::now(), deadline),
-            Err(Error::Unavailable)
+            Err(racer_core::read::Error::Unavailable)
         );
         page.charge_links(16).unwrap();
-        assert_eq!(page.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            page.charge_links(1),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
         assert_eq!(
             page.begin_attempt(deadline, deadline),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
         let mut expired = RangeBudget::ClientPages {
             deadline: Instant::now(),
@@ -2134,9 +2106,12 @@ pub(super) mod tests {
         assert_eq!(next.deadline(), deadline);
         assert_eq!(
             next.begin_attempt(Instant::now(), deadline),
-            Err(Error::Unavailable)
+            Err(racer_core::read::Error::Unavailable)
         );
-        assert_eq!(next.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            next.charge_links(1),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
     }
     #[test]
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
@@ -2165,7 +2140,9 @@ pub(super) mod tests {
                 let gate = gate.clone();
                 stream.inject(Slot::Fetching(Box::pin(async move {
                     for _ in 0..8 {
-                        budget.begin_attempt(Instant::now(), budget.deadline())?;
+                        budget
+                            .begin_attempt(Instant::now(), budget.deadline())
+                            .map_err(Error::from)?;
                         attempts.set(attempts.get() + 1);
                     }
                     poll_fn(|_| {
@@ -2178,7 +2155,8 @@ pub(super) mod tests {
                     .await;
                     let result = budget
                         .begin_attempt(Instant::now(), budget.deadline())
-                        .map(|_| unreachable!("same page received fresh retry credits"));
+                        .map(|_| unreachable!("same page received fresh retry credits"))
+                        .map_err(Error::from);
                     Ok((result, budget))
                 })));
             }
@@ -2488,10 +2466,12 @@ pub(super) mod tests {
             streams[0].lease.as_ref().unwrap().busy_elsewhere(),
             BTreeSet::from([1])
         );
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 1, end: 2 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 1,
+                end: 2,
+            }])
+            .unwrap();
         let selection = Selection::for_test(
             &f.streams.directory.subscriptions,
             metadata.version.clone(),
@@ -2645,9 +2625,10 @@ pub(super) mod tests {
         let granted = Selection::for_test(
             scheduler,
             metadata.version.clone(),
-            crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-            ])
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
             .unwrap(),
         );
         scheduler
@@ -2689,8 +2670,8 @@ pub(super) mod tests {
                 let held = Selection::for_test(
                     scheduler,
                     metadata.version.clone(),
-                    crate::peer::subscriptions::Demand::new(vec![
-                        crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+                    racer_core::subscriptions::Demand::new(vec![
+                        flow_control::subscriptions::Interval { start: 0, end: 1 },
                     ])
                     .unwrap(),
                 );
@@ -2735,13 +2716,13 @@ pub(super) mod tests {
             .selection_demand(&BTreeSet::from([5]), usize::MAX)
             .unwrap()
             .unwrap();
-        use crate::peer::subscriptions::PageInterval;
+        use flow_control::subscriptions::Interval;
         assert_eq!(
             demand.intervals(),
             &[
-                PageInterval { start: 2, end: 3 },
-                PageInterval { start: 4, end: 5 },
-                PageInterval { start: 6, end: 8 },
+                Interval { start: 2, end: 3 },
+                Interval { start: 4, end: 5 },
+                Interval { start: 6, end: 8 },
             ]
         );
         assert_eq!(pages, BTreeSet::from([2, 4, 6, 7]));
@@ -3035,7 +3016,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 page.begin_attempt(uring_runtime::environment::now(), deadline),
-                Err(Error::Unavailable)
+                Err(racer_core::read::Error::Unavailable)
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
@@ -3046,7 +3027,7 @@ pub(super) mod tests {
         clock.advance(timeout);
         assert_eq!(
             stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
     }
 
@@ -3056,12 +3037,12 @@ pub(super) mod tests {
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::StrongEtag;
-        use crate::peer::subscriptions::Demand as WireDemand;
-        use crate::peer::subscriptions::PageInterval;
         use flow_control::Quotas;
+        use flow_control::subscriptions::Interval;
         use racer_control_wire::CacheId;
         use racer_control_wire::MembershipVersion;
         use racer_control_wire::NodeId;
+        use racer_core::subscriptions::Demand as WireDemand;
         fn version() -> ObjectVersion {
             ObjectVersion {
                 object: ObjectId {
@@ -3072,7 +3053,7 @@ pub(super) mod tests {
             }
         }
         fn demand(start: u64, end: u64) -> WireDemand {
-            WireDemand::new(vec![PageInterval { start, end }]).unwrap()
+            WireDemand::new(vec![Interval { start, end }]).unwrap()
         }
         fn page(version: &ObjectVersion, number: u64) -> PageResult {
             let metadata = crate::model::ObjectMetadata {

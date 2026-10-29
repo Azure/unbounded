@@ -33,7 +33,7 @@ def server(tmp_path, small_pages):
 class FakeGpu:
     """A GPU destination backed by a memfd, so the fake server can write it."""
 
-    def __init__(self, size, exportable=True):
+    def __init__(self, size, exportable=True, uuid=None):
         self.size = size
         self.device = 0
         self.fd = os.memfd_create("fake-gpu")
@@ -41,6 +41,8 @@ class FakeGpu:
         self.copies = 0
         if not exportable:
             self.export_fd = self._no_export
+        if uuid is not None:
+            self.gpu_uuid = uuid if callable(uuid) else (lambda: uuid)
 
     def _no_export(self):
         raise NotImplementedError

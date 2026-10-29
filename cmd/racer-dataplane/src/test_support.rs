@@ -313,6 +313,7 @@ pub mod cluster {
             enable_gpu: crate::config::GpuMode::Disabled,
             gpu_staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
             gpu_landing_bytes: crate::config::DEFAULT_GPU_LANDING_BYTES,
+            gpu_pci_p2pdma: false,
             control_endpoint: Some("https://control.invalid".into()),
             managed_control: None,
             enrollment_directory: None,

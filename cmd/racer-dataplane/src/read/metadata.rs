@@ -17,6 +17,7 @@ use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::PageNumber;
+#[cfg(test)]
 use crate::model::StrongEtag;
 use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
@@ -39,42 +40,16 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-const MAX_WAITERS: usize = 64;
-const MAX_REFRESH_ATTEMPTS: usize = 8;
+// Cohort bounds and purposes live in racer-core.
+use racer_core::read::{MAX_REFRESH_ATTEMPTS, MAX_WAITERS, RefreshPurpose};
 
-/// The work a refresh cohort may perform. A pin never bootstraps a current body.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum RefreshPurpose {
-    /// Observe the current version without requesting its body (including HEAD).
-    Current,
-
-    /// Resolve immutable metadata for exactly this version, even after expiry.
-    Pinned(StrongEtag),
-
-    /// Observe the current version and allow acquisition of page zero.
-    Bootstrap,
-}
-
-impl From<MetadataSelector> for RefreshPurpose {
-    /// Metadata-only callers cannot opt into a body-fetching cohort.
-    fn from(selector: MetadataSelector) -> Self {
-        match selector {
-            MetadataSelector::Fresh => Self::Current,
-            MetadataSelector::Pinned(etag) => Self::Pinned(etag),
-        }
-    }
-}
-
-impl RefreshPurpose {
-    /// Select metadata without changing whether the cohort may fetch a body.
-    fn selector(&self) -> MetadataSelector {
-        match self {
-            Self::Current | Self::Bootstrap => MetadataSelector::Fresh,
-            Self::Pinned(etag) => MetadataSelector::Pinned(etag.clone()),
-        }
-    }
-
+/// Peer operation a refresh purpose permits.
+trait PurposeOperation {
     /// Request only the peer operation permitted by this cohort's purpose.
+    fn operation(&self, object: &ObjectId) -> PeerOperation;
+}
+
+impl PurposeOperation for RefreshPurpose {
     fn operation(&self, object: &ObjectId) -> PeerOperation {
         match self {
             Self::Bootstrap => PeerOperation::Bootstrap {
@@ -212,10 +187,13 @@ impl From<Error> for RefreshFailure {
 }
 
 fn caller_budget_failure(error: Error, budget: &AcquisitionBudget) -> bool {
-    matches!(
-        error,
-        Error::Cancelled | Error::DeadlineExceeded | Error::HopBudgetExhausted
-    ) || (error == Error::Unavailable && budget.remaining_attempts() == 0)
+    // Rejections are classified separately by RefreshFailure; for the rest,
+    // racer-core's settlement rule decides whether another waiter retries.
+    !matches!(error, Error::OriginRejected | Error::OriginForbidden)
+        && racer_core::read::Error::try_from(error).is_ok_and(|error| {
+            racer_core::read::refresh_settlement(error, budget.remaining_attempts())
+                == racer_core::read::Settlement::Retry
+        })
 }
 
 /// Storage and page-owner handoff used by metadata refreshes.
@@ -565,7 +543,9 @@ impl MetadataService {
         budget: &mut AcquisitionBudget,
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         authority.validate(&context.object, PageNumber(0))?;
-        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+        budget
+            .begin_attempt(uring_runtime::environment::now(), scope.deadline.0)
+            .map_err(Error::from)?;
         let selector = purpose.selector();
         let acquisition = match purpose {
             RefreshPurpose::Bootstrap => {
@@ -1194,9 +1174,12 @@ pub(crate) mod tests {
         assert_eq!(next.begin_attempt(now, deadline), Ok(deadline));
         assert_eq!(
             supplier.begin_attempt(now, deadline),
-            Err(Error::Unavailable)
+            Err(racer_core::read::Error::Unavailable)
         );
-        assert_eq!(next.begin_attempt(now, deadline), Err(Error::Unavailable));
+        assert_eq!(
+            next.begin_attempt(now, deadline),
+            Err(racer_core::read::Error::Unavailable)
+        );
     }
 
     #[test]

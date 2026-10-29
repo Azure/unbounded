@@ -849,25 +849,47 @@ mod send_in_place {
 }
 
 #[test]
-/// Rails take a free GPU on their NUMA node first, then any free GPU; each
-/// GPU serves one rail at most.
-fn assign_landing_prefers_numa_then_any() {
+/// Every GPU gets a slice on every rail when slots allow, so no GPU is left
+/// without landing on a node with more GPUs than rails. With fewer slots
+/// than rails, NUMA-local rails come first. Slots are shared out evenly.
+fn plan_landing_covers_every_gpu_and_prefers_numa() {
     let rails = [
         (RailId(1), Some(1)),
         (RailId(2), Some(0)),
         (RailId(3), None),
-        (RailId(4), Some(0)),
     ];
-    let gpus = [(0, Some(0)), (1, Some(1)), (2, None)];
+    let gpus = [(0, Some(0)), (1, Some(1)), (2, None), (3, Some(0))];
+    let plan = plan_landing(&rails, &gpus, 7);
+    for &(ordinal, _) in &gpus {
+        let mine: Vec<_> = plan.iter().filter(|p| p.0 == ordinal).collect();
+        assert_eq!(mine.len(), 3, "GPU {ordinal} is on every rail");
+        assert_eq!(mine.iter().map(|p| p.2).sum::<usize>(), 7);
+    }
     assert_eq!(
-        assign_landing(&rails, &gpus),
-        [(RailId(1), 1), (RailId(2), 0), (RailId(3), 2)]
+        plan.iter()
+            .filter(|p| p.0 == 0)
+            .copied()
+            .collect::<Vec<_>>(),
+        [(0, RailId(2), 3), (0, RailId(1), 2), (0, RailId(3), 2)]
     );
-    assert_eq!(assign_landing(&rails, &[]), []);
+    // One slot per GPU: only the best rail.
     assert_eq!(
-        assign_landing(&[(RailId(9), Some(3))], &[(5, Some(1))]),
-        [(RailId(9), 5)]
+        plan_landing(&rails, &gpus, 1),
+        [
+            (0, RailId(2), 1),
+            (1, RailId(1), 1),
+            (2, RailId(1), 1),
+            (3, RailId(2), 1),
+        ]
     );
+    // Two slots, two rails: one each, local first.
+    assert_eq!(
+        plan_landing(&rails[..2], &[(5, Some(1))], 2),
+        [(5, RailId(1), 1), (5, RailId(2), 1)]
+    );
+    assert_eq!(plan_landing(&rails, &[], 4), []);
+    assert_eq!(plan_landing(&[], &gpus, 4), []);
+    assert_eq!(plan_landing(&rails, &gpus, 0), []);
 }
 
 /// Register a simulated GPU's landing buffer on `a`'s rail.
@@ -901,8 +923,9 @@ fn landing_grant_receives_into_gpu_memory() {
     // One slot only.
     let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
     attach_landing(&mut w, &helper, bytes);
-    assert_eq!(w.a.links.landing_ordinal(RAIL), Some(0));
-    assert_eq!(w.b.links.landing_ordinal(RAIL), None);
+    assert!(w.a.links.has_landing(RAIL, 0));
+    assert!(!w.a.links.has_landing(RAIL, 1));
+    assert!(!w.b.links.has_landing(RAIL, 0));
     let (a, b) = (node_id(1), node_id(2));
     let scope = scope();
     assert_eq!(
@@ -913,7 +936,7 @@ fn landing_grant_receives_into_gpu_memory() {
         )
         .err(),
         Some(Error::Unavailable),
-        "landing buffer is on another GPU"
+        "GPU 1 has no landing buffer"
     );
     let pending = drive!(
         w,
@@ -941,7 +964,7 @@ fn landing_grant_receives_into_gpu_memory() {
         _ => panic!("expected a device page"),
     };
     // The bytes are in the GPU buffer, read here through its dma-buf.
-    let landing = w.a.links.node().landing(RAIL).unwrap();
+    let landing = w.a.links.node().landing(RAIL, 0).unwrap();
     let mut bytes = [0; 35];
     let file = std::fs::File::from(
         rdma_verbs::DmabufMemory::fd(&*landing)
@@ -969,9 +992,69 @@ fn landing_grant_receives_into_gpu_memory() {
         drive!(w, poll_fn(|cx| again.arrival.poll(cx))),
         Ok(Arrival::Released)
     ));
-    // Closing the node forgets the landing buffer for the next round.
+    // Closing the node forgets the landing buffer for the next round, and
+    // once the node drains the GPU memory is freed.
+    drop((landing, pending, again));
     w.a.links.close();
-    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+    assert!(!w.a.links.has_landing(RAIL, 0));
+    for _ in 0..100 {
+        pump!(w);
+        if helper.run(crate::gpu::testing::live_staging) == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("landing buffer was not freed after the node drained");
+}
+
+#[test]
+/// Two GPUs on one rail each get a landing slice and a separate device
+/// pool: a read on either GPU lands in its own GPU's memory, and one GPU's
+/// full slice does not refuse the other.
+fn every_gpu_lands_on_a_shared_rail() {
+    let helper = crate::gpu::testing::helper(&[None, None]);
+    let mut w = world();
+    link_up(&mut w);
+    let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
+    attach_landing(&mut w, &helper, bytes);
+    assert!(w.a.links.has_landing(RAIL, 0));
+    assert!(w.a.links.has_landing(RAIL, 1));
+    let (a, b) = (node_id(1), node_id(2));
+    let scope = scope();
+    let mut held = Vec::new();
+    for (ordinal, fill) in [(0, 0x10u8), (1, 0x20)] {
+        let transfer = TransferId([fill; 16]);
+        let pending = drive!(
+            w,
+            w.a.links.grant_landing(&b, RAIL, transfer, ordinal, &scope)
+        )
+        .unwrap();
+        let header = STANDARD.decode(pending.header_value()).unwrap();
+        let grant = AuthenticatedGrant::decode(&header, RAIL, transfer).unwrap();
+        let page = page(&w.b.admission.clone(), 20, fill);
+        drive!(w, w.b.links.send(&a, &grant, &page, &scope)).unwrap();
+        let device = match drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap() {
+            Arrival::Device(page) => page,
+            _ => panic!("expected a device page"),
+        };
+        let landing = w.a.links.node().landing(RAIL, ordinal).unwrap();
+        let landed = crate::gpu::LandedCiphertext::new(&landing, device).unwrap();
+        assert_eq!(landed.ordinal(), ordinal);
+        held.push(landed);
+    }
+    // Each GPU's only slot is taken.
+    for ordinal in [0, 1] {
+        assert_eq!(
+            drive!(
+                w,
+                w.a.links
+                    .grant_landing(&b, RAIL, TransferId([9; 16]), ordinal, &scope)
+            )
+            .err(),
+            Some(Error::Overloaded)
+        );
+    }
+    drop(held);
 }
 
 #[test]
@@ -981,17 +1064,157 @@ fn landing_failures_leave_rails_host_only() {
     let helper = crate::gpu::testing::helper(&[None]);
     let mut w = world();
     attach_landing(&mut w, &helper, (BUFFER_LEN as u64) / 2);
-    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+    assert!(!w.a.links.has_landing(RAIL, 0));
     attach_landing(&mut w, &helper, 0);
-    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+    assert!(!w.a.links.has_landing(RAIL, 0));
     w._sim.fault(
         rdma_verbs::simulation::Operation::RegisterDmabuf,
         rdma_verbs::simulation::Fault::Reject,
     );
     let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
     attach_landing(&mut w, &helper, bytes);
-    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
-    // Registration works on the next try, reusing the same GPU buffer.
+    assert!(!w.a.links.has_landing(RAIL, 0));
+    // No rail holds the buffer, so its GPU memory is freed again.
+    assert_eq!(helper.run(crate::gpu::testing::live_staging), 0);
+    // Registration works on the next try, with a new GPU buffer.
     attach_landing(&mut w, &helper, bytes);
-    assert_eq!(w.a.links.landing_ordinal(RAIL), Some(0));
+    assert!(w.a.links.has_landing(RAIL, 0));
+    assert_eq!(helper.run(crate::gpu::testing::live_staging), 1);
+}
+
+#[test]
+/// A GPU helper that starts after the rails activated (lazy `gpu-read`
+/// start) marks them pending; attaching on the active rails registers the
+/// landing buffer and consumes the mark, so rails never attach twice.
+fn late_gpu_landing_attaches_on_active_rails_once() {
+    let helper = crate::gpu::testing::helper(&[None]);
+    let mut w = world();
+    link_up(&mut w);
+    let node = w.a.links.node().clone();
+    assert!(!node.take_landing_pending());
+    node.set_gpu_landing(helper.clone(), 0);
+    assert!(!node.take_landing_pending(), "0 bytes turns landing off");
+    let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
+    node.set_gpu_landing(helper.clone(), bytes);
+    assert!(!w.a.links.has_landing(RAIL, 0));
+    // `attach_landing` sets the landing again, then attaches like the owner
+    // worker does on its next turn.
+    attach_landing(&mut w, &helper, bytes);
+    assert!(w.a.links.has_landing(RAIL, 0));
+    assert!(!node.take_landing_pending(), "the attach consumed the mark");
+    node.set_gpu_landing(helper, bytes);
+    assert!(node.take_landing_pending());
+    assert!(!node.take_landing_pending());
+}
+
+/// Crash and restart `b` under the same node id: the new owner has no links,
+/// while `a` still holds its `Ready` link to the dead queue pair (half-open).
+fn restart_b(w: &mut World) {
+    let environment = w.clock.environment(1);
+    let fresh = node(&w._sim, 3, node_id(2), Some(&environment));
+    drop(std::mem::replace(&mut w.b, fresh));
+    let admission = w.b.admission.clone();
+    let rails = drive!(
+        w,
+        w.b.links
+            .activate(vec![mapping(3)], &admission, 2 * BUFFER_LEN, &scope())
+    )
+    .unwrap();
+    assert_eq!(rails.len(), 1);
+    pump!(w);
+}
+
+/// After a peer restarts, the survivor's link stays `Ready`
+/// (no traffic means no completion reports the dead peer), so the survivor
+/// never wants a setup. The restarted peer's setup replaces the stale link and
+/// both ends become ready again.
+#[test]
+fn half_open_link_after_peer_restart_recovers_when_the_peer_initiates() {
+    let mut w = world();
+    let (a, b) = (node_id(1), node_id(2));
+    let old = link_up(&mut w);
+    restart_b(&mut w);
+    assert_eq!(w.a.links.ready(&b, RAIL).map(|(_, id)| id), Some(old));
+    assert_eq!(w.b.links.state(&a, RAIL), LinkState::Idle);
+    assert!(!w.a.links.wants(&b, RAIL), "the survivor sees a ready link");
+    assert!(w.b.links.wants(&a, RAIL), "the restarted peer wants a link");
+    let scope = scope();
+    let (epoch, ours) = drive!(w, w.b.links.open(&a, RAIL, &scope)).unwrap();
+    assert_eq!(w.a.links.admit_setup(&b, RAIL), SetupAdmission::Accept);
+    let theirs = drive!(w, w.a.links.accept(&b, RAIL, &ours, &scope)).unwrap();
+    drive!(
+        w,
+        w.b.links.connect(
+            &a,
+            RAIL,
+            epoch,
+            &ours,
+            &theirs,
+            &link_setup::binding(&ours),
+            &scope
+        )
+    )
+    .unwrap();
+    pump!(w);
+    let (_, id_a) = w.a.links.ready(&b, RAIL).expect("survivor ready");
+    let (_, id_b) = w.b.links.ready(&a, RAIL).expect("restarted peer ready");
+    assert_eq!(id_a, id_b);
+    assert_ne!(id_a, old, "the stale link was replaced");
+}
+
+/// The survivor's first use of the half-open link fails at
+/// the transport and breaks it, so its own setups resume after the backoff.
+#[test]
+fn half_open_link_after_peer_restart_breaks_on_first_use() {
+    let mut w = world();
+    let b = node_id(2);
+    link_up(&mut w);
+    restart_b(&mut w);
+    assert!(w.a.links.ready(&b, RAIL).is_some());
+    let scope = scope();
+    // The grant itself may be posted before the transport reports the dead
+    // peer; either way the link must not stay ready.
+    let _ = drive!(w, w.a.links.grant(&b, RAIL, TransferId([6; 16]), &scope));
+    pump!(w);
+    assert!(w.a.links.ready(&b, RAIL).is_none(), "half-open link broke");
+    for _ in 0..8 {
+        w.clock.advance(SETUP_DEADLINE);
+        pump!(w);
+    }
+    assert!(w.a.links.wants(&b, RAIL));
+}
+
+/// Setup tasks hold an `Rc<Links>` (see `connect_link`), so `Links::tasks` is
+/// a reference cycle. `abandon_setups` must break it so an undrained owner
+/// releases the tasks and their admission charges.
+#[test]
+fn abandon_setups_breaks_the_task_cycle_and_releases_charges() {
+    let w = world_for([node_id(1), node_id(2)], true);
+    let links = w.a.links.clone();
+    let charge =
+        w.a.admission
+            .reserve(None, ResourceClass::RequestContext, 128)
+            .unwrap();
+    let held = links.clone();
+    links.spawn(Box::pin(async move {
+        let _owned = (held, charge);
+        std::future::pending::<()>().await;
+        Ok(())
+    }));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert_eq!(links.poll(&mut cx), 1);
+    assert_eq!(w.a.admission.used(ResourceClass::RequestContext), 128);
+    // The world, this test, and the pending task each own one reference.
+    assert_eq!(Rc::strong_count(&links), 3);
+
+    links.abandon_setups();
+    assert_eq!(links.setups(), 0);
+    assert_eq!(Rc::strong_count(&links), 2, "the task's reference is gone");
+    assert_eq!(w.a.admission.used(ResourceClass::RequestContext), 0);
+
+    // An abandoned facade refuses new setups, like a drained one.
+    links.spawn(Box::pin(async { Ok(()) }));
+    assert_eq!(links.setups(), 0);
+    // Idempotent.
+    links.abandon_setups();
 }

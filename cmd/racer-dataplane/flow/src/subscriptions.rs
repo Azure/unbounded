@@ -124,7 +124,9 @@ pub fn select<'a, K: Eq + Hash + 'a>(
 }
 
 /// One retained response slot, including completed but unconsumed responses.
-pub struct Pending<O, V, E> {
+/// `W` is the parked-waiter notification: a [`Waker`] in production, or any
+/// plain value (such as the slot token) for sans-IO callers.
+pub struct Pending<O, V, E, W = Waker> {
     /// Application contract associated with this response.
     pub owner: O,
 
@@ -138,7 +140,7 @@ pub struct Pending<O, V, E> {
     pub result: Option<Result<V, E>>,
 
     /// Last registered response notification.
-    pub waker: Option<Waker>,
+    pub waker: Option<W>,
 
     /// Whether this waiter has an acquisition owner available to take.
     pub promoted: bool,
@@ -147,15 +149,15 @@ pub struct Pending<O, V, E> {
 /// Bounded flight and response storage. The caller serializes transactions and
 /// invokes returned wakers after releasing its lock. Keys and results carry no
 /// authentication or routing assumptions.
-pub struct Fanout<K, O, V, E> {
+pub struct Fanout<K, O, V, E, W = Waker> {
     next: u64,
 
     flights: HashMap<u64, K>,
 
-    pending: HashMap<u64, Pending<O, V, E>>,
+    pending: HashMap<u64, Pending<O, V, E, W>>,
 }
 
-impl<K, O, V, E> Default for Fanout<K, O, V, E> {
+impl<K, O, V, E, W> Default for Fanout<K, O, V, E, W> {
     /// Start with no consumed identifiers or retained response slots.
     fn default() -> Self {
         Self {
@@ -166,19 +168,19 @@ impl<K, O, V, E> Default for Fanout<K, O, V, E> {
     }
 }
 
-impl<K: Eq, O, V, E> Fanout<K, O, V, E> {
+impl<K: Eq, O, V, E, W> Fanout<K, O, V, E, W> {
     /// Inspect active acquisition owners, including abandoned or expired work.
     pub fn flights(&self) -> &HashMap<u64, K> {
         &self.flights
     }
 
     /// Inspect bounded response slots without changing ownership.
-    pub fn pending(&self) -> &HashMap<u64, Pending<O, V, E>> {
+    pub fn pending(&self) -> &HashMap<u64, Pending<O, V, E, W>> {
         &self.pending
     }
 
     /// Mutate response state while the caller holds its transaction lock.
-    pub fn pending_mut(&mut self, token: u64) -> Option<&mut Pending<O, V, E>> {
+    pub fn pending_mut(&mut self, token: u64) -> Option<&mut Pending<O, V, E, W>> {
         self.pending.get_mut(&token)
     }
 
@@ -228,7 +230,7 @@ impl<K: Eq, O, V, E> Fanout<K, O, V, E> {
     }
 
     /// Expire responses without releasing any acquisition owner's capacity.
-    pub fn expire(&mut self, now: u64, mut error: impl FnMut() -> E, wake: &mut Vec<Waker>) {
+    pub fn expire(&mut self, now: u64, mut error: impl FnMut() -> E, wake: &mut Vec<W>) {
         for pending in self.pending.values_mut() {
             if pending.deadline <= now {
                 pending.result = Some(Err(error()));
@@ -240,7 +242,7 @@ impl<K: Eq, O, V, E> Fanout<K, O, V, E> {
     }
 
     /// Consume or abandon exactly one response slot.
-    pub fn remove(&mut self, token: u64) -> Option<Pending<O, V, E>> {
+    pub fn remove(&mut self, token: u64) -> Option<Pending<O, V, E, W>> {
         self.pending.remove(&token)
     }
 
@@ -252,7 +254,7 @@ impl<K: Eq, O, V, E> Fanout<K, O, V, E> {
         flight: u64,
         promote: bool,
         mut complete: impl FnMut(u64, &O, &K) -> Result<V, E>,
-        wake: &mut Vec<Waker>,
+        wake: &mut Vec<W>,
     ) where
         K: Clone,
     {

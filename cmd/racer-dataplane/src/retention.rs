@@ -88,9 +88,6 @@ impl Drop for Payload {
 pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
 pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 
-/// Upper bound of `Scoring::score`: heat 0 to 3 plus 1 for ownership.
-pub(crate) const MAX_SCORE: u8 = 4;
-
 /// One eviction or ordering pass. Ownership and time are pinned when the pass
 /// starts. Over-share classification is computed lazily per candidate cache
 /// and memoized for the rest of the pass, so a pass never walks the published
@@ -273,8 +270,24 @@ impl Retention {
         period: Duration,
         enabled: bool,
     ) -> Result<Self> {
-        let history = SecondSight::new(history_bytes, period, uring_runtime::environment::now())
-            .ok_or(Error::InvalidConfiguration)?;
+        Self::configured_at(
+            history_bytes,
+            heat_entries,
+            period,
+            enabled,
+            uring_runtime::environment::now(),
+        )
+    }
+    /// [`Retention::configured`] with history rotation starting at `now`.
+    pub fn configured_at(
+        history_bytes: usize,
+        heat_entries: usize,
+        period: Duration,
+        enabled: bool,
+        now: Instant,
+    ) -> Result<Self> {
+        let history =
+            SecondSight::new(history_bytes, period, now).ok_or(Error::InvalidConfiguration)?;
         let heat = Heat::new(heat_entries).ok_or(Error::InvalidConfiguration)?;
         Ok(Self {
             state: RefCell::new(State { history, heat }),
@@ -494,7 +507,8 @@ impl Retention {
     pub fn observe(&self, page: &PageId, interest: &Interest) -> Observation {
         self.observe_at(page, interest, uring_runtime::environment::now())
     }
-    fn observe_at(&self, page: &PageId, interest: &Interest, now: Instant) -> Observation {
+    /// [`Retention::observe`] at an explicit instant.
+    pub fn observe_at(&self, page: &PageId, interest: &Interest, now: Instant) -> Observation {
         let mut latched = interest.0.lock().expect("interest mutex poisoned");
         if let Some((identity, observation)) = latched.as_ref() {
             assert_eq!(identity, page, "interest belongs to one logical page");
@@ -508,7 +522,7 @@ impl Retention {
         }
         // Disabled second-sight admits only owned pages.
         let observation = Observation {
-            eligible: owned || (self.enabled && seen),
+            eligible: racer_core::read::retention_eligible(owned, self.enabled, seen),
         };
         *latched = Some((page.clone(), observation));
         self.counters.observations.fetch_add(1, Ordering::Relaxed);
@@ -523,35 +537,34 @@ impl Retention {
     /// Storage installs/removes heat with resident index mappings. Admission never
     /// replaces another resident's exact heat just because hashes collide.
     pub fn track(&self, page: &PageId) -> bool {
-        self.state
-            .borrow_mut()
-            .heat
-            .track(page, uring_runtime::environment::now())
+        self.track_at(page, uring_runtime::environment::now())
+    }
+    /// [`Retention::track`] at an explicit instant.
+    pub fn track_at(&self, page: &PageId, now: Instant) -> bool {
+        self.state.borrow_mut().heat.track(page, now)
     }
     pub fn forget(&self, page: &PageId) {
         self.state.borrow_mut().heat.forget(page);
     }
     pub fn touch(&self, page: &PageId) {
-        self.state
-            .borrow_mut()
-            .heat
-            .touch(page, uring_runtime::environment::now());
+        self.touch_at(page, uring_runtime::environment::now());
+    }
+    /// [`Retention::touch`] at an explicit instant.
+    pub fn touch_at(&self, page: &PageId, now: Instant) {
+        self.state.borrow_mut().heat.touch(page, now);
     }
     pub fn score(&self, page: &PageId) -> u8 {
         self.score_at(page, uring_runtime::environment::now())
     }
-    fn score_at(&self, page: &PageId, now: Instant) -> u8 {
+    /// [`Retention::score`] at an explicit instant.
+    pub fn score_at(&self, page: &PageId, now: Instant) -> u8 {
         let owned = self.is_owned(page);
         self.score_owned_at(page, now, owned)
     }
     fn score_owned_at(&self, page: &PageId, now: Instant, owned: bool) -> u8 {
         let mut state = self.state.borrow_mut();
         let heat = state.heat.score(page, now);
-        if self.enabled {
-            heat + u8::from(owned)
-        } else {
-            0
-        }
+        racer_core::read::retention_score(heat, owned, self.enabled)
     }
     pub fn persistence_attempt(&self, accepted: bool) {
         self.counters.attempts.fetch_add(1, Ordering::Relaxed);
@@ -637,8 +650,12 @@ impl Retention {
         });
     }
     pub fn snapshot(&self) -> Snapshot {
+        self.snapshot_at(uring_runtime::environment::now())
+    }
+    /// [`Retention::snapshot`] with history rotation applied at `now`.
+    pub fn snapshot_at(&self, now: Instant) -> Snapshot {
         let mut state = self.state.borrow_mut();
-        let (set_bits, bits) = state.history.occupancy(uring_runtime::environment::now());
+        let (set_bits, bits) = state.history.occupancy(now);
         Snapshot {
             observations: self.counters.observations.load(Ordering::Relaxed),
             qualified: self.counters.qualified.load(Ordering::Relaxed),

@@ -4,16 +4,22 @@
 //! TokenReview alone is not enough. Token extras name a Pod and Node; both are
 //! read back from the API and must match by UID, and the Pod must be owned by
 //! the live managed DaemonSet and run as the dataplane ServiceAccount.
+//!
+//! Successful reviews and the DaemonSet and ServiceAccount UIDs are cached
+//! briefly and API calls run under a per-process budget; see
+//! [`crate::step::authz`] for the bounds and why they are safe.
 
 use crate::{
     authority::members::{NodeInfo, Ownership, PodInfo},
     kube::{KubeError, paths, str_at},
     limits,
     shared::Shared,
+    step::authz::{self, Bindings, TokenKey},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use racer_control_wire::{ProtocolFailure, TOKEN_AUDIENCE};
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 /// An authorized dataplane caller.
 #[derive(Clone, Debug)]
@@ -59,21 +65,21 @@ pub fn token_expiry(token: &str, now: u64) -> Result<u64, ProtocolFailure> {
     Ok(exp)
 }
 
-fn api(e: KubeError) -> ProtocolFailure {
+/// Map an API failure. A 429 slows this process's authorization budget and
+/// answers `Overloaded`, so the client backs off instead of retrying.
+fn api_failure(shared: &Shared, e: KubeError) -> ProtocolFailure {
     match e {
         KubeError::NotFound => ProtocolFailure::Forbidden,
+        KubeError::Throttled => {
+            shared.auth_budget.borrow_mut().throttled(Instant::now());
+            ProtocolFailure::Overloaded
+        }
         _ => ProtocolFailure::Unavailable,
     }
 }
 
 /// Validated TokenReview user.
-pub struct User {
-    pub uid: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub node_name: String,
-    pub node_uid: String,
-}
+pub use crate::step::authz::Reviewed as User;
 
 fn single_extra(user: &Value, key: &str) -> String {
     match user["extra"][format!("authentication.kubernetes.io/{key}")].as_array() {
@@ -128,7 +134,10 @@ pub async fn review(shared: &Shared, token: &str) -> Result<User, ProtocolFailur
         .api
         .post(paths::TOKEN_REVIEWS, &body)
         .await
-        .map_err(|_| ProtocolFailure::Unavailable)?;
+        .map_err(|e| match api_failure(shared, e) {
+            ProtocolFailure::Overloaded => ProtocolFailure::Overloaded,
+            _ => ProtocolFailure::Unavailable,
+        })?;
     check_review(
         &r["status"],
         &shared.config.namespace,
@@ -136,7 +145,66 @@ pub async fn review(shared: &Shared, token: &str) -> Result<User, ProtocolFailur
     )
 }
 
-/// Full bearer authorization of a dataplane Pod.
+/// TokenReview of `token`, from the cache when a successful review of the
+/// same token is younger than [`authz::REVIEW_TTL`]. See [`crate::step::authz`]
+/// for why reuse is safe.
+async fn reviewed(
+    shared: &Shared,
+    token: &str,
+    key: &TokenKey,
+    expires: u64,
+    now: u64,
+) -> Result<User, ProtocolFailure> {
+    if let Some(u) = shared.authz.borrow_mut().review(key, Instant::now()) {
+        return Ok(u);
+    }
+    let u = review(shared, token).await?;
+    shared.authz.borrow_mut().put_review(
+        *key,
+        u.clone(),
+        Duration::from_secs(expires.saturating_sub(now)),
+        Instant::now(),
+    );
+    Ok(u)
+}
+
+/// DaemonSet and ServiceAccount UIDs, cached for [`authz::BINDINGS_TTL`].
+async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
+    if let Some(b) = shared.authz.borrow_mut().bindings(Instant::now()) {
+        return Ok(b);
+    }
+    let ns = &shared.config.namespace;
+    let ds = shared
+        .api
+        .get(&paths::daemonset(ns, &shared.config.daemonset))
+        .await
+        .map_err(|e| api_failure(shared, e))?;
+    let sa = shared
+        .api
+        .get(&paths::service_account(ns, &shared.config.service_account))
+        .await
+        .map_err(|e| api_failure(shared, e))?;
+    let b = Bindings {
+        daemonset_uid: if str_at(&ds, &["metadata", "deletionTimestamp"]).is_empty() {
+            str_at(&ds, &["metadata", "uid"]).into()
+        } else {
+            String::new()
+        },
+        service_account_uid: str_at(&sa, &["metadata", "uid"]).into(),
+        service_account_deleting: !str_at(&sa, &["metadata", "deletionTimestamp"]).is_empty(),
+    };
+    shared
+        .authz
+        .borrow_mut()
+        .put_bindings(b.clone(), Instant::now());
+    Ok(b)
+}
+
+/// Full bearer authorization of a dataplane Pod. A recent whole
+/// authorization of the token is reused; otherwise the Pod and Node are read
+/// live and the review and bindings may come from [`Shared::authz`]. Every
+/// API call is reserved from [`Shared::auth_budget`] first (waiting up to
+/// [`limits::AUTH_BUDGET_WAIT`]), else `Overloaded` before any call.
 pub async fn authorize(
     shared: &Shared,
     header: Option<&str>,
@@ -144,57 +212,70 @@ pub async fn authorize(
 ) -> Result<Caller, ProtocolFailure> {
     let token = bearer(header)?;
     let expires = token_expiry(token, now)?;
-    let user = review(shared, token).await?;
+    let key = authz::token_key(token);
+    if let Some(c) = shared.authz.borrow_mut().caller(&key, Instant::now()) {
+        return Ok(c);
+    }
+    let calls = shared.authz.borrow().calls(&key, Instant::now());
+    let wait = shared
+        .auth_budget
+        .borrow_mut()
+        .reserve(calls, Instant::now(), limits::AUTH_BUDGET_WAIT)
+        .ok_or(ProtocolFailure::Overloaded)?;
+    if !wait.is_zero() {
+        crate::exec::sleep(wait).await;
+    }
+    let user = reviewed(shared, token, &key, expires, now).await?;
+    let refuse = |bindings: bool| {
+        let mut c = shared.authz.borrow_mut();
+        c.drop_review(&key);
+        if bindings {
+            c.drop_bindings();
+        }
+        ProtocolFailure::Forbidden
+    };
     let ns = &shared.config.namespace;
     let pod = PodInfo::from_json(
         &shared
             .api
             .get(&paths::pod(ns, &user.pod_name))
             .await
-            .map_err(api)?,
+            .map_err(|e| api_failure(shared, e))?,
     );
     if pod.uid != user.pod_uid {
-        return Err(ProtocolFailure::Forbidden);
+        return Err(refuse(false));
     }
-    let ds = shared
-        .api
-        .get(&paths::daemonset(ns, &shared.config.daemonset))
-        .await
-        .map_err(api)?;
+    let b = bindings(shared).await?;
     let ownership = Ownership {
         namespace: ns.clone(),
         daemonset: shared.config.daemonset.clone(),
-        uid: if str_at(&ds, &["metadata", "deletionTimestamp"]).is_empty() {
-            str_at(&ds, &["metadata", "uid"]).into()
-        } else {
-            String::new()
-        },
+        uid: b.daemonset_uid,
         service_account: shared.config.service_account.clone(),
     };
     if !ownership.manages(&pod) {
-        return Err(ProtocolFailure::Forbidden);
+        return Err(refuse(true));
     }
-    let sa = shared
-        .api
-        .get(&paths::service_account(ns, &shared.config.service_account))
-        .await
-        .map_err(api)?;
-    if str_at(&sa, &["metadata", "uid"]) != user.uid
-        || !str_at(&sa, &["metadata", "deletionTimestamp"]).is_empty()
-    {
-        return Err(ProtocolFailure::Forbidden);
+    if b.service_account_uid != user.uid || b.service_account_deleting {
+        return Err(refuse(true));
     }
     let node = NodeInfo::from_json(
         &shared
             .api
             .get(&paths::node(&pod.node_name))
             .await
-            .map_err(api)?,
+            .map_err(|e| api_failure(shared, e))?,
     );
     if !node.authorized() || node.name != user.node_name || node.uid != user.node_uid {
-        return Err(ProtocolFailure::Forbidden);
+        return Err(refuse(false));
     }
-    Ok(Caller { node, expires })
+    let caller = Caller { node, expires };
+    shared.authz.borrow_mut().put_caller(
+        key,
+        caller.clone(),
+        Duration::from_secs(expires.saturating_sub(now)),
+        Instant::now(),
+    );
+    Ok(caller)
 }
 
 /// An authenticated seat holder calling the primary's replica endpoint.
@@ -215,7 +296,7 @@ pub async fn authorize_seat_caller(
 ) -> Result<SeatCaller, ProtocolFailure> {
     let token = bearer(header)?;
     let expires = token_expiry(token, now)?;
-    let user = review(shared, token).await?;
+    let user = reviewed(shared, token, &authz::token_key(token), expires, now).await?;
     let caller = SeatCaller {
         pod_name: user.pod_name,
         pod_uid: user.pod_uid,
@@ -377,6 +458,8 @@ pub(crate) mod tests {
                 ),
             ] {
                 seed(pod, ds, sa, n);
+                // As if the binding cache TTL had passed.
+                *shared.authz.borrow_mut() = Default::default();
                 assert_eq!(
                     authorize(&shared, Some(&header), 1).await.err(),
                     Some(want),
@@ -390,6 +473,110 @@ pub(crate) mod tests {
                     .err(),
                 Some(ProtocolFailure::Unauthenticated)
             );
+        });
+    }
+
+    /// Repeat authorizations reuse the TokenReview and binding reads but
+    /// always read the Pod and Node live; refusals and failed reviews are
+    /// not cached; the budget refuses before any API call.
+    #[test]
+    fn authorization_caches_review_and_bindings_under_budget() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let ns = "racer-system";
+            let node = "11111111-1111-4111-8111-111111111111";
+            let pod = |uid: &str| {
+                json!({
+                "metadata":{"name":"p","namespace":ns,"uid":uid,
+                    "ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":"ds","controller":true}]},
+                "spec":{"nodeName":"n","serviceAccountName":"racer-dataplane"},
+                "status":{"phase":"Running","podIP":"10.0.0.1"}})
+            };
+            api.put_object(
+                &paths::daemonset(ns, "racer-dataplane"),
+                json!({"metadata":{"uid":"ds"}}),
+            );
+            api.put_object(
+                &paths::service_account(ns, "racer-dataplane"),
+                json!({"metadata":{"uid":"sa"}}),
+            );
+            api.put_object(
+                &paths::node("n"),
+                json!({"metadata":{"name":"n","uid":node}}),
+            );
+            api.put_object(&paths::pod(ns, "p"), pod("pu"));
+            let authenticated = std::rc::Rc::new(std::cell::Cell::new(true));
+            let a = authenticated.clone();
+            api.on_post(move |_, _| {
+                let mut s = review_status("system:serviceaccount:racer-system:racer-dataplane");
+                s["user"]["uid"] = "sa".into();
+                s["user"]["extra"]["authentication.kubernetes.io/node-uid"] = json!([node]);
+                s["authenticated"] = a.get().into();
+                Some((201, json!({"status": s})))
+            });
+            let header = format!("Bearer {}", jwt(u64::MAX / 2));
+            let n = || api.requests().len();
+            let posts = || api.requests().iter().filter(|(m, _)| m == "POST").count();
+            authorize(&shared, Some(&header), 1).await.unwrap();
+            assert_eq!((n(), posts()), (5, 1));
+            // Within CALLER_TTL the whole authorization is reused, even
+            // across a Pod change (the documented revocation window).
+            api.put_object(&paths::pod(ns, "p"), pod("other"));
+            authorize(&shared, Some(&header), 1).await.unwrap();
+            assert_eq!(n(), 5);
+            api.put_object(&paths::pod(ns, "p"), pod("pu"));
+            // Past it, cached review and bindings: only the Pod and Node
+            // are read.
+            shared.authz.borrow_mut().drop_callers();
+            authorize(&shared, Some(&header), 1).await.unwrap();
+            assert_eq!((n(), posts()), (7, 1));
+            shared.authz.borrow_mut().drop_callers();
+            // A replaced Pod is refused at once and the review is dropped.
+            api.put_object(&paths::pod(ns, "p"), pod("other"));
+            assert_eq!(
+                authorize(&shared, Some(&header), 1).await.err(),
+                Some(ProtocolFailure::Forbidden)
+            );
+            assert_eq!(n(), 8);
+            api.put_object(&paths::pod(ns, "p"), pod("pu"));
+            authorize(&shared, Some(&header), 1).await.unwrap();
+            assert_eq!((n(), posts()), (11, 2));
+            shared.authz.borrow_mut().drop_callers();
+            // A deleted Pod is refused once no whole authorization is cached.
+            api.delete_object(&paths::pod(ns, "p"));
+            assert_eq!(
+                authorize(&shared, Some(&header), 1).await.err(),
+                Some(ProtocolFailure::Forbidden)
+            );
+            api.put_object(&paths::pod(ns, "p"), pod("pu"));
+            // Failed reviews are never cached.
+            *shared.authz.borrow_mut() = Default::default();
+            authenticated.set(false);
+            for _ in 0..2 {
+                assert_eq!(
+                    authorize(&shared, Some(&header), 1).await.err(),
+                    Some(ProtocolFailure::Unauthenticated)
+                );
+            }
+            authenticated.set(true);
+            assert_eq!(shared.authz.borrow().len(), 0);
+            // An API 429 answers Overloaded and halves the budget.
+            api.fail_next(&[429]);
+            assert_eq!(
+                authorize(&shared, Some(&header), 1).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            assert_eq!(shared.auth_budget.borrow().qps, limits::AUTH_API_QPS / 2.0);
+            // Out of budget: Overloaded before any API call.
+            *shared.auth_budget.borrow_mut() = authz::ApiBudget::new(1e-6, 5.0);
+            authorize(&shared, Some(&header), 1).await.unwrap();
+            shared.authz.borrow_mut().drop_callers();
+            let before = n();
+            assert_eq!(
+                authorize(&shared, Some(&header), 1).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            assert_eq!(n(), before);
         });
     }
 

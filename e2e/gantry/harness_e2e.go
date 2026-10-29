@@ -492,6 +492,7 @@ func (h *harness) waitForMetricIncrease(ctx context.Context, metric string, befo
 		}
 	}
 
+	h.dumpDiagnostics(ctx)
 	h.t.Fatalf("metric %s did not increase above %.0f within 2m", metric, before)
 
 	return before
@@ -514,6 +515,7 @@ func (h *harness) waitForMetricIncreaseOnPod(ctx context.Context, pod, metric st
 		}
 	}
 
+	h.dumpDiagnostics(ctx)
 	h.t.Fatalf("metric %s on %s did not increase above %.0f within 2m", metric, pod, before)
 
 	return before

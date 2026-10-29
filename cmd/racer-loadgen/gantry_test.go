@@ -103,7 +103,9 @@ func TestGantryIntegration(t *testing.T) {
 		return metadata, body, err
 	})
 
-	server := httptest.NewServer(mirror.New(cfg, nil, upstream, mirror.WithContentBackend(gantryracer.NewHandler(client, upstream, nil))).Handler())
+	// Retries are disabled so callback counts reflect exactly one attempt per page.
+	handler := gantryracer.NewHandler(client, upstream, nil, gantryracer.WithRetryBudget(0))
+	server := httptest.NewServer(mirror.New(cfg, nil, upstream, mirror.WithContentBackend(handler)).Handler())
 	t.Cleanup(server.Close)
 	opts := pullTestOptions(server.URL)
 	opts.Namespace = "loadgen.invalid"

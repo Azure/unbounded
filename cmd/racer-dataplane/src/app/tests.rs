@@ -1195,7 +1195,7 @@ fn worker_sizing_funds_derived_connection_pools() {
 impl WorkerApplication {
     // Keep private-field access local; shared fixture assembly belongs to test_support.
     pub(crate) fn into_test_coordinator(self) -> Rc<Coordinator> {
-        self.coordinator
+        self.coordinator.clone()
     }
 }
 
@@ -4831,14 +4831,14 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     let start = std::time::Instant::now();
     let second = Duration::from_secs(1);
     let mut now = start;
-    while now < start + crate::memory::CACHE_IDLE_TTL {
+    while now < start + racer_core::cache::IDLE_TTL {
         worker.maintain_pools(now);
         now += second;
     }
     assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
     // The hit renews the entry for another full TTL.
     let renewed = now;
-    while now < renewed + crate::memory::CACHE_IDLE_TTL {
+    while now < renewed + racer_core::cache::IDLE_TTL {
         worker.maintain_pools(now);
         assert_eq!(worker.aligned_pool_stats().entries, 0);
         now += second;
@@ -4879,4 +4879,97 @@ fn snapshot_refresh_applies_priority_live_and_reweighs_memory() {
             u64::from(priority)
         );
     }
+}
+
+/// Slab files for workers outside the current plan are removed; others are kept.
+#[test]
+fn prune_stale_slab_files_removes_only_extra_worker_files() {
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("prune-slabs-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    for name in [
+        "worker-0-slab-0.dat",
+        "worker-1-slab-0.dat",
+        "worker-2-slab-0.dat",
+        "worker-3-slab-0.dat",
+        "worker-4-slab-0.dat",
+        "checkpoint.0",
+        "worker-x-slab-0.dat",
+    ] {
+        std::fs::write(directory.join(name), b"x").unwrap();
+    }
+    std::fs::create_dir(directory.join("worker-9-slab-0.dat")).unwrap();
+    super::prune_stale_slab_files(&directory, &[WorkerId(0), WorkerId(1), WorkerId(2)]);
+    let mut left: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "checkpoint.0",
+            "worker-0-slab-0.dat",
+            "worker-1-slab-0.dat",
+            "worker-2-slab-0.dat",
+            "worker-9-slab-0.dat",
+            "worker-x-slab-0.dat",
+        ]
+    );
+    // A missing directory is not an error.
+    super::prune_stale_slab_files(&directory.join("missing"), &[WorkerId(0)]);
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+/// A stale slab file still locked by another instance is kept.
+#[test]
+fn prune_stale_slab_files_skips_locked_files() {
+    use std::os::fd::AsRawFd;
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("prune-locked-slabs-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let locked = directory.join("worker-3-slab-0.dat");
+    let unlocked = directory.join("worker-4-slab-0.dat");
+    std::fs::write(&locked, b"x").unwrap();
+    std::fs::write(&unlocked, b"x").unwrap();
+    let holder = std::fs::File::open(&locked).unwrap();
+    // SAFETY: flock borrows a live descriptor owned by this test.
+    assert_eq!(
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    super::prune_stale_slab_files(&directory, &[WorkerId(0)]);
+    assert!(locked.exists());
+    assert!(!unlocked.exists());
+    drop(holder);
+    super::prune_stale_slab_files(&directory, &[WorkerId(0)]);
+    assert!(!locked.exists());
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+/// Pruning never touches files reached through a symlinked slab directory or
+/// a symlinked ancestor, which slab startup also rejects.
+#[test]
+fn prune_stale_slab_files_ignores_symlinked_directories() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("prune-symlink-slabs-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let real = root.join("real");
+    std::fs::create_dir_all(real.join("slabs")).unwrap();
+    let stale = real.join("slabs/worker-3-slab-0.dat");
+    std::fs::write(&stale, b"x").unwrap();
+    std::os::unix::fs::symlink(real.join("slabs"), root.join("linked-slabs")).unwrap();
+    std::os::unix::fs::symlink(&real, root.join("linked-parent")).unwrap();
+    super::prune_stale_slab_files(&root.join("linked-slabs"), &[WorkerId(0)]);
+    super::prune_stale_slab_files(&root.join("linked-parent/slabs"), &[WorkerId(0)]);
+    assert!(stale.exists());
+    // The real path is still pruned.
+    super::prune_stale_slab_files(&real.join("slabs"), &[WorkerId(0)]);
+    assert!(!stale.exists());
+    std::fs::remove_dir_all(&root).unwrap();
 }

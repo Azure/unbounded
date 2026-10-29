@@ -710,6 +710,7 @@ dependencies = [
  "base64",
  "http1",
  "racer-control-wire",
+ "racer-core",
  "racer-crypto",
  "racer-object-wire",
  "sha2",
@@ -832,6 +833,7 @@ dependencies = [
  "libc",
  "racer-admission",
  "racer-control-wire",
+ "racer-core",
  "racer-crypto",
  "rcgen",
  "regex",
@@ -856,6 +858,17 @@ dependencies = [
  "wire-codec",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "racer-core"
+version = "0.1.0"
+dependencies = [
+ "flow-control",
+ "racer-control-wire",
+ "racer-object-wire",
+ "sha2",
+ "topology",
 ]
 
 [[package]]
@@ -901,6 +914,7 @@ dependencies = [
  "prost",
  "racer-cluster-control",
  "racer-control-wire",
+ "racer-core",
  "racer-crypto",
  "racer-gpu",
  "racer-object-wire",
@@ -937,6 +951,20 @@ dependencies = [
  "http1",
  "racer-control-wire",
  "wire-codec",
+]
+
+[[package]]
+name = "racer-sim"
+version = "0.1.0"
+dependencies = [
+ "flow-control",
+ "page-alloc",
+ "racer-cluster-control",
+ "racer-control-wire",
+ "racer-core",
+ "racer-object-wire",
+ "serde_json",
+ "topology",
 ]
 
 [[package]]

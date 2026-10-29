@@ -47,13 +47,9 @@ impl RouteState {
         {
             return Err(Error::Unauthorized);
         }
-        if state.links == 0
-            || state.links > MAX_HOPS as u64
-            || state.visited.is_empty()
-            || state.visited.len() + state.links as usize > MAX_HOPS + 1
-        {
-            return Err(Error::HopBudgetExhausted);
-        }
+        // `visited` includes the sender, so eight links is a sum of nine.
+        racer_core::route::check_wire(state.visited.len(), state.links)
+            .map_err(|_| Error::HopBudgetExhausted)?;
         Ok(state)
     }
 
@@ -61,8 +57,7 @@ impl RouteState {
     pub fn transition(&self, next: &Self, signer: &NodeId) -> Result<()> {
         let mut visited = self.visited.clone();
         visited.push(signer.clone());
-        if self.links <= 1
-            || next.links != self.links - 1
+        if racer_core::route::check_wire_transition(self.links, next.links).is_err()
             || next.attempts > self.attempts
             || next.deadline > self.deadline
             || next.membership != self.membership

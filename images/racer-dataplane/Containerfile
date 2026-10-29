@@ -7,10 +7,14 @@ ARG RUNTIME_IMAGE=ubuntu:noble
 # Build on the target platform: both Rust and the verbs adapter use its ABI.
 FROM ${RUST_IMAGE} AS builder
 ARG RACER_NATIVE_RDMA=true
-# Build the CUDA shim (libracer_gpu_cuda.so.1) and the `cuda` feature. The
-# shim dlopens the driver at runtime, so only nvcc (for the decrypt kernel PTX)
-# is installed here; the runtime image gets the driver from the NVIDIA runtime.
-ARG RACER_NATIVE_CUDA=false
+# Build the CUDA shim (libracer_gpu_cuda.so.1) and the `cuda` feature. On by
+# default so one image serves GPU and CPU nodes. The shim dlopens the driver at
+# runtime, so only nvcc (for the decrypt kernel PTX) is installed here; the
+# runtime image gets the driver from the NVIDIA runtime. With
+# RACER_ENABLE_GPU=auto (the default), the dataplane touches no GPU until the
+# first gpu-read, and turns GPU reads off then if no GPU is usable. Set false
+# for a smaller image without GPU reads.
+ARG RACER_NATIVE_CUDA=true
 ARG CUDA_NVCC_PACKAGE=cuda-nvcc-12-9
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
 WORKDIR /src
@@ -53,6 +57,8 @@ COPY cmd/racer-dataplane/cluster-control/Cargo.toml ./cluster-control/Cargo.toml
 COPY cmd/racer-dataplane/cluster-control/src ./cluster-control/src
 COPY cmd/racer-dataplane/admission/Cargo.toml ./admission/Cargo.toml
 COPY cmd/racer-dataplane/admission/src ./admission/src
+COPY cmd/racer-dataplane/core/Cargo.toml ./core/Cargo.toml
+COPY cmd/racer-dataplane/core/src ./core/src
 COPY cmd/racer-dataplane/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
 COPY cmd/racer-dataplane/peer-wire/src ./peer-wire/src
 COPY cmd/racer-dataplane/object-wire/Cargo.toml ./object-wire/Cargo.toml
@@ -83,6 +89,8 @@ COPY cmd/racer-dataplane/uds-endpoint/src ./uds-endpoint/src
 COPY cmd/racer-dataplane/wire-codec/Cargo.toml ./wire-codec/Cargo.toml
 COPY cmd/racer-dataplane/wire-codec/src ./wire-codec/src
 COPY cmd/racer-dataplane/wire-codec/tests ./wire-codec/tests
+COPY cmd/racer-dataplane/sim/Cargo.toml ./sim/Cargo.toml
+COPY cmd/racer-dataplane/sim/src ./sim/src
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/build-native-cuda.sh ./build-native-cuda.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
@@ -107,7 +115,7 @@ RUN set -eu; \
 # symbol versions, so the binary and verbs adapter run on noble's newer ones.
 FROM ${RUNTIME_IMAGE}
 ARG RACER_NATIVE_RDMA=true
-ARG RACER_NATIVE_CUDA=false
+ARG RACER_NATIVE_CUDA=true
 # cuFile user-space library for GPUDirect Storage. The NVIDIA container runtime
 # injects driver libraries only, not the toolkit's libcufile.so.0, so the CUDA
 # image ships it. The repo matches RUNTIME_IMAGE (ubuntu:noble). cuFile loads
@@ -162,8 +170,12 @@ RUN set -eu; \
 # adapter and CUDA shim under /usr/local/lib where the dynamic loader finds it by soname.
 COPY --from=builder /out/ /
 COPY LICENSE NOTICE /unbounded/licenses/
+# cuFile reads its configuration from CUFILE_ENV_PATH_JSON. Images built
+# without CUDA never load cuFile, so the file and variable are inert there.
+COPY images/racer-dataplane/cufile.json /etc/racer/cufile.json
 RUN ldconfig
 
+ENV CUFILE_ENV_PATH_JSON=/etc/racer/cufile.json
 ENV PATH="/unbounded/bin:${PATH}"
 
 WORKDIR /unbounded

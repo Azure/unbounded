@@ -1,0 +1,1035 @@
+//! Combined mode: [`ControlSim`] and [`NodeWorld`] on one timeline. Pod `i`
+//! is node `i`; control events at or before a data-plane event run first, and
+//! the recorded [`Changes`] then apply: committed memberships become shared
+//! `topology::Membership` versions, each node adopts exactly the version its
+//! client applied (none: it neither reads nor accepts peer links), and Pod
+//! crashes, restarts and removals crash or restart the node.
+
+use serde_json::{Value, json};
+
+use crate::config::Config;
+use crate::control::{self, Changes, ControlSim, CtlFault, Life};
+use crate::engine::{Nanos, SECONDS, mix};
+use crate::faults::Fault;
+use crate::node::NodeWorld;
+use crate::node::world::Event;
+use crate::resources::OriginErrors;
+use crate::workload::Storm;
+
+/// Combined scenario names accepted by the CLI.
+pub const SCENARIOS: &[&str] = &[
+    "full-cold-start",
+    "full-failover",
+    "full-churn",
+    "full-lagging",
+];
+
+/// The control scenario whose plan (settings and faults) a combined
+/// scenario uses, and its default duration.
+fn control_plan(scenario: &str) -> (&'static str, Nanos) {
+    match scenario {
+        "full-cold-start" => ("enrollment-storm", 400 * SECONDS),
+        "full-failover" => ("failover", 900 * SECONDS),
+        "full-churn" => ("ctl-churn", 1200 * SECONDS),
+        _ => ("lagging", 900 * SECONDS),
+    }
+}
+
+/// Data-plane defaults for a combined scenario (before `--config`): a light
+/// Zipf read load so 50,000 nodes stay tractable.
+pub fn data_defaults(config: &mut Config) {
+    config.objects = 4096;
+    config.zipf_s = 1.0;
+    config.request_rate = 0.02;
+}
+
+/// Data-plane faults layered on the control plans (`"combined_faults"` in
+/// `--config`). Used only when `--config` gives no `faults` list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DataFaults {
+    pub enabled: bool,
+    /// Slow nodes per thousand (`full-lagging`, `full-cold-start`).
+    pub slow_permille: u32,
+    /// Slowdown factor of a slow node.
+    pub slow_factor: u8,
+    /// Origin 5xx probability during a burst (`full-failover`).
+    pub p5xx: f64,
+    /// Origin 412 probability during a burst (`full-churn`).
+    pub p412: f64,
+    /// Length of each origin error burst.
+    pub burst_ns: Nanos,
+    /// Site 0 and site 1 are cut apart (`full-failover`).
+    pub partition: bool,
+}
+
+impl Default for DataFaults {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            slow_permille: 10,
+            slow_factor: 8,
+            p5xx: 0.3,
+            p412: 0.1,
+            burst_ns: 30 * SECONDS,
+            partition: true,
+        }
+    }
+}
+
+impl DataFaults {
+    pub fn apply_json(&mut self, value: &Value) -> Result<(), String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| format!("combined_faults: expected an object, got {value}"))?;
+        for (key, v) in obj {
+            let bad = || format!("combined_faults.{key}: invalid value {v}");
+            match key.as_str() {
+                "enabled" => self.enabled = v.as_bool().ok_or_else(bad)?,
+                "partition" => self.partition = v.as_bool().ok_or_else(bad)?,
+                "slow_permille" => {
+                    self.slow_permille = v.as_u64().filter(|n| *n <= 1000).ok_or_else(bad)? as u32;
+                }
+                "slow_factor" => {
+                    self.slow_factor = v
+                        .as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(bad)?;
+                }
+                "p5xx" => {
+                    self.p5xx = v
+                        .as_f64()
+                        .filter(|p| (0.0..=1.0).contains(p))
+                        .ok_or_else(bad)?
+                }
+                "p412" => {
+                    self.p412 = v
+                        .as_f64()
+                        .filter(|p| (0.0..=1.0).contains(p))
+                        .ok_or_else(bad)?
+                }
+                "burst_ns" => self.burst_ns = v.as_u64().ok_or_else(bad)?,
+                _ => return Err(format!("unknown key combined_faults.{key}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `1000 / slow_permille`-th node, slowed during `[from, until)`.
+    fn slow(&self, nodes: u32, from_ns: Nanos, until_ns: Nanos, out: &mut Vec<Fault>) {
+        if self.slow_permille == 0 || self.slow_factor <= 1 {
+            return;
+        }
+        let stride = (1000 / self.slow_permille).max(1);
+        for node in (stride / 2..nodes).step_by(stride as usize) {
+            out.push(Fault::Slow {
+                node,
+                factor: self.slow_factor,
+                from_ns,
+                until_ns,
+            });
+        }
+    }
+
+    fn origin(&self, at: &[Nanos], errors: OriginErrors, out: &mut Vec<Fault>) {
+        if errors.p412 + errors.p5xx <= 0.0 || self.burst_ns == 0 {
+            return;
+        }
+        for from_ns in at {
+            out.push(Fault::OriginErrors {
+                from_ns: *from_ns,
+                until_ns: from_ns + self.burst_ns,
+                errors,
+            });
+        }
+    }
+
+    /// The default data-plane faults of `scenario` over `d` nanoseconds.
+    pub fn plan(&self, scenario: &str, nodes: u32, d: Nanos) -> Vec<Fault> {
+        let mut out = Vec::new();
+        if !self.enabled {
+            return out;
+        }
+        match scenario {
+            "full-cold-start" => self.slow(nodes, d * 3 / 4 - d / 40, d * 3 / 4 + d / 20, &mut out),
+            "full-failover" => {
+                if self.partition {
+                    out.push(Fault::Partition {
+                        from_ns: d * 2 / 5,
+                        until_ns: d / 2,
+                        site_a: 0,
+                        site_b: 1,
+                    });
+                }
+                let errors = OriginErrors {
+                    p5xx: self.p5xx,
+                    ..OriginErrors::default()
+                };
+                self.origin(&[d / 5, d * 3 / 5], errors, &mut out);
+            }
+            "full-churn" => {
+                let errors = OriginErrors {
+                    p412: self.p412,
+                    ..OriginErrors::default()
+                };
+                self.origin(&[d / 2], errors, &mut out);
+            }
+            _ => self.slow(nodes, d / 10, d * 9 / 10, &mut out),
+        }
+        out
+    }
+}
+
+/// Data-plane schedules generated after `--config` (only when empty).
+fn data_schedules(scenario: &str, config: &mut Config) {
+    if config.faults.is_empty() {
+        config.faults = config
+            .combined_faults
+            .plan(scenario, config.nodes, config.duration_ns);
+    }
+    if scenario == "full-cold-start" && config.storms.is_empty() {
+        // Once everyone has enrolled (about 280 s at 50,000 Pods), every
+        // node reads object 0 within `cold_start_window_ns`.
+        config.storms.push(Storm {
+            at_ns: config.duration_ns * 3 / 4,
+            object: 0,
+            nodes: config.nodes,
+            window_ns: cold_start_window_ns(config),
+        });
+    }
+}
+
+/// Arrival window of the `full-cold-start` storm: at least one second, and
+/// twice the owner egress the storm needs (`nodes * page_bytes / (REPLICAS *
+/// nic_bps)`), so it offers at most half of what a page's owners can send.
+fn cold_start_window_ns(config: &Config) -> Nanos {
+    let replicas = topology::REPLICAS as u128;
+    let egress = u128::from(config.nodes) * u128::from(config.page_bytes) * u128::from(SECONDS)
+        / (replicas * u128::from(config.nic_bps.max(1)));
+    (2 * egress).clamp(u128::from(SECONDS), u128::from(Nanos::MAX)) as Nanos
+}
+
+pub struct Combined {
+    pub node: NodeWorld,
+    pub ctl: ControlSim,
+    pruned_ns: Nanos,
+}
+
+impl Combined {
+    pub fn new(
+        config: Config,
+        settings: control::Settings,
+        seed: u64,
+        faults: Vec<CtlFault>,
+    ) -> Self {
+        let mut ctl = ControlSim::new(settings, seed, faults);
+        ctl.record = true;
+        Self {
+            node: NodeWorld::new_combined(config, seed),
+            ctl,
+            pruned_ns: 0,
+        }
+    }
+
+    /// Run both timelines to `end`.
+    pub fn run(&mut self, end: Nanos) {
+        loop {
+            let tn = self.node.engine.next_at().filter(|t| *t <= end);
+            let tc = self.ctl.engine.next_at().filter(|t| *t <= end);
+            match (tn, tc) {
+                (None, None) => break,
+                (tn, Some(c)) if tn.is_none_or(|n| c <= n) => {
+                    self.ctl.advance_to(c);
+                    self.sync(c);
+                }
+                _ => {
+                    self.node.step(end);
+                }
+            }
+        }
+        self.ctl.advance_to(end);
+        self.sync(end);
+        self.node.run(end);
+    }
+
+    /// Apply control changes to the data plane at time `at`.
+    fn sync(&mut self, at: Nanos) {
+        let Changes {
+            memberships,
+            applied,
+            lives,
+        } = std::mem::take(&mut self.ctl.changes);
+        for (version, pods) in memberships {
+            self.node.commit_membership(version, pods, at);
+        }
+        let changed = !applied.is_empty();
+        for (pod, version) in applied {
+            self.node.apply_membership(pod, version);
+        }
+        for (pod, life) in lives {
+            let event = match life {
+                Life::Crashed | Life::Removed => Event::Crash { node: pod },
+                Life::Restarted => Event::Restart { node: pod },
+            };
+            self.node.engine.at(at, event);
+        }
+        // Clients catching up release old versions; prune at most once per
+        // simulated second to keep the O(nodes) scan cheap.
+        if changed && at >= self.pruned_ns + SECONDS {
+            self.pruned_ns = at;
+            self.node.prune_versions();
+        }
+    }
+
+    pub fn trace_hash(&self) -> u64 {
+        mix(self.node.engine.trace.value() ^ self.ctl.engine.trace.value().rotate_left(29))
+    }
+
+    pub fn report(&mut self, scenario: &str, seed: u64) -> Value {
+        let mut report = self.node.report(scenario, seed);
+        let ctl = self.ctl.report(scenario, seed);
+        let ctl_failures = ctl["invariants"]["hard_failures"].as_u64().unwrap_or(0);
+        let node_failures = report["invariants"]["hard_failures"].as_u64().unwrap_or(0);
+        report["logic"] = json!("combined");
+        report["trace_hash"] = json!(format!("{:016x}", self.trace_hash()));
+        report["data_trace_hash"] = json!(format!("{:016x}", self.node.engine.trace.value()));
+        report["events"] =
+            json!(self.node.engine.processed() + ctl["events"].as_u64().unwrap_or(0));
+        let mut extra = 0u64;
+        for (name, bytes) in self.ctl.memory() {
+            report["memory"]["components"][name] = json!(bytes);
+            extra += bytes as u64;
+        }
+        let total = report["memory"]["accounted_bytes"].as_u64().unwrap_or(0) + extra;
+        report["memory"]["accounted_bytes"] = json!(total);
+        report["memory"]["accounted_bytes_per_node"] =
+            json!(total / u64::from(self.node.config.nodes.max(1)));
+        let skew = self.skew();
+        report["combined"] = json!({
+            "hard_failures": node_failures + ctl_failures,
+            "control_invariants": ctl["invariants"],
+            "control_metrics": ctl["metrics"],
+            "control": ctl["control"],
+            "membership_skew_at_end": skew,
+        });
+        report["invariants"]["hard_failures"] = json!(node_failures + ctl_failures);
+        report
+    }
+
+    /// Nodes (not down) by how many committed versions they trail at the end.
+    fn skew(&self) -> Value {
+        let latest = self.ctl.committed_membership_version().unwrap_or(0);
+        let mut current = 0u64;
+        let mut behind = 0u64;
+        let mut unenrolled = 0u64;
+        for n in 0..self.node.config.nodes {
+            if self.node.is_down(n) {
+                continue;
+            }
+            match self.ctl.membership_version(n) {
+                0 => unenrolled += 1,
+                v if v == latest => current += 1,
+                _ => behind += 1,
+            }
+        }
+        json!({"current": current, "behind": behind, "unenrolled": unenrolled, "latest": latest})
+    }
+}
+
+/// Build and run a combined scenario. `overrides` is the `"control"` object
+/// from `--config`; `config` is the data-plane configuration.
+pub fn run(
+    scenario: &str,
+    mut config: Config,
+    seed: u64,
+    duration: Option<Nanos>,
+    overrides: Option<&Value>,
+) -> Result<Value, String> {
+    let (ctl_scenario, default) = control_plan(scenario);
+    let end = duration.unwrap_or(default);
+    config.duration_ns = end;
+    data_schedules(scenario, &mut config);
+    let (mut settings, _, faults) = control::plan(ctl_scenario, config.nodes, Some(end));
+    if let Some(o) = overrides {
+        settings.apply_json(o)?;
+        settings.initial_pods = settings.initial_pods.clamp(1, config.nodes);
+    }
+    let mut world = Combined::new(config, settings, seed, faults);
+    world.run(end);
+    let mut report = world.report(scenario, seed);
+    report["duration_ns"] = json!(end);
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `scenario` with the combined data defaults at `rate`, tuned by `f`.
+    fn tuned(
+        scenario: &str,
+        nodes: u32,
+        rate: f64,
+        seed: u64,
+        secs: Option<u64>,
+        f: impl FnOnce(&mut Config),
+    ) -> Value {
+        let mut config = Config {
+            nodes,
+            ..Config::default()
+        };
+        data_defaults(&mut config);
+        config.request_rate = rate;
+        f(&mut config);
+        run(scenario, config, seed, secs.map(|s| s * SECONDS), None).unwrap()
+    }
+
+    fn quick(scenario: &str, nodes: u32, secs: u64, seed: u64, rate: f64) -> Value {
+        tuned(scenario, nodes, rate, seed, Some(secs), |_| {})
+    }
+
+    /// Failover, 400 nodes, 300 s, rate 0.2.
+    fn failover(seed: u64, f: impl FnOnce(&mut Config)) -> Value {
+        tuned("full-failover", 400, 0.2, seed, Some(300), f)
+    }
+
+    /// Full churn, 500 nodes, default duration, rate 0.005.
+    fn churn(f: impl FnOnce(&mut Config)) -> Value {
+        tuned("full-churn", 500, 0.005, 1, None, f)
+    }
+
+    fn moved(r: &Value) -> u64 {
+        r["origin_per_page"]["repeats"]["after_owner_move"]
+            .as_u64()
+            .unwrap()
+    }
+
+    /// Rank 0 refetches of a successor's copy (`copy_only`, `failed`, `relay`).
+    fn orphans(r: &Value) -> u64 {
+        let o = &r["origin_per_page"]["repeats"]["orphan"];
+        ["copy_only", "failed", "relay"]
+            .iter()
+            .map(|k| o[k].as_u64().unwrap())
+            .sum()
+    }
+
+    fn counter(r: &Value, k: &str) -> u64 {
+        r["metrics"]["counters"][k].as_u64().unwrap_or(0)
+    }
+
+    /// Each data-plane counter is at least its bound.
+    fn at_least(r: &Value, bounds: &[(&str, u64)]) {
+        for (k, min) in bounds {
+            assert!(
+                counter(r, k) >= *min,
+                "{k} < {min}: {}",
+                r["metrics"]["counters"]
+            );
+        }
+    }
+
+    fn zero(r: &Value, keys: &[&str]) {
+        for k in keys {
+            assert_eq!(counter(r, k), 0, "{k}: {}", r["metrics"]["counters"]);
+        }
+    }
+
+    fn ctl_counter(r: &Value, k: &str) -> u64 {
+        r["combined"]["control_metrics"]["counters"][k]
+            .as_u64()
+            .unwrap_or(0)
+    }
+
+    fn assert_clean(r: &Value) {
+        assert_eq!(
+            r["invariants"]["hard_failures"], 0,
+            "{}\n{}",
+            r["invariants"], r["combined"]["control_invariants"]
+        );
+    }
+
+    #[test]
+    fn cold_start_window_fits_owner_egress() {
+        let at = |nodes: u32, nic_bps: u64| {
+            let config = Config {
+                nodes,
+                nic_bps,
+                ..Config::default()
+            };
+            cold_start_window_ns(&config)
+        };
+        // Small fleets keep the one-second storm.
+        assert_eq!(at(200, 1_250_000_000), SECONDS);
+        assert_eq!(at(1, 1), 2 * (1 << 20) * SECONDS / 3);
+        // 50,000 nodes at 10 Gbit/s: twice the ~14 s owner egress bound.
+        let w = at(50_000, 1_250_000_000);
+        assert!((27 * SECONDS..29 * SECONDS).contains(&w), "{w}");
+        // A slower NIC stretches the window in proportion.
+        assert_eq!(at(50_000, 125_000_000) / SECONDS, w * 10 / SECONDS);
+        // Generated only when no storm is configured.
+        let mut config = Config {
+            nodes: 50_000,
+            duration_ns: 400 * SECONDS,
+            ..Config::default()
+        };
+        data_schedules("full-cold-start", &mut config);
+        assert_eq!(config.storms.len(), 1);
+        assert_eq!(config.storms[0].window_ns, w);
+        assert_eq!(config.storms[0].at_ns, 300 * SECONDS);
+    }
+
+    #[test]
+    fn cold_start_reads_after_enrollment() {
+        let r = quick("full-cold-start", 200, 120, 1, 0.05);
+        assert_clean(&r);
+        assert_eq!(r["combined"]["control"]["enrolled"], 200);
+        at_least(&r, &[("reads_skipped_not_enrolled", 1)]);
+        at_least(&r, &[("reads_completed", 1)]);
+        assert!(counter(&r, "flight_joins") + counter(&r, "peer_requests_acquire") > 0);
+        assert!(counter(&r, "membership_publications") >= 1);
+        let max = r["origin_per_page"]["max_requests_per_page"]
+            .as_u64()
+            .unwrap();
+        assert!(max <= topology::REPLICAS as u64 * 2, "{max}");
+    }
+
+    #[test]
+    fn failover_crashes_data_nodes_too() {
+        let r = quick("full-failover", 200, 300, 1, 0.2);
+        assert_clean(&r);
+        assert!(ctl_counter(&r, "ctl_primary_terms") >= 3);
+        assert!(counter(&r, "crashes") >= 3, "{}", r["metrics"]["counters"]);
+        assert!(counter(&r, "restarts") >= 1);
+        at_least(&r, &[("reads_completed", 1)]);
+    }
+
+    /// In a failover run (crashes, a site partition, origin
+    /// error bursts, members enrolling) every repeated origin request is
+    /// classified, and every repeat while the previous fetcher still held
+    /// the page is a skip (an owner above rank 0 that fetched after a
+    /// recorded failure of rank 0) or the one rank 0 refetch such a skip
+    /// leaves behind (an orphan). Each skip orphans at most one refetch, so
+    /// `copy_held <= skips + orphans <= 2 * skips`; the unexplained class
+    /// (a rank 0 refetch with no skip behind it) is a hard invariant.
+    #[test]
+    fn failover_repeats_are_skips_or_their_orphans() {
+        for (nodes, secs, seed) in [(200, 300, 1), (400, 300, 2)] {
+            let r = quick("full-failover", nodes, secs, seed, 0.2);
+            assert_clean(&r);
+            let o = &r["origin_per_page"];
+            let n = |v: &Value| v.as_u64().unwrap();
+            let sum = |v: &Value| v.as_object().unwrap().values().map(n).sum::<u64>();
+            let repeats = &o["repeats"];
+            let classes: u64 = [
+                "after_owner_move",
+                "after_failure",
+                "concurrent",
+                "copy_lost",
+                "copy_held",
+            ]
+            .iter()
+            .map(|k| n(&repeats[k]))
+            .sum();
+            assert_eq!(classes, n(&o["requests"]) - n(&o["pages"]), "{o}");
+            let held = n(&repeats["copy_held"]);
+            assert_eq!(sum(&repeats["held"]), held, "{o}");
+            assert_eq!(n(&repeats["unexplained"]), 0, "{o}");
+            let (skips, orphans) = (sum(&o["skips"]), sum(&repeats["orphan"]));
+            assert!(skips > 0, "{o}");
+            assert!(orphans <= skips, "{o}");
+            assert!(held <= skips + orphans, "{o}");
+            // The worst pages are retries after failed
+            // origin requests. Each follows a failed (or canceled) request
+            // for the page, and without them no page is fetched more than
+            // once per owner.
+            let failures = counter(&r, "origin_5xx")
+                + counter(&r, "origin_412")
+                + counter(&r, "origin_403")
+                + counter(&r, "origin_canceled");
+            assert!(n(&repeats["after_failure"]) <= failures, "{o}");
+            let without = n(&o["max_requests_per_page_excluding_failure_retries"]);
+            assert!(without <= topology::REPLICAS as u64, "{o}");
+            assert!(
+                n(&o["max_requests_per_page"]) <= without + n(&o["max_failure_retries_per_page"]),
+                "{o}"
+            );
+            // Owners funded at their minimum
+            // (`walk::shared_share_short`) fetch only with the authority
+            // every owner has, so their requests land in the classes above
+            // (a new page, a retry after a failure, a skip or its orphan)
+            // and never in the one held class that means a copy was
+            // answered as missing.
+            assert_eq!(n(&repeats["held"]["missed"]), 0, "{o}");
+        }
+    }
+
+    /// An owner that answered another owner's page probe
+    /// without a copy defers readers to it instead of fetching the page
+    /// again, so fewer pages are fetched by rank 0 while a successor's orphan
+    /// copy is held (`copy_only` and `failed` orphans). Without successor
+    /// hints nothing is deferred.
+    #[test]
+    fn failover_readers_are_deferred_to_orphan_holders() {
+        let run_with = |hints: bool| {
+            failover(2, |c| {
+                c.node.successor_hints = hints;
+            })
+        };
+        // 400 nodes, seed 2: 152 such orphans without hints, 104 with.
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        zero(&off, &["successor_deferrals"]);
+        assert!(counter(&on, "successor_deferrals") > 0, "{}", on["metrics"]);
+        at_least(&on, &[("successor_hints_noted", 1)]);
+        assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
+    }
+
+    /// An owner holding a successor hint
+    /// asks the hinted owner copy-only before origin on its own grant, so
+    /// rank 0 copies orphan copies instead of fetching them again. Without
+    /// successor targets no such probe is sent.
+    #[test]
+    fn failover_owners_copy_orphans_from_successors() {
+        let run_with = |targets: bool| {
+            failover(2, |c| {
+                c.node.successor_targets = targets;
+            })
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        zero(&off, &["successor_probes"]);
+        assert!(counter(&on, "successor_copies") > 0, "{}", on["metrics"]);
+        assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
+        // A refetch by rank 0 that noted the holder is rare: its one probe
+        // missed (the holder's fetch had failed) or failed. Since copy-only
+        // requests join a running acquisition, a probe that
+        // reaches a holder still fetching waits in its flight and runs out
+        // of its short time share, which counts as a failure, not a miss.
+        assert!(
+            counter(&on, "origin_repeats_orphan_noted")
+                <= counter(&on, "successor_misses") + counter(&on, "successor_failures"),
+            "{}",
+            on["metrics"]
+        );
+    }
+
+    /// An owner after rank 0 that fetched a page from origin
+    /// offers it to rank 0 later, so rank 0 copies orphans whose holder never
+    /// reached it instead of fetching them again. Offers are bounded by the
+    /// notice schedule. Relay-signed failures are their own
+    /// skip class, apart from rank 0's own failures.
+    #[test]
+    fn failover_holders_offer_orphans_to_rank_zero() {
+        use racer_core::read::hints::NOTICE_TRIES;
+        let run_with = |notices: bool| {
+            failover(2, |c| {
+                c.node.orphan_notices = notices;
+            })
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        zero(&off, &["orphan_offers_sent"]);
+        // Only offers that failed with cut evidence cross
+        // a partition, and without cut groups offers cross it at least as
+        // often.
+        assert!(
+            counter(&on, "partition_link_failures_offers") <= counter(&on, "orphan_offers_cut"),
+            "{}",
+            on["metrics"]
+        );
+        let ungrouped = failover(2, |c| c.node.offer_cut_groups = false);
+        assert!(
+            counter(&on, "partition_link_failures_offers")
+                <= counter(&ungrouped, "partition_link_failures_offers"),
+            "{} {}",
+            counter(&on, "partition_link_failures_offers"),
+            counter(&ungrouped, "partition_link_failures_offers")
+        );
+        let noted = counter(&on, "orphan_notices_noted");
+        let sent = counter(&on, "orphan_offers_sent");
+        at_least(&on, &[("orphan_offers_delivered", 1)]);
+        assert!(sent <= noted * NOTICE_TRIES as u64, "{}", on["metrics"]);
+        // Rank 2 holders also notice rank 1.
+        at_least(&on, &[("orphan_notices_noted_rank1", 1)]);
+        assert_eq!(
+            sent,
+            counter(&on, "orphan_offers_delivered") + counter(&on, "orphan_offers_failed"),
+            "{}",
+            on["metrics"]
+        );
+        let orphans = |r: &Value| {
+            let o = &r["origin_per_page"]["repeats"]["orphan"];
+            o.as_object()
+                .unwrap()
+                .values()
+                .map(|v| v.as_u64().unwrap())
+                .sum::<u64>()
+        };
+        assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
+        // The skip classes partition the skips, and the
+        // relay class is reported.
+        let skips = &on["origin_per_page"]["skips"];
+        assert!(skips.get("relay").is_some(), "{skips}");
+        assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
+    }
+
+    /// During an origin outage (every request fails), an
+    /// owner above rank 0 whose own origin request for a page failed leaves
+    /// the retries after rank 0's own failures to rank 0 for `hang_after`.
+    /// Without the hold every such answer made the owner ask origin too.
+    #[test]
+    fn owners_leave_origin_retries_to_a_failing_rank_zero() {
+        let run_with = |hold: bool| {
+            failover(1, |c| {
+                c.combined_faults.p5xx = 1.0;
+                c.node.rank0_failure_hold = hold;
+            })
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        let skips = |r: &Value| {
+            r["origin_per_page"]["skips"]["failed"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        assert!(skips(&off) > 0, "{}", off["origin_per_page"]);
+        at_least(&on, &[("origin_left_to_rank0_failed", 1)]);
+        assert!(skips(&on) < skips(&off), "{} {}", skips(&on), skips(&off));
+        at_least(&on, &[("rank0_watch_origin_failures", 1)]);
+        assert!(
+            counter(&on, "origin_5xx") < counter(&off, "origin_5xx"),
+            "{} {}",
+            counter(&on, "origin_5xx"),
+            counter(&off, "origin_5xx")
+        );
+        assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
+    }
+
+    /// The Pod crashed for good at `d / 2 + 5 s` leaves the membership once
+    /// its Node has been not ready for the grace, so peers stop choosing it.
+    #[test]
+    fn failover_drops_the_dead_member() {
+        let r = quick("full-failover", 200, 300, 1, 0.2);
+        assert_clean(&r);
+        let age = &r["metrics"]["histograms"]["dead_member_link_age_s"];
+        assert!(counter(&r, "dead_member_links") > 0, "{}", r["metrics"]);
+        // Node monitor grace 40 s, readiness grace 30 s, one 10 s pass,
+        // plus client propagation.
+        assert!(age["max"].as_u64().unwrap() <= 90, "{age}");
+        assert!(
+            ctl_counter(&r, "ctl_commits") > 0 && counter(&r, "membership_publications") >= 2,
+            "{}",
+            r["metrics"]["counters"]
+        );
+    }
+
+    /// As members join and leave, pages move to members that
+    /// arrived after their other owners, which may still hold copies they
+    /// fetched before, however many versions ago. Owners ask those lineage
+    /// targets before origin and readers visit them first, so fewer moved
+    /// pages are fetched again. Every repeat stays explained.
+    #[test]
+    fn lineage_targets_find_copies_of_pages_that_moved() {
+        let run_with = |lineage: bool| {
+            churn(|c| {
+                c.node.lineage = lineage;
+            })
+        };
+        let off = run_with(false);
+        let on = run_with(true);
+        assert_clean(&off);
+        assert_clean(&on);
+        let origin = |r: &Value| r["origin_per_page"]["requests"].as_u64().unwrap();
+        // Seed 1: 91 and 82 repeats after a move, 2,178 and 2,169 requests.
+        assert!(moved(&off) > 0);
+        assert!(
+            moved(&on) < moved(&off),
+            "{} vs {}",
+            moved(&on),
+            moved(&off)
+        );
+        assert!(origin(&on) < origin(&off));
+        assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
+    }
+
+    /// Owners also ask members ranked just
+    /// below them that were owners when they arrived, every lineage probe
+    /// runs on its own grant (so a delegated rank 0 with one credit asks
+    /// too), and a copy-only probe from an earlier owner does not wait on
+    /// the later owner's acquisition (which waits on the prober). Each step
+    /// finds more moved copies, and the last stops the probes timing out.
+    #[test]
+    fn demoted_targets_and_lineage_grants_find_more_moved_copies() {
+        let run_with = |grants: bool, demoted: bool, join_rank: bool| {
+            churn(|c| {
+                c.node.lineage_grants = grants;
+                c.node.demoted_targets = demoted;
+                c.node.copy_join_rank = join_rank;
+            })
+        };
+        let before = run_with(false, false, false);
+        let grants = run_with(true, false, true);
+        let all = run_with(true, true, true);
+        let cycles = run_with(true, true, false);
+        for r in [&before, &grants, &all, &cycles] {
+            assert_clean(r);
+        }
+        let origin = |r: &Value| r["origin_per_page"]["requests"].as_u64().unwrap();
+        assert!(
+            moved(&grants) < moved(&before),
+            "{} vs {}",
+            moved(&grants),
+            moved(&before)
+        );
+        assert!(moved(&all) <= moved(&grants));
+        assert!(origin(&all) < origin(&before));
+        at_least(&all, &[("lineage_grant_copies", 1)]);
+        at_least(&all, &[("demoted_probes", 1)]);
+        zero(&before, &["lineage_grant_probes"]);
+        zero(&grants, &["demoted_probes"]);
+        // Without the join rule, lineage probes wait on acquisitions that
+        // wait on the prober and fail; with it they almost never do.
+        assert!(counter(&cycles, "copy_only_join_declined") == 0);
+        at_least(&all, &[("copy_only_join_declined", 1)]);
+        assert!(
+            counter(&all, "lineage_grant_failures") * 4
+                < counter(&cycles, "lineage_grant_failures"),
+            "{} vs {}",
+            counter(&all, "lineage_grant_failures"),
+            counter(&cycles, "lineage_grant_failures")
+        );
+        assert!(counter(&all, "reads_failed") <= counter(&before, "reads_failed") + 1);
+    }
+
+    /// Granted probes go out at once, which bounds
+    /// their cost to one time share and lowers read latency against sending
+    /// them one after the other; deeper ranks, a lineage cap of
+    /// `MAX_LINEAGE` and unknown-age demoted members find more moved copies
+    /// than three targets from ranks 4 and 5 by arrival.
+    #[test]
+    fn parallel_deep_lineage_probes_find_more_copies_without_more_latency() {
+        let run_with = |parallel: bool, cap: usize, unknown: bool| {
+            churn(|c| {
+                c.node.parallel_granted = parallel;
+                c.node.lineage_cap = cap;
+                c.node.unknown_age_targets = unknown;
+            })
+        };
+        let max = racer_core::read::walk::MAX_LINEAGE;
+        let narrow = run_with(false, 3, false);
+        let sequential = run_with(false, max, true);
+        let parallel = run_with(true, max, true);
+        for r in [&narrow, &sequential, &parallel] {
+            assert_clean(r);
+        }
+        let mean = |r: &Value| {
+            r["metrics"]["histograms"]["read_ns"]["mean"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            moved(&sequential) < moved(&narrow),
+            "{} vs {}",
+            moved(&sequential),
+            moved(&narrow)
+        );
+        assert!(moved(&parallel) <= moved(&sequential) + 2);
+        assert!(
+            mean(&parallel) < mean(&sequential),
+            "{} vs {}",
+            mean(&parallel),
+            mean(&sequential)
+        );
+        // Every holder ranked fourth or fifth is asked.
+        assert_eq!(
+            counter(&parallel, "moved_unasked_holder_rank_4_5_older")
+                + counter(&parallel, "moved_unasked_holder_rank_4_5"),
+            0
+        );
+        at_least(&parallel, &[("granted_batches", 1)]);
+        zero(&sequential, &["granted_batches"]);
+        assert!(counter(&parallel, "reads_failed") <= counter(&narrow, "reads_failed") + 1);
+    }
+
+    /// Members join only once they serve, so no peer link fails toward a
+    /// member that has not applied a membership, and no read fails while one
+    /// is listed. With `report_at_start` both happen.
+    #[test]
+    fn cold_start_members_serve_before_they_are_routable() {
+        let run_with = |report_at_start: bool| {
+            let mut config = Config {
+                nodes: 300,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.05;
+            let o = json!({ "report_at_start": report_at_start });
+            run("full-cold-start", config, 1, Some(120 * SECONDS), Some(&o)).unwrap()
+        };
+        let before = run_with(true);
+        assert_clean(&before);
+        at_least(&before, &[("unready_member_links", 1)]);
+        at_least(&before, &[("reads_failed_while_members_unready", 1)]);
+        let after = run_with(false);
+        assert_clean(&after);
+        assert_eq!(after["combined"]["control"]["enrolled"], 300);
+        zero(&after, &["unready_member_links"]);
+        zero(&after, &["reads_failed_while_members_unready"]);
+        zero(&after, &["reads_failed"]);
+        // The price: a node does not read until a membership lists it.
+        at_least(&after, &[("reads_skipped_not_member", 1)]);
+        at_least(&after, &[("reads_completed", 1)]);
+        assert_eq!(ctl_counter(&after, "ctl_reports"), 300);
+        // Joins are batched: at most one version per hold, plus the empty
+        // bootstrap version and the first join.
+        let versions = ctl_counter(&after, "ctl_membership_versions");
+        let window = ctl_counter(&after, "ctl_all_enrolled_ns") / SECONDS;
+        assert!(
+            versions <= 3 + window / racer_cluster_control::step::primary::JOIN_HOLD_SECS,
+            "{versions} versions in {window} s"
+        );
+        // No client skipped a version on the way.
+        assert_eq!(ctl_counter(&after, "ctl_full_fallbacks_skipped"), 0);
+        assert_eq!(ctl_counter(&after, "ctl_full_fallbacks_other"), 0);
+    }
+
+    #[test]
+    fn churn_grows_the_data_plane() {
+        let r = quick("full-churn", 320, 400, 1, 0.1);
+        assert_clean(&r);
+        assert!(
+            counter(&r, "membership_publications") >= 4,
+            "{}",
+            r["metrics"]["counters"]
+        );
+        assert!(ctl_counter(&r, "ctl_pods_removed") > 0);
+        at_least(&r, &[("membership_adoptions", 1)]);
+        at_least(&r, &[("reads_completed", 1)]);
+    }
+
+    #[test]
+    fn lagging_clients_skew_the_data_plane() {
+        let r = quick("full-lagging", 300, 600, 1, 0.2);
+        assert_clean(&r);
+        assert!(ctl_counter(&r, "ctl_unreachable") > 0);
+        at_least(&r, &[("reads_completed", 1)]);
+        assert!(
+            counter(&r, "stale_membership_replies") + counter(&r, "error_incompatible_membership")
+                > 0,
+            "{}",
+            r["metrics"]["counters"]
+        );
+    }
+
+    /// The combined plans carry data-plane faults by default; the knobs
+    /// turn them off, and an explicit `faults` list replaces them.
+    #[test]
+    fn data_faults_join_the_control_plans() {
+        let d = 300 * SECONDS;
+        let faults = DataFaults::default();
+        let failover = faults.plan("full-failover", 200, d);
+        assert!(
+            failover
+                .iter()
+                .any(|f| matches!(f, Fault::Partition { .. }))
+        );
+        assert_eq!(
+            failover
+                .iter()
+                .filter(|f| matches!(f, Fault::OriginErrors { .. }))
+                .count(),
+            2
+        );
+        let lagging = faults.plan("full-lagging", 1000, d);
+        assert_eq!(lagging.len(), 10);
+        assert!(
+            lagging
+                .iter()
+                .all(|f| matches!(f, Fault::Slow { factor: 8, .. }))
+        );
+        let mut off = faults;
+        off.apply_json(&json!({"enabled": false})).unwrap();
+        assert!(off.plan("full-failover", 200, d).is_empty());
+        assert!(off.apply_json(&json!({"slow_factor": 0})).is_err());
+        assert!(
+            DataFaults::default()
+                .apply_json(&json!({"nope": 1}))
+                .is_err()
+        );
+
+        let r = quick("full-failover", 200, 300, 1, 0.2);
+        assert_clean(&r);
+        at_least(&r, &[("origin_5xx", 1)]);
+        at_least(&r, &[("link_failures", 1)]);
+
+        let mut config = Config {
+            nodes: 200,
+            ..Config::default()
+        };
+        data_defaults(&mut config);
+        config.request_rate = 0.2;
+        config.combined_faults.enabled = false;
+        let r = run(
+            "full-failover",
+            config.clone(),
+            1,
+            Some(300 * SECONDS),
+            None,
+        )
+        .unwrap();
+        assert_clean(&r);
+        zero(&r, &["origin_5xx"]);
+        // An explicit fault list replaces the defaults.
+        config.combined_faults.enabled = true;
+        config.faults = vec![Fault::Slow {
+            node: 1,
+            factor: 2,
+            from_ns: 0,
+            until_ns: SECONDS,
+        }];
+        let r = run("full-failover", config, 1, Some(300 * SECONDS), None).unwrap();
+        zero(&r, &["origin_5xx"]);
+    }
+
+    #[test]
+    fn replays_exactly() {
+        for s in SCENARIOS {
+            let a = quick(s, 80, 120, 3, 0.1);
+            let b = quick(s, 80, 120, 3, 0.1);
+            assert_eq!(a["trace_hash"], b["trace_hash"], "{s}");
+            assert_eq!(a["metrics"], b["metrics"], "{s}");
+        }
+        assert_ne!(
+            quick("full-churn", 80, 120, 3, 0.1)["trace_hash"],
+            quick("full-churn", 80, 120, 4, 0.1)["trace_hash"]
+        );
+    }
+
+    #[test]
+    fn crashed_pod_is_down_and_comes_back() {
+        let mut config = Config {
+            nodes: 40,
+            request_rate: 0.0,
+            ..Config::default()
+        };
+        config.duration_ns = 200 * SECONDS;
+        let (settings, _, _) = control::plan("enrollment-storm", 40, None);
+        let faults = vec![CtlFault::CrashSeats {
+            at_ns: 100 * SECONDS,
+            count: 1,
+            restart_after_ns: Some(30 * SECONDS),
+        }];
+        let mut w = Combined::new(config, settings, 5, faults);
+        w.run(90 * SECONDS);
+        let latest = w.ctl.committed_membership_version().unwrap();
+        assert!((0..40).all(|n| !w.node.is_down(n)));
+        assert_eq!(w.node.versions.latest_number(), latest);
+        w.run(101 * SECONDS);
+        let down: Vec<u32> = (0..40).filter(|n| w.node.is_down(*n)).collect();
+        assert_eq!(down.len(), 1);
+        assert!(!w.node.versions.enrolled(down[0]), "client restarts empty");
+        w.run(200 * SECONDS);
+        assert!(!w.node.is_down(down[0]));
+        assert!(w.node.versions.enrolled(down[0]));
+    }
+}

@@ -1734,8 +1734,6 @@ mod subscriptions {
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;
-    use crate::peer::subscriptions::Demand;
-    use crate::peer::subscriptions::PageInterval;
     use crate::peer::subscriptions::Subscription;
     use crate::peer::subscriptions::TransferGrant;
     use crate::runtime::Reactor;
@@ -1743,9 +1741,11 @@ mod subscriptions {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
+    use flow_control::subscriptions::Interval;
     use racer_control_wire::BundleGeneration;
     use racer_control_wire::KeyringBundle;
     use racer_control_wire::SCHEMA_VERSION;
+    use racer_core::subscriptions::Demand;
     use std::cell::Cell;
     use std::task::Context;
     use std::task::Poll;
@@ -1776,7 +1776,7 @@ mod subscriptions {
                     object: request.origin.object.clone(),
                     etag: StrongEtag::test_value("v1"),
                 },
-                demand: Demand::new(vec![PageInterval { start, end: 20 }]).unwrap(),
+                demand: Demand::new(vec![Interval { start, end: 20 }]).unwrap(),
             },
             mode,
         };
@@ -2096,7 +2096,7 @@ mod subscriptions {
         };
         subscription.demand = Demand::new(
             (0..64)
-                .map(|i| PageInterval {
+                .map(|i| Interval {
                     start: i * 2,
                     end: i * 2 + 1,
                 })
@@ -3158,10 +3158,9 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
                 object: requests[1].origin.object.clone(),
                 etag: StrongEtag::test_value("incast"),
             },
-            demand: super::subscriptions::Demand::new(vec![super::subscriptions::PageInterval {
-                start: 0,
-                end: 1,
-            }])
+            demand: racer_core::subscriptions::Demand::new(vec![
+                flow_control::subscriptions::Interval { start: 0, end: 1 },
+            ])
             .unwrap(),
         },
         mode: FetchMode::CopyOnly,
@@ -3183,6 +3182,36 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
                 .is_none(),
             "metadata bypasses saturated body gate"
         );
+    }
+    // Bodyless page modes bypass too; a body-carrying page still queues.
+    for mode in 0..3 {
+        for (f, t) in fixtures.iter().zip(&transfers) {
+            let mut page = request(&f.admission, 22);
+            page.operation = Operation::Page {
+                page: PageId {
+                    version: ObjectVersion {
+                        object: page.origin.object.clone(),
+                        etag: StrongEtag::test_value("incast"),
+                    },
+                    number: PageNumber(0),
+                },
+                mode: [FetchMode::Ping, FetchMode::Offer, FetchMode::CopyOnly]
+                    .into_iter()
+                    .nth(mode)
+                    .unwrap(),
+            };
+            let mut admit = Box::pin(t.admit_receive(&page, &scope));
+            match (mode, admit.as_mut().poll(&mut cx)) {
+                (2, poll) => {
+                    assert!(poll.is_pending(), "body page waits at saturated gate")
+                }
+                (_, std::task::Poll::Ready(Ok(None))) => {}
+                (_, poll) => panic!(
+                    "bodyless page must bypass the gate, ready: {}",
+                    poll.is_ready()
+                ),
+            }
+        }
     }
     clock.advance(Duration::from_millis(11));
     for g in &gates {
@@ -3552,5 +3581,84 @@ mod adaptive {
         assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 3);
         drop(permits);
         assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
+    }
+}
+mod explicit_clock {
+    //! Adaptive admission and link circuits read only the time they are given.
+    use crate::peer::AdaptivePeers;
+    use crate::peer::Outcome;
+    use crate::telemetry::Metrics;
+    use crate::topology::LinkHealth;
+    use racer_control_wire::NodeId;
+    use racer_core::route::LinkOutcome;
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    static OFFSET_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn clock() -> Instant {
+        *BASE.get_or_init(Instant::now) + Duration::from_millis(OFFSET_MS.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn adaptive_peers_back_off_on_the_supplied_clock() {
+        let peers =
+            AdaptivePeers::with_clock(Default::default(), Metrics::default(), clock).unwrap();
+        let node = NodeId("b".into());
+        let permit = peers.acquire(&node).unwrap();
+        permit.observe(Outcome::PeerFailure);
+        drop(permit);
+        assert!(
+            !peers.available(&node),
+            "backoff holds while time stands still"
+        );
+        assert!(peers.acquire(&node).is_err());
+        OFFSET_MS.fetch_add(250, Ordering::SeqCst);
+        assert!(
+            peers.acquire(&node).is_ok(),
+            "a probe is admitted after backoff"
+        );
+    }
+
+    #[test]
+    fn link_health_acquires_at_the_supplied_time() {
+        let health = LinkHealth::new(1);
+        let node = NodeId("b".into());
+        let start = Instant::now();
+        health
+            .observe_at(&node, LinkOutcome::Refused, start)
+            .unwrap();
+        assert!(health.acquire_at(&node, start).is_err());
+        let later = start + Duration::from_secs(3600);
+        drop(health.acquire_at(&node, later).unwrap());
+    }
+}
+
+/// Bodyless page modes never select an RDMA rail, so a ping or offer is sent
+/// over HTTP without waiting for a link, window grant, or landing slot.
+#[test]
+fn bodyless_page_modes_have_no_rail_hint() {
+    let page = PageId {
+        version: ObjectVersion {
+            object: crate::topology::tests::fixtures::object(),
+            etag: StrongEtag::test_value("rail"),
+        },
+        number: PageNumber(9),
+    };
+    for (mode, expected) in [
+        (FetchMode::Ping, None),
+        (FetchMode::Offer, None),
+        (FetchMode::CopyOnly, Some(page.clone())),
+        (FetchMode::Acquire, Some(page.clone())),
+    ] {
+        let operation = Operation::Page {
+            page: page.clone(),
+            mode,
+        };
+        assert_eq!(crate::peer::rail_hint(&operation), expected);
     }
 }

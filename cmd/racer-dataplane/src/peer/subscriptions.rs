@@ -22,46 +22,10 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
-pub const MAX_DEMAND_INTERVALS: usize = 64;
-
-/// Largest number of selections one subscription may request in flight. The
-/// replay window is a 64-bit map, so no contract may grant more than this.
-pub const MAX_SUBSCRIPTION_FLIGHTS: u16 = 64;
-
-pub use flow_control::subscriptions::Interval as PageInterval;
-use flow_control::subscriptions::{Fanout, contains, include as include_page};
-
-/// Canonical intervals, never an expanded list of pages. Adjacent intervals must
-/// be merged by the sender, so one logical demand has one encoding.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Demand(Vec<PageInterval>);
-
-impl Demand {
-    pub fn new(intervals: Vec<PageInterval>) -> Result<Self> {
-        if !flow_control::subscriptions::canonical(&intervals, MAX_DEMAND_INTERVALS) {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(Self(intervals))
-    }
-
-    pub fn intervals(&self) -> &[PageInterval] {
-        &self.0
-    }
-
-    pub fn contains(&self, page: u64) -> bool {
-        contains(&self.0, page)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    #[cfg(test)]
-    pub fn page_count(&self) -> u64 {
-        // Disjoint intervals in [0, u64::MAX) cannot overflow this sum.
-        self.0.iter().map(|i| i.end - i.start).sum()
-    }
-}
+use racer_core::subscriptions::Demand;
+use racer_core::subscriptions::MAX_DEMAND_INTERVALS;
+pub use racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS;
+use racer_core::subscriptions::SubscriptionLimits;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subscription {
@@ -108,32 +72,35 @@ pub struct TransferGrant {
     pub flights: Option<u16>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct SubscriptionLimits {
-    pub max_entries: usize,
+/// The sans-IO scheduler this module wraps with a mutex, handles and wakers.
+type Core = racer_core::subscriptions::Scheduler<
+    MembershipVersion,
+    NodeId,
+    ObjectVersion,
+    (ObjectMetadata, CiphertextPage),
+    Error,
+>;
 
-    /// Node-wide total, not a per-subscription allocation.
-    pub max_completed_intervals: usize,
+type EntryKey = racer_core::subscriptions::EntryKey<MembershipVersion, NodeId>;
 
-    pub max_inflight: usize,
+type Delivery = racer_core::subscriptions::Delivery<
+    (ObjectMetadata, CiphertextPage),
+    MembershipVersion,
+    NodeId,
+    ObjectVersion,
+>;
 
-    /// Includes unconsumed completed/error responses, not just active waiters.
-    pub max_pending: usize,
-
-    /// Most selections one subscription may have pending at once. A request
-    /// asking for more is granted this many. Bounded by `max_inflight`,
-    /// `max_pending` and `MAX_SUBSCRIPTION_FLIGHTS`.
-    pub max_flights_per_subscription: usize,
-}
-
-impl Default for SubscriptionLimits {
-    fn default() -> Self {
-        Self {
-            max_entries: 1024,
-            max_completed_intervals: 4096,
-            max_inflight: 64,
-            max_pending: 256,
-            max_flights_per_subscription: 8,
+impl From<racer_core::subscriptions::Kind> for Error {
+    fn from(kind: racer_core::subscriptions::Kind) -> Self {
+        use racer_core::subscriptions::Kind;
+        match kind {
+            Kind::DeadlineExceeded => Self::DeadlineExceeded,
+            Kind::Cancelled => Self::Cancelled,
+            Kind::Overloaded => Self::Overloaded,
+            Kind::Unavailable => Self::Unavailable,
+            Kind::StaleFlight => Self::StaleFlight,
+            Kind::Replay => Self::Replay,
+            Kind::InvalidRequest => Self::InvalidRequest,
         }
     }
 }
@@ -144,221 +111,12 @@ pub struct Subscriptions {
     state: Mutex<State>,
 }
 
-#[derive(Default)]
 struct State {
-    now: u64,
-    next_prune: u64,
+    core: Core,
 
-    entries: HashMap<EntryKey, Entry>,
-
-    fanout: Fanout<FlightKey, EntryKey, Completion, Error>,
-
-    completed_intervals: usize,
-
-    wake: Vec<Waker>,
+    /// Registered notifications of parked response slots, by token.
+    wakers: HashMap<u64, Waker>,
 }
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct EntryKey {
-    membership: MembershipVersion,
-
-    receiver: NodeId,
-
-    id: [u8; 16],
-}
-
-struct Entry {
-    /// Latest admitted contract: the highest sequence, its demand, and the
-    /// contract-wide budgets, which every selection debits.
-    subscription: Subscription,
-
-    deadline: u64,
-
-    completed: Vec<PageInterval>,
-
-    /// Granted flights. Never increases for the life of the entry.
-    flights: usize,
-
-    /// Replay window. Bit `i` records that `subscription.sequence - i` was
-    /// admitted; only offsets below `flights` may still be admitted.
-    seen: u64,
-
-    /// Admitted requests that have not selected yet. A newer admission
-    /// supersedes the oldest one when the flight slots are full.
-    admitted: Vec<Reservation>,
-
-    /// Selected flights whose response has not been consumed or dropped.
-    pending: Vec<Flight>,
-
-    /// Allowance a newer ceiling was widened by on account of a lower
-    /// sequence in the window that has not arrived yet: the sequence, whether
-    /// it holds a page, and its bytes. The requester debited that request
-    /// before issuing the newer one, so a late arrival takes this allowance
-    /// instead of the shared budget. Rebuilt by every newer ceiling, which
-    /// forfeits allowance for sequences that left the window.
-    pledges: Vec<(u64, bool, u64)>,
-}
-
-/// One admitted request. Its grant is reported relative to the request's own
-/// demand, budgets and deadline, so every response matches its request.
-#[derive(Clone)]
-struct Reservation {
-    sequence: u64,
-
-    demand: Demand,
-
-    page_budget: u32,
-
-    byte_budget: u64,
-
-    deadline: u64,
-
-    flights: Option<u16>,
-
-    /// Set when a newer ceiling, which the requester had already debited for
-    /// this request, was widened by one page on its account. Forfeited if the
-    /// request never selects.
-    covered_page: bool,
-
-    /// Bytes a newer ceiling was widened by on this request's account. A
-    /// completion charges at least this much, and a failure forfeits it, so
-    /// unused slack never outlives the ceiling that excluded it.
-    covered_bytes: u64,
-}
-
-struct Flight {
-    token: u64,
-
-    page: u64,
-
-    reservation: Reservation,
-
-    /// The completion already charged the contract.
-    settled: bool,
-}
-
-impl Entry {
-    fn reservation(subscription: &Subscription, deadline: u64) -> Reservation {
-        Reservation {
-            sequence: subscription.sequence,
-            demand: subscription.demand.clone(),
-            page_budget: subscription.page_budget,
-            byte_budget: subscription.byte_budget,
-            deadline,
-            flights: subscription.flights,
-            covered_page: false,
-            covered_bytes: 0,
-        }
-    }
-
-    /// Forfeit what newer ceilings granted on account of a request that will
-    /// not consume it.
-    fn forfeit(&mut self, page: bool, bytes: u64) {
-        if page {
-            self.subscription.page_budget = self.subscription.page_budget.saturating_sub(1);
-        }
-        self.subscription.byte_budget = self.subscription.byte_budget.saturating_sub(bytes);
-    }
-
-    /// Apply a newer request's ceilings. The requester debits a full page and
-    /// `PAGE_BYTES + 16` bytes per selection when issuing it, so the newer
-    /// ceilings already exclude every earlier outstanding request. Widen them
-    /// by at most those reservations, never above the current budgets, and
-    /// record the widening on the outstanding requests. Each must charge or
-    /// forfeit its share, so the contract minus every recorded widening never
-    /// exceeds the newest ceiling.
-    fn apply_ceiling(&mut self, sequence: u64, page_budget: u32, byte_budget: u64) {
-        const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
-        let older = |r: &&mut Reservation| r.sequence != sequence;
-        // Lower sequences in the window that have not arrived. Must run after
-        // the replay window has been shifted to `sequence`.
-        let unseen: Vec<u64> = (1..self.flights.min(64) as u64)
-            .filter(|&offset| offset <= sequence && self.seen & (1 << offset) == 0)
-            .map(|offset| sequence - offset)
-            .collect();
-        let pages = self.admitted.iter_mut().filter(older).count() + unseen.len();
-        let flights = pages + self.pending.iter().filter(|f| !f.settled).count();
-        self.subscription.page_budget = self
-            .subscription
-            .page_budget
-            .min(page_budget.saturating_add(u32::try_from(pages).unwrap_or(u32::MAX)));
-        self.subscription.byte_budget = self
-            .subscription
-            .byte_budget
-            .min(byte_budget.saturating_add(RESERVE.saturating_mul(flights as u64)));
-        let mut pages = self.subscription.page_budget.saturating_sub(page_budget);
-        let mut bytes = self.subscription.byte_budget.saturating_sub(byte_budget);
-        let mut cover = |covered: &mut u64| {
-            *covered = bytes.min(RESERVE);
-            bytes -= *covered;
-        };
-        for r in self.admitted.iter_mut().filter(older) {
-            r.covered_page = pages > 0;
-            pages = pages.saturating_sub(1);
-            cover(&mut r.covered_bytes);
-        }
-        for flight in self.pending.iter_mut().filter(|f| !f.settled) {
-            cover(&mut flight.reservation.covered_bytes);
-        }
-        self.pledges = unseen
-            .into_iter()
-            .map(|s| {
-                let page = pages > 0;
-                pages = pages.saturating_sub(1);
-                let mut covered = 0;
-                cover(&mut covered);
-                (s, page, covered)
-            })
-            .collect();
-    }
-
-    /// Hand a late request the allowance pledged for its sequence, if any.
-    /// It then charges or forfeits it like any other covered reservation.
-    fn take_pledge(&mut self, reservation: &mut Reservation) {
-        if let Some(index) = self
-            .pledges
-            .iter()
-            .position(|(s, ..)| *s == reservation.sequence)
-        {
-            let (_, page, bytes) = self.pledges.swap_remove(index);
-            reservation.covered_page = page;
-            reservation.covered_bytes = bytes;
-        }
-    }
-
-    /// Take a flight slot for `reservation`, superseding the oldest admitted
-    /// request if every slot is taken. A request older than every admitted
-    /// one would be superseded at once, so it is a replay.
-    fn reserve(&mut self, reservation: Reservation) -> Result<()> {
-        if self.pending.len() >= self.flights {
-            return Err(Error::Overloaded);
-        }
-        if self.admitted.len() + self.pending.len() >= self.flights {
-            let (index, oldest) = self
-                .admitted
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, r)| r.sequence)
-                .expect("a free flight slot is admitted");
-            if oldest.sequence > reservation.sequence {
-                return Err(Error::Replay);
-            }
-            let oldest = self.admitted.swap_remove(index);
-            self.forfeit(oldest.covered_page, oldest.covered_bytes);
-        }
-        self.admitted.push(reservation);
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FlightKey {
-    membership: MembershipVersion,
-
-    page: PageId,
-}
-
-type Pending = flow_control::subscriptions::Pending<EntryKey, Completion, Error>;
 
 #[derive(Clone)]
 pub struct Completion {
@@ -367,6 +125,31 @@ pub struct Completion {
     pub ciphertext: CiphertextPage,
 
     pub grant: TransferGrant,
+}
+
+impl From<Delivery> for Completion {
+    fn from(delivery: Delivery) -> Self {
+        let (metadata, ciphertext) = delivery.payload;
+        let grant = delivery.grant;
+        Self {
+            metadata,
+            ciphertext,
+            grant: TransferGrant {
+                subscription_id: grant.subscription_id,
+                sequence: grant.sequence,
+                page: PageId {
+                    version: grant.version,
+                    number: PageNumber(grant.page),
+                },
+                membership: grant.membership,
+                receiver: grant.receiver,
+                deadline: grant.deadline,
+                remaining_page_budget: grant.remaining_page_budget,
+                remaining_byte_budget: grant.remaining_byte_budget,
+                flights: grant.flights,
+            },
+        }
+    }
 }
 
 pub enum Selection {
@@ -393,31 +176,34 @@ pub struct Waiter {
 
 impl Subscriptions {
     pub fn new(limits: SubscriptionLimits) -> Result<Self> {
-        if limits.max_entries == 0
-            || limits.max_completed_intervals == 0
-            || limits.max_inflight == 0
-            || limits.max_pending == 0
-            || limits.max_flights_per_subscription == 0
-            || limits.max_flights_per_subscription > limits.max_inflight
-            || limits.max_flights_per_subscription > limits.max_pending
-            || limits.max_flights_per_subscription > usize::from(MAX_SUBSCRIPTION_FLIGHTS)
-        {
-            return Err(Error::InvalidConfiguration);
-        }
+        let core = Core::new(limits).ok_or(Error::InvalidConfiguration)?;
         Ok(Self {
             limits,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                core,
+                wakers: HashMap::new(),
+            }),
         })
     }
 
-    fn with_state<T>(&self, now: Option<u64>, f: impl FnOnce(&mut State) -> T) -> T {
+    /// Run one core transition, then invoke the wakers it readied after
+    /// releasing the mutex.
+    fn with_state<T>(&self, f: impl FnOnce(&mut Core) -> T) -> T {
+        self.with_wakers(|state| f(&mut state.core))
+    }
+
+    /// As `with_state`, with access to the registered wakers.
+    fn with_wakers<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         let (result, wake) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(now) = now {
-                state.expire(now);
-            }
             let result = f(&mut state);
-            (result, std::mem::take(&mut state.wake))
+            let State { core, wakers } = &mut *state;
+            let wake: Vec<Waker> = core
+                .take_wakes()
+                .into_iter()
+                .filter_map(|token| wakers.remove(&token))
+                .collect();
+            (result, wake)
         };
         for waker in wake {
             waker.wake();
@@ -427,7 +213,12 @@ impl Subscriptions {
 
     #[cfg(test)]
     pub fn prune(&self, now_ms: u64) {
-        self.with_state(Some(now_ms), |_| ());
+        self.with_state(|core| core.advance(now_ms));
+    }
+
+    #[cfg(test)]
+    fn inspect<T>(&self, f: impl FnOnce(&Core) -> T) -> T {
+        f(&self.state.lock().unwrap().core)
     }
 
     /// Caller supplies authenticated receiver, membership, and signed deadline.
@@ -510,13 +301,8 @@ impl Subscriptions {
         }
     }
 
-    /// Admit one request on its contract. Sequences are strictly increasing per
-    /// contract, but with `flights > 1` requests may arrive out of order: a
-    /// sequence below the highest admitted one is accepted once if it is
-    /// within the granted flight window. Only the highest sequence replaces
-    /// demand, budgets and deadline; an older request selects from its own
-    /// demand under the current contract budgets, funded by the allowance
-    /// newer ceilings set aside for it (see `Entry::pledges`).
+    /// Validate the authenticated fields, then admit the request on its
+    /// contract (`racer_core::subscriptions::Scheduler::admit`).
     fn admit(
         &self,
         subscription: Subscription,
@@ -536,117 +322,22 @@ impl Subscriptions {
         {
             return Err(Error::InvalidRequest);
         }
-        let granted = usize::from(subscription.flights.unwrap_or(1))
-            .min(self.limits.max_flights_per_subscription);
-        self.with_state(Some(now_ms), |state| {
-            if deadline <= state.now {
-                return Err(Error::DeadlineExceeded);
-            }
-            let key = EntryKey {
-                membership,
-                receiver: receiver.clone(),
-                id: subscription.id,
-            };
-            let sequence = subscription.sequence;
-            if let Some(entry) = state.entries.get_mut(&key) {
-                let latest = entry.subscription.sequence;
-                if sequence <= latest {
-                    // Within the window and never admitted before.
-                    let offset = latest - sequence;
-                    if offset >= entry.flights as u64 || entry.seen & (1 << offset) != 0 {
-                        return Err(Error::Replay);
-                    }
-                    if entry.subscription.version != subscription.version {
-                        return Err(Error::InvalidRequest);
-                    }
-                    // The allowance follows the newest request only: it never
-                    // rises, an in-order newer request may lower it, and a late
-                    // older request leaves it alone (newer intent wins). The
-                    // late request's own grant is still capped at what it
-                    // asked for when the response is built.
-                    entry.reserve(Entry::reservation(&subscription, deadline))?;
-                    // Fund the late request from the allowance a newer ceiling
-                    // excluded for it. The replay bit below makes this once.
-                    let mut reservation = entry.admitted.pop().expect("just reserved");
-                    entry.take_pledge(&mut reservation);
-                    entry.admitted.push(reservation);
-                    entry.seen |= 1 << offset;
-                    return Ok((key, sequence));
-                }
-                // The original single-flight contract refuses any attempt to
-                // raise its deadline or budgets. A multi-flight contract may see
-                // the newest request after other selections already debited it,
-                // so it clamps instead; neither can ever increase.
-                let strict = entry.flights == 1;
-                if entry.subscription.version != subscription.version
-                    || (strict
-                        && (deadline > entry.deadline
-                            || subscription.page_budget > entry.subscription.page_budget
-                            || subscription.byte_budget > entry.subscription.byte_budget))
-                {
-                    return Err(Error::InvalidRequest);
-                }
-                let flights = entry.flights.min(granted);
-                if entry.pending.len() >= flights {
-                    return Err(Error::Overloaded);
-                }
-                entry.flights = flights;
-                entry.reserve(Entry::reservation(&subscription, deadline))?;
-                let shift = sequence - latest;
-                entry.seen = if shift >= 64 { 0 } else { entry.seen << shift } | 1;
-                entry.deadline = entry.deadline.min(deadline);
-                entry.apply_ceiling(sequence, subscription.page_budget, subscription.byte_budget);
-                let (page_budget, byte_budget) = (
-                    entry.subscription.page_budget,
-                    entry.subscription.byte_budget,
-                );
-                entry.subscription = subscription;
-                entry.subscription.page_budget = page_budget;
-                entry.subscription.byte_budget = byte_budget;
-            } else {
-                // A node aggregates all local readers under one logical contract.
-                // Changing IDs cannot obtain duplicate transfers or extra votes.
-                if state.entries.iter().any(|(other, entry)| {
-                    other.membership == membership
-                        && other.receiver == receiver
-                        && entry.subscription.version == subscription.version
-                        && entry.deadline > state.now
-                }) {
-                    return Err(Error::Overloaded);
-                }
-                if state.entries.len() >= self.limits.max_entries {
-                    return Err(Error::Overloaded);
-                }
-                let reservation = Entry::reservation(&subscription, deadline);
-                state.entries.insert(
-                    key.clone(),
-                    Entry {
-                        subscription,
-                        deadline,
-                        completed: Vec::new(),
-                        flights: granted,
-                        seen: 1,
-                        admitted: vec![reservation],
-                        pending: Vec::new(),
-                        pledges: Vec::new(),
-                    },
-                );
-            }
-            Ok((key, sequence))
-        })
+        let contract = racer_core::subscriptions::Contract {
+            id: subscription.id,
+            version: subscription.version,
+            demand: subscription.demand,
+            sequence: subscription.sequence,
+            page_budget: subscription.page_budget,
+            byte_budget: subscription.byte_budget,
+            flights: subscription.flights,
+        };
+        self.with_state(|core| core.admit(contract, membership, receiver, deadline, now_ms))
     }
 
     /// Drop an admitted request that will not select. Its sequence stays in
     /// the replay window.
-    fn release(&self, (key, sequence): &(EntryKey, u64)) {
-        self.with_state(None, |state| {
-            if let Some(entry) = state.entries.get_mut(key)
-                && let Some(index) = entry.admitted.iter().position(|r| r.sequence == *sequence)
-            {
-                let r = entry.admitted.swap_remove(index);
-                entry.forfeit(r.covered_page, r.covered_bytes);
-            }
-        });
+    fn release(&self, key: &(EntryKey, u64)) {
+        self.with_state(|core| core.release(key));
     }
 
     /// Select one page for an admitted request. An unknown eligibility endpoint
@@ -654,87 +345,33 @@ impl Subscriptions {
     /// the lock, then repeats this transaction.
     fn select(
         self: &Arc<Self>,
-        (key, sequence): &(EntryKey, u64),
+        key: &(EntryKey, u64),
         now_ms: u64,
         eligible: impl Fn(u64) -> Option<bool>,
     ) -> Result<std::result::Result<Selection, u64>> {
-        self.with_state(Some(now_ms), |state| {
-            let entry = state.entries.get(key).ok_or(Error::DeadlineExceeded)?;
-            if entry.deadline <= state.now {
-                return Err(Error::DeadlineExceeded);
-            }
-            if entry.pending.len() >= entry.flights {
-                return Err(Error::Overloaded);
-            }
-            let reservation = entry
-                .admitted
-                .iter()
-                .find(|r| r.sequence == *sequence)
-                .ok_or(Error::Replay)?
-                .clone();
-            if entry.subscription.page_budget == 0
-                || entry.subscription.byte_budget == 0
-                || reservation.page_budget == 0
-                || reservation.byte_budget == 0
-            {
-                return Err(Error::Unavailable);
-            }
-            if state.fanout.pending().len() >= self.limits.max_pending {
-                return Err(Error::Overloaded);
-            }
-            let number = match state.select(key, &reservation.demand, &eligible) {
-                Ok(number) => number.ok_or(Error::Unavailable)?,
-                Err(page) => return Ok(Err(page)),
-            };
-            let deadline = entry.deadline.min(reservation.deadline);
-            let page = PageId {
-                version: entry.subscription.version.clone(),
-                number: PageNumber(number),
-            };
-            let flight_key = FlightKey {
-                membership: key.membership,
-                page: page.clone(),
-            };
-            let (token, flight, leader) = state
-                .fanout
-                .attach(
-                    flight_key,
-                    key.clone(),
-                    deadline,
-                    state.now,
-                    self.limits.max_pending,
-                    self.limits.max_inflight,
-                )
-                .ok_or(Error::Overloaded)?;
-            let entry = state.entries.get_mut(key).expect("admitted entry");
-            entry.subscription.page_budget -= 1;
-            entry.admitted.retain(|r| r.sequence != *sequence);
-            // The page debit above consumes any page a newer ceiling granted.
-            let mut reservation = reservation;
-            reservation.covered_page = false;
-            entry.pending.push(Flight {
-                token,
-                page: number,
-                reservation,
-                settled: false,
-            });
-            let waiter = Waiter {
-                scheduler: self.clone(),
-                token: Some(token),
-            };
-            Ok(Ok(if !leader {
-                Selection::Follower(waiter)
-            } else {
-                Selection::Leader {
-                    work: Work {
-                        scheduler: self.clone(),
-                        token: Some(flight),
-                        page,
+        let selected = self.with_state(|core| core.select(key, now_ms, eligible))?;
+        let selected = match selected {
+            Ok(selected) => selected,
+            Err(page) => return Ok(Err(page)),
+        };
+        let waiter = Waiter {
+            scheduler: self.clone(),
+            token: Some(selected.waiter),
+        };
+        Ok(Ok(match selected.work {
+            None => Selection::Follower(waiter),
+            Some(flight) => Selection::Leader {
+                work: Work {
+                    scheduler: self.clone(),
+                    token: Some(flight),
+                    page: PageId {
+                        version: selected.version,
+                        number: PageNumber(selected.page),
                     },
-                    waiter,
-                }
-            }))
-        })
+                },
+                waiter,
+            },
+        }))
     }
 }
 
@@ -751,154 +388,6 @@ impl Drop for Release<'_> {
     }
 }
 
-impl State {
-    fn expire(&mut self, now: u64) {
-        self.now = self.now.max(now);
-        self.fanout
-            .expire(self.now, || Error::DeadlineExceeded, &mut self.wake);
-        if self.now < self.next_prune {
-            return;
-        }
-        self.next_prune = self.now.saturating_add(100);
-        self.entries.retain(|_, entry| {
-            // Retain the spent contract for the signature freshness window after
-            // expiry. Replaying it on a fresh socket cannot renew its deadline.
-            if entry.deadline.saturating_add(60_000) > self.now {
-                true
-            } else {
-                self.completed_intervals -= entry.completed.len();
-                false
-            }
-        });
-        // Never release acquisition capacity while the owner can still run Fill.
-    }
-
-    /// The target votes with the selecting request's own demand, excluding
-    /// pages it already has in flight. Other receivers vote with their latest
-    /// demand.
-    fn select(
-        &self,
-        target: &EntryKey,
-        demand: &Demand,
-        eligible: &impl Fn(u64) -> Option<bool>,
-    ) -> std::result::Result<Option<u64>, u64> {
-        let version = &self.entries[target].subscription.version;
-        // Sweep endpoints, not pages. Count distinct receivers, not subscription
-        // IDs, so one receiver cannot boost its priority by issuing duplicate IDs.
-        let demands = self.entries.iter().filter_map(|(key, entry)| {
-            if key.membership != target.membership
-                || &entry.subscription.version != version
-                || entry.deadline <= self.now
-                || entry.subscription.byte_budget == 0
-                || (entry.subscription.page_budget == 0 && entry.pending.is_empty())
-            {
-                return None;
-            }
-            if key != target {
-                return Some((
-                    &key.receiver,
-                    false,
-                    outstanding(&entry.subscription.demand, &entry.completed),
-                ));
-            }
-            let mut done = entry.completed.clone();
-            for flight in &entry.pending {
-                done = include_page(&done, flight.page);
-            }
-            Some((&key.receiver, true, outstanding(demand, &done)))
-        });
-        flow_control::subscriptions::select(demands, eligible)
-    }
-
-    fn remove_pending(&mut self, token: u64) -> Option<Pending> {
-        let pending = self.fanout.remove(token)?;
-        if let Some(entry) = self.entries.get_mut(&pending.owner)
-            && let Some(index) = entry.pending.iter().position(|f| f.token == token)
-        {
-            let flight = entry.pending.swap_remove(index);
-            if !flight.settled {
-                entry.forfeit(false, flight.reservation.covered_bytes);
-            }
-        }
-        Some(pending)
-    }
-
-    fn finish(&mut self, flight: u64, result: Result<CiphertextCopy>, limit: usize) {
-        // An origin rejection says nothing about another credential supplier.
-        // Elect exactly one retained follower to retry with its own verified
-        // request and original route credits. Never clone or refund authority.
-        let promote = matches!(
-            result,
-            Err(Error::OriginRejected | Error::OriginForbidden | Error::Unauthorized)
-        );
-        self.fanout.finish(
-            flight,
-            promote,
-            |token, owner, key| {
-                let copy = result.as_ref().map_err(|e| *e)?;
-                let entry = self.entries.get_mut(owner).ok_or(Error::DeadlineExceeded)?;
-                let reservation = &entry
-                    .pending
-                    .iter()
-                    .find(|flight| flight.token == token)
-                    .ok_or(Error::StaleFlight)?
-                    .reservation;
-                let bytes = copy.ciphertext.bytes().len() as u64;
-                // Charge at least what newer ceilings set aside for this flight.
-                let contract = entry
-                    .subscription
-                    .byte_budget
-                    .checked_sub(bytes.max(reservation.covered_bytes))
-                    .ok_or(Error::Unavailable)?;
-                let remaining = reservation
-                    .byte_budget
-                    .checked_sub(bytes)
-                    .ok_or(Error::Unavailable)?;
-                // Report the grant relative to the selecting request, so each
-                // response matches its own signed request. The selection
-                // already debited one page from a nonzero request budget.
-                let grant = TransferGrant {
-                    subscription_id: owner.id,
-                    sequence: reservation.sequence,
-                    page: key.page.clone(),
-                    membership: owner.membership,
-                    receiver: owner.receiver.clone(),
-                    deadline: entry.deadline.min(reservation.deadline),
-                    remaining_page_budget: reservation.page_budget - 1,
-                    remaining_byte_budget: remaining,
-                    // Never grant more than this request asked for; the
-                    // requester rejects a larger count as unauthorized.
-                    flights: reservation.flights.map(|requested| {
-                        u16::try_from(entry.flights)
-                            .expect("bounded flights")
-                            .min(requested)
-                    }),
-                };
-                let completed = include_page(&entry.completed, key.page.number.0);
-                let count = self.completed_intervals - entry.completed.len() + completed.len();
-                if count > limit {
-                    return Err(Error::Overloaded);
-                }
-                self.completed_intervals = count;
-                entry.completed = completed;
-                entry.subscription.byte_budget = contract;
-                let flight = entry
-                    .pending
-                    .iter_mut()
-                    .find(|flight| flight.token == token)
-                    .expect("pending flight");
-                flight.settled = true;
-                Ok(Completion {
-                    metadata: copy.metadata.clone(),
-                    ciphertext: copy.ciphertext.clone(),
-                    grant,
-                })
-            },
-            &mut self.wake,
-        );
-    }
-}
-
 impl Work {
     pub fn page(&self) -> &PageId {
         &self.page
@@ -912,36 +401,33 @@ impl Work {
         } else {
             copy.validate_metadata()
         };
-        let result = valid.map(|()| copy);
-        let token = self.token.take().expect("owned work");
-        self.scheduler.with_state(Some(now_ms), |state| {
-            state.finish(token, result, self.scheduler.limits.max_completed_intervals);
+        let result = valid.map(|()| {
+            let bytes = copy.ciphertext.bytes().len() as u64;
+            ((copy.metadata.clone(), copy.ciphertext.clone()), bytes)
         });
+        // Structural failures never promote a follower.
+        let token = self.token.take().expect("owned work");
+        self.scheduler
+            .with_state(|core| core.complete(token, result, false, Some(now_ms)));
         valid
     }
 
     pub fn fail(mut self, error: Error) {
+        // An origin rejection of the supplier's credentials promotes a follower.
+        let promote = matches!(
+            error,
+            Error::OriginRejected | Error::OriginForbidden | Error::Unauthorized
+        );
         let token = self.token.take().expect("owned work");
-        self.scheduler.with_state(None, |state| {
-            state.finish(
-                token,
-                Err(error),
-                self.scheduler.limits.max_completed_intervals,
-            );
-        });
+        self.scheduler
+            .with_state(|core| core.complete(token, Err(error), promote, None));
     }
 }
 
 impl Drop for Work {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
-            self.scheduler.with_state(None, |state| {
-                state.finish(
-                    token,
-                    Err(Error::Cancelled),
-                    self.scheduler.limits.max_completed_intervals,
-                );
-            });
+            self.scheduler.with_state(|core| core.cancel_work(token));
         }
     }
 }
@@ -951,18 +437,16 @@ impl Waiter {
     /// transfer acquisition ownership, and only to one still-live waiter.
     pub fn take_work(&mut self, now_ms: u64) -> Option<Work> {
         let token = self.token?;
-        self.scheduler.with_state(Some(now_ms), |state| {
-            let pending = state.fanout.pending_mut(token)?;
-            if !pending.promoted || pending.result.is_some() {
-                return None;
-            }
-            pending.promoted = false;
-            let flight = pending.flight;
-            Some(Work {
-                scheduler: self.scheduler.clone(),
-                token: Some(flight),
-                page: state.fanout.flights().get(&flight)?.page.clone(),
-            })
+        let (flight, version, page) = self
+            .scheduler
+            .with_state(|core| core.take_work(token, now_ms))?;
+        Some(Work {
+            scheduler: self.scheduler.clone(),
+            token: Some(flight),
+            page: PageId {
+                version,
+                number: PageNumber(page),
+            },
         })
     }
     #[cfg(test)]
@@ -977,63 +461,44 @@ impl Waiter {
     }
 
     pub fn poll_result(&mut self, cx: &mut Context<'_>, now_ms: u64) -> Poll<Result<Completion>> {
+        use racer_core::subscriptions::Polled;
         let waker = cx.waker();
         let Some(token) = self.token else {
             return Poll::Ready(Err(Error::StaleFlight));
         };
-        let result = self.scheduler.with_state(Some(now_ms), |state| {
-            let Some(pending) = state.fanout.pending_mut(token) else {
-                return Poll::Ready(Err(Error::StaleFlight));
-            };
-            if pending.result.is_some() {
-                let pending = state.remove_pending(token).expect("pending slot");
-                if pending.promoted {
-                    // Expiry may win before the elected waiter takes its Work.
-                    // There is no acquisition owner left to fence this flight.
-                    state.finish(
-                        pending.flight,
-                        Err(Error::Cancelled),
-                        self.scheduler.limits.max_completed_intervals,
-                    );
+        // Register under the same lock as the poll, so no wake is lost.
+        let result = self
+            .scheduler
+            .with_wakers(|state| match state.core.poll(token, now_ms) {
+                Polled::Ready(result) => {
+                    state.wakers.remove(&token);
+                    Some(result)
                 }
-                return Poll::Ready(pending.result.expect("ready"));
-            }
-            if !pending
-                .waker
-                .as_ref()
-                .is_some_and(|old| old.will_wake(waker))
-            {
-                pending.waker = Some(waker.clone());
-            }
-            Poll::Pending
-        });
-        if result.is_ready() {
-            self.token = None;
-        }
-        result
+                Polled::Pending => {
+                    let slot = state.wakers.entry(token).or_insert_with(|| waker.clone());
+                    if !slot.will_wake(waker) {
+                        *slot = waker.clone();
+                    }
+                    None
+                }
+            });
+        let Some(result) = result else {
+            return Poll::Pending;
+        };
+        self.token = None;
+        Poll::Ready(result.map(Completion::from))
     }
 }
 
 impl Drop for Waiter {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
-            self.scheduler.with_state(None, |state| {
-                if let Some(pending) = state.remove_pending(token)
-                    && pending.promoted
-                {
-                    state.finish(
-                        pending.flight,
-                        Err(Error::Cancelled),
-                        self.scheduler.limits.max_completed_intervals,
-                    );
-                }
+            self.scheduler.with_wakers(|state| {
+                state.wakers.remove(&token);
+                state.core.cancel_waiter(token);
             });
         }
     }
-}
-
-fn outstanding(demand: &Demand, completed: &[PageInterval]) -> Vec<PageInterval> {
-    flow_control::subscriptions::outstanding(demand.intervals(), completed)
 }
 
 #[cfg(test)]
@@ -1042,6 +507,7 @@ mod tests {
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::StrongEtag;
+    use flow_control::subscriptions::Interval;
     use racer_control_wire::CacheId;
     use std::rc::Rc;
 
@@ -1059,7 +525,7 @@ mod tests {
                 },
                 etag: StrongEtag::test_value("v1"),
             },
-            demand: Demand::new(vec![PageInterval { start, end }]).unwrap(),
+            demand: Demand::new(vec![Interval { start, end }]).unwrap(),
         }
     }
     fn schedule(s: &Arc<Subscriptions>, sub: Subscription, receiver: &str) -> Result<Selection> {
@@ -1081,41 +547,16 @@ mod tests {
             scheduler.select(&key, 50, |_| Some(true)),
             Err(Error::DeadlineExceeded)
         ));
-        assert_eq!(scheduler.state.lock().unwrap().next_prune, 101);
+        assert_eq!(scheduler.inspect(|c| c.next_prune()), 101);
         scheduler.prune(60_049);
         scheduler.prune(60_050);
-        assert_eq!(scheduler.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(scheduler.inspect(|c| c.entry_count()), 1);
         scheduler.prune(60_148);
-        assert_eq!(scheduler.state.lock().unwrap().entries.len(), 1);
+        assert_eq!(scheduler.inspect(|c| c.entry_count()), 1);
         scheduler.prune(60_149);
-        assert!(scheduler.state.lock().unwrap().entries.is_empty());
+        assert_eq!(scheduler.inspect(|c| c.entry_count()), 0);
         scheduler.prune(0);
-        assert_eq!(scheduler.state.lock().unwrap().now, 60_149);
-    }
-    #[test]
-    fn compact_demand_rejects_noncanonical_and_never_expands_pages() {
-        for intervals in [
-            vec![PageInterval { start: 1, end: 1 }],
-            vec![
-                PageInterval { start: 1, end: 3 },
-                PageInterval { start: 3, end: 4 },
-            ],
-            vec![
-                PageInterval { start: 2, end: 4 },
-                PageInterval { start: 1, end: 2 },
-            ],
-            vec![PageInterval { start: 1, end: 2 }; MAX_DEMAND_INTERVALS + 1],
-        ] {
-            assert!(Demand::new(intervals).is_err());
-        }
-        let demand = Demand::new(vec![PageInterval {
-            start: 0,
-            end: u64::MAX,
-        }])
-        .unwrap();
-        assert_eq!(demand.page_count(), u64::MAX);
-        assert!(demand.contains(u64::MAX - 1));
-        assert!(!demand.contains(u64::MAX));
+        assert_eq!(scheduler.inspect(|c| c.now()), 60_149);
     }
     #[test]
     fn deferred_selection_rechecks_fairness_sequence_expiry_capacity_and_credits() {
@@ -1150,9 +591,7 @@ mod tests {
             Err(Error::Overloaded)
         ));
         assert_eq!(
-            scheduler.state.lock().unwrap().entries[&key.0]
-                .subscription
-                .page_budget,
+            scheduler.inspect(|c| c.entry(&key.0).unwrap().page_budget),
             9
         );
         drop((work, waiter, follower));
@@ -1172,9 +611,7 @@ mod tests {
             Err(Error::DeadlineExceeded)
         ));
         assert_eq!(
-            scheduler.state.lock().unwrap().entries[&key.0]
-                .subscription
-                .page_budget,
+            scheduler.inspect(|c| c.entry(&key.0).unwrap().page_budget),
             9
         );
 
@@ -1202,9 +639,7 @@ mod tests {
             Err(Error::Overloaded)
         ));
         assert_eq!(
-            scheduler.state.lock().unwrap().entries[&key.0]
-                .subscription
-                .page_budget,
+            scheduler.inspect(|c| c.entry(&key.0).unwrap().page_budget),
             10
         );
         drop(held);
@@ -1228,7 +663,7 @@ mod tests {
         work.fail(Error::Unavailable);
         assert!(matches!(first.try_result(2), Err(Error::Unavailable)));
         assert!(matches!(second.try_result(2), Err(Error::Unavailable)));
-        assert!(scheduler.state.lock().unwrap().fanout.flights().is_empty());
+        assert_eq!(scheduler.inspect(|c| c.flight_count()), 0);
     }
     #[test]
     fn budgets_sequences_deadlines_membership_and_capacity_are_finite() {
@@ -1283,13 +718,13 @@ mod tests {
         };
         scheduler.prune(1000);
         assert_eq!(
-            scheduler.state.lock().unwrap().fanout.flights().len(),
+            scheduler.inspect(|c| c.flight_count()),
             1,
             "expiry cannot release unfenced acquisition owner"
         );
         drop(waiter);
         drop(work);
-        assert!(scheduler.state.lock().unwrap().fanout.flights().is_empty());
+        assert_eq!(scheduler.inspect(|c| c.flight_count()), 0);
         assert!(matches!(
             scheduler.schedule(sub, MembershipVersion(0), NodeId("a".into()), 2000, 1001),
             Err(Error::InvalidRequest)
@@ -1317,7 +752,7 @@ mod tests {
             Err(Error::InvalidRequest)
         ));
         scheduler.prune(61_000);
-        assert!(scheduler.state.lock().unwrap().entries.is_empty());
+        assert_eq!(scheduler.inspect(|c| c.entry_count()), 0);
     }
     #[test]
     fn credential_failure_elects_one_other_supplier_without_refunding_credits() {
@@ -1349,18 +784,10 @@ mod tests {
         next.fail(Error::OriginRejected);
         assert!(matches!(second.try_result(2), Err(Error::OriginRejected)));
         let last = third.take_work(2).unwrap();
-        assert!(
-            scheduler
-                .state
-                .lock()
-                .unwrap()
-                .entries
-                .values()
-                .all(|e| e.subscription.page_budget == 9)
-        );
+        assert!(scheduler.inspect(|c| c.entries().all(|e| e.page_budget == 9)));
         last.fail(Error::Unavailable);
         assert!(matches!(third.try_result(2), Err(Error::Unavailable)));
-        assert!(scheduler.state.lock().unwrap().fanout.flights().is_empty());
+        assert_eq!(scheduler.inspect(|c| c.flight_count()), 0);
     }
     #[test]
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
@@ -1461,9 +888,8 @@ mod tests {
                 ));
             }
             drop(second);
-            let state = scheduler.state.lock().unwrap();
-            assert!(state.fanout.flights().is_empty());
-            assert!(state.fanout.pending().is_empty());
+            assert_eq!(scheduler.inspect(|c| c.flight_count()), 0);
+            assert_eq!(scheduler.inspect(|c| c.pending_count()), 0);
         }
     }
 
@@ -1530,11 +956,6 @@ mod tests {
         }
     }
 
-    /// Mirror of the requester check in `forwarding::response_matches`.
-    fn requester_accepts(requested: Option<u16>, granted: Option<u16>) -> bool {
-        granted.is_some() == requested.is_some() && granted <= requested
-    }
-
     #[test]
     fn late_selection_grant_is_capped_at_its_own_request() {
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
@@ -1545,14 +966,14 @@ mod tests {
         let grant = waiter.try_result(2).unwrap().unwrap().grant;
         assert_eq!(grant.sequence, 4);
         assert_eq!(grant.flights, Some(1));
-        assert!(requester_accepts(late.flights, grant.flights));
+        assert!(racer_core::route::flights_ok(grant.flights, late.flights));
         let key = EntryKey {
             membership: MembershipVersion(1),
             receiver: NodeId("a".into()),
             id: [1; 16],
         };
         // A late older request does not lower the newest request's allowance.
-        assert_eq!(scheduler.state.lock().unwrap().entries[&key].flights, 3);
+        assert_eq!(scheduler.inspect(|c| c.entry(&key).unwrap().flights), 3);
     }
 
     #[test]
@@ -1566,9 +987,9 @@ mod tests {
         let grant = waiter.try_result(2).unwrap().unwrap().grant;
         assert_eq!(grant.sequence, 4);
         assert_eq!(grant.flights, None);
-        assert!(requester_accepts(late.flights, grant.flights));
-        assert!(!requester_accepts(Some(1), Some(3)));
-        assert!(!requester_accepts(None, Some(1)));
+        assert!(racer_core::route::flights_ok(grant.flights, late.flights));
+        assert!(!racer_core::route::flights_ok(Some(3), Some(1)));
+        assert!(!racer_core::route::flights_ok(Some(1), None));
     }
 
     #[test]
@@ -1591,9 +1012,9 @@ mod tests {
             id: [1; 16],
         };
         {
-            let state = scheduler.state.lock().unwrap();
-            assert_eq!(state.entries[&key].subscription.page_budget, 7);
-            assert_eq!(state.entries[&key].pending.len(), 3);
+            let entry = scheduler.inspect(|c| c.entry(&key).unwrap());
+            assert_eq!(entry.page_budget, 7);
+            assert_eq!(entry.pending, 3);
         }
         // Each grant is relative to its own request: budget minus one page.
         let (work, mut waiter) = held.remove(1);
@@ -1604,9 +1025,7 @@ mod tests {
         assert_eq!(completion.grant.remaining_byte_budget, 1024 - 19);
         assert_eq!(completion.grant.flights, Some(3));
         assert_eq!(
-            scheduler.state.lock().unwrap().entries[&key]
-                .subscription
-                .byte_budget,
+            scheduler.inspect(|c| c.entry(&key).unwrap().byte_budget),
             1024 - 19
         );
         // A consumed response frees one slot for the next sequence.
@@ -1617,9 +1036,7 @@ mod tests {
             "completed and pending pages skipped"
         );
         assert_eq!(
-            scheduler.state.lock().unwrap().entries[&key]
-                .subscription
-                .page_budget,
+            scheduler.inspect(|c| c.entry(&key).unwrap().page_budget),
             // Sequence 4's ceiling of 6 excludes the refused sequence 3, which
             // was never admitted and keeps its own page until the window
             // moves past it.
@@ -1672,7 +1089,7 @@ mod tests {
         let five = admit(multi(1, 5, 3)).unwrap();
         // An older request in the window is admitted once, using its own demand.
         let mut four = multi(1, 4, 3);
-        four.demand = Demand::new(vec![PageInterval { start: 7, end: 8 }]).unwrap();
+        four.demand = Demand::new(vec![Interval { start: 7, end: 8 }]).unwrap();
         let four = admit(four).unwrap();
         assert!(matches!(admit(multi(1, 4, 3)), Err(Error::Replay)));
         assert!(matches!(admit(multi(1, 5, 3)), Err(Error::Replay)));
@@ -1716,12 +1133,7 @@ mod tests {
             receiver: NodeId("a".into()),
             id: [1; 16],
         };
-        assert_eq!(
-            scheduler.state.lock().unwrap().entries[&key]
-                .subscription
-                .page_budget,
-            8
-        );
+        assert_eq!(scheduler.inspect(|c| c.entry(&key).unwrap().page_budget), 8);
         let Selection::Follower(mut follower) =
             schedule(&scheduler, subscription(2, 0, 1), "b").unwrap()
         else {
@@ -1747,12 +1159,8 @@ mod tests {
     }
 
     fn contract(scheduler: &Subscriptions) -> (u32, u64) {
-        let state = scheduler.state.lock().unwrap();
-        let entry = state.entries.values().next().unwrap();
-        (
-            entry.subscription.page_budget,
-            entry.subscription.byte_budget,
-        )
+        let entry = scheduler.inspect(|c| c.entries().next().unwrap());
+        (entry.page_budget, entry.byte_budget)
     }
 
     #[test]

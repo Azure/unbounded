@@ -231,6 +231,16 @@ func TestNVIDIAInjectionModes(t *testing.T) {
 				t.Fatalf("CDI annotation = %q (present %v), want present %v", value, hasCDI, tc.wantCDI)
 			}
 
+			// /dev/nvidia-fs* reaches the container through privileged
+			// mode, not the runtime's NVIDIA_GDS hook.
+			if _, ok := env["NVIDIA_GDS"]; ok {
+				t.Fatal("NVIDIA_GDS must not be set")
+			}
+
+			if container.SecurityContext == nil || container.SecurityContext.Privileged == nil || !*container.SecurityContext.Privileged {
+				t.Fatal("dataplane must be privileged to see /dev/nvidia-fs*")
+			}
+
 			// cuFile classifies slab devices through the host udev database.
 			hasUdevVolume := false
 
@@ -250,6 +260,25 @@ func TestNVIDIAInjectionModes(t *testing.T) {
 
 			if hasUdevVolume != tc.wantEnv || hasUdevMount != tc.wantEnv {
 				t.Fatalf("udev volume/mount = %v/%v, want %v", hasUdevVolume, hasUdevMount, tc.wantEnv)
+			}
+
+			// cuFile writes its log to an emptyDir on the read-only root.
+			hasLogVolume, hasLogMount := false, false
+
+			for _, volume := range template.Spec.Volumes {
+				if volume.Name == "cufile-log" {
+					hasLogVolume = volume.EmptyDir != nil && volume.EmptyDir.SizeLimit != nil && volume.EmptyDir.SizeLimit.String() == CUFileLogSizeLimit
+				}
+			}
+
+			for _, mount := range container.VolumeMounts {
+				if mount.Name == "cufile-log" {
+					hasLogMount = mount.MountPath == CUFileLogDirectory && !mount.ReadOnly
+				}
+			}
+
+			if hasLogVolume != tc.wantEnv || hasLogMount != tc.wantEnv {
+				t.Fatalf("cufile-log volume/mount = %v/%v, want %v", hasLogVolume, hasLogMount, tc.wantEnv)
 			}
 
 			// GPU libraries must never come from a GPU resource request.

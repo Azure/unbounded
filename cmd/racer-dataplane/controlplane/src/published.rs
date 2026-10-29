@@ -120,6 +120,43 @@ impl<T: Generation> Published<T> {
         Ok(state.parts.get(&version).and_then(Weak::upgrade))
     }
 
+    /// Resolve a part held for grace retention that was superseded at most
+    /// `within` before `now`, without extending its lifetime. Peers keep the
+    /// same grace window, so a version this node replaced recently is one
+    /// that a peer which adopted the replacement no earlier than this node
+    /// minus (`grace` - `within`) still resolves. Parts retained only by
+    /// other leases, or held longer than `within`, are not returned: their
+    /// retention at a peer is unknown. `None` when grace retention is off.
+    pub fn resolve_recent(
+        &self,
+        version: T::PartVersion,
+        now: Instant,
+        within: Duration,
+    ) -> Result<Option<Arc<T::Part>>, Error> {
+        if within > self.retention.grace {
+            return Ok(None);
+        }
+        let mut retired = Vec::new();
+        let mut state = self.state.lock().map_err(|_| Error::Internal)?;
+        state.expire(now, &mut retired);
+        // A grace entry expires `grace` after its part was superseded.
+        let recent = state
+            .grace
+            .iter()
+            .find(|(expires, v, _)| {
+                *v == version
+                    && expires
+                        .checked_sub(self.retention.grace)
+                        .is_some_and(|superseded| {
+                            now.saturating_duration_since(superseded) <= within
+                        })
+            })
+            .map(|(_, _, part)| part.clone());
+        drop(state);
+        drop(retired);
+        Ok(recent)
+    }
+
     /// Validate and atomically replace current state, committing staged resources
     /// under the same lock. Both callbacks must be short and must not reenter this
     /// cell. Commit must be infallible and must not panic. A replay never commits.
@@ -425,6 +462,89 @@ mod tests {
         drop(rescued);
         assert!(cell.resolve(1, Instant::now()).unwrap().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolve_recent_returns_only_recently_superseded_grace_parts() {
+        let cell = Arc::new(Published::new(Retention {
+            old_parts: 4,
+            grace_parts: 4,
+            grace_bytes: 16,
+            grace: Duration::from_secs(30),
+        }));
+        let start = Instant::now();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let publish = |version, at| {
+            cell.publish(
+                Arc::new(Value {
+                    version,
+                    part: Arc::new(Part {
+                        owner: Arc::downgrade(&cell),
+                        drops: drops.clone(),
+                    }),
+                    rescue: None,
+                }),
+                at,
+                |_, _| Ok::<_, Error>(()),
+                || (),
+            )
+            .unwrap()
+        };
+        let current = publish(1, start);
+        let within = Duration::from_secs(10);
+        // The current part was never superseded.
+        assert!(cell.resolve_recent(1, start, within).unwrap().is_none());
+        drop(current);
+        let superseded = start + Duration::from_secs(5);
+        let _current = publish(2, superseded);
+        for (offset, recent) in [(0, true), (10, true), (11, false), (31, false)] {
+            let now = superseded + Duration::from_secs(offset);
+            assert_eq!(
+                cell.resolve_recent(1, now, within).unwrap().is_some(),
+                recent,
+                "{offset} s after"
+            );
+        }
+        // A window longer than grace is never trusted.
+        let mut cell = Published::<Value>::new(Retention {
+            old_parts: 4,
+            grace_parts: 4,
+            grace_bytes: 16,
+            grace: Duration::from_secs(5),
+        });
+        assert!(cell.resolve_recent(1, start, within).unwrap().is_none());
+        // Without grace retention nothing is recent, even when a lease keeps
+        // the old part resolvable.
+        cell = Published::new(Retention {
+            old_parts: 1,
+            grace_parts: 0,
+            grace_bytes: 0,
+            grace: Duration::ZERO,
+        });
+        let cell = Arc::new(cell);
+        let lease = |version| {
+            Arc::new(Value {
+                version,
+                part: Arc::new(Part {
+                    owner: Arc::downgrade(&cell),
+                    drops: drops.clone(),
+                }),
+                rescue: None,
+            })
+        };
+        let old = lease(1);
+        let pinned = old.part.clone();
+        cell.publish(old, start, |_, _| Ok::<_, Error>(()), || ())
+            .unwrap();
+        cell.publish(lease(2), start, |_, _| Ok::<_, Error>(()), || ())
+            .unwrap();
+        assert!(cell.resolve(1, start).unwrap().is_some());
+        assert!(
+            cell.resolve_recent(1, start, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        drop(pinned);
     }
 
     #[test]

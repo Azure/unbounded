@@ -964,9 +964,20 @@ async fn serve_connection(
         deadline.set(scope.deadline.0);
         let scope = &scope;
         // Every descriptor must be claimed by a direct read; the rest close here.
+        let mut gpu_read = false;
         let parsed = received.value.and_then(|received| {
             let request = parser.parse(cache, received.head)?;
-            let sink = responses.open_sink(&request.kind, received.descriptors)?;
+            gpu_read = matches!(request.kind, crate::client::ReadKind::GpuRead { .. });
+            Ok((request, received.descriptors))
+        });
+        // A `gpu-read` head is the only request that may start the GPU
+        // helper (`RACER_ENABLE_GPU=auto`); see `Responses::prepare_gpu`.
+        let parsed = match parsed {
+            Ok(parsed) if gpu_read => responses.prepare_gpu(scope).await.map(|()| parsed),
+            other => other,
+        };
+        let parsed = parsed.and_then(|(request, descriptors)| {
+            let sink = responses.open_sink(&request.kind, descriptors)?;
             Ok((request, sink))
         });
         let parsed = match parsed {
@@ -976,6 +987,14 @@ async fn serve_connection(
             },
             other => other,
         };
+        if gpu_read {
+            metrics
+                .gpu()
+                .record_request(crate::gpu_telemetry::GpuReadOutcome::classify(
+                    parsed.as_ref().map(|_| ()).map_err(|error| *error),
+                    responses.has_gpu(),
+                ));
+        }
         let (request, sink) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {

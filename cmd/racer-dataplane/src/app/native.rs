@@ -166,6 +166,22 @@ impl WorkerApplication {
             }
         }
         self.actual_rails = links.active();
+        // The GPU helper started lazily after these rails activated: attach
+        // its landing buffers to them now. Only the owner registers memory.
+        if self.native_owner()
+            && self.native_task.is_none()
+            && !self.actual_rails.is_empty()
+            && links.node().take_landing_pending()
+        {
+            let rails = self.actual_rails.clone();
+            let turn = scope(Duration::from_secs(5))?;
+            self.native_task = Some(Box::pin(async move {
+                links.attach_landings(&rails, &turn).await;
+                Ok(rails)
+            }));
+            cx.waker().wake_by_ref();
+            return Ok(());
+        }
         if !self.native_owner()
             || self.native_task.is_some()
             || !self.actual_rails.is_empty()
@@ -173,7 +189,12 @@ impl WorkerApplication {
         {
             return Ok(());
         }
-        let publication = self.native_publication()?;
+        let publication = match self.native_publication() {
+            // Not a member yet: a new node joins only after it serves.
+            // Activate once a publication lists it.
+            Err(Error::IncompatibleMembership) => return Ok(()),
+            result => result?,
+        };
         if publication.is_empty() {
             return Ok(());
         }
@@ -199,7 +220,12 @@ impl WorkerApplication {
             self.actual_rails = links.active();
             return Ok(());
         }
-        let publication = self.native_publication()?;
+        let publication = match self.native_publication() {
+            // Not a member yet: start serving over TCP and let
+            // `poll_native` activate once a publication lists this node.
+            Err(Error::IncompatibleMembership) => return Ok(()),
+            result => result?,
+        };
         if publication.is_empty() {
             return Ok(());
         }
@@ -1213,15 +1239,119 @@ mod tests {
                 caches: vec![],
             })
             .unwrap();
+        // Not a member yet (a new node joins only once it serves): startup continues without native rails, and local
+        // configuration does not stand in for the missing membership.
         assert_eq!(
             futures::executor::block_on(
                 worker.activate_native(&scope(Duration::from_secs(1)).unwrap())
             ),
+            Ok(())
+        );
+        assert_eq!(
+            worker.native_publication(),
             Err(Error::IncompatibleMembership)
         );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        worker.native_retry = uring_runtime::environment::now();
+        worker.poll_native(&mut cx).unwrap();
+        assert!(worker.native_task.is_none());
         assert!(worker.actual_rails.is_empty());
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
+    }
+
+    /// Readiness needs this node in its own membership: a new node is
+    /// listed only after it serves.
+    #[test]
+    fn membership_is_usable_only_when_it_lists_the_node() {
+        let app = configured();
+        let (mut worker, _engine) = worker(&app, true, true);
+        let listed = worker.snapshots.current().unwrap();
+        worker.snapshot_sequence = Some(listed.sequence);
+        assert!(worker.membership_usable(Some(&listed)));
+        assert!(!worker.membership_usable(None));
+        worker
+            .snapshots
+            .apply(Publication {
+                schema_version: 1,
+                cluster: app.config.cluster.clone(),
+                sequence: PublicationSequence(2),
+                membership_version: MembershipVersion(2),
+                members: vec![],
+                caches: vec![],
+            })
+            .unwrap();
+        let unlisted = worker.snapshots.current().unwrap();
+        worker.snapshot_sequence = Some(unlisted.sequence);
+        assert!(!worker.membership_usable(Some(&unlisted)));
+        // A snapshot this worker has not applied is not usable either.
+        worker.snapshot_sequence = Some(unlisted.sequence);
+        assert!(!worker.membership_usable(Some(&listed)));
+    }
+
+    /// A node admitted after it started activates its rails from the
+    /// publication that first lists it.
+    #[test]
+    fn native_activates_once_membership_lists_the_node() {
+        use rdma_verbs::simulation::Device;
+        use rdma_verbs::simulation::Simulation;
+        let sim = Simulation::new();
+        let simulated = sim
+            .with_devices(vec![Device::new("test-device", [1; 16])])
+            .unwrap();
+        let _environment = simulated.enter();
+        let mut app = configured();
+        app.discovered_nics[0].device = "test-device".into();
+        let (mut worker, engine) = worker(&app, true, true);
+        let listed = worker.snapshots.current().unwrap().membership.clone();
+        worker
+            .snapshots
+            .apply(Publication {
+                schema_version: 1,
+                cluster: app.config.cluster.clone(),
+                sequence: PublicationSequence(2),
+                membership_version: MembershipVersion(2),
+                members: vec![],
+                caches: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            futures::executor::block_on(
+                worker.activate_native(&scope(Duration::from_secs(1)).unwrap())
+            ),
+            Ok(())
+        );
+        let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        worker.native_retry = uring_runtime::environment::now();
+        worker.poll_native(&mut cx).unwrap();
+        assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
+        let member = listed.member(&app.config.node).unwrap().clone();
+        worker
+            .snapshots
+            .apply(Publication {
+                schema_version: 1,
+                cluster: app.config.cluster.clone(),
+                sequence: PublicationSequence(3),
+                membership_version: MembershipVersion(3),
+                members: vec![racer_control_wire::Member {
+                    node: app.config.node.clone(),
+                    shares: member.shares,
+                    peer_endpoint: member.peer_endpoint.clone(),
+                    rails: app.discovered_nics.clone(),
+                    site: member.site.clone(),
+                }],
+                caches: vec![],
+            })
+            .unwrap();
+        worker.native_retry = uring_runtime::environment::now();
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .unwrap();
+        }
+        assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
     }
 
     fn activation_falls_back() {

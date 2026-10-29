@@ -197,18 +197,26 @@ Tune `racer-dataplane-config` in the installation namespace (normally `unbounded
 The operator preserves administrator data and hashes edits into managed rollouts.
 Explicit workload environment wiring takes precedence over ConfigMap imports.
 Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
+The operator checks each value with the same per-key rules the dataplane uses at
+startup: enum and boolean values, decimal syntax, nonzero and range limits, the
+2 MiB multiples of the GPU byte settings, and setting `RACER_IO_WORKERS` and
+`RACER_CRYPTO_HELPERS` together. When a value is invalid, reconciliation fails
+with an error that names every bad key, and the DaemonSet keeps its current
+configuration until the ConfigMap is fixed. Limits that depend on the node, such
+as CPU count or memory, are still checked only by the dataplane at startup.
 
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
 | `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, and managed control threads; managed deployments need at least 3 |
-| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count; requires `RACER_CRYPTO_HELPERS` |
+| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count, 1..65,536; requires `RACER_CRYPTO_HELPERS` |
 | `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
-| `RACER_SHARES` | `4` | Reported shares; explicit Node `shares` wins |
+| `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
+| `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
 | `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
@@ -227,14 +235,14 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
-| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
-| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments |
+| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead (at least 16,797,712 bytes) |
+| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments (at most 1,048,575) |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
-| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
-| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
+| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps; each 1..65,536, and the per-neighbor cap at most the in-flight cap |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
@@ -400,8 +408,13 @@ Racer-Destination-Length: <length>
 - The descriptor comes from `cuMemExportToShareableHandle` with the POSIX file
   descriptor handle type. `Racer-Allocation-Size` is required and must be the
   size passed to `cuMemCreate`.
+- `Racer-Gpu-Uuid` is optional: the UUID of the GPU that holds the memory, as
+  `nvidia-smi` prints it (`GPU-xxxxxxxx-...`). Device numbers in the client's
+  container can differ from the dataplane's, so the dataplane uses the UUID to
+  find the GPU. Without it, the dataplane tries each GPU. The Python client
+  sends it.
 - The answer is 501 when GPU mode is off or the memory is on a GPU the
-  dataplane did not find. It is 400 when the size does not match the memory or
+  dataplane did not find, including an unknown `Racer-Gpu-Uuid`. It is 400 when the size does not match the memory or
   the window does not fit in it.
 - A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
   page is complete.
@@ -788,6 +801,7 @@ only when a cache exists again.
 | Setting in `racer-dataplane-config` | Default | Purpose |
 |------------------------------------|---------|---------|
 | `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
+| `RACER_DATAPLANE_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
 
 Set `RACER_CONTROL_SEATS` in `racer-dataplane-config` to `auto` (the default) or
 an integer from 1 to 16. The active count cannot exceed the eligible node count.
@@ -915,6 +929,45 @@ network access, especially with host networking.
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 
+### GPU metrics
+
+`/metrics` also reports `gpu-read` state. Labels have fixed values or come
+from the GPUs the dataplane found and the active RDMA rails.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
+| `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
+| `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
+
+The rest are reported only when `racer_gpu_enabled` is 1:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_decrypt_available{ordinal,uuid}` | gauge | 1 when the GPU can decrypt sealed pages. 0 means pages for it are decrypted by the CPU. |
+| `racer_gpu_staging_slots_free{ordinal}` | gauge | Free cuFile staging slots on the GPU. |
+| `racer_gpu_cufile_enabled` | gauge | 1 while cuFile reads are on. A driver-level failure turns it off until restart. |
+| `racer_gpu_cufile_disabled_total{reason}` | counter | Times cuFile was turned off for the node: `driver_open`, `staging_register`, or `file_open` (a file registration error other than unsupported). |
+| `racer_gpu_cufile_unsupported_total` | counter | Devices (`st_dev`) whose files cuFile reported as unsupported. Files on such a device are read through host memory; cuFile stays on for other devices. |
+| `racer_gpu_read_pages_total{decrypt}` | counter | Pages written to GPU memory: `gpu` (decrypted on the GPU) or `cpu` (plaintext from host memory, decrypted by the CPU or already cached). |
+| `racer_gpu_pages_rejected_total` | counter | Sealed pages the GPU rejected for a CRC or tag mismatch. |
+| `racer_gpu_cufile_staged_pages_total` | counter | Pages cuFile read from disk straight into GPU staging. |
+| `racer_gpu_cufile_failures_total` | counter | cuFile reads or registrations that failed. The page is read through host memory instead. |
+| `racer_gpu_staging_exhausted_total` | counter | Disk reads that found no free staging slot and went through host memory. |
+| `racer_gpu_landed_pages_decrypted_total` | counter | Pages decrypted on the GPU from an RDMA landing buffer. |
+| `racer_gpu_open_requests` | gauge | `gpu-read` requests that hold GPU resources now. |
+| `racer_gpu_leaked_resources` | gauge | GPU resources leaked on purpose after a failed release. |
+
+When GPU landing is configured (GPU decrypt and RDMA both on), each active
+rail also reports the following. Each decrypting GPU's landing buffer is split
+into one slice per rail, so the `{rail,ordinal}` series are per slice.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_landing_enabled{rail}` | gauge | 1 when at least one GPU landing slice is registered on the rail. |
+| `racer_gpu_landing_slots{rail,ordinal}` | gauge | NIC slots in GPU `ordinal`'s landing slice on the rail. |
+| `racer_gpu_landing_exhausted_total{rail,ordinal}` | counter | Landing grants for that slice that found no free slot. The page lands in host memory instead. |
+
 ## Upgrade and recovery
 
 Keep the operator, dataplane, SDK, and origin adapters on matching
@@ -1003,7 +1056,7 @@ directory read-only and tells the app where the socket is.
 |-----|---------|
 | Label `racer.unbounded-cloud.io/client-socket: enabled` | Turns on the mount |
 | Annotation `racer.unbounded-cloud.io/client-cache` | ClusterCache name. Required |
-| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated app container names. Default: every app container. Init containers are never changed |
+| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated init or app container names. Default: every init and app container, except the injected `racer-object` sidecar |
 | Annotation `racer.unbounded-cloud.io/client-socket-injected` | Set by the webhook to the cache name; do not edit |
 
 Each selected container gets:
@@ -1012,7 +1065,9 @@ Each selected container gets:
   mount still allows `connect` and `sendmsg` on the socket.
 - `RACER_SOCKET=/run/racer/<cache>/client/socket`.
 
-The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
+Init containers, including native sidecars (`restartPolicy: Always`), get the
+same mount, so an init container can fetch through the socket before the app
+starts. The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
 The hostPath type is `Directory`, so the pod waits until the dataplane has
 created the cache directory. Host networking is allowed.
 
@@ -1026,14 +1081,19 @@ container already sets `RACER_SOCKET` or mounts that path.
 GPU reads let a client on the node read an object straight into its own NVIDIA
 GPU memory. They need:
 
-- A dataplane image built with `--build-arg RACER_NATIVE_CUDA=true`.
+- A dataplane image built with CUDA. The released `racer-dataplane` image is,
+  so no setup is needed. It runs on nodes without GPUs too. An image built with
+  `--build-arg RACER_NATIVE_CUDA=false` has no GPU reads.
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
-- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto` turns GPU mode off
-  when no usable GPU is found, or when the image was built without CUDA. `true`
-  makes startup fail instead. `false` turns it off.
+- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto`, the default, does
+  not touch any GPU until a client sends the first `gpu-read`. Only then does
+  the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
+  finds no usable GPU. It does not try again until the pod restarts. `true`
+  sets up the GPUs at startup and makes startup fail when there is no usable
+  GPU. `false` turns it off.
 
-At startup the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
+When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in
 `EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
 for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
@@ -1050,11 +1110,19 @@ Where the bytes come from decides who decrypts them:
 - A page on local disk is read straight from the disk into GPU memory with
   cuFile when it can be. Otherwise the CPU reads it and copies it to the GPU.
   This needs GPUDirect Storage on the host (`nvidia-fs`, or PCIe P2PDMA).
+  For PCI P2PDMA, set `RACER_GPU_PCI_P2PDMA=true`. cuFile then does not fall
+  back to `nvidia-fs`, and if it cannot turn P2PDMA on, the dataplane logs
+  `stage=gpu state=cufile-disabled` and reads through host memory. The
+  `stage=gpu state=enabled` line reports the setting as `pci_p2pdma=<bool>`.
   `racer_gpu_direct_disk_reads_total` and
   `racer_gpu_direct_disk_read_bytes_total` count these reads. After a cuFile
   driver or registration failure the dataplane logs
   `stage=gpu state=cufile-disabled` and reads through host memory until it
-  restarts.
+  restarts. When cuFile only rejects a file because its filesystem or device
+  is not supported, the dataplane logs
+  `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
+  for that device, reads files on that device through host memory until it
+  restarts, and keeps cuFile on for other devices.
 
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
@@ -1062,15 +1130,20 @@ Where the bytes come from decides who decrypts them:
 If the GPU finds a damaged page, the read fails and the dataplane drops that
 copy from memory or disk, as it does when the CPU finds one.
 
-When both GPU reads and RDMA are on, each GPU can get a landing buffer of
-`RACER_GPU_LANDING_BYTES`, split into page slots. Each RDMA rail gets at most
-one GPU's landing buffer, preferring a GPU on the rail's NUMA node. A GPU
-read that needs a page from a peer over that rail, on that GPU, asks the peer
-to write the encrypted page into a free slot. The GPU then checks and
-decrypts it. Such a page is used only by that read: it is not kept in memory,
-written to disk, or shared with other reads. When no slot is free, the GPUs
-do not match, or anything fails, the page comes through host memory as
-before. The dataplane logs `stage=gpu-landing` lines at RDMA activation, and
+When both GPU reads and RDMA are on, each GPU that can decrypt gets a landing
+buffer of `RACER_GPU_LANDING_BYTES` (per GPU, not per rail), split into page
+slots. The buffer is divided across the RDMA rails, so every GPU can land
+pages over every rail. If the buffer has fewer slots than there are rails,
+the rails on the GPU's NUMA node come first. A GPU read that needs a page
+from a peer asks up to two providers, in turn, to write the encrypted page
+into a free slot of that GPU's share on the link's rail. The GPU then checks
+and decrypts it. Such a page is used only by that read: it is not kept in
+memory, written to disk, or shared with other reads, because the host never
+has its bytes. When no slot is free or anything fails, the page comes through
+host memory as before. Landing buffers are registered when GPU mode turns
+on and at each RDMA activation, and freed when the RDMA node closes or when no rail could register
+them. They are not resized at runtime; changing the setting restarts the
+pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
@@ -1096,13 +1169,50 @@ The operator reads it and changes the DaemonSet:
 
 | `RACER_DATAPLANE_NVIDIA` | Behavior |
 |--------------------------|----------|
-| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
-| `cdi` | Also adds the Pod annotation `cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
-| `off` | Adds nothing |
+| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container, mounts the host `/run/udev` read-only at `/run/udev` (cuFile reads each slab device's filesystem type from the udev database), and mounts a 64 MiB `emptyDir` at `/var/log/cufile` for the cuFile log. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
+| `cdi` | Everything `env` adds, plus the Pod annotation `cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
+| `off` | Adds none of these: no NVIDIA variables, no CDI annotation, no `/run/udev` mount, and no cuFile log volume. Without driver libraries there is no GPU, so cuFile is not used |
+
+The dataplane image ships `/etc/racer/cufile.json` and sets
+`CUFILE_ENV_PATH_JSON` to it. It turns off cuFile compatibility mode, so
+cuFile fails instead of copying through host memory and Racer uses its own
+host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
+cuFile settings keep their built-in defaults. To use your own file, build an
+image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
+in `racer-dataplane-config`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
+turns compatibility mode back on.
 
 On nodes set up by the unbounded agent, the NVIDIA runtime is the default
 containerd runtime and runs in CDI mode, so `env` is enough there. These env
 entries are operator wiring: workload overrides cannot change them.
+
+### Testing on GPUs
+
+Regular CI has no GPU. It compiles the decrypt kernels with `nvcc` and runs
+them on the CPU through an emulation, but never loads them on a GPU. On a
+machine with an NVIDIA driver, `nvcc`, and Rust, run:
+
+```sh
+make racer-gpu-test
+```
+
+This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
+tests in `cmd/racer-dataplane/gpu/tests/hardware.rs`: shim load, device
+discovery, import of an exported client allocation, GPU decrypt checked
+against the CPU, and cuFile reads. It fails when no GPU is found; pass
+`RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open
+or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
+`RACER_GPU_TESTS_CUFILE=require` to make that a failure. To also test
+`gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
+running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
+object it can serve (`RACER_GPU_E2E_METADATA` and
+`RACER_GPU_E2E_AUTHORIZATION` are optional). Without the socket, that test is
+skipped; set `RACER_GPU_E2E=require` to make it a failure.
+
+The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
+nightly and on demand. It runs only when the repository variable
+`RACER_GPU_RUNNER` holds the GPU runner labels as a JSON array, for example
+`["self-hosted", "linux", "gpu"]`.
 
 See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
 

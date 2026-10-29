@@ -15,7 +15,7 @@ pub const LEASE_FRESHNESS: Duration = Duration::from_secs(20);
 /// Committed state older than this, by local clock, is not served.
 ///
 /// Every seat rereads the state Secret at least every
-/// [`crate::seat::FOLLOW_INTERVAL`] (5s), so 30s tolerates several failed
+/// [`FOLLOW_INTERVAL`] (5s), so 30s tolerates several failed
 /// reads while bounding how long a seat that cannot reach the API keeps
 /// serving a stale image. Seat Lease freshness ([`LEASE_FRESHNESS`]) is the
 /// tighter bound on authority in the common case.
@@ -49,6 +49,10 @@ pub const MIN_WRITE_BYTES_PER_SEC: u64 = 100 * 1024;
 /// publication bodies are shared, never copied per connection. The effective
 /// cap is lowered further when `RLIMIT_NOFILE` is smaller, see
 /// [`connection_capacity`].
+///
+/// When a publication lands every waiting long poll wakes; beyond
+/// [`MAX_WRITES`] they queue for a write slot ([`MAX_WRITE_WAITERS`],
+/// [`WRITE_QUEUE_GRACE`]) instead of answering 429.
 pub const MAX_CONTROL_CONNECTIONS: usize = 16384;
 
 /// Maximum concurrent TLS handshakes, the CPU-heavy stage of a connection.
@@ -99,10 +103,33 @@ pub const MAX_WEBHOOK_CONNECTIONS: usize = 64;
 /// Maximum concurrent bootstrap requests, including TokenReview and API reads.
 pub const MAX_BOOTSTRAPS: usize = 32;
 
+/// Most Kubernetes API calls per second this process spends on bearer
+/// authorization, see [`crate::step::authz::ApiBudget`]. A ceiling: the 429
+/// feedback, not this number, sizes the rate in a storm.
+pub const AUTH_API_QPS: f64 = 400.0;
+
+/// Longest an authorization waits in the seat for [`AUTH_API_QPS`] budget
+/// before answering `Overloaded`. Held under a bootstrap slot and well
+/// inside [`IO_TIMEOUT`].
+pub const AUTH_BUDGET_WAIT: Duration = Duration::from_secs(2);
+
+/// Burst of [`AUTH_API_QPS`]: a quarter second of calls, so 16 seats
+/// starting together send at most 1,600 calls before the first 429 cuts.
+pub const AUTH_API_BURST: f64 = 100.0;
+
 /// Maximum concurrent responses with a body (publications, keyrings,
 /// enrollments). A slot is held until the last byte is written. Bodies are
 /// shared, so this bounds bandwidth and TLS buffers, not copies.
 pub const MAX_WRITES: usize = 64;
+
+/// Maximum responses queued for a write slot per server: every connection
+/// may wait; the deadline ([`WRITE_QUEUE_GRACE`]) turns overload into 429.
+pub const MAX_WRITE_WAITERS: usize = MAX_CONTROL_CONNECTIONS;
+
+/// How long past its poll deadline a woken long poll may wait for a write
+/// slot. Clients give a long poll `POLL_WAIT` plus 10 s, so this leaves 5 s
+/// to write. Past it the poll answers 429.
+pub const WRITE_QUEUE_GRACE: Duration = Duration::from_secs(5);
 
 /// Maximum concurrent outbound Kubernetes API requests.
 pub const MAX_API_REQUESTS: usize = 48;
@@ -168,6 +195,9 @@ pub const MEMBERS_PER_SEAT: usize = 2048;
 /// Minimum automatic seat count.
 pub const MIN_AUTO_SEATS: usize = 3;
 
+/// Interval between state Secret reads by a seat.
+pub const FOLLOW_INTERVAL: Duration = Duration::from_secs(5);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,7 +229,7 @@ mod tests {
 
     #[test]
     fn freshness_bounds() {
-        assert!(STATE_FRESHNESS >= crate::seat::FOLLOW_INTERVAL * 4);
+        assert!(STATE_FRESHNESS >= FOLLOW_INTERVAL * 4);
         assert!(STATE_FRESHNESS <= LEASE_DURATION);
         assert!(LEASE_FRESHNESS < LEASE_DURATION);
     }

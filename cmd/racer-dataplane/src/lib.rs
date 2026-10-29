@@ -13,6 +13,8 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod gpu;
+pub mod gpu_slot;
+pub mod gpu_telemetry;
 pub mod hardware;
 pub mod http;
 pub mod memory;
@@ -40,9 +42,6 @@ mod subscription_interop;
 pub use subscription_interop::go_sdk_subscription_server as run_subscription_interop_fixture;
 
 pub(crate) mod pressure;
-
-#[cfg(test)]
-mod contention;
 
 #[cfg(test)]
 pub(crate) mod test_support;

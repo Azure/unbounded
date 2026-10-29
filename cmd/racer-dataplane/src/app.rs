@@ -131,8 +131,10 @@ pub struct Application {
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
     devices: Option<devices::Plan>,
-    /// The process-wide GPU helper, when `gpu-read` is enabled.
-    gpu: Option<Arc<crate::gpu::GpuHelper>>,
+    /// The process-wide GPU helper slot. In `RACER_ENABLE_GPU=auto` it
+    /// starts on the first `gpu-read`; read it with `get()`, which never
+    /// starts it.
+    gpu: Arc<crate::gpu_slot::GpuSlot>,
     inventory: Arc<crate::rdma::Inventory>,
 
     /// Startup-fixed selector and claimed disks for `/debug/hardware`.
@@ -211,7 +213,7 @@ impl NodeState {
         Ok(Self {
             peer_admission,
             devices: None,
-            gpu: None,
+            gpu: Default::default(),
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
             hardware: Default::default(),
@@ -239,6 +241,189 @@ impl NodeState {
             pressure: Default::default(),
         })
     }
+}
+
+/// Remove slab files left by workers that no longer exist after a worker-count change.
+///
+/// Only regular files named `worker-<id>-slab-0.dat` with an id outside `workers` are
+/// removed. Each file is removed only while holding the same exclusive lock that slab
+/// startup takes, and only if the path still names the locked inode, so a concurrent
+/// instance's live slabs are skipped. Failures are logged and ignored because stale
+/// files never affect correctness.
+fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    // Like slab startup, never follow a symlink in any path component, so a
+    // directory that slab startup would reject is never enumerated or modified.
+    let Some(dir) = open_slab_directory_nofollow(directory) else {
+        return;
+    };
+    // SAFETY: dup borrows a live descriptor; fdopendir takes ownership on success.
+    let stream = unsafe {
+        let fd = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+        if fd < 0 {
+            return;
+        }
+        let stream = libc::fdopendir(fd);
+        if stream.is_null() {
+            libc::close(fd);
+            return;
+        }
+        stream
+    };
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: stream is a live DIR* owned by this function.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: readdir returned a valid entry with a NUL-terminated name.
+        names.push(unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_owned());
+    }
+    // SAFETY: stream is live and closed exactly once.
+    unsafe { libc::closedir(stream) };
+
+    for name in names {
+        let Some(id) = name
+            .to_str()
+            .ok()
+            .and_then(|n| n.strip_prefix("worker-"))
+            .and_then(|n| n.strip_suffix("-slab-0.dat"))
+            .and_then(|n| n.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        if workers.contains(&WorkerId(id)) {
+            continue;
+        }
+        let path = directory.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        // O_NONBLOCK keeps a FIFO from hanging; the fstat below rejects non-files.
+        // SAFETY: live directory FD and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            eprintln!(
+                "racer-dataplane: stage=slabs failed to open stale slab file {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        // SAFETY: successful openat returned a uniquely owned descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let Ok(locked) = file.metadata() else {
+            continue;
+        };
+        if !locked.is_file() {
+            continue;
+        }
+        // SAFETY: flock synchronously borrows this live descriptor.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            eprintln!(
+                "racer-dataplane: stage=slabs kept locked stale slab file {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        // SAFETY: zeroed stat is a valid out-parameter; FD and name are live.
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        let same = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut current,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            && current.st_mode & libc::S_IFMT == libc::S_IFREG
+            && current.st_dev == locked.dev()
+            && current.st_ino == locked.ino();
+        if !same {
+            continue;
+        }
+        // The lock is held until `file` drops, after the unlink.
+        // SAFETY: live directory FD and NUL-terminated name.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            eprintln!(
+                "racer-dataplane: stage=slabs removed stale slab file {}",
+                path.display()
+            );
+        } else {
+            eprintln!(
+                "racer-dataplane: stage=slabs failed to remove stale slab file {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Open `directory` for reading by resolving each component relative to its
+/// already-open predecessor with `O_NOFOLLOW`, matching the slab startup path
+/// walk in `alloc/src/slab.rs` (`open_private_file`). Returns `None` when any
+/// component is a symlink, missing, or `..`, or the path is not a directory.
+fn open_slab_directory_nofollow(directory: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    if directory
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let anchor = if directory.is_absolute() { c"/" } else { c"." };
+    // SAFETY: valid C path; no borrowed memory retained by open.
+    let fd = unsafe {
+        libc::open(
+            anchor.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: open returned a new, uniquely owned descriptor.
+    let mut current = unsafe { std::fs::File::from_raw_fd(fd) };
+    for component in directory.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let name = std::ffi::CString::new(component.as_bytes()).ok()?;
+        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: live directory FD and NUL-terminated component.
+        let next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if next < 0 {
+            return None;
+        }
+        // SAFETY: successful openat returned a uniquely owned descriptor.
+        current = unsafe { std::fs::File::from_raw_fd(next) };
+    }
+    // Reopen the verified O_PATH directory for reading. "." relative to the
+    // O_PATH descriptor refers to that same inode and is not a symlink.
+    // SAFETY: live O_PATH directory FD and static NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            current.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: successful openat returned a uniquely owned descriptor.
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 impl Application {
@@ -286,19 +471,9 @@ impl Application {
             self.config.limits.retained_snapshots.get(),
         )));
         self.node.inventory.update(self.discovered_nics.clone())?;
-        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu =
-            crate::gpu::GpuHelper::start(self.config.enable_gpu, self.config.gpu_staging_bytes)?;
-        // GPU decrypt and RDMA together: peers' NICs may write gpu-read pages
-        // straight into GPU landing buffers (GPUDirect RDMA). Activation
-        // registers them per rail and leaves a rail host-only on any failure.
-        if self.config.enable_rdma
-            && let Some(gpu) = &self.node.gpu
-        {
-            self.node
-                .native
-                .link_node()
-                .set_gpu_landing(gpu.clone(), self.config.gpu_landing_bytes);
-        }
+        let gpu = self.gpu_slot()?;
+        self.node.metrics[0].1.gpu().attach_slot(gpu.clone());
+        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu = gpu;
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
             self.node
@@ -354,6 +529,10 @@ impl Application {
                 .map(devices::Plan::claimed_disks)
                 .unwrap_or_default(),
         });
+        if devices.is_none() {
+            let workers: Vec<_> = plan.pairs.iter().map(|p| p.worker).collect();
+            prune_stale_slab_files(&self.config.slab_directory, &workers);
+        }
         node.devices = devices;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
@@ -695,6 +874,17 @@ impl StopSignals {
     /// Check whether a handled process signal requested shutdown.
     pub fn requested(&self) -> bool {
         STOP_REQUESTED.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for WorkerApplication {
+    /// Break the `Links` task cycle when the worker is dropped without a drain
+    /// (crash, failed startup, or an aborted group), so setup tasks release
+    /// their connections and admission charges.
+    fn drop(&mut self) {
+        if let Some(links) = &self.links {
+            links.abandon_setups();
+        }
     }
 }
 
@@ -1086,7 +1276,12 @@ impl WorkerApplication {
 
         let paths = Rc::new(
             Paths::with_limits(
-                Rc::new(LinkHealth::default()),
+                // Silence: the rank 0 watch's
+                // allowance, and one peer attempt per ping.
+                Rc::new(
+                    LinkHealth::default()
+                        .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
+                ),
                 limits.cached_paths.get(),
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),
@@ -1148,8 +1343,10 @@ impl WorkerApplication {
                 node.publications.clone(),
             )
             .with_hedges(hedges)
+            .with_reactor(reactor.clone())
             .with_replica_selection(config.replica_selection)
             .with_attempt_timeout(config.peer_attempt_timeout)
+            .with_rank0_hang_after(config.request_timeout / 2)
             .with_observer(admission.policy().observer().clone()),
         );
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
@@ -1382,8 +1579,10 @@ impl WorkerApplication {
         ));
         let mut responses = Responses::new(io.clone(), delivery)
             .with_observer(admission.policy().observer().clone());
-        if let Some(gpu) = &node.gpu {
+        if let Some(gpu) = node.gpu.get() {
             responses = responses.with_gpu(Rc::new(crate::gpu::GpuClient::new(gpu.clone())));
+        } else if node.gpu.standby() {
+            responses = responses.with_lazy_gpu(node.gpu.clone());
         }
         let responses = Rc::new(responses);
         let clients = ClientListeners::new(
@@ -1497,6 +1696,13 @@ impl WorkerApplication {
                 config.segment_bytes,
                 crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
             )
+            // Slab files are a re-fetchable cache. A checkpoint taken at the old
+            // size no longer matches slab_bytes, so recovery starts this worker
+            // cold. An older checkpoint taken at the new size, as after a resize
+            // rollback, may still be accepted; record validation and AEAD then
+            // turn its references to discarded pages into misses, as for any
+            // checkpoint that outlives its payload.
+            .reset_mismatched_size()
         });
         let reader = Rc::new(
             StoreReader::new(
@@ -1673,6 +1879,9 @@ impl WorkerApplication {
         self.ownership_maintenance.poll(now, self.stopping, || {
             self.candidates.refresh_ownership(self.store.writer.index())
         });
+        if !self.stopping {
+            self.coordinator.poll_offers(now);
+        }
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);
@@ -2078,6 +2287,20 @@ impl WorkerApplication {
 }
 
 impl Application {
+    /// Resolve `RACER_ENABLE_GPU` into the process GPU slot; see
+    /// [`gpu_slot`].
+    fn gpu_slot(&self) -> Result<Arc<crate::gpu_slot::GpuSlot>> {
+        gpu_slot(
+            &self.config,
+            cfg!(feature = "cuda"),
+            self.node.metrics[0].1.gpu_shared(),
+            self.config
+                .enable_rdma
+                .then(|| self.node.native.link_node()),
+            Box::new(racer_gpu::Gpu::load),
+        )
+    }
+
     /// Allocate paired worker resources once before building service lanes.
     fn prepare_workers(&self) -> Result<()> {
         let resources = crate::worker::Resources::new(
@@ -2650,9 +2873,7 @@ impl WorkerApplication {
                 listeners_usable: self.started
                     && (self.control.is_none()
                         || self.peer_task.is_some() && self.diagnostic_task.is_some()),
-                membership_usable: snapshot
-                    .as_ref()
-                    .is_some_and(|s| self.snapshot_sequence == Some(s.sequence)),
+                membership_usable: self.membership_usable(snapshot.as_deref()),
                 admission_usable: !self.runtime.admission.is_stopped() && !self.stopping,
                 credentials_valid_until: credentials,
                 observed_until: Some(now + Duration::from_secs(2)),
@@ -2660,6 +2881,17 @@ impl WorkerApplication {
             node.count,
             self.snapshot_sequence,
         )
+    }
+
+    /// The worker applied `snapshot` and it lists this node. A node not
+    /// listed in its own membership cannot route a read; a new node is
+    /// listed only after it serves ("Joining members" in
+    /// designs/racer-core-simulation.md), so it is not ready until then.
+    fn membership_usable(&self, snapshot: Option<&Snapshot>) -> bool {
+        snapshot.is_some_and(|s| {
+            self.snapshot_sequence == Some(s.sequence)
+                && s.membership.position(self.keys.node()).is_ok()
+        })
     }
 
     /// Recover storage and accept initial control state before opening listeners.
@@ -2691,6 +2923,12 @@ impl WorkerApplication {
             self.refresh_snapshot(startup)?;
             self.activate_native(startup).await?;
             self.start_listeners().await?;
+            // Only now may managed control report this Pod: a primary
+            // admits a new member once it reports, so peers never route to
+            // a member whose listener is not open.
+            if let Some(control) = &self.control {
+                control.mark_serving();
+            }
             self.started = true;
             self.observe_health()?;
             Ok(())
@@ -3414,4 +3652,58 @@ impl WorkerPressure {
             next_memory_sample: uring_runtime::environment::now(),
         }
     }
+}
+
+/// Resolve `RACER_ENABLE_GPU` into the process GPU slot. `built` says
+/// whether the binary has the `cuda` feature; `loader` loads the driver.
+///
+/// - `false`: off; nothing GPU-related runs.
+/// - `true`: an explicit request. Start the helper now and fail startup when
+///   no GPU is usable.
+/// - `auto` with `cuda`: touch no GPU now. The helper (driver load, cuInit,
+///   contexts, decrypt probe, cuFile open) starts on the first `gpu-read`
+///   request head, once per process; if that start fails or finds no usable
+///   GPU, GPU mode stays off (501) and is never retried.
+/// - `auto` without `cuda`: off, logged as `reason=not-built`.
+///
+/// Once a helper exists, metrics report it and, with RDMA on (`links`),
+/// peers' NICs may write `gpu-read` pages into GPU landing buffers
+/// (GPUDirect RDMA): activation registers them per rail, and rails already
+/// active when a lazy start finishes get them on the owner worker's next
+/// turn.
+pub(crate) fn gpu_slot(
+    config: &Config,
+    built: bool,
+    telemetry: Arc<crate::gpu_telemetry::GpuTelemetry>,
+    links: Option<Arc<crate::rdma::LinkNode>>,
+    loader: crate::gpu::Loader,
+) -> Result<Arc<crate::gpu_slot::GpuSlot>> {
+    use crate::config::GpuMode;
+    let landing_bytes = config.gpu_landing_bytes;
+    let on_start = move |gpu: &Arc<crate::gpu::GpuHelper>| {
+        telemetry.attach_helper(gpu.clone());
+        if let Some(links) = links {
+            links.set_gpu_landing(gpu.clone(), landing_bytes);
+            telemetry.attach_links(links);
+        }
+    };
+    let (mode, staging, p2pdma) = (
+        config.enable_gpu,
+        config.gpu_staging_bytes,
+        config.gpu_pci_p2pdma,
+    );
+    if mode == GpuMode::Auto && built {
+        eprintln!("racer-dataplane: stage=gpu state=standby start=first-gpu-read");
+        return Ok(Arc::new(crate::gpu_slot::GpuSlot::lazy(
+            Box::new(move || {
+                crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)
+            }),
+            Box::new(on_start),
+        )));
+    }
+    let gpu = crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)?;
+    if let Some(gpu) = &gpu {
+        on_start(gpu);
+    }
+    Ok(Arc::new(crate::gpu_slot::GpuSlot::ready(gpu)))
 }

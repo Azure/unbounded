@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RACER_GPU_ABI_VERSION 1u
+#define RACER_GPU_ABI_VERSION 2u
 
 #define RACER_GPU_OK 0
 #define RACER_GPU_EINVAL (-1)       /* bad argument or handle type */
@@ -29,6 +29,7 @@
 #define RACER_GPU_EIO (-8)          /* cuFile read failed or was short */
 #define RACER_GPU_EBUSY (-9)        /* wrong state, for example no verdict to read */
 #define RACER_GPU_ELEAKED (-10)     /* failed, and cleanup leaked an internal resource */
+#define RACER_GPU_EUNSUPPORTED (-11) /* cuFile does not support this file or its device */
 
 /* Device capability bits in racer_gpu_device.flags. */
 #define RACER_GPU_FLAG_VMM 1u      /* virtual memory management */
@@ -137,8 +138,12 @@ int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *params, void
                       uint64_t src_offset, void *dst, uint64_t dst_offset);
 int racer_gpu_verdict(void *stream, struct racer_gpu_verdict *out);
 
-/* Open the cuFile driver (libcufile.so.0). Safe to call more than once. */
-int racer_gpu_file_open(void);
+/* racer_gpu_file_open flags. */
+#define RACER_GPU_FILE_PCI_P2PDMA 1u /* set cuFile use_pci_p2pdma before the driver opens */
+
+/* Open the cuFile driver (libcufile.so.0). Safe to call more than once;
+ * `flags` take effect only on the call that opens the driver. */
+int racer_gpu_file_open(uint32_t flags);
 /* Register an O_DIRECT fd with cuFile. The fd stays owned by the caller. */
 int racer_gpu_file(int fd, void **out);
 int racer_gpu_file_free(void *file);

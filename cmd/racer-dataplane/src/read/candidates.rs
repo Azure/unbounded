@@ -33,6 +33,7 @@ use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
 use racer_control_wire::NodeId;
+use racer_core::read::hints::OfferEnd;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -52,17 +53,10 @@ fn reserve_hedge_pages(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
     use crate::admission::ResourceClass;
-    use crate::model::PAGE_BYTES;
-    let plaintext = admission.reserve(
-        Some(cache),
-        ResourceClass::Plaintext,
-        PAGE_BYTES as usize * pages,
-    )?;
-    let ciphertext = admission.reserve(
-        Some(cache),
-        ResourceClass::Ciphertext,
-        (PAGE_BYTES as usize + 16) * pages,
-    )?;
+    let (plaintext, ciphertext) =
+        racer_core::read::hedge_page_charges(crate::model::PAGE_BYTES as usize, pages);
+    let plaintext = admission.reserve(Some(cache), ResourceClass::Plaintext, plaintext)?;
+    let ciphertext = admission.reserve(Some(cache), ResourceClass::Ciphertext, ciphertext)?;
     Ok((plaintext, ciphertext))
 }
 
@@ -71,101 +65,93 @@ pub struct OriginAuthority {
     membership: std::sync::Arc<crate::topology::Membership>,
     node: NodeId,
     object: ObjectId,
+    /// The page's ranked owners under `membership`, which `rank` indexes.
+    /// A walk that refreshed its membership grants authority under the
+    /// newer ranking, not the caller's.
+    owners: Vec<NodeId>,
     page: PageNumber,
     predecessor_evidence: Vec<ProbeOutcome>,
     rank: usize,
 }
+use racer_core::read::walk::{
+    Action, Event as FillEvent, Evidence, Features, Fill, FillConfig, HedgeEnd, List, MAX_HANDOFF,
+    Mode as WalkMode, NOT_MEMBER, Notes, Outcome as WalkOutcome, Probe, Rank0Note, Ranked, Ranking,
+    RemainingEnd, RemainingWalk, Reply as FillReply, RouteMode, SilenceNote,
+};
+pub use racer_core::read::{ProbeOutcome, ReplicaSelection};
+pub(crate) use racer_core::read::{VisitOrder, replica_score, visit_order};
+
+/// One read's acquisition (`CandidatePolicy::drive`): the racer-core
+/// [`Fill`] and the rankings its member positions refer to.
+pub(crate) struct Acquisition {
+    fill: Fill,
+    /// The caller's membership version (diagnostics).
+    membership: u64,
+    /// The caller's ranking, for the first `Ranking::Current`.
+    initial: Option<Candidates>,
+    /// The ranking the walk probes.
+    current: Option<Candidates>,
+    /// The previous membership's ranking a stale fallback walks, until the walk takes it.
+    fallback: Option<Candidates>,
+    /// The membership a refresh adopts.
+    latest: Option<std::sync::Arc<crate::topology::Membership>>,
+    /// Version - 1, which predecessors are asked under.
+    previous: Option<std::sync::Arc<crate::topology::Membership>>,
+    /// Version - 1 for a stale fallback, when peers still resolve it.
+    stale_previous: Option<std::sync::Arc<crate::topology::Membership>>,
+    /// The answer awaiting validation, and the outstanding probe's
+    /// destination, mode, and send time.
+    answer: Option<VerifiedResponse>,
+    dest: Option<ProbeDest>,
+    acquire: bool,
+    sent: std::time::Instant,
+    /// A dataplane error racer-core cannot represent, for its failure.
+    error: Option<Error>,
+    phase: Phase,
+    authority: Option<OriginAuthority>,
+    pub(crate) trail: CandidateTrail,
+}
+
+impl Acquisition {
+    /// `error` as racer-core sees it; the dataplane error is kept for the
+    /// read's failure.
+    fn core_error(&mut self, error: Error) -> racer_core::read::Error {
+        racer_core::read::Error::try_from(error).unwrap_or_else(|_| {
+            self.error = Some(error);
+            racer_core::read::Error::Internal
+        })
+    }
+
+    /// The ranking the walk probes.
+    pub(crate) fn candidates(&self) -> &Candidates {
+        self.current.as_ref().expect("ranked")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProbeOutcome {
-    CopyMiss,
-    Unreachable,
-    Overloaded,
-    VersionUnavailable,
-    /// An authenticated response carried a copy that could not be used locally.
-    UnusableCopy,
-}
-/// How a non-owner requester orders its remote attempts across a page's
-/// ranked owners. Placement, rank, and origin authority are unchanged: this only
-/// chooses which owner receives the first Acquire.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ReplicaSelection {
-    /// Visit owners in canonical rank order, so every remote read of a page
-    /// lands on the primary owner first.
-    Primary,
-    /// Visit owners that are direct overlay neighbors before owners that need
-    /// a relay hop. Among equally preferred owners, a rendezvous hash of the
-    /// requester and page picks a stable order, so one requester keeps using
-    /// the same replica for a page while different requesters spread the
-    /// load across all replicas.
-    #[default]
-    Spread,
+enum Phase {
+    Walk,
+    Origin,
+    Remaining,
 }
 
-/// Canonical ranks in the order a non-owner requester visits them. At most
-/// three owners exist; `ordered` itself stays the authoritative rank order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct VisitOrder {
-    ranks: [u8; 3],
-    len: u8,
+enum ProbeDest {
+    Member(u32),
+    Helper(NodeId),
 }
 
-impl VisitOrder {
-    /// The identity order over the first `len` (at most three) ranks.
-    pub(crate) fn canonical(len: usize) -> Self {
-        Self {
-            ranks: [0, 1, 2],
-            len: len.min(3) as u8,
-        }
-    }
-
-    /// Canonical ranks in visiting order.
-    pub(crate) fn ranks(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
-        self.ranks[..usize::from(self.len)]
-            .iter()
-            .map(|rank| usize::from(*rank))
-    }
-
-    /// The canonical rank visited at `index`, if any.
-    pub(crate) fn get(&self, index: usize) -> Option<usize> {
-        self.ranks[..usize::from(self.len)]
-            .get(index)
-            .map(|rank| usize::from(*rank))
-    }
-}
-
-/// Order `len` canonical ranks for a non-owner requester. `Primary` returns the
-/// canonical order. `Spread` visits ranks for which `neighbor` holds first, then
-/// orders each group by descending `score` (ties keep canonical order).
-pub(crate) fn visit_order(
-    selection: ReplicaSelection,
-    len: usize,
-    neighbor: impl Fn(usize) -> bool,
-    score: impl Fn(usize) -> u64,
-) -> VisitOrder {
-    let mut order = VisitOrder::canonical(len);
-    if selection == ReplicaSelection::Primary || order.len < 2 {
-        return order;
-    }
-    let mut keys = [(false, 0u64); 3];
-    for (rank, key) in keys.iter_mut().enumerate().take(usize::from(order.len)) {
-        *key = (!neighbor(rank), u64::MAX - score(rank));
-    }
-    order.ranks[..usize::from(order.len)].sort_by_key(|rank| (keys[usize::from(*rank)], *rank));
-    order
-}
-
-/// Rendezvous weight of one owner for one requester and page. Stable within a
-/// process; it only spreads load, so it never needs to agree across nodes.
-fn replica_score(requester: &NodeId, object: &ObjectId, page: PageNumber, owner: &NodeId) -> u64 {
-    use std::hash::Hash;
-    use std::hash::Hasher;
-    let mut hasher = std::hash::DefaultHasher::new();
-    requester.0.hash(&mut hasher);
-    object.cache.0.hash(&mut hasher);
-    object.key.0.hash(&mut hasher);
-    page.0.hash(&mut hasher);
-    owner.0.hash(&mut hasher);
-    hasher.finish()
+/// The owners of `candidates` as member positions.
+fn positions(candidates: &Candidates) -> List<u32, MAX_HANDOFF> {
+    candidates
+        .ordered
+        .iter()
+        .map(|node| {
+            candidates
+                .membership
+                .position(node)
+                .map_or(NOT_MEMBER, |p| p as u32)
+        })
+        .collect()
 }
 
 pub struct CandidatePolicy {
@@ -180,7 +166,54 @@ pub struct CandidatePolicy {
     published: Arc<controlplane::Published<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
     single_flight: RefCell<SingleFlightPeers>,
+    /// Timer for waiting on a destination that is behind. Without one, the walk skips it as before.
+    reactor: Option<Rc<crate::runtime::Reactor>>,
+    /// Test only: wait without a timer, returning at once.
+    #[cfg(test)]
+    pub(crate) instant_stale_wait: std::cell::Cell<bool>,
+    /// Owners this node answered a page probe without a copy, by page (see
+    /// `racer_core::read::hints`). The coordinator notes and defers on them; an owner walk asks
+    /// them before origin.
+    pub(crate) successors: RefCell<Successors>,
+    /// Pages this node fetched from origin as an owner after rank 0, to offer to rank 0 later (see
+    /// `racer_core::read::hints`).
+    pub(crate) notices: RefCell<Notices>,
+    /// Copy offers in flight ([`MAX_OFFERS_IN_FLIGHT`]).
+    offers: Rc<std::cell::Cell<usize>>,
+    /// Silence pings in flight ([`MAX_PINGS_IN_FLIGHT`]).
+    pub(crate) pings: Rc<std::cell::Cell<usize>>,
+    /// Pages whose rank 0 this node, as an owner above it, found fetching (a probe timed out) or
+    /// overdue (it missed that request's deadline); see `racer_core::liveness`.
+    pub(crate) rank0_watch: RefCell<Rank0Watch>,
 }
+
+/// Counts one copy offer in flight until its task ends or is dropped.
+struct OfferFlight(Rc<std::cell::Cell<usize>>);
+
+impl OfferFlight {
+    fn new(count: Rc<std::cell::Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count)
+    }
+}
+
+impl Drop for OfferFlight {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+/// Orphan notices grouped by their target's site. Keyed by page and the target's owner rank.
+pub(crate) type Notices =
+    racer_core::read::hints::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
+
+pub(crate) use racer_core::liveness::{MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT};
+
+/// When each of the page's owners arrived in this node's membership chain (`Membership::since`),
+/// for lineage targets.
+pub(crate) type Rank0Watch = racer_core::liveness::Rank0Watch<crate::model::PageId, NodeId>;
+
+pub(crate) type Successors = racer_core::read::hints::SuccessorHints<crate::model::PageId, NodeId>;
 
 /// How long a provider stays single-flight after a refused multi-flight
 /// Subscribe. An upgraded provider is asked again after this.
@@ -257,14 +290,6 @@ enum RequestMode {
     FundedRoute,
     DirectHedge,
 }
-#[derive(Default, Clone, Copy)]
-pub(crate) struct HedgeContinuation {
-    // This is local acquisition progress, never placement/origin authority.
-    pub primary_consumed: bool,
-    pub primary_outcome: Option<ProbeOutcome>,
-    pub stale: bool,
-    pub bounded_routes: bool,
-}
 impl CandidatePolicy {
     #[cfg(test)]
     pub(crate) fn hedge_owner(&self) -> Option<&Arc<Hedges>> {
@@ -277,43 +302,29 @@ impl CandidatePolicy {
     pub(crate) async fn hedge_page<'a>(
         &'a self,
         candidates: &Candidates,
+        (first, second, eligible): (usize, usize, bool),
         context: &'a OriginContext,
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         admission: &Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
-        continuation: &mut HedgeContinuation,
         validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, crate::memory::PageResult>,
-    ) -> Result<Option<crate::memory::PageResult>> {
+    ) -> Result<(Option<crate::memory::PageResult>, HedgeEnd)> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
-            return Ok(None);
+            return Ok((None, HedgeEnd::NotStarted));
         };
-        // The hedge primary and duplicate are the first two owners in the same
-        // visiting order the serial fallback uses, so `primary_consumed` skips
-        // exactly the owner the hedge already asked.
-        let (object, page) = operation_identity(operation);
-        let order = self.visit_order(candidates, object, page);
-        let (first, second) = (order.get(0).unwrap_or(0), order.get(1).unwrap_or(0));
-        let eligible = matches!(operation, PeerOperation::Page { .. })
-            && !self.is_candidate(candidates)
-            && candidates.ordered.len() >= 2
-            // A pinned direct exchange carries one link, so its receiver
-            // cannot probe predecessors. Only rank 0 can serve as hedge primary.
-            && first == 0
-            && candidates.ordered[first] != candidates.ordered[second]
-            // Preserve ONE cold fallback: primary(2) + duplicate(1) + the second
-            // visited owner at rank r (sender + r probes + origin = r + 2), with
-            // links 1+1+8. Additional candidates are attempted only when the
-            // original remainder funds them.
-            && budget.remaining_attempts() >= 3 + second as u32 + 2
-            && budget.remaining_links() >= 10
+        // The hedge primary and duplicate are the first two owners in the
+        // visit order the walk uses (`HedgeEnd::Lost` skips the primary). A
+        // pinned direct exchange carries one link, so its receiver cannot
+        // probe predecessors; racer-core keeps one cold fallback fundable.
+        let eligible = eligible
             && [first, second].iter().all(|rank| {
                 self.peers
                     .direct_hedge_available(&candidates.membership, &candidates.ordered[*rank])
             });
         if !eligible {
             hedges.suppressed();
-            return Ok(None);
+            return Ok((None, HedgeEnd::NotStarted));
         }
         check_budget(scope, budget)?;
         let reservation = (|| {
@@ -328,19 +339,17 @@ impl CandidatePolicy {
         })();
         let Ok((slot, _escrow)) = reservation else {
             hedges.suppressed();
-            return Ok(None);
+            return Ok((None, HedgeEnd::NotStarted));
         };
         // Pinned direct exchanges consume exactly one link each. Reserve the
         // remaining original links for serial candidates or one epoch refresh.
-        let mut secondary_budget = budget.partition(1, 1)?;
-        let mut primary_budget = budget.partition(2, 1)?;
+        let (mut secondary_budget, mut primary_budget) =
+            racer_core::read::walk::hedge_budgets(budget)?;
         let primary_scope =
             RequestScope::new(scope.request, scope.deadline.0.min(budget.deadline()))?;
         let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
         let stale = std::cell::Cell::new(false);
         let primary_outcome = std::cell::Cell::new(None);
-        continuation.primary_consumed = true;
-        continuation.bounded_routes = true;
         let primary = async {
             let response = self
                 .request_mode(
@@ -423,21 +432,20 @@ impl CandidatePolicy {
         .await;
         budget.reunite(primary_budget)?;
         budget.reunite(secondary_budget)?;
-        continuation.stale = stale.get();
-        continuation.primary_outcome = primary_outcome.get().or(Some(ProbeOutcome::Unreachable));
         check_budget(scope, budget)?;
+        let lost = HedgeEnd::Lost {
+            stale: stale.get(),
+            primary: primary_outcome.get(),
+            error: None,
+        };
         match result {
-            Ok(result) => Ok(Some(result)),
-            Err(
-                Error::Unavailable
-                | Error::Io
-                | Error::Os(_)
-                | Error::Overloaded
-                | Error::CorruptRecord
-                | Error::MissingKey
-                | Error::InvalidRequest
-                | Error::HeaderTooLarge,
-            ) => Ok(None),
+            Ok(result) => Ok((Some(result), HedgeEnd::Won)),
+            Err(error)
+                if racer_core::read::Error::try_from(error)
+                    .is_ok_and(racer_core::read::walk::hedge_fallback) =>
+            {
+                Ok((None, lost))
+            }
             Err(error) => Err(error),
         }
     }
@@ -671,7 +679,89 @@ impl CandidatePolicy {
             published,
             ownership_refresh: RefCell::default(),
             single_flight: RefCell::default(),
+            reactor: None,
+            #[cfg(test)]
+            instant_stale_wait: std::cell::Cell::new(false),
+            successors: RefCell::new(Successors::new(
+                racer_core::read::hints::HINT_CAPACITY,
+                racer_core::read::hints::HINT_TTL,
+            )),
+            notices: RefCell::new(Notices::new(racer_core::read::hints::NOTICE_CAPACITY)),
+            offers: Rc::default(),
+            pings: Rc::default(),
+            rank0_watch: RefCell::new(Rank0Watch::new(
+                racer_core::liveness::WATCH_CAPACITY,
+                racer_core::liveness::WATCH_TTL,
+                racer_core::liveness::HANG_AFTER,
+            )),
         }
+    }
+
+    /// Feed a walk probe's route evidence to the orphan notices' cut groups: a transport failure or
+    /// timeout toward `destination` holds offers to its site, an answer signed by it releases them.
+    /// Answers that a relay may have signed say nothing.
+    fn observe_route(
+        &self,
+        membership: &crate::topology::Membership,
+        destination: &NodeId,
+        outcome: &WalkOutcome,
+    ) {
+        let cut = match outcome {
+            WalkOutcome::Transport(_) | WalkOutcome::TimedOut => true,
+            WalkOutcome::Copy
+            | WalkOutcome::Shed
+            | WalkOutcome::Failed
+            | WalkOutcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable) => {
+                false
+            }
+            _ => return,
+        };
+        let site = membership
+            .member(destination)
+            .map(|m| m.site.clone())
+            .unwrap_or_default();
+        self.notices
+            .borrow_mut()
+            .observe(site, cut, uring_runtime::environment::now());
+    }
+
+    /// Whether this policy can wait for a destination that is behind.
+    fn can_wait(&self) -> bool {
+        #[cfg(test)]
+        if self.instant_stale_wait.get() {
+            return true;
+        }
+        self.reactor.is_some()
+    }
+
+    /// Let readers wait for a destination that is behind this node's membership instead of skipping
+    /// it.
+    pub(crate) fn with_reactor(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
+        self.reactor = Some(reactor);
+        self
+    }
+
+    /// Sleep until `until` under the request's scope. `false` without a
+    /// timer.
+    async fn stale_sleep(&self, until: std::time::Instant, scope: &RequestScope) -> Result<bool> {
+        use uring_runtime::reactor::timer::SleepMode;
+        #[cfg(test)]
+        if self.instant_stale_wait.get() {
+            return Ok(true);
+        }
+        let Some(reactor) = &self.reactor else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        let mode = if uring_runtime::environment::simulation_seed().is_some() {
+            SleepMode::ClockPoll
+        } else {
+            SleepMode::Kernel
+        };
+        #[cfg(not(test))]
+        let mode = SleepMode::Kernel;
+        reactor.sleep_until(until, mode, scope).await?;
+        Ok(true)
     }
 
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
@@ -699,7 +789,7 @@ impl CandidatePolicy {
         page: PageNumber,
     ) -> VisitOrder {
         let ordered = &candidates.ordered;
-        visit_order(
+        let order = visit_order(
             self.replica_selection,
             ordered.len(),
             |rank| {
@@ -708,12 +798,45 @@ impl CandidatePolicy {
                     .is_neighbor(&self.node, &ordered[rank])
             },
             |rank| replica_score(&self.node, object, page, &ordered[rank]),
-        )
+        );
+        if self.replica_selection != ReplicaSelection::Spread {
+            return order;
+        }
+        // Visit an older later owner before the newer owner that displaced it, which would fetch
+        // the page again.
+        let order = racer_core::read::lineage_first(
+            order,
+            &candidates
+                .ordered
+                .iter()
+                .map(|node| candidates.membership.since(node))
+                .collect::<Vec<_>>(),
+            |rank| {
+                candidates
+                    .membership
+                    .is_neighbor(&self.node, &ordered[rank])
+            },
+        );
+        // Owners that left this node's request unanswered go after the others, silent ones last.
+        let health = self.peers.link_health();
+        racer_core::read::demote_unanswered(order, |rank| health.answering(&ordered[rank]))
     }
 
     /// Bound each local peer exchange independently of the signed operation ceiling.
     pub(crate) fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.attempt_timeout = timeout;
+        self
+    }
+
+    /// How long rank 0 may stay silent on a page after an owner's probe of
+    /// it timed out before the owner presumes it hung (half the client
+    /// request timeout; see `racer_core::liveness`).
+    pub(crate) fn with_rank0_hang_after(self, hang_after: std::time::Duration) -> Self {
+        *self.rank0_watch.borrow_mut() = Rank0Watch::new(
+            racer_core::liveness::WATCH_CAPACITY,
+            racer_core::liveness::WATCH_TTL,
+            hang_after,
+        );
         self
     }
 
@@ -765,6 +888,18 @@ impl CandidatePolicy {
             })
         })
     }
+    /// Whether `node` owns `page` under `membership` by a completed cached
+    /// ranking; never ranks (successor hints).
+    pub(crate) fn owns_cached(
+        &self,
+        membership: &crate::topology::Membership,
+        page: &crate::model::PageId,
+        node: &NodeId,
+    ) -> bool {
+        self.placement
+            .is_owner(membership, &page.version.object, page.number, node)
+    }
+
     /// Retention is a hint from CURRENT publication, not the read's leased route.
     /// This callback is lookup-only: no cold scoring or cache eviction. Missing
     /// and obsolete results contribute no bonus, never a storage pin.
@@ -886,44 +1021,12 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, CandidateResolution> {
-        self.resolve_epoch(
-            candidates,
-            context,
-            operation,
-            scope,
-            budget,
-            |response| Box::pin(async move { Ok(response) }),
-            false,
-            HedgeContinuation::default(),
-        )
+        self.resolve_epoch(candidates, context, operation, scope, budget, |response| {
+            Box::pin(async move { Ok(response) })
+        })
     }
 
-    /// Continue candidate resolution using the completed hedge's evidence.
-    #[allow(clippy::too_many_arguments)] // Preserve the shared budget and continuation boundary.
-    pub(crate) fn resolve_after_hedge<'a>(
-        &'a self,
-        candidates: Candidates,
-        context: &'a OriginContext,
-        operation: PeerOperation,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, crate::memory::AcquiredPage> + 'a,
-        continuation: HedgeContinuation,
-    ) -> Operation<'a, CandidateResolution<crate::memory::AcquiredPage>> {
-        self.resolve_epoch(
-            candidates,
-            context,
-            operation,
-            scope,
-            budget,
-            validate,
-            false,
-            continuation,
-        )
-    }
-
-    /// Resolve candidates within one membership epoch.
-    #[allow(clippy::too_many_arguments)] // Forward explicit acquisition inputs without repackaging.
+    /// Resolve candidates with the walk alone.
     fn resolve_epoch<'a, T: 'a>(
         &'a self,
         candidates: Candidates,
@@ -931,299 +1034,585 @@ impl CandidatePolicy {
         operation: PeerOperation,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
-        retried: bool,
-        continuation: HedgeContinuation,
+        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
     ) -> Operation<'a, CandidateResolution<T>> {
         Box::pin(async move {
-            let mut trail = CandidateTrail {
-                hedge_history_unavailable: continuation.primary_consumed || continuation.stale,
-                ..Default::default()
-            };
-            let page = operation_identity(&operation).1.0;
-            let kind = match &operation {
-                PeerOperation::Page { .. } => CandidateOperation::Page,
-                PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
-                PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
-                PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
-                PeerOperation::Warm { .. } => CandidateOperation::Page,
-            };
-            let membership = candidates.membership.version.0;
-            let result = self
-                .resolve_epoch_traced(
-                    candidates,
+            let mut a = self.acquisition(candidates, &operation, scope, false, true);
+            let mut copy = None;
+            let action = self
+                .drive(
+                    &mut a,
+                    FillEvent::Start { local_hit: false },
                     context,
-                    operation,
+                    &operation,
                     scope,
                     budget,
-                    validate,
-                    retried,
-                    continuation,
-                    &mut trail,
+                    &mut validate,
+                    &mut copy,
                 )
-                .await;
-            if let Err(error) = &result {
-                self.observer.candidate_final(CandidateFinal {
-                    failure: Failure::new(Stage::CandidateExhausted, *error)
-                        .request(scope)
-                        .detail(Detail::Budget {
-                            attempts: budget.remaining_attempts(),
-                            links: budget.remaining_links(),
-                        }),
-                    operation: kind,
-                    page,
-                    membership,
-                    trail,
-                });
+                .await?;
+            match action {
+                Action::Done(Ok(_)) => {
+                    Ok(CandidateResolution::Copy(copy.expect("a validated copy")))
+                }
+                Action::Origin { rank } => {
+                    self.authority(&mut a, rank, &operation);
+                    Ok(CandidateResolution::Origin(
+                        a.authority.take().expect("origin authority"),
+                    ))
+                }
+                action => unreachable!("a walk-only acquisition asked for {action:?}"),
             }
-            result
         })
     }
 
-    /// Resolve one membership epoch while recording candidate evidence.
-    #[allow(clippy::too_many_arguments)] // Keep the borrowed trace separate from acquisition state.
-    fn resolve_epoch_traced<'a, 't, T: 'a>(
-        &'a self,
+    /// A read's acquisition over the caller's ranking `candidates`: the walk
+    /// alone (`walk_only`), or the whole fill with a hedge when `hedge`.
+    pub(crate) fn acquisition(
+        &self,
         candidates: Candidates,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        hedge: bool,
+        walk_only: bool,
+    ) -> Acquisition {
+        // Without a timer, the walk skips a destination that is behind instead of waiting for it.
+        let features = Features::PRODUCTION.with(Features::STALE_WAIT, self.can_wait());
+        Acquisition {
+            fill: Fill::new(FillConfig {
+                operation: operation_kind(operation),
+                hedge,
+                walk_only,
+                scope: scope.deadline.0,
+                features,
+            }),
+            membership: candidates.membership.version.0,
+            initial: Some(candidates),
+            current: None,
+            fallback: None,
+            latest: None,
+            previous: None,
+            stale_previous: None,
+            answer: None,
+            dest: None,
+            acquire: false,
+            sent: uring_runtime::environment::now(),
+            error: None,
+            phase: Phase::Walk,
+            authority: None,
+            trail: CandidateTrail::default(),
+        }
+    }
+
+    /// Run `acquisition` from `event` until it needs what only the caller
+    /// performs: a hedge, an origin fetch, a publication, or the end. A
+    /// validated copy lands in `copy`. racer-core owns every decision; this
+    /// loop performs the rankings and exchanges it plans.
+    #[allow(clippy::too_many_arguments)] // The driver borrows the read's distinct inputs.
+    pub(crate) async fn drive<'a, T: 'a>(
+        &'a self,
+        a: &mut Acquisition,
+        event: FillEvent<'_>,
         context: &'a OriginContext,
-        operation: PeerOperation,
-        scope: &'a RequestScope,
-        budget: &'t mut AcquisitionBudget,
-        mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
-        retried: bool,
-        continuation: HedgeContinuation,
-        trail: &'t mut CandidateTrail,
-    ) -> Operation<'t, CandidateResolution<T>>
-    where
-        'a: 't,
-    {
-        Box::pin(async move {
-            check_budget(scope, budget)?;
-            let (object, page) = operation_identity(&operation);
-            if object != &context.object {
-                return Err(Error::InvalidRequest);
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+        copy: &mut Option<T>,
+    ) -> Result<Action> {
+        let (object, page) = operation_identity(operation);
+        let now = uring_runtime::environment::now;
+        let mut next = a.fill.on(event, budget, now());
+        loop {
+            let (action, evidence) = next;
+            if !matches!(action, Action::Done(Err(_))) {
+                a.error = None;
             }
-            if continuation.stale {
-                let next = self
-                    .refresh_candidates(&candidates, object, page, scope, retried)
-                    .await?;
-                return self
-                    .resolve_epoch_traced(
-                        next,
-                        context,
-                        operation,
-                        scope,
-                        budget,
-                        validate,
-                        true,
-                        HedgeContinuation {
-                            bounded_routes: true,
-                            ..Default::default()
-                        },
-                        trail,
-                    )
-                    .await;
-            }
-            // Public Candidates values are not authority. Recompute before origin.
-            let expected = self
-                .candidates_scoped(candidates.membership.clone(), object, page, scope)
-                .await?;
-            if expected.ordered != candidates.ordered
-                || candidates.ordered.is_empty()
-                || candidates.ordered.len() > 3
+            // The walk took the previous membership's ranking.
+            if a.fallback
+                .as_ref()
+                .is_some_and(|c| c.membership.version.0 == a.fill.version)
             {
-                return Err(Error::IncompatibleMembership);
+                a.current = a.fallback.take();
             }
-            let rank = candidates
-                .ordered
-                .iter()
-                .position(|node| node == &self.node);
-            let mut evidence = Vec::new();
-            let mut saw_transient = false;
-            let mut saw_version = false;
-            let count = rank.unwrap_or(candidates.ordered.len());
-            // Owners probe predecessors in canonical order. A non-owner may
-            // visit owners out of rank order; `canonical` is the destination's
-            // authoritative rank and `index` its position in the visit.
-            let order = if rank.is_some() {
-                VisitOrder::canonical(count)
-            } else {
-                self.visit_order(&candidates, object, page)
-            };
-            for (index, canonical) in order.ranks().enumerate() {
-                let destination = &candidates.ordered[canonical];
-                if continuation.primary_consumed && index == 0 {
-                    let outcome = continuation
-                        .primary_outcome
-                        .unwrap_or(ProbeOutcome::Unreachable);
-                    saw_version |= outcome == ProbeOutcome::VersionUnavailable;
-                    saw_transient |= matches!(
-                        outcome,
-                        ProbeOutcome::Unreachable
-                            | ProbeOutcome::Overloaded
-                            | ProbeOutcome::UnusableCopy
+            if evidence.notes & Notes::REMAINING != 0 {
+                a.phase = Phase::Remaining;
+                a.trail = CandidateTrail {
+                    site: CandidateSite::RemainingCopy,
+                    ..Default::default()
+                };
+            }
+            self.apply(a, &evidence, operation, scope, budget);
+            let event = match action {
+                Action::Rank { ranking, version } => {
+                    let ranked = self
+                        .rank_for(
+                            a, ranking, version, context, object, page, operation, scope, budget,
+                        )
+                        .await;
+                    FillEvent::Ranked(ranked.map_err(|error| a.core_error(error)))
+                }
+                Action::Hints => {
+                    let PeerOperation::Page { page: id, .. } = operation else {
+                        unreachable!("only page owners ask for hints");
+                    };
+                    let current = a.current.as_ref().expect("ranked");
+                    let membership = &current.membership;
+                    let hints: Vec<u32> = self
+                        .successors
+                        .borrow_mut()
+                        .probe(id, now())
+                        .iter()
+                        .filter_map(|node| membership.position(node).ok())
+                        .map(|p| p as u32)
+                        .collect();
+                    let rank0 = match a.fill.rank {
+                        Some(rank) if rank > 0 => {
+                            self.rank0_watch
+                                .borrow()
+                                .state(id, &current.ordered[0], now())
+                        }
+                        _ => racer_core::liveness::Rank0State::Unknown,
+                    };
+                    next = a.fill.on(
+                        FillEvent::Hints {
+                            hints: &hints,
+                            rank0,
+                        },
+                        budget,
+                        now(),
                     );
                     continue;
                 }
-                // With only the sender attempt left, a page Acquire would carry
-                // zero remote credits and reject before checking disk/pending copies.
-                // Spend the same last route on local copies, never new acquisition.
-                // This unpartitioned serial branch grants ceil((attempts - 1) /
-                // opportunities), which is zero exactly when attempts == 1.
-                let copy_only = rank.is_some()
-                    || (!continuation.bounded_routes
-                        && budget.remaining_attempts() == 1
-                        && matches!(operation, PeerOperation::Page { .. }));
-                let mode = if copy_only {
-                    FetchMode::CopyOnly
-                } else {
-                    FetchMode::Acquire
-                };
-                let mut bounded = if rank.is_some()
-                    && budget.remaining_links() < (count - index) as u8 * budget.route_links()
-                {
-                    // Receiver CopyOnly predecessor probes share the inherited
-                    // route pool; the first must not consume every link after
-                    // an incoming eight-link envelope selected failure routing.
-                    let remaining = (count - index) as u8;
-                    Some(budget.partition(1, (budget.remaining_links() / remaining).min(4))?)
-                } else if continuation.bounded_routes
-                    || (rank.is_none()
-                        && !copy_only
-                        && canonical > index
-                        && budget.remaining_attempts() >= canonical as u32 + 2
-                        && budget.remaining_links() >= 8)
-                {
-                    // Fund by the destination's canonical rank: it probes all
-                    // of its predecessors, wherever it falls in this visit.
-                    // An owner visited ahead of its canonical turn takes the
-                    // funded failure route when affordable, so its predecessor
-                    // probes are not starved of links on the shared route.
-                    let attempts = if rank.is_some() {
-                        1
-                    } else {
-                        canonical as u32 + 2
+                Action::Refresh => {
+                    let latest = match self.published.current() {
+                        Ok(latest) => latest.map(|published| published.membership.clone()),
+                        Err(error) => {
+                            let error = a.core_error(Error::from(error));
+                            next = a.fill.on(FillEvent::Abort(error), budget, now());
+                            continue;
+                        }
                     };
-                    let links = if rank.is_some() { 4 } else { 8 };
-                    if budget.remaining_attempts() < attempts || budget.remaining_links() < links {
-                        // Never send an Acquire whose receiving coordinator cannot
-                        // probe its predecessors and still exercise origin authority.
-                        saw_transient = true;
-                        trail.site = CandidateSite::Funding;
-                        break;
-                    }
-                    let mut child = budget.partition(attempts, links)?;
-                    // Receiver needs incoming link plus all predecessor routes.
-                    // A rank2 cold fill cannot execute with a four-link envelope.
-                    if rank.is_none() {
-                        child.note_route_failure();
-                    }
-                    Some(child)
-                } else {
-                    None
-                };
-                let funded = continuation.bounded_routes || (rank.is_none() && bounded.is_some());
-                let request_budget = bounded.as_mut().unwrap_or(&mut *budget);
-                let response = self
-                    .request_traced(
-                        &candidates.membership,
-                        destination,
-                        context,
-                        &operation,
-                        mode,
-                        scope,
-                        request_budget,
-                        // Remaining opportunities in visiting order, including
-                        // this one; owners also reserve a share for origin.
-                        (count - index + usize::from(rank.is_some())) as u32,
-                        if funded {
-                            RequestMode::FundedRoute
-                        } else {
-                            RequestMode::SharedRoute
-                        },
-                        Some((trail, canonical as u8)),
-                    )
-                    .await;
-                if let Some(bounded) = bounded {
-                    budget.reunite(bounded)?;
-                }
-                match response {
-                    Ok(response) => {
-                        if matches!(response.response(), PeerResponse::StaleMembership) {
-                            let next = self
-                                .refresh_candidates(&candidates, object, page, scope, retried)
-                                .await?;
-                            // Preserve the original operation (including ETag),
-                            // cancellation/deadline and already spent link/attempt credits.
-                            return self
-                                .resolve_epoch_traced(
-                                    next,
-                                    context,
-                                    operation,
-                                    scope,
-                                    budget,
-                                    validate,
-                                    true,
-                                    HedgeContinuation {
-                                        bounded_routes: continuation.bounded_routes,
-                                        ..Default::default()
-                                    },
-                                    trail,
+                    let version = latest.as_ref().map(|latest| latest.version.0);
+                    a.latest = latest;
+                    // Version - 1, when still resolvable by peers that adopted
+                    // the current one (replaced within
+                    // `PREVIOUS_MEMBERSHIP_WITHIN`) and listing this node.
+                    let current = a.current.as_ref().expect("ranked");
+                    a.stale_previous = current
+                        .membership
+                        .version
+                        .0
+                        .checked_sub(1)
+                        .and_then(|previous| {
+                            self.published
+                                .resolve_recent(
+                                    previous,
+                                    now(),
+                                    racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
                                 )
-                                .await;
-                        }
-                        let validated =
-                            validated_copy(response, &operation, !copy_only, &mut validate).await;
-                        note_validation(trail, &validated);
-                        match validated? {
-                            Ok(copy) => return Ok(CandidateResolution::Copy(copy)),
-                            Err(outcome) => {
-                                saw_version |= outcome == ProbeOutcome::VersionUnavailable;
-                                saw_transient |= matches!(
-                                    outcome,
-                                    ProbeOutcome::Unreachable
-                                        | ProbeOutcome::Overloaded
-                                        | ProbeOutcome::UnusableCopy
-                                );
-                                evidence.push(outcome);
-                                if matches!(
-                                    outcome,
-                                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
-                                ) {
-                                    budget.note_route_failure();
-                                }
-                            }
-                        }
+                                .ok()
+                                .flatten()
+                        })
+                        .filter(|previous| previous.member(&self.node).is_ok());
+                    FillEvent::Membership {
+                        latest: version,
+                        previous_recent_member: a.stale_previous.is_some(),
                     }
-                    Err(Error::Unavailable | Error::Io | Error::Os(_)) => {
-                        evidence.push(ProbeOutcome::Unreachable);
-                        saw_transient = true;
-                        budget.note_route_failure();
-                    }
-                    Err(Error::Overloaded) => {
-                        evidence.push(ProbeOutcome::Overloaded);
-                        saw_transient = true;
-                        budget.note_route_failure();
-                    }
-                    Err(error) => return Err(error),
                 }
+                Action::Probe(probe) => {
+                    self.probe(a, probe, context, object, page, operation, scope, budget)
+                        .await
+                }
+                Action::Validate => {
+                    let response = a.answer.take().expect("an answer to validate");
+                    let validated = validated_copy(response, operation, a.acquire, validate).await;
+                    note_validation(&mut a.trail, &validated);
+                    FillEvent::Validated(match validated {
+                        Ok(Ok(validated)) => {
+                            *copy = Some(validated);
+                            Ok(None)
+                        }
+                        Ok(Err(outcome)) => Ok(Some(outcome)),
+                        Err(error) => Err(a.core_error(error)),
+                    })
+                }
+                Action::Batch {
+                    first,
+                    count,
+                    remaining_opportunities,
+                } => {
+                    let current = a.current.as_ref().expect("ranked");
+                    let membership = current.membership.clone();
+                    let targets = &a.fill.handoff[first..first + count];
+                    match self
+                        .granted_batch(
+                            &membership,
+                            targets,
+                            remaining_opportunities,
+                            context,
+                            operation,
+                            scope,
+                            budget.deadline(),
+                            validate,
+                            &mut a.trail,
+                        )
+                        .await
+                    {
+                        Ok(Some(validated)) => {
+                            *copy = Some(validated);
+                            FillEvent::BatchDone { copy: true }
+                        }
+                        Ok(None) => FillEvent::BatchDone { copy: false },
+                        Err(error) => FillEvent::Abort(a.core_error(error)),
+                    }
+                }
+                Action::Wait(wait) => {
+                    if let Err(error) = self.stale_sleep(now() + wait, scope).await {
+                        return Err(self.failed(a, error, &evidence, operation, scope, budget));
+                    }
+                    FillEvent::Timer
+                }
+                Action::Done(Err(error)) => {
+                    let error = match (a.error.take(), error) {
+                        (Some(error), racer_core::read::Error::Internal) => error,
+                        (_, error) => Error::from(error),
+                    };
+                    return Err(self.failed(a, error, &evidence, operation, scope, budget));
+                }
+                Action::Origin { .. } => {
+                    a.phase = Phase::Origin;
+                    return Ok(action);
+                }
+                Action::Idle => unreachable!("one probe is outstanding at a time"),
+                action => return Ok(action),
+            };
+            next = a.fill.on(event, budget, now());
+        }
+    }
+
+    /// A ranking the walk asked for, as member positions of its membership.
+    #[allow(clippy::too_many_arguments)] // The ranking borrows the read's distinct inputs.
+    async fn rank_for(
+        &self,
+        a: &mut Acquisition,
+        ranking: Ranking,
+        version: Option<u64>,
+        context: &OriginContext,
+        object: &ObjectId,
+        page: PageNumber,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) -> Result<Ranked> {
+        let page_operation = matches!(operation, PeerOperation::Page { .. });
+        match ranking {
+            Ranking::Current => {
+                check_budget(scope, budget)?;
+                let candidates = match (version, a.initial.take()) {
+                    (None, Some(candidates)) => {
+                        if object != &context.object {
+                            return Err(Error::InvalidRequest);
+                        }
+                        // Public Candidates values are not authority.
+                        // Recompute before origin.
+                        let expected = self
+                            .candidates_scoped(candidates.membership.clone(), object, page, scope)
+                            .await?;
+                        if expected.ordered != candidates.ordered {
+                            return Err(Error::IncompatibleMembership);
+                        }
+                        candidates
+                    }
+                    _ => {
+                        let latest = a.latest.take().ok_or(Error::Unavailable)?;
+                        self.candidates_scoped(latest, object, page, scope).await?
+                    }
+                };
+                if candidates.ordered.is_empty() || candidates.ordered.len() > 3 {
+                    return Err(Error::IncompatibleMembership);
+                }
+                let ranked = self.ranked(&candidates, object, page, page_operation);
+                a.current = Some(candidates);
+                a.previous = None;
+                Ok(ranked)
             }
-            check_budget(scope, budget)?;
-            if let Some(rank) = rank {
-                Ok(CandidateResolution::Origin(OriginAuthority {
-                    diagnostic: trail.clone(),
-                    membership: candidates.membership,
-                    node: self.node.clone(),
-                    object: object.clone(),
-                    page,
-                    predecessor_evidence: evidence,
-                    rank,
-                }))
-            } else if saw_version && !saw_transient {
-                Err(Error::VersionUnavailable)
-            } else {
-                if !matches!(trail.site, CandidateSite::Funding) {
-                    trail.site = CandidateSite::Exhausted;
+            Ranking::Previous => {
+                // Ranking failures are not errors; the walk just goes without.
+                let version = version.expect("a previous version");
+                let current = a.current.as_ref().expect("ranked");
+                let now = uring_runtime::environment::now();
+                let previous = self
+                    .published
+                    .resolve(version, now)
+                    .ok()
+                    .flatten()
+                    .ok_or(Error::Unavailable)?;
+                // Ask predecessors under the previous membership only while
+                // peers that adopted the current one still hold it in grace
+                // (`PREVIOUS_MEMBERSHIP_WITHIN`); a lease held only here says
+                // nothing about a peer.
+                let recent = self
+                    .published
+                    .resolve_recent(
+                        version,
+                        now,
+                        racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+                    )
+                    .ok()
+                    .flatten()
+                    .filter(|recent| recent.member(&self.node).is_ok());
+                let previous = self
+                    .candidates_scoped(previous, object, page, scope)
+                    .await?;
+                // Previous owners that are no longer members are not asked.
+                let owners: List<u32, MAX_HANDOFF> = previous
+                    .ordered
+                    .iter()
+                    .map(|node| {
+                        current
+                            .membership
+                            .position(node)
+                            .map_or(NOT_MEMBER, |p| p as u32)
+                    })
+                    .collect();
+                let recent_member = recent.is_some();
+                a.previous = recent;
+                Ok(Ranked {
+                    recent_member,
+                    ..Ranked::new(version, &owners, None)
+                })
+            }
+            Ranking::Fallback => {
+                let previous = a.stale_previous.take().ok_or(Error::Unavailable)?;
+                let previous = self
+                    .candidates_scoped(previous, object, page, scope)
+                    .await?;
+                if previous.ordered.is_empty() || previous.ordered.len() > 3 {
+                    return Err(Error::IncompatibleMembership);
+                }
+                let ranked = self.ranked(&previous, object, page, page_operation);
+                a.fallback = Some(previous);
+                Ok(ranked)
+            }
+            Ranking::Authority => {
+                check_budget(scope, budget)?;
+                if a.fill.funding {
+                    a.trail.site = CandidateSite::Funding;
+                }
+                let current = a.current.as_ref().expect("ranked");
+                let owners = positions(current);
+                let rank = current.ordered.iter().position(|node| node == &self.node);
+                Ok(Ranked::new(current.membership.version.0, &owners, rank))
+            }
+        }
+    }
+
+    /// What the walk needs from `candidates`: the owners as member
+    /// positions, arrivals, the visit order, and the demoted members.
+    fn ranked(
+        &self,
+        candidates: &Candidates,
+        object: &ObjectId,
+        page: PageNumber,
+        page_operation: bool,
+    ) -> Ranked {
+        let membership = &candidates.membership;
+        let rank = candidates
+            .ordered
+            .iter()
+            .position(|node| node == &self.node);
+        let mut ranked = Ranked::new(membership.version.0, &positions(candidates), rank);
+        ranked.members = membership.members().len();
+        // Arrival order of the page's owners in this node's membership chain.
+        for (since, node) in ranked.since.iter_mut().zip(&candidates.ordered) {
+            *since = membership.since(node);
+        }
+        match rank {
+            None => ranked.order = self.visit_order(candidates, object, page),
+            Some(_) if page_operation => {
+                // Members ranked just below the owners that were owners when they arrived (from the
+                // cached ranking only). Arrivals at generation 0 are unknown: present since this
+                // node's chain began.
+                let demoted = self.placement.demoted(membership, object, page);
+                for node in demoted.iter() {
+                    let Ok(p) = membership.position(node) else {
+                        continue;
+                    };
+                    let index = ranked.demoted.len();
+                    if ranked.demoted.push(p as u32) {
+                        ranked.demoted_since[index] = membership.since(node);
+                    }
+                }
+                ranked.oldest = Some(0);
+            }
+            Some(_) => {}
+        }
+        ranked
+    }
+
+    /// Send one probe the walk planned and report how it ended.
+    #[allow(clippy::too_many_arguments)] // The probe borrows the read's distinct inputs.
+    async fn probe(
+        &self,
+        a: &mut Acquisition,
+        probe: Probe,
+        context: &OriginContext,
+        object: &ObjectId,
+        page: PageNumber,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> FillEvent<'static> {
+        let current = a.current.as_ref().expect("ranked");
+        let membership = current.membership.clone();
+        // Canonical ranks past the owners address handoff targets or, for a
+        // non-owner, the overflow helper.
+        let helper;
+        let destination = match a.fill.dest(&probe) {
+            Some(p) => {
+                a.dest = Some(ProbeDest::Member(p));
+                &membership.members()[p as usize].node
+            }
+            None => match self.fanout_helper(current, object, page) {
+                Some(node) => {
+                    helper = node;
+                    a.dest = Some(ProbeDest::Helper(helper.clone()));
+                    &helper
+                }
+                // Every candidate helper is excluded: a miss.
+                None => return FillEvent::NoHelper,
+            },
+        };
+        let request_membership = match (&a.previous, probe.previous) {
+            (Some(previous), true) => previous.clone(),
+            _ => membership.clone(),
+        };
+        let remaining = a.phase == Phase::Remaining;
+        a.acquire = probe.mode == WalkMode::Acquire;
+        a.sent = uring_runtime::environment::now();
+        let mut timed_out = false;
+        let response = self
+            .request_traced(
+                &request_membership,
+                destination,
+                context,
+                operation,
+                if a.acquire {
+                    FetchMode::Acquire
+                } else {
+                    FetchMode::CopyOnly
+                },
+                scope,
+                a.fill.request_budget(budget),
+                probe.remaining_opportunities,
+                if probe.route == RouteMode::FundedRoute {
+                    RequestMode::FundedRoute
+                } else {
+                    RequestMode::SharedRoute
+                },
+                Some((&mut a.trail, probe.canonical as u8)),
+                &mut timed_out,
+            )
+            .await;
+        FillEvent::Reply(match response {
+            Ok(response) => {
+                let signed = response.origin().node() == destination;
+                let kind = response.response().kind();
+                if kind.has_payload() {
+                    a.answer = Some(response);
+                }
+                FillReply::Answer { kind, signed }
+            }
+            // Sent but unanswered within the attempt's own bound.
+            Err(_) if timed_out && !remaining => FillReply::TimedOut,
+            Err(error) => FillReply::Failed {
+                error: a.core_error(error),
+                sent: true,
+                scope_live: scope.check().is_ok(),
+            },
+        })
+    }
+
+    /// Apply what one event showed: silence, rank 0 and route evidence.
+    fn apply(
+        &self,
+        a: &Acquisition,
+        evidence: &Evidence,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) {
+        // The remaining-copy walk records no evidence.
+        if a.phase == Phase::Remaining {
+            return;
+        }
+        let (Some(dest), Some(current)) = (&a.dest, &a.current) else {
+            return;
+        };
+        let destination = match dest {
+            ProbeDest::Member(p) => &current.membership.members()[*p as usize].node,
+            ProbeDest::Helper(node) => node,
+        };
+        let health = self.peers.link_health();
+        let page = match operation {
+            PeerOperation::Page { page, .. } => Some(page),
+            _ => None,
+        };
+        match (evidence.silence, page) {
+            // The destination answered this node: it is not hung.
+            (Some(SilenceNote::Answered), _) => health.silence_answered(destination),
+            // It shed the request: busy, not hung. A reader's later walks visit it after the page's
+            // other owners for a while.
+            (Some(SilenceNote::Shed), Some(id)) => health.silence_shed(destination, id.clone()),
+            // A probe of the page's rank 0 asks whether rank 0 answers at all: `poll_pings` sends
+            // the ping. Any other timeout only demotes the owner in this node's visit order.
+            (Some(SilenceNote::TimedOut { needed }), Some(id)) => {
+                health.silence_timed_out(destination, id.clone(), a.sent, needed);
+            }
+            _ => {}
+        }
+        // Update the rank 0 watch from this owner's page probe of rank 0: a timeout notes the page
+        // with the request's deadline, an answer signed by rank 0 itself forgets it.
+        if let (Some(note), Some(id)) = (evidence.rank0, page) {
+            let mut watch = self.rank0_watch.borrow_mut();
+            match note {
+                Rank0Note::TimedOut => watch.timed_out(
+                    id.clone(),
+                    destination.clone(),
+                    uring_runtime::environment::now(),
+                    budget.deadline().min(scope.deadline.0),
+                ),
+                Rank0Note::Failed => watch.answered_failure(id, destination),
+                Rank0Note::Answered => watch.answered(id, destination),
+            }
+        }
+        if let Some(Ok(outcome)) = &evidence.outcome {
+            self.observe_route(&current.membership, destination, outcome);
+        }
+    }
+
+    /// Record why the read failed and return the dataplane error.
+    fn failed(
+        &self,
+        a: &mut Acquisition,
+        mut error: Error,
+        evidence: &Evidence,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &AcquisitionBudget,
+    ) -> Error {
+        if a.phase == Phase::Walk && a.fill.funding {
+            a.trail.site = CandidateSite::Funding;
+        }
+        if evidence.notes & (Notes::EXHAUSTED | Notes::EXHAUSTED_FUNDING) != 0
+            || (a.phase == Phase::Walk && error == Error::VersionUnavailable)
+        {
+            if let Err(stop) = check_budget(scope, budget) {
+                error = stop;
+            } else if error == Error::Unavailable {
+                if evidence.notes & Notes::EXHAUSTED != 0 {
+                    a.trail.site = CandidateSite::Exhausted;
                 }
                 self.observer.record(
                     Failure::new(Stage::CandidateExhausted, Error::Unavailable)
@@ -1233,9 +1622,181 @@ impl CandidatePolicy {
                             links: budget.remaining_links(),
                         }),
                 );
-                Err(Error::Unavailable)
             }
+        }
+        match a.phase {
+            Phase::Walk => self.record_final(
+                operation,
+                a.membership,
+                scope,
+                budget,
+                error,
+                std::mem::take(&mut a.trail),
+            ),
+            Phase::Remaining => match (a.fill.remaining_end, &a.authority) {
+                (Some(RemainingEnd::None), Some(authority)) => {
+                    // Record the miss diagnostic; the walk classifies it.
+                    self.final_origin_miss(authority, operation, scope, budget);
+                }
+                _ => {
+                    let membership = a
+                        .current
+                        .as_ref()
+                        .map_or(a.membership, |c| c.membership.version.0);
+                    self.record_final(
+                        operation,
+                        membership,
+                        scope,
+                        budget,
+                        error,
+                        std::mem::take(&mut a.trail),
+                    );
+                }
+            },
+            Phase::Origin => {}
+        }
+        error
+    }
+
+    /// The origin authority the walk ended with at `rank`.
+    pub(crate) fn authority<'a>(
+        &self,
+        a: &'a mut Acquisition,
+        rank: usize,
+        operation: &PeerOperation,
+    ) -> &'a OriginAuthority {
+        let (object, page) = operation_identity(operation);
+        let current = a.current.as_ref().expect("ranked");
+        a.authority.insert(OriginAuthority {
+            diagnostic: a.trail.clone(),
+            membership: current.membership.clone(),
+            node: self.node.clone(),
+            object: object.clone(),
+            owners: current.ordered.clone(),
+            page,
+            predecessor_evidence: a.fill.evidence.to_vec(),
+            rank,
         })
+    }
+
+    /// Send a run of granted probes at once (`Step::Granted`): copy-only, each on its own grant
+    /// (`racer_core::read::walk::granted_budget`), all sharing the first
+    /// probe's time share, so the run costs one round trip instead of one per
+    /// target. Waits for every answer before validating, so no exchange is
+    /// left running; returns the first validated copy in probe order. Any
+    /// other answer, and any transport failure while `scope` still runs, is
+    /// a miss, as for a sequential granted probe.
+    #[allow(clippy::too_many_arguments)] // The batch borrows the walk's distinct inputs.
+    async fn granted_batch<'a, T>(
+        &'a self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        targets: &[u32],
+        remaining_opportunities: u32,
+        context: &'a OriginContext,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        deadline: std::time::Instant,
+        validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+        trail: &mut CandidateTrail,
+    ) -> Result<Option<T>> {
+        let mut grants: Vec<(AcquisitionBudget, bool)> = targets
+            .iter()
+            .map(|_| (racer_core::read::walk::granted_budget(deadline), false))
+            .collect();
+        let node = |p: &u32| &membership.members()[*p as usize].node;
+        let sent = uring_runtime::environment::now();
+        let responses = futures::future::join_all(targets.iter().zip(grants.iter_mut()).map(
+            |(target, (grant, timed_out))| {
+                self.request_traced(
+                    membership,
+                    node(target),
+                    context,
+                    operation,
+                    FetchMode::CopyOnly,
+                    scope,
+                    grant,
+                    remaining_opportunities,
+                    RequestMode::FundedRoute,
+                    None,
+                    timed_out,
+                )
+            },
+        ))
+        .await;
+        // Silence evidence as for a sequential granted probe: the destination's own answer clears
+        // it, a timeout only demotes (a granted target is never rank 0).
+        if let PeerOperation::Page { page: id, .. } = operation {
+            for ((target, (_, timed_out)), response) in targets.iter().zip(&grants).zip(&responses)
+            {
+                let destination = node(target);
+                match response {
+                    Ok(response) if response.origin().node() == destination => {
+                        self.peers.link_health().silence_answered(destination);
+                    }
+                    Err(_) if *timed_out => {
+                        let _ = self.peers.link_health().silence_timed_out(
+                            destination,
+                            id.clone(),
+                            sent,
+                            racer_core::liveness::NO_PING,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for response in responses {
+            match response {
+                Ok(response)
+                    if matches!(
+                        response.response(),
+                        PeerResponse::StaleMembership | PeerResponse::Overloaded
+                    ) => {}
+                Ok(response) => {
+                    let validated = validated_copy(response, operation, false, validate).await;
+                    note_validation(trail, &validated);
+                    match validated {
+                        Ok(Ok(copy)) => return Ok(Some(copy)),
+                        Ok(Err(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error)
+                    if racer_core::read::Error::try_from(error)
+                        .ok()
+                        .and_then(racer_core::read::walk::transport_outcome)
+                        .is_some()
+                        || scope.check().is_ok() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The member this non-owner asks to acquire `page` for it when an owner
+    /// sheds the request (`racer_core::read::budget`): one of the page's
+    /// hash-chosen helpers, never an owner and never this node, preferring a
+    /// direct overlay neighbor so the exchange needs no relay.
+    pub(crate) fn fanout_helper(
+        &self,
+        candidates: &Candidates,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Option<NodeId> {
+        let membership = &candidates.membership;
+        let members = membership.members();
+        racer_core::read::budget::fanout_helper(
+            object,
+            page,
+            &self.node,
+            members.len(),
+            |p| {
+                let node = &members[p].node;
+                node == &self.node || candidates.ordered.contains(node)
+            },
+            |p| membership.is_neighbor(&self.node, &members[p].node),
+        )
+        .map(|p| members[p].node.clone())
     }
 
     /// After an origin version miss, old copies on later candidates remain useful.
@@ -1274,20 +1835,25 @@ impl CandidatePolicy {
                     .iter()
                     .position(|node| node == &self.node)
                     .ok_or(Error::Unauthorized)?;
-                let mut transient = false;
-                for (index, destination) in candidates.ordered.iter().enumerate().skip(rank + 1) {
-                    match self
+                let mut walk = RemainingWalk::new(rank, candidates.ordered.len());
+                let end = loop {
+                    let probe = match walk.next_probe() {
+                        Ok(probe) => probe,
+                        Err(end) => break end,
+                    };
+                    let outcome = match self
                         .request_traced(
                             &candidates.membership,
-                            destination,
+                            &candidates.ordered[probe.canonical],
                             context,
                             operation,
                             FetchMode::CopyOnly,
                             scope,
                             budget,
-                            (candidates.ordered.len() - index) as u32,
+                            probe.remaining_opportunities,
                             RequestMode::SharedRoute,
-                            Some((&mut trail, index as u8)),
+                            Some((&mut trail, probe.index as u8)),
+                            &mut false,
                         )
                         .await
                     {
@@ -1297,26 +1863,23 @@ impl CandidatePolicy {
                             note_validation(&mut trail, &validated);
                             match validated? {
                                 Ok(copy) => return Ok(Some(copy)),
-                                Err(
-                                    ProbeOutcome::Unreachable
-                                    | ProbeOutcome::Overloaded
-                                    | ProbeOutcome::UnusableCopy,
-                                ) => transient = true,
-                                Err(_) => {}
+                                Err(outcome) => WalkOutcome::Probe(outcome),
                             }
                         }
-                        Err(Error::Unavailable | Error::Overloaded | Error::Io | Error::Os(_)) => {
-                            transient = true;
-                            budget.note_route_failure();
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                        Err(error) => match racer_core::read::Error::try_from(error)
+                            .ok()
+                            .and_then(racer_core::read::walk::transport_outcome)
+                        {
+                            Some(outcome) => WalkOutcome::Transport(outcome),
+                            None => return Err(error),
+                        },
+                    };
+                    walk.complete(budget, outcome);
+                };
                 check_budget(scope, budget)?;
-                if transient {
-                    Err(Error::Unavailable)
-                } else {
-                    Ok(None)
+                match end {
+                    RemainingEnd::Unavailable => Err(Error::Unavailable),
+                    RemainingEnd::None | RemainingEnd::Copy => Ok(None),
                 }
             }
             .await;
@@ -1333,29 +1896,6 @@ impl CandidatePolicy {
             }
             result
         })
-    }
-
-    async fn refresh_candidates(
-        &self,
-        previous: &Candidates,
-        object: &ObjectId,
-        page: PageNumber,
-        scope: &RequestScope,
-        retried: bool,
-    ) -> Result<Candidates> {
-        if retried {
-            return Err(Error::IncompatibleMembership);
-        }
-        let latest = self
-            .published
-            .current()?
-            .ok_or(Error::Unavailable)?
-            .membership
-            .clone();
-        if latest.version.0 <= previous.membership.version.0 {
-            return Err(Error::IncompatibleMembership);
-        }
-        self.candidates_scoped(latest, object, page, scope).await
     }
 
     /// Request a peer copy using the accepted membership and remaining budget.
@@ -1409,6 +1949,7 @@ impl CandidatePolicy {
             remaining_opportunities,
             request_mode,
             None,
+            &mut false,
         )
         .await
     }
@@ -1426,6 +1967,7 @@ impl CandidatePolicy {
         remaining_opportunities: u32,
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
+        timed_out: &mut bool,
     ) -> Result<VerifiedResponse> {
         match self
             .request_delivered(
@@ -1440,6 +1982,7 @@ impl CandidatePolicy {
                 request_mode,
                 trail,
                 None,
+                timed_out,
             )
             .await?
         {
@@ -1478,6 +2021,7 @@ impl CandidatePolicy {
             RequestMode::SharedRoute,
             None,
             Some(ordinal),
+            &mut false,
         )
         .await
     }
@@ -1502,7 +2046,9 @@ impl CandidatePolicy {
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
         landing: Option<i32>,
+        timed_out: &mut bool,
     ) -> Result<Delivered> {
+        *timed_out = false;
         let mut remote = [b'?'; 36];
         if trail.is_some() && racer_crypto::identity::canonical_uuid(&destination.0) {
             remote.copy_from_slice(destination.0.as_bytes());
@@ -1529,72 +2075,53 @@ impl CandidatePolicy {
         };
         let result = async {
             check_budget(scope, budget)?;
-            // Reserve the complete permitted route before sending. Lost responses cannot
-            // refund an unknown number of forwarded links. No retry gets fresh credits.
-            let links = budget.route_links();
-            if links == 0 {
-                return Err(Error::HopBudgetExhausted);
+            // A destination this node holds silent fails at once, before any credit is spent; its
+            // own pings go out.
+            if !matches!(mode, FetchMode::Ping) && self.peers.link_health().silent(destination) {
+                return Err(Error::Unavailable);
             }
+            // racer-core reserves the complete route and remote credits before
+            // sending and derives the share, local cap, and body budget. Lost
+            // responses cannot refund forwarded links; no retry gets fresh credits.
             let now = uring_runtime::environment::now();
-            let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
-            // Share bounds idle fallback. A separate nonrenewable local cap bounds
-            // every exchange, even when no alternative is affordable.
-            // Sign the original hard ceiling before sending; it never renews.
-            let deadline = now + (overall - now) / remaining_opportunities.max(1);
-            let attempt_end = now
-                + self
-                    .attempt_timeout
-                    .min(if matches!(request_mode, RequestMode::DirectHedge) {
-                        (overall - now) / 3
+            let plan = racer_core::read::walk::plan_attempt(
+                budget,
+                racer_core::read::walk::AttemptInputs {
+                    now,
+                    caller_deadline: scope.deadline.0,
+                    remaining_opportunities,
+                    route: match request_mode {
+                        RequestMode::SharedRoute => RouteMode::SharedRoute,
+                        RequestMode::FundedRoute => RouteMode::FundedRoute,
+                        RequestMode::DirectHedge => RouteMode::DirectHedge,
+                    },
+                    mode: if matches!(mode, FetchMode::Acquire) {
+                        WalkMode::Acquire
                     } else {
-                        overall - now
-                    });
+                        WalkMode::CopyOnly
+                    },
+                    attempt_timeout: self.attempt_timeout,
+                    failure_links: crate::topology::FAILURE_LINKS,
+                },
+            )?;
+            let links = plan.links;
+            let overall = plan.overall;
+            let attempt_end = plan.attempt_end;
+            let attempts = plan.remote_attempts;
             // The local exchange may time out before the signed contract. Shortening
             // the latter per attempt would make a later update renew provider authority.
             let signed_deadline = overall;
             if trail.is_some() {
                 facts.overall = crate::telemetry::timestamp(overall);
-                facts.share = crate::telemetry::timestamp(deadline);
+                facts.share = crate::telemetry::timestamp(plan.share);
                 facts.cap = crate::telemetry::timestamp(attempt_end);
             }
             // A clone shares cancellation: timing it out would cancel the caller too.
             let mut attempt_scope = RequestScope::new(scope.request, overall)?;
-            attempt_scope.set_candidate_idle((deadline - now).min(attempt_end - now))?;
+            attempt_scope.set_candidate_idle(plan.idle)?;
             attempt_scope.set_candidate_total(attempt_end)?;
-            attempt_scope.body_deadlines = Some((overall, deadline));
-            let attempts = if matches!(mode, FetchMode::Acquire) {
-                // Reserve remote acquisition credits from the same original call.
-                // Without a signed response receipt unused remote credits stay spent.
-                let credits = if matches!(request_mode, RequestMode::FundedRoute) {
-                    budget.remaining_attempts()
-                } else {
-                    budget
-                        .remaining_attempts()
-                        .div_ceil(remaining_opportunities.max(1))
-                };
-                budget.partition(credits, 0)?.remaining_attempts()
-            } else {
-                0
-            };
-            let mut complete_by = attempt_end;
-            if remaining_opportunities > 1
-                && budget.remaining_attempts() > 0
-                && budget.remaining_links() >= crate::topology::FAILURE_LINKS
-            {
-                // Reserve at most half the original post-share interval for fallback,
-                // including subscription/fixed-page fallback. The local cap may be tighter.
-                let reserve = (deadline - now).min((overall - deadline) / 2);
-                if !reserve.is_zero() {
-                    complete_by = complete_by.min(overall - reserve);
-                }
-            }
-            // Observe actual known-length body progress, not checkout/head latency.
-            // Even a last candidate should not occupy the whole budget if its measured
-            // rate cannot finish in time. Healthy bodies may exceed the idle share.
-            let observation = (deadline - now)
-                .min((attempt_end - now) / 3)
-                .max(std::time::Duration::from_nanos(1));
-            attempt_scope.set_candidate_body_budget(observation, complete_by)?;
+            attempt_scope.body_deadlines = Some((overall, plan.share));
+            attempt_scope.set_candidate_body_budget(plan.observation, plan.complete_by)?;
             let mut bytes = [0; 16];
             uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
             let attempt = AttemptId(bytes);
@@ -1711,14 +2238,35 @@ impl CandidatePolicy {
                     }
                 }
             }
+            // A verified `StaleMembership` comes from a node that could not resolve this request's
+            // membership, so the remote credits it carried were never used: return them, and the
+            // links past the hops that carried it to that node.
+            if let Ok(Delivered::Response(response)) = &response
+                && matches!(response.response(), PeerResponse::StaleMembership)
+            {
+                budget.refund_remote(attempts)?;
+                budget.refund_links(racer_core::read::budget::stale_unused_links(
+                    links,
+                    response.forwarders().len() + 1,
+                ))?;
+            }
             check_budget(scope, budget)?;
             let stop = stopped.or_else(|| attempt_scope.check().err());
             facts.stop = stop;
+            // The caller's scope and budget still hold here, so a deadline is
+            // the attempt's own bound: the request was sent and is unanswered
+            // (`WalkOutcome::TimedOut`).
             match stop {
-                Some(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                Some(Error::DeadlineExceeded) => {
+                    *timed_out = true;
+                    Err(Error::Unavailable)
+                }
                 Some(error) => Err(error),
                 None => match response {
-                    Err(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                    Err(Error::DeadlineExceeded) => {
+                        *timed_out = true;
+                        Err(Error::Unavailable)
+                    }
                     result => result,
                 },
             }
@@ -1734,17 +2282,288 @@ impl CandidatePolicy {
         result
     }
 
-    pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
-        if authority.predecessor_evidence.iter().any(|outcome| {
-            matches!(
-                outcome,
-                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded | ProbeOutcome::UnusableCopy
-            )
-        }) {
-            Error::Unavailable
-        } else {
-            Error::VersionUnavailable
+    /// This node fetched `page` from origin at `rank` among `owners`: when that is after rank 0,
+    /// remember to offer rank 0 the copy later (`racer_core::read::hints`). Returns whether a
+    /// notice was noted.
+    pub(crate) fn note_orphan(
+        &self,
+        page: &crate::model::PageId,
+        owners: &[NodeId],
+        rank: usize,
+        evidence: &[ProbeOutcome],
+    ) -> bool {
+        use racer_core::read::hints::{notice_indexes, should_notice};
+        if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) {
+            return false;
         }
+        let now = uring_runtime::environment::now();
+        let mut noted = false;
+        // Rank 0 and, for a holder at rank 2, rank 1 unless it answered this owner's walk.
+        for index in notice_indexes(Some(rank), evidence) {
+            let Some(target) = owners.get(usize::from(index)) else {
+                continue;
+            };
+            if target == &self.node {
+                continue;
+            }
+            self.notices
+                .borrow_mut()
+                .note((page.clone(), index), target.clone(), now);
+            noted = true;
+        }
+        noted
+    }
+
+    /// This node's own origin request for `page`, made with authority at `rank` among `owners`,
+    /// failed with `error`: above rank 0, leave retries after rank 0's own failures to rank 0 for a
+    /// while (`racer_core::liveness`). Terminal origin answers (a missing version, rejected or
+    /// forbidden credentials) are not failures of origin and are ignored.
+    pub(crate) fn note_origin_failure(
+        &self,
+        page: &crate::model::PageId,
+        owners: &[NodeId],
+        rank: usize,
+        error: &Error,
+    ) {
+        if rank == 0
+            || owners.get(rank) != Some(&self.node)
+            || matches!(
+                error,
+                Error::VersionUnavailable
+                    | Error::OriginRejected
+                    | Error::OriginForbidden
+                    | Error::NotFound
+            )
+        {
+            return;
+        }
+        let Some(rank0) = owners.first() else {
+            return;
+        };
+        self.rank0_watch.borrow_mut().failed(
+            page.clone(),
+            rank0.clone(),
+            uring_runtime::environment::now(),
+        );
+    }
+
+    /// Send due copy offers, at most [`MAX_OFFERS_IN_FLIGHT`] at a time, each on its own detached
+    /// driver task and fixed route grant (never a reader's budget). `holds` reports whether this
+    /// node still holds a page; a page it lost is dropped. Best effort: an offer that is not
+    /// answered `Miss` by its destination is tried again on the notice's schedule or expires, and
+    /// never reaches a reader. Call once per worker service turn.
+    pub(crate) fn poll_offers(
+        self: &Rc<Self>,
+        now: std::time::Instant,
+        holds: impl Fn(&crate::model::PageId) -> bool,
+        metrics: &Metrics,
+    ) {
+        let membership = self
+            .published
+            .current()
+            .ok()
+            .flatten()
+            .map(|published| published.membership.clone());
+        // Offers are held per target site while a cut lasts; members without a site, or unknown,
+        // share one group.
+        let site = move |node: &NodeId| -> String {
+            membership
+                .as_ref()
+                .and_then(|m| m.member(node).ok())
+                .map(|m| m.site.clone())
+                .unwrap_or_default()
+        };
+        while self.offers.get() < MAX_OFFERS_IN_FLIGHT {
+            let Some(due) = self.notices.borrow_mut().pop_open(now, &site) else {
+                return;
+            };
+            let group = site(&due.target);
+            if !holds(&due.key.0) {
+                self.notices.borrow_mut().release(&group);
+                continue;
+            }
+            let Ok(permit) = uring_runtime::drivers::reserve() else {
+                // No driver slot this turn: count it as a failed offer
+                // (local, so not a cut).
+                let _ = self
+                    .notices
+                    .borrow_mut()
+                    .offer_result(due, OfferEnd::Refused, group, now);
+                return;
+            };
+            let flight = OfferFlight::new(self.offers.clone());
+            let policy = self.clone();
+            let metrics = metrics.clone();
+            permit.submit_detached(Box::pin(async move {
+                let _flight = flight;
+                metrics.record(Event::OrphanOfferSent, 1);
+                let end = policy.offer(&due).await.unwrap_or(OfferEnd::Cut);
+                let now = uring_runtime::environment::now();
+                match end {
+                    OfferEnd::Dropped => {}
+                    OfferEnd::Delivered => metrics.record(Event::OrphanOfferDelivered, 1),
+                    OfferEnd::Refused | OfferEnd::Cut => {
+                        metrics.record(Event::OrphanOfferFailed, 1);
+                    }
+                }
+                let _ = policy
+                    .notices
+                    .borrow_mut()
+                    .offer_result(due, end, group, now);
+                Ok::<(), Error>(())
+            }));
+        }
+    }
+
+    /// This worker's link health (tests set its silence timing).
+    #[cfg(test)]
+    pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
+        self.peers.link_health()
+    }
+
+    /// Send due silence pings (`racer_core::liveness`), at most [`MAX_PINGS_IN_FLIGHT`] at a time,
+    /// each on its own detached driver task and fixed route grant (never a reader's budget). Call
+    /// once per worker service turn.
+    pub(crate) fn poll_pings(self: &Rc<Self>, now: std::time::Instant, metrics: &Metrics) {
+        let health = self.peers.link_health();
+        let room = MAX_PINGS_IN_FLIGHT.saturating_sub(self.pings.get());
+        if room == 0 {
+            return;
+        }
+        for (peer, page) in health.due_pings(now, room) {
+            let Ok(permit) = uring_runtime::drivers::reserve() else {
+                // No driver slot this turn: the ping's slot goes stale and
+                // the next timeout asks again.
+                return;
+            };
+            let flight = OfferFlight::new(self.pings.clone());
+            let policy = self.clone();
+            let metrics = metrics.clone();
+            let health = health.clone();
+            permit.submit_detached(Box::pin(async move {
+                let _flight = flight;
+                metrics.record(Event::SilencePingSent, 1);
+                let answered = policy.ping(&peer, &page).await;
+                let now = uring_runtime::environment::now();
+                if health.ping_outcome(&peer, answered, now) {
+                    metrics.record(Event::SilencePeerSilent, 1);
+                }
+                Ok::<(), Error>(())
+            }));
+        }
+    }
+
+    /// Ping `peer` about `page` (mode `ping`, answered `Miss` at once), and
+    /// classify the result (`racer_core::liveness::ping_verdict`).
+    async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
+        use racer_core::read::hints::NOTICE_LINKS;
+        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        let mut id = [0; 16];
+        uring_runtime::environment::fill_random(&mut id).ok()?;
+        let scope = RequestScope::new(crate::model::RequestId(id), deadline).ok()?;
+        let membership = self.published.current().ok()??.membership.clone();
+        let context = OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let operation = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::Ping,
+        };
+        // A fresh grant: one local exchange, no remote attempts, and
+        // `NOTICE_LINKS` route links.
+        let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
+        let mut timed_out = false;
+        let response = self
+            .request_traced(
+                &membership,
+                peer,
+                &context,
+                &operation,
+                FetchMode::Ping,
+                &scope,
+                &mut budget,
+                1,
+                RequestMode::FundedRoute,
+                None,
+                &mut timed_out,
+            )
+            .await;
+        racer_core::liveness::ping_verdict(match response {
+            Ok(response) => Ok((
+                response.origin().node() == peer,
+                matches!(response.response(), PeerResponse::Unavailable),
+            )),
+            Err(error) => Err(timed_out || matches!(error, Error::DeadlineExceeded)),
+        })
+    }
+
+    /// Send one copy offer for `due` to the page's current rank 0, and
+    /// classify how it ended. Errors before sending are cut evidence too
+    /// (membership or route lookup).
+    async fn offer(
+        &self,
+        due: &racer_core::read::hints::Due<(crate::model::PageId, u8), NodeId>,
+    ) -> Result<OfferEnd> {
+        use racer_core::read::hints::{NOTICE_LINKS, notice_target};
+        let (page, index) = (&due.key.0, due.key.1);
+        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        let mut id = [0; 16];
+        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+        let scope = RequestScope::new(crate::model::RequestId(id), deadline)?;
+        let membership = self
+            .published
+            .current()?
+            .ok_or(Error::Unavailable)?
+            .membership
+            .clone();
+        let mut owners = self
+            .candidates_scoped(
+                membership.clone(),
+                &page.version.object,
+                page.number,
+                &scope,
+            )
+            .await?
+            .ordered;
+        owners.truncate(3);
+        let Some(target) = notice_target(&self.node, &owners, true, index) else {
+            return Ok(OfferEnd::Dropped);
+        };
+        let context = OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let operation = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::Offer,
+        };
+        // A fresh grant: one local exchange, no remote attempts, and
+        // `NOTICE_LINKS` route links.
+        let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
+        let response = self
+            .request_mode(
+                &membership,
+                &target,
+                &context,
+                &operation,
+                FetchMode::Offer,
+                &scope,
+                &mut budget,
+                1,
+                RequestMode::FundedRoute,
+            )
+            .await;
+        Ok(OfferEnd::of(response.ok().and_then(|response| {
+            (response.origin().node() == &target)
+                .then(|| matches!(response.response(), PeerResponse::Miss))
+        })))
+    }
+
+    pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
+        racer_core::read::origin_miss_error(&authority.predecessor_evidence).into()
     }
     pub(super) fn final_origin_miss(
         &self,
@@ -1891,11 +2710,10 @@ async fn validated_copy<'a, T>(
         Ok(copy) => Ok(Ok(copy)),
         // Only page content validation is recoverable here. Transport/security
         // errors never enter this helper, and Unauthorized remains terminal.
-        Err(Error::CorruptRecord | Error::MissingKey)
-            if matches!(
-                operation,
-                PeerOperation::Page { .. } | PeerOperation::Bootstrap { .. }
-            ) =>
+        Err(error)
+            if racer_core::read::Error::try_from(error).is_ok_and(|error| {
+                racer_core::read::unusable_copy(error, operation_kind(operation)).is_some()
+            }) =>
         {
             Ok(Err(ProbeOutcome::UnusableCopy))
         }
@@ -1903,19 +2721,35 @@ async fn validated_copy<'a, T>(
     }
 }
 impl OriginAuthority {
+    /// The canonical rank this authority was granted at.
+    pub(crate) fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// The page's ranked owners `rank` indexes: those of the membership the
+    /// walk ended under, which may be newer than the caller's.
+    pub(crate) fn owners(&self) -> &[NodeId] {
+        &self.owners
+    }
+
+    /// The predecessors' answers this authority rests on, in rank order.
+    pub(crate) fn predecessor_evidence(&self) -> &[ProbeOutcome] {
+        &self.predecessor_evidence
+    }
+
     pub fn validate(&self, object: &ObjectId, page: PageNumber) -> Result<()> {
-        if object != &self.object || page != self.page {
-            return Err(Error::Unauthorized);
-        }
-        // Private construction follows a recomputed ranking under this immutable
-        // membership. Validation need not rehash the entire cluster on each write.
-        if self.rank >= 3
-            || self.predecessor_evidence.len() != self.rank
-            || self.membership.member(&self.node).is_err()
-        {
-            return Err(Error::Unauthorized);
-        }
-        Ok(())
+        racer_core::read::validate_origin_authority(
+            racer_core::read::AuthorityFacts {
+                object: &self.object,
+                page: self.page,
+                rank: self.rank,
+                predecessor_evidence: self.predecessor_evidence.len(),
+                member: self.membership.member(&self.node).is_ok(),
+            },
+            object,
+            page,
+        )
+        .map_err(Error::from)
     }
 }
 
@@ -1978,119 +2812,109 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
         },
     }
 }
+/// Payload-free shape of `operation` for racer-core classification.
+pub(crate) fn operation_kind(operation: &PeerOperation) -> racer_core::read::OperationKind {
+    use racer_core::read::OperationKind;
+    match operation {
+        PeerOperation::Subscribe { .. } => OperationKind::Subscribe,
+        PeerOperation::Page { .. } => OperationKind::Page,
+        PeerOperation::Metadata { selector, .. } => OperationKind::Metadata {
+            fresh: matches!(selector, MetadataSelector::Fresh),
+        },
+        PeerOperation::Bootstrap { .. } => OperationKind::Bootstrap,
+        PeerOperation::Warm { .. } => OperationKind::Warm,
+    }
+}
+
 // `acquire` describes the actual probe, which may be CopyOnly even when the
 // caller's operation requests acquisition (predecessors and remaining copies).
+// racer-core owns the outcome table; this supplies payload identity checks.
 fn classify(
     response: &PeerResponse,
     operation: &PeerOperation,
     acquire: bool,
 ) -> Result<Option<ProbeOutcome>> {
-    match response {
-        PeerResponse::Selected {
-            metadata,
-            ciphertext,
-            grant,
-        } => match operation {
-            PeerOperation::Subscribe { subscription, .. }
-                if grant.page.version == subscription.version
-                    && subscription.demand.contains(grant.page.number.0)
-                    && ciphertext.envelope().page == grant.page
-                    && metadata.version == subscription.version =>
-            {
-                metadata.immutable().validate_page(ciphertext.envelope())?;
-                Ok(None)
-            }
-            _ => Err(Error::CorruptRecord),
-        },
-        PeerResponse::Miss => Ok(Some(ProbeOutcome::CopyMiss)),
-        PeerResponse::NotFound => match operation {
-            PeerOperation::Bootstrap { .. } if acquire => Err(Error::NotFound),
-            PeerOperation::Metadata {
-                selector: MetadataSelector::Fresh,
-                ..
-            } if acquire => Err(Error::NotFound),
-            _ => Err(Error::Unauthorized),
-        },
-        PeerResponse::VersionUnavailable => Ok(Some(ProbeOutcome::VersionUnavailable)),
-        PeerResponse::Unavailable => Ok(Some(ProbeOutcome::Unreachable)),
-        PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
-        PeerResponse::OriginRejected => Err(Error::OriginRejected),
-        PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
-        PeerResponse::StaleMembership => Err(Error::IncompatibleMembership),
-        // Warm acknowledgements never answer a candidate data probe.
-        PeerResponse::Held { .. } | PeerResponse::Warmed | PeerResponse::Released => {
-            Err(Error::CorruptRecord)
+    racer_core::read::classify(response.kind(), operation_kind(operation), acquire, || {
+        validate_payload(response, operation)
+    })
+}
+
+/// Payload identity and content checks for a response whose kind answers the
+/// operation's kind. Mismatches are corrupt records.
+fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Result<()> {
+    match (response, operation) {
+        (
+            PeerResponse::Selected {
+                metadata,
+                ciphertext,
+                grant,
+            },
+            PeerOperation::Subscribe { subscription, .. },
+        ) if grant.page.version == subscription.version
+            && subscription.demand.contains(grant.page.number.0)
+            && ciphertext.envelope().page == grant.page
+            && metadata.version == subscription.version =>
+        {
+            metadata
+                .immutable()
+                .validate_page(ciphertext.envelope())
+                .map_err(Error::from)
         }
-        PeerResponse::Bootstrap {
-            metadata,
-            page_zero,
-        } => match operation {
-            PeerOperation::Bootstrap { object, .. } if &metadata.version.object == object => {
-                if let Some(page) = page_zero {
-                    metadata.immutable().validate_page(page.envelope())?;
-                    if page.envelope().page.number.0 != 0 {
-                        return Err(Error::CorruptRecord);
-                    }
-                }
-                if page_zero.is_some() != (metadata.length != 0) {
+        (
+            PeerResponse::Bootstrap {
+                metadata,
+                page_zero,
+            },
+            PeerOperation::Bootstrap { object, .. },
+        ) if &metadata.version.object == object => {
+            if let Some(page) = page_zero {
+                metadata.immutable().validate_page(page.envelope())?;
+                if page.envelope().page.number.0 != 0 {
                     return Err(Error::CorruptRecord);
                 }
-                Ok(None)
             }
-            _ => Err(Error::CorruptRecord),
-        },
-        PeerResponse::Page {
-            metadata,
-            ciphertext,
-        } => match operation {
-            PeerOperation::Page { page, .. }
-                if &ciphertext.envelope().page == page && metadata.version == page.version =>
-            {
-                metadata.immutable().validate_page(ciphertext.envelope())?;
-                Ok(None)
+            if page_zero.is_some() != (metadata.length != 0) {
+                return Err(Error::CorruptRecord);
             }
-            _ => Err(Error::CorruptRecord),
-        },
-        PeerResponse::Metadata(metadata) => match operation {
+            Ok(())
+        }
+        (
+            PeerResponse::Page {
+                metadata,
+                ciphertext,
+            },
+            PeerOperation::Page { page, .. },
+        ) if &ciphertext.envelope().page == page && metadata.version == page.version => metadata
+            .immutable()
+            .validate_page(ciphertext.envelope())
+            .map_err(Error::from),
+        (
+            PeerResponse::Metadata(metadata),
             PeerOperation::Metadata {
                 object, selector, ..
-            } if &metadata.version.object == object => {
-                if let MetadataSelector::Pinned(etag) = selector
-                    && &metadata.version.etag != etag
-                {
-                    return Err(Error::CorruptRecord);
-                }
-                Ok(None)
+            },
+        ) if &metadata.version.object == object => {
+            if let MetadataSelector::Pinned(etag) = selector
+                && &metadata.version.etag != etag
+            {
+                return Err(Error::CorruptRecord);
             }
-            _ => Err(Error::CorruptRecord),
-        },
+            Ok(())
+        }
+        _ => Err(Error::CorruptRecord),
     }
 }
 
-// Opt-in, node-shared speculative page capacity. No background task or byte bypass.
-//
-// RACER_PAGE_HEDGE_SLOTS=0 disables hedging. RACER_PAGE_HEDGE_DELAY_MS defaults
-// to 100; RACER_PAGE_HEDGE_BYTES defaults to one maximum duplicate
-// plaintext+ciphertext pair (32 MiB + 16).
-// Only noncandidate plaintext fixed-page reads with two direct healthy neighbors
-// qualify. Their distinct destinations are pinned first hops over HTTP. Metadata,
-// subscription selection, ciphertext relays, native paths and full GETs do not race.
-// One CopyOnly secondary may start; normal acquisition credits are partitioned,
-// never replenished. Duplicate escrow is held in addition to actual buffer quota,
-// intentionally over-accounting rather than requiring a transport-wide reservation
-// handoff. Admission also preflights two full contender buffers before credits:
-// the existing serial page plus escrow plus both contenders require 64 MiB of
-// plaintext capacity in an otherwise empty worker. Low quotas fall back serially.
-// Pair exchanges have a local one-third-remaining cap; signed authority stays
-// unchanged. Serial continuation skips the consumed primary, keeps the CopyOnly
-// secondary eligible for Acquire, and preserves credits for later candidates.
-// One authorized cold fallback requires six original attempts/ten links; the
-// standard eight/sixteen allowance can hedge without budget inflation. A second
-// cold fallback needs additional original credits and is skipped if underfunded.
-// A valid winner waits for the losing exchange/crypto fence before return:
-// this can limit the latency benefit and is not an early-publication implementation.
+// Opt-in, node-shared speculative page hedging (`RACER_PAGE_HEDGE_SLOTS=0` disables it;
+// `RACER_PAGE_HEDGE_DELAY_MS` defaults to 100, `RACER_PAGE_HEDGE_BYTES` to one duplicate
+// plaintext+ciphertext pair). Only non-owner plaintext page reads with two direct healthy owners
+// race, over pinned first hops. Credits are partitioned, never replenished; duplicate escrow is held
+// on top of buffer quota, and admission preflights both contender buffers before spending credits,
+// so low quotas fall back to the serial walk. The serial continuation skips the consumed primary.
+// A winner waits for the loser's exchange and crypto fence before returning.
 
-pub const DUPLICATE_BYTES: usize = crate::model::PAGE_BYTES as usize * 2 + 16;
+pub const DUPLICATE_BYTES: usize =
+    racer_core::read::duplicate_bytes(crate::model::PAGE_BYTES as usize);
 #[derive(Clone, Copy)]
 pub struct HedgeConfig {
     pub delay: Duration,
@@ -2221,13 +3045,7 @@ pub(crate) async fn race(
     .await
 }
 fn recoverable(error: Error) -> bool {
-    matches!(
-        error,
-        Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded | Error::CorruptRecord | Error::MissingKey | Error::Cancelled
-    // Malformed framing is local to that contender, not authority to
-    // cancel another independently authenticated usable page.
-    | Error::InvalidRequest | Error::HeaderTooLarge
-    )
+    racer_core::read::Error::try_from(error).is_ok_and(racer_core::read::recoverable)
 }
 
 #[cfg(test)]
@@ -2417,53 +3235,6 @@ pub(super) mod tests {
             Rc::new(CredentialCrypto::new(keys, admission)),
         )
     }
-    fn visit(
-        selection: ReplicaSelection,
-        len: usize,
-        neighbors: &[usize],
-        scores: [u64; 3],
-    ) -> Vec<usize> {
-        super::visit_order(selection, len, |r| neighbors.contains(&r), |r| scores[r])
-            .ranks()
-            .collect()
-    }
-
-    #[test]
-    fn visit_order_primary_is_canonical_regardless_of_neighbors_or_scores() {
-        for len in 0..=4 {
-            let expected: Vec<_> = (0..len.min(3)).collect();
-            assert_eq!(
-                visit(ReplicaSelection::Primary, len, &[2], [1, 2, 3]),
-                expected
-            );
-            assert_eq!(
-                visit(ReplicaSelection::Primary, len, &[], [9, 0, 5]),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn visit_order_spread_prefers_neighbors_then_highest_score() {
-        use ReplicaSelection::Spread;
-        // All neighbors: pure rendezvous order by descending score.
-        assert_eq!(visit(Spread, 3, &[0, 1, 2], [1, 3, 2]), vec![1, 2, 0]);
-        // Neighbors first even with lower scores; non-neighbors last.
-        assert_eq!(visit(Spread, 3, &[2], [9, 8, 1]), vec![2, 0, 1]);
-        assert_eq!(visit(Spread, 3, &[0, 2], [1, 9, 2]), vec![2, 0, 1]);
-        // No neighbors: rendezvous order over all owners.
-        assert_eq!(visit(Spread, 3, &[], [1, 3, 2]), vec![1, 2, 0]);
-        // Equal scores keep canonical order within a group.
-        assert_eq!(visit(Spread, 3, &[0, 1, 2], [5, 5, 5]), vec![0, 1, 2]);
-        // Two candidates and fewer.
-        assert_eq!(visit(Spread, 2, &[1], [9, 1, 0]), vec![1, 0]);
-        assert_eq!(visit(Spread, 2, &[0, 1], [1, 9, 0]), vec![1, 0]);
-        assert_eq!(visit(Spread, 1, &[], [0, 9, 9]), vec![0]);
-        assert!(visit(Spread, 0, &[0], [0, 0, 0]).is_empty());
-        // Never more than three ranks.
-        assert_eq!(visit(Spread, 5, &[0, 1, 2], [1, 2, 3]), vec![2, 1, 0]);
-    }
-
     fn spread_membership(count: usize) -> std::sync::Arc<crate::topology::Membership> {
         use crate::topology::Member;
         use crate::topology::Membership;
@@ -2540,6 +3311,73 @@ pub(super) mod tests {
             relayed_first_spread < relayed_first_primary,
             "spread {relayed_first_spread} must relay less than primary {relayed_first_primary}"
         );
+    }
+
+    /// A reader whose first choice arrived in the membership chain after a later owner visits that
+    /// older owner first, which may hold the copy it fetched while it ranked higher. Primary keeps
+    /// the canonical order; with no arrivals in the chain nothing changes.
+    #[test]
+    fn spread_visits_an_older_later_owner_before_a_newer_owner() {
+        use crate::topology::Membership;
+        let all = spread_membership(12);
+        let placement = Placement::new(64);
+        let mut moved = 0;
+        for page in 0..32 {
+            let ranked = placement.rank(all.clone(), &object(), PageNumber(page));
+            let newest = ranked.ordered[0].clone();
+            // `newest` arrives in version 2; the others were in version 1.
+            let before = Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                all.members()
+                    .iter()
+                    .filter(|m| m.node != newest)
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap();
+            let chain = std::sync::Arc::new(
+                Membership::validate_with_predecessor(
+                    racer_control_wire::MembershipVersion(2),
+                    all.members().to_vec(),
+                    Some(&before),
+                )
+                .unwrap(),
+            );
+            let candidates = placement.rank(chain.clone(), &object(), PageNumber(page));
+            assert_eq!(candidates.ordered, ranked.ordered);
+            for requester in all.members() {
+                if candidates.ordered.contains(&requester.node) {
+                    continue;
+                }
+                let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+                let plain = spread
+                    .visit_order(&ranked, &object(), PageNumber(page))
+                    .ranks()
+                    .collect::<Vec<_>>();
+                let lineage = spread
+                    .visit_order(&candidates, &object(), PageNumber(page))
+                    .ranks()
+                    .collect::<Vec<_>>();
+                if plain[0] == 0 {
+                    // The newer rank 0 goes after the first older owner.
+                    let mut expected = plain.clone();
+                    expected[..2].rotate_left(1);
+                    assert_eq!(lineage, expected, "page {page}");
+                    moved += 1;
+                } else {
+                    assert_eq!(lineage, plain, "page {page}");
+                }
+                let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+                assert_eq!(
+                    primary
+                        .visit_order(&candidates, &object(), PageNumber(page))
+                        .ranks()
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
+            }
+        }
+        assert!(moved > 0);
     }
 
     #[test]
@@ -2666,15 +3504,212 @@ pub(super) mod tests {
                 );
                 assert!(calls.iter().all(|(_, copy, ..)| !copy));
                 if selection == ReplicaSelection::Spread {
-                    // Rank 2 visited first: it must be able to probe two
-                    // predecessors and then reach origin, over failure routes.
+                    // Rank 2 visited first: it must be able to ask rank 0 to
+                    // acquire, probe rank 1, and then reach origin itself, over
+                    // failure routes (`owner_funding` less the exchange).
                     let (_, _, attempts, links) = &calls[0];
-                    assert_eq!(*attempts, 3);
+                    assert_eq!(*attempts, racer_core::read::walk::owner_funding(2) - 1);
                     assert_eq!(*links, 8);
                 } else {
                     // Primary first: shared route, shared credits.
                     assert_eq!(calls[0].3, 4);
                 }
+            }
+        });
+    }
+
+    /// Signs every reply as its destination, answering `Overloaded` (owners
+    /// shedding a hot page) or `Miss` (the helper); records each request.
+    struct ShedPeer {
+        nodes: Vec<NodeId>,
+        signing: Vec<crate::peer::forwarding::Forwarding>,
+        local: usize,
+        owners: Vec<NodeId>,
+        /// Owners fail at the transport (no signed reply) instead.
+        transport: bool,
+        #[allow(clippy::type_complexity)]
+        calls: RefCell<Vec<(NodeId, bool, u32, u8)>>,
+    }
+    impl ShedPeer {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
+            false
+        }
+        fn request_direct<'a>(
+            &'a self,
+            _: PeerRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            panic!("shed fixture does not admit direct hedges")
+        }
+        fn request<'a>(
+            &'a self,
+            request: PeerRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            Box::pin(async move {
+                let destination = request.route.destination.clone();
+                let copy = matches!(
+                    request.operation,
+                    PeerOperation::Page {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    }
+                );
+                self.calls.borrow_mut().push((
+                    destination.clone(),
+                    copy,
+                    request.route.remaining_attempts,
+                    request.route.remaining_links,
+                ));
+                let owner = self.owners.contains(&destination);
+                if owner && self.transport {
+                    return Err(Error::Overloaded);
+                }
+                let remote = self.nodes.iter().position(|n| n == &destination).unwrap();
+                let (signed, binding) = self.signing[self.local].sign_request(request)?;
+                let admitted = self.signing[remote].verify_request(signed)?;
+                let response = if owner {
+                    PeerResponse::Overloaded
+                } else {
+                    PeerResponse::Miss
+                };
+                let response = self.signing[remote].sign_response(admitted.binding(), response)?;
+                self.signing[self.local].verify_response(response, &binding)
+            })
+        }
+    }
+
+    /// A non-owner whose owner itself sheds it (a signed `Overloaded` from the destination) asks
+    /// the page's overflow helper once, with an Acquire funded from what is left (too little for
+    /// the helper to ask another helper), then the remaining owners. A transport `Overloaded` (no
+    /// signed answer, as from a congested route) does not.
+    #[test]
+    fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
+        use crate::test_support::security::{network, node};
+        futures::executor::block_on(async {
+            let count = 16;
+            let nodes: Vec<NodeId> = (0..count).map(node).collect();
+            let membership = std::sync::Arc::new(
+                crate::topology::Membership::validate(
+                    racer_control_wire::MembershipVersion(1),
+                    nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| crate::topology::Member {
+                            node: n.clone(),
+                            shares: std::num::NonZeroU32::new(4).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                            rails: vec![],
+                            site: String::new(),
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+            let placement = Placement::new(8);
+            let local = 0;
+            let probe = spread_policy(nodes[local].clone(), ReplicaSelection::Primary);
+            let (page, candidates, helper) = (0..256)
+                .map(PageNumber)
+                .find_map(|page| {
+                    let candidates = placement.rank(membership.clone(), &object(), page);
+                    if candidates.ordered.contains(&nodes[local]) {
+                        return None;
+                    }
+                    let helper = probe.fanout_helper(&candidates, &object(), page)?;
+                    Some((page, candidates, helper))
+                })
+                .expect("some page has a helper");
+            assert!(!candidates.ordered.contains(&helper) && helper != nodes[local]);
+            for transport in [false, true] {
+                let peers = Rc::new(ShedPeer {
+                    nodes: nodes.clone(),
+                    signing: network(count)
+                        .into_iter()
+                        .map(crate::peer::forwarding::Forwarding::new)
+                        .collect(),
+                    local,
+                    owners: candidates.ordered.clone(),
+                    transport,
+                    calls: RefCell::default(),
+                });
+                let policy = CandidatePolicy::new(
+                    nodes[local].clone(),
+                    Rc::new(Placement::new(8)),
+                    Requester::scripted(
+                        peers.clone(),
+                        ShedPeer::direct_hedge_available,
+                        ShedPeer::request,
+                        ShedPeer::request_direct,
+                    ),
+                    probe.credentials.clone(),
+                    probe.published.clone(),
+                );
+                let context = OriginContext {
+                    object: object(),
+                    metadata: None,
+                    authorization: None,
+                };
+                let scope = scope();
+                let mut budget = AcquisitionBudget::new(
+                    scope.deadline.0,
+                    racer_core::read::PAGE_ATTEMPTS,
+                    racer_core::read::PAGE_LINKS,
+                );
+                let operation = PeerOperation::Page {
+                    page: crate::model::PageId {
+                        version: crate::model::ObjectVersion {
+                            object: object(),
+                            etag: crate::model::StrongEtag::test_value("v1"),
+                        },
+                        number: page,
+                    },
+                    mode: FetchMode::Acquire,
+                };
+                let result = policy
+                    .resolve_with_budget(
+                        candidates.clone(),
+                        &context,
+                        operation,
+                        &scope,
+                        &mut budget,
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(Error::Unavailable)),
+                    "{:?}",
+                    result.err()
+                );
+                let calls = peers.calls.borrow();
+                let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
+                if transport {
+                    assert!(!visited.contains(&helper), "{visited:?}");
+                    continue;
+                }
+                assert_eq!(
+                    visited[..2],
+                    [candidates.ordered[0].clone(), helper.clone()]
+                );
+                assert_eq!(visited.iter().filter(|n| **n == helper).count(), 1);
+                assert!(visited[2..].iter().all(|n| candidates.ordered.contains(n)));
+                // The helper probe is an Acquire carrying fewer credits than a
+                // walk needs to ask a helper itself.
+                let (_, copy, attempts, links) = &calls[1];
+                assert!(!copy);
+                assert!(*attempts >= 1);
+                assert!(*attempts < racer_core::read::budget::HELPER_MIN_ATTEMPTS);
+                // It carries its whole funded envelope, not a normal four-link route, so the helper
+                // can still reach rank 0 through a relay.
+                assert!(
+                    *links > racer_core::read::budget::NORMAL_ROUTE_LINKS,
+                    "{links}"
+                );
             }
         });
     }
@@ -3393,6 +4428,7 @@ pub(super) mod tests {
             membership,
             node: ranked.ordered[1].clone(),
             object: object(),
+            owners: ranked.ordered.clone(),
             page: PageNumber(0),
             predecessor_evidence: vec![ProbeOutcome::Unreachable],
             rank: 1,

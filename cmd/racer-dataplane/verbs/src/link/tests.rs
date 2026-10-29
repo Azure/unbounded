@@ -142,7 +142,7 @@ fn poll<T>(op: &Op<T>) -> Option<Result<T>> {
 fn grant(side: &mut Side, length: u32, deadline: Instant, now: Instant) -> Op<Granted> {
     let (granted, done) = op();
     side.link
-        .grant(&side.pool, false, [7; 16], length, deadline, done, now);
+        .grant(&side.pool, None, [7; 16], length, deadline, done, now);
     granted
 }
 

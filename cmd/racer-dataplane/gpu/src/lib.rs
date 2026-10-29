@@ -36,6 +36,7 @@
 //! - Neither: [`Gpu::load`] returns [`Error::Unavailable`].
 //!
 //! Hardware-free tests: `cargo test -p racer-gpu --features simulation`.
+//! Tests on a real GPU: `make racer-gpu-test` (`tests/hardware.rs`).
 mod ffi;
 pub mod gcm;
 
@@ -89,6 +90,10 @@ pub enum Error {
 
     /// The call failed and a resource was leaked on purpose.
     Leaked,
+
+    /// cuFile does not support this file, its filesystem, or its device,
+    /// with this cuFile status. Files on other devices may still work.
+    Unsupported(i32),
 }
 
 impl std::fmt::Display for Error {
@@ -96,6 +101,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Driver(code) => write!(f, "GPU driver call failed with status {code}"),
+            Self::Unsupported(code) => {
+                write!(f, "cuFile does not support the file (status {code})")
+            }
             other => write!(f, "{other:?}"),
         }
     }
@@ -166,15 +174,7 @@ impl DeviceInfo {
 
     /// The UUID in `GPU-xxxxxxxx-xxxx-...` form, as `nvidia-smi` prints it.
     pub fn uuid_string(&self) -> String {
-        let hex: String = self.uuid.iter().map(|b| format!("{b:02x}")).collect();
-        format!(
-            "GPU-{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        )
+        uuid_string(&self.uuid)
     }
 
     /// From the C record.
@@ -218,6 +218,7 @@ impl Gpu {
         let shared = Rc::new(Shared {
             api,
             leaks: Cell::new(0),
+            file_flags: Cell::new(0),
         });
         shared.check(unsafe { (shared.api.init)() })?;
         Ok(Self { shared })
@@ -258,7 +259,7 @@ impl Gpu {
     /// Open the cuFile driver if needed and register an `O_DIRECT` file.
     pub fn open_file(&self, fd: OwnedFd) -> Result<GpuFile> {
         let shared = &self.shared;
-        shared.check(unsafe { (shared.api.file_open)() })?;
+        shared.check(unsafe { (shared.api.file_open)(shared.file_flags.get()) })?;
         let fd = cufile_descriptor(fd);
         let raw = create(shared, |out| unsafe {
             (shared.api.file)(fd.as_raw_fd(), out)
@@ -275,12 +276,27 @@ impl Gpu {
         self.shared.leaks.get()
     }
 
+    /// Ask cuFile to use PCI P2PDMA (`use_pci_p2pdma`) instead of
+    /// nvidia-fs. Takes effect only if set before the cuFile driver opens,
+    /// and applies to [`FileReader`]s made after this call. When on, a
+    /// cuFile that cannot set it fails to open.
+    pub fn set_pci_p2pdma(&self, enabled: bool) {
+        let flags = self.shared.file_flags.get() & !ffi::file_flag::PCI_P2PDMA;
+        let bit = if enabled {
+            ffi::file_flag::PCI_P2PDMA
+        } else {
+            0
+        };
+        self.shared.file_flags.set(flags | bit);
+    }
+
     /// A handle that runs [`FileRead`]s on any thread. It does not keep the
     /// backend loaded: drop every reader thread's work before this [`Gpu`]
     /// and the objects the reads name.
     pub fn file_reader(&self) -> FileReader {
         FileReader {
             file_open: self.shared.api.file_open,
+            file_flags: self.shared.file_flags.get(),
             file_read: self.shared.api.file_read,
             last_driver_error: self.shared.api.last_driver_error,
             #[cfg(any(test, feature = "simulation"))]
@@ -292,7 +308,9 @@ impl Gpu {
 /// Runs cuFile reads off the helper thread. Cheap to clone.
 #[derive(Clone)]
 pub struct FileReader {
-    file_open: unsafe extern "C" fn() -> c_int,
+    file_open: unsafe extern "C" fn(u32) -> c_int,
+
+    file_flags: u32,
 
     file_read: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> i64,
 
@@ -310,7 +328,10 @@ impl FileReader {
     pub fn open_driver(&self) -> Result<()> {
         #[cfg(any(test, feature = "simulation"))]
         let _environment = self.enter();
-        ffi::check(unsafe { (self.file_open)() }, self.last_driver_error)
+        ffi::check(
+            unsafe { (self.file_open)(self.file_flags) },
+            self.last_driver_error,
+        )
     }
 
     /// Run `read` and wait for it. Errors are those of [`GpuFile::read`].
@@ -551,7 +572,7 @@ impl StagingBuffer {
             return Ok(());
         }
         let shared = &self.0.context.0.shared;
-        shared.check(unsafe { (shared.api.file_open)() })?;
+        shared.check(unsafe { (shared.api.file_open)(shared.file_flags.get()) })?;
         shared.check(unsafe { (shared.api.staging_register)(self.0.raw.as_ptr()) })?;
         self.0.registered.set(true);
         Ok(())
@@ -641,6 +662,19 @@ pub enum Verdict {
 
     /// Verification did not run (a launch failed). Nothing was written.
     NotRun,
+}
+
+/// A GPU UUID in `GPU-xxxxxxxx-xxxx-...` form, as `nvidia-smi` prints it.
+pub fn uuid_string(uuid: &[u8; 16]) -> String {
+    let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 /// A CUDA stream. Work is visible only after [`Stream::synchronize`].

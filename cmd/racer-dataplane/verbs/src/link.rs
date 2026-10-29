@@ -421,9 +421,10 @@ pub(crate) struct Link {
 
     free_windows: Vec<usize>,
 
-    /// Free windows tied to the device pool. A window stays tied to the
-    /// first region it binds, so device grants never reuse host windows.
-    free_device_windows: Vec<usize>,
+    /// Free windows tied to each device pool, by pool id. A window stays
+    /// tied to the first region it binds, so device grants never reuse host
+    /// windows or another device pool's windows.
+    free_device_windows: BTreeMap<u32, Vec<usize>>,
 
     free_slots: Vec<u32>,
 
@@ -503,7 +504,7 @@ impl Link {
             free_windows: (0..windows.len()).rev().collect(),
             windows,
             device: device.clone(),
-            free_device_windows: Vec::new(),
+            free_device_windows: BTreeMap::new(),
             control,
             epoch,
             role,
@@ -617,14 +618,14 @@ impl Link {
 
     /// Bind a window over a free buffer and queue a `Grant`. `done` gets the
     /// tag and arrival op once the `Grant` is posted. With `device`, the
-    /// buffer comes from the device pool and the arrival is
+    /// buffer comes from that device pool and the arrival is
     /// [`Arrival::Device`]: fails with [`Error::Unavailable`] if the rail has
-    /// no device pool and [`Error::Overloaded`] if none is free.
+    /// no such device pool and [`Error::Overloaded`] if none is free.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn grant(
         &mut self,
         pool: &Pool,
-        device: bool,
+        device: Option<u32>,
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
@@ -646,17 +647,18 @@ impl Link {
             return;
         }
 
-        if device && pool.device_shared().is_none() {
+        if device.is_some_and(|id| pool.device_shared(id).is_none()) {
             let _ = done.complete(Err(Error::Unavailable));
             return;
         }
 
-        let window = if device {
-            match self.free_device_windows.pop() {
+        let window = if let Some(id) = device {
+            match self.free_device_windows.get_mut(&id).and_then(Vec::pop) {
                 Some(window) => window,
                 None => match MemoryWindow::new(&self.device) {
-                    // At most one device window per concurrent grant, so
-                    // device windows never exceed the grant cap.
+                    // At most one device window per concurrent grant per
+                    // device pool, so each pool's windows never exceed the
+                    // grant cap.
                     Ok(window) => {
                         self.windows.push(window);
                         self.windows.len() - 1
@@ -671,8 +673,8 @@ impl Link {
             self.free_windows.pop().expect("a window per grant")
         };
 
-        let taken = if device {
-            pool.take_device(BufferState::Binding)
+        let taken = if let Some(id) = device {
+            pool.take_device(id, BufferState::Binding)
         } else {
             pool.take(BufferState::Binding)
         };
@@ -702,9 +704,9 @@ impl Link {
     }
 
     /// Return `window` to its free list.
-    fn free_window(&mut self, device: bool, window: usize) {
-        if device {
-            self.free_device_windows.push(window);
+    fn free_window(&mut self, device: Option<u32>, window: usize) {
+        if let Some(id) = device {
+            self.free_device_windows.entry(id).or_default().push(window);
         } else {
             self.free_windows.push(window);
         }
@@ -938,7 +940,7 @@ impl Link {
             InFlight::Invalidate(tag) => {
                 let mut entry = self.grants.remove(&tag).ok_or(Break::Error)?;
                 let buffer = entry.buffer.take().ok_or(Break::Error)?;
-                self.free_window(buffer.is_device(), entry.window);
+                self.free_window(buffer.device(), entry.window);
                 let GrantState::Invalidating(outcome) = entry.state else {
                     return Err(Break::Error);
                 };

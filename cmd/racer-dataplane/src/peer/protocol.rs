@@ -52,6 +52,19 @@ use uring_runtime::environment::Deadline;
 pub enum FetchMode {
     CopyOnly,
     Acquire,
+    /// A copy offer (`racer_core::read::hints`): the
+    /// requester holds the page and tells its rank 0. Page requests only, with
+    /// no origin credentials and no remote attempts; the receiver never sends a
+    /// body or acquires, and answers `Miss`. Receivers that predate it reject
+    /// the request, which the sender treats as not delivered.
+    Offer,
+    /// A silence ping (`racer_core::liveness`):
+    /// the requester asks whether the receiver answers at all. Page requests
+    /// only, like [`Self::Offer`]; the receiver answers `Miss` at once
+    /// without looking at its cache or flights, so the answer never waits
+    /// on work. Receivers that predate it reject the request, which still
+    /// signs an answer and proves them alive.
+    Ping,
 }
 
 /// Retained HTTP provenance and exclusively socket-owned ordered sessions.
@@ -307,40 +320,10 @@ pub struct PeerRequest {
     pub route: RouteBudget,
 }
 /// Unsigned local result. Transport must sign it against the admitted request.
-pub enum PeerResponse {
-    Selected {
-        metadata: ObjectMetadata,
-        ciphertext: CiphertextPage,
-        grant: super::subscriptions::TransferGrant,
-    },
-    Bootstrap {
-        metadata: ObjectMetadata,
-        page_zero: Option<CiphertextPage>,
-    },
-    Page {
-        metadata: ObjectMetadata,
-        ciphertext: CiphertextPage,
-    },
-    Metadata(ObjectMetadata),
-    Miss,
-    /// Authoritative origin absence, only for fresh metadata Acquire.
-    NotFound,
-    VersionUnavailable,
-    Unavailable,
-    Overloaded,
-    OriginRejected,
-    OriginForbidden,
-    /// Authenticated peer no longer retains the requested routing epoch.
-    StaleMembership,
-    /// Warm holds accepted until this wall-clock time (millisecond precision).
-    Held {
-        until: SystemTime,
-    },
-    /// The requested warm page is published on the owner's disk under its hold.
-    Warmed,
-    /// The warm lease is gone. Unused capacity is freed after the last lease.
-    Released,
-}
+/// The payload-generic shape and its `kind` live in racer-core.
+pub type PeerResponse =
+    racer_core::read::PeerResponse<CiphertextPage, super::subscriptions::TransferGrant>;
+
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.
 /// Verification must check that the operation and effective route agree with the
@@ -572,7 +555,14 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     if op_object != &request.origin.object {
         return Err(Error::InvalidRequest);
     }
-    if matches!(mode, FetchMode::CopyOnly) && request.route.remaining_attempts != 0 {
+    if !matches!(mode, FetchMode::Acquire) && request.route.remaining_attempts != 0 {
+        return Err(Error::InvalidRequest);
+    }
+    if matches!(mode, FetchMode::Offer | FetchMode::Ping)
+        && (!matches!(request.operation, Operation::Page { .. })
+            || request.origin.authorization.is_some()
+            || request.origin.metadata.is_some())
+    {
         return Err(Error::InvalidRequest);
     }
     push(
@@ -581,6 +571,8 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         match mode {
             FetchMode::CopyOnly => "copy",
             FetchMode::Acquire => "acquire",
+            FetchMode::Offer => "offer",
+            FetchMode::Ping => "ping",
         },
     );
     push_binary(&mut head, "racer-request", &request.origin.request.0);
@@ -997,10 +989,10 @@ fn version(head: &MessageHead) -> Result<ObjectVersion> {
         etag: etag(head)?,
     })
 }
-pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand> {
-    use super::subscriptions::Demand;
-    use super::subscriptions::MAX_DEMAND_INTERVALS;
-    use super::subscriptions::PageInterval;
+pub(crate) fn demand(head: &MessageHead) -> Result<racer_core::subscriptions::Demand> {
+    use flow_control::subscriptions::Interval;
+    use racer_core::subscriptions::Demand;
+    use racer_core::subscriptions::MAX_DEMAND_INTERVALS;
     let encoded = bytes(head, "racer-demand")?;
     if encoded.len() % 16 != 0 || encoded.len() / 16 > MAX_DEMAND_INTERVALS {
         return Err(Error::InvalidRequest);
@@ -1008,12 +1000,13 @@ pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand>
     Demand::new(
         encoded
             .chunks_exact(16)
-            .map(|chunk| PageInterval {
+            .map(|chunk| Interval {
                 start: u64::from_be_bytes(chunk[..8].try_into().unwrap()),
                 end: u64::from_be_bytes(chunk[8..].try_into().unwrap()),
             })
             .collect(),
     )
+    .ok_or(Error::InvalidRequest)
 }
 pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::TransferGrant> {
     Ok(super::subscriptions::TransferGrant {
@@ -1161,7 +1154,7 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
     let visited = decode_nodes(field(head, "racer-route-visited")?.as_bytes())?;
-    if remaining_links as usize + visited.len() > 9 {
+    if !racer_core::route::within_wire(visited.len(), u64::from(remaining_links)) {
         return Err(Error::HopBudgetExhausted);
     }
     Ok(RouteBudget {
@@ -1198,6 +1191,8 @@ impl SecurityCodec {
         let mode = match field(head, "racer-mode")?.as_str() {
             "copy" => FetchMode::CopyOnly,
             "acquire" => FetchMode::Acquire,
+            "offer" => FetchMode::Offer,
+            "ping" => FetchMode::Ping,
             _ => return Err(Error::InvalidRequest),
         };
         let object = object(head)?;

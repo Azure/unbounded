@@ -94,6 +94,11 @@ pub fn seat_lease(seat: usize) -> String {
 /// Primary Lease annotation: JSON array of the Node of each seat, `""` when vacant.
 pub const SEAT_NODES: &str = "racer.unbounded-cloud.io/seat-nodes";
 
+/// Primary Lease annotation: the committed state sequence. Changing it
+/// rewrites the Lease, so every seat follower, which watches the Lease,
+/// reads the new record at once instead of at its next poll.
+pub const SEQUENCE: &str = "racer.unbounded-cloud.io/sequence";
+
 /// Primary Lease annotation: seconds over which Pods spread vacant seat claims.
 pub const CLAIM_WINDOW: &str = "racer.unbounded-cloud.io/claim-window";
 

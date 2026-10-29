@@ -37,6 +37,7 @@ use http1::StartLine;
 use racer_control_wire::CacheId;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -246,7 +247,12 @@ pub struct Responses {
 
     delivery: Rc<Delivery>,
 
-    gpu: Option<Rc<dyn GpuService>>,
+    /// The `gpu-read` backend once known. Filled from `lazy_gpu` when the
+    /// first `gpu-read` on this worker starts (or finds) the GPU helper.
+    gpu: std::cell::RefCell<Option<Rc<dyn GpuService>>>,
+
+    /// The process GPU slot while it waits for its first `gpu-read`.
+    lazy_gpu: Option<Arc<crate::gpu_slot::GpuSlot>>,
 }
 
 /// Duplex subscription framing. Delivered leases stay pinned until exact release.
@@ -845,14 +851,60 @@ impl Responses {
             io,
             delivery,
             observer: Observer::default(),
-            gpu: None,
+            gpu: Default::default(),
+            lazy_gpu: None,
         }
     }
 
     /// Serve `gpu-read` with this backend. Without one, `gpu-read` is 501.
     pub fn with_gpu(mut self, gpu: Rc<dyn GpuService>) -> Self {
-        self.gpu = Some(gpu);
+        self.gpu = std::cell::RefCell::new(Some(gpu));
         self
+    }
+
+    /// Serve `gpu-read` with the helper in `slot`, starting it on the first
+    /// `gpu-read` (see [`Self::prepare_gpu`]).
+    pub fn with_lazy_gpu(mut self, slot: Arc<crate::gpu_slot::GpuSlot>) -> Self {
+        self.lazy_gpu = Some(slot);
+        self
+    }
+
+    /// Before opening a `gpu-read` sink: start the GPU helper if this is the
+    /// process's first `gpu-read`, or pick up one another worker started.
+    /// Awaits without blocking the worker. Other requests never call this,
+    /// so nothing else touches a GPU.
+    ///
+    /// The wait honors `scope`: an expired or cancelled request stops waiting
+    /// and releases its connection, while the shared start keeps running for
+    /// later requests.
+    pub(crate) async fn prepare_gpu(&self, scope: &RequestScope) -> Result<()> {
+        if self.gpu.borrow().is_some() {
+            return Ok(());
+        }
+        let Some(slot) = &self.lazy_gpu else {
+            return Ok(());
+        };
+        let cancellation = scope.cancellation.subscribe()?;
+        let mut start = std::pin::pin!(slot.get_or_start());
+        let started = std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            start.as_mut().poll(cx).map(Ok::<_, Error>)
+        })
+        .await?;
+        let Some(helper) = started else {
+            return Ok(());
+        };
+        let mut gpu = self.gpu.borrow_mut();
+        if gpu.is_none() {
+            *gpu = Some(Rc::new(crate::gpu::GpuClient::new(helper)));
+        }
+        Ok(())
+    }
+
+    /// Whether this worker serves `gpu-read`.
+    pub(crate) fn has_gpu(&self) -> bool {
+        self.gpu.borrow().is_some()
     }
 
     /// Check the descriptors that came with a request and open its sink.
@@ -861,7 +913,8 @@ impl Responses {
         kind: &ReadKind,
         received: http1::connection::ReceivedDescriptors,
     ) -> Result<Option<Box<dyn DirectSink>>> {
-        direct::open_sink(kind, received, &self.delivery, self.gpu.as_ref())
+        let gpu = self.gpu.borrow().clone();
+        direct::open_sink(kind, received, &self.delivery, gpu.as_ref())
     }
 
     /// Route detailed delivery failures to the worker's observer.

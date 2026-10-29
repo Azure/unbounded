@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRacerEnabledEnvironment(t *testing.T) {
@@ -136,6 +137,59 @@ func TestRacerTuning(t *testing.T) {
 				t.Fatalf("zero must select defaults: %v", err)
 			}
 		})
+	}
+}
+
+func TestRacerRetryBudget(t *testing.T) {
+	c := NewDefault()
+	c.RacerEnabled = true
+	c.UpstreamRegistries = []UpstreamRegistry{{Name: "registry.example", Endpoint: "https://registry.example"}}
+
+	if c.RacerRetryBudget != 30*time.Second {
+		t.Fatalf("default = %v", c.RacerRetryBudget)
+	}
+
+	if err := c.LoadYAML(strings.NewReader("racer_retry_budget: 5s")); err != nil || c.RacerRetryBudget != 5*time.Second {
+		t.Fatalf("YAML = %v, err = %v", c.RacerRetryBudget, err)
+	}
+
+	env := func(value string) func(string) string {
+		return func(key string) string {
+			if key == "GANTRY_RACER_RETRY_BUDGET" {
+				return value
+			}
+
+			return ""
+		}
+	}
+
+	if err := c.LoadEnv(env("6s")); err != nil || c.RacerRetryBudget != 6*time.Second {
+		t.Fatalf("env = %v, err = %v", c.RacerRetryBudget, err)
+	}
+
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	c.BindFlags(flags)
+
+	if err := flags.Parse([]string{"--racer-retry-budget=7s"}); err != nil || c.RacerRetryBudget != 7*time.Second {
+		t.Fatalf("flag = %v, err = %v", c.RacerRetryBudget, err)
+	}
+
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.LoadEnv(env("invalid")); err == nil || !strings.Contains(err.Error(), "GANTRY_RACER_RETRY_BUDGET") {
+		t.Fatalf("parse error = %v", err)
+	}
+
+	c.RacerRetryBudget = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("zero must disable retries: %v", err)
+	}
+
+	c.RacerRetryBudget = -time.Second
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "racer_retry_budget") {
+		t.Fatalf("negative validation = %v", err)
 	}
 }
 

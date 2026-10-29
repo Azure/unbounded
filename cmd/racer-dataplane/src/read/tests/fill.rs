@@ -3017,6 +3017,8 @@ pub(super) struct TestOrigin {
     pub(super) calls: Cell<usize>,
     pub(super) metadata: ObjectMetadata,
     pub(super) reject_once: Cell<bool>,
+    /// Fail the next page fetch with a retryable `Unavailable`.
+    pub(super) fail_once: Cell<bool>,
     pub(super) version_unavailable: Cell<bool>,
     pub(super) blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
     pub(super) started_pages: RefCell<Vec<u64>>,
@@ -3075,6 +3077,9 @@ impl Origin for TestOrigin {
             .await;
             if self.reject_once.replace(false) {
                 return Err(Error::OriginForbidden);
+            }
+            if self.fail_once.replace(false) {
+                return Err(Error::Unavailable);
             }
             if self.version_unavailable.get() {
                 return Err(Error::VersionUnavailable);
@@ -3387,6 +3392,7 @@ fn fixture_with_caches(
         calls: Cell::new(0),
         metadata,
         reject_once: Cell::new(false),
+        fail_once: Cell::new(false),
         version_unavailable: Cell::new(false),
         blocked_pages: RefCell::new(Default::default()),
         started_pages: RefCell::new(Vec::new()),
@@ -5051,6 +5057,52 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     let _ = drive_io(replacement, &f.reactor, &mut f.engine, &f.crypto);
 }
 
+/// When the leader's caller is canceled while its fill
+/// driver runs, the driver keeps running for the other acquisition caller
+/// instead of canceling; that caller completes from the same operation.
+#[test]
+fn canceled_leader_fill_driver_continues_for_remaining_caller() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = cold_disk_fixture();
+    let other = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let mut a_budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let mut b_budget = AcquisitionBudget::new(other.deadline.0, 4, 8);
+    let mut a = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut a_budget,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(a.as_mut().poll(&mut cx).is_pending());
+    let mut b = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &other,
+        &mut b_budget,
+    );
+    assert!(b.as_mut().poll(&mut cx).is_pending());
+    f.scope.cancel().unwrap();
+    assert!(matches!(
+        a.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    ));
+    drop(a);
+    uring_runtime::drivers::poll(&mut cx, 64);
+    let flights = &f.fill.dependencies.flights;
+    let entry = flights
+        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
+        .entries[0]
+        .unwrap();
+    assert_eq!(entry.cancel_request_seen_age_us, None, "driver handed over");
+    assert_eq!(entry.operations, 1);
+    assert!(drive_io(b, &f.reactor, &mut f.engine, &f.crypto).is_ok());
+    assert_eq!(b_budget.remaining_attempts(), 4, "adopter spent nothing");
+}
+
 #[test]
 fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -5425,6 +5477,58 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
     ));
     assert_eq!(budget.remaining_attempts(), 4);
     assert_eq!(f.origin.calls.get(), 0);
+}
+
+/// A copy-only request that must not wait on this node's
+/// running acquisition (`join` false, an earlier owner asking) is a miss at
+/// once, with no origin side effect, while one that may join waits for the
+/// running acquisition and gets its copy.
+#[test]
+fn copy_only_without_join_misses_a_running_acquisition_and_with_join_waits() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let mut running = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(running.as_mut().poll(&mut cx).is_pending());
+    assert!(f.fill.dependencies.flights.acquiring(&f.page));
+    let mut declined = f.fill.copy_only_joining(&f.page, &f.scope, false);
+    assert!(matches!(
+        declined.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(None))
+    ));
+    let mut joined = f.fill.copy_only_joining(&f.page, &f.scope, true);
+    assert!(joined.as_mut().poll(&mut cx).is_pending());
+    let (result, copy) = drive(
+        futures::future::join(running, joined),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
+    assert!(copy.unwrap().is_some());
+    assert_eq!(f.origin.calls.get(), 1);
+    // Without a running acquisition `join` changes nothing: a local copy
+    // is served either way.
+    for join in [false, true] {
+        assert!(
+            drive(
+                f.fill.copy_only_joining(&f.page, &f.scope, join),
+                &mut f.engine,
+                &f.crypto
+            )
+            .unwrap()
+            .is_some(),
+            "join {join}"
+        );
+    }
+    assert_eq!(f.origin.calls.get(), 1);
 }
 
 #[test]

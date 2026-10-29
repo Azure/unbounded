@@ -94,21 +94,14 @@ pub(crate) fn inherited_budget(
     scope: &RequestScope,
 ) -> Result<AcquisitionBudget> {
     scope.check()?;
-    if route.remaining_links > 8 || route.remaining_links == 0 || route.visited.is_empty() {
-        return Err(Error::HopBudgetExhausted);
-    }
-    let mut budget = AcquisitionBudget::new(
-        scope.deadline.0.min(route.deadline.0),
+    racer_core::read::budget::inherited_budget(
+        scope.deadline.0,
+        route.deadline.0,
         route.remaining_attempts,
-        route
-            .remaining_links
-            .checked_sub(1)
-            .ok_or(Error::HopBudgetExhausted)?,
-    );
-    if route.remaining_links > 4 {
-        budget.note_route_failure();
-    }
-    Ok(budget)
+        route.remaining_links,
+        route.visited.len(),
+    )
+    .map_err(Error::from)
 }
 
 impl Coordinator {
@@ -135,6 +128,210 @@ impl Coordinator {
             streams,
             credentials,
             availability,
+        }
+    }
+
+    /// The page's ranked owners under `membership`, or `None` when ranking
+    /// fails (successor hints are best effort).
+    async fn page_owners(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+    ) -> Option<Vec<racer_control_wire::NodeId>> {
+        let mut owners = self
+            .fill
+            .dependencies
+            .candidates
+            .candidates_scoped(membership, &page.version.object, page.number, scope)
+            .await
+            .ok()?
+            .ordered;
+        owners.truncate(3);
+        Some(owners)
+    }
+
+    /// This node answered `requester`'s page probe without a copy: remember
+    /// that `requester` is likely to fetch the page itself. A copy-only miss
+    /// is noted without ranking (deferral checks ownership); a failed
+    /// acquisition is noted when the ranking this node's own walk cached
+    /// shows both as owners. Neither path ranks a page.
+    fn note_successor(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: &crate::topology::Membership,
+        copy_only: bool,
+    ) {
+        let candidates = &self.fill.dependencies.candidates;
+        let local = &candidates.node;
+        let owners = || {
+            candidates.owns_cached(membership, page, local)
+                && candidates.owns_cached(membership, page, requester)
+        };
+        if local == requester || !(copy_only || owners()) {
+            return;
+        }
+        self.fill
+            .dependencies
+            .candidates
+            .successors
+            .borrow_mut()
+            .note(
+                page.clone(),
+                requester.clone(),
+                uring_runtime::environment::now(),
+            );
+        self.fill
+            .metrics
+            .record(crate::telemetry::Event::SuccessorHint, 1);
+    }
+
+    /// Whether to answer a non-owner's page `Acquire` with `Miss` because
+    /// another owner fetched the page after this node answered it without a
+    /// copy. Free when no hint names the page.
+    async fn defer_to_successor(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> bool {
+        use racer_core::read::hints::{MAX_DEFERRALS, defer_allowed, successor_deferral};
+        if !defer_allowed(self.fill.dependencies.flights.acquiring(page)) {
+            return false;
+        }
+        let hints = self
+            .fill
+            .dependencies
+            .candidates
+            .successors
+            .borrow()
+            .peek_for(page, requester, uring_runtime::environment::now());
+        if hints.is_empty() {
+            return false;
+        }
+        let Some(owners) = self.page_owners(membership, page, scope).await else {
+            return false;
+        };
+        let local = &self.fill.dependencies.candidates.node;
+        let Some(to) = successor_deferral(hints, local, requester, &owners) else {
+            return false;
+        };
+        self.fill
+            .dependencies
+            .candidates
+            .successors
+            .borrow_mut()
+            .charge(
+                page,
+                requester.clone(),
+                &to,
+                MAX_DEFERRALS,
+                uring_runtime::environment::now(),
+            );
+        self.fill
+            .metrics
+            .record(crate::telemetry::Event::SuccessorDeferral, 1);
+        true
+    }
+
+    /// Whether a copy-only page request from `requester` may wait on this
+    /// node's running acquisition of the page
+    /// (`racer_core::read::copy_join_allowed`). Ranks
+    /// the page only while an acquisition runs.
+    async fn copy_join_allowed(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> bool {
+        if !self.fill.dependencies.flights.acquiring(page) {
+            return true;
+        }
+        let Some(owners) = self.page_owners(membership, page, scope).await else {
+            return true;
+        };
+        let local = &self.fill.dependencies.candidates.node;
+        let allowed = racer_core::read::copy_join_allowed(&owners, local, requester);
+        if !allowed {
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::CopyJoinDeclined, 1);
+        }
+        allowed
+    }
+
+    /// Send this node's due copy offers; call once per
+    /// worker service turn.
+    pub(crate) fn poll_offers(&self, now: std::time::Instant) {
+        let fill = &self.fill;
+        fill.dependencies
+            .candidates
+            .poll_offers(now, |page| fill.holds(page), &fill.metrics);
+        // Silence pings share the turn.
+        fill.dependencies.candidates.poll_pings(now, &fill.metrics);
+    }
+
+    /// Answer a copy offer: `requester` fetched `page` from
+    /// origin as an owner ranked after this node. Note it as a successor
+    /// hint for this node's own next acquisition (it defers no readers,
+    /// `SuccessorHints::note_offer`), unless this node holds the page or is
+    /// fetching it. Never opens credentials, acquires, or sends a
+    /// body.
+    fn serve_offer(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+    ) -> Result<PeerResponse> {
+        let holds = self.fill.holds(page);
+        let acquiring = self.fill.dependencies.flights.acquiring(page);
+        if &self.fill.dependencies.candidates.node != requester
+            && self
+                .fill
+                .dependencies
+                .candidates
+                .successors
+                .borrow_mut()
+                .note_offer(
+                    page.clone(),
+                    requester.clone(),
+                    holds,
+                    acquiring,
+                    uring_runtime::environment::now(),
+                )
+        {
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::SuccessorHint, 1);
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::OrphanOfferNoted, 1);
+        }
+        Ok(PeerResponse::Miss)
+    }
+
+    /// Serve a page copy-only: a local copy or `Miss`, never acquisition.
+    /// `join` lets it wait on a running acquisition of the page.
+    async fn serve_page_copy(
+        &self,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+        join: bool,
+    ) -> Result<PeerResponse> {
+        match self.fill.copy_only_joining(page, scope, join).await? {
+            Some((metadata, ciphertext)) => {
+                metadata.immutable().validate_page(ciphertext.envelope())?;
+                if &ciphertext.envelope().page != page {
+                    return Err(Error::CorruptRecord);
+                }
+                Ok(PeerResponse::Page {
+                    metadata,
+                    ciphertext,
+                })
+            }
+            None => Ok(PeerResponse::Miss),
         }
     }
 
@@ -297,30 +494,106 @@ impl LocalPageService for Coordinator {
             {
                 return Err(Error::Unauthorized);
             }
-            let object = match &request.operation {
-                PeerOperation::Subscribe { .. } => return Err(Error::InvalidRequest),
-                PeerOperation::Bootstrap { object, .. } => object,
-                PeerOperation::Page { page, .. } => &page.version.object,
-                PeerOperation::Metadata { object, .. } => object,
-                PeerOperation::Warm { version, .. } => &version.object,
-            };
-            if object != &request.origin.object {
-                return Err(Error::InvalidRequest);
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Offer,
+            } = &request.operation
+            {
+                if page.version.object != request.origin.object {
+                    return Err(Error::InvalidRequest);
+                }
+                return self.serve_offer(page, &requester);
             }
-            if !self
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Ping,
+            } = &request.operation
+            {
+                // A silence ping: answered at once,
+                // never waiting on the cache or a flight.
+                if page.version.object != request.origin.object {
+                    return Err(Error::InvalidRequest);
+                }
+                self.fill
+                    .metrics
+                    .record(crate::telemetry::Event::SilencePingAnswered, 1);
+                return Ok(PeerResponse::Miss);
+            }
+            let object = match &request.operation {
+                PeerOperation::Subscribe { .. } => None,
+                PeerOperation::Bootstrap { object, .. } => Some(object),
+                PeerOperation::Page { page, .. } => Some(&page.version.object),
+                PeerOperation::Metadata { object, .. } => Some(object),
+                PeerOperation::Warm { version, .. } => Some(&version.object),
+            };
+            let object_matches = object.is_some_and(|object| object == &request.origin.object);
+            use racer_core::read::{ServeAction, ServeFacts, serve_action};
+            let facts = |cache_available| ServeFacts {
+                operation: candidates::operation_kind(&request.operation),
+                copy_only: matches!(
+                    request.operation,
+                    PeerOperation::Bootstrap {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    } | PeerOperation::Page {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    } | PeerOperation::Metadata {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    } | PeerOperation::Subscribe {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    }
+                ),
+                object_matches,
+                cache_available,
+            };
+            // racer-core dispatches. Malformed requests are rejected before
+            // consulting cache availability.
+            if let ServeAction::Reject(error) = serve_action(facts(true)) {
+                return Err(error.into());
+            }
+            let object = object.ok_or(Error::InvalidRequest)?;
+            let cache_available = self
                 .snapshots
                 .current()?
                 .ok_or(Error::Unavailable)?
                 .caches
                 .iter()
                 .any(|c| c.id == object.cache)
-                || !self.availability.metadata(&object.cache)
-            {
+                && self.availability.metadata(&object.cache);
+            let action = serve_action(facts(cache_available));
+            if action == ServeAction::Miss {
                 return Ok(PeerResponse::Miss);
             }
             let mut effective = scope.clone();
-            effective.deadline.0 = effective.deadline.0.min(request.route.deadline.0);
+            effective.deadline.0 =
+                racer_core::read::serve_deadline(effective.deadline.0, request.route.deadline.0);
             effective.check()?;
+            // A non-owner's Acquire for a page another owner fetched after
+            // this node answered it without a copy is served copy-only: the
+            // reader asks that owner next instead of this node fetching the
+            // page again.
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Acquire,
+            } = &request.operation
+                && self
+                    .defer_to_successor(page, &requester, membership.clone(), &effective)
+                    .await
+            {
+                return self.serve_page_copy(page, &effective, true).await;
+            }
+            // Answers to a page probe without a copy are noted below.
+            let noted = match &request.operation {
+                PeerOperation::Page { page, mode } => {
+                    Some((page.clone(), matches!(mode, FetchMode::CopyOnly)))
+                }
+                _ => None,
+            };
+            let noted_membership = membership.clone();
+            let noted_requester = requester.clone();
             // Copy-only never opens credentials and never invokes acquisition.
             // The ingress lease is still retained while serving those bytes.
             let result = match request.operation {
@@ -338,23 +611,12 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Page {
                     page,
                     mode: FetchMode::CopyOnly,
-                } => self
-                    .fill
-                    .copy_only(&page, &effective)
-                    .await
-                    .and_then(|copy| match copy {
-                        Some((metadata, ciphertext)) => {
-                            metadata.immutable().validate_page(ciphertext.envelope())?;
-                            if ciphertext.envelope().page != page {
-                                return Err(Error::CorruptRecord);
-                            }
-                            Ok(PeerResponse::Page {
-                                metadata,
-                                ciphertext,
-                            })
-                        }
-                        None => Ok(PeerResponse::Miss),
-                    }),
+                } => {
+                    let join = self
+                        .copy_join_allowed(&page, &requester, membership.clone(), &effective)
+                        .await;
+                    self.serve_page_copy(&page, &effective, join).await
+                }
                 PeerOperation::Metadata {
                     object,
                     selector,
@@ -377,6 +639,7 @@ impl LocalPageService for Coordinator {
                         })
                 }
                 operation => {
+                    debug_assert_eq!(action, ServeAction::Acquire);
                     let mut budget = inherited_budget(&request.route, &effective)?;
                     let context = self.open_context(request.origin)?;
                     match operation {
@@ -453,6 +716,16 @@ impl LocalPageService for Coordinator {
                     }
                 }
             };
+            if let Some((page, copy_only)) = noted {
+                let missed = match &result {
+                    Ok(PeerResponse::Miss) => copy_only,
+                    Err(_) => !copy_only,
+                    Ok(_) => false,
+                };
+                if missed {
+                    self.note_successor(&page, &noted_requester, &noted_membership, copy_only);
+                }
+            }
             match result {
                 Ok(response) => Ok(response),
                 Err(error) => {
@@ -511,17 +784,19 @@ fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
 
 /// Translate expected acquisition failures without masking internal peer errors.
 fn peer_error(error: Error) -> Result<PeerResponse> {
-    match error {
-        Error::NotFound => Ok(PeerResponse::NotFound),
-        Error::VersionUnavailable => Ok(PeerResponse::VersionUnavailable),
-        Error::Overloaded => Ok(PeerResponse::Overloaded),
-        Error::OriginRejected => Ok(PeerResponse::OriginRejected),
-        Error::OriginForbidden => Ok(PeerResponse::OriginForbidden),
-        Error::Unavailable | Error::HopBudgetExhausted | Error::DeadlineExceeded => {
-            Ok(PeerResponse::Unavailable)
-        }
-        error => Err(error),
-    }
+    use racer_core::read::ResponseKind;
+    let kind = racer_core::read::Error::try_from(error)
+        .ok()
+        .and_then(racer_core::read::peer_error);
+    Ok(match kind {
+        Some(ResponseKind::NotFound) => PeerResponse::NotFound,
+        Some(ResponseKind::VersionUnavailable) => PeerResponse::VersionUnavailable,
+        Some(ResponseKind::Overloaded) => PeerResponse::Overloaded,
+        Some(ResponseKind::OriginRejected) => PeerResponse::OriginRejected,
+        Some(ResponseKind::OriginForbidden) => PeerResponse::OriginForbidden,
+        Some(ResponseKind::Unavailable) => PeerResponse::Unavailable,
+        _ => return Err(error),
+    })
 }
 
 #[cfg(test)]

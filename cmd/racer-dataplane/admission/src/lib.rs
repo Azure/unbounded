@@ -1,6 +1,6 @@
 //! Mutating admission logic for Racer pods. [`ENABLED_LABEL`] injects the
 //! racer-object sidecar as a native sidecar (a restartable init container).
-//! [`CLIENT_SOCKET_LABEL`] mounts the Racer client socket into app containers.
+//! [`CLIENT_SOCKET_LABEL`] mounts the Racer client socket into init and app containers.
 //! The two opt-ins are independent and both apply when a pod sets both labels.
 //!
 //! It reads an `admission.k8s.io/v1` `AdmissionReview` and returns the
@@ -50,8 +50,8 @@ pub const INJECTED_ANNOTATION: &str = "racer.unbounded-cloud.io/object-sidecar-i
 pub const CLIENT_SOCKET_LABEL: &str = "racer.unbounded-cloud.io/client-socket";
 /// Names the ClusterCache whose client socket is mounted.
 pub const CLIENT_CACHE_ANNOTATION: &str = "racer.unbounded-cloud.io/client-cache";
-/// Optionally lists, comma-separated, the app containers that get the mount.
-/// The default is every app container.
+/// Optionally lists, comma-separated, the init and app containers that get the
+/// mount. The default is every init and app container except racer-object.
 pub const CLIENT_CONTAINERS_ANNOTATION: &str = "racer.unbounded-cloud.io/client-containers";
 /// Records the mounted cache.
 pub const CLIENT_SOCKET_INJECTED_ANNOTATION: &str =

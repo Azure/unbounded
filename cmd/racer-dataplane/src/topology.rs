@@ -11,6 +11,8 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailMapping;
+use racer_core::liveness::Silence;
+use racer_core::route::LinkOutcome;
 use sha2::Digest;
 use sha2::Sha256;
 use std::future::Future;
@@ -41,6 +43,10 @@ const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
     inner: flow_control::Circuits<NodeId>,
+    /// Destinations that accept requests and never answer them
+    /// (`racer_core::liveness`). A ping carries the
+    /// page of the last unanswered exchange.
+    silence: std::cell::RefCell<Silence<NodeId, crate::model::PageId>>,
 }
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
@@ -49,18 +55,12 @@ impl Default for LinkHealth {
         Self::new(MAX_DEGREE)
     }
 }
-#[derive(Clone, Copy, Debug)]
-pub enum LinkOutcome {
-    Success,
-    Timeout,
-    Refused,
-    ProtocolFailure,
-}
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
-        self.inner
-            .acquire(node, uring_runtime::environment::now())
-            .map_err(Into::into)
+        self.acquire_at(node, uring_runtime::environment::now())
+    }
+    pub fn acquire_at(&self, node: &NodeId, now: Instant) -> Result<LinkProbe<'_>> {
+        self.inner.acquire(node, now).map_err(Into::into)
     }
     /// Application misses and credential rejection do not open transport circuits.
     pub async fn run<T>(
@@ -70,22 +70,98 @@ impl LinkHealth {
     ) -> Result<T> {
         let _probe = self.acquire(endpoint)?;
         let result = operation.await;
-        let outcome = match &result {
-            Err(Error::Io | Error::Os(_) | Error::Unavailable) => Some(LinkOutcome::Refused),
-            Err(Error::DeadlineExceeded) => Some(LinkOutcome::Timeout),
-            Err(Error::BadGateway | Error::CorruptRecord) => Some(LinkOutcome::ProtocolFailure),
-            Err(Error::Cancelled | Error::Overloaded) => None,
-            _ => Some(LinkOutcome::Success),
-        };
+        let outcome = racer_core::route::operation_link_outcome(
+            result.as_ref().map(|_| ()).map_err(Error::fault),
+        );
         if let Some(outcome) = outcome {
             let _ = self.observe(endpoint, outcome);
         }
         result
     }
-    pub const fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             inner: flow_control::Circuits::new(capacity, Duration::from_secs(1)),
+            silence: std::cell::RefCell::new(Silence::new(
+                racer_core::liveness::SILENCE_CAPACITY,
+                racer_core::liveness::HANG_AFTER,
+                SILENCE_PING_TIMEOUT,
+            )),
         }
+    }
+    /// Silence timing (`racer_core::liveness::Silence::new`):
+    /// `hang_after` is half the client request timeout and `ping_timeout`
+    /// the peer attempt timeout.
+    pub fn with_silence(self, hang_after: Duration, ping_timeout: Duration) -> Self {
+        self.set_silence(hang_after, ping_timeout);
+        self
+    }
+    /// [`Self::with_silence`] on a shared handle; forgets every peer.
+    pub fn set_silence(&self, hang_after: Duration, ping_timeout: Duration) {
+        *self.silence.borrow_mut() = Silence::new(
+            racer_core::liveness::SILENCE_CAPACITY,
+            hang_after,
+            ping_timeout,
+        );
+    }
+    /// An exchange for `page` sent to `peer` at `sent` ended unanswered; see
+    /// `Silence::timed_out`. Returns whether a ping is wanted.
+    pub fn silence_timed_out(
+        &self,
+        peer: &NodeId,
+        page: crate::model::PageId,
+        sent: Instant,
+        needed: u32,
+    ) -> bool {
+        self.silence.borrow_mut().timed_out(
+            peer.clone(),
+            page,
+            sent,
+            uring_runtime::environment::now(),
+            needed,
+        )
+    }
+    /// `peer` answered an exchange: it is not hung.
+    pub fn silence_answered(&self, peer: &NodeId) {
+        self.silence
+            .borrow_mut()
+            .answered(peer, uring_runtime::environment::now());
+    }
+    /// `peer` itself shed an exchange for `page` (an `Overloaded` it
+    /// signed): it is alive and busy; see `Silence::shed`.
+    pub fn silence_shed(&self, peer: &NodeId, page: crate::model::PageId) {
+        self.silence
+            .borrow_mut()
+            .shed(peer.clone(), page, uring_runtime::environment::now());
+    }
+    /// At most `max` pings due now, each marked outstanding
+    /// (`Silence::due_pings`).
+    pub fn due_pings(&self, now: Instant, max: usize) -> Vec<(NodeId, crate::model::PageId)> {
+        self.silence.borrow_mut().due_pings(now, max)
+    }
+    /// Outcome of a ping sent for `peer` (`Silence::ping_result`).
+    /// Returns whether `peer` became silent.
+    pub fn ping_outcome(&self, peer: &NodeId, answered: Option<bool>, now: Instant) -> bool {
+        self.silence.borrow_mut().ping_result(peer, answered, now)
+    }
+    /// What this worker last learned about `peer`'s answers (readers'
+    /// visit order).
+    pub fn answering(&self, peer: &NodeId) -> racer_core::read::Answering {
+        use racer_core::read::Answering;
+        let now = uring_runtime::environment::now();
+        let silence = self.silence.borrow();
+        if silence.silent(peer, now) {
+            Answering::Silent
+        } else if silence.unanswered(peer, now) {
+            Answering::Unanswered
+        } else {
+            Answering::Answers
+        }
+    }
+    /// Whether `peer` is silent: requests for it fail at once.
+    pub fn silent(&self, peer: &NodeId) -> bool {
+        self.silence
+            .borrow()
+            .silent(peer, uring_runtime::environment::now())
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
         self.observe_at(neighbor, outcome, uring_runtime::environment::now())
@@ -104,7 +180,8 @@ impl LinkHealth {
         self.available_at(neighbor, uring_runtime::environment::now())
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
-        Ok(self.inner.available(neighbor, now))
+        // A silent neighbor is routed around.
+        Ok(self.inner.available(neighbor, now) && !self.silence.borrow().silent(neighbor, now))
     }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
         self.try_acquire_at(neighbor, uring_runtime::environment::now())
@@ -119,14 +196,18 @@ impl LinkHealth {
         self.inner.len()
     }
 }
+/// Default ping time bound: the default peer attempt timeout.
+pub const SILENCE_PING_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn backoff(node: &NodeId, failures: u32) -> Duration {
-    let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
     let mut digest = hash_domain(b"racer/link-backoff/v1\0");
     hash_bytes(&mut digest, node.0.as_bytes());
     digest.update(failures.to_be_bytes());
     let digest = hash_finish(digest);
-    let jitter = u64::from(u16::from_be_bytes([digest[0], digest[1]])) % (base / 4 + 1);
-    Duration::from_millis(base + jitter)
+    racer_core::route::link_backoff(
+        failures,
+        u64::from(u16::from_be_bytes([digest[0], digest[1]])),
+    )
 }
 
 pub(crate) fn hash_object(hash: &mut Sha256, object: &ObjectId, page: PageNumber) {
@@ -284,6 +365,12 @@ impl Membership {
             .position(node.0.as_bytes())
             .ok_or(Error::IncompatibleMembership)
     }
+    /// The local generation in which `node` arrived in this node's
+    /// membership chain (`topology::Membership::since`); `None` for a
+    /// non-member. Placement uses it for lineage handoff targets.
+    pub fn since(&self, node: &NodeId) -> Option<u32> {
+        self.inner.since(self.inner.position(node.0.as_bytes())?)
+    }
     pub fn member(&self, node: &NodeId) -> Result<&Member> {
         Ok(&self.members()[self.position(node)?])
     }
@@ -400,6 +487,22 @@ impl Placement {
             .map(|ranked| candidates(membership, ranked))
     }
 
+    /// Cache-only: members ranked just below the page's owners, best first,
+    /// from a complete cached ranking. Never ranks.
+    pub fn demoted(
+        &self,
+        membership: &Membership,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Vec<NodeId> {
+        self.inner
+            .demoted(&membership.inner, &encoded_key(object, page))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|index| membership.members()[index].node.clone())
+            .collect()
+    }
+
     pub fn is_owner(
         &self,
         membership: &Membership,
@@ -503,59 +606,53 @@ pub struct RouteBudget {
     pub remaining_attempts: u32,
     pub deadline: Deadline,
 }
+impl From<racer_core::route::RouteFault> for Error {
+    fn from(fault: racer_core::route::RouteFault) -> Self {
+        use racer_core::route::RouteFault;
+        match fault {
+            RouteFault::DeadlineExceeded => Self::DeadlineExceeded,
+            RouteFault::HopBudgetExhausted => Self::HopBudgetExhausted,
+            RouteFault::Invalid => Self::InvalidRequest,
+        }
+    }
+}
+impl Error {
+    /// The failure class the sans-IO peer decisions (`racer_core::route`) read.
+    pub fn fault(&self) -> racer_core::route::Fault {
+        use racer_core::route::Fault;
+        match self {
+            Self::Overloaded => Fault::Overloaded,
+            Self::Unavailable => Fault::Unavailable,
+            Self::Io => Fault::Io,
+            Self::Os(_) => Fault::Os,
+            Self::DeadlineExceeded => Fault::DeadlineExceeded,
+            Self::BadGateway => Fault::BadGateway,
+            Self::CorruptRecord => Fault::CorruptRecord,
+            Self::Cancelled => Fault::Cancelled,
+            Self::HopBudgetExhausted => Fault::HopBudgetExhausted,
+            Self::IncompatibleMembership => Fault::IncompatibleMembership,
+            Self::NotFound => Fault::NotFound,
+            Self::VersionUnavailable => Fault::VersionUnavailable,
+            Self::Unauthorized => Fault::Unauthorized,
+            Self::OriginForbidden => Fault::OriginForbidden,
+            Self::MissingKey => Fault::MissingKey,
+            _ => Fault::Other,
+        }
+    }
+}
 pub const NORMAL_LINKS: u8 = 4;
 pub const FAILURE_LINKS: u8 = 8;
 impl RouteBudget {
-    /// `visited` contains prior senders, excluding the current recipient.
-    pub fn forwarded(&self, from: &NodeId, next: &NodeId) -> Result<Self> {
-        self.validate_at(from, uring_runtime::environment::now())?;
-        if self.remaining_links == 0 {
-            return Err(Error::HopBudgetExhausted);
-        }
-        if next == from || self.visited.contains(next) {
-            return Err(Error::InvalidRequest);
-        }
-        let mut forwarded = self.clone();
-        forwarded.visited.push(from.clone());
-        forwarded.remaining_links -= 1;
-        Ok(forwarded)
-    }
-    /// Authentication verifies this monotonic relationship between signed hops.
-    pub fn validate_forwarded(&self, forwarded: &Self, from: &NodeId, next: &NodeId) -> Result<()> {
-        let expected = self.forwarded(from, next)?;
-        if forwarded.membership != expected.membership
-            || forwarded.request != expected.request
-            || forwarded.attempt != expected.attempt
-            || forwarded.destination != expected.destination
-            || forwarded.visited != expected.visited
-            || forwarded.remaining_links != expected.remaining_links
-            || forwarded.remaining_attempts > expected.remaining_attempts
-            || forwarded.deadline.0 > expected.deadline.0
-        {
-            return Err(Error::InvalidRequest);
-        }
-        forwarded.validate_at(next, uring_runtime::environment::now())
-    }
     fn validate_at(&self, from: &NodeId, now: Instant) -> Result<()> {
-        if now >= self.deadline.0 {
-            return Err(Error::DeadlineExceeded);
-        }
-        if self.visited.len() > usize::from(FAILURE_LINKS)
-            || self.visited.len() + usize::from(self.remaining_links) > usize::from(FAILURE_LINKS)
-        {
-            return Err(Error::HopBudgetExhausted);
-        }
-        if self.visited.contains(from)
-            || self.visited.contains(&self.destination)
-            || self
-                .visited
-                .iter()
-                .enumerate()
-                .any(|(i, node)| self.visited[..i].contains(node))
-        {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(())
+        racer_core::route::validate(
+            &self.visited,
+            from,
+            &self.destination,
+            self.remaining_links,
+            self.deadline.0,
+            now,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -613,6 +710,22 @@ impl Paths {
         budget: &'a RouteBudget,
         scope: &'a RequestScope,
     ) -> Operation<'a, Route> {
+        self.shortest_probe_async(membership, from, budget, scope, false)
+    }
+
+    /// Like [`Self::shortest_async`]. With `ping`, the budget's destination
+    /// is not routed around for silence: an origin's recovery ping must be
+    /// able to reach the peer it holds silent. Circuit
+    /// health and peer admission still apply, and silent intermediate
+    /// neighbors are still routed around.
+    pub fn shortest_probe_async<'a>(
+        &'a self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        from: &'a NodeId,
+        budget: &'a RouteBudget,
+        scope: &'a RequestScope,
+        ping: bool,
+    ) -> Operation<'a, Route> {
         Box::pin(async move {
             scope.check()?;
             budget.validate_at(from, uring_runtime::environment::now())?;
@@ -629,7 +742,8 @@ impl Paths {
                 .iter()
                 .map(|node| membership.position(node))
                 .collect::<Result<Vec<_>>>()?;
-            let blocked = self.blocked(&membership, source)?;
+            let exempt = ping.then_some(&budget.destination);
+            let blocked = self.blocked(&membership, source, exempt)?;
             let mut seed = [0; 32];
             seed[..16].copy_from_slice(&budget.request.0);
             seed[16..].copy_from_slice(&budget.attempt.0);
@@ -660,7 +774,7 @@ impl Paths {
             scope.check()?;
             budget.validate_at(from, uring_runtime::environment::now())?;
             // Health/admission may change while yielded. Retry under the same budget.
-            if self.blocked(&membership, source)? != blocked {
+            if self.blocked(&membership, source, exempt)? != blocked {
                 return Err(Error::Unavailable);
             }
             let nodes = nodes?
@@ -671,7 +785,13 @@ impl Paths {
         })
     }
 
-    fn blocked(&self, membership: &Membership, source: usize) -> Result<Vec<usize>> {
+    fn blocked(
+        &self,
+        membership: &Membership,
+        source: usize,
+        exempt: Option<&NodeId>,
+    ) -> Result<Vec<usize>> {
+        let now = uring_runtime::environment::now();
         let positions = membership.inner.neighbors(source);
         let neighbors: Vec<_> = positions
             .iter()
@@ -680,7 +800,13 @@ impl Paths {
         self.health.retain_neighbors(&neighbors);
         let mut blocked = Vec::new();
         for (position, node) in positions.into_iter().zip(&neighbors) {
-            if !self.health.available(node)?
+            let available = if exempt == Some(node) {
+                // Circuit state only: a ping may reach the silent neighbor it tests.
+                self.health.inner.available(node, now)
+            } else {
+                self.health.available_at(node, now)?
+            };
+            if !available
                 || self
                     .peer_admission
                     .as_ref()
@@ -704,6 +830,59 @@ fn map_error(error: ::topology::Error) -> Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A destination whose ping went unanswered is
+    /// silent: unavailable for routing until it answers anything.
+    #[test]
+    fn a_silent_peer_is_routed_around_until_it_answers() {
+        let clock = uring_runtime::environment::SimulationClock::new(1);
+        let _env = clock.environment(0).enter();
+        let health =
+            LinkHealth::default().with_silence(Duration::from_secs(10), Duration::from_secs(2));
+        let peer = NodeId("peer".into());
+        let page = crate::model::PageId {
+            version: crate::model::ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: crate::model::CacheKey([7; 32]),
+                },
+                etag: crate::model::StrongEtag::test_value("v"),
+            },
+            number: PageNumber(3),
+        };
+        let sent = uring_runtime::environment::now();
+        clock.advance(Duration::from_secs(2));
+        // One unanswered exchange over the last link asks nothing yet.
+        assert!(!health.silence_timed_out(
+            &peer,
+            page.clone(),
+            sent,
+            racer_core::liveness::LINK_TIMEOUTS
+        ));
+        assert!(health.silence_timed_out(
+            &peer,
+            page.clone(),
+            sent,
+            racer_core::liveness::LINK_TIMEOUTS
+        ));
+        let now = uring_runtime::environment::now();
+        assert_eq!(health.due_pings(now, 8), vec![(peer.clone(), page.clone())]);
+        assert!(health.available(&peer).unwrap());
+        // A relay's overload proves nothing; an unanswered ping does.
+        assert!(!health.ping_outcome(&peer, None, now));
+        assert!(!health.silent(&peer));
+        assert!(health.ping_outcome(&peer, Some(false), now));
+        assert!(health.silent(&peer));
+        assert!(!health.available(&peer).unwrap());
+        // Pinged again after the hold; an answer clears it.
+        assert!(health.due_pings(now, 8).is_empty());
+        clock.advance(Duration::from_secs(20));
+        let later = uring_runtime::environment::now();
+        assert_eq!(health.due_pings(later, 8).len(), 1);
+        assert!(!health.ping_outcome(&peer, Some(true), later));
+        assert!(!health.silent(&peer));
+        assert!(health.available(&peer).unwrap());
+    }
 
     pub(crate) mod fixtures {
         use super::*;
@@ -1446,8 +1625,8 @@ pub(crate) mod tests {
 
     pub(crate) mod scenarios {
         use super::*;
-        use crate::topology::LinkOutcome;
         use crate::topology::tests::fixtures::membership;
+        use racer_core::route::LinkOutcome;
         use std::time::Duration;
         fn budget(
             members: &std::sync::Arc<crate::topology::Membership>,
@@ -1464,6 +1643,99 @@ pub(crate) mod tests {
                 remaining_attempts: 3,
                 deadline: Deadline(Instant::now() + Duration::from_secs(60)),
             }
+        }
+        /// Hold `peer` silent: two unanswered last links, then a failed ping.
+        fn silence(health: &LinkHealth, peer: &NodeId) {
+            let page = crate::model::PageId {
+                version: crate::model::ObjectVersion {
+                    object: crate::topology::tests::fixtures::object(),
+                    etag: crate::model::StrongEtag::test_value("v"),
+                },
+                number: PageNumber(0),
+            };
+            let sent = Instant::now() - Duration::from_secs(5);
+            for _ in 0..2 {
+                health.silence_timed_out(
+                    peer,
+                    page.clone(),
+                    sent,
+                    racer_core::liveness::LINK_TIMEOUTS,
+                );
+            }
+            assert_eq!(health.due_pings(Instant::now(), 8).len(), 1);
+            assert!(health.ping_outcome(peer, Some(false), Instant::now()));
+            assert!(health.silent(peer));
+        }
+        fn probe(
+            paths: &Paths,
+            members: &std::sync::Arc<crate::topology::Membership>,
+            source: &NodeId,
+            request: &RouteBudget,
+            ping: bool,
+        ) -> Result<Route> {
+            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            futures::executor::block_on(paths.shortest_probe_async(
+                members.clone(),
+                source,
+                request,
+                &scope,
+                ping,
+            ))
+        }
+        /// An origin's recovery ping to a neighbor it holds
+        /// silent goes over the direct link; other requests route around it,
+        /// and an open circuit or a silent intermediate still blocks.
+        #[test]
+        fn a_ping_reaches_the_silent_neighbor_it_tests() {
+            let members = membership(64);
+            let source = &members.members()[0].node;
+            let neighbors = members.neighbors(source).unwrap();
+            let target = neighbors[0].clone();
+            let to = members.position(&target).unwrap();
+            let health = Rc::new(
+                LinkHealth::default().with_silence(Duration::from_secs(1), Duration::from_secs(1)),
+            );
+            let paths = Paths::new(health.clone(), 0);
+            let request = budget(&members, to, 1);
+            // Healthy: both reach it directly.
+            for ping in [false, true] {
+                let route = probe(&paths, &members, source, &request, ping).unwrap();
+                assert_eq!(route.nodes[1], target);
+            }
+            silence(&health, &target);
+            // A one-link budget: only the direct link reaches it.
+            assert_eq!(
+                probe(&paths, &members, source, &request, false).unwrap_err(),
+                Error::Unavailable
+            );
+            let route = probe(&paths, &members, source, &request, true).unwrap();
+            assert_eq!(route.nodes, vec![source.clone(), target.clone()]);
+            // A silent intermediate is still routed around for a ping to a
+            // non-neighbor whose only short path crosses it.
+            let far = members
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .find(|n| n != source && !neighbors.contains(n))
+                .unwrap();
+            let far_request = budget(&members, members.position(&far).unwrap(), 4);
+            for ping in [false, true] {
+                if let Ok(route) = probe(&paths, &members, source, &far_request, ping) {
+                    assert_ne!(route.nodes[1], target);
+                }
+            }
+            // An open circuit blocks even a ping.
+            health
+                .observe_at(
+                    &target,
+                    LinkOutcome::Timeout,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap();
+            assert_eq!(
+                probe(&paths, &members, source, &request, true).unwrap_err(),
+                Error::Unavailable
+            );
         }
         #[test]
         fn path_search_limit_is_independent_of_cache_and_released_on_drop() {
@@ -1490,6 +1762,45 @@ pub(crate) mod tests {
                 placement_error(::topology::Error::SamplingExhausted),
                 Error::Internal
             );
+        }
+        /// Production `Paths::new` queues searches beyond its 8
+        /// slots instead of failing them with `Overloaded`; a queued search runs
+        /// when a slot frees, and a cancelled one leaves the queue.
+        #[test]
+        fn searches_beyond_the_slot_limit_wait_for_a_slot() {
+            let members = membership(100_000);
+            let source = &members.members()[0].node;
+            let paths = Paths::new(Rc::new(LinkHealth::default()), 0);
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let budgets: Vec<_> = (0..10)
+                .map(|i| budget(&members, 80_003 + i, NORMAL_LINKS))
+                .collect();
+            let scopes: Vec<_> = budgets
+                .iter()
+                .map(|b| RequestScope::new(b.request, b.deadline.0).unwrap())
+                .collect();
+            let mut running: Vec<_> = budgets[..8]
+                .iter()
+                .zip(&scopes)
+                .map(|(b, scope)| paths.shortest_async(members.clone(), source, b, scope))
+                .collect();
+            for search in &mut running {
+                assert!(search.as_mut().poll(&mut cx).is_pending());
+            }
+            let mut cancelled =
+                paths.shortest_async(members.clone(), source, &budgets[8], &scopes[8]);
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            let mut waiting =
+                paths.shortest_async(members.clone(), source, &budgets[9], &scopes[9]);
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            drop(cancelled);
+            drop(running.pop());
+            let route = loop {
+                if let std::task::Poll::Ready(route) = waiting.as_mut().poll(&mut cx) {
+                    break route;
+                }
+            };
+            assert!(route.is_ok());
         }
         #[test]
         fn independent_hash_vectors_cache_reselection_and_snapshot_weights() {
@@ -1619,23 +1930,58 @@ pub(crate) mod tests {
             // A fresh cold search succeeds after dropping the previous operation.
             assert!(cold.shortest(members.clone(), source, &request).is_ok());
         }
+        /// Forwarding a search-form budget goes through the one rule in
+        /// `racer_core::route`; the signed wire form is checked in peer-wire.
         #[test]
         fn forwarded_budget_is_monotonic_and_rejects_cycles() {
             let members = membership(100);
             let request = budget(&members, 99, 4);
             let from = &members.members()[0].node;
             let next = &members.members()[1].node;
-            let forwarded = request.forwarded(from, next).unwrap();
-            request.validate_forwarded(&forwarded, from, next).unwrap();
-            assert_eq!(forwarded.remaining_links, 3);
-            assert_eq!(forwarded.remaining_attempts, request.remaining_attempts);
-            assert!(forwarded.forwarded(next, from).is_err());
-            let mut invalid = forwarded.clone();
-            invalid.remaining_attempts += 1;
-            assert!(request.validate_forwarded(&invalid, from, next).is_err());
-            invalid = forwarded;
-            invalid.deadline.0 += Duration::from_secs(1);
-            assert!(request.validate_forwarded(&invalid, from, next).is_err());
+            let now = uring_runtime::environment::now();
+            let forward = |visited: &[NodeId], holder: &NodeId, to: &NodeId, links: u8| {
+                racer_core::route::forward(
+                    visited,
+                    holder,
+                    to,
+                    &request.destination,
+                    links,
+                    request.deadline.0,
+                    now,
+                )
+            };
+            let links = forward(&request.visited, from, next, request.remaining_links).unwrap();
+            assert_eq!(links, 3);
+            let mut forwarded = request.clone();
+            forwarded.visited.push(from.clone());
+            forwarded.remaining_links = links;
+            forwarded.validate_at(next, now).unwrap();
+            assert_eq!(
+                forward(&forwarded.visited, next, from, links),
+                Err(racer_core::route::RouteFault::Invalid)
+            );
+            assert_eq!(
+                forward(&forwarded.visited, next, next, links),
+                Err(racer_core::route::RouteFault::Invalid)
+            );
+            assert_eq!(
+                forward(&forwarded.visited, next, &members.members()[2].node, 0),
+                Err(racer_core::route::RouteFault::HopBudgetExhausted)
+            );
+            // A holder that already appears in `visited` is a cycle.
+            assert!(forwarded.validate_at(from, now).is_err());
+            assert_eq!(
+                racer_core::route::forward(
+                    &request.visited,
+                    from,
+                    next,
+                    &request.destination,
+                    request.remaining_links,
+                    request.deadline.0,
+                    request.deadline.0,
+                ),
+                Err(racer_core::route::RouteFault::DeadlineExceeded)
+            );
         }
         #[test]
         fn rejects_unknown_and_empty_membership() {

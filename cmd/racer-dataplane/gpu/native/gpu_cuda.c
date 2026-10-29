@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #ifdef RACER_GPU_PTX
@@ -372,6 +373,18 @@ static int import_release(struct gpu_import *a) {
     return RACER_GPU_OK;
 }
 
+/* Whether device `ordinal` in this process is the context's GPU. */
+static int same_device(struct gpu_context *c, int ordinal) {
+    CUdevice dev;
+    CUuuid mine, theirs;
+    if (ordinal < 0 || cu.cuDeviceGet(&dev, ordinal) != CUDA_SUCCESS) return 0;
+    if (dev == c->dev) return 1;
+    if (cu.cuDeviceGetUuid(&theirs, dev) != CUDA_SUCCESS ||
+        cu.cuDeviceGetUuid(&mine, c->dev) != CUDA_SUCCESS)
+        return 0;
+    return !memcmp(mine.bytes, theirs.bytes, sizeof(mine.bytes));
+}
+
 int racer_gpu_import(void *context, int fd, uint64_t size, void **out) {
     struct gpu_context *c = context;
     if (!c || fd < 0 || !size || size > SIZE_MAX || !out) return RACER_GPU_EINVAL;
@@ -395,7 +408,15 @@ int racer_gpu_import(void *context, int fd, uint64_t size, void **out) {
     a->has_handle = 1;
     rc = drv(cu.cuMemGetAllocationPropertiesFromHandle(&prop, a->handle));
     if (rc) goto fail;
-    if (prop.location.type != CU_MEM_LOCATION_TYPE_DEVICE || prop.location.id != c->ordinal) {
+    if (prop.location.type != CU_MEM_LOCATION_TYPE_DEVICE) {
+        rc = RACER_GPU_EDEVICE;
+        goto fail;
+    }
+    /* The driver reports the location in this process's device numbering,
+     * which can differ from the exporter's (CUDA_VISIBLE_DEVICES). Compare
+     * physical GPUs by UUID, not ordinals, so a stale or foreign number can
+     * never pass. A number this process cannot resolve is another GPU. */
+    if (!same_device(c, prop.location.id)) {
         rc = RACER_GPU_EDEVICE;
         goto fail;
     }
@@ -635,7 +656,7 @@ static int file_error(CUfileError_t e) {
  * for P2PDMA, which can take most of a second, so a failure is not retried. */
 static int cf_failed;
 
-int racer_gpu_file_open(void) {
+int racer_gpu_file_open(uint32_t flags) {
     int rc = RACER_GPU_OK;
     pthread_mutex_lock(&load_lock);
     if (cf_failed) {
@@ -653,13 +674,38 @@ int racer_gpu_file_open(void) {
         /* Without nvidia-fs or P2PDMA, cuFile's compatibility mode does a
          * POSIX read into a bounce buffer and a copy on this helper thread,
          * so every GPU job waits behind the disk. Racer's own host path does
-         * that work on I/O threads. Turn it off unless the operator chose a
-         * value with CUFILE_ALLOW_COMPAT_MODE; cuFileDriverOpen then fails
-         * without GPUDirect Storage and Racer uses its host path. */
+         * that work on I/O threads. Turn it off unless CUFILE_ALLOW_COMPAT_MODE
+         * is true, 1 or yes; then turn it on, since cufile.json turns it off.
+         * With it off, cuFileDriverOpen fails without GPUDirect Storage and
+         * Racer uses its host path. */
         cuFileSetParameterBool_fn set_bool =
             (cuFileSetParameterBool_fn)dlsym(table.lib, "cuFileSetParameterBool");
-        if (set_bool && !getenv("CUFILE_ALLOW_COMPAT_MODE"))
-            set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, false);
+        if (set_bool) {
+            const char *compat = getenv("CUFILE_ALLOW_COMPAT_MODE");
+            bool allow = compat && (!strcasecmp(compat, "true") ||
+                                    !strcmp(compat, "1") ||
+                                    !strcasecmp(compat, "yes"));
+            set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, allow);
+        }
+        /* PCI P2PDMA (cuFile 1.13+) reads NVMe into GPU memory without
+         * nvidia-fs. Only turn it on: leave cufile.json's value otherwise.
+         * Without cuFileSetParameterBool, or if cuFile rejects the value,
+         * fail the open so Racer reports cuFile off and uses its host path
+         * rather than run without the path the operator asked for. */
+        if (flags & RACER_GPU_FILE_PCI_P2PDMA) {
+            if (!set_bool) {
+                dlclose(table.lib);
+                cf_failed = 1;
+                rc = RACER_GPU_EUNAVAILABLE;
+                goto out;
+            }
+            if (file_error(set_bool(CUFILE_PARAM_USE_PCIP2PDMA, true))) {
+                dlclose(table.lib);
+                cf_failed = 1;
+                rc = RACER_GPU_EUNAVAILABLE;
+                goto out;
+            }
+        }
         if (file_error(table.cuFileDriverOpen())) {
             dlclose(table.lib);
             cf_failed = 1;
@@ -690,7 +736,11 @@ int racer_gpu_file(int fd, void **out) {
     memset(&descr, 0, sizeof(descr));
     descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
     descr.handle.fd = fd;
-    int rc = file_error(cf.cuFileHandleRegister(&f->handle, &descr));
+    CUfileError_t e = cf.cuFileHandleRegister(&f->handle, &descr);
+    int rc = file_error(e);
+    if (rc && (e.err == CU_FILE_IO_NOT_SUPPORTED || e.err == CU_FILE_DEVICE_NOT_SUPPORTED ||
+               e.err == CU_FILE_INVALID_FILE_TYPE))
+        rc = RACER_GPU_EUNSUPPORTED;
     if (rc) {
         free(f);
         return rc;

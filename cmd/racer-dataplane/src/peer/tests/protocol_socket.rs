@@ -557,13 +557,99 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     }
 }
 
+/// A relay that holds the destination silent (a ping
+/// to it went unanswered) answers `Unavailable` at once instead of sending
+/// the request to a peer that would never answer it.
 #[test]
-fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+fn relay_fails_a_request_for_a_silent_destination_at_once() {
     use crate::topology::LinkHealth;
-    use crate::topology::LinkOutcome;
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
+    let signers = signers();
+    let origin = Forwarding::new(signers[0].clone());
+    let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
+    let socket = SocketFixture::new(2);
+    let admission = socket.admission.clone();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, B, C]
+                .iter()
+                .map(|n| Member {
+                    node: NodeId((*n).into()),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:9".into(),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let network = Rc::new(
+        PeerNetwork::new(
+            NodeId(B.into()),
+            crate::test_support::published_membership(membership.clone()),
+        )
+        .unwrap(),
+    );
+    let health = Rc::new(
+        LinkHealth::default()
+            .with_silence(std::time::Duration::ZERO, std::time::Duration::from_secs(1)),
+    );
+    let destination = NodeId(C.into());
+    let page = crate::model::PageId {
+        version: crate::model::ObjectVersion {
+            object: crate::model::ObjectId {
+                cache: CacheId("cache".into()),
+                key: crate::model::CacheKey([3; 32]),
+            },
+            etag: crate::model::StrongEtag::test_value("v"),
+        },
+        number: crate::model::PageNumber(0),
+    };
+    let now = uring_runtime::environment::now();
+    assert!(health.silence_timed_out(&destination, page, now, 1));
+    assert_eq!(health.due_pings(now, 1).len(), 1);
+    assert!(health.ping_outcome(&destination, Some(false), now));
+    let paths = Rc::new(Paths::new(health, 1));
+    let requester = Rc::new(Requester::new(
+        paths.clone(),
+        forwarding.clone(),
+        socket.transfers(signers[1].clone()),
+        network.clone(),
+    ));
+    let relay = Relay::new(
+        paths,
+        forwarding.clone(),
+        requester.clone(),
+        admission.clone(),
+        network,
+    );
+    let local = request(&admission, 11);
+    assert_eq!(local.route.destination, destination);
+    let scope = local.origin.scope().clone();
+    let (signed, _) = origin.sign_request_to(local, signers[1].node()).unwrap();
+    let ingress = forwarding.verify_request(signed).unwrap();
+    let result =
+        crate::http::tests::drive(&socket.reactor, relay.forward(ingress, membership, &scope));
+    assert!(
+        matches!(result, Err(Error::Unavailable)),
+        "{:?}",
+        result.err()
+    );
+    assert_eq!(requester.outbound_requests(), 0);
+    assert_eq!(admission.used(ResourceClass::Relay), 0);
+}
+
+#[test]
+fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
+    use racer_core::route::LinkOutcome;
     let signers = signers();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
@@ -1805,4 +1891,173 @@ mod established_sessions {
             baseline + f.io.retained_buffer_bytes()
         );
     }
+}
+
+/// An owner already writing `hot_page_threshold()` bodies of a page,
+/// at least half of all bodies it writes, answers a signed `Overloaded` to a
+/// requester that is neither an owner nor a helper of the page, without
+/// calling the page service; below either threshold, for a page it does not
+/// own, or for a helper requester, it serves.
+#[test]
+fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
+    use crate::http::Codec;
+    use crate::runtime::Reactor;
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
+    use racer_core::read::budget::is_helper;
+    use std::cell::Cell;
+    use std::num::NonZeroU32;
+    let hot = crate::peer::server::hot_page_threshold();
+    struct Service(Rc<Cell<usize>>);
+    impl server::LocalPageService for Service {
+        fn serve_peer<'a>(
+            &'a self,
+            _: crate::peer::forwarding::VerifiedRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, PeerResponse> {
+            Box::pin(async move {
+                self.0.set(self.0.get() + 1);
+                Ok(PeerResponse::Miss)
+            })
+        }
+    }
+    let signers = signers();
+    let sender = Forwarding::new(signers[0].clone());
+    let destination = Rc::new(Forwarding::new(signers[2].clone()));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(false).limits,
+    )));
+    let mut nodes: Vec<String> = [A, B, C].iter().map(|n| (*n).to_owned()).collect();
+    nodes.extend((4..16).map(|i| format!("{i:08}-1111-4111-8111-111111111111")));
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Member {
+                    node: NodeId(n.clone()),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let network = Rc::new(
+        PeerNetwork::new(
+            NodeId(C.into()),
+            crate::test_support::published_membership(membership.clone()),
+        )
+        .unwrap(),
+    );
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth::default()), 4));
+    let outbound = NoOutbound::new(signers[2].clone(), network.clone());
+    let relay = Rc::new(Relay::new(
+        paths,
+        destination.clone(),
+        outbound.requester.clone(),
+        admission.clone(),
+        network.clone(),
+    ));
+    let io = Rc::new(crate::http::new_io(
+        Rc::new(Reactor::new(admission.clone())),
+        Codec::new(65536),
+        admission.clone(),
+        16777232,
+    ));
+    let calls = Rc::new(Cell::new(0));
+    let server = server::PeerServer::for_test(
+        io,
+        destination,
+        admission.clone(),
+        Rc::new(Service(calls.clone())),
+        relay,
+        Rc::new(codec(&admission)),
+        signers[2].clone(),
+    );
+    let object = ObjectId {
+        cache: CacheId(CACHE.into()),
+        key: CacheKey([3; 32]),
+    };
+    let page_id = |number: u64| crate::model::PageId {
+        version: crate::model::ObjectVersion {
+            object: object.clone(),
+            etag: crate::model::StrongEtag::test_value("v1"),
+        },
+        number: PageNumber(number),
+    };
+    // Pages C owns, split by whether requester A is an owner or a helper.
+    let placement = crate::topology::Placement::new(64);
+    let a = membership.position(&NodeId(A.into())).unwrap();
+    let mut shed_page = None;
+    let mut helper_page = None;
+    let mut foreign_page = None;
+    for number in 0..4096 {
+        let owners = placement
+            .rank(membership.clone(), &object, PageNumber(number))
+            .ordered;
+        let owns = |n: &str| owners.contains(&NodeId(n.into()));
+        let helper = is_helper(&object, PageNumber(number), a, membership.members().len());
+        match (owns(C), owns(A), helper) {
+            (true, false, false) => shed_page = shed_page.or(Some(number)),
+            (true, false, true) => helper_page = helper_page.or(Some(number)),
+            (false, false, false) => foreign_page = foreign_page.or(Some(number)),
+            _ => {}
+        }
+    }
+    let (shed_page, helper_page, foreign_page) = (
+        shed_page.unwrap(),
+        helper_page.expect("A helps some page C owns"),
+        foreign_page.unwrap(),
+    );
+    let mut attempt = 0u8;
+    let mut ask = |number: u64| {
+        attempt += 1;
+        let mut request = request(&admission, attempt);
+        request.operation = Operation::Page {
+            page: page_id(number),
+            mode: FetchMode::CopyOnly,
+        };
+        let scope = request.origin.scope().clone();
+        let (signed, binding) = sender.sign_request(request).unwrap();
+        let response = futures::executor::block_on(server.dispatch(signed, &scope)).unwrap();
+        matches!(
+            sender
+                .verify_response(response, &binding)
+                .unwrap()
+                .response(),
+            PeerResponse::Overloaded
+        )
+    };
+    // Below the threshold every page is served.
+    let held = server.hold_streaming(&page_id(shed_page), hot - 1);
+    assert!(!ask(shed_page));
+    assert_eq!(calls.get(), 1);
+    drop(held);
+    assert_eq!(server.streaming(&page_id(shed_page)), (0, 0));
+    // At the threshold a non-owner, non-helper reader is shed unserved.
+    let held = server.hold_streaming(&page_id(shed_page), hot);
+    assert_eq!(server.streaming(&page_id(shed_page)), (hot, hot));
+    assert!(ask(shed_page));
+    assert_eq!(calls.get(), 1);
+    // Not while the page is less than half of what the owner is writing.
+    let other = server.hold_streaming(&page_id(foreign_page), hot + 1);
+    assert!(!ask(shed_page));
+    assert_eq!(calls.get(), 2);
+    drop((held, other));
+    // A helper of the page is always served.
+    let held = server.hold_streaming(&page_id(helper_page), hot);
+    assert!(!ask(helper_page));
+    assert_eq!(calls.get(), 3);
+    drop(held);
+    // A node that does not own the page (for example a helper) never sheds.
+    let _held = server.hold_streaming(&page_id(foreign_page), hot);
+    assert!(!ask(foreign_page));
+    assert_eq!(calls.get(), 4);
 }
