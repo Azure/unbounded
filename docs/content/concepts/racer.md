@@ -81,6 +81,12 @@ Optional `spec.priority` (0 to 1000, default 500) sets how a cache shares each
 node's capacity with other caches. It is a relative weight, not a quota. See
 [Priority]({{< relref "reference/racer" >}}#priority).
 
+Optional `spec.passthrough` turns off caching: Racer proxies reads to the
+origin and keeps no data. Its `route` is `Peers` (default; owner nodes read
+from their origins and share reads cluster-wide) or `Local` (each node reads
+from its own origin). See
+[Passthrough]({{< relref "reference/racer" >}}#passthrough).
+
 ### Objects, Keys, and Versions
 
 - **Key** -- 32 bytes chosen by the app, often a content digest such as a
