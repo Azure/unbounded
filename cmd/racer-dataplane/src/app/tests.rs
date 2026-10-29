@@ -1195,7 +1195,7 @@ fn worker_sizing_funds_derived_connection_pools() {
 impl WorkerApplication {
     // Keep private-field access local; shared fixture assembly belongs to test_support.
     pub(crate) fn into_test_coordinator(self) -> Rc<Coordinator> {
-        self.coordinator
+        self.coordinator.clone()
     }
 }
 
@@ -4831,14 +4831,14 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     let start = std::time::Instant::now();
     let second = Duration::from_secs(1);
     let mut now = start;
-    while now < start + crate::memory::CACHE_IDLE_TTL {
+    while now < start + racer_core::cache::IDLE_TTL {
         worker.maintain_pools(now);
         now += second;
     }
     assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
     // The hit renews the entry for another full TTL.
     let renewed = now;
-    while now < renewed + crate::memory::CACHE_IDLE_TTL {
+    while now < renewed + racer_core::cache::IDLE_TTL {
         worker.maintain_pools(now);
         assert_eq!(worker.aligned_pool_stats().entries, 0);
         now += second;

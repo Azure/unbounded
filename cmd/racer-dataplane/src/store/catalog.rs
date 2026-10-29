@@ -173,20 +173,15 @@ impl IndexSnapshot {
         Ok(())
     }
 }
-/// Upper bound of `page_value`.
-const MAX_PAGE_VALUE: u8 = 2 * crate::retention::MAX_SCORE + 1;
-
-/// Per-byte segment value of one page. While any cache is over share, every
-/// under-share page outvalues every over-share page, so segments dominated by
-/// over-share data recycle first; the retention score still orders pages within
-/// one class. With no cache over share this is the plain retention score.
+/// Per-byte segment value of one page; see
+/// [`racer_core::cache::class_score`].
 fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId) -> u8 {
-    let score = scoring.score(page);
-    if !scoring.any_over_share() || scoring.over_share(&page.version.object.cache) {
-        score
-    } else {
-        score + crate::retention::MAX_SCORE + 1
-    }
+    let any = scoring.any_over_share();
+    racer_core::cache::class_score(
+        scoring.score(page),
+        any,
+        any && scoring.over_share(&page.version.object.cache),
+    )
 }
 impl Index {
     pub(super) fn bind_hold_segments(&self, segments: Rc<Segments>, free_reserve: usize) {
@@ -1244,20 +1239,14 @@ impl Index {
         let state = self.state.borrow();
         state.pages.segment_score(
             segment,
-            256,
-            // Charge unseen mappings at the highest value they could have.
-            crate::model::PAGE_BYTES
-                * u64::from(if scoring.any_over_share() {
-                    MAX_PAGE_VALUE
-                } else {
-                    crate::retention::MAX_SCORE
-                }),
+            racer_core::cache::SCAN_BUDGET,
+            racer_core::cache::unseen_value_for(crate::model::PAGE_BYTES, scoring.any_over_share()),
             |page, entry| {
-                let bytes = entry
-                    .metadata
-                    .page_length(page)
-                    .unwrap_or(crate::model::PAGE_BYTES as u32);
-                u64::from(bytes) * u64::from(page_value(scoring, page))
+                racer_core::cache::page_value(
+                    entry.metadata.page_length(page).ok(),
+                    crate::model::PAGE_BYTES as u32,
+                    page_value(scoring, page),
+                )
             },
         )
     }
@@ -1417,7 +1406,10 @@ impl SegmentClock {
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
     /// a later poll; ownership and heat cannot prevent eventual reclamation.
     pub fn reclaim_now(&self) -> Result<()> {
-        let now = uring_runtime::environment::now();
+        self.reclaim_at(uring_runtime::environment::now())
+    }
+    /// [`Self::reclaim_now`] with retention heat evaluated at an explicit time.
+    pub fn reclaim_at(&self, now: std::time::Instant) -> Result<()> {
         let retention = self.index.retention();
         let scoring = retention.scoring_at(now, self.index.disk_capacity());
         self.clock
@@ -2494,6 +2486,126 @@ mod tests {
         // Cursor progression and wrap are asserted in page_alloc::index tests.
         assert_eq!(retention.score(&page), 0);
         drop(ticket);
+    }
+    /// The simulator's payload-free `PhantomEntries` makes the same CLOCK
+    /// eviction decisions as the catalog index when given the same scores.
+    #[test]
+    fn phantom_segment_entries_match_catalog_reclamation() {
+        use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
+        for seed in 1..=4u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut draw = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let count = 12;
+            let real_segments = Rc::new(segments(1024, count));
+            let phantom_segments = Rc::new(segments(1024, count));
+            let index = Rc::new(index(4096));
+            index.set_page_capacity(4096).unwrap();
+            let owned = Rc::new(RefCell::new(std::collections::HashSet::new()));
+            let classify = owned.clone();
+            index
+                .retention()
+                .set_ownership(Rc::new(move |page| classify.borrow().contains(page)));
+            let real = SegmentClock::new(index.clone(), real_segments.clone(), 1);
+            let phantom_clock = page_alloc::SegmentClock::new(phantom_segments.clone());
+            let phantom = page_alloc::PhantomEntries::<PageId>::default();
+            let now = uring_runtime::environment::now();
+            let mut pages = Vec::new();
+            let mut next = 0;
+            let mut total_evicted = 0;
+            for round in 0..60 {
+                // Fill every free slot on both tables in the same order.
+                while real_segments.free_count() > 0 {
+                    let (_, a) = real_segments.append(1024).unwrap();
+                    let (_, b) = phantom_segments.append(1024).unwrap();
+                    assert_eq!(a, b);
+                    let segment = a.offset() / 1024;
+                    for _ in 0..1 + draw() % 4 {
+                        next += 1;
+                        let length = 1 + draw() % 900;
+                        let (page, mut entry) =
+                            indexed(descriptor(&format!("p{next}"), length), segment);
+                        entry.location.extent = a;
+                        if draw() % 3 == 0 {
+                            owned.borrow_mut().insert(page.clone());
+                        }
+                        index.publish(page.clone(), entry).unwrap();
+                        phantom
+                            .publish(
+                                page.clone(),
+                                u32::try_from(length).unwrap(),
+                                SegmentId(segment),
+                            )
+                            .unwrap();
+                        pages.push(page);
+                    }
+                }
+                for _ in 0..draw() % 4 {
+                    let page = &pages[usize::try_from(draw()).unwrap() % pages.len()];
+                    index.retention().touch(page);
+                }
+                if draw() % 2 == 0 {
+                    let segment = SegmentId(draw() % count as u64);
+                    real.mark_read(segment).unwrap();
+                    phantom_clock.mark_read(segment).unwrap();
+                }
+                let reserve = 1 + usize::try_from(draw() % 3).unwrap();
+                let retention = index.retention();
+                let scoring = retention.scoring_at(now, index.disk_capacity());
+                let expected = real.clock.reclaim_scored(
+                    &*real.index,
+                    reserve,
+                    FOREGROUND_RECLAIM_BUDGET.segment_visits,
+                    FOREGROUND_RECLAIM_BUDGET.mapping_removals,
+                    |segment| real.index.segment_score_with(segment, &scoring),
+                );
+                let actual = phantom_clock.reclaim_scored(
+                    &phantom,
+                    reserve,
+                    FOREGROUND_RECLAIM_BUDGET.segment_visits,
+                    FOREGROUND_RECLAIM_BUDGET.mapping_removals,
+                    |segment| {
+                        phantom.segment_score(
+                            segment,
+                            SCAN_BUDGET,
+                            unseen_value(crate::model::PAGE_BYTES),
+                            |page, bytes| {
+                                page_value(
+                                    Some(bytes),
+                                    crate::model::PAGE_BYTES as u32,
+                                    scoring.score(page),
+                                )
+                            },
+                        )
+                    },
+                );
+                assert_eq!(expected, actual, "seed {seed} round {round}");
+                let evicted = phantom.take_evicted();
+                total_evicted += evicted.len();
+                for (page, _) in evicted {
+                    owned.borrow_mut().remove(&page);
+                }
+                for id in 0..count as u64 {
+                    assert_eq!(
+                        real_segments.state(SegmentId(id)).unwrap(),
+                        phantom_segments.state(SegmentId(id)).unwrap(),
+                        "seed {seed} round {round} segment {id}"
+                    );
+                }
+                for page in &pages {
+                    assert_eq!(
+                        index.lookup(page).unwrap().is_some(),
+                        phantom.get(page).is_some(),
+                        "seed {seed} round {round}"
+                    );
+                }
+            }
+            assert!(total_evicted > 100, "{total_evicted}");
+        }
     }
     #[test]
     fn second_sight_mixed_segments_use_live_payload_value_not_padding_or_last_read() {

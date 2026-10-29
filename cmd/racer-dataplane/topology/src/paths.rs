@@ -12,8 +12,13 @@ use std::{
     mem::size_of,
     rc::Rc,
     sync::Arc,
-    task::Poll,
+    task::{Poll, Waker},
 };
+
+/// Searches that may wait for a free slot per [`Paths`] by default (eight per
+/// search slot). Waiting is FIFO; a search that would exceed this fails with
+/// [`Error::Overloaded`] at once.
+pub const DEFAULT_SEARCH_QUEUE: usize = 64;
 
 /// A route request. All positions refer to the same membership.
 ///
@@ -46,7 +51,15 @@ pub struct PathQuery<'a> {
 /// Finds routes and caches the results.
 ///
 /// Use one per worker thread. It does no I/O and has no timers.
-pub struct Paths {
+///
+/// `S` decides how searches run. The default, [`Exhaustive`], searches the
+/// graph. The simulator replays searches from a memo shared by many `Paths`:
+/// each `Paths` keeps only its own LRU of keys and in-flight counters, while
+/// hits, misses, evictions, admission limits, and the number of polls per
+/// search stay identical.
+pub struct Paths<S: Searches = Exhaustive> {
+    searches: S,
+
     cache_entries: usize,
 
     cache_bytes: usize,
@@ -55,7 +68,71 @@ pub struct Paths {
 
     cache: RefCell<PathCache>,
 
-    inflight: RefCell<BTreeMap<PathKey, Rc<RefCell<SharedSearch>>>>,
+    inflight: RefCell<BTreeMap<PathKey, Rc<RefCell<SharedSearch<S>>>>>,
+
+    queue_limit: usize,
+
+    queue: RefCell<SearchQueue>,
+}
+
+/// Callers waiting, in arrival order, for a free search slot.
+#[derive(Default)]
+struct SearchQueue {
+    next: u64,
+
+    waiting: VecDeque<(u64, Option<Waker>)>,
+}
+
+impl SearchQueue {
+    /// Take the head's waker so it can be woken outside the borrow.
+    fn head_waker(&mut self) -> Option<Waker> {
+        self.waiting.front_mut().and_then(|(_, waker)| waker.take())
+    }
+}
+
+/// How [`Paths`] runs one route search.
+pub trait Searches {
+    /// State of one running search.
+    type Search;
+
+    /// Start a search for `key` on `membership`'s graph.
+    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> Self::Search;
+
+    /// Do one bounded step. Returns true when the search is done.
+    fn step(&self, search: &mut Self::Search) -> bool;
+
+    /// Routes found by a finished search.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unreachable`] when no route fits.
+    fn finish(&self, search: &Self::Search) -> Result<Alternatives>;
+}
+
+/// Default [`Searches`]: run the real bidirectional search.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Exhaustive;
+
+impl Searches for Exhaustive {
+    type Search = EqualCostSearch;
+
+    #[inline]
+    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> EqualCostSearch {
+        EqualCostSearch::new(membership.graph(), key)
+    }
+
+    #[inline]
+    fn step(&self, search: &mut EqualCostSearch) -> bool {
+        let step = search.step(SEARCH_QUANTUM);
+        debug_assert!(
+            step.expansions <= SEARCH_QUANTUM && step.edges <= step.expansions * MAX_DEGREE
+        );
+        step.done
+    }
+
+    #[inline]
+    fn finish(&self, search: &EqualCostSearch) -> Result<Alternatives> {
+        search.finish().map(Rc::new)
+    }
 }
 
 /// Most nodes one poll may expand before yielding.
@@ -69,8 +146,8 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// Cache key for a search. Weights and seed are left out on purpose, so
 /// requests that differ only in those share one search.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct PathKey {
+#[derive(Clone, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct PathKey {
     membership: [u8; 32],
 
     from: usize,
@@ -85,6 +162,13 @@ struct PathKey {
 }
 
 impl PathKey {
+    /// Topology identity ([`Membership::topology_identity`]) of the graph
+    /// searched.
+    #[must_use]
+    pub fn topology(&self) -> [u8; 32] {
+        self.membership
+    }
+
     /// Check the query and sort its lists so equal queries get equal keys.
     fn new<M: Member>(membership: &Membership<M>, query: &PathQuery<'_>) -> Result<Self> {
         let count = membership.members().len();
@@ -127,7 +211,7 @@ impl PathKey {
 }
 
 /// Candidate routes, one per usable first hop.
-type Alternatives = Rc<Vec<Vec<usize>>>;
+pub type Alternatives = Rc<Vec<Vec<usize>>>;
 
 /// LRU cache of search results, limited by entry count and bytes.
 #[derive(Default)]
@@ -251,18 +335,18 @@ impl PathCache {
 }
 
 /// A search that several callers may be waiting on.
-enum SharedSearch {
-    Working(Box<EqualCostSearch>),
+enum SharedSearch<S: Searches> {
+    Working(Box<S::Search>),
 
     Done(Result<Alternatives>),
 }
 
-impl SharedSearch {
+impl<S: Searches> SharedSearch<S> {
     /// Run one small step. When done, cache the result and share it with
     /// every waiter.
     fn poll(
         &mut self,
-        paths: &Paths,
+        paths: &Paths<S>,
         key: &PathKey,
         cx: &std::task::Context<'_>,
     ) -> Poll<Result<Alternatives>> {
@@ -270,35 +354,32 @@ impl SharedSearch {
             Self::Working(search) => search,
             Self::Done(result) => return Poll::Ready(result.clone()),
         };
-        let step = search.step(SEARCH_QUANTUM);
-        debug_assert!(
-            step.expansions <= SEARCH_QUANTUM && step.edges <= step.expansions * MAX_DEGREE
-        );
-        if !step.done {
+        if !paths.searches.step(search) {
             // Every waiter drives progress; no leader or unbounded waker list.
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        let result = search.finish().map(Rc::new);
+        let result = paths.searches.finish(search);
         if let Ok(alternatives) = &result {
             paths.store(key.clone(), Rc::clone(alternatives));
         }
         paths.inflight.borrow_mut().remove(key);
+        paths.wake_queue_head();
         *self = Self::Done(result.clone());
         Poll::Ready(result)
     }
 }
 
 /// One caller's hold on a running search.
-struct SearchAdmission<'a> {
-    paths: &'a Paths,
+struct SearchAdmission<'a, S: Searches> {
+    paths: &'a Paths<S>,
 
     key: PathKey,
 
-    shared: Rc<RefCell<SharedSearch>>,
+    shared: Rc<RefCell<SharedSearch<S>>>,
 }
 
-impl Drop for SearchAdmission<'_> {
+impl<S: Searches> Drop for SearchAdmission<'_, S> {
     /// If this is the last caller waiting, cancel the search.
     fn drop(&mut self) {
         let mut inflight = self.paths.inflight.borrow_mut();
@@ -307,19 +388,49 @@ impl Drop for SearchAdmission<'_> {
             .is_some_and(|search| Rc::ptr_eq(search, &self.shared) && Rc::strong_count(search) == 2)
         {
             inflight.remove(&self.key);
+            drop(inflight);
+            self.paths.wake_queue_head();
         }
     }
 }
 
+/// One caller's place in the search queue. Dropping it (admitted, finished,
+/// or cancelled) leaves the queue and wakes the next caller.
+struct QueueTicket<'a, S: Searches> {
+    paths: &'a Paths<S>,
+
+    ticket: u64,
+}
+
+impl<S: Searches> Drop for QueueTicket<'_, S> {
+    fn drop(&mut self) {
+        let mut queue = self.paths.queue.borrow_mut();
+        if let Some(index) = queue.waiting.iter().position(|(t, _)| *t == self.ticket) {
+            queue.waiting.remove(index);
+        }
+        drop(queue);
+        self.paths.wake_queue_head();
+    }
+}
+
+/// What a queued caller found when it was let through.
+enum Waited<S: Searches> {
+    Cached(Alternatives),
+
+    Join(Rc<RefCell<SharedSearch<S>>>),
+}
+
 impl Paths {
-    /// Cache up to `capacity` results and about 8 MiB. Allow 8 searches at once.
+    /// Cache up to `capacity` results and about 8 MiB. Allow 8 searches at
+    /// once, and up to [`DEFAULT_SEARCH_QUEUE`] more waiting for a slot.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        Self::with_limits(capacity, 8 * 1024 * 1024, 8)
+        Self::with_limits(capacity, 8 * 1024 * 1024, 8).with_queue(DEFAULT_SEARCH_QUEUE)
     }
 
     /// Set the cache entry limit, cache byte limit, and how many searches may
-    /// run at once.
+    /// run at once. No search waits: when all slots are busy a new search
+    /// fails with [`Error::Overloaded`]; see [`Paths::with_queue`].
     ///
     /// - A zero cache limit turns the cache off.
     /// - Zero searches means only cache hits and self routes work.
@@ -329,13 +440,79 @@ impl Paths {
     /// memory limit. A result too big for the cache is not cached.
     #[must_use]
     pub fn with_limits(cache_entries: usize, cache_bytes: usize, active_searches: usize) -> Self {
+        Self::with_searches(cache_entries, cache_bytes, active_searches, Exhaustive)
+    }
+}
+
+impl<S: Searches> Paths<S> {
+    /// Like [`Paths::with_limits`], with a chosen [`Searches`] strategy.
+    #[must_use]
+    pub fn with_searches(
+        cache_entries: usize,
+        cache_bytes: usize,
+        active_searches: usize,
+        searches: S,
+    ) -> Self {
         Self {
+            searches,
             cache_entries,
             cache_bytes,
             search_limit: active_searches,
             cache: RefCell::new(PathCache::default()),
             inflight: RefCell::new(BTreeMap::new()),
+            queue_limit: 0,
+            queue: RefCell::new(SearchQueue::default()),
         }
+    }
+
+    /// Let up to `limit` searches wait, in arrival order, for a free slot
+    /// instead of failing with [`Error::Overloaded`]. A waiting caller holds
+    /// no slot and does no work; it is woken when a slot frees or the caller
+    /// ahead of it leaves. It drops out when its future is dropped (for
+    /// example on its deadline). Zero (the default) disables waiting.
+    #[must_use]
+    pub fn with_queue(mut self, limit: usize) -> Self {
+        self.queue_limit = limit;
+        self
+    }
+
+    /// Number of searches waiting for a slot.
+    #[must_use]
+    pub fn queued_searches(&self) -> usize {
+        self.queue.borrow().waiting.len()
+    }
+
+    /// Wake the first waiting caller, if any, so it can check for a slot.
+    fn wake_queue_head(&self) {
+        let waker = self.queue.borrow_mut().head_waker();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Join a running search for `key`, or start one in a free slot. `None`
+    /// when every slot is busy. Waiting callers go first: a free slot goes to
+    /// the head of the queue (`head`), or to a new caller only while nobody
+    /// waits.
+    fn admit<M: Member>(
+        &self,
+        membership: &Membership<M>,
+        key: &PathKey,
+        head: bool,
+    ) -> Option<Rc<RefCell<SharedSearch<S>>>> {
+        let mut inflight = self.inflight.borrow_mut();
+        if let Some(shared) = inflight.get(key) {
+            return Some(Rc::clone(shared));
+        }
+        if inflight.len() >= self.search_limit || (!head && !self.queue.borrow().waiting.is_empty())
+        {
+            return None;
+        }
+        let shared = Rc::new(RefCell::new(SharedSearch::Working(Box::new(
+            self.searches.start(membership, key),
+        ))));
+        inflight.insert(key.clone(), Rc::clone(&shared));
+        Some(shared)
     }
 
     /// Number of cached results.
@@ -369,7 +546,8 @@ impl Paths {
     /// # Errors
     /// - [`Error::InvalidQuery`] if the query breaks a [`PathQuery`] rule.
     /// - [`Error::Unreachable`] if no route fits in `links` hops.
-    /// - [`Error::Overloaded`] if too many searches are already running.
+    /// - [`Error::Overloaded`] if every search slot is busy and the wait
+    ///   queue ([`Paths::with_queue`]) is full.
     /// - [`Error::SamplingExhausted`] if weighted picking gives up (very rare).
     pub async fn route<M: Member>(
         &self,
@@ -386,20 +564,14 @@ impl Paths {
         if let Some(alternatives) = self.cache.borrow_mut().get(&key) {
             return select_route(membership, &alternatives, query.seed);
         }
-        let shared = {
-            let mut inflight = self.inflight.borrow_mut();
-            if let Some(shared) = inflight.get(&key) {
-                Rc::clone(shared)
-            } else {
-                if inflight.len() >= self.search_limit {
-                    return Err(Error::Overloaded);
+        let shared = match self.admit(membership, &key, false) {
+            Some(shared) => shared,
+            None => match self.wait(membership, &key).await? {
+                Waited::Cached(alternatives) => {
+                    return select_route(membership, &alternatives, query.seed);
                 }
-                let shared = Rc::new(RefCell::new(SharedSearch::Working(Box::new(
-                    EqualCostSearch::new(membership.graph(), &key),
-                ))));
-                inflight.insert(key.clone(), Rc::clone(&shared));
-                shared
-            }
+                Waited::Join(shared) => shared,
+            },
         };
         let admission = SearchAdmission {
             paths: self,
@@ -410,6 +582,49 @@ impl Paths {
             std::future::poll_fn(|cx| admission.shared.borrow_mut().poll(self, &admission.key, cx))
                 .await?;
         select_route(membership, &alternatives, query.seed)
+    }
+
+    /// Wait in the queue until this caller's search result is cached, a
+    /// matching search is running, or it reaches the head and a slot frees.
+    async fn wait<M: Member>(
+        &self,
+        membership: &Membership<M>,
+        key: &PathKey,
+    ) -> Result<Waited<S>> {
+        let ticket = {
+            let mut queue = self.queue.borrow_mut();
+            if queue.waiting.len() >= self.queue_limit {
+                return Err(Error::Overloaded);
+            }
+            let ticket = queue.next;
+            queue.next += 1;
+            queue.waiting.push_back((ticket, None));
+            ticket
+        };
+        let _ticket = QueueTicket {
+            paths: self,
+            ticket,
+        };
+        std::future::poll_fn(|cx| {
+            if let Some(alternatives) = self.cache.borrow_mut().get(key) {
+                return Poll::Ready(Ok(Waited::Cached(alternatives)));
+            }
+            let head = self
+                .queue
+                .borrow()
+                .waiting
+                .front()
+                .is_some_and(|(t, _)| *t == ticket);
+            if let Some(shared) = self.admit(membership, key, head) {
+                return Poll::Ready(Ok(Waited::Join(shared)));
+            }
+            let mut queue = self.queue.borrow_mut();
+            if let Some((_, waker)) = queue.waiting.iter_mut().find(|(t, _)| *t == ticket) {
+                *waker = Some(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     /// Cache a finished search result.
@@ -522,7 +737,7 @@ impl EqualCostWave {
 /// It tracks which first hops lead to each node. It finishes the whole layer
 /// where the sides meet, so every shortest first hop is found, not just the
 /// first one by ID. It keeps one route per first hop, not every route.
-struct EqualCostSearch {
+pub struct EqualCostSearch {
     graph: Arc<Vec<Vec<usize>>>,
 
     key: PathKey,
@@ -683,7 +898,7 @@ impl EqualCostSearch {
 mod tests {
     use super::*;
 
-    use futures::{executor::block_on, task::noop_waker_ref};
+    use futures::{FutureExt, executor::block_on, task::noop_waker_ref};
 
     use std::{future::Future, num::NonZeroU32, task::Context};
 
@@ -1454,6 +1669,145 @@ mod tests {
         assert_eq!(paths.active_searches(), 1);
         drop(next);
         assert_eq!(paths.active_searches(), 0);
+    }
+
+    /// Wakers that count their wakes.
+    fn counting_waker() -> (Waker, Arc<std::sync::atomic::AtomicUsize>) {
+        struct Count(Arc<std::sync::atomic::AtomicUsize>);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (Waker::from(Arc::new(Count(Arc::clone(&count)))), count)
+    }
+
+    /// Run a pinned route future to completion with a no-op waker.
+    fn finish<F: Future + ?Sized>(mut future: std::pin::Pin<&mut F>) -> F::Output {
+        let mut cx = Context::from_waker(noop_waker_ref());
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+        }
+    }
+
+    /// Known issue 10: with a queue, a search beyond the slot limit waits and
+    /// runs when a slot frees, in arrival order; a full queue still rejects.
+    #[test]
+    fn queued_searches_wait_in_order_and_full_queue_rejects() {
+        let members = membership(10_000);
+        let paths = Paths::with_limits(0, 0, 1).with_queue(2);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut running = Box::pin(paths.route(&members, query(0, 9999, 4)));
+        assert!(running.as_mut().poll(&mut cx).is_pending());
+        let (first_waker, first_wakes) = counting_waker();
+        let (second_waker, second_wakes) = counting_waker();
+        let mut first = Box::pin(paths.route(&members, query(1, 9999, 4)));
+        let mut second = Box::pin(paths.route(&members, query(2, 9999, 4)));
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+        assert_eq!(paths.queued_searches(), 2);
+        assert_eq!(paths.active_searches(), 1);
+        // The queue is full.
+        assert_eq!(
+            block_on(paths.route(&members, query(3, 9999, 4))),
+            Err(Error::Overloaded)
+        );
+        // Cache hits and self routes never wait.
+        assert_eq!(block_on(paths.route(&members, query(5, 5, 4))), Ok(vec![5]));
+        // A free slot goes to the head of the queue only.
+        assert!(finish(running.as_mut()).is_ok());
+        assert_eq!(first_wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(second_wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+        assert_eq!(paths.active_searches(), 0);
+        // The head leaves the queue and takes the slot (it may finish on this
+        // first step).
+        let polled = first.as_mut().poll(&mut Context::from_waker(&first_waker));
+        assert_eq!(paths.queued_searches(), 1);
+        assert_eq!(paths.active_searches(), usize::from(polled.is_pending()));
+        // Leaving the queue woke the next caller.
+        assert_eq!(second_wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if polled.is_pending() {
+            assert!(finish(first.as_mut()).is_ok());
+        }
+        assert!(finish(second.as_mut()).is_ok());
+        assert_eq!((paths.active_searches(), paths.queued_searches()), (0, 0));
+    }
+
+    /// A new caller does not take a free slot ahead of waiting callers, a
+    /// cancelled waiter leaves the queue and wakes the next one, and a waiter
+    /// whose search is already running joins it without a slot.
+    #[test]
+    fn queue_is_fair_cancellable_and_joins_running_searches() {
+        let members = membership(10_000);
+        let paths = Paths::with_limits(0, 0, 1).with_queue(4);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut running = Box::pin(paths.route(&members, query(0, 9999, 4)));
+        assert!(running.as_mut().poll(&mut cx).is_pending());
+        let (head_waker, _) = counting_waker();
+        let (next_waker, next_wakes) = counting_waker();
+        let mut head = Box::pin(paths.route(&members, query(1, 9999, 4)));
+        let mut joiner = Box::pin(paths.route(
+            &members,
+            PathQuery {
+                seed: b"joiner",
+                ..query(0, 9999, 4)
+            },
+        ));
+        let mut next = Box::pin(paths.route(&members, query(2, 9999, 4)));
+        assert!(
+            head.as_mut()
+                .poll(&mut Context::from_waker(&head_waker))
+                .is_pending()
+        );
+        // Same key as the running search: joins at once, no queue entry.
+        assert!(joiner.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&next_waker))
+                .is_pending()
+        );
+        assert_eq!(paths.queued_searches(), 2);
+        // Cancelling the head wakes the next waiter.
+        drop(head);
+        assert_eq!(paths.queued_searches(), 1);
+        assert_eq!(next_wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(finish(running.as_mut()).is_ok());
+        assert!(finish(joiner.as_mut()).is_ok());
+        // A newcomer must queue behind `next` even though a slot is free.
+        let mut newcomer = Box::pin(paths.route(&members, query(3, 9999, 4)));
+        assert!(newcomer.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(paths.active_searches(), 0);
+        assert_eq!(paths.queued_searches(), 2);
+        assert!(finish(next.as_mut()).is_ok());
+        assert!(finish(newcomer.as_mut()).is_ok());
+        assert_eq!((paths.active_searches(), paths.queued_searches()), (0, 0));
+        // Without a queue the old behavior holds.
+        assert_eq!(
+            Paths::with_limits(0, 0, 0)
+                .route(&members, query(0, 1, 4))
+                .now_or_never(),
+            Some(Err(Error::Overloaded))
+        );
+        assert_eq!(Paths::new(0).queue_limit, DEFAULT_SEARCH_QUEUE);
     }
 
     /// Cache settings do not change the search limit.

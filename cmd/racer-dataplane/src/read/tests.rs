@@ -24,6 +24,7 @@ pub(super) fn admission_coordinator() -> (Rc<Coordinator>, impl Sized) {
 }
 mod hot_reads;
 mod peer_copies;
+mod persist_policy;
 mod remote;
 mod warming;
 
@@ -142,7 +143,7 @@ fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
     assert_eq!(budget.remaining_links(), 0);
     assert_eq!(
         budget.begin_attempt(now, scope.deadline.0),
-        Err(Error::Unavailable)
+        Err(racer_core::read::Error::Unavailable)
     );
     route.remaining_links = 8;
     route.remaining_attempts = 3;
@@ -1220,6 +1221,186 @@ mod flight {
             );
         }
 
+        /// Successor hints never defer a reader away from a
+        /// running acquisition: `acquiring` is true only while a leader runs.
+        #[test]
+        fn acquiring_only_while_a_leader_runs() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a) = (origin(), scope());
+            let mut a_budget = budget();
+            let page = fence().page;
+            assert!(!flights.acquiring(&page));
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let leader = lead(&mut a);
+            assert!(flights.acquiring(&page));
+            let result = result(&flights, fence().page);
+            assert_eq!(flights.publish(leader, result), Ok(FlightState::Complete));
+            assert!(!flights.acquiring(&page));
+        }
+
+        /// A canceled leader's running operation continues for
+        /// the remaining acquisition waiter instead of being canceled; the
+        /// elected capability publishes and the adopter completes without
+        /// leading a second fill or spending its budget.
+        #[test]
+        fn canceled_leader_hands_running_operation_to_live_waiter() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let (mut a_budget, mut b_budget) = (budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let mut b = join(&flights, &context, &scope_b, &mut b_budget);
+            let leader = lead(&mut a);
+            let mut operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            assert!(poll(b.wait()).is_pending());
+            let cx = &mut Context::from_waker(futures::task::noop_waker_ref());
+            assert!(!operation.poll_cancellation(cx));
+            scope_a.cancel().unwrap();
+            flights.poll_budgeted(1).unwrap();
+            assert!(!operation.cancellation_requested(), "b adopts the work");
+            assert!(!operation.poll_cancellation(cx));
+            failed(&mut a, Error::Cancelled);
+            drop(a);
+            assert!(poll(b.wait()).is_pending(), "no second election");
+            operation.complete().unwrap();
+            let page = result(&flights, fence().page);
+            assert_eq!(flights.publish(leader, page), Ok(FlightState::Complete));
+            assert!(matches!(
+                poll(b.wait()),
+                Poll::Ready(Ok(AcquisitionEvent::Complete(_)))
+            ));
+            drop(b);
+            assert_eq!(b_budget.remaining_attempts(), 3);
+        }
+
+        /// The handed-over operation is canceled once its last adopter is gone,
+        /// copy waiters never adopt, and an elected caller's own deadline or
+        /// cancellation reported by the driver retries for an eligible waiter.
+        #[test]
+        fn handover_ends_with_last_adopter_and_caller_scope_failure_retries() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b, scope_c) = (origin(), scope(), scope(), scope());
+            let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let mut b = join(&flights, &context, &scope_b, &mut b_budget);
+            let leader = lead(&mut a);
+            let mut copy = match flights.join_copy(&fence().page, &scope_c).unwrap() {
+                JoinedCopy::Waiter(waiter) => waiter,
+                _ => panic!("expected copy waiter"),
+            };
+            let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            scope_a.cancel().unwrap();
+            assert!(!operation.cancellation_requested());
+            scope_b.cancel().unwrap();
+            assert!(
+                operation.cancellation_requested(),
+                "copy waiters cannot adopt"
+            );
+            failed(&mut b, Error::Cancelled);
+            operation.complete().unwrap();
+            assert!(matches!(
+                poll(copy.wait()),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+            drop((a, b, copy, leader));
+
+            let (scope_d, scope_e) = (scope(), scope());
+            let mut d = join(&flights, &context, &scope_d, &mut c_budget);
+            let mut e_budget = budget();
+            let mut e = join(&flights, &context, &scope_e, &mut e_budget);
+            let leader = lead(&mut d);
+            let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            scope_d.cancel().unwrap();
+            assert!(!operation.cancellation_requested());
+            operation.complete().unwrap();
+            assert_eq!(
+                flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled)),
+                Ok(FlightState::RetryPending)
+            );
+            let retry = lead(&mut e);
+            assert_eq!(
+                e.acquisition(&retry).unwrap().budget.remaining_attempts(),
+                3
+            );
+            flights
+                .fail(retry, AcquisitionFailure::Terminal(Error::Io))
+                .unwrap();
+            failed(&mut e, Error::Io);
+        }
+
+        /// Dropping or canceling the last adopter wakes the driver polling the
+        /// handed-over operation so it cancels its fetch and releases its
+        /// charges promptly, while a remaining adopter keeps the work running.
+        #[test]
+        fn last_adopter_gone_wakes_driver_promptly() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct Wakes(AtomicUsize);
+            impl futures::task::ArcWake for Wakes {
+                fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+                    arc_self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let wakes = std::sync::Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = futures::task::waker(wakes.clone());
+            let cx = &mut Context::from_waker(&waker);
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b, scope_c) = (origin(), scope(), scope(), scope());
+            let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let b = join(&flights, &context, &scope_b, &mut b_budget);
+            let mut c = join(&flights, &context, &scope_c, &mut c_budget);
+            let leader = lead(&mut a);
+            let page = fence().page;
+            let mut operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            assert!(!operation.poll_cancellation(cx));
+            scope_a.cancel().unwrap();
+            failed(&mut a, Error::Cancelled);
+            drop(a);
+            assert!(!operation.poll_cancellation(cx), "b and c adopt");
+            let before = wakes.0.load(Ordering::SeqCst);
+            drop(b);
+            assert!(wakes.0.load(Ordering::SeqCst) > before, "driver re-checks");
+            assert!(!operation.poll_cancellation(cx), "c keeps the fill running");
+            let before = wakes.0.load(Ordering::SeqCst);
+            scope_c.cancel().unwrap();
+            assert!(poll(c.wait()).is_ready());
+            assert!(
+                wakes.0.load(Ordering::SeqCst) > before,
+                "canceling the last adopter wakes the driver"
+            );
+            assert!(operation.poll_cancellation(cx));
+            drop(c);
+            operation.complete().unwrap();
+            let _ = flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled));
+            assert!(!flights.acquiring(&page));
+            let drain_scope = scope();
+            assert!(
+                matches!(poll(flights.drain(&drain_scope)), Poll::Ready(Ok(()))),
+                "no flight charges remain"
+            );
+        }
+
+        /// Without handover (warm gates fence on the operation) the old
+        /// cancellation stands even when another waiter remains.
+        #[test]
+        fn without_handover_canceled_leader_revokes_running_operation() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let (mut a_budget, mut b_budget) = (budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let mut b = join(&flights, &context, &scope_b, &mut b_budget);
+            let leader = lead(&mut a);
+            let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            scope_a.cancel().unwrap();
+            assert!(operation.cancellation_requested());
+            assert!(poll(b.wait()).is_pending());
+            operation.complete().unwrap();
+            assert!(lead(&mut b).fence.generation > leader.fence.generation);
+        }
+
         #[test]
         fn join_preserves_occupied_flight_until_operation_drains() {
             let flights = flights(FlightLimits::default());
@@ -1646,15 +1827,27 @@ mod flight {
     #[test]
     fn link_refund_is_bounded_and_transfers_do_not_duplicate_refund_rights() {
         let mut original = budget();
-        assert_eq!(original.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            original.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         original.charge_links(6).unwrap();
         let mut child = original.partition(1, 1).unwrap();
-        assert_eq!(child.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            child.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         let mut moved = original.transfer();
-        assert_eq!(original.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            original.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         moved.refund_links(2).unwrap();
         assert_eq!(moved.remaining_links(), 3);
-        assert_eq!(moved.refund_links(5), Err(Error::InvalidRequest));
+        assert_eq!(
+            moved.refund_links(5),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         assert_eq!(moved.remaining_links(), 3);
     }
 
@@ -1664,7 +1857,7 @@ mod flight {
         let deadline = original.deadline();
         assert!(matches!(
             original.partition(2, 9),
-            Err(Error::HopBudgetExhausted)
+            Err(racer_core::read::Error::HopBudgetExhausted)
         ));
         assert_eq!(original.remaining_attempts(), 3);
         let mut child = original.partition(2, 5).unwrap();
@@ -1674,7 +1867,7 @@ mod flight {
         );
         assert_eq!(
             child.begin_peer_attempt(Instant::now(), deadline, 6),
-            Err(Error::HopBudgetExhausted)
+            Err(racer_core::read::Error::HopBudgetExhausted)
         );
         assert_eq!(child.remaining_attempts(), 2);
         assert_eq!(
@@ -1865,12 +2058,24 @@ mod flight {
         let mut original = budget();
         original.charge_links(6).unwrap();
         let mut child = original.partition(1, 2).unwrap();
-        assert_eq!(child.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            child.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         let mut moved = original.transfer();
-        assert_eq!(original.refund_links(1), Err(Error::InvalidRequest));
-        assert_eq!(moved.refund_links(7), Err(Error::InvalidRequest));
+        assert_eq!(
+            original.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
+        assert_eq!(
+            moved.refund_links(7),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         moved.refund_links(6).unwrap();
-        assert_eq!(moved.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            moved.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         assert_eq!(moved.remaining_links() + child.remaining_links(), 8);
     }
 
@@ -1991,11 +2196,20 @@ mod flight {
         let mut budget = AcquisitionBudget::new(original, 2, 4);
         assert_eq!(budget.begin_attempt(now, later), Ok(original));
         assert_eq!(budget.charge_links(3), Ok(()));
-        assert_eq!(budget.charge_links(2), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            budget.charge_links(2),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
         assert_eq!(budget.charge_links(1), Ok(()));
         assert_eq!(budget.begin_attempt(now, later), Ok(original));
-        assert_eq!(budget.begin_attempt(now, later), Err(Error::Unavailable));
-        assert_eq!(budget.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            budget.begin_attempt(now, later),
+            Err(racer_core::read::Error::Unavailable)
+        );
+        assert_eq!(
+            budget.charge_links(1),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
     }
 
     #[test]
@@ -2005,17 +2219,20 @@ mod flight {
         let mut first = AcquisitionBudget::new(deadline, 1, 0);
         let mut remaining = AcquisitionBudget::new(deadline, 1, 4);
         assert_eq!(first.begin_attempt(now, deadline), Ok(deadline));
-        assert_eq!(first.begin_attempt(now, deadline), Err(Error::Unavailable));
+        assert_eq!(
+            first.begin_attempt(now, deadline),
+            Err(racer_core::read::Error::Unavailable)
+        );
         assert_eq!(
             remaining.begin_attempt(now, now),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
         // Expiry checks and failed charges do not consume unrelated credits.
         assert_eq!(remaining.begin_attempt(now, deadline), Ok(deadline));
         assert_eq!(remaining.charge_links(4), Ok(()));
         assert_eq!(
             first.begin_attempt(deadline, deadline),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
     }
 }
@@ -2083,6 +2300,14 @@ mod timeouts {
         /// Answer Subscribes with a signed `Unavailable`, as a relay does
         /// when the provider behind it drops the exchange.
         relay_unavailable: Cell<bool>,
+        /// Page requests fail at once with a transport error (`Io`).
+        fail_pages: Cell<bool>,
+        /// The destination answers page requests with a signed
+        /// `Unavailable`, as a rank 0 whose origin fetch failed does.
+        pages_unavailable: Cell<bool>,
+        /// The next this many page requests are shed by their destination
+        /// (a signed `Overloaded`, as a hot page's owner does).
+        shed_pages: Cell<usize>,
     }
 
     impl Peers {
@@ -2115,6 +2340,13 @@ mod timeouts {
             let response = match &request.operation {
                 PeerOperation::Subscribe { .. } if self.relay_unavailable.get() => {
                     PeerResponse::Unavailable
+                }
+                PeerOperation::Page { .. } if self.pages_unavailable.get() => {
+                    PeerResponse::Unavailable
+                }
+                PeerOperation::Page { .. } if self.shed_pages.get() > 0 => {
+                    self.shed_pages.set(self.shed_pages.get() - 1);
+                    PeerResponse::Overloaded
                 }
                 PeerOperation::Subscribe { .. } | PeerOperation::Page { .. } => PeerResponse::Miss,
                 _ => PeerResponse::Metadata(metadata),
@@ -2176,11 +2408,13 @@ mod timeouts {
                 attempts: request.route.remaining_attempts,
                 links: request.route.remaining_links,
             });
-            let refused = self.refuse_flights.get()
+            let refused = (self.refuse_flights.get()
                 && matches!(
                     &request.operation,
                     PeerOperation::Subscribe { subscription, .. } if subscription.flights.is_some()
-                );
+                ))
+                || (self.fail_pages.get()
+                    && matches!(&request.operation, PeerOperation::Page { .. }));
             Box::pin(async move {
                 let _membership = membership;
                 if refused {
@@ -2259,6 +2493,9 @@ mod timeouts {
                 late_success,
                 refuse_flights: Cell::new(false),
                 relay_unavailable: Cell::new(false),
+                fail_pages: Cell::new(false),
+                pages_unavailable: Cell::new(false),
+                shed_pages: Cell::new(0),
             });
             let policy = CandidatePolicy::new(
                 local,
@@ -2286,6 +2523,56 @@ mod timeouts {
                 scope,
                 budget,
             }
+        }
+
+        fn page(&self) -> crate::model::PageId {
+            crate::model::PageId {
+                version: ObjectVersion {
+                    object: self.context.object.clone(),
+                    etag: StrongEtag::test_value("v"),
+                },
+                number: PageNumber(0),
+            }
+        }
+
+        /// Resolve an `Acquire` of page 0; with `stall`, poll once and let `clock` pass the
+        /// attempt timeout first.
+        fn resolve_page(
+            &mut self,
+            clock: &uring_runtime::environment::SimulationClock,
+            stall: bool,
+        ) -> Result<CandidateResolution> {
+            let operation = PeerOperation::Page {
+                page: self.page(),
+                mode: FetchMode::Acquire,
+            };
+            let candidates = Candidates {
+                membership: self.candidates.membership.clone(),
+                ordered: self.candidates.ordered.clone(),
+            };
+            let mut resolve = self.policy.resolve_with_budget(
+                candidates,
+                &self.context,
+                operation,
+                &self.scope,
+                &mut self.budget,
+            );
+            if stall {
+                assert!(poll(resolve.as_mut()).is_pending());
+                clock.advance(Duration::from_secs(2));
+            }
+            let Poll::Ready(result) = poll(resolve.as_mut()) else {
+                panic!("bounded resolution")
+            };
+            result
+        }
+
+        /// Destinations of the calls from the `from`th on.
+        fn visited(&self, from: usize) -> Vec<NodeId> {
+            self.peers.calls.borrow()[from..]
+                .iter()
+                .map(|c| c.destination.clone())
+                .collect()
         }
 
         fn operation(&self) -> PeerOperation {
@@ -2613,6 +2900,238 @@ mod timeouts {
         assert_eq!(f.scope.check(), Ok(()));
     }
 
+    /// An owner above rank 0 whose page `Acquire` to rank 0
+    /// is sent but unanswered within the attempt does not take origin
+    /// authority (rank 0 is most likely still fetching); the walk ends
+    /// `Unavailable` and the caller retries into rank 0's acquisition. A
+    /// transport failure from rank 0 still lets the owner fetch.
+    #[test]
+    fn owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out() {
+        for stalled in [1, 0] {
+            let clock = uring_runtime::environment::SimulationClock::new(201);
+            let _env = clock.environment(0).enter();
+            let mut f = Fixture::new(Some(1), stalled, false).bounded(201, 60, 24);
+            f.policy = f.policy.with_attempt_timeout(Duration::from_secs(1));
+            if stalled == 0 {
+                // Rank 0 refuses at once: a transport failure, not a timeout.
+                f.peers.fail_pages.set(true);
+            }
+            let rank0 = f.candidates.ordered[0].clone();
+            let result = f.resolve_page(&clock, stalled != 0);
+            let calls = f.peers.calls.borrow();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].destination, rank0);
+            assert!(!calls[0].copy, "rank 1 delegates with an Acquire");
+            if stalled != 0 {
+                assert!(matches!(result, Err(Error::Unavailable)));
+            } else {
+                assert!(matches!(result, Ok(CandidateResolution::Origin(_))));
+            }
+            assert_eq!(f.scope.check(), Ok(()));
+        }
+    }
+
+    /// After rank 0 timed out, another timeout of rank 0
+    /// does not give rank 1 authority for `with_rank0_hang_after`, even past the first request's short
+    /// deadline (rank 0's acquisition outlives it while other waiters join);
+    /// a rank 0 still silent after that (hung) no longer blocks the page: the
+    /// next timeout gives authority.
+    #[test]
+    fn owner_page_walk_bounds_the_wait_for_a_silent_rank_zero() {
+        let clock = uring_runtime::environment::SimulationClock::new(205);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(Some(1), 3, false).bounded(205, 3, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_rank0_hang_after(Duration::from_secs(5));
+        let rank0 = f.candidates.ordered[0].clone();
+        // t = 0..2: rank 0 accepts and stays silent; leave the fetch to it.
+        let first = f.resolve_page(&clock, true);
+        assert!(matches!(first, Err(Error::Unavailable)));
+        // t = 5..7: past the first request's 3 s deadline but within the
+        // 5 s allowance: a timeout still leaves the fetch to rank 0.
+        clock.advance(Duration::from_secs(3));
+        f = f.bounded(207, 60, 24);
+        let second = f.resolve_page(&clock, true);
+        assert!(matches!(second, Err(Error::Unavailable)));
+        // t = 10: rank 0 is overdue; a timeout gives authority.
+        clock.advance(Duration::from_secs(3));
+        f = f.bounded(208, 60, 24);
+        let third = f.resolve_page(&clock, true);
+        assert!(matches!(third, Ok(CandidateResolution::Origin(_))));
+        let calls = f.peers.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
+    }
+
+    /// Rank 0 itself answering an owner's delegation that
+    /// its fetch failed gives the owner origin authority, unless the owner's
+    /// own origin request for the page failed less than
+    /// `with_rank0_hang_after` ago; then the retry is left to rank 0. A
+    /// terminal origin answer is not an origin failure, and a miss from
+    /// rank 0 forgets the failure.
+    #[test]
+    fn owner_leaves_origin_retries_to_a_failing_rank_zero() {
+        let clock = uring_runtime::environment::SimulationClock::new(209);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(Some(1), 0, false).bounded(209, 60, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_rank0_hang_after(Duration::from_secs(5));
+        f.peers.pages_unavailable.set(true);
+        let page = f.page();
+        let rank0 = f.candidates.ordered[0].clone();
+        let ordered = f.candidates.ordered.clone();
+        let resolve_once = |f: &mut Fixture, request: u8| {
+            *f = std::mem::replace(f, Fixture::new(Some(1), 0, false)).bounded(request, 60, 24);
+            matches!(
+                f.resolve_page(&clock, false),
+                Ok(CandidateResolution::Origin(_))
+            )
+        };
+        // A failure local to rank 0: the owner fetches.
+        assert!(resolve_once(&mut f, 210));
+        // Terminal origin answers are not origin failures.
+        f.policy
+            .note_origin_failure(&page, &ordered, 1, &Error::VersionUnavailable);
+        assert!(resolve_once(&mut f, 211));
+        // The owner's own fetch failed: leave retries to rank 0.
+        f.policy
+            .note_origin_failure(&page, &ordered, 1, &Error::Unavailable);
+        assert!(!resolve_once(&mut f, 212));
+        clock.advance(Duration::from_secs(4));
+        assert!(!resolve_once(&mut f, 213));
+        // `hang_after` later the owner fetches once more.
+        clock.advance(Duration::from_secs(1));
+        assert!(resolve_once(&mut f, 214));
+        f.policy
+            .note_origin_failure(&page, &ordered, 1, &Error::DeadlineExceeded);
+        assert!(!resolve_once(&mut f, 215));
+        // A miss from rank 0 forgets it.
+        f.peers.pages_unavailable.set(false);
+        assert!(resolve_once(&mut f, 216));
+        f.peers.pages_unavailable.set(true);
+        assert!(resolve_once(&mut f, 217));
+        // Rank 0 never notes its own failures.
+        f.policy
+            .note_origin_failure(&page, &ordered, 0, &Error::Unavailable);
+        assert!(resolve_once(&mut f, 218));
+        let calls = f.peers.calls.borrow();
+        assert_eq!(calls.len(), 9);
+        assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
+    }
+
+    /// A reader whose probe of an owner
+    /// went unanswered visits that owner after the page's other owners on
+    /// its next walk, instead of first again (`Spread` is deterministic per
+    /// requester and page); an answer from it restores its place.
+    #[test]
+    fn reader_visits_an_owner_that_left_it_unanswered_after_the_others() {
+        let clock = uring_runtime::environment::SimulationClock::new(209);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 1, false).bounded(209, 60, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_replica_selection(crate::read::candidates::ReplicaSelection::Spread);
+        // No minimum wait, so the scripted timeout counts.
+        f.policy
+            .link_health()
+            .set_silence(Duration::ZERO, Duration::from_secs(1));
+        let _ = f.resolve_page(&clock, true);
+        let first = f.visited(0);
+        assert!(first.len() >= 2, "{first:?}");
+        let hung = first[0].clone();
+        assert_eq!(
+            f.policy.link_health().answering(&hung),
+            racer_core::read::Answering::Unanswered
+        );
+        // The next walk visits it last: everyone else answered.
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(210, 60, 24);
+        let _ = f.resolve_page(&clock, false);
+        let second = f.visited(before);
+        assert_eq!(second.last(), Some(&hung), "{first:?} then {second:?}");
+        assert_ne!(second[0], hung);
+        // It answered this time: its place is restored.
+        assert_eq!(
+            f.policy.link_health().answering(&hung),
+            racer_core::read::Answering::Answers
+        );
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(211, 60, 24);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(f.visited(before)[0], hung);
+    }
+
+    /// An owner that itself shed a reader's
+    /// request (a signed `Overloaded`, as a hot page's owner does) is busy,
+    /// not hung. The reader's next walks visit it after the page's other
+    /// owners for the quiet time (half a request timeout), without a ping,
+    /// instead of first again (`Spread` is deterministic per requester and
+    /// page, so a retried read repeated the shed walk). Any other answer
+    /// from it, or the quiet time passing, restores its place.
+    #[test]
+    fn reader_visits_an_owner_that_shed_it_after_the_others() {
+        use racer_core::read::Answering;
+        let clock = uring_runtime::environment::SimulationClock::new(212);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 0, false).bounded(212, 60, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_replica_selection(crate::read::candidates::ReplicaSelection::Spread);
+        f.policy
+            .link_health()
+            .set_silence(Duration::from_secs(5), Duration::from_secs(1));
+        // Without a shed, the first owner visited.
+        let _ = f.resolve_page(&clock, false);
+        let usual = f.visited(0);
+        let busy = usual[0].clone();
+        assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
+        // It sheds this time: busy, alive, never pinged.
+        f.peers.shed_pages.set(1);
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(213, 60, 24);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(f.visited(before)[0], busy);
+        assert_eq!(
+            f.policy.link_health().answering(&busy),
+            Answering::Unanswered
+        );
+        assert!(!f.policy.link_health().silent(&busy));
+        assert!(
+            f.policy
+                .link_health()
+                .due_pings(uring_runtime::environment::now(), 16)
+                .is_empty()
+        );
+        // The next walk visits it last; it answers, which restores its place.
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(214, 60, 24);
+        let _ = f.resolve_page(&clock, false);
+        let next = f.visited(before);
+        assert_ne!(next[0], busy, "{usual:?} then {next:?}");
+        assert_eq!(next.last(), Some(&busy), "{usual:?} then {next:?}");
+        assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
+        // A shed is forgotten after the quiet time without another answer.
+        f.peers.shed_pages.set(1);
+        f = f.bounded(215, 60, 24);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(
+            f.policy.link_health().answering(&busy),
+            Answering::Unanswered
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(216, 60, 24);
+        let _ = f.resolve_page(&clock, false);
+        assert_eq!(f.visited(before)[0], busy);
+    }
+
     #[test]
     fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
         let clock = uring_runtime::environment::SimulationClock::new(200);
@@ -2637,16 +3156,12 @@ mod timeouts {
             membership: f.candidates.membership.clone(),
             ordered: f.candidates.ordered.clone(),
         };
+        // A metadata walk: rank 1 takes origin authority from rank 0's
+        // timeout. (A page walk leaves the fetch to rank 0 instead; see `owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out`.)
         let mut resolve = f.policy.resolve_with_budget(
             candidates,
             &f.context,
-            match &operation {
-                PeerOperation::Page { page, .. } => PeerOperation::Page {
-                    page: page.clone(),
-                    mode: FetchMode::Acquire,
-                },
-                _ => unreachable!(),
-            },
+            f.operation(),
             &f.scope,
             &mut f.budget,
         );
@@ -2750,10 +3265,12 @@ mod timeouts {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let version = ObjectVersion {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
@@ -2873,10 +3390,12 @@ mod timeouts {
         let mut f = Fixture::new(Some(1), 0, false);
         f.peers.refuse_flights.set(true);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let version = ObjectVersion {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
@@ -2945,10 +3464,12 @@ mod timeouts {
         // `Unavailable` for the dropped exchange.
         f.peers.relay_unavailable.set(true);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let version = ObjectVersion {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
@@ -3014,10 +3535,12 @@ mod timeouts {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
         let scheduler = crate::read::range_stream::Scheduler::new(1);
-        let demand = crate::peer::subscriptions::Demand::new(vec![
-            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-        ])
-        .unwrap();
+        let demand =
+            racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+                start: 0,
+                end: 1,
+            }])
+            .unwrap();
         let selection = crate::read::range_stream::Selection::for_test(
             &scheduler,
             ObjectVersion {

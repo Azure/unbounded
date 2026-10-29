@@ -120,11 +120,12 @@ pub fn micro_time(since_epoch: Duration) -> String {
     )
 }
 
-/// Current wall time as MicroTime.
-pub fn now_micro() -> String {
+/// `wall` as MicroTime. Callers pass the wall clock (production:
+/// `SystemTime::now()`), so this module stays pure. Times before the epoch
+/// render as the epoch.
+pub fn now_micro(wall: std::time::SystemTime) -> String {
     micro_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        wall.duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default(),
     )
 }
@@ -180,10 +181,16 @@ pub fn may_claim_primary(holds_seat: bool, primary_expired: bool) -> bool {
 }
 
 /// Pseudo-random delay before contending, spread by Pod UID and attempt.
+/// Timing jitter only, so a non-cryptographic hash (FNV-1a, then a
+/// splitmix64 finalizer) is enough.
 pub fn claim_delay(pod_uid: &str, attempt: u32, spread: Duration) -> Duration {
-    use sha2::Digest;
-    let h = sha2::Sha256::digest(format!("{pod_uid}/{attempt}"));
-    let n = u64::from_be_bytes(h[..8].try_into().expect("8 bytes"));
+    let mut n = 0xcbf2_9ce4_8422_2325u64;
+    for b in pod_uid.bytes().chain([b'/']).chain(attempt.to_be_bytes()) {
+        n = (n ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    n = (n ^ (n >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    n = (n ^ (n >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    n ^= n >> 31;
     let ms = spread.as_millis().max(1) as u64;
     Duration::from_millis(n % ms)
 }
@@ -249,6 +256,14 @@ mod tests {
             micro_time(Duration::from_secs(253_402_300_799)),
             "9999-12-31T23:59:59.000000Z"
         );
+    }
+
+    #[test]
+    fn now_micro_uses_given_wall_time() {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_709_164_800);
+        assert_eq!(now_micro(t), "2024-02-29T00:00:00.000000Z");
+        let before = std::time::UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(now_micro(before), "1970-01-01T00:00:00.000000Z");
     }
 
     #[test]

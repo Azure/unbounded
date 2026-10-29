@@ -167,6 +167,16 @@ impl AdaptivePeers {
         self.inner.hedge_available(node)
     }
     pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
+        Self::with_clock(config, metrics, now)
+    }
+    /// As `new`, reading time from `clock` instead of the runtime clock. A
+    /// simulator passes its virtual clock; `new` passes the runtime clock, so
+    /// production pays nothing for the parameter.
+    pub(crate) fn with_clock(
+        config: Config,
+        metrics: Metrics,
+        clock: fn() -> std::time::Instant,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
             shard: metrics.writer_shard(),
@@ -180,7 +190,7 @@ impl AdaptivePeers {
                     retire_after: Duration::from_secs(60),
                 },
                 AdmissionObserver(metrics),
-                now,
+                clock,
             )?,
         }))
     }
@@ -251,6 +261,28 @@ impl PeerNetwork {
 
 /// Narrow a caller's scope to the signed route without creating a new cancellation
 /// domain or extending the original deadline.
+/// The page that selects an RDMA rail for `operation`, if any. Bodyless page
+/// modes (ping, offer) have none: they take HTTP and never wait for an RDMA
+/// link, window grant, or landing slot before sending.
+pub(crate) fn rail_hint(operation: &protocol::Operation) -> Option<crate::model::PageId> {
+    match operation {
+        protocol::Operation::Page {
+            mode: protocol::FetchMode::Ping | protocol::FetchMode::Offer,
+            ..
+        } => None,
+        protocol::Operation::Page { page, .. } => Some(page.clone()),
+        protocol::Operation::Subscribe { subscription, .. } => subscription
+            .demand
+            .intervals()
+            .first()
+            .map(|interval| crate::model::PageId {
+                version: subscription.version.clone(),
+                number: crate::model::PageNumber(interval.start),
+            }),
+        _ => None,
+    }
+}
+
 pub(crate) fn request_scope(
     request: &protocol::PeerRequest,
     scope: &RequestScope,
@@ -286,15 +318,11 @@ pub(crate) fn search_budget(
     route: &crate::topology::RouteBudget,
     local: &NodeId,
 ) -> Result<crate::topology::RouteBudget> {
+    let (keep, remaining_links) =
+        racer_core::route::search_budget(&route.visited, route.remaining_links, local)?;
     let mut budget = route.clone();
-    if budget.visited.last() == Some(local) {
-        budget.visited.pop();
-    } else {
-        budget.remaining_links = budget
-            .remaining_links
-            .checked_sub(1)
-            .ok_or(Error::HopBudgetExhausted)?;
-    }
+    budget.visited.truncate(keep);
+    budget.remaining_links = remaining_links;
     Ok(budget)
 }
 /// Opaque bounded transit with recorded reverse-path responses, never a page cache.
@@ -363,13 +391,24 @@ impl Relay {
             check_membership(request.request(), &membership)?;
             let network = &self.network;
             let budget = &request.request().route;
-            if budget.destination == network.local || budget.visited.contains(&network.local) {
+            let remaining_links = racer_core::route::relay(
+                &budget.visited,
+                &budget.destination,
+                budget.remaining_links,
+                &network.local,
+            );
+            if remaining_links == Err(racer_core::route::RouteFault::Invalid) {
                 return Err(Error::InvalidRequest);
             }
             let reservation = match relay.as_ref() {
                 Some(reservation) => reservation.clone(),
                 None => Rc::new(self.admission.reserve(None, ResourceClass::Relay, 1)?),
             };
+            // A destination this node holds silent fails at once:
+            // signed `Unavailable`, as for no route.
+            if self.paths.link_health().silent(&budget.destination) {
+                return Err(Error::Unavailable);
+            }
             let search_budget = search_budget(budget, &network.local)?;
             let route = self
                 .paths
@@ -385,10 +424,7 @@ impl Relay {
             let binding = request.binding().clone();
             let mut visited = budget.visited.clone();
             visited.push(network.local.clone());
-            let remaining_links = budget
-                .remaining_links
-                .checked_sub(1)
-                .ok_or(Error::HopBudgetExhausted)?;
+            let remaining_links = remaining_links?;
             let outbound_budget = crate::topology::RouteBudget {
                 membership: budget.membership,
                 request: budget.request,
@@ -499,6 +535,8 @@ pub enum Requester {
         /// a landed page for a request or None to answer it as a plain request.
         #[cfg(test)]
         landing: Option<(i32, ScriptedLanding)>,
+        /// Silence state the candidate policy keeps for scripted peers.
+        health: Rc<crate::topology::LinkHealth>,
     },
 }
 
@@ -529,6 +567,7 @@ impl Requester {
     ) -> Rc<Self> {
         let capability = state.clone();
         Rc::new(Self::Scripted {
+            health: Rc::new(crate::topology::LinkHealth::default()),
             available: Box::new(move |m, n| available(&capability, m, n)),
             request: Box::new(move |r, m, scope, is_direct| {
                 let state = state.clone();
@@ -829,11 +868,26 @@ impl Requester {
             let scope = request_scope(&request, scope)?;
             check_membership(&request, &membership)?;
             let search_budget = search_budget(&request.route, &network.local)?;
+            // An origin's own recovery ping may use the link to the peer it
+            // holds silent; that link is what it tests.
+            let ping = matches!(
+                request.operation,
+                protocol::Operation::Page {
+                    mode: protocol::FetchMode::Ping,
+                    ..
+                }
+            );
             let route = observer.result(
                 Stage::PeerRoute,
                 &scope,
                 paths
-                    .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
+                    .shortest_probe_async(
+                        membership.clone(),
+                        &network.local,
+                        &search_budget,
+                        &scope,
+                        ping,
+                    )
                     .await,
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
@@ -902,6 +956,14 @@ impl Requester {
     }
 }
 impl Requester {
+    /// This worker's link health (silence included).
+    pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
+        match self {
+            Self::Network { health, .. } => health.clone(),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted { health, .. } => health.clone(),
+        }
+    }
     fn exchange_inner<'a>(
         &'a self,
         request: SignedRequest,
@@ -957,18 +1019,7 @@ impl Requester {
             // The hint chooses a candidate rail, never the provider's page order.
             // The sender validates the actual selected page against that rail and
             // falls back to HTTP before exporting a window when they disagree.
-            let rail_hint = match &request.request.operation {
-                protocol::Operation::Page { page, .. } => Some(page.clone()),
-                protocol::Operation::Subscribe { subscription, .. } => subscription
-                    .demand
-                    .intervals()
-                    .first()
-                    .map(|interval| crate::model::PageId {
-                        version: subscription.version.clone(),
-                        number: crate::model::PageNumber(interval.start),
-                    }),
-                _ => None,
-            };
+            let rail_hint = rail_hint(&request.request.operation);
             let plan = if direct_http {
                 if next != budget.destination {
                     return Err(Error::InvalidRequest);
@@ -986,8 +1037,17 @@ impl Requester {
             } else {
                 crate::rdma::TransportPlan::Http
             };
+            // The last link: this sender learns whether the destination
+            // answers.
+            let last_page = match &request.request.operation {
+                protocol::Operation::Page { page, .. } if next == budget.destination => {
+                    Some(page.clone())
+                }
+                _ => None,
+            };
             let receive_permit = transfers.admit_receive(&request.request, &scope).await?;
             let _probe = health.acquire(&next)?;
+            let sent = uring_runtime::environment::now();
             let permit = paths
                 .peer_admission
                 .as_ref()
@@ -1016,34 +1076,46 @@ impl Requester {
                 Ok(response) => self.verify_exchange(response, &binding, &scope).await,
                 Err(error) => Err(error),
             };
-            use crate::topology::LinkOutcome;
-            let outcome = match &response {
-                Ok(transport::RelayResponse::Complete(_) | transport::RelayResponse::Landed(_)) => {
-                    Some(LinkOutcome::Success)
+            use racer_core::route;
+            let exchange = match &response {
+                Ok(transport::RelayResponse::Complete(response)) => route::Exchange::Complete {
+                    overloaded: matches!(response.response, protocol::PeerResponse::Overloaded),
+                },
+                // A landed page was verified by the transport, like a complete response.
+                Ok(transport::RelayResponse::Landed(_)) => {
+                    route::Exchange::Complete { overloaded: false }
                 }
-                Err(_) if permit.is_none() && socket_failure.get() => Some(LinkOutcome::Refused),
-                // Unavailable/deadline/protocol errors can arise locally or at a
-                // downstream node. Do not blame an immediate peer without evidence.
-                _ => None,
+                Ok(_) => route::Exchange::Streaming,
+                Err(error) => route::Exchange::Failed {
+                    fault: error.fault(),
+                    socket_failure: socket_failure.get(),
+                },
             };
-            if let Some(outcome) = outcome {
+            // Unavailable/deadline/protocol errors can arise locally or at a
+            // downstream node. Do not blame an immediate peer without evidence.
+            let (link, admission, silence) = route::exchange_evidence(exchange, permit.is_some());
+            if let Some(outcome) = link {
                 health.observe(&next, outcome)?;
             }
             if let Some(permit) = permit {
-                permit.observe(match &response {
-                    // A downstream overload is not attributable to the immediate
-                    // peer. It also must not increase its admission or recover a probe.
-                    Ok(transport::RelayResponse::Complete(response))
-                        if matches!(response.response, protocol::PeerResponse::Overloaded) =>
-                    {
-                        Outcome::Neutral
+                // A downstream overload is not attributable to the immediate
+                // peer. It also must not increase its admission or recover a probe.
+                permit.observe(admission);
+            }
+            if let Some(page) = last_page {
+                match silence {
+                    Some(true) => health.silence_answered(&next),
+                    // `CandidatePolicy::poll_pings` sends the ping.
+                    Some(false) => {
+                        let _ = health.silence_timed_out(
+                            &next,
+                            page,
+                            sent,
+                            racer_core::liveness::LINK_TIMEOUTS,
+                        );
                     }
-                    Ok(
-                        transport::RelayResponse::Complete(_) | transport::RelayResponse::Landed(_),
-                    ) => Outcome::Verified,
-                    Err(Error::Overloaded) => Outcome::LocalPressure,
-                    _ => Outcome::Neutral,
-                });
+                    None => {}
+                }
             }
             drop(membership);
             response

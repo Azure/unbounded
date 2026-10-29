@@ -31,6 +31,8 @@ pub enum KubeError {
     Forbidden,
     Invalid,
     TooLarge,
+    /// 429: the API server is shedding load. Callers slow down.
+    Throttled,
     Unavailable,
 }
 
@@ -51,6 +53,7 @@ pub fn status_error(status: u16) -> Option<KubeError> {
         409 => KubeError::Conflict,
         410 => KubeError::Gone,
         413 => KubeError::TooLarge,
+        429 => KubeError::Throttled,
         _ => KubeError::Unavailable,
     })
 }
@@ -649,6 +652,8 @@ mod tests {
             KubeError::Invalid
         );
         assert_eq!(status_error(409), Some(KubeError::Conflict));
+        assert_eq!(status_error(429), Some(KubeError::Throttled));
+        assert_eq!(status_error(503), Some(KubeError::Unavailable));
         assert_eq!(status_error(204), None);
         assert_eq!(escape("a b/c"), "a%20b%2Fc");
     }

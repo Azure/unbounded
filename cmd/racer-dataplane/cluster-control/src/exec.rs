@@ -326,20 +326,58 @@ pub async fn timeout<T>(
 }
 
 /// Edge-free broadcast: waiters wake on every [`Signal::notify`].
+///
+/// Each [`Signal::changed`] future owns one entry in a slab of wakers, so
+/// registering, re-registering, and dropping a waiter are O(1) and a notify
+/// with W waiters is O(W).
 #[derive(Clone, Default)]
 pub struct Signal(Rc<SignalInner>);
 
 #[derive(Default)]
 struct SignalInner {
     generation: Cell<u64>,
-    wakers: RefCell<Vec<Waker>>,
+    wakers: RefCell<WakerSlab>,
+}
+
+#[derive(Default)]
+struct WakerSlab {
+    entries: Vec<Option<Waker>>,
+    free: Vec<usize>,
+    live: usize,
+}
+
+impl WakerSlab {
+    fn insert(&mut self, waker: Waker) -> usize {
+        self.live += 1;
+        match self.free.pop() {
+            Some(i) => {
+                self.entries[i] = Some(waker);
+                i
+            }
+            None => {
+                self.entries.push(Some(waker));
+                self.entries.len() - 1
+            }
+        }
+    }
+
+    fn remove(&mut self, i: usize) {
+        if let Some(e) = self.entries.get_mut(i)
+            && e.take().is_some()
+        {
+            self.live -= 1;
+            self.free.push(i);
+        }
+    }
 }
 
 impl Signal {
     /// Wake all current waiters.
     pub fn notify(&self) {
         self.0.generation.set(self.0.generation.get() + 1);
-        for w in self.0.wakers.borrow_mut().drain(..) {
+        // Take the slab first: a waker may run code that registers again.
+        let slab = std::mem::take(&mut *self.0.wakers.borrow_mut());
+        for w in slab.entries.into_iter().flatten() {
             w.wake();
         }
     }
@@ -349,44 +387,190 @@ impl Signal {
         self.0.generation.get()
     }
 
+    /// Wakers registered and not yet woken or dropped.
+    #[cfg(test)]
+    pub fn waiters(&self) -> usize {
+        self.0.wakers.borrow().live
+    }
+
     /// Wait until the generation differs from `seen`.
-    pub fn changed(&self, seen: u64) -> impl Future<Output = ()> + '_ {
-        std::future::poll_fn(move |cx| {
-            if self.0.generation.get() != seen {
-                return Poll::Ready(());
-            }
-            let mut wakers = self.0.wakers.borrow_mut();
-            if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                wakers.push(cx.waker().clone());
-            }
-            Poll::Pending
-        })
+    pub fn changed(&self, seen: u64) -> Changed<'_> {
+        Changed {
+            signal: self,
+            seen,
+            slot: None,
+        }
     }
 }
 
-/// A counting semaphore without queuing. `try_acquire` fails when full.
+/// Future of [`Signal::changed`].
+pub struct Changed<'a> {
+    signal: &'a Signal,
+    seen: u64,
+    /// Slab index, valid while the generation still equals `seen` (a
+    /// notify empties the slab and bumps the generation together).
+    slot: Option<usize>,
+}
+
+impl Future for Changed<'_> {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let signal = self.signal;
+        let inner = &signal.0;
+        if inner.generation.get() != self.seen {
+            self.slot = None;
+            return Poll::Ready(());
+        }
+        let mut slab = inner.wakers.borrow_mut();
+        match self.slot {
+            Some(i) => {
+                if let Some(Some(w)) = slab.entries.get_mut(i)
+                    && !w.will_wake(cx.waker())
+                {
+                    w.clone_from(cx.waker());
+                }
+            }
+            None => {
+                let i = slab.insert(cx.waker().clone());
+                drop(slab);
+                self.slot = Some(i);
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for Changed<'_> {
+    fn drop(&mut self) {
+        if let Some(i) = self.slot
+            && self.signal.0.generation.get() == self.seen
+        {
+            self.signal.0.wakers.borrow_mut().remove(i);
+        }
+    }
+}
+
+/// A counting semaphore with an optional bounded FIFO wait.
+/// [`Slots::try_acquire`] fails when full; [`Slots::acquire`] queues until a
+/// deadline. The rules are [`crate::step::admission::WriteQueue`], shared
+/// with the simulator.
 #[derive(Clone)]
-pub struct Slots(Rc<Cell<usize>>, usize);
+pub struct Slots(Rc<RefCell<SlotQueue>>);
+
+type SlotQueue = crate::step::admission::WriteQueue<Rc<SlotWaiter>>;
+
+/// A queued [`Slots::acquire`].
+#[derive(Default)]
+pub struct SlotWaiter {
+    /// The slot was handed to this waiter.
+    granted: Cell<bool>,
+    /// The waiter gave up; skip it.
+    gone: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+fn waiting(w: &Rc<SlotWaiter>) -> bool {
+    !w.gone.get() && !w.granted.get()
+}
 
 /// A held slot.
-pub struct Slot(Rc<Cell<usize>>);
+pub struct Slot(Rc<RefCell<SlotQueue>>);
+
+fn release(queue: &Rc<RefCell<SlotQueue>>) {
+    let next = queue.borrow_mut().release(waiting);
+    if let Some(w) = next {
+        w.granted.set(true);
+        if let Some(waker) = w.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
+        release(&self.0);
     }
 }
 
 impl Slots {
+    /// `capacity` concurrent holders; nobody may wait.
     pub fn new(capacity: usize) -> Self {
-        Self(Rc::new(Cell::new(0)), capacity)
+        Self::queued(capacity, 0)
     }
 
+    /// `capacity` concurrent holders and up to `max_waiting` queued
+    /// [`Slots::acquire`] calls.
+    pub fn queued(capacity: usize, max_waiting: usize) -> Self {
+        Self(Rc::new(RefCell::new(SlotQueue::new(capacity, max_waiting))))
+    }
+
+    /// Take a slot now. Fails when full or when others are queued.
     pub fn try_acquire(&self) -> Option<Slot> {
-        (self.0.get() < self.1).then(|| {
-            self.0.set(self.0.get() + 1);
-            Slot(self.0.clone())
-        })
+        self.0
+            .borrow_mut()
+            .try_take(waiting)
+            .then(|| Slot(self.0.clone()))
+    }
+
+    /// Slots held.
+    #[cfg(test)]
+    pub fn used(&self) -> usize {
+        self.0.borrow().used
+    }
+
+    /// Take a slot, waiting in FIFO order until `at`. `None` when the queue
+    /// is full or the deadline passes first.
+    pub async fn acquire(&self, at: Instant) -> Option<Slot> {
+        let waiter = Rc::new(SlotWaiter::default());
+        let admit = self.0.borrow_mut().admit(waiter.clone(), waiting);
+        match admit {
+            crate::step::admission::Admit::Take => return Some(Slot(self.0.clone())),
+            crate::step::admission::Admit::Full => return None,
+            crate::step::admission::Admit::Wait => {}
+        }
+        // From here the waiter is queued: `Pending` marks it gone on any
+        // exit, and hands a granted but unclaimed slot to the next waiter.
+        let pending = Pending {
+            queue: self.0.clone(),
+            waiter,
+        };
+        let granted = std::future::poll_fn(|cx| {
+            if pending.waiter.granted.get() {
+                return Poll::Ready(());
+            }
+            *pending.waiter.waker.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        });
+        if deadline(at, granted).await.is_err() && !pending.waiter.granted.get() {
+            return None;
+        }
+        pending.waiter.gone.set(true);
+        Some(Slot(self.0.clone()))
+    }
+
+    /// Queued entries, including ones that gave up and are not yet trimmed.
+    #[cfg(test)]
+    pub fn waiting(&self) -> usize {
+        self.0.borrow().waiting()
+    }
+}
+
+struct Pending {
+    queue: Rc<RefCell<SlotQueue>>,
+    waiter: Rc<SlotWaiter>,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if self.waiter.gone.replace(true) {
+            // Claimed: the slot moved into a `Slot`.
+            return;
+        }
+        if self.waiter.granted.get() {
+            // Granted but never claimed: pass it on.
+            release(&self.queue);
+        }
     }
 }
 
@@ -525,7 +709,10 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::{
+        io::{Read, Write},
+        sync::atomic::{AtomicUsize, Ordering::SeqCst},
+    };
 
     #[test]
     fn timers_fire_in_order_and_deadline_cancels() {
@@ -552,6 +739,201 @@ mod tests {
             sleep(Duration::from_millis(40)).await;
         });
         assert_eq!(*order.borrow(), vec![1, 2]);
+    }
+
+    /// Polls `f` once with `waker`.
+    fn poll_with<F: Future>(f: std::pin::Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
+        f.poll(&mut std::task::Context::from_waker(waker))
+    }
+
+    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
+        struct W(Arc<AtomicUsize>);
+        impl std::task::Wake for W {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        (Waker::from(Arc::new(W(n.clone()))), n)
+    }
+
+    #[test]
+    fn signal_registration_is_one_entry_per_waiter() {
+        let signal = Signal::default();
+        let g = signal.generation();
+        let (w1, n1) = counting_waker();
+        let (w2, n2) = counting_waker();
+        let mut a = std::pin::pin!(signal.changed(g));
+        let mut b = std::pin::pin!(signal.changed(g));
+        for _ in 0..100 {
+            assert!(poll_with(a.as_mut(), &w1).is_pending());
+        }
+        // Re-polling with another waker replaces the entry, not appends.
+        assert!(poll_with(a.as_mut(), &w2).is_pending());
+        assert!(poll_with(b.as_mut(), &w1).is_pending());
+        assert_eq!(signal.waiters(), 2);
+        signal.notify();
+        assert_eq!(signal.waiters(), 0);
+        // `a` last registered `w2`, `b` registered `w1`: one wake each.
+        assert_eq!(n1.load(SeqCst), 1);
+        assert_eq!(n2.load(SeqCst), 1);
+        assert!(poll_with(a.as_mut(), &w1).is_ready());
+        assert!(poll_with(b.as_mut(), &w1).is_ready());
+        // Already changed: ready without registering.
+        let mut c = std::pin::pin!(signal.changed(g));
+        assert!(poll_with(c.as_mut(), &w1).is_ready());
+        assert_eq!(signal.waiters(), 0);
+    }
+
+    #[test]
+    fn signal_dropped_waiters_free_their_entries() {
+        let signal = Signal::default();
+        let g = signal.generation();
+        let (w, n) = counting_waker();
+        for _ in 0..1000 {
+            let mut f = std::pin::pin!(signal.changed(g));
+            assert!(poll_with(f.as_mut(), &w).is_pending());
+        }
+        // Timed out waiters do not accumulate, and their slots are reused.
+        assert_eq!(signal.waiters(), 0);
+        assert!(signal.0.wakers.borrow().entries.len() <= 1);
+        signal.notify();
+        assert_eq!(n.load(SeqCst), 0);
+        // A waiter dropped after a notify does not touch the new slab.
+        let g = signal.generation();
+        let mut old = Box::pin(signal.changed(g));
+        assert!(poll_with(old.as_mut(), &w).is_pending());
+        signal.notify();
+        let mut new = std::pin::pin!(signal.changed(signal.generation()));
+        assert!(poll_with(new.as_mut(), &w).is_pending());
+        drop(old);
+        assert_eq!(signal.waiters(), 1);
+    }
+
+    #[test]
+    fn signal_wakes_many_waiters_in_linear_work() {
+        let mut ex = Executor::new(4096).unwrap();
+        let signal = Signal::default();
+        let woken = Rc::new(Cell::new(0usize));
+        ex.block_on(async {
+            for _ in 0..2000 {
+                let s = signal.clone();
+                let w = woken.clone();
+                spawn(async move {
+                    // Wait twice: the second wait re-registers after a wake.
+                    for _ in 0..2 {
+                        let g = s.generation();
+                        s.changed(g).await;
+                        w.set(w.get() + 1);
+                    }
+                })
+                .unwrap();
+            }
+            sleep(Duration::from_millis(5)).await;
+            assert_eq!(signal.waiters(), 2000);
+            signal.notify();
+            sleep(Duration::from_millis(5)).await;
+            assert_eq!(signal.waiters(), 2000);
+            assert!(signal.0.wakers.borrow().entries.len() == 2000);
+            signal.notify();
+            sleep(Duration::from_millis(5)).await;
+        });
+        assert_eq!(woken.get(), 4000);
+        assert_eq!(signal.waiters(), 0);
+    }
+
+    #[test]
+    fn slots_queue_in_order_and_hand_over() {
+        let mut ex = Executor::new(64).unwrap();
+        ex.block_on(async {
+            let slots = Slots::queued(1, 2);
+            let held = slots.try_acquire().unwrap();
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let far = Instant::now() + Duration::from_secs(5);
+            for i in 0..2 {
+                let (s, o) = (slots.clone(), order.clone());
+                spawn(async move {
+                    let slot = s.acquire(far).await.unwrap();
+                    o.borrow_mut().push(i);
+                    sleep(Duration::from_millis(5)).await;
+                    drop(slot);
+                })
+                .unwrap();
+                sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(slots.waiting(), 2);
+            // Queue full: real overload fails at once.
+            assert!(slots.acquire(far).await.is_none());
+            // No queue jumping.
+            assert!(slots.try_acquire().is_none());
+            drop(held);
+            assert_eq!(slots.used(), 1);
+            sleep(Duration::from_millis(30)).await;
+            assert_eq!(*order.borrow(), vec![0, 1]);
+            assert_eq!(slots.used(), 0);
+            assert!(slots.try_acquire().is_some());
+        });
+    }
+
+    #[test]
+    fn slots_wait_times_out_and_cancel_passes_slot_on() {
+        let mut ex = Executor::new(64).unwrap();
+        ex.block_on(async {
+            let slots = Slots::queued(1, 8);
+            let held = slots.try_acquire().unwrap();
+            // Deadline passes while queued.
+            let soon = Instant::now() + Duration::from_millis(10);
+            assert!(slots.acquire(soon).await.is_none());
+            // A cancelled waiter (timeout around acquire) is skipped.
+            let far = Instant::now() + Duration::from_secs(5);
+            assert!(
+                timeout(Duration::from_millis(5), slots.acquire(far))
+                    .await
+                    .is_err()
+            );
+            let got = Rc::new(Cell::new(false));
+            let (s, g) = (slots.clone(), got.clone());
+            spawn(async move {
+                let _slot = s.acquire(far).await.unwrap();
+                g.set(true);
+            })
+            .unwrap();
+            sleep(Duration::from_millis(2)).await;
+            drop(held);
+            sleep(Duration::from_millis(5)).await;
+            assert!(got.get());
+            assert_eq!(slots.used(), 0);
+            // Free slot and empty queue: acquire does not wait.
+            assert!(slots.acquire(Instant::now()).await.is_some());
+            // Plain `new` never queues.
+            let plain = Slots::new(1);
+            let _h = plain.try_acquire().unwrap();
+            assert!(plain.acquire(far).await.is_none());
+        });
+    }
+
+    #[test]
+    fn slots_granted_but_unclaimed_slot_moves_on() {
+        let slots = Slots::queued(1, 8);
+        let held = slots.try_acquire().unwrap();
+        let far = Instant::now() + Duration::from_secs(5);
+        let (w, _) = counting_waker();
+        let mut ex = Executor::new(8).unwrap();
+        ex.block_on(async {
+            let mut first = Box::pin(slots.acquire(far));
+            let mut second = Box::pin(slots.acquire(far));
+            assert!(poll_with(first.as_mut(), &w).is_pending());
+            assert!(poll_with(second.as_mut(), &w).is_pending());
+            // The slot is handed to `first`, which is dropped before it runs.
+            drop(held);
+            drop(first);
+            assert_eq!(slots.used(), 1);
+            match poll_with(second.as_mut(), &w) {
+                Poll::Ready(Some(s)) => drop(s),
+                _ => panic!("second waiter did not get the slot"),
+            }
+            assert_eq!(slots.used(), 0);
+        });
     }
 
     #[test]
@@ -599,6 +981,6 @@ mod tests {
         });
         let mut ex2 = ex;
         let f = flag.clone();
-        ex2.run(move || f.load(std::sync::atomic::Ordering::SeqCst));
+        ex2.run(move || f.load(SeqCst));
     }
 }

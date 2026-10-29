@@ -41,33 +41,7 @@ pub enum AdmissionMode {
     SecondSight,
 }
 
-/// Independent bounded-resource dimensions. Validation precedes resource creation.
-#[derive(Clone, Debug)]
-pub struct Limits {
-    pub plaintext_bytes: NonZeroUsize,
-    pub ciphertext_bytes: NonZeroUsize,
-    pub dirty_bytes: NonZeroUsize,
-    pub registered_bytes: NonZeroUsize,
-    pub request_context_bytes: NonZeroUsize,
-    pub flights: NonZeroUsize,
-    pub waiters_per_flight: NonZeroUsize,
-    pub queue_entries: NonZeroUsize,
-    pub connections_per_neighbor: NonZeroUsize,
-    pub client_connections: NonZeroUsize,
-    pub pipes: NonZeroUsize,
-    pub range_window_pages: NonZeroUsize,
-    pub header_bytes: NonZeroUsize,
-    pub placement_cache_bytes: NonZeroUsize,
-    pub cached_paths: NonZeroUsize,
-    pub path_cache_bytes: NonZeroUsize,
-    /// Per-worker active searches, independent of cache retention and worker count.
-    pub active_path_searches: NonZeroUsize,
-    /// Old live membership generations in addition to current; cache-only
-    /// publications reuse a generation and do not consume another slot.
-    pub retained_snapshots: NonZeroUsize,
-    pub metadata_entries: NonZeroUsize,
-    pub relay_transfers: NonZeroUsize,
-}
+pub use racer_core::admission::Limits;
 
 /// Which limit dimensions were left unset in the environment.
 ///
@@ -233,6 +207,8 @@ impl Config {
         if !gpu_landing_bytes.is_multiple_of(GPU_STAGING_UNIT) {
             return Err(Error::InvalidConfiguration);
         }
+        // Per-worker limit defaults live with the admission rules in racer-core.
+        let defaults = Limits::default();
         let mut config = Self {
             warm: crate::read::warm::Config {
                 max_ttl: Duration::from_secs(raw.warm_max_ttl_secs.unwrap_or(3600)),
@@ -343,30 +319,79 @@ impl Config {
                 // count during sizing, so their defaults are stated per worker
                 // and multiplied back out by `scale_limits` once the planner
                 // resolves that count. A page is 16 MiB.
-                plaintext_bytes: nonzero_usize(raw.plaintext_bytes.unwrap_or(64 * MIB))?,
-                ciphertext_bytes: nonzero_usize(raw.ciphertext_bytes.unwrap_or(128 * MIB))?,
-                dirty_bytes: nonzero_usize(raw.dirty_bytes.unwrap_or(160 * MIB))?,
-                registered_bytes: nonzero_usize(raw.registered_bytes.unwrap_or(96 * MIB))?,
+                plaintext_bytes: nonzero_usize(
+                    raw.plaintext_bytes
+                        .unwrap_or(defaults.plaintext_bytes.get() as u64),
+                )?,
+                ciphertext_bytes: nonzero_usize(
+                    raw.ciphertext_bytes
+                        .unwrap_or(defaults.ciphertext_bytes.get() as u64),
+                )?,
+                dirty_bytes: nonzero_usize(
+                    raw.dirty_bytes.unwrap_or(defaults.dirty_bytes.get() as u64),
+                )?,
+                registered_bytes: nonzero_usize(
+                    raw.registered_bytes
+                        .unwrap_or(defaults.registered_bytes.get() as u64),
+                )?,
                 request_context_bytes: nonzero_usize(
-                    raw.request_context_bytes.unwrap_or(32 * MIB),
+                    raw.request_context_bytes
+                        .unwrap_or(defaults.request_context_bytes.get() as u64),
                 )?,
-                flights: nonzero_usize(raw.flights.unwrap_or(64))?,
-                waiters_per_flight: nonzero_usize(raw.waiters_per_flight.unwrap_or(64))?,
-                queue_entries: nonzero_usize(raw.queue_entries.unwrap_or(256))?,
-                connections_per_neighbor: nonzero_usize(raw.connections_per_neighbor.unwrap_or(2))?,
-                client_connections: nonzero_usize(raw.client_connections.unwrap_or(64))?,
-                pipes: nonzero_usize(raw.pipes.unwrap_or(16))?,
-                range_window_pages: nonzero_usize(raw.range_window_pages.unwrap_or(2))?,
-                header_bytes: nonzero_usize(raw.header_bytes.unwrap_or(32 * 1024))?,
+                flights: nonzero_usize(raw.flights.unwrap_or(defaults.flights.get() as u64))?,
+                waiters_per_flight: nonzero_usize(
+                    raw.waiters_per_flight
+                        .unwrap_or(defaults.waiters_per_flight.get() as u64),
+                )?,
+                queue_entries: nonzero_usize(
+                    raw.queue_entries
+                        .unwrap_or(defaults.queue_entries.get() as u64),
+                )?,
+                connections_per_neighbor: nonzero_usize(
+                    raw.connections_per_neighbor
+                        .unwrap_or(defaults.connections_per_neighbor.get() as u64),
+                )?,
+                client_connections: nonzero_usize(
+                    raw.client_connections
+                        .unwrap_or(defaults.client_connections.get() as u64),
+                )?,
+                pipes: nonzero_usize(raw.pipes.unwrap_or(defaults.pipes.get() as u64))?,
+                range_window_pages: nonzero_usize(
+                    raw.range_window_pages
+                        .unwrap_or(defaults.range_window_pages.get() as u64),
+                )?,
+                header_bytes: nonzero_usize(
+                    raw.header_bytes
+                        .unwrap_or(defaults.header_bytes.get() as u64),
+                )?,
                 placement_cache_bytes: nonzero_usize(
-                    raw.placement_cache_bytes.unwrap_or(16 * MIB),
+                    raw.placement_cache_bytes
+                        .unwrap_or(defaults.placement_cache_bytes.get() as u64),
                 )?,
-                cached_paths: nonzero_usize(raw.cached_paths.unwrap_or(128))?,
-                path_cache_bytes: nonzero_usize(raw.path_cache_bytes.unwrap_or(8 * MIB))?,
-                active_path_searches: nonzero_usize(raw.active_path_searches.unwrap_or(8))?,
-                retained_snapshots: nonzero_usize(raw.retained_snapshots.unwrap_or(2))?,
-                metadata_entries: nonzero_usize(raw.metadata_entries.unwrap_or(4096))?,
-                relay_transfers: nonzero_usize(raw.relay_transfers.unwrap_or(16))?,
+                cached_paths: nonzero_usize(
+                    raw.cached_paths
+                        .unwrap_or(defaults.cached_paths.get() as u64),
+                )?,
+                path_cache_bytes: nonzero_usize(
+                    raw.path_cache_bytes
+                        .unwrap_or(defaults.path_cache_bytes.get() as u64),
+                )?,
+                active_path_searches: nonzero_usize(
+                    raw.active_path_searches
+                        .unwrap_or(defaults.active_path_searches.get() as u64),
+                )?,
+                retained_snapshots: nonzero_usize(
+                    raw.retained_snapshots
+                        .unwrap_or(defaults.retained_snapshots.get() as u64),
+                )?,
+                metadata_entries: nonzero_usize(
+                    raw.metadata_entries
+                        .unwrap_or(defaults.metadata_entries.get() as u64),
+                )?,
+                relay_transfers: nonzero_usize(
+                    raw.relay_transfers
+                        .unwrap_or(defaults.relay_transfers.get() as u64),
+                )?,
             },
             scaled_limits: ScaledLimits {
                 plaintext_bytes: raw.plaintext_bytes.is_none(),

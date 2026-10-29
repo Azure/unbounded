@@ -5,10 +5,11 @@
 //! name field selector. They read a seat Lease only after a paced, jittered
 //! delay when the primary reports a vacancy, or when no primary is live.
 
+use crate::step::seat::{self as rules, Lottery, SeatRenew};
 use crate::{
     DiscoveredEndpoint, DiscoveredEndpoints, Error, annotations,
     authority::{
-        election::{self, LeaseObservation, Observer, SeatView},
+        election::{self, LeaseObservation},
         publication::{self, Image},
         state::{self, lease_authority},
     },
@@ -30,12 +31,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
-
-/// Interval between state Secret reads by a seat.
-pub const FOLLOW_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Longest cold start claim window.
-const MAX_COLD_WINDOW: u64 = 600;
 
 impl PrimaryView {
     /// Whether `node` holds a seat that is kept. A seat at or beyond
@@ -125,6 +120,7 @@ pub fn apply_primary(
     if *current != list {
         *current = list;
     }
+    shared.primary_lease.notify();
     shared.changed.notify();
 }
 
@@ -137,9 +133,12 @@ pub fn initial_seats(shared: &Shared) -> usize {
 }
 
 fn jitter(shared: &Shared, salt: u32, max: Duration) -> Duration {
-    let mut b = [0u8; 4];
-    let _ = getrandom::getrandom(&mut b);
-    election::claim_delay(&shared.config.pod_uid, salt ^ u32::from_ne_bytes(b), max)
+    rules::jitter(
+        &shared.config.pod_uid,
+        &mut **shared.rng.borrow_mut(),
+        salt,
+        max,
+    )
 }
 
 /// Watch the primary Lease. One watch per Pod; no polling while it holds.
@@ -357,98 +356,61 @@ pub fn new_seat(shared: &Shared, index: usize) -> Result<Seat, Error> {
     })
 }
 
-fn claim_views(
-    seen: &BTreeMap<usize, LeaseObservation>,
-    observer: &Observer,
-    candidate: usize,
-    now: Instant,
-) -> Vec<SeatView> {
-    seen.iter()
-        .filter_map(|(index, observation)| {
-            let expired = observer.expired(observation, now);
-            // Only the selected seat was just read. A stale cached vacancy
-            // must not shadow it, but live observations still guard Node uniqueness.
-            if *index != candidate && expired {
-                return None;
-            }
-            Some(SeatView {
-                index: *index,
-                holder: lease::holder_key(observation),
-                holder_node: observation
-                    .annotations
-                    .get(annotations::HOLDER_NODE)
-                    .cloned(),
-                expired,
-            })
-        })
-        .collect()
-}
-
 /// Compete for a seat when one is vacant. Paced to keep API load low.
 pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Option<Instant>)>>) {
     let ns = shared.config.namespace.clone();
-    let mut attempt = 0u32;
-    let mut observer = Observer::default();
-    let mut seen: BTreeMap<usize, LeaseObservation> = BTreeMap::new();
+    let mut lottery = Lottery::default();
     while !shared.stopping.get() {
-        if shared.seat.borrow().is_some() || shared.cluster.borrow().is_empty() {
-            exec::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        let now = Instant::now();
         let view = shared.primary.borrow().clone();
-        let live = view.live(primary_changed.borrow().1, now);
-        let (candidates, window) = if live {
-            if view.node_seated(&shared.config.node_name) {
-                (Vec::new(), 0)
-            } else {
-                let v: Vec<usize> = (0..view.desired)
-                    .filter(|i| view.seat_nodes.get(*i).is_none_or(String::is_empty))
-                    .collect();
-                (v, view.claim_window.clamp(5, 3600))
+        let plan = lottery.plan(
+            &rules::LotteryInputs {
+                holds_seat: shared.seat.borrow().is_some(),
+                cluster_known: !shared.cluster.borrow().is_empty(),
+                view: &view,
+                primary_changed_at: primary_changed.borrow().1,
+                node: &shared.config.node_name,
+                pod_uid: &shared.config.pod_uid,
+                initial_seats: initial_seats(&shared),
+            },
+            Instant::now(),
+            &mut **shared.rng.borrow_mut(),
+        );
+        let index = match plan {
+            rules::Plan::Idle(d) | rules::Plan::NoVacancy(d) => {
+                exec::sleep(d).await;
+                continue;
             }
-        } else {
-            (
-                (0..initial_seats(&shared)).collect(),
-                (5u64 << attempt.min(7)).min(MAX_COLD_WINDOW),
-            )
+            rules::Plan::Attempt { delay, index } => {
+                exec::sleep(delay).await;
+                index
+            }
         };
-        if candidates.is_empty() {
-            attempt = 0;
-            exec::sleep(Duration::from_secs(10) + jitter(&shared, 1, Duration::from_secs(10)))
-                .await;
-            continue;
-        }
-        exec::sleep(jitter(&shared, attempt, Duration::from_secs(window))).await;
         if shared.seat.borrow().is_some() || shared.stopping.get() {
             continue;
         }
-        let index = candidates[(jitter(&shared, 3, Duration::from_millis(1 << 20)).as_millis()
-            as usize)
-            % candidates.len()];
-        attempt = attempt.saturating_add(1);
+        lottery.begin();
         let name = annotations::seat_lease(index);
         let Ok(object) = lease::get(&shared.lease_api, &ns, &name).await else {
             continue;
         };
         let obs = lease::observe(&object);
-        observer.observe(&obs, Instant::now());
-        seen.insert(index, obs.clone());
-        let views = claim_views(&seen, &observer, index, Instant::now());
-        let desired = if live {
-            view.desired
-        } else {
-            initial_seats(&shared)
-        };
-        if election::seat_to_claim(&views, desired, &shared.config.node_name, &shared.identity)
-            != Some(index)
-        {
+        if !lottery.observe(
+            index,
+            &obs,
+            Instant::now(),
+            &shared.config.node_name,
+            &shared.identity,
+        ) {
             continue;
         }
         let Ok(seat) = new_seat(&shared, index) else {
             continue;
         };
-        let spec = election::claim(&obs.spec, &shared.config.pod_name, &election::now_micro());
+        let spec = election::claim(
+            &obs.spec,
+            &shared.config.pod_name,
+            &election::now_micro(SystemTime::now()),
+        );
         let started = Instant::now();
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         match lease::put(&shared.lease_api, &ns, &body).await {
@@ -458,7 +420,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
                 let seat = Rc::new(seat);
                 *shared.seat.borrow_mut() = Some(seat.clone());
                 shared.changed.notify();
-                attempt = 0;
+                lottery.won();
                 let s = shared.clone();
                 let _ = exec::spawn(seat_task(s.clone(), seat.clone(), v));
                 let _ = exec::spawn(follower(s.clone(), seat.clone()));
@@ -541,60 +503,50 @@ fn ready_changed(shared: &Shared, seat: &Seat, object: &serde_json::Value) -> bo
 /// Renew the seat Lease until it is lost, shrunk away, or the runtime stops.
 pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_json::Value) {
     let ns = shared.config.namespace.clone();
-    let mut next = Instant::now() + limits::LEASE_RENEW;
-    let mut last_put = Instant::now();
+    let mut schedule = SeatRenew::new(Instant::now());
     loop {
         let generation = shared.changed.generation();
-        let _ = exec::deadline(next, shared.changed.changed(generation)).await;
+        let _ = exec::deadline(schedule.next, shared.changed.changed(generation)).await;
         if !seat_still_mine(&shared, &seat) {
             return;
         }
         let now = Instant::now();
         let view = shared.primary.borrow().clone();
-        let stopping = shared.stopping.get();
-        // Another live seat on this Node with a lower index wins.
-        let duplicate = view
-            .seat_nodes
-            .iter()
-            .enumerate()
-            .any(|(i, n)| i < seat.index && *n == shared.config.node_name);
-        let rotation = serving_rotation_due(&seat.control.borrow(), seat.index, SystemTime::now());
-        let shrink = view.holder.is_some()
-            && election::must_release(seat.index, view.desired)
-            && !shared.is_primary.get();
-        if stopping || duplicate || shrink || rotation {
-            let spec = election::release(&lease::observe(&object).spec);
-            let a: BTreeMap<_, _> = my_seat_annotations(&shared, &seat)
-                .into_keys()
-                .map(|k| (k, None))
-                .collect();
-            // Held across the clear so shutdown waits for the PUT.
-            let _releasing = shared.releasing();
-            shared.lose_seat();
-            let _ = exec::timeout(
-                limits::API_TIMEOUT,
-                lease::put(&shared.lease_api, &ns, &lease::with(&object, &spec, &a)),
-            )
-            .await;
-            return;
-        }
-        if now < next {
-            // Woken by a change; refresh annotations only at renew time,
-            // except readiness, which the primary needs to publish us. That
-            // is written early, at most once a second so failures cannot spin.
-            if ready_changed(&shared, &seat, &object) {
-                next = next.min(last_put + Duration::from_secs(1));
+        let inputs = rules::RenewInputs::from_view(
+            &view,
+            seat.index,
+            &shared.config.node_name,
+            shared.is_primary.get(),
+            shared.stopping.get(),
+            serving_rotation_due(&seat.control.borrow(), seat.index, SystemTime::now()),
+            ready_changed(&shared, &seat, &object),
+        );
+        match schedule.decide(now, inputs) {
+            rules::Action::Wait => continue,
+            rules::Action::Release => {
+                let spec = election::release(&lease::observe(&object).spec);
+                let a: BTreeMap<_, _> = my_seat_annotations(&shared, &seat)
+                    .into_keys()
+                    .map(|k| (k, None))
+                    .collect();
+                // Held across the clear so shutdown waits for the PUT.
+                let _releasing = shared.releasing();
+                shared.lose_seat();
+                let _ = exec::timeout(
+                    limits::API_TIMEOUT,
+                    lease::put(&shared.lease_api, &ns, &lease::with(&object, &spec, &a)),
+                )
+                .await;
+                return;
             }
-            if now < next {
-                continue;
-            }
+            rules::Action::Renew => {}
         }
         rotate(&shared, &seat);
         let obs = lease::observe(&object);
-        let spec = election::renew(&obs.spec, &election::now_micro());
+        let spec = election::renew(&obs.spec, &election::now_micro(SystemTime::now()));
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         let started = Instant::now();
-        last_put = started;
+        schedule.put_started(started);
         match exec::timeout(
             limits::LEASE_RENEW,
             lease::put(&shared.lease_api, &ns, &body),
@@ -605,32 +557,35 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                 object = v;
                 seat.lease.set(lease_authority(started));
                 shared.changed.notify();
-                next = started + limits::LEASE_RENEW;
+                schedule.put_ok(started);
             }
             Ok(Err(KubeError::Conflict)) => {
-                match lease::get(&shared.lease_api, &ns, &obs.name).await {
-                    Ok(v)
-                        if crate::primary::same_term(
-                            &lease::observe(&v),
-                            &shared.identity,
-                            &state::Term {
-                                lease_uid: seat.lease_uid.borrow().clone(),
-                                transitions: obs.spec.transitions,
-                                holder: String::new(),
-                            },
-                        ) =>
-                    {
-                        object = v;
-                        next = Instant::now();
+                let read = lease::get(&shared.lease_api, &ns, &obs.name).await;
+                let same = read.as_ref().ok().map(|v| {
+                    crate::primary::same_term(
+                        &lease::observe(v),
+                        &shared.identity,
+                        &state::Term {
+                            lease_uid: seat.lease_uid.borrow().clone(),
+                            transitions: obs.spec.transitions,
+                            holder: String::new(),
+                        },
+                    )
+                });
+                match schedule.conflict(same, Instant::now()) {
+                    rules::Conflict::Retry => {
+                        if let Ok(v) = read {
+                            object = v;
+                        }
                     }
-                    Ok(_) => {
+                    rules::Conflict::Lose => {
                         shared.lose_seat();
                         return;
                     }
-                    Err(_) => next = Instant::now() + Duration::from_secs(2),
+                    rules::Conflict::Later => {}
                 }
             }
-            _ => next = Instant::now() + Duration::from_secs(2),
+            _ => schedule.put_failed(Instant::now()),
         }
         if !seat.lease.get().fresh(Instant::now()) {
             shared.lose_seat();
@@ -643,9 +598,22 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
 pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
     while seat_still_mine(&shared, &seat) && !shared.stopping.get() {
         let started = Instant::now();
+        // Taken before the read: a primary Lease change (a commit publishes
+        // its sequence there) that arrives while the read is in flight may
+        // not be in what it returned, so it wakes the next read (Known
+        // issue 48). `changed` is taken after the read, because the read's
+        // own `install_record` notifies it.
+        let lease = shared.primary_lease.generation();
         let _ = follow_once(&shared, started).await;
         let generation = shared.changed.generation();
-        let _ = exec::timeout(FOLLOW_INTERVAL, shared.changed.changed(generation)).await;
+        let _ = exec::timeout(
+            crate::limits::FOLLOW_INTERVAL,
+            futures::future::select(
+                std::pin::pin!(shared.primary_lease.changed(lease)),
+                std::pin::pin!(shared.changed.changed(generation)),
+            ),
+        )
+        .await;
         // Wake on every change, but read at most every second.
         exec::sleep_until(started + Duration::from_secs(1)).await;
     }
@@ -653,60 +621,58 @@ pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
 
 /// Read and install committed state once.
 pub async fn follow_once(shared: &Shared, started: Instant) -> Result<(), Error> {
+    let installs = shared.serving.borrow().installs;
     let secret = shared
         .lease_api
         .get(&paths::state(&shared.config.namespace))
         .await?;
     let uid = str_at(&secret, &["metadata", "uid"]);
-    if uid != shared.cluster.borrow().as_str() {
-        fail_closed(shared);
-        return Err(Error::InvalidState);
-    }
     let initialized = !str_at(
         &secret,
         &["metadata", "annotations", annotations::INITIALIZED],
     )
     .is_empty();
-    if initialized && !state_markers_match(&secret, uid) {
-        fail_closed(shared);
-        return Err(Error::InvalidState);
-    }
-    let data = secret["data"][annotations::STATE_KEY]
+    let decoded = secret["data"][annotations::STATE_KEY]
         .as_str()
-        .map(|s| STANDARD.decode(s));
-    let data = match data {
-        Some(Ok(d)) => Some(d),
-        Some(Err(_)) => {
-            fail_closed(shared);
-            return Err(Error::InvalidState);
-        }
-        None => None,
-    };
-    let record = match state::decode(uid, initialized, data.as_deref()) {
-        Ok(Some(r)) => r,
-        // Uninitialized after this process accepted state: wiped.
-        Ok(None) if shared.serving.borrow().high_water.is_some() => {
-            fail_closed(shared);
-            return Err(Error::InvalidState);
-        }
-        Ok(None) => return Ok(()),
-        Err(_) => {
+        .map(|s| STANDARD.decode(s).map_err(|_| ()));
+    let cluster = shared.cluster.borrow().clone();
+    let read = rules::read(&rules::SecretRead {
+        cluster: &cluster,
+        uid,
+        initialized,
+        markers_match: !initialized || state_markers_match(&secret, uid),
+        data: decoded.as_ref().map(|d| d.as_deref().map_err(|_| ())),
+        accepted_before: shared.serving.borrow().high_water.is_some(),
+    });
+    let record = match read {
+        rules::Read::Install(r) => *r,
+        rules::Read::Uninitialized => return Ok(()),
+        rules::Read::FailClosed => {
             fail_closed(shared);
             return Err(Error::InvalidState);
         }
     };
+    let superseded = {
+        let s = shared.serving.borrow();
+        rules::superseded(installs != s.installs, s.high_water.as_ref(), &record)
+    };
+    if superseded {
+        // The primary committed while this read was in flight.
+        return Ok(());
+    }
     install_record(shared, record, started).map_err(|_| Error::InvalidState)?;
     let need_image = {
         let s = shared.serving.borrow();
         let Some(r) = s.record.as_ref() else {
             return Err(Error::InvalidState);
         };
-        r.sequence != 0
-            && s.image.as_ref().is_none_or(|i| {
-                i.record.sequence != r.sequence || i.record.content_hash != r.content_hash
-            })
+        rules::need_image(
+            r,
+            s.image.as_ref().map(|i| &i.record),
+            shared.is_primary.get(),
+        )
     };
-    if need_image && !shared.is_primary.get() {
+    if need_image {
         fetch_image(shared).await?;
     }
     Ok(())
@@ -745,10 +711,7 @@ pub fn install_record(
 ) -> Result<(), state::StateError> {
     let cluster = shared.cluster.borrow().clone();
     let mut s = shared.serving.borrow_mut();
-    if s.high_water
-        .as_ref()
-        .is_some_and(|old| state::check_monotonic(old, &record).is_err())
-    {
+    if rules::admit(s.high_water.as_ref(), &record).is_err() {
         // A rollback is never accepted.
         drop(s);
         fail_closed(shared);
@@ -770,16 +733,10 @@ pub fn install_record(
         s.roots = record.keyring.root_ders();
         shared.verifier.set_roots(&s.roots);
     }
-    if s.image
-        .as_ref()
-        .is_some_and(|i| i.record.sequence != record.sequence)
-        && shared.is_primary.get()
-    {
-        // The primary installs images itself on commit.
-    }
     s.high_water = Some(record.clone());
     s.record = Some(record);
     s.confirmed = Some(confirmed);
+    s.installs += 1;
     drop(s);
     shared.changed.notify();
     Ok(())
@@ -869,6 +826,7 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{authority::election::Observer, step::seat::claim_views};
     use crate::{
         authority::keyring::{self, Durable, MAX_ROOTS, Offer},
         kube::fake,
@@ -1194,6 +1152,104 @@ mod tests {
                 follow_once(&shared, Instant::now()).await.is_err(),
                 "stays closed"
             );
+        });
+    }
+
+    /// The primary commits while its own follower's read is
+    /// in flight; the read answers the record the commit replaced. That is
+    /// older news, not a rollback, and the primary keeps serving.
+    #[test]
+    fn a_commit_during_the_primarys_follower_read_does_not_fail_closed() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let uid = shared.cluster.borrow().clone();
+            let path = paths::state(&shared.config.namespace);
+            let put = |r: &state::StateRecord| {
+                api.put_object(
+                    &path,
+                    serde_json::json!({"metadata": {"name": "racer-state", "uid": uid,
+                        "annotations": {annotations::INITIALIZED: uid, annotations::CLUSTER_ID: uid}},
+                        "data": {annotations::CLUSTER_KEY: STANDARD.encode(&uid),
+                            annotations::STATE_KEY: STANDARD.encode(state::encode(r).unwrap())}}),
+                );
+            };
+            shared.is_primary.set(true);
+            put(&record(4));
+            follow_once(&shared, Instant::now()).await.unwrap();
+            let delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(300));
+            api.delay_gets(delay);
+            let read = follow_once(&shared, Instant::now());
+            let commit = async {
+                exec::sleep(Duration::from_millis(100)).await;
+                // `primary.rs` `reconcile`: write, then install.
+                put(&record(5));
+                install_record(&shared, record(5), Instant::now()).unwrap();
+            };
+            let (read, ()) = futures::future::join(read, commit).await;
+            assert!(read.is_ok(), "{read:?}");
+            let sequence = shared.serving.borrow().record.as_ref().map(|r| r.sequence);
+            assert_eq!(sequence, Some(5));
+            assert_eq!(shared.last_error.get(), None);
+            // A rollback read after the commit is still refused.
+            api.delay_gets(std::sync::Arc::new(0.into()));
+            put(&record(4));
+            assert!(follow_once(&shared, Instant::now()).await.is_err());
+            assert!(shared.serving.borrow().record.is_none());
+        });
+    }
+
+    /// A primary Lease change (a commit) that arrives while
+    /// the follower's read is in flight wakes the next read at the 1 s floor
+    /// instead of after `crate::limits::FOLLOW_INTERVAL`.
+    #[test]
+    fn follower_rereads_after_a_lease_change_during_its_read() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let uid = shared.cluster.borrow().clone();
+            let path = paths::state(&shared.config.namespace);
+            let put = |r: &state::StateRecord| {
+                api.put_object(
+                    &path,
+                    serde_json::json!({"metadata": {"name": "racer-state", "uid": uid,
+                        "annotations": {annotations::INITIALIZED: uid, annotations::CLUSTER_ID: uid}},
+                        "data": {annotations::CLUSTER_KEY: STANDARD.encode(&uid),
+                            annotations::STATE_KEY: STANDARD.encode(state::encode(r).unwrap())}}),
+                );
+            };
+            // The primary installs no image from itself.
+            shared.is_primary.set(true);
+            put(&record(4));
+            let delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(400));
+            api.delay_gets(delay.clone());
+            let seat = Rc::new(new_seat(&shared, 0).unwrap());
+            *shared.seat.borrow_mut() = Some(seat.clone());
+            let started = Instant::now();
+            exec::spawn(follower(shared.clone(), seat)).unwrap();
+            // The first read is in flight and answers sequence 4.
+            exec::sleep(Duration::from_millis(100)).await;
+            put(&record(5));
+            let endpoints: DiscoveredEndpoints = Default::default();
+            let changed = RefCell::new((String::new(), None));
+            let mut lease = LeaseObservation {
+                resource_version: "7".into(),
+                ..Default::default()
+            };
+            lease
+                .annotations
+                .insert(annotations::SEQUENCE.into(), "5".into());
+            apply_primary(&shared, &lease, &endpoints, &changed);
+            let sequence = || shared.serving.borrow().record.as_ref().map(|r| r.sequence);
+            exec::sleep_until(started + Duration::from_millis(600)).await;
+            assert_eq!(
+                sequence(),
+                Some(4),
+                "the in-flight read predates the change"
+            );
+            // Next read at the 1 s floor, answered 400 ms later.
+            exec::sleep_until(started + Duration::from_millis(2_500)).await;
+            assert_eq!(sequence(), Some(5), "woken by the change during the read");
+            shared.stopping.set(true);
+            shared.changed.notify();
         });
     }
 }

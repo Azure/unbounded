@@ -2309,7 +2309,7 @@ pub(crate) mod tests {
             }
             assert_eq!(
                 pages.len(),
-                outbound - crate::admission::METADATA_OUTBOUND_RESERVE
+                outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE
             );
             assert!(pool.snapshot().entries[&a].0 > 0 && pool.snapshot().entries[&b].0 > 0);
             let scope = scope();
@@ -2328,7 +2328,7 @@ pub(crate) mod tests {
             ));
             assert_eq!(
                 admission.used(ResourceClass::OrdinaryOutboundConnection),
-                outbound - crate::admission::METADATA_OUTBOUND_RESERVE
+                outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE
             );
             drop((page, pages.pop()));
             let (lease, _) = pool
@@ -2352,7 +2352,7 @@ pub(crate) mod tests {
                 cache: racer_control_wire::CacheId("cache".into()),
                 path,
             };
-            let ordinary = outbound - crate::admission::METADATA_OUTBOUND_RESERVE;
+            let ordinary = outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE;
             // Real page connections fill the ordinary quota.
             let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
                 .map(|_| exchanged(&pool, &reactor, &admission, &origin, &listener, false))
@@ -2406,7 +2406,7 @@ pub(crate) mod tests {
                 path: path.clone(),
             };
             let (a, b) = (origin("cache-a"), origin("cache-b"));
-            let ordinary = outbound - crate::admission::METADATA_OUTBOUND_RESERVE;
+            let ordinary = outbound - racer_core::admission::METADATA_OUTBOUND_RESERVE;
             // Cache B's pages hold every ordinary charge; cache A holds only metadata.
             let (pages, mut peers): (Vec<_>, Vec<_>) = (0..ordinary)
                 .map(|_| exchanged(&pool, &reactor, &admission, &b, &listener, false))

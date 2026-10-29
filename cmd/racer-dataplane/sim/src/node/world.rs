@@ -1,0 +1,5162 @@
+//! Event-driven read path over real node logic.
+//!
+//! One client page read: dispatch to a worker, then the memory and disk indexes. A miss joins the
+//! worker's `PageFlights`; the leader drives `racer_core::read::walk::Fill`, routing each probe hop
+//! by hop (`decide_hop`, `search_budget`/`relay`). The destination applies `serve_action`. Only a
+//! walk that ends with validated origin authority reaches origin; publication inserts into memory
+//! and applies the `persist` rule.
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
+use crate::phantom::{Phantom, SharedRoutes};
+use page_alloc::SegmentId;
+use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
+use racer_core::liveness::{
+    LINK_TIMEOUTS, MAX_OFFERS_IN_FLIGHT, MAX_PINGS_IN_FLIGHT, NO_PING, ping_verdict,
+};
+use racer_core::read::Error;
+use racer_core::read::Source;
+use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
+use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
+use racer_core::read::flight::{Joined, Wait as FlightEvent};
+use racer_core::read::hints::{
+    Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, should_notice,
+};
+use racer_core::read::hints::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral};
+use racer_core::read::walk::{
+    Action, AttemptInputs, AttemptPlan, Event as FillEvent, Evidence, Features, FillConfig,
+    HedgeEnd, List, Mode, NOT_MEMBER, Notes, Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, Rank0Note,
+    Rank0State, Ranked, Ranking, Reply as FillReply, RouteMode, SilenceNote, TargetKind,
+    granted_budget, hedge_budgets, hedge_fallback, owner_funding_min, plan_attempt,
+};
+use racer_core::read::{
+    Answering, AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind,
+    classify, demote_unanswered, lineage_first, replica_score, validate_origin_authority,
+    visit_order,
+};
+use racer_core::read::{DIRECT_AHEAD, PageBudget, SlotKind, direct_fills, first_failure};
+use racer_core::read::{
+    Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
+};
+use racer_core::read::{ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline};
+use racer_core::route::Fault;
+use racer_core::route::MAX_LINKS;
+use racer_core::route::{Hop, RelayFailure, RelayPlan, Response, decide_hop, relay_failure};
+use racer_core::time::SplitMix64;
+use serde_json::{Value, json};
+use topology::{PathQuery, Placement};
+
+use super::state::{COMPONENTS, Disk, Ids, Members, Node, Shared, Versions, record_bytes};
+use super::state::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
+use crate::config::Config;
+use crate::engine::Fixed;
+use crate::engine::{Engine, MILLIS, Nanos, Role, SECONDS, Streams, mix};
+use crate::faults::{Fault as SimFault, Partitions, origin_errors_at};
+use crate::report::{Invariants, Metrics, peak_rss_bytes};
+use crate::resources::{Fabric, Origin, OriginHandle, OriginOutcome};
+use crate::workload::{Poisson, Reads, page_id};
+
+/// Maximum read attempts before a read fails.
+const MAX_ATTEMPTS: u8 = 4;
+
+/// Where a resolved page came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Got {
+    Local,
+    Peer,
+    Origin,
+    Joined,
+}
+
+/// One client page read.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientRead {
+    pub node: u32,
+    pub incarnation: u32,
+    pub page: u64,
+    pub start: Nanos,
+    pub attempt: u8,
+    /// Range read id, 0 for a single page.
+    pub range: u64,
+    pub slot: u16,
+}
+
+/// Who wants a page at a node.
+#[derive(Clone, Copy, Debug)]
+pub enum Want {
+    Client(ClientRead),
+    /// A peer request waiting at its destination: an acquire, or a copy-only request joined to a
+    /// running acquisition (`copy_only`).
+    Peer {
+        msg: u64,
+        copy_only: bool,
+    },
+}
+
+/// A reply as the requester sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The exchange failed without a signed response.
+    Transport,
+    Response(ResponseKind),
+    /// `Overloaded` signed by the destination itself, not by a relay.
+    Shed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Event {
+    Arrive {
+        node: u32,
+    },
+    Read(ClientRead),
+    Hop {
+        msg: u64,
+    },
+    LinkDown {
+        msg: u64,
+        holder: u32,
+    },
+    Reply {
+        probe: u64,
+        reply: Reply,
+    },
+    ProbeTimeout {
+        probe: u64,
+    },
+    OriginDone {
+        fill: u64,
+        outcome: OriginOutcome,
+    },
+    Resolve {
+        want: Want,
+        result: Result<Got, Error>,
+    },
+    Written {
+        write: u64,
+    },
+    Publish,
+    Membership {
+        node: u32,
+        live: bool,
+    },
+    Crash {
+        node: u32,
+    },
+    Restart {
+        node: u32,
+    },
+    Slow {
+        node: u32,
+        factor: u8,
+    },
+    /// The waiter a fill serves reached its deadline while the fill's origin request was
+    /// outstanding: hand the fill over to another live waiter, or cancel it like production's fill
+    /// driver (`src/read/fill.rs`, `FlightOperation::poll_cancellation` and
+    /// `owned_scope.cancel()`).
+    OriginCancel {
+        fill: u64,
+    },
+    /// Deliver moved origin completions that are due (`origin_moved`).
+    OriginWake,
+    /// A hedge race's duplicate delay elapsed.
+    HedgeDelay {
+        fill: u64,
+    },
+    /// A relayed reply finished streaming (or was abandoned): release the relays' `Relay`
+    /// reservations held under `id`.
+    Release {
+        id: u64,
+    },
+    /// A ranking or route search task yielded; run its next slice.
+    Slice {
+        task: u64,
+    },
+    /// A fill's wait for a destination that is behind ended.
+    StaleWait {
+        fill: u64,
+    },
+    /// Orphan notices of `node` may be due.
+    Notice {
+        node: u32,
+    },
+    /// The requester of `msg` gives up: if its destination has not answered the last link's sender
+    /// by now, that sender notes the timeout.
+    LastHop {
+        msg: u64,
+    },
+    /// Silent next hops of `from` may be due for another ping.
+    SilenceRecheck {
+        from: u32,
+        to: u32,
+    },
+}
+
+impl Event {
+    fn tag(&self) -> (u64, u64, u64) {
+        match *self {
+            Self::Arrive { node } => (1, node.into(), 0),
+            Self::Read(r) => (2, r.node.into(), r.page),
+            Self::Hop { msg } => (3, msg, 0),
+            Self::LinkDown { msg, holder } => (4, msg, holder.into()),
+            Self::Reply { probe, reply } => (
+                5,
+                probe,
+                match reply {
+                    Reply::Transport => 0,
+                    Reply::Response(kind) => 1 + kind as u64,
+                    Reply::Shed => 1_000,
+                },
+            ),
+            Self::ProbeTimeout { probe } => (6, probe, 0),
+            Self::OriginDone { fill, outcome } => (7, fill, outcome as u64),
+            Self::Resolve { want, result } => (
+                8,
+                match want {
+                    Want::Client(r) => r.page,
+                    Want::Peer { msg, .. } => msg,
+                },
+                result.is_ok().into(),
+            ),
+            Self::Written { write } => (9, write, 0),
+            Self::Publish => (10, 0, 0),
+            Self::Membership { node, live } => (11, node.into(), live.into()),
+            Self::Crash { node } => (12, node.into(), 0),
+            Self::Restart { node } => (13, node.into(), 0),
+            Self::Slow { node, factor } => (14, node.into(), factor.into()),
+            Self::Slice { task } => (16, task, 0),
+            Self::HedgeDelay { fill } => (17, fill, 0),
+            Self::Release { id } => (18, id, 0),
+            Self::OriginCancel { fill } => (19, fill, 0),
+            Self::OriginWake => (20, 0, 0),
+            Self::StaleWait { fill } => (21, fill, 0),
+            Self::Notice { node } => (22, node.into(), 0),
+            Self::LastHop { msg } => (23, msg, 0),
+            Self::SilenceRecheck { from, to } => (25, (u64::from(from) << 32) | u64::from(to), 0),
+        }
+    }
+}
+
+type TaskFuture = Pin<Box<dyn Future<Output = Result<Vec<usize>, topology::Error>>>>;
+
+/// What to do with a finished ranking or route search.
+enum Then {
+    /// A ranking a fill's acquisition asked for (`Action::Rank`) under membership `version`;
+    /// `recent` for `Ranking::Previous`.
+    Ranked {
+        fill: u64,
+        ranking: Ranking,
+        version: u64,
+        recent: bool,
+    },
+    /// Route search for a message at `holder`.
+    Route {
+        msg: u64,
+        holder: u32,
+        plan: Option<RelayPlan>,
+        blocked: Vec<usize>,
+    },
+}
+
+/// A yielding ranking or route search: the real future, polled once per simulated CPU slice on its
+/// worker's CPU FIFO.
+struct Task {
+    node: u32,
+    worker: u8,
+    incarnation: u32,
+    future: TaskFuture,
+    members: Rc<Members>,
+    /// CPU per poll after the first (ranking: one chunk for every poll).
+    slice_ns: Nanos,
+    first_ns: Nanos,
+    polls: u64,
+    route: bool,
+    then: Then,
+    done: Option<Result<Vec<usize>, topology::Error>>,
+    /// Pending without having woken itself: waiting in the route search queue (`Paths::with_queue`)
+    /// until another task wakes it.
+    parked: bool,
+}
+
+/// A task waker: records the task id so the world can schedule its next slice.
+struct TaskWaker {
+    task: u64,
+    woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl std::task::Wake for TaskWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.woken.lock().expect("single thread").push(self.task);
+    }
+}
+
+struct Fill {
+    /// Attempts the fill started with (inherited, for a peer's Acquire).
+    initial_attempts: u32,
+    node: u32,
+    incarnation: u32,
+    worker: u8,
+    page: u64,
+    leader: u64,
+    token: u64,
+    /// The acquisition's decisions (`racer_core::read::walk::Fill`).
+    core: racer_core::read::walk::Fill,
+    budget: AcquisitionBudget,
+    scope: Instant,
+    /// Kind of the pending granted probe, for counters: `successor`, `lineage` or `demoted`.
+    granted_kind: Option<&'static str>,
+    /// The outstanding walk probe's answer and mode, for `Action::Validate`.
+    kind: ResponseKind,
+    acquire: bool,
+    probe: Option<u64>,
+    /// Granted probes sent at once (`Step::Granted`), and whether one of them returned a copy.
+    batch: Vec<BatchProbe>,
+    batch_copy: bool,
+    /// The leader's retention observation, used at publication.
+    eligible: bool,
+    hedge: Option<Box<Race>>,
+    _reservation: Vec<SimCharge>,
+    /// When the fill started (repeat classification).
+    started: Nanos,
+    /// Destination of the outstanding walk probe, and when it was sent.
+    asking: Option<u32>,
+    sent: Nanos,
+    /// Why the outstanding walk probe failed in transport, if it did.
+    cut: Option<Cut>,
+    /// The outstanding walk probe's answer was signed by a relay on the route rather than by its
+    /// destination.
+    relayed: bool,
+    /// Walk probes so far: destination and how each ended (repeat classification,
+    /// [`NodeWorld::classify_repeat`]).
+    asked: Vec<(u32, Asked)>,
+    /// Outstanding origin request and its outcome (drawn at issue).
+    origin: Option<(OriginHandle, OriginOutcome)>,
+    /// The fill was canceled at its scope.
+    canceled: bool,
+    /// Its origin request overlapped another node's request for the page
+    /// (`origin_repeats_concurrent`).
+    concurrent: bool,
+}
+
+/// A due copy offer: keyed by page and the target's owner rank.
+type OfferDue = Due<(u64, u8), u32>;
+
+/// How one walk probe ended, for repeat classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Asked {
+    Copy,
+    Miss,
+    /// Transport failure, and why (see [`Cut`]).
+    Unreachable(Cut),
+    /// The destination answered with a failure of its own (for a delegation: rank 0's own
+    /// acquisition, such as its origin request, failed).
+    Failed,
+    /// A relay on the route answered with a failure (`Unavailable` signed by the relay,
+    /// `fail_hop`): the destination never saw the request.
+    Relayed,
+    /// The destination or a relay shed the request, or it was behind.
+    Busy,
+    /// The probe could not be planned (budget) or failed terminally.
+    Unfunded,
+}
+
+/// Why a walk probe failed in transport (repeat classification).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Cut {
+    /// A node on the way, or the destination, is a member that does not serve yet.
+    NotServing,
+    /// A site partition cut a link on the way.
+    Partition,
+    /// A node on the way, or the destination, is down.
+    Down,
+    /// No route within the probe's links, or the route changed.
+    Route,
+    /// A link circuit was open (backoff after earlier failures).
+    Circuit,
+    /// The attempt timed out or a relay failed otherwise.
+    Other,
+}
+
+/// Skip causes (`classify_repeat`) with their `origin_skips_*` and `origin_repeats_orphan_*`
+/// counters; `copy` never orphans and is not reported.
+const SKIPS: [(&str, &str, &str); 12] = [
+    (
+        "not_serving",
+        "origin_skips_not_serving",
+        "origin_repeats_orphan_not_serving",
+    ),
+    (
+        "partition",
+        "origin_skips_partition",
+        "origin_repeats_orphan_partition",
+    ),
+    ("down", "origin_skips_down", "origin_repeats_orphan_down"),
+    ("route", "origin_skips_route", "origin_repeats_orphan_route"),
+    (
+        "circuit",
+        "origin_skips_circuit",
+        "origin_repeats_orphan_circuit",
+    ),
+    (
+        "timeout",
+        "origin_skips_timeout",
+        "origin_repeats_orphan_timeout",
+    ),
+    (
+        "failed",
+        "origin_skips_failed",
+        "origin_repeats_orphan_failed",
+    ),
+    ("relay", "origin_skips_relay", "origin_repeats_orphan_relay"),
+    ("busy", "origin_skips_busy", "origin_repeats_orphan_busy"),
+    (
+        "copy_only",
+        "origin_skips_copy_only",
+        "origin_repeats_orphan_copy_only",
+    ),
+    (
+        "unfunded",
+        "origin_skips_unfunded",
+        "origin_repeats_orphan_unfunded",
+    ),
+    ("copy", "origin_skips_copy", "origin_repeats_orphan_copy"),
+];
+
+/// The `SKIPS` entry for `skip` (unknown causes count as `unfunded`).
+fn skip_counters(skip: &str) -> (&'static str, &'static str) {
+    let (_, s, o) = SKIPS.iter().find(|e| e.0 == skip).unwrap_or(&SKIPS[10]);
+    (s, o)
+}
+
+/// The last origin request for a page ([`NodeWorld::classify_repeat`]).
+#[derive(Clone, Copy, Debug)]
+struct LastOrigin {
+    node: u32,
+    /// The page's rank 0 under that request's membership.
+    rank0: u32,
+    /// `None` while in flight, then whether it succeeded.
+    ok: Option<bool>,
+    /// When it completed.
+    done: Nanos,
+    /// For a fetch by an owner above rank 0: why rank 0 did not serve it (`origin_skips_*`).
+    skip: Option<&'static str>,
+}
+
+impl Fill {
+    /// Outstanding probe ids, including hedge contenders.
+    fn probes(&self) -> impl Iterator<Item = u64> + use<> {
+        let race = self.hedge.as_ref();
+        let batch: Vec<u64> = self
+            .batch
+            .iter()
+            .filter(|b| !b.done)
+            .map(|b| b.pid)
+            .collect();
+        [
+            self.probe,
+            race.and_then(|r| r.primary),
+            race.and_then(|r| r.secondary),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(batch)
+    }
+}
+
+struct Waiting {
+    node: u32,
+    incarnation: u32,
+    worker: u8,
+    page: u64,
+    id: u64,
+    want: Want,
+    /// Retention observation latched when this operation joined.
+    eligible: bool,
+    /// Budget and plaintext need, kept so a waiter re-elected after the leader's origin rejection
+    /// can lead its own fill.
+    budget: Option<AcquisitionBudget>,
+    plaintext: bool,
+}
+
+struct Msg {
+    probe: u64,
+    requester: u32,
+    /// Current holder (the node the message is at or travelling to).
+    at: u32,
+    dest: u32,
+    version: u64,
+    page: u64,
+    acquire: bool,
+    /// Wire form: the requester and every relay so far.
+    path: Vec<u32>,
+    links: u8,
+    attempts: u32,
+    deadline: Nanos,
+    /// When the requester abandons this exchange (its attempt timeout).
+    abandon: Nanos,
+    relays: Vec<SimCharge>,
+    /// A pinned single-link hedge exchange.
+    direct: bool,
+    /// An orphan notice's copy offer: answered `Miss` without a body.
+    offer: bool,
+    /// A silence ping: answered `Miss` at once.
+    ping: bool,
+}
+
+/// An outstanding silence ping.
+struct SimPing {
+    node: u32,
+    incarnation: u32,
+    dest: u32,
+    /// A relay, not the destination, answered it.
+    relayed: bool,
+}
+
+struct Probing {
+    fill: u64,
+    acquire: bool,
+    /// Remote credits the request carried, refunded on a verified `StaleMembership`
+    /// (`AcquisitionBudget::refund_remote`).
+    remote: u32,
+    /// Links the request was charged (`AttemptPlan::links`).
+    links: u8,
+    /// Links the answer travelled back over (`forwarders + 1` on a verified production answer), set
+    /// when the answer is sent.
+    hops: usize,
+    /// `Some(true)` for a hedge primary, `Some(false)` for its duplicate.
+    hedge: Option<bool>,
+    /// Index in the fill's `batch`: one of a run of granted probes sent at once (`Step::Granted`).
+    granted: Option<usize>,
+    /// The destination, and when the request was sent (silence evidence on a timeout).
+    dest: u32,
+    sent: Nanos,
+}
+
+/// One granted probe of a batch (`Step::Granted`).
+struct BatchProbe {
+    pid: u64,
+    dest: u32,
+    /// Counter kind: `successor`, `lineage` or `demoted`.
+    kind: &'static str,
+    /// Why it failed in transport, if it did (first cause wins).
+    cut: Option<Cut>,
+    /// A relay on the route signed its answer.
+    relayed: bool,
+    /// Answered (or timed out).
+    done: bool,
+}
+
+/// One hedge race (production `hedge_page` and `drivers::race`).
+struct Race {
+    primary_budget: AcquisitionBudget,
+    secondary_budget: AcquisitionBudget,
+    /// Outstanding probe ids.
+    primary: Option<u64>,
+    secondary: Option<u64>,
+    primary_done: bool,
+    secondary_done: bool,
+    /// The duplicate's delay elapsed (or the primary finished first).
+    launched: bool,
+    /// `Some(true)` when the primary won.
+    winner: Option<bool>,
+    fatal: Option<Error>,
+    primary_outcome: Option<ProbeOutcome>,
+    stale: bool,
+    /// Budget before the split, for `budget_never_grows`.
+    before: (u32, u8),
+    first: usize,
+    second: usize,
+    _permit: flow_control::HedgePermit,
+    _escrow: Vec<SimCharge>,
+}
+
+/// Production `DUPLICATE_BYTES` at the simulated page size.
+pub const DUPLICATE_BYTES: usize = racer_core::read::duplicate_bytes(PAGE_BYTES);
+
+/// Production `reserve_hedge_pages`: plaintext and ciphertext for `pages`.
+fn hedge_pages(quotas: &super::state::SimQuotas, pages: usize) -> Result<Vec<SimCharge>, Error> {
+    let (plaintext, ciphertext) = racer_core::read::hedge_page_charges(PAGE_BYTES, pages);
+    Ok(vec![
+        reserve(quotas, ResourceClass::Plaintext, plaintext)?,
+        reserve(quotas, ResourceClass::Ciphertext, ciphertext)?,
+    ])
+}
+
+struct RangeRead {
+    node: u32,
+    first: u64,
+    start: Nanos,
+    offset: usize,
+    slots: Vec<SlotKind>,
+    incarnation: u32,
+}
+
+fn err_name(e: Error) -> &'static str {
+    match e {
+        Error::InvalidConfiguration => "error_invalid_configuration",
+        Error::InvalidRequest => "error_invalid_request",
+        Error::HeaderTooLarge => "error_header_too_large",
+        Error::NotFound => "error_not_found",
+        Error::Internal => "error_internal",
+        Error::VersionUnavailable => "error_version_unavailable",
+        Error::Unavailable => "error_unavailable",
+        Error::Overloaded => "error_overloaded",
+        Error::DeadlineExceeded => "error_deadline_exceeded",
+        Error::Cancelled => "error_cancelled",
+        Error::Unauthorized => "error_unauthorized",
+        Error::OriginRejected => "error_origin_rejected",
+        Error::OriginForbidden => "error_origin_forbidden",
+        Error::IncompatibleMembership => "error_incompatible_membership",
+        Error::HopBudgetExhausted => "error_hop_budget_exhausted",
+        Error::CorruptRecord => "error_corrupt_record",
+        Error::MissingKey => "error_missing_key",
+        Error::Io => "error_io",
+        Error::Os(_) => "error_os",
+    }
+}
+
+/// Bodies in `map[key]` still streaming at `now`; drops finished ones.
+fn live_ends<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, Vec<Nanos>, Fixed>,
+    key: K,
+    now: Nanos,
+) -> usize {
+    let Some(ends) = map.get_mut(&key) else {
+        return 0;
+    };
+    ends.retain(|end| *end > now);
+    let n = ends.len();
+    if n == 0 {
+        map.remove(&key);
+    }
+    n
+}
+
+fn err_reply(e: Error) -> Reply {
+    peer_error(e).map_or(Reply::Transport, Reply::Response)
+}
+
+fn response_kind(r: Response) -> ResponseKind {
+    match r {
+        Response::Overloaded => ResponseKind::Overloaded,
+        Response::Unavailable => ResponseKind::Unavailable,
+        Response::NotFound => ResponseKind::NotFound,
+        Response::VersionUnavailable => ResponseKind::VersionUnavailable,
+        Response::OriginRejected => ResponseKind::OriginRejected,
+        Response::OriginForbidden => ResponseKind::OriginForbidden,
+        Response::StaleMembership => ResponseKind::StaleMembership,
+    }
+}
+
+/// Production link backoff (`racer_core::route::link_backoff`), with jitter from a fixed mix
+/// instead of SHA-256 of the node name.
+fn link_backoff(node: &u32, failures: u32) -> Duration {
+    racer_core::route::link_backoff(
+        failures,
+        mix((u64::from(*node) << 32) | u64::from(failures)),
+    )
+}
+
+pub struct NodeWorld {
+    pub config: Config,
+    pub engine: Engine<Event>,
+    pub fabric: Fabric,
+    pub origin: Origin,
+    pub metrics: Metrics,
+    pub invariants: Invariants,
+    pub versions: Versions,
+    partitions: Partitions,
+    /// Some fault hangs a peer server ([`SimFault::Hang`]).
+    hangs: bool,
+    ids: Ids,
+    shared: Shared,
+    nodes: Vec<Node>,
+    node_rng: Vec<SplitMix64>,
+    reads: Reads,
+    arrivals: Poisson,
+    base: Instant,
+    next_id: u64,
+    fills: HashMap<u64, Fill, Fixed>,
+    tokens: HashMap<u64, Waiting, Fixed>,
+    msgs: HashMap<u64, Msg, Fixed>,
+    probes: HashMap<u64, Probing, Fixed>,
+    /// Outstanding copy offers: the sending node, its incarnation, and the notice.
+    offers: HashMap<u64, (u32, u32, OfferDue), Fixed>,
+    /// Outstanding offers a relay answered (cut evidence).
+    offers_relayed: HashSet<u64, Fixed>,
+    ranges: HashMap<u64, RangeRead, Fixed>,
+    writes: HashMap<u64, SimCharge, Fixed>,
+    /// Relay reservations of replies still streaming (see `Event::Release`).
+    held: HashMap<u64, Vec<SimCharge>, Fixed>,
+    /// End times of page bodies each (node, page) is still streaming (production: page responses
+    /// being written, `send_http_response`).
+    streaming: HashMap<(u32, u64), Vec<Nanos>, Fixed>,
+    /// End times of all page bodies each node is still streaming.
+    bodies: HashMap<u32, Vec<Nanos>, Fixed>,
+    origin_per_page: HashMap<u64, u32, Fixed>,
+    /// Per page, origin requests classified `origin_repeats_after_failure` (the previous request
+    /// for the page failed); the report's
+    /// `max_requests_per_page_excluding_failure_retries` leaves them out.
+    failure_retries_per_page: HashMap<u64, u32, Fixed>,
+    /// Earliest scheduled [`Event::OriginWake`], which delivers origin completions a cancellation
+    /// moved earlier ([`Origin::pop_moved`]), so a cancellation schedules one event, not one per
+    /// moved request.
+    origin_wake: Option<Nanos>,
+    /// Per page: the node that last asked origin for it and the page's rank 0 under that request's
+    /// membership (see [`Self::classify_repeat`]).
+    last_origin: HashMap<u64, LastOrigin, Fixed>,
+    tasks: HashMap<u64, Task, Fixed>,
+    /// When each currently down node went down.
+    down_since: HashMap<u32, Nanos, Fixed>,
+    /// Messages sent over their last link and not answered yet: the sender of that link, the
+    /// destination, the page and the send time.
+    last_hops: HashMap<u64, (u32, u32, u64, Nanos), Fixed>,
+    /// Outstanding silence pings by probe id.
+    pings: HashMap<u64, SimPing, Fixed>,
+    /// Task ids woken since the last drain (see [`TaskWaker`]).
+    woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    publish_scheduled: bool,
+}
+
+impl NodeWorld {
+    pub fn new(config: Config, seed: u64) -> Self {
+        Self::build(config, seed, false)
+    }
+
+    /// Combined mode: membership versions come from the control plane ([`Self::commit_membership`])
+    /// and each node adopts the version its control client applied ([`Self::apply_membership`]).
+    pub fn new_combined(config: Config, seed: u64) -> Self {
+        Self::build(config, seed, true)
+    }
+
+    fn build(config: Config, seed: u64, combined: bool) -> Self {
+        let streams = Streams::new(seed);
+        let fabric = Fabric::new(&config, &mut streams.stream(Role::Topology, 0));
+        let origin = Origin::new(&config, streams.stream(Role::Origin, 0));
+        let n = config.nodes;
+        // Instants are only used as offsets from this base, so runs replay.
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
+        let shared = Shared {
+            phantom: Phantom::new(),
+            routes: SharedRoutes::new(),
+            rejections: Rejections::default(),
+        };
+        let node_config = config.node;
+        let nodes = (0..n)
+            .map(|_| {
+                Node::new(
+                    &node_config,
+                    config.workers,
+                    Disk::new(
+                        config.disk_pages,
+                        node_config.pages_per_segment,
+                        config.page_bytes,
+                    ),
+                    &shared,
+                    config.disk_pages,
+                    base,
+                )
+            })
+            .collect();
+        let mut world = Self {
+            engine: Engine::new(),
+            fabric,
+            origin,
+            metrics: Metrics::default(),
+            invariants: Invariants::default(),
+            versions: if combined {
+                Versions::external(n, node_config.retained_versions)
+            } else {
+                Versions::new(
+                    n,
+                    node_config.membership_lag_ns,
+                    node_config.retained_versions,
+                )
+            },
+            partitions: Partitions::from_faults(&config.faults),
+            hangs: config
+                .faults
+                .iter()
+                .any(|f| matches!(f, SimFault::Hang { .. })),
+            ids: Ids::new(n, config.workers.max(1), config.pages_per_object),
+            shared,
+            nodes,
+            node_rng: (0..n)
+                .map(|i| streams.stream(Role::Node, i.into()))
+                .collect(),
+            reads: Reads::new(
+                config.objects,
+                config.zipf_s,
+                config.pages_per_object,
+                config.range_fraction,
+                config.range_pages,
+            ),
+            arrivals: Poisson::new(config.request_rate),
+            base,
+            next_id: 0,
+            fills: HashMap::default(),
+            tokens: HashMap::default(),
+            msgs: HashMap::default(),
+            probes: HashMap::default(),
+            offers: HashMap::default(),
+            offers_relayed: HashSet::default(),
+            ranges: HashMap::default(),
+            writes: HashMap::default(),
+            held: HashMap::default(),
+            streaming: HashMap::default(),
+            last_hops: HashMap::default(),
+            pings: HashMap::default(),
+            bodies: HashMap::default(),
+            origin_per_page: HashMap::default(),
+            failure_retries_per_page: HashMap::default(),
+            origin_wake: None,
+            last_origin: HashMap::default(),
+            tasks: HashMap::default(),
+            down_since: HashMap::default(),
+            woken: std::sync::Arc::default(),
+            publish_scheduled: false,
+            config,
+        };
+        world.schedule_initial(&streams);
+        world
+    }
+
+    fn schedule_initial(&mut self, streams: &Streams) {
+        for node in 0..self.config.nodes {
+            if let Some(gap) = self.arrivals.gap(&mut self.node_rng[node as usize]) {
+                self.engine.at(gap, Event::Arrive { node });
+            }
+        }
+        let mut storm_rng = streams.stream(Role::Workload, 1);
+        for storm in self.config.storms.clone() {
+            for (at, node) in storm.expand(self.config.nodes, &mut storm_rng) {
+                for p in 0..self.config.pages_per_object {
+                    let page = page_id(storm.object, p, self.config.pages_per_object);
+                    self.engine.at(
+                        at,
+                        Event::Read(ClientRead {
+                            node,
+                            incarnation: 0,
+                            page,
+                            start: at,
+                            attempt: 0,
+                            range: 0,
+                            slot: 0,
+                        }),
+                    );
+                }
+            }
+        }
+        for c in self.config.churn.clone() {
+            self.engine.at(
+                c.at_ns,
+                Event::Membership {
+                    node: c.node,
+                    live: c.join,
+                },
+            );
+        }
+        for f in self.config.faults.clone() {
+            match f {
+                SimFault::Crash {
+                    node,
+                    at_ns,
+                    restart_ns,
+                } => {
+                    self.engine.at(at_ns, Event::Crash { node });
+                    self.engine
+                        .at(restart_ns.max(at_ns), Event::Restart { node });
+                }
+                SimFault::Slow {
+                    node,
+                    factor,
+                    from_ns,
+                    until_ns,
+                } => {
+                    self.engine.at(from_ns, Event::Slow { node, factor });
+                    self.engine
+                        .at(until_ns.max(from_ns), Event::Slow { node, factor: 1 });
+                }
+                SimFault::Partition { .. }
+                | SimFault::Hang { .. }
+                | SimFault::OriginErrors { .. } => {}
+            }
+        }
+    }
+
+    pub fn run(&mut self, end: Nanos) {
+        while self.step(end) {}
+        self.engine.finish(end);
+    }
+
+    /// Process the next event at or before `end`. Returns false when none.
+    pub fn step(&mut self, end: Nanos) -> bool {
+        let Some(event) = self.engine.pop_until(end) else {
+            return false;
+        };
+        let now = self.engine.now();
+        let (tag, a, b) = event.tag();
+        self.engine.trace.record(now, tag, a, b);
+        self.handle(event);
+        true
+    }
+
+    /// Combined mode: the control plane committed membership `number` with `members` (node ids) at
+    /// `now`. Prunes versions no live node needs.
+    pub fn commit_membership(&mut self, number: u64, members: Vec<u32>, now: Nanos) {
+        let added = self.versions.commit(number, members, now);
+        if !added {
+            return;
+        }
+        self.metrics.incr("membership_publications");
+        self.engine.trace.record(now, 15, number, 0);
+        self.prune_versions();
+    }
+
+    /// Combined mode: `node`'s control client applied `number` (0 when the client restarted and has
+    /// no snapshot yet).
+    pub fn apply_membership(&mut self, node: u32, number: u64) {
+        if self.valid(node) {
+            self.versions.apply(node, number);
+        }
+    }
+
+    /// Combined mode: drop versions no live node can resolve.
+    pub fn prune_versions(&mut self) {
+        let nodes = &self.nodes;
+        if self.versions.prune(|n| nodes[n as usize].down) {
+            self.shared.phantom.forget(&self.versions.identities());
+            self.shared
+                .routes
+                .forget(&self.versions.topology_identities());
+        }
+    }
+
+    /// Whether `node` is crashed or removed.
+    pub fn is_down(&self, node: u32) -> bool {
+        self.nodes.get(node as usize).is_none_or(|n| n.down)
+    }
+
+    fn now(&self) -> Nanos {
+        self.engine.now()
+    }
+
+    fn instant(&self, t: Nanos) -> Instant {
+        self.base + Duration::from_nanos(t)
+    }
+
+    fn nanos(&self, i: Instant) -> Nanos {
+        i.saturating_duration_since(self.base).as_nanos() as Nanos
+    }
+
+    fn fresh(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    fn valid(&self, node: u32) -> bool {
+        node < self.config.nodes
+    }
+
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Arrive { node } => self.arrive(node),
+            Event::Read(r) => self.read(r),
+            Event::Hop { msg } => self.hop(msg),
+            Event::LinkDown { msg, holder } => self.fail_hop(msg, holder, Fault::Unavailable),
+            Event::Reply { probe, reply } => self.reply(probe, reply),
+            Event::ProbeTimeout { probe } => {
+                if let Some((node, incarnation, due)) = self.offers.remove(&probe) {
+                    self.offers_relayed.remove(&probe);
+                    self.offer_done(node, incarnation, due, OfferEnd::Cut);
+                }
+                if let Some(ping) = self.pings.remove(&probe) {
+                    self.ping_done(ping, None);
+                }
+                if let Some(p) = self.probes.remove(&probe) {
+                    self.metrics.incr("probe_timeouts");
+                    match p.hedge {
+                        Some(primary) => {
+                            self.hedge_result(p.fill, primary, Err(Error::Unavailable))
+                        }
+                        None if let Some(index) = p.granted => {
+                            // A granted probe of a batch is never rank 0's: its timeout only
+                            // demotes, as a sequential granted probe's does.
+                            self.requester_timeout(p.fill, p.dest, p.sent, NO_PING);
+                            self.complete_batch_probe(p.fill, index, Ok(Outcome::TimedOut))
+                        }
+                        // Sent, but unanswered within the attempt's own bound (production
+                        // `request_traced`, attempt scope).
+                        None => {
+                            if let Some(fill) = self.fills.get_mut(&p.fill) {
+                                fill.probe = None;
+                            }
+                            self.drive(p.fill, FillEvent::Reply(FillReply::TimedOut));
+                        }
+                    }
+                }
+            }
+            Event::OriginDone { fill, .. } => {
+                if let Some((handle, _)) = self.fills.get(&fill).and_then(|f| f.origin)
+                    && self.origin.due_as_issued(handle, self.engine.now())
+                {
+                    self.origin_complete(fill);
+                }
+            }
+            Event::Resolve { want, result } => self.resolve(want, result),
+            Event::Written { write } => {
+                self.writes.remove(&write);
+            }
+            Event::Publish => self.publish(),
+            Event::Membership { node, live } => {
+                if self.versions.set(node, live) {
+                    self.metrics.incr("membership_changes");
+                    if !self.publish_scheduled {
+                        self.publish_scheduled = true;
+                        let batch = self.config.node.membership_batch_ns;
+                        self.engine
+                            .at((self.now() / batch + 1) * batch, Event::Publish);
+                    }
+                }
+            }
+            Event::Crash { node } => self.crash(node),
+            Event::Restart { node } => {
+                if self.valid(node) && self.nodes[node as usize].down {
+                    self.nodes[node as usize].down = false;
+                    self.down_since.remove(&node);
+                    self.fabric.reset_node(node, self.now());
+                    self.metrics.incr("restarts");
+                    // The restarted process's membership chain starts at the membership it finds.
+                    self.nodes[node as usize].lineage_base = self
+                        .versions
+                        .get(self.versions.latest_number())
+                        .map(|v| v.members.generation());
+                }
+            }
+            Event::Slow { node, factor } => {
+                if self.valid(node) {
+                    self.fabric.slow[node as usize] = factor.max(1);
+                }
+            }
+            Event::Slice { task } => self.slice(task),
+            Event::HedgeDelay { fill } => self.hedge_delay(fill),
+            Event::StaleWait { fill } => self.drive(fill, FillEvent::Timer),
+            Event::Notice { node } => self.send_notices(node),
+            // The requester gave up: a last link still unanswered is a timeout for its sender.
+            Event::LastHop { msg } => {
+                if let Some((sender, dest, page, sent)) = self.last_hops.remove(&msg) {
+                    self.metrics.incr("silence_timeouts");
+                    self.silence_timeout(sender, dest, page, sent, LINK_TIMEOUTS);
+                }
+            }
+            Event::SilenceRecheck { from, .. } => self.poll_pings(from),
+            Event::OriginCancel { fill } => self.origin_cancel(fill),
+            Event::OriginWake => self.origin_wake(),
+            Event::Release { id } => {
+                self.held.remove(&id);
+            }
+        }
+    }
+
+    fn publish(&mut self) {
+        self.publish_scheduled = false;
+        let now = self.now();
+        let dropped = self.versions.publish(now);
+        self.metrics.incr("membership_publications");
+        if dropped {
+            self.shared.phantom.forget(&self.versions.identities());
+            self.shared
+                .routes
+                .forget(&self.versions.topology_identities());
+        }
+    }
+
+    fn crash(&mut self, node: u32) {
+        if !self.valid(node) || self.nodes[node as usize].down {
+            return;
+        }
+        self.metrics.incr("crashes");
+        let mut dead: Vec<u64> = self
+            .fills
+            .iter()
+            .filter(|(_, f)| f.node == node)
+            .map(|(id, _)| *id)
+            .collect();
+        dead.sort_unstable();
+        for id in dead {
+            if let Some(fill) = self.fills.remove(&id) {
+                // A crash closes the node's origin connections.
+                if let Some((handle, ..)) = fill.origin {
+                    self.cancel_origin(handle);
+                }
+                for probe in fill.probes() {
+                    self.probes.remove(&probe);
+                }
+            }
+        }
+        self.tokens.retain(|_, w| w.node != node);
+        // Dropping a task's future releases its placement pin or search slot.
+        self.tasks.retain(|_, t| t.node != node);
+        self.wake_tasks(None);
+        self.ranges.retain(|_, r| r.node != node);
+        let now = self.instant(self.now());
+        let node_config = self.config.node;
+        let n = &mut self.nodes[node as usize];
+        n.restart(&node_config, &self.shared, self.config.disk_pages, now);
+        n.down = true;
+        self.down_since.insert(node, self.now());
+    }
+
+    /// Adopt the newest membership version visible to `node` now, running placement maintenance on
+    /// every worker when it changes.
+    fn adopt(&mut self, node: u32) -> u64 {
+        let now = self.now();
+        let version = self.versions.adopted(node, now);
+        let (number, members) = (version.number, version.members.clone());
+        let old = self.nodes[node as usize].version;
+        let base = &mut self.nodes[node as usize].lineage_base;
+        if base.is_none() {
+            *base = Some(members.generation());
+        }
+        if number == old {
+            return number;
+        }
+        self.invariants.check(
+            "membership_version_monotonic",
+            number > old,
+            now,
+            Some(node),
+            || format!("adopted version {number} after {old}"),
+        );
+        self.metrics.incr("membership_adoptions");
+        let costs = self.fabric.costs;
+        let n = &mut self.nodes[node as usize];
+        n.version = number.max(old);
+        for (w, worker) in n.workers.iter().enumerate() {
+            let mut steps = 0u64;
+            while steps < 4096 {
+                match worker.placement.maintain(&members) {
+                    topology::Maintenance::Progress => steps += 1,
+                    topology::Maintenance::Idle | topology::Maintenance::Blocked => break,
+                }
+            }
+            if steps > 0 {
+                self.metrics.add("placement_maintenance_steps", steps);
+                self.fabric
+                    .cpu(now, node, w as u8, steps * costs.ranking_chunk_ns);
+            }
+        }
+        number
+    }
+
+    // ---- client reads ----
+
+    fn arrive(&mut self, node: u32) {
+        if !self.valid(node) {
+            return;
+        }
+        let now = self.now();
+        let rng = &mut self.node_rng[node as usize];
+        if let Some(gap) = self.arrivals.gap(rng) {
+            self.engine.after(gap, Event::Arrive { node });
+        }
+        if self.nodes[node as usize].down {
+            return;
+        }
+        if !self.versions.enrolled(node) {
+            self.metrics.incr("reads_skipped_not_enrolled");
+            return;
+        }
+        // Not listed in the membership it holds: production `/readyz` is false
+        // (`WorkerApplication::membership_usable`) and a read could not route.
+        if self
+            .versions
+            .adopted(node, now)
+            .members
+            .position(&node.to_be_bytes())
+            .is_none()
+        {
+            self.metrics.incr("reads_skipped_not_member");
+            return;
+        }
+        let read = self.reads.draw(rng);
+        let first = page_id(read.object, read.first, self.config.pages_per_object);
+        let incarnation = self.nodes[node as usize].incarnation;
+        if read.pages <= 1 {
+            self.read(ClientRead {
+                node,
+                incarnation,
+                page: first,
+                start: now,
+                attempt: 0,
+                range: 0,
+                slot: 0,
+            });
+            return;
+        }
+        self.metrics.incr("range_reads");
+        let id = self.fresh();
+        self.ranges.insert(
+            id,
+            RangeRead {
+                node,
+                first,
+                start: now,
+                offset: 0,
+                slots: vec![SlotKind::Missing { select: false }; read.pages as usize],
+                incarnation,
+            },
+        );
+        self.schedule_range(id);
+    }
+
+    /// Start the slots `direct_fills` plans for a range read.
+    fn schedule_range(&mut self, id: u64) {
+        let now = self.now();
+        let Some(range) = self.ranges.get_mut(&id) else {
+            return;
+        };
+        while range.offset < range.slots.len() && range.slots[range.offset] == SlotKind::Ready {
+            range.offset += 1;
+        }
+        let window = &range.slots[range.offset..];
+        if window.is_empty() || first_failure(window) == Some(0) {
+            let ok = window.is_empty();
+            let range = self.ranges.remove(&id).expect("present");
+            if ok {
+                self.metrics.incr("range_reads_completed");
+                self.metrics.observe("range_read_ns", now - range.start);
+            } else {
+                self.metrics.incr("range_reads_failed");
+            }
+            return;
+        }
+        let plan = direct_fills(window, DIRECT_AHEAD, |_| false);
+        let offset = range.offset;
+        let mut start = Vec::with_capacity(plan.len());
+        for i in plan {
+            let slot = offset + i;
+            if matches!(range.slots[slot], SlotKind::Missing { .. }) {
+                range.slots[slot] = SlotKind::Fetching;
+                start.push(ClientRead {
+                    node: range.node,
+                    incarnation: range.incarnation,
+                    page: range.first + slot as u64,
+                    start: now,
+                    attempt: 0,
+                    range: id,
+                    slot: slot as u16,
+                });
+            }
+        }
+        for r in start {
+            self.read(r);
+        }
+    }
+
+    fn range_slot_done(&mut self, r: ClientRead, ok: bool) {
+        if r.range == 0 {
+            return;
+        }
+        if let Some(range) = self.ranges.get_mut(&r.range) {
+            range.slots[r.slot as usize] = if ok {
+                SlotKind::Ready
+            } else {
+                SlotKind::Failed
+            };
+            self.schedule_range(r.range);
+        }
+    }
+
+    fn read(&mut self, r: ClientRead) {
+        let node = r.node;
+        if !self.valid(node) {
+            return;
+        }
+        let n = &self.nodes[node as usize];
+        if n.down || n.incarnation != r.incarnation {
+            self.metrics.incr("reads_lost_to_crash");
+            return;
+        }
+        if !self.versions.enrolled(node) {
+            self.metrics.incr("reads_skipped_not_enrolled");
+            return;
+        }
+        self.adopt(node);
+        let now = self.now();
+        let deadline = self.instant(r.start + self.config.node.read_timeout_ns);
+        match (PageBudget::Client { deadline }).next_page(self.instant(now)) {
+            Ok(budget) => self.want(node, r.page, Want::Client(r), budget, true),
+            Err(e) => self.resolve(Want::Client(r), Err(e)),
+        }
+    }
+
+    // ---- local tiers and flights ----
+
+    fn want(
+        &mut self,
+        node: u32,
+        page: u64,
+        want: Want,
+        budget: AcquisitionBudget,
+        plaintext: bool,
+    ) {
+        let now = self.now();
+        let w = self.ids.worker(page);
+        let costs = self.fabric.costs;
+        let t = self.fabric.cpu(now, node, w, costs.request_ns);
+        let peer = matches!(want, Want::Peer { .. });
+        // Production observes retention once per client operation, before the memory lookup result
+        // is used (`src/read/fill.rs` `acquire_with_prefetch`.
+        let eligible = if peer {
+            self.owned(node, w, page)
+        } else {
+            self.observe(node, w, page)
+        };
+        let n = &mut self.nodes[node as usize];
+        let worker = &mut n.workers[w as usize];
+        if worker.memory.pages.contains_key(&page) {
+            let _ = worker.memory.touch(&page);
+            self.metrics.incr(if peer {
+                "peer_memory_hits"
+            } else {
+                "memory_hits"
+            });
+            if !peer {
+                self.persist_page(node, w, page, eligible);
+            }
+            self.resolve_at(want, Ok(Got::Local), t);
+            return;
+        }
+        if n.disk.entries.get(&page).is_some() {
+            self.metrics
+                .incr(if peer { "peer_disk_hits" } else { "disk_hits" });
+            let read = self
+                .fabric
+                .disk_read(t, node, record_bytes(self.config.page_bytes));
+            self.memory_insert(node, w, page);
+            self.resolve_at(want, Ok(Got::Local), read);
+            return;
+        }
+        self.metrics.incr(if peer {
+            "peer_local_misses"
+        } else {
+            "local_misses"
+        });
+        let page_id = self.ids.page(page);
+        let instant = self.instant(now);
+        let mut wakes = Vec::new();
+        let n = &mut self.nodes[node as usize];
+        let incarnation = n.incarnation;
+        let worker = &mut n.workers[w as usize];
+        let quotas = &worker.quotas;
+        let joined = worker.flights.join(
+            &page_id,
+            instant,
+            budget.deadline(),
+            budget.remaining_attempts(),
+            plaintext,
+            |kind| flight_charge(quotas, kind),
+            &mut wakes,
+        );
+        match joined {
+            Err(e) => {
+                self.metrics.incr("flight_join_rejected");
+                self.resolve_at(want, Err(e), t);
+            }
+            Ok(Joined::Miss) => unreachable!("acquisition joins never miss"),
+            Ok(Joined::Settled(_)) => {
+                self.metrics.incr("flight_completed_joins");
+                if !peer {
+                    self.persist_page(node, w, page, eligible);
+                }
+                self.resolve_at(want, Ok(Got::Joined), t);
+            }
+            Ok(Joined::Waiter(id)) => {
+                self.next_id += 1;
+                let token = self.next_id;
+                let event = worker.flights.poll(
+                    &page_id,
+                    id,
+                    instant,
+                    budget.remaining_attempts(),
+                    token,
+                    &mut wakes,
+                );
+                self.tokens.insert(
+                    token,
+                    Waiting {
+                        node,
+                        incarnation,
+                        worker: w,
+                        page,
+                        id,
+                        want,
+                        eligible,
+                        budget: None,
+                        plaintext,
+                    },
+                );
+                match event {
+                    Ok(FlightEvent::Lead) => {
+                        self.start_fill(node, w, page, id, token, budget, plaintext, eligible);
+                    }
+                    Ok(FlightEvent::Pending) => {
+                        if let Some(waiting) = self.tokens.get_mut(&token) {
+                            waiting.budget = Some(budget);
+                        }
+                        self.metrics.incr("flight_joins");
+                    }
+                    Ok(FlightEvent::Ready(_) | FlightEvent::Failed(_)) => wakes.push(token),
+                    Err(e) => {
+                        self.tokens.remove(&token);
+                        self.detach(node, w, page, id);
+                        self.resolve_at(want, Err(e), t);
+                    }
+                }
+            }
+        }
+        for token in wakes {
+            self.wake(token);
+        }
+    }
+
+    fn detach(&mut self, node: u32, w: u8, page: u64, id: u64) {
+        let page_id = self.ids.page(page);
+        let mut wakes = Vec::new();
+        let worker = &mut self.nodes[node as usize].workers[w as usize];
+        worker.flights.detach(&page_id, id, &mut wakes);
+        for token in wakes {
+            self.wake(token);
+        }
+    }
+
+    fn wake(&mut self, token: u64) {
+        let Some(waiting) = self.tokens.remove(&token) else {
+            return;
+        };
+        let n = &self.nodes[waiting.node as usize];
+        if n.incarnation != waiting.incarnation {
+            return;
+        }
+        let page_id = self.ids.page(waiting.page);
+        let now = self.instant(self.now());
+        let mut wakes = Vec::new();
+        let worker = &mut self.nodes[waiting.node as usize].workers[waiting.worker as usize];
+        let attempts = waiting
+            .budget
+            .as_ref()
+            .map_or(0, AcquisitionBudget::remaining_attempts);
+        let event = worker
+            .flights
+            .poll(&page_id, waiting.id, now, attempts, token, &mut wakes);
+        let result = match event {
+            Ok(FlightEvent::Pending) => {
+                self.tokens.insert(token, waiting);
+                return;
+            }
+            Ok(FlightEvent::Ready(_)) => {
+                if let Want::Client(_) = waiting.want {
+                    self.persist_page(waiting.node, waiting.worker, waiting.page, waiting.eligible);
+                }
+                Ok(Got::Joined)
+            }
+            Ok(FlightEvent::Failed(e)) | Err(e) => Err(e),
+            Ok(FlightEvent::Lead) if waiting.budget.is_some() => {
+                // The previous leader's origin attempt was rejected for its credentials
+                // (`PageFlights::finish`); this waiter fills with its own budget, as production
+                // re-elects in `Flights::fail`.
+                self.metrics.incr("flight_reelected");
+                let mut waiting = waiting;
+                let budget = waiting.budget.take().expect("checked");
+                let (node, w, page, id) = (waiting.node, waiting.worker, waiting.page, waiting.id);
+                let (plaintext, eligible) = (waiting.plaintext, waiting.eligible);
+                self.tokens.insert(token, waiting);
+                self.start_fill(node, w, page, id, token, budget, plaintext, eligible);
+                for token in wakes {
+                    self.wake(token);
+                }
+                return;
+            }
+            Ok(FlightEvent::Lead) => {
+                // A waiter whose budget already moved to a fill cannot lead twice.
+                self.metrics.incr("flight_unexpected_lead");
+                worker.flights.cancel(&page_id, waiting.id, &mut wakes);
+                Err(Error::Unavailable)
+            }
+        };
+        self.detach(waiting.node, waiting.worker, waiting.page, waiting.id);
+        self.resolve(waiting.want, result);
+        for token in wakes {
+            self.wake(token);
+        }
+    }
+
+    fn resolve_at(&mut self, want: Want, result: Result<Got, Error>, at: Nanos) {
+        if at <= self.now() {
+            self.resolve(want, result);
+        } else {
+            self.engine.at(at, Event::Resolve { want, result });
+        }
+    }
+
+    fn resolve(&mut self, want: Want, result: Result<Got, Error>) {
+        let now = self.now();
+        match want {
+            Want::Client(mut r) => {
+                let n = &self.nodes[r.node as usize];
+                if n.down || n.incarnation != r.incarnation {
+                    self.metrics.incr("reads_lost_to_crash");
+                    return;
+                }
+                match result {
+                    Ok(got) => {
+                        let open = self.fabric.crypto(
+                            now,
+                            r.node,
+                            self.fabric.costs.aead(self.config.page_bytes),
+                        );
+                        let latency = open - r.start;
+                        self.metrics.incr("reads_completed");
+                        self.metrics.observe("read_ns", latency);
+                        self.metrics.observe(
+                            match got {
+                                Got::Local => "read_local_ns",
+                                Got::Peer => "read_peer_ns",
+                                Got::Origin => "read_origin_ns",
+                                Got::Joined => "read_joined_ns",
+                            },
+                            latency,
+                        );
+                        self.range_slot_done(r, true);
+                    }
+                    Err(e) => {
+                        if recoverable(e) && r.attempt + 1 < MAX_ATTEMPTS {
+                            self.metrics.incr("read_retries");
+                            r.attempt += 1;
+                            let backoff =
+                                2 * self.fabric.rtt.rtt(0, 0).max(MILLIS) * u64::from(r.attempt);
+                            self.engine.after(backoff, Event::Read(r));
+                        } else {
+                            self.metrics.incr("reads_failed");
+                            self.metrics.incr(err_name(e));
+                            if self.hangs
+                                && crate::faults::hung(&self.config.faults, r.node, self.now())
+                            {
+                                // The reader's own peer server hangs: the answers to its requests
+                                // are lost.
+                                self.metrics.incr("reads_failed_on_hung_nodes");
+                            }
+                            if self.versions.unready_members() > 0 {
+                                // Reads failing while some member cannot serve yet.
+                                self.metrics.incr("reads_failed_while_members_unready");
+                            }
+                            self.range_slot_done(r, false);
+                        }
+                    }
+                }
+            }
+            Want::Peer { msg, copy_only } => {
+                let Some(m) = self.msgs.get(&msg) else {
+                    return;
+                };
+                let (dest, page) = (m.dest, m.page);
+                match result {
+                    Ok(_) => self.send_reply(msg, dest, Reply::Response(ResponseKind::Page), now),
+                    Err(e) => {
+                        // Production notes a failed acquire, not a failed copy-only wait
+                        // (`Coordinator::serve_peer`).
+                        if !copy_only {
+                            self.note_hint(dest, page, m.requester, false);
+                        }
+                        let reply = err_reply(e);
+                        self.send_reply(msg, dest, reply, now);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Production `Coordinator::serve_peer`.
+    fn defer_to_successor(&mut self, node: u32, page: u64, requester: u32) -> bool {
+        if !self.config.node.successor_hints {
+            return false;
+        }
+        let w = self.ids.worker(page);
+        let instant = self.instant(self.now());
+        let n = &self.nodes[node as usize];
+        if n.hints.is_empty()
+            || n.workers[w as usize].memory.pages.contains_key(&page)
+            || n.disk.entries.get(&page).is_some()
+        {
+            return false;
+        }
+        let hints = n.hints.peek_for(&page, &requester, instant);
+        if hints.is_empty() {
+            return false;
+        }
+        let acquiring = n.workers[w as usize]
+            .flights
+            .acquiring(&self.ids.page(page));
+        if !defer_allowed(acquiring) {
+            return false;
+        }
+        let owners = self.owners_at(node, w, page, true);
+        let Some(to) = successor_deferral(hints, &node, &requester, &owners) else {
+            return false;
+        };
+        self.nodes[node as usize]
+            .hints
+            .charge(&page, requester, &to, MAX_DEFERRALS, instant);
+        true
+    }
+
+    /// Arrival generations of `owners` in `node`'s membership chain (production
+    /// `Membership::since`): the shared chain clamped to the generation this node's process started
+    /// from.
+    fn chain_base(&self, node: u32) -> u32 {
+        self.versions
+            .chain_base(node)
+            .or(self.nodes[node as usize].lineage_base)
+            .unwrap_or(0)
+    }
+
+    fn since_of(&self, node: u32, members: &Members, owners: &[u32]) -> Vec<Option<u32>> {
+        if !self.config.node.lineage {
+            return vec![None; owners.len()];
+        }
+        let base = self.chain_base(node);
+        owners
+            .iter()
+            .map(|c| {
+                members
+                    .position(&c.to_be_bytes())
+                    .and_then(|p| members.since(p))
+                    .map(|s| s.max(base))
+            })
+            .collect()
+    }
+
+    /// The page's owners under the membership `at` adopted, ranking them when `rank` (production
+    /// `CandidatePolicy::candidates_scoped`) or only from the placement cache (production
+    /// `Placement::cached`).
+    fn owners_at(&self, at: u32, w: u8, page: u64, rank: bool) -> Vec<u32> {
+        let n = &self.nodes[at as usize];
+        let Some(version) = self.versions.get(n.version) else {
+            return Vec::new();
+        };
+        let key = page.to_be_bytes();
+        let placement = &n.workers[w as usize].placement;
+        let ranked = if rank {
+            placement.rank(&version.members, &key)
+        } else {
+            placement.cached(&version.members, &key).unwrap_or_default()
+        };
+        ranked
+            .into_iter()
+            .take(3)
+            .map(|p| version.members.members()[p].node)
+            .collect()
+    }
+
+    /// `node` answered `requester`'s page probe without a copy (production
+    /// `Coordinator::serve_peer`).
+    fn note_hint(&mut self, node: u32, page: u64, requester: u32, copy_only: bool) {
+        if !self.config.node.successor_hints || node == requester {
+            return;
+        }
+        let w = self.ids.worker(page);
+        if !copy_only && !should_note(&node, &requester, &self.owners_at(node, w, page, false)) {
+            return;
+        }
+        self.metrics.incr("successor_hints_noted");
+        let instant = self.instant(self.now());
+        self.nodes[node as usize]
+            .hints
+            .note(page, requester, instant);
+    }
+
+    pub fn memory_insert(&mut self, node: u32, w: u8, page: u64) {
+        let cap = (self.config.memory_pages / u32::from(self.fabric.workers)).max(1) as usize;
+        let memory = &mut self.nodes[node as usize].workers[w as usize].memory;
+        // Production `MemoryCache::publish` keeps a resident page's position: a duplicate publish
+        // is not a use and must not renew freshness (`src/memory.rs`).
+        if memory.pages.contains_key(&page) {
+            return;
+        }
+        while memory.len() >= cap {
+            let Some(victim) = memory.victim(|_| true) else {
+                break;
+            };
+            memory.remove(&victim);
+            self.metrics.incr("memory_evictions");
+        }
+        if memory.insert(page, self.config.page_bytes as u32).is_err() {
+            self.metrics.incr("memory_ticks_exhausted");
+        }
+    }
+
+    // ---- fill ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_fill(
+        &mut self,
+        node: u32,
+        w: u8,
+        page: u64,
+        leader: u64,
+        token: u64,
+        budget: AcquisitionBudget,
+        plaintext: bool,
+        eligible: bool,
+    ) {
+        let id = self.fresh();
+        let initial_attempts = budget.remaining_attempts();
+        let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
+        let mut reservation = Vec::with_capacity(2);
+        let mut failed = None;
+        let classes: &[(ResourceClass, usize)] = if plaintext {
+            &[
+                (ResourceClass::Plaintext, PAGE_BYTES),
+                (ResourceClass::Ciphertext, PAGE_BYTES + 16),
+            ]
+        } else {
+            &[(ResourceClass::Ciphertext, PAGE_BYTES + 16)]
+        };
+        for (class, amount) in classes {
+            match reserve(quotas, *class, *amount) {
+                Ok(charge) => reservation.push(charge),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        // Production lets the running fill pass to another live waiter when its leader expires (,
+        // `Flights::allow_handover`), bounded by a hard ceiling on its owned scope.
+        let handover = self.config.node.flight_handover;
+        let page_id = self.ids.page(page);
+        let mut wakes = Vec::new();
+        let flights = &mut self.nodes[node as usize].workers[w as usize].flights;
+        let retained = if handover {
+            flights.allow_handover(&page_id, leader, &mut wakes)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| flights.retain_operation(&page_id, leader, &mut wakes));
+        self.invariants.check(
+            "flight_leader_valid",
+            retained.is_ok(),
+            self.engine.now(),
+            Some(node),
+            || format!("retain page {page} leader {leader}: {retained:?}"),
+        );
+        let scope = racer_core::read::flight::handover_ceiling(
+            self.instant(self.engine.now()),
+            budget.deadline(),
+            handover,
+        );
+        let node_config = &self.config.node;
+        let features = [
+            (Features::LINEAGE_GRANTS, node_config.lineage_grants),
+            (Features::LINEAGE_SLACK, node_config.lineage_slack),
+            (Features::PARALLEL_GRANTED, node_config.parallel_granted),
+            (Features::HELPER, node_config.fanout),
+            (Features::STALE_FALLBACK, node_config.stale_fallback),
+            (Features::STALE_WAIT, node_config.stale_wait),
+            (
+                Features::RANK0_FAILED,
+                node_config.rank0_watch && node_config.rank0_failure_hold,
+            ),
+        ]
+        .into_iter()
+        .fold(
+            Features::new(0, node_config.lineage_cap),
+            |features, (bit, on)| features.with(bit, on),
+        );
+        let core = racer_core::read::walk::Fill::new(FillConfig {
+            operation: OperationKind::Page,
+            hedge: plaintext,
+            walk_only: false,
+            scope,
+            features,
+        });
+        self.fills.insert(
+            id,
+            Fill {
+                initial_attempts,
+                node,
+                incarnation: self.nodes[node as usize].incarnation,
+                worker: w,
+                page,
+                leader,
+                token,
+                core,
+                budget,
+                scope,
+                granted_kind: None,
+                kind: ResponseKind::Miss,
+                acquire: false,
+                batch: Vec::new(),
+                batch_copy: false,
+                probe: None,
+                eligible,
+                hedge: None,
+                _reservation: reservation,
+                started: self.engine.now(),
+                asking: None,
+                sent: 0,
+                cut: None,
+                relayed: false,
+                asked: Vec::new(),
+                origin: None,
+                canceled: false,
+                concurrent: false,
+            },
+        );
+        self.metrics.incr("fills");
+        match failed {
+            Some(e) => self.finish_fill(id, Err(e)),
+            None => self.drive(id, FillEvent::Start { local_hit: false }),
+        }
+        for token in wakes {
+            self.wake(token);
+        }
+    }
+
+    /// Start a yielding task and run its first slice now.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &mut self,
+        node: u32,
+        worker: u8,
+        future: TaskFuture,
+        members: Rc<Members>,
+        route: bool,
+        then: Then,
+    ) {
+        let costs = self.fabric.costs;
+        let (first_ns, slice_ns) = if route {
+            // A cache hit answers on the first poll; each further poll expands up to 32 nodes
+            // (`SEARCH_QUANTUM`).
+            (0, 32 * costs.path_expand_ns_per_node)
+        } else {
+            // Each poll scores up to 256 members (`WORK_QUANTUM`).
+            (costs.ranking_chunk_ns, costs.ranking_chunk_ns)
+        };
+        let id = self.fresh();
+        self.tasks.insert(
+            id,
+            Task {
+                node,
+                worker,
+                incarnation: self.nodes[node as usize].incarnation,
+                future,
+                members,
+                slice_ns,
+                first_ns,
+                polls: 0,
+                route,
+                then,
+                done: None,
+                parked: false,
+            },
+        );
+        self.slice(id);
+    }
+
+    /// Run one slice of `task`: deliver a finished result, or poll the future once and reserve that
+    /// poll's CPU on the worker FIFO.
+    fn slice(&mut self, id: u64) {
+        let now = self.now();
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return;
+        };
+        if task.done.is_some() {
+            let task = self.tasks.remove(&id).expect("present");
+            return self.task_done(task);
+        }
+        task.parked = false;
+        let waker = Waker::from(std::sync::Arc::new(TaskWaker {
+            task: id,
+            woken: self.woken.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
+        let poll = task.future.as_mut().poll(&mut cx);
+        task.polls += 1;
+        let cost = if task.polls == 1 {
+            task.first_ns
+        } else {
+            task.slice_ns
+        };
+        let (node, worker, route) = (task.node, task.worker, task.route);
+        if route {
+            if task.polls > 1 {
+                self.metrics.incr("route_search_polls");
+            }
+        } else {
+            self.metrics.incr("ranking_polls");
+        }
+        let end = if cost == 0 {
+            now
+        } else {
+            self.fabric.cpu(now, node, worker, cost)
+        };
+        let task = self.tasks.get_mut(&id).expect("present");
+        if let Poll::Ready(result) = poll {
+            if end <= now {
+                let task = self.tasks.remove(&id).expect("present");
+                self.wake_tasks(None);
+                return self.task_done(Task {
+                    done: Some(result),
+                    ..task
+                });
+            }
+            task.done = Some(result);
+        } else if !self.wake_tasks(Some(id)) {
+            // Queued for a search slot: no next slice until a wake.
+            self.metrics.incr("route_search_queued");
+            self.tasks.get_mut(&id).expect("present").parked = true;
+            return;
+        }
+        self.wake_tasks(None);
+        self.engine.at(end.max(now + 1), Event::Slice { task: id });
+    }
+
+    /// Schedule a slice now for every parked task woken since the last call. Returns whether
+    /// `current` (the task being polled) woke itself.
+    fn wake_tasks(&mut self, current: Option<u64>) -> bool {
+        let woken = std::mem::take(&mut *self.woken.lock().expect("single thread"));
+        let mut itself = false;
+        let now = self.now();
+        for id in woken {
+            if Some(id) == current {
+                itself = true;
+                continue;
+            }
+            if let Some(task) = self.tasks.get_mut(&id)
+                && task.parked
+            {
+                task.parked = false;
+                self.metrics.incr("route_search_queue_wakes");
+                self.engine.at(now, Event::Slice { task: id });
+            }
+        }
+        itself
+    }
+
+    fn task_done(&mut self, task: Task) {
+        let Task {
+            node,
+            incarnation,
+            members,
+            then,
+            done,
+            ..
+        } = task;
+        if self.nodes[node as usize].incarnation != incarnation {
+            return;
+        }
+        let result = done.expect("finished task");
+        if matches!(result, Err(topology::Error::Overloaded)) {
+            self.metrics.incr(if matches!(then, Then::Route { .. }) {
+                "route_search_overloaded"
+            } else {
+                "ranking_overloaded"
+            });
+        }
+        match then {
+            Then::Ranked {
+                fill,
+                ranking,
+                version,
+                recent,
+            } => {
+                let cands = Self::to_nodes(&members, result);
+                self.ranked(fill, ranking, version, recent, members, cands);
+            }
+            Then::Route {
+                msg,
+                holder,
+                plan,
+                blocked,
+            } => self.routed(msg, holder, plan, blocked, members, result),
+        }
+    }
+
+    fn to_nodes(
+        members: &Members,
+        result: Result<Vec<usize>, topology::Error>,
+    ) -> Result<Vec<u32>, Error> {
+        let owners = result.map_err(|_| Error::Overloaded)?;
+        Ok(owners
+            .into_iter()
+            .map(|p| members.members()[p].node)
+            .collect())
+    }
+
+    /// Rank `page` with the worker's phantom placement as a yielding task:
+    /// one CPU ranking chunk per poll, the cache entry pinned until done.
+    fn rank(&mut self, node: u32, w: u8, members: Rc<Members>, page: u64, then: Then) {
+        let placement = self.nodes[node as usize].workers[w as usize]
+            .placement
+            .clone();
+        let held = members.clone();
+        let future: TaskFuture = Box::pin(async move {
+            let key = page.to_be_bytes();
+            placement.rank_async(&held, &key).await
+        });
+        self.spawn(node, w, future, members, false, then);
+    }
+
+    /// Feed `event` to fill `id`'s acquisition and perform the actions it asks for until one waits
+    /// on a scheduled event (production `CandidatePolicy::drive`).
+    fn drive(&mut self, id: u64, mut event: FillEvent<'_>) {
+        loop {
+            let now = self.instant(self.now());
+            let Some(fill) = self.fills.get_mut(&id) else {
+                return;
+            };
+            let (action, evidence) = fill.core.on(event, &mut fill.budget, now);
+            self.apply(id, evidence);
+            event = match action {
+                Action::Rank { ranking, version } => match self.rank_for(id, ranking, version) {
+                    Some(ranked) => FillEvent::Ranked(ranked),
+                    None => return,
+                },
+                Action::Hints => return self.hints(id),
+                Action::Hedge {
+                    eligible,
+                    first,
+                    second,
+                } => {
+                    if self.try_hedge(id, eligible, first, second) {
+                        return;
+                    }
+                    FillEvent::Hedge(HedgeEnd::NotStarted)
+                }
+                Action::Refresh => {
+                    let node = self.fills[&id].node;
+                    let latest = self.adopt(node);
+                    let (member, recent) = self.previous_facts(id);
+                    FillEvent::Membership {
+                        latest: Some(latest),
+                        previous_recent_member: member && recent,
+                    }
+                }
+                Action::Probe(probe) => match self.send_probe(id, probe) {
+                    None => return,
+                    Some(event) => event,
+                },
+                Action::Validate => {
+                    // A phantom page claims the page it was asked for; the
+                    // identity check is the same callback production runs.
+                    let fill = &self.fills[&id];
+                    let (expected, claimed) = (self.ids.page(fill.page), self.ids.page(fill.page));
+                    FillEvent::Validated(classify(
+                        fill.kind,
+                        OperationKind::Page,
+                        fill.acquire,
+                        || {
+                            if claimed == expected {
+                                Ok(())
+                            } else {
+                                Err(Error::CorruptRecord)
+                            }
+                        },
+                    ))
+                }
+                Action::Batch {
+                    first,
+                    count,
+                    remaining_opportunities,
+                } => return self.send_granted(id, first, count, remaining_opportunities),
+                Action::Wait(wait) => {
+                    let fill = self.fills.get_mut(&id).expect("present");
+                    if fill.core.waits > 1 {
+                        // A further wait.
+                        self.metrics.incr("stale_waits_again");
+                    }
+                    fill.asking = None;
+                    self.metrics.incr("stale_waits");
+                    self.engine
+                        .after(wait.as_nanos() as Nanos, Event::StaleWait { fill: id });
+                    return;
+                }
+                Action::Origin { rank } => match self.origin_authority(id, rank) {
+                    Ok(()) => return self.issue_origin(id),
+                    Err(e) => FillEvent::Abort(e),
+                },
+                Action::Publish(_) => {
+                    let fill = &self.fills[&id];
+                    let (node, w, page, eligible) =
+                        (fill.node, fill.worker, fill.page, fill.eligible);
+                    self.memory_insert(node, w, page);
+                    self.persist_page(node, w, page, eligible);
+                    FillEvent::Published(Ok(()))
+                }
+                Action::Done(result) => return self.finish_fill(id, result),
+                Action::Idle => return,
+            };
+        }
+    }
+
+    /// Rank the page for fill `id` as a yielding task, or answer at once
+    /// when there is nothing to rank.
+    fn rank_for(
+        &mut self,
+        id: u64,
+        ranking: Ranking,
+        version: Option<u64>,
+    ) -> Option<Result<Ranked, Error>> {
+        let fill = &self.fills[&id];
+        let (node, w, page) = (fill.node, fill.worker, fill.page);
+        let version = match ranking {
+            Ranking::Current => self.adopt(node),
+            _ => version.expect("a version to rank"),
+        };
+        let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
+            return Some(Err(Error::IncompatibleMembership));
+        };
+        // Production asks predecessors under the previous membership only within
+        // `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only with grace retention on
+        // (`Published::resolve_recent`), so peers still resolve it. Measuring from the version's
+        // publication is the stricter of the two.
+        let recent = ranking == Ranking::Previous && {
+            let (member, recent) = self.previous_facts(id);
+            member && recent
+        };
+        self.rank(
+            node,
+            w,
+            members,
+            page,
+            Then::Ranked {
+                fill: id,
+                ranking,
+                version,
+                recent,
+            },
+        );
+        None
+    }
+
+    /// A ranking for fill `id` finished.
+    fn ranked(
+        &mut self,
+        id: u64,
+        ranking: Ranking,
+        version: u64,
+        recent: bool,
+        members: Rc<Members>,
+        cands: Result<Vec<u32>, Error>,
+    ) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let node = fill.node;
+        let ranked = cands.map(|cands| match ranking {
+            Ranking::Current | Ranking::Fallback => {
+                self.walk_ranking(id, version, &members, &cands)
+            }
+            Ranking::Previous => {
+                // Previous owners that are no longer members are not asked.
+                let current = self
+                    .versions
+                    .get(fill.core.version)
+                    .map(|v| v.members.clone());
+                let owners: Vec<u32> = cands
+                    .iter()
+                    .map(|n| {
+                        if current
+                            .as_ref()
+                            .is_some_and(|m| m.position(&n.to_be_bytes()).is_some())
+                        {
+                            *n
+                        } else {
+                            NOT_MEMBER
+                        }
+                    })
+                    .collect();
+                Ranked {
+                    recent_member: recent,
+                    ..Ranked::new(version, &owners, None)
+                }
+            }
+            Ranking::Authority => {
+                Ranked::new(version, &cands, cands.iter().position(|c| *c == node))
+            }
+        });
+        self.drive(id, FillEvent::Ranked(ranked));
+    }
+
+    /// What fill `id` walks under `members`: production `CandidatePolicy::visit_order` and the
+    /// arrivals and demoted members `CandidatePolicy::ranked` collects.
+    fn walk_ranking(&self, id: u64, version: u64, members: &Members, cands: &[u32]) -> Ranked {
+        let fill = &self.fills[&id];
+        let (node, w, page) = (fill.node, fill.worker, fill.page);
+        let rank = cands.iter().position(|c| *c == node);
+        let me = members.position(&node.to_be_bytes());
+        let neighbor = |r: usize| matches!((me, members.position(&cands[r].to_be_bytes())), (Some(a), Some(b)) if members.is_neighbor(a, b));
+        // Arrival order of the owners in this node's chain (production `Membership::since`): the
+        // shared chain clamped to the generation this node's process started from.
+        let since = self.since_of(node, members, cands);
+        let mut ranked = Ranked::new(version, cands, rank);
+        ranked.members = members.members().len();
+        for (s, c) in ranked.since.iter_mut().zip(&since) {
+            *s = *c;
+        }
+        if rank.is_none() {
+            let requester = self.ids.node(node);
+            let (object, number) = (self.ids.object(page), self.ids.number(page));
+            let order = visit_order(ReplicaSelection::Spread, cands.len(), neighbor, |r| {
+                replica_score(requester, &object, number, self.ids.node(cands[r]))
+            });
+            // A non-owner visits an older later owner before the newer owner
+            // that displaced it.
+            let order = lineage_first(order, &since, neighbor);
+            // Owners that left this node's request unanswered go last.
+            ranked.order = if self.config.node.silence {
+                let at = self.instant(self.now());
+                let silence = &self.nodes[node as usize].silence;
+                demote_unanswered(order, |r| {
+                    if silence.silent(&cands[r], at) {
+                        Answering::Silent
+                    } else if silence.unanswered(&cands[r], at) {
+                        Answering::Unanswered
+                    } else {
+                        Answering::Answers
+                    }
+                })
+            } else {
+                order
+            };
+        } else if self.config.node.demoted_targets {
+            // Members ranked just below the owners that were owners when
+            // they arrived (production `Placement::demoted`).
+            let below: Vec<u32> = self.nodes[node as usize].workers[w as usize]
+                .placement
+                .demoted(members, &page.to_be_bytes())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| members.members()[p].node)
+                .collect();
+            let below_since = self.since_of(node, members, &below);
+            ranked.demoted = List::from_slice(&below);
+            for (s, c) in ranked.demoted_since.iter_mut().zip(&below_since) {
+                *s = *c;
+            }
+            // Arrivals at the chain's start are unknown (production
+            // `Membership::since` 0).
+            ranked.oldest = self
+                .config
+                .node
+                .unknown_age_targets
+                .then(|| self.chain_base(node));
+        }
+        ranked
+    }
+
+    /// Production `CandidatePolicy::drive` hints: an owner's successor
+    /// hints for the page, and what it last learned about rank 0's acquisition of it.
+    fn hints(&mut self, id: u64) {
+        let fill = &self.fills[&id];
+        let (node, page, rank, rank0) = (
+            fill.node,
+            fill.page,
+            fill.core.rank,
+            fill.core.owners.first().copied(),
+        );
+        let instant = self.instant(self.now());
+        let hints = if self.config.node.successor_targets
+            && self.config.node.successor_hints
+            && !self.nodes[node as usize].hints.is_empty()
+        {
+            self.nodes[node as usize].hints.probe(&page, instant)
+        } else {
+            Vec::new()
+        };
+        let rank0 = match (rank, rank0) {
+            (Some(r), Some(first)) if r > 0 && self.config.node.rank0_watch => self.nodes
+                [node as usize]
+                .rank0
+                .state(&page, &first, instant),
+            _ => Rank0State::Unknown,
+        };
+        match rank0 {
+            Rank0State::Fetching => self.metrics.incr("rank0_watch_fetching_walks"),
+            Rank0State::Overdue => self.metrics.incr("rank0_watch_overdue_walks"),
+            Rank0State::Failed => self.metrics.incr("rank0_watch_failed_walks"),
+            Rank0State::Unknown => {}
+        }
+        self.drive(
+            id,
+            FillEvent::Hints {
+                hints: &hints,
+                rank0,
+            },
+        );
+    }
+
+    /// Fill `id`'s membership version - 1: whether this node is a member of it, and whether it was
+    /// replaced recently enough that peers still resolve it (`PREVIOUS_MEMBERSHIP_WITHIN`, measured
+    /// from the publication).
+    fn previous_facts(&self, id: u64) -> (bool, bool) {
+        let now = self.now();
+        let fill = &self.fills[&id];
+        let (node, version) = (fill.node, fill.core.version);
+        let member = version
+            .checked_sub(1)
+            .and_then(|v| self.versions.get(v))
+            .is_some_and(|v| v.members.position(&node.to_be_bytes()).is_some());
+        let recent = self.config.node.retained_versions >= 1
+            && self.versions.get(version).is_some_and(|v| {
+                now.saturating_sub(v.published) <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
+            });
+        (member, recent)
+    }
+
+    /// Apply what one event showed: silence, rank 0 and route evidence, and
+    /// counters (production `CandidatePolicy::apply`).
+    fn apply(&mut self, id: u64, evidence: Evidence) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let (node, page) = (fill.node, fill.page);
+        let at = self.instant(self.now());
+        match (evidence.silence, fill.asking) {
+            (Some(SilenceNote::TimedOut { needed }), Some(dest)) => {
+                let sent = fill.sent;
+                self.requester_timeout(id, dest, sent, needed);
+            }
+            (Some(note), Some(dest)) => {
+                let silence = &mut self.nodes[node as usize].silence;
+                if note == SilenceNote::Shed && self.config.node.shed_busy {
+                    // The destination itself shed the request: busy, not hung.
+                    silence.shed(dest, page, at);
+                } else {
+                    silence.answered(&dest, at);
+                }
+            }
+            _ => {}
+        }
+        if let Some(outcome) = evidence.outcome {
+            self.complete_probe(id, outcome, &evidence);
+        }
+        let notes = evidence.notes;
+        for (note, counter) in [
+            (Notes::STALE_SKIP, "stale_destination_skips"),
+            (Notes::OWNER_STALE_SKIP, "owner_stale_destination_skips"),
+            (Notes::REFRESH, "walk_membership_refreshes"),
+            (Notes::FALLBACK, "stale_fallbacks"),
+            (Notes::FALLBACK_DENIED, "stale_fallback_denied"),
+            (Notes::WAIT_DENIED, "stale_waits_denied"),
+            (Notes::RANK0_LEFT, "origin_left_to_rank0"),
+            (Notes::WALK_COPY, "walk_copies"),
+            (Notes::EXHAUSTED, "walk_exhausted"),
+            (Notes::EXHAUSTED_FUNDING, "walk_exhausted_funding"),
+            (Notes::EXHAUSTED_STALE, "walk_exhausted_stale"),
+            (Notes::REMAINING, "remaining_walks"),
+        ] {
+            if notes & note != 0 {
+                self.metrics.incr(counter);
+            }
+        }
+        if notes & Notes::FALLBACK_BLOCKED != 0 {
+            // Why a non-owner could not fall back.
+            let (member, recent) = self.previous_facts(id);
+            self.metrics.incr(if !member {
+                "stale_fallback_not_member"
+            } else if !recent {
+                "stale_fallback_not_recent"
+            } else {
+                "stale_fallback_other"
+            });
+        }
+        if notes & Notes::RANK0_LEFT != 0 {
+            // Rank 0's own acquisition failed.
+            let fill = &self.fills[&id];
+            let rank0 = fill.core.owners.first().copied();
+            if fill
+                .asked
+                .iter()
+                .rev()
+                .find(|(dest, _)| Some(*dest) == rank0)
+                .is_some_and(|(_, a)| *a == Asked::Failed)
+            {
+                self.metrics.incr("origin_left_to_rank0_failed");
+            }
+        }
+    }
+
+    /// Whether `node` may open a pinned direct exchange to `dest` now
+    /// (production `direct_hedge_available`: link health allows it).
+    fn direct_available(&self, node: u32, dest: u32) -> bool {
+        let instant = self.instant(self.now());
+        self.nodes[node as usize].links.available(&dest, instant)
+    }
+
+    /// Production `hedge_page` (`src/read/candidates.rs`): start a hedge race when enabled,
+    /// eligible, directly reachable, and admitted. Returns whether it started.
+    fn try_hedge(&mut self, id: u64, eligible: bool, first: usize, second: usize) -> bool {
+        let now = self.now();
+        let instant = self.instant(now);
+        let fill = self.fills.get(&id).expect("present");
+        let (node, w) = (fill.node, fill.worker);
+        let enabled = self.config.node.hedge_slots > 0;
+        if eligible {
+            self.metrics.incr("hedge_eligible");
+        }
+        if !enabled {
+            return false;
+        }
+        let (a, b) = (fill.core.owners[first], fill.core.owners[second]);
+        let started = eligible && self.direct_available(node, a) && self.direct_available(node, b);
+        let reservation = started
+            .then(|| {
+                let n = &self.nodes[node as usize];
+                let quotas = &n.workers[w as usize].quotas;
+                let escrow = hedge_pages(quotas, 1)?;
+                // Fund both contenders before spending credits.
+                drop(hedge_pages(quotas, 2)?);
+                let delay = Duration::from_nanos(self.config.node.hedge_delay_ns);
+                let permit = n
+                    .hedges
+                    .acquire(DUPLICATE_BYTES, instant + delay)
+                    .map_err(|_| Error::Overloaded)?;
+                Ok::<_, Error>((permit, escrow))
+            })
+            .and_then(Result::ok);
+        let Some((permit, escrow)) = reservation else {
+            if eligible {
+                self.metrics.incr("hedge_suppressed");
+            }
+            return false;
+        };
+        let fill = self.fills.get_mut(&id).expect("present");
+        let (before_attempts, before_links) = (
+            fill.budget.remaining_attempts(),
+            fill.budget.remaining_links(),
+        );
+        let Ok((secondary, primary)) = hedge_budgets(&mut fill.budget) else {
+            self.metrics.incr("hedge_suppressed");
+            return false;
+        };
+        fill.hedge = Some(Box::new(Race {
+            primary_budget: primary,
+            secondary_budget: secondary,
+            primary: None,
+            secondary: None,
+            primary_done: false,
+            secondary_done: false,
+            launched: false,
+            winner: None,
+            fatal: None,
+            primary_outcome: None,
+            stale: false,
+            before: (before_attempts, before_links),
+            first,
+            second,
+            _permit: permit,
+            _escrow: escrow,
+        }));
+        self.metrics.incr("hedge_races");
+        match self.send_hedge(id, true) {
+            Ok(()) => {
+                let delay = self.config.node.hedge_delay_ns;
+                self.engine
+                    .after(delay.max(1), Event::HedgeDelay { fill: id });
+            }
+            Err(e) => self.hedge_result(id, true, Err(e)),
+        }
+        true
+    }
+
+    /// Plan and send one hedge contender as a pinned direct exchange.
+    fn send_hedge(&mut self, id: u64, primary: bool) -> Result<(), Error> {
+        let now = self.now();
+        let instant = self.instant(now);
+        let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
+        let fill = self.fills.get_mut(&id).expect("present");
+        let scope = fill.scope.min(fill.budget.deadline());
+        let race = fill.hedge.as_mut().expect("racing");
+        let (budget, canonical, mode) = if primary {
+            (&mut race.primary_budget, race.first, Mode::Acquire)
+        } else {
+            (&mut race.secondary_budget, race.second, Mode::CopyOnly)
+        };
+        let (before_attempts, before_links) =
+            (budget.remaining_attempts(), budget.remaining_links());
+        let plan = plan_attempt(
+            budget,
+            AttemptInputs {
+                now: instant,
+                caller_deadline: scope,
+                remaining_opportunities: 3,
+                route: RouteMode::DirectHedge,
+                mode,
+                attempt_timeout,
+                failure_links: MAX_LINKS,
+            },
+        )?;
+        let node = fill.node;
+        self.invariants.check(
+            "budget_never_grows",
+            plan.links <= before_links && plan.links == 1 && plan.remote_attempts < before_attempts.max(1),
+            now,
+            Some(node),
+            || format!("hedge plan {} links {} attempts from {before_links} links {before_attempts} attempts", plan.links, plan.remote_attempts),
+        );
+        let dest = fill.core.owners[canonical];
+        let version = self.fills[&id].core.version;
+        let pid = self.launch(
+            id,
+            dest,
+            version,
+            mode == Mode::Acquire,
+            &plan,
+            true,
+            Some(primary),
+        );
+        let race = self
+            .fills
+            .get_mut(&id)
+            .expect("present")
+            .hedge
+            .as_mut()
+            .expect("racing");
+        if primary {
+            race.primary = Some(pid);
+        } else {
+            race.secondary = Some(pid);
+        }
+        Ok(())
+    }
+
+    /// The hedge delay elapsed: launch the copy-only duplicate unless the
+    /// primary already finished or the race is decided.
+    fn hedge_delay(&mut self, id: u64) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let Some(race) = &fill.hedge else {
+            return;
+        };
+        if race.launched || race.secondary_done || race.winner.is_some() || race.fatal.is_some() {
+            return;
+        }
+        let (node, w, dest) = (fill.node, fill.worker, fill.core.owners[race.second]);
+        // Recheck the link and local headroom after the delay.
+        let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
+        let ok = self.direct_available(node, dest) && hedge_pages(quotas, 1).is_ok();
+        let race = self
+            .fills
+            .get_mut(&id)
+            .expect("present")
+            .hedge
+            .as_mut()
+            .expect("racing");
+        race.launched = true;
+        if !ok {
+            self.metrics.incr("hedge_suppressed");
+            return self.hedge_result(id, false, Err(Error::Overloaded));
+        }
+        self.metrics.incr("hedge_started");
+        self.metrics
+            .add("hedge_duplicate_bytes", DUPLICATE_BYTES as u64);
+        if let Err(e) = self.send_hedge(id, false) {
+            self.hedge_result(id, false, Err(e));
+        }
+    }
+
+    /// One hedge contender finished (production `record_result` in `uring_runtime::drivers::race`).
+    fn hedge_result(&mut self, id: u64, primary: bool, result: Result<(), Error>) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let Some(race) = fill.hedge.as_mut() else {
+            return;
+        };
+        if primary {
+            race.primary = None;
+            race.primary_done = true;
+            if !race.launched {
+                // A ready primary never launches the duplicate.
+                race.secondary_done = true;
+            }
+        } else {
+            race.secondary = None;
+            race.secondary_done = true;
+        }
+        match result {
+            Ok(()) if race.winner.is_none() && race.fatal.is_none() => {
+                race.winner = Some(primary);
+            }
+            Err(e) if !recoverable(e) && race.winner.is_none() && race.fatal.is_none() => {
+                race.fatal = Some(e);
+            }
+            _ => {}
+        }
+        let decided = race.winner.is_some() || race.fatal.is_some();
+        let mut cancel = Vec::new();
+        if decided {
+            if let Some(pid) = race.primary.take() {
+                race.primary_done = true;
+                cancel.push(pid);
+            }
+            if let Some(pid) = race.secondary.take() {
+                race.secondary_done = true;
+                cancel.push(pid);
+            }
+            race.secondary_done |= !race.launched;
+        }
+        let finished = race.primary_done && race.secondary_done;
+        for pid in cancel {
+            // The loser is canceled: its exchange and relay charges are released now. Production
+            // waits for the loser's completion fence; the simulator releases at cancellation.
+            self.metrics.incr("hedge_losers_canceled");
+            self.probes.remove(&pid);
+            if let Some(mid) = self
+                .msgs
+                .iter()
+                .find(|(_, m)| m.probe == pid)
+                .map(|(k, _)| *k)
+            {
+                self.msgs.remove(&mid);
+            }
+        }
+        if finished {
+            self.finish_race(id);
+        }
+    }
+
+    /// Both contenders are fenced: reunite budgets and report the race.
+    fn finish_race(&mut self, id: u64) {
+        let now = self.now();
+        let fill = self.fills.get_mut(&id).expect("present");
+        let race = *fill.hedge.take().expect("racing");
+        let node = fill.node;
+        let reunited = fill
+            .budget
+            .reunite(race.primary_budget)
+            .and_then(|()| fill.budget.reunite(race.secondary_budget));
+        let (attempts, links) = (
+            fill.budget.remaining_attempts(),
+            fill.budget.remaining_links(),
+        );
+        let (before_attempts, before_links) = race.before;
+        self.invariants.check(
+            "budget_never_grows",
+            reunited.is_ok() && attempts <= before_attempts && links <= before_links,
+            now,
+            Some(node),
+            || format!("hedge reunited {links} links {attempts} attempts from {before_links} links {before_attempts} attempts"),
+        );
+        if let Err(e) = reunited {
+            return self.drive(id, FillEvent::Abort(e));
+        }
+        let end = match race.winner {
+            Some(primary) => {
+                self.metrics.incr(if primary {
+                    "hedge_primary_won"
+                } else {
+                    "hedge_won"
+                });
+                HedgeEnd::Won
+            }
+            None => {
+                if race.fatal.is_none_or(hedge_fallback) {
+                    self.metrics.incr("hedge_fallbacks");
+                }
+                HedgeEnd::Lost {
+                    stale: race.stale,
+                    primary: race.primary_outcome,
+                    error: race.fatal,
+                }
+            }
+        };
+        self.drive(id, FillEvent::Hedge(end));
+    }
+
+    /// Counter kind of handoff target `i` of fill `id`, and count the probe.
+    fn handoff_kind(&mut self, id: u64, i: usize) -> Option<&'static str> {
+        let kind = match self.fills[&id].core.target_kind(i) {
+            TargetKind::Successor => Some("successor"),
+            TargetKind::Demoted => Some("demoted"),
+            TargetKind::Lineage => Some("lineage"),
+            TargetKind::Handoff => None,
+        };
+        self.metrics.incr(match kind {
+            Some("successor") => "successor_probes",
+            Some("demoted") => "demoted_probes",
+            Some(_) => "lineage_grant_probes",
+            None => "handoff_probes",
+        });
+        kind
+    }
+
+    /// Production `CandidatePolicy::granted_batch`: send handoff targets
+    /// `first..first + count` at once, each copy-only on its own grant, and report them together
+    /// once all have answered (`batch_maybe_done`).
+    fn send_granted(&mut self, id: u64, first: usize, count: usize, remaining_opportunities: u32) {
+        let now = self.now();
+        let instant = self.instant(now);
+        let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
+        self.metrics.incr("granted_batches");
+        self.metrics.observe("granted_batch_probes", count as u64);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.batch.clear();
+        fill.batch_copy = false;
+        for i in first..first + count {
+            let kind = self.handoff_kind(id, i).unwrap_or("successor");
+            let fill = self.fills.get_mut(&id).expect("present");
+            let dest = fill.core.handoff[i];
+            let scope = fill.scope.min(fill.budget.deadline());
+            let mut grant = granted_budget(fill.budget.deadline());
+            let (before_attempts, before_links) =
+                (grant.remaining_attempts(), grant.remaining_links());
+            let plan = plan_attempt(
+                &mut grant,
+                AttemptInputs {
+                    now: instant,
+                    caller_deadline: scope,
+                    remaining_opportunities,
+                    route: RouteMode::FundedRoute,
+                    mode: Mode::CopyOnly,
+                    attempt_timeout,
+                    failure_links: MAX_LINKS,
+                },
+            );
+            let Ok(plan) = plan else {
+                // An unfundable grant is only a miss.
+                fill.asked.push((dest, Asked::Unfunded));
+                self.count_granted(kind, "failures");
+                continue;
+            };
+            self.invariants.check(
+                "budget_never_grows",
+                plan.links <= before_links
+                    && plan.links <= MAX_LINKS
+                    && plan.remote_attempts < before_attempts,
+                now,
+                Some(fill.node),
+                || {
+                    format!(
+                        "granted plan {} links {} attempts from {before_links} links {before_attempts} attempts",
+                        plan.links, plan.remote_attempts
+                    )
+                },
+            );
+            let version = fill.core.version;
+            let index = fill.batch.len();
+            fill.batch.push(BatchProbe {
+                pid: 0,
+                dest,
+                kind,
+                cut: None,
+                relayed: false,
+                done: false,
+            });
+            // The first hop may fail synchronously and answer through an
+            // event, never inline, so the batch entry is complete first.
+            let pid = self.launch(id, dest, version, false, &plan, false, None);
+            if let Some(p) = self.probes.get_mut(&pid) {
+                p.granted = Some(index);
+            }
+            if let Some(fill) = self.fills.get_mut(&id)
+                && let Some(b) = fill.batch.get_mut(index)
+            {
+                b.pid = pid;
+            }
+        }
+        self.batch_maybe_done(id);
+    }
+
+    fn count_granted(&mut self, kind: &str, what: &str) {
+        self.metrics.incr(granted_counter(kind, what));
+    }
+
+    /// Granted probe `index` of fill `id` answered with `outcome`.
+    fn complete_batch_probe(&mut self, id: u64, index: usize, outcome: Result<Outcome, Error>) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let Some(b) = fill.batch.get_mut(index) else {
+            return;
+        };
+        if b.done {
+            return;
+        }
+        b.done = true;
+        let (dest, kind, cut, relayed) = (b.dest, b.kind, b.cut, b.relayed);
+        let asked = match &outcome {
+            Ok(Outcome::Copy) => Asked::Copy,
+            Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
+                Asked::Miss
+            }
+            Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
+                Asked::Unreachable(cut.unwrap_or(Cut::Other))
+            }
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Failed,
+            Ok(_) => Asked::Busy,
+            Err(_) => Asked::Unfunded,
+        };
+        fill.asked.push((dest, asked));
+        fill.batch_copy |= asked == Asked::Copy;
+        let what = match asked {
+            Asked::Copy => "copies",
+            Asked::Miss => "misses",
+            _ => "failures",
+        };
+        self.count_granted(kind, what);
+        self.batch_maybe_done(id);
+    }
+
+    /// Every granted probe of fill `id` answered: report them to the walk.
+    fn batch_maybe_done(&mut self, id: u64) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        if fill.batch.iter().any(|b| !b.done) {
+            return;
+        }
+        let copy = std::mem::take(&mut fill.batch_copy);
+        fill.batch.clear();
+        self.drive(id, FillEvent::BatchDone { copy });
+    }
+
+    /// Plan and send one probe. `Some` is the event that answers it at once:
+    /// no helper to ask, or a probe that could not be planned.
+    fn send_probe(&mut self, id: u64, probe: Probe) -> Option<FillEvent<'static>> {
+        let now = self.now();
+        let instant = self.instant(now);
+        let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
+        let fill = &self.fills[&id];
+        let owners = fill.core.owners.len();
+        let dest = match fill.core.dest(&probe) {
+            Some(dest) => {
+                if let Some(i) = probe.canonical.checked_sub(owners) {
+                    let kind = self.handoff_kind(id, i);
+                    self.fills.get_mut(&id).expect("present").granted_kind = kind;
+                }
+                dest
+            }
+            None => match self.fanout_helper(id) {
+                Some(helper) => {
+                    self.metrics.incr("helper_probes");
+                    helper
+                }
+                // Every candidate helper is excluded: a miss.
+                None => return Some(FillEvent::NoHelper),
+            },
+        };
+        let fill = self.fills.get_mut(&id).expect("present");
+        // Peer exchanges stay within the leader's own budget deadline
+        // (`src/read/candidates.rs`, `scope.deadline.0.min(budget.deadline())`).
+        let scope = fill.scope.min(fill.budget.deadline());
+        let rank = fill.core.rank;
+        let version = fill.core.version - u64::from(probe.previous);
+        let budget = fill.core.request_budget(&mut fill.budget);
+        let (before_attempts, before_links) =
+            (budget.remaining_attempts(), budget.remaining_links());
+        let plan = plan_attempt(
+            budget,
+            AttemptInputs {
+                now: instant,
+                caller_deadline: scope,
+                remaining_opportunities: probe.remaining_opportunities,
+                route: probe.route,
+                mode: probe.mode,
+                attempt_timeout,
+                failure_links: MAX_LINKS,
+            },
+        );
+        let plan = match plan {
+            Ok(plan) => {
+                if rank.is_none()
+                    && probe.route == RouteMode::FundedRoute
+                    && probe.mode == Mode::Acquire
+                    && plan.links < MAX_LINKS
+                {
+                    // A non-owner funds an out-of-order owner with less than a full route: it was
+                    // reached by a funded route itself (`walk::funded_links`).
+                    self.metrics.incr("forwarded_funded_routes");
+                }
+                plan
+            }
+            Err(error) => {
+                fill.asked.push((dest, Asked::Unfunded));
+                return Some(FillEvent::Reply(FillReply::Failed {
+                    error,
+                    sent: false,
+                    scope_live: false,
+                }));
+            }
+        };
+        self.invariants.check(
+            "budget_never_grows",
+            plan.links <= before_links
+                && plan.links <= MAX_LINKS
+                && plan.remote_attempts < before_attempts,
+            now,
+            Some(fill.node),
+            || {
+                format!(
+                    "attempt plan {} links {} attempts from {before_links} links {before_attempts} attempts",
+                    plan.links, plan.remote_attempts
+                )
+            },
+        );
+        let acquire = probe.mode == Mode::Acquire;
+        // Predecessors that held the same rank under the previous membership
+        // are asked under it (`Probe::previous`).
+        if probe.previous {
+            self.metrics.incr("previous_membership_probes");
+        }
+        // Set before launching: the first hop may fail synchronously.
+        fill.asking = Some(dest);
+        fill.sent = now;
+        fill.cut = None;
+        let pid = self.launch(id, dest, version, acquire, &plan, false, None);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.probe = Some(pid);
+        None
+    }
+
+    /// Send one planned probe for fill `id` to `dest`. Returns the probe id.
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &mut self,
+        id: u64,
+        dest: u32,
+        version: u64,
+        acquire: bool,
+        plan: &AttemptPlan,
+        direct: bool,
+        hedge: Option<bool>,
+    ) -> u64 {
+        let now = self.now();
+        let fill = &self.fills[&id];
+        let deadline = plan.overall.saturating_duration_since(self.base).as_nanos() as Nanos;
+        let node = fill.node;
+        let msg = Msg {
+            probe: 0,
+            requester: node,
+            at: node,
+            dest,
+            version,
+            page: fill.page,
+            acquire,
+            path: vec![node],
+            links: plan.links,
+            attempts: plan.remote_attempts,
+            deadline,
+            abandon: self.nanos(plan.attempt_end).max(now + 1),
+            relays: Vec::new(),
+            direct,
+            offer: false,
+            ping: false,
+        };
+        let pid = self.fresh();
+        let mid = self.fresh();
+        self.probes.insert(
+            pid,
+            Probing {
+                fill: id,
+                acquire,
+                remote: plan.remote_attempts,
+                links: plan.links,
+                hops: 0,
+                hedge,
+                granted: None,
+                dest,
+                sent: now,
+            },
+        );
+        self.msgs.insert(mid, Msg { probe: pid, ..msg });
+        let timeout = self.nanos(plan.attempt_end).max(now + 1);
+        self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
+        self.metrics.incr(if acquire {
+            "peer_requests_acquire"
+        } else {
+            "peer_requests_copy_only"
+        });
+        self.forward(mid, node, None);
+        pid
+    }
+
+    // ---- peer messages ----
+
+    /// Route `msg` one hop from `holder`. `plan` is the relay plan at a relay; `None` at the
+    /// requester.
+    fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
+        let m = self.msgs.get(&mid).expect("message");
+        let instant = self.instant(self.now());
+        let own_ping = m.ping && holder == m.requester;
+        if !own_ping && self.nodes[holder as usize].silence.silent(&m.dest, instant) {
+            // Production `Paths::shortest_async`: the destination is a silent next hop of this
+            // node.
+            self.metrics.incr("silent_destination_fails");
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        }
+        let m = self.msgs.get(&mid).expect("message");
+        if m.direct && plan.is_none() {
+            // A pinned direct hedge exchange: one link, no route search (production
+            // `request_direct`).
+            let dest = m.dest;
+            return self.link(mid, holder, None, dest);
+        }
+        let Some(version) = self.versions.get(m.version) else {
+            return self.fail_hop(mid, holder, Fault::IncompatibleMembership);
+        };
+        let members = version.members.clone();
+        let search = match plan {
+            None => racer_core::route::search_budget(&m.path, m.links, &holder),
+            Some(plan) => plan.search,
+        };
+        let Ok((keep, links)) = search else {
+            return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
+        };
+        let (Some(from), Some(to)) = (
+            members.position(&holder.to_be_bytes()),
+            members.position(&m.dest.to_be_bytes()),
+        ) else {
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        };
+        let visited: Option<Vec<usize>> = m.path[..keep]
+            .iter()
+            .map(|n| members.position(&n.to_be_bytes()))
+            .collect();
+        let Some(visited) = visited else {
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        };
+        // Production `shortest_probe_async`: an origin's own ping may use the link to the
+        // destination it holds silent.
+        let exempt = own_ping.then_some(m.dest);
+        let blocked = self.blocked(holder, &members, exempt);
+        let seed = m.probe.to_be_bytes();
+        let worker = (m.probe % u64::from(self.fabric.workers)) as u8;
+        let paths = self.nodes[holder as usize].paths.clone();
+        let held = members.clone();
+        let hint = blocked.clone();
+        let future: TaskFuture = Box::pin(async move {
+            let query = PathQuery {
+                from,
+                to,
+                links,
+                visited: &visited,
+                blocked: &hint,
+                seed: &seed,
+            };
+            paths.route(&held, query).await
+        });
+        self.spawn(
+            holder,
+            worker,
+            future,
+            members,
+            true,
+            Then::Route {
+                msg: mid,
+                holder,
+                plan,
+                blocked,
+            },
+        );
+    }
+
+    /// Links from `holder` its circuits currently block (the path hint).
+    fn blocked(&self, holder: u32, members: &Members, exempt: Option<u32>) -> Vec<usize> {
+        let instant = self.instant(self.now());
+        let n = &self.nodes[holder as usize];
+        let mut blocked: Vec<usize> = n
+            .suspects
+            .iter()
+            .filter(|s| !n.links.available(s, instant))
+            .filter_map(|s| members.position(&s.to_be_bytes()))
+            .collect();
+        // Production `LinkHealth::available`: silent next hops too.
+        let me = members.position(&holder.to_be_bytes());
+        let mut silent: Vec<usize> = n
+            .silence
+            .silent_peers(instant)
+            .filter(|s| Some(**s) != exempt)
+            .filter_map(|s| members.position(&s.to_be_bytes()))
+            .filter(|p| me.is_some_and(|me| members.is_neighbor(me, *p)))
+            .filter(|p| !blocked.contains(p))
+            .collect();
+        silent.sort_unstable();
+        blocked.extend(silent);
+        blocked
+    }
+
+    /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester asks whether `dest`
+    /// hangs (production `request_traced`).
+    fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos, needed: u32) {
+        if !self.config.node.silence {
+            return;
+        }
+        if let Some((node, page)) = self.fills.get(&id).map(|f| (f.node, f.page)) {
+            self.silence_timeout(node, dest, page, sent, needed);
+        }
+    }
+
+    /// `node`'s exchange with `dest`, sent at `sent`, timed out.
+    fn silence_timeout(&mut self, node: u32, dest: u32, page: u64, sent: Nanos, needed: u32) {
+        let (sent, at) = (self.instant(sent), self.instant(self.now()));
+        if self.nodes[node as usize]
+            .silence
+            .timed_out(dest, page, sent, at, needed)
+        {
+            self.poll_pings(node);
+        }
+    }
+
+    /// Send `node`'s due silence pings, at most [`MAX_PINGS_IN_FLIGHT`] at once (production
+    /// `CandidatePolicy::poll_pings`).
+    fn poll_pings(&mut self, node: u32) {
+        let at = self.instant(self.now());
+        let n = &mut self.nodes[node as usize];
+        let room = MAX_PINGS_IN_FLIGHT.saturating_sub(n.pings.into());
+        if n.down || room == 0 {
+            return;
+        }
+        for (to, page) in n.silence.due_pings(at, room) {
+            if self.nodes[node as usize].silence.silent(&to, at) {
+                self.metrics.incr("silence_rechecks");
+            }
+            // Production `CandidatePolicy::poll_pings`: answered `Miss` at once.
+            self.nodes[node as usize].pings += 1;
+            let pid = self.launch_control(node, to, page, false);
+            let incarnation = self.nodes[node as usize].incarnation;
+            let ping = SimPing {
+                node,
+                incarnation,
+                dest: to,
+                relayed: false,
+            };
+            self.pings.insert(pid, ping);
+            self.metrics.incr("silence_pings");
+        }
+    }
+
+    /// Send a ping or copy offer from `node` on its own route grant ([`NOTICE_LINKS`], no
+    /// attempts); returns its probe id.
+    fn launch_control(&mut self, node: u32, dest: u32, page: u64, offer: bool) -> u64 {
+        let timeout = self.now() + self.config.node.attempt_timeout_ns;
+        let pid = self.fresh();
+        let mid = self.fresh();
+        let msg = Msg {
+            probe: pid,
+            requester: node,
+            at: node,
+            dest,
+            version: self.nodes[node as usize].version,
+            page,
+            acquire: false,
+            path: vec![node],
+            links: NOTICE_LINKS,
+            attempts: 0,
+            deadline: timeout,
+            abandon: timeout,
+            relays: Vec::new(),
+            direct: false,
+            offer,
+            ping: !offer,
+        };
+        self.msgs.insert(mid, msg);
+        self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
+        self.forward(mid, node, None);
+        pid
+    }
+
+    /// A ping ended with `reply`, or unanswered within its time bound (`None`), classified by
+    /// `ping_verdict`.
+    fn ping_done(&mut self, ping: SimPing, reply: Option<Reply>) {
+        let n = &self.nodes[ping.node as usize];
+        if n.down || n.incarnation != ping.incarnation {
+            return;
+        }
+        self.nodes[ping.node as usize].pings -= 1;
+        let at = self.instant(self.now());
+        let (from, to) = (ping.node, ping.dest);
+        let silence = &mut self.nodes[from as usize].silence;
+        let answered = ping_verdict(match reply {
+            None => Err(true),
+            Some(Reply::Shed) => Ok((true, false)),
+            Some(Reply::Response(kind)) => Ok((!ping.relayed, kind == ResponseKind::Unavailable)),
+            Some(Reply::Transport) => Err(false),
+        });
+        let Some(alive) = answered else {
+            self.metrics.incr("silence_pings_inconclusive");
+            return self.poll_pings(from);
+        };
+        if alive && silence.silent(&to, at) {
+            self.metrics.incr("silence_recoveries");
+        }
+        if silence.ping_result(&to, answered, at) {
+            self.metrics.incr("silence_marks");
+        }
+        if silence.silent(&to, at) {
+            // Ping it again after the hold, to learn that it recovered.
+            let hold = silence.hold().as_nanos() as Nanos;
+            self.engine.after(hold, Event::SilenceRecheck { from, to });
+        }
+        self.poll_pings(from);
+    }
+
+    /// A route search for `mid` at `holder` finished.
+    fn routed(
+        &mut self,
+        mid: u64,
+        holder: u32,
+        plan: Option<RelayPlan>,
+        blocked: Vec<usize>,
+        members: Rc<Members>,
+        route: Result<Vec<usize>, topology::Error>,
+    ) {
+        if !self.msgs.contains_key(&mid) {
+            return;
+        }
+        if self.nodes[holder as usize].down {
+            return;
+        }
+        // Production `Paths::shortest` (`src/topology.rs`): link health may change while the search
+        // yields; a changed blocked set fails the attempt with `Unavailable` under the same budget.
+        let exempt = self
+            .msgs
+            .get(&mid)
+            .filter(|m| m.ping && holder == m.requester)
+            .map(|m| m.dest);
+        if self.blocked(holder, &members, exempt) != blocked {
+            self.metrics.incr("route_blocked_changed");
+            self.note_cut(mid, Cut::Route);
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        }
+        let route = match route {
+            Ok(route) => route,
+            Err(topology::Error::Overloaded) => {
+                return self.fail_hop(mid, holder, Fault::Overloaded);
+            }
+            Err(_) => {
+                self.metrics.incr("route_unreachable");
+                self.note_cut(mid, Cut::Route);
+                return self.fail_hop(mid, holder, Fault::Unavailable);
+            }
+        };
+        let next = members.members()[route[1]].node;
+        let m = &self.msgs[&mid];
+        if m.ping
+            && holder == m.requester
+            && next == m.dest
+            && self.nodes[holder as usize]
+                .silence
+                .silent(&next, self.instant(self.now()))
+        {
+            // The ping tests the link it holds silent.
+            self.metrics.incr("silence_pings_direct");
+        }
+        self.link(mid, holder, plan, next);
+    }
+
+    /// Send `mid` from `holder` over its link to `next`.
+    fn link(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>, next: u32) {
+        let now = self.now();
+        let instant = self.instant(now);
+        let m = self.msgs.get_mut(&mid).expect("message");
+        if let Some(plan) = plan {
+            let Ok(outbound) = plan.outbound else {
+                self.note_cut(mid, Cut::Route);
+                return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
+            };
+            let inbound = m.links;
+            self.invariants.check(
+                "budget_never_grows",
+                outbound < inbound,
+                now,
+                Some(holder),
+                || format!("relay forwards {outbound} links after receiving {inbound}"),
+            );
+            m.path.push(holder);
+            m.links = outbound;
+        }
+        m.at = next;
+        // Link: acquire the circuit, then see whether the link works.
+        let n = &mut self.nodes[holder as usize];
+        let Ok(probe) = n.links.acquire(&next, instant) else {
+            self.metrics.incr("link_circuit_open");
+            self.note_cut(mid, Cut::Circuit);
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        };
+        drop(probe);
+        let site = |x: u32| self.fabric.site[x as usize];
+        let partitioned = self.partitions.blocked(now, site(holder), site(next));
+        let cut = if self.nodes[next as usize].down {
+            Some(Cut::Down)
+        } else if !self.versions.enrolled(next) {
+            Some(Cut::NotServing)
+        } else if partitioned {
+            Some(Cut::Partition)
+        } else {
+            None
+        };
+        let up = cut.is_none();
+        if let Some(cut) = cut {
+            self.note_cut(mid, cut);
+        }
+        let unready = cut == Some(Cut::NotServing);
+        let n = &mut self.nodes[holder as usize];
+        if up {
+            n.links.success(&next);
+            if next == self.msgs[&mid].dest && self.config.node.silence {
+                // The last link: this sender learns whether the destination answers.
+                let (abandon, page) = (self.msgs[&mid].abandon, self.msgs[&mid].page);
+                self.last_hops.insert(mid, (holder, next, page, now));
+                self.engine
+                    .at(abandon.max(now + 1), Event::LastHop { msg: mid });
+            }
+            let costs = self.fabric.costs;
+            let signed = self.fabric.crypto(now, holder, costs.sign_ns);
+            let arrive = self.fabric.message(signed, holder, next);
+            self.metrics.incr("peer_messages");
+            // The receiver verifies when the message arrives (in `hop`), so no future slot is
+            // reserved on its crypto helper.
+            self.engine.at(arrive, Event::Hop { msg: mid });
+        } else {
+            self.metrics.incr("link_failures");
+            if partitioned
+                && let Some(m) = self.msgs.get(&mid)
+                && m.offer
+            {
+                // A copy offer crossed the cut.
+                self.metrics.incr("partition_link_failures_offers");
+            }
+            if unready {
+                // A member that has not applied a membership yet: no peer listener.
+                self.metrics.incr("unready_member_links");
+            }
+            if let Some(since) = self.down_since.get(&next) {
+                // A peer chose a crashed member: how long after the crash.
+                self.metrics.incr("dead_member_links");
+                self.metrics
+                    .observe("dead_member_link_age_s", (now - since) / SECONDS);
+            }
+            let _ = n.links.failure(&next, instant, link_backoff);
+            if !n.suspects.contains(&next) && n.suspects.len() < topology::MAX_DEGREE {
+                n.suspects.push(next);
+            }
+            self.engine.after(
+                self.config.node.connect_timeout_ns,
+                Event::LinkDown { msg: mid, holder },
+            );
+        }
+    }
+
+    /// Forwarding from `holder` failed with `fault`.
+    fn note_cut(&mut self, mid: u64, cut: Cut) {
+        let Some(m) = self.msgs.get(&mid) else {
+            return;
+        };
+        let Some(p) = self.probes.get(&m.probe) else {
+            return;
+        };
+        if let Some(index) = p.granted {
+            if let Some(b) = self
+                .fills
+                .get_mut(&p.fill)
+                .and_then(|f| f.batch.get_mut(index))
+                && b.cut.is_none()
+            {
+                b.cut = Some(cut);
+            }
+        } else if p.hedge.is_none()
+            && let Some(fill) = self.fills.get_mut(&p.fill)
+            && fill.cut.is_none()
+        {
+            fill.cut = Some(cut);
+        }
+    }
+
+    fn fail_hop(&mut self, mid: u64, holder: u32, fault: Fault) {
+        let Some(m) = self.msgs.get(&mid) else {
+            return;
+        };
+        if holder == m.requester && m.path.len() == 1 {
+            // The requester's own send failed: a transport error.
+            let probe = m.probe;
+            self.msgs.remove(&mid);
+            self.engine.at(
+                self.now(),
+                Event::Reply {
+                    probe,
+                    reply: Reply::Transport,
+                },
+            );
+            return;
+        }
+        let now = self.now();
+        let reply = match relay_failure(fault, m.ping) {
+            RelayFailure::Respond(r) => Some(Reply::Response(response_kind(r))),
+            RelayFailure::RespondIfLive(r) => {
+                (now < m.deadline).then_some(Reply::Response(response_kind(r)))
+            }
+            RelayFailure::Propagate => Some(Reply::Transport),
+        };
+        match reply {
+            Some(reply) => self.send_reply(mid, holder, reply, now),
+            None => {
+                self.metrics.incr("relay_failures_dropped");
+                self.msgs.remove(&mid);
+            }
+        }
+    }
+
+    fn hop(&mut self, mid: u64) {
+        let now = self.now();
+        let Some(m) = self.msgs.get(&mid) else {
+            return;
+        };
+        let at = m.at;
+        if self.nodes[at as usize].down || !self.versions.enrolled(at) {
+            self.metrics.incr("messages_lost_to_crash");
+            // A crash fails the connection: link health, not silence.
+            self.last_hops.remove(&mid);
+            let cut = if self.nodes[at as usize].down {
+                Cut::Down
+            } else {
+                Cut::NotServing
+            };
+            self.note_cut(mid, cut);
+            self.msgs.remove(&mid);
+            return;
+        }
+        if self.hangs && crate::faults::hung(&self.config.faults, at, now) {
+            // A hung peer server: accepted, never answered or forwarded; the requester's attempt
+            // times out.
+            self.metrics.incr("messages_lost_to_hang");
+            self.msgs.remove(&mid);
+            return;
+        }
+        if now >= m.abandon {
+            // The requester gave up: production relays and the destination see the upstream
+            // connection close and drop the exchange.
+            self.metrics.incr("requests_abandoned");
+            self.msgs.remove(&mid);
+            return;
+        }
+        self.fabric.crypto(now, at, self.fabric.costs.verify_ns);
+        self.adopt(at);
+        let m = self.msgs.get(&mid).expect("message");
+        let known = self.versions.known(at, m.version, now);
+        let hop = decide_hop(&at, &m.path, &m.dest, m.links, known);
+        match hop {
+            Hop::StaleMembership => {
+                self.metrics.incr("stale_membership_replies");
+                self.send_reply(mid, at, Reply::Response(ResponseKind::StaleMembership), now);
+            }
+            Hop::Serve => {
+                let used = m.path.len();
+                self.invariants.check(
+                    "route_within_hop_limit",
+                    used <= usize::from(MAX_LINKS),
+                    now,
+                    Some(at),
+                    || format!("request reached its destination after {used} links"),
+                );
+                self.metrics.observe("request_hops", used as u64);
+                self.serve(mid);
+            }
+            Hop::Relay(plan) => {
+                let valid = plan.outbound != Err(racer_core::route::RouteFault::Invalid);
+                self.invariants
+                    .check("relay_route_valid", valid, now, Some(at), || {
+                        "relay received a route that revisits it".to_owned()
+                    });
+                if !valid {
+                    self.msgs.remove(&mid);
+                    return;
+                }
+                self.metrics.incr("relays");
+                let worker = (m.probe % u64::from(self.fabric.workers)) as usize;
+                let quotas = &self.nodes[at as usize].workers[worker].quotas;
+                match reserve(quotas, ResourceClass::Relay, 1) {
+                    Ok(charge) => {
+                        let m = self.msgs.get_mut(&mid).expect("message");
+                        m.relays.push(charge);
+                        self.forward(mid, at, Some(plan));
+                    }
+                    Err(_) => self.fail_hop(mid, at, Fault::Overloaded),
+                }
+            }
+        }
+    }
+
+    /// The member fill `id`'s node asks to acquire its page (production
+    /// `CandidatePolicy::fanout_helper`): one of the page's helpers, never an owner or the node
+    /// itself, preferring a direct overlay neighbor.
+    fn fanout_helper(&self, id: u64) -> Option<u32> {
+        let fill = &self.fills[&id];
+        let (node, page) = (fill.node, fill.page);
+        let members = &self.versions.get(fill.core.version)?.members;
+        let me = members.position(&node.to_be_bytes());
+        let at = |p: usize| members.members()[p].node;
+        fanout_helper(
+            &self.ids.object(page),
+            self.ids.number(page),
+            self.ids.node(node),
+            members.members().len(),
+            |p| at(p) == node || fill.core.owners.contains(&at(p)),
+            |p| me.is_some_and(|me| members.is_neighbor(me, p)),
+        )
+        .map(at)
+    }
+
+    /// Bodies of one page an owner streams before it may shed (production `hot_page_threshold`).
+    fn hot_page_threshold(&self) -> usize {
+        match self.config.node.hot_page_bodies {
+            0 => hot_page_bodies(self.config.page_bytes),
+            n => n as usize,
+        }
+    }
+
+    /// Production hot-page shed (`racer_core::read::budget::shed_hot_page`): an owner already
+    /// streaming [`Self::hot_page_threshold`] bodies of `page`, at least half of all bodies it
+    /// streams, answers `Overloaded` to a requester that is neither an owner nor a helper of the
+    /// page.
+    fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
+        let now = self.now();
+        let streaming = live_ends(&mut self.streaming, (dest, page), now);
+        let threshold = self.hot_page_threshold();
+        if streaming < threshold || !self.config.node.fanout {
+            return false;
+        }
+        let all = live_ends(&mut self.bodies, dest, now);
+        // Production ranks the page here (`PeerServer::shed_hot_page`, `placement.rank`), not only
+        // from the placement cache: an owner that holds the page without having ranked it under its
+        // current membership (fetched under an older one, or never missed it since) still sheds.
+        let w = self.ids.worker(page);
+        let owners = self.owners_at(dest, w, page, true);
+        let version = self.nodes[dest as usize].version;
+        let Some(members) = self.versions.get(version).map(|v| &v.members) else {
+            return false;
+        };
+        let helper = || {
+            members.position(&requester.to_be_bytes()).is_some_and(|p| {
+                let (object, number) = (self.ids.object(page), self.ids.number(page));
+                is_helper(&object, number, p, members.members().len())
+            })
+        };
+        shed_hot_page(
+            &owners, &dest, &requester, helper, streaming, all, threshold,
+        )
+    }
+
+    fn serve(&mut self, mid: u64) {
+        let now = self.now();
+        let m = self.msgs.get(&mid).expect("message");
+        let (dest, page, requester) = (m.dest, m.page, m.requester);
+        if m.offer {
+            return self.serve_offer(mid, dest, page, requester);
+        }
+        if m.ping {
+            // Production: mode `ping` is answered `Miss` at once, without looking at the cache or
+            // flights.
+            let t = self.fabric.cpu(now, dest, 0, self.fabric.costs.request_ns);
+            return self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
+        }
+        if self.shed_hot(dest, requester, page) {
+            self.metrics.incr("hot_page_sheds");
+            let reply = err_reply(Error::Overloaded);
+            self.send_reply(mid, dest, reply, now);
+            return;
+        }
+        let m = self.msgs.get(&mid).expect("message");
+        let action = serve_action(ServeFacts {
+            operation: OperationKind::Page,
+            copy_only: !m.acquire,
+            object_matches: true,
+            cache_available: true,
+        });
+        match action {
+            ServeAction::Reject(e) => {
+                let reply = err_reply(e);
+                self.send_reply(mid, dest, reply, now);
+            }
+            ServeAction::Miss => {
+                self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), now);
+            }
+            ServeAction::CopyOnly => {
+                let w = self.ids.worker(page);
+                let costs = self.fabric.costs;
+                let t = self.fabric.cpu(now, dest, w, costs.request_ns);
+                let n = &mut self.nodes[dest as usize];
+                let worker = &mut n.workers[w as usize];
+                if worker.memory.pages.contains_key(&page) {
+                    let _ = worker.memory.touch(&page);
+                    self.metrics.incr("copy_only_hits");
+                    self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), t);
+                } else if n.disk.entries.get(&page).is_some() {
+                    self.metrics.incr("copy_only_hits");
+                    let read = self
+                        .fabric
+                        .disk_read(t, dest, record_bytes(self.config.page_bytes));
+                    self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), read);
+                } else if !self.join_copy(mid, dest, page, t) {
+                    self.metrics.incr("copy_only_misses");
+                    self.note_hint(dest, page, requester, true);
+                    self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
+                }
+            }
+            ServeAction::Acquire if self.defer_to_successor(dest, page, requester) => {
+                // Another owner fetched this page after this node answered it without a copy: let
+                // the requester ask it instead of fetching again.
+                self.metrics.incr("successor_deferrals");
+                self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), now);
+            }
+            ServeAction::Acquire => {
+                let m = self.msgs.get(&mid).expect("message");
+                let scope = self.instant(now + self.config.node.serve_timeout_ns);
+                let route = self.instant(m.deadline);
+                let (attempts, links) = (m.attempts, m.links);
+                match inherited_budget(scope, route, attempts, links, m.path.len()) {
+                    Err(e) => {
+                        let reply = err_reply(e);
+                        self.send_reply(mid, dest, reply, now);
+                    }
+                    Ok(budget) => {
+                        self.invariants.check(
+                            "budget_never_grows",
+                            budget.remaining_links() < links
+                                && budget.remaining_attempts() <= attempts
+                                && budget.deadline() <= serve_deadline(scope, route),
+                            now,
+                            Some(dest),
+                            || {
+                                format!(
+                                    "inherited {} links {} attempts from {links} links {attempts} attempts",
+                                    budget.remaining_links(),
+                                    budget.remaining_attempts()
+                                )
+                            },
+                        );
+                        self.metrics.incr("peer_acquires");
+                        self.want(
+                            dest,
+                            page,
+                            Want::Peer {
+                                msg: mid,
+                                copy_only: false,
+                            },
+                            budget,
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A copy-only request found no local copy: join the destination's running acquisition of the
+    /// page without acquisition rights, like production `FillEngine::copy_only`
+    /// (`Flights::join_copy`), and answer with its result.
+    fn join_copy(&mut self, mid: u64, dest: u32, page: u64, t: Nanos) -> bool {
+        let now = self.now();
+        // Production `Coordinator::copy_join_allowed`: an owner ranked before this node, asking it
+        // for a copy, must not wait on its acquisition, which most likely waits on that owner.
+        let w = self.ids.worker(page);
+        if self.config.node.copy_join_rank
+            && self.nodes[dest as usize].workers[w as usize]
+                .flights
+                .acquiring(&self.ids.page(page))
+        {
+            let requester = self.msgs[&mid].requester;
+            let owners = self.owners_at(dest, w, page, true);
+            if !copy_join_allowed(&owners, &dest, &requester) {
+                self.metrics.incr("copy_only_join_declined");
+                return false;
+            }
+        }
+        let deadline = {
+            let m = &self.msgs[&mid];
+            self.instant(m.deadline.min(now + self.config.node.serve_timeout_ns))
+        };
+        let w = self.ids.worker(page);
+        let page_id = self.ids.page(page);
+        let instant = self.instant(now);
+        let mut wakes = Vec::new();
+        let n = &mut self.nodes[dest as usize];
+        let incarnation = n.incarnation;
+        let worker = &mut n.workers[w as usize];
+        let quotas = &worker.quotas;
+        let joined = worker.flights.join_copy(
+            &page_id,
+            instant,
+            deadline,
+            |kind| flight_charge(quotas, kind),
+            &mut wakes,
+        );
+        let handled = match joined {
+            Ok(Joined::Miss) => false,
+            Ok(Joined::Settled(_)) => {
+                self.metrics.incr("copy_only_flight_hits");
+                self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), t);
+                true
+            }
+            Err(e) => {
+                self.metrics.incr("copy_only_join_rejected");
+                let reply = err_reply(e);
+                self.send_reply(mid, dest, reply, t);
+                true
+            }
+            Ok(Joined::Waiter(id)) => {
+                self.metrics.incr("copy_only_flight_joins");
+                self.next_id += 1;
+                let token = self.next_id;
+                let worker = &mut self.nodes[dest as usize].workers[w as usize];
+                let event = worker
+                    .flights
+                    .poll(&page_id, id, instant, 0, token, &mut wakes);
+                self.tokens.insert(
+                    token,
+                    Waiting {
+                        node: dest,
+                        incarnation,
+                        worker: w,
+                        page,
+                        id,
+                        want: Want::Peer {
+                            msg: mid,
+                            copy_only: true,
+                        },
+                        eligible: false,
+                        budget: None,
+                        plaintext: false,
+                    },
+                );
+                if !matches!(event, Ok(FlightEvent::Pending)) {
+                    wakes.push(token);
+                }
+                true
+            }
+        };
+        for token in wakes {
+            self.wake(token);
+        }
+        handled
+    }
+
+    /// Send `reply` for `mid` from `from` back along the reverse route, starting at `ready`. Pages
+    /// travel as cut-through transfers.
+    fn send_reply(&mut self, mid: u64, from: u32, reply: Reply, ready: Nanos) {
+        let Some(m) = self.msgs.remove(&mid) else {
+            return;
+        };
+        if from != m.dest && self.offers.contains_key(&m.probe) {
+            self.offers_relayed.insert(m.probe);
+        }
+        if from != m.dest
+            && let Some(ping) = self.pings.get_mut(&m.probe)
+        {
+            ping.relayed = true;
+        }
+        if from != m.dest
+            && let Some(p) = self.probes.get(&m.probe)
+            && p.hedge.is_none()
+            && let Some(fill) = self.fills.get_mut(&p.fill)
+        {
+            // A relay signs this answer.
+            match p.granted.and_then(|i| fill.batch.get_mut(i)) {
+                Some(b) => b.relayed = true,
+                None => fill.relayed = true,
+            }
+        }
+        if from == m.dest
+            && ready < m.abandon
+            && let Some((sender, dest, ..)) = self.last_hops.remove(&mid)
+        {
+            // The destination answered before the requester gave up.
+            let at = self.instant(self.now());
+            self.nodes[sender as usize].silence.answered(&dest, at);
+        }
+        let reply = if from == m.dest && reply == Reply::Response(ResponseKind::Overloaded) {
+            Reply::Shed
+        } else {
+            reply
+        };
+        let now = self.now();
+        let mut route: Vec<u32> = Vec::with_capacity(m.path.len() + 1);
+        route.push(from);
+        route.extend(m.path.iter().rev().copied());
+        let site = |x: u32| self.fabric.site[x as usize];
+        let alive = route.windows(2).all(|hop| {
+            !self.nodes[hop[1] as usize].down
+                && !self.partitions.blocked(now, site(hop[0]), site(hop[1]))
+        });
+        if !alive {
+            self.metrics.incr("replies_lost");
+            return;
+        }
+        let costs = self.fabric.costs;
+        let links = (route.len() - 1) as u64;
+        if let Some(p) = self.probes.get_mut(&m.probe) {
+            p.hops = route.len() - 1;
+        }
+        let arrive = if reply == Reply::Response(ResponseKind::Page) {
+            let bytes = self.config.page_bytes;
+            let sealed = self.fabric.crypto(ready, from, costs.sign_ns);
+            // The body streams only while the requester still waits; relays hold their `Relay`
+            // reservation until the body has passed (production keeps it on the connection while
+            // streaming, `peer/server.rs` `relay.reservation`).
+            let done = self.fabric.transfer_until(sealed, &route, bytes, m.abandon);
+            let release = done.unwrap_or(m.abandon);
+            if !m.relays.is_empty() {
+                self.metrics
+                    .observe("relay_hold_stream_ns", release.saturating_sub(ready));
+            }
+            if !m.relays.is_empty() && release > now {
+                let id = self.fresh();
+                self.held.insert(id, m.relays);
+                self.engine.at(release, Event::Release { id });
+            }
+            let Some(done) = done else {
+                self.metrics.incr("replies_abandoned");
+                return;
+            };
+            if done > now {
+                self.streaming.entry((from, m.page)).or_default().push(done);
+                self.bodies.entry(from).or_default().push(done);
+            }
+            self.metrics.add("peer_bytes", bytes * links);
+            self.metrics.observe("hops", links);
+            done
+        } else {
+            let mut t = self.fabric.crypto(ready, from, costs.sign_ns);
+            for hop in route.windows(2) {
+                t = self.fabric.message(t, hop[0], hop[1]);
+            }
+            t
+        };
+        self.engine.at(
+            arrive,
+            Event::Reply {
+                probe: m.probe,
+                reply,
+            },
+        );
+    }
+
+    fn reply(&mut self, pid: u64, reply: Reply) {
+        if let Some(ping) = self.pings.remove(&pid) {
+            return self.ping_done(ping, Some(reply));
+        }
+        if let Some((node, incarnation, due)) = self.offers.remove(&pid) {
+            // A relay's answer is cut evidence.
+            let relayed = self.offers_relayed.remove(&pid);
+            let end = OfferEnd::of(
+                (!relayed && reply != Reply::Transport)
+                    .then_some(reply == Reply::Response(ResponseKind::Miss)),
+            );
+            self.offer_done(node, incarnation, due, end);
+            return;
+        }
+        let Some(probe) = self.probes.remove(&pid) else {
+            self.metrics.incr("late_replies");
+            if reply == Reply::Response(ResponseKind::Page) {
+                // A page body that kept streaming after its requester gave up (bodies stop at the
+                // requester's attempt deadline).
+                self.metrics.incr("late_page_replies");
+            }
+            return;
+        };
+        let Some(fill) = self.fills.get(&probe.fill) else {
+            return;
+        };
+        let now = self.now();
+        self.fabric
+            .crypto(now, fill.node, self.fabric.costs.verify_ns);
+        let (node, page) = (fill.node, fill.page);
+        let relayed = match probe.granted {
+            Some(i) => fill.batch.get(i).is_some_and(|b| b.relayed),
+            None => fill.relayed,
+        };
+        if probe.hedge.is_none() && !relayed && reply == Reply::Shed {
+            // The same owner shed this node's request for the page within half a request timeout
+            // before (; measurement only, the last few sheds per node).
+            let window = self.config.node.read_timeout_ns / 2;
+            let recent = &mut self.nodes[node as usize].recent_sheds;
+            recent.retain(|&(.., t)| now.saturating_sub(t) < window);
+            if recent.iter().any(|&(d, p, _)| d == probe.dest && p == page) {
+                self.metrics.incr("shed_repeats");
+            }
+            if recent.len() >= super::state::RECENT_SHEDS {
+                recent.remove(0);
+            }
+            recent.push((probe.dest, page, now));
+        }
+        // A phantom page claims the page it was asked for; the identity check is the same callback
+        // production runs.
+        let outcome = || match reply {
+            Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
+            Reply::Shed => Ok(Outcome::Shed),
+            Reply::Response(ResponseKind::StaleMembership) => Ok(Outcome::StaleMembership),
+            Reply::Response(kind) => {
+                let (expected, claimed) = (self.ids.page(page), self.ids.page(page));
+                classify(kind, OperationKind::Page, probe.acquire, || {
+                    if claimed == expected {
+                        Ok(())
+                    } else {
+                        Err(Error::CorruptRecord)
+                    }
+                })
+                .map(|outcome| outcome.map_or(Outcome::Copy, Outcome::Probe))
+            }
+        };
+        match probe.hedge {
+            None if let Some(index) = probe.granted => {
+                if !relayed && reply != Reply::Transport {
+                    // The destination answered this node: it is not hung.
+                    let at = self.instant(now);
+                    let silence = &mut self.nodes[node as usize].silence;
+                    if reply == Reply::Shed && self.config.node.shed_busy {
+                        silence.shed(probe.dest, page, at);
+                    } else {
+                        silence.answered(&probe.dest, at);
+                    }
+                }
+                let outcome = outcome();
+                self.complete_batch_probe(probe.fill, index, outcome)
+            }
+            None => {
+                let fill = self.fills.get_mut(&probe.fill).expect("present");
+                fill.probe = None;
+                if reply == Reply::Response(ResponseKind::StaleMembership) {
+                    // The answering node could not resolve the request's membership, so the credits
+                    // it carried were never used (production `request_traced`), and neither were
+                    // the links past it.
+                    let budget = fill.core.request_budget(&mut fill.budget);
+                    let unused = if self.config.node.stale_link_refund {
+                        stale_unused_links(probe.links, probe.hops)
+                    } else {
+                        0
+                    };
+                    let refunded = budget
+                        .refund_remote(probe.remote)
+                        .and_then(|()| budget.refund_links(unused));
+                    self.metrics.add("stale_links_refunded", u64::from(unused));
+                    self.invariants.check(
+                        "budget_never_grows",
+                        refunded.is_ok(),
+                        now,
+                        Some(node),
+                        || format!("refund {} remote credits: {refunded:?}", probe.remote),
+                    );
+                }
+                let reply = match reply {
+                    Reply::Transport => FillReply::Failed {
+                        error: Error::Unavailable,
+                        sent: true,
+                        scope_live: true,
+                    },
+                    Reply::Shed => FillReply::Answer {
+                        kind: ResponseKind::Overloaded,
+                        signed: true,
+                    },
+                    Reply::Response(kind) => {
+                        let fill = self.fills.get_mut(&probe.fill).expect("present");
+                        (fill.kind, fill.acquire) = (kind, probe.acquire);
+                        FillReply::Answer {
+                            kind,
+                            signed: !relayed,
+                        }
+                    }
+                };
+                self.drive(probe.fill, FillEvent::Reply(reply));
+            }
+            Some(primary) => {
+                // Production `hedge_page` contenders: a page wins, a stale reply marks the race
+                // stale, any other answer is a recoverable `Unavailable` (the primary's is kept as
+                // the walk's first evidence).
+                let result = match outcome() {
+                    Ok(Outcome::Copy) => Ok(()),
+                    Ok(Outcome::StaleMembership) => {
+                        self.set_race(probe.fill, |r| r.stale = true);
+                        Err(Error::Unavailable)
+                    }
+                    Ok(Outcome::Shed) => {
+                        if primary {
+                            self.set_race(probe.fill, |r| {
+                                r.primary_outcome = Some(ProbeOutcome::Overloaded)
+                            });
+                        }
+                        Err(Error::Unavailable)
+                    }
+                    Ok(Outcome::Probe(o)) => {
+                        if primary {
+                            self.set_race(probe.fill, |r| r.primary_outcome = Some(o));
+                        }
+                        Err(Error::Unavailable)
+                    }
+                    Ok(
+                        Outcome::Transport(_)
+                        | Outcome::StaleDestination
+                        | Outcome::TimedOut
+                        | Outcome::Failed,
+                    ) => Err(Error::Unavailable),
+                    Err(e) => Err(e),
+                };
+                self.hedge_result(probe.fill, primary, result);
+            }
+        }
+    }
+
+    fn set_race(&mut self, id: u64, f: impl FnOnce(&mut Race)) {
+        if let Some(race) = self.fills.get_mut(&id).and_then(|f| f.hedge.as_mut()) {
+            f(race);
+        }
+    }
+
+    /// Record how fill `id`'s walk probe ended: rank 0 watch, repeat classification, and route
+    /// evidence (production `CandidatePolicy::apply`).
+    fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>, evidence: &Evidence) {
+        if evidence.helper {
+            let label = match &outcome {
+                Ok(Outcome::Copy) => "helper_copies",
+                Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
+                    "helper_unreachable"
+                }
+                Ok(Outcome::Transport(_) | Outcome::Probe(ProbeOutcome::Overloaded)) => {
+                    "helper_overloaded"
+                }
+                Ok(Outcome::Shed) => "helper_shed",
+                Ok(_) => "helper_misses",
+                Err(_) => "helper_errors",
+            };
+            self.metrics.incr(label);
+        }
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        if evidence.granted {
+            let kind = fill.granted_kind.unwrap_or("successor");
+            let what = match &outcome {
+                Ok(Outcome::Copy) => "copies",
+                Ok(Outcome::Probe(ProbeOutcome::CopyMiss)) => "misses",
+                _ => "failures",
+            };
+            self.metrics.incr(granted_counter(kind, what));
+        }
+        if let Some(note) = evidence.rank0
+            && self.config.node.rank0_watch
+        {
+            // Production `CandidatePolicy::apply`.
+            let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
+            let rank0 = fill.core.owners[0];
+            let instant = self.instant(self.now());
+            let watch = &mut self.nodes[node as usize].rank0;
+            match note {
+                Rank0Note::TimedOut => watch.timed_out(page, rank0, instant, deadline),
+                Rank0Note::Failed => watch.answered_failure(&page, &rank0),
+                Rank0Note::Answered => watch.answered(&page, &rank0),
+            }
+        }
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        // Both are per probe: a cut noted for a relay-signed answer must not leak into the next
+        // probe's classification.
+        let cut = fill.cut.take();
+        let relayed = std::mem::take(&mut fill.relayed);
+        let Some(dest) = fill.asking.take() else {
+            return;
+        };
+        let asked = match &outcome {
+            Ok(Outcome::Copy) => Asked::Copy,
+            Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
+                Asked::Miss
+            }
+            Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
+                Asked::Unreachable(cut.unwrap_or(Cut::Other))
+            }
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable) | Outcome::Failed) => Asked::Failed,
+            Ok(_) => Asked::Busy,
+            Err(_) => Asked::Unfunded,
+        };
+        fill.asked.push((dest, asked));
+        // This node's reads see cuts its offers would cross.
+        let cut = match asked {
+            Asked::Unreachable(_) => Some(true),
+            Asked::Copy | Asked::Miss | Asked::Failed => Some(false),
+            Asked::Relayed | Asked::Busy | Asked::Unfunded => None,
+        };
+        if let Some(cut) = cut
+            && self.config.node.offer_cut_groups
+        {
+            let node = fill.node;
+            let site = self.fabric.site[dest as usize];
+            let instant = self.instant(self.now());
+            self.nodes[node as usize]
+                .notices
+                .observe(site, cut, instant);
+        }
+    }
+
+    /// Validate origin authority before fill `id`'s owner at `rank` fetches (production
+    /// `OriginAuthority::validate` and `begin_attempt` in `src/read/fill.rs`), and check that only
+    /// a ranked owner reaches the origin.
+    fn origin_authority(&mut self, id: u64, rank: usize) -> Result<(), Error> {
+        let now = self.now();
+        let fill = &self.fills[&id];
+        let (node, page, version) = (fill.node, fill.page, fill.core.version);
+        let members = self
+            .versions
+            .get(version)
+            .map(|v| v.members.clone())
+            .ok_or(Error::IncompatibleMembership)?;
+        let object = self.ids.object(page);
+        let number = self.ids.number(page);
+        let authority = validate_origin_authority(
+            AuthorityFacts {
+                object: &object,
+                page: number,
+                rank,
+                predecessor_evidence: fill.core.evidence.len(),
+                member: members.position(&node.to_be_bytes()).is_some(),
+            },
+            &object,
+            number,
+        );
+        let owner = fill.core.owners.get(rank) == Some(&node);
+        let ok = owner && authority.is_ok();
+        self.invariants
+            .check("only_owner_hits_origin", ok, now, Some(node), || {
+                format!(
+                    "page {page} rank {rank} owners {:?} authority {authority:?}",
+                    self.fills[&id].core.owners
+                )
+            });
+        if !ok {
+            return Err(Error::Unauthorized);
+        }
+        if version < self.versions.latest_number() {
+            self.metrics.incr("origin_on_older_membership");
+        }
+        let instant = self.instant(now);
+        let fill = self.fills.get_mut(&id).expect("present");
+        // Production debits one attempt before origin (`src/read/fill.rs`, `budget.begin_attempt`
+        // after `authority.validate`); an owner without one fails the fill.
+        let scope = fill.scope;
+        if let Err(e) = fill.budget.begin_attempt(instant, scope) {
+            self.metrics.incr("origin_unfunded");
+            // Started with fewer credits than its predecessor probes and its origin attempt need,
+            // or spent them.
+            self.metrics
+                .incr(if fill.initial_attempts < owner_funding_min(rank) - 1 {
+                    "origin_unfunded_short"
+                } else {
+                    "origin_unfunded_spent"
+                });
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn issue_origin(&mut self, id: u64) {
+        let now = self.now();
+        let page = self.fills[&id].page;
+        let errors = origin_errors_at(&self.config.faults, self.config.origin_errors, now);
+        let object = page / u64::from(self.config.pages_per_object);
+        let (handle, done, outcome) =
+            self.origin
+                .request_tracked(now, object, self.config.page_bytes, errors, id);
+        self.metrics.incr("origin_requests");
+        *self.origin_per_page.entry(page).or_default() += 1;
+        self.classify_repeat(id);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.origin = Some((handle, outcome));
+        // Production bounds the origin exchange by the deadline of the waiter the fill currently
+        // serves, then hands it over or cancels it (`src/read/fill.rs`,
+        // `FlightOperation::poll_cancellation`).
+        if let Some(check) = self.origin_check_at(id)
+            && done > check
+        {
+            self.engine.at(check, Event::OriginCancel { fill: id });
+        }
+        self.engine
+            .at(done, Event::OriginDone { fill: id, outcome });
+    }
+
+    /// Close an outstanding origin request now and move the completions of the requests queued
+    /// behind it.
+    fn cancel_origin(&mut self, handle: OriginHandle) {
+        let now = self.engine.now();
+        if self.origin.cancel(handle, now) > 0 {
+            self.schedule_origin_wake();
+        }
+    }
+
+    fn schedule_origin_wake(&mut self) {
+        if let Some(next) = self.origin.next_moved()
+            && self.origin_wake.is_none_or(|w| next < w)
+        {
+            self.origin_wake = Some(next);
+            self.engine.at(next, Event::OriginWake);
+        }
+    }
+
+    fn origin_wake(&mut self) {
+        let now = self.engine.now();
+        if self.origin_wake == Some(now) {
+            self.origin_wake = None;
+        }
+        for id in self.origin.pop_moved(now) {
+            self.origin_complete(id);
+        }
+        self.schedule_origin_wake();
+    }
+
+    /// The fill's scope expired with its origin request outstanding: close it (freeing origin
+    /// concurrency and bandwidth for later requests) and fail the fill with `DeadlineExceeded`, as
+    /// production does.
+    fn origin_cancel(&mut self, id: u64) {
+        let now = self.now();
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let Some((handle, _)) = fill.origin else {
+            return;
+        };
+        let Some(done) = self.origin.end(handle).filter(|done| *done > now) else {
+            return;
+        };
+        if let Some(check) = self.hand_over(id) {
+            if done > check {
+                self.engine.at(check, Event::OriginCancel { fill: id });
+            }
+            return;
+        }
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.origin = None;
+        fill.canceled = true;
+        let (node, page) = (fill.node, fill.page);
+        self.metrics.incr("origin_canceled");
+        self.note_origin_failure(id);
+        self.cancel_origin(handle);
+        if let Some(last) = self.last_origin.get_mut(&page)
+            && last.node == node
+            && last.ok.is_none()
+        {
+            last.ok = Some(false);
+            last.done = now;
+        }
+        self.drive(id, FillEvent::Origin(Err(Error::DeadlineExceeded)));
+    }
+
+    /// When the fill's origin request must next be checked: the deadline of the waiter it serves,
+    /// capped by the fill's ceiling.
+    fn origin_check_at(&self, id: u64) -> Option<Nanos> {
+        let fill = &self.fills[&id];
+        let flights = &self.nodes[fill.node as usize].workers[fill.worker as usize].flights;
+        let deadline = flights.leader_deadline(&self.ids.page(fill.page))?;
+        Some(self.nanos(deadline.min(fill.scope)))
+    }
+
+    /// The waiter fill `id` serves reached its deadline.
+    fn hand_over(&mut self, id: u64) -> Option<Nanos> {
+        let now = self.now();
+        let instant = self.instant(now);
+        let fill = &self.fills[&id];
+        let (node, w, page, leader, token, ceiling) = (
+            fill.node,
+            fill.worker,
+            fill.page,
+            fill.leader,
+            fill.token,
+            self.nanos(fill.scope),
+        );
+        if now >= ceiling {
+            return None;
+        }
+        let page_id = self.ids.page(page);
+        let mut wakes = Vec::new();
+        let flights = &mut self.nodes[node as usize].workers[w as usize].flights;
+        flights.refresh(&page_id, instant, &mut wakes);
+        let live = flights
+            .leader_deadline(&page_id)
+            .filter(|deadline| *deadline > instant);
+        for token in wakes {
+            self.wake(token);
+        }
+        live?;
+        self.metrics.incr("flight_handovers");
+        if let Some(waiting) = self.tokens.remove(&token) {
+            self.detach(node, w, page, leader);
+            self.resolve(waiting.want, Err(Error::DeadlineExceeded));
+        }
+        self.origin_check_at(id)
+    }
+
+    /// Classify a repeated origin request for a page against the last request `A` for it: rank 0
+    /// moved, `A` failed, `A` still in flight (concurrent), `A` lost its copy, or `A` still holds it
+    /// (`origin_repeats_held_*`, the avoidable class unless a skip, orphan or race).
+    fn classify_repeat(&mut self, id: u64) {
+        let now = self.now();
+        let fill = &self.fills[&id];
+        let (node, page) = (fill.node, fill.page);
+        let rank0 = fill.core.owners.first().copied().unwrap_or(node);
+        // An owner above rank 0 reaches origin only with transient evidence against rank 0: record
+        // why rank 0 did not serve (the last probe of rank 0 decides).
+        let skip = (fill.core.rank.is_some_and(|r| r > 0)).then(|| {
+            let last = fill
+                .asked
+                .iter()
+                .rev()
+                .find(|(dest, _)| *dest == rank0)
+                .map(|(_, a)| *a);
+            match last {
+                Some(Asked::Unreachable(cut)) => match cut {
+                    Cut::NotServing => "not_serving",
+                    Cut::Partition => "partition",
+                    Cut::Down => "down",
+                    Cut::Route => "route",
+                    Cut::Circuit => "circuit",
+                    Cut::Other => "timeout",
+                },
+                Some(Asked::Failed) => "failed",
+                Some(Asked::Relayed) => "relay",
+                Some(Asked::Busy) => "busy",
+                Some(Asked::Miss) => "copy_only",
+                Some(Asked::Copy) => "copy",
+                Some(Asked::Unfunded) | None => "unfunded",
+            }
+        });
+        if let Some(skip) = skip {
+            self.metrics.incr(skip_counters(skip).0);
+        }
+        let next = LastOrigin {
+            node,
+            rank0,
+            ok: None,
+            done: now,
+            skip,
+        };
+        let Some(last) = self.last_origin.insert(page, next) else {
+            return;
+        };
+        let held = |n: &NodeWorld| {
+            let holder = &n.nodes[last.node as usize];
+            !holder.down
+                && (holder.disk.entries.get(&page).is_some()
+                    || holder
+                        .workers
+                        .iter()
+                        .any(|w| w.memory.pages.contains_key(&page)))
+        };
+        let class = if last.rank0 != rank0 {
+            "origin_repeats_after_move"
+        } else if last.ok == Some(false) {
+            "origin_repeats_after_failure"
+        } else if last.ok.is_none() {
+            self.fills.get_mut(&id).expect("present").concurrent = true;
+            "origin_repeats_concurrent"
+        } else if !held(self) {
+            "origin_repeats_copy_lost"
+        } else {
+            let asked = |kind: fn(Asked) -> bool| {
+                fill.asked
+                    .iter()
+                    .any(|&(dest, a)| dest == last.node && kind(a))
+            };
+            let cause = if last.done > fill.started {
+                "origin_repeats_held_raced"
+            } else if asked(|a| matches!(a, Asked::Unreachable(_) | Asked::Failed | Asked::Relayed))
+            {
+                "origin_repeats_held_unreachable"
+            } else if asked(|a| a == Asked::Busy) {
+                "origin_repeats_held_busy"
+            } else if asked(|a| a == Asked::Unfunded) {
+                "origin_repeats_held_unfunded"
+            } else if asked(|a| matches!(a, Asked::Miss | Asked::Copy)) {
+                "origin_repeats_held_missed"
+            } else {
+                "origin_repeats_held_unasked"
+            };
+            self.metrics.incr(cause);
+            // `A` fetched as an owner above rank 0, so rank 0 has no copy and fetches again: charge
+            // the repeat to why `A` skipped it.
+            if let Some(orphan) = last.skip {
+                self.metrics.incr(skip_counters(orphan).1);
+                // Rank 0 refetching although it noted the holder: its one
+                // successor probe of the hint was spent, missed, or the hint expired.
+                if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
+                    self.metrics.incr("origin_repeats_orphan_noted");
+                }
+            }
+            // Every such repeat is a skip itself (`F` above rank 0), an orphan (`A` fetched as a
+            // skip), or raced.
+            let explained =
+                skip.is_some() || last.skip.is_some() || cause == "origin_repeats_held_raced";
+            if !explained {
+                self.metrics.incr("origin_repeats_held_unexplained");
+            }
+            self.invariants.check(
+                "origin_repeat_explained",
+                explained,
+                now,
+                Some(node),
+                || {
+                    format!(
+                        "page {page} fetched by {node} while {} still holds it ({cause})",
+                        last.node
+                    )
+                },
+            );
+            "origin_repeats_copy_held"
+        };
+        if class == "origin_repeats_after_failure" {
+            *self.failure_retries_per_page.entry(page).or_default() += 1;
+        }
+        self.metrics.incr(class);
+    }
+
+    fn origin_complete(&mut self, id: u64) {
+        let now = self.engine.now();
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let Some((handle, outcome)) = fill.origin.take() else {
+            return;
+        };
+        self.origin.finish(handle);
+        self.metrics.incr("origin_answered");
+        let (scope, node) = (fill.scope, fill.node);
+        let scope = self.nanos(scope);
+        self.invariants
+            .check("origin_within_scope", now <= scope, now, Some(node), || {
+                format!("fill {id} origin answered at {now} after its scope {scope}")
+            });
+        // A handed-over fill runs only while some waiter it serves is live.
+        let live = self.origin_check_at(id).is_some_and(|check| now <= check);
+        self.invariants
+            .check("origin_for_live_waiter", live, now, Some(node), || {
+                format!("fill {id} origin answered at {now} with no live waiter")
+            });
+        let fill = self.fills.get_mut(&id).expect("present");
+        let result = match outcome {
+            OriginOutcome::Ok => {
+                self.metrics.add("origin_bytes", self.config.page_bytes);
+                if fill.concurrent {
+                    // Overlapping requests that cost egress.
+                    self.metrics.incr("origin_concurrent_completed");
+                }
+                Ok(())
+            }
+            OriginOutcome::PreconditionFailed => {
+                self.metrics.incr("origin_412");
+                Err(Error::VersionUnavailable)
+            }
+            OriginOutcome::Forbidden => {
+                self.metrics.incr("origin_403");
+                Err(Error::OriginForbidden)
+            }
+            OriginOutcome::ServerError => {
+                self.metrics.incr("origin_5xx");
+                Err(Error::Unavailable)
+            }
+        };
+        let (node, page) = (fill.node, fill.page);
+        let ok = result.is_ok();
+        let failed = matches!(result, Err(Error::Unavailable));
+        let notice = ok && should_notice(fill.core.rank);
+        // The walk's predecessor evidence in rank order (the last answer of each predecessor;
+        // production `OriginAuthority`).
+        let evidence: Vec<ProbeOutcome> = fill
+            .core
+            .owners
+            .iter()
+            .take(fill.core.rank.unwrap_or(0))
+            .map(|c| {
+                match fill
+                    .asked
+                    .iter()
+                    .rev()
+                    .find(|(d, _)| d == c)
+                    .map(|(_, a)| *a)
+                {
+                    Some(Asked::Miss) => ProbeOutcome::CopyMiss,
+                    _ => ProbeOutcome::Unreachable,
+                }
+            })
+            .collect();
+        let targets: Vec<(u8, u32)> = notice_indexes(fill.core.rank, &evidence)
+            .into_iter()
+            .filter_map(|i| fill.core.owners.get(usize::from(i)).map(|t| (i, *t)))
+            .collect();
+        if failed {
+            self.note_origin_failure(id);
+        }
+        if notice {
+            self.note_notice(node, page, &targets);
+        }
+        let now = self.now();
+        if let Some(last) = self.last_origin.get_mut(&page)
+            && last.node == node
+            && last.ok.is_none()
+        {
+            last.ok = Some(ok);
+            last.done = now;
+        }
+        self.drive(id, FillEvent::Origin(result));
+    }
+
+    /// Production `CandidatePolicy::note_origin_failure`: an owner above rank 0 whose own origin
+    /// request failed leaves retries after rank 0's own failures to rank 0 for a while.
+    fn note_origin_failure(&mut self, id: u64) {
+        if !self.config.node.rank0_watch || !self.config.node.rank0_failure_hold {
+            return;
+        }
+        let fill = &self.fills[&id];
+        let (Some(rank), Some(rank0)) = (fill.core.rank, fill.core.owners.first().copied()) else {
+            return;
+        };
+        if rank == 0 {
+            return;
+        }
+        let (node, page) = (fill.node, fill.page);
+        let instant = self.instant(self.now());
+        self.nodes[node as usize].rank0.failed(page, rank0, instant);
+        self.metrics.incr("rank0_watch_origin_failures");
+    }
+
+    /// `node` fetched `page` from origin as an owner after `targets` (owner rank, node): offer the
+    /// copy to rank 0 later, and to rank 1 (, `node.offer_predecessors`).
+    fn note_notice(&mut self, node: u32, page: u64, targets: &[(u8, u32)]) {
+        let config = &self.config.node;
+        if !config.orphan_notices || !config.successor_hints {
+            return;
+        }
+        let instant = self.instant(self.now());
+        for &(index, target) in targets {
+            if target == node || (index > 0 && !config.offer_predecessors) {
+                continue;
+            }
+            let due = self.nodes[node as usize]
+                .notices
+                .note((page, index), target, instant);
+            self.metrics.incr("orphan_notices_noted");
+            if index > 0 {
+                self.metrics.incr("orphan_notices_noted_rank1");
+            }
+            self.engine.at(self.nanos(due), Event::Notice { node });
+        }
+    }
+
+    /// Send `node`'s due copy offers (production orphan notice timer).
+    fn send_notices(&mut self, node: u32) {
+        if self.nodes[node as usize].down {
+            return;
+        }
+        let instant = self.instant(self.now());
+        let grouped = self.config.node.offer_cut_groups;
+        while usize::from(self.nodes[node as usize].offers) < MAX_OFFERS_IN_FLIGHT {
+            let notices = &mut self.nodes[node as usize].notices;
+            let sites = &self.fabric.site;
+            let next = if grouped {
+                notices.pop_open(instant, |t| sites[*t as usize])
+            } else {
+                notices.pop_due(instant)
+            };
+            let Some(due) = next else {
+                break;
+            };
+            let (page, index) = due.key;
+            let w = self.ids.worker(page);
+            let n = &self.nodes[node as usize];
+            let holds = n.workers[w as usize].memory.pages.contains_key(&page)
+                || n.disk.entries.get(&page).is_some();
+            let owners = self.owners_at(node, w, page, true);
+            match notice_target(&node, &owners, holds, index) {
+                Some(target) => {
+                    let due = Due { target, ..due };
+                    let incarnation = self.nodes[node as usize].incarnation;
+                    self.nodes[node as usize].offers += 1;
+                    let pid = self.launch_control(node, due.target, due.key.0, true);
+                    self.offers.insert(pid, (node, incarnation, due));
+                    self.metrics.incr("orphan_offers_sent");
+                }
+                None => {
+                    self.metrics.incr("orphan_notices_dropped");
+                    let group = self.fabric.site[due.target as usize];
+                    self.nodes[node as usize].notices.release(&group);
+                }
+            }
+        }
+        // Offers deferred by a blocked site come due when the block ends.
+        if let Some(at) = self.nodes[node as usize].notices.next_due()
+            && at > instant
+            && self.nodes[node as usize].notices.has_deferred()
+        {
+            self.engine.at(self.nanos(at), Event::Notice { node });
+        }
+    }
+
+    /// A copy offer ended: delivered, or try again after the next delay.
+    fn offer_done(&mut self, node: u32, incarnation: u32, due: OfferDue, end: OfferEnd) {
+        let n = &self.nodes[node as usize];
+        let live = !n.down && n.incarnation == incarnation;
+        let group = self.fabric.site[due.target as usize];
+        let grouped = self.config.node.offer_cut_groups;
+        let delivered = end == OfferEnd::Delivered;
+        self.metrics.incr(if delivered {
+            "orphan_offers_delivered"
+        } else {
+            "orphan_offers_failed"
+        });
+        if !live {
+            return;
+        }
+        self.nodes[node as usize].offers -= 1;
+        if delivered && !grouped {
+            return self.send_notices(node);
+        }
+        let instant = self.instant(self.now());
+        let notices = &mut self.nodes[node as usize].notices;
+        let next = if grouped {
+            if end == OfferEnd::Cut {
+                self.metrics.incr("orphan_offers_cut");
+            }
+            notices.offer_result(due, end, group, instant)
+        } else {
+            notices.failed(due, instant)
+        };
+        match next {
+            _ if delivered => {}
+            Some(next) => self.engine.at(self.nanos(next), Event::Notice { node }),
+            None => self.metrics.incr("orphan_notices_expired"),
+        }
+        self.send_notices(node);
+    }
+
+    /// Answer a copy offer `Miss`, noting the requester as a successor hint when this node neither
+    /// holds the page nor is fetching it (production `Coordinator::serve_peer`).
+    fn serve_offer(&mut self, mid: u64, dest: u32, page: u64, requester: u32) {
+        let now = self.now();
+        let w = self.ids.worker(page);
+        let n = &self.nodes[dest as usize];
+        let holds = n.workers[w as usize].memory.pages.contains_key(&page)
+            || n.disk.entries.get(&page).is_some();
+        let acquiring = n.workers[w as usize]
+            .flights
+            .acquiring(&self.ids.page(page));
+        let instant = self.instant(now);
+        // Production `Coordinator::serve_offer`: armed for this node's own successor probe,
+        // deferring no readers.
+        if self.config.node.successor_hints
+            && dest != requester
+            && self.nodes[dest as usize]
+                .hints
+                .note_offer(page, requester, holds, acquiring, instant)
+        {
+            self.metrics.incr("orphan_offers_noted");
+            self.metrics.incr("successor_hints_noted");
+        } else {
+            self.metrics.incr("orphan_offers_redundant");
+        }
+        let t = self.fabric.cpu(now, dest, w, self.fabric.costs.request_ns);
+        self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
+    }
+
+    /// Whether `node` owns `page` in its current published snapshot, from the worker's cached
+    /// ranking only (production `Retention::is_owned`: missing or partial rankings are not owned).
+    fn owned(&self, node: u32, w: u8, page: u64) -> bool {
+        let n = &self.nodes[node as usize];
+        let Some(version) = self.versions.get(n.version) else {
+            return false;
+        };
+        let Some(me) = version.members.position(&node.to_be_bytes()) else {
+            return false;
+        };
+        n.workers[w as usize]
+            .placement
+            .is_owner(&version.members, &page.to_be_bytes(), |o| o == me)
+    }
+
+    /// Production `Retention::observe_at` for one client operation: the ownership predicate, then
+    /// second-sight history and heat.
+    fn observe(&mut self, node: u32, w: u8, page: u64) -> bool {
+        let owned = self.owned(node, w, page);
+        let instant = self.instant(self.now());
+        let retention = &mut self.nodes[node as usize].retention;
+        let seen = retention.history.observe(&page, instant);
+        retention.heat.touch(&page, instant);
+        self.metrics.incr("retention_observations");
+        let eligible = retention_eligible(owned, true, seen);
+        if eligible {
+            self.metrics.incr("retention_qualified");
+        }
+        eligible
+    }
+
+    /// Production `persist_verified`: write an eligible, not yet resident page, with ownership
+    /// reclassified now and the observation latched.
+    fn persist_page(&mut self, node: u32, w: u8, page: u64, eligible: bool) {
+        let owned = self.owned(node, w, page);
+        let n = &self.nodes[node as usize];
+        let quotas = &n.workers[w as usize].quotas;
+        let decision = persist(PersistFacts {
+            eligible,
+            metadata_valid: true,
+            resident: n.disk.entries.get(&page).is_some(),
+            owned,
+            dirty_limit: quotas.limit(ResourceClass::DirtyCiphertext),
+            dirty_used: quotas.used(ResourceClass::DirtyCiphertext),
+            amount: PAGE_BYTES + 16,
+            one_page: PAGE_BYTES,
+        });
+        self.metrics.incr(match decision {
+            Persist::Ineligible => "persist_ineligible",
+            Persist::Resident => "persist_resident",
+            Persist::NoHeadroom => "persist_no_headroom",
+            Persist::Write => "persist_write",
+        });
+        if decision == Persist::Write {
+            self.disk_write(node, w, page);
+        }
+    }
+
+    fn disk_write(&mut self, node: u32, w: u8, page: u64) {
+        let now = self.now();
+        let instant = self.instant(now);
+        let page_bytes = self.config.page_bytes;
+        let record = record_bytes(page_bytes);
+        let version = self.nodes[node as usize].version;
+        let members = self.versions.get(version).map(|v| v.members.clone());
+        let me = members
+            .as_ref()
+            .and_then(|m| m.position(&node.to_be_bytes()));
+        let n = &mut self.nodes[node as usize];
+        let charge = match reserve(
+            &n.workers[w as usize].quotas,
+            ResourceClass::DirtyCiphertext,
+            PAGE_BYTES + 16,
+        ) {
+            Ok(charge) => charge,
+            Err(_) => {
+                self.metrics.incr("disk_write_rejected");
+                return;
+            }
+        };
+        let mut appended = n.disk.segments.append(record as usize);
+        if appended.is_err() {
+            let Node {
+                workers,
+                disk,
+                retention,
+                ..
+            } = n;
+            let ids = &self.ids;
+            let owned = |p: &u64| match (&members, me) {
+                (Some(m), Some(me)) => {
+                    workers[ids.worker(*p) as usize]
+                        .placement
+                        .is_owner(m, &p.to_be_bytes(), |o| o == me)
+                }
+                _ => false,
+            };
+            let _ = disk
+                .clock
+                .reclaim_scored(&disk.entries, 1, 64, 256, |segment| {
+                    disk.entries.segment_score(
+                        segment,
+                        SCAN_BUDGET,
+                        unseen_value(page_bytes),
+                        |p, bytes| {
+                            let heat = retention.heat.score(p, instant);
+                            page_value(
+                                Some(bytes),
+                                page_bytes as u32,
+                                retention_score(heat, owned(p), true),
+                            )
+                        },
+                    )
+                });
+            let evicted = disk.entries.take_evicted();
+            for (p, _) in &evicted {
+                retention.heat.forget(p);
+            }
+            self.metrics.add("disk_evictions", evicted.len() as u64);
+            appended = disk.segments.append(record as usize);
+        }
+        let n = &mut self.nodes[node as usize];
+        let Ok((lease, extent)) = appended else {
+            self.metrics.incr("disk_write_skipped");
+            return;
+        };
+        let segment = SegmentId(extent.offset() / n.disk.segment_bytes());
+        drop(lease);
+        if n.disk
+            .entries
+            .publish(page, page_bytes as u32, segment)
+            .is_err()
+        {
+            self.metrics.incr("disk_write_skipped");
+            return;
+        }
+        n.retention.heat.track(&page, instant);
+        self.metrics.incr("disk_writes");
+        let done = self.fabric.disk_write(now, node, record);
+        let write = self.fresh();
+        self.writes.insert(write, charge);
+        self.engine.at(done, Event::Written { write });
+    }
+
+    fn finish_fill(&mut self, id: u64, result: Result<Source, Error>) {
+        let Some(fill) = self.fills.remove(&id) else {
+            return;
+        };
+        if let Some((handle, ..)) = fill.origin {
+            self.cancel_origin(handle);
+        }
+        for probe in fill.probes() {
+            self.probes.remove(&probe);
+        }
+        let now = self.now();
+        let n = &mut self.nodes[fill.node as usize];
+        if n.incarnation != fill.incarnation {
+            return;
+        }
+        let n = &mut self.nodes[fill.node as usize];
+        self.metrics.incr(match result {
+            Ok(Source::Origin) => "fills_from_origin",
+            Ok(Source::Peer) => "fills_from_peer",
+            Ok(Source::Local) => "fills_local",
+            Ok(Source::Hedge) => "fills_from_hedge",
+            Err(_) => "fills_failed",
+        });
+        let page_id = self.ids.page(fill.page);
+        let mut wakes = Vec::new();
+        let worker = &mut n.workers[fill.worker as usize];
+        // Production completes the retained operation first, then publishes and ignores
+        // `StaleFlight` (`src/read/fill.rs`, `operation.complete()` and `let _ =
+        // flights.publish_acquired(..)`): a leader revoked while its fill ran (canceled or past its
+        // deadline) cannot settle the flight, which already drained to a retry once the fill
+        // completed.
+        if fill.canceled {
+            // Production cancels the fill because the leader's scope expired
+            // (`Operation::cancellation_requested`) and completes the operation with the clock at
+            // that time, so the table sees the leader revoked; the sim's table clock only advances
+            // on joins and polls.
+            worker
+                .flights
+                .refresh(&page_id, self.base + Duration::from_nanos(now), &mut wakes);
+        }
+        let completed = worker.flights.complete_operation(&page_id, &mut wakes);
+        let active = worker.flights.is_leader(&page_id, fill.leader);
+        if !active {
+            self.metrics.incr("flight_stale_finishes");
+        }
+        // Same leader settlement as production `Fill` (`src/read/fill.rs`): a credential rejection
+        // fails only the leader and re-elects.
+        let finished = if active {
+            worker.flights.finish(
+                &page_id,
+                fill.leader,
+                result
+                    .map(|_| self.config.page_bytes as u32)
+                    .map_err(racer_core::read::acquisition_failure),
+                &mut wakes,
+            )
+        } else {
+            Ok(())
+        };
+        self.invariants.check(
+            "flight_leader_valid",
+            finished.is_ok() && completed.is_ok(),
+            now,
+            Some(fill.node),
+            || {
+                format!(
+                    "finish page {} leader {}: {finished:?}, operation {completed:?}",
+                    fill.page, fill.leader
+                )
+            },
+        );
+        let leader = self.tokens.remove(&fill.token);
+        self.detach(fill.node, fill.worker, fill.page, fill.leader);
+        if let Some(leader) = leader {
+            let got = result.map(|source| match source {
+                Source::Origin => Got::Origin,
+                Source::Peer | Source::Hedge => Got::Peer,
+                Source::Local => Got::Local,
+            });
+            self.resolve(leader.want, got);
+        }
+        // A rejection both notifies and settles, so a waiter can appear twice; wake each once (a
+        // second wake would re-lead it).
+        let mut seen = HashSet::new();
+        for token in wakes {
+            if token != fill.token && seen.insert(token) {
+                self.wake(token);
+            }
+        }
+    }
+
+    // ---- report ----
+
+    pub fn memory(&self) -> Vec<(&'static str, usize)> {
+        let mut sums = [0; COMPONENTS.len()];
+        for n in &self.nodes {
+            n.account(&mut sums);
+        }
+        let mut list: Vec<_> = COMPONENTS.into_iter().zip(sums).collect();
+        // Shared memos: real rankings (`RETAINED_DEPTH` 16-byte scores and a cursor; 48 bytes more
+        // than five 24-byte scores with one spare) and route alternatives, estimated per entry.
+        list.push(("placement_memo", self.shared.phantom.memo_len() * 288));
+        list.push(("route_memo", self.shared.routes.memo_len() * 320));
+        list.push(("membership_versions", self.versions.approximate_bytes()));
+        list.push(("engine", self.engine.approximate_bytes()));
+        list.push(("fabric", self.fabric.approximate_bytes()));
+        list.push(("origin", self.origin.approximate_bytes()));
+        list.push(("ids", self.ids.approximate_bytes()));
+        list.push(("workload", self.reads.approximate_bytes()));
+        list.push((
+            "in_flight",
+            self.fills.len() * (std::mem::size_of::<Fill>() + 64)
+                + self.tokens.len() * (std::mem::size_of::<Waiting>() + 16)
+                + self.msgs.len() * (std::mem::size_of::<Msg>() + 64)
+                + self.probes.len() * 32
+                + self.ranges.len() * 96
+                + self.writes.len() * 96
+                + self.streaming.len() * 64
+                + self.bodies.len() * 64
+                + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
+        ));
+        list.push(("origin_per_page", self.origin_per_page.capacity() * 16));
+        list.push((
+            "failure_retries_per_page",
+            self.failure_retries_per_page.capacity() * 16,
+        ));
+        list.push(("last_origin", self.last_origin.capacity() * 32));
+        list.push((
+            "node_rng",
+            self.node_rng.capacity() * std::mem::size_of::<SplitMix64>(),
+        ));
+        list
+    }
+
+    pub fn rejections(&self) -> Value {
+        let counts = *self.shared.rejections.borrow();
+        let mut out = serde_json::Map::new();
+        for class in ResourceClass::ALL {
+            out.insert(class.name().into(), json!(counts[class as usize]));
+        }
+        out.insert("keys".into(), json!(counts[ResourceClass::ALL.len()]));
+        Value::Object(out)
+    }
+
+    pub fn report(&self, scenario: &str, seed: u64) -> Value {
+        let memory = self.memory();
+        let total: usize = memory.iter().map(|(_, b)| b).sum();
+        let nodes = self.config.nodes.max(1) as usize;
+        let max_per_page = self.origin_per_page.values().copied().max().unwrap_or(0);
+        // Requests per page other than retries after a failed origin request, and the most such
+        // retries on one page.
+        let retries = |p: &u64| self.failure_retries_per_page.get(p).copied().unwrap_or(0);
+        let max_without_retries = self
+            .origin_per_page
+            .iter()
+            .map(|(p, c)| c - retries(p))
+            .max()
+            .unwrap_or(0);
+        let max_retries = self
+            .failure_retries_per_page
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let c = |k: &str| self.metrics.get(k);
+        let requests: u64 = self.origin_per_page.values().map(|c| u64::from(*c)).sum();
+        let pages = self.origin_per_page.len();
+        json!({
+            "scenario": scenario,
+            "logic": "real",
+            "nodes": self.config.nodes,
+            "seed": seed,
+            "duration_ns": self.engine.now(),
+            "events": self.engine.processed(),
+            "trace_hash": format!("{:016x}", self.engine.trace.value()),
+            "metrics": self.metrics.to_json(),
+            "origin_per_page": {
+                "pages": pages,
+                "requests": requests,
+                "max_requests_per_page": max_per_page,
+                "max_requests_per_page_excluding_failure_retries": max_without_retries,
+                "max_failure_retries_per_page": max_retries,
+                "repeats": {
+                    "after_owner_move": c("origin_repeats_after_move"),
+                    "copy_lost": c("origin_repeats_copy_lost"),
+                    "after_failure": c("origin_repeats_after_failure"),
+                    "concurrent": c("origin_repeats_concurrent"),
+                    "copy_held": c("origin_repeats_copy_held"),
+                    "held": {
+                        "raced": c("origin_repeats_held_raced"),
+                        "unreachable": c("origin_repeats_held_unreachable"),
+                        "busy": c("origin_repeats_held_busy"),
+                        "unfunded": c("origin_repeats_held_unfunded"),
+                        "missed": c("origin_repeats_held_missed"),
+                        "unasked": c("origin_repeats_held_unasked"),
+                    },
+                    "unexplained": c("origin_repeats_held_unexplained"),
+                    "orphan": SKIPS[..11]
+                        .iter()
+                        .map(|(k, _, o)| (k.to_string(), json!(c(o))))
+                        .collect::<serde_json::Map<_, _>>(),
+                },
+                "skips": SKIPS[..11]
+                    .iter()
+                    .map(|(k, sk, _)| (k.to_string(), json!(c(sk))))
+                    .collect::<serde_json::Map<_, _>>(),
+            },
+            "rejections": self.rejections(),
+            "membership": {
+                "placement_memo_entries": self.shared.phantom.memo_len(),
+            },
+            "invariants": self.invariants.to_json(),
+            "memory": {
+                "components": memory.iter().map(|(k, v)| ((*k).to_owned(), json!(v))).collect::<serde_json::Map<_, _>>(),
+                "accounted_bytes": total,
+                "accounted_bytes_per_node": total / nodes,
+                "peak_rss_bytes": peak_rss_bytes(),
+            },
+        })
+    }
+
+    /// Origin requests for `page` so far.
+    pub fn origin_requests(&self, page: u64) -> u32 {
+        self.origin_per_page.get(&page).copied().unwrap_or(0)
+    }
+
+    /// Whether worker `w` of `node` holds `page` in memory.
+    pub fn in_memory(&self, node: u32, w: u8, page: u64) -> bool {
+        self.nodes[node as usize].workers[w as usize]
+            .memory
+            .pages
+            .contains_key(&page)
+    }
+
+    /// Whether `node` holds `page` on disk.
+    pub fn on_disk(&self, node: u32, page: u64) -> bool {
+        self.nodes[node as usize].disk.entries.get(&page).is_some()
+    }
+
+    /// The ranked owners of `page` in the latest membership (node ids).
+    pub fn owners(&self, page: u64) -> Vec<u32> {
+        let members = self.members();
+        Placement::<Phantom>::with_rankings(0, self.shared.phantom.clone())
+            .rank(&members, &page.to_be_bytes())
+            .into_iter()
+            .map(|p| members.members()[p].node)
+            .collect()
+    }
+
+    /// Shared handles for tests.
+    pub fn members(&self) -> Rc<Members> {
+        self.versions.latest().members.clone()
+    }
+}
+
+/// Counter for a granted probe of `kind` that ended `what`.
+fn granted_counter(kind: &str, what: &str) -> &'static str {
+    let row = match kind {
+        "successor" => ["successor_copies", "successor_misses", "successor_failures"],
+        "demoted" => ["demoted_copies", "demoted_misses", "demoted_failures"],
+        _ => [
+            "lineage_grant_copies",
+            "lineage_grant_misses",
+            "lineage_grant_failures",
+        ],
+    };
+    row[match what {
+        "copies" => 0,
+        "misses" => 1,
+        _ => 2,
+    }]
+}
+
+#[cfg(test)]
+mod shed_tests {
+    use super::*;
+
+    /// Production `PeerServer::shed_hot_page` ranks the page (`placement.rank`), so an owner
+    /// sheds even when its placement cache holds no ranking of the page under its current
+    /// membership (it fetched the page under an older one, or has served it from memory since).
+    #[test]
+    fn owner_without_a_cached_ranking_sheds_a_hot_page() {
+        let nodes = 256;
+        let config = Config {
+            nodes,
+            request_rate: 0.0,
+            pages_per_object: 1,
+            ..Config::default()
+        };
+        let mut world = NodeWorld::new(config, 1);
+        let page = 0;
+        let w = world.ids.worker(page);
+        let members = world
+            .versions
+            .get(world.nodes[0].version)
+            .unwrap()
+            .members
+            .clone();
+        // Rank on a node that is not asked below, so the owners' own caches stay empty.
+        let ranker = (0..nodes)
+            .find(|n| !world.owners_at(*n, w, page, true).contains(n))
+            .unwrap();
+        let owners = world.owners_at(ranker, w, page, true);
+        assert_eq!(owners.len(), 3);
+        let owner = owners[0];
+        assert!(world.owners_at(owner, w, page, false).is_empty());
+        let helper = |n: u32| {
+            members.position(&n.to_be_bytes()).is_some_and(|p| {
+                is_helper(
+                    &world.ids.object(page),
+                    world.ids.number(page),
+                    p,
+                    members.members().len(),
+                )
+            })
+        };
+        let reader = (0..nodes)
+            .find(|n| !owners.contains(n) && !helper(*n) && *n != ranker)
+            .unwrap();
+        let helper_node = (0..nodes).find(|n| !owners.contains(n) && helper(*n));
+        let threshold = world.hot_page_threshold();
+        let busy = vec![SECONDS; threshold];
+        world.streaming.insert((owner, page), busy.clone());
+        world.bodies.insert(owner, busy);
+        assert!(world.shed_hot(owner, reader, page));
+        assert!(!world.shed_hot(owner, owners[1], page), "owners are exempt");
+        if let Some(h) = helper_node {
+            assert!(!world.shed_hot(owner, h, page), "helpers are exempt");
+        }
+        // A non-owner never sheds, cached ranking or not.
+        let busy = vec![SECONDS; threshold];
+        world.streaming.insert((reader, page), busy.clone());
+        world.bodies.insert(reader, busy);
+        assert!(!world.shed_hot(reader, ranker, page));
+        world
+            .streaming
+            .insert((owner, page), vec![SECONDS; threshold - 1]);
+        assert!(!world.shed_hot(owner, reader, page), "below the threshold");
+    }
+}

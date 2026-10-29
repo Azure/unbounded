@@ -6,7 +6,6 @@
 //! bytes. Origin 412 does not prove old copies absent from other permitted caches.
 
 use super::candidates::CandidatePolicy;
-use super::candidates::CandidateResolution;
 use super::flight::AcquisitionBudget;
 use super::flight::AcquisitionEvent;
 use super::flight::AcquisitionFailure;
@@ -89,14 +88,8 @@ fn host_descriptor(
     descriptor.as_fd().try_clone_to_owned().ok()
 }
 
-/// Optional writes may use half of the aggregate class budget, with a floor
-/// sufficient for one valid page when the configured budget can hold it. Owned
-/// usage counts against this conservative ceiling; quota admission remains the
-/// authority for per-cache fairness and all completion-owned allocations.
-pub(super) fn optional_headroom(limit: usize, used: usize, amount: usize, one_page: usize) -> bool {
-    let ceiling = limit.min((limit / 2).max(one_page));
-    amount <= ceiling && used <= ceiling - amount
-}
+use racer_core::read::LeaderSource;
+pub(super) use racer_core::read::optional_headroom;
 #[derive(Clone)]
 pub struct Fill {
     pub(super) dependencies: FillDependencies,
@@ -1438,20 +1431,27 @@ impl Fill {
         use std::future::Future;
 
         let mut shared_local = false;
-        let ready = match self.dependencies.flights.ciphertext_for(&leader)? {
-            Some(ready) => Some(ready),
-            // Cached pages retain only ciphertext. A plaintext acquisition
-            // decrypts it through the shared local plaintext job, so range
-            // probes and warm readers of the same page share one reservation
-            // and one decrypt in either arrival order.
-            None if plaintext
-                && (self.local_plaintext.get(page).is_some()
-                    || self.dependencies.memory.unverified(page)?.is_some()) =>
-            {
+        let retained = self.dependencies.flights.ciphertext_for(&leader)?;
+        // racer-core orders the local sources. Cached pages retain only
+        // ciphertext; a plaintext acquisition decrypts it through the shared
+        // local plaintext job, so range probes and warm readers of the same
+        // page share one reservation and one decrypt in either arrival order.
+        let local_job = || self.local_plaintext.get(page).is_some();
+        let unverified =
+            || -> Result<bool> { Ok(self.dependencies.memory.unverified(page)?.is_some()) };
+        let source = racer_core::read::leader_source(
+            retained.is_some(),
+            plaintext,
+            plaintext && local_job(),
+            plaintext && !local_job() && retained.is_none() && unverified()?,
+        );
+        let ready = match source {
+            LeaderSource::Retained => retained,
+            LeaderSource::SharedLocal => {
                 shared_local = true;
                 None
             }
-            None => {
+            LeaderSource::Cached => {
                 let cached = self.metrics.lookup(
                     LookupTier::Ciphertext,
                     self.dependencies.memory.unverified(page),
@@ -1478,11 +1478,24 @@ impl Fill {
         // abandonment must cancel only this work.
         let caller_scope = acquisition.scope.clone();
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
-        let owned_scope = RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
-        let operation = self
-            .dependencies
-            .flights
-            .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
+        // Unless the caller fences on this work (warm gates), the running fill continues for
+        // another live acquisition waiter when the leader expires or is canceled, instead of being
+        // canceled and restarted from scratch by the next leader. The owned scope then runs to a
+        // hard ceiling; the driver cancels it as soon as no live waiter remains
+        // (`FlightOperation::poll_cancellation`). Attempts and links stay charged to the leader's
+        // budget; the extra time is within the adopting waiter's own deadline and budget.
+        let handover = !self.fence_acquisition;
+        let ceiling = racer_core::read::flight::handover_ceiling(
+            uring_runtime::environment::now(),
+            caller_scope.deadline.0,
+            handover,
+        );
+        let owned_scope = RequestScope::new(caller_scope.request, ceiling)?;
+        let mut operation = self.dependencies.flights.retain_driver_operation(
+            &leader,
+            self.metrics.lease(Gauge::ActiveFills)?,
+            handover,
+        )?;
         let mut owned_budget = acquisition.budget.transfer();
         let owned_membership = acquisition.membership.clone();
         let owned_page = page.clone();
@@ -1578,7 +1591,8 @@ impl Fill {
                     caller_cancellation.register(cx.waker());
                 }
                 if !owned_scope.cancellation.is_cancelled()
-                    && (caller_scope.check().is_err() || operation.cancellation_requested())
+                    && ((!handover && caller_scope.check().is_err())
+                        || operation.poll_cancellation(cx))
                 {
                     if let Some(diagnostic) = &fill.diagnostic {
                         diagnostic.cancellation_seen();
@@ -1602,21 +1616,25 @@ impl Fill {
                     }
                     if let AcquiredPage::Ciphertext(copy) = &result {
                         match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
-                            Ok(())
-                            | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
+                            Ok(()) => {}
+                            Err(error)
+                                if racer_core::read::Error::try_from(error)
+                                    .is_ok_and(racer_core::read::ciphertext_publish_tolerated) => {}
                             Err(error) => return Err(error),
                         }
                     }
                     let _ = flights.publish_acquired(leader, result);
                 }
-                Err(Error::OriginRejected) => {
-                    let _ = flights.fail(leader, AcquisitionFailure::OriginRejected);
-                }
-                Err(Error::OriginForbidden) => {
-                    let _ = flights.fail(leader, AcquisitionFailure::OriginForbidden);
-                }
                 Err(error) => {
-                    let _ = flights.fail(leader, AcquisitionFailure::Terminal(error));
+                    use racer_core::read::FailureKind;
+                    let failure = match racer_core::read::Error::try_from(error)
+                        .map(racer_core::read::acquisition_failure)
+                    {
+                        Ok(FailureKind::OriginRejected) => AcquisitionFailure::OriginRejected,
+                        Ok(FailureKind::OriginForbidden) => AcquisitionFailure::OriginForbidden,
+                        _ => AcquisitionFailure::Terminal(error),
+                    };
+                    let _ = flights.fail(leader, failure);
                 }
             }
             let _ = send.send(owned_budget);
@@ -1704,6 +1722,16 @@ impl Fill {
         self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
+    /// Whether this node holds a copy of `page` in memory, pending write, or
+    /// the disk index, without reading it (orphan notices and copy offers).
+    /// Lookup errors count as not held.
+    pub(crate) fn holds(&self, page: &PageId) -> bool {
+        let deps = &self.dependencies;
+        deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
+            || deps.writer.copy_only(page).is_ok_and(|c| c.is_some())
+            || deps.writer.index().lookup(page).is_ok_and(|c| c.is_some())
+    }
+
     /// Strictly local completed/pending copy or join of existing work; never starts
     /// another acquisition or contacts origin. Use Flights::join_copy, whose waiter
     /// has no election/context API. Ciphertext preserves its nonce/tag.
@@ -1711,6 +1739,17 @@ impl Fill {
         &'a self,
         page: &'a PageId,
         scope: &'a RequestScope,
+    ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
+        self.copy_only_joining(page, scope, true)
+    }
+
+    /// [`Self::copy_only`]; without `join` a running acquisition of the page is a miss instead of
+    /// something to wait on.
+    pub fn copy_only_joining<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+        join: bool,
     ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
         Box::pin(async move {
             scope.check()?;
@@ -1741,6 +1780,9 @@ impl Fill {
                 }
                 Ok(None) | Err(Error::MissingKey | Error::Io | Error::Os(_)) => {}
                 Err(error) => return Err(error),
+            }
+            if !join {
+                return Ok(None);
             }
             match self.dependencies.flights.join_copy(page, scope)? {
                 JoinedCopy::Ciphertext(copy) => {
@@ -2005,6 +2047,10 @@ impl Fill {
         result
     }
 
+    /// Drive the read's racer-core acquisition
+    /// ([`super::candidates::CandidatePolicy::drive`]): it decides each step,
+    /// and this loop performs the hedge, origin fetch, and publication.
+    /// Errors raised by the I/O itself return directly.
     pub(super) async fn acquire_once(
         &self,
         page: &PageId,
@@ -2014,8 +2060,10 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         want_plaintext: bool,
     ) -> Result<AcquiredPage> {
-        if let Some(result) = self.acquire_local_copy(page, scope, want_plaintext).await? {
-            return Ok(result);
+        use racer_core::read::Source;
+        use racer_core::read::walk::{Action, Event as FillEvent};
+        if let Some(local) = self.acquire_local_copy(page, scope, want_plaintext).await? {
+            return Ok(local);
         }
         let candidates = self
             .timed(
@@ -2034,215 +2082,217 @@ impl Fill {
             .await?;
         // Cipher-only acquisitions reserve no plaintext until origin actually
         // supplies a page. Requester consumers still authenticate before acceptance.
-        let mut plaintext = if want_plaintext {
-            Some(
+        let mut plaintext = None;
+        if want_plaintext {
+            plaintext = Some(
                 self.call(
                     DriverStage::PlaintextReclaim,
                     self.reserve_network_plaintext(scope, page),
                 )
                 .await?,
-            )
-        } else {
-            None
-        };
+            );
+        }
         let operation = PeerOperation::Page {
             page: page.clone(),
             mode: FetchMode::Acquire,
         };
-        let mut hedge_continuation = super::candidates::HedgeContinuation::default();
-        let hedge_start = uring_runtime::environment::now();
-        if want_plaintext
-            && let Some(result) = self
-                .timed(
-                    Event::FillHedgeCount,
-                    Event::FillHedgeNs,
-                    self.call(
-                        DriverStage::CandidateCompositeCall,
-                        self.dependencies.candidates.hedge_page(
-                            &candidates,
-                            context,
-                            &operation,
-                            scope,
-                            budget,
-                            &self.dependencies.admission,
-                            &mut hedge_continuation,
-                            |response, child| {
-                                Box::pin(async move {
-                                    self.metrics.record_duration(
-                                        Event::FillPeerResponseCount,
-                                        Event::FillPeerResponseNs,
-                                        hedge_start,
-                                    );
-                                    let copy = response_copy(response.response(), page)?;
-                                    if let Some(existing) =
-                                        self.retained_metadata(&page.version, &child).await?
-                                        && !existing.compatible(&copy.metadata.immutable())
-                                    {
-                                        return Err(Error::CorruptRecord);
-                                    }
-                                    let result = self
-                                        .timed(
-                                            Event::FillPeerDecryptCount,
-                                            Event::FillPeerDecryptNs,
-                                            self.decrypt_response(page, response, None, &child),
-                                        )
-                                        .await?;
-                                    // A sibling may publish while crypto runs. Recheck before
-                                    // election, not only after a winner has canceled its peer.
-                                    if let Some(existing) =
-                                        self.retained_metadata(&page.version, &child).await?
-                                        && !existing.compatible(&result.metadata.immutable())
-                                    {
-                                        return Err(Error::CorruptRecord);
-                                    }
-                                    Ok(result)
-                                })
-                            },
-                        ),
-                    ),
-                )
-                .await?
-        {
-            result.validate_for(page)?;
-            scope.check()?;
-            self.call(
-                DriverStage::PublishCall,
-                self.publish(result.clone(), None, scope),
-            )
-            .await?;
-            self.metrics.record(Event::PeerHit, 1);
-            return Ok(result.into());
-        }
-        // Keep the accepted ranking to probe later cached copies on an origin 412.
-        let resolution = self
-            .call(
-                DriverStage::CandidateCompositeCall,
-                self.dependencies.candidates.resolve_after_hedge(
-                    crate::topology::Candidates {
-                        membership: candidates.membership.clone(),
-                        ordered: candidates.ordered.clone(),
-                    },
-                    context,
-                    operation,
-                    scope,
-                    budget,
-                    |response| {
-                        let reserved = plaintext.take();
-                        Box::pin(async move {
-                            if want_plaintext {
-                                self.decrypt_response(page, response, reserved, scope)
-                                    .await
-                                    .map(AcquiredPage::from)
-                            } else {
-                                Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                                    copy: response_copy(response.response(), page)?,
-                                    disk_token: None,
-                                }))
-                            }
-                        })
-                    },
-                    hedge_continuation,
-                ),
-            )
-            .await?;
-        let mut source = Event::PeerHit;
-        let result = match resolution {
-            CandidateResolution::Copy(result) => result,
-            CandidateResolution::Origin(authority) => {
-                authority.validate(&context.object, page.number)?;
-                budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
-                scope.check()?;
-                // Peer reception owns its ciphertext allocation. Reserve encryption
-                // output only when this candidate actually needs an origin fill.
-                let ciphertext = self.observe_reservation(
-                    scope,
-                    page,
-                    FillAdmissionSite::OriginCiphertext,
-                    || {
-                        self.reserve_with_reclamation(
-                            &context.object.cache,
-                            ResourceClass::Ciphertext,
-                            PAGE_BYTES as usize + 16,
-                        )
-                    },
-                )?;
-                let plaintext = match plaintext.take() {
-                    Some(reserved) => reserved,
-                    None => self.observe_reservation(
+        let peer_page = |response, reserved| {
+            Box::pin(async move {
+                if want_plaintext {
+                    self.decrypt_response(page, response, reserved, scope)
+                        .await
+                        .map(AcquiredPage::from)
+                } else {
+                    Ok(AcquiredPage::Ciphertext(UnverifiedPage {
+                        copy: response_copy(response.response(), page)?,
+                        disk_token: None,
+                    }))
+                }
+            }) as Operation<'_, AcquiredPage>
+        };
+        let policy = &self.dependencies.candidates;
+        let mut acquisition =
+            policy.acquisition(candidates, &operation, scope, want_plaintext, false);
+        let mut acquired = None;
+        let mut event = FillEvent::Start { local_hit: false };
+        loop {
+            let action = self
+                .call(
+                    DriverStage::CandidateCompositeCall,
+                    Box::pin(policy.drive(
+                        &mut acquisition,
+                        event,
+                        context,
+                        &operation,
                         scope,
-                        page,
-                        FillAdmissionSite::OriginPlaintext,
-                        || self.reserve_bootstrap(&context.object.cache),
-                    )?,
-                };
-                match self
-                    .call(
-                        DriverStage::OriginCall,
-                        self.dependencies
-                            .origin
-                            .page_reserved(&authority, context, page, plaintext, scope),
-                    )
-                    .await
-                {
-                    Ok(origin) => {
-                        source = Event::OriginFill;
-                        self.encrypt_origin_page(page, origin, ciphertext, scope)
-                            .await?
-                            .into()
-                    }
-                    Err(Error::VersionUnavailable) => {
-                        let operation = PeerOperation::Page {
-                            page: page.clone(),
-                            mode: FetchMode::CopyOnly,
-                        };
-                        self.call(
-                            DriverStage::CandidateCompositeCall,
-                            self.dependencies.candidates.remaining_validated_copy(
-                                &candidates,
-                                context,
-                                &operation,
-                                scope,
-                                budget,
-                                |response| {
-                                    Box::pin(async move {
-                                        if want_plaintext {
-                                            self.decrypt_response(page, response, None, scope)
-                                                .await
-                                                .map(AcquiredPage::from)
-                                        } else {
-                                            Ok(AcquiredPage::Ciphertext(UnverifiedPage {
-                                                copy: response_copy(response.response(), page)?,
-                                                disk_token: None,
-                                            }))
-                                        }
-                                    })
-                                },
+                        budget,
+                        &mut |response| peer_page(response, plaintext.take()),
+                        &mut acquired,
+                    )),
+                )
+                .await?;
+            event = match action {
+                Action::Hedge {
+                    eligible,
+                    first,
+                    second,
+                } => {
+                    let hedge_start = uring_runtime::environment::now();
+                    let (result, end) = self
+                        .timed(
+                            Event::FillHedgeCount,
+                            Event::FillHedgeNs,
+                            self.call(
+                                DriverStage::CandidateCompositeCall,
+                                policy.hedge_page(
+                                    acquisition.candidates(),
+                                    (first, second, eligible),
+                                    context,
+                                    &operation,
+                                    scope,
+                                    budget,
+                                    &self.dependencies.admission,
+                                    |response, child| {
+                                        Box::pin(async move {
+                                            self.metrics.record_duration(
+                                                Event::FillPeerResponseCount,
+                                                Event::FillPeerResponseNs,
+                                                hedge_start,
+                                            );
+                                            let copy = response_copy(response.response(), page)?;
+                                            if let Some(existing) = self
+                                                .retained_metadata(&page.version, &child)
+                                                .await?
+                                                && !existing.compatible(&copy.metadata.immutable())
+                                            {
+                                                return Err(Error::CorruptRecord);
+                                            }
+                                            let result = self
+                                                .timed(
+                                                    Event::FillPeerDecryptCount,
+                                                    Event::FillPeerDecryptNs,
+                                                    self.decrypt_response(
+                                                        page, response, None, &child,
+                                                    ),
+                                                )
+                                                .await?;
+                                            // A sibling may publish while crypto runs. Recheck before
+                                            // election, not only after a winner has canceled its peer.
+                                            if let Some(existing) = self
+                                                .retained_metadata(&page.version, &child)
+                                                .await?
+                                                && !existing
+                                                    .compatible(&result.metadata.immutable())
+                                            {
+                                                return Err(Error::CorruptRecord);
+                                            }
+                                            Ok(result)
+                                        })
+                                    },
+                                ),
                             ),
                         )
-                        .await?
-                        .ok_or_else(|| {
-                            self.dependencies
-                                .candidates
-                                .final_origin_miss(&authority, &operation, scope, budget)
-                        })?
-                    }
-                    Err(error) => return Err(error),
+                        .await?;
+                    acquisition.trail.hedge_history_unavailable =
+                        !matches!(end, racer_core::read::walk::HedgeEnd::NotStarted);
+                    acquired = result.map(AcquiredPage::from);
+                    FillEvent::Hedge(end)
                 }
-            }
-        };
-        result.validate_for(page)?;
-        scope.check()?;
-        if let AcquiredPage::Plaintext(page) = &result {
-            // Origin encryption already produced a verified whole page. Preserve
-            // that evidence even when the supplier requested only ciphertext.
-            self.call(
-                DriverStage::PublishCall,
-                self.publish(page.clone(), None, scope),
-            )
-            .await?;
+                Action::Origin { rank } => {
+                    let authority = policy.authority(&mut acquisition, rank, &operation);
+                    authority.validate(&context.object, page.number)?;
+                    budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+                    scope.check()?;
+                    // Peer reception owns its ciphertext allocation. Reserve encryption
+                    // output only when this candidate actually needs an origin fill.
+                    let ciphertext = self.observe_reservation(
+                        scope,
+                        page,
+                        FillAdmissionSite::OriginCiphertext,
+                        || {
+                            self.reserve_with_reclamation(
+                                &context.object.cache,
+                                ResourceClass::Ciphertext,
+                                PAGE_BYTES as usize + 16,
+                            )
+                        },
+                    )?;
+                    let plaintext = match plaintext.take() {
+                        Some(reserved) => reserved,
+                        None => self.observe_reservation(
+                            scope,
+                            page,
+                            FillAdmissionSite::OriginPlaintext,
+                            || self.reserve_bootstrap(&context.object.cache),
+                        )?,
+                    };
+                    match self
+                        .call(
+                            DriverStage::OriginCall,
+                            self.dependencies
+                                .origin
+                                .page_reserved(authority, context, page, plaintext, scope),
+                        )
+                        .await
+                    {
+                        Ok(origin) => {
+                            // An owner after rank 0 holds a copy rank 0 may not know of: offer it
+                            // later. The authority's owners: a walk that refreshed its membership
+                            // ranks under the newer one.
+                            if policy.note_orphan(
+                                page,
+                                authority.owners(),
+                                authority.rank(),
+                                authority.predecessor_evidence(),
+                            ) {
+                                self.metrics.record(Event::OrphanNotice, 1);
+                            }
+                            acquired = Some(
+                                self.encrypt_origin_page(page, origin, ciphertext, scope)
+                                    .await?
+                                    .into(),
+                            );
+                            FillEvent::Origin(Ok(()))
+                        }
+                        Err(error) => {
+                            if error != Error::VersionUnavailable {
+                                policy.note_origin_failure(
+                                    page,
+                                    authority.owners(),
+                                    authority.rank(),
+                                    &error,
+                                );
+                            }
+                            FillEvent::Origin(Err(error.try_into()?))
+                        }
+                    }
+                }
+                Action::Publish(_) => {
+                    let result = acquired.as_ref().expect("acquired page");
+                    result.validate_for(page)?;
+                    scope.check()?;
+                    if let AcquiredPage::Plaintext(page) = result {
+                        // Origin encryption already produced a verified whole page. Preserve
+                        // that evidence even when the supplier requested only ciphertext.
+                        self.call(
+                            DriverStage::PublishCall,
+                            self.publish(page.clone(), None, scope),
+                        )
+                        .await?;
+                    }
+                    FillEvent::Published(Ok(()))
+                }
+                Action::Done(Ok(source)) => {
+                    match source {
+                        Source::Local => {}
+                        Source::Origin => self.metrics.record(Event::OriginFill, 1),
+                        Source::Hedge | Source::Peer => self.metrics.record(Event::PeerHit, 1),
+                    }
+                    return Ok(acquired.expect("acquired page"));
+                }
+                action => unreachable!("the acquisition driver performs {action:?}"),
+            };
         }
-        self.metrics.record(source, 1);
-        Ok(result)
     }
 
     async fn encrypt_origin_page(
@@ -2583,7 +2633,7 @@ impl Fill {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;
         let limit = admission.limit(class);
-        let ceiling = limit.min((limit / 2).max(one_page));
+        let ceiling = racer_core::read::optional_ceiling(limit, one_page);
         if amount > ceiling {
             return false;
         }

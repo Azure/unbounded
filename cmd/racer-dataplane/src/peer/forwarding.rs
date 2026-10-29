@@ -223,6 +223,7 @@ impl VerifiedRequest {
         let mode = match mode {
             FetchMode::Acquire => FetchMode::Acquire,
             FetchMode::CopyOnly => FetchMode::CopyOnly,
+            FetchMode::Offer | FetchMode::Ping => return Err(Error::InvalidRequest),
         };
         self.signed.request.operation = Operation::Page { page, mode };
         Ok(self)
@@ -879,6 +880,7 @@ fn response_hop_head(
     peer_wire::forwarding::response_hop_head(original, previous, request, path, index)
         .map_err(Into::into)
 }
+use racer_core::route;
 fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;
     if outcome == "selected" {
@@ -898,17 +900,32 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         }
         let receivers = protocol::decode_nodes(field(request, "racer-route-visited")?.as_bytes())?;
         if !crate::peer::protocol::demand(request)?.contains(number(response, "racer-page")?)
-            || number(response, "racer-grant-membership")?
-                != number(request, "racer-route-membership")?
-            || receivers.first() != Some(&node_field(response, "racer-grant-receiver")?)
-            || number(response, "racer-grant-deadline")? > number(request, "racer-route-deadline")?
-            || number(response, "racer-grant-deadline")?
-                <= protocol::millis(uring_runtime::environment::wall_now())?
-            || number(response, "racer-page-budget")?.checked_add(1)
-                != Some(number(request, "racer-page-budget")?)
-            || number(response, "racer-byte-budget")?
-                .checked_add(number(response, "racer-ciphertext-length")?)
-                != Some(number(request, "racer-byte-budget")?)
+            || !route::grant_membership_ok(
+                number(response, "racer-grant-membership")?,
+                number(request, "racer-route-membership")?,
+            )
+            || !route::grant_receiver_ok(&receivers, &node_field(response, "racer-grant-receiver")?)
+            || !route::grant_deadline_ok(
+                number(response, "racer-grant-deadline")?,
+                number(request, "racer-route-deadline")?,
+                // Read the clock only when the route bound holds, as before.
+                if number(response, "racer-grant-deadline")?
+                    > number(request, "racer-route-deadline")?
+                {
+                    u64::MAX
+                } else {
+                    protocol::millis(uring_runtime::environment::wall_now())?
+                },
+            )
+            || !route::page_budget_ok(
+                number(response, "racer-page-budget")?,
+                number(request, "racer-page-budget")?,
+            )
+            || !route::byte_budget_ok(
+                number(response, "racer-byte-budget")?,
+                number(response, "racer-ciphertext-length")?,
+                number(request, "racer-byte-budget")?,
+            )
         {
             return Err(Error::Unauthorized);
         }
@@ -916,32 +933,28 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         // and never exceeds what was asked.
         let granted = protocol::subscription_flights(response)?;
         let requested = protocol::subscription_flights(request)?;
-        if granted.is_some() != requested.is_some() || granted > requested {
+        if !route::flights_ok(granted, requested) {
             return Err(Error::Unauthorized);
         }
         return Ok(());
     }
     if outcome == "not-found"
-        && (!matches!(
-            field(request, "racer-operation")?.as_str(),
-            "metadata" | "bootstrap"
-        ) || field(request, "racer-mode")? != "acquire"
-            || field(request, "racer-selector")? != "fresh")
+        && !route::not_found_ok(
+            &field(request, "racer-operation")?,
+            &field(request, "racer-mode")?,
+            &field(request, "racer-selector")?,
+        )
     {
         return Err(Error::Unauthorized);
     }
-    if let Some(action) = match outcome.as_str() {
-        "held" => Some("hold"),
-        "warmed" => Some("fill"),
-        "released" => Some("release"),
-        _ => None,
-    } {
+    let typed = route::Outcome::from_wire(&outcome);
+    if let Some(action) = typed.warm_action() {
         if field(request, "racer-operation")? != "warm"
             || field(request, "racer-warm-action")? != action
         {
             return Err(Error::Unauthorized);
         }
-        if outcome == "held"
+        if typed == route::Outcome::Held
             && number(response, "racer-warm-until")? > number(request, "racer-warm-until")?
         {
             // An owner may shorten a hold to its own TTL cap, never extend the ask.
@@ -950,7 +963,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         }
         return Ok(());
     }
-    if outcome != "page" && outcome != "metadata" && outcome != "bootstrap" {
+    if !typed.echoes_operation() {
         return Ok(());
     }
     if field(request, "racer-operation")? != outcome {
@@ -972,7 +985,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
     if outcome == "bootstrap" {
         let length = protocol::number(response, "racer-length")?;
         let present = protocol::number(response, "racer-page-present")?;
-        if present != u64::from(length != 0)
+        if !route::bootstrap_presence_ok(length, present)
             || (present == 1 && protocol::number(response, "racer-page")? != 0)
         {
             return Err(Error::Unauthorized);
@@ -987,18 +1000,8 @@ fn response_authority(
     request: &MessageHead,
     signer: &NodeId,
 ) -> Result<()> {
-    if matches!(
-        field(response, "racer-outcome")?.as_str(),
-        "page"
-            | "metadata"
-            | "bootstrap"
-            | "selected"
-            | "not-found"
-            | "held"
-            | "warmed"
-            | "released"
-    ) && signer != &node_field(request, "racer-route-destination")?
-    {
+    let outcome = route::Outcome::from_wire(&field(response, "racer-outcome")?);
+    if outcome.asserts_success() && signer != &node_field(request, "racer-route-destination")? {
         return Err(Error::Unauthorized);
     }
     Ok(())

@@ -38,9 +38,10 @@
 
 pub mod annotations;
 mod auth;
-mod authority;
+pub mod authority;
 mod config;
 mod control;
+pub mod entropy;
 mod exec;
 mod http;
 mod kube;
@@ -51,11 +52,13 @@ mod primary;
 mod seat;
 mod server;
 mod shared;
+pub mod step;
 #[cfg(test)]
 mod tests;
 
 pub use config::{Config, Rotation, SeatPolicy};
 pub use control::{Bootstrap, Diagnostics, Handle, Role, start};
+pub use shared::PrimaryView;
 
 /// Threads started by [`start`]. The dataplane counts this against its budget.
 pub const CONTROL_THREADS: usize = 1;

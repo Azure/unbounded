@@ -138,10 +138,15 @@ impl RequestScope {
     }
 
     pub(crate) fn candidate_progress(&self) -> Result<()> {
-        self.check()?;
+        self.candidate_progress_at(uring_runtime::environment::now())
+    }
+
+    /// [`RequestScope::candidate_progress`] at an explicit instant.
+    pub(crate) fn candidate_progress_at(&self, now: Instant) -> Result<()> {
+        self.check_at(now)?;
         if let Some(idle) = self.cancellation.state.candidate_idle.get() {
             let mut idle = idle.lock().map_err(|_| Error::Unavailable)?;
-            idle.1 = uring_runtime::environment::now() + idle.0;
+            idle.1 = now + idle.0;
         }
         Ok(())
     }
@@ -167,12 +172,21 @@ impl RequestScope {
     /// checkout/admission/head wait. Integer cross products avoid rate thresholds,
     /// division by zero and overflowing Instant additions. Completion is retained.
     pub(crate) fn candidate_body_progress(&self, received: usize, total: usize) -> Result<()> {
-        self.candidate_progress()?;
+        self.candidate_body_progress_at(received, total, uring_runtime::environment::now())
+    }
+
+    /// [`RequestScope::candidate_body_progress`] at an explicit instant.
+    pub(crate) fn candidate_body_progress_at(
+        &self,
+        received: usize,
+        total: usize,
+        now: Instant,
+    ) -> Result<()> {
+        self.candidate_progress_at(now)?;
         if received > total {
             return Err(Error::InvalidRequest);
         }
         if let Some(body) = self.cancellation.state.candidate_body.get() {
-            let now = uring_runtime::environment::now();
             let mut body = body.lock().map_err(|_| Error::Unavailable)?;
             if !body.advance(now, received, total) {
                 return Err(Error::DeadlineExceeded);
@@ -190,25 +204,29 @@ impl RequestScope {
         })
     }
     pub fn check(&self) -> Result<()> {
+        self.check_at(uring_runtime::environment::now())
+    }
+    /// [`RequestScope::check`] against an explicit instant instead of the
+    /// environment clock.
+    pub fn check_at(&self, now: Instant) -> Result<()> {
         if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
-        } else if uring_runtime::environment::now() >= self.deadline.0 {
+        } else if now >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
             if let Some(expires) = self.cancellation.state.candidate_total.get()
-                && uring_runtime::environment::now() >= *expires
+                && now >= *expires
             {
                 return Err(Error::DeadlineExceeded);
             }
             if let Some(body) = self.cancellation.state.candidate_body.get() {
                 let body = body.lock().map_err(|_| Error::Unavailable)?;
-                if body.expired(uring_runtime::environment::now()) {
+                if body.expired(now) {
                     return Err(Error::DeadlineExceeded);
                 }
             }
             if let Some(idle) = self.cancellation.state.candidate_idle.get()
-                && uring_runtime::environment::now()
-                    >= idle.lock().map_err(|_| Error::Unavailable)?.1
+                && now >= idle.lock().map_err(|_| Error::Unavailable)?.1
             {
                 return Err(Error::DeadlineExceeded);
             }
@@ -659,6 +677,30 @@ mod tests {
                 scope.cancel().unwrap();
                 assert_eq!(uring_runtime::Scope::check(&clone), Err(Error::Cancelled));
                 assert_eq!(count.0.load(Ordering::Relaxed), 1);
+            }
+            /// Explicit-time checks match the environment clock without reading it.
+            #[test]
+            fn check_at_uses_explicit_instant() {
+                let start = Instant::now();
+                let scope =
+                    RequestScope::new(RequestId([7; 16]), start + Duration::from_secs(30)).unwrap();
+                scope
+                    .set_candidate_total(start + Duration::from_secs(10))
+                    .unwrap();
+                assert_eq!(scope.check_at(start), Ok(()));
+                assert_eq!(scope.check_at(start + Duration::from_secs(9)), Ok(()));
+                assert_eq!(
+                    scope.check_at(start + Duration::from_secs(10)),
+                    Err(Error::DeadlineExceeded)
+                );
+                let late = RequestScope::new(RequestId([8; 16]), start).unwrap();
+                assert_eq!(late.check_at(start), Err(Error::DeadlineExceeded));
+                assert_eq!(late.check_at(start - Duration::from_secs(1)), Ok(()));
+                late.cancel().unwrap();
+                assert_eq!(
+                    late.check_at(start - Duration::from_secs(1)),
+                    Err(Error::Cancelled)
+                );
             }
             #[test]
             fn clones_preserve_deadline_and_wake_independent_waiters() {

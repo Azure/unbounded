@@ -97,14 +97,17 @@ impl Drop for PollGuard<'_> {
     }
 }
 
+/// Hold the one long poll `node` may have open, admitted by
+/// [`crate::step::admission::start_poll`] against `current`.
 fn admit_poll<'a>(
     set: &'a RefCell<HashSet<String>>,
     node: &str,
+    after: Option<u64>,
+    current: Option<u64>,
 ) -> Result<PollGuard<'a>, ProtocolFailure> {
-    if !set.borrow_mut().insert(node.into()) {
-        return Err(ProtocolFailure::Overloaded);
-    }
-    Ok(PollGuard(set, node.into()))
+    let node = node.to_string();
+    start_poll(&mut set.borrow_mut(), &node, after, current)?;
+    Ok(PollGuard(set, node))
 }
 
 /// Parse `after=N`. Absent means no cursor. Zero is a conflict.
@@ -123,15 +126,7 @@ pub fn cursor(query: Option<&str>) -> Result<Option<u64>, ProtocolFailure> {
     Ok(Some(n))
 }
 
-/// A cursor ahead of what this seat serves means this seat lags another
-/// seat the client already read from. Like the Go controller, answer 503 so
-/// the client retries or fails over instead of treating its cursor as bad.
-fn check_ahead(after: Option<u64>, current: u64) -> Result<(), ProtocolFailure> {
-    if after.is_some_and(|a| a > current) {
-        return Err(ProtocolFailure::Unavailable);
-    }
-    Ok(())
-}
+use crate::step::admission::start_poll;
 
 fn pki_failure(e: PkiError) -> ProtocolFailure {
     match e {
@@ -350,7 +345,7 @@ impl Server {
             connections: Slots::new(budget.connections),
             handshakes: Slots::new(budget.handshakes),
             bootstraps: Slots::new(budget.bootstraps),
-            writes: Slots::new(budget.writes),
+            writes: Slots::queued(budget.writes, limits::MAX_WRITE_WAITERS),
             polls: RefCell::new(HashSet::new()),
             keyring_polls: RefCell::new(HashSet::new()),
         })
@@ -519,6 +514,31 @@ impl Server {
         self.writes.try_acquire().ok_or(ProtocolFailure::Overloaded)
     }
 
+    /// Write slot for a long poll reply. Waits in FIFO order until
+    /// `poll_deadline` plus [`limits::WRITE_QUEUE_GRACE`], clamped to seat
+    /// authority and `expires` (the caller's credential), so a mass wake
+    /// queues instead of answering 429. A full queue or a passed deadline is
+    /// overload and still answers 429. Authority is rechecked after waiting.
+    async fn queued_write_slot(
+        &self,
+        poll_deadline: Instant,
+        expires: u64,
+    ) -> Result<Slot, ProtocolFailure> {
+        let mut at = (poll_deadline + limits::WRITE_QUEUE_GRACE).min(caller_deadline(expires));
+        if let Some(a) = self.shared.authority().deadline() {
+            at = at.min(a);
+        }
+        let slot = self
+            .writes
+            .acquire(at)
+            .await
+            .ok_or(ProtocolFailure::Overloaded)?;
+        if !self.shared.ready() {
+            return Err(ProtocolFailure::Unavailable);
+        }
+        Ok(slot)
+    }
+
     /// Enrollment. The caller holds a bootstrap admission slot.
     async fn bootstrap(&self, head: &Head, body: &[u8]) -> Result<Reply<'static>, Fail> {
         if !self.shared.ready() {
@@ -627,10 +647,8 @@ impl Server {
         chain: &[Vec<u8>],
     ) -> Result<Reply<'_>, ProtocolFailure> {
         let id = self.certificate(chain)?;
-        let poll = admit_poll(&self.polls, &id.node)?;
-        let image = self.shared.image().ok_or(ProtocolFailure::Unavailable)?;
-        check_ahead(after, image.record.sequence)?;
-        drop(image);
+        let current = self.shared.image().map(|i| i.record.sequence);
+        let poll = admit_poll(&self.polls, &id.node, after, current)?;
         let deadline = self.poll_deadline(id.expires)?;
         let newer = |i: &Image| after.is_none_or(|a| i.record.sequence > a);
         let found = self
@@ -647,7 +665,19 @@ impl Server {
         let reply = match found {
             None => Reply::no_content(),
             Some(image) => {
-                let write = self.write_slot()?;
+                let write = self
+                    .queued_write_slot(deadline, id2.expires.min(id.expires))
+                    .await?;
+                // The slot wait may be long: recheck the certificate, then
+                // readiness, before data leaves.
+                if self.certificate(chain)?.node != id.node {
+                    return Err(ProtocolFailure::Forbidden);
+                }
+                if !self.shared.ready() {
+                    return Err(ProtocolFailure::Unavailable);
+                }
+                // A newer image may have landed while queued.
+                let image = self.shared.image().filter(newer).unwrap_or(image);
                 let base = head.one(DELTA_HEADER).ok().flatten();
                 Reply::ok(image.for_base(after, base), write)
             }
@@ -682,6 +712,7 @@ impl Server {
         if bearer && !chain.is_empty() {
             return Err(ProtocolFailure::Unauthenticated);
         }
+        let authorized_at = Instant::now();
         let (node, expires) = if bearer {
             let c = self.authorize_bearer(head).await?;
             (c.node.uid, c.expires)
@@ -689,17 +720,53 @@ impl Server {
             let id = self.certificate(chain)?;
             (id.node, id.expires)
         };
-        let poll = admit_poll(&self.keyring_polls, &node)?;
-        let (generation, _) = self.shared.bundle().ok_or(ProtocolFailure::Unavailable)?;
-        check_ahead(after, generation)?;
+        let current = self.shared.bundle().map(|(g, _)| g);
+        let poll = admit_poll(&self.keyring_polls, &node, after, current)?;
         let deadline = self.poll_deadline(expires)?;
-        let found = self
-            .wait_until(deadline, || {
-                self.shared
-                    .bundle()
-                    .filter(|(g, _)| after.is_none_or(|a| *g > a))
-            })
-            .await;
+        let newer = || {
+            self.shared
+                .bundle()
+                .filter(|(g, _)| after.is_none_or(|a| *g > a))
+        };
+        // Data already there: the authorization above is current, so the
+        // bearer recheck below may be skipped if the write slot comes
+        // quickly. An unenrolled client's first keyring poll (no cursor)
+        // takes this path.
+        let immediate = newer().is_some();
+        let found = self.wait_until(deadline, newer).await;
+        let reply = match found {
+            None => {
+                self.recheck_keyring_caller(head, chain, bearer, &node, expires, false)
+                    .await?;
+                Reply::no_content()
+            }
+            Some((_, bytes)) => {
+                // The slot wait may outlast the authorization cache, so the
+                // caller is rechecked after it, then readiness after that.
+                let write = self.queued_write_slot(deadline, expires).await?;
+                let full = bearer_recheck(true, immediate, authorized_at.elapsed());
+                self.recheck_keyring_caller(head, chain, bearer, &node, expires, full)
+                    .await?;
+                Reply::ok(bytes, write)
+            }
+        };
+        Ok(reply.until(expires).polling(poll))
+    }
+
+    /// Recheck a keyring caller before replying, then readiness. `full`
+    /// re-runs bearer authorization (normally served by the cache); without
+    /// it a bearer caller is only checked for token expiry. An empty 204
+    /// reveals nothing, so it needs no API calls, which keeps idle bearer
+    /// polls from amplifying into reviews.
+    async fn recheck_keyring_caller(
+        &self,
+        head: &Head,
+        chain: &[Vec<u8>],
+        bearer: bool,
+        node: &str,
+        expires: u64,
+        full: bool,
+    ) -> Result<(), ProtocolFailure> {
         if !bearer {
             let again = self.certificate(chain)?;
             if again.node != node {
@@ -707,10 +774,7 @@ impl Server {
             }
         } else if expires <= unix_now() {
             return Err(ProtocolFailure::Unauthenticated);
-        } else if found.is_some() {
-            // Data is about to leave: the Pod, Node, and token must still be
-            // live. An empty 204 reveals nothing, so it needs no API calls,
-            // which keeps idle bearer polls from amplifying into reviews.
+        } else if full {
             let again = self.authorize_bearer(head).await?;
             if again.node.uid != node {
                 return Err(ProtocolFailure::Forbidden);
@@ -719,11 +783,7 @@ impl Server {
         if !self.shared.ready() {
             return Err(ProtocolFailure::Unavailable);
         }
-        let reply = match found {
-            None => Reply::no_content(),
-            Some((_, bytes)) => Reply::ok(bytes, self.write_slot()?),
-        };
-        Ok(reply.until(expires).polling(poll))
+        Ok(())
     }
 
     async fn replica(
@@ -751,14 +811,42 @@ impl Server {
                     .filter(|i| after.is_none_or(|a| i.record.sequence > a))
             })
             .await;
-        if !self.shared.is_primary.get() || !self.shared.ready() {
+        if !self.shared.ready() {
             return Err(ProtocolFailure::Unavailable);
         }
+        require_primary(self.shared.is_primary.get())?;
         let reply = match found {
             None => Reply::no_content(),
-            Some(i) => Reply::ok(i.encoded.clone(), self.write_slot()?),
+            Some(i) => {
+                let slot = self.queued_write_slot(deadline, expires).await?;
+                // Recheck the seat caller after the slot wait (the review
+                // is normally cached). The primary term can also end while
+                // this reply waits, and a follower seat stays ready, so
+                // recheck the role, then readiness.
+                exec::timeout(
+                    self.budget.io,
+                    auth::authorize_seat(&self.shared, authorization, unix_now()),
+                )
+                .await
+                .map_err(|_| ProtocolFailure::Unavailable)??;
+                require_primary(self.shared.is_primary.get())?;
+                if !self.shared.ready() {
+                    return Err(ProtocolFailure::Unavailable);
+                }
+                Reply::ok(i.encoded.clone(), slot)
+            }
         };
         Ok(reply.until(expires))
+    }
+}
+
+/// Replica images are served only while this process holds the primary
+/// term.
+fn require_primary(is_primary: bool) -> Result<(), ProtocolFailure> {
+    if is_primary {
+        Ok(())
+    } else {
+        Err(ProtocolFailure::Unavailable)
     }
 }
 
@@ -1102,6 +1190,16 @@ pub fn pinned_client(certificate: &[u8]) -> Result<Arc<rustls::ClientConfig>, cr
     Ok(Arc::new(config))
 }
 
+/// Whether a bearer keyring poll authorizes again before replying. Only
+/// data needs it: a 204 reveals nothing. Data found before waiting may
+/// leave under the authorization just made, but only while that
+/// authorization is younger than
+/// [`crate::step::authz::CALLER_TTL`]; a long write slot
+/// wait otherwise outlasts it.
+fn bearer_recheck(found: bool, immediate: bool, age: Duration) -> bool {
+    found && (!immediate || age >= crate::step::authz::CALLER_TTL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1174,10 +1272,7 @@ mod tests {
 
     #[test]
     fn lagging_seat_cursor_is_unavailable() {
-        assert_eq!(check_ahead(None, 5), Ok(()));
-        assert_eq!(check_ahead(Some(5), 5), Ok(()));
-        assert_eq!(check_ahead(Some(4), 5), Ok(()));
-        let e = check_ahead(Some(6), 5).unwrap_err();
+        let e = crate::step::admission::check_ahead(Some(6), 5).unwrap_err();
         assert_eq!(e, ProtocolFailure::Unavailable);
         let r = String::from_utf8(error_response(e)).unwrap();
         assert!(r.starts_with("HTTP/1.1 503") && r.contains("Retry-After: 1"));
@@ -1867,15 +1962,75 @@ mod tests {
     }
 
     #[test]
+    fn long_poll_replies_queue_for_a_write_slot() {
+        fake::run(|_, kube| async move {
+            let (shared, _) = seated(kube);
+            let server = Server::with_budget(shared.clone(), budget());
+            let expires = unix_now() + 3600;
+            let held = server.write_slot().unwrap();
+            // Enrollment and other non-poll replies still fail fast.
+            assert_eq!(server.write_slot().err(), Some(ProtocolFailure::Overloaded));
+            // A poll whose deadline (plus grace) passes while queued: 429.
+            let past = Instant::now() - limits::WRITE_QUEUE_GRACE;
+            assert_eq!(
+                server.queued_write_slot(past, expires).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            // An expired credential bounds the wait too.
+            let now = Instant::now();
+            assert_eq!(
+                server.queued_write_slot(now, unix_now()).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            // A queued poll gets the slot when it is released instead of a
+            // 429, then rechecks readiness (this seat is not ready: 503).
+            let result = Rc::new(RefCell::new(None));
+            let (s, r) = (server.clone(), result.clone());
+            exec::spawn(async move {
+                let out = s.queued_write_slot(Instant::now(), expires).await;
+                *r.borrow_mut() = Some(out.err());
+            })
+            .unwrap();
+            exec::sleep(Duration::from_millis(20)).await;
+            assert!(result.borrow().is_none());
+            drop(held);
+            exec::sleep(Duration::from_millis(20)).await;
+            assert_eq!(*result.borrow(), Some(Some(ProtocolFailure::Unavailable)));
+            assert!(server.write_slot().is_ok());
+            shared.stopping.set(true);
+        });
+    }
+
+    #[test]
+    fn replica_requires_the_primary_term() {
+        assert_eq!(require_primary(true), Ok(()));
+        assert_eq!(require_primary(false), Err(ProtocolFailure::Unavailable));
+    }
+
+    #[test]
+    fn bearer_keyring_rechecks_only_after_a_wait() {
+        let ttl = crate::step::authz::CALLER_TTL;
+        let zero = Duration::ZERO;
+        assert!(bearer_recheck(true, false, zero));
+        assert!(!bearer_recheck(true, true, zero));
+        assert!(!bearer_recheck(true, true, ttl - Duration::from_millis(1)));
+        // A write slot wait that reaches the cache TTL forces a recheck.
+        assert!(bearer_recheck(true, true, ttl));
+        assert!(bearer_recheck(true, true, ttl * 3));
+        assert!(!bearer_recheck(false, false, zero));
+        assert!(!bearer_recheck(false, true, ttl * 3));
+    }
+
+    #[test]
     fn poll_admission_is_per_node() {
         let set = RefCell::new(HashSet::new());
-        let g = admit_poll(&set, "n").unwrap();
+        let g = admit_poll(&set, "n", None, Some(1)).unwrap();
         assert_eq!(
-            admit_poll(&set, "n").err(),
+            admit_poll(&set, "n", None, Some(1)).err(),
             Some(ProtocolFailure::Overloaded)
         );
-        assert!(admit_poll(&set, "m").is_ok());
+        assert!(admit_poll(&set, "m", None, Some(1)).is_ok());
         drop(g);
-        assert!(admit_poll(&set, "n").is_ok());
+        assert!(admit_poll(&set, "n", None, Some(1)).is_ok());
     }
 }

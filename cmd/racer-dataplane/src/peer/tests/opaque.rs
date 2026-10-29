@@ -908,6 +908,38 @@ struct RelayFixture {
     page: crate::memory::CiphertextPage,
 }
 
+/// A page body counts toward the
+/// hot-page shed whichever transport writes it. `send_native` (RDMA) used to
+/// bypass the count that only `send_http_response` took, so an owner serving
+/// mostly over native transfers shed less. Both paths now take the same
+/// `page_streaming` guard, which counts a non-empty page body until dropped
+/// and nothing for any other response.
+#[test]
+fn page_bodies_count_toward_the_hot_page_shed_on_every_transport() {
+    let f = RelayFixture::new(true);
+    let id = f.page.envelope().page.clone();
+    let page = PeerResponse::Page {
+        metadata: f.metadata.clone(),
+        ciphertext: f.page.clone(),
+    };
+    assert_eq!(f.server.streaming(&id), (0, 0));
+    let first = f.server.page_streaming(&page);
+    let second = f.server.page_streaming(&page);
+    assert!(first.is_some() && second.is_some());
+    assert_eq!(f.server.streaming(&id), (2, 2));
+    drop(first);
+    assert_eq!(f.server.streaming(&id), (1, 1));
+    drop(second);
+    assert_eq!(f.server.streaming(&id), (0, 0));
+    assert!(f.server.page_streaming(&PeerResponse::Overloaded).is_none());
+    assert!(
+        f.server
+            .page_streaming(&PeerResponse::StaleMembership)
+            .is_none()
+    );
+    assert_eq!(f.server.streaming(&id), (0, 0));
+}
+
 #[test]
 fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
     use crate::security::CryptoClient;

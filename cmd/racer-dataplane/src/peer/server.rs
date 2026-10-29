@@ -71,7 +71,48 @@ pub struct PeerServer {
     signatures: Rc<crate::peer::protocol::Signatures>,
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
+    /// Page response bodies this server is writing, per page
+    /// (`racer_core::read::budget::shed_hot_page`).
+    streaming: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
 }
+
+/// Bodies of one page an owner writes before it may shed readers of that page:
+/// `racer_core::read::budget::HOT_PAGE_QUEUE_BYTES` of production pages.
+pub(crate) const fn hot_page_threshold() -> usize {
+    racer_core::read::budget::hot_page_bodies(crate::model::PAGE_BYTES)
+}
+
+/// Counts one page body being written until dropped.
+struct Streaming {
+    pages: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
+    page: crate::model::PageId,
+}
+
+impl Streaming {
+    fn new(
+        pages: &Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
+        page: crate::model::PageId,
+    ) -> Self {
+        *pages.borrow_mut().entry(page.clone()).or_default() += 1;
+        Self {
+            pages: pages.clone(),
+            page,
+        }
+    }
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        let mut pages = self.pages.borrow_mut();
+        if let Some(count) = pages.get_mut(&self.page) {
+            *count -= 1;
+            if *count == 0 {
+                pages.remove(&self.page);
+            }
+        }
+    }
+}
+
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
@@ -319,7 +360,73 @@ impl PeerServer {
             signatures,
             transfers,
             request_timeout: settings.request_timeout,
+            streaming: Rc::default(),
         }
+    }
+
+    /// Bodies of `page` this server is writing now, and of all pages.
+    pub(crate) fn streaming(&self, page: &crate::model::PageId) -> (usize, usize) {
+        let pages = self.streaming.borrow();
+        (pages.get(page).copied().unwrap_or(0), pages.values().sum())
+    }
+
+    /// Count a page response's body as being written until the result drops
+    /// (`None` for any other response or an empty body).
+    pub(crate) fn page_streaming(&self, response: &PeerResponse) -> Option<impl Sized + use<>> {
+        match response {
+            PeerResponse::Page { ciphertext, .. } if !ciphertext.bytes().is_empty() => Some(
+                Streaming::new(&self.streaming, ciphertext.envelope().page.clone()),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Count `n` bodies of `page` as being written until the result drops.
+    #[cfg(test)]
+    pub(crate) fn hold_streaming(
+        &self,
+        page: &crate::model::PageId,
+        n: usize,
+    ) -> impl Sized + use<> {
+        (0..n)
+            .map(|_| Streaming::new(&self.streaming, page.clone()))
+            .collect::<Vec<_>>()
+    }
+
+    /// Whether to answer a page request with `Overloaded` because this node owns the page and is
+    /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
+    /// all the bodies it is writing. The requester then asks one of the page's helpers, which,
+    /// like the page's owners, is never shed. The ranking is only computed for a page that is
+    /// already hot, and stays in this server's placement cache.
+    fn shed_hot_page(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+    ) -> bool {
+        use racer_core::read::budget::{is_helper, shed_hot_page};
+        let threshold = hot_page_threshold();
+        let (streaming, all) = self.streaming(page);
+        if streaming < threshold {
+            return false;
+        }
+        let (object, number) = (&page.version.object, page.number);
+        let owners = self.placement.rank(membership.clone(), object, number);
+        let helper = || {
+            membership
+                .position(requester)
+                .is_ok_and(|p| is_helper(object, number, p, membership.members().len()))
+        };
+        let local = &self.relay.network.local;
+        shed_hot_page(
+            &owners.ordered,
+            local,
+            requester,
+            helper,
+            streaming,
+            all,
+            threshold,
+        )
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.
@@ -419,11 +526,12 @@ impl PeerServer {
                 .relay
                 .network
                 .membership(request.request().route.membership);
+            let hop = self.decide_hop(&request, membership.is_ok());
             let response = match &membership {
                 Ok(membership)
                     if admitted.is_none()
                         && self.opaque_relay()
-                        && request.request().route.destination != self.relay.network.local =>
+                        && matches!(hop, racer_core::route::Hop::Relay(_)) =>
                 {
                     let network = &self.relay.network;
                     let previous = request
@@ -433,6 +541,7 @@ impl PeerServer {
                         .node();
                     network.endpoint(membership, previous)?;
                     let binding = request.binding().clone();
+                    let ping = is_ping(&request);
                     let result = match self
                         .admission
                         .reserve(None, ResourceClass::Relay, 1)
@@ -523,21 +632,20 @@ impl PeerServer {
                         Ok((super::transport::RelayResponse::Landed(_), _)) => {
                             return Err(Error::Internal);
                         }
-                        Err(Error::Overloaded) => self
-                            .forwarding
-                            .sign_response(&binding, PeerResponse::Overloaded)?,
-                        Err(
-                            Error::Unavailable
-                            | Error::Io
-                            | Error::Os(_)
-                            | Error::HopBudgetExhausted
-                            | Error::IncompatibleMembership,
-                        ) => {
-                            request_scope.check()?;
-                            self.forwarding
-                                .sign_response(&binding, PeerResponse::Unavailable)?
+                        Err(error) => {
+                            use racer_core::route::{self, RelayFailure};
+                            match route::relay_failure(error.fault(), ping) {
+                                RelayFailure::Respond(response) => self
+                                    .forwarding
+                                    .sign_response(&binding, peer_response(response))?,
+                                RelayFailure::RespondIfLive(response) => {
+                                    request_scope.check()?;
+                                    self.forwarding
+                                        .sign_response(&binding, peer_response(response))?
+                                }
+                                RelayFailure::Propagate => return Err(error),
+                            }
                         }
-                        Err(error) => return Err(error),
                     }
                 }
                 Ok(membership) => {
@@ -552,11 +660,11 @@ impl PeerServer {
                             &received.connection,
                             &request_scope,
                             &exchange,
-                            self.dispatch_verified(request, membership.clone(), &exchange),
+                            self.dispatch_verified(request, membership.clone(), hop, &exchange),
                         )
                         .await?
                     } else {
-                        self.dispatch_verified(request, membership.clone(), &request_scope)
+                        self.dispatch_verified(request, membership.clone(), hop, &request_scope)
                             .await?
                     }
                 }
@@ -567,10 +675,14 @@ impl PeerServer {
             };
             let mut connection = received.connection;
             if let (Some(admitted), Ok(membership)) = (admitted, &membership) {
+                // A native (RDMA) page body counts toward the hot-page shed
+                // like an HTTP one, until it is written or abandoned.
+                let streaming = self.page_streaming(&response.response);
                 let (returned, sent) = self
                     .transfers
                     .send_native(connection, &response, admitted, membership, &request_scope)
                     .await?;
+                drop(streaming);
                 connection = returned;
                 if sent {
                     connection.finish_exchange()?;
@@ -639,6 +751,8 @@ impl PeerServer {
             _ => &[],
         };
         let head = super::protocol::encode_envelope(&response.authentication, true, body.len())?;
+        // Counted from the head until the body is written or abandoned.
+        let _streaming = self.page_streaming(&response.response);
         let sent = self.io.send_head(connection, head, scope).await?;
         let mut connection = sent.connection;
         if !body.is_empty() {
@@ -680,25 +794,46 @@ impl PeerServer {
                 .network
                 .membership(request.request().route.membership);
             let membership = match membership {
-                Ok(membership) => membership,
-                Err(Error::IncompatibleMembership) => {
-                    return self
-                        .forwarding
-                        .sign_response(request.binding(), PeerResponse::StaleMembership);
-                }
+                Ok(membership) => Some(membership),
+                Err(Error::IncompatibleMembership) => None,
                 Err(error) => return Err(error),
             };
-            self.dispatch_verified(request, membership, scope).await
+            let hop = self.decide_hop(&request, membership.is_some());
+            let Some(membership) = membership else {
+                return self
+                    .forwarding
+                    .sign_response(request.binding(), PeerResponse::StaleMembership);
+            };
+            self.dispatch_verified(request, membership, hop, scope)
+                .await
         })
+    }
+
+    /// What this node does with a verified request (`racer_core::route`).
+    fn decide_hop(
+        &self,
+        request: &VerifiedRequest,
+        membership_known: bool,
+    ) -> racer_core::route::Hop {
+        let route = &request.request().route;
+        racer_core::route::decide_hop(
+            &self.relay.network.local,
+            &route.visited,
+            &route.destination,
+            route.remaining_links,
+            membership_known,
+        )
     }
 
     fn dispatch_verified<'a>(
         &'a self,
         request: VerifiedRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
+        hop: racer_core::route::Hop,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
+            use racer_core::route::{self, Hop, RelayFailure};
             let scope = super::request_scope(request.request(), scope)?;
             let network = &self.relay.network;
             let previous = request
@@ -707,46 +842,60 @@ impl PeerServer {
                 .unwrap_or(request.origin())
                 .node();
             network.endpoint(&membership, previous)?;
-            if request.request().route.destination != network.local {
+            if let Hop::Relay(_) = hop {
                 let binding = request.binding().clone();
+                let ping = is_ping(&request);
                 let result = self.relay.forward(request, membership, &scope).await;
                 let result = self.admission.policy().observer().result(
                     crate::telemetry::Stage::PeerRelay,
                     &scope,
                     result,
                 );
-                return match result {
-                    Ok(response) => Ok(response),
-                    Err(Error::Overloaded) => self
+                let error = match result {
+                    Ok(response) => return Ok(response),
+                    Err(error) => error,
+                };
+                return match route::relay_failure(error.fault(), ping) {
+                    RelayFailure::Respond(response) => self
                         .forwarding
-                        .sign_response(&binding, PeerResponse::Overloaded),
-                    Err(
-                        Error::Unavailable
-                        | Error::Io
-                        | Error::Os(_)
-                        | Error::HopBudgetExhausted
-                        | Error::IncompatibleMembership,
-                    ) => {
+                        .sign_response(&binding, peer_response(response)),
+                    RelayFailure::RespondIfLive(response) => {
                         scope.check()?;
                         self.forwarding
-                            .sign_response(&binding, PeerResponse::Unavailable)
+                            .sign_response(&binding, peer_response(response))
                     }
-                    Err(error) => Err(error),
+                    RelayFailure::Propagate => Err(error),
                 };
             }
             let binding = request.binding().clone();
+            // A copy offer or a silence ping carries no body, so hot-page
+            // shedding does not apply.
+            if let super::protocol::Operation::Page { page, mode } = &request.request().operation
+                && !matches!(
+                    mode,
+                    super::protocol::FetchMode::Offer | super::protocol::FetchMode::Ping
+                )
+                && self.shed_hot_page(page, request.origin().node(), &membership)
+            {
+                self.metrics.record(crate::telemetry::Event::Overload, 1);
+                return self
+                    .forwarding
+                    .sign_response(&binding, PeerResponse::Overloaded);
+            }
             let reservation = self
                 .admission
                 .reserve(None, ResourceClass::Waiter, 1)
                 .map_err(Error::from);
             let _reservation = match reservation {
                 Ok(reservation) => reservation,
-                Err(Error::Overloaded) => {
-                    return self
-                        .forwarding
-                        .sign_response(&binding, PeerResponse::Overloaded);
+                Err(error) => {
+                    return match route::waiter_failure(error.fault()) {
+                        Some(response) => self
+                            .forwarding
+                            .sign_response(&binding, peer_response(response)),
+                        None => Err(error),
+                    };
                 }
-                Err(error) => return Err(error),
             };
             let result = self.serve_selected(request, membership, &scope).await;
             let result = self.admission.policy().observer().result(
@@ -756,19 +905,10 @@ impl PeerServer {
             );
             let response = match result {
                 Ok(response) => response,
-                Err(Error::NotFound) => PeerResponse::NotFound,
-                Err(Error::VersionUnavailable) => PeerResponse::VersionUnavailable,
-                Err(Error::Overloaded) => PeerResponse::Overloaded,
-                Err(Error::Unauthorized) => PeerResponse::OriginRejected,
-                Err(Error::OriginForbidden) => PeerResponse::OriginForbidden,
-                Err(
-                    Error::Unavailable
-                    | Error::Io
-                    | Error::Os(_)
-                    | Error::MissingKey
-                    | Error::CorruptRecord,
-                ) => PeerResponse::Unavailable,
-                Err(error) => return Err(error),
+                Err(error) => match route::serve_failure(error.fault()) {
+                    Some(response) => peer_response(response),
+                    None => return Err(error),
+                },
             };
             scope.check()?;
             self.forwarding.sign_response(&binding, response)
@@ -927,6 +1067,31 @@ fn header_scope(
     );
     Ok(header)
 }
+/// Whether `request` is a silence ping (`route::relay_failure`).
+fn is_ping(request: &VerifiedRequest) -> bool {
+    matches!(
+        request.request().operation,
+        super::protocol::Operation::Page {
+            mode: super::protocol::FetchMode::Ping,
+            ..
+        }
+    )
+}
+
+/// Signed response for a failure class chosen by `racer_core::route`.
+fn peer_response(response: racer_core::route::Response) -> PeerResponse {
+    use racer_core::route::Response;
+    match response {
+        Response::Overloaded => PeerResponse::Overloaded,
+        Response::Unavailable => PeerResponse::Unavailable,
+        Response::NotFound => PeerResponse::NotFound,
+        Response::VersionUnavailable => PeerResponse::VersionUnavailable,
+        Response::OriginRejected => PeerResponse::OriginRejected,
+        Response::OriginForbidden => PeerResponse::OriginForbidden,
+        Response::StaleMembership => PeerResponse::StaleMembership,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

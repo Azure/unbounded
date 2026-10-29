@@ -2070,6 +2070,31 @@ mod tests {
         assert!(owner.acquire(&Key(3)).is_ok());
     }
 
+    /// A caller-owned clock drives backoff without reading wall time.
+    #[test]
+    fn explicit_clock_drives_peer_backoff() {
+        thread_local! {
+            static BASE: Instant = Instant::now();
+            static OFFSET: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+        }
+        fn clock() -> Instant {
+            BASE.with(|base| *base + OFFSET.get())
+        }
+        let owner = Adaptive::new(config(), Counts::default(), clock).unwrap();
+        let failed = owner.acquire(&1).unwrap();
+        failed.observe(Outcome::PeerFailure);
+        drop(failed);
+        assert!(!owner.available(&1));
+        OFFSET.set(config().backoff - Duration::from_millis(1));
+        assert!(!owner.available(&1));
+        OFFSET.set(config().backoff);
+        assert!(owner.available(&1));
+        let probe = owner.acquire(&1).unwrap();
+        probe.observe(Outcome::PeerFailure);
+        drop(probe);
+        assert!(!owner.available(&1));
+    }
+
     /// Stale success cannot undo failure and shared fences retain active work.
     #[test]
     fn fences_generation_exclusivity_and_local_pressure() {

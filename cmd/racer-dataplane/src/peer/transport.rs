@@ -1140,9 +1140,17 @@ impl Transfers {
         request: &super::protocol::PeerRequest,
         scope: &RequestScope,
     ) -> Result<Option<Arc<super::receive::Permit>>> {
+        // Metadata and the bodyless page modes (offer, ping) never receive a
+        // body, so they bypass the body gate. A ping queued behind local
+        // congestion would time out and count as silence from a healthy peer.
+        use super::protocol::{FetchMode, Operation};
         if matches!(
             request.operation,
-            super::protocol::Operation::Metadata { .. }
+            Operation::Metadata { .. }
+                | Operation::Page {
+                    mode: FetchMode::Ping | FetchMode::Offer,
+                    ..
+                }
         ) {
             return Ok(None);
         }

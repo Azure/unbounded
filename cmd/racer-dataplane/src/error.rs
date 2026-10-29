@@ -81,6 +81,65 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<racer_core::read::Error> for Error {
+    fn from(error: racer_core::read::Error) -> Self {
+        use racer_core::read::Error as Core;
+        match error {
+            Core::InvalidConfiguration => Self::InvalidConfiguration,
+            Core::InvalidRequest => Self::InvalidRequest,
+            Core::HeaderTooLarge => Self::HeaderTooLarge,
+            Core::NotFound => Self::NotFound,
+            Core::Internal => Self::Internal,
+            Core::VersionUnavailable => Self::VersionUnavailable,
+            Core::Unavailable => Self::Unavailable,
+            Core::Overloaded => Self::Overloaded,
+            Core::DeadlineExceeded => Self::DeadlineExceeded,
+            Core::Cancelled => Self::Cancelled,
+            Core::Unauthorized => Self::Unauthorized,
+            Core::OriginRejected => Self::OriginRejected,
+            Core::OriginForbidden => Self::OriginForbidden,
+            Core::IncompatibleMembership => Self::IncompatibleMembership,
+            Core::HopBudgetExhausted => Self::HopBudgetExhausted,
+            Core::CorruptRecord => Self::CorruptRecord,
+            Core::MissingKey => Self::MissingKey,
+            Core::Io => Self::Io,
+            Core::Os(errno) => Self::Os(errno),
+        }
+    }
+}
+
+/// Errors with a sans-IO counterpart; any other error has no core meaning and
+/// is returned unchanged.
+impl TryFrom<Error> for racer_core::read::Error {
+    type Error = Error;
+
+    fn try_from(error: Error) -> Result<Self> {
+        use racer_core::read::Error as Core;
+        Ok(match error {
+            Error::InvalidConfiguration => Core::InvalidConfiguration,
+            Error::InvalidRequest => Core::InvalidRequest,
+            Error::HeaderTooLarge => Core::HeaderTooLarge,
+            Error::NotFound => Core::NotFound,
+            Error::Internal => Core::Internal,
+            Error::VersionUnavailable => Core::VersionUnavailable,
+            Error::Unavailable => Core::Unavailable,
+            Error::Overloaded => Core::Overloaded,
+            Error::DeadlineExceeded => Core::DeadlineExceeded,
+            Error::Cancelled => Core::Cancelled,
+            Error::Unauthorized => Core::Unauthorized,
+            Error::OriginRejected => Core::OriginRejected,
+            Error::OriginForbidden => Core::OriginForbidden,
+            Error::IncompatibleMembership => Core::IncompatibleMembership,
+            Error::HopBudgetExhausted => Core::HopBudgetExhausted,
+            Error::CorruptRecord => Core::CorruptRecord,
+            Error::MissingKey => Core::MissingKey,
+            Error::Io => Core::Io,
+            Error::Os(errno) => Core::Os(errno),
+            other => return Err(other),
+        })
+    }
+}
+
 impl From<controlplane::Error> for Error {
     fn from(error: controlplane::Error) -> Self {
         match error {

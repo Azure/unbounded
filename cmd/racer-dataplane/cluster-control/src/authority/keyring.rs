@@ -12,6 +12,7 @@
 //! at its NotAfter. A removed root is listed as retired until its NotAfter so a
 //! stale Lease annotation can never add it back.
 
+use crate::entropy::Entropy;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire::{
     self as wire, BundleGeneration, CacheDefinition, CacheEncryptionKey, CacheId, CacheKeyPurpose,
@@ -348,13 +349,20 @@ pub fn admit_catalog(
     Ok(out)
 }
 
-fn new_key(cache: &str, purpose: &str, state: &str, generation: u64) -> Result<Key, KeyringError> {
+fn new_key(
+    rng: &mut dyn Entropy,
+    cache: &str,
+    purpose: &str,
+    state: &str,
+    generation: u64,
+) -> Result<Key, KeyringError> {
     let mut suffix = [0u8; 4];
-    getrandom::getrandom(&mut suffix).map_err(|_| KeyringError::Entropy)?;
+    rng.fill(&mut suffix).map_err(|_| KeyringError::Entropy)?;
     let id = KeyId::from_generation(generation, u32::from_be_bytes(suffix))
         .map_err(|_| KeyringError::Unavailable)?;
     let mut material = zeroize::Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(&mut *material).map_err(|_| KeyringError::Entropy)?;
+    rng.fill(&mut *material)
+        .map_err(|_| KeyringError::Entropy)?;
     Ok(Key {
         cache: cache.into(),
         id: id.0.iter().map(|b| format!("{b:02x}")).collect(),
@@ -381,7 +389,14 @@ pub fn plan(
     offers: &[Offer],
     now: u64,
 ) -> Result<Plan, KeyringError> {
-    plan_with(policy, current, Some(catalog), offers, now)
+    plan_with(
+        policy,
+        current,
+        Some(catalog),
+        offers,
+        now,
+        &mut crate::entropy::OsEntropy,
+    )
 }
 
 /// Like [`plan`], but `None` means the catalog is unknown, for example before
@@ -394,6 +409,7 @@ pub fn plan_with(
     catalog: Option<&[CacheDefinition]>,
     offers: &[Offer],
     now: u64,
+    rng: &mut dyn Entropy,
 ) -> Result<Plan, KeyringError> {
     let mut d = current.clone();
     // A key created now belongs to the next generation.
@@ -414,7 +430,7 @@ pub fn plan_with(
                 if creation == 0 {
                     return Err(KeyringError::Unavailable);
                 }
-                d.keys.push(new_key(&c.id.0, p, "active", creation)?);
+                d.keys.push(new_key(rng, &c.id.0, p, "active", creation)?);
             }
         }
     }
@@ -445,7 +461,7 @@ pub fn plan_with(
         }
         let mut prepared = Vec::new();
         for k in d.keys.iter().filter(|k| k.state == "active") {
-            prepared.push(new_key(&k.cache, &k.purpose, "prepared", creation)?);
+            prepared.push(new_key(rng, &k.cache, &k.purpose, "prepared", creation)?);
         }
         d.keys.extend(prepared);
         d.activate_at = now + policy.prepare_for.as_secs();
@@ -543,6 +559,8 @@ pub fn plan_with(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::entropy::{Failing, OsEntropy};
+    use racer_core::time::SplitMix64;
 
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
     const DAY: u64 = 86400;
@@ -705,17 +723,17 @@ pub(crate) mod tests {
         )
         .unwrap()
         .durable;
-        let p = plan_with(&policy(), &d, None, &[], t).unwrap();
+        let p = plan_with(&policy(), &d, None, &[], t, &mut OsEntropy).unwrap();
         assert_eq!(p.durable.keys, d.keys);
         assert_eq!(p.durable.generation, d.generation);
         assert!(!p.changed);
         // Rotation still proceeds on the existing keys.
-        let p = plan_with(&policy(), &d, None, &[], d.next_rotation).unwrap();
+        let p = plan_with(&policy(), &d, None, &[], d.next_rotation, &mut OsEntropy).unwrap();
         assert_eq!(p.durable.keys.len(), 8);
         assert!(d.keys.iter().all(|k| p.durable.keys.contains(k)));
         // An empty known catalog does drop them.
         assert!(
-            plan_with(&policy(), &d, Some(&[]), &[], t)
+            plan_with(&policy(), &d, Some(&[]), &[], t, &mut OsEntropy)
                 .unwrap()
                 .durable
                 .keys
@@ -849,7 +867,8 @@ pub(crate) mod tests {
         d.generation = 1;
         for c in &catalog {
             for p in PURPOSES {
-                d.keys.push(new_key(&c.id.0, p, "active", 1).unwrap());
+                d.keys
+                    .push(new_key(&mut OsEntropy, &c.id.0, p, "active", 1).unwrap());
             }
         }
         assert_eq!(d.keyed_caches().len(), 3);
@@ -862,8 +881,10 @@ pub(crate) mod tests {
         for i in 0..cap {
             let id = format!("{i:08x}-2222-4222-8222-222222222222");
             for p in PURPOSES {
-                big.keys.push(new_key(&id, p, "active", 1).unwrap());
-                big.keys.push(new_key(&id, p, "prepared", 2).unwrap());
+                big.keys
+                    .push(new_key(&mut OsEntropy, &id, p, "active", 1).unwrap());
+                big.keys
+                    .push(new_key(&mut OsEntropy, &id, p, "prepared", 2).unwrap());
             }
         }
         for i in 0..MAX_ROOTS {
@@ -892,21 +913,90 @@ pub(crate) mod tests {
             generation: 1,
             ..Default::default()
         };
-        d.keys
-            .push(new_key("11111111-1111-4111-8111-111111111111", "page", "active", 1).unwrap());
+        d.keys.push(
+            new_key(
+                &mut OsEntropy,
+                "11111111-1111-4111-8111-111111111111",
+                "page",
+                "active",
+                1,
+            )
+            .unwrap(),
+        );
         d.validate().unwrap();
         let mut two = d.clone();
-        two.keys
-            .push(new_key("11111111-1111-4111-8111-111111111111", "page", "active", 1).unwrap());
+        two.keys.push(
+            new_key(
+                &mut OsEntropy,
+                "11111111-1111-4111-8111-111111111111",
+                "page",
+                "active",
+                1,
+            )
+            .unwrap(),
+        );
         assert!(two.validate().is_err());
         let mut future = d.clone();
-        future.keys[0] =
-            new_key("11111111-1111-4111-8111-111111111111", "page", "active", 5).unwrap();
+        future.keys[0] = new_key(
+            &mut OsEntropy,
+            "11111111-1111-4111-8111-111111111111",
+            "page",
+            "active",
+            5,
+        )
+        .unwrap();
         assert!(future.validate().is_err());
         assert!(
             format!("{:?}", d.keys[0])
                 .find(&d.keys[0].material)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn plan_uses_injected_entropy() {
+        let catalog: Vec<_> = (0..2).map(cache).collect();
+        let d = Durable::default();
+        let t = now();
+        let a = plan_with(
+            &policy(),
+            &d,
+            Some(&catalog),
+            &[],
+            t,
+            &mut SplitMix64::new(5),
+        )
+        .unwrap();
+        let b = plan_with(
+            &policy(),
+            &d,
+            Some(&catalog),
+            &[],
+            t,
+            &mut SplitMix64::new(5),
+        )
+        .unwrap();
+        assert!(a.changed);
+        assert_eq!(
+            serde_json::to_vec(&a.durable).unwrap(),
+            serde_json::to_vec(&b.durable).unwrap()
+        );
+        let c = plan_with(
+            &policy(),
+            &d,
+            Some(&catalog),
+            &[],
+            t,
+            &mut SplitMix64::new(6),
+        )
+        .unwrap();
+        assert_ne!(
+            serde_json::to_vec(&a.durable).unwrap(),
+            serde_json::to_vec(&c.durable).unwrap()
+        );
+        assert_eq!(
+            plan_with(&policy(), &d, Some(&catalog), &[], t, &mut Failing).err(),
+            Some(KeyringError::Entropy)
         );
     }
 }

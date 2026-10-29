@@ -44,7 +44,4 @@ pub use subscription_interop::go_sdk_subscription_server as run_subscription_int
 pub(crate) mod pressure;
 
 #[cfg(test)]
-mod contention;
-
-#[cfg(test)]
 pub(crate) mod test_support;

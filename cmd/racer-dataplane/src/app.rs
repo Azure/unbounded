@@ -690,6 +690,17 @@ impl StopSignals {
     }
 }
 
+impl Drop for WorkerApplication {
+    /// Break the `Links` task cycle when the worker is dropped without a drain
+    /// (crash, failed startup, or an aborted group), so setup tasks release
+    /// their connections and admission charges.
+    fn drop(&mut self) {
+        if let Some(links) = &self.links {
+            links.abandon_setups();
+        }
+    }
+}
+
 impl Drop for StopSignals {
     fn drop(&mut self) {
         let mut installed = match INSTALLED.lock() {
@@ -1078,7 +1089,12 @@ impl WorkerApplication {
 
         let paths = Rc::new(
             Paths::with_limits(
-                Rc::new(LinkHealth::default()),
+                // Silence: the rank 0 watch's
+                // allowance, and one peer attempt per ping.
+                Rc::new(
+                    LinkHealth::default()
+                        .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
+                ),
                 limits.cached_paths.get(),
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),
@@ -1140,8 +1156,10 @@ impl WorkerApplication {
                 node.publications.clone(),
             )
             .with_hedges(hedges)
+            .with_reactor(reactor.clone())
             .with_replica_selection(config.replica_selection)
             .with_attempt_timeout(config.peer_attempt_timeout)
+            .with_rank0_hang_after(config.request_timeout / 2)
             .with_observer(admission.policy().observer().clone()),
         );
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
@@ -1667,6 +1685,9 @@ impl WorkerApplication {
         self.ownership_maintenance.poll(now, self.stopping, || {
             self.candidates.refresh_ownership(self.store.writer.index())
         });
+        if !self.stopping {
+            self.coordinator.poll_offers(now);
+        }
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);
@@ -2658,9 +2679,7 @@ impl WorkerApplication {
                 listeners_usable: self.started
                     && (self.control.is_none()
                         || self.peer_task.is_some() && self.diagnostic_task.is_some()),
-                membership_usable: snapshot
-                    .as_ref()
-                    .is_some_and(|s| self.snapshot_sequence == Some(s.sequence)),
+                membership_usable: self.membership_usable(snapshot.as_deref()),
                 admission_usable: !self.runtime.admission.is_stopped() && !self.stopping,
                 credentials_valid_until: credentials,
                 observed_until: Some(now + Duration::from_secs(2)),
@@ -2668,6 +2687,17 @@ impl WorkerApplication {
             node.count,
             self.snapshot_sequence,
         )
+    }
+
+    /// The worker applied `snapshot` and it lists this node. A node not
+    /// listed in its own membership cannot route a read; a new node is
+    /// listed only after it serves ("Joining members" in
+    /// designs/racer-core-simulation.md), so it is not ready until then.
+    fn membership_usable(&self, snapshot: Option<&Snapshot>) -> bool {
+        snapshot.is_some_and(|s| {
+            self.snapshot_sequence == Some(s.sequence)
+                && s.membership.position(self.keys.node()).is_ok()
+        })
     }
 
     /// Recover storage and accept initial control state before opening listeners.
@@ -2699,6 +2729,12 @@ impl WorkerApplication {
             self.refresh_snapshot(startup)?;
             self.activate_native(startup).await?;
             self.start_listeners().await?;
+            // Only now may managed control report this Pod: a primary
+            // admits a new member once it reports, so peers never route to
+            // a member whose listener is not open.
+            if let Some(control) = &self.control {
+                control.mark_serving();
+            }
             self.started = true;
             self.observe_health()?;
             Ok(())

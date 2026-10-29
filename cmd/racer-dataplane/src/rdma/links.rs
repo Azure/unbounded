@@ -684,6 +684,19 @@ impl Links {
         })
     }
 
+    /// Drop every background setup without waiting, and refuse new ones.
+    ///
+    /// Setup tasks own an `Rc<Links>` (`connect_link`), so `tasks` forms a
+    /// reference cycle with this value. The owner must call this when it is
+    /// dropped without a drain, or the tasks, their connections, and their
+    /// admission charges are never released.
+    pub fn abandon_setups(&self) {
+        self.draining.set(true);
+        // Take first: dropping a task runs `SetupAttempt::drop`, which uses `self`.
+        let tasks = std::mem::take(&mut *self.tasks.borrow_mut());
+        drop(tasks);
+    }
+
     /// Run `task` in the background on this worker. Driven by [`Self::poll`].
     pub fn spawn(&self, task: Operation<'static, ()>) {
         if !self.draining.get() {

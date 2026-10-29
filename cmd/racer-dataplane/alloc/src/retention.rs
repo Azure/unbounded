@@ -7,8 +7,11 @@ use std::time::{Duration, Instant};
 const GENERATIONS: usize = 4;
 
 /// Bounded rotating Bloom history. A hit is a hint, never identity or ownership.
-pub struct SecondSight {
-    hash: RandomState,
+///
+/// Production uses the randomly keyed [`RandomState`]; simulators pass a seeded
+/// [`BuildHasher`] through [`SecondSight::with_hasher`] so false positives replay.
+pub struct SecondSight<S = RandomState> {
+    hash: S,
 
     pages: [Vec<u64>; GENERATIONS],
 
@@ -24,12 +27,19 @@ pub struct SecondSight {
 impl SecondSight {
     /// Construct four generations within the byte budget, starting at `now`.
     pub fn new(bytes: usize, period: Duration, now: Instant) -> Option<Self> {
+        Self::with_hasher(bytes, period, now, RandomState::new())
+    }
+}
+
+impl<S: BuildHasher> SecondSight<S> {
+    /// Like [`SecondSight::new`] with an explicit, possibly deterministic, hasher.
+    pub fn with_hasher(bytes: usize, period: Duration, now: Instant, hash: S) -> Option<Self> {
         let words = bytes / (GENERATIONS * 8);
         if words == 0 || period.is_zero() || period.as_nanos() > u64::MAX as u128 {
             return None;
         }
         Some(Self {
-            hash: RandomState::new(),
+            hash,
             pages: std::array::from_fn(|_| vec![0; words]),
             occupancy: [0; GENERATIONS],
             current: 0,
@@ -87,8 +97,11 @@ impl SecondSight {
 }
 
 /// Exact, capacity-bounded resident heat. Only explicitly tracked keys can heat up.
-pub struct Heat<K> {
-    entries: HashMap<K, Temperature>,
+///
+/// The table is never iterated, so the hasher only affects performance; it is a
+/// parameter so simulators can avoid OS randomness entirely.
+pub struct Heat<K, S = RandomState> {
+    entries: HashMap<K, Temperature, S>,
 
     capacity: usize,
 }
@@ -112,8 +125,15 @@ impl Temperature {
 impl<K: Eq + Hash + Clone> Heat<K> {
     /// Create an empty exact table; zero capacity is invalid.
     pub fn new(capacity: usize) -> Option<Self> {
+        Self::with_hasher(capacity, RandomState::new())
+    }
+}
+
+impl<K: Eq + Hash + Clone, S: BuildHasher> Heat<K, S> {
+    /// Like [`Heat::new`] with an explicit hasher.
+    pub fn with_hasher(capacity: usize, hash: S) -> Option<Self> {
         (capacity != 0).then(|| Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_hasher(hash),
             capacity,
         })
     }
@@ -187,6 +207,32 @@ mod tests {
         }
         assert!(SecondSight::new(31, Duration::from_secs(1), start).is_none());
         assert!(SecondSight::new(32, Duration::ZERO, start).is_none());
+    }
+
+    /// Fixed-key hashers make Bloom collisions identical across instances.
+    #[test]
+    fn seeded_hasher_replays_identically() {
+        use std::hash::BuildHasherDefault;
+        type Fixed = BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+        let start = Instant::now();
+        let run = || {
+            let mut history =
+                SecondSight::with_hasher(64, Duration::from_secs(60), start, Fixed::default())
+                    .unwrap();
+            (0..200u64)
+                .map(|key| history.observe(&key, start))
+                .collect::<Vec<_>>()
+        };
+        let first = run();
+        assert_eq!(first, run());
+        assert!(first.iter().any(|seen| *seen), "tiny filter must collide");
+        assert!(
+            SecondSight::with_hasher(31, Duration::from_secs(1), start, Fixed::default()).is_none()
+        );
+        let mut heat = Heat::with_hasher(1, Fixed::default()).unwrap();
+        assert!(heat.track(&1u64, start));
+        assert!(!heat.track(&2u64, start));
+        assert!(Heat::<u64, Fixed>::with_hasher(0, Fixed::default()).is_none());
     }
 
     #[test]

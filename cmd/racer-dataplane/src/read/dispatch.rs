@@ -28,8 +28,6 @@ use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
 use crate::store::holds::{HoldEpoch, HoldPages, HolderKind};
-use sha2::Digest;
-use sha2::Sha256;
 use std::cell::RefCell;
 #[cfg(test)]
 use std::future::Future;
@@ -1414,18 +1412,13 @@ impl LocalPageService for Arc<WorkerDirectory> {
     }
 }
 
-pub struct WorkerMap {
-    workers: Vec<WorkerId>,
-}
+/// Local worker assignment; the rule lives in racer-core.
+pub struct WorkerMap(racer_core::read::WorkerMap);
 impl WorkerMap {
     /// Canonical worker order makes assignment independent of discovery order.
     /// Changing this set requires draining all flights first.
-    pub fn new(mut workers: Vec<WorkerId>) -> Result<Self> {
-        workers.sort_unstable_by_key(|worker| worker.0);
-        if workers.is_empty() || workers.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(Error::InvalidConfiguration);
-        }
-        Ok(Self { workers })
+    pub fn new(workers: Vec<WorkerId>) -> Result<Self> {
+        Ok(Self(racer_core::read::WorkerMap::new(workers)?))
     }
 
     /// Same owner as this object's page zero, without needing an ETag first.
@@ -1437,21 +1430,12 @@ impl WorkerMap {
     }
 
     fn select(&self, object: &ObjectId, page: u64) -> Result<WorkerId> {
-        let mut hash = Sha256::new();
-        hash.update(b"racer.local-worker.v1\0");
-        let length = u64::try_from(object.cache.0.len()).map_err(|_| Error::InvalidRequest)?;
-        hash.update(length.to_be_bytes());
-        hash.update(object.cache.0.as_bytes());
-        hash.update(object.key.0);
-        hash.update(page.to_be_bytes());
-        let digest = hash.finalize();
-        Ok(self.select_digest(&digest.into()))
+        Ok(self.0.select(object, page)?)
     }
 
+    #[cfg(test)]
     fn select_digest(&self, digest: &[u8; 32]) -> WorkerId {
-        let index = u64::from_be_bytes(digest[..8].try_into().expect("eight digest bytes"))
-            % u64::try_from(self.workers.len()).expect("worker count fits u64");
-        self.workers[index as usize]
+        self.0.select_digest(digest)
     }
 }
 
@@ -1587,8 +1571,8 @@ mod tests {
                     envelope,
                 )
             } else {
-                let demand = crate::peer::subscriptions::Demand::new(vec![
-                    crate::peer::subscriptions::PageInterval { start: 8, end: 10 },
+                let demand = racer_core::subscriptions::Demand::new(vec![
+                    flow_control::subscriptions::Interval { start: 8, end: 10 },
                 ])
                 .unwrap();
                 Work::Select(

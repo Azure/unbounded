@@ -708,6 +708,148 @@ pub trait SegmentEntries {
     fn is_empty(&self, segment: SegmentId) -> bool;
 }
 
+#[cfg(feature = "simulation")]
+/// Payload-free [`SegmentEntries`] for simulation: page to segment mappings,
+/// page lengths, read holds, and active writes, but no data or metadata.
+///
+/// Removal visits a segment's mappings in publication order, as the catalog
+/// index does, so [`SegmentClock`] makes the same eviction decisions when the
+/// caller supplies the same scores. Removed pages are recorded for the caller
+/// to drain with [`PhantomEntries::take_evicted`].
+pub struct PhantomEntries<K, H = std::collections::hash_map::RandomState> {
+    index: RefCell<crate::index::PageIndex<K, u32, H>>,
+
+    held: RefCell<HashSet<SegmentId>>,
+
+    writing: RefCell<HashSet<SegmentId>>,
+
+    evicted: RefCell<Vec<(K, u32)>>,
+}
+
+#[cfg(feature = "simulation")]
+impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> Default
+    for PhantomEntries<K, H>
+{
+    fn default() -> Self {
+        Self {
+            index: RefCell::new(crate::index::PageIndex::default()),
+            held: RefCell::new(HashSet::new()),
+            writing: RefCell::new(HashSet::new()),
+            evicted: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(feature = "simulation")]
+impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> PhantomEntries<K, H> {
+    /// Publish `page` with `bytes` of payload in `segment`, replacing any
+    /// older mapping. Returns the replaced length.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unavailable`] when publication ages are exhausted.
+    pub fn publish(&self, page: K, bytes: u32, segment: SegmentId) -> Result<Option<u32>> {
+        self.index
+            .borrow_mut()
+            .insert(page, bytes, segment)
+            .map_err(|_| Error::Unavailable)
+    }
+
+    /// Remove one mapping. Returns its length.
+    pub fn remove(&self, page: &K) -> Option<u32> {
+        self.index.borrow_mut().remove(page)
+    }
+
+    /// Length of a live mapping.
+    pub fn get(&self, page: &K) -> Option<u32> {
+        self.index.borrow().get(page).copied()
+    }
+
+    /// Number of live mappings.
+    pub fn len(&self) -> usize {
+        self.index.borrow().len()
+    }
+
+    /// Whether there are no live mappings.
+    pub fn is_empty(&self) -> bool {
+        self.index.borrow().is_empty()
+    }
+
+    /// Set or clear a read hold, which vetoes reclamation of the segment.
+    pub fn set_held(&self, segment: SegmentId, held: bool) {
+        let mut set = self.held.borrow_mut();
+        if held {
+            set.insert(segment);
+        } else {
+            set.remove(&segment);
+        }
+    }
+
+    /// Set or clear an active unpublished write, which vetoes eviction.
+    pub fn set_writing(&self, segment: SegmentId, writing: bool) {
+        let mut set = self.writing.borrow_mut();
+        if writing {
+            set.insert(segment);
+        } else {
+            set.remove(&segment);
+        }
+    }
+
+    /// Sum `value(page, bytes)` over at most `budget` mappings of `segment`,
+    /// charging `unseen` per mapping beyond the budget, like the catalog.
+    pub fn segment_score(
+        &self,
+        segment: SegmentId,
+        budget: usize,
+        unseen: u64,
+        mut value: impl FnMut(&K, u32) -> u64,
+    ) -> u64 {
+        self.index
+            .borrow()
+            .segment_score(segment, budget, unseen, |page, bytes| value(page, *bytes))
+    }
+
+    /// Drain pages removed by reclamation, in removal order.
+    pub fn take_evicted(&self) -> Vec<(K, u32)> {
+        std::mem::take(&mut self.evicted.borrow_mut())
+    }
+}
+
+#[cfg(feature = "simulation")]
+impl<K: Eq + std::hash::Hash + Clone, H: std::hash::BuildHasher + Default> SegmentEntries
+    for PhantomEntries<K, H>
+{
+    fn can_reclaim(&self, segment: SegmentId) -> bool {
+        !self.held.borrow().contains(&segment)
+    }
+
+    fn can_evict(&self, segment: SegmentId) -> bool {
+        !self.writing.borrow().contains(&segment) && self.can_reclaim(segment)
+    }
+
+    fn remove_bounded(&self, segment: SegmentId, budget: usize) -> usize {
+        if !self.can_evict(segment) {
+            return 0;
+        }
+        let pages: Vec<K> = self
+            .index
+            .borrow()
+            .segment(segment, budget)
+            .map(|(page, _)| page.clone())
+            .collect();
+        let mut index = self.index.borrow_mut();
+        let mut evicted = self.evicted.borrow_mut();
+        for page in &pages {
+            let bytes = index.remove(page).expect("indexed page");
+            evicted.push((page.clone(), bytes));
+        }
+        pages.len()
+    }
+
+    fn is_empty(&self, segment: SegmentId) -> bool {
+        self.index.borrow().segment_empty(segment)
+    }
+}
+
 /// One worker-local cursor and recent-read set for index and physical reclamation.
 #[repr(align(64))]
 pub struct SegmentClock {
@@ -1853,5 +1995,84 @@ mod clock_tests {
         segments.restore(segments.snapshot()).unwrap();
         clock.reclaim(&entries, 0, 0, 0).unwrap();
         assert!(clock.recent.borrow().is_empty());
+    }
+}
+
+/// Payload-free entries used by the simulator.
+#[cfg(all(test, feature = "simulation"))]
+mod phantom_tests {
+    use super::*;
+
+    /// Build a table where every slot is sealed.
+    fn sealed(count: usize) -> Rc<Segments> {
+        let segments = Segments::new(512);
+        segments
+            .configure(
+                512 * count as u64,
+                count,
+                Alignment::new(512, 512, 512).unwrap(),
+            )
+            .unwrap();
+        for _ in 0..count {
+            drop(segments.append(512).unwrap());
+        }
+        Rc::new(segments)
+    }
+
+    /// Mappings are removed in publication order and reported once.
+    #[test]
+    fn removal_follows_publication_order_and_reports_evictions() {
+        let entries = PhantomEntries::<u64>::default();
+        assert!(entries.is_empty());
+        for page in [5, 3, 9] {
+            assert_eq!(entries.publish(page, 10, SegmentId(0)).unwrap(), None);
+        }
+        assert_eq!(entries.publish(3, 20, SegmentId(0)).unwrap(), Some(10));
+        assert_eq!(entries.publish(7, 1, SegmentId(1)).unwrap(), None);
+        assert_eq!(entries.remove_bounded(SegmentId(0), 2), 2);
+        assert_eq!(entries.take_evicted(), vec![(5, 10), (9, 10)]);
+        assert!(entries.take_evicted().is_empty());
+        assert!(!SegmentEntries::is_empty(&entries, SegmentId(0)));
+        assert_eq!(entries.remove_bounded(SegmentId(0), 9), 1);
+        assert!(SegmentEntries::is_empty(&entries, SegmentId(0)));
+        assert_eq!(entries.get(&7), Some(1));
+        assert_eq!(entries.remove(&7), Some(1));
+        assert_eq!(entries.remove(&7), None);
+        assert_eq!(entries.len(), 0);
+    }
+
+    /// Holds veto reclamation; writes veto eviction only.
+    #[test]
+    fn holds_and_writes_veto_like_the_catalog() {
+        let entries = PhantomEntries::<u64>::default();
+        entries.publish(1, 10, SegmentId(0)).unwrap();
+        entries.set_writing(SegmentId(0), true);
+        assert!(entries.can_reclaim(SegmentId(0)));
+        assert!(!entries.can_evict(SegmentId(0)));
+        assert_eq!(entries.remove_bounded(SegmentId(0), 1), 0);
+        entries.set_writing(SegmentId(0), false);
+        entries.set_held(SegmentId(0), true);
+        assert!(!entries.can_reclaim(SegmentId(0)));
+        assert!(!entries.can_evict(SegmentId(0)));
+        entries.set_held(SegmentId(0), false);
+        assert!(entries.can_evict(SegmentId(0)));
+    }
+
+    /// The clock evicts the lowest scored segment and skips held ones.
+    #[test]
+    fn clock_ranks_phantom_segments_by_score() {
+        let segments = sealed(3);
+        let clock = SegmentClock::new(segments.clone());
+        let entries = PhantomEntries::<u64>::default();
+        for (page, segment, bytes) in [(1, 0, 30), (2, 1, 10), (3, 2, 5)] {
+            entries.publish(page, bytes, SegmentId(segment)).unwrap();
+        }
+        entries.set_held(SegmentId(2), true);
+        let score =
+            |segment| entries.segment_score(segment, 256, 1000, |_, bytes| u64::from(bytes));
+        clock.reclaim_scored(&entries, 1, 64, 256, score).unwrap();
+        assert_eq!(entries.take_evicted(), vec![(2, 10)]);
+        assert_eq!(segments.state(SegmentId(1)).unwrap(), SegmentState::Free);
+        assert_eq!(entries.segment_score(SegmentId(0), 0, 1000, |_, _| 1), 1000);
     }
 }

@@ -1106,3 +1106,115 @@ fn late_gpu_landing_attaches_on_active_rails_once() {
     assert!(node.take_landing_pending());
     assert!(!node.take_landing_pending());
 }
+
+/// Crash and restart `b` under the same node id: the new owner has no links,
+/// while `a` still holds its `Ready` link to the dead queue pair (half-open).
+fn restart_b(w: &mut World) {
+    let environment = w.clock.environment(1);
+    let fresh = node(&w._sim, 3, node_id(2), Some(&environment));
+    drop(std::mem::replace(&mut w.b, fresh));
+    let admission = w.b.admission.clone();
+    let rails = drive!(
+        w,
+        w.b.links
+            .activate(vec![mapping(3)], &admission, 2 * BUFFER_LEN, &scope())
+    )
+    .unwrap();
+    assert_eq!(rails.len(), 1);
+    pump!(w);
+}
+
+/// After a peer restarts, the survivor's link stays `Ready`
+/// (no traffic means no completion reports the dead peer), so the survivor
+/// never wants a setup. The restarted peer's setup replaces the stale link and
+/// both ends become ready again.
+#[test]
+fn half_open_link_after_peer_restart_recovers_when_the_peer_initiates() {
+    let mut w = world();
+    let (a, b) = (node_id(1), node_id(2));
+    let old = link_up(&mut w);
+    restart_b(&mut w);
+    assert_eq!(w.a.links.ready(&b, RAIL).map(|(_, id)| id), Some(old));
+    assert_eq!(w.b.links.state(&a, RAIL), LinkState::Idle);
+    assert!(!w.a.links.wants(&b, RAIL), "the survivor sees a ready link");
+    assert!(w.b.links.wants(&a, RAIL), "the restarted peer wants a link");
+    let scope = scope();
+    let (epoch, ours) = drive!(w, w.b.links.open(&a, RAIL, &scope)).unwrap();
+    assert_eq!(w.a.links.admit_setup(&b, RAIL), SetupAdmission::Accept);
+    let theirs = drive!(w, w.a.links.accept(&b, RAIL, &ours, &scope)).unwrap();
+    drive!(
+        w,
+        w.b.links.connect(
+            &a,
+            RAIL,
+            epoch,
+            &ours,
+            &theirs,
+            &link_setup::binding(&ours),
+            &scope
+        )
+    )
+    .unwrap();
+    pump!(w);
+    let (_, id_a) = w.a.links.ready(&b, RAIL).expect("survivor ready");
+    let (_, id_b) = w.b.links.ready(&a, RAIL).expect("restarted peer ready");
+    assert_eq!(id_a, id_b);
+    assert_ne!(id_a, old, "the stale link was replaced");
+}
+
+/// The survivor's first use of the half-open link fails at
+/// the transport and breaks it, so its own setups resume after the backoff.
+#[test]
+fn half_open_link_after_peer_restart_breaks_on_first_use() {
+    let mut w = world();
+    let b = node_id(2);
+    link_up(&mut w);
+    restart_b(&mut w);
+    assert!(w.a.links.ready(&b, RAIL).is_some());
+    let scope = scope();
+    // The grant itself may be posted before the transport reports the dead
+    // peer; either way the link must not stay ready.
+    let _ = drive!(w, w.a.links.grant(&b, RAIL, TransferId([6; 16]), &scope));
+    pump!(w);
+    assert!(w.a.links.ready(&b, RAIL).is_none(), "half-open link broke");
+    for _ in 0..8 {
+        w.clock.advance(SETUP_DEADLINE);
+        pump!(w);
+    }
+    assert!(w.a.links.wants(&b, RAIL));
+}
+
+/// Setup tasks hold an `Rc<Links>` (see `connect_link`), so `Links::tasks` is
+/// a reference cycle. `abandon_setups` must break it so an undrained owner
+/// releases the tasks and their admission charges.
+#[test]
+fn abandon_setups_breaks_the_task_cycle_and_releases_charges() {
+    let w = world_for([node_id(1), node_id(2)], true);
+    let links = w.a.links.clone();
+    let charge =
+        w.a.admission
+            .reserve(None, ResourceClass::RequestContext, 128)
+            .unwrap();
+    let held = links.clone();
+    links.spawn(Box::pin(async move {
+        let _owned = (held, charge);
+        std::future::pending::<()>().await;
+        Ok(())
+    }));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert_eq!(links.poll(&mut cx), 1);
+    assert_eq!(w.a.admission.used(ResourceClass::RequestContext), 128);
+    // The world, this test, and the pending task each own one reference.
+    assert_eq!(Rc::strong_count(&links), 3);
+
+    links.abandon_setups();
+    assert_eq!(links.setups(), 0);
+    assert_eq!(Rc::strong_count(&links), 2, "the task's reference is gone");
+    assert_eq!(w.a.admission.used(ResourceClass::RequestContext), 0);
+
+    // An abandoned facade refuses new setups, like a drained one.
+    links.spawn(Box::pin(async { Ok(()) }));
+    assert_eq!(links.setups(), 0);
+    // Idempotent.
+    links.abandon_setups();
+}

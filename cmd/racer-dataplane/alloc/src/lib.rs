@@ -168,6 +168,8 @@ pub use demand::{
     DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
+#[cfg(feature = "simulation")]
+pub use segments::PhantomEntries;
 pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
     SegmentSnapshot, SegmentState, Segments,

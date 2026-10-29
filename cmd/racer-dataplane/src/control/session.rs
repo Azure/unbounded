@@ -31,6 +31,14 @@ pub struct Session {
     /// Managed-mode report sink and the last rails it accepted.
     report: RefCell<Option<(super::Report, Option<Vec<wire::RailMapping>>)>>,
 
+    /// Rails persisted before the node serves peers, reported by
+    /// [`Session::mark_serving`]. The primary admits a new member only once
+    /// its Pod reports, so the report must not precede the peer listener.
+    unreported: RefCell<Option<Vec<wire::RailMapping>>>,
+
+    /// Set once the peer listener is open.
+    serving: std::cell::Cell<bool>,
+
     endpoint: ControlEndpoint,
 
     enrollment_transport: rest::Transport<ReactorControlIo>,
@@ -399,6 +407,8 @@ impl Session {
             rails,
             shares,
             report: RefCell::new(None),
+            unreported: RefCell::new(None),
+            serving: std::cell::Cell::new(false),
             endpoint,
             enrollment_transport,
             block_devices: RefCell::new(None),
@@ -489,8 +499,24 @@ impl Session {
         *self.report.borrow_mut() = Some((report, None));
     }
 
+    /// The peer listener is open: report the rails held back so far. A
+    /// managed primary admits a new member only after this report ("Joining
+    /// members" in designs/racer-core-simulation.md).
+    pub fn mark_serving(&self) {
+        self.serving.set(true);
+        let held = self.unreported.borrow_mut().take();
+        if let Some(nics) = held {
+            self.report_rails(&nics);
+        }
+    }
+
     /// Forward persisted rails once per distinct value; the sink only enqueues.
+    /// Before [`Session::mark_serving`] the newest rails are held instead.
     fn report_rails(&self, nics: &[wire::RailMapping]) {
+        if !self.serving.get() {
+            *self.unreported.borrow_mut() = Some(nics.to_vec());
+            return;
+        }
         let mut slot = self.report.borrow_mut();
         if let Some((report, last)) = slot.as_mut()
             && last.as_deref() != Some(nics)
@@ -1446,6 +1472,7 @@ pub(super) mod tests {
     #[test]
     fn managed_report_forwards_distinct_rails_only() {
         let session = session();
+        session.mark_serving();
         session.report_rails(&[]);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
@@ -1464,5 +1491,48 @@ pub(super) mod tests {
         session.report_rails(std::slice::from_ref(&rail));
         session.report_rails(std::slice::from_ref(&rail));
         assert_eq!(*seen.lock().unwrap(), vec![(4, vec![]), (4, vec![rail])]);
+    }
+
+    /// Nothing is reported before the peer listener is
+    /// open; then only the newest rails, once.
+    #[test]
+    fn managed_report_waits_until_serving() {
+        let session = session();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        session.set_report(Arc::new(move |shares, rails| {
+            sink.lock().unwrap().push((shares, rails))
+        }));
+        let rail = wire::RailMapping {
+            rail: wire::RailId(0),
+            device: "mlx5_0".into(),
+            port: 1,
+            gid: None,
+            numa_node: Some(0),
+        };
+        session.report_rails(&[]);
+        session.report_rails(std::slice::from_ref(&rail));
+        assert!(seen.lock().unwrap().is_empty(), "reported before serving");
+        session.mark_serving();
+        assert_eq!(*seen.lock().unwrap(), vec![(4, vec![rail.clone()])]);
+        session.mark_serving();
+        session.report_rails(std::slice::from_ref(&rail));
+        assert_eq!(seen.lock().unwrap().len(), 1, "same rails reported twice");
+        session.report_rails(&[]);
+        assert_eq!(*seen.lock().unwrap(), vec![(4, vec![rail]), (4, vec![])]);
+    }
+
+    /// Without any persisted rails, serving reports nothing (there is
+    /// nothing to report yet; enrollment persists rails first).
+    #[test]
+    fn serving_without_rails_reports_nothing() {
+        let session = session();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        session.set_report(Arc::new(move |shares, rails| {
+            sink.lock().unwrap().push((shares, rails))
+        }));
+        session.mark_serving();
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

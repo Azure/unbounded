@@ -734,7 +734,23 @@ mod faults {
             let object = self.object_id(5);
             let candidates = self.ranked_nodes(&object);
             let source = candidates[0];
-            let receiver = candidates[1];
+            // The fault is consumed only if the read crosses the link set up
+            // below. In larger topologies not every pair shares an overlay
+            // edge, and a non-neighbor routes through a relay instead, so pick
+            // the best-ranked candidate that is a direct neighbor of `source`.
+            let membership = self.nodes[0].workers[0]
+                .app
+                .snapshots
+                .current()
+                .unwrap()
+                .membership
+                .clone();
+            let source_id = self.nodes[source].config.node.clone();
+            let receiver = candidates[1..]
+                .iter()
+                .copied()
+                .find(|&n| membership.is_neighbor(&source_id, &self.nodes[n].config.node))
+                .unwrap_or(candidates[1]);
             self.update(5);
             // Candidates probe predecessors CopyOnly before filling from origin.
             // Warm the primary's exact version first, including in two-node clusters.
@@ -778,11 +794,11 @@ mod scenarios {
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;
         use crate::peer::protocol::PeerResponse;
-        use crate::peer::subscriptions::Demand;
-        use crate::peer::subscriptions::PageInterval;
         use crate::peer::subscriptions::Subscription;
         use crate::security::OriginContext;
         use crate::topology::RouteBudget;
+        use flow_control::subscriptions::Interval;
+        use racer_core::subscriptions::Demand;
 
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -838,7 +854,7 @@ mod scenarios {
                             object: object.clone(),
                             etag: StrongEtag::test_value("absent"),
                         },
-                        demand: Demand::new(vec![PageInterval { start: 0, end: 1 }]).unwrap(),
+                        demand: Demand::new(vec![Interval { start: 0, end: 1 }]).unwrap(),
                         page_budget: 3 - u32::from(sequence),
                         byte_budget: PAGE_BYTES + 16,
                         flights: None,
@@ -2756,7 +2772,8 @@ impl Harness {
     }
 
     /// Set up the persistent link from node `a` to node `b` and wait until
-    /// both ends are ready, waiting out any backoff.
+    /// both ends are ready, waiting out any backoff. If `a` is ready but `b`
+    /// is not (`b` restarted under `a`'s link), `b` initiates instead.
     fn connect_links(&mut self, a: usize, b: usize) {
         let rail = racer_control_wire::RailId(0);
         for _ in 0..64 {
@@ -2770,19 +2787,30 @@ impl Harness {
                 self.coverage.action("native-link");
                 return;
             }
-            if let rdma_verbs::LinkState::Backoff(until) = links.state(&peer, rail) {
-                self.clock.advance(
-                    until.saturating_duration_since(uring_runtime::environment::now())
-                        + Duration::from_millis(1),
-                );
+            for state in [links.state(&peer, rail), remote.state(&local, rail)] {
+                if let rdma_verbs::LinkState::Backoff(until) = state {
+                    self.clock.advance(
+                        until.saturating_duration_since(uring_runtime::environment::now())
+                            + Duration::from_millis(1),
+                    );
+                }
             }
+            // A crash-restart of `b` leaves `a` holding a half-open `Ready`
+            // link that `a` only discovers on use, so `a` never wants a setup.
+            // In production the restarted peer sets up the
+            // link when it needs one and `a` replaces the stale link; do that.
+            let (from, to, target) = if links.ready(&peer, rail).is_some() {
+                (b, a, local)
+            } else {
+                (a, b, peer)
+            };
             let endpoint =
-                crate::http::Endpoint::Peer(self.nodes[b].config.peer_listen.to_string());
-            self.nodes[a].workers[0]
+                crate::http::Endpoint::Peer(self.nodes[to].config.peer_listen.to_string());
+            self.nodes[from].workers[0]
                 .app
                 .peers
                 .transfers()
-                .ensure_link(&endpoint, &peer, rail);
+                .ensure_link(&endpoint, &target, rail);
             self.settle();
         }
         panic!("seed={} link setup stalled", self.seed);
