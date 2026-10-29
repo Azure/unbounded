@@ -376,6 +376,7 @@ Enumerated fields:
 |---|---|
 | `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container` *(open: section 3, question 3)*. |
 | `control.goal.type` | `machina`, `static` (the goal settings in the configuration file are the goal), `plugin` |
+| `control.goal.pollInterval` | A duration. Default `10m`. Only for the `plugin` source (section 7.3). |
 | `control.status.type` | `machina`, `none`, `plugin` |
 | `control.operations.enabled` | `true` (default): handle MachineOperations through machina. `false`: ignore them. |
 | `hooks[].failurePolicy` | `Fail`, `Ignore`. If omitted, each event's default (section 5.3). |
@@ -431,6 +432,19 @@ The configuration has two kinds of settings:
 |---|---|---|---|
 | Install-time settings | `machine`, `runtime` (except `runtime.nspawnContainer.image`), `credentials`, `control`, `plugins`, `hooks`, `extensions` | The configuration file only | Reset, then `v2 start` with the new file. Running `v2 start` with different install-time settings on an installed host fails the install check. |
 | Goal settings (`config.GoalSettings`) | `cluster`, `kubelet`, `components`, `artifacts`, `runtime.nspawnContainer.image` | The configuration file at bootstrap, then the goal source | A goal with different goal settings; drift decides whether a repave is needed (section 8.4) |
+
+The install check compares a fingerprint of the install-time settings only.
+v1's fingerprint also covers the Kubernetes version, OCI image and API server
+(`cmd/agent/internal/cmd/bootstrap.go:65-78`), which are goal settings in v2.
+Running `v2 start` again with different goal settings:
+
+- on a complete install, is accepted and changes nothing; the daemon handles
+  the difference as drift (section 8.4);
+- on a resumed install where the node has not started yet, provisions from the
+  new file;
+- on a resumed install where the node already started, fails if the bundle
+  rendered from the new file has a different digest from the running slot's.
+  The operator must reset, as with any fingerprint mismatch in v1.
 
 A goal source returns goal settings only. A plugin's `goal.get` response that
 contains any other field fails validation. In particular, a goal cannot change
@@ -636,11 +650,21 @@ or the environment.
 | `preflight.check` | Configuration summary | `[{name, severity, message}]` |
 | `hook` | The event payload, including the event name (5.3) | None. A plugin that handles hooks lists `hook` once in `describe`, whatever events it subscribes to. |
 
-`status.report` phases are `Provisioning`, `Ready`, `Pending` (a repave is
-waiting for the Node to be deleted), `Reconciling` (a repave or reboot is in
-progress), `Failed` and `Resetting`. `attempts` is set while a repave is being
-retried, and `leftovers` lists anything reset could not remove, as
-`{kind, id, reason}`.
+`status.report` phases:
+
+| Phase | Meaning | Reasons |
+|---|---|---|
+| `Provisioning` | The node is being built, or has started but its Node object has not been seen yet | `NodeNotRegistered` after 10 minutes without a Node (section 8.4) |
+| `Ready` | The node is running and the daemon has seen its Node object | None |
+| `Pending` | A repave is waiting for the Node to be deleted | None |
+| `Reconciling` | A repave or reboot is in progress | None |
+| `Failed` | The agent cannot make progress without a retry or an operator | `StateMismatch` (section 7.7), `StateCorrupt` (section 7.7), `RepaveFailed` (section 8.5) |
+| `Resetting` | A reset is in progress | None |
+
+`attempts` is set while a repave is being retried, and `leftovers` lists
+anything reset could not remove, as `{kind, id, reason}`. A MachineOperation
+the agent cannot handle is failed on the operation itself, with reason
+`UnsupportedOperation` (section 13); it does not change the node's phase.
 
 Operational rules:
 
@@ -682,7 +706,7 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Node state | `/var/lib/unbounded/agent-v2/node-state.json` and `.sha256` |
 | Artifact cache | `/var/lib/unbounded/agent-v2/artifacts/<sha256>` |
 | Slots: saved bundle manifests, and on `host` the staged binaries and files | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
-| Configuration copy, daemon credentials, upgrade signal | `/etc/unbounded/agent-v2/` |
+| Configuration copy (`config.json`), daemon credentials, upgrade signal | `/etc/unbounded/agent-v2/` |
 | Daemon units | `unbounded-agent-v2-daemon.service`, `unbounded-agent-v2-daemon-recovery.service` |
 | First-boot unit, if a provisioning tool installed one | For example v1's Ignition unit, `unbounded-agent-bootstrap.service` (`internal/provision/script.go:13`) |
 | Extension host units and files | As declared in each extension (section 5.4) |
@@ -694,7 +718,6 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Undo log | `/var/lib/unbounded/agent-v2/hostprep.json` |
 | Sysctls | `/etc/sysctl.d/99-kubernetes.conf`, plus values set at runtime by node components |
 | nftables flush | `nftables-flush.service`, `/etc/unbounded/kube/nftables-clear.nft` |
-| LocalDNS network | `unbounded-localdns-network.service`, `/opt/unbounded/agent/libexec/unbounded-localdns-network` |
 | apt hardening | `/etc/apt/apt.conf.d/99-unbounded-no-restart-systemd`, `/etc/needrestart/conf.d/99-unbounded.conf` |
 | Docker | `iptables: false` in `/etc/docker/daemon.json`, with a backup of the original; `docker.service` and `docker.socket` masked |
 | Swap | Tagged comments on swap entries in `/etc/fstab`; swap units masked |
@@ -705,6 +728,7 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Runtime | Items |
 |---|---|
 | `nspawn-container` | `/var/lib/machines/kube{1,2}`, `/etc/systemd/nspawn/kube{1,2}.nspawn`, `systemd-nspawn@kube{1,2}.service.d/`, `unbounded-node-boot-hook@kube{1,2}.service`, `/run/bpffs/kube{1,2}` |
+| Both, when LocalDNS is enabled | `unbounded-localdns-network.service` and `/opt/unbounded/agent/libexec/unbounded-localdns-network`, written before every node start and removed by the host network reset (section 8.3) |
 | `host` | `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, `containerd.service`, `kubelet.service`, `localdns.service` and its slice, `/run/cdi/nvidia.yaml`, the ownership and active-slot records and adoption backups under `/var/lib/unbounded/agent-v2/host-runtime/`, and the owned paths in the host runtime doc, section 4 |
 
 **Temporary:**
@@ -989,6 +1013,7 @@ type NodeBundle struct {
 	Units           []Unit           // units that run inside the node
 	SharedHostPaths []SharedHostPath // host paths made visible inside the node
 	Devices         DeviceRequest    // GPUs, KVM, InfiniBand, block, additional devices
+	HostUnits       []Unit           // host units the node needs: the LocalDNS network unit
 	Boot            []BootStep       // ordered: localdns, containerd, image import, kubelet, extensions
 	Readiness       Readiness        // kubelet active, kubeconfig non-empty, LocalDNS ready URLs
 }
@@ -1018,6 +1043,15 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
 - Boot hooks and `Recover` read the saved manifest. Nothing renders a bundle
   again after `Provision`, so nothing needs credentials or a host probe outside
   provisioning.
+
+After `Start` or `Restart`, the node manager waits for `Readiness` with v1's
+timeouts. A timeout fails the step like any other error.
+
+| Wait | When | Timeout |
+|---|---|---|
+| kubelet's kubeconfig is non-empty, after TLS bootstrapping | Bootstrap | 2 minutes (`pkg/agent/phases/nodestart/wait_kubelet.go:74`) |
+| `kubelet.service` is active | Repave and NodeReboot | 60 seconds (`wait_kubelet.go:48`) |
+| LocalDNS readiness endpoints respond, when LocalDNS is enabled | Every start | 1 minute (`pkg/agent/phases/nodestart/localdns.go:195`) |
 
 ### 7.3 Control plane integration
 
@@ -1058,9 +1092,15 @@ Built-in providers:
   and its MachineConfigurationVersion as v1 does
   (`cmd/agent/internal/daemon/controller_node.go:75-105`), and writes Machine
   status.
-- `static`: the goal settings in the configuration file are the goal; the
-  version is their digest.
-- `plugin`: delegates to a plugin (section 5.5).
+- `static`: the goal settings in the agent's copy of the configuration file,
+  `/etc/unbounded/agent-v2/config.json`, are the goal; the version is their
+  digest. The daemon watches the file. An operator changes the goal by editing
+  its goal settings. Edits to install-time settings are ignored and logged as a
+  warning (section 5.2).
+- `plugin`: delegates to a plugin (section 5.5). The daemon calls `goal.get` on
+  every Node event and every `control.goal.pollInterval`, which defaults to 10
+  minutes with up to 10% random jitter. The interval applies only to this
+  source.
 
 Bootstrap does not ask the goal source for a goal. It builds the first node
 from the configuration file and records an empty goal version. The daemon's
@@ -1127,6 +1167,8 @@ type Manager interface {
 	Reboot(ctx context.Context) error
 	Reset(ctx context.Context, trigger ResetTrigger) error
 	Recover(ctx context.Context) error // finish or clean up interrupted work
+	// Observe reads the Node and the applied state, and calls the runtime's
+	// Inspect. The daemon calls it on every reconcile.
 	Observe(ctx context.Context) (control.Observation, error)
 }
 
@@ -1236,7 +1278,7 @@ sequenceDiagram
   CLI->>CLI: log experimental warning, load and validate config, select runtime
   CLI->>St: acquire install lock, run the install check
   alt already complete
-    CLI->>NM: verify node and daemon, repair daemon if needed
+    CLI->>NM: verify node and daemon, repair daemon if needed, ignore goal-setting differences
   else fresh or resume
     CLI->>Px: hook agent.install.before
     CLI->>Px: hook host.prepare.before
@@ -1251,10 +1293,11 @@ sequenceDiagram
     NM->>RT: Provision a and save its manifest, unless a is already running
     NM->>Px: hook node.provision.after, with resumed true if a was already running
     NM->>Px: hook node.start.before, unless a is already running
+    NM->>NM: write slot a's host units
     NM->>RT: Start a, which enables it
     NM->>RT: Access a, wait for readiness
     NM->>St: save applied state with an empty goal version
-    NM->>Px: hook node.start.after, status.report Ready
+    NM->>Px: hook node.start.after
     CLI->>SD: install and start unbounded-agent-v2-daemon
     CLI->>Px: hook agent.install.after
     CLI->>St: mark install complete
@@ -1278,6 +1321,12 @@ with no target in between:
 The prerequisites are the same for both runtimes: the nftables flush, the
 LocalDNS network helper, extension host units with `orderBeforeNode`, and
 `nodeDependencies.requires` units.
+
+The LocalDNS network unit is not host preparation. Its settings come from the
+goal, and the host network reset removes it during a repave. The node manager
+writes it, with its helper, from the bundle's `HostUnits` before every
+`Start`, as v1 does at every node start
+(`pkg/agent/phases/nodestart/localdns.go:104-176`).
 
 The prerequisite and pre-start units are oneshots with `RemainAfterExit=no`.
 They are inactive once they finish, so every later start of a unit that
@@ -1322,11 +1371,11 @@ flowchart TD
   P -- yes --> RF["nodemanager.Recover: finish the interrupted repave"]
   P -- no --> K{"Request kind"}
   K -- operation --> OP["NodeReboot, AgentUpgrade or AgentReset handler"]
-  K -- reconcile --> O["Observe Node, goal and applied state"]
+  K -- reconcile --> O["Observe Node, goal, applied state and runtime state"]
   O --> D{"Decide"}
   D -- Reset --> RS["Reset, then stop daemon"]
   D -- Repave --> AP["Apply goal"]
-  D -- Wait --> W["status.report Pending"]
+  D -- Wait --> W["status.report Pending, or Provisioning until the Node is seen"]
   D -- Steady --> S["status.report Ready"]
 ```
 
@@ -1382,14 +1431,14 @@ sequenceDiagram
   NM->>Px: hook node.stop.before old
   NM->>RT: Stop old, which disables it
   NM->>Px: hook node.stop.after old
-  NM->>NM: host network reset
+  NM->>NM: host network reset, then write the new slot's host units
   NM->>Px: hook node.start.before new
   NM->>RT: Start new, which enables it
   NM->>RT: Access new, wait for readiness
   NM->>Px: hook node.start.after new
   NM->>St: commit the applied goal and digest, clear Pending
   NM->>RT: Destroy old
-  NM->>Px: hook node.repave.after, status.report Ready
+  NM->>Px: hook node.repave.after, status.report Provisioning
 ```
 
 "Old" is the slot that was running before the repave, and "new" is the other
@@ -1406,8 +1455,8 @@ When a repave fails, it is retried, matching v1:
 - Every attempt reads the goal again, as v1 does
   (`cmd/agent/internal/daemon/controller_node.go:43`). A goal change also
   queues an attempt at once, so a corrected goal does not wait out the backoff.
-- Each failed attempt is reported as `Failed`, with the attempt count and the
-  last error (`Pending.Attempts`, `Pending.LastError`).
+- Each failed attempt is reported as `Failed` with reason `RepaveFailed`, the
+  attempt count and the last error (`Pending.Attempts`, `Pending.LastError`).
 - There is no rollback. The old slot stays stopped and intact until a later
   attempt succeeds, and is destroyed only then. Starting the old node again is
   not useful: the control plane deleted its Node to approve the repave, and its
@@ -1415,6 +1464,14 @@ When a repave fails, it is retried, matching v1:
 - If stopping the old slot fails, for example with `ErrNodeBusy` or
   `ErrMountsRemain` on `host`, the attempt ends there and the new slot is not
   started. The node stays down until a retry succeeds, as in v1.
+
+If the goal changes while a repave is in progress:
+
+- Before the new slot has been started, the next attempt replaces `Pending`
+  and provisions the new slot again from the new goal.
+- Once the new slot has been started, the repave finishes and commits the goal
+  it started with. The newer goal is then ordinary drift and needs another Node
+  deletion (section 8.4).
 
 ### 8.6 NodeReboot
 
@@ -1715,6 +1772,7 @@ here should match v1.
 | Reset | Leaves host preparation in place | Reverses it from the undo log | 12 |
 | MachineOperations without a handler | Ignored | Failed, if the kind belongs to the agent | 13 |
 | Configuration | v1 JSON or environment variables | Versioned v2 file, or v1 JSON converted; environment variables dropped | 5.2, appendix A |
+| Install check | Fingerprints the Kubernetes version, OCI image and API server, and fails `start` on any change | Fingerprints install-time settings only; goal-setting changes are handled as drift | 5.2 |
 | Agent upgrade | Checks the candidate answers `version` | Also checks it answers `v2 version` | 8.7 |
 | Extension points | `pkg/agent` as a library | Plugins, hooks and declarative extensions | 5 |
 
