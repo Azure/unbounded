@@ -1132,6 +1132,12 @@ Where the bytes come from decides who decrypts them:
   `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
   for that device, reads files on that device through host memory until it
   restarts, and keeps cuFile on for other devices.
+- When several `gpu-read` requests want the same page at once, such as every
+  GPU loading the same model weights, the page is read from disk or a peer
+  only once. A request for the same GPU, or for a GPU that can copy from it
+  directly (peer access), reuses that encrypted copy. Each GPU still checks
+  and decrypts the page itself. The copy is reused only while some request
+  still holds it. `racer_gpu_direct_joined_total` counts reused copies.
 
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
