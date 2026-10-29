@@ -191,6 +191,7 @@ impl Checkpointer {
 
     /// Periodic disposable hints. The coordinator serializes generations. No
     /// fsync is issued.
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_async(
         &self,
         cluster: ClusterId,
