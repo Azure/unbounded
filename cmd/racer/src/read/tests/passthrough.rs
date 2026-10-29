@@ -517,3 +517,42 @@ fn reads_after_switching_a_warmed_cache_to_passthrough_use_origin() {
         assert_eq!(directory.warm.lease_count(&version), 0, "{mode:?}");
     }
 }
+
+/// A publication queued by a cached fill can reach the metadata owner after
+/// the cache switched to passthrough. The owner drops it rather than
+/// repopulating the catalog after the one-time purge.
+#[test]
+fn queued_publication_is_dropped_after_switching_to_passthrough() {
+    use crate::test_support::security::network;
+    for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _queue = queue.enter();
+        let signers = network(1);
+        let mut f = fixture_with(PAGE_BYTES + 7, None);
+        f.reactor.init().unwrap();
+        let membership = f.membership.clone();
+        let (local, mut endpoint, _publication) =
+            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        let directory = f.fill.dependencies.metadata_owner.clone();
+        let mut metadata = f.origin.metadata.immutable();
+        metadata.version.etag = StrongEtag::test_value("queued-publish");
+        let version = metadata.version.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // The cached fill queues its publication before the mode switch.
+        let mut future = directory.queue_publication(metadata, &f.scope).unwrap();
+        f.set_mode(mode);
+        let mut output = None;
+        for _ in 0..4096 {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                output = Some(result);
+                break;
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        output.expect("publication did not complete").unwrap();
+        drop(future);
+        let published = local.metadata.catalog().version(&version).unwrap();
+        assert_eq!(published.is_some(), !mode.passthrough(), "{mode:?}");
+        endpoint.uninstall().unwrap();
+    }
+}

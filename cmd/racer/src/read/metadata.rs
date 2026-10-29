@@ -232,6 +232,12 @@ impl MetadataService {
         self.storage.index.publish_version(metadata)
     }
 
+    /// The catalog this service publishes into.
+    #[cfg(test)]
+    pub(crate) fn catalog(&self) -> &Rc<Index> {
+        &self.storage.index
+    }
+
     /// Build a worker-local coordinator with bounded refresh registrations.
     pub fn new(
         candidates: Rc<CandidatePolicy>,

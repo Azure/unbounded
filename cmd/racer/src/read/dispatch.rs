@@ -1017,6 +1017,23 @@ impl WorkerDirectory {
             }
         })
     }
+    /// Queue a publication on the metadata owner's mailbox, as a fill on
+    /// another worker would, even when the owner is this thread.
+    #[cfg(test)]
+    pub(crate) fn queue_publication<'a>(
+        &'a self,
+        metadata: VersionMetadata,
+        scope: &'a RequestScope,
+    ) -> Result<Operation<'a, ()>> {
+        let owner = self.metadata_owner(&metadata.version.object)?;
+        let receipt = self.submit(owner, Work::Publish(metadata), scope, None)?;
+        Ok(Box::pin(async move {
+            match receipt.await?.value? {
+                Value::Published => Ok(()),
+                _ => Err(Error::StaleFlight),
+            }
+        }))
+    }
     pub fn retained_metadata<'a>(
         &'a self,
         version: &'a ObjectVersion,
@@ -1396,7 +1413,12 @@ async fn execute(
             Ok(Value::Published)
         }
         Work::Publish(metadata) => {
-            local.metadata.publish_version(metadata)?;
+            // A fill queued while the cache was cached may arrive after the
+            // switch to passthrough and its one-time purge. Drop it so the
+            // catalog never retains passthrough metadata.
+            if !local.fill.passthrough(&metadata.version.object.cache) {
+                local.metadata.publish_version(metadata)?;
+            }
             Ok(Value::Published)
         }
         Work::Retained(version) => local
