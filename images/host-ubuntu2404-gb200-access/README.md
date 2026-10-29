@@ -27,8 +27,10 @@ The dedicated build script runs on a native ARM64 host. It mounts the qualified
 raw disk in a private mount namespace, performs the package and DKMS work in the
 disk's own ARM64 userspace, then boots a disposable overlay. It uses KVM when
 available and otherwise uses TCG to verify that the exact target kernel starts.
-Full userspace and driver validation belongs on the separately authorized
-target-hardware canary. The build verifies:
+Pull requests that change this image run the same native ARM64 disk build and
+boot verification without publishing an image. Full userspace and driver
+validation belongs on the separately authorized target-hardware canary. The
+build verifies:
 
 - the source and package checksums;
 - Ubuntu `24.04` and kernel `6.14.0-1003-azure-nvidia` package versions;

@@ -8,6 +8,11 @@ on:
     tags:
       - "images/*/*"
 
+  pull_request:
+    paths:
+      - ".github/workflows/images.yaml"
+      - "images/host-ubuntu2404-gb200-access/**"
+
   workflow_dispatch:
     inputs:
       image:
@@ -54,6 +59,9 @@ jobs:
             ref="${{ github.ref_name }}"            # e.g. images/agent-ubuntu2404/v1.0.0
             name=$(echo "$ref" | cut -d/ -f2)       # e.g. agent-ubuntu2404
             tag=$(echo "$ref" | cut -d/ -f3-)       # e.g. v1.0.0
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            name=host-ubuntu2404-gb200-access
+            tag="${{ github.event.pull_request.head.sha }}"
           else
             # workflow_dispatch
             name="${{ inputs.image }}"
@@ -116,6 +124,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -163,7 +172,7 @@ jobs:
           context: .
           file: ${{ needs.resolve.outputs.file }}
           platforms: ${{ needs.resolve.outputs.platforms }}
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
