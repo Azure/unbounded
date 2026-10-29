@@ -29,8 +29,13 @@ runtime has no container, so it has to provide each guarantee itself.
 
 ## 2. Principles
 
-1. **Delete only what is provably owned.** A path is deleted only if it is in
-   the ownership record or the installed-files manifest.
+1. **Delete only what is provably owned.** A file or directory is deleted only
+   if it is in the ownership record or the installed-files manifest. Network
+   objects are the one exception, because the host network namespace keeps no
+   record of who created what. They are deleted when they match names that only
+   node components create, such as the `UNBOUNDED-*`, `KUBE-*` and `CNI-*`
+   iptables chains and unbounded-net's links, or when an extension declares
+   them (main doc, section 11).
 2. **Never cross a mount or follow a symlink while deleting.** A mount found
    inside a tree being deleted aborts the deletion. Pod volumes are often bind
    mounts of host data, and deleting through one destroys that data.
@@ -62,30 +67,31 @@ durably with a `.sha256` sidecar.
     }
   ],
   "installedFiles": [ { "path": "/etc/systemd/system/kubelet.service", "sha256": "..." } ],
-  "originalSysctls": { "net.ipv4.ip_forward": "0", "net.ipv4.conf.eth0.rp_filter": "2" },
   "rtTablesExisted": true,
   "observedHostPaths": [ "/var/lib/some-daemonset" ]
 }
 ```
 
 The runtime takes ownership of each path on the first slot change (section 8). It
-records the path before creating anything there.
+records the path before creating anything there. Original sysctl values are not
+kept here; the host preparation undo log keeps them for both runtimes (main
+doc, section 12).
 
 | State of the path when the runtime takes ownership | Result |
 |---|---|
 | Absent | Create it; record `created: true` |
 | Exists and empty | Record `created: false` |
 | Exists and is a mount point, such as a dedicated disk for `/var/lib/containerd` | Record `preexistingMount: true`. The mount is never unmounted; only its contents are wiped. |
-| Exists, non-empty, no adoption entry | Preflight error `existing-node-state`, listing the path |
-| Exists, non-empty, adoption `Preserve` | Copy the contents into a backup, then take ownership with `adopted: "Preserve"`. Teardown restores the backup. |
-| Exists, non-empty, adoption `Discard` | Take ownership with `adopted: "Discard"`. The contents are deleted at the first wipe. Teardown leaves the path empty. |
+| Exists, non-empty, no `adoptExistingPaths` entry | Preflight error `existing-node-state`, listing the path |
+| Exists, non-empty, adoption policy `Preserve` | Copy the contents into a backup, then take ownership with `adopted: "Preserve"`. Teardown restores the backup. |
+| Exists, non-empty, adoption policy `Discard` | Take ownership with `adopted: "Discard"`. The contents are deleted at the first wipe. Teardown leaves the path empty. |
 
 `Preserve` backups:
 
 - live in `/var/lib/unbounded/agent-v2/host-runtime/adopted/<sha256-of-path>/`;
 - keep mode, ownership, extended attributes and SELinux labels;
-- are capped at `runtime.host.adoptPreserveMaxBytes`, 1 GiB by default; above
-  the cap, preflight fails and suggests `Discard`;
+- are capped per path at `runtime.host.adoptPreserveMaxBytes`, 1 GiB by
+  default; above the cap, preflight fails and suggests `Discard`;
 - must stay within one filesystem; a mount inside the tree fails the adoption.
 
 Preflight reports the adoption plan before anything changes: each path, its
@@ -98,33 +104,32 @@ Without an ownership record, Teardown is conservative (section 9).
 
 ## 4. Owned resources
 
-Classes: **volatile** paths are cleared at Unmount, **persistent** paths at
-Wipe, **installed** items at Uninstall, and **file edits** (line-level changes
-to host files) are reverted at Uninstall.
+**Volatile** paths are cleared by Unmount, and **persistent** paths by Wipe
+(section 5). The last column says which cleanup level removes each resource.
 
-| Path or resource | Created by | Class | Notes |
+| Path or resource | Created by | Cleared at | Notes |
 |---|---|---|---|
-| Processes in `unboundednode.slice` | runtime, kubelet, containerd | process | Section 6 |
-| Mounts under `/var/lib/kubelet`, `/var/lib/containerd`, `/run/containerd` | kubelet, containerd | mount | Section 7 |
-| `/run/netns/cni-*`, these entries only | containerd and CNI *(inference)* | network namespace | Section 7 |
-| `/run/containerd` | containerd; gantry hostPath (`deploy/gantry/chart/values.yaml:26`) | volatile | |
-| `/run/unbounded-net` | unbounded-net hostPath (`deploy/net/node/03-daemonset.yaml.tmpl:136-139`) | volatile | IPAM socket |
-| `/run/racer` | racer hostPath (`internal/racer/workload/workload.go:292`) | volatile | |
-| `/var/run/cdi/nvidia.yaml` | runtime pre-start hook | volatile | Regenerated on every start |
-| `/var/lib/kubelet` | kubelet, bundle | persistent | Includes kubelet client certificates, so a wipe forces TLS bootstrapping again |
-| `/var/lib/containerd` | containerd | persistent | Images and gantry's content cache; see `retainContainerImages` (section 8) |
-| `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | persistent | Rewritten from the bundle on each slot change |
-| `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | persistent | Bundle plugins are installed again after the wipe |
-| `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:314-319`) | persistent | |
-| `/var/lib/cni` | CNI IPAM *(inference)* | persistent | |
-| `/var/log/pods`, `/var/log/containers` | kubelet *(inference)* | persistent | |
-| `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | persistent | The directory is left alone; the host may have its own WireGuard configuration |
-| `/var/lib/gantry` | gantry (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | persistent | libp2p identity |
-| `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | persistent | |
-| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | file edit | Lines removed at Uninstall. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
-| Slot directories | runtime | staged | Removed by `Destroy` or Teardown |
-| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, the LocalDNS network unit and helper, extension host units | runtime | installed | |
-| Extension `cleanup.statePaths` | consumer | as declared | Section 13 |
+| Processes in `unboundednode.slice` | runtime, kubelet, containerd | Terminate | Section 6 |
+| Mounts under `/var/lib/kubelet`, `/var/lib/containerd`, `/run/containerd` | kubelet, containerd | Unmount | Section 7 |
+| `/run/netns/cni-*`, these entries only | containerd and CNI *(inference)* | Unmount | Section 7 |
+| `/run/containerd` | containerd; gantry hostPath (`deploy/gantry/chart/values.yaml:26`) | Unmount (volatile) | |
+| `/run/unbounded-net` | unbounded-net hostPath (`deploy/net/node/03-daemonset.yaml.tmpl:136-139`) | Unmount (volatile) | IPAM socket |
+| `/run/racer` | racer hostPath (`internal/racer/workload/workload.go:292`) | Unmount (volatile) | |
+| `/run/cdi/nvidia.yaml` | runtime pre-start boot hook | Unmount (volatile) | Regenerated on every start. containerd also reads it as `/var/run/cdi`. |
+| `/var/lib/kubelet` | kubelet, bundle | Wipe (persistent) | Includes kubelet client certificates, so a wipe forces TLS bootstrapping again |
+| `/var/lib/containerd` | containerd | Wipe (persistent) | Images and gantry's content cache; see `retainContainerImages` (section 8) |
+| `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | Wipe (persistent) | Rewritten from the bundle on each slot change |
+| `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | Wipe (persistent) | Bundle plugins are installed again after the wipe |
+| `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:314-319`) | Wipe (persistent) | |
+| `/var/lib/cni` | CNI IPAM *(inference)* | Wipe (persistent) | |
+| `/var/log/pods`, `/var/log/containers` | kubelet *(inference)* | Wipe (persistent) | |
+| `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | Wipe (persistent) | The directory is left alone; the host may have its own WireGuard configuration |
+| `/var/lib/gantry` | gantry (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Wipe (persistent) | libp2p identity |
+| `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | Wipe (persistent) | |
+| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | Uninstall | A line-level edit. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
+| Slot directories | runtime | `Destroy`, or Uninstall | |
+| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, extension host units | runtime | Uninstall | The LocalDNS network unit and helper belong to host preparation and the host network reset (main doc, sections 11 and 12) |
+| Extension `cleanup.statePaths` | consumer | Unmount or Wipe, by the declared class | Section 13 |
 
 ## 5. Cleanup levels
 
@@ -172,16 +177,19 @@ Containment:
 - The slice name has no hyphen. systemd treats `-` as the slice hierarchy
   separator, and kubelet escapes `-` in `cgroupRoot` *(inference)*.
 
+systemd does the stopping. Stopping a slice stops every unit in it: SIGTERM,
+then SIGKILL after each unit's stop timeout *(inference: systemd slice and
+scope semantics)*. The runtime bounds the wait itself and uses `cgroup.kill`
+only as a backstop:
+
 ```mermaid
 sequenceDiagram
   participant HR as host runtime
   participant SD as systemd
   participant CG as unboundednode.slice
-  HR->>SD: stop kubelet.service
-  HR->>SD: stop containerd.service, shims stay in the slice
-  HR->>SD: stop localdns.service
-  HR->>CG: SIGTERM every process in the subtree
-  HR->>CG: wait for populated 0, up to stopGracePeriod
+  HR->>SD: stop kubelet.service, so it cannot restart pods
+  HR->>SD: stop unboundednode.slice, waiting up to stopGracePeriod
+  HR->>CG: check populated 0
   alt still populated
     HR->>CG: write 1 to cgroup.kill
     HR->>CG: wait for populated 0, up to killTimeout
@@ -189,24 +197,27 @@ sequenceDiagram
   alt still populated
     HR-->>HR: fail with ErrNodeBusy, report PIDs, executables and states
   end
-  HR->>SD: stop unboundednode.slice, reset-failed
+  HR->>SD: reset-failed
 ```
 
+- Stopping the slice also stops containerd's shims. They run in the slice even
+  though containerd's `KillMode=process` leaves them running when only
+  containerd stops.
 - `stopGracePeriod` defaults to 30 seconds and `killTimeout` to 15 seconds,
   matching v1's machine stop and terminate waits
   (`pkg/agent/phases/reset/machine.go:66,83`).
-- Signals are sent to the whole cgroup, not per pod through the CRI. That
-  matches v1, where pods get SIGTERM and then SIGKILL as the machine scope
-  stops *(inference)*.
+- Signals go to the whole slice, not to each pod through the CRI. That matches
+  v1, where pods get SIGTERM and then SIGKILL as the machine scope stops
+  *(inference)*.
 - A process stuck in uninterruptible sleep, for example on a dead NFS mount,
   leaves the cgroup populated. Terminate then fails, and Wipe never runs over
   live state.
 
 Preflight for the `host` runtime requires the unified cgroup v2 hierarchy and
-`cgroup.kill` (Linux 5.14 or later). If `cgroup.kill` is missing, the runtime
-falls back to repeated SIGKILL over `cgroup.procs` until the cgroup is empty.
-v1 only checks that `/sys/fs/cgroup` exists
-(`pkg/agent/phases/host/preflight_host.go:476-491`).
+`cgroup.kill`, which needs Linux 5.14 or later *(inference: kernel cgroup v2
+interface)*. Every supported host kernel has it: Ubuntu 24.04 ships 6.8 and
+Azure Linux 3 ships 6.6 *(inference)*. v1 only checks that `/sys/fs/cgroup`
+exists (`pkg/agent/phases/host/preflight_host.go:476-491`).
 
 ## 7. Unmount
 
@@ -270,8 +281,7 @@ Wipe:
 2. Terminate and Unmount, both verified.
 3. Clear every persistent path in the ownership record and every declared
    `cleanup.statePaths` entry. Directories keep their mode and SELinux label;
-   only their contents are removed. The WireGuard and CDI entries are single
-   files.
+   only their contents are removed. The WireGuard entries are single files.
 4. The safe remover opens with `O_NOFOLLOW`, compares `st_dev` with the root's
    device at every directory and aborts with `ErrMountInTree` on a mismatch,
    unlinks symlinks without following them, and refuses if an owned path has
@@ -332,8 +342,9 @@ Without an ownership record, Teardown is conservative:
 - Every non-empty standard path in section 4 is reported as a leftover.
 - `v2 reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.
-- The original sysctl values cannot be restored without the record. That is
-  reported with the list of keys.
+- Host preparation, including the original sysctl values, is still reversed
+  from its own undo log (main doc, section 12). If that log is missing too, the
+  sysctl keys that could not be restored are reported.
 
 ## 10. Post-conditions
 
@@ -416,12 +427,6 @@ const (
 	LevelUninstall                  // nothing the runtime installed
 )
 
-type Leftover struct {
-	Kind   string // process, mount, netns, path, unit, link, rule, chain, pin, sysctl
-	ID     string
-	Reason string
-}
-
 type cleaner struct {
 	sys    SystemOps
 	owned  *OwnershipStore
@@ -430,7 +435,7 @@ type cleaner struct {
 }
 
 func (c *cleaner) To(ctx context.Context, lvl Level) error
-func (c *cleaner) Verify(ctx context.Context, lvl Level) ([]Leftover, error)
+func (c *cleaner) Verify(ctx context.Context, lvl Level) ([]runtime.Leftover, error)
 
 // SystemOps is the boundary between the cleaner and the operating system.
 // Fakes drive unit tests for ordering and safety.
