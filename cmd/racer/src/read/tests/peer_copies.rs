@@ -3863,7 +3863,7 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
             } else {
                 Reply::Stale
             };
-            peers.reply(&n, reply);
+            peers.reply(n, reply);
         }
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, attempts, links);
         let result = acquire(&mut f, &mut budget);
@@ -3934,7 +3934,7 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
                 } else {
                     Reply::Miss
                 };
-                peers.reply(&n, reply);
+                peers.reply(n, reply);
             }
             // Then version 1's other owner, which is not a current one. It
             // is also the member ranked fourth, a demoted target granted with
@@ -4025,7 +4025,7 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
                 } else {
                     Reply::Miss
                 };
-                peers.reply(&n, reply);
+                peers.reply(n, reply);
             }
         }
         // What a delegation carries: the origin credit and one link.
@@ -4282,7 +4282,7 @@ fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
             .iter()
             .filter(|n| **n != ordered[0] && **n != ordered[1])
         {
-            peers.reply(&node, Reply::Miss);
+            peers.reply(node, Reply::Miss);
         }
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
         let result = acquire(&mut f, &mut budget).unwrap();
