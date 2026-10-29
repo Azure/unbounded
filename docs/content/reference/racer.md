@@ -216,6 +216,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
+| `RACER_GPU_PEER` | `auto` | `auto` lets one GPU copy an encrypted page another GPU already holds over NVLink or PCIe peer-to-peer where the driver allows it; `off` moves such pages through host memory. Each GPU still checks the page itself |
 | `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
