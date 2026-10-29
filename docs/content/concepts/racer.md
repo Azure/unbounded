@@ -45,7 +45,9 @@ another fetch.
 - **No code changes for most apps.** The
   [`racer-object` sidecar]({{< relref "reference/racer-object" >}}) serves an
   S3 or Azure Blob API on pod loopback. A webhook adds it to labeled pods.
-  Existing S3 and Azure SDK clients only change their endpoint. vLLM and
+  Existing S3 and Azure SDK clients change only settings: the endpoint, plus
+  [path-style addressing and checksum settings]({{< relref "reference/racer-object#s3-api" >}})
+  for S3. vLLM and
   containerd have their own integrations.
 - **Encrypted and verified data.** Pages are encrypted and authenticated with
   a per-cache key between nodes and on disk. Nodes sign their requests. The
