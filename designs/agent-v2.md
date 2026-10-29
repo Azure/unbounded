@@ -1148,7 +1148,7 @@ sequenceDiagram
 - `nspawn-container`: `systemctl restart systemd-nspawn@<m>`, which runs the
   hooks again, matching v1
   (`pkg/agent/phases/nodestart/nspawn_lifecycle.go:36-40`).
-- `host`: Quiesce and Release (section 10), the pre-start hook, the pre target
+- `host`: Terminate and Unmount (section 10), the pre-start hook, the pre target
   and node target, then the post-start hook.
 
 There is no host network reset on reboot, matching v1's `RestartNode`
@@ -1353,9 +1353,9 @@ Without a claims record, Teardown is conservative (10.10).
 
 ### 10.4 Owned resources
 
-Classes: **volatile** paths are cleared at Release, **persistent** paths at
-Wipe, **installed** items at Remove, and **edits** (line-level changes to host
-files) are reverted at Remove.
+Classes: **volatile** paths are cleared at Unmount, **persistent** paths at
+Wipe, **installed** items at Uninstall, and **edits** (line-level changes to
+host files) are reverted at Uninstall.
 
 | Path or resource | Created by | Class | Notes |
 |---|---|---|---|
@@ -1376,7 +1376,7 @@ files) are reverted at Remove.
 | `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | persistent | The directory is left alone; the host may have its own WireGuard configuration |
 | `/var/lib/gantry` | gantry (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | persistent | libp2p identity |
 | `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | persistent | |
-| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | edit | Lines removed at Remove. If the file did not exist at claim time and only default content remains, the file is removed. |
+| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | edit | Lines removed at Uninstall. If the file did not exist at claim time and only default content remains, the file is removed. |
 | Slot directories | runtime | staged | Removed by `Destroy` or Teardown |
 | Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, the `unbounded-node*` targets, the LocalDNS network unit and helper, extension host units | runtime | installed | |
 | Extension `cleanup.statePaths` | consumer | as declared | 10.14 |
@@ -1387,32 +1387,32 @@ Each level includes every level before it.
 
 | Level | Removes | `nspawn-container` equivalent |
 |---|---|---|
-| Quiesce | All node processes | Stopping or terminating the machine |
-| Release | Node mounts, pod network namespace handles, volatile paths | The machine's mount namespace and `/run` going away |
+| Terminate | All node processes | `machinectl terminate`, or stopping the machine |
+| Unmount | Node mounts, pod network namespace handles, and the runtime directories under `/run` | The machine's mount namespace and `/run` going away |
 | Wipe | All persistent node state | A new rootfs |
-| Remove | Everything the runtime installed: units, files, slots, edits, claims | `machinectl remove` and removal of the nspawn configuration |
+| Uninstall | Everything the runtime installed: units, files, slots, edits, claims | `machinectl remove` and removal of the nspawn configuration |
 
 ```mermaid
 flowchart LR
-  Q["Quiesce"] --> R["Release"] --> W["Wipe"] --> X["Remove"]
-  S["Stop, Restart"] -.->|runs up to| R
+  T1["Terminate"] --> U1["Unmount"] --> W["Wipe"] --> X["Uninstall"]
+  S["Stop, Restart"] -.->|runs up to| U1
   A["Start of a new activation"] -.->|runs up to| W
   T["Teardown"] -.->|runs up to| X
 ```
 
 | Method | `host` runtime behavior |
 |---|---|
-| `Stop(slot)` | Quiesce, then Release |
-| `Restart(slot)` | Quiesce, Release, the pre-start hook, start the pre target and node target, the post-start hook |
+| `Stop(slot)` | Terminate, then Unmount |
+| `Restart(slot)` | Terminate, Unmount, the pre-start hook, start the pre target and node target, the post-start hook |
 | `Start(slot)`, same activation | Start the pre target, then the node target. No wipe. |
-| `Start(slot)`, new activation | Quiesce, Release, Wipe, verify, install the slot's content, write the activation record, start (10.8) |
+| `Start(slot)`, new activation | Terminate, Unmount, Wipe, verify, install the slot's content, write the activation record, start (10.8) |
 | `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotActive` for the active slot. |
-| `Teardown()` | Every level through Remove (10.10) |
+| `Teardown()` | Every level through Uninstall (10.10) |
 
 The host network reset is not a runtime method. The node manager runs it for
 both runtimes (10.9).
 
-### 10.6 Quiesce
+### 10.6 Terminate
 
 Containment:
 
@@ -1454,7 +1454,7 @@ sequenceDiagram
   matches v1, where pods get SIGTERM and then SIGKILL as the machine scope
   stops *(inference)*.
 - A process stuck in uninterruptible sleep, for example on a dead NFS mount,
-  leaves the cgroup populated. Quiesce then fails, and Wipe never runs over
+  leaves the cgroup populated. Terminate then fails, and Wipe never runs over
   live state.
 
 Preflight for the `host` runtime requires the unified cgroup v2 hierarchy and
@@ -1463,9 +1463,9 @@ falls back to repeated SIGKILL over `cgroup.procs` until the cgroup is empty.
 v1 only checks that `/sys/fs/cgroup` exists
 (`pkg/agent/phases/host/preflight_host.go:476-491`).
 
-### 10.7 Release
+### 10.7 Unmount
 
-Release runs only after Quiesce has verified that no node processes remain.
+Unmount runs only after Terminate has verified that no node processes remain.
 
 1. Read `/proc/self/mountinfo`. Select mount points under the owned mount roots
    and under `/run/netns/cni-*`, excluding `baselineMount` roots.
@@ -1490,7 +1490,7 @@ first `Start` after `Provision` begins with fresh state.
 stateDiagram-v2
   [*] --> Inactive
   Inactive --> Wiping: Start, activation does not match slot and digest
-  Wiping --> Installing: Quiesce, Release and Wipe verified
+  Wiping --> Installing: Terminate, Unmount and Wipe verified
   Installing --> Active: slot content installed, record phase Active
   Active --> Running: start pre target, then node target
   Running --> Active: Stop
@@ -1502,7 +1502,7 @@ stateDiagram-v2
 Wipe:
 
 1. Write `phase: Wiping` durably.
-2. Quiesce and Release, both verified.
+2. Terminate and Unmount, both verified.
 3. Clear every persistent path in the claims record and every declared
    `cleanup.statePaths` entry. Directories keep their mode and SELinux label;
    only their contents are removed. The WireGuard and CDI entries are single
@@ -1528,7 +1528,7 @@ With `runtime.host.repave.retainContainerImages: true`, step 3 does not clear
    namespace, delete all leases except image leases, and run garbage
    collection. Images, their content and their unpacked snapshots remain,
    including gantry's cache.
-3. Stop the maintenance instance and Quiesce its slice again.
+3. Stop the maintenance instance and run Terminate on its slice again.
 4. Delete the CRI plugin's state directory under `/var/lib/containerd`
    (`io.containerd.grpc.v1.cri`). Nothing else inside containerd's root is
    deleted file by file, so its metadata stays consistent.
@@ -1570,7 +1570,7 @@ again *(inference)*.
 
 ```mermaid
 flowchart TD
-  A["Mark install Resetting"] --> B["Quiesce, Release, Wipe, best effort"]
+  A["Mark install Resetting"] --> B["Terminate, Unmount, Wipe, best effort"]
   B --> C["Host network reset, teardown scope"]
   C --> D["Stop, disable and remove installed units, daemon-reload, reset-failed"]
   D --> E["Remove installed files, content checked against the manifest"]
@@ -1602,8 +1602,8 @@ Without a claims record, Teardown is conservative:
 
 | After | Must be true | On violation |
 |---|---|---|
-| Quiesce | `unboundednode.slice` reports `populated 0`; no process runs an executable from a slot directory | `ErrNodeBusy`; Wipe and Start do not run |
-| Release | No non-baseline mounts under the owned roots; no `/run/netns/cni-*` | `ErrMountsRemain`; Wipe does not run |
+| Terminate | `unboundednode.slice` reports `populated 0`; no process runs an executable from a slot directory | `ErrNodeBusy`; Wipe and Start do not run |
+| Unmount | No non-baseline mounts under the owned roots; no `/run/netns/cni-*` | `ErrMountsRemain`; Wipe does not run |
 | Wipe | Every persistent owned path is empty; no declared pins remain | `ErrStateRemains`; the slot is not activated |
 | Host network reset | No owned links, rules or tables; no `unbounded_localdns` table; on Teardown, no owned chains | Repave: error, retried by `Recover`. Teardown: leftover. |
 | Teardown | Nothing in the footprint remains; no claims record | Leftovers reported; non-zero exit |
@@ -1615,7 +1615,7 @@ Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
 
 | Interrupted during | Next action |
 |---|---|
-| Quiesce or Release inside `Stop` | `Stop` is idempotent; `Recover` or the caller runs it again |
+| Terminate or Unmount inside `Stop` | `Stop` is idempotent; `Recover` or the caller runs it again |
 | `phase: Wiping` or `Installing` | The next `Start` wipes again, then installs |
 | `phase: Active`, before the node target starts | `Start` with the same activation, no wipe |
 | Teardown | Run again from the beginning; every step tolerates absent state |
@@ -1624,7 +1624,7 @@ Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
 ### 10.13 Not cleaned
 
 1. **Undeclared hostPath directories** outside the owned list. Before each
-   Quiesce, the runtime lists the host sources of all container mounts through
+   Terminate, the runtime lists the host sources of all container mounts through
    the CRI API and records them as `observedHostPaths`. Wipe and Teardown
    report them but never delete them, so the gap with `nspawn-container` stays
    visible.
@@ -1672,10 +1672,10 @@ package host // internal/agentv2/runtime/host
 type Level int
 
 const (
-	LevelQuiesce Level = iota + 1 // no node processes
-	LevelRelease                  // no node mounts, pod netns handles or volatile state
-	LevelWipe                     // no persistent node state
-	LevelRemove                   // nothing the runtime installed
+	LevelTerminate Level = iota + 1 // no node processes
+	LevelUnmount                    // no node mounts, pod netns handles or volatile state
+	LevelWipe                       // no persistent node state
+	LevelUninstall                  // nothing the runtime installed
 )
 
 type Leftover struct {
@@ -1890,6 +1890,7 @@ decision.
 | - | Export policy | Internal by default; export by recorded decision only |
 | - | Lifecycle event names | `<subject>.<state>.<before\|after>`, all lowercase, with every state having both phases |
 | - | Hook subscriptions | Whole-segment `*` wildcards are allowed in `hooks[].event` |
+| - | `host` runtime cleanup level names | Terminate, Unmount, Wipe, Uninstall |
 
 ## 18. Questions for reviewers
 
