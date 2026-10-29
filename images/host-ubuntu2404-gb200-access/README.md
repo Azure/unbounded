@@ -12,10 +12,13 @@ then installs the archived Ubuntu 24.04 kernel
 `6.14.0-1003-azure-nvidia` (`6.14.0-1003.3`) from a fixed Ubuntu snapshot. It
 removes the source image's newer kernel so the required version is the only
 installed boot kernel. The image also carries forward the validated lab
-installation's host settings: the exact IOMMU, GIC, SMMU, allocation, and
-network-interface kernel parameters; an explicit nouveau blacklist; held
-versioned kernel packages; and removal of any John Cabaj package source. It does
-not add the proposed-package source or perform a broad package upgrade.
+installation's host settings: the exact IOMMU, GIC, SMMU, and allocation
+kernel parameters; an explicit nouveau blacklist; held versioned kernel
+packages; and removal of any John Cabaj package source. The installation's
+`net.ifnames=0` override is intentionally omitted because target-hardware
+validation showed that it prevents the provisioning interface from returning
+after repave. The image does not add the proposed-package source or perform a
+broad package upgrade.
 
 The image installs pinned `ssh-import-id` and adds a native cloud-init user
 fragment for the reviewed host access accounts. Passwords remain locked, shells
