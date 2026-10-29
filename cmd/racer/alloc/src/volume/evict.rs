@@ -70,7 +70,12 @@ impl<C: Charge> Volume<C> {
     where
         S::Error: From<Error>,
     {
-        Box::pin(async move { self.evict(reactor, scope, now, None).await })
+        Box::pin(async move {
+            Ok(self
+                .evict(reactor, scope, now, None)
+                .await?
+                .then(|| self.take_evicted()))
+        })
     }
 
     pub(super) async fn evict<S: Scope, B: Budget>(
@@ -79,12 +84,12 @@ impl<C: Charge> Volume<C> {
         scope: &S,
         now: u64,
         tier: Option<Tier>,
-    ) -> std::result::Result<Option<Vec<(Key, Value)>>, S::Error>
+    ) -> std::result::Result<bool, S::Error>
     where
         S::Error: From<Error>,
     {
         let Some((slot, incarnation)) = self.shared.state().slots.evict_candidate(now, tier) else {
-            return Ok(None);
+            return Ok(false);
         };
         let mut guard = EvictionGuard {
             shared: &self.shared,
@@ -93,7 +98,7 @@ impl<C: Charge> Volume<C> {
         };
         self.evict_slot(reactor, scope, slot, incarnation, now, &mut guard)
             .await?;
-        Ok(Some(self.take_evicted()))
+        Ok(true)
     }
 
     /// Entries removed by evictions and not yet returned, for example by one
@@ -262,9 +267,11 @@ impl<C: Charge> Volume<C> {
     /// [`Volume::allocate`], reopening partly filled slots and then evicting
     /// up to `max_evictions` slots while it returns `Busy`. When the storage
     /// slot quota blocks a storage allocation, only expired storage slots are
-    /// evicted. Returns the reservation and the entries removed by eviction
-    /// (also when allocation still fails, they are gone). Does not evict when
-    /// the dirty limit is what blocks allocation.
+    /// evicted. Returns the reservation and the removed entries (also when
+    /// allocation still fails, they are gone), including any left queued by an
+    /// earlier eviction that failed or was dropped. On an error or a drop the
+    /// removed entries stay queued for [`Volume::take_evicted`]. Does not
+    /// evict when the dirty limit is what blocks allocation.
     pub fn allocate_evicting<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -278,20 +285,19 @@ impl<C: Charge> Volume<C> {
         S::Error: From<Error>,
     {
         Box::pin(async move {
-            let mut evicted = Vec::new();
             let mut evictions = 0;
             let mut reopens = 0;
             loop {
                 match self.allocate(tier, length) {
                     Err(Error::Busy) if !self.needs_commit() => {}
-                    result => return Ok((result, evicted)),
+                    result => return Ok((result, self.take_evicted())),
                 }
                 if reopens < REOPENS && self.reopen(reactor, scope, tier, length).await? {
                     reopens += 1;
                     continue;
                 }
                 if evictions >= max_evictions {
-                    return Ok((Err(Error::Busy), evicted));
+                    return Ok((Err(Error::Busy), self.take_evicted()));
                 }
                 evictions += 1;
                 let only = self
@@ -300,13 +306,12 @@ impl<C: Charge> Volume<C> {
                     .slots
                     .storage_quota_blocks(tier, length)
                     .then_some(Tier::Storage);
-                match self.evict(reactor, scope, now, only).await? {
-                    Some(removed) => evicted.extend(removed),
-                    None => {
-                        // Loose retention bounds may hide expired slots.
-                        if self.refresh_retain(reactor, 4, scope).await? == 0 {
-                            return Ok((Err(Error::Busy), evicted));
-                        }
+                // Removed entries stay queued on the volume until returned,
+                // so an error or a drop below loses none of them.
+                if !self.evict(reactor, scope, now, only).await? {
+                    // Loose retention bounds may hide expired slots.
+                    if self.refresh_retain(reactor, 4, scope).await? == 0 {
+                        return Ok((Err(Error::Busy), self.take_evicted()));
                     }
                 }
             }
@@ -358,7 +363,7 @@ impl<C: Charge> Volume<C> {
     /// [`Volume::free_slots`]) or nothing more can
     /// be evicted, at most `max_evictions` slots. Run it ahead of allocation
     /// (for example from a timer) so foreground writes rarely evict. Returns
-    /// the removed entries.
+    /// the removed entries, as [`Volume::allocate_evicting`] does.
     pub fn reserve_free<'a, S: Scope, B: Budget>(
         &'a self,
         reactor: &'a Reactor<S, B>,
@@ -371,17 +376,17 @@ impl<C: Charge> Volume<C> {
         S::Error: From<Error>,
     {
         Box::pin(async move {
-            let mut evicted = Vec::new();
             for _ in 0..max_evictions {
                 if self.shared.state().slots.data_free_slots() >= free_slots {
                     break;
                 }
-                match self.evict(reactor, scope, now, None).await? {
-                    Some(removed) => evicted.extend(removed),
-                    None => break,
+                // Removed entries stay queued on the volume until returned,
+                // so an error or a drop below loses none of them.
+                if !self.evict(reactor, scope, now, None).await? {
+                    break;
                 }
             }
-            Ok(evicted)
+            Ok(self.take_evicted())
         })
     }
 }

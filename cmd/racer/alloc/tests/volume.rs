@@ -1102,6 +1102,60 @@ mod simulation {
         assert!(entries(&reactor, &volume).is_empty());
     }
 
+    /// Entries removed by an earlier eviction of a multi-slot call stay
+    /// queued on the volume when a later eviction of the same call is
+    /// dropped, so the caller can still take them.
+    #[test]
+    fn dropped_multi_slot_eviction_keeps_earlier_removals_queued() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, slab, _) = mount(&reactor, 8, Limits::UNLIMITED).unwrap();
+        let count = 6000;
+        for n in 0..count {
+            put(&reactor, &volume, &slab, Tier::Cache, key(1, n), 100, 0).unwrap();
+            if n % 1000 == 999 {
+                commit(&reactor, &volume).unwrap();
+            }
+        }
+        commit(&reactor, &volume).unwrap();
+        crash(&sim, volume, slab);
+        let (volume, _slab, _) = mount(&reactor, 8, Limits::UNLIMITED).unwrap();
+        let slots: std::collections::BTreeSet<u32> = (0..count)
+            .map(|n| get(&reactor, &volume, &key(1, n)).unwrap().slot)
+            .collect();
+        assert!(slots.len() >= 2, "records span several slots");
+        let gone = |volume: &page_alloc::volume::Volume<()>| {
+            (0..count)
+                .filter(|n| volume.try_get(&key(1, *n)) == Some(None))
+                .count()
+        };
+        let mut reserve: Task<'_, _> = volume.reserve_free(&reactor, u64::MAX, 50, 2, &SCOPE);
+        let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
+        // Stop part way through the second slot.
+        let mut first = None;
+        for _ in 0..100_000 {
+            assert!(reserve.as_mut().poll(cx).is_pending(), "finished early");
+            let removed = gone(&volume);
+            let full = slots.iter().any(|slot| {
+                (0..count).all(|n| {
+                    volume.try_get(&key(1, n)) == Some(None)
+                        || get(&reactor, &volume, &key(1, n)).unwrap().slot != *slot
+                })
+            });
+            if first.is_none() && full {
+                first = Some(removed);
+            }
+            if first.is_some_and(|first| removed > first) {
+                break;
+            }
+            reactor.poll_budgeted(64).unwrap();
+        }
+        let removed = gone(&volume);
+        assert!(first.is_some_and(|first| removed > first));
+        drop(reserve);
+        assert_eq!(volume.take_evicted().len(), removed);
+    }
+
     /// Removal and retention paths commit at the dirty limit instead of
     /// growing the overlay without bound.
     #[test]
