@@ -229,7 +229,8 @@ Container images are multi-stage builds on Azure Linux 3.0, built with
 - **[Networking Concepts]({{< relref "concepts/networking" >}})** -- How
   unbounded-net provides cross-site pod connectivity.
 - **[Racer Distributed Cache]({{< relref "concepts/racer" >}})** -- Shared
-  object caching, origins, and access boundaries.
+  object caching on existing nodes, when to use it, origins, and access
+  boundaries.
 - **[Networking Reference]({{< relref "reference/networking" >}})** -- Full
   unbounded-net CRDs, configuration, routing flows, and operations.
 - **[Bare Metal Concepts]({{< relref "concepts/bare-metal" >}})** -- PXE boot,
