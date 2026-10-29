@@ -63,6 +63,9 @@ customize_disk() {
         "${root}/etc/default/grub.d/60-gb200-lab-kernel.cfg"
     cp "${script_dir}/assets/blacklist-nouveau.conf" \
         "${root}/etc/modprobe.d/blacklist-nouveau.conf"
+    cp "${script_dir}/assets/verify.py" "${root}/tmp/verify.py"
+    cp "${script_dir}/../netboot/assets/vendor-data.tmpl" \
+        "${root}/tmp/vendor-data.tmpl"
     cp "${script_dir}/assets/customize.sh" "${root}/tmp/customize.sh"
     test ! -e "${root}/usr/sbin/policy-rc.d"
     printf '#!/bin/sh\nexit 101\n' > "${root}/usr/sbin/policy-rc.d"
@@ -71,7 +74,11 @@ customize_disk() {
         DEBIAN_FRONTEND=noninteractive \
         SYSTEMD_OFFLINE=1 \
         /bin/sh /tmp/customize.sh
-    rm -f "${root}/tmp/customize.sh" "${root}/usr/sbin/policy-rc.d"
+    rm -f \
+        "${root}/tmp/customize.sh" \
+        "${root}/tmp/vendor-data.tmpl" \
+        "${root}/tmp/verify.py" \
+        "${root}/usr/sbin/policy-rc.d"
 
     # shellcheck disable=SC2016
     chroot "${root}" dpkg-query -W -f='${Version}\n' \

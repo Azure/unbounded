@@ -86,6 +86,10 @@ test -d "/lib/modules/${kernel_release}/updates/dkms"
 find "/lib/modules/${kernel_release}/updates/dkms" \
     -name 'nvidia.ko*' -print -quit | grep -q .
 cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
+python3 /tmp/verify.py \
+    --image-config /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg \
+    --vendor-template /tmp/vendor-data.tmpl \
+    --dpkg-status /var/lib/dpkg/status
 grep -qx 'blacklist nouveau' /etc/modprobe.d/blacklist-nouveau.conf
 
 cat > /etc/modules-load.d/nvidia.conf <<'EOF'

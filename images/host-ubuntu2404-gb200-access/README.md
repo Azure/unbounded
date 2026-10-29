@@ -38,7 +38,8 @@ build verifies:
   absence of the John Cabaj package source;
 - the boot kernel symlink and rebuilt NVIDIA DKMS module;
 - NVIDIA module loading and device-node initialization before cloud-final;
-- the cloud-init user fragment schema;
+- the exact reviewed user policy and real Noble cloud-init merge against the
+  rendered MetalMan vendor-data;
 - the installed `ssh-import-id` package version;
 - the EFI GRUB entries and exact target-kernel boot, reaching userspace when
   compatible KVM is available;
