@@ -3120,7 +3120,16 @@ impl Drop for Fixture {
     }
 }
 impl Fixture {
-    fn metadata_index(&self, capacity: usize) -> Rc<Index> {
+    /// Republish this fixture's cache in `mode`, as a ClusterCache edit would.
+    pub(super) fn set_mode(&self, mode: racer_control_wire::CacheMode) {
+        self.fill
+            .dependencies
+            .memory
+            .availability()
+            .publish_modes(vec![(self.context.object.cache.clone(), mode)]);
+    }
+
+    pub(super) fn metadata_index(&self, capacity: usize) -> Rc<Index> {
         Rc::new(Index::new(
             WorkerId(0),
             capacity,
@@ -3136,7 +3145,7 @@ impl Fixture {
         self.metadata_service_with_index(origin, capacity, self.metadata_index(4))
     }
 
-    fn metadata_service_with_index(
+    pub(super) fn metadata_service_with_index(
         &self,
         origin: Rc<dyn Origin>,
         capacity: usize,
@@ -3485,7 +3494,7 @@ pub(super) fn drive<T>(
     panic!("bounded test executor did not complete");
 }
 
-fn adapter_client(
+pub(super) fn adapter_client(
     f: &Fixture,
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {

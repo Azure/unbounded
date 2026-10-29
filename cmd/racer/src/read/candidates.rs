@@ -72,6 +72,9 @@ pub struct OriginAuthority {
     page: PageNumber,
     predecessor_evidence: Vec<ProbeOutcome>,
     rank: usize,
+    /// Minted by [`CandidatePolicy::local_authority`] for a passthrough cache
+    /// on the local route: this node calls its own origin without ranking.
+    local: bool,
 }
 use racer_core::read::walk::{
     Action, Event as FillEvent, Evidence, Features, Fill, FillConfig, HedgeEnd, List, MAX_HANDOFF,
@@ -1676,7 +1679,36 @@ impl CandidatePolicy {
             page,
             predecessor_evidence: a.fill.evidence.to_vec(),
             rank,
+            local: false,
         })
+    }
+
+    /// Grant this node origin access for `object`/`page` without ranking or
+    /// asking peers. Only a cache published as passthrough with the local
+    /// route qualifies; the origin is always this node's own origin socket.
+    pub(crate) fn local_authority(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+        page: PageNumber,
+        mode: racer_control_wire::CacheMode,
+    ) -> Result<OriginAuthority> {
+        if mode != racer_control_wire::CacheMode::PassthroughLocal {
+            return Err(Error::Unauthorized);
+        }
+        let authority = OriginAuthority {
+            diagnostic: CandidateTrail::default(),
+            membership,
+            node: self.node.clone(),
+            object: object.clone(),
+            owners: vec![self.node.clone()],
+            page,
+            predecessor_evidence: Vec::new(),
+            rank: 0,
+            local: true,
+        };
+        authority.validate(object, page)?;
+        Ok(authority)
     }
 
     /// Send a run of granted probes at once (`Step::Granted`): copy-only, each on its own grant
@@ -2745,6 +2777,7 @@ impl OriginAuthority {
                 rank: self.rank,
                 predecessor_evidence: self.predecessor_evidence.len(),
                 member: self.membership.member(&self.node).is_ok(),
+                local: self.local,
             },
             object,
             page,
@@ -4432,6 +4465,7 @@ pub(super) mod tests {
             page: PageNumber(0),
             predecessor_evidence: vec![ProbeOutcome::Unreachable],
             rank: 1,
+            local: false,
         };
         assert_eq!(policy.origin_miss_error(&authority), Error::Unavailable);
         authority.predecessor_evidence = vec![ProbeOutcome::CopyMiss];

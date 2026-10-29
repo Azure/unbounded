@@ -455,17 +455,27 @@ impl MetadataService {
         scope.check()?;
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
-        let candidates = self
-            .candidates
-            .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
-            .await?;
-        let operation = purpose.operation(&context.object);
+        let mode = self.storage.fill.mode(&context.object.cache);
+        let resolution = if mode == racer_control_wire::CacheMode::PassthroughLocal {
+            // The local route asks this node's own origin and never a peer.
+            CandidateResolution::Origin(self.candidates.local_authority(
+                membership.clone(),
+                &context.object,
+                PageNumber(0),
+                mode,
+            )?)
+        } else {
+            let candidates = self
+                .candidates
+                .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
+                .await?;
+            let operation = purpose.operation(&context.object);
+            self.candidates
+                .resolve_with_budget(candidates, context, operation, scope, budget)
+                .await?
+        };
         let mut bootstrap_page = None;
-        let metadata = match self
-            .candidates
-            .resolve_with_budget(candidates, context, operation, scope, budget)
-            .await?
-        {
+        let metadata = match resolution {
             CandidateResolution::Copy(response) => match response.response() {
                 PeerResponse::Bootstrap {
                     metadata,
@@ -518,6 +528,14 @@ impl MetadataService {
         scope.check()?;
         super::validate_metadata(&metadata, &context.object, &purpose.selector())?;
         self.observe_clock()?;
+        // A passthrough cache revalidates every read with origin; only the
+        // read that resolved this observation uses it.
+        if self.storage.fill.passthrough(&context.object.cache) {
+            return Ok(RefreshOutput {
+                metadata,
+                page: bootstrap_page,
+            });
+        }
         if matches!(purpose, RefreshPurpose::Current | RefreshPurpose::Bootstrap)
             && self.clock.borrow().inner.epoch() == clock_epoch
         {
@@ -620,6 +638,11 @@ impl MetadataService {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<crate::origin::MetadataReply> {
+        // No peer retains a passthrough copy, and the local route never asks
+        // peers, so the origin's miss is final.
+        if self.storage.fill.passthrough(&context.object.cache) {
+            return Err(Error::VersionUnavailable);
+        }
         let candidates = self
             .candidates
             .candidates_scoped(membership, &context.object, PageNumber(0), scope)
@@ -751,6 +774,10 @@ impl MetadataService {
     ) -> Operation<'a, Option<ObjectMetadata>> {
         Box::pin(async move {
             scope.check()?;
+            // Passthrough metadata is never reused across reads.
+            if self.storage.fill.passthrough(&context.object.cache) {
+                return Ok(None);
+            }
             let now = self.observe_clock()?;
             match selector {
                 MetadataSelector::Fresh => {

@@ -22,6 +22,11 @@ impl Observation {
     pub fn eligible(self) -> bool {
         self.eligible
     }
+
+    /// A decision that never admits the page to disk, for caches that retain nothing.
+    pub fn never() -> Self {
+        Self { eligible: false }
+    }
 }
 
 /// One token per logical page interest, retained across retries and handoffs.

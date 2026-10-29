@@ -1205,11 +1205,20 @@ impl MemoryCache {
             expiry: RefCell::new(racer_core::cache::Expiry::default()),
         }
     }
+    /// Published cache admission and modes shared with the read path.
+    pub(crate) fn availability(&self) -> &Rc<crate::control::Availability> {
+        &self.availability
+    }
     fn available(&self, page: &CachedPage) -> bool {
-        self.availability.page(
-            &page.metadata.version.object.cache,
-            page.ciphertext.envelope().key_id,
-        )
+        // A passthrough cache retains nothing, so residual entries from before
+        // a mode change are never served.
+        !self
+            .availability
+            .passthrough(&page.metadata.version.object.cache)
+            && self.availability.page(
+                &page.metadata.version.object.cache,
+                page.ciphertext.envelope().key_id,
+            )
     }
     /// The authenticated cached page, touched, after dropping it if its cache
     /// or key is no longer admitted.
@@ -1252,10 +1261,11 @@ impl MemoryCache {
         }
         let mut entries = self.ciphertext_entries.borrow_mut();
         if entries.get(page).is_some_and(|entry| {
-            !self.availability.page(
-                &page.version.object.cache,
-                entry.copy.ciphertext.envelope().key_id,
-            )
+            self.availability.passthrough(&page.version.object.cache)
+                || !self.availability.page(
+                    &page.version.object.cache,
+                    entry.copy.ciphertext.envelope().key_id,
+                )
         }) {
             entries.remove(page);
         }
@@ -1265,6 +1275,10 @@ impl MemoryCache {
     pub(crate) fn publish_ciphertext(&self, mut page: UnverifiedPage) -> Result<()> {
         self.pool.validate_ciphertext(&page.copy)?;
         let id = &page.copy.ciphertext.envelope().page;
+        // Passthrough pages live only as long as their in-flight readers.
+        if self.availability.passthrough(&id.version.object.cache) {
+            return Ok(());
+        }
         if !self.availability.page(
             &id.version.object.cache,
             page.copy.ciphertext.envelope().key_id,
@@ -1322,6 +1336,13 @@ impl MemoryCache {
     /// Validate matching identities and full-page bounds before retaining the bundle.
     pub fn publish(&self, page: PageResult) -> Result<()> {
         self.pool.validate_page(&page)?;
+        // Passthrough pages live only as long as their in-flight readers.
+        if self
+            .availability
+            .passthrough(&page.metadata.version.object.cache)
+        {
+            return Ok(());
+        }
         self.publish_validated(page)
     }
     fn publish_validated(&self, mut page: PageResult) -> Result<()> {
@@ -1382,6 +1403,9 @@ impl MemoryCache {
         entries.insert(page)
     }
     pub(crate) fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
+        if self.availability.passthrough(&version.object.cache) {
+            return Ok(None);
+        }
         let entries = self.entries.borrow();
         let found = entries
             .versions

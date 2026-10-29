@@ -554,6 +554,9 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
+    /// The cache retains nothing: no peer selections and no spill holds.
+    passthrough: bool,
+
     error: Option<Error>,
 
     lease: Option<WindowLease>,
@@ -646,6 +649,7 @@ impl RangeStreams {
             return Err(Error::InvalidRange);
         }
         Ok(RangeStream {
+            passthrough: false,
             error: None,
             lease: None,
             credits: None,
@@ -676,6 +680,13 @@ impl RangeStream {
         self.range
     }
 
+    /// Fetch every page directly through its owner's flight, for a cache that
+    /// retains nothing. Selections would ask providers for retained copies and
+    /// spill would hold pages on disk. Call before the subscription is configured.
+    pub(crate) fn set_passthrough(&mut self) {
+        self.passthrough = true;
+    }
+
     /// Install exact page/byte release credits once, before delivery. The fetch
     /// window is the configured `range_window_pages`, further limited by the
     /// client's unreleased credits.
@@ -694,7 +705,7 @@ impl RangeStream {
         self.credits = Some(credits);
         self.lease = Some(lease);
         let limit = self.directory.warm.config().range_spill_pages;
-        self.spill = (limit != 0).then(|| Spill {
+        self.spill = (limit != 0 && !self.passthrough).then(|| Spill {
             limit,
             refused: false,
             pages: BTreeMap::new(),
@@ -1102,7 +1113,7 @@ impl RangeStream {
     /// fan-out. While a warm job runs for the version, reads only fetch pages
     /// directly, each waiting for the warm job to finish that page.
     fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
-        if self.directory.warm.contains(&self.metadata.version) {
+        if self.passthrough || self.directory.warm.contains(&self.metadata.version) {
             return Ok(None);
         }
         let Some(lease) = self.lease.as_ref() else {
@@ -2570,6 +2581,43 @@ pub(super) mod tests {
                 .all(|slot| matches!(slot, Slot::Missing { select: true }))
         );
         job.stop();
+    }
+    #[test]
+    fn passthrough_stream_issues_no_selection_and_never_spills() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        f.streams
+            .directory
+            .warm
+            .configure(crate::read::warm::Config {
+                range_spill_pages: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut metadata = metadata();
+        metadata.length = 4 * PAGE_BYTES;
+        for passthrough in [false, true] {
+            let mut stream = f.open(
+                &metadata,
+                ByteRange::From(0).resolve(metadata.length).unwrap(),
+                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap(),
+            );
+            if passthrough {
+                stream.set_passthrough();
+            }
+            stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+            assert_eq!(stream.spill.is_none(), passthrough);
+            for _ in 0..4 {
+                stream.inject(Slot::Missing { select: true });
+            }
+            // Selections ask providers for retained copies; passthrough
+            // pages are each fetched through their owner's flight instead.
+            assert_eq!(
+                stream.plan_selection().unwrap().is_none(),
+                passthrough,
+                "passthrough={passthrough}"
+            );
+        }
     }
     #[test]
     fn read_keeps_disjoint_selections_in_flight_up_to_spare_granted_flights() {

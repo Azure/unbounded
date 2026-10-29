@@ -1224,6 +1224,13 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
+        // Holds and warm fills retain pages, which a passthrough cache never does.
+        Work::Hold(version, ..) if local.fill.passthrough(&version.object.cache) => {
+            Err(Error::Unavailable)
+        }
+        Work::Warm(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
+            Err(Error::Unavailable)
+        }
         Work::Hold(version, pages, until, kind) => {
             let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
             let epoch = local
