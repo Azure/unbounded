@@ -106,7 +106,7 @@ test "${ssh_import_id_version}" = 5.11-0ubuntu2.24.04.1 ||
     fail "ssh-import-id has version ${ssh_import_id_version}"
 installed_kernels="$(
     dpkg-query -W -f='${Package} ${Status}\n' 'linux-image-*' 2>/dev/null |
-        awk '$2 == "install" && $3 == "ok" && $4 == "installed" { print $1 }'
+        awk '$3 == "ok" && $4 == "installed" { print $1 }'
 )"
 test "${installed_kernels}" = linux-image-6.14.0-1003-azure-nvidia ||
     fail "unexpected installed kernel packages: ${installed_kernels}"
