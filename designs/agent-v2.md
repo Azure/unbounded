@@ -10,7 +10,8 @@
 
 ## Review guide
 
-- Sections 1-4 explain the problem, the goals and the core decisions.
+- Sections 1-4 explain the problem, the goals and the core decisions. Section
+  1.4 defines the terms used throughout.
 - Section 5 is the external contract that consumers such as AKS Flex Node would
   build against: the CLI, the configuration file, plugins, hooks and
   declarative extensions.
@@ -74,7 +75,7 @@ implementation rather than a switch added to v1.
 |---|---|---|
 | Goal state | `RootFS` carries nspawn file paths; the machine directory is `/var/lib/machines/<m>`; `NodeStart.MachineName` is the `systemd-run` target | `pkg/agent/goalstates/rootfs.go:11-58`, `resolve.go:86-97`, `nodestart.go:6-9` |
 | Writing node files | Every node file is written from the host into the machine directory | e.g. `pkg/agent/phases/nodestart/kubelet.go:75` |
-| Running commands in the node | One funnel: `systemd-run --machine=<m> --pipe --wait` | `internal/executil/exec.go:258-267` |
+| Running commands in the node | Every command goes through `systemd-run --machine=<m> --pipe --wait` | `internal/executil/exec.go:258-267` |
 | Bootstrap | Always targets `kube1`; uses `machinectl list` to decide whether the rootfs needs building | `cmd/agent/internal/cmd/bootstrap.go:92,161,220` |
 | Host preparation | Masks the host `containerd` and `kubelet` units, which a host runtime needs | `bootstrap.go:111`, `pkg/agent/phases/host/disable_systemd_unit.go:36-43` |
 | Daemon | Defaults to the nspawn operator, and hardcodes it in `RepairDaemon`; repave alternates `kube1` and `kube2` | `cmd/agent/internal/daemon/daemon.go:101`, `lifecycle.go:461`, `nodeoperator.go:248-296` |
@@ -122,6 +123,22 @@ Several patterns in Flex point to missing extension points:
 Flex needs about a dozen customization points. It does not need the whole
 library.
 
+### 1.4 Terms
+
+| Term | Meaning |
+|---|---|
+| Host | The machine the agent runs on: a virtual machine or a bare-metal server. |
+| Node | The Kubernetes worker: kubelet, containerd, LocalDNS and the pods they run. In v1 it always runs in an nspawn container on the host. |
+| Runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). Section 7.1 defines the interface. |
+| Slot | One of two places, `a` and `b`, where a runtime can hold a node. One slot runs the node; the other is used to build a replacement during a repave. For `nspawn-container`, the slots are v1's `kube1` and `kube2` machines. |
+| Repave | Replacing the node with a new one, built from the desired configuration in the other slot. The new node registers with Kubernetes as a fresh Node. A repave is triggered by deleting the Kubernetes Node object (section 8.4). |
+| Goal | The desired configuration for this machine, from machina, a plugin or the configuration file. Its version is an opaque value that changes whenever the goal does. |
+| Drift | A difference between the goal and the applied configuration that needs a repave to take effect, such as a new Kubernetes version. |
+| Bundle | The rendered description of one node: files, binaries, units and start order (section 7.2). Not related to v1's offline artifact bundles. |
+| Node manager | The runtime-independent component that drives bootstrap, repave, reboot and reset by calling the runtime (section 7.6). |
+| Reset | Removing the node, the agent and everything they created from the host (section 8.8). The runtime's part of a reset is its `Teardown` method; section 10.10 describes it for the `host` runtime. |
+| Slot change | For the `host` runtime, starting a slot whose content differs from what last ran. The runtime wipes node state first (section 10.8). |
+
 ## 2. Goals and non-goals
 
 ### 2.1 Goals
@@ -151,7 +168,7 @@ library.
 | D1 | v2 ships as `unbounded-agent v2 <command>` in the existing binary. The only v1 command change is registering the `v2` group in `cmd/agent/internal/cmd/cmd.go:30-39`. |
 | D2 | Every `v2` command logs a warning before doing any work (section 5.1). |
 | D3 | All v2 code lives under `internal/agentv2`. It may use existing `pkg/agent` and `internal` packages as libraries without changing their v1 behavior. Code it needs from `cmd/agent/internal` is copied (section 6.2). |
-| D4 | Node content is described declaratively as a `NodeBundle` and handed to the runtime. The orchestrator never writes into a node after it starts. |
+| D4 | Node content is described declaratively as a `NodeBundle` and handed to the runtime. The node manager never writes into a node after it starts. |
 | D5 | Consumers extend the agent with, in order of preference: configuration, declarative extensions, and exec plugins. There are no in-process Go plugins. |
 | D6 | v2 has its own state directories, units and locks. It shares only the agent binary layout under `/opt/unbounded/agent/bin`, because the binary is the same (section 5.6). *(Open for review, section 18.)* |
 
@@ -218,7 +235,7 @@ Data flows in three steps:
    *where* it runs.
 
 Both runtimes share the host kernel and the host network namespace with the
-node. The orchestrator relies on this: it configures host sysctls for the node
+node. The node manager relies on this: it configures host sysctls for the node
 and cleans host network state after stopping a node. A future runtime that
 breaks this assumption would need to add a capability to the interface.
 
@@ -231,10 +248,10 @@ and experimental until section 14 promotes it.
 
 | Command | Purpose |
 |---|---|
-| `v2 start` | Bootstrap: admission, host preparation, provision, start the node, install the daemon |
+| `v2 start` | Bootstrap: install check, host preparation, provision, start the node, install the daemon |
 | `v2 preflight [--output json] [--ignore-errors]` | Read-only checks: built-in, runtime, extension and plugin checks |
 | `v2 daemon` | Long-running reconciler, run by `unbounded-agent-v2-daemon.service` |
-| `v2 reset [--force-standard-paths]` | Remove the node, the runtime footprint, extensions, host preparation and agent state |
+| `v2 reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
 | `v2 status [--output json]` | New. Runtime, slots, applied goal version, node readiness and any cleanup leftovers |
 | `v2 agent-upgrade [--preflight]` | Upgrade the agent binary from the host |
 | `v2 runtime-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit |
@@ -255,7 +272,7 @@ variable cloud-init and Ignition already set
 (`cmd/kubectl-unbounded/app/ignition.go:187`). v2 does not read configuration
 from other environment variables.
 
-`--force-standard-paths` only has an effect when the host runtime's claims
+`--force-standard-paths` only has an effect when the host runtime's ownership
 record is missing (section 10.10). MachineOperations and goal-driven resets
 never set it.
 
@@ -399,7 +416,7 @@ fields specific to each event.
 
 | Event | Fires | Payload | Default failure policy |
 |---|---|---|---|
-| `agent.install.before` | After admission of a fresh or resumed install, before host preparation | runtime, admission kind (`Fresh` or `Resume`) | `Fail` |
+| `agent.install.before` | After the install check accepts a fresh or resumed install, before host preparation | runtime, install kind (`Fresh` or `Resume`) | `Fail` |
 | `agent.install.after` | After the daemon is installed, before the install is marked complete | runtime, active slot | `Fail` |
 | `host.prepare.before` | Before host preparation | runtime | `Fail` |
 | `host.prepare.after` | After host preparation | runtime | `Fail` |
@@ -466,7 +483,7 @@ agent itself renders.
     "units": [ { "name": "static-routes.service", "content": "...", "orderBeforeNode": true } ],
     "files": [ { "path": "/etc/aks-flex-node/static-routes.sh", "mode": "0755", "content": "..." } ]
   },
-  "hostExposures": [ { "hostPath": "/opt/aks-flex-node/bin", "nodePath": "/opt/aks-flex-node/bin", "readOnly": true } ],
+  "sharedHostPaths": [ { "hostPath": "/opt/aks-flex-node/bin", "nodePath": "/opt/aks-flex-node/bin", "readOnly": true } ],
   "nodeDependencies": { "requires": ["systemd-udev-settle.service", "himdsd.service"] },
   "cleanup": {}
 }
@@ -478,15 +495,15 @@ Rules:
   preflight reachability checks as built-in artifacts.
 - `host.units` with `orderBeforeNode` get `Before=` and
   `RequiredBy=unbounded-node-pre.target`.
-- `hostExposures` are realized by the runtime: a bind mount for
-  `nspawn-container`, the path itself for `host`.
+- `sharedHostPaths` are host paths made visible inside the node: a bind mount
+  for `nspawn-container`, the path itself for `host`.
 - `cleanup` declares state the extension's workloads create (section 10.14).
 - Everything an extension creates is recorded in state and removed by reset.
 
-Two stable systemd anchors replace the hardcoded `systemd-nspawn@`
+Two systemd targets with fixed names replace the hardcoded `systemd-nspawn@`
 dependencies in v1's assets and in Flex:
 
-| Anchor | Meaning |
+| Target | Meaning |
 |---|---|
 | `unbounded-node-pre.target` | Everything the node needs from the host: the nftables flush, the LocalDNS network helper and extension host units. The runtime's node boot unit `Requires=` and is `After=` this target. |
 | `unbounded-node.target` | The node itself. Consumers order `After=` it. |
@@ -516,7 +533,7 @@ or the environment.
 |---|---|---|
 | `describe` | None | `{protocolVersions[], methods[]}`. Called at startup. A configured method the plugin does not list fails startup. |
 | `goal.register` | Machine identity, runtime, versions | None |
-| `goal.get` | Node observation, applied state | `{version, config, disposition}`. `config` is a full `AgentConfiguration`; `disposition` is `Active` or `Delete`. |
+| `goal.get` | Node observation, applied state | `{version, config, delete}`. `config` is a full `AgentConfiguration`. `delete` is `true` when the machine is being removed and the node must be reset. |
 | `status.report` | `{phase, reason, message, appliedVersion, runtime}` | None |
 | `credentials.bootstrap` | None | `{apiServer, caCertBase64, token}` |
 | `credentials.cluster` | None | A Kubernetes `ExecCredential` |
@@ -537,7 +554,7 @@ there is no plugin process to supervise and each call is easy to test. Goal
 changes are picked up by polling plus Node events. A streaming transport can be
 added later as a new protocol version.
 
-### 5.6 On-host footprint
+### 5.6 What v2 creates on the host
 
 | Item | Location |
 |---|---|
@@ -546,9 +563,9 @@ added later as a new protocol version.
 | Install record | `/var/lib/unbounded/agent-v2/install.json` |
 | Install lock | `/run/unbounded-agent-v2-install.lock` |
 | Node state | `/var/lib/unbounded/agent-v2/node-state.json` and `.sha256` |
-| Host preparation journal | `/var/lib/unbounded/agent-v2/hostprep.json` |
+| Host preparation undo log | `/var/lib/unbounded/agent-v2/hostprep.json` |
 | Artifact cache | `/var/lib/unbounded/agent-v2/artifacts/<sha256>` |
-| Host runtime state | `/var/lib/unbounded/agent-v2/host-runtime/` (claims, activation, adoption backups) |
+| Host runtime state | `/var/lib/unbounded/agent-v2/host-runtime/` (ownership record, active-slot record, adoption backups) |
 | Host runtime slots | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Configuration copy, daemon credentials, upgrade signal | `/etc/unbounded/agent-v2/` |
 | Units, both runtimes | `unbounded-agent-v2-daemon.service`, `unbounded-agent-v2-daemon-recovery.service`, `unbounded-node-pre.target`, `unbounded-node.target`, `nftables-flush.service` |
@@ -565,9 +582,9 @@ identity the cluster sees is configurable: the daemon CSR group and name
 |---|---|
 | Own configuration schema, translated with `ToAgentConfig` | Flex's bootstrap script renders an `AgentConfiguration`; dynamic values come from providers |
 | ARM Machine backend: create, get, ETag, status | `goal` and `status` plugin providers |
-| Reset on a deleting taint plus a missing ARM Machine | `goal.get` sees the Node's taints and returns `disposition: Delete` |
+| Reset on a deleting taint plus a missing ARM Machine | `goal.get` sees the Node's taints and returns `delete: true` |
 | Fresh bootstrap data before a repave | `credentials.bootstrap` provider, called before every provision |
-| Kubelet exec credential, binary copied into the rootfs | `credentials.kubelet.type: exec` plus a `hostExposures` entry |
+| Kubelet exec credential, binary copied into the rootfs | `credentials.kubelet.type: exec` plus a `sharedHostPaths` entry |
 | Daemon exec credential, host path rewritten | `credentials.daemon.type: exec` |
 | CSR group `aks-flex-node-daemons` | `credentials.daemon.csr.group` |
 | Static routes with `RequiredBy=systemd-nspawn@.service` | Host extension unit with `orderBeforeNode` |
@@ -579,7 +596,7 @@ identity the cluster sees is configurable: the daemon CSR group and name
 | `machineOperationMode: disable` | `control.operations.type: disabled` |
 | Startup gate around its reconcilers | Built in (section 8.4) |
 | Own blue/green upgrade, signal file, recovery unit and unit names | Built in (section 8.7) |
-| Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `v2 reset` plus the documented footprint |
+| Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `v2 reset` plus the documented list of what v2 creates (5.6) |
 
 ## 6. Code layout
 
@@ -596,11 +613,11 @@ internal/agentv2/
     runtimetest/  fake runtime and conformance suite
     host/         the host runtime, including cleanup (section 10)
     nspawn/       the nspawn-container runtime
-  hostprep/       host preparation tasks, requirement merging, the undo journal
+  hostprep/       host preparation tasks, requirement merging, the undo log
   hostnet/        host network reset, used for both runtimes
   artifacts/      cache, download, verification, offline sources
   state/          install record, node state, locks
-  bootstrap/      admission and stages
+  bootstrap/      install check and stages
   nodemanager/    Ensure, Apply, Reboot, Reset, Recover, Decide
   control/        goal sources, status sinks, operation source (machina, static, plugin)
   credentials/    bootstrap (static, tpm, plugin), kubelet, daemon (csr, kubeconfig, exec)
@@ -626,7 +643,7 @@ so v1 stays untouched and the copies can diverge.
 | `cmd/agent/internal/daemon` unit and recovery assets, enable, stop and repair logic | `internal/agentv2/daemon` | Unit runs `<current> v2 daemon` |
 | `cmd/agent/internal/daemon/bootstrap_status.go` and Machine registration (`daemon.go:303-406`) | `internal/agentv2/control` (the `machina` providers) | Behind the goal and status interfaces |
 | `cmd/agent/internal/daemon/agentupgrade.go`, `hostupgrade.go` | `internal/agentv2/agentupgrade` | Verifies `v2` support in candidates |
-| The MachineOperation reconciler in `pkg/agent/daemon/machineoperation.go` | `internal/agentv2/control` | Fails unsupported agent-domain operations (section 12) |
+| The MachineOperation reconciler in `pkg/agent/daemon/machineoperation.go` | `internal/agentv2/control` | Fails unsupported operations that belong to the agent (section 12) |
 | Rendering templates from `pkg/agent/phases/nodestart/assets` and `pkg/agent/phases/rootfs/assets` | `internal/agentv2/bundle` and `runtime/nspawn` | None at first; parity is enforced by golden tests (section 15) |
 
 Each copied file starts with a comment naming its source path and the commit it
@@ -677,7 +694,7 @@ const (
 // through this interface.
 //
 // Every runtime shares the host kernel and the host network namespace with
-// the node. The orchestrator relies on this: it configures host sysctls for
+// the node. The node manager relies on this: it configures host sysctls for
 // the node and cleans host network state after Stop.
 type NodeRuntime interface {
 	Kind() Kind
@@ -687,8 +704,8 @@ type NodeRuntime interface {
 	HostRequirements(spec *nodespec.NodeSpec) HostRequirements
 	// Preflight returns read-only runtime checks.
 	Preflight(spec *nodespec.NodeSpec) []preflight.Checker
-	// Footprint lists every unit, path and link the runtime may create.
-	Footprint() Footprint
+	// OwnedResources lists every unit, path and link the runtime may create.
+	OwnedResources() OwnedResources
 	// Layout tells the renderer where node content lives, from the node's view.
 	Layout(slot Slot) bundle.Layout
 
@@ -698,7 +715,8 @@ type NodeRuntime interface {
 	Stop(ctx context.Context, slot Slot) error
 	Restart(ctx context.Context, slot Slot) error
 	Destroy(ctx context.Context, slot Slot) error
-	// Teardown removes everything in Footprint, with or without state records.
+	// Teardown removes everything in OwnedResources, with or without state
+	// records.
 	Teardown(ctx context.Context) error
 
 	// Access observes a started node: readiness and diagnostics.
@@ -747,7 +765,7 @@ Rules every runtime must follow. A shared conformance suite,
    state. The one exception is container image content, when the runtime is
    configured to keep it (`runtime.host.repave.retainContainerImages`).
    `Restart` keeps all state.
-5. The orchestrator puts content into a node only through `Provision`.
+5. The node manager puts content into a node only through `Provision`.
    Runtime-owned hooks may change the node, for example NVIDIA wiring in the
    `nspawn-container` post-start hook.
 6. Runtimes do not download artifacts, call the Kubernetes API, or run plugins.
@@ -784,14 +802,14 @@ type Layout struct {
 }
 
 type NodeBundle struct {
-	Digest        string
-	Artifacts     []Artifact     // verified files in the host artifact cache, with node paths
-	Files         []File         // configs, kubeconfigs, CA, unit drop-ins
-	Units         []Unit         // units that run inside the node
-	HostExposures []HostExposure // host paths the node must see
-	Devices       DeviceRequest  // GPUs, KVM, InfiniBand, block, additional devices
-	Boot          []BootStep     // ordered: localdns, containerd, image import, kubelet, extensions
-	Readiness     Readiness      // kubelet active, kubeconfig non-empty, LocalDNS ready URLs
+	Digest          string
+	Artifacts       []Artifact       // verified files in the host artifact cache, with node paths
+	Files           []File           // configs, kubeconfigs, CA, unit drop-ins
+	Units           []Unit           // units that run inside the node
+	SharedHostPaths []SharedHostPath // host paths made visible inside the node
+	Devices         DeviceRequest    // GPUs, KVM, InfiniBand, block, additional devices
+	Boot            []BootStep       // ordered: localdns, containerd, image import, kubelet, extensions
+	Readiness       Readiness        // kubelet active, kubeconfig non-empty, LocalDNS ready URLs
 }
 
 type File struct {
@@ -808,24 +826,23 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
 The bundle is not persisted. It is rendered again from the applied
 configuration whenever it is needed, for example by the boot hooks.
 
+This "bundle" is unrelated to v1's offline artifact bundles
+(`pkg/agent/bootstrapartifacts`). Those are archives of downloadable
+artifacts; a `NodeBundle` is the rendered description of one node.
+
 ### 7.3 Control plane integration
 
 ```go
 package control
 
-type Disposition string
-
-const (
-	Active Disposition = "Active"
-	Delete Disposition = "Delete"
-)
-
 type Goal struct {
 	// Version is opaque: a MachineConfigurationVersion name, an ARM ETag or a
 	// digest of the configuration file. It is compared for equality only.
-	Version     string
-	Config      *config.AgentConfiguration
-	Disposition Disposition
+	Version string
+	Config  *config.AgentConfiguration
+	// Delete is true when the machine is being removed and the node must be
+	// reset.
+	Delete bool
 }
 
 type Observation struct {
@@ -1047,10 +1064,10 @@ flowchart TD
   T4["Startup"] --> Q
   Q[("Serialized queue, one worker")] --> G{"Startup gate open?"}
   G -- no --> RQ["Requeue"]
-  G -- yes --> L{"Mutation lock acquired?"}
+  G -- yes --> L{"Install lock acquired?"}
   L -- no --> RQ
   L -- yes --> P{"Pending repave in state?"}
-  P -- yes --> RF["nodemanager.Recover: roll forward"]
+  P -- yes --> RF["nodemanager.Recover: finish the interrupted repave"]
   P -- no --> K{"Request kind"}
   K -- operation --> OP["NodeReboot, AgentUpgrade or AgentReset handler"]
   K -- reconcile --> O["Observe Node, goal and applied state"]
@@ -1066,19 +1083,20 @@ The startup gate opens after a pending AgentUpgrade result is published,
 
 `Decide`:
 
-| Goal disposition | Node object | Goal version vs applied | Drift | Action |
+| Goal `delete` | Node object | Goal version vs applied | Drift | Action |
 |---|---|---|---|---|
-| `Delete` | Any | Any | Any | Reset |
-| `Active` | Never observed for the active slot | Any | Any | Wait: kubelet has not registered yet |
-| `Active` | Present | Equal | Not applicable | Steady; record the Node UID |
-| `Active` | Present | Differs | No | Steady; mark the version applied |
-| `Active` | Present | Differs | Yes | Wait: repave pending until the Node is deleted |
-| `Active` | Deleted: UID seen before, now absent | Any | Yes | Repave |
-| `Active` | Deleted | Any | No | Steady; mark applied, matching v1 (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
+| `true` | Any | Any | Any | Reset |
+| `false` | Never observed for the active slot | Any | Any | Wait: kubelet has not registered yet |
+| `false` | Present | Equal | Not applicable | Steady; record the Node UID |
+| `false` | Present | Differs | No | Steady; mark the version applied |
+| `false` | Present | Differs | Yes | Wait: repave pending until the Node is deleted |
+| `false` | Deleted: UID seen before, now absent | Any | Yes | Repave |
+| `false` | Deleted | Any | No | Steady; mark applied, matching v1 (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
 
-Unlike v1, which reacts only to Node delete events, this is level-triggered: a
-Node deleted while the daemon was down is still noticed. The recorded Node UID
-keeps a node that has not registered yet from looking deleted.
+v1 only reacts to Node delete events, so it misses a Node deleted while the
+daemon is down. v2 instead compares what it observes on every reconcile, so
+that deletion is still noticed when the daemon comes back. The recorded Node
+UID keeps a node that has not registered yet from looking deleted.
 
 ### 8.5 Repave
 
@@ -1162,7 +1180,7 @@ sequenceDiagram
   participant AB as agentbinary
   participant SD as systemd
   participant N as daemon (new)
-  D->>D: mutation lock, activation lock, MarkInProgress
+  D->>D: install lock, binary activation lock, MarkInProgress
   D->>D: hook agent.upgrade.before
   D->>AB: download, verify sha256, install inactive slot
   AB->>AB: candidate must answer version and v2 version
@@ -1185,7 +1203,7 @@ This is v1's mechanism
 ### 8.8 Reset
 
 Reset is triggered by `v2 reset`, an `AgentReset` MachineOperation, or a goal
-with `disposition: Delete`.
+with `delete: true`.
 
 ```mermaid
 sequenceDiagram
@@ -1198,10 +1216,10 @@ sequenceDiagram
   T->>St: install lock, mark Resetting
   T->>Px: hook agent.reset.before
   T->>Px: hook node.stop.before, if a node is running
-  T->>RT: Teardown, covering both slots and the full footprint
+  T->>RT: Teardown, covering both slots and everything the runtime owns
   T->>Px: hook node.stop.after, if a node was running
   T->>HN: host network reset, teardown scope
-  T->>HP: replay the undo journal
+  T->>HP: replay the undo log
   T->>St: remove node state, artifact cache, install record
   T->>Px: hook agent.reset.after
   T->>T: stop and remove the daemon unit, last when daemon-initiated
@@ -1214,12 +1232,12 @@ sequenceDiagram
 | Slot | `/var/lib/machines/kube1`, `kube2` | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Provision | Unpack the OCI image; write the bundle, `.nspawn` file and unit override | Stage binaries and rendered files into the slot directory |
 | Start | `machinectl start`, then boot steps through `systemd-run -M` | Install units and configuration from the slot, start the pre target and `unbounded-node.target` |
-| Fresh state | A new rootfs | Wipe the claimed paths (section 10.8) |
+| Fresh state | A new rootfs | Wipe the owned paths (section 10.8) |
 | `NodeAccess` | `systemd-run -M` | Direct |
 | NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start hook, writing `/var/run/cdi/nvidia.yaml` |
 | NVIDIA Container Toolkit | From the GPU OCI image (`images/agent-ubuntu2404-nvidia/Containerfile:21-31`) | Shipped as an agent artifact (section 9.2) |
 | Devices and extra mounts | Bind mounts plus `DeviceAllow` | Nothing to do; already visible |
-| Host exposures | Bind mounts | The paths themselves |
+| Shared host paths | Bind mounts | The paths themselves |
 | Resolver | Writes the node's `/etc/resolv.conf` | Never touches the host's `/etc/resolv.conf`; kubelet uses `--resolv-conf` (`pkg/agent/goalstates/resolve.go:163-166`) |
 | Host requirements | `systemd-container`; mask the host's containerd and kubelet | Own `containerd.service` and `kubelet.service`; mask docker; check for conflicting packages |
 
@@ -1238,7 +1256,7 @@ The node runs directly on the host:
 - `containerd.service`, `kubelet.service` and `localdns.service` keep their
   standard names and run in `unboundednode.slice` (section 10.6).
 - Binaries live in the active slot's directory; units point at them. A repave
-  stages the new slot, then rewrites the units on activation.
+  stages the new slot, then rewrites the units when it switches to that slot.
 - Preflight adds a `conflicting-packages` check for distro packages that ship
   kubelet, containerd or docker's containerd.
 
@@ -1277,7 +1295,7 @@ runtime has no container, so it has to provide each guarantee itself.
 |---|---|---|
 | Node processes: kubelet, containerd, shims, pods | Stopping the machine kills its whole cgroup scope (`pkg/agent/phases/reset/machine.go:33-91`) | Contain them in one slice and kill it (10.6) |
 | Pod mounts, overlay rootfs, `/run/netns/cni-*` | They live in the container's mount namespace and its `/run` *(inference)* | Unmount and remove them (10.7) |
-| kubelet, containerd and CNI state | A repave unpacks a new rootfs | Wipe the claimed paths (10.8) |
+| kubelet, containerd and CNI state | A repave unpacks a new rootfs | Wipe the owned paths (10.8) |
 | Pod hostPath data | hostPaths resolve inside the rootfs, e.g. `/etc/wireguard`, `/opt/cni/bin` (`deploy/net/node/03-daemonset.yaml.tmpl:135-155`) and `/var/lib/gantry/libp2p` (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Wipe the known and declared paths, report the rest (10.8, 10.13) |
 | Network: links, routes, rules, nftables and iptables | Nothing: the network namespace is already shared (`pkg/agent/phases/rootfs/assets/nspawn.conf:20-21`) | The same network reset as today (10.9) |
 | eBPF pins | Each machine gets its own bpffs (`nspawn.conf:27-29`) | Pins land in the host's bpffs; only declared pins are cleaned (10.13) |
@@ -1285,22 +1303,22 @@ runtime has no container, so it has to provide each guarantee itself.
 ### 10.2 Principles
 
 1. **Delete only what is provably owned.** A path is deleted only if it is in
-   the claims record or the installed-files manifest.
+   the ownership record or the installed-files manifest.
 2. **Never cross a mount or follow a symlink while deleting.** A mount found
    inside a tree being deleted aborts the deletion. Pod volumes are often bind
    mounts of host data, and deleting through one destroys that data.
 3. **Contain processes in a slice** that can be killed as a unit.
 4. **Every level is idempotent and restartable.** Intent is written durably
    before acting.
-5. **Fail closed before start, best effort on teardown.** A failed check before
-   starting a fresh node blocks the start. Teardown runs every step, then
-   reports leftovers.
+5. **Refuse to start on unclean state; clean up as much as possible on
+   teardown.** A failed check before starting a fresh node blocks the start.
+   Teardown runs every step even if some fail, then reports leftovers.
 6. **Report what cannot be cleaned** rather than ignoring it.
 
 ### 10.3 Ownership and adoption
 
-The claims record is
-`/var/lib/unbounded/agent-v2/host-runtime/claims.json`, mode 0600, written
+The `host` runtime records every host path it owns in its ownership record,
+`/var/lib/unbounded/agent-v2/host-runtime/owned-paths.json`, mode 0600, written
 durably with a `.sha256` sidecar.
 
 ```json
@@ -1308,32 +1326,32 @@ durably with a `.sha256` sidecar.
   "schemaVersion": 1,
   "installID": "4f1c...",
   "paths": [
-    { "path": "/var/lib/kubelet", "class": "persistent", "created": true, "baselineMount": false },
+    { "path": "/var/lib/kubelet", "class": "persistent", "created": true, "preexistingMount": false },
     {
-      "path": "/opt/cni/bin", "class": "persistent", "created": false, "baselineMount": false,
+      "path": "/opt/cni/bin", "class": "persistent", "created": false, "preexistingMount": false,
       "adopted": "Preserve",
       "backup": "/var/lib/unbounded/agent-v2/host-runtime/adopted/9c1e...",
       "backupSHA256": "..."
     }
   ],
   "installedFiles": [ { "path": "/etc/systemd/system/kubelet.service", "sha256": "..." } ],
-  "sysctlBaseline": { "net.ipv4.ip_forward": "0", "net.ipv4.conf.eth0.rp_filter": "2" },
+  "originalSysctls": { "net.ipv4.ip_forward": "0", "net.ipv4.conf.eth0.rp_filter": "2" },
   "rtTablesExisted": true,
   "observedHostPaths": [ "/var/lib/some-daemonset" ]
 }
 ```
 
-Claims are made on the first activation (10.8), before anything is created at
-the path, and recorded first.
+The runtime takes ownership of each path on the first slot change (10.8). It
+records the path before creating anything there.
 
-| State of the path at claim time | Result |
+| State of the path when the runtime takes ownership | Result |
 |---|---|
 | Absent | Create it; record `created: true` |
 | Exists and empty | Record `created: false` |
-| Exists and is a mount point, such as a dedicated disk for `/var/lib/containerd` | Record `baselineMount: true`. The mount is never unmounted; only its contents are wiped. |
+| Exists and is a mount point, such as a dedicated disk for `/var/lib/containerd` | Record `preexistingMount: true`. The mount is never unmounted; only its contents are wiped. |
 | Exists, non-empty, no adoption entry | Preflight error `existing-node-state`, listing the path |
-| Exists, non-empty, adoption `Preserve` | Copy the contents into a backup, then claim with `adopted: "Preserve"`. Teardown restores the backup. |
-| Exists, non-empty, adoption `Discard` | Claim with `adopted: "Discard"`. The contents are deleted at the first wipe. Teardown leaves the path empty. |
+| Exists, non-empty, adoption `Preserve` | Copy the contents into a backup, then take ownership with `adopted: "Preserve"`. Teardown restores the backup. |
+| Exists, non-empty, adoption `Discard` | Take ownership with `adopted: "Discard"`. The contents are deleted at the first wipe. Teardown leaves the path empty. |
 
 `Preserve` backups:
 
@@ -1349,26 +1367,26 @@ mode, its size and file count, and the owning OS package if there is one
 upgrade could write into a path the node now owns; removing the package is the
 recommended alternative.
 
-Without a claims record, Teardown is conservative (10.10).
+Without an ownership record, Teardown is conservative (10.10).
 
 ### 10.4 Owned resources
 
 Classes: **volatile** paths are cleared at Unmount, **persistent** paths at
-Wipe, **installed** items at Uninstall, and **edits** (line-level changes to
-host files) are reverted at Uninstall.
+Wipe, **installed** items at Uninstall, and **file edits** (line-level changes
+to host files) are reverted at Uninstall.
 
 | Path or resource | Created by | Class | Notes |
 |---|---|---|---|
 | Processes in `unboundednode.slice` | runtime, kubelet, containerd | process | 10.6 |
 | Mounts under `/var/lib/kubelet`, `/var/lib/containerd`, `/run/containerd` | kubelet, containerd | mount | 10.7 |
-| `/run/netns/cni-*`, these entries only | containerd and CNI *(inference)* | netns | 10.7 |
+| `/run/netns/cni-*`, these entries only | containerd and CNI *(inference)* | network namespace | 10.7 |
 | `/run/containerd` | containerd; gantry hostPath (`deploy/gantry/chart/values.yaml:26`) | volatile | |
 | `/run/unbounded-net` | unbounded-net hostPath (`deploy/net/node/03-daemonset.yaml.tmpl:136-139`) | volatile | IPAM socket |
 | `/run/racer` | racer hostPath (`internal/racer/workload/workload.go:292`) | volatile | |
 | `/var/run/cdi/nvidia.yaml` | runtime pre-start hook | volatile | Regenerated on every start |
 | `/var/lib/kubelet` | kubelet, bundle | persistent | Includes kubelet client certificates, so a wipe forces TLS bootstrapping again |
 | `/var/lib/containerd` | containerd | persistent | Images and gantry's content cache; see `retainContainerImages` (10.8) |
-| `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | persistent | Rewritten from the bundle on activation |
+| `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | persistent | Rewritten from the bundle on each slot change |
 | `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | persistent | Bundle plugins are installed again after the wipe |
 | `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:263`) | persistent | |
 | `/var/lib/cni` | CNI IPAM *(inference)* | persistent | |
@@ -1376,7 +1394,7 @@ host files) are reverted at Uninstall.
 | `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | persistent | The directory is left alone; the host may have its own WireGuard configuration |
 | `/var/lib/gantry` | gantry (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | persistent | libp2p identity |
 | `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | persistent | |
-| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | edit | Lines removed at Uninstall. If the file did not exist at claim time and only default content remains, the file is removed. |
+| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | file edit | Lines removed at Uninstall. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
 | Slot directories | runtime | staged | Removed by `Destroy` or Teardown |
 | Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, the `unbounded-node*` targets, the LocalDNS network unit and helper, extension host units | runtime | installed | |
 | Extension `cleanup.statePaths` | consumer | as declared | 10.14 |
@@ -1388,15 +1406,15 @@ Each level includes every level before it.
 | Level | Removes | `nspawn-container` equivalent |
 |---|---|---|
 | Terminate | All node processes | `machinectl terminate`, or stopping the machine |
-| Unmount | Node mounts, pod network namespace handles, and the runtime directories under `/run` | The machine's mount namespace and `/run` going away |
+| Unmount | Node mounts, pod network namespace files under `/run/netns`, and the runtime directories under `/run` | The machine's mount namespace and `/run` going away |
 | Wipe | All persistent node state | A new rootfs |
-| Uninstall | Everything the runtime installed: units, files, slots, edits, claims | `machinectl remove` and removal of the nspawn configuration |
+| Uninstall | Everything the runtime installed: units, files, slots, file edits, the ownership record | `machinectl remove` and removal of the nspawn configuration |
 
 ```mermaid
 flowchart LR
   T1["Terminate"] --> U1["Unmount"] --> W["Wipe"] --> X["Uninstall"]
   S["Stop, Restart"] -.->|runs up to| U1
-  A["Start of a new activation"] -.->|runs up to| W
+  A["Start after a slot change"] -.->|runs up to| W
   T["Teardown"] -.->|runs up to| X
 ```
 
@@ -1404,8 +1422,8 @@ flowchart LR
 |---|---|
 | `Stop(slot)` | Terminate, then Unmount |
 | `Restart(slot)` | Terminate, Unmount, the pre-start hook, start the pre target and node target, the post-start hook |
-| `Start(slot)`, same activation | Start the pre target, then the node target. No wipe. |
-| `Start(slot)`, new activation | Terminate, Unmount, Wipe, verify, install the slot's content, write the activation record, start (10.8) |
+| `Start(slot)`, same slot and bundle as last time | Start the pre target, then the node target. No wipe. |
+| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, start (10.8) |
 | `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotActive` for the active slot. |
 | `Teardown()` | Every level through Uninstall (10.10) |
 
@@ -1467,34 +1485,37 @@ v1 only checks that `/sys/fs/cgroup` exists
 
 Unmount runs only after Terminate has verified that no node processes remain.
 
-1. Read `/proc/self/mountinfo`. Select mount points under the owned mount roots
-   and under `/run/netns/cni-*`, excluding `baselineMount` roots.
+1. Read `/proc/self/mountinfo`. Select mount points under the owned paths that
+   hold mounts (`/var/lib/kubelet`, `/var/lib/containerd`, `/run/containerd`)
+   and under `/run/netns/cni-*`. Leave out any path marked `preexistingMount`.
 2. Unmount deepest first: `umount2(path, 0)`; on `EBUSY`, retry three times one
    second apart; then `umount2(path, MNT_DETACH)` and record a warning.
-3. Repeat until no selected mounts remain, at most five passes, since shared
-   propagation peers can expose mounts again *(inference)*. If mounts remain,
-   fail with `ErrMountsRemain`.
-4. For each `/run/netns/cni-*`, unmount if needed, then unlink. With no
-   processes holding them, the kernel frees the namespaces and their veth
-   peers disappear from the host *(inference)*.
+3. Repeat until no selected mounts remain, at most five passes, since mounts
+   shared with other mount namespaces can reappear *(inference)*. If mounts
+   remain, fail with `ErrMountsRemain`.
+4. For each pod network namespace file `/run/netns/cni-*`, unmount it if
+   needed, then delete it. With no processes using them, the kernel frees the
+   namespaces and their veth peers disappear from the host *(inference)*.
 5. Clear volatile paths with the safe remover (10.8).
 
-### 10.8 Wipe and activation
+### 10.8 Wipe and slot changes
 
-The activation record,
-`/var/lib/unbounded/agent-v2/host-runtime/activation.json`, holds
-`{slot, bundleDigest, phase}`. It is how the `host` runtime keeps rule 4: the
-first `Start` after `Provision` begins with fresh state.
+The active-slot record,
+`/var/lib/unbounded/agent-v2/host-runtime/active-slot.json`, holds
+`{slot, bundleDigest, phase}`. When `Start` is called with a slot or bundle
+that differs from the record, the runtime is making a *slot change*, and it
+wipes node state first. This is how the `host` runtime keeps rule 4: the first
+`Start` after `Provision` begins with fresh state.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Inactive
-  Inactive --> Wiping: Start, activation does not match slot and digest
+  Inactive --> Wiping: Start, record does not match slot and digest
   Wiping --> Installing: Terminate, Unmount and Wipe verified
   Installing --> Active: slot content installed, record phase Active
   Active --> Running: start pre target, then node target
   Running --> Active: Stop
-  Active --> Running: Start, same activation, no wipe
+  Active --> Running: Start, same slot and digest, no wipe
   Wiping --> Wiping: crash, the next Start redoes the wipe
   Installing --> Wiping: crash, the next Start redoes the wipe
 ```
@@ -1503,13 +1524,13 @@ Wipe:
 
 1. Write `phase: Wiping` durably.
 2. Terminate and Unmount, both verified.
-3. Clear every persistent path in the claims record and every declared
+3. Clear every persistent path in the ownership record and every declared
    `cleanup.statePaths` entry. Directories keep their mode and SELinux label;
    only their contents are removed. The WireGuard and CDI entries are single
    files.
 4. The safe remover opens with `O_NOFOLLOW`, compares `st_dev` with the root's
    device at every directory and aborts with `ErrMountInTree` on a mismatch,
-   unlinks symlinks without following them, and refuses if the claimed root has
+   unlinks symlinks without following them, and refuses if an owned path has
    become a symlink.
 5. Delete declared eBPF pins (10.14).
 6. Verify (10.11). Write `phase: Installing`, install the slot's units,
@@ -1520,7 +1541,7 @@ With `runtime.host.repave.retainContainerImages: true`, step 3 does not clear
 `/var/lib/containerd`. Instead it performs an image-preserving reset:
 
 1. Start a temporary maintenance containerd: the binary from the slot being
-   activated, a private configuration and socket under
+   switched to, a private configuration and socket under
    `/run/unbounded-agent-v2/containerd-maint/`, the CRI plugin disabled (so no
    CNI work or sandbox recovery), running in `unboundednode.slice`.
 2. Through the containerd Go client, which is already a dependency
@@ -1574,20 +1595,20 @@ flowchart TD
   B --> C["Host network reset, teardown scope"]
   C --> D["Stop, disable and remove installed units, daemon-reload, reset-failed"]
   D --> E["Remove installed files, content checked against the manifest"]
-  E --> F["Claimed paths: remove created ones, restore Preserve backups, clear the rest"]
-  F --> G["Revert edits: rt_tables lines"]
-  G --> H["Replay the host preparation undo journal, section 11"]
-  H --> I["Remove slots, activation and claims records"]
+  E --> F["Owned paths: remove created ones, restore Preserve backups, clear the rest"]
+  F --> G["Revert file edits: rt_tables lines"]
+  G --> H["Replay the host preparation undo log, section 11"]
+  H --> I["Remove slots, the active-slot record and the ownership record"]
   I --> J["Report leftovers, exit non-zero if any"]
 ```
 
 - A file whose content no longer matches the manifest is still removed, because
   the path is owned. The mismatch is logged.
 - `Preserve` backups are deleted only after a verified restore.
-- The claims record is removed last, so a crash anywhere earlier repeats the
+- The ownership record is removed last, so a crash anywhere earlier repeats the
   full Teardown.
 
-Without a claims record, Teardown is conservative:
+Without an ownership record, Teardown is conservative:
 
 - It removes only paths and units unique to v2: slot directories,
   `unboundednode.slice`, the `unbounded-node*` targets, v2 state, the LocalDNS
@@ -1595,18 +1616,18 @@ Without a claims record, Teardown is conservative:
 - Every non-empty standard path in 10.4 is reported as a leftover.
 - `v2 reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.
-- The sysctl baseline cannot be restored without the record. That is reported
-  with the list of keys.
+- The original sysctl values cannot be restored without the record. That is
+  reported with the list of keys.
 
 ### 10.11 Post-conditions
 
 | After | Must be true | On violation |
 |---|---|---|
 | Terminate | `unboundednode.slice` reports `populated 0`; no process runs an executable from a slot directory | `ErrNodeBusy`; Wipe and Start do not run |
-| Unmount | No non-baseline mounts under the owned roots; no `/run/netns/cni-*` | `ErrMountsRemain`; Wipe does not run |
-| Wipe | Every persistent owned path is empty; no declared pins remain | `ErrStateRemains`; the slot is not activated |
+| Unmount | No mounts under the owned paths apart from `preexistingMount` paths; no `/run/netns/cni-*` files | `ErrMountsRemain`; Wipe does not run |
+| Wipe | Every persistent owned path is empty; no declared pins remain | `ErrStateRemains`; the slot change does not continue |
 | Host network reset | No owned links, rules or tables; no `unbounded_localdns` table; on Teardown, no owned chains | Repave: error, retried by `Recover`. Teardown: leftover. |
-| Teardown | Nothing in the footprint remains; no claims record | Leftovers reported; non-zero exit |
+| Teardown | None of the runtime's owned resources remain; no ownership record | Leftovers reported; non-zero exit |
 
 Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
 `v2 status`, and through the status sink.
@@ -1617,7 +1638,7 @@ Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
 |---|---|
 | Terminate or Unmount inside `Stop` | `Stop` is idempotent; `Recover` or the caller runs it again |
 | `phase: Wiping` or `Installing` | The next `Start` wipes again, then installs |
-| `phase: Active`, before the node target starts | `Start` with the same activation, no wipe |
+| `phase: Active`, before the node target starts | `Start` with the same slot and digest, no wipe |
 | Teardown | Run again from the beginning; every step tolerates absent state |
 | A repave | `nodemanager.Recover` (8.5) drives the runtime methods above |
 
@@ -1629,15 +1650,15 @@ Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
    report them but never delete them, so the gap with `nspawn-container` stays
    visible.
 2. **Mounts made in the host mount namespace by privileged pods**, for example
-   through `nsenter -t 1` or bidirectional mount propagation outside the owned
-   roots.
+   through `nsenter -t 1` or bidirectional mount propagation, outside the owned
+   paths.
 3. **eBPF pins** in the host's `/sys/fs/bpf` from other eBPF CNIs, unless
    declared. unbounded-net pins nothing; its program is attached only to
    `unbounded0` (`cmd/unbounded-net-node/tunnel_config.go:95-105`,
    `internal/net/ebpf/tunnel_map.go:182`) and goes away when that link is
    deleted *(inference)*.
-4. **Kernel modules, conntrack entries, and sysctls outside the baseline
-   list.** These last until the host reboots.
+4. **Kernel modules, conntrack entries, and sysctls whose original values were
+   not recorded.** These last until the host reboots.
 5. **journald logs and Kubernetes API objects** (Node, CSRs, Machine), as in
    v1.
 
@@ -1659,7 +1680,8 @@ declare its state:
 }
 ```
 
-- Declared paths are claimed under the same rules as built-in ones (10.3).
+- The runtime takes ownership of declared paths under the same rules as
+  built-in ones (10.3).
 - `bpfPins` must be under `/sys/fs/bpf`.
 - Declared links are deleted only when both name and kind match.
 
@@ -1673,7 +1695,7 @@ type Level int
 
 const (
 	LevelTerminate Level = iota + 1 // no node processes
-	LevelUnmount                    // no node mounts, pod netns handles or volatile state
+	LevelUnmount                    // no node mounts, pod network namespace files or volatile state
 	LevelWipe                       // no persistent node state
 	LevelUninstall                  // nothing the runtime installed
 )
@@ -1686,7 +1708,7 @@ type Leftover struct {
 
 type cleaner struct {
 	sys    SystemOps
-	claims *ClaimStore
+	owned  *OwnershipStore
 	limits Limits // StopGracePeriod, KillTimeout, UnmountRetries
 	log    *slog.Logger
 }
@@ -1694,8 +1716,8 @@ type cleaner struct {
 func (c *cleaner) To(ctx context.Context, lvl Level) error
 func (c *cleaner) Verify(ctx context.Context, lvl Level) ([]Leftover, error)
 
-// SystemOps is the seam to the operating system. Fakes drive unit tests for
-// ordering and safety.
+// SystemOps is the boundary between the cleaner and the operating system.
+// Fakes drive unit tests for ordering and safety.
 type SystemOps interface {
 	Systemd() Systemd // Stop, Disable, DaemonReload, ResetFailed
 	Cgroups() Cgroups // Signal, Kill, Populated, Procs
@@ -1722,8 +1744,8 @@ func Reset(ctx context.Context, log *slog.Logger, scope Scope, decl []extensions
 
 ## 11. Host preparation and its reversal
 
-Host preparation records an undo step in
-`/var/lib/unbounded/agent-v2/hostprep.json` before each change. Reset replays
+Host preparation records an undo step in its undo log,
+`/var/lib/unbounded/agent-v2/hostprep.json`, before each change. Reset replays
 the steps in reverse order, for both runtimes. This makes v2's reset do what
 v1's help text promises ("restore the host to its original state",
 `cmd/agent/internal/cmd/reset.go:22-24`) but v1 does not do
@@ -1731,8 +1753,8 @@ v1's help text promises ("restore the host to its original state",
 
 | Change (v1 source) | Undo step |
 |---|---|
-| `/etc/sysctl.d/99-kubernetes.conf` and `sysctl --system` (`pkg/agent/phases/host/os.go:310-335`) | Remove the file and restore the sysctl baseline |
-| Node component sysctls: forwarding, `rp_filter` and `src_valid_mark` on all, default and each existing interface, conntrack settings (`images/net/node-agent-init.sh:17-45`, `internal/net/controller/kubeproxy_controller.go:858-862`) | Restore the baseline captured before the first node start |
+| `/etc/sysctl.d/99-kubernetes.conf` and `sysctl --system` (`pkg/agent/phases/host/os.go:310-335`) | Remove the file and restore the original sysctl values |
+| Node component sysctls: forwarding, `rp_filter` and `src_valid_mark` on all, default and each existing interface, conntrack settings (`images/net/node-agent-init.sh:17-45`, `internal/net/controller/kubeproxy_controller.go:858-862`) | Restore the original values, recorded before the first node start |
 | `nftables-flush.service` and `nftables-clear.nft` (`pkg/agent/phases/host/configure_nftables.go:65-128`) | Disable and remove them, then `systemctl try-restart nftables.service iptables.service ip6tables.service` so the host firewall returns |
 | Mask docker and set `iptables: false` in `/etc/docker/daemon.json` (`pkg/agent/phases/host/configure_docker.go:30-66`) | Restore the backed-up `daemon.json`, or remove it if it did not exist, and unmask |
 | Mask the host's containerd and kubelet (`nspawn-container` only) | Unmask |
@@ -1750,8 +1772,8 @@ operations other controllers handle
 machine-ops-controller and metalman.
 
 v2 fails a matching operation with reason `UnsupportedOperation` only when its
-kind is in the agent's domain and v2 has no handler for it. The agent's domain
-is the three kinds above plus any future kind beginning with `Node` or
+kind belongs to the agent and v2 has no handler for it. The kinds that belong
+to the agent are the three above plus any future kind beginning with `Node` or
 `Agent`, so a newer agent operation reaching an older agent fails instead of
 staying pending. `Host*` kinds are always ignored, as
 `designs/lifecycle-operations.md:12-15` describes.
@@ -1765,16 +1787,16 @@ Flex. The scoping is open for review (section 18).
 
 | v1 capability | v1 location | v2 location |
 |---|---|---|
-| Admission, locks and fingerprint | `cmd/agent/internal/installstate`, `cmd/agent/internal/bootstrap` | `state`, `bootstrap` |
+| Install check, locks and fingerprint | `cmd/agent/internal/installstate`, `cmd/agent/internal/bootstrap` | `state`, `bootstrap` |
 | Preflight, including resume awareness | `cmd/agent/internal/cmd/preflight.go`, `pkg/agent/phases/*/preflight*` | `preflight`, plus runtime and plugin checks |
 | Configuration file | `cmd/agent/internal/cmd/config.go` | `config`, v1alpha1 plus v1 JSON conversion |
-| Host preparation | `pkg/agent/phases/host` | `hostprep`, now with an undo journal |
+| Host preparation | `pkg/agent/phases/host` | `hostprep`, now with an undo log |
 | Artifacts, offline sources, overrides, image archives | `pkg/agent/phases/rootfs/{kube,cri,cni,container_images}.go`, `pkg/agent/artifactsource`, `pkg/agent/bootstrapartifacts` | `artifacts` |
 | containerd, kubelet and LocalDNS configuration | `pkg/agent/phases/nodestart` | `bundle` |
 | Kubelet authentication modes | `pkg/agent/phases/nodestart/kubelet.go:282-379` | `credentials` and `bundle` |
 | TPM attestation | `cmd/agent/internal/attest` | `credentials`, the `tpm` provider |
 | Machine registration and status | `cmd/agent/internal/daemon/daemon.go:303-406`, `bootstrap_status.go` | `control`, the `machina` providers |
-| NVIDIA, AMD and host devices | `pkg/agent/goalstates`, `pkg/agent/phases/nodestart/nvidia.go` | Discovery in `nodespec`, exposure in each runtime |
+| NVIDIA, AMD and host devices | `pkg/agent/goalstates`, `pkg/agent/phases/nodestart/nvidia.go` | Discovery in `nodespec`; each runtime makes the devices available to the node |
 | nspawn lifecycle hooks | `pkg/agent/nspawnlifecycle` | `runtime.Hook` and `v2 runtime-hook` |
 | Daemon CSR credentials | `pkg/agent/daemoncred` | `credentials`, the `csr` provider |
 | Repave on Node delete with drift detection | `cmd/agent/internal/daemon/controller_node.go`, `nodeoperator.go` | `daemon`, `nodemanager` |
@@ -1814,8 +1836,9 @@ Unit and conformance tests:
   output and permission checks.
 - Host cleanup with a fake `SystemOps`: order of operations, `ErrNodeBusy` on a
   hung process, refusal to cross a bind mount inside `/var/lib/kubelet/pods`,
-  symlink-swap refusal, keeping `baselineMount` roots mounted, crash replay at
-  every activation phase, conservative Teardown without a claims record, and
+  refusal when an owned path is replaced by a symlink, keeping
+  `preexistingMount` paths mounted, crash replay at every phase of a slot
+  change, conservative Teardown without an ownership record, and
   `--force-standard-paths`.
 - Adoption: the `Preserve` round-trip including mode, extended attributes and
   SELinux labels; the size cap; rejection of a mount inside an adopted tree;
@@ -1878,7 +1901,7 @@ decision.
 | O6 | Unsupported MachineOperations? | Fail them; scoping in section 12 is open for review |
 | O7 | `host` runtime unit names? | Standard `kubelet.service` and `containerd.service` |
 | O8 | NVIDIA Container Toolkit source on `host`? | Shipped as an agent artifact |
-| O9 | Should reset reverse host preparation? | Yes, for both runtimes, through the undo journal |
+| O9 | Should reset reverse host preparation? | Yes, for both runtimes, through the undo log |
 | O10 | Is `v2` visible in help? | Yes |
 | O11 | Configuration from environment variables? | Dropped |
 | H-D1 | Process containment on `host`? | A dedicated `unboundednode.slice` |
@@ -1886,18 +1909,19 @@ decision.
 | H-D3 | Restore sysctls and the host firewall on reset? | Yes |
 | H-D4 | Wipe container images on repave? | Configurable, wiped by default |
 | H-D5 | Existing content at owned paths? | Adoption as an explicit per-path configuration option |
-| H-D6 | Teardown without a claims record? | Conservative, with `--force-standard-paths` for the CLI |
+| H-D6 | Teardown without an ownership record? | Conservative, with `--force-standard-paths` for the CLI |
 | - | Export policy | Internal by default; export by recorded decision only |
 | - | Lifecycle event names | `<subject>.<state>.<before\|after>`, all lowercase, with every state having both phases |
 | - | Hook subscriptions | Whole-segment `*` wildcards are allowed in `hooks[].event` |
 | - | `host` runtime cleanup level names | Terminate, Unmount, Wipe, Uninstall |
+| - | Terminology | Plain terms throughout; project-specific terms are defined in section 1.4 |
 
 ## 18. Questions for reviewers
 
-1. **MachineOperation scoping (section 12).** Is "fail only agent-domain kinds,
-   identified as the current three plus any `Node*` or `Agent*` kind" the
-   right rule? It relies on a naming convention for future kinds that the API
-   does not currently document.
+1. **MachineOperation scoping (section 12).** Is "fail only kinds that belong
+   to the agent, meaning the current three plus any `Node*` or `Agent*` kind"
+   the right rule? It relies on a naming convention for future kinds that the
+   API does not currently document.
 2. **Separate v2 state (D6).** v2 uses its own state directories, units and
    locks, sharing only the binary layout. The alternative is to share v1's
    names. Separate names avoid any confusion between the two, but the `-v2`
@@ -1912,9 +1936,10 @@ decision.
    separate binary copy so they survive an upgrade rollback. Is the `current`
    link enough for v2, given the recovery unit restores `last-good` into
    `current`?
-6. **The `Decide` behavior change (section 8.4).** Moving from delete events to
-   level-triggered observation means a Node deleted while the daemon was down
-   now triggers a repave when the daemon returns. Is that the behavior we want?
+6. **The `Decide` behavior change (section 8.4).** v2 compares the observed
+   Node on every reconcile instead of reacting only to delete events. A Node
+   deleted while the daemon was down therefore triggers a repave when the
+   daemon returns. Is that the behavior we want?
 
 ## 19. Code and documentation disagreements
 
@@ -1954,7 +1979,8 @@ noted.
 - **A gRPC plugin protocol.** Deferred. Exec per call is enough for the current
   methods; a streaming transport can come later as a new protocol version.
 - **A distribution profile for renaming units and paths.** Rejected (O2). It
-  multiplies the on-host footprint and the cleanup surface.
+  multiplies the names the agent creates on the host, and so the work of
+  cleaning them up.
 - **Move shared code to `internal/agent` instead of copying.** Rejected (O1).
   It is a large cross-package refactor of v1, and v2's versions will diverge.
 - **Virtual machine runtime.** Out of scope; no current plans.
