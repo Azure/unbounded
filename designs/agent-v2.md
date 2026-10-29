@@ -205,6 +205,10 @@ decision.
 | D30 | v2 copies v1's rendering templates and relies on golden tests for parity. | Open: question 4 |
 | D31 | The boot hooks run through the `current` agent binary link. | Open: question 5 |
 | D32 | The daemon compares the observed Node on every reconcile instead of reacting only to delete events. | Open: question 6 |
+| D33 | A failed repave is retried indefinitely with controller-runtime's default backoff. There is no attempt limit, no rollback and no restart of the old node, matching v1 (section 8.5). | Decided |
+| D34 | A node that never registers is reported as `NodeNotRegistered` after 10 minutes, but is not repaved without a Node deletion, matching v1 (section 8.4). | Decided |
+| D35 | Settings are split into install-time settings, which come only from the configuration file, and goal settings, which are the only thing a goal can change (section 5.2). | Decided |
+| D36 | `Preserve` adoption and container image retention are built in the first implementation, not deferred. | Decided |
 
 Why D4 still matters with only two runtimes:
 
@@ -226,7 +230,7 @@ flowchart TB
     EXT["Declarative extensions"]
   end
   subgraph Agent["unbounded-agent v2 (internal/agentv2)"]
-    CLI["cli: start, preflight, daemon, reset, status, agent-upgrade, runtime-hook"]
+    CLI["cli: start, preflight, daemon, reset, status, agent-upgrade, boot-hook"]
     BOOT["bootstrap coordinator"]
     DAE["daemon: serialized controller"]
     NM["nodemanager"]
@@ -288,7 +292,7 @@ and experimental until section 15 promotes it.
 | `v2 reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
 | `v2 status [--output json]` | New. Runtime, slots, applied goal version, node readiness and any cleanup leftovers |
 | `v2 agent-upgrade [--preflight]` | Upgrade the agent binary from the host |
-| `v2 runtime-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit |
+| `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
 | `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
 | `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
 
@@ -408,6 +412,27 @@ The LocalDNS Corefile template variables become a documented contract:
 (`pkg/agent/goalstates/assets/default-localdns.Corefile.tmpl:2-33`). Flex's
 LocalDNS rendering depends on these names.
 
+#### Install-time settings and goal settings
+
+The configuration has two kinds of settings:
+
+| Kind | Fields | Where they come from | How they change |
+|---|---|---|---|
+| Install-time settings | `machine`, `runtime` (except `runtime.nspawnContainer.image`), `credentials`, `control`, `plugins`, `hooks`, `extensions` | The configuration file only | Reset, then `v2 start` with the new file. Running `v2 start` with different install-time settings on an installed host fails the install check. |
+| Goal settings (`config.GoalSettings`) | `cluster`, `kubelet`, `components`, `artifacts`, `runtime.nspawnContainer.image` | The configuration file at bootstrap, then the goal source | A goal with different goal settings; drift decides whether a repave is needed (section 8.4) |
+
+A goal source returns goal settings only. A plugin's `goal.get` response that
+contains any other field fails validation. In particular, a goal cannot change
+the runtime, the plugins, the hooks or the extensions. Removing or changing an
+extension needs a reset and a new install.
+
+A v1 configuration converts to the `nspawn-container` runtime. Machina
+generates v1 configurations and machina API changes are a non-goal, so a
+machina-provisioned host always gets `nspawn-container`. Using the `host`
+runtime needs a configuration file written by hand, for example through
+`kubectl unbounded` manual bootstrap or a custom first-boot configuration,
+until machina adds a way to choose the runtime.
+
 ### 5.3 Extension mechanisms
 
 | Mechanism | Use it for | Can it replace built-in behavior? |
@@ -452,7 +477,7 @@ fields specific to each event.
 | Event | Fires | Payload | Default failure policy |
 |---|---|---|---|
 | `agent.install.before` | After the install check accepts a fresh or resumed install, before host preparation | runtime, install kind (`Fresh` or `Resume`) | `Fail` |
-| `agent.install.after` | After the daemon is installed, before the install is marked complete | runtime, active slot | `Fail` |
+| `agent.install.after` | After the daemon is installed, before the install is marked complete | runtime, slot | `Fail` |
 | `host.prepare.before` | Before host preparation | runtime | `Fail` |
 | `host.prepare.after` | After host preparation | runtime | `Fail` |
 | `node.provision.before` | Before `Provision(slot)` | slot, goal version | `Fail` |
@@ -568,7 +593,7 @@ or the environment.
 |---|---|---|
 | `describe` | None | `{protocolVersions[], methods[]}`. Called at startup. A configured method the plugin does not list fails startup. |
 | `goal.register` | Machine identity, runtime, versions | None |
-| `goal.get` | Node observation, applied state | `{version, config, delete}`. `config` is a full `AgentConfiguration`. `delete` is `true` when the machine is being removed and the node must be reset. |
+| `goal.get` | Node observation, applied state | `{version, settings, delete}`. `settings` holds goal settings only (section 5.2). `delete` is `true` when the machine is being removed and the node must be reset. |
 | `status.report` | `{phase, reason, message, appliedVersion, runtime}` | None |
 | `credentials.bootstrap` | None | `{apiServer, caCertBase64, token}` |
 | `credentials.cluster` | None | A Kubernetes `ExecCredential` |
@@ -746,7 +771,10 @@ type NodeRuntime interface {
 
 	Inspect(ctx context.Context) (State, error)
 	Provision(ctx context.Context, slot Slot, b *bundle.NodeBundle) error
+	// Start enables the slot, so systemd starts it at boot, disables the
+	// other slot, and starts the node.
 	Start(ctx context.Context, slot Slot) error
+	// Stop stops the node and disables the slot.
 	Stop(ctx context.Context, slot Slot) error
 	Restart(ctx context.Context, slot Slot) error
 	Destroy(ctx context.Context, slot Slot) error
@@ -756,16 +784,21 @@ type NodeRuntime interface {
 
 	// Access observes a started node: readiness and diagnostics.
 	Access(slot Slot) NodeAccess
-	// Hook runs runtime-owned work that systemd triggers around node boot.
-	Hook(ctx context.Context, phase HookPhase, slot Slot, b *bundle.NodeBundle) error
+	// BootHook runs runtime-owned work that systemd triggers around node
+	// boot. It reads the slot's saved bundle manifest (section 7.2) and never
+	// renders a bundle, fetches credentials or uses the network.
+	BootHook(ctx context.Context, phase BootPhase, slot Slot) error
 }
 
-type SlotPhase string // Absent, Provisioned, Running, Stopped
+// SlotPhase is one of Absent, Provisioned, Running or Stopped. Provisioned
+// means the slot's content is in place and the slot has not started since that
+// content was provisioned.
+type SlotPhase string
 
 type SlotState struct {
 	Phase        SlotPhase
-	BundleDigest string
-	NeverStarted bool // the next Start begins with fresh node state
+	Enabled      bool   // systemd starts this slot at boot
+	BundleDigest string // digest of the saved bundle manifest
 }
 
 type State struct{ Slots map[Slot]SlotState }
@@ -776,16 +809,16 @@ type NodeAccess interface {
 	Exec(ctx context.Context, argv ...string) ([]byte, error)
 }
 
-type HookPhase string
+type BootPhase string
 
 const (
-	HookPreStart  HookPhase = "pre-start"
-	HookPostStart HookPhase = "post-start"
+	BootPreStart  BootPhase = "pre-start"
+	BootPostStart BootPhase = "post-start"
 )
 
 var (
-	ErrSlotBusy   = errors.New("another slot is running")
-	ErrSlotActive = errors.New("slot is the active slot")
+	ErrSlotBusy    = errors.New("another slot is running")
+	ErrSlotEnabled = errors.New("slot is the enabled slot")
 )
 ```
 
@@ -794,16 +827,28 @@ Rules every runtime must follow. A shared conformance suite,
 
 1. Every method is idempotent and safe to repeat after a crash.
 2. `Provision` and `Destroy` on one slot never affect the other slot while it
-   runs.
+   runs. `Destroy` returns `ErrSlotEnabled` for the enabled slot.
 3. `Start(x)` returns `ErrSlotBusy` while another slot is running.
-4. The first `Start` after `Provision` begins with empty kubelet and containerd
-   state. The one exception is container image content, when the runtime is
+4. The first time a slot starts after its content was provisioned, it begins
+   with empty kubelet and containerd state. Provisioning identical content
+   again, with the same bundle digest, does not count as new content. The one
+   exception to empty state is container image content, when the runtime is
    configured to keep it (`runtime.host.repave.retainContainerImages`).
-   `Restart` keeps all state.
-5. The node manager puts content into a node only through `Provision`.
-   Runtime-owned hooks may change the node, for example NVIDIA wiring in the
-   `nspawn-container` post-start hook.
-6. Runtimes do not download artifacts, call the Kubernetes API, or run plugins.
+5. `Restart` keeps persistent node state. Volatile state under `/run` is lost,
+   as it would be on a host reboot.
+6. At most one slot is enabled. `Start` enables its slot and disables the other;
+   `Stop` disables its slot. After a host reboot, systemd starts the enabled
+   slot on its own. No lifecycle hooks (section 5.3) fire for a node that
+   systemd starts at boot.
+7. The node manager puts content into a node only through `Provision`. Boot
+   hooks may change the node, for example NVIDIA wiring in the
+   `nspawn-container` post-start boot hook.
+8. Runtimes do not download artifacts, call the Kubernetes API, or run plugins.
+
+The runtime is the only authority on which slot is enabled and running. The
+node manager does not record it separately; it records the bundle digests of
+the applied and pending goals (section 7.7) and compares them with what
+`Inspect` reports.
 
 ### 7.2 Node spec and bundle
 
@@ -823,7 +868,9 @@ type NodeSpec struct {
 	Images       []ImageArchiveRequest
 }
 
-func Resolve(ctx context.Context, cfg *config.AgentConfiguration, creds *credentials.Bootstrap, probe HostProbe) (*NodeSpec, error)
+// Resolve combines the install-time settings from the configuration file with
+// the goal settings of the goal being applied.
+func Resolve(ctx context.Context, install *config.InstallSettings, goal *config.GoalSettings, creds *credentials.Bootstrap, probe HostProbe) (*NodeSpec, error)
 ```
 
 ```go
@@ -858,8 +905,20 @@ type File struct {
 func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (*NodeBundle, error)
 ```
 
-The bundle is not persisted. It is rendered again from the applied
-configuration whenever it is needed, for example by the boot hooks.
+`Provision` saves the bundle in the slot, so it is rendered only once:
+
+- The manifest is saved as `/var/lib/unbounded/agent-v2/slots/<slot>/bundle.json`
+  for both runtimes, followed by a completion marker written last. A slot
+  without the marker is not provisioned.
+- The contents of `Secret` files, such as the bootstrap kubeconfig, are not in
+  the manifest. They are written only to their place in the node (in the
+  nspawn rootfs, or under the slot directory with mode 0600 on `host`).
+- The digest covers every artifact, unit and non-secret file, but only the path
+  and mode of secret files. A refreshed bootstrap token therefore does not
+  change the digest.
+- Boot hooks and `Recover` read the saved manifest. Nothing renders a bundle
+  again after `Provision`, so nothing needs credentials or a host probe outside
+  provisioning.
 
 This "bundle" is unrelated to v1's offline artifact bundles
 (`pkg/agent/bootstrapartifacts`). Those are archives of downloadable
@@ -874,7 +933,9 @@ type Goal struct {
 	// Version is opaque: a MachineConfigurationVersion name, an ARM ETag or a
 	// digest of the configuration file. It is compared for equality only.
 	Version string
-	Config  *config.AgentConfiguration
+	// Settings holds only goal settings (section 5.2). Install-time settings
+	// never come from a goal.
+	Settings *config.GoalSettings
 	// Delete is true when the machine is being removed and the node must be
 	// reset.
 	Delete bool
@@ -898,12 +959,21 @@ type StatusSink interface {
 
 Built-in providers:
 
-- `machina`: registers the Machine, reads the desired configuration from the
-  Machine and its MachineConfigurationVersion as v1 does
+- `machina`: registers the Machine, reads the goal settings from the Machine
+  and its MachineConfigurationVersion as v1 does
   (`cmd/agent/internal/daemon/controller_node.go:75-105`), and writes Machine
   status.
-- `static`: the configuration file is the goal; the version is its digest.
+- `static`: the goal settings in the configuration file are the goal; the
+  version is their digest.
 - `plugin`: delegates to a plugin (section 5.5).
+
+Bootstrap does not ask the goal source for a goal. It builds the first node
+from the configuration file and records an empty goal version. The daemon's
+first reconcile settles it: if the goal's settings match what was applied, the
+goal's version is recorded as applied; if they differ, the node waits for a
+repave like any other drift. v1 behaves the same way, because it compares the
+desired configuration with the applied one and never records a version at
+bootstrap (`cmd/agent/internal/daemon/controller_node.go:43-62`).
 
 ### 7.4 Credentials
 
@@ -957,7 +1027,7 @@ type Client interface {
 package nodemanager
 
 type Manager interface {
-	Ensure(ctx context.Context, cfg *config.AgentConfiguration) error // bootstrap on slot A
+	Ensure(ctx context.Context, cfg *config.AgentConfiguration) error // bootstrap on slot a
 	Apply(ctx context.Context, g *control.Goal) error                 // repave to the inactive slot
 	Reboot(ctx context.Context) error
 	Reset(ctx context.Context, trigger ResetTrigger) error
@@ -967,7 +1037,7 @@ type Manager interface {
 
 type Action string // Steady, Wait, Repave, Reset
 
-func Decide(obs control.Observation, g *control.Goal, drift func(applied, desired *config.AgentConfiguration) bool) Action
+func Decide(obs control.Observation, g *control.Goal, drift func(applied, desired *config.GoalSettings) bool) Action
 ```
 
 The drift function starts from v1's `hasDrift`
@@ -980,19 +1050,21 @@ for one runtime, such as the nspawn OCI image, are contributed by that runtime.
 package state
 
 type Applied struct {
-	Runtime      runtime.Kind
-	ActiveSlot   runtime.Slot
-	Pending      *Pending // non-nil while a repave is in flight
-	GoalVersion  string
-	Config       *config.AgentConfiguration
-	BundleDigest string
-	NodeUID      string // UID of the Node the active slot registered, once observed
+	GoalVersion  string               // empty until the daemon's first reconcile settles it
+	Settings     *config.GoalSettings // the goal settings the running node was built from
+	BundleDigest string               // digest of that node's saved bundle manifest
+	StartedAt    time.Time            // when that node started, for the registration timeout
+	NodeUID      string               // UID of the Node it registered, once observed
+	Pending      *Pending             // non-nil while a repave is in flight
 }
 
 type Pending struct {
-	Slot        runtime.Slot
-	GoalVersion string
-	Config      *config.AgentConfiguration
+	Slot         runtime.Slot
+	GoalVersion  string
+	Settings     *config.GoalSettings
+	BundleDigest string
+	Attempts     int
+	LastError    string
 }
 ```
 
@@ -1002,6 +1074,20 @@ both slots have a configuration file
 (`cmd/agent/internal/daemon/nodeoperator.go:77`), which can happen after a
 crash during a repave.
 
+The record does not say which slot is enabled or running; only the runtime
+knows that (section 7.1). `Recover` compares the bundle digest of the enabled
+slot, as reported by `Inspect`, with the digests in this record:
+
+| Enabled slot's digest | Meaning | `Recover` does |
+|---|---|---|
+| Matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot | Continues or retries the pending repave, if any |
+| Matches `Pending.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
+| No slot is enabled, and `Pending` is set | The old slot was stopped, but the new one was not started | Continues the pending repave from starting the new slot |
+| Any other case | The record and the host disagree | Reports `StateMismatch` and changes nothing |
+
+The runtime kind is an install-time setting, so it lives in the install
+record, not here.
+
 ## 8. Lifecycles
 
 ### 8.1 Slot states
@@ -1009,16 +1095,19 @@ crash during a repave.
 ```mermaid
 stateDiagram-v2
   [*] --> Absent
-  Absent --> Provisioned: Provision
+  Absent --> Provisioned: Provision saves the manifest
   Provisioned --> Provisioned: Provision, same digest is a no-op
-  Provisioned --> Running: Start, fresh node state
-  Running --> Running: Restart, state kept
-  Running --> Stopped: Stop
-  Stopped --> Running: Start, state kept
+  Provisioned --> Running: Start enables the slot, fresh node state
+  Running --> Running: Restart, persistent state kept
+  Running --> Stopped: Stop disables the slot
+  Stopped --> Running: Start enables the slot, state kept
   Provisioned --> Absent: Destroy
   Stopped --> Absent: Destroy
   Running --> Absent: Teardown
 ```
+
+A host reboot does not change a slot's phase: systemd starts the enabled slot
+again, and it stays Running.
 
 ### 8.2 Bootstrap (`v2 start`)
 
@@ -1035,7 +1124,7 @@ sequenceDiagram
   participant SD as systemd
   Op->>CLI: start with config
   CLI->>CLI: log experimental warning, load and validate config, select runtime
-  CLI->>St: acquire install lock, admit
+  CLI->>St: acquire install lock, run the install check
   alt already complete
     CLI->>NM: verify node and daemon, repair daemon if needed
   else fresh or resume
@@ -1047,14 +1136,14 @@ sequenceDiagram
     CLI->>Px: goal.register, status.report Provisioning
     CLI->>NM: Ensure
     NM->>RT: Inspect
-    NM->>NM: resolve NodeSpec, cache artifacts, render bundle for slot A
+    NM->>NM: resolve NodeSpec, cache artifacts, render the bundle for slot a
     NM->>Px: hook node.provision.before
-    NM->>RT: Provision A, skipped with its hooks if A is running
+    NM->>RT: Provision a and save its manifest, skipped with its hooks if a is running
     NM->>Px: hook node.provision.after
     NM->>Px: hook node.start.before
-    NM->>RT: Start A
-    NM->>RT: Access A, wait for readiness
-    NM->>St: save applied state, active A
+    NM->>RT: Start a, which enables it
+    NM->>RT: Access a, wait for readiness
+    NM->>St: save applied state with an empty goal version
     NM->>Px: hook node.start.after, status.report Ready
     CLI->>SD: install and start unbounded-agent-v2-daemon
     CLI->>Px: hook agent.install.after
@@ -1069,15 +1158,15 @@ sequenceDiagram
   participant SD as systemd
   participant Pre as unbounded-node-pre.target
   participant U as node boot unit
-  participant A as v2 runtime-hook
+  participant A as v2 boot-hook
   participant RT as NodeRuntime
   participant D as v2 daemon
   SD->>Pre: nftables flush, LocalDNS network helper, extension host units
-  SD->>U: start the active slot's boot unit
+  SD->>U: start the enabled slot's boot unit
   U->>A: ExecStartPre pre-start slot
-  A->>RT: Hook pre-start, from the applied state
+  A->>RT: BootHook pre-start, from the slot's saved manifest
   U->>A: ExecStartPost post-start slot
-  A->>RT: Hook post-start
+  A->>RT: BootHook post-start
   SD->>D: start daemon, Recover, then reconcile
 ```
 
@@ -1121,17 +1210,30 @@ The startup gate opens after a pending AgentUpgrade result is published,
 | Goal `delete` | Node object | Goal version vs applied | Drift | Action |
 |---|---|---|---|---|
 | `true` | Any | Any | Any | Reset |
-| `false` | Never observed for the active slot | Any | Any | Wait: kubelet has not registered yet |
-| `false` | Present | Equal | Not applicable | Steady; record the Node UID |
-| `false` | Present | Differs | No | Steady; mark the version applied |
-| `false` | Present | Differs | Yes | Wait: repave pending until the Node is deleted |
+| `false` | Never observed since the current node started | Any | Any | Wait: kubelet has not registered yet. After 10 minutes, also report `NodeNotRegistered`. |
+| `false` | Present, with the recorded UID or on first sighting | Equal | Not applicable | Steady; record the Node UID |
+| `false` | Present, with the recorded UID | Differs | No | Steady; record the goal version as applied |
+| `false` | Present, with the recorded UID | Differs | Yes | Wait: repave pending until the Node is deleted |
+| `false` | Present, with a different UID: deleted and recreated | Any | Yes | Repave |
+| `false` | Present, with a different UID | Any | No | Steady; record the new UID and the goal version |
 | `false` | Deleted: UID seen before, now absent | Any | Yes | Repave |
-| `false` | Deleted | Any | No | Steady; mark applied, matching v1 (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
+| `false` | Deleted | Any | No | Steady; record the goal version as applied, matching v1 (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
 
 v1 only reacts to Node delete events, so it misses a Node deleted while the
 daemon is down. v2 instead compares what it observes on every reconcile, so
 that deletion is still noticed when the daemon comes back. The recorded Node
-UID keeps a node that has not registered yet from looking deleted.
+UID keeps a node that has not registered yet from looking deleted, and catches
+a Node that was deleted and recreated while the daemon was not watching.
+
+"Record the goal version as applied" changes nothing on the running node. Goal
+settings that the drift function ignores, such as artifact download sources,
+are saved with the version and take effect at the next provision.
+
+A node that never registers is reported but not repaved, because there is no
+Node to delete. This matches v1, where such a node also stays as it is. The
+`NodeNotRegistered` status, counted from `Applied.StartedAt`, makes the problem
+visible. Recovery is manual, as in v1: an `AgentReset` operation or
+`v2 reset`, then `v2 start`.
 
 ### 8.5 Repave
 
@@ -1145,39 +1247,55 @@ sequenceDiagram
   participant RT as NodeRuntime
   D->>NM: Apply goal
   NM->>Px: hook node.repave.before, credentials.bootstrap
-  NM->>NM: resolve NodeSpec, cache artifacts, render bundle for slot B
-  NM->>St: save Pending slot B
-  NM->>Px: hook node.provision.before B
-  NM->>RT: Provision B
-  NM->>Px: hook node.provision.after B
-  NM->>Px: hook node.stop.before A
-  NM->>RT: Stop A
-  NM->>Px: hook node.stop.after A
+  NM->>NM: resolve NodeSpec, cache artifacts, render the bundle for the new slot
+  NM->>St: save Pending with the new slot and its bundle digest
+  NM->>Px: hook node.provision.before new
+  NM->>RT: Provision new and save its manifest
+  NM->>Px: hook node.provision.after new
+  NM->>Px: hook node.stop.before old
+  NM->>RT: Stop old, which disables it
+  NM->>Px: hook node.stop.after old
   NM->>NM: host network reset
-  NM->>Px: hook node.start.before B
-  NM->>RT: Start B
-  NM->>RT: Access B, wait for readiness
-  NM->>St: commit active B, applied goal, clear Pending
-  NM->>Px: hook node.start.after B
-  NM->>RT: Destroy A
+  NM->>Px: hook node.start.before new
+  NM->>RT: Start new, which enables it
+  NM->>RT: Access new, wait for readiness
+  NM->>St: commit the applied goal and digest, clear Pending
+  NM->>Px: hook node.start.after new
+  NM->>RT: Destroy old
   NM->>Px: hook node.repave.after, status.report Ready
 ```
 
-`Recover` after a crash:
+"Old" is the slot that was running before the repave, and "new" is the other
+slot. After the first repave, the old slot is `b`.
 
-- `Pending` is set and A was never stopped: run `Apply` again. `Provision` is
-  idempotent.
-- `Pending` is set and A is stopped: continue from `Start B`.
-- No `Pending`, but a slot other than the active one is provisioned: `Destroy`
-  it.
+`Recover` after a crash follows the table in section 7.7. In addition, a
+provisioned slot that is neither enabled nor pending is destroyed.
+
+When a repave fails, it is retried, matching v1:
+
+- Retries never stop. They use controller-runtime's default per-item backoff,
+  as v1 does: v1 configures no rate limiter of its own
+  (`pkg/agent/daemon/setup.go:45-50`).
+- Every attempt reads the goal again, as v1 does
+  (`cmd/agent/internal/daemon/controller_node.go:43`). A goal change also
+  queues an attempt at once, so a corrected goal does not wait out the backoff.
+- Each failed attempt is reported as `Failed`, with the attempt count and the
+  last error (`Pending.Attempts`, `Pending.LastError`).
+- There is no rollback. The old slot stays stopped and intact until a later
+  attempt succeeds, and is destroyed only then. Starting the old node again is
+  not useful: the control plane deleted its Node to approve the repave, and its
+  workloads are already gone.
+- If stopping the old slot fails, for example with `ErrNodeBusy` or
+  `ErrMountsRemain` on `host`, the attempt ends there and the new slot is not
+  started. The node stays down until a retry succeeds, as in v1.
 
 Differences from v1:
 
 - v1 persists the new configuration before waiting for kubelet, then removes
   the old slot (`cmd/agent/internal/daemon/nodeoperator.go:275-285`). v2
   commits only once the node is ready.
-- The old slot is destroyed only after the commit. A later version could roll
-  back by starting A again. Automatic rollback is not proposed, matching v1.
+- v1 reuses a partially unpacked rootfs after a crash (section 19). v2
+  provisions a slot again unless its completion marker is present.
 
 ### 8.6 NodeReboot
 
@@ -1190,7 +1308,7 @@ sequenceDiagram
   D->>Px: MarkInProgress
   D->>NM: Reboot
   NM->>Px: hook node.restart.before
-  NM->>RT: Restart active slot
+  NM->>RT: Restart the enabled slot
   NM->>RT: Access, wait for readiness
   NM->>Px: hook node.restart.after
   D->>Px: Finish Complete or Failed
@@ -1267,6 +1385,7 @@ sequenceDiagram
 | Slot | `/var/lib/machines/kube1`, `kube2` | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Provision | Unpack the OCI image; write the bundle, `.nspawn` file and unit override | Stage binaries and rendered files into the slot directory |
 | Start | `machinectl start`, then boot steps through `systemd-run -M` | Install units and configuration from the slot, start the pre target and `unbounded-node.target` |
+| Enabled at boot | `machinectl enable` on `Start`, as v1 does (`pkg/agent/phases/nodestart/nspawn.go:99`), and `machinectl disable` on `Stop` (`pkg/agent/phases/reset/machine.go:39`) | The node units are enabled on `Start` and disabled on `Stop` |
 | Fresh state | A new rootfs | Wipe the owned paths (host runtime doc, section 8) |
 | `NodeAccess` | `systemd-run -M` | Direct |
 | NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start hook, writing `/var/run/cdi/nvidia.yaml` |
@@ -1290,7 +1409,7 @@ The node runs directly on the host:
 
 - `containerd.service`, `kubelet.service` and `localdns.service` keep their
   standard names and run in `unboundednode.slice` (host runtime doc, section 6).
-- Binaries live in the active slot's directory; units point at them. A repave
+- Binaries live in the enabled slot's directory; units point at them. A repave
   stages the new slot, then rewrites the units when it switches to that slot.
 - Preflight adds a `conflicting-packages` check for distro packages that ship
   kubelet, containerd or docker's containerd.
@@ -1437,7 +1556,7 @@ Flex. The scoping is open for review (section 18).
 | TPM attestation | `cmd/agent/internal/attest` | `credentials`, the `tpm` provider |
 | Machine registration and status | `cmd/agent/internal/daemon/daemon.go:303-406`, `bootstrap_status.go` | `control`, the `machina` providers |
 | NVIDIA, AMD and host devices | `pkg/agent/goalstates`, `pkg/agent/phases/nodestart/nvidia.go` | Discovery in `nodespec`; each runtime makes the devices available to the node |
-| nspawn lifecycle hooks | `pkg/agent/nspawnlifecycle` | `runtime.Hook` and `v2 runtime-hook` |
+| nspawn lifecycle hooks | `pkg/agent/nspawnlifecycle` | `runtime.BootHook` and `v2 boot-hook` |
 | Daemon CSR credentials | `pkg/agent/daemoncred` | `credentials`, the `csr` provider |
 | Repave on Node delete with drift detection | `cmd/agent/internal/daemon/controller_node.go`, `nodeoperator.go` | `daemon`, `nodemanager` |
 | NodeReboot, AgentUpgrade, AgentReset | `cmd/agent/internal/daemon/controller_machineoperation.go` | `daemon`, `agentupgrade`, `nodemanager` |
