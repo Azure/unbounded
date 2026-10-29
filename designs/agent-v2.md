@@ -97,22 +97,9 @@ Flex translates its own configuration schema into `pkg/agent/config` types and
 then composes its own agent from `pkg/agent` packages: its own task graphs for
 host setup, start, reboot, repave and reset; its own daemon around
 `daemon.SetupController`; and its own upgrade orchestration over
-`pkg/agent/agentbinary`.
-
-On top of that it adds:
-
-- an ARM Machine backend for desired state and status, using the ARM ETag as a
-  settings version;
-- fresh bootstrap data fetched from ARM before a repave;
-- an exec credential for kubelet and the daemon (`aks-flex-node token
-  kubelogin`), which requires copying its binary into the nspawn rootfs;
-- static host routes ordered before `systemd-nspawn@`;
-- Node Problem Detector, downloaded into the rootfs and started with
-  `systemd-run --machine`;
-- extra `Requires=` dependencies on the nspawn unit;
-- an AKS LocalDNS Corefile template that uses unbounded's template variables;
-- Arc and NPD preflight checks;
-- a taint-based reset trigger.
+`pkg/agent/agentbinary`. Its own additions, such as an ARM Machine backend,
+exec credentials, static routes and Node Problem Detector, are listed with
+their v2 equivalents in section 5.7.
 
 Several patterns in Flex point to missing extension points:
 
@@ -220,7 +207,7 @@ flowchart TB
     BOOT["bootstrap coordinator"]
     DAE["daemon: serialized controller"]
     NM["nodemanager"]
-    CTRL["control: goal sources, status sinks, operations"]
+    CTRL["control: goal sources, status reporters, operations"]
     CRED["credentials"]
     HK["hooks and plugin client"]
     SPEC["nodespec"]
@@ -267,8 +254,6 @@ Why node content is a declarative bundle, even with only two runtimes:
 - Rendering is a pure function, so it can be tested against v1's golden files.
 - Extensions merge into the bundle, replacing Flex's pattern of writing into
   the machine directory after provisioning.
-- The node manager never writes into a node after it starts; all content goes
-  through `Provision`.
 
 Both runtimes share the host kernel and the host network namespace with the
 node. The node manager relies on this: it configures host sysctls for the node
@@ -295,13 +280,10 @@ and experimental until section 15 promotes it.
 | `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
 
 The `v2` group is listed in `unbounded-agent --help` as "Experimental v2 agent
-(unstable)". Its `PersistentPreRunE` sets up logging and immediately logs:
+(unstable)". Every `v2` command logs this warning as its first line of output:
 
 > unbounded-agent v2 is experimental: configuration, plugin protocol and
 > on-host layout may change without notice; not supported for production use.
-
-v1 commands set up logging inside `RunE` (`cmd/agent/internal/cmd/start.go:31`).
-v2 does it earlier so the warning is always the first line of output.
 
 Configuration is read from `--config` or `UNBOUNDED_AGENT_CONFIG_FILE`, the
 variable cloud-init and Ignition already set
@@ -362,7 +344,7 @@ provisioning works unchanged.
     {
       "name": "aks",
       "command": ["/opt/aks-flex-node/bin/aks-flex-node-plugin"],
-      "timeouts": { "goal.get": "60s", "hook": "2m" }
+      "timeouts": { "goal.get": "60s" }
     }
   ],
   "hooks": [
@@ -393,9 +375,6 @@ Enumerated fields:
 | Field | Values |
 |---|---|
 | `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container` *(open: section 3, question 3)*. |
-| `credentials.bootstrap.type` | `static`, `tpm` (metalman attestation), `plugin` |
-| `credentials.kubelet.type` | `bootstrap`, `kubeconfig`, `exec` |
-| `credentials.daemon.type` | `csr`, `kubeconfig`, `plugin` |
 | `control.goal.type` | `machina`, `static` (the goal settings in the configuration file are the goal), `plugin` |
 | `control.status.type` | `machina`, `none`, `plugin` |
 | `control.operations.enabled` | `true` (default): handle MachineOperations through machina. `false`: ignore them. |
@@ -471,7 +450,7 @@ until machina adds a way to choose the runtime.
 |---|---|---|
 | Configuration | Kubelet settings, labels, taints, versions, the LocalDNS template, credential modes | Not applicable |
 | Declarative extensions (5.4) | Extra node binaries, files and units; extra host units; ordering before node boot; cleanup declarations | No, additive only |
-| Providers, through exec plugins (5.5) | Goal source, status sink, bootstrap credentials, daemon credentials, extra preflight checks | Yes, a provider replaces one built-in implementation |
+| Providers, through exec plugins (5.5) | Goal source, status reporter, bootstrap credentials, daemon credentials, extra preflight checks | Yes, a provider replaces one built-in implementation |
 | Lifecycle hooks, through exec plugins (5.5) | Side effects at fixed points | No. Hooks observe, and can fail the operation. |
 
 Use the first mechanism that fits, in this order. There are no in-process Go
@@ -486,10 +465,6 @@ Events are named `<subject>.<action>.<phase>`:
   only separate segments, so a future action that needs more than one word
   would use hyphens.
 - The phase is `before` or `after`. Every action has both.
-
-`before` and `after` are used instead of `pre` and `post` so these events are
-not confused with the runtime's internal pre-start and post-start boot hooks
-(section 8.3).
 
 When events fire:
 
@@ -642,7 +617,7 @@ or the environment.
   "apiVersion": "plugin.agent.unbounded-cloud.io/v1alpha1",
   "kind": "Request",
   "method": "goal.get",
-  "context": { "machine": "m-01", "node": "m-01", "runtime": "host", "agentVersion": "..." },
+  "context": { "machineName": "m-01", "nodeName": "m-01", "runtime": "host", "agentVersion": "..." },
   "payload": {
     "node": { "exists": true, "uid": "...", "labels": {}, "taints": [] },
     "applied": { "goalVersion": "..." }
@@ -673,9 +648,10 @@ Operational rules:
   If a plugin configured as a provider does not list a method the
   configuration uses, startup fails.
 - **Timeouts** are set per method in `plugins[].timeouts`. The defaults are 10
-  seconds for `describe`, 60 seconds for every other method, and
-  `hooks[].timeout` for a hook. On a timeout or cancellation the plugin gets
-  SIGTERM, then SIGKILL after 5 seconds.
+  seconds for `describe` and 60 seconds for every other method. A hook's
+  timeout is set only by its `hooks[].timeout`, which also defaults to 60
+  seconds. On a timeout or cancellation the plugin gets SIGTERM, then SIGKILL
+  after 5 seconds.
 - **Output limits:** a response larger than 1 MiB on stdout is a failure. Only
   the first 64 KiB of stderr is logged.
 - **Ownership:** the plugin's executable path must be absolute. The file and
@@ -687,10 +663,8 @@ Operational rules:
 - **Upgrades:** the agent never upgrades plugins. Compatibility is negotiated
   through `describe`.
 
-The exec model follows the kubelet credential provider and CNI patterns:
-there is no plugin process to supervise and each call is easy to test. Goal
-changes are picked up by polling plus Node events. A streaming transport can be
-added later as a new protocol version.
+Goal changes from a plugin goal source are picked up by polling plus Node
+events (section 7.3).
 
 ### 5.6 What v2 creates on the host
 
@@ -740,8 +714,8 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Maintenance containerd during an image-preserving wipe (`host` only) | `/run/unbounded-agent-v2/containerd-maint/` |
 
 On-host names are fixed. Consumers cannot rename units or paths. Only the
-identity the cluster sees is configurable: the daemon CSR group and name
-(`credentials.daemon.csr`).
+identity the cluster sees is configurable: the daemon CSR group
+(`credentials.daemon.csr.group`).
 
 ### 5.7 Mapping AKS Flex Node customizations
 
@@ -786,7 +760,7 @@ internal/agentv2/
   state/          install record, node state, locks
   bootstrap/      install check and stages
   nodemanager/    Ensure, Apply, Reboot, Reset, Recover, Decide
-  control/        goal sources, status sinks, operation source (machina, static, plugin)
+  control/        goal sources, status reporters, operation source (machina, static, plugin)
   credentials/    bootstrap (static, tpm, plugin), kubelet, daemon (csr, kubeconfig, plugin)
   daemon/         controller wiring, startup gate, operation handlers, unit assets
   agentupgrade/   MachineOperation and CLI upgrade over pkg/agent/agentbinary
@@ -1045,10 +1019,6 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
   again after `Provision`, so nothing needs credentials or a host probe outside
   provisioning.
 
-This "bundle" is unrelated to v1's offline artifact bundles
-(`pkg/agent/bootstrapartifacts`). Those are archives of downloadable
-artifacts; a `NodeBundle` is the rendered description of one node.
-
 ### 7.3 Control plane integration
 
 ```go
@@ -1077,7 +1047,7 @@ type GoalSource interface {
 	Trigger() Trigger // an event source, or a poll interval
 }
 
-type StatusSink interface {
+type StatusReporter interface {
 	Report(ctx context.Context, s Status) error
 }
 ```
@@ -1193,11 +1163,8 @@ type Pending struct {
 }
 ```
 
-A single `Applied` record replaces v1's per-slot applied-configuration files.
-It removes an ambiguity in v1: `FindActiveMachine` returns `kube1` whenever
-both slots have a configuration file
-(`cmd/agent/internal/daemon/nodeoperator.go:77`), which can happen after a
-crash during a repave.
+A single `Applied` record replaces v1's per-slot applied-configuration files
+(section 14.1).
 
 The record does not say which slot is enabled or running; only the runtime
 knows that (section 7.1). `Recover` compares the bundle digest of the enabled
@@ -1219,8 +1186,8 @@ The rules for every v2 state file: the install record, node state, the host
 preparation undo log, the host runtime's ownership and active-slot records, and
 saved bundle manifests.
 
-- Each file has a `schemaVersion` and is written durably, with a `.sha256`
-  sidecar.
+- Each file has a `schemaVersion`, is written and synced to disk before it is
+  used, and has a `.sha256` sidecar.
 - New fields are only ever added, never renamed or removed, and older readers
   ignore fields they don't know. An upgrade can roll back to the `last-good`
   binary (section 8.7), which must still be able to read what the newer binary
@@ -1380,11 +1347,10 @@ The startup gate opens after a pending AgentUpgrade result is published,
 | `false` | Deleted: UID seen before, now absent | Any | Yes | Repave |
 | `false` | Deleted | Any | No | Steady; record the goal version as applied, matching v1 (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
 
-v1 only reacts to Node delete events, so it misses a Node deleted while the
-daemon is down. v2 instead compares what it observes on every reconcile, so
-that deletion is still noticed when the daemon comes back. The recorded Node
-UID keeps a node that has not registered yet from looking deleted, and catches
-a Node that was deleted and recreated while the daemon was not watching.
+Unlike v1, which reacts only to delete events, v2 compares what it observes on
+every reconcile, so a Node deleted while the daemon was down is still noticed.
+The recorded Node UID keeps a node that has not registered yet from looking
+deleted, and catches a Node that was deleted and recreated.
 
 "Record the goal version as applied" changes nothing on the running node. Goal
 settings that the drift function ignores, such as artifact download sources,
@@ -1449,16 +1415,6 @@ When a repave fails, it is retried, matching v1:
 - If stopping the old slot fails, for example with `ErrNodeBusy` or
   `ErrMountsRemain` on `host`, the attempt ends there and the new slot is not
   started. The node stays down until a retry succeeds, as in v1.
-
-Differences from v1:
-
-- v1 persists the new configuration before waiting for kubelet, then removes
-  the old slot (`cmd/agent/internal/daemon/nodeoperator.go:275-285`). v2
-  commits only once the node is ready.
-- v1 skips unpacking the OCI image when the machine directory is not empty
-  (`pkg/agent/phases/rootfs/oci/task.go:61-64`), so after a crash partway
-  through an unpack, later attempts reuse a partial rootfs. v2 provisions a
-  slot again unless its completion marker is present.
 
 ### 8.6 NodeReboot
 
@@ -1623,7 +1579,6 @@ The workloads on a `host` node see the real host rather than a container. For
 example, racer's `/dev` hostPath is the host's whole `/dev`
 (`internal/racer/workload/workload.go:269`), and unbounded-net's init container
 reaches the real init with `nsenter -t 1` (`images/net/node-agent-init.sh:17`).
-The `host` runtime documentation must say this.
 
 ## 10. Host runtime cleanup
 
@@ -1657,17 +1612,11 @@ Teardown, for both runtimes. It hardens v1's `CleanupNetwork`
 
 The whole-ruleset flush at node start is kept for both runtimes. v1's
 `nftables-flush.service` runs `flush ruleset`
-(`pkg/agent/phases/host/assets/nftables-clear.nft:6`). Every nspawn machine
-pulls it in (`RequiredBy=systemd-nspawn@.service`, `nftables-flush.service:20-21`)
-and is ordered after it
-(`pkg/agent/phases/rootfs/assets/service-override.conf:39`). The flush
-deliberately also clears a host firewall's default-drop policy, which would
-otherwise make the kubelet unreachable (`nftables-flush.service:7-12`).
-
-In v2 the flush stays a direct prerequisite of each runtime's boot unit
-(section 8.3). It is a oneshot with `RemainAfterExit=no`
-(`nftables-flush.service:16-18`), so every start of the node runs it again
-*(inference; validation task V5)*.
+(`pkg/agent/phases/host/assets/nftables-clear.nft:6`). It deliberately also
+clears a host firewall's default-drop policy, which would otherwise make the
+kubelet unreachable (`nftables-flush.service:7-12`). In v2 it stays a
+prerequisite of each runtime's boot unit, so it runs on every node start
+(section 8.3).
 
 The shared package that implements it:
 
@@ -1691,10 +1640,7 @@ Host preparation records an undo step in its undo log,
 the steps in reverse order, for both runtimes. This makes v2's reset do what
 v1's help text promises ("restore the host to its original state",
 `cmd/agent/internal/cmd/reset.go:22-24`) but v1 does not do
-(`cmd/agent/internal/daemon/reset.go:168-195`). v1 does have a legacy uninstall
-script that reverses host preparation
-(`internal/provision/assets/unbounded-agent-uninstall.sh`), but only tests call
-it (`internal/provision/script.go:35`).
+(`cmd/agent/internal/daemon/reset.go:168-195`).
 
 | Change (v1 source) | Undo step |
 |---|---|
@@ -1758,12 +1704,12 @@ here should match v1.
 
 | Area | v1 | v2 | Section |
 |---|---|---|---|
-| Noticing a deleted Node | Reacts only to delete events, so it misses one deleted while the daemon is down | Compares the observed Node on every reconcile, and records its UID | 8.4 (open: question 6) |
+| Noticing a deleted Node | Reacts only to delete events, so it misses one deleted while the daemon is down | Compares the observed Node on every reconcile, and records its UID | 8.4 (open: section 3, question 6) |
 | A Node deleted and recreated | Not handled | Treated as a deletion; repaves if there is drift | 8.4 |
 | A node that never registers | Stays as it is, with no report | Stays as it is, and reports `NodeNotRegistered` after 10 minutes | 8.4 |
-| Repave commit | Saves the new configuration before kubelet is confirmed running | Commits only once the new node is ready | 8.5 |
-| A crash during a repave unpack | Later attempts reuse a partial rootfs | A slot is provisioned again unless its completion marker is present | 8.5 |
-| Active slot after a crash | `kube1` wins if both slots have a configuration file | The runtime reports the enabled slot; `Recover` reconciles by bundle digest | 7.7 |
+| Repave commit | Saves the new configuration before kubelet is confirmed running (`cmd/agent/internal/daemon/nodeoperator.go:275-285`) | Commits only once the new node is ready | 8.5 |
+| A crash during a repave unpack | Skips unpacking when the machine directory is not empty, so later attempts reuse a partial rootfs (`pkg/agent/phases/rootfs/oci/task.go:61-64`) | A slot is provisioned again unless its completion marker is present | 7.2 |
+| Active slot after a crash | `kube1` wins if both slots have a configuration file (`cmd/agent/internal/daemon/nodeoperator.go:77`) | The runtime reports the enabled slot; `Recover` reconciles by bundle digest | 7.7 |
 | Boot hooks | Regenerate configuration from the applied config | Read the bundle manifest saved at provision time | 7.2 |
 | Host network reset | Fixed names and a fixed WireGuard range | Names plus link kinds, any WireGuard port, and owned iptables chains removed on reset | 11 |
 | Reset | Leaves host preparation in place | Reverses it from the undo log | 12 |
@@ -1776,7 +1722,7 @@ here should match v1.
 
 1. Everything starts in `internal/agentv2`.
 2. Moving a package to `pkg/agentv2/<area>/<version>` requires a decision
-   record appended to this document stating: the consumer and why the binary
+   recorded in a design doc under `designs/`, stating: the consumer and why the binary
    hook points are not enough, the exact API surface, the stability level
    (alpha, beta or stable) and compatibility promise, and the owner.
 3. Export types before behavior. The likely first candidates are the plugin
@@ -1876,6 +1822,6 @@ and converted field by field:
 | `NSpawnLifecycle` | Not converted. v2 always runs its own boot hooks, so a v1 configuration that sets it is rejected with an explanation. |
 
 A converted configuration gets the v1 defaults for everything v1 did not
-configure: `runtime.type` is `nspawn-container`, the goal source, status sink
+configure: `runtime.type` is `nspawn-container`, the goal source, status reporter
 and MachineOperations are `machina`, and there are no plugins, hooks or
 extensions.
