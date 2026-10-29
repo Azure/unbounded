@@ -30,18 +30,25 @@ apt-mark hold \
     "linux-modules-${kernel_release}" \
     "linux-modules-extra-${kernel_release}"
 
+echo "Removing the John Cabaj package source."
 for source in /etc/apt/sources.list.d/*; do
     test -f "${source}" || continue
-    if grep -qi john-cabaj "${source}"; then
+    if printf '%s\n' "${source}" | grep -qi john-cabaj ||
+        grep -qi john-cabaj "${source}"; then
         rm -f "${source}"
     fi
 done
 if grep -Rqi john-cabaj /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    echo "The John Cabaj package source is still configured." >&2
     exit 1
 fi
 
+echo "Updating target-kernel EFI GRUB entries."
 boot_configs="$(find /boot/efi -type f -name grub.cfg -print)"
-test -n "${boot_configs}"
+if test -z "${boot_configs}"; then
+    echo "No EFI GRUB configuration was found." >&2
+    exit 1
+fi
 validated_boot_configs=0
 for config in ${boot_configs}; do
     if ! grep -Eq \
@@ -71,8 +78,12 @@ for config in ${boot_configs}; do
     done
     validated_boot_configs=$((validated_boot_configs + 1))
 done
-test "${validated_boot_configs}" -gt 0
+if test "${validated_boot_configs}" -eq 0; then
+    echo "No EFI GRUB configuration referenced the source or target kernel." >&2
+    exit 1
+fi
 
+echo "Validating installed kernel and access packages."
 for package in \
     linux-azure-nvidia-6.14-headers-6.14.0-1003 \
     linux-headers-6.14.0-1003-azure-nvidia \
