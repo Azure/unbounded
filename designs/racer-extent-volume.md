@@ -483,7 +483,9 @@ metadata pages read.
   residency of their pages restored, in maintenance batches after startup.
 - Held pages are stored in the storage tier with `retain_until` set to the
   hold expiry. Storage-tier writes with no live hold use `retain_until` 0.
-  Eviction compares `retain_until` with wall clock time.
+  Eviction compares `retain_until` with wall clock time, but never with a time
+  ahead of the monotonic time elapsed since its last reading, so a forward
+  wall clock jump cannot evict a page whose hold is still live.
 - Removing a cache, or dropping a page whose record is invalid, deletes its
   entries from the index (see `cmd/racer/src/store/disk.rs`).
 - The checkpoint file keeps only object metadata.

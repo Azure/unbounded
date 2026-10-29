@@ -116,6 +116,32 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Eviction time for wall time `wall`, read at monotonic `now`, given the
+/// previous reading `anchor`. Storage entries are kept until their
+/// `retain_until` passes this time. It follows the wall clock, except that it
+/// never runs ahead of the monotonic time elapsed since the anchor: a held page
+/// stays live until both clocks pass its deadline, so a forward wall-clock jump
+/// must not let eviction remove it early. After such a jump the result lags the
+/// wall clock by the jump, which only retains storage slots longer. Returns the
+/// time and the next anchor.
+fn eviction_time(
+    anchor: Option<(u64, std::time::Instant)>,
+    wall: u64,
+    now: std::time::Instant,
+) -> (u64, (u64, std::time::Instant)) {
+    match anchor {
+        Some((secs, at)) => {
+            let limit = secs.saturating_add(now.saturating_duration_since(at).as_secs());
+            if wall <= limit {
+                (wall, (wall, now))
+            } else {
+                (limit, (secs, at))
+            }
+        }
+        None => (wall, (wall, now)),
+    }
+}
+
 /// Whole seconds since the Unix epoch, rounded up, so protection never ends early.
 pub(super) fn ceil_unix(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH).map_or(0, |d| {
@@ -168,6 +194,17 @@ impl Index {
     /// The mounted volume and the reactor its I/O runs on.
     fn io(&self) -> Option<(Rc<DiskVolume>, Rc<Reactor>)> {
         Some((self.volume()?, self.reactor.borrow().clone()?))
+    }
+
+    /// Eviction time in Unix seconds; see [`eviction_time`].
+    fn eviction_now(&self) -> u64 {
+        let (now, anchor) = eviction_time(
+            self.eviction_clock.get(),
+            now_unix(),
+            uring_runtime::environment::now(),
+        );
+        self.eviction_clock.set(Some(anchor));
+        now
     }
 
     /// Whether the extent volume is mounted.
@@ -509,7 +546,14 @@ impl Index {
         }
         self.reserve_stuck.set(false);
         let allocated = volume
-            .allocate_evicting(&*reactor, tier, length, now_unix(), EVICTION_BUDGET, scope)
+            .allocate_evicting(
+                &*reactor,
+                tier,
+                length,
+                self.eviction_now(),
+                EVICTION_BUDGET,
+                scope,
+            )
             .await;
         // A failed eviction may have removed entries before it stopped.
         self.forget_pages(&volume.take_evicted(), true);
@@ -800,7 +844,7 @@ impl Index {
                 .reserve_free(
                     reactor,
                     FREE_SLOT_RESERVE,
-                    now_unix(),
+                    self.eviction_now(),
                     RESERVE_EVICTIONS,
                     scope,
                 )
@@ -1560,5 +1604,33 @@ impl Index {
         while self.maintenance_queued() {
             self.block(self.maintain(&scope, false)).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eviction_time;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn eviction_time_follows_wall_clock_but_caps_forward_jumps() {
+        let start = Instant::now();
+        // The first reading is the wall clock.
+        let (now, anchor) = eviction_time(None, 1000, start);
+        assert_eq!((now, anchor), (1000, (1000, start)));
+        // Normal progress follows the wall clock and moves the anchor.
+        let later = start + Duration::from_secs(10);
+        let (now, anchor) = eviction_time(Some(anchor), 1010, later);
+        assert_eq!((now, anchor), (1010, (1010, later)));
+        // A forward jump is capped by monotonic progress and keeps the anchor.
+        let jumped = later + Duration::from_secs(5);
+        let (now, kept) = eviction_time(Some(anchor), 5000, jumped);
+        assert_eq!((now, kept), (1015, anchor));
+        // The cap keeps advancing with monotonic time after the jump.
+        let (now, _) = eviction_time(Some(kept), 5010, jumped + Duration::from_secs(10));
+        assert_eq!(now, 1025);
+        // A backward jump is followed at once.
+        let (now, anchor) = eviction_time(Some(kept), 900, jumped);
+        assert_eq!((now, anchor), (900, (900, jumped)));
     }
 }

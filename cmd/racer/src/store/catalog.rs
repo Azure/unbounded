@@ -78,6 +78,10 @@ pub struct Index {
     /// next allocation.
     pub(super) reserve_stuck: Cell<bool>,
 
+    /// Wall seconds and the monotonic instant they were read at, for the
+    /// eviction clock (see `Index::eviction_now`).
+    pub(super) eviction_clock: Cell<Option<(u64, std::time::Instant)>>,
+
     pub(super) holds: RefCell<super::holds::Holds>,
 
     pub(super) versions: RefCell<super::versions::VersionTable>,
@@ -189,6 +193,7 @@ impl Index {
             reactor: RefCell::new(None),
             maintenance: RefCell::new(super::disk::Maintenance::default()),
             reserve_stuck: Cell::new(false),
+            eviction_clock: Cell::new(None),
             holds: RefCell::new(super::holds::Holds::default()),
             versions: RefCell::new(
                 super::versions::VersionTable::new(page_capacity)
@@ -1227,6 +1232,61 @@ mod tests {
                 held.contains(&number),
                 "page {number}"
             );
+        }
+    }
+
+    /// Eviction never runs ahead of monotonic time: after a forward wall-clock
+    /// jump, a storage page whose deadline the wall clock already passed is
+    /// kept until monotonic time catches up.
+    #[test]
+    fn forward_wall_clock_jump_does_not_evict_storage_pages_early() {
+        let index = index(8);
+        let disk = TestDisk::mount(&index, 8);
+        let metadata = descriptor("jump", 17);
+        let held = page(&metadata, 0);
+        index.reserve_hold_now(&held.version, 1, until()).unwrap();
+        // A whole-slot record closes its slot, so eviction may choose it.
+        let ticket = index.hold_ticket(&held).unwrap();
+        disk.put_whole(&index, &held, &metadata, key_id(), Tier::Storage);
+        drop(ticket);
+        // The deadline passed by the wall clock, so the hold has ended there.
+        let wall = uring_runtime::environment::wall_now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (key, _) = index.disk_entry_now(&held).unwrap();
+        let volume = index.volume().unwrap();
+        let scope = crate::store::test_disk::scope();
+        assert!(
+            disk.drive(volume.set_retain(&*disk.reactor, &key, wall - 10, &scope))
+                .unwrap()
+        );
+        // Model a wall clock that jumped forward by 1000 seconds: by
+        // monotonic time it is still 1000 seconds earlier.
+        index
+            .eviction_clock
+            .set(Some((wall - 1000, uring_runtime::environment::now())));
+        let mut reservations = Vec::new();
+        while let Ok(reservation) = index.allocate_now(Tier::Cache, SLOT_BYTES) {
+            reservations.push(reservation);
+        }
+        assert!(
+            index.lookup(&held).unwrap().is_some(),
+            "kept by monotonic time"
+        );
+        // Once eviction time reaches the deadline, the slot can go.
+        drop(reservations);
+        index.eviction_clock.set(None);
+        let mut reservations = Vec::new();
+        while index.lookup(&held).unwrap().is_some() {
+            let r = index.allocate_now(Tier::Cache, SLOT_BYTES);
+            if r.is_err() {
+                for slot in 0..8 {
+                    eprintln!("DBG {slot} {:?}", volume.slot_state(slot));
+                }
+                eprintln!("DBG wall {wall} n={}", reservations.len());
+            }
+            reservations.push(r.unwrap());
         }
     }
 
