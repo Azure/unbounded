@@ -115,7 +115,7 @@ to host files) are reverted at Uninstall.
 | `/var/lib/containerd` | containerd | persistent | Images and gantry's content cache; see `retainContainerImages` (section 8) |
 | `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | persistent | Rewritten from the bundle on each slot change |
 | `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | persistent | Bundle plugins are installed again after the wipe |
-| `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:263`) | persistent | |
+| `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:314-319`) | persistent | |
 | `/var/lib/cni` | CNI IPAM *(inference)* | persistent | |
 | `/var/log/pods`, `/var/log/containers` | kubelet *(inference)* | persistent | |
 | `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | persistent | The directory is left alone; the host may have its own WireGuard configuration |

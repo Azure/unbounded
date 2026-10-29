@@ -50,17 +50,20 @@ binary under a `v2` subcommand, marked experimental.
 
 v1 is organized in four layers:
 
-- **Commands.** `start`, `preflight`, `daemon`, `reset`, `agent-upgrade`,
-  `version`, plus hidden `nspawn-lifecycle` and
-  `record-agent-upgrade-failure-signal` (`cmd/agent/internal/cmd/cmd.go:30-39`).
+- **Commands.** `start`, `preflight`, `daemon`, `reset` and `version`, plus
+  hidden `agent-upgrade` (`cmd/agent/internal/cmd/agentupgrade.go:70`),
+  `nspawn-lifecycle` and `record-agent-upgrade-failure-signal`
+  (`cmd/agent/internal/cmd/cmd.go:30-39`).
 - **Bootstrap coordinator.** Runs `PrepareHost`, `PrepareRootFS`,
   `EnsureNodeStarted` and `EnsureDaemonInstalled` under an install lock and an
   install record that classifies each run as fresh, resumed or complete
-  (`cmd/agent/internal/bootstrap/coordinator.go:29-38`).
+  (`cmd/agent/internal/bootstrap/coordinator.go`: the stages at `:29-38`, the
+  lock at `:72`, the classification at `:83-115` and the stage loop at
+  `:126-135`).
 - **Goal state and phases.** Configuration resolves to
   `MachineGoalState{RootFS, NodeStart}` (`pkg/agent/goalstates/resolve.go:37-40`).
-  Work is composed from `phases.Task` values with `Serial` and `Parallel`
-  (`pkg/agent/phases/phases.go:17-20`).
+  Work is composed from `phases.Task` values (`pkg/agent/phases/phases.go:17-20`)
+  with `Serial` (`:62`) and `Parallel` (`:87`).
 - **Daemon.** A controller-runtime manager that repaves when its Node is
   deleted and handles the `NodeReboot`, `AgentUpgrade` and `AgentReset`
   MachineOperations (`cmd/agent/internal/daemon/controller.go:95-99`). Node
@@ -77,11 +80,11 @@ implementation rather than a switch added to v1.
 | Goal state | `RootFS` carries nspawn file paths; the machine directory is `/var/lib/machines/<m>`; `NodeStart.MachineName` is the `systemd-run` target | `pkg/agent/goalstates/rootfs.go:11-58`, `resolve.go:86-97`, `nodestart.go:6-9` |
 | Writing node files | Every node file is written from the host into the machine directory | e.g. `pkg/agent/phases/nodestart/kubelet.go:75` |
 | Running commands in the node | Every command goes through `systemd-run --machine=<m> --pipe --wait` | `internal/executil/exec.go:258-267` |
-| Bootstrap | Always targets `kube1`; uses `machinectl list` to decide whether the rootfs needs building | `cmd/agent/internal/cmd/bootstrap.go:92,161,220` |
+| Bootstrap | Always targets `kube1`, and skips building the rootfs when `machinectl list` shows the machine is registered. The same check decides whether to save the applied config. | `cmd/agent/internal/cmd/bootstrap.go:92` (target), `:161` (rootfs), `:220` (applied config), `pkg/agent/phases/reset/machine.go:256` (`machinectl list`) |
 | Host preparation | Masks the host `containerd` and `kubelet` units, which a host runtime needs | `bootstrap.go:111`, `pkg/agent/phases/host/disable_systemd_unit.go:36-43` |
 | Daemon | Defaults to the nspawn operator, and hardcodes it in `RepairDaemon`; repave alternates `kube1` and `kube2` | `cmd/agent/internal/daemon/daemon.go:101`, `lifecycle.go:461`, `nodeoperator.go:248-296` |
 | Reset | Hardcodes `kube1` and `kube2` and the nspawn teardown | `cmd/agent/internal/daemon/reset.go:168-195` |
-| Lifecycle hooks | systemd runs `nspawn-lifecycle pre-start` and `post-start` around `systemd-nspawn@<m>` | `pkg/agent/nspawnlifecycle/lifecycle.go:67-129` |
+| Lifecycle hooks | Around `systemd-nspawn@<m>`, systemd runs `nspawn-lifecycle pre-start` as a separate oneshot unit and `post-start` as `ExecStartPost` | Wiring: `pkg/agent/phases/rootfs/assets/service-override.conf:37-38,48`, `config-regeneration.service:11`. Code: `pkg/agent/nspawnlifecycle/lifecycle.go:67-129` |
 
 ### 1.3 How AKS Flex Node consumes v1 today
 
@@ -392,8 +395,9 @@ Validation rules:
 - `runtime.host.adoptExistingPaths[].path` must be a built-in owned path
   (host runtime doc, section 4) or an extension-declared state path.
 - For the `host` runtime, `cgroupRoot` and `cgroupDriver` are reserved and
-  rejected in `kubelet.configuration`, in addition to v1's reserved fields
-  (`pkg/agent/config/config.go:615-623`).
+  rejected in `kubelet.configuration`, in addition to the fields v1 already
+  reserves, including `authorization.mode`
+  (`pkg/agent/config/config.go:604-623`).
 - `credentials.kubelet.exec.command` and `credentials.daemon.exec.command` are
   host paths. The runtime makes the kubelet command visible inside the node
   (section 9).
@@ -1266,10 +1270,10 @@ sequenceDiagram
 | Fresh state | A new rootfs | Wipe the owned paths (host runtime doc, section 8) |
 | `NodeAccess` | `systemd-run -M` | Direct |
 | NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start hook, writing `/var/run/cdi/nvidia.yaml` |
-| NVIDIA Container Toolkit | From the GPU OCI image (`images/agent-ubuntu2404-nvidia/Containerfile:21-31`) | Shipped as an agent artifact (section 9.2) |
+| NVIDIA Container Toolkit | From the GPU OCI image (`images/agent-ubuntu2404-nvidia/Containerfile:22-32`) | Shipped as an agent artifact (section 9.2) |
 | Devices and extra mounts | Bind mounts plus `DeviceAllow` | Nothing to do; already visible |
 | Shared host paths | Bind mounts | The paths themselves |
-| Resolver | Writes the node's `/etc/resolv.conf` | Never touches the host's `/etc/resolv.conf`; kubelet uses `--resolv-conf` (`pkg/agent/goalstates/resolve.go:163-166`) |
+| Resolver | Writes the node's `/etc/resolv.conf` | Never touches the host's `/etc/resolv.conf`. When LocalDNS is enabled, kubelet's `resolvConf` setting points at the LocalDNS resolver file (`pkg/agent/goalstates/resolve.go:163-166`, `pkg/agent/phases/nodestart/kubelet.go:129-130`); otherwise kubelet uses the host's resolver. |
 | Host requirements | `systemd-container`; mask the host's containerd and kubelet | Own `containerd.service` and `kubelet.service`; mask docker; check for conflicting packages |
 
 ### 9.1 `nspawn-container`
@@ -1347,8 +1351,10 @@ Teardown, for both runtimes. It hardens v1's `CleanupNetwork`
 
 The whole-ruleset flush at node start is kept for both runtimes. v1's
 `nftables-flush.service` runs `flush ruleset`
-(`pkg/agent/phases/host/assets/nftables-clear.nft:6`) and is ordered before
-every nspawn machine (`nftables-flush.service:20-21`). It deliberately also
+(`pkg/agent/phases/host/assets/nftables-clear.nft:6`). Every nspawn machine pulls
+it in (`RequiredBy=systemd-nspawn@.service`, `nftables-flush.service:20-21`) and
+is ordered after it (`pkg/agent/phases/rootfs/assets/service-override.conf:39`).
+It deliberately also
 clears a host firewall's default-drop policy, which would otherwise make the
 kubelet unreachable (`nftables-flush.service:7-12`). In v2 it is a member of
 `unbounded-node-pre.target`. Because it is a oneshot with
@@ -1380,14 +1386,17 @@ Host preparation records an undo step in its undo log,
 the steps in reverse order, for both runtimes. This makes v2's reset do what
 v1's help text promises ("restore the host to its original state",
 `cmd/agent/internal/cmd/reset.go:22-24`) but v1 does not do
-(`cmd/agent/internal/daemon/reset.go:168-195`).
+(`cmd/agent/internal/daemon/reset.go:168-195`). v1 does have a legacy uninstall
+script that reverses host preparation
+(`internal/provision/assets/unbounded-agent-uninstall.sh`), but only tests call
+it (`internal/provision/script.go:35`).
 
 | Change (v1 source) | Undo step |
 |---|---|
 | `/etc/sysctl.d/99-kubernetes.conf` and `sysctl --system` (`pkg/agent/phases/host/os.go:310-335`) | Remove the file and restore the original sysctl values |
 | Node component sysctls: forwarding, `rp_filter` and `src_valid_mark` on all, default and each existing interface, conntrack settings (`images/net/node-agent-init.sh:17-45`, `internal/net/controller/kubeproxy_controller.go:858-862`) | Restore the original values, recorded before the first node start |
 | `nftables-flush.service` and `nftables-clear.nft` (`pkg/agent/phases/host/configure_nftables.go:65-128`) | Disable and remove them, then `systemctl try-restart nftables.service iptables.service ip6tables.service` so the host firewall returns |
-| Mask docker and set `iptables: false` in `/etc/docker/daemon.json` (`pkg/agent/phases/host/configure_docker.go:30-66`) | Restore the backed-up `daemon.json`, or remove it if it did not exist, and unmask |
+| Mask docker (`pkg/agent/phases/host/disable_systemd_unit.go:30-33,59-75`) and set `iptables: false` in `/etc/docker/daemon.json` (`pkg/agent/phases/host/configure_docker.go:30-66`) | Restore the backed-up `daemon.json`, or remove it if it did not exist, and unmask |
 | Mask the host's containerd and kubelet (`nspawn-container` only) | Unmask |
 | Disable swap: mask units, `swapoff`, comment out fstab entries (`pkg/agent/phases/host/disable_swap.go:39-53`) | Uncomment only the fstab lines the agent commented, which are tagged, and unmask the units. Swap returns at the next boot; `swapon` is not run. |
 | apt hardening drop-ins (`pkg/agent/phases/host/apt.go:39-95`) | Remove them |
@@ -1555,9 +1564,25 @@ noted.
   (`cmd/agent/internal/daemon/controller_node.go:54-62`).
 - `cmd/agent/internal/cmd/reset.go:22-24` says reset restores the host to its
   original state. Host preparation is not reversed
-  (`cmd/agent/internal/daemon/reset.go:168-195`). v2 fixes this (section 12).
+  (`cmd/agent/internal/daemon/reset.go:168-195`). The uninstall script that does
+  reverse it (`internal/provision/assets/unbounded-agent-uninstall.sh`) is only
+  called from tests (`internal/provision/script.go:35`). v2 fixes this
+  (section 12).
 - `pkg/agent/goalstates/resolve.go:315` logs a fallback to debootstrap, which
   no longer exists.
+- The `OperationKind` comment says "custom operations may be supported by
+  individual cloud controllers"
+  (`api/machina/v1alpha3/machineoperation_types.go:51-53`), but the enum on the
+  next line is closed. This matters for open question 1.
+- A repave in v1 provisions the new machine with `rootfs.Provision`
+  (`cmd/agent/internal/daemon/nodeoperator.go:277`), which skips unpacking the
+  OCI image when the machine directory is not empty
+  (`pkg/agent/phases/rootfs/oci/task.go:61-64`). A crash partway through an
+  unpack therefore leaves a partial rootfs that later retries reuse. Only the
+  bootstrap path, `ProvisionOwned`, checks a completion marker
+  (`pkg/agent/phases/rootfs/provision.go:23-27`, `oci/task.go:66-75`). v2 saves
+  a completion marker and the bundle manifest for every provision
+  (section 7.2).
 
 ## 20. Alternatives considered
 
