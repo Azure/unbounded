@@ -128,7 +128,7 @@ Without an ownership record, Teardown is conservative (section 9).
 | `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | Wipe (persistent) | |
 | `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | Uninstall | A line-level edit. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
 | Slot directories | runtime | `Destroy`, or Uninstall | |
-| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, extension host units | runtime | Uninstall | The LocalDNS network unit and helper belong to host preparation and the host network reset (main doc, sections 11 and 12) |
+| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, extension host units | runtime | Uninstall | The node manager writes the LocalDNS network unit and helper before every node start, and the host network reset removes them (main doc, sections 8.3 and 11) |
 | Extension `cleanup.statePaths` | consumer | Unmount or Wipe, by the declared class | Section 13 |
 
 ## 5. Cleanup levels
@@ -369,11 +369,13 @@ Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
 
 ## 12. Not cleaned
 
-1. **Undeclared hostPath directories** outside the owned list. Before each
-   Terminate, the runtime lists the host sources of all container mounts through
-   the CRI API and records them as `observedHostPaths`. Wipe and Teardown
-   report them but never delete them, so the gap with `nspawn-container` stays
-   visible.
+1. **Undeclared hostPath directories** outside the owned list. Whenever
+   `Inspect` runs while containerd is running, the runtime lists the host
+   sources of all container mounts through the CRI API and records them as
+   `observedHostPaths`. The daemon calls `Inspect` on every reconcile, so the
+   list stays current, and Terminate uses the last recorded list even when
+   containerd has already stopped. Wipe and Teardown report these paths but
+   never delete them, so the gap with `nspawn-container` stays visible.
 2. **Mounts made in the host mount namespace by privileged pods**, for example
    through `nsenter -t 1` or bidirectional mount propagation, outside the owned
    paths.
