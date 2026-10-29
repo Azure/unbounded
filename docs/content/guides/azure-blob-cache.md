@@ -15,8 +15,8 @@ then read blobs from a local endpoint at `http://127.0.0.1:8080`. The first read
 of a blob fetches it from Azure. Later reads come from the cache.
 
 The cache runs on your existing nodes, so you need no extra cache servers.
-Each blob is read from Azure by only a few nodes, even when every node reads
-it. Apps keep using the Azure Blob or S3 SDK they already use; only the
+Racer splits each blob into 16 MiB pages. Each page is read from Azure only
+by its few owner nodes, even when every node reads it. Apps keep using the Azure Blob or S3 SDK they already use; only the
 endpoint changes.
 
 ## Before You Start
