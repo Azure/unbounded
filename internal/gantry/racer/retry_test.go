@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -509,8 +510,9 @@ func TestRacerRetryResumesOverHTTP(t *testing.T) {
 
 				var stages retryStages
 
+				observed := make(chan HTTPObservation, 1)
 				h := retryHandler(client, 5*time.Second, &stages)
-				handler := WrapHTTP(mirror.New(racerConfig(), trap, trap, mirror.WithContentBackend(h)).Handler(), time.Second, nil)
+				handler := WrapHTTP(mirror.New(racerConfig(), trap, trap, mirror.WithContentBackend(h)).Handler(), time.Second, func(o HTTPObservation) { observed <- o })
 				server, _ := handlerStreamServer(t, mode, handler)
 				rangeHeader, status := handlerRange(offset)
 
@@ -524,7 +526,67 @@ func TestRacerRetryResumesOverHTTP(t *testing.T) {
 				if stages.count("write_body") < 1 {
 					t.Fatalf("retries=%v", stages.stages)
 				}
+
+				// A recovered source failure must not count as aborted.
+				select {
+				case o := <-observed:
+					if o.Aborted || racerOutcome(t, o) != "complete" {
+						t.Fatalf("observation=%+v", o)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("no observation")
+				}
 			})
 		}
 	}
+}
+
+// An unrecovered source failure still counts as aborted.
+func TestRacerRetryResumeGivesUpOverHTTPAborts(t *testing.T) {
+	data := racerDistinctPayload(12, int(racersdk.PageSize)+65539)
+	metadata := racerMetadata(t, racerDigest(data), len(data))
+	client := racerFakeClient(t, func(_ context.Context, req racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		if req.Head {
+			return metadata, nil, nil
+		}
+
+		return metadata, io.NopCloser(io.MultiReader(bytes.NewReader(data[req.Offset:req.Offset+1]), racerReadError{})), nil
+	})
+	trap := &racerDirectTrap{}
+
+	var stages retryStages
+
+	observed := make(chan HTTPObservation, 1)
+	h := retryHandler(client, 50*time.Millisecond, &stages)
+	handler := WrapHTTP(mirror.New(racerConfig(), trap, trap, mirror.WithContentBackend(h)).Handler(), time.Second, func(o HTTPObservation) { observed <- o })
+	server, _ := handlerStreamServer(t, "plaintext", handler)
+
+	resp := racerRequest(t, server, http.MethodGet, "blobs", racerDigest(data), "", "")
+	_, _ = io.Copy(io.Discard, resp.Body) //nolint:errcheck // the stream is expected to abort
+	_ = resp.Body.Close()                 //nolint:errcheck // best-effort close
+
+	select {
+	case o := <-observed:
+		if !o.Aborted || racerOutcome(t, o) != "aborted" {
+			t.Fatalf("observation=%+v", o)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no observation")
+	}
+}
+
+// racerOutcome returns the requests_total outcome label MirrorResponse records.
+func racerOutcome(t *testing.T, o HTTPObservation) string {
+	t.Helper()
+
+	m := NewMetrics(metrics.New())
+	m.MirrorResponse(o)
+
+	for _, outcome := range []string{"complete", "aborted"} {
+		if testutil.ToFloat64(m.requests.WithLabelValues(racerMetricMethod(o.Method), strconv.Itoa(o.Status), outcome)) == 1 {
+			return outcome
+		}
+	}
+
+	return ""
 }

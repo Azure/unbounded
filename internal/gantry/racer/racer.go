@@ -628,6 +628,12 @@ func (s *Handler) streamContent(ctx context.Context, w http.ResponseWriter, id s
 		written += n
 
 		if err == nil && written == remaining {
+			// Every byte reached w, so earlier failures were source-side and
+			// recovered by resume. Downstream failures after this still count.
+			if current != value {
+				racerClearRecoveredFailure(w)
+			}
+
 			return
 		}
 
@@ -897,6 +903,25 @@ type racerResponseWriter struct {
 }
 
 func (w *racerResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// racerClearRecoveredFailure clears the sticky failure left by a source-side
+// read error or interrupt once a resume has delivered the full body. A broken
+// downstream would have failed the resumed writes instead.
+func racerClearRecoveredFailure(w http.ResponseWriter) {
+	for w != nil {
+		if rw, ok := w.(*racerResponseWriter); ok {
+			rw.failed = false
+			return
+		}
+
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+
+		w = u.Unwrap()
+	}
+}
 
 // SetWriteDeadline coordinates SDK deadlines with rolling handler deadlines.
 // An immediate interruption is sticky until explicitly cleared. Serializing the
