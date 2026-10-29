@@ -1,17 +1,11 @@
 # Unbounded Agent v2: Host Runtime Cleanup
 
-| Field | Value |
-|---|---|
-| Status | Draft for review |
-| Scope | How the `host` runtime of the v2 agent stops, cleans up and removes a node that runs directly on the host |
-| Parent document | [`agent-v2.md`](agent-v2.md), referred to here as the main doc |
-| Repository baseline | `main` at `dca6c964d1d4d03614fe190fcd60ce49c380e914` |
-| Date | 2026-10-29 |
+Part of the [Unbounded Agent v2 design](README.md). The README has the status,
+repository baseline, citation conventions and terms.
 
-This document expands section 10 of the main doc. References of the form
-"main doc, section N" point there. Code citations and *(inference)* marks follow
-the main doc's conventions.
-
+This document specifies how the `host` runtime stops, cleans up and removes a
+node that runs directly on the host. It has no container to throw away, so it
+must stop processes, unmount volumes and remove state itself.
 
 ## 1. Why the host runtime needs explicit cleanup
 
@@ -24,7 +18,7 @@ runtime has no container, so it has to provide each guarantee itself.
 | Pod mounts, overlay rootfs, `/run/netns/cni-*` | They live in the container's mount namespace and its `/run` *(inference)* | Unmount and remove them (section 7) |
 | kubelet, containerd and CNI state | A repave unpacks a new rootfs | Wipe the owned paths (section 8) |
 | Pod hostPath data | hostPaths resolve inside the rootfs, e.g. `/etc/wireguard`, `/opt/cni/bin` (`deploy/net/node/03-daemonset.yaml.tmpl:135-155`) and `/var/lib/gantry/libp2p` (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Wipe the known and declared paths, report the rest (sections 8 and 12) |
-| Network: links, routes, rules, nftables and iptables | Nothing: the network namespace is already shared (`pkg/agent/phases/rootfs/assets/nspawn.conf:20-21`) | The same network reset as today (main doc, section 11) |
+| Network: links, routes, rules, nftables and iptables | Nothing: the network namespace is already shared (`pkg/agent/phases/rootfs/assets/nspawn.conf:20-21`) | The same network reset as today ([host changes, section 2](06-host-changes.md#2-host-network-reset)) |
 | eBPF pins | Each machine gets its own bpffs (`nspawn.conf:27-29`) | Pins land in the host's bpffs; only declared pins are cleaned (section 12) |
 
 ## 2. Principles
@@ -35,7 +29,7 @@ runtime has no container, so it has to provide each guarantee itself.
    record of who created what. They are deleted when they match names that only
    node components create, such as the `UNBOUNDED-*`, `KUBE-*` and `CNI-*`
    iptables chains and unbounded-net's links, or when an extension declares
-   them (main doc, section 11).
+   them ([host changes, section 2](06-host-changes.md#2-host-network-reset)).
 2. **Never cross a mount or follow a symlink while deleting.** A mount found
    inside a tree being deleted aborts the deletion. Pod volumes are often bind
    mounts of host data, and deleting through one destroys that data.
@@ -128,7 +122,7 @@ Without an ownership record, Teardown is conservative (section 9).
 | `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | Wipe (persistent) | |
 | `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | Uninstall | A line-level edit. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
 | Slot directories | runtime | `Destroy`, or Uninstall | |
-| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, extension host units | runtime | Uninstall | The node manager writes the LocalDNS network unit and helper before every node start, and the host network reset removes them (main doc, sections 8.3 and 11) |
+| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, extension host units | runtime | Uninstall | The node manager writes the LocalDNS network unit and helper before every node start, and the host network reset removes them ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units) and [host changes, section 2](06-host-changes.md#2-host-network-reset)) |
 | Extension `cleanup.statePaths` | consumer | Unmount or Wipe, by the declared class | Section 13 |
 
 ## 5. Cleanup levels
@@ -153,14 +147,14 @@ flowchart LR
 | Method | `host` runtime behavior |
 |---|---|
 | `Stop(slot)` | Terminate, then Unmount, then disable `unbounded-node.target` |
-| `Restart(slot)` | Terminate, Unmount, then start the node units again; starting them runs the prerequisites and the pre-start boot hook first (main doc, section 8.3) |
+| `Restart(slot)` | Terminate, Unmount, then start the node units again; starting them runs the prerequisites and the pre-start boot hook first ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
 | `Start(slot)`, same slot and bundle as last time | Enable `unbounded-node.target` and start it. No wipe. |
 | `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, then enable and start `unbounded-node.target` (section 8) |
 | `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotEnabled` for the enabled slot. |
 | `Teardown()` | Every level through Uninstall (section 9) |
 
 The host network reset is not a runtime method. The node manager runs it for
-both runtimes (main doc, section 11).
+both runtimes ([host changes, section 2](06-host-changes.md#2-host-network-reset)).
 
 ## 6. Terminate
 
@@ -240,9 +234,9 @@ The active-slot record,
 `{slot, bundleDigest, phase}`. When `Start` is called with a slot or bundle
 digest that differs from the record, the runtime is making a *slot change*, and
 it wipes node state first. This is how the `host` runtime keeps rule 4 of the
-main doc's section 7.1: the first time a slot starts after its content was
+[node runtime, section 1](03-node-runtime.md#1-node-runtime): the first time a slot starts after its content was
 provisioned, it begins with fresh state. The digest is read from the slot's
-saved bundle manifest and leaves out secret contents (main doc, section 7.2),
+saved bundle manifest and leaves out secret contents ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)),
 so a refreshed bootstrap token never causes a wipe.
 
 This record is the `host` runtime's own record of which slot is installed into
@@ -308,7 +302,7 @@ With `runtime.host.repave.retainContainerImages: true`, step 3 does not clear
    sandboxes, fall back to a full clear and log why.
 
 This option does not apply to `nspawn-container`, where a repave always
-unpacks a new rootfs. The mechanism needs a prototype (main doc, validation task V2).
+unpacks a new rootfs. The mechanism needs a prototype (validation task V2 in [implementation, section 3](09-implementation.md#3-testing-and-validation)).
 
 ## 9. Teardown
 
@@ -320,7 +314,7 @@ flowchart TD
   D --> E["Remove installed files, content checked against the manifest"]
   E --> F["Owned paths: remove created ones, restore Preserve backups, clear the rest"]
   F --> G["Revert file edits: rt_tables lines"]
-  G --> H["Replay the host preparation undo log, main doc section 12"]
+  G --> H["Replay the host preparation undo log, host changes doc, section 3"]
   H --> I["Remove slots, the active-slot record and the ownership record"]
   I --> J["Report leftovers, exit non-zero if any"]
 ```
@@ -341,7 +335,7 @@ Without an ownership record, Teardown is conservative:
 - `v2 reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.
 - Host preparation, including the original sysctl values, is still reversed
-  from its own undo log (main doc, section 12). If that log is missing too, the
+  from its own undo log ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). If that log is missing too, the
   sysctl keys that could not be restored are reported.
 
 ## 10. Post-conditions
@@ -365,7 +359,7 @@ Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
 | `phase: Wiping` or `Installing` | The next `Start` wipes again, then installs |
 | `phase: Active`, before the node target starts | `Start` with the same slot and digest, no wipe |
 | Teardown | Run again from the beginning; every step tolerates absent state |
-| A repave | `nodemanager.Recover` (main doc, section 8.5) drives the runtime methods above |
+| A repave | `nodemanager.Recover` ([lifecycles, section 2](05-lifecycles.md#2-repave)) drives the runtime methods above |
 
 ## 12. Not cleaned
 
