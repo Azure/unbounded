@@ -629,3 +629,153 @@ fn host_source_is_held_until_stream_sync() {
     assert_eq!(weak.strong_count(), 0);
     assert_eq!(stream.retained_host_sources(), 0);
 }
+
+#[test]
+/// Peer access is granted per (dst, src) pair; a denied pair is not an error.
+fn peer_access_allowed_and_denied() {
+    let sim = simulation();
+    sim.set_peer(1, 0, false);
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let (ctx0, ctx1) = (gpu.context(0).unwrap(), gpu.context(1).unwrap());
+    assert_eq!(ctx0.enable_peer(&ctx1), Ok(true));
+    assert_eq!(ctx1.enable_peer(&ctx0), Ok(false));
+    assert_eq!(ctx0.enable_peer(&ctx0), Ok(true));
+    // Enabling twice is fine.
+    assert_eq!(ctx0.enable_peer(&ctx1), Ok(true));
+    sim.set_peer(1, 0, true);
+    assert_eq!(ctx1.enable_peer(&ctx0), Ok(true));
+    sim.fault(Operation::Peer, -5);
+    assert_eq!(ctx1.enable_peer(&ctx0), Err(Error::Driver(999)));
+}
+
+/// Two contexts, staging "abcdefghij" on GPU 1, and a stream on GPU 0.
+fn peer_setup(
+    sim: &Simulation,
+) -> (
+    Gpu,
+    racer_gpu::Context,
+    racer_gpu::Context,
+    racer_gpu::StagingBuffer,
+    racer_gpu::Stream,
+) {
+    let gpu = Gpu::load().unwrap();
+    let (ctx0, ctx1) = (gpu.context(0).unwrap(), gpu.context(1).unwrap());
+    let remote = ctx1.staging(32).unwrap();
+    let remote_stream = ctx1.stream().unwrap();
+    remote_stream
+        .copy_from_host(Destination::Staging(&remote), 0, *b"abcdefghij")
+        .unwrap();
+    remote_stream.synchronize().unwrap();
+    let stream = ctx0.stream().unwrap();
+    let _ = sim;
+    (gpu, ctx0, ctx1, remote, stream)
+}
+
+#[test]
+/// A peer copy moves staged bytes from one GPU into another GPU's buffers.
+fn copy_from_peer_copies_across_gpus() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let (_gpu, ctx0, ctx1, remote, stream) = peer_setup(&sim);
+    assert!(ctx0.enable_peer(&ctx1).unwrap());
+    let client = sim.allocate(0, GRANULARITY);
+    let import = ctx0
+        .import(client.try_clone().unwrap(), GRANULARITY, 10..20)
+        .unwrap();
+    let local = ctx0.staging(32).unwrap();
+    stream
+        .copy_from_peer(Destination::Staging(&local), 4, &remote, 0, 10)
+        .unwrap();
+    stream
+        .copy_from_peer(Destination::Import(&import), 10, &remote, 2, 5)
+        .unwrap();
+    stream.synchronize().unwrap();
+    let mut out = [0; 10];
+    stream.read_staging(&local, 4, &mut out).unwrap();
+    assert_eq!(&out, b"abcdefghij");
+    assert_eq!(read_allocation(&client, 10, 5), b"cdefg");
+}
+
+#[test]
+/// Peer copies need enabled access, another context, and in-bounds ranges.
+fn copy_from_peer_rejects_bad_requests() {
+    let sim = simulation();
+    sim.set_peer(0, 1, false);
+    let _env = sim.enter();
+    let (_gpu, ctx0, ctx1, remote, stream) = peer_setup(&sim);
+    let local = ctx0.staging(32).unwrap();
+    let dst = Destination::Staging(&local);
+    // Not enabled.
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &remote, 0, 10),
+        Err(Error::WrongDevice)
+    );
+    // Denied pair stays disabled.
+    assert_eq!(ctx0.enable_peer(&ctx1), Ok(false));
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &remote, 0, 10),
+        Err(Error::WrongDevice)
+    );
+    sim.set_peer(0, 1, true);
+    assert!(ctx0.enable_peer(&ctx1).unwrap());
+    // Same context: use copy_from_staging.
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &local, 0, 10),
+        Err(Error::WrongDevice)
+    );
+    // Destination on the source's GPU.
+    assert_eq!(
+        stream.copy_from_peer(Destination::Staging(&remote), 0, &remote, 0, 10),
+        Err(Error::WrongDevice)
+    );
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &remote, 30, 5),
+        Err(Error::InvalidRange)
+    );
+    assert_eq!(
+        stream.copy_from_peer(dst, 30, &remote, 0, 5),
+        Err(Error::InvalidRange)
+    );
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &remote, 0, 0),
+        Err(Error::InvalidRange)
+    );
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &remote, u64::MAX, 2),
+        Err(Error::InvalidRange)
+    );
+    sim.fault(Operation::CopyPeer, -5);
+    assert_eq!(
+        stream.copy_from_peer(dst, 0, &remote, 0, 10),
+        Err(Error::Driver(999))
+    );
+    // The fault was one-shot.
+    stream.copy_from_peer(dst, 0, &remote, 0, 10).unwrap();
+    stream.synchronize().unwrap();
+}
+
+#[test]
+/// The peer source and its context stay alive until the stream syncs.
+fn peer_source_is_held_until_stream_sync() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let (_gpu, ctx0, ctx1, remote, stream) = peer_setup(&sim);
+    assert!(ctx0.enable_peer(&ctx1).unwrap());
+    let local = ctx0.staging(32).unwrap();
+    stream
+        .copy_from_peer(Destination::Staging(&local), 0, &remote, 0, 10)
+        .unwrap();
+    assert!(remote.in_flight());
+    drop((remote, ctx1));
+    assert_eq!(sim.live().staging, 2);
+    assert_eq!(sim.live().contexts, 2);
+    stream.synchronize().unwrap();
+    assert_eq!(sim.live().staging, 1);
+    assert_eq!(sim.live().contexts, 1);
+    assert!(
+        sim.trace()
+            .iter()
+            .any(|e| e.operation == Operation::CopyPeer && e.result == 0)
+    );
+}
