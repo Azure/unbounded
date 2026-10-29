@@ -1652,6 +1652,85 @@ fn removal_visibility_changes_without_worker_or_checkpoint_barriers() {
 }
 
 #[test]
+fn snapshot_refresh_purges_cache_entering_passthrough() {
+    use racer_control_wire as wire;
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut worker, _, _) = local_worker(&config, &node, 1);
+    let cached = definition();
+    let current_scope = scope(Duration::from_secs(1)).unwrap();
+    worker
+        .snapshots
+        .apply(publication(&config, 1, vec![cached.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    let (_, _, roots) = crate::test_support::security::issued();
+    worker
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: wire::SCHEMA_VERSION,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: roots,
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
+                    cache: cached.id.clone(),
+                    id: crate::model::key_id_from_generation(1, 7).unwrap(),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
+        })
+        .unwrap();
+    let index = worker.store.writer.index().clone();
+    let retain = |worker: &WorkerApplication| {
+        let page = page(worker);
+        let ciphertext = Arc::downgrade(&page.ciphertext.inner);
+        index.publish_version(page.metadata.immutable()).unwrap();
+        worker.memory.publish(page).unwrap();
+        ciphertext
+    };
+    let retained = retain(&worker);
+    assert_eq!(retained.strong_count(), 1);
+    assert_eq!(index.snapshot_metadata().len(), 1);
+    // A priority-only change keeps retained data.
+    let mut reweighted = cached.clone();
+    reweighted.priority = 900;
+    worker
+        .snapshots
+        .apply(publication(&config, 2, vec![reweighted.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    assert_eq!(retained.strong_count(), 1);
+    assert_eq!(index.snapshot_metadata().len(), 1);
+    for (sequence, mode) in [
+        (3, wire::CacheMode::PassthroughPeers),
+        (4, wire::CacheMode::PassthroughLocal),
+    ] {
+        let mut passthrough = reweighted.clone();
+        passthrough.mode = mode;
+        worker
+            .snapshots
+            .apply(publication(&config, sequence, vec![passthrough.clone()]))
+            .unwrap();
+        worker.refresh_snapshot(&current_scope).unwrap();
+        assert_eq!(worker.caches, vec![passthrough]);
+        assert!(retained.upgrade().is_none(), "{mode:?}");
+        assert!(index.snapshot_metadata().is_empty(), "{mode:?}");
+    }
+    // Leaving passthrough retains again; nothing is purged on the way out.
+    worker
+        .snapshots
+        .apply(publication(&config, 5, vec![reweighted.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    let retained = retain(&worker);
+    assert_eq!(retained.strong_count(), 1);
+    assert_eq!(index.snapshot_metadata().len(), 1);
+}
+
+#[test]
 fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     use racer_control_wire as wire;
     let config = crate::test_support::cluster::config(false);

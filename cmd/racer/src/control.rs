@@ -199,6 +199,22 @@ impl Availability {
             .is_ok_and(|s| s.is_some_and(|s| s.caches.iter().any(|c| &c.id == cache)))
     }
 
+    /// Published mode of this cache. Unpublished caches report `Cached`; the
+    /// other admission checks already refuse them.
+    pub fn mode(&self, cache: &CacheId) -> racer_control_wire::CacheMode {
+        self.publications
+            .current()
+            .ok()
+            .flatten()
+            .and_then(|s| s.caches.iter().find(|c| &c.id == cache).map(|c| c.mode))
+            .unwrap_or_default()
+    }
+
+    /// Whether this cache retains no pages or metadata.
+    pub fn passthrough(&self, cache: &CacheId) -> bool {
+        self.mode(cache).passthrough()
+    }
+
     /// Require both cache admission and an active page key for metadata reads.
     pub fn metadata(&self, cache: &CacheId) -> bool {
         self.cache(cache) && self.keys.active(cache, KeyPurpose::Page).is_ok()
@@ -213,41 +229,73 @@ impl Availability {
 /// Publish a single-node fixture admitting the supplied cache namespaces.
 #[cfg(test)]
 pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availability> {
-    use racer_control_wire::SCHEMA_VERSION;
-    let publications = Arc::new(Published::new(Snapshot::retention(1)));
-    PublicationTarget::new(keys.cluster().clone(), publications.clone())
-        .apply(Publication {
-            schema_version: SCHEMA_VERSION,
-            cluster: keys.cluster().clone(),
-            sequence: PublicationSequence(1),
-            membership_version: racer_control_wire::MembershipVersion(1),
-            members: vec![wire::Member {
-                node: keys.node().clone(),
-                shares: std::num::NonZeroU32::new(1).unwrap(),
-                peer_endpoint: "127.0.0.1:7443".into(),
-                rails: vec![],
-                site: String::new(),
-            }],
-            caches: caches
-                .into_iter()
-                .enumerate()
-                .map(|(i, id)| {
-                    let name = format!("rotation-{i}");
-                    let (client_socket, origin_socket) =
-                        wire::canonical_socket_paths(&name).unwrap();
-                    CacheDefinition {
-                        id,
-                        name,
-                        client_socket,
-                        origin_socket,
-                        priority: racer_control_wire::DEFAULT_PRIORITY,
-                        mode: racer_control_wire::CacheMode::Cached,
-                    }
-                })
-                .collect(),
-        })
-        .unwrap();
-    Rc::new(Availability::new(publications, keys))
+    for_cache_modes(
+        keys,
+        caches
+            .into_iter()
+            .map(|id| (id, racer_control_wire::CacheMode::Cached))
+            .collect(),
+    )
+}
+
+/// Publish a single-node fixture admitting the supplied caches in their modes.
+#[cfg(test)]
+pub(crate) fn for_cache_modes(
+    keys: Rc<Keyring>,
+    caches: Vec<(CacheId, racer_control_wire::CacheMode)>,
+) -> Rc<Availability> {
+    let availability = Rc::new(Availability::new(
+        Arc::new(Published::new(Snapshot::retention(1))),
+        keys,
+    ));
+    availability.publish_modes(caches);
+    availability
+}
+
+#[cfg(test)]
+impl Availability {
+    /// Publish the next single-node fixture with `caches` in their modes, as a
+    /// controller would after a ClusterCache edit.
+    pub(crate) fn publish_modes(&self, caches: Vec<(CacheId, racer_control_wire::CacheMode)>) {
+        use racer_control_wire::SCHEMA_VERSION;
+        let sequence = self
+            .publications
+            .current()
+            .unwrap()
+            .map_or(1, |snapshot| snapshot.sequence.0 + 1);
+        PublicationTarget::new(self.keys.cluster().clone(), self.publications.clone())
+            .apply(Publication {
+                schema_version: SCHEMA_VERSION,
+                cluster: self.keys.cluster().clone(),
+                sequence: PublicationSequence(sequence),
+                membership_version: racer_control_wire::MembershipVersion(1),
+                members: vec![wire::Member {
+                    node: self.keys.node().clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+                caches: caches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (id, mode))| {
+                        let name = format!("rotation-{i}");
+                        let (client_socket, origin_socket) =
+                            wire::canonical_socket_paths(&name).unwrap();
+                        CacheDefinition {
+                            id,
+                            name,
+                            client_socket,
+                            origin_socket,
+                            priority: racer_control_wire::DEFAULT_PRIORITY,
+                            mode,
+                        }
+                    })
+                    .collect(),
+            })
+            .unwrap();
+    }
 }
 
 // Racer policy and health around the generic worker-local REST transport.

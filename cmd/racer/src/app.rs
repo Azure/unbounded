@@ -1836,6 +1836,20 @@ impl WorkerApplication {
                 self.store.writer.remove_cache(&old.id)?;
             }
         }
+        // A cache entering passthrough drops whatever this worker retained for
+        // it, including records left from before a restart. Reads already skip
+        // such residue once the publication changes.
+        for new in &snapshot.caches {
+            let was_passthrough = self
+                .caches
+                .iter()
+                .find(|old| old.id == new.id)
+                .is_some_and(|old| old.mode.passthrough());
+            if new.mode.passthrough() && !was_passthrough {
+                self.memory.remove_cache(&new.id)?;
+                self.store.writer.remove_cache(&new.id)?;
+            }
+        }
         current_scope.check()?;
         // Priority changes apply live: memory shares are recomputed now, disk
         // shares on the next ranking pass.
