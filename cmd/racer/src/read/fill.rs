@@ -978,7 +978,8 @@ impl Fill {
 
     /// A GPU copy of `page` for `target`, shared with concurrent sealed
     /// fetches: a live copy on a reachable GPU, the result of a reachable
-    /// fetch in progress, or a fetch of our own that others may then share.
+    /// fetch in progress, or a fetch of our own that others may then share,
+    /// tracked alongside any fetch in progress on a GPU this one cannot reach.
     /// None means use the path through host memory. A waiter whose leader
     /// finished without a GPU copy returns None rather than retrying the
     /// GPU fetch itself; a waiter whose leader was abandoned looks again.

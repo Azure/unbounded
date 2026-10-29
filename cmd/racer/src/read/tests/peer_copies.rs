@@ -3009,10 +3009,21 @@ mod landing {
         lands: impl Fn(usize) -> bool + 'static,
         helper: Arc<GpuHelper>,
     ) -> Landing {
+        landing_with_buffer(ordinal, 0, lands, helper)
+    }
+
+    /// Like [`landing_with`], with the landing buffer on GPU `buffer`.
+    fn landing_with_buffer(
+        ordinal: i32,
+        buffer: i32,
+        lands: impl Fn(usize) -> bool + 'static,
+        helper: Arc<GpuHelper>,
+    ) -> Landing {
         let mut f = fixture();
         let copy = encrypted_copy(&mut f);
         let (peers, ordered) = install_peers(&mut f, None);
-        let buffer = crate::gpu::testing::landing(&helper, 0, 2 * crate::gpu::SLOT_BYTES).unwrap();
+        let buffer =
+            crate::gpu::testing::landing(&helper, buffer, 2 * crate::gpu::SLOT_BYTES).unwrap();
         crate::gpu::testing::nic_write(&buffer, 0, copy.ciphertext.bytes());
         let asked = Rc::new(Cell::new(0));
         let envelope = copy.ciphertext.envelope().clone();
@@ -3421,6 +3432,40 @@ mod landing {
         assert_eq!(l.f.fill.metrics.count(Event::GpuDirectJoined), 0);
         assert_decrypts(&l.helper, 1, 0, first);
         assert_decrypts(&l.helper, 2, 1, second);
+    }
+
+    #[test]
+    /// While a fetch is in flight on GPU 0, concurrent fetches on GPU 1,
+    /// which has no peer path to it, lead a flight of their own: the first
+    /// lands the page on GPU 1 and the second joins it.
+    fn gpus_without_a_peer_path_share_among_themselves() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
+            simulation.set_peer(1, 0, false);
+            simulation.set_peer(0, 1, false);
+        });
+        let mut l = landing_with_buffer(1, 1, |n| n == 1, helper);
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let mut pages: Vec<_> = acquire_sealed_together(&mut l, &[1, 1])
+            .into_iter()
+            .map(sealed)
+            .collect();
+        lead.finish(crate::read::gpu_copies::Outcome::Nothing);
+        assert_eq!(l.asked.get(), 1, "one landing request");
+        assert!(l.peers.calls.borrow().is_empty());
+        assert!(Arc::ptr_eq(&landed_arc(&pages[0]), &landed_arc(&pages[1])));
+        assert_eq!(landed_arc(&pages[0]).ordinal(), 1);
+        assert_eq!(joined_count(&l.helper), 1);
+        assert_eq!(l.f.fill.metrics.count(Event::GpuDirectJoined), 1);
+        let second = pages.pop().unwrap();
+        assert_decrypts(&l.helper, 1, 1, pages.pop().unwrap());
+        assert_decrypts(&l.helper, 2, 1, second);
+        assert_eq!(l.helper.leaked(), 0);
     }
 
     #[test]

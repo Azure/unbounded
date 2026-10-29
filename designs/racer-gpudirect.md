@@ -363,7 +363,8 @@ GPU still checks the CRC (when known) and the tag, and decrypts by itself.
 2. ciphertext in the memory cache (sealed from host memory, as before);
 3. a shared GPU copy: a live copy on the same GPU, then a live copy on a GPU
    this GPU can copy from; else join a fetch in flight on a reachable GPU;
-   else lead a new fetch that others may join;
+   else lead a new fetch that others may join, even while a fetch is in
+   flight on a GPU this one cannot reach;
 4. the usual path through host memory.
 
 A request's own fetch tries cuFile from local disk, then a peer landing.
@@ -383,14 +384,18 @@ reports whether a pair has a working peer path.
 
 If a peer copy fails, that direction of the pair is turned off until restart
 and the page takes the host bounce. Only the failed direction is turned off.
-Lookups only share across GPUs that have a peer path; others fetch on their
-own.
+Lookups only share across GPUs that have a peer path. A request whose GPU
+cannot reach any fetch in flight leads a separate fetch, which requests on
+its own GPU, or on GPUs that can reach it, join.
 
 **Retention.** The table holds weak references. A copy is reusable only while
 some request still holds it; the table never pins GPU memory or landing
 slots. Dead entries are pruned on lookup and insert. The table is per owning
 worker and capped at 4096 pages (`MAX_PAGES`). Past the cap, a new fetch runs
-privately. Each page has at most one fetch in flight.
+privately. Each page has at most 8 fetches in flight (`MAX_FLIGHTS`), one
+per group of GPUs that cannot reach each other's; past that, a request with
+no reachable fetch to join fetches privately. An abandoned fetch only sends
+its own waiters to look again.
 
 **Cancellation.** A waiter that is cancelled stops waiting and returns its
 error. If the leader is cancelled or times out, waiters are told the fetch

@@ -12,7 +12,9 @@
 //! copy is reusable only while some request still holds it, and dead entries
 //! are pruned on lookup and on insert. While the first request fetches, later
 //! requests for a reachable GPU wait for it instead of starting their own
-//! fetch.
+//! fetch. A request whose GPU cannot reach any in-flight fetch of the page
+//! leads a fetch of its own, tracked alongside the others, so requests on
+//! GPUs without a peer path still share among themselves.
 
 use super::sealed::SealedPage;
 use super::sealed::SealedSource;
@@ -39,6 +41,10 @@ use std::sync::Weak;
 /// Pages indexed at once. A new fetch past this bound runs privately rather
 /// than grow the table, after dead entries are pruned.
 pub(super) const MAX_PAGES: usize = 4096;
+
+/// In-flight fetches tracked at once for one page, one per group of GPUs
+/// that cannot reach each other. A new fetch past this bound runs privately.
+pub(super) const MAX_FLIGHTS: usize = 8;
 
 /// Everything but the ciphertext and the key that a request needs to build a
 /// sealed page around shared ciphertext. The key is derived again from the
@@ -195,7 +201,7 @@ struct InFlight {
 #[derive(Default)]
 struct Entry {
     copies: Vec<RetainedCopy>,
-    flight: Option<InFlight>,
+    flights: Vec<InFlight>,
 }
 
 impl Entry {
@@ -204,7 +210,7 @@ impl Entry {
     }
 
     fn is_empty(&self) -> bool {
-        self.copies.is_empty() && self.flight.is_none()
+        self.copies.is_empty() && self.flights.is_empty()
     }
 }
 
@@ -219,8 +225,9 @@ pub(super) enum Lookup {
     /// Fetch, and share the result through this handle.
     Lead(Lead),
 
-    /// Fetch without sharing: the in-flight fetch is on a GPU this one
-    /// cannot copy from, or the table is full.
+    /// Fetch without sharing: no in-flight fetch is on a GPU this one can
+    /// copy from and the page already tracks MAX_FLIGHTS, or the table is
+    /// full.
     Private,
 }
 
@@ -240,7 +247,7 @@ impl GpuCopies {
 
     /// Find a reusable copy of `page` for GPU `ordinal`: one on the same
     /// GPU first, then one on a GPU it can copy from. Otherwise join a
-    /// reachable in-flight fetch, or lead a new one.
+    /// reachable in-flight fetch, the same GPU's first, or lead a new one.
     pub(super) fn lookup(
         self: &Rc<Self>,
         page: &PageId,
@@ -262,12 +269,21 @@ impl GpuCopies {
             if let Some(live) = live {
                 return Lookup::Live(live);
             }
-            if let Some(flight) = &entry.flight {
-                return if helper.peers(ordinal, flight.ordinal) {
-                    Lookup::Join(flight.receive.clone())
-                } else {
-                    Lookup::Private
-                };
+            let flight = entry
+                .flights
+                .iter()
+                .find(|flight| flight.ordinal == ordinal)
+                .or_else(|| {
+                    entry
+                        .flights
+                        .iter()
+                        .find(|flight| helper.peers(ordinal, flight.ordinal))
+                });
+            if let Some(flight) = flight {
+                return Lookup::Join(flight.receive.clone());
+            }
+            if entry.flights.len() >= MAX_FLIGHTS {
+                return Lookup::Private;
             }
         } else if entries.len() >= MAX_PAGES {
             entries.retain(|_, entry| {
@@ -284,11 +300,15 @@ impl GpuCopies {
         let receive = async move { receive.await.unwrap_or(Outcome::Abandoned) }
             .boxed_local()
             .shared();
-        entries.entry(page.clone()).or_default().flight = Some(InFlight {
-            id,
-            ordinal,
-            receive,
-        });
+        entries
+            .entry(page.clone())
+            .or_default()
+            .flights
+            .push(InFlight {
+                id,
+                ordinal,
+                receive,
+            });
         Lookup::Lead(Lead {
             table: self.clone(),
             page: page.clone(),
@@ -298,7 +318,7 @@ impl GpuCopies {
     }
 
     /// Forget every copy of `page`, after a GPU rejected one, so later
-    /// readers fetch it again. An in-flight fetch still completes.
+    /// readers fetch it again. In-flight fetches still complete.
     pub(crate) fn forget(&self, page: &PageId) {
         let mut entries = self.entries.borrow_mut();
         if let Some(entry) = entries.get_mut(page) {
@@ -315,9 +335,7 @@ impl GpuCopies {
         let Some(entry) = entries.get_mut(page) else {
             return;
         };
-        if entry.flight.as_ref().is_some_and(|flight| flight.id == id) {
-            entry.flight = None;
-        }
+        entry.flights.retain(|flight| flight.id != id);
         entry.prune();
         if let Some(copy) = copy {
             entry.copies.push(copy.retain());
@@ -417,21 +435,93 @@ mod tests {
     }
 
     #[test]
-    /// A fetch on a GPU that cannot copy from the leader's runs privately.
+    /// A fetch on a GPU that cannot copy from the leader's leads a flight of
+    /// its own, which later fetches on its GPU join.
     fn unreachable_lead_is_not_joined() {
         let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
             simulation.set_peer(1, 0, false)
         });
         let table = Rc::new(GpuCopies::default());
-        let _lead = lead(table.lookup(&page(0), &helper, 0));
+        let _first = lead(table.lookup(&page(0), &helper, 0));
+        let _second = lead(table.lookup(&page(0), &helper, 1));
+        assert_eq!(table.len(), 1);
+        assert!(matches!(
+            table.lookup(&page(0), &helper, 0),
+            Lookup::Join(_)
+        ));
         assert!(matches!(
             table.lookup(&page(0), &helper, 1),
+            Lookup::Join(_)
+        ));
+    }
+
+    #[test]
+    /// A waiter joins the flight its GPU can reach, and a dropped lead only
+    /// abandons its own waiters.
+    fn independent_flights_end_independently() {
+        // 0 and 1 reach each other; 2 reaches neither.
+        let helper = crate::gpu::testing::helper_with(&[None, None, None], |simulation| {
+            for other in [0, 1] {
+                simulation.set_peer(2, other, false);
+                simulation.set_peer(other, 2, false);
+            }
+        });
+        let table = Rc::new(GpuCopies::default());
+        let isolated = lead(table.lookup(&page(0), &helper, 2));
+        let shared = lead(table.lookup(&page(0), &helper, 0));
+        let Lookup::Join(on_shared) = table.lookup(&page(0), &helper, 1) else {
+            panic!("expected to join");
+        };
+        let Lookup::Join(on_isolated) = table.lookup(&page(0), &helper, 2) else {
+            panic!("expected to join");
+        };
+        drop(isolated);
+        assert!(matches!(
+            futures::executor::block_on(on_isolated),
+            Outcome::Abandoned
+        ));
+        assert!(on_shared.peek().is_none());
+        assert!(matches!(
+            table.lookup(&page(0), &helper, 1),
+            Lookup::Join(_)
+        ));
+        shared.finish(Outcome::Nothing);
+        assert!(matches!(
+            futures::executor::block_on(on_shared),
+            Outcome::Nothing
+        ));
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    /// A page tracks at most MAX_FLIGHTS flights; past that, fetches on
+    /// unreachable GPUs run privately until a flight ends.
+    fn flights_per_page_are_bounded() {
+        let gpus = MAX_FLIGHTS + 1;
+        let helper = crate::gpu::testing::helper_with(&vec![None; gpus], move |simulation| {
+            for from in 0..gpus as i32 {
+                for to in 0..gpus as i32 {
+                    if from != to {
+                        simulation.set_peer(from, to, false);
+                    }
+                }
+            }
+        });
+        let table = Rc::new(GpuCopies::default());
+        let mut leads: Vec<Lead> = (0..MAX_FLIGHTS as i32)
+            .map(|ordinal| lead(table.lookup(&page(0), &helper, ordinal)))
+            .collect();
+        let last = MAX_FLIGHTS as i32;
+        assert!(matches!(
+            table.lookup(&page(0), &helper, last),
             Lookup::Private
         ));
         assert!(matches!(
             table.lookup(&page(0), &helper, 0),
             Lookup::Join(_)
         ));
+        drop(leads.pop());
+        let _last = lead(table.lookup(&page(0), &helper, last));
     }
 
     #[test]

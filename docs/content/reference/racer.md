@@ -1139,7 +1139,9 @@ Where the bytes come from decides who decrypts them:
 - When several `gpu-read` requests want the same page at once, such as every
   GPU loading the same model weights, the page is read from disk or a peer
   only once. A request for the same GPU, or for a GPU that can copy from it
-  directly (peer access), reuses that encrypted copy. Each GPU still checks
+  directly (peer access), reuses that encrypted copy. GPUs that cannot copy
+  from each other, such as with `RACER_GPU_PEER=off`, each read the page
+  once and share it among requests for that GPU. Each GPU still checks
   and decrypts the page itself. The copy is reused only while some request
   still holds it. `racer_gpu_direct_joined_total` counts reused copies.
 
