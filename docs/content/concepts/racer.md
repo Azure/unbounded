@@ -52,8 +52,9 @@ another fetch.
 - **Encrypted and verified data.** Pages are encrypted and authenticated with
   a per-cache key between nodes and on disk. Nodes sign their requests. The
   SDK checks that every range arrived intact before it hands over the last
-  byte. A corrupt or tampered page makes the read fail, so an app never
-  completes a read with bad data.
+  byte. Racer rejects a corrupt or tampered cached page and fetches a good
+  copy from another node or the origin, so an app never completes a read
+  with bad data.
 - **One cache for images, models, and datasets.** Several caches share each
   node's capacity by priority. Gantry can store container images in Racer, and
   apps can warm and hold specific model or dataset versions ahead of a job.
