@@ -110,8 +110,12 @@ spec:
 - Object metadata (ETag, size, expiry) is not reused across reads, so each read
   revalidates with the origin. One read still pins one object version for all
   of its pages.
-- Warm and hold (pinning) requests are rejected.
+- Retention is refused. A HEAD that asks for retention still returns metadata,
+  but without `Racer-Retain-Until`, and counts in `racer_warm_refused_total`.
+  Owners refuse hold and warm fill requests for the cache.
 - `spec.priority` still weights in-flight memory use.
+- With the `Local` route, `racer_passthrough_local_origin_fills_total` counts
+  pages that a node read from its own origin.
 - `spec.passthrough` can be added, changed, or removed at any time. When a cache
   switches to passthrough, data previously cached for it is dropped.
 
