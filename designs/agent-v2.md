@@ -316,7 +316,8 @@ works unchanged.
     { "name": "aks", "command": ["/opt/aks-flex-node/bin/aks-flex-node-plugin"] }
   ],
   "hooks": [
-    { "event": "node.ready", "plugin": "aks", "timeout": "2m", "failurePolicy": "Fail" }
+    { "event": "node.start.after", "plugin": "aks", "timeout": "2m", "failurePolicy": "Fail" },
+    { "event": "node.*.after", "plugin": "aks", "timeout": "30s", "failurePolicy": "Ignore" }
   ],
   "extensions": []
 }
@@ -364,20 +365,80 @@ LocalDNS rendering depends on these names.
 | Providers, through exec plugins (5.5) | Goal source, status sink, bootstrap credentials, daemon credentials, extra preflight checks | Yes, a provider replaces one built-in implementation |
 | Lifecycle hooks, through exec plugins (5.5) | Side effects at fixed points | No. Hooks observe, and can fail the operation. |
 
-Lifecycle hook events:
+#### Lifecycle hook events
+
+Events are named `<subject>.<state>.<phase>`:
+
+- The subject is `agent`, `host` or `node`.
+- The state is a lowercase word. A state that needs more than one word uses
+  hyphens, for example `image-import`. Dots only separate segments.
+- The phase is `before` or `after`. Every state has both.
+
+`before` and `after` are used instead of `pre` and `post` so these events are
+not confused with the runtime's internal `pre-start` and `post-start` systemd
+hooks (section 8.3).
+
+When events fire:
+
+- A `before` event fires immediately before its step. If a hook with failure
+  policy `Fail` fails, the step does not run and the operation fails.
+- An `after` event fires when its step completes, whether it succeeded or
+  not. The payload carries `result` (`Succeeded` or `Failed`) and `message`. If
+  a hook with policy `Fail` fails after a successful step, the operation is
+  reported as failed, but the step is not rolled back.
+- Hooks fire every time the agent runs a step, including on a resumed
+  bootstrap or a retried operation, so hooks must be idempotent. A step the
+  agent skips entirely, such as provisioning a slot that is already running,
+  fires no events.
+- The default failure policy is `Fail` for steps that bring the node or agent
+  up. It is `Ignore` for stopping and reset, and for the `after` events of
+  repave and upgrade, so a broken hook can never block stopping or cleanup.
+
+Every payload includes `event`, the concrete event name. The table lists the
+fields specific to each event.
 
 | Event | Fires | Payload | Default failure policy |
 |---|---|---|---|
-| `bootstrap.starting` | After admission, before host preparation | machine, runtime, admission kind | `Fail` |
-| `host.prepared` | After host preparation | runtime | `Fail` |
-| `node.provisioned` | After `Provision(slot)`, before `Start` | slot, bundle digest, goal version | `Fail` |
-| `node.ready` | After the node is ready (bootstrap, repave, reboot) | slot, node name, goal version | `Fail` |
-| `node.stopping` | Before `Stop` (repave, reboot, reset) | slot, reason | `Ignore` |
-| `repave.starting` | Before a repave | from slot, to slot, goal versions | `Fail` |
-| `repave.finished` | After a repave | result | `Ignore` |
-| `agent.upgraded` | When the new daemon publishes an upgrade result | old and new version, result | `Ignore` |
-| `reset.starting` | Before a reset | trigger: CLI, operation or goal | `Ignore` |
-| `reset.finished` | After a reset | leftovers | `Ignore` |
+| `agent.install.before` | After admission of a fresh or resumed install, before host preparation | runtime, admission kind (`Fresh` or `Resume`) | `Fail` |
+| `agent.install.after` | After the daemon is installed, before the install is marked complete | runtime, active slot | `Fail` |
+| `host.prepare.before` | Before host preparation | runtime | `Fail` |
+| `host.prepare.after` | After host preparation | runtime | `Fail` |
+| `node.provision.before` | Before `Provision(slot)` | slot, goal version | `Fail` |
+| `node.provision.after` | After `Provision(slot)` | slot, goal version, bundle digest | `Fail` |
+| `node.start.before` | Before `Start(slot)` | slot, goal version | `Fail` |
+| `node.start.after` | After `Start(slot)` and the readiness wait | slot, goal version, node name | `Fail` |
+| `node.stop.before` | Before `Stop(slot)` | slot, reason (`Repave` or `Reset`) | `Ignore` |
+| `node.stop.after` | After `Stop(slot)` | slot, reason | `Ignore` |
+| `node.restart.before` | Before `Restart(slot)` for a NodeReboot | slot, operation name | `Fail` |
+| `node.restart.after` | After `Restart(slot)` and the readiness wait | slot, operation name, node name | `Fail` |
+| `node.repave.before` | Before a repave begins | from slot, to slot, applied and goal versions | `Fail` |
+| `node.repave.after` | After the repave commits and the old slot is destroyed, or after it fails | from slot, to slot, goal version | `Ignore` |
+| `agent.upgrade.before` | In the old daemon, before the new binary is staged | current version, operation name | `Fail` |
+| `agent.upgrade.after` | In the daemon that publishes the upgrade result | old and new version, operation name | `Ignore` |
+| `agent.reset.before` | Before reset begins | trigger (`CLI`, `Operation` or `Goal`) | `Ignore` |
+| `agent.reset.after` | After reset, before the daemon unit is removed | trigger, leftovers | `Ignore` |
+
+The order of events in each lifecycle:
+
+| Lifecycle | Events, in order |
+|---|---|
+| Bootstrap (8.2) | `agent.install.before`, `host.prepare.before`, `host.prepare.after`, `node.provision.before`, `node.provision.after`, `node.start.before`, `node.start.after`, `agent.install.after` |
+| Repave (8.5) | `node.repave.before`, `node.provision.before` (B), `node.provision.after` (B), `node.stop.before` (A), `node.stop.after` (A), `node.start.before` (B), `node.start.after` (B), `node.repave.after` |
+| NodeReboot (8.6) | `node.restart.before`, `node.restart.after` |
+| AgentUpgrade (8.7) | `agent.upgrade.before` in the old daemon, `agent.upgrade.after` in the new one |
+| Reset (8.8) | `agent.reset.before`, `node.stop.before` and `node.stop.after` if a node is running, `agent.reset.after` |
+
+NodeReboot has its own `restart` pair rather than stop and start events,
+because for `nspawn-container` a restart is a single unit restart.
+
+#### Subscribing to events
+
+`hooks[].event` must have exactly three segments. Each segment is either a
+known value or `*`, which matches any value for that whole segment. Examples:
+`node.start.after`, `node.*.after`, `agent.upgrade.*`. Partial wildcards such
+as `node.st*` and unknown values are rejected when the configuration is
+validated, which catches typos. When several hooks match one event, they run
+one at a time in the order they appear in the configuration.
 
 ### 5.4 Declarative extensions
 
@@ -460,7 +521,7 @@ or the environment.
 | `credentials.bootstrap` | None | `{apiServer, caCertBase64, token}` |
 | `credentials.cluster` | None | A Kubernetes `ExecCredential` |
 | `preflight.check` | Configuration summary | `[{name, severity, message}]` |
-| `hook.<event>` | The event payload (5.3) | None |
+| `hook.<event>` | The event payload (5.3) | None. For example, `hook.node.start.after`. |
 
 Operational rules:
 
@@ -926,21 +987,25 @@ sequenceDiagram
   alt already complete
     CLI->>NM: verify node and daemon, repair daemon if needed
   else fresh or resume
-    CLI->>Px: hook bootstrap.starting
+    CLI->>Px: hook agent.install.before
+    CLI->>Px: hook host.prepare.before
     CLI->>HP: common tasks, runtime requirements, extension host units
-    CLI->>Px: hook host.prepared
+    CLI->>Px: hook host.prepare.after
     CLI->>Px: credentials.bootstrap
     CLI->>Px: goal.register, status.report Provisioning
     CLI->>NM: Ensure
     NM->>RT: Inspect
     NM->>NM: resolve NodeSpec, cache artifacts, render bundle for slot A
-    NM->>RT: Provision A, skipped if A is running
-    NM->>Px: hook node.provisioned
+    NM->>Px: hook node.provision.before
+    NM->>RT: Provision A, skipped with its hooks if A is running
+    NM->>Px: hook node.provision.after
+    NM->>Px: hook node.start.before
     NM->>RT: Start A
     NM->>RT: Access A, wait for readiness
     NM->>St: save applied state, active A
-    NM->>Px: hook node.ready, status.report Ready
+    NM->>Px: hook node.start.after, status.report Ready
     CLI->>SD: install and start unbounded-agent-v2-daemon
+    CLI->>Px: hook agent.install.after
     CLI->>St: mark install complete
   end
 ```
@@ -1026,18 +1091,23 @@ sequenceDiagram
   participant Px as providers and hooks
   participant RT as NodeRuntime
   D->>NM: Apply goal
-  NM->>Px: hook repave.starting, credentials.bootstrap
+  NM->>Px: hook node.repave.before, credentials.bootstrap
   NM->>NM: resolve NodeSpec, cache artifacts, render bundle for slot B
   NM->>St: save Pending slot B
+  NM->>Px: hook node.provision.before B
   NM->>RT: Provision B
-  NM->>Px: hook node.provisioned, hook node.stopping
+  NM->>Px: hook node.provision.after B
+  NM->>Px: hook node.stop.before A
   NM->>RT: Stop A
+  NM->>Px: hook node.stop.after A
   NM->>NM: host network reset
+  NM->>Px: hook node.start.before B
   NM->>RT: Start B
   NM->>RT: Access B, wait for readiness
   NM->>St: commit active B, applied goal, clear Pending
+  NM->>Px: hook node.start.after B
   NM->>RT: Destroy A
-  NM->>Px: hook node.ready, hook repave.finished, status.report Ready
+  NM->>Px: hook node.repave.after, status.report Ready
 ```
 
 `Recover` after a crash:
@@ -1066,10 +1136,10 @@ sequenceDiagram
   participant Px as hooks and status
   D->>Px: MarkInProgress
   D->>NM: Reboot
-  NM->>Px: hook node.stopping
+  NM->>Px: hook node.restart.before
   NM->>RT: Restart active slot
   NM->>RT: Access, wait for readiness
-  NM->>Px: hook node.ready
+  NM->>Px: hook node.restart.after
   D->>Px: Finish Complete or Failed
 ```
 
@@ -1093,13 +1163,14 @@ sequenceDiagram
   participant SD as systemd
   participant N as daemon (new)
   D->>D: mutation lock, activation lock, MarkInProgress
+  D->>D: hook agent.upgrade.before
   D->>AB: download, verify sha256, install inactive slot
   AB->>AB: candidate must answer version and v2 version
   AB->>AB: switch current link, keep last-good
   D->>D: write upgrade signal, re-exec current
   N->>N: startup gate publishes Complete from the signal
-  N->>N: hook agent.upgraded
-  SD-->>SD: on repeated failure the recovery unit restores last-good and records Failed
+  N->>N: hook agent.upgrade.after
+  SD-->>SD: on repeated failure the recovery unit restores last-good, whose daemon publishes Failed and fires agent.upgrade.after
 ```
 
 This is v1's mechanism
@@ -1125,12 +1196,14 @@ sequenceDiagram
   participant HN as hostnet
   participant HP as hostprep
   T->>St: install lock, mark Resetting
-  T->>Px: hook reset.starting
+  T->>Px: hook agent.reset.before
+  T->>Px: hook node.stop.before, if a node is running
   T->>RT: Teardown, covering both slots and the full footprint
+  T->>Px: hook node.stop.after, if a node was running
   T->>HN: host network reset, teardown scope
   T->>HP: replay the undo journal
   T->>St: remove node state, artifact cache, install record
-  T->>Px: hook reset.finished
+  T->>Px: hook agent.reset.after
   T->>T: stop and remove the daemon unit, last when daemon-initiated
 ```
 
@@ -1815,6 +1888,8 @@ decision.
 | H-D5 | Existing content at owned paths? | Adoption as an explicit per-path configuration option |
 | H-D6 | Teardown without a claims record? | Conservative, with `--force-standard-paths` for the CLI |
 | - | Export policy | Internal by default; export by recorded decision only |
+| - | Lifecycle event names | `<subject>.<state>.<before\|after>`, all lowercase, with every state having both phases |
+| - | Hook subscriptions | Whole-segment `*` wildcards are allowed in `hooks[].event` |
 
 ## 18. Questions for reviewers
 
