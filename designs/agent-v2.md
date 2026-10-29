@@ -135,7 +135,7 @@ library.
 | Host | The machine the agent runs on: a virtual machine or a bare-metal server. |
 | Node | The Kubernetes worker: kubelet, containerd, LocalDNS and the pods they run. In v1 it always runs in an nspawn container on the host. |
 | Runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). Section 7.1 defines the interface. |
-| Slot | One of two places, `a` and `b`, where a runtime can hold a node. One slot runs the node; the other is used to build a replacement during a repave. For `nspawn-container`, the slots are v1's `kube1` and `kube2` machines. |
+| Slot | One of two places, `a` and `b`, where a runtime keeps a node's content. One slot holds the running node; the other is used to build a replacement during a repave. For `nspawn-container`, a slot is a whole machine, v1's `kube1` or `kube2`, including the node's state. For `host`, a slot holds only staged binaries and rendered files; the node's state lives in shared host paths and is wiped on a slot change. |
 | Repave | Replacing the node with a new one, built from the desired configuration in the other slot. The new node registers with Kubernetes as a fresh Node. A repave is triggered by deleting the Kubernetes Node object (section 8.4). |
 | Goal | The desired configuration for this machine, from machina, a plugin or the configuration file. Its version is an opaque value that changes whenever the goal does. |
 | Drift | A difference between the goal and the applied configuration that needs a repave to take effect, such as a new Kubernetes version. |
@@ -150,7 +150,8 @@ library.
 
 - **G1.** One interface for hosting a Kubernetes node, with two
   implementations: `host` and `nspawn-container`.
-- **G2.** Feature parity with v1 (section 14).
+- **G2.** Feature parity with v1 (section 14), except for the intended
+  behavior changes listed in section 14.1.
 - **G3.** Consumers customize the agent binary through hook points. They do
   not link against agent Go packages.
 - **G4.** v1 behavior is unchanged, apart from the small changes listed in
@@ -1574,7 +1575,7 @@ v2 (section 6.3), so nothing else uses it. v1's reset removes it the same way
 | Enabled at boot | `machinectl enable` on `Start`, as v1 does (`pkg/agent/phases/nodestart/nspawn.go:99`), and `machinectl disable` on `Stop` (`pkg/agent/phases/reset/machine.go:39`) | The node units are enabled on `Start` and disabled on `Stop` |
 | Fresh state | A new rootfs | Wipe the owned paths (host runtime doc, section 8) |
 | `NodeAccess` | `systemd-run -M` | Direct |
-| NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start boot hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start boot hook, writing `/run/cdi/nvidia.yaml`, which containerd also reads as `/var/run/cdi` |
+| NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start boot hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start boot hook, writing `/run/cdi/nvidia.yaml`, which containerd also reads as `/var/run/cdi` *(inference: containerd's default CDI directories)* |
 | NVIDIA Container Toolkit | From the GPU OCI image (`images/agent-ubuntu2404-nvidia/Containerfile:22-32`) | Shipped as an agent artifact (section 9.2) |
 | Devices and extra mounts | Bind mounts plus `DeviceAllow` | Nothing to do; already visible |
 | Shared host paths | Bind mounts | The paths themselves; `hostPath` must equal `nodePath` |
@@ -1751,6 +1752,27 @@ Flex. The scoping is open for review (section 18).
 | Host-root move from `/usr/local` | `internal/hostroot` | Not carried over: v2 only installs fresh |
 | Configuration from legacy environment variables | `cmd/agent/internal/cmd/config.go` | Dropped |
 
+### 14.1 Behavior changes from v1
+
+Where v2 intentionally behaves differently from v1. Everything not listed
+here should match v1.
+
+| Area | v1 | v2 | Section |
+|---|---|---|---|
+| Noticing a deleted Node | Reacts only to delete events, so it misses one deleted while the daemon is down | Compares the observed Node on every reconcile, and records its UID | 8.4 (open: question 6) |
+| A Node deleted and recreated | Not handled | Treated as a deletion; repaves if there is drift | 8.4 |
+| A node that never registers | Stays as it is, with no report | Stays as it is, and reports `NodeNotRegistered` after 10 minutes | 8.4 |
+| Repave commit | Saves the new configuration before kubelet is confirmed running | Commits only once the new node is ready | 8.5 |
+| A crash during a repave unpack | Later attempts reuse a partial rootfs | A slot is provisioned again unless its completion marker is present | 8.5, 19 |
+| Active slot after a crash | `kube1` wins if both slots have a configuration file | The runtime reports the enabled slot; `Recover` reconciles by bundle digest | 7.7 |
+| Boot hooks | Regenerate configuration from the applied config | Read the bundle manifest saved at provision time | 7.2 |
+| Host network reset | Fixed names and a fixed WireGuard range | Names plus link kinds, any WireGuard port, and owned iptables chains removed on reset | 11 |
+| Reset | Leaves host preparation in place | Reverses it from the undo log | 12 |
+| MachineOperations without a handler | Ignored | Failed, if the kind belongs to the agent | 13 |
+| Configuration | v1 JSON or environment variables | Versioned v2 file, or v1 JSON converted; environment variables dropped | 5.2, appendix A |
+| Agent upgrade | Checks the candidate answers `version` | Also checks it answers `v2 version` | 8.7 |
+| Extension points | `pkg/agent` as a library | Plugins, hooks and declarative extensions | 5 |
+
 ## 15. Export policy
 
 1. Everything starts in `internal/agentv2`.
@@ -1844,9 +1866,10 @@ built:
 4. **Rendering templates (section 6.2).** v2 copies v1's templates and relies on
    golden tests for parity. The alternative is to add exported, render-only
    functions to `pkg/agent`, which avoids the copy but changes a public package.
-5. **Hook binary stability (section 8.3).** v1 runs its systemd hooks through a
-   separate binary copy so they survive an upgrade rollback. Is the `current`
-   link enough for v2, given the recovery unit restores `last-good` into
+5. **Boot hook binary (section 8.3, D31).** v1 runs its systemd hooks through a
+   separate binary copy so they survive an upgrade rollback
+   (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Is the `current` link
+   enough for v2's boot hooks, given the recovery unit restores `last-good` into
    `current`?
 6. **The `Decide` behavior change (section 8.4).** v2 compares the observed
    Node on every reconcile instead of reacting only to delete events. A Node
