@@ -1088,6 +1088,26 @@ mod simulation {
         assert_eq!(evict_one(&reactor, &volume, 50), None);
     }
 
+    /// A lease taken while an eviction yields keeps the slot from being freed
+    /// and reused; a later eviction frees it once the lease is gone.
+    #[test]
+    fn eviction_keeps_a_slot_leased_while_it_runs() {
+        let (sim, _env) = setup();
+        let reactor = TestReactor::new(64, ());
+        let (volume, _slab) = many_storage(&sim, &reactor);
+        let slot = get(&reactor, &volume, &key(1, 2999)).unwrap().slot;
+        let free = volume.free_slots();
+        let eviction = evict_part_way(&reactor, &volume, 50);
+        let lease = volume.lease(slot).unwrap();
+        let evicted = drive(&reactor, eviction).unwrap().unwrap();
+        assert_eq!(evicted.len(), 3000);
+        assert_eq!(volume.free_slots(), free, "a leased slot is not freed");
+        assert_eq!(evict_one(&reactor, &volume, 50), None);
+        drop(lease);
+        assert_eq!(evict_one(&reactor, &volume, 50), Some(Vec::new()));
+        assert_eq!(volume.free_slots(), free + 1);
+    }
+
     #[test]
     fn dropped_eviction_gives_back_the_slot_and_its_removals() {
         let (sim, _env) = setup();

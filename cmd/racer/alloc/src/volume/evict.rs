@@ -51,7 +51,8 @@ impl<C: Charge> Volume<C> {
     /// the index. Returns the removed entries, or `None` when no slot can be
     /// evicted.
     ///
-    /// A slot can be evicted when it is not open, not leased, its reference
+    /// A slot can be evicted when it is not open, not leased (when chosen and
+    /// when its eviction finishes), its reference
     /// bit is clear, and it is a cache slot or a storage slot whose
     /// `retain_until` bound is below `now`. When no such slot exists, an idle
     /// open cache slot is closed and evicted. The slot is free at once, even
@@ -215,8 +216,10 @@ impl<C: Charge> Volume<C> {
                 }
         });
         guard.done = true;
-        if kept {
-            // An entry of the slot is still retained: keep the slot.
+        if kept || state.slots.leased(slot) {
+            // An entry of the slot is still retained, or a read leased the
+            // slot while the scan yielded: keep the slot. Its removed entries
+            // stay removed, so a later eviction frees it once unleased.
             state.slots.cancel_eviction(slot).map_err(S::Error::from)?;
         } else if lost {
             // Some records of the slot are unaccounted for: an index entry may

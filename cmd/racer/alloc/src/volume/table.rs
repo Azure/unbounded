@@ -1252,6 +1252,13 @@ impl Slots {
         true
     }
 
+    /// Whether `slot` has a live lease.
+    pub fn leased(&self, slot: u32) -> bool {
+        self.leases
+            .get(slot as usize)
+            .is_some_and(|leases| leases.get() != 0)
+    }
+
     /// Pin a slot. Panics if `slot` is out of range.
     pub fn lease(&self, slot: u32) -> SlotLease {
         SlotLease::new(&self.leases, slot)
