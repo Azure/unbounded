@@ -25,7 +25,7 @@ node count, and seed always give the same trace hash.
 
 ## racer-core
 
-Path: `cmd/racer-dataplane/core`, crate `racer-core`, lib `racer_core`.
+Path: `cmd/racer/core`, crate `racer-core`, lib `racer_core`.
 
 Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-control`, and `sha2`.
 
@@ -54,7 +54,7 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
 
 ### Production callers
 
-- The dataplane (`cmd/racer-dataplane/src`) calls `racer_core` directly. Page fills drive
+- The dataplane (`cmd/racer/src`) calls `racer_core` directly. Page fills drive
   `racer_core::read::walk::Fill` (`CandidatePolicy::drive` in `src/read/candidates.rs`, called
   from `acquire_once` in `src/read/fill.rs`). The simulator drives the same machine
   (`NodeWorld::drive` in `sim/src/node/world.rs`). Range reads use `racer_core::read` range slots
@@ -87,7 +87,7 @@ A phantom cache makes the same decisions as the real cache but stores no payload
 
 ## racer-sim
 
-Path: `cmd/racer-dataplane/sim`, crate and binary `racer-sim`.
+Path: `cmd/racer/sim`, crate and binary `racer-sim`.
 
 | Module | Role |
 | --- | --- |

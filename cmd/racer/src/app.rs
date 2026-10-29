@@ -311,7 +311,7 @@ fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
         };
         if fd < 0 {
             eprintln!(
-                "racer-dataplane: stage=slabs failed to open stale slab file {}: {}",
+                "racer: stage=slabs failed to open stale slab file {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
             );
@@ -328,7 +328,7 @@ fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
         // SAFETY: flock synchronously borrows this live descriptor.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             eprintln!(
-                "racer-dataplane: stage=slabs kept locked stale slab file {}: {}",
+                "racer: stage=slabs kept locked stale slab file {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
             );
@@ -354,12 +354,12 @@ fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
         // SAFETY: live directory FD and NUL-terminated name.
         if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
             eprintln!(
-                "racer-dataplane: stage=slabs removed stale slab file {}",
+                "racer: stage=slabs removed stale slab file {}",
                 path.display()
             );
         } else {
             eprintln!(
-                "racer-dataplane: stage=slabs failed to remove stale slab file {}: {}",
+                "racer: stage=slabs failed to remove stale slab file {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
             );
