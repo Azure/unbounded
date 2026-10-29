@@ -360,3 +360,96 @@ impl Drop for Lead {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::*;
+
+    fn page(number: u64) -> PageId {
+        PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: racer_control_wire::CacheId(
+                        "00000000-0000-4000-8000-000000000001".into(),
+                    ),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            number: PageNumber(number),
+        }
+    }
+
+    fn lead(lookup: Lookup) -> Lead {
+        match lookup {
+            Lookup::Lead(lead) => lead,
+            _ => panic!("expected to lead"),
+        }
+    }
+
+    #[test]
+    /// Waiters on a dropped lead see Abandoned, and the page can be led
+    /// again; a finished lead with nothing to share leaves no entry.
+    fn dropped_lead_abandons_its_waiters() {
+        let helper = crate::gpu::testing::helper(&[None, None]);
+        let table = Rc::new(GpuCopies::default());
+        let first = lead(table.lookup(&page(0), &helper, 0));
+        let Lookup::Join(receive) = table.lookup(&page(0), &helper, 1) else {
+            panic!("expected to join");
+        };
+        drop(first);
+        assert!(matches!(
+            futures::executor::block_on(receive),
+            Outcome::Abandoned
+        ));
+        assert_eq!(table.len(), 0);
+        let second = lead(table.lookup(&page(0), &helper, 1));
+        let Lookup::Join(receive) = table.lookup(&page(0), &helper, 0) else {
+            panic!("expected to join");
+        };
+        second.finish(Outcome::Nothing);
+        assert!(matches!(
+            futures::executor::block_on(receive),
+            Outcome::Nothing
+        ));
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    /// A fetch on a GPU that cannot copy from the leader's runs privately.
+    fn unreachable_lead_is_not_joined() {
+        let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
+            simulation.set_peer(1, 0, false)
+        });
+        let table = Rc::new(GpuCopies::default());
+        let _lead = lead(table.lookup(&page(0), &helper, 0));
+        assert!(matches!(
+            table.lookup(&page(0), &helper, 1),
+            Lookup::Private
+        ));
+        assert!(matches!(
+            table.lookup(&page(0), &helper, 0),
+            Lookup::Join(_)
+        ));
+    }
+
+    #[test]
+    /// The table stops at MAX_PAGES live entries, and makes room again
+    /// once their fetches end.
+    fn table_is_bounded() {
+        let helper = crate::gpu::testing::helper(&[None]);
+        let table = Rc::new(GpuCopies::default());
+        let leads: Vec<Lead> = (0..MAX_PAGES as u64)
+            .map(|number| lead(table.lookup(&page(number), &helper, 0)))
+            .collect();
+        assert_eq!(table.len(), MAX_PAGES);
+        let extra = page(MAX_PAGES as u64);
+        assert!(matches!(table.lookup(&extra, &helper, 0), Lookup::Private));
+        assert_eq!(table.len(), MAX_PAGES);
+        drop(leads);
+        assert_eq!(table.len(), 0);
+        let _lead = lead(table.lookup(&extra, &helper, 0));
+        assert_eq!(table.len(), 1);
+    }
+}
