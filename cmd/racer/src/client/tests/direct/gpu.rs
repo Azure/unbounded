@@ -306,13 +306,9 @@ fn gpu_mode_resolves_against_hardware() {
     // Without the cuda feature, auto never loads a backend.
     if !cfg!(feature = "cuda") {
         assert!(
-            GpuHelper::start(
-                GpuMode::Auto,
-                crate::config::DEFAULT_GPU_STAGING_BYTES,
-                false
-            )
-            .unwrap()
-            .is_none()
+            GpuHelper::start(GpuMode::Auto, crate::gpu::GpuOptions::default())
+                .unwrap()
+                .is_none()
         );
     }
 }

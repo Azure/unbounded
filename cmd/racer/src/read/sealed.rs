@@ -57,19 +57,23 @@ pub enum SealedSource {
     /// through the slab, or received from a peer.
     Host(UnverifiedPage),
 
-    /// Ciphertext already in the target GPU's staging memory, read from a
-    /// local v2 disk record with cuFile.
+    /// Ciphertext already in a GPU's staging memory, read from a local v2
+    /// disk record with cuFile. Shared: several sealed pages may hold the
+    /// same slot, which returns to its pool when the last one drops. The
+    /// slot may be on another GPU than the target; the helper then copies
+    /// it to the target GPU first.
     Staged {
-        staged: StagedCiphertext,
+        staged: Arc<StagedCiphertext>,
 
         /// The disk mapping the bytes came from.
         token: ReadToken,
     },
 
-    /// Ciphertext a peer's NIC wrote straight into the target GPU's RDMA
-    /// landing buffer. No host copy exists, so nothing is shared, published,
-    /// or persisted, and the page is used once.
-    Landed(LandedCiphertext),
+    /// Ciphertext a peer's NIC wrote straight into a GPU's RDMA landing
+    /// buffer. No host copy exists, so nothing is published or persisted.
+    /// Shared like [`Self::Staged`]: the landing page is reused only after
+    /// the last holder drops.
+    Landed(Arc<LandedCiphertext>),
 }
 
 /// A page that only the GPU will authenticate. Nothing here is proof of

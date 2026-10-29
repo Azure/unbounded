@@ -1099,7 +1099,7 @@ impl Fill {
             expected_crc: None,
             metadata,
             envelope,
-            source: super::sealed::SealedSource::Landed(landed),
+            source: super::sealed::SealedSource::Landed(Arc::new(landed)),
         });
         sealed.validate_for(page)?;
         self.metrics.record(Event::PeerHit, 1);
@@ -1197,7 +1197,10 @@ impl Fill {
             aad,
             key,
             expected_crc: Some(checksum),
-            source: super::sealed::SealedSource::Staged { staged, token },
+            source: super::sealed::SealedSource::Staged {
+                staged: Arc::new(staged),
+                token,
+            },
         });
         sealed.validate_for(page)?;
         self.metrics.record(Event::DiskHit, 1);

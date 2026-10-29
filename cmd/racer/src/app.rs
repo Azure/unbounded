@@ -3684,21 +3684,20 @@ pub(crate) fn gpu_slot(
             telemetry.attach_links(links);
         }
     };
-    let (mode, staging, p2pdma) = (
-        config.enable_gpu,
-        config.gpu_staging_bytes,
-        config.gpu_pci_p2pdma,
-    );
+    let mode = config.enable_gpu;
+    let options = crate::gpu::GpuOptions {
+        staging_bytes: config.gpu_staging_bytes,
+        pci_p2pdma: config.gpu_pci_p2pdma,
+        peer: config.gpu_peer,
+    };
     if mode == GpuMode::Auto && built {
         eprintln!("racer: stage=gpu state=standby start=first-gpu-read");
         return Ok(Arc::new(crate::gpu_slot::GpuSlot::lazy(
-            Box::new(move || {
-                crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)
-            }),
+            Box::new(move || crate::gpu::GpuHelper::start_built(mode, built, options, loader)),
             Box::new(on_start),
         )));
     }
-    let gpu = crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)?;
+    let gpu = crate::gpu::GpuHelper::start_built(mode, built, options, loader)?;
     if let Some(gpu) = &gpu {
         on_start(gpu);
     }
