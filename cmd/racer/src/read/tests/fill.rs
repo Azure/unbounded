@@ -3024,6 +3024,8 @@ pub(super) struct TestOrigin {
     pub(super) version_unavailable: Cell<bool>,
     pub(super) blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
     pub(super) started_pages: RefCell<Vec<u64>>,
+    /// Answer metadata refreshes with `metadata` instead of panicking.
+    pub(super) serve_metadata: Cell<bool>,
 }
 impl Origin for TestOrigin {
     fn bootstrap_reserved<'a>(
@@ -3042,7 +3044,16 @@ impl Origin for TestOrigin {
         _: crate::model::MetadataSelector,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
-        Box::pin(async { panic!("pinned page fill must not refresh metadata") })
+        Box::pin(async move {
+            assert!(
+                self.serve_metadata.get(),
+                "pinned page fill must not refresh metadata"
+            );
+            Ok(MetadataReply {
+                metadata: self.metadata.clone(),
+                page_zero: None,
+            })
+        })
     }
     fn page_reserved<'a>(
         &'a self,
@@ -3407,6 +3418,7 @@ fn fixture_with_caches(
         fail_once: Cell::new(false),
         version_unavailable: Cell::new(false),
         blocked_pages: RefCell::new(Default::default()),
+        serve_metadata: Cell::new(false),
         started_pages: RefCell::new(Vec::new()),
     });
     let (port, engine) = security::pair(worker, 0, config.limits.queue_entries);

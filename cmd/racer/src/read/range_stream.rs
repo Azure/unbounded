@@ -1037,9 +1037,11 @@ impl RangeStream {
     /// Direct fills to keep in flight beyond the head page. Provider selections
     /// deliver verified plaintext, so a sealed read fills its whole window
     /// directly. Its direct fills stage disk pages with cuFile and keep
-    /// ciphertext for the GPU to decrypt.
+    /// ciphertext for the GPU to decrypt. A passthrough read never selects,
+    /// so it also fills its whole window directly to keep origin reads
+    /// parallel. The range budget still bounds the fills in flight.
     fn direct_ahead(&self) -> usize {
-        if self.sealed.is_some() {
+        if self.sealed.is_some() || self.passthrough {
             self.window_pages.saturating_sub(1).max(DIRECT_AHEAD)
         } else {
             DIRECT_AHEAD
@@ -1756,6 +1758,23 @@ pub(super) mod tests {
                 })
                 .unwrap();
             assert_eq!(stream.direct_ahead(), sealed, "window {window}");
+        }
+    }
+
+    #[test]
+    fn passthrough_reads_fill_their_whole_window_directly() {
+        for (window, passthrough) in [(1, 1), (2, 1), (8, 7)] {
+            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let mut metadata = metadata();
+            metadata.length = 16 * PAGE_BYTES;
+            let range = ByteRange::From(0).resolve(metadata.length).unwrap();
+            let scope =
+                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
+            let mut stream = f.open(&metadata, range, scope);
+            assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
+            stream.set_passthrough();
+            assert_eq!(stream.direct_ahead(), passthrough, "window {window}");
         }
     }
 

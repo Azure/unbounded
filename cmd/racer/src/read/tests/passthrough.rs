@@ -556,3 +556,64 @@ fn queued_publication_is_dropped_after_switching_to_passthrough() {
         endpoint.uninstall().unwrap();
     }
 }
+
+/// A passthrough stream never selects from peers, so it fills its whole
+/// configured window directly: several blocked origin pages are outstanding
+/// at once rather than only the head plus one page ahead.
+#[test]
+fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
+    use super::hot_reads::{coordinator_with_window, local_membership};
+    use crate::client::{ClientRequest, ReadKind};
+    use crate::test_support::security::network;
+    const WINDOW: usize = 4;
+    for mode in MODES {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let signers = network(1);
+        let mut f = fixture_with(6 * PAGE_BYTES + 7, None);
+        f.reactor.init().unwrap();
+        f.set_mode(mode);
+        // Passthrough revalidates metadata on every read.
+        f.origin.serve_metadata.set(true);
+        let membership = local_membership(&signers[0]);
+        let (local, mut endpoint, _publication) =
+            coordinator_with_window(&f, &signers[0], &membership, NoPeer::requester(), WINDOW);
+        f.origin.blocked_pages.borrow_mut().extend(0..7);
+        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let request = ClientRequest {
+            retain: None,
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: None,
+                page_credits: 64,
+                byte_credits: 64 * PAGE_BYTES,
+            },
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        };
+        let mut stream = match futures::executor::block_on(local.read(request, &scope))
+            .unwrap()
+            .payload
+        {
+            crate::read::ReadPayload::Stream(stream) => stream,
+            crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..256 {
+            assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        let started = f.origin.started_pages.borrow().clone();
+        assert_eq!(started, (0..WINDOW as u64).collect::<Vec<_>>(), "{mode:?}");
+        f.origin.blocked_pages.borrow_mut().clear();
+        futures::executor::block_on(stream.cancel()).unwrap();
+        drop(stream);
+        for _ in 0..256 {
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        endpoint.uninstall().unwrap();
+    }
+}
