@@ -11,12 +11,17 @@ The derivative keeps that disk's NVIDIA stack, firmware, and image provenance,
 then installs the archived Ubuntu 24.04 kernel
 `6.14.0-1003-azure-nvidia` (`6.14.0-1003.3`) from a fixed Ubuntu snapshot. It
 removes the source image's newer kernel so the required version is the only
-installed boot kernel. It also installs pinned `ssh-import-id` and adds a native
-cloud-init user fragment for the reviewed host access accounts. Passwords remain
-locked, shells are `/bin/bash`, and each account has passwordless sudo. `bcho`
-deliberately has no `ssh_import_id` entry because it currently has no published
-GitHub keys. The other accounts import keys from their same-named GitHub
-identities.
+installed boot kernel. The image also carries forward the validated lab
+installation's host settings: the exact IOMMU, GIC, SMMU, allocation, and
+network-interface kernel parameters; an explicit nouveau blacklist; held
+versioned kernel packages; and removal of any John Cabaj package source. It does
+not add the proposed-package source or perform a broad package upgrade.
+
+The image installs pinned `ssh-import-id` and adds a native cloud-init user
+fragment for the reviewed host access accounts. Passwords remain locked, shells
+are `/bin/bash`, and each account has passwordless sudo. `bcho` deliberately has
+no `ssh_import_id` entry because it currently has no published GitHub keys. The
+other accounts import keys from their same-named GitHub identities.
 
 The dedicated build script runs on a native ARM64 host. It mounts the qualified
 raw disk in a private mount namespace, performs the package and DKMS work in the
@@ -27,6 +32,8 @@ target-hardware canary. The build verifies:
 
 - the source and package checksums;
 - Ubuntu `24.04` and kernel `6.14.0-1003-azure-nvidia` package versions;
+- the validated lab kernel command line, package holds, nouveau blacklist, and
+  absence of the John Cabaj package source;
 - the boot kernel symlink and rebuilt NVIDIA DKMS module;
 - NVIDIA module loading and device-node initialization before cloud-final;
 - the cloud-init user fragment schema;

@@ -12,6 +12,7 @@ source_image=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312
 ubuntu_image=docker.io/library/ubuntu@sha256:18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d
 kernel_release=6.14.0-1003-azure-nvidia
 kernel_version=6.14.0-1003.3
+kernel_parameters="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1 init_on_alloc=0 net.ifnames=0"
 
 volume_suffix=
 if [ "$(basename "${container_engine}")" = podman ]; then
@@ -57,6 +58,11 @@ customize_disk() {
     cp -a "${work}/packages" "${root}/tmp/packages"
     cp "${script_dir}/assets/90-gb200-access-users.cfg" \
         "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
+    mkdir -p "${root}/etc/default/grub.d" "${root}/etc/modprobe.d"
+    cp "${script_dir}/assets/60-gb200-lab-kernel.cfg" \
+        "${root}/etc/default/grub.d/60-gb200-lab-kernel.cfg"
+    cp "${script_dir}/assets/blacklist-nouveau.conf" \
+        "${root}/etc/modprobe.d/blacklist-nouveau.conf"
     cp "${script_dir}/assets/customize.sh" "${root}/tmp/customize.sh"
     test ! -e "${root}/usr/sbin/policy-rc.d"
     printf '#!/bin/sh\nexit 101\n' > "${root}/usr/sbin/policy-rc.d"
@@ -81,6 +87,15 @@ customize_disk() {
     fi
     cmp "${script_dir}/assets/90-gb200-access-users.cfg" \
         "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
+    cmp "${script_dir}/assets/60-gb200-lab-kernel.cfg" \
+        "${root}/etc/default/grub.d/60-gb200-lab-kernel.cfg"
+    cmp "${script_dir}/assets/blacklist-nouveau.conf" \
+        "${root}/etc/modprobe.d/blacklist-nouveau.conf"
+    if grep -Rqi john-cabaj \
+        "${root}/etc/apt/sources.list" \
+        "${root}/etc/apt/sources.list.d" 2>/dev/null; then
+        exit 1
+    fi
     diff -u <(printf '%s\n' nvidia nvidia_modeset nvidia_uvm nvidia_drm) \
         "${root}/etc/modules-load.d/nvidia.conf"
     diff -u <(cat <<'EOF'
@@ -239,6 +254,10 @@ else
     echo system > "${work}/boot-level"
 fi
 grep -m1 "Linux version ${kernel_release}" "${work}/boot.log"
+kernel_command_line=$(grep -m1 "Kernel command line:" "${work}/boot.log")
+for parameter in ${kernel_parameters}; do
+    printf '%s\n' "${kernel_command_line}" | grep -Fq "${parameter}"
+done
 if grep -qx system "${work}/boot-level"; then
     grep -Em1 'Reached target .*Multi-User System| login:' "${work}/boot.log"
 else
