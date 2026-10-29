@@ -1156,7 +1156,7 @@ package nodemanager
 
 type Manager interface {
 	Ensure(ctx context.Context, cfg *config.AgentConfiguration) error // bootstrap on slot a
-	Apply(ctx context.Context, g *control.Goal) error                 // repave to the inactive slot
+	Apply(ctx context.Context, g *control.Goal) error                 // repave into the other slot
 	Reboot(ctx context.Context) error
 	Reset(ctx context.Context, trigger ResetTrigger) error
 	Recover(ctx context.Context) error // finish or clean up interrupted work
@@ -1500,7 +1500,7 @@ sequenceDiagram
   participant N as daemon (new)
   D->>D: install lock, binary activation lock, MarkInProgress
   D->>D: hook agent.upgrade.before
-  D->>AB: download, verify sha256, install inactive slot
+  D->>AB: download, verify sha256, install into the inactive blue or green binary
   AB->>AB: candidate must answer version and v2 version
   AB->>AB: switch current link, keep last-good
   D->>D: write upgrade signal, re-exec current
@@ -1522,7 +1522,7 @@ The `v2 agent-upgrade` command is the other way in. Host delivery automation
 runs it on the host, from a separately staged candidate binary, without a
 MachineOperation, as v1's hidden `agent-upgrade` command is run
 (`cmd/agent/internal/cmd/agentupgrade.go:63-70`). It uses the same activation:
-install into the inactive slot, switch the `current` link, restart the daemon
+install into the inactive blue or green binary, switch the `current` link, restart the daemon
 unit and wait until it is healthy, rolling back if it is not
 (`pkg/agent/agentbinary/activation.go:86-246`). The `agent.upgrade.before` and
 `agent.upgrade.after` events fire on this path too.
