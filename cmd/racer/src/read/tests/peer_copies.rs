@@ -3475,6 +3475,55 @@ mod landing {
     }
 
     #[test]
+    /// A leader that finishes with nothing sends a waiting fetch straight to
+    /// the host path without a GPU attempt of its own.
+    fn finished_lead_without_a_copy_skips_the_waiters_gpu_fetch() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Copy(l.copy.clone())));
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let target = SealedTarget {
+            helper: l.helper.clone(),
+            ordinal: 0,
+        };
+        let f = &mut l.f;
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
+        let fetch = f.fill.acquire_sealed(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+            &target,
+        );
+        let finish = async move {
+            yield_once().await;
+            lead.finish(crate::read::gpu_copies::Outcome::Nothing);
+        };
+        let (fetched, ()) = drive(
+            futures::future::join(fetch, finish),
+            &mut f.engine,
+            &f.crypto,
+        );
+        let fetched = fetched.unwrap();
+        assert!(!matches!(
+            fetched,
+            Fetched::Sealed(ref sealed) if matches!(sealed.source, SealedSource::Landed(_))
+        ));
+        assert_eq!(l.asked.get(), 0, "no landing attempt of its own");
+        assert_eq!(l.peers.calls.borrow().len(), 1, "one host fetch");
+        assert_eq!(joined_count(&l.helper), 0);
+    }
+
+    #[test]
     /// When the leading request ends before its fetch does, a waiting
     /// fetch looks again and fetches the page itself.
     fn abandoned_lead_lets_the_waiting_fetch_fetch() {

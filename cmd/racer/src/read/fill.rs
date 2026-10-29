@@ -979,7 +979,9 @@ impl Fill {
     /// A GPU copy of `page` for `target`, shared with concurrent sealed
     /// fetches: a live copy on a reachable GPU, the result of a reachable
     /// fetch in progress, or a fetch of our own that others may then share.
-    /// None means use the path through host memory.
+    /// None means use the path through host memory. A waiter whose leader
+    /// finished without a GPU copy returns None rather than retrying the
+    /// GPU fetch itself; a waiter whose leader was abandoned looks again.
     async fn shared_gpu_copy(
         &self,
         page: &PageId,
@@ -1012,11 +1014,16 @@ impl Fill {
                             .private_gpu_copy(page, membership, context, scope, budget, target)
                             .await;
                     }
-                    Outcome::Nothing => {
-                        return self
-                            .private_gpu_copy(page, membership, context, scope, budget, target)
-                            .await;
-                    }
+                    // The leader finished without a GPU copy: cuFile and the
+                    // landing failed or did not apply, its GPU had no free
+                    // slot, or the page came through host memory. Repeating
+                    // its attempt would likely fail the same way, once per
+                    // waiter, so take the host single flight instead. This
+                    // includes slot exhaustion on the leader's GPU even when
+                    // this request's GPU differs and might have a free slot:
+                    // the host path is always correct, and it is cheaper than
+                    // N repeated disk or landing attempts under load.
+                    Outcome::Nothing => return Ok(None),
                     Outcome::Abandoned if retries > 0 => retries -= 1,
                     Outcome::Abandoned => {
                         return self
