@@ -42,7 +42,14 @@ fi
 
 boot_configs="$(find /boot/efi -type f -name grub.cfg -print)"
 test -n "${boot_configs}"
+validated_boot_configs=0
 for config in ${boot_configs}; do
+    if ! grep -Eq \
+        "/boot/(vmlinuz|initrd\\.img)-(${source_kernel_release}|${kernel_release})([[:space:]]|$)" \
+        "${config}"; then
+        continue
+    fi
+
     sed -i "s/${source_kernel_release}/${kernel_release}/g" "${config}"
     sed -i \
         "/^[[:space:]]*linux[[:space:]].*\\/boot\\/vmlinuz-${kernel_release}/ {
@@ -62,7 +69,9 @@ for config in ${boot_configs}; do
     for parameter in ${kernel_parameters}; do
         printf '%s\n' "${kernel_lines}" | grep -Fq " ${parameter}"
     done
+    validated_boot_configs=$((validated_boot_configs + 1))
 done
+test "${validated_boot_configs}" -gt 0
 
 for package in \
     linux-azure-nvidia-6.14-headers-6.14.0-1003 \
