@@ -241,6 +241,7 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
                         client_socket,
                         origin_socket,
                         priority: racer_control_wire::DEFAULT_PRIORITY,
+                        mode: racer_control_wire::CacheMode::Cached,
                     }
                 })
                 .collect(),

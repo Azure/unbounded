@@ -2629,6 +2629,7 @@ pub(crate) mod tests {
                         client_socket: "/c".into(),
                         origin_socket: "/o".into(),
                         priority,
+                        mode: racer_control_wire::CacheMode::Cached,
                     };
                     let weigh = |low_priority, high_priority| {
                         admission.policy().weights().update(&[

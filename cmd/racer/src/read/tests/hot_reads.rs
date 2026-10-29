@@ -1010,6 +1010,7 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
+            mode: racer_control_wire::CacheMode::Cached,
         };
     admission
         .policy()

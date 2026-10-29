@@ -962,6 +962,7 @@ fn definition() -> CacheDefinition {
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
         priority: racer_control_wire::DEFAULT_PRIORITY,
+        mode: racer_control_wire::CacheMode::Cached,
     }
 }
 fn scope() -> RequestScope {
@@ -2845,6 +2846,7 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 origin_socket: format!("/run/racer/{name}/origin/socket").into(),
                 name,
                 priority: racer_control_wire::DEFAULT_PRIORITY,
+                mode: racer_control_wire::CacheMode::Cached,
             }
         })
         .collect();
