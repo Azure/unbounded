@@ -123,7 +123,7 @@ to host files) are reverted at Uninstall.
 | `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | persistent | |
 | `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | file edit | Lines removed at Uninstall. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
 | Slot directories | runtime | staged | Removed by `Destroy` or Teardown |
-| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, the `unbounded-node*` targets, the LocalDNS network unit and helper, extension host units | runtime | installed | |
+| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, the LocalDNS network unit and helper, extension host units | runtime | installed | |
 | Extension `cleanup.statePaths` | consumer | as declared | Section 13 |
 
 ## 5. Cleanup levels
@@ -147,10 +147,10 @@ flowchart LR
 
 | Method | `host` runtime behavior |
 |---|---|
-| `Stop(slot)` | Terminate, then Unmount, then disable the slot's units |
-| `Restart(slot)` | Terminate, Unmount, the pre-start hook, start the pre target and node target, the post-start hook |
-| `Start(slot)`, same slot and bundle as last time | Enable the slot's units, then start the pre target and the node target. No wipe. |
-| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, enable the slot's units, start (section 8) |
+| `Stop(slot)` | Terminate, then Unmount, then disable `unbounded-node.target` |
+| `Restart(slot)` | Terminate, Unmount, then start the node units again; starting them runs the prerequisites and the pre-start boot hook first (main doc, section 8.3) |
+| `Start(slot)`, same slot and bundle as last time | Enable `unbounded-node.target` and start it. No wipe. |
+| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, then enable and start `unbounded-node.target` (section 8) |
 | `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotEnabled` for the enabled slot. |
 | `Teardown()` | Every level through Uninstall (section 9) |
 
@@ -249,7 +249,7 @@ like this:
 | The slot in the record, phase `Active`, node units running | Running |
 | The slot in the record, phase `Active`, node units stopped | Stopped |
 
-`Enabled` is true for the slot in the record while its units are enabled.
+`Enabled` is true for the slot in the record while `unbounded-node.target` is enabled.
 
 ```mermaid
 stateDiagram-v2
@@ -257,8 +257,8 @@ stateDiagram-v2
   Inactive --> Wiping: Start, record does not match slot and digest
   Wiping --> Installing: Terminate, Unmount and Wipe verified
   Installing --> Active: slot content installed, record phase Active
-  Active --> Running: enable units, start pre target, then node target
-  Running --> Active: Stop, which disables the units
+  Active --> Running: enable and start unbounded-node.target
+  Running --> Active: Stop, which disables unbounded-node.target
   Active --> Running: Start, same slot and digest, no wipe
   Wiping --> Wiping: crash, the next Start redoes the wipe
   Installing --> Wiping: crash, the next Start redoes the wipe
@@ -327,8 +327,8 @@ flowchart TD
 Without an ownership record, Teardown is conservative:
 
 - It removes only paths and units unique to v2: slot directories,
-  `unboundednode.slice`, the `unbounded-node*` targets, v2 state, the LocalDNS
-  network unit and `nftables-flush.service`.
+  `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`,
+  v2 state, the LocalDNS network unit and `nftables-flush.service`.
 - Every non-empty standard path in section 4 is reported as a leftover.
 - `v2 reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.

@@ -553,20 +553,20 @@ Rules:
 
 - Extension artifacts go through the same artifact cache, offline sources and
   preflight reachability checks as built-in artifacts.
-- `host.units` with `orderBeforeNode` get `Before=` and
-  `RequiredBy=unbounded-node-pre.target`.
+- `host.units` with `orderBeforeNode` run, and must succeed, before every start
+  of the node. `nodeDependencies.requires` units must be active before the node
+  starts. The runtime writes the systemd wiring for both (section 8.3);
+  consumers never refer to runtime unit names.
 - `sharedHostPaths` are host paths made visible inside the node: a bind mount
   for `nspawn-container`, the path itself for `host`.
 - `cleanup` declares state the extension's workloads create (host runtime doc, section 13).
 - Everything an extension creates is recorded in state and removed by reset.
+- Extensions are install-time settings: changing or removing one needs a reset
+  and a new install (section 5.2).
 
-Two systemd targets with fixed names replace the hardcoded `systemd-nspawn@`
-dependencies in v1's assets and in Flex:
-
-| Target | Meaning |
-|---|---|
-| `unbounded-node-pre.target` | Everything the node needs from the host: the nftables flush, the LocalDNS network helper and extension host units. The runtime's node boot unit `Requires=` and is `After=` this target. |
-| `unbounded-node.target` | The node itself. Consumers order `After=` it. |
+This replaces the hardcoded `systemd-nspawn@` dependencies in v1's assets and
+in Flex, such as Flex's static routes with
+`RequiredBy=systemd-nspawn@.service`.
 
 ### 5.5 Plugin protocol
 
@@ -628,9 +628,9 @@ added later as a new protocol version.
 | Host runtime state | `/var/lib/unbounded/agent-v2/host-runtime/` (ownership record, active-slot record, adoption backups) |
 | Host runtime slots | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Configuration copy, daemon credentials, upgrade signal | `/etc/unbounded/agent-v2/` |
-| Units, both runtimes | `unbounded-agent-v2-daemon.service`, `unbounded-agent-v2-daemon-recovery.service`, `unbounded-node-pre.target`, `unbounded-node.target`, `nftables-flush.service` |
-| `nspawn-container` runtime | `/var/lib/machines/kube{1,2}`, `/etc/systemd/nspawn/kube{1,2}.nspawn`, `systemd-nspawn@kube{1,2}.service.d/` |
-| `host` runtime | `unboundednode.slice`, `containerd.service`, `kubelet.service`, `localdns.service`, plus the owned paths in the host runtime doc, section 4 |
+| Units, both runtimes | `unbounded-agent-v2-daemon.service`, `unbounded-agent-v2-daemon-recovery.service`, `nftables-flush.service`, `unbounded-localdns-network.service` |
+| `nspawn-container` runtime | `/var/lib/machines/kube{1,2}`, `/etc/systemd/nspawn/kube{1,2}.nspawn`, `systemd-nspawn@kube{1,2}.service.d/`, `unbounded-node-boot-hook@kube{1,2}.service` |
+| `host` runtime | `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, `containerd.service`, `kubelet.service`, `localdns.service`, plus the owned paths in the host runtime doc, section 4 |
 
 On-host names are fixed. Consumers cannot rename units or paths. Only the
 identity the cluster sees is configurable: the daemon CSR group and name
@@ -1151,28 +1151,46 @@ sequenceDiagram
   end
 ```
 
-### 8.3 Host boot
+### 8.3 Host boot and boot units
+
+Each runtime has a *boot unit*: the unit that must start before the node does.
+Host-side prerequisites are oneshot units that the boot unit requires directly,
+with no target in between:
+
+| | `nspawn-container` | `host` |
+|---|---|---|
+| Started at boot through | The enabled machine (`machinectl enable`) | `unbounded-node.target`, enabled by `Start`, which wants `containerd.service`, `kubelet.service` and `localdns.service` |
+| Boot unit | `systemd-nspawn@<m>.service` for the enabled slot | `unbounded-node-prestart.service`, a oneshot that the three node units each `Requires=` and are ordered after |
+| How prerequisites attach | `RequiredBy=systemd-nspawn@.service` in the prerequisite, which covers both slots, plus `After=` in the machine's unit override, as v1 does (`pkg/agent/phases/host/assets/nftables-flush.service:20-21`, `pkg/agent/phases/rootfs/assets/service-override.conf:39`). A `Before=` on the template would not reach the instances (`nftables-flush.service:3-5`). | `RequiredBy=` and `Before=unbounded-node-prestart.service` in the prerequisite |
+| Pre-start boot hook | A separate oneshot unit, `unbounded-node-boot-hook@<m>.service`, that the machine's override `Requires=` and is ordered after, as v1's config-regeneration unit is (`service-override.conf:37-38`) | Run by `unbounded-node-prestart.service` |
+| Post-start boot hook | `ExecStartPost=` in the machine's override, as in v1 (`service-override.conf:48`) | None: the NVIDIA CDI spec is generated in the pre-start boot hook |
+
+The prerequisites are the same for both runtimes: the nftables flush, the
+LocalDNS network helper, extension host units with `orderBeforeNode`, and
+`nodeDependencies.requires` units.
+
+The prerequisite and pre-start units are oneshots with `RemainAfterExit=no`.
+They are inactive once they finish, so every later start of a unit that
+requires them runs them again *(inference)*. That covers a host boot, a
+NodeReboot on `nspawn-container` (`systemctl restart systemd-nspawn@<m>`), and
+starting the node units again on a `host` restart. It is how v1's nftables
+flush already runs again on each machine start. Validation task V5 confirms it.
 
 ```mermaid
 sequenceDiagram
   participant SD as systemd
-  participant Pre as unbounded-node-pre.target
-  participant U as node boot unit
-  participant A as v2 boot-hook
-  participant RT as NodeRuntime
+  participant U as boot unit
+  participant P as prerequisite oneshots
+  participant H as pre-start boot hook
+  participant N as node
   participant D as v2 daemon
-  SD->>Pre: nftables flush, LocalDNS network helper, extension host units
-  SD->>U: start the enabled slot's boot unit
-  U->>A: ExecStartPre pre-start slot
-  A->>RT: BootHook pre-start, from the slot's saved manifest
-  U->>A: ExecStartPost post-start slot
-  A->>RT: BootHook post-start
+  SD->>U: start the enabled slot
+  U->>P: Requires, nftables flush, LocalDNS network helper, extension host units
+  U->>H: Requires, v2 boot-hook pre-start, from the slot's saved manifest
+  U->>N: node starts
+  N->>N: nspawn-container only, ExecStartPost runs v2 boot-hook post-start
   SD->>D: start daemon, Recover, then reconcile
 ```
-
-The node boot unit is `systemd-nspawn@kube1.service` or `@kube2` for
-`nspawn-container`, and `containerd.service` plus `kubelet.service`, grouped by
-`unbounded-node.target`, for `host`.
 
 v1 runs its hooks through a separate copy of the binary that survives an
 upgrade rollback (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Whether
@@ -1319,8 +1337,9 @@ sequenceDiagram
 - `nspawn-container`: `systemctl restart systemd-nspawn@<m>`, which runs the
   hooks again, matching v1
   (`pkg/agent/phases/nodestart/nspawn_lifecycle.go:36-40`).
-- `host`: Terminate and Unmount (host runtime doc, sections 6 and 7), the pre-start hook, the pre target
-  and node target, then the post-start hook.
+- `host`: Terminate and Unmount (host runtime doc, sections 6 and 7), then start
+  the node units again. Starting them runs the prerequisites and the pre-start
+  boot hook again first (section 8.3).
 
 There is no host network reset on reboot, matching v1's `RestartNode`
 (`cmd/agent/internal/daemon/nodeoperator.go:224-229`).
@@ -1384,7 +1403,7 @@ sequenceDiagram
 |---|---|---|
 | Slot | `/var/lib/machines/kube1`, `kube2` | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Provision | Unpack the OCI image; write the bundle, `.nspawn` file and unit override | Stage binaries and rendered files into the slot directory |
-| Start | `machinectl start`, then boot steps through `systemd-run -M` | Install units and configuration from the slot, start the pre target and `unbounded-node.target` |
+| Start | `machinectl start`, then boot steps through `systemd-run -M` | Install units and configuration from the slot, then start `unbounded-node.target` (section 8.3) |
 | Enabled at boot | `machinectl enable` on `Start`, as v1 does (`pkg/agent/phases/nodestart/nspawn.go:99`), and `machinectl disable` on `Stop` (`pkg/agent/phases/reset/machine.go:39`) | The node units are enabled on `Start` and disabled on `Stop` |
 | Fresh state | A new rootfs | Wipe the owned paths (host runtime doc, section 8) |
 | `NodeAccess` | `systemd-run -M` | Direct |
@@ -1470,18 +1489,17 @@ Teardown, for both runtimes. It hardens v1's `CleanupNetwork`
 
 The whole-ruleset flush at node start is kept for both runtimes. v1's
 `nftables-flush.service` runs `flush ruleset`
-(`pkg/agent/phases/host/assets/nftables-clear.nft:6`). Every nspawn machine pulls
-it in (`RequiredBy=systemd-nspawn@.service`, `nftables-flush.service:20-21`) and
-is ordered after it (`pkg/agent/phases/rootfs/assets/service-override.conf:39`).
-It deliberately also
-clears a host firewall's default-drop policy, which would otherwise make the
-kubelet unreachable (`nftables-flush.service:7-12`). In v2 it is a member of
-`unbounded-node-pre.target`. Because it is a oneshot with
-`RemainAfterExit=no` (`nftables-flush.service:16-18`), and starting an active
-target does not run its members again, the runtime starts the pre target's
-oneshot units explicitly on every `Start` and `Restart`. That matches
-`nspawn-container`, where each start of `systemd-nspawn@<m>` pulls the flush in
-again *(inference)*.
+(`pkg/agent/phases/host/assets/nftables-clear.nft:6`). Every nspawn machine
+pulls it in (`RequiredBy=systemd-nspawn@.service`, `nftables-flush.service:20-21`)
+and is ordered after it
+(`pkg/agent/phases/rootfs/assets/service-override.conf:39`). The flush
+deliberately also clears a host firewall's default-drop policy, which would
+otherwise make the kubelet unreachable (`nftables-flush.service:7-12`).
+
+In v2 the flush stays a direct prerequisite of each runtime's boot unit
+(section 8.3). It is a oneshot with `RemainAfterExit=no`
+(`nftables-flush.service:16-18`), so every start of the node runs it again
+*(inference; validation task V5)*.
 
 The shared package that implements it:
 
@@ -1617,8 +1635,8 @@ harnesses with `runtime.type` as a test dimension:
 - GPU coverage on `hack/agent/azure-gpu-vm`.
 - A sample Flex-like plugin as a fixture.
 
-Validation tasks that need prototypes before the `host` runtime leaves
-experimental:
+Validation tasks. Each needs a prototype before the feature it covers is
+built:
 
 | ID | Task |
 |---|---|
@@ -1626,6 +1644,7 @@ experimental:
 | V2 | The image-preserving containerd reset (host runtime doc, section 8) against containerd 2.1.8 (`pkg/agent/goalstates/constants.go:121`), including the CRI plugin's state directory layout. |
 | V3 | The minimal NVIDIA Container Toolkit binary set for CDI mode, and how the toolkit finds its configuration in the slot directory without editing the host's. |
 | V4 | SELinux labels for binaries executed from the slot directories on Azure Linux 3. |
+| V5 | The oneshot prerequisites and pre-start boot hook run again on every start of the boot unit: after a host reboot, on `systemctl restart systemd-nspawn@<m>`, and when the `host` node units start again after a restart (section 8.3). |
 
 ## 17. Risks
 
