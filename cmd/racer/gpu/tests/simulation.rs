@@ -779,3 +779,34 @@ fn peer_source_is_held_until_stream_sync() {
             .any(|e| e.operation == Operation::CopyPeer && e.result == 0)
     );
 }
+
+#[test]
+/// A failed readback keeps its host landing buffer until the stream
+/// synchronizes, and leaves the caller's buffer untouched.
+fn failed_readback_retains_landing_buffer() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(4096).unwrap();
+    let stream = ctx.stream().unwrap();
+    stream
+        .copy_from_host(Destination::Staging(&staging), 0, vec![7u8; 16])
+        .unwrap();
+    stream.synchronize().unwrap();
+
+    sim.fault(Operation::CopyD2h, -5);
+    let mut out = vec![0u8; 16];
+    assert!(stream.read_staging(&staging, 0, &mut out).is_err());
+    assert_eq!(out, vec![0u8; 16]);
+    assert_eq!(stream.retained_host_sources(), 1);
+    stream.synchronize().unwrap();
+    assert_eq!(stream.retained_host_sources(), 0);
+
+    // A successful readback fills the caller's buffer and holds nothing.
+    stream.read_staging(&staging, 0, &mut out).unwrap();
+    assert_eq!(out, vec![7u8; 16]);
+    assert_eq!(stream.retained_host_sources(), 0);
+    drop(stream);
+    assert_eq!(gpu.leaked(), 0);
+}

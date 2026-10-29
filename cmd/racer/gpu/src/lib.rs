@@ -865,23 +865,35 @@ impl Stream {
 
     /// Copy staging bytes to the host and wait for this stream. Client
     /// imports can never be read.
+    ///
+    /// The copy lands in a host buffer the stream owns, and `out` is filled
+    /// only after the copy completes. If the call fails, the copy may still
+    /// be queued, so the stream keeps that buffer until a later successful
+    /// [`Stream::synchronize`] or leaks it if the stream is dropped first.
     pub fn read_staging(&self, src: &StagingBuffer, offset: u64, out: &mut [u8]) -> Result<()> {
         if out.is_empty() {
             return Err(Error::InvalidRange);
         }
         let (raw, hold) = self.source(src, offset, out.len() as u64)?;
+        let mut landing = vec![0u8; out.len()].into_boxed_slice();
+        let ptr = landing.as_mut_ptr();
         let rc = unsafe {
             (self.shared().api.copy_d2h)(
                 self.raw.as_ptr(),
-                out.as_mut_ptr().cast(),
+                ptr.cast(),
                 raw,
                 offset,
                 out.len() as u64,
             )
         };
         self.retain([hold]);
-        self.shared().check(rc)?;
-        // copy_d2h synchronized the stream.
+        if rc != 0 {
+            // The copy may still be queued and write the buffer later.
+            self.retain([Retained::Host(Box::new(landing))]);
+            return self.shared().check(rc);
+        }
+        // copy_d2h synchronized the stream, so the landing buffer is final.
+        out.copy_from_slice(&landing);
         self.retained.borrow_mut().clear();
         Ok(())
     }
