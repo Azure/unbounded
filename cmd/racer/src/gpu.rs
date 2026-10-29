@@ -2612,6 +2612,23 @@ mod tests {
         assert_eq!(counter(&helper.counters().decrypted), 2);
         assert_eq!(helper.free_slots(0), helper.free_slots(1));
         assert_eq!(helper.leaked(), 0);
+        let text = scrape(&helper);
+        assert!(text.contains("racer_gpu_peer_copies_total 2\n"), "{text}");
+        let bytes = counter(&helper.counters().peer_copy_bytes);
+        assert!(bytes > 5016);
+        assert!(text.contains(&format!("racer_gpu_peer_copy_bytes_total {bytes}\n")));
+        assert!(text.contains("racer_gpu_peer_failures_total 0\n"));
+        assert!(text.contains("racer_gpu_peer_bounces_total 0\n"));
+        assert!(text.contains("racer_gpu_read_pages_total{decrypt=\"gpu\"} 2\n"));
+    }
+
+    /// Render the Prometheus text a worker scrape would produce.
+    fn scrape(helper: &Arc<GpuHelper>) -> String {
+        let metrics = crate::telemetry::Metrics::for_workers(2).unwrap();
+        metrics[0].gpu().attach_helper(helper.clone());
+        let mut text = String::new();
+        metrics[1].write_prometheus(&mut text).unwrap();
+        text
     }
 
     #[test]
@@ -2675,6 +2692,10 @@ mod tests {
         assert_eq!(operations(&helper, Operation::CopyPeer), attempts);
         assert_eq!(counter(&helper.counters().peer_bounces), 2);
         assert_eq!(counter(&helper.counters().peer_failures), 1);
+        let text = scrape(&helper);
+        assert!(text.contains("racer_gpu_peer_failures_total 1\n"), "{text}");
+        assert!(text.contains("racer_gpu_peer_bounces_total 2\n"));
+        assert!(text.contains("racer_gpu_peer_copies_total 0\n"));
     }
 
     #[test]
