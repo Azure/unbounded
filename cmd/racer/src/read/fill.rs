@@ -97,6 +97,8 @@ pub struct Fill {
     pub(super) local_copies: Rc<LocalCopies>,
     pub(super) local_plaintext: Rc<LocalPlaintext>,
     local_plaintext_keys: Rc<LocalPlaintextKeys>,
+    /// GPU copies of sealed ciphertext that concurrent sealed fetches share.
+    pub(super) gpu_copies: Rc<super::gpu_copies::GpuCopies>,
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
@@ -149,6 +151,9 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
 /// Bound on retries after a joined local plaintext job fails under its
 /// starter's inherited scope.
 const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
+/// Bound on looking again after a shared GPU fetch that this sealed fetch
+/// waited for was abandoned by the request that started it.
+const GPU_COPY_JOIN_RETRIES: usize = 2;
 
 /// Providers a `gpu-read` asks, in visit order, to land a page in GPU
 /// memory before it takes the usual path. Each is one CopyOnly request
@@ -828,6 +833,7 @@ impl Fill {
             local_copies: Rc::new(LocalCopies::default()),
             local_plaintext: Rc::new(LocalPlaintext::default()),
             local_plaintext_keys: Rc::default(),
+            gpu_copies: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
         }
@@ -901,11 +907,20 @@ impl Fill {
     }
 
     /// Acquire one page for direct GPU delivery: verified plaintext when a
-    /// reader still holds it on the CPU, otherwise ciphertext (from memory
-    /// first, then disk, peers or origin) for the GPU to verify and
-    /// decrypt. Network and disk copies keep the usual single-flight sharing,
-    /// memory publication and disk persistence; only the CPU decrypt and the
-    /// plaintext publication are skipped.
+    /// reader still holds it on the CPU, otherwise ciphertext for the GPU to
+    /// verify and decrypt.
+    ///
+    /// Ciphertext kept in memory is sealed from host memory. Otherwise the
+    /// page is read from local disk into GPU staging with cuFile, or landed
+    /// by a peer straight into GPU memory. Those GPU copies are shared among
+    /// concurrent sealed fetches of the page through `gpu_copies`: a fetch
+    /// for the same GPU, or for a GPU that can copy from it over a peer
+    /// path, reuses a live copy or waits for the fetch in progress instead
+    /// of reading the page again. GPU copies are never published to memory
+    /// or shared with plaintext readers. When no GPU copy can be made, the
+    /// page takes the usual path through host memory, which keeps the usual
+    /// single-flight sharing, memory publication and disk persistence; only
+    /// the CPU decrypt and the plaintext publication are skipped.
     pub(crate) async fn acquire_sealed(
         &self,
         page: PageId,
@@ -929,34 +944,11 @@ impl Fill {
         // for the GPU from host memory below.
         let cached = self.dependencies.memory.unverified(&page)?.is_some();
         if !cached
-            && target.helper.cufile()
-            && self
-                .dependencies
-                .writer
-                .copy_only(&page)
-                .ok()
-                .flatten()
-                .is_none()
+            && let Some(fetched) = self
+                .shared_gpu_copy(&page, membership.clone(), context, scope, budget, target)
+                .await?
         {
-            match self.stage_from_disk(&page, scope, target).await {
-                Ok(Some(sealed)) => return Ok(Fetched::Sealed(sealed)),
-                Ok(None) => {}
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-                // Any other failure reads the page through host memory.
-                Err(_) => {}
-            }
-        }
-        if !cached {
-            match self
-                .land_from_peer(&page, membership.clone(), context, scope, budget, target)
-                .await
-            {
-                Ok(Some(fetched)) => return Ok(fetched),
-                Ok(None) => {}
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-                // Any other failure takes the usual path through host memory.
-                Err(_) => {}
-            }
+            return Ok(fetched);
         }
         let acquired = self
             .acquire_with_prefetch(
@@ -984,10 +976,153 @@ impl Fill {
         }
     }
 
+    /// A GPU copy of `page` for `target`, shared with concurrent sealed
+    /// fetches: a live copy on a reachable GPU, the result of a reachable
+    /// fetch in progress, or a fetch of our own that others may then share.
+    /// None means use the path through host memory.
+    async fn shared_gpu_copy(
+        &self,
+        page: &PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<Option<super::sealed::Fetched>> {
+        use super::gpu_copies::Lookup;
+        use super::gpu_copies::Outcome;
+        let mut retries = GPU_COPY_JOIN_RETRIES;
+        loop {
+            scope.check()?;
+            match self.gpu_copies.lookup(page, &target.helper, target.ordinal) {
+                Lookup::Live(copy) => {
+                    if let Some(fetched) = self.joined_gpu_copy(page, &copy, target) {
+                        return Ok(Some(fetched));
+                    }
+                    return self
+                        .private_gpu_copy(page, membership, context, scope, budget, target)
+                        .await;
+                }
+                Lookup::Join(receive) => match self.await_gpu_copy(receive, scope).await? {
+                    Outcome::Copy(copy) => {
+                        if let Some(fetched) = self.joined_gpu_copy(page, &copy, target) {
+                            return Ok(Some(fetched));
+                        }
+                        return self
+                            .private_gpu_copy(page, membership, context, scope, budget, target)
+                            .await;
+                    }
+                    Outcome::Nothing => {
+                        return self
+                            .private_gpu_copy(page, membership, context, scope, budget, target)
+                            .await;
+                    }
+                    Outcome::Abandoned if retries > 0 => retries -= 1,
+                    Outcome::Abandoned => {
+                        return self
+                            .private_gpu_copy(page, membership, context, scope, budget, target)
+                            .await;
+                    }
+                },
+                Lookup::Lead(lead) => {
+                    // Dropping `lead` on cancellation tells waiters to look again.
+                    let result = self
+                        .private_gpu_copy(page, membership, context, scope, budget, target)
+                        .await;
+                    lead.finish(match &result {
+                        Ok(Some(super::sealed::Fetched::Sealed(sealed))) => {
+                            super::gpu_copies::SharedCopy::from_sealed(sealed)
+                                .map_or(Outcome::Nothing, Outcome::Copy)
+                        }
+                        Err(Error::Cancelled | Error::DeadlineExceeded) => Outcome::Abandoned,
+                        _ => Outcome::Nothing,
+                    });
+                    return result;
+                }
+                Lookup::Private => {
+                    return self
+                        .private_gpu_copy(page, membership, context, scope, budget, target)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Wait for another request's GPU fetch, or for this request to end.
+    async fn await_gpu_copy(
+        &self,
+        mut receive: super::gpu_copies::Receiver,
+        scope: &RequestScope,
+    ) -> Result<super::gpu_copies::Outcome> {
+        use std::future::Future;
+        let cancellation = scope.cancellation.subscribe()?;
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            let outcome = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
+            std::task::Poll::Ready(Ok(outcome))
+        })
+        .await
+    }
+
+    /// A sealed page around a copy another request fetched, counted as joined.
+    /// None when the copy cannot be used here.
+    fn joined_gpu_copy(
+        &self,
+        page: &PageId,
+        copy: &super::gpu_copies::SharedCopy,
+        target: &super::sealed::SealedTarget,
+    ) -> Option<super::sealed::Fetched> {
+        let sealed = copy.sealed(&self.dependencies.crypto, page).ok()?;
+        target.helper.record_joined();
+        self.metrics.record(Event::GpuDirectJoined, 1);
+        Some(super::sealed::Fetched::Sealed(sealed))
+    }
+
+    /// This request's own GPU fetch: cuFile from local disk, then a peer
+    /// landing. None means use the path through host memory.
+    async fn private_gpu_copy(
+        &self,
+        page: &PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<Option<super::sealed::Fetched>> {
+        if target.helper.cufile()
+            && self
+                .dependencies
+                .writer
+                .copy_only(page)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            match self.stage_from_disk(page, scope, target).await {
+                Ok(Some(sealed)) => return Ok(Some(super::sealed::Fetched::Sealed(sealed))),
+                Ok(None) => {}
+                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                // Any other failure reads the page through host memory.
+                Err(_) => {}
+            }
+        }
+        match self
+            .land_from_peer(page, membership, context, scope, budget, target)
+            .await
+        {
+            Ok(fetched) => Ok(fetched),
+            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => Err(error),
+            // Any other failure takes the usual path through host memory.
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Fetch a page from a peer straight into a GPU landing buffer (GPUDirect
-    /// RDMA). This is a private fetch for one sealed read: it does not join
-    /// or create a shared single flight, and a landed page is never published
-    /// to memory or persisted, because there are no host bytes to share.
+    /// RDMA). It does not join or create the host single flight, and a landed
+    /// page is never published to memory or persisted, because there are no
+    /// host bytes. Concurrent sealed fetches share the landed copy through
+    /// `gpu_copies` instead.
     ///
     /// Up to [`LANDING_PROVIDERS`] providers are asked in visit order, one
     /// CopyOnly request each; a miss or failure moves on to the next. None
@@ -1214,7 +1349,9 @@ impl Fill {
     /// rejected copy is dropped from memory and disk, as a failed CPU decrypt
     /// would drop it; an authenticated network copy may now be persisted.
     pub(crate) fn sealed_verdict(&self, report: super::sealed::SealedReport, passed: bool) {
-        let super::sealed::SealedReport { page, copy, token } = report;
+        let super::sealed::SealedReport {
+            page, copy, token, ..
+        } = report;
         if passed {
             if let Some(copy) = copy
                 && copy.disk_token.is_none()
@@ -1234,6 +1371,8 @@ impl Fill {
         if let Some(token) = &token {
             let _ = self.dependencies.disk.invalidate(token);
         }
+        // Later sealed fetches must not reuse the rejected GPU copy.
+        self.gpu_copies.forget(&page);
     }
 
     /// Warm gates own transfer exclusion until accepted acquisition work is fenced.

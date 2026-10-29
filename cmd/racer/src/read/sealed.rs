@@ -105,13 +105,19 @@ pub struct SealedReport {
 
     /// The disk mapping a staged copy came from, to drop on failure.
     pub(crate) token: Option<ReadToken>,
+
+    /// The ciphertext was landed in GPU memory by a peer. The owner may
+    /// share it with other sealed fetches, so it must hear of a failure.
+    pub(crate) landed: bool,
 }
 
 impl SealedReport {
-    /// Whether the owner holds anything to persist or invalidate for this
-    /// page. Landed pages are used once and leave nothing behind.
-    pub(crate) fn has_owner_state(&self) -> bool {
-        self.copy.is_some() || self.token.is_some()
+    /// Whether the owner has anything to act on for this verdict: a host
+    /// copy to persist or invalidate, a disk mapping to drop, or, on
+    /// failure, a shared landed copy to forget. A passed landed page leaves
+    /// nothing behind.
+    pub(crate) fn has_owner_state(&self, passed: bool) -> bool {
+        self.copy.is_some() || self.token.is_some() || (self.landed && !passed)
     }
 }
 
@@ -128,6 +134,7 @@ impl SealedPage {
             page: self.page().clone(),
             copy,
             token,
+            landed: matches!(self.source, SealedSource::Landed(_)),
         }
     }
 
