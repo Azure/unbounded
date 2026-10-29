@@ -251,41 +251,80 @@ impl NodeState {
 /// instance's live slabs are skipped. Failures are logged and ignored because stale
 /// files never affect correctness.
 fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    let Ok(entries) = std::fs::read_dir(directory) else {
+    // Like slab startup, never follow a symlink in any path component, so a
+    // directory that slab startup would reject is never enumerated or modified.
+    let Some(dir) = open_slab_directory_nofollow(directory) else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
+    // SAFETY: dup borrows a live descriptor; fdopendir takes ownership on success.
+    let stream = unsafe {
+        let fd = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+        if fd < 0 {
+            return;
+        }
+        let stream = libc::fdopendir(fd);
+        if stream.is_null() {
+            libc::close(fd);
+            return;
+        }
+        stream
+    };
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: stream is a live DIR* owned by this function.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: readdir returned a valid entry with a NUL-terminated name.
+        names.push(unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_owned());
+    }
+    // SAFETY: stream is live and closed exactly once.
+    unsafe { libc::closedir(stream) };
+
+    for name in names {
         let Some(id) = name
             .to_str()
+            .ok()
             .and_then(|n| n.strip_prefix("worker-"))
             .and_then(|n| n.strip_suffix("-slab-0.dat"))
             .and_then(|n| n.parse::<u16>().ok())
         else {
             continue;
         };
-        if workers.contains(&WorkerId(id)) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+        if workers.contains(&WorkerId(id)) {
             continue;
         }
-        let path = entry.path();
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                eprintln!(
-                    "racer-dataplane: stage=slabs failed to open stale slab file {}: {error}",
-                    path.display()
-                );
-                continue;
-            }
+        let path = directory.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        // O_NONBLOCK keeps a FIFO from hanging; the fstat below rejects non-files.
+        // SAFETY: live directory FD and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
         };
+        if fd < 0 {
+            eprintln!(
+                "racer-dataplane: stage=slabs failed to open stale slab file {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            continue;
+        }
+        // SAFETY: successful openat returned a uniquely owned descriptor.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let Ok(locked) = file.metadata() else {
+            continue;
+        };
+        if !locked.is_file() {
+            continue;
+        }
         // SAFETY: flock synchronously borrows this live descriptor.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             eprintln!(
@@ -295,27 +334,96 @@ fn prune_stale_slab_files(directory: &std::path::Path, workers: &[WorkerId]) {
             );
             continue;
         }
-        let same = match (file.metadata(), std::fs::symlink_metadata(&path)) {
-            (Ok(locked), Ok(current)) => {
-                current.is_file() && locked.dev() == current.dev() && locked.ino() == current.ino()
-            }
-            _ => false,
-        };
+        // SAFETY: zeroed stat is a valid out-parameter; FD and name are live.
+        let mut current: libc::stat = unsafe { std::mem::zeroed() };
+        let same = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut current,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            && current.st_mode & libc::S_IFMT == libc::S_IFREG
+            && current.st_dev == locked.dev()
+            && current.st_ino == locked.ino();
         if !same {
             continue;
         }
         // The lock is held until `file` drops, after the unlink.
-        match std::fs::remove_file(&path) {
-            Ok(()) => eprintln!(
+        // SAFETY: live directory FD and NUL-terminated name.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            eprintln!(
                 "racer-dataplane: stage=slabs removed stale slab file {}",
                 path.display()
-            ),
-            Err(error) => eprintln!(
-                "racer-dataplane: stage=slabs failed to remove stale slab file {}: {error}",
-                path.display()
-            ),
+            );
+        } else {
+            eprintln!(
+                "racer-dataplane: stage=slabs failed to remove stale slab file {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
         }
     }
+}
+
+/// Open `directory` for reading by resolving each component relative to its
+/// already-open predecessor with `O_NOFOLLOW`, matching the slab startup path
+/// walk in `alloc/src/slab.rs` (`open_private_file`). Returns `None` when any
+/// component is a symlink, missing, or `..`, or the path is not a directory.
+fn open_slab_directory_nofollow(directory: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    if directory
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    let anchor = if directory.is_absolute() { c"/" } else { c"." };
+    // SAFETY: valid C path; no borrowed memory retained by open.
+    let fd = unsafe {
+        libc::open(
+            anchor.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: open returned a new, uniquely owned descriptor.
+    let mut current = unsafe { std::fs::File::from_raw_fd(fd) };
+    for component in directory.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let name = std::ffi::CString::new(component.as_bytes()).ok()?;
+        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: live directory FD and NUL-terminated component.
+        let next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if next < 0 {
+            return None;
+        }
+        // SAFETY: successful openat returned a uniquely owned descriptor.
+        current = unsafe { std::fs::File::from_raw_fd(next) };
+    }
+    // Reopen the verified O_PATH directory for reading. "." relative to the
+    // O_PATH descriptor refers to that same inode and is not a symlink.
+    // SAFETY: live O_PATH directory FD and static NUL-terminated name.
+    let fd = unsafe {
+        libc::openat(
+            current.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: successful openat returned a uniquely owned descriptor.
+    Some(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 impl Application {

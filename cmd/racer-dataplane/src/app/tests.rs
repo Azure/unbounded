@@ -4950,3 +4950,26 @@ fn prune_stale_slab_files_skips_locked_files() {
     assert!(!locked.exists());
     std::fs::remove_dir_all(&directory).unwrap();
 }
+
+/// Pruning never touches files reached through a symlinked slab directory or
+/// a symlinked ancestor, which slab startup also rejects.
+#[test]
+fn prune_stale_slab_files_ignores_symlinked_directories() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("prune-symlink-slabs-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let real = root.join("real");
+    std::fs::create_dir_all(real.join("slabs")).unwrap();
+    let stale = real.join("slabs/worker-3-slab-0.dat");
+    std::fs::write(&stale, b"x").unwrap();
+    std::os::unix::fs::symlink(real.join("slabs"), root.join("linked-slabs")).unwrap();
+    std::os::unix::fs::symlink(&real, root.join("linked-parent")).unwrap();
+    super::prune_stale_slab_files(&root.join("linked-slabs"), &[WorkerId(0)]);
+    super::prune_stale_slab_files(&root.join("linked-parent/slabs"), &[WorkerId(0)]);
+    assert!(stale.exists());
+    // The real path is still pruned.
+    super::prune_stale_slab_files(&real.join("slabs"), &[WorkerId(0)]);
+    assert!(!stale.exists());
+    std::fs::remove_dir_all(&root).unwrap();
+}
