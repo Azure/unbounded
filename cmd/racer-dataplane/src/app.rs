@@ -1570,9 +1570,12 @@ impl WorkerApplication {
                 config.segment_bytes,
                 crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
             )
-            // Slab files are a re-fetchable cache. A changed slab size makes any
-            // checkpoint for this file incompatible (its recorded slab_bytes no
-            // longer match), so recovery starts this worker cold.
+            // Slab files are a re-fetchable cache. A checkpoint taken at the old
+            // size no longer matches slab_bytes, so recovery starts this worker
+            // cold. An older checkpoint taken at the new size, as after a resize
+            // rollback, may still be accepted; record validation and AEAD then
+            // turn its references to discarded pages into misses, as for any
+            // checkpoint that outlives its payload.
             .reset_mismatched_size()
         });
         let reader = Rc::new(
