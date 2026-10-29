@@ -147,11 +147,11 @@ flowchart LR
 
 | Method | `host` runtime behavior |
 |---|---|
-| `Stop(slot)` | Terminate, then Unmount |
+| `Stop(slot)` | Terminate, then Unmount, then disable the slot's units |
 | `Restart(slot)` | Terminate, Unmount, the pre-start hook, start the pre target and node target, the post-start hook |
-| `Start(slot)`, same slot and bundle as last time | Start the pre target, then the node target. No wipe. |
-| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, start (section 8) |
-| `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotActive` for the active slot. |
+| `Start(slot)`, same slot and bundle as last time | Enable the slot's units, then start the pre target and the node target. No wipe. |
+| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, enable the slot's units, start (section 8) |
+| `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotEnabled` for the enabled slot. |
 | `Teardown()` | Every level through Uninstall (section 9) |
 
 The host network reset is not a runtime method. The node manager runs it for
@@ -230,9 +230,26 @@ Unmount runs only after Terminate has verified that no node processes remain.
 The active-slot record,
 `/var/lib/unbounded/agent-v2/host-runtime/active-slot.json`, holds
 `{slot, bundleDigest, phase}`. When `Start` is called with a slot or bundle
-that differs from the record, the runtime is making a *slot change*, and it
-wipes node state first. This is how the `host` runtime keeps rule 4: the first
-`Start` after `Provision` begins with fresh state.
+digest that differs from the record, the runtime is making a *slot change*, and
+it wipes node state first. This is how the `host` runtime keeps rule 4 of the
+main doc's section 7.1: the first time a slot starts after its content was
+provisioned, it begins with fresh state. The digest is read from the slot's
+saved bundle manifest and leaves out secret contents (main doc, section 7.2),
+so a refreshed bootstrap token never causes a wipe.
+
+This record is the `host` runtime's own record of which slot is installed into
+the shared paths. The node manager keeps no copy of it. `Inspect` reports it
+like this:
+
+| Host state | `Inspect` reports for the slot |
+|---|---|
+| No slot directory, or no completion marker | Absent |
+| Complete slot directory, not the slot in the record | Provisioned |
+| The slot in the record, with phase `Wiping` or `Installing` | Provisioned: a slot change is in progress, and the next `Start` finishes it |
+| The slot in the record, phase `Active`, node units running | Running |
+| The slot in the record, phase `Active`, node units stopped | Stopped |
+
+`Enabled` is true for the slot in the record while its units are enabled.
 
 ```mermaid
 stateDiagram-v2
@@ -240,8 +257,8 @@ stateDiagram-v2
   Inactive --> Wiping: Start, record does not match slot and digest
   Wiping --> Installing: Terminate, Unmount and Wipe verified
   Installing --> Active: slot content installed, record phase Active
-  Active --> Running: start pre target, then node target
-  Running --> Active: Stop
+  Active --> Running: enable units, start pre target, then node target
+  Running --> Active: Stop, which disables the units
   Active --> Running: Start, same slot and digest, no wipe
   Wiping --> Wiping: crash, the next Start redoes the wipe
   Installing --> Wiping: crash, the next Start redoes the wipe
