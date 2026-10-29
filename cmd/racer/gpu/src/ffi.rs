@@ -186,6 +186,10 @@ native_api! {
 
     copy_d2d: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) -> c_int,
 
+    peer: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_int) -> c_int,
+
+    copy_peer: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) -> c_int,
+
     copy_d2h: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64, u64) -> c_int,
 
     decrypt: unsafe extern "C" fn(
@@ -359,6 +363,11 @@ mod tests {
             let mut out = std::ptr::null_mut();
             assert_eq!(unsafe { (api.context)(0, &mut out) }, code::EUNAVAILABLE);
             assert_eq!(unsafe { (api.file)(3, &mut out) }, code::EUNAVAILABLE);
+            let mut access = 1;
+            assert_eq!(
+                unsafe { (api.peer)(std::ptr::null_mut(), std::ptr::null_mut(), &mut access) },
+                code::EINVAL
+            );
         }
     }
 }

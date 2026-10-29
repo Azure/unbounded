@@ -22,7 +22,7 @@ use crate::{
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{c_int, c_void},
     fs::File,
     os::{
@@ -94,6 +94,8 @@ pub enum Operation {
     CopyH2d,
     CopyD2d,
     CopyD2h,
+    Peer,
+    CopyPeer,
     Decrypt,
     Verdict,
     FileOpen,
@@ -259,6 +261,12 @@ struct World {
     /// memfd inode to device ordinal.
     allocations: BTreeMap<(u64, u64), i32>,
 
+    /// (dst, src) ordinal pairs with no peer path. Others have one.
+    no_peer: BTreeSet<(i32, i32)>,
+
+    /// (dst context handle, src ordinal) pairs enabled by `peer`.
+    peers: BTreeSet<(usize, i32)>,
+
     faults: VecDeque<(Operation, c_int)>,
 
     trace: Vec<Event>,
@@ -326,6 +334,17 @@ impl Simulation {
     /// `-5` is a driver error). Nothing changes.
     pub fn fault(&self, operation: Operation, code: c_int) {
         self.world().faults.push_back((operation, code));
+    }
+
+    /// Whether GPU `dst` can read GPU `src`'s memory over a peer path. By
+    /// default every pair can. Affects later `enable_peer` calls only.
+    pub fn set_peer(&self, dst: i32, src: i32, allowed: bool) {
+        let mut world = self.world();
+        if allowed {
+            world.no_peer.remove(&(dst, src));
+        } else {
+            world.no_peer.insert((dst, src));
+        }
     }
 
     /// Behave like a shim built without decrypt kernels.
@@ -704,6 +723,56 @@ unsafe extern "C" fn copy_d2d(
     })
 }
 
+unsafe extern "C" fn peer(dst: *mut c_void, src: *mut c_void, access: *mut c_int) -> c_int {
+    with(Operation::Peer, |w| {
+        let (Some(d), Some(from)) = (w.contexts.get(&id(dst)), w.contexts.get(&id(src))) else {
+            return (code::EINVAL, id(dst));
+        };
+        if access.is_null() {
+            return (code::EINVAL, id(dst));
+        }
+        let (d, from) = (d.ordinal, from.ordinal);
+        let allowed = d == from || !w.no_peer.contains(&(d, from));
+        if allowed {
+            w.peers.insert((id(dst), from));
+        }
+        unsafe { *access = allowed as c_int };
+        (code::OK, id(dst))
+    })
+}
+
+unsafe extern "C" fn copy_peer(
+    stream: *mut c_void,
+    dst: *mut c_void,
+    dst_offset: u64,
+    src: *mut c_void,
+    src_offset: u64,
+    length: u64,
+) -> c_int {
+    with(Operation::CopyPeer, |w| {
+        if let Err(rc) = w.pair(stream, dst) {
+            return (rc, id(dst));
+        }
+        let Some(b) = w.buffers.get(&id(src)) else {
+            return (code::EINVAL, id(dst));
+        };
+        let Some(from) = w.staging(id(src)) else {
+            return (code::EINVAL, id(dst));
+        };
+        let context = w.streams[&id(stream)].context;
+        if b.context == context || !w.peers.contains(&(context, w.contexts[&b.context].ordinal)) {
+            return (code::EDEVICE, id(dst));
+        }
+        if !span(w.buffers[&id(dst)].size, dst_offset, length)
+            || !span(from.len() as u64, src_offset, length)
+        {
+            return (code::ERANGE, id(dst));
+        }
+        let bytes = from[src_offset as usize..(src_offset + length) as usize].to_vec();
+        (w.write(id(dst), dst_offset, &bytes), id(dst))
+    })
+}
+
 unsafe extern "C" fn copy_d2h(
     stream: *mut c_void,
     dst: *mut c_void,
@@ -967,6 +1036,8 @@ pub(crate) fn api() -> Rc<Api> {
         staging_free,
         copy_h2d,
         copy_d2d,
+        peer,
+        copy_peer,
         copy_d2h,
         decrypt,
         verdict,
