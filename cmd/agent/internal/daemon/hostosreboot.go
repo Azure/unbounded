@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-	"time"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,7 +19,6 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
-	"github.com/Azure/unbounded/internal/executil"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 )
 
@@ -40,33 +38,6 @@ func readBootID() (string, error) {
 	}
 
 	return id, nil
-}
-
-// rebootHostTimeout bounds systemctl calls that run without the caller's
-// cancellation.
-const rebootHostTimeout = time.Minute
-
-// rebootHost asks systemd to reboot the host. systemctl runs without the
-// caller's cancellation because systemd stops this daemon, and cancels its
-// context, as soon as the reboot starts. If systemctl still reports an error,
-// rebootHost succeeds when systemd is already stopping, because the reboot is
-// then under way.
-func rebootHost(ctx context.Context, log *slog.Logger) error {
-	cmdCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rebootHostTimeout)
-	defer cancel()
-
-	rebootErr := executil.RunCmd(cmdCtx, log, executil.Systemctl(), "reboot")
-	if rebootErr == nil {
-		return nil
-	}
-
-	state, err := executil.OutputCmd(cmdCtx, log, "systemctl", "show", "--property=SystemState", "--value")
-	if err == nil && strings.TrimSpace(state) == "stopping" {
-		log.Warn("systemctl reboot reported an error, but systemd is already stopping", "error", rebootErr)
-		return nil
-	}
-
-	return fmt.Errorf("systemctl reboot: %w", rebootErr)
 }
 
 func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {

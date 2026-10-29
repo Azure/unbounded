@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -255,7 +256,7 @@ func (nspawnNodeOperator) BootID() (string, error) {
 }
 
 func (nspawnNodeOperator) RebootHost(ctx context.Context, log *slog.Logger) error {
-	return rebootHost(ctx, log)
+	return daemon.RebootHost(ctx, log)
 }
 
 func (nspawnNodeOperator) RepaveNode(
