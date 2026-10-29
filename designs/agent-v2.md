@@ -1458,8 +1458,10 @@ Differences from v1:
 - v1 persists the new configuration before waiting for kubelet, then removes
   the old slot (`cmd/agent/internal/daemon/nodeoperator.go:275-285`). v2
   commits only once the node is ready.
-- v1 reuses a partially unpacked rootfs after a crash (section 19). v2
-  provisions a slot again unless its completion marker is present.
+- v1 skips unpacking the OCI image when the machine directory is not empty
+  (`pkg/agent/phases/rootfs/oci/task.go:61-64`), so after a crash partway
+  through an unpack, later attempts reuse a partial rootfs. v2 provisions a
+  slot again unless its completion marker is present.
 
 ### 8.6 NodeReboot
 
@@ -1763,7 +1765,7 @@ here should match v1.
 | A Node deleted and recreated | Not handled | Treated as a deletion; repaves if there is drift | 8.4 |
 | A node that never registers | Stays as it is, with no report | Stays as it is, and reports `NodeNotRegistered` after 10 minutes | 8.4 |
 | Repave commit | Saves the new configuration before kubelet is confirmed running | Commits only once the new node is ready | 8.5 |
-| A crash during a repave unpack | Later attempts reuse a partial rootfs | A slot is provisioned again unless its completion marker is present | 8.5, 19 |
+| A crash during a repave unpack | Later attempts reuse a partial rootfs | A slot is provisioned again unless its completion marker is present | 8.5 |
 | Active slot after a crash | `kube1` wins if both slots have a configuration file | The runtime reports the enabled slot; `Recover` reconciles by bundle digest | 7.7 |
 | Boot hooks | Regenerate configuration from the applied config | Read the bundle manifest saved at provision time | 7.2 |
 | Host network reset | Fixed names and a fixed WireGuard range | Names plus link kinds, any WireGuard port, and owned iptables chains removed on reset | 11 |
@@ -1855,7 +1857,10 @@ built:
 1. **MachineOperation scoping (section 13, D12).** Is "fail only kinds that belong
    to the agent, meaning the current three plus any `Node*` or `Agent*` kind"
    the right rule? It relies on a naming convention for future kinds that the
-   API does not currently document.
+   API does not currently document. The `OperationKind` enum is closed
+   (`api/machina/v1alpha3/machineoperation_types.go:54`), although its comment
+   says custom operations may be supported by individual cloud controllers
+   (`:51-53`).
 2. **Separate v2 state (D6).** v2 uses its own state directories, units and
    locks, sharing only the binary layout. The alternative is to share v1's
    names. Separate names avoid any confusion between the two, but the `-v2`
@@ -1875,66 +1880,6 @@ built:
    Node on every reconcile instead of reacting only to delete events. A Node
    deleted while the daemon was down therefore triggers a repave when the
    daemon returns. Is that the behavior we want?
-
-## 19. Code and documentation disagreements
-
-These were found while researching v1. This document follows the code unless
-noted.
-
-- `designs/agent-daemon-controller.md:232-242` says matching operations without
-  a handler are failed. The code ignores them
-  (`pkg/agent/daemon/machineoperation.go:114-118,139-141`). v2 adopts a scoped
-  version of the documented behavior (section 13).
-- `designs/lifecycle-operations.md:25` and the API comment
-  (`api/machina/v1alpha3/machineoperation_types.go:58-61`) say NodeReboot stops
-  kubelet and containerd first. The code restarts the nspawn unit only
-  (`pkg/agent/phases/nodestart/nspawn_lifecycle.go:36-40`).
-- `designs/lifecycle-operations.md:48-52` says deleting a Node always recreates
-  it. The code skips the repave when there is no drift
-  (`cmd/agent/internal/daemon/controller_node.go:54-62`).
-- `cmd/agent/internal/cmd/reset.go:22-24` says reset restores the host to its
-  original state. Host preparation is not reversed
-  (`cmd/agent/internal/daemon/reset.go:168-195`). The uninstall script that does
-  reverse it (`internal/provision/assets/unbounded-agent-uninstall.sh`) is only
-  called from tests (`internal/provision/script.go:35`). v2 fixes this
-  (section 12).
-- `pkg/agent/goalstates/resolve.go:315` logs a fallback to debootstrap, which
-  no longer exists.
-- The `OperationKind` comment says "custom operations may be supported by
-  individual cloud controllers"
-  (`api/machina/v1alpha3/machineoperation_types.go:51-53`), but the enum on the
-  next line is closed. This matters for open question 1.
-- A repave in v1 provisions the new machine with `rootfs.Provision`
-  (`cmd/agent/internal/daemon/nodeoperator.go:277`), which skips unpacking the
-  OCI image when the machine directory is not empty
-  (`pkg/agent/phases/rootfs/oci/task.go:61-64`). A crash partway through an
-  unpack therefore leaves a partial rootfs that later retries reuse. Only the
-  bootstrap path, `ProvisionOwned`, checks a completion marker
-  (`pkg/agent/phases/rootfs/provision.go:23-27`, `oci/task.go:66-75`). v2 saves
-  a completion marker and the bundle manifest for every provision
-  (section 7.2).
-
-## 20. Alternatives considered
-
-- **Add a runtime switch to v1.** Rejected. nspawn is assumed in every layer
-  (section 1.2), so the change would touch nearly all of v1's production code.
-- **A separate `unbounded-agent-v2` binary.** Rejected in favor of D1: a
-  subcommand reuses the existing delivery, install script, upgrade path and
-  release artifacts.
-- **Keep library consumption for AKS Flex Node.** Rejected. Section 1.3 shows
-  the cost: copied task lists, re-composed sequences, writes into internal
-  paths and dependencies on unexported names.
-- **In-process Go plugins** (the `plugin` package or a framework such as
-  go-plugin). Rejected: version coupling, build constraints and a larger trust
-  surface than exec plugins.
-- **A gRPC plugin protocol.** Deferred. Exec per call is enough for the current
-  methods; a streaming transport can come later as a new protocol version.
-- **A distribution profile for renaming units and paths.** Rejected (D8). It
-  multiplies the names the agent creates on the host, and so the work of
-  cleaning them up.
-- **Move shared code to `internal/agent` instead of copying.** Rejected (D3).
-  It is a large cross-package refactor of v1, and v2's versions will diverge.
-- **Virtual machine runtime.** Out of scope; no current plans.
 
 ## Appendix A. Converting a v1 configuration
 
