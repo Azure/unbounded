@@ -1140,8 +1140,13 @@ impl Fixture {
     /// budget of two reserves one turn for accept and drives one connection
     /// per pass, so connections that become ready together submit their I/O
     /// one at a time and the reactor reaps it before the next connection runs.
+    ///
+    /// The deadline only catches hangs. Simulated GPU decrypts run the
+    /// bit-serial host GCM emulation on the single helper thread, roughly
+    /// 0.4-0.7s per page on one CPU, so a multi-page exchange on a shared CI
+    /// runner can legitimately take several seconds.
     fn receive_budgeted(&self, socket: &mut UnixStream, eof: bool, budget: usize) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut output = Vec::new();
         loop {
             self.pump(budget);
