@@ -961,7 +961,12 @@ impl Fill {
         // plaintext. A cached copy skips the disk and peer paths and is sealed
         // for the GPU from host memory below.
         let cached = self.dependencies.memory.unverified(&page)?.is_some();
+        // Passthrough never serves a retained copy, so a residual disk copy
+        // awaiting the worker purge is not staged, and a local-route read
+        // never contacts peers.
+        let mode = self.mode(&page.version.object.cache);
         if !cached
+            && !mode.passthrough()
             && target.helper.cufile()
             && self
                 .dependencies
@@ -979,7 +984,7 @@ impl Fill {
                 Err(_) => {}
             }
         }
-        if !cached {
+        if !cached && mode != racer_control_wire::CacheMode::PassthroughLocal {
             match self
                 .land_from_peer(&page, membership.clone(), context, scope, budget, target)
                 .await

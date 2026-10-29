@@ -3237,6 +3237,63 @@ mod landing {
         assert!(l.peers.calls.borrow().len() >= 3);
         assert_eq!(landed_count(&l.helper), 0);
     }
+
+    #[test]
+    /// A local-route passthrough sealed read on a non-owner fills from this
+    /// node's origin without asking any peer to land the page.
+    fn passthrough_local_sealed_read_never_asks_peers() {
+        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+        let mut l = landing(0, true);
+        l.f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+        let fetched = acquire_sealed(&mut l);
+        assert!(fetched.is_ok(), "{:?}", fetched.err());
+        assert_eq!(l.asked.get(), 0);
+        assert!(l.peers.calls.borrow().is_empty());
+        assert_eq!(l.f.origin.calls.get(), 1);
+        assert_eq!(landed_count(&l.helper), 0);
+        assert!(
+            l.f.fill
+                .dependencies
+                .memory
+                .get(&l.f.page)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    /// A disk copy written before a switch to passthrough is not staged for a
+    /// sealed read in either passthrough mode.
+    fn passthrough_sealed_read_does_not_stage_a_residual_disk_copy() {
+        for mode in [
+            racer_control_wire::CacheMode::PassthroughPeers,
+            racer_control_wire::CacheMode::PassthroughLocal,
+        ] {
+            let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+            let mut l = landing(0, false);
+            let deps = l.f.fill.dependencies.clone();
+            let dirty = deps
+                .admission
+                .reserve(
+                    Some(&l.f.context.object.cache),
+                    ResourceClass::DirtyCiphertext,
+                    l.copy.ciphertext.bytes().len(),
+                )
+                .unwrap();
+            deps.writer.enqueue(l.copy.clone(), dirty).ok();
+            drive_disk(&l.f, deps.writer.progress(8, &l.f.scope)).unwrap();
+            assert!(
+                deps.writer.index().lookup(&l.f.page).unwrap().is_some(),
+                "{mode:?}"
+            );
+            deps.memory.remove_cache(&l.f.context.object.cache).unwrap();
+            l.f.set_mode(mode);
+            l.peers.reply(&l.ordered[0], Reply::Copy(l.copy.clone()));
+            let fetched = acquire_sealed(&mut l);
+            assert!(fetched.is_ok(), "{mode:?}: {:?}", fetched.err());
+            assert_eq!(l.f.fill.metrics.count(Event::DiskHit), 0, "{mode:?}");
+        }
+    }
 }
 
 /// Install a published membership equal to the fixture's (version 1), so a
