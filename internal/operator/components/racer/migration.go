@@ -484,6 +484,11 @@ func planOrphanClaim(ctx context.Context, env *component.Env, plan *component.Pl
 // settings the new installation no longer reads. The retired controller used
 // them to render the dataplane; dropping them silently would move a running
 // cluster to another peer port or off the host network.
+// legacyNVIDIAKey is the NVIDIA injection key the retired racer-controller
+// read from racer-config. It is independent of workload.NVIDIAKey, which was
+// renamed.
+const legacyNVIDIAKey = "RACER_DATAPLANE_NVIDIA"
+
 func checkLegacyConfig(ctx context.Context, env *component.Env) error {
 	config := &corev1.ConfigMap{}
 
@@ -512,8 +517,12 @@ func checkLegacyConfig(ctx context.Context, env *component.Env) error {
 		}
 	}
 
-	if value, ok := config.Data[workload.NVIDIAKey]; ok && strings.TrimSpace(value) != string(workload.NVIDIAEnv) {
-		unsupported = append(unsupported, workload.NVIDIAKey+" (set it in ConfigMap "+dataplaneConfigName+" instead)")
+	// The retired controller read the pre-rename key, so check that spelling
+	// explicitly; the renamed key is checked too in case it was set by hand.
+	for _, key := range []string{legacyNVIDIAKey, workload.NVIDIAKey} {
+		if value, ok := config.Data[key]; ok && strings.TrimSpace(value) != string(workload.NVIDIAEnv) {
+			unsupported = append(unsupported, key+" (set "+workload.NVIDIAKey+" in ConfigMap "+dataplaneConfigName+" instead)")
+		}
 	}
 
 	if strings.TrimSpace(config.Data["RACER_POD_NETWORK_NODES"]) != "" {

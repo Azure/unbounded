@@ -803,13 +803,16 @@ func TestLegacyMigrationRefusesDroppedWorkloadSettings(t *testing.T) {
 		data map[string]string
 		want string
 	}{
-		"peer port":       {data: map[string]string{"RACER_PEER_PORT": "9000"}, want: "RACER_PEER_PORT"},
-		"diagnostics":     {data: map[string]string{"RACER_DIAGNOSTICS_PORT": "9191"}, want: "RACER_DIAGNOSTICS_PORT"},
-		"host network":    {data: map[string]string{"RACER_HOST_NETWORK": "true"}, want: "RACER_HOST_NETWORK"},
-		"bad bool":        {data: map[string]string{"RACER_HOST_NETWORK": "yes"}, want: "RACER_HOST_NETWORK"},
-		"pod network":     {data: map[string]string{"RACER_POD_NETWORK_NODES": "a"}, want: "RACER_POD_NETWORK_NODES"},
-		"nvidia":          {data: map[string]string{"RACER_NVIDIA": "cdi"}, want: "RACER_NVIDIA"},
-		"defaults accept": {data: map[string]string{"RACER_PEER_PORT": "8082", "RACER_HOST_NETWORK": "false", "RACER_NVIDIA": "env"}},
+		"peer port":         {data: map[string]string{"RACER_PEER_PORT": "9000"}, want: "RACER_PEER_PORT"},
+		"diagnostics":       {data: map[string]string{"RACER_DIAGNOSTICS_PORT": "9191"}, want: "RACER_DIAGNOSTICS_PORT"},
+		"host network":      {data: map[string]string{"RACER_HOST_NETWORK": "true"}, want: "RACER_HOST_NETWORK"},
+		"bad bool":          {data: map[string]string{"RACER_HOST_NETWORK": "yes"}, want: "RACER_HOST_NETWORK"},
+		"pod network":       {data: map[string]string{"RACER_POD_NETWORK_NODES": "a"}, want: "RACER_POD_NETWORK_NODES"},
+		"nvidia":            {data: map[string]string{"RACER_NVIDIA": "cdi"}, want: "RACER_NVIDIA"},
+		"legacy nvidia":     {data: map[string]string{"RACER_DATAPLANE_NVIDIA": "off"}, want: "RACER_DATAPLANE_NVIDIA"},
+		"legacy nvidia cdi": {data: map[string]string{"RACER_DATAPLANE_NVIDIA": " cdi "}, want: "RACER_DATAPLANE_NVIDIA"},
+		"legacy env accept": {data: map[string]string{"RACER_DATAPLANE_NVIDIA": " env "}},
+		"defaults accept":   {data: map[string]string{"RACER_PEER_PORT": "8082", "RACER_HOST_NETWORK": "false", "RACER_NVIDIA": "env"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			objects := legacyObjects(ns)
