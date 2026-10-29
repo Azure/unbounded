@@ -86,7 +86,7 @@ prereq CLIs:
 | `applyManifests()` | renders `deploy/gantry/chart` with the pinned Helm binary, rewrites the DaemonSet image policy for the side-loaded image, and applies the core manifests (NetworkPolicy is intentionally not applied) |
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
-| pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` |
+| pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, evicts the seed copy that cold start left on worker B, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` on worker B's Gantry pod |
 | multi-arch cache-miss check | stores a real multi-platform graph, removes its image record, restarts the seed Gantry pod, verifies the index response from the seed's transfer endpoint, then pulls the index digest from another node using a nonexistent origin repository |
 | `teardown()` | `kind delete cluster` (skipped when `E2E_KEEP=1`) |
 

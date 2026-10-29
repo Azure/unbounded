@@ -68,17 +68,28 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	workers := h.workerNodes(ctx)
 
 	advertiseBefore := h.metricSum(ctx, "gantry_advertise_total")
-	peerHitBefore := h.metricSum(ctx, "p2p_peer_fetch_total", `outcome="hit"`)
 
 	h.deletePod(ctx, "gantry-e2e-first")
 	h.applyPullPod(ctx, "gantry-e2e-first", workers[0])
 	h.waitForPodReady(ctx, "gantry-e2e-first")
 	h.waitForMetricIncrease(ctx, "gantry_advertise_total", advertiseBefore)
 
+	// The e2e config has eight chairs and eight nodes, so every node is a
+	// seed and the first pull's cold start also copies each blob into
+	// workers[1]'s containerd under a Gantry lease. Kubelet on workers[1]
+	// would then find every blob locally and never ask the mirror, leaving
+	// the peer-hit assertion to depend on whether the first requester
+	// happened to read a remote seed before its own local copy finished.
+	// Evict that copy so the second pull has to fetch from a peer.
+	h.evictImageFromNode(ctx, workers[1])
+
+	secondGantryPod := h.gantryPodOnNode(ctx, workers[1])
+	peerHitBefore := h.metricSumOnPod(ctx, secondGantryPod, "p2p_peer_fetch_total", `outcome="hit"`)
+
 	h.deletePod(ctx, "gantry-e2e-second")
 	h.applyPullPod(ctx, "gantry-e2e-second", workers[1])
 	h.waitForPodReady(ctx, "gantry-e2e-second")
-	h.waitForMetricIncrease(ctx, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
+	h.waitForMetricIncreaseOnPod(ctx, secondGantryPod, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
 }
 
 // TestE2E_ColdStartDesignatedOriginPuller proves the per-digest Lease-chair
