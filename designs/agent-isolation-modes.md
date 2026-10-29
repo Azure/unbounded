@@ -18,15 +18,11 @@ where the node stack (containerd, kubelet, CNI, CoreDNS) runs.
 | `nspawn`    | In a systemd-nspawn machine (today's behavior)       | Default       |
 | `none`      | Directly on the host as agent-owned systemd units    | New           |
 | `container` | In a privileged OCI container (for Azure Container Linux) | New, provisional |
-| `microvm`   | In a micro VM                                        | Reserved, design note only |
 
 ## 1.1 Delivery scope
 
-The first delivery covers three modes: `nspawn` (existing), `none` (bare host)
-and `container` (Azure Container Linux). WP0 to WP5 are in scope. `microvm` is
-out of scope for this delivery: the enum value is reserved, the agent rejects
-it as not implemented, and WP6 (a design note, no code) is optional and may be
-deferred until `microvm` work is actually planned.
+This design covers three modes: `nspawn` (existing), `none` (bare host) and
+`container` (Azure Container Linux). WP0 to WP5 are in scope.
 
 ## 2. Goals and non-goals
 
@@ -42,7 +38,6 @@ Goals:
 
 Non-goals:
 
-- Implementing `microvm`. Only the interface leaves room for it (section 12).
 - Changing the existing `nspawn` repave semantics.
 - Auto-detecting a mode. The configured mode is always explicit.
 - Time or effort estimates (per `AGENTS.md`).
@@ -112,7 +107,6 @@ There is no isolation field today. The nearest existing knobs are
    these paths resolve identically for every consumer: `/run/containerd`,
    `/etc/containerd/certs.d`, `/var/lib/kubelet`, `/opt/cni`, bpffs.
    unbounded-net-node, gantry and their charts must not change per mode.
-   `microvm` is the known exception.
 4. **Nspawn is unchanged.** WP0 must be behavior preserving. Existing golden
    files and unit tests are the safety net and must not be edited to pass.
 5. **Explicit mode.** The default is `nspawn`. Preflight fails fast with a
@@ -130,14 +124,13 @@ field:
 
 ```go
 // Isolation selects where the node stack runs. Defaults to nspawn.
-// +kubebuilder:validation:Enum=nspawn;none;container;microvm
+// +kubebuilder:validation:Enum=nspawn;none;container
 // +optional
 Isolation IsolationMode `json:"isolation,omitempty"`
 ```
 
 It is additive within `v1alpha3`. No API version bump. Regenerate with
-`make generate`; never edit CRD YAML by hand. `microvm` is accepted by the enum
-but rejected by the agent as not implemented.
+`make generate`; never edit CRD YAML by hand.
 
 ### 6.2 Agent config
 
@@ -176,7 +169,6 @@ const (
     ModeNSpawn    Mode = "nspawn"
     ModeNone      Mode = "none"
     ModeContainer Mode = "container"
-    ModeMicroVM   Mode = "microvm"
 )
 
 // Backend owns where the node stack runs.
@@ -225,7 +217,6 @@ backend applies them its own way:
 - `nspawn`: render `.nspawn` binds and `DeviceAllow`.
 - `container`: render OCI mounts, devices and cgroup device rules.
 - `none`: nothing to apply (host is native).
-- `microvm`: documented gap (needs VFIO passthrough).
 
 **Registry.** `isolation.New(mode, deps)` returns the backend. Unknown modes
 error. Tests use a fake backend.
@@ -297,13 +288,6 @@ Provisional until the node facts in section 13 are collected.
 - Exec: via `runc exec` (or equivalent) behind `Backend.Exec`. Logs: container
   journal via `journalctl -M` equivalent or `runc exec journalctl`.
 
-### 8.4 `microvm` (reserved)
-
-Only a design note (WP6). The interface must not preclude it. Known invariant
-breaks: guest has its own network and filesystem (invariant 3 does not hold),
-needs a guest kernel and a vsock control channel, GPU needs VFIO, and
-host-global state (LocalDNS, WireGuard) must be bridged into the guest.
-
 ## 9. Operation matrix
 
 | Operation | `nspawn` | `none` | `container` |
@@ -338,11 +322,11 @@ New `MachineOperation` type `IsolationMigrate` (alongside `NodeReboot`) in
 
 ### 10.2 Supported strategies
 
-| From / To | `nspawn` | `container` | `none` | `microvm` |
-|---|---|---|---|---|
-| `nspawn` | n/a | in-place or reprovision | reprovision | reprovision (future) |
-| `container` | in-place or reprovision | n/a | reprovision | reprovision (future) |
-| `none` | reprovision | reprovision | n/a | reprovision (future) |
+| From / To | `nspawn` | `container` | `none` |
+|---|---|---|---|
+| `nspawn` | n/a | in-place or reprovision | reprovision |
+| `container` | in-place or reprovision | n/a | reprovision |
+| `none` | reprovision | reprovision | n/a |
 
 Reprovision is always available: drain, reset, bootstrap in the new mode.
 
@@ -387,7 +371,7 @@ WPs:
   report instead of editing.
 
 Dependency graph: WP0 -> (WP1, WP2, WP3 in parallel after WP0 interface lands)
--> WP4 -> WP5. WP6 is independent.
+-> WP4 -> WP5.
 
 ### WP0: Extract the interface (behavior preserving)
 
@@ -535,7 +519,7 @@ Docs (`docs/` is public site documentation only, not design material):
 
 - Split `docs/content/reference/agent/nspawn.md` into an isolation overview
   (comparison table, "choosing a mode"), one page per mode (`nspawn`, `none`,
-  `container`, and a short "planned" `microvm` page), and a migration page.
+  `container`), and a migration page.
 - Add per-mode sections to `reference/gpu/{nvidia,amd}.md`,
   `reference/agent/{_index,configuration}.md`, `guides/agent.md`,
   `guides/operations/_index.md`, `concepts/overview.md`, `reference/cli.md`.
@@ -554,16 +538,6 @@ E2E:
 Acceptance: docs build; every mode page covers requirements, bootstrap, each
 operation in section 9, GPU, LocalDNS, limits and troubleshooting; links valid;
 `make lint` passes; e2e results reported honestly, including anything not run.
-
-### WP6: `microvm` design note (optional, deferred)
-
-Depends on: nothing. Not part of the first delivery. Owns: a section appended to this document or a new
-`designs/agent-isolation-microvm.md`.
-
-Content: constraints from section 8.4, candidate hypervisors, the network and
-filesystem model that replaces invariant 3, how LocalDNS and WireGuard cross
-the boundary, GPU passthrough, and what the `Backend` interface would need to
-add. No code.
 
 ## 12. Testing strategy
 
