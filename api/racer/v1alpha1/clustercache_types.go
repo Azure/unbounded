@@ -52,6 +52,60 @@ type ClusterCacheSpec struct {
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
 	Priority *int32 `json:"priority,omitempty"`
+
+	// Passthrough, when set, turns off caching for this cache: Racer proxies
+	// reads to the origin and keeps no data. Pages are not written to disk and
+	// are held in memory only while concurrent readers share an in-flight
+	// origin read. Object metadata (ETag, size, expiry) is not reused across
+	// reads, so each read revalidates with the origin; one read still pins one
+	// object version for all of its pages. Warm and hold (pinning) requests are
+	// rejected. Priority still weights in-flight memory use. Passthrough may be
+	// added, changed, or removed at any time; when a cache switches to
+	// passthrough, data previously cached for it is dropped.
+	// +optional
+	Passthrough *Passthrough `json:"passthrough,omitempty"`
+}
+
+// PassthroughRoute selects which node's origin serves a passthrough read.
+// +kubebuilder:validation:Enum=Peers;Local
+type PassthroughRoute string
+
+const (
+	// PassthroughRoutePeers routes each page to its owner nodes through the
+	// mesh, as for a cached cache. The owner calls its local origin, and
+	// concurrent reads of the same page anywhere in the cluster share one
+	// origin read (singleflight), with many pages in flight at once
+	// (pipelining). Nothing is retained after in-flight readers finish.
+	PassthroughRoutePeers PassthroughRoute = "Peers"
+	// PassthroughRouteLocal makes the reading node call its own local origin
+	// directly; it never asks peers. Concurrent reads of the same page on one
+	// node still share one origin read.
+	PassthroughRouteLocal PassthroughRoute = "Local"
+)
+
+// Passthrough configures a cache that proxies reads without caching.
+type Passthrough struct {
+	// Route selects which node's origin serves a read. Peers routes pages to
+	// their owner nodes and shares origin reads cluster-wide. Local reads from
+	// the reading node's own origin, so every reading node needs an origin
+	// (a managed spec.origin runs one per dataplane node). When unset, Peers.
+	// +kubebuilder:default=Peers
+	// +optional
+	Route PassthroughRoute `json:"route,omitempty"`
+}
+
+// EffectivePassthroughRoute reports whether passthrough is enabled and its
+// route, defaulting an empty route to PassthroughRoutePeers.
+func (s ClusterCacheSpec) EffectivePassthroughRoute() (PassthroughRoute, bool) {
+	if s.Passthrough == nil {
+		return "", false
+	}
+
+	if s.Passthrough.Route == "" {
+		return PassthroughRoutePeers, true
+	}
+
+	return s.Passthrough.Route, true
 }
 
 const (

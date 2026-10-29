@@ -404,3 +404,122 @@ func TestEnvtestClusterCachePriorityValidation(t *testing.T) {
 		require.True(t, apierrors.IsInvalid(err), "%v", err)
 	})
 }
+
+func TestEnvtestClusterCachePassthroughValidation(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API validation tests")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"crd"}, ErrorIfCRDPathMissing: true}
+	rc, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, AddToScheme(scheme))
+	c, err := client.New(rc, client.Options{Scheme: scheme})
+	require.NoError(t, err)
+
+	n := 0
+	create := func(spec map[string]any) (string, error) {
+		n++
+		name := fmt.Sprintf("passthrough-%d", n)
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "ClusterCache",
+			"metadata":   map[string]any{"name": name},
+			"spec":       spec,
+		}}
+
+		return name, c.Create(t.Context(), obj)
+	}
+
+	for name, spec := range map[string]map[string]any{
+		"unset": {},
+		"empty": {"passthrough": map[string]any{}},
+		"peers": {"passthrough": map[string]any{"route": "Peers"}},
+		"local": {"passthrough": map[string]any{"route": "Local"}},
+	} {
+		t.Run("accepts "+name, func(t *testing.T) {
+			_, err := create(spec)
+			require.NoError(t, err)
+		})
+	}
+
+	for name, route := range map[string]string{"unknown": "Remote", "lowercase": "local", "empty string": ""} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := create(map[string]any{"passthrough": map[string]any{"route": route}})
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, "spec.passthrough.route")
+		})
+	}
+
+	t.Run("defaults route to Peers", func(t *testing.T) {
+		name, err := create(map[string]any{"passthrough": map[string]any{}})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.NotNil(t, cache.Spec.Passthrough)
+		require.Equal(t, PassthroughRoutePeers, cache.Spec.Passthrough.Route)
+	})
+
+	t.Run("unset stays unset", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.Nil(t, cache.Spec.Passthrough)
+	})
+
+	update := func(t *testing.T, name string, passthrough any) error {
+		t.Helper()
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, obj))
+
+		if passthrough == nil {
+			unstructured.RemoveNestedField(obj.Object, "spec", "passthrough")
+		} else {
+			require.NoError(t, unstructured.SetNestedField(obj.Object, passthrough, "spec", "passthrough"))
+		}
+
+		return c.Update(t.Context(), obj)
+	}
+
+	t.Run("allows adding, changing, and removing passthrough", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		for _, passthrough := range []any{
+			map[string]any{},
+			map[string]any{"route": "Local"},
+			map[string]any{"route": "Peers"},
+			nil,
+			map[string]any{"route": "Local"},
+		} {
+			require.NoError(t, update(t, name, passthrough))
+		}
+
+		err = update(t, name, map[string]any{"route": "Remote"})
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+	})
+
+	t.Run("allows passthrough with managed origin", func(t *testing.T) {
+		name := "passthrough-origin"
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "ClusterCache",
+			"metadata":   map[string]any{"name": name},
+			"spec": map[string]any{
+				"origin":      azureCredential(map[string]any{"default": map[string]any{}}),
+				"passthrough": map[string]any{"route": "Local"},
+			},
+		}}
+		require.NoError(t, c.Create(t.Context(), obj))
+		require.NoError(t, update(t, name, nil))
+	})
+}
