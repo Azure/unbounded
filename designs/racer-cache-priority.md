@@ -35,7 +35,7 @@ Non-goals:
 - Hard quotas or reservations. No cache gets a guaranteed byte count.
 - Cross-node coordination. Each node, and each worker, decides alone.
 - Mixed versions. The controller and dataplane must be upgraded together.
-- Removing exact bytes of one cache from a shared segment.
+- Removing exact bytes of one cache from a shared slot.
 
 ## API
 
@@ -87,29 +87,11 @@ Rules:
 
 ### Disk eviction
 
-Page-index eviction ranks a bounded set of candidates by the tuple
-`(under_share, score, age)`. It does not search for the best page overall.
-
-Retention keeps resident caches ordered by resident bytes per unit of weight.
-Over-share caches are always a prefix of this order, so each eviction takes the
-over-share caches among the top 64, without classifying every cache. The order
-changes in O(log C) when a cache's resident bytes change and is rebuilt only
-after a priority catalog change.
-
-Each eviction splits a 64-page budget across those caches and scans each
-through its own age order with its own cursor, so older under-share pages
-cannot hide them. If no unheld page is found, it ranks the next 64 pages of the
-global age order. An under-share page can then be evicted even though an
-unheld over-share page exists outside the candidates, for example when the
-scanned pages of every candidate cache are held, or when more than 64 caches
-are over share.
-
-Segment reclamation works on whole segments, and a segment holds pages from many
-caches. Segment value weights under-share pages heavily, so segments that hold
-mostly over-share data are recycled first. While no cache is over share, segment value
-is the plain retention score, as before. Priority cannot remove only one
-cache's bytes from a shared segment; under-share pages in a recycled segment are
-lost with it.
+Disk eviction is the extent volume's slot CLOCK (see
+[racer-extent-volume.md](racer-extent-volume.md)). It frees whole 16 MiB slots,
+and a slot holds pages of many caches, so it cannot remove one cache's bytes.
+It does not use priority. Priority reaches the disk through admission and the
+pending write queue, described below.
 
 ### Pending write queue
 
@@ -166,8 +148,8 @@ discarded.
 ### Disk admission
 
 Optional (non-owned) pages are rejected when their cache is over share and the
-worker has no free segments beyond the reserve. Owned pages are always admitted
-and compete through eviction.
+worker has no free slots beyond the reserve that maintenance keeps ahead of
+allocation. Owned pages are always admitted and compete through eviction.
 
 ## Accounting
 
@@ -176,7 +158,8 @@ Each worker tracks indexed payload bytes per cache:
 - Add on retention publish, subtract on evict, using the existing retention
   hooks.
 - Clear the entry when the cache is removed from the catalog.
-- Rebuild from restored index mappings on checkpoint recovery.
+- Rebuild from the volume's pages when the startup restore checks each
+  recovered version.
 
 Accounting uses logical payload bytes, the same unit as
 `racer_disk_indexed_payload_bytes`. It does not include headers, padding, or
@@ -210,8 +193,8 @@ the published catalog:
 The unlabeled counter `racer_retention_share_rejected_total` counts optional
 pages skipped by disk admission because their cache was over share.
 
-A worker's disk capacity for shares is the smaller of index entries times the
-page size and slab segments times the segment size. A cache whose share is the
+A worker's disk capacity for shares is the smaller of disk page entries times
+the page size and volume slots times the slot size. A cache whose share is the
 whole capacity (a single cache, or before any catalog is published) is never
 over share.
 
@@ -224,17 +207,14 @@ that worker. The node sums can hide per-worker differences.
 - Controller: unset resolves to 500; a priority change republishes the catalog.
 - Wire: encode and decode with `priority`; strict decode rejects a missing field.
 - Share math: weighted shares, all-zero equal split, single cache, and removal.
-- Accounting: publish, evict, cache removal, and checkpoint rebuild.
+- Accounting: publish, evict, cache removal, and restart rebuild.
 - Each tier: bounded scans prefer over-share victims; score and age still order
   within a class; holds are never evicted; an unheld over-share page never
   displaces an under-share page in the queue; memory limits follow
   weights with floor and max; non-owned admission is rejected only when over
-  share and free segments are at the reserve.
-- Deterministic simulation: two caches with priorities 900 and 100 under steady
-  churn converge toward a resident ratio near 9:1. Priority 0 next to a nonzero
-  cache keeps only idle capacity.
-- Live update: change priority mid-run and check the ratio moves toward the new
-  weights without restart.
+  share and free slots are at the reserve.
+- Live update: change priority and check that over-share classification
+  follows the new weights without restart.
 
 ## Alternatives considered
 

@@ -225,7 +225,6 @@ impl SubscriptionFixture {
         use store::StoreReader;
         use store::StoreWriter;
         use store::catalog::Index;
-        use store::catalog::SegmentClock;
 
         let mut limits = interop_limits();
         // Independent of the 512 MiB logical object: at most four plaintext pages.
@@ -276,26 +275,38 @@ impl SubscriptionFixture {
             .unwrap(),
         );
         let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
-        let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         let slabs = Rc::new(page_alloc::Slab::new(
             root.join("slabs/worker-0-slab-0.dat"),
-            256 * 1024 * 1024,
-            64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            16 * page_alloc::volume::SLOT_BYTES,
+            page_alloc::volume::SLOT_BYTES,
+            crate::store::MAX_RECORD_BYTES,
         ));
-        let _ = slabs.open_configured(&segments).unwrap();
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
-            segments.clone(),
             slabs.clone(),
             admission.clone(),
             reactor.clone(),
             availability.clone(),
         ));
+        {
+            let scope = RequestScope::new(
+                crate::model::RequestId([4; 16]),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+            let mut open = writer.open(&scope);
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            loop {
+                reactor.poll_budgeted(64).unwrap();
+                if let std::task::Poll::Ready(result) = open.as_mut().poll(&mut cx) {
+                    let _ = result.unwrap();
+                    break;
+                }
+                reactor.wait(std::time::Duration::from_millis(1)).unwrap();
+            }
+        }
         let disk = Rc::new(StoreReader::new(
-            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
             index.clone(),
-            segments,
             slabs,
             admission.clone(),
             reactor.clone(),

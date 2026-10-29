@@ -479,7 +479,7 @@ mod tests {
             .collect();
         assert_eq!(
             values.len(),
-            14 + usize::from(values.contains_key("RACER_MAX_THREADS"))
+            15 + usize::from(values.contains_key("RACER_MAX_THREADS"))
         );
         assert_eq!(values.get("RACER_CONTROL_SEATS"), Some(&"auto"));
         let mut config = Config::from_lookup(|name| {
@@ -507,7 +507,11 @@ mod tests {
                 .map(|value| value.parse::<usize>().unwrap())
                 .unwrap_or(crate::config::DEFAULT_MAX_THREADS)
         );
-        assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
+        // Rounded down to whole extent volume slots.
+        assert_eq!(
+            config.slab_bytes,
+            1024 * 1024 * 1024 / page_alloc::volume::SLOT_BYTES * page_alloc::volume::SLOT_BYTES
+        );
         // Byte budgets stay unset so the runtime scales them per I/O worker.
         for key in [
             "RACER_PLAINTEXT_BYTES",

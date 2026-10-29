@@ -52,8 +52,10 @@ pub struct DiskClassSnapshot {
     pub published_payload_bytes: u64,
     pub index_evicted_pages: u64,
     pub index_evicted_payload_bytes: u64,
-    pub segment_evicted_pages: u64,
-    pub segment_evicted_payload_bytes: u64,
+    /// Pages lost to volume slot eviction, exported under the historical
+    /// `racer_disk_class_segment_evicted_*` names.
+    pub slot_evicted_pages: u64,
+    pub slot_evicted_payload_bytes: u64,
     pub read_payload_bytes: u64,
 }
 /// Counts one storage owner's logical page payload, not ciphertext or padding.
@@ -100,6 +102,7 @@ pub(crate) struct Scoring<'a> {
     capacity: u64,
     basis: OnceCell<ShareBasis>,
     classified: RefCell<HashMap<CacheId, bool>>,
+    #[cfg(test)]
     any_over_share: OnceCell<bool>,
 }
 impl Scoring<'_> {
@@ -132,6 +135,7 @@ impl Scoring<'_> {
     /// pressure, highest first. Over-share caches form a prefix of the
     /// pressure order, so this misses one only when more than `limit` caches
     /// are over share. Costs O(limit) between catalog changes.
+    #[cfg(test)]
     pub(crate) fn over_share_candidates(&self, limit: usize) -> Vec<CacheId> {
         let mut caches = self.retention.pressure_order(limit);
         caches.retain(|cache| self.over_share(cache));
@@ -139,6 +143,7 @@ impl Scoring<'_> {
     }
     /// Whether any cache with resident payload is over share. Checks only the
     /// top of the pressure order, once per pass.
+    #[cfg(test)]
     pub(crate) fn any_over_share(&self) -> bool {
         *self
             .any_over_share
@@ -212,9 +217,11 @@ pub struct Retention {
     pressure: RefCell<Option<PressureOrder>>,
 
     /// Full rebuilds of `pressure`, for complexity regression tests.
+    #[cfg(test)]
     pressure_rebuilds: Cell<u64>,
 
     /// Directory entries returned to callers, for complexity regression tests.
+    #[cfg(test)]
     pressure_visits: Cell<u64>,
 }
 /// One resident cache, keyed by resident bytes per unit of weight.
@@ -303,7 +310,9 @@ impl Retention {
             unpublished: Cell::new(None),
             basis_scans: Cell::new(0),
             pressure: RefCell::new(None),
+            #[cfg(test)]
             pressure_rebuilds: Cell::new(0),
+            #[cfg(test)]
             pressure_visits: Cell::new(0),
         })
     }
@@ -336,6 +345,7 @@ impl Retention {
             capacity,
             basis: OnceCell::new(),
             classified: RefCell::default(),
+            #[cfg(test)]
             any_over_share: OnceCell::new(),
         }
     }
@@ -406,6 +416,7 @@ impl Retention {
     }
     /// Up to `limit` resident caches with the highest pressure, highest first.
     /// O(limit) plus O(C log C) only after the weights table changed.
+    #[cfg(test)]
     fn pressure_order(&self, limit: usize) -> Vec<CacheId> {
         let weights = self.weights.borrow();
         let mut pressure = self.pressure.borrow_mut();
@@ -446,11 +457,6 @@ impl Retention {
         self.pressure_visits
             .set(self.pressure_visits.get() + top.len() as u64);
         top
-    }
-    /// Pressure order rebuilds and returned entries, for complexity tests.
-    #[cfg(test)]
-    pub(crate) fn pressure_counters(&self) -> (u64, u64) {
-        (self.pressure_rebuilds.get(), self.pressure_visits.get())
     }
     /// Indexed payload bytes currently charged to one cache.
     pub fn cache_payload_bytes(&self, cache: &CacheId) -> u64 {
@@ -627,13 +633,12 @@ impl Retention {
             c.published_payload_bytes = c.published_payload_bytes.saturating_add(bytes);
         });
     }
-    pub(crate) fn evicted(&self, page: &PageId, bytes: u64, segment: bool) {
+    /// Count an evicted disk page: by volume slot eviction when `slot`, else
+    /// by index eviction.
+    pub(crate) fn evicted(&self, page: &PageId, bytes: u64, slot: bool) {
         self.disk_event(page, |c| {
-            let (pages, payload) = if segment {
-                (
-                    &mut c.segment_evicted_pages,
-                    &mut c.segment_evicted_payload_bytes,
-                )
+            let (pages, payload) = if slot {
+                (&mut c.slot_evicted_pages, &mut c.slot_evicted_payload_bytes)
             } else {
                 (
                     &mut c.index_evicted_pages,
@@ -1000,8 +1005,8 @@ mod tests {
             assert_eq!(snapshot.disk[1].read_payload_bytes, 17);
             assert_eq!(snapshot.disk[1].index_evicted_pages, 1);
             assert_eq!(snapshot.disk[1].index_evicted_payload_bytes, 17);
-            assert_eq!(snapshot.disk[0].segment_evicted_pages, 1);
-            assert_eq!(snapshot.disk[0].segment_evicted_payload_bytes, 3);
+            assert_eq!(snapshot.disk[0].slot_evicted_pages, 1);
+            assert_eq!(snapshot.disk[0].slot_evicted_payload_bytes, 3);
             assert_eq!(snapshot.observations, 0);
             assert_eq!(snapshot.heat_entries, 0);
         }

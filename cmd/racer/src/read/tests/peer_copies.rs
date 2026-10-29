@@ -456,7 +456,7 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
     for (disk, missing) in [(false, false), (true, false), (false, true)] {
         let mut target = fixture();
         target.reactor.init().unwrap();
-        let _ = futures::executor::block_on(target.fill.dependencies.writer.open()).unwrap();
+        let _ = drive_disk(&target, target.fill.dependencies.writer.open(&target.scope)).unwrap();
         let mut seed_budget = AcquisitionBudget::new(target.scope.deadline.0, 4, 8);
         let seeded = if missing {
             None
@@ -2267,7 +2267,7 @@ fn corrupt_disk_decrypt_is_counted_without_publishing_plaintext() {
         .unwrap();
     f.fill.dependencies.writer.enqueue(bad, dirty).unwrap();
     f.reactor.init().unwrap();
-    let _ = futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    let _ = drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
     let result = drive_io(
         f.fill.acquire_local_copy(&f.page, &f.scope, true),

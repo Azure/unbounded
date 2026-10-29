@@ -1406,14 +1406,14 @@ mod tests {
                     "/slabs/worker-0-slab-0.dat".into(),
                     64 * 1024 * 1024,
                     32 * 1024 * 1024,
-                    crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                    crate::store::MAX_RECORD_BYTES,
                 );
                 assert!(slabs.open_now().is_ok());
                 let other = Slab::<flow_control::Charge<AdmissionPolicy>>::new(
                     "/slabs/worker-0-slab-0.dat".into(),
                     64 * 1024 * 1024,
                     32 * 1024 * 1024,
-                    crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                    crate::store::MAX_RECORD_BYTES,
                 );
                 assert_eq!(
                     other.open_now().map_err(Error::from),

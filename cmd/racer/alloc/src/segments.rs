@@ -3,12 +3,75 @@
 //! Slot reuse is metadata-only: it never erases, truncates, or compacts disk bytes.
 //! Existing leases protect their captured used prefix even after eviction starts.
 //! Freeze protects table mutation, not caller indexes or data-I/O completion.
-use crate::{Alignment, Error, Extent, MAX_SEGMENTS, Result, SegmentGeometry};
+use crate::{Alignment, Error, Extent, Result};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashSet},
     rc::Rc,
 };
+
+/// Maximum number of slots retained by a segment allocation table.
+pub const MAX_SEGMENTS: u64 = 1_000_000;
+
+/// Validated physical dimensions, independent of record formats and slot quotas.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentGeometry {
+    slab_bytes: u64,
+
+    segment_bytes: u64,
+
+    segment_count: u64,
+
+    alignment: Alignment,
+}
+
+impl SegmentGeometry {
+    /// Validate physical geometry; retained tables separately enforce MAX_SEGMENTS.
+    pub fn new(
+        slab_bytes: u64,
+        segment_bytes: u64,
+        segment_count: u64,
+        alignment: Alignment,
+    ) -> Result<Self> {
+        if segment_bytes == 0
+            || slab_bytes == 0
+            || segment_count == 0
+            || !slab_bytes.is_multiple_of(segment_bytes)
+            || segment_count > slab_bytes / segment_bytes
+            || !segment_bytes.is_multiple_of(alignment.offset())
+            || !segment_bytes.is_multiple_of(alignment.length() as u64)
+            || segment_count.checked_mul(segment_bytes).is_none()
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(Self {
+            slab_bytes,
+            segment_bytes,
+            segment_count,
+            alignment,
+        })
+    }
+
+    /// Full logical size of the physical file.
+    pub fn slab_bytes(self) -> u64 {
+        self.slab_bytes
+    }
+
+    /// Fixed physical size of each segment.
+    pub fn segment_bytes(self) -> u64 {
+        self.segment_bytes
+    }
+
+    /// Number of exposed segments, possibly less than the physical file allows.
+    pub fn segment_count(self) -> u64 {
+        self.segment_count
+    }
+
+    /// Direct-I/O requirements validated with these dimensions.
+    pub fn alignment(self) -> Alignment {
+        self.alignment
+    }
+}
 
 /// Stable slot number within one allocation table, not authority to access it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -98,6 +161,7 @@ impl SegmentLease {
     }
 
     /// Borrow the nominal identity without granting table mutation authority.
+    #[cfg(test)]
     pub(crate) fn table_identity(&self) -> TableIdentity {
         self.table.clone()
     }
@@ -273,6 +337,7 @@ impl Segments {
     }
 
     /// Clone identity only, without granting allocation authority.
+    #[cfg(test)]
     pub(crate) fn table_identity(&self) -> TableIdentity {
         self.table.clone()
     }

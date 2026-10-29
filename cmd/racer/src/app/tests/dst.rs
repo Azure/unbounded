@@ -316,14 +316,13 @@ mod faults {
                                 .store
                                 .writer
                                 .index()
-                                .snapshot()
-                                .unwrap()
-                                .entries
+                                .disk_pages()
                                 .into_iter()
                                 .map(move |entry| (n, w, entry))
                         })
                 })
-                .filter(|(node, worker, (page, entry))| {
+                .filter(|(node, worker, entry)| {
+                    let page = &entry.page;
                     let object =
                         usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
                     object > 1
@@ -353,7 +352,8 @@ mod faults {
                 self.traffic(1, false);
                 return;
             }
-            let (node, worker, (page, entry)) = &entries[self.rng.pick(entries.len())];
+            let (node, worker, entry) = &entries[self.rng.pick(entries.len())];
+            let page = &entry.page;
             let object = usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
             let mut client = self.request_on(object, true, false, *node);
             // The corruption probe must request the selected persisted page rather
@@ -366,7 +366,7 @@ mod faults {
                 .slab_directory
                 .join(format!("worker-{worker}-slab-0.dat"));
             self.sim.disk().sync_all().unwrap();
-            let offset = entry.location.extent.offset();
+            let offset = entry.offset;
             let original = self
                 .sim
                 .disk()
@@ -1337,9 +1337,11 @@ mod scenarios {
         assert!(harness.coverage.secondary_worker_turns > 0);
         assert!(harness.coverage.relay_turns > 0);
         // Exact deterministic count under injected pressure. Delivery mode,
-        // replica selection, receive charge sizes, and memory probes change turn
-        // ordering, so this pins the default `spread` selection with aligned TCP
-        // receive, which charges each body's whole pooled size class.
+        // replica selection, receive charge sizes, the read window's memory
+        // probes, and background disk commits change turn ordering, so this
+        // pins the default `spread` selection with aligned TCP receive, which
+        // charges each body's whole pooled size class, and lazy disk index
+        // commits that leave their node buffers in the idle pool.
         assert_eq!(harness.coverage.success, 8, "opaque={opaque}");
     }
 }
@@ -1744,9 +1746,9 @@ mod traffic {
             }
             for node in &self.nodes {
                 for worker in &node.workers {
-                    let snapshot = worker.app.store.writer.index().snapshot().unwrap();
-                    assert!(snapshot.entries.len() <= node.config.limits.metadata_entries.get());
-                    self.coverage.persisted += snapshot.entries.len();
+                    let pages = worker.app.store.writer.index().disk_pages().len();
+                    assert!(pages <= node.config.limits.metadata_entries.get());
+                    self.coverage.persisted += pages;
                 }
             }
             self.cache_obligations();
@@ -2373,8 +2375,7 @@ impl Harness {
         config.peer_listen = format!("127.0.0.1:{}", 20000 + id).parse().unwrap();
         config.diagnostics_listen = format!("127.0.0.1:{}", 30000 + id).parse().unwrap();
         config.slab_directory = format!("/dst/node-{id}/slabs").into();
-        config.slab_bytes = 256 * 1024 * 1024;
-        config.free_segment_reserve = 1;
+        config.slab_bytes = 16 * page_alloc::volume::SLOT_BYTES;
         config.limits.queue_entries = NonZeroUsize::new(64).unwrap();
         config.limits.client_connections = NonZeroUsize::new(64).unwrap();
         config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();
@@ -2674,6 +2675,9 @@ impl Harness {
                     endpoint.simulation_crash();
                 }
                 worker.app.drivers.simulation_crash();
+                if let Some(links) = &worker.app.links {
+                    links.abandon_setups();
+                }
             }
             node.workers[0].app.directory.simulation_crash();
         } else {

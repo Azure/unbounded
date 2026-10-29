@@ -7,6 +7,8 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::model::PAGE_BYTES;
 use crate::store::MAX_HEADER_BYTES;
+use page_alloc::volume::MIN_SLOTS;
+use page_alloc::volume::SLOT_BYTES;
 use racer_control_wire::ClusterId;
 use racer_control_wire::DEFAULT_SHARES;
 use racer_control_wire::NodeId;
@@ -82,6 +84,10 @@ pub struct Config {
     pub peer_receive: crate::peer::receive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
+    /// Per-worker byte budget of the extent volume's metadata page cache.
+    /// The disk index lives on disk; this bounds how much of it stays in
+    /// memory. Cold lookups read pages from disk.
+    pub disk_metadata_cache_bytes: NonZeroUsize,
     pub admission_mode: AdmissionMode,
     /// Node-wide Bloom history, divided by final I/O worker count.
     pub admission_history_bytes: NonZeroUsize,
@@ -147,9 +153,8 @@ pub struct Config {
     /// EBUSY, such as a predecessor process still releasing its claim. Zero
     /// disables waiting.
     pub device_busy_wait: Duration,
+    /// File-mode slab size, rounded down to whole extent volume slots.
     pub slab_bytes: u64,
-    pub segment_bytes: u64,
-    pub free_segment_reserve: usize,
     pub limits: Limits,
     /// Limit dimensions still carrying per-worker defaults. See [`ScaledLimits`].
     pub scaled_limits: ScaledLimits,
@@ -180,6 +185,9 @@ impl Config {
             }
         }
         let raw: RawConfig = envy::from_iter(values).map_err(|_| Error::InvalidConfiguration)?;
+        for warning in legacy_warnings(&raw) {
+            eprintln!("racer: {warning}");
+        }
         // Auto reserves native resources only with usable startup hardware.
         // Explicit true reserves them even when absent, enabling hotplug recovery.
         let enable_rdma = match raw.enable_rdma.as_deref().unwrap_or("auto") {
@@ -246,6 +254,10 @@ impl Config {
             },
             shares: nonzero_u32(raw.shares.unwrap_or(u64::from(DEFAULT_SHARES)))?,
             disk_page_entries: nonzero_usize(raw.disk_page_entries.unwrap_or(65536))?,
+            disk_metadata_cache_bytes: nonzero_usize(
+                raw.disk_metadata_cache_bytes
+                    .unwrap_or(crate::store::disk::DEFAULT_METADATA_CACHE_BYTES as u64),
+            )?,
             admission_mode: match raw.admission_mode.as_deref().unwrap_or("second-sight") {
                 "disabled" => AdmissionMode::Disabled,
                 "second-sight" => AdmissionMode::SecondSight,
@@ -311,9 +323,7 @@ impl Config {
                 .unwrap_or_else(|| "/host/dev".into())
                 .into(),
             device_busy_wait: Duration::from_secs(raw.device_busy_wait_secs.unwrap_or(120)),
-            slab_bytes: raw.slab_bytes.unwrap_or(16 * 1024 * MIB),
-            segment_bytes: raw.segment_bytes.unwrap_or(1024 * MIB),
-            free_segment_reserve: to_usize(raw.free_segment_reserve.unwrap_or(2))?,
+            slab_bytes: raw.slab_bytes.unwrap_or(16 * 1024 * MIB) / SLOT_BYTES * SLOT_BYTES,
             limits: Limits {
                 // Byte and count dimensions below are divided by the I/O worker
                 // count during sizing, so their defaults are stated per worker
@@ -508,6 +518,8 @@ impl Config {
         self.peer_receive.validate()?;
         self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
+            || !(MIB as usize..=64 * 1024 * MIB as usize)
+                .contains(&self.disk_metadata_cache_bytes.get())
             || self.checkpoint_bytes.get() > 512 * MIB as usize
             || !(32..=512 * MIB as usize).contains(&self.admission_history_bytes.get())
             || self.admission_period < Duration::from_secs(1)
@@ -562,16 +574,14 @@ impl Config {
             .checked_add(16)
             .and_then(|n| n.checked_add(MAX_HEADER_BYTES as u64))
             .ok_or(Error::InvalidConfiguration)?;
-        if self.segment_bytes < record_bytes
+        // One full page record must fit a slot, and the volume needs its meta
+        // slot plus room for data.
+        let slots = self.slab_bytes / SLOT_BYTES;
+        if record_bytes > SLOT_BYTES
             || self.slab_bytes > i64::MAX as u64
-            || self.slab_bytes == 0
-            || !self.slab_bytes.is_multiple_of(self.segment_bytes)
-            || self.free_segment_reserve == 0
+            || slots < MIN_SLOTS
+            || to_usize(slots)? > MAX_ENTRIES
         {
-            return Err(Error::InvalidConfiguration);
-        }
-        let segments = to_usize(self.slab_bytes / self.segment_bytes)?;
-        if segments > MAX_ENTRIES || self.free_segment_reserve >= segments {
             return Err(Error::InvalidConfiguration);
         }
         let limits = &self.limits;
@@ -815,10 +825,28 @@ const ENV_NAMES: &[&str] = &[
     "RELAY_TRANSFERS",
     "ORIGIN_CONNECTIONS_PER_CACHE",
     "DISK_PAGE_ENTRIES",
+    "DISK_METADATA_CACHE_BYTES",
     "ADMISSION_HISTORY_BYTES",
     "CHECKPOINT_BYTES",
     "SEND_CRC_PAIR",
 ];
+
+/// Messages for accepted configuration keys that no longer have an effect.
+fn legacy_warnings(raw: &RawConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if raw.segment_bytes.is_some() {
+        warnings.push(format!(
+            "RACER_SEGMENT_BYTES is ignored; disk space is allocated in {SLOT_BYTES} byte slots"
+        ));
+    }
+    if raw.free_segment_reserve.is_some() {
+        warnings.push(
+            "RACER_FREE_SEGMENT_RESERVE is ignored; the extent volume reserves its own space"
+                .to_owned(),
+        );
+    }
+    warnings
+}
 
 /// Parsed values before application defaults, conversions, and cross-field policy.
 #[derive(serde::Deserialize)]
@@ -884,8 +912,10 @@ struct RawConfig {
     peer_receive_wait_ms: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     slab_bytes: Option<u64>,
+    /// Accepted for compatibility and ignored, with a warning.
     #[serde(default, deserialize_with = "decimal")]
     segment_bytes: Option<u64>,
+    /// Accepted for compatibility and ignored, with a warning.
     #[serde(default, deserialize_with = "decimal")]
     free_segment_reserve: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -946,6 +976,8 @@ struct RawConfig {
     origin_connections_per_cache: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     disk_page_entries: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    disk_metadata_cache_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     admission_history_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1911,9 +1943,8 @@ mod tests {
             config.enable_rdma,
             cfg!(feature = "rdma") && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
         );
-        assert_eq!(config.slab_bytes / config.segment_bytes, 16);
+        assert_eq!(config.slab_bytes, 1022 * SLOT_BYTES);
         assert!(!config.opaque_relay);
-        assert_eq!(config.free_segment_reserve, 2);
         assert!(config.diagnostics_listen.ip().is_loopback());
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.peer_attempt_timeout, Duration::from_secs(30));
@@ -2438,6 +2469,18 @@ mod tests {
         .unwrap();
         assert_eq!(config.disk_page_entries.get(), 8192);
         assert_eq!(config.limits.metadata_entries.get(), 32);
+        assert_eq!(
+            parse(&[]).unwrap().disk_metadata_cache_bytes.get(),
+            256 << 20
+        );
+        let config = parse(&[("RACER_DISK_METADATA_CACHE_BYTES", "16777216")]).unwrap();
+        assert_eq!(config.disk_metadata_cache_bytes.get(), 16 << 20);
+        for value in ["0", "1048575", "68719476737"] {
+            assert!(
+                parse(&[("RACER_DISK_METADATA_CACHE_BYTES", value)]).is_err(),
+                "{value}"
+            );
+        }
         for value in [
             "",
             " 8",
@@ -2566,27 +2609,59 @@ mod tests {
     }
 
     #[test]
-    fn geometry_includes_aead_and_envelope_and_preserves_a_writable_segment() {
+    fn geometry_rounds_to_whole_slots_and_requires_minimum_slots() {
         let mut config = parse(&[]).unwrap();
-        let minimum = PAGE_BYTES + 16 + MAX_HEADER_BYTES as u64;
-        config.segment_bytes = minimum;
-        config.slab_bytes = minimum * 3;
+        assert!(PAGE_BYTES + 16 + MAX_HEADER_BYTES as u64 <= SLOT_BYTES);
+        config.slab_bytes = MIN_SLOTS * SLOT_BYTES;
         assert_eq!(config.validate(), Ok(()));
-        config.segment_bytes -= 1;
-        config.slab_bytes = config.segment_bytes * 3;
+        config.slab_bytes -= 1;
         assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        let rounded = parse(&[(
+            "RACER_SLAB_BYTES",
+            &(5 * SLOT_BYTES + SLOT_BYTES / 2).to_string(),
+        )])
+        .unwrap();
+        assert_eq!(rounded.slab_bytes, 5 * SLOT_BYTES);
         for (name, value) in [
-            ("RACER_SEGMENT_BYTES", "0"),
             ("RACER_SLAB_BYTES", "0"),
-            ("RACER_SEGMENT_BYTES", "16777216"),
-            ("RACER_SLAB_BYTES", "1073741825"),
-            ("RACER_FREE_SEGMENT_RESERVE", "0"),
-            ("RACER_FREE_SEGMENT_RESERVE", "16"),
+            ("RACER_SLAB_BYTES", &(3 * SLOT_BYTES + 1).to_string()),
             ("RACER_SLAB_BYTES", "18446744073709551615"),
-            ("RACER_FREE_SEGMENT_RESERVE", "18446744073709551615"),
         ] {
             assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
         }
+    }
+
+    #[test]
+    fn legacy_segment_keys_are_accepted_ignored_and_warned() {
+        let config = parse(&[
+            ("RACER_SEGMENT_BYTES", "16777216"),
+            ("RACER_FREE_SEGMENT_RESERVE", "0"),
+        ])
+        .unwrap();
+        assert_eq!(config.slab_bytes, parse(&[]).unwrap().slab_bytes);
+        let raw: RawConfig = envy::from_iter([
+            ("CLUSTER_ID".to_owned(), "cluster".to_owned()),
+            (
+                "CONTROL_ENDPOINT".to_owned(),
+                "https://control.example".to_owned(),
+            ),
+            ("SEGMENT_BYTES".to_owned(), "1".to_owned()),
+            ("FREE_SEGMENT_RESERVE".to_owned(), "2".to_owned()),
+        ])
+        .unwrap();
+        let warnings = legacy_warnings(&raw);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("RACER_SEGMENT_BYTES is ignored"));
+        assert!(warnings[1].contains("RACER_FREE_SEGMENT_RESERVE is ignored"));
+        let raw: RawConfig = envy::from_iter([
+            ("CLUSTER_ID".to_owned(), "cluster".to_owned()),
+            (
+                "CONTROL_ENDPOINT".to_owned(),
+                "https://control.example".to_owned(),
+            ),
+        ])
+        .unwrap();
+        assert!(legacy_warnings(&raw).is_empty());
     }
 
     #[test]

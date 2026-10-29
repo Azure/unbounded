@@ -1724,12 +1724,13 @@ impl Fill {
     }
     /// Whether this node holds a copy of `page` in memory, pending write, or
     /// the disk index, without reading it (orphan notices and copy offers).
-    /// Lookup errors count as not held.
+    /// Lookup errors, and disk entries whose index page is not in memory,
+    /// count as not held.
     pub(crate) fn holds(&self, page: &PageId) -> bool {
         let deps = &self.dependencies;
         deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
             || deps.writer.copy_only(page).is_ok_and(|c| c.is_some())
-            || deps.writer.index().lookup(page).is_ok_and(|c| c.is_some())
+            || deps.writer.index().on_disk_cached(page)
     }
 
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -2538,15 +2539,7 @@ impl Fill {
         {
             return;
         }
-        if self
-            .dependencies
-            .writer
-            .index()
-            .lookup(id)
-            .ok()
-            .flatten()
-            .is_some()
-        {
+        if self.dependencies.writer.index().on_disk_cached(id) {
             return;
         }
         let cache = &copy.metadata.version.object.cache.clone();
