@@ -7,6 +7,11 @@ kernel_release=6.14.0-1003-azure-nvidia
 source_kernel_release=7.0.0-1019-nvidia-64k
 kernel_parameters="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1 init_on_alloc=0 net.ifnames=0"
 
+fail() {
+    echo "$*" >&2
+    exit 1
+}
+
 dpkg --install \
     /tmp/packages/wget_1.21.4-1ubuntu4.5_arm64.deb \
     /tmp/packages/ssh-import-id_5.11-0ubuntu2.24.04.1_all.deb
@@ -90,21 +95,34 @@ for package in \
     linux-image-6.14.0-1003-azure-nvidia \
     linux-modules-6.14.0-1003-azure-nvidia \
     linux-modules-extra-6.14.0-1003-azure-nvidia; do
-    test "$(dpkg-query -W -f='${Version}' "${package}")" = 6.14.0-1003.3
-    apt-mark showhold | grep -qx "${package}"
+    package_version="$(dpkg-query -W -f='${Version}' "${package}")"
+    test "${package_version}" = 6.14.0-1003.3 ||
+        fail "${package} has version ${package_version}"
+    apt-mark showhold | grep -qx "${package}" ||
+        fail "${package} is not held"
 done
-test "$(dpkg-query -W -f='${Version}' ssh-import-id)" = 5.11-0ubuntu2.24.04.1
-test "$(
+ssh_import_id_version="$(dpkg-query -W -f='${Version}' ssh-import-id)"
+test "${ssh_import_id_version}" = 5.11-0ubuntu2.24.04.1 ||
+    fail "ssh-import-id has version ${ssh_import_id_version}"
+installed_kernels="$(
     dpkg-query -W -f='${Package} ${Status}\n' 'linux-image-*' 2>/dev/null |
         awk '$2 == "install" && $3 == "ok" && $4 == "installed" { print $1 }'
-)" = linux-image-6.14.0-1003-azure-nvidia
+)"
+test "${installed_kernels}" = linux-image-6.14.0-1003-azure-nvidia ||
+    fail "unexpected installed kernel packages: ${installed_kernels}"
 # shellcheck source=/dev/null
 . /etc/os-release
-test "${VERSION_ID}" = 24.04
-test "$(readlink /boot/vmlinuz)" = "vmlinuz-${kernel_release}"
-test -d "/lib/modules/${kernel_release}/updates/dkms"
+test "${VERSION_ID}" = 24.04 ||
+    fail "unexpected Ubuntu version: ${VERSION_ID}"
+boot_kernel="$(readlink /boot/vmlinuz)"
+test "${boot_kernel}" = "vmlinuz-${kernel_release}" ||
+    fail "/boot/vmlinuz points to ${boot_kernel}"
+test -d "/lib/modules/${kernel_release}/updates/dkms" ||
+    fail "NVIDIA DKMS output directory is missing"
 find "/lib/modules/${kernel_release}/updates/dkms" \
-    -name 'nvidia.ko*' -print -quit | grep -q .
+    -name 'nvidia.ko*' -print -quit | grep -q . ||
+    fail "nvidia.ko is missing from the target kernel"
+echo "Validating cloud-init access policy."
 cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
 python3 /tmp/verify.py \
     --image-config /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg \
