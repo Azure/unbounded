@@ -3675,6 +3675,42 @@ mod landing {
         assert_eq!(l.asked.get(), 2);
         assert!(Arc::ptr_eq(&landed_arc(&second), &landed_arc(&third)));
     }
+
+    #[test]
+    /// A fetch in flight when a GPU rejects the page may carry the same
+    /// rejected ciphertext, so its copy is not shared once it finishes: the
+    /// next fetch fetches again.
+    fn failed_verdict_detaches_an_in_flight_fetch() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_every(0);
+        let first = sealed(acquire_sealed_on(&mut l, 0));
+        // Stand in for a fetch that started before the verdict and will
+        // finish with the same ciphertext.
+        l.f.fill.gpu_copies.forget(&l.f.page);
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let crate::read::gpu_copies::Lookup::Join(waiter) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 1)
+        else {
+            panic!("expected to join");
+        };
+        l.f.fill.sealed_verdict(first.report(), false);
+        let shared = crate::read::gpu_copies::SharedCopy::from_sealed(&first).unwrap();
+        lead.finish(crate::read::gpu_copies::Outcome::Copy(shared));
+        // The existing waiter still gets the leader's copy to check itself.
+        assert!(matches!(
+            futures::executor::block_on(waiter),
+            crate::read::gpu_copies::Outcome::Copy(_)
+        ));
+        let second = sealed(acquire_sealed_on(&mut l, 0));
+        assert_eq!(l.asked.get(), 2, "fetched again");
+        assert!(!Arc::ptr_eq(&landed_arc(&first), &landed_arc(&second)));
+        assert_eq!(joined_count(&l.helper), 0);
+    }
 }
 
 /// Install a published membership equal to the fixture's (version 1), so a

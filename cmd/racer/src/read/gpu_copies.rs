@@ -15,6 +15,12 @@
 //! fetch. A request whose GPU cannot reach any in-flight fetch of the page
 //! leads a fetch of its own, tracked alongside the others, so requests on
 //! GPUs without a peer path still share among themselves.
+//!
+//! When a GPU rejects a copy, [`GpuCopies::forget`] drops the page's copies
+//! and detaches its in-flight fetches. A detached fetch may have read the
+//! same rejected record, so later requests no longer join it, and its
+//! result is never recorded; its existing waiters still receive it and
+//! check it themselves.
 
 use super::sealed::SealedPage;
 use super::sealed::SealedSource;
@@ -318,15 +324,14 @@ impl GpuCopies {
     }
 
     /// Forget every copy of `page`, after a GPU rejected one, so later
-    /// readers fetch it again. In-flight fetches still complete.
+    /// readers fetch it again. In-flight fetches are detached: they may have
+    /// read the rejected ciphertext, so later lookups do not join them and
+    /// their results are not recorded. Their waiters still get the results
+    /// and check them as usual.
     pub(crate) fn forget(&self, page: &PageId) {
-        let mut entries = self.entries.borrow_mut();
-        if let Some(entry) = entries.get_mut(page) {
-            entry.copies.clear();
-            if entry.is_empty() {
-                entries.remove(page);
-            }
-        }
+        // Dropping the entry drops only the table's receivers; waiters hold
+        // clones, and a detached lead's close finds no flight to record.
+        self.entries.borrow_mut().remove(page);
     }
 
     /// Close fetch `id` of `page`, recording `copy` when there is one.
@@ -335,9 +340,13 @@ impl GpuCopies {
         let Some(entry) = entries.get_mut(page) else {
             return;
         };
+        let tracked = entry.flights.len();
         entry.flights.retain(|flight| flight.id != id);
+        // A flight no longer tracked was detached by `forget`: its result
+        // may be the rejected ciphertext, so it is not recorded.
+        let detached = entry.flights.len() == tracked;
         entry.prune();
-        if let Some(copy) = copy {
+        if let Some(copy) = copy.filter(|_| !detached) {
             entry.copies.push(copy.retain());
         }
         if entry.is_empty() {
@@ -521,6 +530,121 @@ mod tests {
             Lookup::Join(_)
         ));
         drop(leads.pop());
+        let _last = lead(table.lookup(&page(0), &helper, last));
+    }
+
+    /// A live GPU copy of page 0 on GPU `ordinal`, for publishing.
+    fn copy(helper: &Arc<GpuHelper>, ordinal: i32) -> (Arc<LandedCiphertext>, SharedCopy) {
+        let buffer = crate::gpu::testing::landing(helper, ordinal, crate::gpu::SLOT_BYTES).unwrap();
+        let landed = Arc::new(LandedCiphertext::for_test(&buffer, 0, 16));
+        let shared = SharedCopy {
+            facts: Rc::new(Facts {
+                metadata: ObjectMetadata {
+                    version: page(0).version,
+                    length: 1,
+                    content_type: None,
+                    expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+                },
+                envelope: PageEnvelope {
+                    cipher: PageCipher::Xaes256Gcm,
+                    page: page(0),
+                    key_id: racer_control_wire::KeyId([0; 16]),
+                    nonce: Nonce([0; 24]),
+                    plaintext_length: 1,
+                    ciphertext_length: 17,
+                },
+                aad: vec![],
+                expected_crc: None,
+            }),
+            held: Held::Landed(landed.clone()),
+        };
+        (landed, shared)
+    }
+
+    #[test]
+    /// Forgetting a page detaches its flights: later lookups lead a new
+    /// flight, a detached lead's copy is not recorded, and its existing
+    /// waiters still receive it.
+    fn forget_detaches_in_flight_fetches() {
+        let helper = crate::gpu::testing::helper(&[None, None]);
+        let table = Rc::new(GpuCopies::default());
+        let old = lead(table.lookup(&page(0), &helper, 0));
+        let Lookup::Join(waiter) = table.lookup(&page(0), &helper, 1) else {
+            panic!("expected to join");
+        };
+        table.forget(&page(0));
+        assert_eq!(table.len(), 0);
+        let new = lead(table.lookup(&page(0), &helper, 1));
+        let (_landed, shared) = copy(&helper, 0);
+        old.finish(Outcome::Copy(shared));
+        let Outcome::Copy(received) = futures::executor::block_on(waiter) else {
+            panic!("expected the leader's copy");
+        };
+        assert_eq!(received.ordinal(), 0);
+        // The detached copy is alive but not shared; the new flight is
+        // still tracked and joinable.
+        assert!(matches!(
+            table.lookup(&page(0), &helper, 0),
+            Lookup::Join(_)
+        ));
+        let (_fresh, fresh) = copy(&helper, 1);
+        new.finish(Outcome::Copy(fresh));
+        let Lookup::Live(live) = table.lookup(&page(0), &helper, 0) else {
+            panic!("expected the new flight's copy");
+        };
+        assert_eq!(live.ordinal(), 1);
+    }
+
+    #[test]
+    /// A detached lead that is dropped or finishes with nothing leaves no
+    /// entry behind and does not disturb a newer flight.
+    fn detached_flights_leave_nothing_behind() {
+        let helper = crate::gpu::testing::helper(&[None]);
+        let table = Rc::new(GpuCopies::default());
+        let dropped = lead(table.lookup(&page(0), &helper, 0));
+        let finished = lead(table.lookup(&page(1), &helper, 0));
+        table.forget(&page(0));
+        table.forget(&page(1));
+        drop(dropped);
+        finished.finish(Outcome::Nothing);
+        assert_eq!(table.len(), 0);
+        let (_landed, shared) = copy(&helper, 0);
+        let old = lead(table.lookup(&page(0), &helper, 0));
+        table.forget(&page(0));
+        let _new = lead(table.lookup(&page(0), &helper, 0));
+        old.finish(Outcome::Copy(shared));
+        assert!(matches!(
+            table.lookup(&page(0), &helper, 0),
+            Lookup::Join(_)
+        ));
+        // Forgetting an unknown page is a no-op.
+        table.forget(&page(7));
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    /// Detached flights do not count against MAX_FLIGHTS.
+    fn detached_flights_free_the_per_page_bound() {
+        let gpus = MAX_FLIGHTS + 1;
+        let helper = crate::gpu::testing::helper_with(&vec![None; gpus], move |simulation| {
+            for from in 0..gpus as i32 {
+                for to in 0..gpus as i32 {
+                    if from != to {
+                        simulation.set_peer(from, to, false);
+                    }
+                }
+            }
+        });
+        let table = Rc::new(GpuCopies::default());
+        let _leads: Vec<Lead> = (0..MAX_FLIGHTS as i32)
+            .map(|ordinal| lead(table.lookup(&page(0), &helper, ordinal)))
+            .collect();
+        let last = MAX_FLIGHTS as i32;
+        assert!(matches!(
+            table.lookup(&page(0), &helper, last),
+            Lookup::Private
+        ));
+        table.forget(&page(0));
         let _last = lead(table.lookup(&page(0), &helper, last));
     }
 

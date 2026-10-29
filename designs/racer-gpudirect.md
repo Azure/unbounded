@@ -417,7 +417,10 @@ cuFile read or landing.
 except a passed verdict for a landed page, which leaves the owner nothing to
 do and settles where it was reported. A failed verdict drops the
 host and disk copies as before and forgets every shared GPU copy of the page
-(`GpuCopies::forget`), so later requests fetch it again.
+(`GpuCopies::forget`), so later requests fetch it again. It also detaches the
+page's in-flight fetches, which may have read the same rejected record: later
+requests do not join them and their results are not shared, though requests
+already waiting on them still receive and check them.
 
 **Metrics.** `racer_gpu_direct_joined_total` counts sealed pages served from
 another request's GPU copy. The GPU helper also counts joined pages, peer
