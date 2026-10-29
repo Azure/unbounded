@@ -51,10 +51,12 @@ another fetch.
   containerd have their own integrations.
 - **Encrypted and verified data.** Pages are encrypted and authenticated with
   a per-cache key between nodes and on disk. Nodes sign their requests. The
-  SDK checks that every range arrived intact before it hands over the last
-  byte. Racer rejects a corrupt or tampered cached page and fetches a good
-  copy from another node or the origin, so an app never completes a read
-  with bad data.
+  SDK holds back the last byte of each range until Racer confirms the whole
+  range arrived intact. Data streams to the app as it arrives, so an app
+  that needs all-or-nothing input should wait for the read to complete
+  before using it. Racer rejects a corrupt or tampered cached page and
+  fetches a good copy from another node or the origin, so an app never
+  completes a read with bad data.
 - **One cache for images, models, and datasets.** Several caches share each
   node's capacity by priority. Gantry can store container images in Racer, and
   apps can warm and hold specific model or dataset versions ahead of a job.
@@ -75,7 +77,7 @@ scale with the cluster instead of running a separate cache tier.
 | Hybrid, multi-cloud, or edge clusters | The same DaemonSet and API work on every Linux node in the cluster. S3-compatible support covers on-premises object stores. Nothing depends on one cloud's managed services. |
 | Internal or custom data sources | An origin answers two requests, HEAD and GET, through the Go SDK. A new source needs a small adapter, not a new cache product. |
 | Rate-limited, throttled, or costly sources | Only page owners read from the source, and Racer does not silently send reads to the source when the cache fails. Source load stays bounded during both rollouts and failures. |
-| Data that must stay encrypted and verified | Pages are encrypted on node disks and on the wire, and every range is checked before the app uses it. |
+| Data that must stay encrypted and verified | Pages are encrypted on node disks and on the wire, and a read only completes if every page passed checks. |
 | Container images, models, and datasets in one cluster | One cache layer serves all three. Priority decides how they share node capacity. |
 | Fast model loads on NVIDIA GPU nodes | The [vLLM integration]({{< relref "guides/racer-vllm" >}}) reads weights straight into GPU memory, and RDMA speeds node-to-node transfers. |
 
