@@ -13,14 +13,15 @@ scrape() {
   kubectl -n gantry-bench cp "$file.ips" "$tools:/tmp/$label.ips" >/dev/null
   rm -f "$file.ips"
   # Each download gets its final name only on success, so the file count
-  # shows whether every pod was scraped.
+  # shows whether every pod was scraped. The IP file has one line per pod,
+  # blank for a pod without an IP yet, so count every line.
   if ! kubectl -n gantry-bench exec "$tools" -- sh -c "rm -rf /tmp/m-$label; mkdir -p /tmp/m-$label
 for ip in \$(cat /tmp/$label.ips); do
   (wget -qO /tmp/m-$label/\$ip.part -T 5 http://\$ip:$port/metrics && mv /tmp/m-$label/\$ip.part /tmp/m-$label/\$ip.prom) &
   if [ \$(jobs | wc -l) -ge 64 ]; then wait; fi
 done
 wait
-want=\$(grep -c . /tmp/$label.ips)
+want=\$(grep -c '' /tmp/$label.ips)
 got=\$(ls /tmp/m-$label | grep -c '\.prom\$')
 if [ \"\$got\" -ne \"\$want\" ]; then
   echo \"$label: scraped \$got of \$want pods\" >&2
