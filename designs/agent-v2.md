@@ -197,7 +197,7 @@ decision.
 | D22 | Existing content at an owned path can be adopted, as an explicit per-path configuration option. | Decided |
 | D23 | Teardown without an ownership record is conservative; the CLI has `--force-standard-paths`. | Decided |
 | D24 | Code is internal by default and is exported only by a recorded decision (section 15). | Decided |
-| D25 | Lifecycle events are named `<subject>.<state>.<before\|after>`, all lowercase, and every state has both phases. | Decided |
+| D25 | Lifecycle events are named `<subject>.<action>.<before\|after>`, all lowercase, and every action has both phases. | Decided |
 | D26 | Hook subscriptions may use whole-segment `*` wildcards. | Decided |
 | D27 | The `host` runtime cleanup levels are Terminate, Unmount, Wipe and Uninstall. | Decided |
 | D28 | The doc uses plain terms; project-specific terms are defined in section 1.4. | Decided |
@@ -209,6 +209,7 @@ decision.
 | D34 | A node that never registers is reported as `NodeNotRegistered` after 10 minutes, but is not repaved without a Node deletion, matching v1 (section 8.4). | Decided |
 | D35 | Settings are split into install-time settings, which come only from the configuration file, and goal settings, which are the only thing a goal can change (section 5.2). | Decided |
 | D36 | `Preserve` adoption and container image retention are built in the first implementation, not deferred. | Decided |
+| D37 | Lifecycle hooks stay in the first implementation, with one `hook` plugin method, no overlapping subscriptions per plugin, `after` events fired again on a resumed bootstrap, and `node.start.after` before the repave commit (section 5.3). | Decided |
 
 Why D4 still matters with only two runtimes:
 
@@ -372,7 +373,7 @@ works unchanged.
   ],
   "hooks": [
     { "event": "node.start.after", "plugin": "aks", "timeout": "2m", "failurePolicy": "Fail" },
-    { "event": "node.*.after", "plugin": "aks", "timeout": "30s", "failurePolicy": "Ignore" }
+    { "event": "agent.upgrade.*", "plugin": "aks", "timeout": "30s" }
   ],
   "extensions": []
 }
@@ -444,16 +445,17 @@ until machina adds a way to choose the runtime.
 
 #### Lifecycle hook events
 
-Events are named `<subject>.<state>.<phase>`:
+Events are named `<subject>.<action>.<phase>`:
 
 - The subject is `agent`, `host` or `node`.
-- The state is a lowercase word. A state that needs more than one word uses
-  hyphens, for example `image-import`. Dots only separate segments.
-- The phase is `before` or `after`. Every state has both.
+- The action is a lowercase word, such as `install`, `start` or `repave`. Dots
+  only separate segments, so a future action that needs more than one word
+  would use hyphens.
+- The phase is `before` or `after`. Every action has both.
 
 `before` and `after` are used instead of `pre` and `post` so these events are
-not confused with the runtime's internal `pre-start` and `post-start` systemd
-hooks (section 8.3).
+not confused with the runtime's internal pre-start and post-start boot hooks
+(section 8.3).
 
 When events fire:
 
@@ -461,15 +463,21 @@ When events fire:
   policy `Fail` fails, the step does not run and the operation fails.
 - An `after` event fires when its step completes, whether it succeeded or
   not. The payload carries `result` (`Succeeded` or `Failed`) and `message`. If
-  a hook with policy `Fail` fails after a successful step, the operation is
+  the step succeeded and a hook with policy `Fail` then fails, the operation is
   reported as failed, but the step is not rolled back.
-- Hooks fire every time the agent runs a step, including on a resumed
-  bootstrap or a retried operation, so hooks must be idempotent. A step the
-  agent skips entirely, such as provisioning a slot that is already running,
-  fires no events.
-- The default failure policy is `Fail` for steps that bring the node or agent
-  up. It is `Ignore` for stopping and reset, and for the `after` events of
-  repave and upgrade, so a broken hook can never block stopping or cleanup.
+- Hooks fire every time the agent runs a step, including on a retried
+  operation, so hooks must be idempotent.
+- On a resumed bootstrap, a step that is already done, such as provisioning a
+  slot that is already running, is skipped. Its `before` event does not fire,
+  but its `after` event fires again with `resumed: true` in the payload. A hook
+  that failed on the earlier attempt is therefore retried, and the bootstrap is
+  not marked complete until it succeeds.
+- No events fire when systemd starts the node at boot (section 7.1, rule 6).
+- If a hook entry has no failure policy, each event uses its default from the
+  table below, including when the entry matches through a wildcard. The
+  default is `Fail` for steps that bring the node or agent up. It is `Ignore`
+  for stopping and reset, and for the `after` events of repave and upgrade, so
+  a broken hook can never block stopping or cleanup.
 
 Every payload includes `event`, the concrete event name. The table lists the
 fields specific to each event.
@@ -483,15 +491,15 @@ fields specific to each event.
 | `node.provision.before` | Before `Provision(slot)` | slot, goal version | `Fail` |
 | `node.provision.after` | After `Provision(slot)` | slot, goal version, bundle digest | `Fail` |
 | `node.start.before` | Before `Start(slot)` | slot, goal version | `Fail` |
-| `node.start.after` | After `Start(slot)` and the readiness wait | slot, goal version, node name | `Fail` |
+| `node.start.after` | After `Start(slot)` and the readiness wait. During a repave, before the commit. | slot, goal version, node name | `Fail` |
 | `node.stop.before` | Before `Stop(slot)` | slot, reason (`Repave` or `Reset`) | `Ignore` |
 | `node.stop.after` | After `Stop(slot)` | slot, reason | `Ignore` |
 | `node.restart.before` | Before `Restart(slot)` for a NodeReboot | slot, operation name | `Fail` |
 | `node.restart.after` | After `Restart(slot)` and the readiness wait | slot, operation name, node name | `Fail` |
-| `node.repave.before` | Before a repave begins | from slot, to slot, applied and goal versions | `Fail` |
-| `node.repave.after` | After the repave commits and the old slot is destroyed, or after it fails | from slot, to slot, goal version | `Ignore` |
-| `agent.upgrade.before` | In the old daemon, before the new binary is staged | current version, operation name | `Fail` |
-| `agent.upgrade.after` | In the daemon that publishes the upgrade result | old and new version, operation name | `Ignore` |
+| `node.repave.before` | Before a repave begins | old slot, new slot, applied and goal versions | `Fail` |
+| `node.repave.after` | After the repave commits and the old slot is destroyed, or after an attempt fails | old slot, new slot, goal version | `Ignore` |
+| `agent.upgrade.before` | Before the new binary is staged, in the daemon or the `v2 agent-upgrade` command | current version, operation name if any | `Fail` |
+| `agent.upgrade.after` | In the daemon that publishes the upgrade result | old and new version, operation name if any | `Ignore` |
 | `agent.reset.before` | Before reset begins | trigger (`CLI`, `Operation` or `Goal`) | `Ignore` |
 | `agent.reset.after` | After reset, before the daemon unit is removed | trigger, leftovers | `Ignore` |
 
@@ -500,22 +508,34 @@ The order of events in each lifecycle:
 | Lifecycle | Events, in order |
 |---|---|
 | Bootstrap (8.2) | `agent.install.before`, `host.prepare.before`, `host.prepare.after`, `node.provision.before`, `node.provision.after`, `node.start.before`, `node.start.after`, `agent.install.after` |
-| Repave (8.5) | `node.repave.before`, `node.provision.before` (B), `node.provision.after` (B), `node.stop.before` (A), `node.stop.after` (A), `node.start.before` (B), `node.start.after` (B), `node.repave.after` |
+| Repave (8.5) | `node.repave.before`, `node.provision.before` (new), `node.provision.after` (new), `node.stop.before` (old), `node.stop.after` (old), `node.start.before` (new), `node.start.after` (new), `node.repave.after` |
 | NodeReboot (8.6) | `node.restart.before`, `node.restart.after` |
-| AgentUpgrade (8.7) | `agent.upgrade.before` in the old daemon, `agent.upgrade.after` in the new one |
+| AgentUpgrade (8.7) | `agent.upgrade.before` in the old daemon or the CLI, `agent.upgrade.after` in the new daemon |
 | Reset (8.8) | `agent.reset.before`, `node.stop.before` and `node.stop.after` if a node is running, `agent.reset.after` |
 
 NodeReboot has its own `restart` pair rather than stop and start events,
 because for `nspawn-container` a restart is a single unit restart.
 
+During a repave, `node.start.after` for the new slot fires before the commit. A
+hook that fails under `Fail` therefore leaves the repave pending, and it is
+retried like any other failed attempt (section 8.5).
+
 #### Subscribing to events
 
 `hooks[].event` must have exactly three segments. Each segment is either a
 known value or `*`, which matches any value for that whole segment. Examples:
-`node.start.after`, `node.*.after`, `agent.upgrade.*`. Partial wildcards such
-as `node.st*` and unknown values are rejected when the configuration is
-validated, which catches typos. When several hooks match one event, they run
-one at a time in the order they appear in the configuration.
+`node.start.after`, `node.*.after`, `agent.upgrade.*`.
+
+Validation rejects:
+
+- partial wildcards such as `node.st*`, and unknown values, which catches
+  typos;
+- two entries for the same plugin that can match the same event, such as
+  `node.start.after` and `node.*.after` for one plugin. Each plugin therefore
+  receives each event at most once.
+
+When entries for different plugins match one event, their hooks run one at a
+time in the order they appear in the configuration.
 
 ### 5.4 Declarative extensions
 
@@ -598,7 +618,7 @@ or the environment.
 | `credentials.bootstrap` | None | `{apiServer, caCertBase64, token}` |
 | `credentials.cluster` | None | A Kubernetes `ExecCredential` |
 | `preflight.check` | Configuration summary | `[{name, severity, message}]` |
-| `hook.<event>` | The event payload (5.3) | None. For example, `hook.node.start.after`. |
+| `hook` | The event payload, including the event name (5.3) | None. A plugin that handles hooks lists `hook` once in `describe`, whatever events it subscribes to. |
 
 Operational rules:
 
@@ -1137,10 +1157,10 @@ sequenceDiagram
     CLI->>NM: Ensure
     NM->>RT: Inspect
     NM->>NM: resolve NodeSpec, cache artifacts, render the bundle for slot a
-    NM->>Px: hook node.provision.before
-    NM->>RT: Provision a and save its manifest, skipped with its hooks if a is running
-    NM->>Px: hook node.provision.after
-    NM->>Px: hook node.start.before
+    NM->>Px: hook node.provision.before, unless a is already running
+    NM->>RT: Provision a and save its manifest, unless a is already running
+    NM->>Px: hook node.provision.after, with resumed true if a was already running
+    NM->>Px: hook node.start.before, unless a is already running
     NM->>RT: Start a, which enables it
     NM->>RT: Access a, wait for readiness
     NM->>St: save applied state with an empty goal version
@@ -1277,8 +1297,8 @@ sequenceDiagram
   NM->>Px: hook node.start.before new
   NM->>RT: Start new, which enables it
   NM->>RT: Access new, wait for readiness
-  NM->>St: commit the applied goal and digest, clear Pending
   NM->>Px: hook node.start.after new
+  NM->>St: commit the applied goal and digest, clear Pending
   NM->>RT: Destroy old
   NM->>Px: hook node.repave.after, status.report Ready
 ```
