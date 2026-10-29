@@ -14,6 +14,10 @@ reads each safetensors file through the local Racer dataplane. When GPU mode is
 on, the dataplane writes the bytes straight into GPU memory. Otherwise the
 client falls back to host memory, then to a plain stream.
 
+This helps most when many vLLM replicas start at once. Each page of the
+weights comes from the source only a few times, and the replicas share the
+pages among themselves instead of each downloading the full model.
+
 ## Before You Start
 
 - A ClusterCache whose origin holds the model files. The
