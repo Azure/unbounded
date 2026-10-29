@@ -396,10 +396,12 @@ privately. Each page has at most one fetch in flight.
 error. If the leader is cancelled or times out, waiters are told the fetch
 was abandoned and look again, up to two times (`GPU_COPY_JOIN_RETRIES`),
 then fetch on their own. If the leader's fetch ends with no GPU copy, waiters
-fetch on their own.
+take the usual path through host memory rather than repeat the leader's
+cuFile read or landing.
 
-**Verdicts.** Every verdict, including verdicts for landed and joined pages,
-goes to the page's owner (`Fill::sealed_verdict`). A failed verdict drops the
+**Verdicts.** Every verdict goes to the page's owner (`Fill::sealed_verdict`),
+except a passed verdict for a landed page, which leaves the owner nothing to
+do and settles where it was reported. A failed verdict drops the
 host and disk copies as before and forgets every shared GPU copy of the page
 (`GpuCopies::forget`), so later requests fetch it again.
 
