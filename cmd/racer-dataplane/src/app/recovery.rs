@@ -1001,6 +1001,55 @@ mod tests {
         );
     }
 
+    /// A geometry change (slab size, segment size, or worker count) skips stale
+    /// checkpoints and starts cold instead of failing node recovery.
+    #[test]
+    fn changed_slab_size_or_worker_count_skips_stale_checkpoint() {
+        let node = NodeState::default();
+        let keys = crate::test_support::security::keys();
+        let live = |ids: &[WorkerId], g: CheckpointGeometry| -> HashMap<_, _> {
+            ids.iter().map(|id| (*id, g)).collect()
+        };
+        let choose = |cuts: Vec<CheckpointImage>, g: &HashMap<WorkerId, CheckpointGeometry>| {
+            select(cuts, g, &node.workers, (4, 4), &keys, &caches())
+        };
+        let three = [WorkerId(0), WorkerId(1), WorkerId(2)];
+        let five = [
+            WorkerId(0),
+            WorkerId(1),
+            WorkerId(2),
+            WorkerId(3),
+            WorkerId(4),
+        ];
+        // Sanity: an unchanged geometry and worker set recovers.
+        assert!(choose(vec![image(1, &three)], &live(&three, geometry())).is_some());
+        // Larger slab per worker.
+        let bigger =
+            CheckpointGeometry::new(16384, 4096, 4, Alignment::new(4096, 4096, 4096).unwrap())
+                .unwrap();
+        assert!(choose(vec![image(1, &three)], &live(&three, bigger)).is_none());
+        // Different segment size.
+        let segment =
+            CheckpointGeometry::new(8192, 8192, 1, Alignment::new(4096, 4096, 4096).unwrap())
+                .unwrap();
+        assert!(choose(vec![image(1, &three)], &live(&three, segment)).is_none());
+        // More workers, with and without a slab size change.
+        assert!(choose(vec![image(1, &three)], &live(&five, geometry())).is_none());
+        assert!(choose(vec![image(1, &three)], &live(&five, bigger)).is_none());
+        // Fewer workers.
+        assert!(choose(vec![image(1, &five)], &live(&three, geometry())).is_none());
+        // A newer compatible cut still wins over older stale ones.
+        assert_eq!(
+            choose(
+                vec![image(3, &five), image(2, &three)],
+                &live(&three, geometry())
+            )
+            .unwrap()
+            .sequence,
+            2
+        );
+    }
+
     #[test]
     fn newest_complete_cut_wins_and_partial_duplicate_or_foreign_workers_fall_back() {
         let node = NodeState::default();

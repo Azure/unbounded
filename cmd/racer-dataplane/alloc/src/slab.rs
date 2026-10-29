@@ -64,6 +64,9 @@ pub struct Slab<C: Charge> {
 
     max_record_bytes: usize,
 
+    /// Recreate a regular slab file whose size differs from the configured capacity.
+    reset_mismatched: bool,
+
     opened: RefCell<Option<OpenSlab>>,
 
     writes: Rc<WriteState>,
@@ -84,10 +87,21 @@ impl<C: Charge> Slab<C> {
             capacity_bytes,
             segment_bytes,
             max_record_bytes,
+            reset_mismatched: false,
             opened: RefCell::new(None),
             writes: Rc::new(WriteState::default()),
             idle_buffer: Rc::new(RefCell::new(crate::BufferPool::default())),
         }
+    }
+
+    /// Treat an existing regular slab file of the wrong size as a disposable cache:
+    /// truncate it to zero and recreate it at the configured capacity instead of
+    /// failing with `InvalidConfiguration`. Device-backed slabs ignore this flag.
+    /// The caller must ensure no recovered metadata references the old contents.
+    #[must_use]
+    pub fn reset_mismatched_size(mut self) -> Self {
+        self.reset_mismatched = true;
+        self
     }
 
     /// Describe device ranges in logical segment order, without creating, sizing,
@@ -417,8 +431,16 @@ impl<C: Charge> Slab<C> {
             // The virtual filesystem has a fixed root owner, independent of host uid.
             validate_file(stat.stx_mode as u32, stat.stx_uid, 0, stat.stx_nlink as u64)?;
             let a = alignment_from_stat(&stat)?;
-            let geometry = self.validate_layout(a, stat.stx_size)?;
-            if stat.stx_size == 0 {
+            let mut size = stat.stx_size;
+            if self.reset_mismatched && size != 0 && size != self.capacity_bytes {
+                self.validate_layout(a, 0)?;
+                handle
+                    .set_len(0)
+                    .map_err(|e| system_error("ftruncate", e))?;
+                size = 0;
+            }
+            let geometry = self.validate_layout(a, size)?;
+            if size == 0 {
                 handle
                     .set_len(self.capacity_bytes)
                     .map_err(|e| system_error("ftruncate", e))?;
@@ -449,7 +471,7 @@ impl<C: Charge> Slab<C> {
             unsafe { libc::geteuid() },
             metadata.nlink(),
         )?;
-        let size = metadata.len();
+        let mut size = metadata.len();
         // Delay O_DIRECT until after rejecting nonregular files (including FIFOs).
         // SAFETY: fcntl synchronously borrows this live descriptor.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
@@ -470,6 +492,17 @@ impl<C: Charge> Slab<C> {
             ));
         }
         let a = probe(&file)?;
+        if self.reset_mismatched && size != 0 && size != self.capacity_bytes {
+            // Validate everything except the stale size before discarding data.
+            self.validate_layout(a, 0)?;
+            eprintln!(
+                "racer: slab {} has {size} bytes, configured {}; discarding stale cache contents",
+                path.display(),
+                self.capacity_bytes
+            );
+            file.set_len(0).map_err(|e| system_error("ftruncate", e))?;
+            size = 0;
+        }
         let geometry = self.validate_layout(a, size)?;
         if size == 0 {
             file.set_len(self.capacity_bytes)
@@ -1869,6 +1902,62 @@ mod tests {
             crate::MAX_SEGMENTS + 1
         );
         assert_eq!(std::fs::metadata(path).unwrap().len(), capacity);
+    }
+
+    /// Opt-in reset recreates stale-size cache files but still rejects invalid dimensions.
+    #[test]
+    fn reset_mismatched_size_recreates_grown_or_shrunk_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = Directory::new();
+        let probe = Slab::<()>::new(directory.0.join("capability-probe"), 4096, 4096, 512);
+        if real_alignment(probe.open_now()).is_none() {
+            return;
+        }
+        for (old, new) in [(8192u64, 16384u64), (16384, 8192)] {
+            let path = directory.0.join(format!("data-{old}-{new}"));
+            std::fs::write(&path, vec![42u8; old as usize]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            // Without opt-in the stale size is still rejected and preserved.
+            let strict = Slab::<()>::new(path.clone(), new, 4096, 512);
+            assert_eq!(strict.open_now(), Err(Error::InvalidConfiguration));
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), old);
+            drop(strict);
+            let slab = Slab::<()>::new(path.clone(), new, 4096, 512).reset_mismatched_size();
+            assert!(real_alignment(slab.open_now()).is_some());
+            assert_eq!(slab.capacity_bytes(), new);
+            drop(slab);
+            let contents = std::fs::read(&path).unwrap();
+            assert_eq!(contents.len() as u64, new);
+            // Stale cache bytes are discarded rather than reinterpreted.
+            assert!(contents.iter().all(|b| *b == 0));
+        }
+        // Matching sizes keep their contents.
+        let path = directory.0.join("same");
+        std::fs::write(&path, vec![7u8; 8192]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let slab = Slab::<()>::new(path.clone(), 8192, 4096, 512).reset_mismatched_size();
+        assert!(real_alignment(slab.open_now()).is_some());
+        drop(slab);
+        assert!(std::fs::read(&path).unwrap().iter().all(|b| *b == 7));
+        // Genuinely invalid configurations still fail and leave stale files untouched.
+        let path = directory.0.join("invalid-existing");
+        std::fs::write(&path, vec![9u8; 8192]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for (capacity, segment, record) in [
+            (0, 4096, 512),
+            (4096, 0, 512),
+            (4096, 4096, 0),
+            (12289, 4096, 512),
+            (16384, 4096, 4097),
+        ] {
+            assert_eq!(
+                Slab::<()>::new(path.clone(), capacity, segment, record)
+                    .reset_mismatched_size()
+                    .open_now(),
+                Err(Error::InvalidConfiguration)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 8192]);
+        }
     }
 
     /// Invalid startup dimensions never truncate a preexisting nonempty file.
