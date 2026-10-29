@@ -1559,7 +1559,13 @@ impl Helper {
     fn write(&mut self, id: u64, offset: u64, work: &Work) -> Result<()> {
         let plaintext = match work {
             Work::Plaintext(plaintext) => plaintext,
-            Work::Sealed(sealed) => return self.write_sealed(id, offset, sealed),
+            Work::Sealed(sealed) => {
+                let result = self.write_sealed(id, offset, sealed);
+                if result.is_err() {
+                    self.fence_source(id, &sealed.page.source);
+                }
+                return result;
+            }
         };
         let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let destination = racer_gpu::Destination::Import(&request.import);
@@ -1574,6 +1580,35 @@ impl Helper {
             .plaintext
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// After a failed sealed write, make sure no queued GPU work still reads
+    /// the ciphertext's staged slot or landing page before the page drops
+    /// and the slot goes back for another cuFile read or NIC write. The
+    /// streams retain the GPU allocation, not the slot. If no fence
+    /// succeeds, the slot is quarantined for the life of the process.
+    fn fence_source(&mut self, id: u64, source: &SealedSource) {
+        let ordinal = match source {
+            SealedSource::Host(_) => return,
+            SealedSource::Staged { staged, .. } => staged.ordinal(),
+            SealedSource::Landed(landed) => landed.ordinal(),
+        };
+        let mut fenced = self
+            .requests
+            .get(&id)
+            .is_none_or(|request| request.stream.synchronize().is_ok());
+        if let Some(utility) = self.utility.get(&ordinal) {
+            fenced &= utility.synchronize().is_ok();
+        }
+        if fenced {
+            return;
+        }
+        eprintln!("racer-dataplane: stage=gpu ordinal={ordinal} state=ciphertext-quarantined");
+        match source {
+            SealedSource::Host(_) => {}
+            SealedSource::Staged { staged, .. } => std::mem::forget(staged.clone()),
+            SealedSource::Landed(landed) => std::mem::forget(landed.clone()),
+        }
     }
 
     /// This GPU's staging buffer, allocated on first use.
@@ -2696,6 +2731,43 @@ mod tests {
         assert!(text.contains("racer_gpu_peer_failures_total 1\n"), "{text}");
         assert!(text.contains("racer_gpu_peer_bounces_total 2\n"));
         assert!(text.contains("racer_gpu_peer_copies_total 0\n"));
+    }
+
+    #[test]
+    /// A peer copy that fails to synchronize, then a failed bounce, leave
+    /// the source slot out of the pool when no fence succeeds afterward.
+    fn unfenced_failed_copy_quarantines_the_source_slot() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _fd = import(&helper, 1, 1);
+        let free = helper.free_slots(0);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| {
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::CopyD2h, -5);
+            simulation().fault(Operation::StreamSync, -5);
+        });
+        assert!(write(&helper, 1, page, 0..5000).is_err());
+        assert_eq!(counter(&helper.counters().peer_failures), 1);
+        assert_eq!(helper.free_slots(0), free - 1, "slot stays out");
+    }
+
+    #[test]
+    /// The same failures return the slot once a later fence succeeds.
+    fn fenced_failed_copy_returns_the_source_slot() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _fd = import(&helper, 1, 1);
+        let free = helper.free_slots(0);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| {
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::CopyD2h, -5);
+        });
+        assert!(write(&helper, 1, page, 0..5000).is_err());
+        assert_eq!(helper.free_slots(0), free);
     }
 
     #[test]
