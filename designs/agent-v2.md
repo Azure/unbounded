@@ -10,8 +10,11 @@
 
 ## Review guide
 
-- Sections 1-4 explain the problem, the goals, every decision with its status,
-  and the architecture. Section 1.4 defines the terms used throughout.
+- Sections 1 and 2 explain the problem and the goals. Section 1.4 defines the
+  terms used throughout.
+- Section 3 lists what is still open. Please focus review comments there, on
+  sections 5 and 7, and on the host runtime doc.
+- Section 4 is the architecture overview.
 - Section 5 is the external contract that consumers such as AKS Flex Node would
   build against: the CLI, the configuration file, plugins, hooks and
   declarative extensions.
@@ -23,8 +26,6 @@
   host network reset and section 12 how host preparation is reversed.
 - Sections 13-17 cover operations, parity with v1, the export policy, testing
   and risks.
-- Section 18 lists what is still open. Please focus review comments there, on
-  sections 5 and 7, and on the host runtime doc.
 - Appendix A maps v1 configuration fields to v2.
 
 Code citations are `file:line` against the baseline above. Statements that rely
@@ -168,61 +169,42 @@ library.
 - Changing `pkg/agent` behavior for its existing consumers, apart from the
   additive v2 detection check (section 6.3).
 
-## 3. Decisions
+## 3. Open questions
 
-Every decision made so far, in design discussion and in review. Open items are
-explained in section 18. Changing a decided item should be a deliberate
-decision.
+These are still open. Please focus review comments here. Everything else in
+this document was settled in design discussion and an earlier review round.
 
-| ID | Decision | Status |
-|---|---|---|
-| D1 | v2 ships as `unbounded-agent v2 <command>` in the existing binary. The only v1 command change is registering the `v2` group in `cmd/agent/internal/cmd/cmd.go:30-39`. | Decided |
-| D2 | Every `v2` command logs a warning before doing any work (section 5.1), and the group is marked experimental in help. | Decided |
-| D3 | All v2 code lives under `internal/agentv2`. It may use existing `pkg/agent` and `internal` packages as libraries without changing their v1 behavior. Code it needs from `cmd/agent/internal` is copied, not moved (section 6.2). | Decided |
-| D4 | Node content is described declaratively as a `NodeBundle` and handed to the runtime. The node manager never writes into a node after it starts. | Decided |
-| D5 | Consumers extend the agent with, in order of preference: configuration, declarative extensions, and exec plugins. There are no in-process Go plugins. | Decided |
-| D6 | v2 has its own state directories, daemon units and locks, and shares the agent binary layout under `/opt/unbounded/agent/bin`, because the binary is the same (section 5.6). Some other names are the same as v1's: `kubelet.service`, `containerd.service`, `localdns.service`, `nftables-flush.service` and the `kube1`/`kube2` machines. That is one reason v1 and v2 cannot be installed on the same host, and each refuses to install over the other (section 6.3). | Open: question 2 |
-| D7 | The runtime kinds are `host` and `nspawn-container` only. | Decided |
-| D8 | On-host unit and path names are fixed. Only the identity the cluster sees, the daemon CSR group and name, is configurable. | Decided |
-| D9 | v1 detects a v2 install through an additive existing-deployment check. | Decided |
-| D10 | Plugins are executables run once per call, with JSON on stdin and stdout. | Decided |
-| D11 | A matching MachineOperation that belongs to the agent but has no handler is failed (section 13). | Decided |
-| D12 | Which operation kinds belong to the agent (section 13). | Open: question 1 |
-| D13 | The `host` runtime uses the standard `kubelet.service` and `containerd.service` unit names. | Decided |
-| D14 | On `host`, the NVIDIA Container Toolkit is shipped as an agent artifact. | Decided |
-| D15 | Reset reverses host preparation for both runtimes, through an undo log. | Decided |
-| D16 | The `v2` command group is visible in `--help`. | Decided |
-| D17 | Configuration from legacy environment variables is dropped. | Decided |
-| D18 | The `host` runtime contains the node's processes in a dedicated `unboundednode.slice`. | Decided |
-| D19 | The whole-ruleset nftables flush at node start is kept. | Decided |
-| D20 | Reset restores original sysctl values and the host firewall. | Decided |
-| D21 | Wiping container images on a `host` repave is configurable, and on by default. | Decided |
-| D22 | Existing content at an owned path can be adopted, as an explicit per-path configuration option. | Decided |
-| D23 | Teardown without an ownership record is conservative; the CLI has `--force-standard-paths`. | Decided |
-| D24 | Code is internal by default and is exported only by a recorded decision (section 15). | Decided |
-| D25 | Lifecycle events are named `<subject>.<action>.<before\|after>`, all lowercase, and every action has both phases. | Decided |
-| D26 | Hook subscriptions may use whole-segment `*` wildcards. | Decided |
-| D27 | The `host` runtime cleanup levels are Terminate, Unmount, Wipe and Uninstall. | Decided |
-| D28 | The doc uses plain terms; project-specific terms are defined in section 1.4. | Decided |
-| D29 | A configuration without `runtime.type` gets `nspawn-container`. | Open: question 3 |
-| D30 | v2 copies v1's rendering templates and relies on golden tests for parity. | Open: question 4 |
-| D31 | The boot hooks run through the `current` agent binary link. | Open: question 5 |
-| D32 | The daemon compares the observed Node on every reconcile instead of reacting only to delete events. | Open: question 6 |
-| D33 | A failed repave is retried indefinitely with controller-runtime's default backoff. There is no attempt limit, no rollback and no restart of the old node, matching v1 (section 8.5). | Decided |
-| D34 | A node that never registers is reported as `NodeNotRegistered` after 10 minutes, but is not repaved without a Node deletion, matching v1 (section 8.4). | Decided |
-| D35 | Settings are split into install-time settings, which come only from the configuration file, and goal settings, which are the only thing a goal can change (section 5.2). | Decided |
-| D36 | `Preserve` adoption and container image retention are built in the first implementation, not deferred. | Decided |
-| D37 | Lifecycle hooks stay in the first implementation, with one `hook` plugin method, no overlapping subscriptions per plugin, `after` events fired again on a resumed bootstrap, and `node.start.after` before the repave commit (section 5.3). | Decided |
-
-Why D4 still matters with only two runtimes:
-
-- The `host` runtime needs an exact record of what it installed, for cleanup
-  and for deciding when a node must start with fresh state.
-- A bundle can be staged into the inactive slot while the active node keeps
-  running.
-- Rendering is a pure function, so it can be tested against v1's golden files.
-- Extensions merge into the bundle, replacing Flex's pattern of writing into
-  the machine directory after provisioning.
+1. **MachineOperation scoping (section 13).** Is "fail only kinds that belong
+   to the agent, meaning the current three plus any `Node*` or `Agent*` kind"
+   the right rule? It relies on a naming convention for future kinds that the
+   API does not currently document. The `OperationKind` enum is closed
+   (`api/machina/v1alpha3/machineoperation_types.go:54`), although its comment
+   says custom operations may be supported by individual cloud controllers
+   (`:51-53`).
+2. **Separate v2 state (section 5.6).** v2 uses its own state directories,
+   daemon units and locks, and shares the agent binary layout under
+   `/opt/unbounded/agent/bin`. Some node-level names are the same as v1's:
+   `kubelet.service`, `containerd.service`, `localdns.service`,
+   `nftables-flush.service` and the `kube1`/`kube2` machines. That is one reason
+   v1 and v2 cannot be installed on the same host, and each refuses to install
+   over the other (section 6.3). The alternative is to share v1's state and
+   daemon names too. Separate names avoid any confusion between the two, but the
+   `-v2` names would need renaming if v2 later replaces v1.
+3. **Default runtime (section 5.2).** A configuration without `runtime.type` gets
+   `nspawn-container`, which keeps machina provisioning unchanged. Should the
+   field be required instead?
+4. **Rendering templates (section 6.2).** v2 copies v1's templates and relies on
+   golden tests for parity. The alternative is to add exported, render-only
+   functions to `pkg/agent`, which avoids the copy but changes a public package.
+5. **Boot hook binary (section 8.3).** v1 runs its systemd hooks through a
+   separate binary copy so they survive an upgrade rollback
+   (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Is the `current` link
+   enough for v2's boot hooks, given the recovery unit restores `last-good` into
+   `current`?
+6. **The `Decide` behavior change (section 8.4).** v2 compares the observed
+   Node on every reconcile instead of reacting only to delete events. A Node
+   deleted while the daemon was down therefore triggers a repave when the
+   daemon returns. Is that the behavior we want?
 
 ## 4. Architecture overview
 
@@ -275,6 +257,18 @@ Data flows in three steps:
    render to a `NodeBundle`.
 3. The bundle is handed to `NodeRuntime.Provision(slot, bundle)`, which decides
    *where* it runs.
+
+Why node content is a declarative bundle, even with only two runtimes:
+
+- The `host` runtime needs an exact record of what it installed, for cleanup
+  and for deciding when a node must start with fresh state.
+- A bundle can be staged into the inactive slot while the active node keeps
+  running.
+- Rendering is a pure function, so it can be tested against v1's golden files.
+- Extensions merge into the bundle, replacing Flex's pattern of writing into
+  the machine directory after provisioning.
+- The node manager never writes into a node after it starts; all content goes
+  through `Provision`.
 
 Both runtimes share the host kernel and the host network namespace with the
 node. The node manager relies on this: it configures host sysctls for the node
@@ -398,7 +392,7 @@ Enumerated fields:
 
 | Field | Values |
 |---|---|
-| `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container` *(open for review, section 18)*. |
+| `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container` *(open: section 3, question 3)*. |
 | `credentials.bootstrap.type` | `static`, `tpm` (metalman attestation), `plugin` |
 | `credentials.kubelet.type` | `bootstrap`, `kubeconfig`, `exec` |
 | `credentials.daemon.type` | `csr`, `kubeconfig`, `plugin` |
@@ -479,6 +473,9 @@ until machina adds a way to choose the runtime.
 | Declarative extensions (5.4) | Extra node binaries, files and units; extra host units; ordering before node boot; cleanup declarations | No, additive only |
 | Providers, through exec plugins (5.5) | Goal source, status sink, bootstrap credentials, daemon credentials, extra preflight checks | Yes, a provider replaces one built-in implementation |
 | Lifecycle hooks, through exec plugins (5.5) | Side effects at fixed points | No. Hooks observe, and can fail the operation. |
+
+Use the first mechanism that fits, in this order. There are no in-process Go
+plugins: consumers never link agent code.
 
 #### Lifecycle hook events
 
@@ -832,7 +829,7 @@ Changes outside `internal/agentv2`:
 
 | Change | Why | Effect on v1 and its consumers |
 |---|---|---|
-| Register the `v2` command group in `cmd/agent/internal/cmd/cmd.go:30-39` | Delivery (D1) | None; v1 commands are unchanged |
+| Register the `v2` command group in `cmd/agent/internal/cmd/cmd.go:30-39` | Delivery: the `v2` command group (section 5.1) | None; v1 commands are unchanged |
 | In `pkg/agent/phases/host/preflight_existing_deployment.go:130-139`, also detect v2's install record and daemon unit | Without it, v1 `start` on a v2 `host` runtime would mask v2's `kubelet` and `containerd` units | Additive; it only fires on hosts with v2 installed. AKS Flex Node calls `host.Preflight`, so it sees the check too. |
 | Add the NVIDIA Container Toolkit artifact to `hack/cmd/agent-artifacts-builder` | The `host` runtime ships the toolkit as an artifact (section 9.2) | Offline artifact bundles gain an artifact that v1 ignores |
 
@@ -1340,7 +1337,7 @@ sequenceDiagram
 
 v1 runs its hooks through a separate copy of the binary that survives an
 upgrade rollback (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Whether
-v2 can use the `current` link instead is listed in section 18.
+v2 can use the `current` link instead is open question 5 (section 3).
 
 ### 8.4 Daemon reconcile
 
@@ -1729,7 +1726,7 @@ staying pending. `Host*` kinds are always ignored, as
 This differs from v1, which ignores every operation without a handler
 (`pkg/agent/daemon/machineoperation.go:114-118,139-141`). v2 implements it in
 its own copy of the reconciler, so `pkg/agent/daemon` is unchanged for v1 and
-Flex. The scoping is open for review (section 18).
+Flex. The scoping is open question 1 (section 3).
 
 ## 14. Parity with v1
 
@@ -1851,35 +1848,6 @@ built:
 - **Experimental code ships in the production binary.** It is reachable only
   through `v2` commands.
 - **Copied code drifts from v1.** The list in section 6.2 is the mitigation.
-
-## 18. Questions for reviewers
-
-1. **MachineOperation scoping (section 13, D12).** Is "fail only kinds that belong
-   to the agent, meaning the current three plus any `Node*` or `Agent*` kind"
-   the right rule? It relies on a naming convention for future kinds that the
-   API does not currently document. The `OperationKind` enum is closed
-   (`api/machina/v1alpha3/machineoperation_types.go:54`), although its comment
-   says custom operations may be supported by individual cloud controllers
-   (`:51-53`).
-2. **Separate v2 state (D6).** v2 uses its own state directories, units and
-   locks, sharing only the binary layout. The alternative is to share v1's
-   names. Separate names avoid any confusion between the two, but the `-v2`
-   names would need renaming if v2 later replaces v1.
-3. **Default runtime.** A configuration without `runtime.type` gets
-   `nspawn-container`, which keeps machina provisioning unchanged. Should the
-   field be required instead?
-4. **Rendering templates (section 6.2).** v2 copies v1's templates and relies on
-   golden tests for parity. The alternative is to add exported, render-only
-   functions to `pkg/agent`, which avoids the copy but changes a public package.
-5. **Boot hook binary (section 8.3, D31).** v1 runs its systemd hooks through a
-   separate binary copy so they survive an upgrade rollback
-   (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Is the `current` link
-   enough for v2's boot hooks, given the recovery unit restores `last-good` into
-   `current`?
-6. **The `Decide` behavior change (section 8.4).** v2 compares the observed
-   Node on every reconcile instead of reacting only to delete events. A Node
-   deleted while the daemon was down therefore triggers a repave when the
-   daemon returns. Is that the behavior we want?
 
 ## Appendix A. Converting a v1 configuration
 
