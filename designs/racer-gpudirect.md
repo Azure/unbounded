@@ -384,6 +384,15 @@ reports whether a pair has a working peer path.
 
 If a peer copy fails, that direction of the pair is turned off until restart
 and the page takes the host bounce. Only the failed direction is turned off.
+After any failed `write_sealed`, the helper synchronizes the request stream
+(and the source GPU's utility stream). If the source cannot be fenced, its
+slot is never reused (`state=ciphertext-quarantined`). If the request stream
+cannot be fenced, queued work may still write the destination GPU's scratch
+slots, so that GPU is tainted (`state=scratch-tainted`): the helper keeps the
+stream alive, even past its request's release, and refuses later sealed
+writes on that GPU with `Unavailable` before touching scratch. Each refused
+write retries the fence; once every held stream synchronizes, the taint
+clears (`state=scratch-fenced`).
 Lookups only share across GPUs that have a peer path. A request whose GPU
 cannot reach any fetch in flight leads a separate fetch, which requests on
 its own GPU, or on GPUs that can reach it, join.

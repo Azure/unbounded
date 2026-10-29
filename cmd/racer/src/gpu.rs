@@ -1035,7 +1035,8 @@ impl Drop for GpuSink {
 /// One request's GPU objects. Field order matters: the stream drops first,
 /// which synchronizes it, then the import.
 struct Request {
-    stream: racer_gpu::Stream,
+    /// Shared with [`Helper::tainted`] while a failed write on it is unfenced.
+    stream: std::rc::Rc<racer_gpu::Stream>,
     import: racer_gpu::ImportedAllocation,
 }
 
@@ -1153,6 +1154,12 @@ struct Helper {
     /// A stream per GPU for reading ciphertext back to the host when it
     /// moves between GPUs without a peer path. Made on first use.
     utility: HashMap<i32, racer_gpu::Stream>,
+    /// Request streams, by the GPU they write, whose failed sealed write
+    /// could not be fenced. Their queued copies or decrypts may still write
+    /// that GPU's scratch slots, so sealed writes there are refused until
+    /// every one of them synchronizes. Held here, a stream outlives its
+    /// request's release.
+    tainted: HashMap<i32, Vec<std::rc::Rc<racer_gpu::Stream>>>,
     state: HelperState,
 }
 
@@ -1209,6 +1216,7 @@ fn helper_main(
                 requests: HashMap::new(),
                 landing: HashMap::new(),
                 utility: HashMap::new(),
+                tainted: HashMap::new(),
                 state,
             }
         }
@@ -1543,6 +1551,7 @@ impl Helper {
                         );
                     }
                     let stream = context.stream().map_err(import_error)?;
+                    let stream = std::rc::Rc::new(stream);
                     self.requests.insert(id, Request { stream, import });
                     return Ok(context.ordinal());
                 }
@@ -1562,7 +1571,8 @@ impl Helper {
             Work::Sealed(sealed) => {
                 let result = self.write_sealed(id, offset, sealed);
                 if result.is_err() {
-                    self.fence_source(id, &sealed.page.source);
+                    let fenced = self.fence_request(id);
+                    self.fence_source(fenced, &sealed.page.source);
                 }
                 return result;
             }
@@ -1587,16 +1597,13 @@ impl Helper {
     /// and the slot goes back for another cuFile read or NIC write. The
     /// streams retain the GPU allocation, not the slot. If no fence
     /// succeeds, the slot is quarantined for the life of the process.
-    fn fence_source(&mut self, id: u64, source: &SealedSource) {
+    /// `fenced` says whether the request stream synchronized.
+    fn fence_source(&mut self, mut fenced: bool, source: &SealedSource) {
         let ordinal = match source {
             SealedSource::Host(_) => return,
             SealedSource::Staged { staged, .. } => staged.ordinal(),
             SealedSource::Landed(landed) => landed.ordinal(),
         };
-        let mut fenced = self
-            .requests
-            .get(&id)
-            .is_none_or(|request| request.stream.synchronize().is_ok());
         if let Some(utility) = self.utility.get(&ordinal) {
             fenced &= utility.synchronize().is_ok();
         }
@@ -1609,6 +1616,46 @@ impl Helper {
             SealedSource::Staged { staged, .. } => std::mem::forget(staged.clone()),
             SealedSource::Landed(landed) => std::mem::forget(landed.clone()),
         }
+    }
+
+    /// After a failed sealed write, wait for request `id`'s stream. If that
+    /// fails, a copy into or a decrypt out of the destination GPU's scratch
+    /// may still be queued, so that GPU's scratch is tainted until the
+    /// stream synchronizes. Returns whether the stream is fenced.
+    fn fence_request(&mut self, id: u64) -> bool {
+        let Some(request) = self.requests.get(&id) else {
+            return true;
+        };
+        if request.stream.synchronize().is_ok() {
+            return true;
+        }
+        let ordinal = request.import.ordinal();
+        let stream = request.stream.clone();
+        let held = self.tainted.entry(ordinal).or_default();
+        if held.is_empty() {
+            eprintln!("racer-dataplane: stage=gpu ordinal={ordinal} state=scratch-tainted");
+        }
+        if !held.iter().any(|known| std::rc::Rc::ptr_eq(known, &stream)) {
+            held.push(stream);
+        }
+        false
+    }
+
+    /// Refuse to use GPU `ordinal`'s scratch while an unfenced failed write
+    /// may still write it. Each held stream is synchronized again first;
+    /// once all are fenced the taint clears and they are released.
+    fn check_scratch(&mut self, ordinal: i32) -> Result<()> {
+        let Some(held) = self.tainted.get_mut(&ordinal) else {
+            return Ok(());
+        };
+        held.retain(|stream| stream.synchronize().is_err());
+        if !held.is_empty() {
+            return Err(Error::Unavailable);
+        }
+        self.tainted.remove(&ordinal);
+        eprintln!("racer-dataplane: stage=gpu ordinal={ordinal} state=scratch-fenced");
+        self.note_leaks();
+        Ok(())
     }
 
     /// This GPU's staging buffer, allocated on first use.
@@ -1796,6 +1843,7 @@ impl Helper {
             .ok_or(Error::Internal)?
             .import
             .ordinal();
+        self.check_scratch(ordinal)?;
         self.staging(ordinal)?;
         let page = &sealed.page;
         let length = u64::from(page.plaintext_length());
@@ -2768,6 +2816,146 @@ mod tests {
         });
         assert!(write(&helper, 1, page, 0..5000).is_err());
         assert_eq!(helper.free_slots(0), free);
+    }
+
+    /// Copies and decrypts that may write a GPU's scratch slots so far.
+    fn scratch_work(helper: &GpuHelper) -> usize {
+        use racer_gpu::simulation::Operation;
+        [Operation::CopyH2d, Operation::CopyPeer, Operation::Decrypt]
+            .into_iter()
+            .map(|operation| operations(helper, operation))
+            .sum()
+    }
+
+    /// Fail a cross-GPU write on request 1 (GPU 1) so that its stream is
+    /// never fenced: the peer copy and the bounce fail to synchronize, and
+    /// so does the fence after them.
+    fn taint_gpu_one(helper: &GpuHelper) {
+        use racer_gpu::simulation::Operation;
+        let page = staged(helper, 0, &plaintext());
+        helper.run(|| {
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::StreamSync, -5);
+        });
+        assert_eq!(write(helper, 1, page, 0..5000), Err(Error::Unavailable));
+    }
+
+    #[test]
+    /// An unfenced failed write blocks later sealed writes on the same GPU,
+    /// from other requests too, without touching its scratch, until a fence
+    /// succeeds. Then writes succeed again.
+    fn unfenced_failed_write_blocks_scratch_until_fenced() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _first = import(&helper, 1, 1);
+        let fd = import(&helper, 2, 1);
+        taint_gpu_one(&helper);
+        // The retried fence fails: refused before any scratch work.
+        let page = staged(&helper, 0, &plaintext);
+        let before = scratch_work(&helper);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        assert_eq!(write(&helper, 2, page, 0..5000), Err(Error::Unavailable));
+        assert_eq!(scratch_work(&helper), before, "scratch untouched");
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            vec![0; 5000]
+        );
+        // The fence succeeds now: the write goes through, partial or whole.
+        write(&helper, 2, staged(&helper, 1, &plaintext), 10..20).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 10),
+            plaintext[10..20]
+        );
+        write(&helper, 2, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A taint on one GPU leaves another GPU's sealed writes alone and
+    /// stays on its own GPU.
+    fn scratch_taint_is_per_gpu() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _first = import(&helper, 1, 1);
+        let other = import(&helper, 2, 0);
+        taint_gpu_one(&helper);
+        write(&helper, 2, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&other, 0, 5000),
+            plaintext
+        );
+        // GPU 1 is still tainted: its next failed fence refuses.
+        let _third = import(&helper, 3, 1);
+        let page = staged(&helper, 1, &plaintext);
+        let before = scratch_work(&helper);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        assert_eq!(write(&helper, 3, page, 10..20), Err(Error::Unavailable));
+        assert_eq!(scratch_work(&helper), before);
+    }
+
+    #[test]
+    /// A tainting request may be released while its stream is unfenced: the
+    /// taint keeps the stream alive, nothing leaks, and the next fence on
+    /// it clears the taint.
+    fn released_tainting_request_keeps_its_stream_until_fenced() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _first = import(&helper, 1, 1);
+        let fd = import(&helper, 2, 1);
+        taint_gpu_one(&helper);
+        let streams = helper.run(|| simulation().live().streams);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        let (reply, answer) = oneshot::channel();
+        helper
+            .send(Job::Release {
+                id: 1,
+                reply: Some(reply),
+            })
+            .unwrap();
+        assert_eq!(
+            futures::executor::block_on(answer).unwrap(),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(helper.run(|| simulation().live().streams), streams);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        let page = staged(&helper, 1, &plaintext);
+        assert_eq!(write(&helper, 2, page, 0..5000), Err(Error::Unavailable));
+        write(&helper, 2, staged(&helper, 1, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(helper.run(|| simulation().live().streams), streams - 1);
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A failed write whose stream fences does not taint the GPU.
+    fn fenced_failed_write_does_not_block_scratch() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 0);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        assert_eq!(write(&helper, 1, page, 10..20), Err(Error::Unavailable));
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        // The fault now lands on the decrypt's own sync, not a taint check.
+        let page = staged(&helper, 0, &plaintext);
+        assert_eq!(write(&helper, 1, page, 0..5000), Err(Error::Unavailable));
+        write(&helper, 1, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
     }
 
     #[test]
