@@ -814,6 +814,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "controlplane",
+ "envy",
+ "flow-control",
+ "futures",
+ "getrandom",
+ "http1",
+ "io-uring",
+ "libc",
+ "page-alloc",
+ "peer-wire",
+ "prost",
+ "racer-cluster-control",
+ "racer-control-wire",
+ "racer-core",
+ "racer-crypto",
+ "racer-gpu",
+ "racer-object-wire",
+ "rcgen",
+ "rdma-verbs",
+ "regex",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "telemetry",
+ "topology",
+ "uds-endpoint",
+ "uring-runtime",
+ "wire-codec",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "racer-admission"
 version = "0.1.0"
 dependencies = [
@@ -893,44 +931,6 @@ dependencies = [
  "uring-runtime",
  "x509-parser",
  "xaes-256-gcm",
- "zeroize",
-]
-
-[[package]]
-name = "racer"
-version = "0.1.0"
-dependencies = [
- "base64",
- "controlplane",
- "envy",
- "flow-control",
- "futures",
- "getrandom",
- "http1",
- "io-uring",
- "libc",
- "page-alloc",
- "peer-wire",
- "prost",
- "racer-cluster-control",
- "racer-control-wire",
- "racer-core",
- "racer-crypto",
- "racer-gpu",
- "racer-object-wire",
- "rcgen",
- "rdma-verbs",
- "regex",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "telemetry",
- "topology",
- "uds-endpoint",
- "uring-runtime",
- "wire-codec",
- "x509-parser",
  "zeroize",
 ]
 
