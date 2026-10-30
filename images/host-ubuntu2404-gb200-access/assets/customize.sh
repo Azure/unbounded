@@ -5,8 +5,8 @@ set -eu
 
 kernel_release=6.14.0-1003-azure-nvidia
 source_kernel_release=7.0.0-1019-nvidia-64k
-kernel_parameters="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
-forbidden_kernel_parameters="net.ifnames=0"
+kernel_parameters="iommu.passthrough=1 arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
+forbidden_kernel_parameters="net.ifnames=0 irqchip.gicv3_nolpi=y"
 
 fail() {
     echo "$*" >&2

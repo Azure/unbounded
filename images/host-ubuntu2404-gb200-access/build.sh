@@ -12,8 +12,8 @@ source_image=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312
 ubuntu_image=docker.io/library/ubuntu@sha256:18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d
 kernel_release=6.14.0-1003-azure-nvidia
 kernel_version=6.14.0-1003.3
-kernel_parameters="iommu.passthrough=1 irqchip.gicv3_nolpi=y arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
-forbidden_kernel_parameters="net.ifnames=0"
+kernel_parameters="iommu.passthrough=1 arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
+forbidden_kernel_parameters="net.ifnames=0 irqchip.gicv3_nolpi=y"
 
 volume_suffix=
 if [ "$(basename "${container_engine}")" = podman ]; then
