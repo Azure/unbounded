@@ -553,7 +553,7 @@ impl Application {
         if let Some((manager, thread)) = ublk {
             manager.request_stop();
             if thread.join().is_err() {
-                eprintln!("racer-dataplane: component=ublk stage=control state=panicked");
+                eprintln!("racer: component=ublk stage=control state=panicked");
             }
         }
         match result {
@@ -2407,7 +2407,7 @@ fn reserve_ublk_submissions(ublk: &crate::config::UblkConfig, limits: &mut Limit
         // Config parsing bounds the ublk share; the per-worker ordinary
         // queue can still push the total over the cap. Say which sizes did.
         eprintln!(
-            "racer-dataplane: component=ublk stage=reserve error=reactor queue too large queue_entries={} ublk_entries={extra} limit={MAX_UBLK_QUEUE_ENTRIES}",
+            "racer: component=ublk stage=reserve error=reactor queue too large queue_entries={} ublk_entries={extra} limit={MAX_UBLK_QUEUE_ENTRIES}",
             limits.queue_entries.get()
         );
         return Err(Error::InvalidConfiguration);

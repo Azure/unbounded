@@ -272,7 +272,7 @@ fn parse_ublk(
     }
     if raw.len() * usize::from(queue_depth) > MAX_UBLK_TAGS {
         eprintln!(
-            "racer-dataplane: component=ublk stage=config error=too many tags devices={} queue_depth={queue_depth} limit={MAX_UBLK_TAGS}",
+            "racer: component=ublk stage=config error=too many tags devices={} queue_depth={queue_depth} limit={MAX_UBLK_TAGS}",
             raw.len()
         );
         return Err(Error::InvalidConfiguration);
