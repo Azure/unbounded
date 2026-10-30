@@ -137,11 +137,16 @@ python3 /tmp/verify.py \
     --vendor-template /tmp/vendor-data.tmpl \
     --dpkg-status /var/lib/dpkg/status \
     --agent-archive "${agent_archive}"
-agent_verify_dir="$(mktemp -d)"
+mkdir -p /var/lib/unbounded
+agent_verify_dir="$(mktemp -d /var/lib/unbounded/verify-agent.XXXXXX)"
 trap 'rm -rf "${agent_verify_dir}"' EXIT
 tar -xzf "${agent_archive}" -C "${agent_verify_dir}" unbounded-agent
-"${agent_verify_dir}/unbounded-agent" version |
-    grep -Fq "unbounded-agent ${agent_version}"
+if ! agent_version_output="$("${agent_verify_dir}/unbounded-agent" version 2>&1)"; then
+    fail "embedded agent version check failed: ${agent_version_output}"
+fi
+printf '%s\n' "${agent_version_output}" |
+    grep -Fq "unbounded-agent ${agent_version}" ||
+    fail "embedded agent reports unexpected version: ${agent_version_output}"
 rm -rf "${agent_verify_dir}"
 trap - EXIT
 grep -qx 'blacklist nouveau' /etc/modprobe.d/blacklist-nouveau.conf
