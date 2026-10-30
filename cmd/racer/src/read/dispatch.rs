@@ -1017,6 +1017,18 @@ impl WorkerDirectory {
             }
         })
     }
+    /// Run `f` as if this thread did not own its installed worker, so local
+    /// work is queued on the mailbox as another worker's request would be.
+    #[cfg(test)]
+    pub(crate) fn as_remote<T>(&self, f: impl FnOnce() -> T) -> T {
+        let key = self as *const Self as usize;
+        let entry = LOCALS.with(|locals| locals.borrow_mut().remove(&key));
+        let output = f();
+        if let Some(entry) = entry {
+            LOCALS.with(|locals| locals.borrow_mut().insert(key, entry));
+        }
+        output
+    }
     /// Queue a publication on the metadata owner's mailbox, as a fill on
     /// another worker would, even when the owner is this thread.
     #[cfg(test)]

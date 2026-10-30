@@ -228,7 +228,18 @@ pub struct MetadataService {
 
 impl MetadataService {
     /// Page completion handoff: immutable facts only, never fresh admission.
+    ///
+    /// A passthrough cache never retains metadata, so publication is dropped.
+    /// Callers may resume after an await that spanned a switch to passthrough
+    /// and its one-time catalog purge, so the mode is checked here.
     pub fn publish_version(&self, metadata: crate::model::VersionMetadata) -> Result<()> {
+        if self
+            .storage
+            .fill
+            .passthrough(&metadata.version.object.cache)
+        {
+            return Ok(());
+        }
         self.storage.index.publish_version(metadata)
     }
 
@@ -811,11 +822,16 @@ impl MetadataService {
                         .retained_metadata(&version, scope)
                         .await?;
                     scope.check()?;
+                    // The cache may have switched to passthrough during the
+                    // fanout; the retained copy must then be revalidated.
+                    if self.storage.fill.passthrough(&context.object.cache) {
+                        return Ok(None);
+                    }
                     if let Some(metadata) = retained {
                         if metadata.version != version {
                             return Err(Error::CorruptRecord);
                         }
-                        self.storage.index.publish_version(metadata.clone())?;
+                        self.publish_version(metadata.clone())?;
                         Ok(Some(metadata.for_pin()))
                     } else {
                         Ok(None)

@@ -557,6 +557,60 @@ fn queued_publication_is_dropped_after_switching_to_passthrough() {
     }
 }
 
+/// A pinned copy-only lookup can receive a retained descriptor from a page
+/// owner after the cache switched to passthrough. The lookup drops it rather
+/// than republishing it or answering without origin revalidation.
+#[test]
+fn delayed_retained_metadata_is_dropped_after_switching_to_passthrough() {
+    use crate::model::MetadataSelector;
+    use crate::test_support::security::network;
+    for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _queue = queue.enter();
+        let signers = network(1);
+        let mut f = fixture_with(PAGE_BYTES + 7, None);
+        f.reactor.init().unwrap();
+        let membership = f.membership.clone();
+        // A cached read leaves page zero and its metadata in owner memory.
+        acquire_plain(&mut f).unwrap();
+        let version = f.page.version.clone();
+        let index = f.metadata_index(8);
+        let service = f.metadata_service_with_index(f.origin.clone(), 8, index.clone());
+        let (_local, mut endpoint, _publication) =
+            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
+        let directory = f.fill.dependencies.metadata_owner.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        // The lookup queues its retained-metadata request before the owner runs.
+        let mut lookup = service.copy_only(
+            MetadataSelector::Pinned(version.etag.clone()),
+            &f.context,
+            &f.scope,
+        );
+        let first = directory.as_remote(|| lookup.as_mut().poll(&mut cx));
+        assert!(first.is_pending(), "{first:?}");
+        // The owner answers from memory before the switch is observed.
+        for _ in 0..64 {
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        f.set_mode(mode);
+        let mut output = None;
+        for _ in 0..4096 {
+            if let Poll::Ready(result) = lookup.as_mut().poll(&mut cx) {
+                output = Some(result);
+                break;
+            }
+            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        }
+        drop(lookup);
+        let found = output.expect("lookup did not complete").unwrap();
+        assert_eq!(found.is_some(), !mode.passthrough(), "{mode:?}");
+        f.set_mode(CacheMode::Cached);
+        let published = index.version(&version).unwrap();
+        assert_eq!(published.is_some(), !mode.passthrough(), "{mode:?}");
+        endpoint.uninstall().unwrap();
+    }
+}
+
 /// A passthrough stream never selects from peers, so it fills its whole
 /// configured window directly: several blocked origin pages are outstanding
 /// at once rather than only the head plus one page ahead.
