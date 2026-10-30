@@ -28,10 +28,19 @@ type Source struct {
 
 	// Index is the entry's position in that document's overrides list.
 	Index int
+
+	// Field names the document field an entry was made from, such as
+	// images.kubeProxy, rather than a position in the overrides list. Index is
+	// unused when it is set.
+	Field string
 }
 
 // String renders a source for error messages and annotations.
 func (s Source) String() string {
+	if s.Field != "" {
+		return s.Key + ":" + s.Field
+	}
+
 	return fmt.Sprintf("%s[%d]", s.Key, s.Index)
 }
 
@@ -43,7 +52,8 @@ type SourcedEntry struct {
 
 // Parse reads every key in a ConfigMap payload as an independent overrides
 // document and returns the entries in deterministic order: sorted ConfigMap
-// key, then position within that key's document.
+// key, then position within that key's document, then the entries the
+// document's images block stands for.
 //
 // Keys are independent, and a key that fails does not stop the others being
 // read. That is the whole reason the format is one document per key: splitting
@@ -118,6 +128,7 @@ func Parse(data map[string]string) ([]SourcedEntry, []Problem, error) {
 		keyEntries, keyProblems := parseEntries(key, doc)
 
 		entries = append(entries, keyEntries...)
+		entries = append(entries, imageEntries(key, doc)...)
 		problems = append(problems, keyProblems...)
 	}
 

@@ -180,6 +180,10 @@ func describeChanges(entry override.Entry) string {
 		parts = append(parts, "addInit("+strings.Join(entry.AddInitContainers, ",")+")")
 	}
 
+	if entry.KubeProxyImage != "" {
+		parts = append(parts, "kubeProxyImage("+entry.KubeProxyImage+")")
+	}
+
 	return joinNonEmpty(parts, " ")
 }
 

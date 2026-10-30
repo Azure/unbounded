@@ -29,7 +29,7 @@ var schedulingPaths = [][]string{
 //  1. capture the operator's identity and scheduling from the workload
 //  2. strategic-merge every contributor's patch, minus scheduling
 //  3. combine scheduling additively, so operator constraints survive
-//  4. append extraArgs
+//  4. append extraArgs, then the flag images.kubeProxy stands for
 //  5. re-stamp identity and the paths a typed Site field owns, so correctness
 //     does not depend on validation being exhaustive
 //
@@ -68,6 +68,10 @@ func merge(workload *unstructured.Unstructured, contributors []SourcedEntry) err
 	}
 
 	if err := applyExtraArgs(workload, contributors); err != nil {
+		return err
+	}
+
+	if err := applyKubeProxyImage(workload, contributors); err != nil {
 		return err
 	}
 

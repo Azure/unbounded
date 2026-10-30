@@ -114,13 +114,28 @@ does not exist, it uses `registry.k8s.io/kube-proxy:<server version>`.
 
 Set `controller.managedKubeProxy.image` to override the image for all
 unbounded-managed kube-proxy DaemonSets, for example when pulling kube-proxy
-through a private registry. Set `controller.managedKubeProxy.enabled` to `false`
-to disable their creation.
+through a private registry. It takes one of two forms:
+
+- A reference with a tag or digest, such as
+  `myregistry.example.com/kube-proxy:v1.34.2`, is used as-is.
+- A reference without one, such as `myregistry.example.com/kube-proxy`, takes
+  the tag of the image `kube-system/kube-proxy` runs, so a mirror of the
+  provider's kube-proxy keeps the provider's version. If that DaemonSet does
+  not exist, or its image is pinned by digest alone, the tag is the server
+  version. A registry port, as in `localhost:5000/kube-proxy`, is not a tag.
+
+The controller works out the image once, when it starts. When the operator
+manages unbounded-net, the image can also be set through the operator's
+overrides ConfigMap, which validates it before anything is written and takes
+precedence over this setting. See
+[Overriding the managed kube-proxy image]({{< relref "reference/workload-overrides#overriding-the-managed-kube-proxy-image" >}}).
+
+Set `controller.managedKubeProxy.enabled` to `false` to disable their creation.
 
 | Flag | Runtime setting | Default | Description |
 |------|-----------------|---------|-------------|
 | `--managed-kube-proxy` | `controller.managedKubeProxy.enabled` | `true` | Create kube-proxy DaemonSets for unbounded-managed Site nodes not covered by provider kube-proxy. |
-| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. |
+| `--managed-kube-proxy-image` | `controller.managedKubeProxy.image` | `""` | Override the kube-proxy image used by unbounded-managed DaemonSets. Without a tag or digest, the tag comes from `kube-system/kube-proxy`, or the server version. |
 
 ### Leader Election
 
