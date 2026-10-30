@@ -22,8 +22,8 @@ func machineHardRebootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hard-reboot NAME",
 		Short: "Hard-reboot a machine through MachineOperation",
-		Long: `Hard-reboot creates a MachineOperation CR requesting a full host
-power cycle. The machina controller or cloud controller processes the
+		Long: `Hard-reboot creates a HostOutOfBandReboot MachineOperation CR requesting a
+full out-of-band host power cycle. The machina controller or cloud controller processes the
 operation and updates MachineOperation status to "Complete" or "Failed".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -47,7 +47,7 @@ operation and updates MachineOperation status to "Complete" or "Failed".`,
 func runHardReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
 	opName := fmt.Sprintf("%s-hard-reboot-%d", name, time.Now().Unix())
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostReboot, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostOutOfBandReboot, ttlSeconds); err != nil {
 		return err
 	}
 

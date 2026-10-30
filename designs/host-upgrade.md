@@ -145,7 +145,7 @@ chooses the node rootfs image is not a list of supported host updaters.
 
 ### 3.2 Existing documentation needs a follow-up
 
-`designs/lifecycle-operations.md:21-26` assigns standalone HostReboot to
+`designs/lifecycle-operations.md:21-26` assigns standalone HostOutOfBandReboot to
 provider/BMC controllers and NodeReboot to the agent. Its definition of host
 operations is currently limited to power and replacement (`:7-10`); this proposal
 intentionally extends that vocabulary to OS maintenance.
@@ -598,7 +598,7 @@ Unbounded checks health, we need to coordinate or change that setup. We cannot
 promise rollback after another service has already closed that window.
 
 A graceful reboot is part of HostUpgrade itself. Do not create a separate
-provider/BMC HostReboot while holding the upgrade's maintenance claim: the two
+provider/BMC HostOutOfBandReboot while holding the upgrade's maintenance claim: the two
 operations could end up waiting on each other.
 
 ### 8.3 What counts as success
@@ -726,7 +726,7 @@ to respect an upgrade's maintenance claim, even though they do not run upgrades.
 ### 11.2 Shared maintenance ownership
 
 An upgrade must not overlap another HostUpgrade, NodeReboot, AgentUpgrade,
-AgentReset, node repave, HostReboot, HostPowerOff, or HostReplace. Power-on and
+AgentReset, node repave, HostOutOfBandReboot, HostPowerOff, or HostReplace. Power-on and
 other recovery actions also need an explicit recovery decision before bypassing
 the current owner.
 

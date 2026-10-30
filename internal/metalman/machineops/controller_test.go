@@ -121,10 +121,11 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 		{"poweron boot", v1alpha3.OperationHostPowerOn, "disable", redfish.PowerOff, ""},
 		{"poweron state", v1alpha3.OperationHostPowerOn, "state", redfish.PowerOff, ""},
 		{"poweron reset", v1alpha3.OperationHostPowerOn, "On", redfish.PowerOff, ""},
-		{"reboot boot", v1alpha3.OperationHostReboot, "disable", redfish.PowerOn, ""},
-		{"reboot state", v1alpha3.OperationHostReboot, "state", redfish.PowerOn, ""},
-		{"reboot off", v1alpha3.OperationHostReboot, "ForceOff", redfish.PowerOn, ""},
-		{"reboot on", v1alpha3.OperationHostReboot, "On", redfish.PowerOff, v1alpha3.OperationStagePoweringOn},
+		{"reboot boot", v1alpha3.OperationHostOutOfBandReboot, "disable", redfish.PowerOn, ""},
+		{"reboot state", v1alpha3.OperationHostOutOfBandReboot, "state", redfish.PowerOn, ""},
+		{"reboot off", v1alpha3.OperationHostOutOfBandReboot, "ForceOff", redfish.PowerOn, ""},
+		{"reboot on", v1alpha3.OperationHostOutOfBandReboot, "On", redfish.PowerOff, v1alpha3.OperationStagePoweringOn},
+		{"reboot alias off", v1alpha3.OperationHostOOBReboot, "ForceOff", redfish.PowerOn, ""},
 		{"repave factory", v1alpha3.OperationHostReplace, "factory", redfish.PowerOff, ""},
 		{"repave state", v1alpha3.OperationHostReplace, "state", redfish.PowerOff, ""},
 		{"repave off", v1alpha3.OperationHostReplace, "ForceOff", redfish.PowerOn, ""},
@@ -216,7 +217,7 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 func TestReconcilerReadinessDefersExpiredStageTimeout(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostReboot, v1alpha3.OperationHostReplace} {
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostOutOfBandReboot, v1alpha3.OperationHostReplace} {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
 
@@ -289,7 +290,7 @@ func TestRetryTargetPreservesReadinessBudget(t *testing.T) {
 func TestReconcilerOrdinaryRedfishErrorsStillRetryAndFail(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostReboot, v1alpha3.OperationHostReplace} {
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostOutOfBandReboot, v1alpha3.OperationHostReplace} {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
 
@@ -334,7 +335,7 @@ func TestReconcilerDoesNotCompleteRebootPowerOnForTransientState(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	op := testOperation("op-reboot", v1alpha3.OperationHostReboot)
+	op := testOperation("op-reboot", v1alpha3.OperationHostOutOfBandReboot)
 	op.Spec.MachineRef = machine.Name
 	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
 		MachineRef:    machine.Name,
@@ -538,6 +539,29 @@ func TestReconcilerIgnoresMachineRefOutsideSite(t *testing.T) {
 
 	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
 	require.NoError(t, err)
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Empty(t, updated.Status.Phase)
+}
+
+func TestReconcilerIgnoresHostOSReboot(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	op := testOperation("op-soft", v1alpha3.OperationHostOSReboot)
+	op.Spec.MachineRef = machine.Name
+
+	require.False(t, shouldReconcile(op))
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+	require.NoError(t, err)
+	require.Empty(t, power.calls)
 
 	var updated v1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &updated))
