@@ -613,15 +613,26 @@ impl WarmRegistry {
         }
     }
 
-    /// Forget warm state for `cache` once it stops retaining pages. Completed
-    /// jobs are stopped and removed so readers stop waiting on purged copies,
-    /// running jobs are canceled, and its leases are dropped with their unused
-    /// hold capacity queued for release.
+    #[cfg(test)]
     pub(crate) fn forget_cache(&self, cache: &racer_control_wire::CacheId) {
+        self.forget_caches(&std::collections::HashSet::from([cache.clone()]));
+    }
+
+    /// Forget warm state for every cache in `caches` once they stop retaining
+    /// pages, in one pass. Completed jobs are stopped and removed so readers
+    /// stop waiting on purged copies, running jobs are canceled, and their
+    /// leases are dropped with their unused hold capacity queued for release.
+    pub(crate) fn forget_caches(
+        &self,
+        caches: &std::collections::HashSet<racer_control_wire::CacheId>,
+    ) {
+        if caches.is_empty() {
+            return;
+        }
         let mut cancel = Vec::new();
         let mut stopped = Vec::new();
         self.jobs.lock().unwrap().retain(|version, job| {
-            if version.object.cache != *cache {
+            if !caches.contains(&version.object.cache) {
                 return true;
             }
             let progress = job.progress.lock().unwrap();
@@ -644,7 +655,7 @@ impl WarmRegistry {
             let generation = leases.next;
             let mut emptied = Vec::new();
             leases.versions.retain(|version, _| {
-                let keep = version.object.cache != *cache;
+                let keep = !caches.contains(&version.object.cache);
                 if !keep {
                     emptied.push((version.clone(), generation));
                 }

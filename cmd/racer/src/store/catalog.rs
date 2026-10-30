@@ -1250,24 +1250,33 @@ impl Index {
             },
         )
     }
+    #[cfg(test)]
     pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
+        self.remove_caches(&std::collections::HashSet::from([cache.clone()]));
+    }
+    /// Remove holds, pages, and metadata for every cache in `caches` in one
+    /// pass over each table.
+    pub fn remove_caches(&self, caches: &std::collections::HashSet<racer_control_wire::CacheId>) {
+        if caches.is_empty() {
+            return;
+        }
         self.holds
             .borrow_mut()
             .entries
-            .retain(|version, _| &version.object.cache != cache);
+            .retain(|version, _| !caches.contains(&version.object.cache));
         let mut s = self.state.borrow_mut();
         let pages: Vec<_> = s
             .pages
             .keys()
-            .filter(|p| &p.version.object.cache == cache)
+            .filter(|p| caches.contains(&p.version.object.cache))
             .cloned()
             .collect();
         for p in pages {
             Self::remove_page(&mut s, &p);
         }
-        s.metadata.retain(|v, _| &v.object.cache != cache);
-        s.order.retain(|v| &v.object.cache != cache);
-        s.current.retain(|o, _| &o.cache != cache);
+        s.metadata.retain(|v, _| !caches.contains(&v.object.cache));
+        s.order.retain(|v| !caches.contains(&v.object.cache));
+        s.current.retain(|o, _| !caches.contains(&o.cache));
     }
     fn check_length(s: &State, m: &VersionMetadata) -> Result<()> {
         if s.versions
@@ -3041,6 +3050,25 @@ mod priority_tests {
         index.remove_cache(&cache("b"));
         assert_accounting(&index);
         assert_eq!(index.retention().cache_payload_bytes(&cache("b")), 0);
+    }
+
+    #[test]
+    fn remove_caches_removes_only_listed_caches_in_one_call() {
+        let index = index(8, &[("a", 1), ("b", 1), ("c", 1)]);
+        publish(&index, "a", "0", 0);
+        publish(&index, "b", "0", 0);
+        publish(&index, "c", "0", 0);
+        index.remove_caches(&std::collections::HashSet::new());
+        assert_eq!(index.state.borrow().pages.len(), 3);
+        index.remove_caches(&std::collections::HashSet::from([cache("a"), cache("c")]));
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), 0);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("c")), 0);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("b")), PAGE);
+        let s = index.state.borrow();
+        assert_eq!(s.pages.len(), 1);
+        assert!(s.pages.keys().all(|p| p.version.object.cache == cache("b")));
+        assert!(s.metadata.keys().all(|v| v.object.cache == cache("b")));
     }
 
     #[test]

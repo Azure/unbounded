@@ -1333,14 +1333,22 @@ impl StoreWriter {
         })
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
+        self.remove_caches(&std::collections::HashSet::from([cache.clone()]))
+    }
+    /// Remove pending writes and indexed pages for every cache in `caches`
+    /// in one pass over each table.
+    pub fn remove_caches(&self, caches: &std::collections::HashSet<CacheId>) -> Result<()> {
+        if caches.is_empty() {
+            return Ok(());
+        }
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
-        pending.retain(|p, _| &p.version.object.cache != cache);
+        pending.retain(|p, _| !caches.contains(&p.version.object.cache));
         self.note_discard(before - pending.len());
         self.queue
             .borrow_mut()
-            .retain(|p| &p.version.object.cache != cache);
-        self.index.remove_cache(cache);
+            .retain(|p| !caches.contains(&p.version.object.cache));
+        self.index.remove_caches(caches);
         Ok(())
     }
     pub fn is_idle(&self) -> bool {

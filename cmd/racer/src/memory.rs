@@ -1496,15 +1496,24 @@ impl MemoryCache {
         }
         released
     }
+    #[cfg(test)]
     pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
+        self.remove_caches(&std::collections::HashSet::from([cache.clone()]))
+    }
+    /// Remove every entry belonging to any cache in `caches` in one pass over
+    /// each table, so cost does not scale with the number of caches.
+    pub(crate) fn remove_caches(&self, caches: &std::collections::HashSet<CacheId>) -> Result<()> {
+        if caches.is_empty() {
+            return Ok(());
+        }
         self.ciphertext_entries
             .borrow_mut()
-            .retain(|id| &id.version.object.cache != cache);
+            .retain(|id| !caches.contains(&id.version.object.cache));
         let mut entries = self.entries.borrow_mut();
         let removed: Vec<_> = entries
             .pages
             .keys()
-            .filter(|id| &id.version.object.cache == cache)
+            .filter(|id| caches.contains(&id.version.object.cache))
             .cloned()
             .collect();
         for id in removed {
