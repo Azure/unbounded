@@ -1836,20 +1836,16 @@ impl WorkerApplication {
                 self.store.writer.remove_cache(&old.id)?;
             }
         }
-        // A cache entering passthrough drops whatever this worker retained for
-        // it, including records left from before a restart. Reads already skip
-        // such residue once the publication changes.
-        for new in &snapshot.caches {
-            let was_passthrough = self
-                .caches
-                .iter()
-                .find(|old| old.id == new.id)
-                .is_some_and(|old| old.mode.passthrough());
-            if new.mode.passthrough() && !was_passthrough {
-                self.memory.remove_cache(&new.id)?;
-                self.store.writer.remove_cache(&new.id)?;
-                self.node.workers.warm.forget_cache(&new.id);
-            }
+        // Passthrough caches drop whatever this worker retained for them,
+        // including records left from before a restart. Reads observe each
+        // publication directly, but this worker may skip intermediate ones
+        // (passthrough, cached, passthrough), so purge on every changed
+        // snapshot rather than only on an observed transition. Purges are
+        // idempotent and passthrough reads retain nothing, so repeats are safe.
+        for new in snapshot.caches.iter().filter(|new| new.mode.passthrough()) {
+            self.memory.remove_cache(&new.id)?;
+            self.store.writer.remove_cache(&new.id)?;
+            self.node.workers.warm.forget_cache(&new.id);
         }
         current_scope.check()?;
         // Priority changes apply live: memory shares are recomputed now, disk

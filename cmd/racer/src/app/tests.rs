@@ -1719,10 +1719,27 @@ fn snapshot_refresh_purges_cache_entering_passthrough() {
         assert!(retained.upgrade().is_none(), "{mode:?}");
         assert!(index.snapshot_metadata().is_empty(), "{mode:?}");
     }
-    // Leaving passthrough retains again; nothing is purged on the way out.
+    // Reads observe a cached publication the worker never refreshes; data
+    // retained then must still be purged when passthrough is next seen.
     worker
         .snapshots
         .apply(publication(&config, 5, vec![reweighted.clone()]))
+        .unwrap();
+    let retained = retain(&worker);
+    assert_eq!(retained.strong_count(), 1);
+    let mut passthrough = reweighted.clone();
+    passthrough.mode = wire::CacheMode::PassthroughPeers;
+    worker
+        .snapshots
+        .apply(publication(&config, 6, vec![passthrough]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    assert!(retained.upgrade().is_none());
+    assert!(index.snapshot_metadata().is_empty());
+    // Leaving passthrough retains again; nothing is purged on the way out.
+    worker
+        .snapshots
+        .apply(publication(&config, 7, vec![reweighted.clone()]))
         .unwrap();
     worker.refresh_snapshot(&current_scope).unwrap();
     let retained = retain(&worker);
