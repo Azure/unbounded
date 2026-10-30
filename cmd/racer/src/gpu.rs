@@ -1299,7 +1299,7 @@ fn enable_peers(contexts: &[racer_gpu::Context], enabled: bool) -> PeerMatrix {
                     (Err(error), _) => format!("failed reason={error}"),
                 };
                 eprintln!(
-                    "racer-dataplane: stage=gpu ordinal={} peer={} state={status}",
+                    "racer: stage=gpu ordinal={} peer={} state={status}",
                     dst.ordinal(),
                     src.ordinal()
                 );
@@ -1610,7 +1610,7 @@ impl Helper {
         if fenced {
             return;
         }
-        eprintln!("racer-dataplane: stage=gpu ordinal={ordinal} state=ciphertext-quarantined");
+        eprintln!("racer: stage=gpu ordinal={ordinal} state=ciphertext-quarantined");
         match source {
             SealedSource::Host(_) => {}
             SealedSource::Staged { staged, .. } => std::mem::forget(staged.clone()),
@@ -1633,7 +1633,7 @@ impl Helper {
         let stream = request.stream.clone();
         let held = self.tainted.entry(ordinal).or_default();
         if held.is_empty() {
-            eprintln!("racer-dataplane: stage=gpu ordinal={ordinal} state=scratch-tainted");
+            eprintln!("racer: stage=gpu ordinal={ordinal} state=scratch-tainted");
         }
         if !held.iter().any(|known| std::rc::Rc::ptr_eq(known, &stream)) {
             held.push(stream);
@@ -1653,7 +1653,7 @@ impl Helper {
             return Err(Error::Unavailable);
         }
         self.tainted.remove(&ordinal);
-        eprintln!("racer-dataplane: stage=gpu ordinal={ordinal} state=scratch-fenced");
+        eprintln!("racer: stage=gpu ordinal={ordinal} state=scratch-fenced");
         self.note_leaks();
         Ok(())
     }
@@ -1996,7 +1996,7 @@ impl Helper {
                     counters.peer_failures.fetch_add(1, Ordering::Relaxed);
                     if peer.is_some_and(|allowed| allowed.swap(false, Ordering::Relaxed)) {
                         eprintln!(
-                            "racer-dataplane: stage=gpu ordinal={dst} peer={src} state=peer-disabled reason={error}"
+                            "racer: stage=gpu ordinal={dst} peer={src} state=peer-disabled reason={error}"
                         );
                     }
                 }
