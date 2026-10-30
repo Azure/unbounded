@@ -8,6 +8,7 @@ source_kernel_release=7.0.0-1019-nvidia-64k
 kernel_parameters="iommu.passthrough=1 arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
 forbidden_kernel_parameters="net.ifnames=0 irqchip.gicv3_nolpi=y"
 agent_version=v0.17.0-rc.1
+agent_reported_version="${agent_version#v}"
 agent_archive=/opt/unbounded/bootstrap/unbounded-agent-linux-arm64.tar.gz
 
 fail() {
@@ -145,7 +146,7 @@ if ! agent_version_output="$("${agent_verify_dir}/unbounded-agent" version 2>&1)
     fail "embedded agent version check failed: ${agent_version_output}"
 fi
 printf '%s\n' "${agent_version_output}" |
-    grep -Fq "unbounded-agent ${agent_version}" ||
+    grep -Fq "unbounded-agent ${agent_reported_version} " ||
     fail "embedded agent reports unexpected version: ${agent_version_output}"
 rm -rf "${agent_verify_dir}"
 trap - EXIT
