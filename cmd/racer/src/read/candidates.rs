@@ -2753,6 +2753,12 @@ async fn validated_copy<'a, T>(
     }
 }
 impl OriginAuthority {
+    /// This grant as if it followed `evidence` from its predecessors.
+    #[cfg(test)]
+    pub(crate) fn with_predecessor_evidence(mut self, evidence: Vec<ProbeOutcome>) -> Self {
+        self.predecessor_evidence = evidence;
+        self
+    }
     /// The canonical rank this authority was granted at.
     pub(crate) fn rank(&self) -> usize {
         self.rank

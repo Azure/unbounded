@@ -646,7 +646,7 @@ impl MetadataService {
 
     /// A conditional origin miss says nothing about immutable copies on later
     /// candidates. Probe them copy-only before reporting the pin unavailable.
-    async fn copy_after_origin_miss(
+    pub(super) async fn copy_after_origin_miss(
         &self,
         authority: &super::candidates::OriginAuthority,
         selector: &MetadataSelector,
@@ -655,20 +655,24 @@ impl MetadataService {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<crate::origin::MetadataReply> {
-        // No peer retains a passthrough copy, and the local route never asks
-        // peers, so the origin's miss is final.
-        if self.storage.fill.passthrough(&context.object.cache) {
-            return Err(Error::VersionUnavailable);
-        }
-        let candidates = self
-            .candidates
-            .candidates_scoped(membership, &context.object, PageNumber(0), scope)
-            .await?;
         let operation = PeerOperation::Metadata {
             object: context.object.clone(),
             selector: selector.clone(),
             mode: FetchMode::CopyOnly,
         };
+        // No peer retains a passthrough copy, and the local route never asks
+        // peers, so there is nothing to probe. The miss is still classified
+        // from the predecessor evidence, as in cached mode: a predecessor
+        // that was unreachable or overloaded leaves the pin retryable.
+        if self.storage.fill.passthrough(&context.object.cache) {
+            return Err(self
+                .candidates
+                .final_origin_miss(authority, &operation, scope, budget));
+        }
+        let candidates = self
+            .candidates
+            .candidates_scoped(membership, &context.object, PageNumber(0), scope)
+            .await?;
         let response = self
             .candidates
             .remaining_copy(&candidates, context, &operation, scope, budget)

@@ -671,3 +671,57 @@ fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
         endpoint.uninstall().unwrap();
     }
 }
+
+/// A passthrough origin miss for a pinned version skips the copy probes but
+/// keeps cached mode's classification: it is final only after clean misses,
+/// and stays retryable when a predecessor was unreachable or overloaded.
+#[test]
+fn passthrough_pinned_origin_miss_keeps_transient_predecessors_retryable() {
+    use crate::model::MetadataSelector;
+    use crate::read::candidates::ProbeOutcome;
+    use crate::test_support::origin::AdapterOrigin;
+    for mode in MODES {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _queue = queue.enter();
+        let mut f = fixture();
+        f.set_mode(mode);
+        let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
+        let index = f.metadata_index(8);
+        let service = f.metadata_service_with_index(adapter_client(&f, &adapter), 1, index);
+        let selector = MetadataSelector::Pinned(f.origin.metadata.version.etag.clone());
+        for (evidence, expected) in [
+            (vec![], Error::VersionUnavailable),
+            (vec![ProbeOutcome::CopyMiss], Error::VersionUnavailable),
+            (vec![ProbeOutcome::Unreachable], Error::Unavailable),
+            (vec![ProbeOutcome::Overloaded], Error::Unavailable),
+        ] {
+            let authority = f
+                .fill
+                .dependencies
+                .candidates
+                .local_authority(
+                    f.membership.clone(),
+                    &f.page.version.object,
+                    PageNumber(0),
+                    CacheMode::PassthroughLocal,
+                )
+                .unwrap()
+                .with_predecessor_evidence(evidence.clone());
+            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+            let result = drive_io(
+                service.copy_after_origin_miss(
+                    &authority,
+                    &selector,
+                    f.membership.clone(),
+                    &f.context,
+                    &f.scope,
+                    &mut budget,
+                ),
+                &f.reactor,
+                &mut f.engine,
+                &f.crypto,
+            );
+            assert_eq!(result.err(), Some(expected), "{mode:?} {evidence:?}");
+        }
+    }
+}
