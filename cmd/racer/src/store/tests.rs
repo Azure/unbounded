@@ -5531,3 +5531,39 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
     assert_eq!(writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }
+
+/// A fill can resume after the snapshot purge for a cache that switched to
+/// passthrough, and a write can be in flight across the switch. The writer
+/// rechecks the mode at enqueue and at index publication, so neither lands on
+/// disk.
+#[test]
+fn passthrough_cache_never_enqueues_or_publishes_to_disk() {
+    use racer_control_wire::CacheMode;
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let availability = crate::test_support::availability();
+    let f = Fixture::assemble(Directory::new(), availability.clone());
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let index = f.store.writer.index().clone();
+    for mode in [CacheMode::PassthroughPeers, CacheMode::PassthroughLocal] {
+        let copy = f.copy(1, 113);
+        let id = copy.ciphertext.envelope().page.clone();
+        let cache = id.version.object.cache.clone();
+        availability.publish_modes(vec![(cache.clone(), CacheMode::Cached)]);
+        f.store.writer.remove_cache(&cache).unwrap();
+        // Queued while cached, then the mode switches before the write
+        // publishes. The index publication must refuse it.
+        f.enqueue(copy.clone()).unwrap();
+        assert_eq!(f.store.writer.pending_count(), 1);
+        availability.publish_modes(vec![(cache.clone(), mode)]);
+        assert!(f.store.writer.copy_only(&id).unwrap().is_none(), "{mode:?}");
+        drive(&f.reactor, f.store.writer.progress(8, &scope())).unwrap();
+        assert!(index.lookup(&id).unwrap().is_none(), "{mode:?}");
+        // After the purge, a resumed fill cannot enqueue at all.
+        f.store.writer.remove_cache(&cache).unwrap();
+        assert_eq!(f.enqueue(copy), Err(Error::Unavailable), "{mode:?}");
+        assert_eq!(f.store.writer.pending_count(), 0, "{mode:?}");
+        assert!(index.lookup(&id).unwrap().is_none(), "{mode:?}");
+    }
+}

@@ -637,10 +637,14 @@ impl StoreWriter {
             .validate(location.segment, location.generation, &location.extent)?;
         Ok(self.segments.lease(location.segment, location.generation)?)
     }
+    /// Whether `page` may be queued, published, or served from pending work.
+    /// A passthrough cache retains nothing, so this is rechecked at enqueue
+    /// and again at index publication: a fill that resumes after the
+    /// snapshot purge, or a write in flight across it, never lands on disk.
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
-        self.availability
-            .page(&e.page.version.object.cache, e.key_id)
+        let cache = &e.page.version.object.cache;
+        self.availability.page(cache, e.key_id) && !self.availability.passthrough(cache)
     }
     pub fn enqueue(
         &self,
@@ -794,6 +798,12 @@ impl StoreWriter {
             || logical > crate::model::PAGE_BYTES as usize + MAX_HEADER_BYTES + 16
         {
             return Err(Error::InvalidConfiguration);
+        }
+        if self
+            .availability
+            .passthrough(&page.metadata.version.object.cache)
+        {
+            return Err(Error::Unavailable);
         }
         if !self.allowed(&page) {
             return Err(Error::MissingKey);
