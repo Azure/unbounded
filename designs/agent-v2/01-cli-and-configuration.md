@@ -12,6 +12,7 @@ repository baseline, citation conventions and terms.
 | `v2 daemon` | Long-running reconciler, run by `unbounded-agent-v2-daemon.service` |
 | `v2 reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
 | `v2 status [--output json]` | New. Runtime, slots, applied goal version, node readiness and any cleanup leftovers |
+| `v2 migrate [--rollback] [--adopt-machine]` | Move a v1 host, or a machine another `pkg/agent` consumer built, to v2 without replacing its node, or roll that back ([migrating from v1](10-migration-from-v1.md)) |
 | `v2 agent-upgrade [--preflight]` | Activate a staged agent binary without a MachineOperation, for host delivery automation ([lifecycles, section 4](05-lifecycles.md#4-agentupgrade)) |
 | `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
 | `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |

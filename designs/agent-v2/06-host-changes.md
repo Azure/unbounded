@@ -23,6 +23,8 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Daemon units | `unbounded-agent-v2-daemon.service`, `unbounded-agent-v2-daemon-recovery.service` |
 | First-boot unit, if a provisioning tool installed one | For example v1's Ignition unit, `unbounded-agent-bootstrap.service` (`internal/provision/script.go:13`) |
 | Extension host units and files | As declared in each extension ([extensions, section 2](02-extensions.md#2-declarative-extensions)) |
+| On a host migrated from v1: the migration record, and v1's files until v2's first repave | `/var/lib/unbounded/agent-v2/migration.json`, `/var/lib/unbounded/agent-v2/migration/v1-backup/` ([migrating from v1, section 7](10-migration-from-v1.md#7-finishing-and-rollback)) |
+| While a migration is in progress | `unbounded-agent-v2-migrate.service` |
 
 **Host preparation (section 3), for both runtimes:**
 

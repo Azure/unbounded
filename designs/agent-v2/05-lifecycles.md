@@ -202,7 +202,7 @@ sequenceDiagram
   T->>Px: hook node.stop.after, if a node was running
   T->>HN: host network reset, teardown scope
   T->>HP: replay the undo log
-  T->>St: remove node state, artifact cache, slots and /etc/unbounded/agent-v2
+  T->>St: remove node state, artifact cache, slots, any migration backup and /etc/unbounded/agent-v2
   T->>T: remove the agent binary directory, /opt/unbounded/agent
   T->>Px: hook agent.reset.after
   T->>St: remove the install record
@@ -218,3 +218,10 @@ result.
 The agent binary directory is removed because v1 cannot be installed alongside
 v2 ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)), so nothing else uses it. v1's reset removes it the same way
 (`cmd/agent/internal/daemon/lifecycle.go:343-351`).
+
+## 6. Migration from v1
+
+A v1 host becomes a v2 host without replacing its node: v2 takes over the
+running nspawn machine as its slot and replaces only the agent around it. The
+lifecycle, its crash behavior and rollback are in
+[migrating from v1](10-migration-from-v1.md).
