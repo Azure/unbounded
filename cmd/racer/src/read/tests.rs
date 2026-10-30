@@ -8,6 +8,9 @@ mod fill;
 /// Keep a live cache graph for mailbox admission tests without activating listeners.
 pub(super) fn admission_coordinator() -> (Rc<Coordinator>, impl Sized) {
     let f = fill::fixture();
+    // Warm admission reserves hard holds, which need the mounted volume.
+    f.reactor.init().unwrap();
+    let _ = fill::drive_disk(&f, f.fill.dependencies.writer.open(&f.scope)).unwrap();
     let (local, endpoint, _) = f.read_graph(
         Rc::new(f.fill.clone()),
         &f.membership,

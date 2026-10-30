@@ -574,7 +574,7 @@ mod tests {
         let policy = AdmissionPolicy::new(crate::test_support::cluster::config(false).limits);
         assert_eq!(policy.floor(ResourceClass::Ciphertext), 16_842_752);
         for alignment in [512usize, 4096] {
-            let logical = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
+            let logical = crate::store::MAX_RECORD_BYTES;
             let extent = logical.div_ceil(alignment) * alignment;
             assert!(
                 page_alloc::buffer_capacity(extent).unwrap()

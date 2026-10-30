@@ -27,7 +27,6 @@ use crate::security::PageCryptoEngine;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
-use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::Placement;
 use crate::worker::CryptoRuntime;
@@ -293,6 +292,7 @@ pub mod cluster {
             peer_receive: Default::default(),
             shares: NonZeroU32::new(4).unwrap(),
             disk_page_entries: NonZeroUsize::new(65536).unwrap(),
+            disk_metadata_cache_bytes: NonZeroUsize::new(64 << 20).unwrap(),
             admission_mode: crate::config::AdmissionMode::SecondSight,
             admission_history_bytes: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
             admission_period: Duration::from_secs(60),
@@ -323,9 +323,7 @@ pub mod cluster {
             service_account_token: "unused/token".into(),
             identity_directory: "unused/identity".into(),
             slab_directory: "unused/slabs".into(),
-            slab_bytes: 1024 * 1024 * 1024,
-            segment_bytes: 64 * 1024 * 1024,
-            free_segment_reserve: 2,
+            slab_bytes: 64 * page_alloc::volume::SLOT_BYTES,
             origin_connections_per_cache: NonZeroUsize::new(8).unwrap(),
             request_timeout: Duration::from_secs(30),
             peer_attempt_timeout: Duration::from_secs(30),
@@ -496,7 +494,6 @@ pub(crate) struct ReadWorker {
     memory: Rc<MemoryCache>,
     cache: racer_control_wire::CacheId,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    clock: Rc<SegmentClock>,
     reactor: Rc<Reactor>,
     metrics: crate::telemetry::Metrics,
     /// Keep cached pages and queued disk writes between polls.
@@ -562,27 +559,22 @@ impl ReadWorker {
         );
         let buffers = BufferPool::new(admission.clone());
         let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
-        let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
-        // Reads use an empty disk index. No slabs need to be opened or written.
+        // Reads use an unmounted, empty disk. No slabs need to be opened or written.
         let slabs = Rc::new(page_alloc::Slab::new(
             Self::disk_root(&origin).join("slabs/worker-0-slab-0.dat"),
-            256 * 1024 * 1024,
-            64 * 1024 * 1024,
-            crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+            16 * page_alloc::volume::SLOT_BYTES,
+            page_alloc::volume::SLOT_BYTES,
+            crate::store::MAX_RECORD_BYTES,
         ));
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
-            segments.clone(),
             slabs.clone(),
             admission.clone(),
             reactor.clone(),
             availability.clone(),
         ));
-        let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
         let disk = Rc::new(StoreReader::new(
-            clock.clone(),
             index.clone(),
-            segments,
             slabs,
             admission.clone(),
             reactor.clone(),
@@ -661,7 +653,6 @@ impl ReadWorker {
             memory,
             cache: cache.id,
             admission: worker_admission,
-            clock,
             reactor: worker_reactor,
             metrics,
             retain: std::cell::Cell::new(false),
@@ -694,9 +685,29 @@ impl ReadWorker {
     pub fn open_disk(&self) {
         std::fs::create_dir_all(Self::disk_root(&self.origin).join("slabs")).unwrap();
         self.writer
-            .configure(self.admission.clone(), self.clock.clone(), 8, 64)
+            .configure(self.admission.clone(), 8, 64)
             .unwrap();
-        let _ = futures::executor::block_on(self.writer.open()).unwrap();
+        let scope = crate::runtime::RequestScope::new(
+            crate::model::RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut open = self.writer.open(&scope);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let std::task::Poll::Ready(result) = open.as_mut().poll(&mut cx) {
+                let _ = result.unwrap();
+                break;
+            }
+            self.reactor.poll_budgeted(32).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disk open did not finish"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// Write `copy` to disk and wait until it is published.
@@ -734,16 +745,10 @@ impl ReadWorker {
         }
     }
 
-    /// The published disk location of a page, if any.
-    pub fn disk_location(
-        &self,
-        page: &crate::model::PageId,
-    ) -> Option<crate::store::catalog::RecordLocation> {
-        self.writer
-            .index()
-            .lookup(page)
-            .unwrap()
-            .map(|entry| entry.location)
+    /// The slab byte range of a page's published record, if any.
+    pub fn disk_location(&self, page: &crate::model::PageId) -> Option<page_alloc::Extent> {
+        let (offset, length) = self.writer.index().record_extent(page)?;
+        Some(page_alloc::Extent::new(offset, length as usize).unwrap())
     }
 
     /// The slab file backing this worker's disk.

@@ -1287,14 +1287,16 @@ fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
     let checkpoint = fs::read(scratch.0.join("slabs/checkpoint.0")).unwrap();
     let image = checkpoint::decode(&checkpoint).unwrap();
     assert_eq!(image.shards.len(), 1);
-    assert_eq!(
-        image.shards[0].index.entries.len(),
-        3,
-        "graceful cut must contain every encrypted page"
+    assert!(
+        !image.shards[0].index.versions.is_empty(),
+        "graceful cut must describe the versions of encrypted pages"
     );
-    for (page, entry) in &image.shards[0].index.entries {
-        assert_eq!(page.version.object.cache.0, CACHE);
-        assert_eq!(entry.key_id.0, [7; 16]);
+    for entry in &image.shards[0].index.versions {
+        assert_eq!(entry.version.object.cache.0, CACHE);
+        assert_eq!(
+            entry.key_ids.iter().map(|k| k.0).collect::<Vec<_>>(),
+            vec![[7; 16]]
+        );
     }
     drop(origin);
     let (mut second, origin) = Process::start(&scratch, &control, 1);

@@ -18,17 +18,18 @@ import (
 // gpuStagingUnit mirrors GPU_STAGING_UNIT in cmd/racer/src/config.rs.
 const gpuStagingUnit = 2 << 20
 
-// Constants mirrored from cmd/racer/src: MIB, MAX_BYTES, and
-// MAX_ENTRIES in config.rs, PAGE_BYTES in model, DUPLICATE_BYTES in
-// read/candidates.rs, and the storage record size checked in config.rs
-// (a page, a 16-byte tag, and MAX_HEADER_BYTES from store.rs).
+// Constants mirrored from cmd/racer: MIB, MAX_BYTES, and
+// MAX_ENTRIES in src/config.rs, PAGE_BYTES in src/model, DUPLICATE_BYTES in
+// src/read/candidates.rs, and SLOT_BYTES and MIN_SLOTS in
+// alloc/src/volume/format.rs.
 const (
 	mib            = 1 << 20
 	maxBytes       = 64 << 30
 	maxEntries     = 1 << 20
 	pageBytes      = 16 * mib
 	duplicateBytes = 2*pageBytes + 16
-	recordBytes    = pageBytes + 16 + 16384 + 4096
+	slotBytes      = 4104 * 4096
+	minSlots       = 4
 )
 
 // The checks below mirror the startup parsing in
@@ -51,7 +52,9 @@ var (
 	}
 
 	// Inclusive single-key ranges from Config::from_lookup and the validate
-	// methods it calls. Cross-key rules, such as RACER_CRYPTO_HELPERS at most
+	// methods it calls. RACER_SEGMENT_BYTES and RACER_FREE_SEGMENT_RESERVE are
+	// accepted and ignored with a warning, so only their integer syntax is
+	// checked. Cross-key rules, such as RACER_CRYPTO_HELPERS at most
 	// RACER_IO_WORKERS or plaintext budgets that must fit the range window,
 	// are left to the dataplane.
 	dataplaneRangeKeys = map[string][2]uint64{
@@ -78,9 +81,10 @@ var (
 		"RACER_PEER_RECEIVE_MAX":             {0, 65536},
 		"RACER_PEER_RECEIVE_QUEUE_MAX":       {1, 65536},
 		"RACER_PEER_RECEIVE_WAIT_MS":         {1, 30000},
-		"RACER_SLAB_BYTES":                   {1, math.MaxInt64},
-		"RACER_SEGMENT_BYTES":                {recordBytes, math.MaxInt64},
-		"RACER_FREE_SEGMENT_RESERVE":         {1, maxEntries - 1},
+		"RACER_SLAB_BYTES":                   {minSlots * slotBytes, (maxEntries+1)*slotBytes - 1},
+		"RACER_DISK_METADATA_CACHE_BYTES":    {mib, maxBytes},
+		"RACER_SEGMENT_BYTES":                {0, math.MaxUint64},
+		"RACER_FREE_SEGMENT_RESERVE":         {0, math.MaxUint64},
 		"RACER_PLAINTEXT_BYTES":              {1, maxBytes},
 		"RACER_CIPHERTEXT_BYTES":             {1, maxBytes},
 		"RACER_DIRTY_BYTES":                  {pageBytes + 16, maxBytes},

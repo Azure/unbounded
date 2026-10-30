@@ -565,17 +565,16 @@ fn gpu_read_tampered_disk_ciphertext_fails_and_drops_the_record() {
     let data = body(5000);
     let fixture = gpu_fixture(data, &helper);
     arrange(&fixture, &helper, 1, 5000, false, true);
-    let location = worker(&fixture).disk_location(&page_id(0)).unwrap();
+    let extent = worker(&fixture).disk_location(&page_id(0)).unwrap();
     let slab = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(worker(&fixture).slab_path())
         .unwrap();
-    let mut record = vec![0; location.extent.length()];
-    slab.read_exact_at(&mut record, location.extent.offset())
-        .unwrap();
-    let decoded = crate::store::parse_bytes(&record, location.extent).unwrap();
-    let at = location.extent.offset() + decoded.ciphertext.start as u64 + 10;
+    let mut record = vec![0; extent.length()];
+    slab.read_exact_at(&mut record, extent.offset()).unwrap();
+    let decoded = crate::store::parse_bytes(&record, extent).unwrap();
+    let at = extent.offset() + decoded.ciphertext.start as u64 + 10;
     let mut byte = [0];
     slab.read_exact_at(&mut byte, at).unwrap();
     slab.write_all_at(&[byte[0] ^ 1], at).unwrap();

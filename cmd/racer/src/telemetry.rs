@@ -801,7 +801,7 @@ mod warm_metric_tests {
         let snapshot = HeldSnapshot {
             pages: 2,
             payload_bytes: 17,
-            segments: 1,
+            slots: 1,
         };
         workers[0].observe_held(snapshot);
         workers[0].observe_held(snapshot);
@@ -819,7 +819,7 @@ mod warm_metric_tests {
             worker.observe_held(HeldSnapshot {
                 pages: u64::MAX,
                 payload_bytes: u64::MAX,
-                segments: u64::MAX,
+                slots: u64::MAX,
             });
         }
         struct Full;
@@ -1075,8 +1075,8 @@ mod retention_metric_tests {
                 published_payload_bytes: 17,
                 index_evicted_pages: 2,
                 index_evicted_payload_bytes: 34,
-                segment_evicted_pages: 3,
-                segment_evicted_payload_bytes: 51,
+                slot_evicted_pages: 3,
+                slot_evicted_payload_bytes: 51,
                 read_payload_bytes: u64::MAX,
             };
             worker.observe_retention(snapshot);
@@ -3381,7 +3381,7 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::PendingDiskWrites => "racer_pending_disk_writes",
             Self::ActiveDeliveries => "racer_active_deliveries",
             Self::EffectivePayloadBytes => "racer_effective_payload_bytes",
-            Self::SegmentTailBytes => "racer_segment_tail_bytes",
+            Self::SlotTailBytes => "racer_segment_tail_bytes",
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
             Self::MemoryPressureLevel => "racer_memory_pressure_level",
@@ -3449,7 +3449,7 @@ impl Metrics {
             for (total, value) in
                 totals
                     .iter_mut()
-                    .zip([snapshot.pages, snapshot.payload_bytes, snapshot.segments])
+                    .zip([snapshot.pages, snapshot.payload_bytes, snapshot.slots])
             {
                 *total = total.saturating_add(value);
             }
@@ -3564,8 +3564,8 @@ impl Metrics {
                     class.published_payload_bytes,
                     class.index_evicted_pages,
                     class.index_evicted_payload_bytes,
-                    class.segment_evicted_pages,
-                    class.segment_evicted_payload_bytes,
+                    class.slot_evicted_pages,
+                    class.slot_evicted_payload_bytes,
                     class.read_payload_bytes,
                 ]) {
                     *total = total.saturating_add(value);
@@ -5007,15 +5007,15 @@ pub(crate) mod tests {
                             published_payload_bytes: u64::MAX,
                             index_evicted_pages: u64::MAX,
                             index_evicted_payload_bytes: u64::MAX,
-                            segment_evicted_pages: u64::MAX,
-                            segment_evicted_payload_bytes: u64::MAX,
+                            slot_evicted_pages: u64::MAX,
+                            slot_evicted_payload_bytes: u64::MAX,
                             read_payload_bytes: u64::MAX,
                         }; 2],
                     });
                     metrics.observe_held(crate::store::catalog::HeldSnapshot {
                         pages: u64::MAX,
                         payload_bytes: u64::MAX,
-                        segments: u64::MAX,
+                        slots: u64::MAX,
                     });
                     admission
                 })

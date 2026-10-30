@@ -242,12 +242,12 @@ above:
   whole page decrypts straight into the window. The scratch plaintext is not
   wiped; it is dataplane-owned GPU memory that is never read back to the host.
 - The other slots hold cuFile reads. The page's owning worker reads the record
-  header through host memory (`StoreReader::direct_read`), holds the segment
-  lease, and asks the GPU helper to read the ciphertext into a free slot. The
-  helper registers the file with cuFile once and hands the read to one of four
-  reader threads, so several reads run at once while the helper decrypts. In a
-  test on one NVMe drive, one thread reached about 5 GiB/s and two or more
-  reached the drive's limit of about 6 GiB/s. When no slot is free, cuFile
+  header through host memory (`StoreReader::direct_read`), holds a lease on
+  the record's disk volume slot, and asks the GPU helper to read the ciphertext
+  into a free slot. The helper registers the file with cuFile once and hands
+  the read to one of four reader threads, so several reads run at once while
+  the helper decrypts. In a test on one NVMe drive, one thread reached about
+  5 GiB/s and two or more reached the drive's limit of about 6 GiB/s. When no slot is free, cuFile
   fails, or the record is v1, unaligned, or on a simulated descriptor, the
   worker reads the page through host memory instead.
 - The helper opens the cuFile driver on another thread at startup. Opening it
@@ -363,10 +363,9 @@ cuFile needs the ciphertext to start on a 4 KiB boundary on the device, so the
 writer uses a record unit of at least 4 KiB: the slab's direct-I/O extent unit,
 raised to 4 KiB when the extent unit is smaller. Readers still accept any
 `header_len` that is a multiple of 512 bytes, so records written with a smaller
-unit stay readable and are read through host memory. With 4 KiB record units,
-every record in a segment starts 4 KiB aligned relative to the segment, and the
-ciphertext is 4 KiB aligned on the device when the segment's physical start is
-too. The dataplane does not assume this. It computes
+unit stay readable and are read through host memory. Volume records start
+on 4 KiB units within a slot, so with 4 KiB record units the ciphertext is 4 KiB
+aligned on the device when the slot's physical start is too. The dataplane does not assume this. It computes
 the absolute offset for each read and falls back to host memory if the offset is
 not aligned.
 

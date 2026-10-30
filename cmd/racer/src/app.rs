@@ -66,8 +66,7 @@ use crate::store::Store;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
-use crate::store::catalog::SegmentClock;
-use crate::store::checkpoint::CheckpointGeometry;
+use crate::store::checkpoint::CheckpointLayout;
 use crate::store::checkpoint::Checkpointer;
 use crate::store::checkpoint::Recovery;
 use crate::store::checkpoint::ShardImage;
@@ -624,6 +623,42 @@ fn retry_enrollment<T>(
     }
 }
 
+/// Full-page capacity of a volume at actual direct-I/O alignment, conservatively
+/// allowing the largest supported record header, and the slot tail space left
+/// by full-page records. The meta slot holds no pages.
+fn payload_capacity(slot_count: u64, alignment: page_alloc::Alignment) -> Result<(u64, u64)> {
+    use page_alloc::volume::SLOT_BYTES;
+    let record = alignment
+        .extent(0, crate::store::MAX_RECORD_BYTES)?
+        .length() as u64;
+    let pages = SLOT_BYTES / record;
+    let usable = slot_count.saturating_sub(1);
+    Ok((
+        usable * pages * crate::model::PAGE_BYTES,
+        usable * (SLOT_BYTES - pages * record),
+    ))
+}
+
+/// Interval between lazy commits of cache-tier disk index changes.
+const DISK_COMMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether to start a lazy disk commit: changes are pending, none is running,
+/// the worker is not stopping, and the interval passed since the last one
+/// started. Once shutdown begins, the final shutdown commit owns any remaining
+/// changes, so repeated failing attempts cannot hold drain open.
+fn lazy_commit_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    dirty: bool,
+    running: bool,
+    stopping: bool,
+) -> bool {
+    dirty
+        && !running
+        && !stopping
+        && last.is_none_or(|last| now.saturating_duration_since(last) >= DISK_COMMIT_INTERVAL)
+}
+
 /// Create a bounded scope for application-owned lifecycle operations.
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
@@ -981,6 +1016,12 @@ pub struct WorkerApplication {
     peer_task: Option<Operation<'static, ()>>,
 
     writer_task: Option<Operation<'static, ()>>,
+
+    /// Lazy commit of cache-tier disk index changes.
+    commit_task: Option<Operation<'static, ()>>,
+
+    /// Start of the last lazy commit.
+    last_commit: Option<std::time::Instant>,
 
     /// Successful I/O returns its reserved slot instead of toggling shared state blindly.
     checkpoint_task: Option<Operation<'static, recovery::Publication>>,
@@ -1480,6 +1521,8 @@ impl WorkerApplication {
             keyring_scope: None,
             peer_task: None,
             writer_task: None,
+            commit_task: None,
+            last_commit: None,
             checkpoint_task: None,
             checkpoint_snapshot: None,
             checkpoint_generation: 0,
@@ -1659,17 +1702,16 @@ impl WorkerApplication {
             limits.metadata_entries.get(),
             availability.clone(),
         ));
-        let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
-        let eviction = Rc::new(SegmentClock::with_budget(
-            index.clone(),
-            segments.clone(),
-            config.free_segment_reserve,
-            crate::store::catalog::FOREGROUND_RECLAIM_BUDGET,
-        ));
         let devices = node
             .devices
             .as_ref()
             .map(|plan| &plan.workers[worker.0 as usize]);
+        // File mode uses whole volume slots; a remainder is left unused.
+        let slab_bytes =
+            config.slab_bytes / page_alloc::volume::SLOT_BYTES * page_alloc::volume::SLOT_BYTES;
+        let slab_file = config
+            .slab_directory
+            .join(format!("worker-{}-slab-0.dat", worker.0));
         let slabs = Rc::new(if let Some(devices) = devices {
             page_alloc::Slab::from_devices(
                 devices
@@ -1680,32 +1722,26 @@ impl WorkerApplication {
                         offset: placement.offset,
                     })
                     .collect(),
-                config.segment_bytes,
-                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                page_alloc::volume::SLOT_BYTES,
+                crate::store::MAX_RECORD_BYTES,
                 devices.alignment,
             )?
         } else {
             page_alloc::Slab::new(
-                config
-                    .slab_directory
-                    .join(format!("worker-{}-slab-0.dat", worker.0)),
-                config.slab_bytes,
-                config.segment_bytes,
-                crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
+                slab_file,
+                slab_bytes,
+                page_alloc::volume::SLOT_BYTES,
+                crate::store::MAX_RECORD_BYTES,
             )
-            // Slab files are a re-fetchable cache. A checkpoint taken at the old
-            // size no longer matches slab_bytes, so recovery starts this worker
-            // cold. An older checkpoint taken at the new size, as after a resize
-            // rollback, may still be accepted; record validation and AEAD then
-            // turn its references to discarded pages into misses, as for any
-            // checkpoint that outlives its payload.
+            // Slab files are a re-fetchable cache. A file left at another size,
+            // by an older layout or a resize, is truncated and recreated at
+            // slab_bytes under the slab's exclusive lock, held through mount,
+            // and the volume is then formatted fresh.
             .reset_mismatched_size()
         });
         let reader = Rc::new(
             StoreReader::new(
-                eviction.clone(),
                 index.clone(),
-                segments.clone(),
                 slabs.clone(),
                 runtime.admission.clone(),
                 runtime.reactor.clone(),
@@ -1713,38 +1749,37 @@ impl WorkerApplication {
             )
             .with_metrics(metrics.clone()),
         );
-        let writer = Rc::new(
-            StoreWriter::new(
-                index.clone(),
-                segments.clone(),
-                slabs,
-                runtime.admission.clone(),
-                runtime.reactor.clone(),
-                availability,
-            )
-            .with_metrics(metrics.clone())
-            .with_disk_groups(devices.map_or_else(
-                || {
-                    vec![(
-                        format!("file:worker-{}-slab-0.dat", worker.0).into(),
-                        (config.slab_bytes / config.segment_bytes) as usize,
-                    )]
-                },
-                |devices| devices.disk_groups.clone(),
-            )),
-        );
+        let writer = StoreWriter::new(
+            index.clone(),
+            slabs,
+            runtime.admission.clone(),
+            runtime.reactor.clone(),
+            availability,
+        )
+        .with_metrics(metrics.clone())
+        .with_disk_groups(devices.map_or_else(
+            || {
+                vec![(
+                    format!("file:worker-{}-slab-0.dat", worker.0).into(),
+                    (slab_bytes / page_alloc::volume::SLOT_BYTES) as usize,
+                )]
+            },
+            |devices| devices.disk_groups.clone(),
+        ));
+        let writer = Rc::new(writer);
         let disk_page_entries = devices
             .map_or((config.disk_page_entries.get() / node.count).max(1), |d| {
                 d.page_entries
             });
         writer.configure(
             runtime.admission.clone(),
-            eviction.clone(),
             limits.queue_entries.get(),
             disk_page_entries,
         )?;
+        writer.set_metadata_cache_bytes(config.disk_metadata_cache_bytes.get());
         // Install once before Fill attaches current-membership ownership. The
-        // writer, index, and segment clock all consult this same worker policy.
+        // writer, index, and volume eviction accounting all consult this same
+        // worker policy.
         writer.set_retention(Rc::new(crate::retention::Retention::configured(
             config.admission_history_per_worker(node.count)?,
             disk_page_entries
@@ -1762,17 +1797,11 @@ impl WorkerApplication {
             reader,
             writer,
             checkpoint: Rc::new(
-                Checkpointer::new(
-                    config.slab_directory.clone(),
-                    index.clone(),
-                    segments.clone(),
-                )
-                .with_layout(
+                Checkpointer::new(config.slab_directory.clone(), index.clone()).with_layout(
                     devices.map_or(crate::store::checkpoint::FILE_LAYOUT_DIGEST, |d| d.digest),
                 ),
             ),
-            recovery: Recovery::new(config.slab_directory.clone(), index, segments),
-            eviction,
+            recovery: Recovery::new(index),
         })
     }
 
@@ -2191,8 +2220,46 @@ impl WorkerApplication {
             let writer = self.store.writer.clone();
             let write_scope = scope(self.timeout)?;
             self.writer_task = Some(Box::pin(async move {
-                writer.progress(8, &write_scope).await.map(|_| ())
+                writer
+                    .progress(crate::store::WRITER_PROGRESS_BUDGET, &write_scope)
+                    .await
+                    .map(|_| ())
             }));
+        }
+        self.poll_disk_commit(cx)
+    }
+
+    /// Commit cache-tier disk index changes about once per second while there
+    /// are any, including freed space that only later commits release. Storage-tier writes commit before they are acknowledged, so a
+    /// crash loses at most the cache pages of the last interval.
+    fn poll_disk_commit(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        if let Some(Err(error)) = poll_task(&mut self.commit_task, cx)
+            && !crate::store::is_disposable_commit_error(&error)
+        {
+            return Err(error);
+        }
+        let now = uring_runtime::environment::now();
+        let index = self.store.writer.index();
+        // Queued maintenance (prefetches for memory-only callers, cache
+        // removals) and a full dirty limit do not wait for the interval.
+        let urgent = (index.maintenance_due() || index.needs_commit())
+            && self.commit_task.is_none()
+            && !self.stopping;
+        if urgent
+            || lazy_commit_due(
+                self.last_commit,
+                now,
+                index.is_dirty(),
+                self.commit_task.is_some(),
+                self.stopping,
+            )
+        {
+            self.last_commit = Some(now);
+            let writer = self.store.writer.clone();
+            let commit_scope = scope(self.timeout)?;
+            self.commit_task = Some(Box::pin(
+                async move { writer.maintain(&commit_scope).await },
+            ));
         }
         Ok(())
     }
@@ -2498,6 +2565,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                     && self.peer_task.is_none()
                     && self.ingress_peers.is_empty()
                     && self.writer_task.is_none()
+                    && self.commit_task.is_none()
                     && self.checkpoint_task.is_none()
                     && self.checkpoint_snapshot.is_none()
                     && self.checkpoint_generation == 0
@@ -2510,6 +2578,13 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 }
             })
             .await;
+            // Make the last cache inserts durable on a clean shutdown. A cache
+            // commit failure only loses those pages.
+            if let Err(error) = self.store.writer.commit(&deadline).await
+                && !crate::store::is_disposable_commit_error(&error)
+            {
+                first_error.get_or_insert(error);
+            }
             if let Some(links) = &self.links {
                 links.drain().await?;
             }
@@ -2866,7 +2941,7 @@ impl WorkerApplication {
             self.worker,
             Resources {
                 workers_usable: self.started && !self.stopping,
-                storage_usable: self.store.writer.slabs().alignment().is_ok(),
+                storage_usable: self.store.writer.index().is_mounted(),
                 listeners_usable: self.started
                     && (self.control.is_none()
                         || self.peer_task.is_some() && self.diagnostic_task.is_some()),
@@ -2906,7 +2981,7 @@ impl WorkerApplication {
                 .checkpoint
                 .prepare_directory(&self.runtime.reactor, startup)
                 .await?;
-            let geometry = self.prepare_storage().await?;
+            let geometry = self.prepare_storage(startup).await?;
             self.endpoint = Some(
                 self.directory
                     .install(self.worker, self.coordinator.clone())?,
@@ -2933,24 +3008,25 @@ impl WorkerApplication {
     }
 
     /// Open storage and publish the effective disk capacity metrics.
-    async fn prepare_storage(&self) -> Result<CheckpointGeometry> {
-        let _ = self.store.open().await?;
-        let geometry = self.store.checkpoint.geometry()?;
-        let (payload, tail) = geometry.payload_capacity(
-            self.store.eviction.reserve(),
-            self.store.writer.index().page_capacity(),
-        )?;
+    async fn prepare_storage(&self, startup: &RequestScope) -> Result<CheckpointLayout> {
+        let alignment = self.store.open(startup).await?;
+        let layout = self.store.checkpoint.layout()?;
+        let slots = self
+            .store
+            .writer
+            .index()
+            .volume()
+            .map_or(0, |volume| volume.slot_count());
+        let (payload, tail) = payload_capacity(slots, alignment)?;
         self.telemetry
             .metrics
             .add_gauge(Gauge::EffectivePayloadBytes, payload);
-        self.telemetry
-            .metrics
-            .add_gauge(Gauge::SegmentTailBytes, tail);
+        self.telemetry.metrics.add_gauge(Gauge::SlotTailBytes, tail);
         self.telemetry.metrics.add_gauge(
             Gauge::DiskPageEntries,
             self.store.writer.index().page_capacity() as u64,
         );
-        Ok(geometry)
+        Ok(layout)
     }
 
     /// Drive enrollment and local installation until the first publication is accepted.

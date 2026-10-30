@@ -143,10 +143,10 @@ impl CheckpointCut {
     }
 }
 
-/// Startup rendezvous for geometry validation and all-worker installation.
+/// Startup rendezvous for layout validation and all-worker installation.
 #[derive(Default)]
 pub(super) struct RecoveryCut {
-    geometry: HashMap<WorkerId, CheckpointGeometry>,
+    layout: HashMap<WorkerId, CheckpointLayout>,
 
     selected: bool,
 
@@ -176,26 +176,19 @@ impl WorkerApplication {
                 return Err(error);
             }
         };
-        image.index.entries.retain(|(page, entry)| {
-            self.caches
-                .iter()
-                .any(|c| c.id == page.version.object.cache)
-                && self
-                    .keys
-                    .lease(
-                        Some(&page.version.object.cache),
-                        entry.key_id,
-                        KeyPurpose::Page,
-                    )
-                    .is_ok()
-        });
-        image.index.metadata.retain(|m| {
-            self.caches.iter().any(|c| c.id == m.version.object.cache)
-                && self
-                    .keys
-                    .active(&m.version.object.cache, KeyPurpose::Page)
-                    .is_ok()
-        });
+        image.index.retain_available(
+            |cache| {
+                self.caches.iter().any(|c| &c.id == cache)
+                    && self.keys.active(cache, KeyPurpose::Page).is_ok()
+            },
+            |cache, key_id| {
+                self.caches.iter().any(|c| &c.id == cache)
+                    && self
+                        .keys
+                        .lease(Some(cache), key_id, KeyPurpose::Page)
+                        .is_ok()
+            },
+        );
         {
             let mut cut = node.checkpoint.lock().map_err(|_| Error::Unavailable)?;
             if let Some(result) = cut.result() {
@@ -392,15 +385,15 @@ impl WorkerApplication {
     /// Validate a whole-node recovery candidate before installing any worker shard.
     pub(super) async fn recover_node(
         &self,
-        geometry: CheckpointGeometry,
+        layout: CheckpointLayout,
         startup: &RequestScope,
     ) -> Result<()> {
         let node = &self.node;
         node.recovery
             .lock()
             .map_err(|_| Error::Unavailable)?
-            .geometry
-            .insert(self.worker, geometry);
+            .layout
+            .insert(self.worker, layout);
         std::future::poll_fn(|cx| {
             startup.check()?;
             if STOP_REQUESTED.load(Ordering::Relaxed) {
@@ -410,7 +403,7 @@ impl WorkerApplication {
             if let Some(error) = cut.failure {
                 return Poll::Ready(Err(error));
             }
-            if cut.geometry.len() == node.count {
+            if cut.layout.len() == node.count {
                 Poll::Ready(Ok(()))
             } else {
                 cx.waker().wake_by_ref();
@@ -449,7 +442,7 @@ impl WorkerApplication {
                         });
                     let selected = select(
                         images,
-                        &cut.geometry,
+                        &cut.layout,
                         &node.workers,
                         (
                             self.store.writer.index().page_capacity(),
@@ -517,6 +510,27 @@ impl WorkerApplication {
             }
         })
         .await?;
+        // Cache removals are committed lazily, so a crash can bring back pages
+        // of a removed cache. Drop them before any request is admitted.
+        let accepted: Vec<_> = self
+            .snapshots
+            .current()?
+            .caches
+            .iter()
+            .map(|cache| cache.id.clone())
+            .collect();
+        let purged = self
+            .store
+            .writer
+            .index()
+            .retain_caches(&accepted, startup)
+            .await?;
+        if purged != 0 {
+            eprintln!(
+                "racer: worker {} removed {purged} disk pages of removed caches",
+                self.worker.0
+            );
+        }
         Ok(())
     }
 }
@@ -524,7 +538,7 @@ impl WorkerApplication {
 /// Select the newest compatible candidate without retaining two decoded images.
 fn select(
     candidates: impl IntoIterator<Item = CheckpointImage>,
-    geometry: &HashMap<WorkerId, CheckpointGeometry>,
+    layout: &HashMap<WorkerId, CheckpointLayout>,
     workers: &WorkerDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
@@ -536,7 +550,7 @@ fn select(
         let sequence = image.sequence;
         let selected = validate_candidate(
             image,
-            geometry,
+            layout,
             workers,
             (page_capacity, metadata_capacity),
             keys,
@@ -549,10 +563,10 @@ fn select(
     })
 }
 
-/// Filter unavailable keys and caches, then validate geometry, capacity, and ownership.
+/// Filter unavailable keys and caches, then validate layout, capacity, and ownership.
 fn validate_candidate(
     mut image: CheckpointImage,
-    geometry: &HashMap<WorkerId, CheckpointGeometry>,
+    layout: &HashMap<WorkerId, CheckpointLayout>,
     workers: &WorkerDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
@@ -563,7 +577,7 @@ fn validate_candidate(
         return None;
     }
     let ids: HashSet<_> = image.shards.iter().map(|s| s.worker).collect();
-    if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
+    if ids.len() != image.shards.len() || ids != layout.keys().copied().collect() {
         return None;
     }
     let available = |cache: &racer_control_wire::CacheId| caches.iter().any(|c| &c.id == cache);
@@ -573,7 +587,7 @@ fn validate_candidate(
         |cache, id| available(cache) && keys.lease(Some(cache), id, KeyPurpose::Page).is_ok(),
     );
     for shard in &image.shards {
-        if geometry.get(&shard.worker) != Some(&shard.geometry) || shard.validate().is_err() {
+        if layout.get(&shard.worker) != Some(&shard.layout) || shard.validate().is_err() {
             return None;
         }
         if page_capacity == 0 {
@@ -583,14 +597,13 @@ fn validate_candidate(
             .index
             .validate_capacity(page_capacity, metadata_capacity)
             .ok()?;
+        // Version descriptors follow pages, which any worker may hold, so only
+        // standalone descriptors have a single owner.
         if shard
             .index
-            .entries
+            .metadata
             .iter()
-            .any(|(page, _)| workers.page_owner(page) != Ok(shard.worker))
-            || shard.index.metadata.iter().any(|metadata| {
-                workers.metadata_owner(&metadata.version.object) != Ok(shard.worker)
-            })
+            .any(|metadata| workers.metadata_owner(&metadata.version.object) != Ok(shard.worker))
         {
             return None;
         }
@@ -605,8 +618,7 @@ mod tests {
     use super::*;
     use crate::store::catalog::IndexSnapshot;
     use crate::store::checkpoint::CHECKPOINT_VERSION;
-    use page_alloc::Alignment;
-    use page_alloc::Segments;
+    use crate::store::versions::VersionEntry;
 
     /// Cold cuts keep their distinct slot policy; later cuts alternate after success.
     #[test]
@@ -820,8 +832,10 @@ mod tests {
         assert_eq!(cut.result(), Some(Err(Error::Io)));
     }
 
-    fn geometry() -> CheckpointGeometry {
-        CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
+    fn geometry() -> CheckpointLayout {
+        CheckpointLayout {
+            layout_digest: crate::store::checkpoint::FILE_LAYOUT_DIGEST,
+        }
     }
     fn caches() -> Vec<racer_control_wire::CacheDefinition> {
         let mut cache = crate::app::tests::definition();
@@ -835,25 +849,10 @@ mod tests {
             sequence,
             shards: ids
                 .iter()
-                .map(|worker| {
-                    let g = geometry();
-                    let segments = Segments::new(g.segment_bytes);
-                    segments
-                        .configure(
-                            g.slab_bytes,
-                            g.segment_count as usize,
-                            g.alignment().unwrap(),
-                        )
-                        .unwrap();
-                    ShardImage {
-                        worker: *worker,
-                        geometry: g,
-                        index: IndexSnapshot {
-                            entries: vec![],
-                            metadata: vec![],
-                        },
-                        segments: segments.snapshot(),
-                    }
+                .map(|worker| ShardImage {
+                    worker: *worker,
+                    layout: geometry(),
+                    index: IndexSnapshot::default(),
                 })
                 .collect(),
         }
@@ -871,17 +870,8 @@ mod tests {
         let candidate = |sequence, digests: [[u8; 32]; 2]| {
             let mut cut = image(sequence, &ids);
             for (i, shard) in cut.shards.iter_mut().enumerate() {
-                shard.geometry = layouts[i];
-                shard.geometry.layout_digest = digests[i];
-                let segments = Segments::new(shard.geometry.segment_bytes);
-                segments
-                    .configure(
-                        shard.geometry.slab_bytes,
-                        6,
-                        shard.geometry.alignment().unwrap(),
-                    )
-                    .unwrap();
-                shard.segments = segments.snapshot();
+                shard.layout = layouts[i];
+                shard.layout.layout_digest = digests[i];
             }
             cut
         };
@@ -895,16 +885,16 @@ mod tests {
                 })
                 .collect()
         };
-        let choose = |cuts, geometry: &HashMap<WorkerId, CheckpointGeometry>| {
+        let choose = |cuts, geometry: &HashMap<WorkerId, CheckpointLayout>| {
             select(cuts, geometry, &node.workers, (4, 4), &keys, &caches())
         };
         let g = live(guarded);
         assert!(choose(vec![candidate(2, mismatched), candidate(1, mismatched)], &g).is_none());
         let mut mixed = candidate(3, guarded);
-        mixed.shards[1].geometry.layout_digest = mismatched[1];
+        mixed.shards[1].layout.layout_digest = mismatched[1];
         assert!(choose(vec![mixed], &g).is_none());
         let mut mixed = candidate(3, guarded);
-        mixed.shards[1].geometry.layout_digest = mismatched[1];
+        mixed.shards[1].layout.layout_digest = mismatched[1];
         assert_eq!(
             choose(vec![mixed, candidate(2, guarded)], &g)
                 .unwrap()
@@ -919,15 +909,6 @@ mod tests {
                     4,
                     crate::test_support::availability(),
                 ));
-                let segments = Rc::new(Segments::new(shard.geometry.segment_bytes));
-                segments
-                    .configure(
-                        shard.geometry.slab_bytes,
-                        shard.geometry.segment_count as usize,
-                        shard.geometry.alignment().unwrap(),
-                    )
-                    .unwrap();
-                let fresh = segments.snapshot();
                 let metadata = crate::model::VersionMetadata {
                     content_type: None,
                     version: crate::model::ObjectVersion {
@@ -939,51 +920,18 @@ mod tests {
                     },
                     length: 17,
                 };
-                let (lease, extent) = segments.append(4096).unwrap();
-                let allocated = segments
-                    .snapshot()
-                    .into_iter()
-                    .find(|s| matches!(s.state, page_alloc::SegmentState::Open))
-                    .unwrap();
-                index
-                    .publish(
-                        crate::model::PageId {
-                            version: metadata.version.clone(),
-                            number: crate::model::PageNumber(0),
-                        },
-                        crate::store::catalog::IndexedPage {
-                            location: crate::store::catalog::RecordLocation {
-                                segment: allocated.id,
-                                generation: allocated.generation,
-                                extent,
-                            },
-                            metadata: metadata.clone(),
-                            key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                        },
-                    )
-                    .unwrap();
                 index.publish_version(metadata).unwrap();
-                drop(lease);
-                assert!(!index.snapshot().unwrap().entries.is_empty());
                 assert!(!index.snapshot().unwrap().metadata.is_empty());
-                assert_ne!(segments.snapshot(), fresh);
-                let recovery =
-                    Recovery::new(std::path::PathBuf::new(), index.clone(), segments.clone());
-                recovery.configure_geometry(shard.geometry).unwrap();
+                let recovery = Recovery::new(index.clone());
+                recovery.configure_layout(shard.layout);
                 futures::executor::block_on(recovery.install_shard(if reset {
                     None
                 } else {
                     Some(shard)
                 }))
                 .unwrap();
-                assert!(index.snapshot().unwrap().entries.is_empty());
+                assert!(index.snapshot().unwrap().versions.is_empty());
                 assert!(index.snapshot().unwrap().metadata.is_empty());
-                // Freeing the occupied slot advances its generation so the
-                // discarded record location can never validate again.
-                let mut expected = fresh;
-                expected[allocated.id.0 as usize].generation =
-                    page_alloc::Generation(allocated.generation.0 + 1);
-                assert_eq!(segments.snapshot(), expected);
             }
         };
         install(candidate(0, guarded), true);
@@ -1001,16 +949,16 @@ mod tests {
         );
     }
 
-    /// A geometry change (slab size, segment size, or worker count) skips stale
-    /// checkpoints and starts cold instead of failing node recovery.
+    /// A layout change (slab or device geometry) or a changed worker count
+    /// skips stale checkpoints and starts cold instead of failing node recovery.
     #[test]
-    fn changed_slab_size_or_worker_count_skips_stale_checkpoint() {
+    fn changed_layout_or_worker_count_skips_stale_checkpoint() {
         let node = NodeState::default();
         let keys = crate::test_support::security::keys();
-        let live = |ids: &[WorkerId], g: CheckpointGeometry| -> HashMap<_, _> {
+        let live = |ids: &[WorkerId], g: CheckpointLayout| -> HashMap<_, _> {
             ids.iter().map(|id| (*id, g)).collect()
         };
-        let choose = |cuts: Vec<CheckpointImage>, g: &HashMap<WorkerId, CheckpointGeometry>| {
+        let choose = |cuts: Vec<CheckpointImage>, g: &HashMap<WorkerId, CheckpointLayout>| {
             select(cuts, g, &node.workers, (4, 4), &keys, &caches())
         };
         let three = [WorkerId(0), WorkerId(1), WorkerId(2)];
@@ -1021,19 +969,15 @@ mod tests {
             WorkerId(3),
             WorkerId(4),
         ];
-        // Sanity: an unchanged geometry and worker set recovers.
+        // Sanity: an unchanged layout and worker set recovers.
         assert!(choose(vec![image(1, &three)], &live(&three, geometry())).is_some());
-        // Larger slab per worker.
-        let bigger =
-            CheckpointGeometry::new(16384, 4096, 4, Alignment::new(4096, 4096, 4096).unwrap())
-                .unwrap();
+        // A different storage layout, such as a resized slab or device set.
+        let bigger = CheckpointLayout {
+            layout_digest: [0xa5; 32],
+        };
+        assert_ne!(bigger.layout_digest, geometry().layout_digest);
         assert!(choose(vec![image(1, &three)], &live(&three, bigger)).is_none());
-        // Different segment size.
-        let segment =
-            CheckpointGeometry::new(8192, 8192, 1, Alignment::new(4096, 4096, 4096).unwrap())
-                .unwrap();
-        assert!(choose(vec![image(1, &three)], &live(&three, segment)).is_none());
-        // More workers, with and without a slab size change.
+        // More workers, with and without a layout change.
         assert!(choose(vec![image(1, &three)], &live(&five, geometry())).is_none());
         assert!(choose(vec![image(1, &three)], &live(&five, bigger)).is_none());
         // Fewer workers.
@@ -1127,8 +1071,6 @@ mod tests {
     {
         use crate::model::VersionMetadata;
         use crate::model::*;
-        use crate::store::catalog::IndexedPage;
-        use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
         let keys = crate::test_support::security::keys();
@@ -1137,15 +1079,6 @@ mod tests {
         let g = geometry();
         let geometry = [(WorkerId(0), g)].into_iter().collect();
         let mut old = image(8, &[WorkerId(0)]);
-        let segments = Segments::new(g.segment_bytes);
-        segments
-            .configure(
-                g.slab_bytes,
-                g.segment_count as usize,
-                g.alignment().unwrap(),
-            )
-            .unwrap();
-        let append = segments.append(4096).unwrap();
         let metadata = VersionMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -1157,24 +1090,10 @@ mod tests {
             },
             length: 3,
         };
-        let page = PageId {
-            version: metadata.version.clone(),
-            number: PageNumber(0),
-        };
-        old.shards[0].index.entries.push((
-            page.clone(),
-            IndexedPage {
-                location: RecordLocation {
-                    segment: append.0.id(),
-                    generation: append.0.generation(),
-                    extent: append.1,
-                },
-                metadata: metadata.clone(),
-                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
-            },
-        ));
-        drop(append);
-        old.shards[0].segments = segments.snapshot();
+        let mut version = VersionEntry::new(metadata.clone());
+        version.add_key_id(crate::model::key_id_from_generation(1, 1).unwrap());
+        version.add_key_id(racer_control_wire::KeyId([98; 16]));
+        old.shards[0].index.versions.push(version);
         let mut standalone = metadata.clone();
         standalone.version.etag = StrongEtag::test_value("head-only");
         standalone.length = 0;
@@ -1191,7 +1110,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(removed.shards[0].index.entries.is_empty());
+        assert!(removed.shards[0].index.versions.is_empty());
         assert!(removed.shards[0].index.metadata.is_empty());
         let retained = select(
             vec![decoded()],
@@ -1202,10 +1121,16 @@ mod tests {
             &caches,
         )
         .unwrap();
-        assert_eq!(retained.shards[0].index.entries.len(), 1);
+        assert_eq!(retained.shards[0].index.versions.len(), 1);
+        // Unavailable page keys are dropped; the version keeps the live one.
+        assert_eq!(
+            retained.shards[0].index.versions[0].key_ids,
+            vec![crate::model::key_id_from_generation(1, 1).unwrap()]
+        );
         assert_eq!(retained.shards[0].index.metadata, vec![standalone]);
         let mut missing_page = decoded();
-        missing_page.shards[0].index.entries[0].1.key_id = racer_control_wire::KeyId([99; 16]);
+        missing_page.shards[0].index.versions[0].key_ids =
+            vec![racer_control_wire::KeyId([99; 16])];
         let filtered = select(
             vec![missing_page],
             &geometry,
@@ -1215,7 +1140,7 @@ mod tests {
             &caches,
         )
         .unwrap();
-        assert!(filtered.shards[0].index.entries.is_empty());
+        assert!(filtered.shards[0].index.versions.is_empty());
         assert_eq!(filtered.shards[0].index.metadata.len(), 1);
         keys.install(racer_control_wire::KeyringBundle {
             schema_version: 1,
@@ -1234,26 +1159,17 @@ mod tests {
             &caches,
         )
         .unwrap();
-        assert!(keyless.shards[0].index.entries.is_empty());
+        assert!(keyless.shards[0].index.versions.is_empty());
         assert!(keyless.shards[0].index.metadata.is_empty());
         let index = Rc::new(Index::new(
             WorkerId(0),
             16,
             crate::test_support::availability(),
         ));
-        let segments = Rc::new(Segments::new(g.segment_bytes));
-        segments
-            .configure(
-                g.slab_bytes,
-                g.segment_count as usize,
-                g.alignment().unwrap(),
-            )
-            .unwrap();
-        let recovery = Recovery::new(std::path::PathBuf::new(), index.clone(), segments);
-        recovery.configure_geometry(g).unwrap();
+        let recovery = Recovery::new(index.clone());
+        recovery.configure_layout(g);
         futures::executor::block_on(recovery.install_shard(keyless.shards.into_iter().next()))
             .unwrap();
-        assert!(index.lookup(&page).unwrap().is_none());
         assert!(index.version(&metadata.version).unwrap().is_none());
     }
 
@@ -1265,8 +1181,6 @@ mod tests {
     fn foreign_cluster_cut_with_matching_cache_and_key_id_is_skipped() {
         use crate::model::VersionMetadata;
         use crate::model::*;
-        use crate::store::catalog::IndexedPage;
-        use crate::store::catalog::RecordLocation;
         use crate::store::checkpoint;
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
         let keys = crate::test_support::security::keys();
@@ -1274,15 +1188,6 @@ mod tests {
         let g = geometry();
         let geometry = [(WorkerId(0), g)].into_iter().collect();
         let mut cut = image(5, &[WorkerId(0)]);
-        let segments = Segments::new(g.segment_bytes);
-        segments
-            .configure(
-                g.slab_bytes,
-                g.segment_count as usize,
-                g.alignment().unwrap(),
-            )
-            .unwrap();
-        let append = segments.append(4096).unwrap();
         let metadata = VersionMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -1299,23 +1204,9 @@ mod tests {
             keys.lease(Some(&caches[0].id), key_id, KeyPurpose::Page)
                 .is_ok()
         );
-        cut.shards[0].index.entries.push((
-            PageId {
-                version: metadata.version.clone(),
-                number: PageNumber(0),
-            },
-            IndexedPage {
-                location: RecordLocation {
-                    segment: append.0.id(),
-                    generation: append.0.generation(),
-                    extent: append.1,
-                },
-                metadata,
-                key_id,
-            },
-        ));
-        drop(append);
-        cut.shards[0].segments = segments.snapshot();
+        let mut version = VersionEntry::new(metadata);
+        version.add_key_id(key_id);
+        cut.shards[0].index.versions.push(version);
         let same = checkpoint::encode(&cut).unwrap();
         let mut foreign_cut = checkpoint::decode(&same).unwrap();
         foreign_cut.cluster =
@@ -1337,7 +1228,7 @@ mod tests {
         // Same-cluster restart keeps the page.
         let restarted = select_one(vec![decode(&same)]).unwrap();
         assert_eq!(restarted.cluster, *keys.cluster());
-        assert_eq!(restarted.shards[0].index.entries.len(), 1);
+        assert_eq!(restarted.shards[0].index.versions.len(), 1);
 
         // A foreign cut alone gives a cold cache, not a startup error.
         assert!(select_one(vec![decode(&foreign)]).is_none());
@@ -1345,7 +1236,7 @@ mod tests {
         // A newer foreign cut falls back to the older same-cluster cut.
         let selected = select_one(vec![decode(&foreign), decode(&same)]).unwrap();
         assert_eq!(selected.sequence, 5);
-        assert_eq!(selected.shards[0].index.entries.len(), 1);
+        assert_eq!(selected.shards[0].index.versions.len(), 1);
     }
 
     #[test]
@@ -1410,9 +1301,46 @@ mod tests {
             app.snapshots
                 .apply(publication(&config, 1, vec![]))
                 .unwrap();
-            let _ = futures::executor::block_on(app.store.open()).unwrap();
+            app.runtime.reactor.init().unwrap();
+            let startup = scope(Duration::from_secs(5)).unwrap();
+            let _ = crate::app::tests::drive_peer(&app.runtime.reactor, app.store.open(&startup))
+                .unwrap();
+            // A page of a cache missing from the accepted publication, as a
+            // crash after a lazily committed removal could leave behind.
+            let index = app.store.writer.index();
+            let volume = index.volume().unwrap();
+            let reservation = volume
+                .allocate(page_alloc::volume::Tier::Cache, 4096)
+                .unwrap();
+            let charge = app
+                .runtime
+                .admission
+                .reserve(None, crate::admission::ResourceClass::Ciphertext, 4096)
+                .unwrap();
+            let buffer = app.store.writer.slabs().allocate(4096, charge).unwrap();
+            let _ = crate::app::tests::drive_peer(
+                &app.runtime.reactor,
+                volume.write(&*app.runtime.reactor, &reservation, buffer, &startup),
+            )
+            .unwrap();
+            let generation = volume.next_generation();
+            let removed = racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
+            volume
+                .publish(
+                    page_alloc::volume::Key::new(
+                        crate::store::key::cache_hash(&removed),
+                        [3; 12],
+                        0,
+                    ),
+                    reservation,
+                    4096,
+                    generation,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(index.disk_len(), 1);
             let shard = futures::executor::block_on(app.store.checkpoint.snapshot_shard()).unwrap();
-            let geometry = shard.geometry;
+            let geometry = shard.layout;
             app.store.checkpoint.finish_snapshot();
             let bytes = crate::store::checkpoint::encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
@@ -1426,6 +1354,8 @@ mod tests {
                 app.recover_node(geometry, &scope(Duration::from_secs(5)).unwrap()),
             )
             .unwrap();
+            // The accepted publication has no caches, so recovery purges the page.
+            assert_eq!(app.store.writer.index().disk_len(), 0);
             let cut = node.recovery.lock().unwrap();
             assert!(cut.selected && cut.installed.contains(&WorkerId(0)));
             assert!(cut.failure.is_none());
@@ -1439,7 +1369,7 @@ mod tests {
                     .index()
                     .snapshot()
                     .unwrap()
-                    .entries
+                    .versions
                     .is_empty()
             );
         }
