@@ -38,6 +38,7 @@ type mediaTestDriver struct {
 	opName    string
 	calls     []string
 	err       error
+	powerErr  error
 	supported bool
 	state     redfish.PowerState
 	seen      *v1alpha3.Machine
@@ -85,7 +86,7 @@ func (d *mediaTestDriver) DeleteVirtualMedia(ctx context.Context, _ bootmedia.So
 }
 
 func (d *mediaTestDriver) PowerState(context.Context) (redfish.PowerState, error) {
-	return d.state, nil
+	return d.state, d.powerErr
 }
 
 func (d *mediaTestDriver) Reset(ctx context.Context, action redfish.ResetType) error {
@@ -1189,17 +1190,118 @@ func TestVirtualMediaBootRetriesAreBounded(t *testing.T) {
 	require.Contains(t, current.Status.Targets[0].Message, "did not boot the virtual media")
 }
 
-func TestVirtualMediaNoBootRetryAfterLoaderStart(t *testing.T) {
-	r, _, _, op := mediaFixture(t)
+func TestVirtualMediaRetriesIfHostPowersOffAfterLoaderStart(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
 	current := mediaInstalling(t, r, op.Name)
 	current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
 	require.NoError(t, r.Status().Update(t.Context(), current))
 
+	oldID := current.Status.Targets[0].BootMedia.ID
+	resets := slices.Clone(d.calls)
+	d.state = redfish.PowerOff
 	r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(30 * time.Minute)) }
 	current = mediaStep(t, r, op.Name)
-	require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
-	require.Zero(t, current.Status.Targets[0].BootMedia.BootAttempts)
-	require.Contains(t, current.Status.Targets[0].Message, "write the boot image")
+	b := current.Status.Targets[0].BootMedia
+	require.Equal(t, "Replacing", b.Phase)
+	require.Equal(t, oldID, b.ID)
+	require.Equal(t, int32(1), b.BootAttempts)
+	require.NotNil(t, b.LoaderStartedAt, "keep the persisted handoff until the old media is released")
+	require.Len(t, d.calls, len(resets), "the retry decision must be saved before side effects")
+
+	current = mediaStep(t, r, op.Name)
+	b = current.Status.Targets[0].BootMedia
+	require.Equal(t, "Preparing", b.Phase)
+	require.NotEqual(t, oldID, b.ID)
+	require.Nil(t, b.LoaderStartedAt)
+	require.False(t, b.ImageWritten)
+	require.Nil(t, b.RebootRequestedAt)
+	require.Equal(t, []string{"cleanup", "delete", "release"}, d.calls[len(resets):])
+
+	for range 8 {
+		current = mediaStep(t, r, op.Name)
+	}
+
+	b = current.Status.Targets[0].BootMedia
+	require.Equal(t, "Installing", b.Phase)
+	require.Equal(t, "ub-"+b.ID+".iso", b.SourceName)
+	require.Equal(t, []string{"cleanup", "delete", "release", "prepare", "stage", "mount", "boot", string(redfish.ResetOn)}, d.calls[len(resets):])
+}
+
+func TestVirtualMediaWaitsAfterLoaderStartUnlessPowerOff(t *testing.T) {
+	tests := []struct {
+		name     string
+		state    redfish.PowerState
+		powerErr error
+	}{
+		{name: "power on", state: redfish.PowerOn},
+		{name: "powering on", state: redfish.PowerState("PoweringOn")},
+		{name: "powering off", state: redfish.PowerState("PoweringOff")},
+		{name: "unknown", state: redfish.PowerState("Unknown")},
+		{name: "read error", state: redfish.PowerOn, powerErr: errors.New("BMC read failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, d, _, op := mediaFixture(t)
+			current := mediaInstalling(t, r, op.Name)
+			current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+			require.NoError(t, r.Status().Update(t.Context(), current))
+
+			calls := slices.Clone(d.calls)
+			d.state = tt.state
+			d.powerErr = tt.powerErr
+			r.Now = func() metav1.Time { return metav1.NewTime(fixedNow().Add(30 * time.Minute)) }
+			current = mediaStep(t, r, op.Name)
+
+			require.Equal(t, "Installing", current.Status.Targets[0].BootMedia.Phase)
+			require.Zero(t, current.Status.Targets[0].BootMedia.BootAttempts)
+			require.NotNil(t, current.Status.Targets[0].BootMedia.LoaderStartedAt)
+			require.Contains(t, current.Status.Targets[0].Message, "write the boot image")
+			require.Equal(t, calls, d.calls)
+		})
+	}
+}
+
+func TestVirtualMediaDoesNotRetryAfterInstallerProgress(t *testing.T) {
+	tests := []struct {
+		name              string
+		imageWritten      bool
+		rebootRequestedAt *metav1.Time
+	}{
+		{name: "image written", imageWritten: true},
+		{name: "reboot handoff", rebootRequestedAt: ptrTo(fixedNow())},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, d, machine, op := mediaFixture(t)
+			current := mediaInstalling(t, r, op.Name)
+			current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+			current.Status.Targets[0].BootMedia.ImageWritten = tt.imageWritten
+			current.Status.Targets[0].BootMedia.RebootRequestedAt = tt.rebootRequestedAt
+			d.state = redfish.PowerOff
+
+			change := r.advanceVirtualMedia(t.Context(), current, machine, current.Status.Targets[0], metav1.NewTime(fixedNow().Add(30*time.Minute)))
+			require.NoError(t, change.err)
+			require.Equal(t, "Installing", change.target.BootMedia.Phase)
+			require.Zero(t, change.target.BootMedia.BootAttempts)
+			require.NotNil(t, change.target.BootMedia.LoaderStartedAt)
+			require.Contains(t, change.target.Message, "write the boot image")
+		})
+	}
+}
+
+func TestVirtualMediaPowerOffAfterLoaderHonorsBootRetryBound(t *testing.T) {
+	r, d, _, op := mediaFixture(t)
+	current := mediaInstalling(t, r, op.Name)
+	current.Status.Targets[0].BootMedia.LoaderStartedAt = ptrTo(fixedNow())
+	current.Status.Targets[0].BootMedia.BootAttempts = mediaMaxBootAttempts - 1
+	require.NoError(t, r.Status().Update(t.Context(), current))
+
+	d.state = redfish.PowerOff
+	current = mediaStep(t, r, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, current.Status.Targets[0].Phase)
+	require.Contains(t, current.Status.Targets[0].Message, mediaNoLoaderTimeoutMessage)
+	require.Equal(t, int32(mediaMaxBootAttempts-1), current.Status.Targets[0].BootMedia.BootAttempts)
+	require.True(t, current.Status.Targets[0].BootMedia.Abandoned)
 }
 
 func TestVirtualMediaMergeKeepsLoaderStartOverStaleRetry(t *testing.T) {
@@ -1222,6 +1324,57 @@ func TestVirtualMediaMergeKeepsLoaderStartOverStaleRetry(t *testing.T) {
 	updated = v1alpha3.MachineOperationTargetStatus{BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ID: "a", Phase: "Installing"}}
 	mergeMediaCallbacks(&updated, latest)
 	require.Equal(t, started, updated.BootMedia.LoaderStartedAt)
+}
+
+func TestVirtualMediaMergeInstallerProgressCancelsPowerOffRetry(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		imageWritten  bool
+		rebootStarted bool
+		retryFailed   bool
+	}{
+		{name: "image written during retry decision", imageWritten: true},
+		{name: "reboot handoff during retry decision", rebootStarted: true},
+		{name: "image written during final failure", imageWritten: true, retryFailed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			started := ptrTo(fixedNow())
+			latest := v1alpha3.MachineOperationTargetStatus{
+				Phase: v1alpha3.OperationPhaseInProgress,
+				Stage: v1alpha3.OperationStageWaitingRepave,
+				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+					ID: "a", Phase: "Installing", PhaseStartedAt: ptrTo(fixedNow()),
+					LoaderStartedAt: started, ImageWritten: tt.imageWritten,
+				},
+			}
+			if tt.rebootStarted {
+				latest.BootMedia.RebootRequestedAt = ptrTo(metav1.NewTime(fixedNow().Add(time.Minute)))
+			}
+
+			updated := latest.DeepCopy()
+			updated.BootMedia.Phase = "Replacing"
+			updated.BootMedia.BootAttempts = 1
+			updated.Message = "host did not boot the virtual media; retrying (attempt 2)"
+			if tt.retryFailed {
+				updated.Phase = v1alpha3.OperationPhaseFailed
+				updated.CompletedAt = ptrTo(metav1.NewTime(fixedNow().Add(2 * time.Minute)))
+				updated.Message = reasonTimedOut + ": " + mediaNoLoaderTimeoutMessage
+				updated.BootMedia.BootAttempts = latest.BootMedia.BootAttempts
+				updated.BootMedia.Abandoned = true
+			}
+
+			mergeMediaCallbacks(updated, latest)
+			require.Equal(t, latest.Phase, updated.Phase)
+			require.Equal(t, latest.Stage, updated.Stage)
+			require.Nil(t, updated.CompletedAt)
+			require.Equal(t, "Installing", updated.BootMedia.Phase)
+			require.Equal(t, latest.BootMedia.BootAttempts, updated.BootMedia.BootAttempts)
+			require.False(t, updated.BootMedia.Abandoned)
+			require.Equal(t, tt.imageWritten, updated.BootMedia.ImageWritten)
+			require.Equal(t, latest.BootMedia.RebootRequestedAt, updated.BootMedia.RebootRequestedAt)
+			require.Contains(t, updated.Message, "write the boot image")
+		})
+	}
 }
 
 func TestVirtualMediaMergeLoaderStartWithFailure(t *testing.T) {
