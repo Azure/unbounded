@@ -15,7 +15,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -140,7 +139,7 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 	flags.DurationVar(&cfg.InformerResyncPeriod, "informer-resync-period", 300*time.Second, "Resync period for Kubernetes informers")
 	flags.DurationVar(&cfg.KubeProxyHealthInterval, "kube-proxy-health-interval", 30*time.Second, "Interval between kube-proxy health checks on the controller node (0 to disable)")
 	flags.BoolVar(&cfg.ManagedKubeProxyEnabled, "managed-kube-proxy", true, "Create kube-proxy DaemonSets for unbounded-managed site nodes not covered by provider kube-proxy")
-	flags.StringVar(&cfg.ManagedKubeProxyImage, "managed-kube-proxy-image", "", "kube-proxy image for managed site DaemonSets (default: registry.k8s.io/kube-proxy:<server version>)")
+	flags.StringVar(&cfg.ManagedKubeProxyImage, config.ManagedKubeProxyImageFlag, "", "kube-proxy image for managed site DaemonSets. A reference without a tag or digest takes its tag from kube-system/kube-proxy, or the server version if that DaemonSet does not exist (default: the kube-system/kube-proxy image, else registry.k8s.io/kube-proxy:<server version>)")
 	flags.DurationVar(&cfg.NodeTokenLifetime, "node-token-lifetime", 4*time.Hour, "Lifetime of HMAC tokens issued to node agents")
 	flags.DurationVar(&cfg.ViewerTokenLifetime, "viewer-token-lifetime", 30*time.Minute, "Lifetime of HMAC tokens issued to dashboard viewers")
 
@@ -251,7 +250,7 @@ func applyControllerRuntimeConfig(cmd *cobra.Command, cfg *config.Config, config
 		cfg.ManagedKubeProxyEnabled = *runtimeCfg.Controller.ManagedKubeProxy.Enabled
 	}
 
-	if !flags.Changed("managed-kube-proxy-image") && runtimeCfg.Controller.ManagedKubeProxy.Image != "" {
+	if !flags.Changed(config.ManagedKubeProxyImageFlag) && runtimeCfg.Controller.ManagedKubeProxy.Image != "" {
 		cfg.ManagedKubeProxyImage = runtimeCfg.Controller.ManagedKubeProxy.Image
 	}
 
@@ -693,24 +692,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		}()
 
 		if cfg.ManagedKubeProxyEnabled {
-			image := cfg.ManagedKubeProxyImage
-			if image == "" {
-				image = defaultKubeProxyImage(ctx, clientset)
-			}
-
-			kubeProxyCtrl, err := controller.NewManagedKubeProxyController(clientset, dynamicInformerFactory, informerFactory, controller.ManagedKubeProxyOptions{
-				Namespace: controllerNamespace,
-				Image:     image,
-			})
-			if err != nil {
-				klog.Errorf("Failed to create managed kube-proxy controller: %v", err)
-			} else {
-				go func() {
-					if err := kubeProxyCtrl.Run(ctx, 2); err != nil {
-						klog.Errorf("Managed kube-proxy controller error: %v", err)
-					}
-				}()
-			}
+			startManagedKubeProxyController(ctx, clientset, dynamicInformerFactory, informerFactory, controllerNamespace, cfg.ManagedKubeProxyImage)
 		} else {
 			klog.Info("Managed kube-proxy controller disabled")
 		}
@@ -786,27 +768,40 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 	return nil
 }
 
-func defaultKubeProxyImage(ctx context.Context, clientset kubernetes.Interface) string {
-	version := "latest"
+// startManagedKubeProxyController works out the managed kube-proxy image and
+// starts the controller that runs it. Failures are logged rather than returned:
+// managed kube-proxy is one controller among many, and the rest still run.
+func startManagedKubeProxyController(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	dynamicInformerFactory dynamicinformer.DynamicSharedInformerFactory,
+	informerFactory informers.SharedInformerFactory,
+	namespace, configuredImage string,
+) {
+	image, err := controller.ManagedKubeProxyImage(ctx, clientset, configuredImage)
+	if err != nil {
+		klog.Errorf("Managed kube-proxy controller not started: %v", err)
 
-	if serverVersion, err := clientset.Discovery().ServerVersion(); err != nil {
-		klog.Warningf("Failed to discover Kubernetes server version for managed kube-proxy image: %v", err)
-	} else if serverVersion.GitVersion != "" {
-		version = serverVersion.GitVersion
+		return
 	}
 
-	ds, err := clientset.AppsV1().DaemonSets("kube-system").Get(ctx, "kube-proxy", metav1.GetOptions{})
-	if err == nil {
-		for _, container := range ds.Spec.Template.Spec.Containers {
-			if container.Name == "kube-proxy" && container.Image != "" {
-				return container.Image
-			}
+	klog.Infof("Managed kube-proxy image: %s", image)
+
+	kubeProxyCtrl, err := controller.NewManagedKubeProxyController(clientset, dynamicInformerFactory, informerFactory, controller.ManagedKubeProxyOptions{
+		Namespace: namespace,
+		Image:     image,
+	})
+	if err != nil {
+		klog.Errorf("Failed to create managed kube-proxy controller: %v", err)
+
+		return
+	}
+
+	go func() {
+		if err := kubeProxyCtrl.Run(ctx, 2); err != nil {
+			klog.Errorf("Managed kube-proxy controller error: %v", err)
 		}
-	} else if !apierrors.IsNotFound(err) {
-		klog.Warningf("Failed to read kube-system/kube-proxy for managed kube-proxy image: %v", err)
-	}
-
-	return "registry.k8s.io/kube-proxy:" + version
+	}()
 }
 
 // injectCABundle updates the webhook and APIService configurations with the

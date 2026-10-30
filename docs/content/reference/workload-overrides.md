@@ -110,6 +110,10 @@ data:
 
 At least one of `patch` and `extraArgs` must be present.
 
+A document can also set `images`, next to `overrides`, for the one image no
+workload the operator emits declares. See
+[Overriding the managed kube-proxy image](#overriding-the-managed-kube-proxy-image).
+
 Each component emits one kind, except `net` and `racer`:
 
 | Component | Kinds | Per-Site |
@@ -524,6 +528,7 @@ worth knowing before an incident.
 | Failure | What is withheld |
 |---|---|
 | An entry fails validation | Only the workloads that entry could have resolved to, matched on its `component`, `kind` and `sites`. |
+| `images.kubeProxy` fails validation | Only the net controller Deployment, which is the only workload it changes. |
 | An entry names a component that is not recognized | Nothing. Entries resolve by component, so it could never have matched a workload. |
 | A ConfigMap key fails to parse | **Every** overridable workload, on every Site. The entries in that key were never read, so there is no way to know what they would have changed. |
 | The ConfigMap cannot be read at all | As above. |
@@ -563,6 +568,49 @@ An overridden image is recorded on the workload as an
 `unbounded-cloud.io/version-drift` annotation, on the Site status, and called out
 by `kubectl unbounded overrides status`.
 
+## Overriding the managed kube-proxy image
+
+The managed kube-proxy DaemonSets are not workloads the operator emits: the net
+controller creates one per Site at runtime, so no patch can reach them. Their
+image is set at the top level of a document instead, next to `overrides`:
+
+```yaml
+apiVersion: overrides.unbounded-cloud.io/v1alpha1
+images:
+  kubeProxy:
+    image: myregistry.example.com/kube-proxy
+```
+
+A document may set `images` alone or alongside an `overrides` list. The image
+takes one of two forms:
+
+- **With a tag or digest**, such as `myregistry.example.com/kube-proxy:v1.34.2`,
+  it is used as-is.
+- **Without one**, it takes the tag of the image the cluster's own
+  `kube-system/kube-proxy` DaemonSet runs, so a mirror of the provider's
+  kube-proxy keeps the provider's version. Without that DaemonSet, or when its
+  image is pinned by digest alone, the tag is the API server's version. A
+  registry port, as in `localhost:5000/kube-proxy`, is not a tag.
+
+The operator passes the image to the net controller as its
+`--managed-kube-proxy-image` flag, on the `controller` container of the
+`unbounded-net-controller` Deployment, so it takes precedence over
+`controller.managedKubeProxy.image` in the `unbounded-net-config` ConfigMap.
+Changing it rolls the net controller, which works out the image once when it
+starts and updates every managed kube-proxy DaemonSet to match.
+
+Otherwise it behaves like an entry targeting the `net` Deployment:
+
+- A malformed image withholds only the net controller Deployment.
+- Two keys setting different images are rejected, with both named. Two keys
+  setting the same image are fine.
+- While `images.kubeProxy` is set, an entry that passes
+  `--managed-kube-proxy-image` itself, through `extraArgs` or a replaced `args`
+  list, is rejected, so the image is only ever set in one place.
+- The net controller Deployment carries the usual override annotations, with
+  the source written as `<key>:images.kubeProxy`. It gets no `version-drift`
+  annotation, because the controller's own image is unchanged.
+
 ## Annotations on an overridden workload
 
 Every overridden workload carries these, which is the fastest way to answer
@@ -571,7 +619,7 @@ Every overridden workload carries these, which is the fastest way to answer
 | Annotation | Meaning |
 |---|---|
 | `unbounded-cloud.io/override-hash` | Hash of the entries merged into this object. The matching desired hash is in `Site.status.overrides`, computed over the same set, so the two are directly comparable. |
-| `unbounded-cloud.io/override-source` | The ConfigMap keys and entry indices that shaped the object, for example `resources.yaml[0],sidecar.yaml[2]`. Truncated to `,+N more` past 8 KiB, since Kubernetes caps all annotations on an object at 256 KiB and the hash is the authoritative record. |
+| `unbounded-cloud.io/override-source` | The ConfigMap keys and entry indices that shaped the object, for example `resources.yaml[0],sidecar.yaml[2]`, or `kube-proxy.yaml:images.kubeProxy` for an `images` setting. Truncated to `,+N more` past 8 KiB, since Kubernetes caps all annotations on an object at 256 KiB and the hash is the authoritative record. |
 | `unbounded-cloud.io/version-drift` | Present only when an override changed a container image. |
 
 These keys are reserved: a patch that writes anything under
