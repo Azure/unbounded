@@ -59,10 +59,12 @@ func TestRebootHost(t *testing.T) {
 			installFakeSystemctl(t, tt.script)
 
 			log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
 			ctx := context.Background()
 			if tt.cancelContext {
 				canceledCtx, cancel := context.WithCancel(ctx)
 				cancel()
+
 				ctx = canceledCtx
 			}
 
