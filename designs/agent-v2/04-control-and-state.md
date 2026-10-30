@@ -53,12 +53,14 @@ Built-in providers:
   source.
 
 Bootstrap does not ask the goal source for a goal. It builds the first node
-from the configuration file and records an empty goal version. The daemon's
-first reconcile settles it: if the goal's settings match what was applied, the
-goal's version is recorded as applied; if they differ, the node waits for a
-repave like any other drift. v1 behaves the same way, because it compares the
-desired configuration with the applied one and never records a version at
-bootstrap (`cmd/agent/internal/daemon/controller_node.go:43-62`).
+from the configuration file and records an empty goal version. The goal
+version is recorded only when the daemon handles a Node deletion (section 5),
+as in v1, which never records a version at bootstrap
+(`cmd/agent/internal/daemon/controller_node.go:43-68`).
+
+The `machina` status reporter writes `Machine.status.configuration` and the
+Machine's `RepavePending` condition at the same moments v1 does: only when the
+daemon handles a Node deletion (`controller_node.go:54-68,116-133`).
 
 ## 2. Credentials
 
@@ -101,9 +103,13 @@ type Manager interface {
 	Observe(ctx context.Context) (control.Observation, error)
 }
 
+// Trigger is why the daemon is reconciling: NodeDeleted when it saw this
+// node's Node object being deleted, otherwise GoalChanged, Poll or Startup.
+type Trigger string
+
 type Action string // Steady, Wait, Repave, Reset
 
-func Decide(obs control.Observation, g *control.Goal, drift func(applied, desired *config.GoalSettings) bool) Action
+func Decide(t Trigger, obs control.Observation, g *control.Goal, drift func(applied, desired *config.GoalSettings) bool) Action
 ```
 
 The drift function starts from v1's `hasDrift`
@@ -116,23 +122,30 @@ for one runtime, such as the nspawn OCI image, are contributed by that runtime.
 package state
 
 type Applied struct {
-	GoalVersion  string               // empty until the daemon's first reconcile settles it
+	GoalVersion  string               // empty until the daemon first handles a Node deletion
 	Settings     *config.GoalSettings // the goal settings the running node was built from
 	BundleDigest string               // digest of that node's saved bundle manifest
 	StartedAt    time.Time            // when that node started, for the registration timeout
-	NodeUID      string               // UID of the Node it registered, once observed
-	Pending      *Pending             // non-nil while a repave is in flight
+	Pending      *Pending             // non-nil from the moment a repave is approved
 }
 
 type Pending struct {
-	Slot         runtime.Slot
+	ApprovedAt   time.Time    // when the daemon saw the Node deleted
+	Slot         runtime.Slot // empty until the new slot's bundle is rendered
 	GoalVersion  string
 	Settings     *config.GoalSettings
-	BundleDigest string
+	BundleDigest string // empty until the new slot's bundle is rendered
 	Attempts     int
 	LastError    string
 }
 ```
+
+The daemon saves `Pending` as soon as it handles a Node deletion that needs a
+repave, before it resolves the node spec or downloads anything. Once saved, a
+repave survives any restart of the daemon or the host: `Recover` continues it,
+and an operator never has to approve it again. v1 keeps the approval only in
+memory, so a daemon restart before the repave finishes loses it
+([v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1)).
 
 A single `Applied` record replaces v1's per-slot applied-configuration files
 ([v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1)).
@@ -143,7 +156,7 @@ slot, as reported by `Inspect`, with the digests in this record:
 
 | Enabled slot's digest | Meaning | `Recover` does |
 |---|---|---|
-| Matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot | Continues or retries the pending repave, if any |
+| Matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Pending.Slot` empty) | Continues or retries the pending repave, if any, from the beginning of its first unfinished step |
 | Matches `Pending.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
 | No slot is enabled, and `Pending` is set | The old slot was stopped, but the new one was not started | Continues the pending repave from starting the new slot |
 | Any other case | The record and the host disagree | Reports `StateMismatch` and changes nothing |
@@ -173,7 +186,7 @@ saved bundle manifests.
 
 ```mermaid
 flowchart TD
-  T1["Node events"] --> Q
+  T1["Node deleted, or Node status changed"] --> Q
   T2["Goal source events or poll timer"] --> Q
   T3["MachineOperation events"] --> Q
   T4["Startup"] --> Q
@@ -189,31 +202,35 @@ flowchart TD
   O --> D{"Decide"}
   D -- Reset --> RS["Reset, then stop daemon"]
   D -- Repave --> AP["Apply goal"]
-  D -- Wait --> W["status.report Pending, or Provisioning until the Node is seen"]
-  D -- Steady --> S["status.report Ready"]
+  D -- Wait --> W["status.report Pending"]
+  D -- Steady --> S["status.report Ready, or Provisioning while the Node does not exist"]
 ```
 
 The startup gate opens after a pending AgentUpgrade result is published,
 `Recover` has finished, and the caches have synced.
 
-`Decide`:
+`Decide` repaves only when the daemon itself sees this node's Node object
+being deleted, as v1 does: v1 watches only Node delete events
+(`cmd/agent/internal/daemon/controller.go:155-160`).
 
-| Goal `delete` | Node object | Goal version vs applied | Drift | Action |
-|---|---|---|---|---|
-| `true` | Any | Any | Any | Reset |
-| `false` | Never observed since the current node started | Any | Any | Wait: kubelet has not registered yet. After 10 minutes, also report `NodeNotRegistered`. |
-| `false` | Present, with the recorded UID or on first sighting | Equal | Not applicable | Steady; record the Node UID |
-| `false` | Present, with the recorded UID | Differs | No | Steady; record the goal version as applied |
-| `false` | Present, with the recorded UID | Differs | Yes | Wait: repave pending until the Node is deleted |
-| `false` | Present, with a different UID: deleted and recreated | Any | Yes | Repave |
-| `false` | Present, with a different UID | Any | No | Steady; record the new UID and the goal version |
-| `false` | Deleted: UID seen before, now absent | Any | Yes | Repave |
-| `false` | Deleted | Any | No | Steady; record the goal version as applied, matching v1 (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
+| Trigger | Goal `delete` | Drift | Action |
+|---|---|---|---|
+| Any | `true` | Any | Reset |
+| `NodeDeleted` | `false` | Yes | Repave: save `Pending`, then `Apply` |
+| `NodeDeleted` | `false` | No | Steady; record the goal version as applied, as v1 does (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
+| Any other | `false` | Yes | Wait: a repave is pending until the Node is deleted |
+| Any other | `false` | No | Steady |
 
-Unlike v1, which reacts only to delete events, v2 compares what it observes on
-every reconcile, so a Node deleted while the daemon was down is still noticed.
-The recorded Node UID keeps a node that has not registered yet from looking
-deleted, and catches a Node that was deleted and recreated.
+A Node deleted while the daemon is not running is never acted on, as in v1.
+Stopping the daemon is therefore a safe way to keep a node as it is, for
+example while debugging. To repave after such a deletion, start the daemon and
+delete the Node again. kubelet registers the Node again when it restarts
+*(inference: kubelet registers once at startup)*, for example after a
+NodeReboot operation or a host reboot.
+
+The reported phase is `Pending` while a repave waits for the Node to be
+deleted. Otherwise it follows the Node: `Ready` while the Node exists, and
+`Provisioning` while it does not.
 
 "Record the goal version as applied" changes nothing on the running node. Goal
 settings that the drift function ignores, such as artifact download sources,

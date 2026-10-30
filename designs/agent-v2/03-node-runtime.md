@@ -58,8 +58,9 @@ type NodeRuntime interface {
 	// Access observes a started node: readiness and diagnostics.
 	Access(slot Slot) NodeAccess
 	// BootHook runs runtime-owned work that systemd triggers around node
-	// boot. It reads the slot's saved bundle manifest (section 2) and never
-	// renders a bundle, fetches credentials or uses the network.
+	// boot. It reads the slot's saved bundle manifest (section 2) and looks up
+	// the host's devices again (section 4). It never renders node content,
+	// fetches credentials or uses the network.
 	BootHook(ctx context.Context, phase BootPhase, slot Slot) error
 }
 
@@ -170,7 +171,7 @@ type NodeBundle struct {
 	Files           []File           // configs, kubeconfigs, CA, unit drop-ins
 	Units           []Unit           // units that run inside the node
 	SharedHostPaths []SharedHostPath // host paths made visible inside the node
-	Devices         DeviceRequest    // GPUs, KVM, InfiniBand, block, additional devices
+	Devices         DeviceRequest    // device kinds and extra devices the node asks for, not host paths
 	HostUnits       []Unit           // host units the node needs: the LocalDNS network unit
 	Boot            []BootStep       // ordered: localdns, containerd, image import, kubelet, extensions
 	Readiness       Readiness        // kubelet active, kubeconfig non-empty, LocalDNS ready URLs
@@ -198,9 +199,13 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
 - The digest covers every artifact, unit and non-secret file, but only the path
   and mode of secret files. A refreshed bootstrap token therefore does not
   change the digest.
-- Boot hooks and `Recover` read the saved manifest. Nothing renders a bundle
-  again after `Provision`, so nothing needs credentials or a host probe outside
-  provisioning.
+- The manifest also records the goal settings it was rendered from. A resumed
+  bootstrap uses them to record what an already running node was actually
+  built from ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).
+- Boot hooks and `Recover` read the saved manifest. Nothing renders node
+  content again after `Provision`, so nothing needs credentials outside
+  provisioning. The one thing looked up again at every node start is the
+  host's devices (section 4).
 
 After `Start` or `Restart`, the node manager waits for `Readiness` with v1's
 timeouts. A timeout fails the step like any other error.
@@ -254,6 +259,15 @@ writes it, with its helper, from the bundle's `HostUnits` before every
 `Start`, as v1 does at every node start
 (`pkg/agent/phases/nodestart/localdns.go:104-176`).
 
+On `nspawn-container`, the pre-start boot hook also finds the host's devices
+again and rewrites the machine's `.nspawn` file and unit override from the
+saved manifest and the devices it finds, using the current agent binary. v1's
+pre-start hook does the same (`pkg/agent/nspawnlifecycle/lifecycle.go:67-93`).
+A device that appears while the host boots, such as an InfiniBand device, is
+therefore visible inside the node without a repave. These are the runtime's
+host-side files, not node content, so they are not in the bundle digest and
+never cause a repave. On `host`, the node sees the host's devices directly.
+
 The prerequisite and pre-start units are oneshots with `RemainAfterExit=no`.
 They are inactive once they finish, so every later start of a unit that
 requires them runs them again *(inference)*. That covers a host boot, a
@@ -271,7 +285,7 @@ sequenceDiagram
   participant D as v2 daemon
   SD->>U: start the enabled slot
   U->>P: Requires, nftables flush, LocalDNS network helper, extension host units
-  U->>H: Requires, v2 boot-hook pre-start, from the slot's saved manifest
+  U->>H: Requires, v2 boot-hook pre-start, from the saved manifest and the host's devices
   U->>N: node starts
   N->>N: nspawn-container only, ExecStartPost runs v2 boot-hook post-start
   SD->>D: start daemon, Recover, then reconcile
@@ -293,7 +307,8 @@ v2 can use the `current` link instead is open question 5 ([overview, section 3](
 | `NodeAccess` | `systemd-run -M` | Direct |
 | NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start boot hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start boot hook, writing `/run/cdi/nvidia.yaml`, which containerd also reads as `/var/run/cdi` *(inference: containerd's default CDI directories)* |
 | NVIDIA Container Toolkit | From the GPU OCI image (`images/agent-ubuntu2404-nvidia/Containerfile:22-32`) | Shipped as an agent artifact (section 5.2) |
-| Devices and extra mounts | Bind mounts plus `DeviceAllow` | Nothing to do; already visible |
+| Devices and extra mounts | Bind mounts plus `DeviceAllow`, found again at every machine start (section 4) | Nothing to do; already visible |
+| Boot ID that kubelet reports | A new one at every machine start *(inference: systemd-nspawn gives each container boot its own boot ID)* | A new one at every node start (section 5.2) |
 | Shared host paths | Bind mounts | The paths themselves; `hostPath` must equal `nodePath` |
 | Kubelet exec credential command | Bind-mounted read-only at the same path | The path itself |
 | Resolver | Writes the node's `/etc/resolv.conf` | Never touches the host's `/etc/resolv.conf`. When LocalDNS is enabled, kubelet's `resolvConf` setting points at the LocalDNS resolver file (`pkg/agent/goalstates/resolve.go:163-166`, `pkg/agent/phases/nodestart/kubelet.go:129-130`); otherwise kubelet uses the host's resolver. |
@@ -317,6 +332,14 @@ The node runs directly on the host:
   stages the new slot, then rewrites the units when it switches to that slot.
 - Preflight adds a `conflicting-packages` check for distro packages that ship
   kubelet, containerd or docker's containerd.
+- kubelet gets a boot ID of its own that changes at every node start, as it
+  does in an nspawn container. The pre-start boot hook writes a random ID to
+  `/run/unbounded-node/boot_id`, and `kubelet.service` mounts it over
+  `/proc/sys/kernel/random/boot_id` with `BindReadOnlyPaths=`. A NodeReboot
+  therefore shows a new boot ID and a `Rebooted` event on the Node, as in v1,
+  even though the host's kernel did not restart *(inference: kubelet reports
+  the boot ID it reads from that file; validation task V6
+  ([implementation, section 3](09-implementation.md#3-testing-and-validation)))*.
 
 NVIDIA Container Toolkit, as an artifact:
 

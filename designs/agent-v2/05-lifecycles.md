@@ -20,7 +20,7 @@ sequenceDiagram
   CLI->>CLI: log experimental warning, load and validate config, select runtime
   CLI->>St: acquire install lock, run the install check
   alt already complete
-    CLI->>NM: verify node and daemon, repair daemon if needed, ignore goal-setting differences
+    CLI->>NM: verify node and daemon, repair daemon if needed, ignore other differences in the file
   else fresh or resume
     CLI->>Px: hook agent.install.before
     CLI->>Px: hook host.prepare.before
@@ -38,7 +38,7 @@ sequenceDiagram
     NM->>NM: write slot a's host units
     NM->>RT: Start a, which enables it
     NM->>RT: Access a, wait for readiness
-    NM->>St: save applied state with an empty goal version
+    NM->>St: save applied state from a's saved manifest, with an empty goal version
     NM->>Px: hook node.start.after
     CLI->>SD: install and start unbounded-agent-v2-daemon
     CLI->>Px: hook agent.install.after
@@ -56,10 +56,11 @@ sequenceDiagram
   participant St as node state
   participant Px as providers and hooks
   participant RT as NodeRuntime
+  D->>St: sees the Node deleted with drift, saves Pending
   D->>NM: Apply goal
   NM->>Px: hook node.repave.before, credentials.bootstrap
   NM->>NM: resolve NodeSpec, cache artifacts, render the bundle for the new slot
-  NM->>St: save Pending with the new slot and its bundle digest
+  NM->>St: record the new slot and its bundle digest in Pending
   NM->>Px: hook node.provision.before new
   NM->>RT: Provision new and save its manifest
   NM->>Px: hook node.provision.after new
@@ -86,7 +87,9 @@ When a repave fails, it is retried, matching v1:
 
 - Retries never stop. They use controller-runtime's default per-item backoff,
   as v1 does: v1 configures no rate limiter of its own
-  (`pkg/agent/daemon/setup.go:45-50`).
+  (`pkg/agent/daemon/setup.go:45-50`). Unlike v1, they also continue after a
+  daemon or host restart, because `Pending` was saved when the deletion was
+  seen.
 - Every attempt reads the goal again, as v1 does
   (`cmd/agent/internal/daemon/controller_node.go:43`). A goal change also
   queues an attempt at once, so a corrected goal does not wait out the backoff.
@@ -103,7 +106,9 @@ When a repave fails, it is retried, matching v1:
 If the goal changes while a repave is in progress:
 
 - Before the new slot has been started, the next attempt replaces `Pending`
-  and provisions the new slot again from the new goal.
+  and provisions the new slot again from the new goal. If the new goal no
+  longer has drift, the attempt clears `Pending` and records the goal version
+  as applied, as for a deletion with no drift.
 - Once the new slot has been started, the repave finishes and commits the goal
   it started with. The newer goal is then ordinary drift and needs another Node
   deletion ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)).
@@ -132,7 +137,9 @@ sequenceDiagram
   (`pkg/agent/phases/nodestart/nspawn_lifecycle.go:36-40`).
 - `host`: Terminate and Unmount ([host runtime cleanup](07-host-runtime-cleanup.md), sections 6 and 7), then start
   the node units again. Starting them runs the prerequisites and the pre-start
-  boot hook again first ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)).
+  boot hook again first ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). The pre-start boot hook gives
+  kubelet a new boot ID, so the Node shows the same reboot signals as on
+  `nspawn-container` ([node runtime, section 5.2](03-node-runtime.md#52-host)).
 
 There is no host network reset on reboot, matching v1's `RestartNode`
 (`cmd/agent/internal/daemon/nodeoperator.go:224-229`).

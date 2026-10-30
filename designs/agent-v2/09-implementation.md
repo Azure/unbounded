@@ -95,6 +95,7 @@ built:
 | V3 | The minimal NVIDIA Container Toolkit binary set for CDI mode, and how the toolkit finds its configuration in the slot directory without editing the host's. |
 | V4 | SELinux labels for binaries executed from the slot directories on Azure Linux 3. |
 | V5 | The oneshot prerequisites and pre-start boot hook run again on every start of the boot unit: after a host reboot, on `systemctl restart systemd-nspawn@<m>`, and when the `host` node units start again after a restart ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
+| V6 | On `host`, kubelet reports the boot ID mounted over `/proc/sys/kernel/random/boot_id` for `kubelet.service`, a NodeReboot produces a new Node boot ID and a `Rebooted` event, and nothing else on the node depends on kubelet's boot ID matching the kernel's. |
 
 ## 4. Risks
 
