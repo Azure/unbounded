@@ -27,6 +27,14 @@ are `/bin/bash`, and each account has passwordless sudo. `bcho` deliberately has
 no `ssh_import_id` entry because it currently has no published GitHub keys. The
 other accounts import keys from their same-named GitHub identities.
 
+The disk also embeds the exact ARM64 `unbounded-agent` release archive
+`v0.17.0-rc.1` at
+`/opt/unbounded/bootstrap/unbounded-agent-linux-arm64.tar.gz`. Configure the
+Machine's `spec.agent.url` as
+`file:///opt/unbounded/bootstrap/unbounded-agent-linux-arm64.tar.gz` so the
+existing MetalMan bootstrap uses the image-local archive. First boot therefore
+does not depend on GitHub or a temporary serving pod.
+
 The dedicated build script runs on a native ARM64 host. It mounts the qualified
 raw disk in a private mount namespace, performs the package and DKMS work in the
 disk's own ARM64 userspace, then boots a disposable overlay. It uses KVM when
@@ -45,6 +53,8 @@ build verifies:
 - the exact reviewed user policy and real Noble cloud-init merge against the
   rendered MetalMan vendor-data;
 - the installed `ssh-import-id` package version;
+- the embedded agent archive checksum, contents, ARM64 ELF architecture, and
+  reported version;
 - the EFI GRUB entries and exact target-kernel boot, reaching userspace when
   compatible KVM is available;
 - empty machine identity and absent SSH host private keys; and
@@ -72,7 +82,8 @@ current vendor user.
 Cloud-init user-data has higher precedence and can still replace the baked
 users. Before a separately authorized `HostReplace`, remove or replace any
 temporary Machine user-data ConfigMap reference whose cloud-config defines
-`users`.
+`users`. Also replace any temporary `spec.agent.url` with the image-local URL
+above and retain `spec.agent.version: v0.17.0-rc.1`.
 
 Building or publishing this artifact does not update a Machine, start a
 `HostReplace`, reboot a host, or otherwise activate the image.

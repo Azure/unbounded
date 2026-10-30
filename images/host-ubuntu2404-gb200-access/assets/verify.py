@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
+import struct
+import tarfile
 
-from cloudinit import util
 import yaml
 
 
@@ -25,6 +27,11 @@ USERS = [
     "vpatelsj",
 ]
 SSH_IMPORT_ID_VERSION = "5.11-0ubuntu2.24.04.1"
+AGENT_ARCHIVE_SHA256 = (
+    "faf21645f33cd5ef80cce04ccb2d8c9fc289cfb1dedbaeb47cf85e58186a8ff0"
+)
+AGENT_ARCHIVE_MEMBERS = ["LICENSE", "NOTICE", "unbounded-agent"]
+ELF_MACHINE_AARCH64 = 183
 GENERIC_USERS = """users:
 - name: unbounded-metal
   lock_passwd: true
@@ -98,6 +105,8 @@ def render_vendor_data(template: str, preserve_image_users: bool) -> dict:
 
 
 def verify_merge(image_config: dict, vendor_template: Path) -> None:
+    from cloudinit import util
+
     template = vendor_template.read_text()
     dedicated_vendor = render_vendor_data(template, True)
     if "users" in dedicated_vendor:
@@ -128,12 +137,46 @@ def installed_packages(status_path: Path) -> dict[str, str]:
     return packages
 
 
+def validate_agent_archive(
+    archive_path: Path, expected_sha256: str = AGENT_ARCHIVE_SHA256
+) -> None:
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    if digest != expected_sha256:
+        raise RuntimeError(
+            f"agent archive checksum is {digest}, expected {expected_sha256}"
+        )
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        if archive.getnames() != AGENT_ARCHIVE_MEMBERS:
+            raise RuntimeError("agent archive members changed")
+        member = archive.getmember("unbounded-agent")
+        if not member.isfile() or member.mode & 0o111 == 0:
+            raise RuntimeError("agent archive binary is not executable")
+        binary = archive.extractfile(member)
+        if binary is None:
+            raise RuntimeError("agent archive binary cannot be read")
+        header = binary.read(20)
+
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        raise RuntimeError("agent archive binary is not ELF")
+    byte_order = {1: "<", 2: ">"}.get(header[5])
+    if byte_order is None:
+        raise RuntimeError("agent archive binary has invalid ELF byte order")
+    machine = struct.unpack(f"{byte_order}H", header[18:20])[0]
+    if machine != ELF_MACHINE_AARCH64:
+        raise RuntimeError("agent archive binary is not ARM64")
+
+
 def verify(
-    image_config_path: Path, vendor_template_path: Path, status_path: Path
+    image_config_path: Path,
+    vendor_template_path: Path,
+    status_path: Path,
+    agent_archive_path: Path,
 ) -> None:
     image_config = load_mapping(image_config_path)
     validate_users(image_config)
     verify_merge(image_config, vendor_template_path)
+    validate_agent_archive(agent_archive_path)
     packages = installed_packages(status_path)
     if packages.get("ssh-import-id") != SSH_IMPORT_ID_VERSION:
         raise RuntimeError("pinned ssh-import-id package is not installed")
@@ -144,8 +187,14 @@ def main() -> None:
     parser.add_argument("--image-config", type=Path, required=True)
     parser.add_argument("--vendor-template", type=Path, required=True)
     parser.add_argument("--dpkg-status", type=Path, required=True)
+    parser.add_argument("--agent-archive", type=Path, required=True)
     args = parser.parse_args()
-    verify(args.image_config, args.vendor_template, args.dpkg_status)
+    verify(
+        args.image_config,
+        args.vendor_template,
+        args.dpkg_status,
+        args.agent_archive,
+    )
 
 
 if __name__ == "__main__":

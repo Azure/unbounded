@@ -7,6 +7,8 @@ kernel_release=6.14.0-1003-azure-nvidia
 source_kernel_release=7.0.0-1019-nvidia-64k
 kernel_parameters="iommu.passthrough=1 arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
 forbidden_kernel_parameters="net.ifnames=0 irqchip.gicv3_nolpi=y"
+agent_version=v0.17.0-rc.1
+agent_archive=/opt/unbounded/bootstrap/unbounded-agent-linux-arm64.tar.gz
 
 fail() {
     echo "$*" >&2
@@ -133,7 +135,15 @@ cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
 python3 /tmp/verify.py \
     --image-config /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg \
     --vendor-template /tmp/vendor-data.tmpl \
-    --dpkg-status /var/lib/dpkg/status
+    --dpkg-status /var/lib/dpkg/status \
+    --agent-archive "${agent_archive}"
+agent_verify_dir="$(mktemp -d)"
+trap 'rm -rf "${agent_verify_dir}"' EXIT
+tar -xzf "${agent_archive}" -C "${agent_verify_dir}" unbounded-agent
+"${agent_verify_dir}/unbounded-agent" version |
+    grep -Fq "unbounded-agent ${agent_version}"
+rm -rf "${agent_verify_dir}"
+trap - EXIT
 grep -qx 'blacklist nouveau' /etc/modprobe.d/blacklist-nouveau.conf
 
 cat > /etc/modules-load.d/nvidia.conf <<'EOF'

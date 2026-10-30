@@ -10,6 +10,9 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 container_engine=${CONTAINER_ENGINE:-docker}
 source_image=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
 ubuntu_image=docker.io/library/ubuntu@sha256:18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d
+agent_version=v0.17.0-rc.1
+agent_asset=unbounded-agent-linux-arm64.tar.gz
+agent_url=https://github.com/Azure/unbounded/releases/download/${agent_version}/${agent_asset}
 kernel_release=6.14.0-1003-azure-nvidia
 kernel_version=6.14.0-1003.3
 kernel_parameters="iommu.passthrough=1 arm_smmu_v3.disable_msipolling=1 init_on_alloc=0"
@@ -57,6 +60,9 @@ customize_disk() {
 
     rm -rf "${root}/tmp/packages"
     cp -a "${work}/packages" "${root}/tmp/packages"
+    install -D -m 0644 \
+        "${work}/packages/${agent_asset}" \
+        "${root}/opt/unbounded/bootstrap/${agent_asset}"
     cp "${script_dir}/assets/90-gb200-access-users.cfg" \
         "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
     mkdir -p "${root}/etc/default/grub.d" "${root}/etc/modprobe.d"
@@ -185,6 +191,7 @@ chmod 0777 "${work}/packages"
         curl ${curl_options} "${snapshot}/pool/main/l/linux-signed-azure-nvidia-6.14/linux-image-6.14.0-1003-azure-nvidia_6.14.0-1003.3_arm64.deb"
         curl ${curl_options} "${snapshot}/pool/main/l/linux-azure-nvidia-6.14/linux-modules-6.14.0-1003-azure-nvidia_6.14.0-1003.3_arm64.deb"
         curl ${curl_options} "${snapshot}/pool/main/l/linux-azure-nvidia-6.14/linux-modules-extra-6.14.0-1003-azure-nvidia_6.14.0-1003.3_arm64.deb"
+        curl ${curl_options} "'"${agent_url}"'"
     '
 (
     cd "${work}/packages"
@@ -197,6 +204,7 @@ ed71643b8873240cce1ac905b7993f3372436d39410894f413968f43839f84e6  wget_1.21.4-1u
 4714c5910f7a5ccf0484237e8c6a661a5a610aab5d7369d3889976887c12d86e  linux-image-6.14.0-1003-azure-nvidia_6.14.0-1003.3_arm64.deb
 a25a29b4f78e08f81a2ce83d68119f03ff5dd686336cdc8a71155458a46e7775  linux-modules-6.14.0-1003-azure-nvidia_6.14.0-1003.3_arm64.deb
 080225782d2e7278133252e46d79eb91da6d58e1ac38bd5e56982c0fffa5b5b1  linux-modules-extra-6.14.0-1003-azure-nvidia_6.14.0-1003.3_arm64.deb
+faf21645f33cd5ef80cce04ccb2d8c9fc289cfb1dedbaeb47cf85e58186a8ff0  unbounded-agent-linux-arm64.tar.gz
 EOF
 )
 
