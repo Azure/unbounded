@@ -82,6 +82,18 @@ controller:
     image: <image>
 ```
 
+An override with a tag or digest is used as-is. One without, such as a private
+mirror's `myregistry.example.com/kube-proxy`, takes the tag of the image
+`kube-system/kube-proxy` runs, so the mirror keeps the provider's version. If
+that DaemonSet does not exist, or its image is pinned by digest alone, the tag is
+the server version. Only the tag carries over, never the digest, because a
+mirror that re-pushed the image can hold it under a different digest.
+
+The image is worked out once, when the controller starts leading. Where the
+operator manages unbounded-net, `images.kubeProxy` in its overrides ConfigMap
+sets the same flag on the controller Deployment, so it takes precedence over
+the runtime setting and changing it restarts the controller.
+
 Managed kube-proxy can be disabled with:
 
 ```yaml
