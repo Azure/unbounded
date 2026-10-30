@@ -175,6 +175,81 @@ func TestOverridesListShowsEntries(t *testing.T) {
 	}
 }
 
+// TestOverridesListShowsTheKubeProxyImage covers a document that sets only
+// images.kubeProxy: it has no overrides list, but it does declare something,
+// and the table has to say what and where.
+func TestOverridesListShowsTheKubeProxyImage(t *testing.T) {
+	document := `apiVersion: ` + override.APIVersion + `
+images:
+  kubeProxy:
+    image: myreg.example/kube-proxy
+`
+
+	cl := fake.NewClientBuilder().
+		WithScheme(overridesScheme(t)).
+		WithObjects(overridesConfigMapFor(map[string]string{"kube-proxy.yaml": document})).
+		Build()
+
+	var out bytes.Buffer
+	if err := runOverridesList(t.Context(), cl, overridesNamespace, &out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	for _, want := range []string{"kube-proxy.yaml:images.kubeProxy", "net", "Deployment", "kubeProxyImage(myreg.example/kube-proxy)"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output = %q, want it to contain %q", out.String(), want)
+		}
+	}
+
+	if strings.Contains(out.String(), "declares no entries") {
+		t.Fatalf("output = %q, want it not to call the document empty", out.String())
+	}
+}
+
+func TestOverridesValidateAcceptsADocumentThatOnlySetsImages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kube-proxy.yaml")
+
+	document := `apiVersion: ` + override.APIVersion + `
+images:
+  kubeProxy:
+    image: myreg.example/kube-proxy
+`
+
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := runOverridesValidateFiles([]string{path}, &out); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "ok: 1 entry") {
+		t.Fatalf("output = %q, want a success line", out.String())
+	}
+}
+
+func TestOverridesValidateRejectsAMalformedKubeProxyImage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kube-proxy.yaml")
+
+	document := `apiVersion: ` + override.APIVersion + `
+images:
+  kubeProxy:
+    image: myreg.example/Kube-Proxy
+`
+
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	var out bytes.Buffer
+
+	err := runOverridesValidateFiles([]string{path}, &out)
+	if err == nil || !strings.Contains(err.Error(), "images.kubeProxy") {
+		t.Fatalf("validate error = %v, want the kube-proxy image rejected", err)
+	}
+}
+
 // TestOverridesListWarnsAboutUnknownSites covers the inert-but-worth-saying
 // case: a Site name that matches nothing is expected before the Site exists,
 // and a typo otherwise.

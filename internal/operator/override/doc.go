@@ -42,7 +42,28 @@ const APIVersion = "overrides.unbounded-cloud.io/v1alpha1"
 // one of these.
 type Document struct {
 	APIVersion string  `yaml:"apiVersion"`
+	Images     *Images `yaml:"images,omitempty"`
 	Overrides  []Entry `yaml:"overrides"`
+}
+
+// Images sets images that no workload the operator emits declares, so no patch
+// can reach them.
+//
+// The managed kube-proxy DaemonSets are created by the net controller at
+// runtime, not by the operator, and the controller takes their image as a flag
+// on its own container. Each field is therefore shorthand for that flag, and
+// resolves to the workload that carries it: it is validated, merged, hashed,
+// reported and withheld exactly like an entry targeting that workload.
+type Images struct {
+	// KubeProxy sets the image of the managed kube-proxy DaemonSets.
+	KubeProxy *ImageOverride `yaml:"kubeProxy,omitempty"`
+}
+
+// ImageOverride sets one image.
+type ImageOverride struct {
+	// Image is either a reference with a tag or digest, used as-is, or one
+	// without, which takes the version of the image it replaces.
+	Image string `yaml:"image"`
 }
 
 // Entry targets one workload, or one workload per Site, and describes what to
@@ -88,9 +109,18 @@ type Entry struct {
 	// metadata, spec.replicas and the pod template are all reachable through
 	// one field.
 	Patch map[string]any `yaml:"patch,omitempty"`
+
+	// KubeProxyImage is set only on the entry a document's images.kubeProxy
+	// becomes. It cannot be written in an overrides list: the yaml tag keeps it
+	// out of decoding, so strict parsing rejects it there as an unknown field.
+	//
+	// Its JSON name is omitted when empty because the contributor hash encodes
+	// entries as JSON, and every hash already stamped on a workload has to
+	// survive the field being added.
+	KubeProxyImage string `json:"KubeProxyImage,omitempty" yaml:"-"`
 }
 
 // HasWork reports whether the entry asks for any change at all.
 func (e Entry) HasWork() bool {
-	return len(e.Patch) > 0 || len(e.ExtraArgs) > 0
+	return len(e.Patch) > 0 || len(e.ExtraArgs) > 0 || e.KubeProxyImage != ""
 }
