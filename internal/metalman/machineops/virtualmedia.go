@@ -402,20 +402,27 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 				// The BMC sometimes powers on without a usable virtual drive.
 				// No installer can run before the loader fetches its config,
 				// so a fresh power cycle is safe.
-				if b.BootAttempts+1 >= mediaMaxBootAttempts {
-					return failTarget(target, reasonTimedOut, mediaNoLoaderTimeoutMessage, now)
+				return retryVirtualMediaBoot(target, &b, now)
+			}
+
+			if b.LoaderStartedAt != nil && !b.ImageWritten && b.RebootRequestedAt == nil && r.PowerClients != nil {
+				pc, err := r.PowerClients.ForMachine(ctx, mediaMachine(target))
+				if err != nil {
+					target.Message = "waiting for virtual media installer to write the boot image; host power state unavailable: " + err.Error()
+
+					return targetChange{target: target}
 				}
 
-				// Some firmware can keep a broken virtual drive for an image
-				// name, and mounting the same name again does not fix it. Replace
-				// the staged image with a new name before the next boot.
-				b.BootAttempts++
-				b.Phase = "Replacing"
-				b.PhaseStartedAt = &now
-				b.ReadinessStartedAt = nil
-				target.Message = fmt.Sprintf("host did not boot the virtual media; retrying (attempt %d)", b.BootAttempts+1)
+				state, err := pc.PowerState(ctx)
+				if err != nil {
+					target.Message = "waiting for virtual media installer to write the boot image; host power state unavailable: " + err.Error()
 
-				return targetChange{target: target}
+					return targetChange{target: target}
+				}
+
+				if state == redfish.PowerOff {
+					return retryVirtualMediaBoot(target, &b, now)
+				}
 			}
 
 			target.Message = "waiting for virtual media installer to write the boot image"
@@ -495,6 +502,10 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 			id, err = newMediaID()
 			if err == nil {
 				b.ID, b.SourceName, b.SourceServer = id, "", ""
+				b.LoaderStartedAt = nil
+				b.ImageWritten = false
+				b.RebootRequestedAt = nil
+				b.Abandoned = false
 				next = "Preparing"
 			}
 		}
@@ -551,6 +562,29 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	}
 
 	target.Message = "virtual media: " + b.Phase
+
+	return targetChange{target: target}
+}
+
+func retryVirtualMediaBoot(target v1alpha3.MachineOperationTargetStatus, b *v1alpha3.MachineOperationBootMediaStatus, now metav1.Time) targetChange {
+	if b.BootAttempts+1 >= mediaMaxBootAttempts {
+		if b.LoaderStartedAt != nil {
+			// Exact PowerOff proves the installer is no longer running, so
+			// terminal cleanup does not need to retain the stale handoff.
+			b.Abandoned = true
+		}
+
+		return failTarget(target, reasonTimedOut, mediaNoLoaderTimeoutMessage, now)
+	}
+
+	// Some firmware can keep a broken virtual drive for an image name, and
+	// mounting the same name again does not fix it. Replace the staged image
+	// with a new name before the next boot.
+	b.BootAttempts++
+	b.Phase = "Replacing"
+	b.PhaseStartedAt = &now
+	b.ReadinessStartedAt = nil
+	target.Message = fmt.Sprintf("host did not boot the virtual media; retrying (attempt %d)", b.BootAttempts+1)
 
 	return targetChange{target: target}
 }
@@ -657,6 +691,26 @@ func mergeMediaCallbacks(updated *v1alpha3.MachineOperationTargetStatus, latest 
 	}
 
 	updated.BootMedia.Released = updated.BootMedia.Released || latest.BootMedia.Released
+	retryDecision := updated.BootMedia.Phase == "Replacing" &&
+		updated.BootMedia.BootAttempts != latest.BootMedia.BootAttempts
+	retryFailed := updated.Phase == v1alpha3.OperationPhaseFailed &&
+		updated.Message == reasonTimedOut+": "+mediaNoLoaderTimeoutMessage
+
+	if (latest.BootMedia.ImageWritten || latest.BootMedia.RebootRequestedAt != nil) && (retryDecision || retryFailed) {
+		// A callback won the race with a power-off recovery decision. Preserve
+		// installer progress and never replace media after the image write or
+		// reboot handoff has started.
+		updated.Phase = latest.Phase
+		updated.Stage = latest.Stage
+		updated.CompletedAt = latest.CompletedAt.DeepCopy()
+		updated.Message = "waiting for virtual media installer to write the boot image"
+		updated.BootMedia.Phase = latest.BootMedia.Phase
+		updated.BootMedia.PhaseStartedAt = latest.BootMedia.PhaseStartedAt.DeepCopy()
+		updated.BootMedia.ReadinessStartedAt = latest.BootMedia.ReadinessStartedAt.DeepCopy()
+		updated.BootMedia.BootAttempts = latest.BootMedia.BootAttempts
+		updated.BootMedia.Abandoned = latest.BootMedia.Abandoned
+	}
+
 	updated.BootMedia.Abandoned = updated.BootMedia.Abandoned || latest.BootMedia.Abandoned
 
 	if latest.BootMedia.LoaderStartedAt != nil && updated.BootMedia.LoaderStartedAt == nil {

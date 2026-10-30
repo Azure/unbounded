@@ -1,0 +1,15 @@
+{
+  "schema": "unbounded.gb200.host-access.v1",
+  "base_image": "ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb",
+  "ubuntu": "24.04",
+  "kernel_release": "6.14.0-1003-azure-nvidia",
+  "kernel_package_version": "6.14.0-1003.3",
+  "ubuntu_snapshot": "20251001T235959Z",
+  "agent_version": "v0.17.0-rc.1",
+  "agent_asset": "unbounded-agent-linux-arm64.tar.gz",
+  "agent_sha256": "faf21645f33cd5ef80cce04ccb2d8c9fc289cfb1dedbaeb47cf85e58186a8ff0",
+  "ssh_import_id": "5.11-0ubuntu2.24.04.1",
+  "ssh_import_id_sha256": "97bb2840a271ee0573da934ce1811f961e4b844fe876e34602b4661db25135b5",
+  "wget": "1.21.4-1ubuntu4.5",
+  "wget_sha256": "ed71643b8873240cce1ac905b7993f3372436d39410894f413968f43839f84e6"
+}
