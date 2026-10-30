@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
@@ -413,4 +414,148 @@ func TestUpdateWireGuardFromSlices_GatewayRoutingChanges(t *testing.T) {
 			}
 		})
 	}
+}
+
+// peeredGatewayFixture reconciles a gateway node in Site "local" beside Sites
+// "remote" and "third", each with one node CIDR and one pod pool.
+type peeredGatewayFixture struct {
+	sites, pools, peerings, empty cache.SharedIndexInformer
+	cfg                           *config
+	state                         *wireGuardState
+	calls                         int
+}
+
+func newPeeredGatewayFixture(t *testing.T) *peeredGatewayFixture {
+	t.Helper()
+
+	f := &peeredGatewayFixture{
+		sites:    newInformerWithObjects(),
+		peerings: newInformerWithObjects(),
+		empty:    newInformerWithObjects(),
+		cfg:      &config{NodeName: "self", WireGuardPort: 51820, PreferredPrivateEncap: "WireGuard"},
+		state: &wireGuardState{
+			nodeName:  "self",
+			clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "self"}}),
+		},
+	}
+
+	for name, cidrs := range map[string][2]string{
+		"local":  {"10.1.0.0/16", "10.244.0.0/16"},
+		"remote": {"10.2.0.0/16", "10.245.0.0/16"},
+		"third":  {"10.3.0.0/16", "10.246.0.0/16"},
+	} {
+		site := &unboundedv1alpha3.Site{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: unboundedv1alpha3.SiteSpec{
+				NodeCidrs:          []string{cidrs[0]},
+				PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{CidrBlocks: []string{cidrs[1]}}},
+			},
+		}
+		if err := f.sites.GetStore().Add(toUnstructured(t, site)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	f.pools = newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "local-pool"},
+		Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{{
+			Name: "self", SiteName: "local", WireGuardPublicKey: "pub-self", GatewayWireguardPort: 51821,
+		}}},
+	}))
+
+	original := configureWireGuardFunc
+	configureWireGuardFunc = func(context.Context, *config, string, []meshPeerInfo, []gatewayPeerInfo, string, map[string]bool, map[string]bool, map[string]bool, map[string]string, map[string]string, map[string]string, map[string]string, map[string]string, map[string]int, map[string]int, map[string]int, map[string]int, map[string]int, []unboundednetnetlink.DesiredRoute, map[string]bool, *wireGuardState, map[string]healthcheck.HealthCheckSettings) error {
+		f.calls++
+		return nil
+	}
+
+	t.Cleanup(func() { configureWireGuardFunc = original })
+
+	return f
+}
+
+func (f *peeredGatewayFixture) setPeering(t *testing.T, spec unboundednetv1alpha1.SitePeeringSpec) {
+	t.Helper()
+
+	peering := &unboundednetv1alpha1.SitePeering{ObjectMeta: metav1.ObjectMeta{Name: "peering"}, Spec: spec}
+	if err := f.peerings.GetStore().Add(toUnstructured(t, peering)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gatewaySupernets reconciles once and returns the extra unbounded0 routes the
+// gateway node computed.
+func (f *peeredGatewayFixture) gatewaySupernets(t *testing.T) []string {
+	t.Helper()
+
+	if err := updateWireGuardFromSlices(context.Background(), nil, f.sites, f.empty, f.pools, f.empty,
+		f.peerings, f.empty, f.empty, f.cfg, "local", "priv", "pub-self", true, f.state); err != nil {
+		t.Fatal(err)
+	}
+
+	return f.state.siteRouting.gatewaySupernets
+}
+
+func TestUpdateWireGuardFromSlices_GatewaySkipsPeeredNodeCIDRs(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		peering   *unboundednetv1alpha1.SitePeeringSpec
+		wantRoute bool
+	}{
+		{name: "no peering", wantRoute: true},
+		{name: "meshNodes unset", peering: &unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"local", "remote"}}},
+		{name: "meshNodes false", peering: &unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"local", "remote"}, MeshNodes: new(false)}},
+		{name: "disabled peering", peering: &unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"local", "remote"}, Enabled: new(false)}, wantRoute: true},
+		{name: "peering between other Sites", peering: &unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"remote", "third"}}, wantRoute: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newPeeredGatewayFixture(t)
+			if tt.peering != nil {
+				f.setPeering(t, *tt.peering)
+			}
+
+			routes := f.gatewaySupernets(t)
+			if got := slices.Contains(routes, "10.2.0.0/16"); got != tt.wantRoute {
+				t.Fatalf("remote node CIDR in gateway routes=%v, want %v: %v", got, tt.wantRoute, routes)
+			}
+
+			// The remote pod pool and the unpeered Site never depend on the peering.
+			for _, cidr := range []string{"10.245.0.0/16", "10.3.0.0/16"} {
+				if !slices.Contains(routes, cidr) {
+					t.Fatalf("gateway route %s was lost: %v", cidr, routes)
+				}
+			}
+		})
+	}
+}
+
+func TestUpdateWireGuardFromSlices_GatewayFollowsSitePeeringChanges(t *testing.T) {
+	f := newPeeredGatewayFixture(t)
+	peering := unboundednetv1alpha1.SitePeeringSpec{Sites: []string{"local", "remote"}}
+
+	reconcile := func(step string, wantRoute bool, wantCalls int) {
+		t.Helper()
+
+		routes := f.gatewaySupernets(t)
+		if got := slices.Contains(routes, "10.2.0.0/16"); got != wantRoute {
+			t.Fatalf("%s: remote node CIDR in gateway routes=%v, want %v: %v", step, got, wantRoute, routes)
+		}
+
+		if f.calls != wantCalls {
+			t.Fatalf("%s: configuration calls=%d, want %d", step, f.calls, wantCalls)
+		}
+	}
+
+	f.setPeering(t, peering)
+	reconcile("peered", false, 1)
+	reconcile("unchanged", false, 1)
+
+	if err := f.peerings.GetStore().Replace(nil, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcile("peering deleted", true, 2)
+
+	f.setPeering(t, peering)
+	reconcile("peering restored", false, 3)
 }
