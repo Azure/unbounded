@@ -637,10 +637,14 @@ impl StoreWriter {
             .validate(location.segment, location.generation, &location.extent)?;
         Ok(self.segments.lease(location.segment, location.generation)?)
     }
+    /// Whether `page` may be queued, published, or served from pending work.
+    /// A passthrough cache retains nothing, so this is rechecked at enqueue
+    /// and again at index publication: a fill that resumes after the
+    /// snapshot purge, or a write in flight across it, never lands on disk.
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
-        self.availability
-            .page(&e.page.version.object.cache, e.key_id)
+        let cache = &e.page.version.object.cache;
+        self.availability.page(cache, e.key_id) && !self.availability.passthrough(cache)
     }
     pub fn enqueue(
         &self,
@@ -794,6 +798,12 @@ impl StoreWriter {
             || logical > crate::model::PAGE_BYTES as usize + MAX_HEADER_BYTES + 16
         {
             return Err(Error::InvalidConfiguration);
+        }
+        if self
+            .availability
+            .passthrough(&page.metadata.version.object.cache)
+        {
+            return Err(Error::Unavailable);
         }
         if !self.allowed(&page) {
             return Err(Error::MissingKey);
@@ -1333,14 +1343,22 @@ impl StoreWriter {
         })
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
+        self.remove_caches(&std::collections::HashSet::from([cache.clone()]))
+    }
+    /// Remove pending writes and indexed pages for every cache in `caches`
+    /// in one pass over each table.
+    pub fn remove_caches(&self, caches: &std::collections::HashSet<CacheId>) -> Result<()> {
+        if caches.is_empty() {
+            return Ok(());
+        }
         let mut pending = self.pending.borrow_mut();
         let before = pending.len();
-        pending.retain(|p, _| &p.version.object.cache != cache);
+        pending.retain(|p, _| !caches.contains(&p.version.object.cache));
         self.note_discard(before - pending.len());
         self.queue
             .borrow_mut()
-            .retain(|p| &p.version.object.cache != cache);
-        self.index.remove_cache(cache);
+            .retain(|p| !caches.contains(&p.version.object.cache));
+        self.index.remove_caches(caches);
         Ok(())
     }
     pub fn is_idle(&self) -> bool {

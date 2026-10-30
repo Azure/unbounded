@@ -228,8 +228,25 @@ pub struct MetadataService {
 
 impl MetadataService {
     /// Page completion handoff: immutable facts only, never fresh admission.
+    ///
+    /// A passthrough cache never retains metadata, so publication is dropped.
+    /// Callers may resume after an await that spanned a switch to passthrough
+    /// and its one-time catalog purge, so the mode is checked here.
     pub fn publish_version(&self, metadata: crate::model::VersionMetadata) -> Result<()> {
+        if self
+            .storage
+            .fill
+            .passthrough(&metadata.version.object.cache)
+        {
+            return Ok(());
+        }
         self.storage.index.publish_version(metadata)
+    }
+
+    /// The catalog this service publishes into.
+    #[cfg(test)]
+    pub(crate) fn catalog(&self) -> &Rc<Index> {
+        &self.storage.index
     }
 
     /// Build a worker-local coordinator with bounded refresh registrations.
@@ -455,17 +472,27 @@ impl MetadataService {
         scope.check()?;
         self.observe_clock()?;
         let clock_epoch = self.clock.borrow().inner.epoch();
-        let candidates = self
-            .candidates
-            .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
-            .await?;
-        let operation = purpose.operation(&context.object);
+        let mode = self.storage.fill.mode(&context.object.cache);
+        let resolution = if mode == racer_control_wire::CacheMode::PassthroughLocal {
+            // The local route asks this node's own origin and never a peer.
+            CandidateResolution::Origin(self.candidates.local_authority(
+                membership.clone(),
+                &context.object,
+                PageNumber(0),
+                mode,
+            )?)
+        } else {
+            let candidates = self
+                .candidates
+                .candidates_scoped(membership.clone(), &context.object, PageNumber(0), scope)
+                .await?;
+            let operation = purpose.operation(&context.object);
+            self.candidates
+                .resolve_with_budget(candidates, context, operation, scope, budget)
+                .await?
+        };
         let mut bootstrap_page = None;
-        let metadata = match self
-            .candidates
-            .resolve_with_budget(candidates, context, operation, scope, budget)
-            .await?
-        {
+        let metadata = match resolution {
             CandidateResolution::Copy(response) => match response.response() {
                 PeerResponse::Bootstrap {
                     metadata,
@@ -518,6 +545,14 @@ impl MetadataService {
         scope.check()?;
         super::validate_metadata(&metadata, &context.object, &purpose.selector())?;
         self.observe_clock()?;
+        // A passthrough cache revalidates every read with origin; only the
+        // read that resolved this observation uses it.
+        if self.storage.fill.passthrough(&context.object.cache) {
+            return Ok(RefreshOutput {
+                metadata,
+                page: bootstrap_page,
+            });
+        }
         if matches!(purpose, RefreshPurpose::Current | RefreshPurpose::Bootstrap)
             && self.clock.borrow().inner.epoch() == clock_epoch
         {
@@ -611,7 +646,7 @@ impl MetadataService {
 
     /// A conditional origin miss says nothing about immutable copies on later
     /// candidates. Probe them copy-only before reporting the pin unavailable.
-    async fn copy_after_origin_miss(
+    pub(super) async fn copy_after_origin_miss(
         &self,
         authority: &super::candidates::OriginAuthority,
         selector: &MetadataSelector,
@@ -620,15 +655,24 @@ impl MetadataService {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<crate::origin::MetadataReply> {
-        let candidates = self
-            .candidates
-            .candidates_scoped(membership, &context.object, PageNumber(0), scope)
-            .await?;
         let operation = PeerOperation::Metadata {
             object: context.object.clone(),
             selector: selector.clone(),
             mode: FetchMode::CopyOnly,
         };
+        // No peer retains a passthrough copy, and the local route never asks
+        // peers, so there is nothing to probe. The miss is still classified
+        // from the predecessor evidence, as in cached mode: a predecessor
+        // that was unreachable or overloaded leaves the pin retryable.
+        if self.storage.fill.passthrough(&context.object.cache) {
+            return Err(self
+                .candidates
+                .final_origin_miss(authority, &operation, scope, budget));
+        }
+        let candidates = self
+            .candidates
+            .candidates_scoped(membership, &context.object, PageNumber(0), scope)
+            .await?;
         let response = self
             .candidates
             .remaining_copy(&candidates, context, &operation, scope, budget)
@@ -751,6 +795,10 @@ impl MetadataService {
     ) -> Operation<'a, Option<ObjectMetadata>> {
         Box::pin(async move {
             scope.check()?;
+            // Passthrough metadata is never reused across reads.
+            if self.storage.fill.passthrough(&context.object.cache) {
+                return Ok(None);
+            }
             let now = self.observe_clock()?;
             match selector {
                 MetadataSelector::Fresh => {
@@ -778,11 +826,16 @@ impl MetadataService {
                         .retained_metadata(&version, scope)
                         .await?;
                     scope.check()?;
+                    // The cache may have switched to passthrough during the
+                    // fanout; the retained copy must then be revalidated.
+                    if self.storage.fill.passthrough(&context.object.cache) {
+                        return Ok(None);
+                    }
                     if let Some(metadata) = retained {
                         if metadata.version != version {
                             return Err(Error::CorruptRecord);
                         }
-                        self.storage.index.publish_version(metadata.clone())?;
+                        self.publish_version(metadata.clone())?;
                         Ok(Some(metadata.for_pin()))
                     } else {
                         Ok(None)

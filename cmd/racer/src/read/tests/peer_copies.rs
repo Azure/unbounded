@@ -983,6 +983,69 @@ fn subscription_behind_remote_warm_fills_only_the_published_head() {
     drop(job);
 }
 
+/// A subscription opened while the cache was cached keeps selecting after the
+/// cache switches to local passthrough. Its selections must reach this node's
+/// origin through the ordinary page flight, contact no peer, and retain nothing.
+#[test]
+fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
+    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let mut f = fixture();
+    let (peers, _ordered) = install_peers(&mut f, None);
+    let signers = network(4);
+    let (_local, mut endpoint, _published) =
+        super::hot_reads::coordinator(&f, &signers[peers.local], &f.membership, peers.requester());
+    let demand =
+        racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+            start: 0,
+            end: 4,
+        }])
+        .unwrap();
+    // The subscription and its selection exist before the switch.
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let selection =
+        crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
+    f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
+    let mut work = Box::pin(f.fill.select_subscription(
+        &selection,
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut result = None;
+    for _ in 0..4096 {
+        if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
+            result = Some(value);
+            break;
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
+            &mut f.engine,
+            &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(64).unwrap();
+    }
+    drop(work);
+    let page = result.expect("passthrough selection").unwrap();
+    assert_eq!(page.plaintext.bytes(), b"abc");
+    drop(page);
+    assert!(peers.calls.borrow().is_empty(), "no peer is contacted");
+    assert!(peers.demands.borrow().is_empty(), "no selection is offered");
+    assert_eq!(f.origin.calls.get(), 1);
+    let deps = &f.fill.dependencies;
+    assert!(deps.memory.get(&f.page).unwrap().is_none());
+    assert!(deps.memory.ciphertext(&f.page).unwrap().is_none());
+    assert_eq!(deps.writer.pending_count(), 0);
+    assert!(deps.writer.index().lookup(&f.page).unwrap().is_none());
+    endpoint.uninstall().unwrap();
+}
+
 #[test]
 fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
@@ -3237,6 +3300,63 @@ mod landing {
         assert!(l.peers.calls.borrow().len() >= 3);
         assert_eq!(landed_count(&l.helper), 0);
     }
+
+    #[test]
+    /// A local-route passthrough sealed read on a non-owner fills from this
+    /// node's origin without asking any peer to land the page.
+    fn passthrough_local_sealed_read_never_asks_peers() {
+        let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+        let mut l = landing(0, true);
+        l.f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+        let fetched = acquire_sealed(&mut l);
+        assert!(fetched.is_ok(), "{:?}", fetched.err());
+        assert_eq!(l.asked.get(), 0);
+        assert!(l.peers.calls.borrow().is_empty());
+        assert_eq!(l.f.origin.calls.get(), 1);
+        assert_eq!(landed_count(&l.helper), 0);
+        assert!(
+            l.f.fill
+                .dependencies
+                .memory
+                .get(&l.f.page)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    /// A disk copy written before a switch to passthrough is not staged for a
+    /// sealed read in either passthrough mode.
+    fn passthrough_sealed_read_does_not_stage_a_residual_disk_copy() {
+        for mode in [
+            racer_control_wire::CacheMode::PassthroughPeers,
+            racer_control_wire::CacheMode::PassthroughLocal,
+        ] {
+            let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+            let mut l = landing(0, false);
+            let deps = l.f.fill.dependencies.clone();
+            let dirty = deps
+                .admission
+                .reserve(
+                    Some(&l.f.context.object.cache),
+                    ResourceClass::DirtyCiphertext,
+                    l.copy.ciphertext.bytes().len(),
+                )
+                .unwrap();
+            deps.writer.enqueue(l.copy.clone(), dirty).ok();
+            drive_disk(&l.f, deps.writer.progress(8, &l.f.scope)).unwrap();
+            assert!(
+                deps.writer.index().lookup(&l.f.page).unwrap().is_some(),
+                "{mode:?}"
+            );
+            deps.memory.remove_cache(&l.f.context.object.cache).unwrap();
+            l.f.set_mode(mode);
+            l.peers.reply(&l.ordered[0], Reply::Copy(l.copy.clone()));
+            let fetched = acquire_sealed(&mut l);
+            assert!(fetched.is_ok(), "{mode:?}: {:?}", fetched.err());
+            assert_eq!(l.f.fill.metrics.count(Event::DiskHit), 0, "{mode:?}");
+        }
+    }
 }
 
 /// Install a published membership equal to the fixture's (version 1), so a
@@ -4958,4 +5078,184 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
             assert!(!candidates.notices.borrow().is_empty());
         }
     }
+}
+
+/// In peers passthrough mode, readers on distinct non-owner nodes and the
+/// ranked owner's own reader share the owner's single origin flight, and no
+/// node retains the page afterward.
+#[test]
+fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
+    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
+    let (_, ordered) = install_peers(&mut fixtures[0], None);
+    let membership = fixtures[0].membership.clone();
+    let owner = (0..4).find(|i| node(*i) == ordered[0]).unwrap();
+    let mesh = Rc::new(Mesh {
+        signing: network(4).into_iter().map(Forwarding::new).collect(),
+        nodes: RefCell::new(Vec::new()),
+        calls: RefCell::new(Vec::new()),
+        unavailable: RefCell::new(Vec::new()),
+        admissions: fixtures
+            .iter()
+            .map(|f| f.fill.dependencies.admission.clone())
+            .collect(),
+    });
+    let mut endpoints = Vec::new();
+    for (i, f) in fixtures.iter_mut().enumerate() {
+        f.membership = membership.clone();
+        let peers = Rc::new(Peer {
+            mesh: mesh.clone(),
+            local: i,
+        });
+        let policy = CandidatePolicy::new(
+            node(i),
+            Rc::new(Placement::new(16)),
+            Requester::scripted(
+                peers,
+                Peer::direct_hedge_available,
+                Peer::request,
+                Peer::request_direct,
+            ),
+            f.fill.dependencies.credentials.clone(),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
+        );
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(policy);
+        f.fill = Fill::new(deps);
+        f.set_mode(racer_control_wire::CacheMode::PassthroughPeers);
+        f.origin.blocked_pages.borrow_mut().insert(0);
+        let (coordinator, endpoint, _) = f.read_graph(
+            Rc::new(f.fill.clone()),
+            &membership,
+            ReadGraphSettings {
+                name: "passthrough",
+                snapshots: 4,
+                metadata: 16,
+                window: 1,
+                stall: Duration::from_secs(10),
+                seed: None,
+            },
+        );
+        endpoints.push(endpoint);
+        mesh.nodes.borrow_mut().push(coordinator);
+    }
+
+    // Every node reads: the owner locally, the other three through the mesh.
+    let mut budgets: Vec<_> = fixtures
+        .iter()
+        .map(|f| AcquisitionBudget::new(f.scope.deadline.0, 8, 16))
+        .collect();
+    let contexts: Vec<_> = fixtures
+        .iter()
+        .map(|f| OriginContext {
+            object: f.context.object.clone(),
+            metadata: None,
+            authorization: None,
+        })
+        .collect();
+    let readers: Vec<_> = fixtures
+        .iter()
+        .map(|f| (f.fill.clone(), f.page.clone(), f.scope.clone()))
+        .collect();
+    let mut reads: Vec<_> = readers
+        .iter()
+        .zip(&contexts)
+        .zip(budgets.iter_mut())
+        .map(|(((fill, page, scope), context), budget)| {
+            Box::pin(fill.acquire(page.clone(), membership.clone(), context, scope, budget))
+        })
+        .collect();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut results: Vec<Option<Result<PageResult>>> = (0..4).map(|_| None).collect();
+    macro_rules! step {
+        () => {{
+            uring_runtime::drivers::poll(&mut cx, 64);
+            for f in fixtures.iter_mut() {
+                uring_runtime::group::Service::poll_budgeted(
+                    &mut f.engine,
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
+                f.crypto.poll_budgeted(64).unwrap();
+            }
+            for (i, read) in reads.iter_mut().enumerate() {
+                if results[i].is_none() {
+                    if let Poll::Ready(done) = read.as_mut().poll(&mut cx) {
+                        results[i] = Some(done);
+                    }
+                }
+            }
+        }};
+    }
+    for _ in 0..256 {
+        step!();
+    }
+    // While origin is blocked, every reader is still waiting and every
+    // non-owner has delegated to the owner.
+    assert!(results.iter().all(Option::is_none));
+    let mut expected = vec![0; 4];
+    expected[owner] = 1;
+    assert_eq!(
+        fixtures
+            .iter()
+            .map(|f| f.origin.calls.get())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for i in (0..4).filter(|i| *i != owner) {
+        assert!(
+            mesh.calls
+                .borrow()
+                .iter()
+                .any(|(from, to, _, _, _)| *from == node(i) && *to == node(owner)),
+            "node {i} did not ask the owner: {:?}",
+            mesh.calls.borrow()
+        );
+    }
+
+    for f in &fixtures {
+        f.origin.blocked_pages.borrow_mut().clear();
+    }
+    for _ in 0..512 {
+        if results.iter().all(Option::is_some) {
+            break;
+        }
+        step!();
+    }
+    drop(reads);
+    for (i, result) in results.into_iter().enumerate() {
+        let result = result
+            .unwrap_or_else(|| panic!("node {i} read did not finish"))
+            .unwrap_or_else(|e| panic!("node {i} read failed: {e:?}"));
+        assert_eq!(result.plaintext.bytes(), b"abc", "node {i}");
+    }
+    assert_eq!(
+        fixtures
+            .iter()
+            .map(|f| f.origin.calls.get())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for (i, f) in fixtures.iter().enumerate() {
+        let deps = &f.fill.dependencies;
+        assert!(deps.memory.get(&f.page).unwrap().is_none(), "node {i}");
+        assert!(
+            deps.memory.ciphertext(&f.page).unwrap().is_none(),
+            "node {i}"
+        );
+        assert!(
+            deps.memory.metadata(&f.page.version).unwrap().is_none(),
+            "node {i}"
+        );
+        assert_eq!(deps.writer.pending_count(), 0, "node {i}");
+        assert!(
+            deps.writer.index().lookup(&f.page).unwrap().is_none(),
+            "node {i}"
+        );
+        assert!(!f.fill.holds(&f.page), "node {i}");
+    }
+    drop(endpoints);
 }

@@ -1017,6 +1017,35 @@ impl WorkerDirectory {
             }
         })
     }
+    /// Run `f` as if this thread did not own its installed worker, so local
+    /// work is queued on the mailbox as another worker's request would be.
+    #[cfg(test)]
+    pub(crate) fn as_remote<T>(&self, f: impl FnOnce() -> T) -> T {
+        let key = self as *const Self as usize;
+        let entry = LOCALS.with(|locals| locals.borrow_mut().remove(&key));
+        let output = f();
+        if let Some(entry) = entry {
+            LOCALS.with(|locals| locals.borrow_mut().insert(key, entry));
+        }
+        output
+    }
+    /// Queue a publication on the metadata owner's mailbox, as a fill on
+    /// another worker would, even when the owner is this thread.
+    #[cfg(test)]
+    pub(crate) fn queue_publication<'a>(
+        &'a self,
+        metadata: VersionMetadata,
+        scope: &'a RequestScope,
+    ) -> Result<Operation<'a, ()>> {
+        let owner = self.metadata_owner(&metadata.version.object)?;
+        let receipt = self.submit(owner, Work::Publish(metadata), scope, None)?;
+        Ok(Box::pin(async move {
+            match receipt.await?.value? {
+                Value::Published => Ok(()),
+                _ => Err(Error::StaleFlight),
+            }
+        }))
+    }
     pub fn retained_metadata<'a>(
         &'a self,
         version: &'a ObjectVersion,
@@ -1224,6 +1253,13 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
+        // Holds and warm fills retain pages, which a passthrough cache never does.
+        Work::Hold(version, ..) if local.fill.passthrough(&version.object.cache) => {
+            Err(Error::Unavailable)
+        }
+        Work::Warm(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
+            Err(Error::Unavailable)
+        }
         Work::Hold(version, pages, until, kind) => {
             let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
             let epoch = local
@@ -1342,8 +1378,10 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Fetch(page, membership, envelope) => {
-            if let Warmed::Local(result) =
-                local.streams.directory().warmed_page(&page, scope).await?
+            // Passthrough caches retain nothing, so skip stale warm state.
+            if !local.fill.passthrough(&page.version.object.cache)
+                && let Warmed::Local(result) =
+                    local.streams.directory().warmed_page(&page, scope).await?
             {
                 return Ok(Value::Page(*result));
             }
@@ -1361,8 +1399,10 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::FetchSealed(page, membership, envelope, target) => {
-            if let Warmed::Local(result) =
-                local.streams.directory().warmed_page(&page, scope).await?
+            // Passthrough caches retain nothing, so skip stale warm state.
+            if !local.fill.passthrough(&page.version.object.cache)
+                && let Warmed::Local(result) =
+                    local.streams.directory().warmed_page(&page, scope).await?
             {
                 return Ok(Value::Fetched(super::sealed::Fetched::Page(*result)));
             }
@@ -1385,7 +1425,12 @@ async fn execute(
             Ok(Value::Published)
         }
         Work::Publish(metadata) => {
-            local.metadata.publish_version(metadata)?;
+            // A fill queued while the cache was cached may arrive after the
+            // switch to passthrough and its one-time purge. Drop it so the
+            // catalog never retains passthrough metadata.
+            if !local.fill.passthrough(&metadata.version.object.cache) {
+                local.metadata.publish_version(metadata)?;
+            }
             Ok(Value::Published)
         }
         Work::Retained(version) => local

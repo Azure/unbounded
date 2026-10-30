@@ -693,7 +693,7 @@ impl LocalPageService for Gate {
         })
     }
 }
-fn local_membership(signer: &Signatures) -> std::sync::Arc<crate::topology::Membership> {
+pub(super) fn local_membership(signer: &Signatures) -> std::sync::Arc<crate::topology::Membership> {
     Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -723,7 +723,7 @@ pub(super) fn coordinator(
 }
 
 /// A read graph whose range streams use a `window`-page fetch window.
-fn coordinator_with_window(
+pub(super) fn coordinator_with_window(
     f: &Fixture,
     signer: &Rc<Signatures>,
     membership: &std::sync::Arc<crate::topology::Membership>,
@@ -1010,6 +1010,7 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
             client_socket: "/c".into(),
             origin_socket: "/o".into(),
             priority,
+            mode: racer_control_wire::CacheMode::Cached,
         };
     admission
         .policy()

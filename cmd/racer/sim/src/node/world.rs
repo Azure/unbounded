@@ -4132,6 +4132,7 @@ impl NodeWorld {
                 rank,
                 predecessor_evidence: fill.core.evidence.len(),
                 member: members.position(&node.to_be_bytes()).is_some(),
+                local: false,
             },
             &object,
             number,

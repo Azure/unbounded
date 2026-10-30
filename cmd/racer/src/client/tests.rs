@@ -962,6 +962,7 @@ fn definition() -> CacheDefinition {
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
         priority: racer_control_wire::DEFAULT_PRIORITY,
+        mode: racer_control_wire::CacheMode::Cached,
     }
 }
 fn scope() -> RequestScope {
@@ -2845,6 +2846,7 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 origin_socket: format!("/run/racer/{name}/origin/socket").into(),
                 name,
                 priority: racer_control_wire::DEFAULT_PRIORITY,
+                mode: racer_control_wire::CacheMode::Cached,
             }
         })
         .collect();
@@ -2853,12 +2855,18 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
         .iter()
         .map(|cache| Rc::as_ptr(&fixture.listeners.listeners.borrow()[&cache.id]))
         .collect();
-    for cache in &mut caches {
+    for (n, cache) in caches.iter_mut().enumerate() {
         cache.priority = 7;
+        // Mode changes in either direction reuse the socket too.
+        cache.mode = [
+            racer_control_wire::CacheMode::PassthroughPeers,
+            racer_control_wire::CacheMode::PassthroughLocal,
+            racer_control_wire::CacheMode::Cached,
+        ][n % 3];
     }
     let prepared =
         futures::executor::block_on(fixture.listeners.prepare(&caches, &scope())).unwrap();
-    // The publication carries the new priorities even though sockets are reused.
+    // The publication carries the new priorities and modes even though sockets are reused.
     assert_eq!(prepared.definitions(), caches.as_slice());
     prepared.commit();
     for (cache, old) in caches.iter().zip(&before) {
@@ -2883,6 +2891,13 @@ fn listener_reuse_ignores_only_priority() {
     let mut next = definition();
     next.priority = 0;
     assert!(same_endpoint(&current, &next));
+    for mode in [
+        racer_control_wire::CacheMode::PassthroughPeers,
+        racer_control_wire::CacheMode::PassthroughLocal,
+    ] {
+        next.mode = mode;
+        assert!(same_endpoint(&current, &next));
+    }
     let changes: [fn(&mut CacheDefinition); 4] = [
         |d| d.id = CacheId("00000000-0000-4000-8000-000000000fff".into()),
         |d| d.name = "other".into(),

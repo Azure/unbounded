@@ -96,3 +96,43 @@ func TestClusterCachePriorityJSONDeepCopyAndDefault(t *testing.T) {
 	require.Nil(t, unset.Spec.Priority)
 	require.Equal(t, DefaultPriority, unset.Spec.EffectivePriority())
 }
+
+func TestClusterCachePassthroughJSONDeepCopyAndDefault(t *testing.T) {
+	route, ok := ClusterCacheSpec{}.EffectivePassthroughRoute()
+	require.False(t, ok)
+	require.Empty(t, route)
+
+	route, ok = ClusterCacheSpec{Passthrough: &Passthrough{}}.EffectivePassthroughRoute()
+	require.True(t, ok)
+	require.Equal(t, PassthroughRoutePeers, route)
+
+	for _, want := range []PassthroughRoute{PassthroughRoutePeers, PassthroughRouteLocal} {
+		route, ok = ClusterCacheSpec{Passthrough: &Passthrough{Route: want}}.EffectivePassthroughRoute()
+		require.True(t, ok)
+		require.Equal(t, want, route)
+	}
+
+	cache := &ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}, Spec: ClusterCacheSpec{Passthrough: &Passthrough{Route: PassthroughRouteLocal}}}
+	data, err := json.Marshal(cache)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"passthrough":{"route":"Local"}}}`, string(data))
+
+	decoded := &ClusterCache{}
+	require.NoError(t, json.Unmarshal(data, decoded))
+	require.Equal(t, cache, decoded)
+
+	copy := cache.DeepCopy()
+	copy.Spec.Passthrough.Route = PassthroughRoutePeers
+	require.Equal(t, PassthroughRouteLocal, cache.Spec.Passthrough.Route)
+
+	empty := &ClusterCache{}
+	require.NoError(t, json.Unmarshal([]byte(`{"metadata":{"name":"cache"},"spec":{"passthrough":{}}}`), empty))
+	require.NotNil(t, empty.Spec.Passthrough)
+	route, ok = empty.Spec.EffectivePassthroughRoute()
+	require.True(t, ok)
+	require.Equal(t, PassthroughRoutePeers, route)
+
+	data, err = json.Marshal(&ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}})
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "passthrough")
+}

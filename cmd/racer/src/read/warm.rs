@@ -380,6 +380,16 @@ impl WarmRegistry {
         job.complete(page, revision).unwrap();
     }
 
+    /// Marks a test job completed and retained until `until`.
+    #[cfg(test)]
+    pub(crate) fn finish(job: &Job, until: SystemTime) {
+        job.update(|progress| {
+            progress.running = false;
+            progress.admissions = 0;
+            progress.until = Some(until);
+        });
+    }
+
     /// Pages a remote primary owner holds are not stored on this node.
     #[cfg(test)]
     pub(crate) fn is_local_page(&self, page: &PageId) -> bool {
@@ -603,6 +613,70 @@ impl WarmRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn forget_cache(&self, cache: &racer_control_wire::CacheId) {
+        self.forget_caches(&std::collections::HashSet::from([cache.clone()]));
+    }
+
+    /// Forget warm state for every cache in `caches` once they stop retaining
+    /// pages, in one pass. Completed jobs are stopped and removed so readers
+    /// stop waiting on purged copies, running jobs are canceled, and their
+    /// leases are dropped with their unused hold capacity queued for release.
+    pub(crate) fn forget_caches(
+        &self,
+        caches: &std::collections::HashSet<racer_control_wire::CacheId>,
+    ) {
+        if caches.is_empty() {
+            return;
+        }
+        let mut cancel = Vec::new();
+        let mut stopped = Vec::new();
+        let mut wake = Vec::new();
+        self.jobs.lock().unwrap().retain(|version, job| {
+            if !caches.contains(&version.object.cache) {
+                return true;
+            }
+            let mut progress = job.progress.lock().unwrap();
+            if progress.running || progress.admissions != 0 {
+                // Stop the job and hide its completions under the progress
+                // lock. A page that lands after this, or a run that ends
+                // before observing cancellation, must not leave a marker
+                // for a purged copy. The job's last guard removes it.
+                progress.stopped = true;
+                progress.completed.clear();
+                wake.extend(progress.waiters.values().map(|(waker, _, _)| waker.clone()));
+                cancel.push(job.clone());
+                true
+            } else {
+                stopped.push(job.clone());
+                false
+            }
+        });
+        for job in stopped {
+            job.stop();
+        }
+        for job in cancel {
+            let _ = job.scope.cancel();
+        }
+        for waker in wake {
+            waker.wake();
+        }
+        let emptied = {
+            let mut leases = self.leases.lock().unwrap();
+            let generation = leases.next;
+            let mut emptied = Vec::new();
+            leases.versions.retain(|version, _| {
+                let keep = !caches.contains(&version.object.cache);
+                if !keep {
+                    emptied.push((version.clone(), generation));
+                }
+                keep
+            });
+            emptied
+        };
+        self.release_expired(emptied);
+    }
+
     pub(crate) fn poll_deadlines(&self) {
         let now = uring_runtime::environment::now();
         let wall = uring_runtime::environment::wall_now();
@@ -739,7 +813,8 @@ impl Job {
     fn complete(&self, page: u64, revision: u64) -> Result<()> {
         let wake = {
             let mut progress = self.progress.lock().unwrap();
-            if progress.revision != revision {
+            // A stopped job's copies may already be purged.
+            if progress.revision != revision || progress.stopped {
                 return Ok(());
             }
             progress.completed.insert(page)?;
@@ -1950,6 +2025,51 @@ mod tests {
         }));
         assert_eq!(result, Err(Error::VersionUnavailable));
         assert_eq!(calls.get(), 1);
+    }
+
+    /// A running job canceled by `forget_caches` can still complete pages or
+    /// finish before it observes cancellation. Neither may leave a completion
+    /// marker for a copy the purge already removed.
+    #[test]
+    fn forgotten_running_job_records_no_completion_after_purge() {
+        let registry = WarmRegistry::new(1);
+        let page = PageId {
+            version: version("forgotten"),
+            number: PageNumber(0),
+        };
+        let (job, _) = registry.begin(&page.version).unwrap();
+        WarmRegistry::publish(&job, 0);
+        let scope = scope();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let next = PageId {
+            number: PageNumber(1),
+            ..page.clone()
+        };
+        let mut waiting = Box::pin(registry.wait(&next, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        registry.forget_cache(&page.version.object.cache);
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Unwarmed))
+        );
+        drop(waiting);
+        // In-flight pages land and the run ends after the purge.
+        WarmRegistry::publish(&job, 1);
+        WarmRegistry::finish(
+            &job,
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+        );
+        for number in [0, 1] {
+            let page = PageId {
+                number: PageNumber(number),
+                ..page.clone()
+            };
+            assert_eq!(
+                futures::executor::block_on(registry.wait(&page, &scope)),
+                Ok(WarmWait::Unwarmed),
+                "page {number}"
+            );
+        }
     }
 
     #[test]
