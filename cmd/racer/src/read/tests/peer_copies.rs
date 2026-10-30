@@ -983,6 +983,69 @@ fn subscription_behind_remote_warm_fills_only_the_published_head() {
     drop(job);
 }
 
+/// A subscription opened while the cache was cached keeps selecting after the
+/// cache switches to local passthrough. Its selections must reach this node's
+/// origin through the ordinary page flight, contact no peer, and retain nothing.
+#[test]
+fn open_subscription_selects_no_peers_after_switching_to_passthrough_local() {
+    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let mut f = fixture();
+    let (peers, _ordered) = install_peers(&mut f, None);
+    let signers = network(4);
+    let (_local, mut endpoint, _published) =
+        super::hot_reads::coordinator(&f, &signers[peers.local], &f.membership, peers.requester());
+    let demand =
+        racer_core::subscriptions::Demand::new(vec![flow_control::subscriptions::Interval {
+            start: 0,
+            end: 4,
+        }])
+        .unwrap();
+    // The subscription and its selection exist before the switch.
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let selection =
+        crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
+    f.set_mode(racer_control_wire::CacheMode::PassthroughLocal);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
+    let mut work = Box::pin(f.fill.select_subscription(
+        &selection,
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut result = None;
+    for _ in 0..4096 {
+        if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
+            result = Some(value);
+            break;
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
+            &mut f.engine,
+            &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(64).unwrap();
+    }
+    drop(work);
+    let page = result.expect("passthrough selection").unwrap();
+    assert_eq!(page.plaintext.bytes(), b"abc");
+    drop(page);
+    assert!(peers.calls.borrow().is_empty(), "no peer is contacted");
+    assert!(peers.demands.borrow().is_empty(), "no selection is offered");
+    assert_eq!(f.origin.calls.get(), 1);
+    let deps = &f.fill.dependencies;
+    assert!(deps.memory.get(&f.page).unwrap().is_none());
+    assert!(deps.memory.ciphertext(&f.page).unwrap().is_none());
+    assert_eq!(deps.writer.pending_count(), 0);
+    assert!(deps.writer.index().lookup(&f.page).unwrap().is_none());
+    endpoint.uninstall().unwrap();
+}
+
 #[test]
 fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();

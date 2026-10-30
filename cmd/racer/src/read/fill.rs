@@ -470,16 +470,23 @@ impl Fill {
         if version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        // Passthrough caches retain nothing, so a warm job left over from
-        // before the switch cannot hold a usable copy.
-        let warmed = if self.passthrough(&version.object.cache) {
-            super::dispatch::Warmed::Unwarmed
-        } else {
-            self.dependencies
+        // A subscription opened while the cache was cached can outlive a
+        // switch to passthrough. Passthrough caches retain nothing, so a warm
+        // job or provider cannot hold a usable copy, and the local route must
+        // never contact peers. Fill only the head through the ordinary page
+        // flight, which applies the current mode.
+        if self.passthrough(&version.object.cache) {
+            return self
+                .dependencies
                 .metadata_owner
-                .warmed_page(&head, scope)
-                .await?
-        };
+                .acquire_unobserved(head, membership, context, scope, budget)
+                .await;
+        }
+        let warmed = self
+            .dependencies
+            .metadata_owner
+            .warmed_page(&head, scope)
+            .await?;
         match warmed {
             super::dispatch::Warmed::Local(page) => return Ok(*page),
             super::dispatch::Warmed::Unwarmed => {}
