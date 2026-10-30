@@ -31,6 +31,7 @@ pub mod security;
 pub mod store;
 pub mod telemetry;
 pub mod topology;
+pub(crate) mod ublk;
 pub mod worker;
 
 #[cfg(feature = "subscription-interop")]

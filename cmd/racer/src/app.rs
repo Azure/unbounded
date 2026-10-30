@@ -186,6 +186,9 @@ pub struct NodeState {
 
     /// Process-wide memory-pressure level, written only by the control worker.
     pressure: crate::pressure::SharedPressure,
+
+    /// ublk device table shared with the `ublk-control` thread, when enabled.
+    ublk: Option<Arc<crate::ublk::manager::Manager>>,
 }
 
 impl Default for NodeState {
@@ -239,6 +242,7 @@ impl NodeState {
             observations: Observations::default(),
             native: native::NativeNode::default(),
             pressure: Default::default(),
+            ublk: None,
         })
     }
 }
@@ -458,6 +462,7 @@ impl Application {
             self.config.io_workers.is_some(),
         )?;
         self.config.admission_history_per_worker(plan.pairs.len())?;
+        reserve_ublk_submissions(&self.config.ublk, &mut self.limits)?;
         log_worker_plan("final", &plan);
         self.node = Arc::new(NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
@@ -537,6 +542,7 @@ impl Application {
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
+        let ublk = self.start_ublk(plan.pairs.len())?;
         self.prepare_workers()?;
         let mut workers = WorkerGroup::new(plan);
         let result = if self.config.managed() {
@@ -544,6 +550,12 @@ impl Application {
         } else {
             workers.run(&self)
         };
+        if let Some((manager, thread)) = ublk {
+            manager.request_stop();
+            if thread.join().is_err() {
+                eprintln!("racer: component=ublk stage=control state=panicked");
+            }
+        }
         match result {
             Err(error) if signal_stop(error, signals.requested()) => Ok(()),
             result => result,
@@ -1041,6 +1053,9 @@ pub struct WorkerApplication {
     cache_preparing_generation: u64,
 
     control_scope: Option<RequestScope>,
+
+    /// This worker's ublk queues, when ublk is enabled.
+    ublk: Option<crate::ublk::worker::UblkWorker<crate::ublk::directory::DirectoryBackend>>,
 }
 
 /// Ownership is optional eviction guidance. Even Progress may mean the ranking
@@ -1133,6 +1148,27 @@ mod ownership_maintenance_tests {
 }
 
 impl WorkerApplication {
+    /// Whether ublk devices may still send reads. True until the control
+    /// thread has stopped every device.
+    fn ublk_holds_reads(&self) -> bool {
+        self.node
+            .ublk
+            .as_ref()
+            .is_some_and(|manager| !manager.control_done())
+    }
+
+    /// Stop the worker quotas once ublk no longer holds reads, or at once when
+    /// `force` is set (the drain deadline passed). Until then ublk reads of
+    /// uncached pages, and the peer fills they cause, still reserve buffers.
+    fn release_ublk_quotas(&self, force: bool) {
+        let admission = &self.runtime.admission;
+        if !admission.policy().stop_deferred() || (!force && self.ublk_holds_reads()) {
+            return;
+        }
+        admission.policy().defer_stop(false);
+        admission.stop();
+    }
+
     /// All constructors below only connect dependencies. Runtime commands route
     /// listener work to page/metadata owners before any acquisition is dispatched.
     pub fn assemble(
@@ -1447,7 +1483,11 @@ impl WorkerApplication {
                 telemetry.profiling = Some(controller);
             }
         }
+        let ublk = Self::assemble_ublk(config, &node, worker, &runtime, &snapshots)?;
+        // Worker shutdown must not stop the quotas while devices still read.
+        runtime.admission.policy().defer_stop(ublk.is_some());
         Ok(Self {
+            ublk,
             ingress_peers: futures::stream::FuturesUnordered::new(),
             #[cfg(test)]
             peer_requester: requester,
@@ -1514,6 +1554,56 @@ impl WorkerApplication {
             next_health: uring_runtime::environment::now(),
             pressure: WorkerPressure::new(config.memory_pressure, &node_pressure, is_sampler),
         })
+    }
+
+    /// Build this worker's ublk queue service. Queue `q` of every device is
+    /// served by the worker at position `q` in the node's worker list.
+    fn assemble_ublk(
+        config: &Config,
+        node: &NodeState,
+        worker: WorkerId,
+        runtime: &WorkerRuntime,
+        snapshots: &Rc<PublicationTarget>,
+    ) -> Result<Option<crate::ublk::worker::UblkWorker<crate::ublk::directory::DirectoryBackend>>>
+    {
+        let Some(manager) = &node.ublk else {
+            return Ok(None);
+        };
+        let q = node
+            .metrics
+            .iter()
+            .position(|(id, _)| *id == worker)
+            .and_then(|q| u16::try_from(q).ok())
+            .filter(|q| *q < manager.queues())
+            .ok_or(Error::InvalidConfiguration)?;
+        let backend = Rc::new(crate::ublk::directory::DirectoryBackend {
+            directory: node.workers.clone(),
+            snapshots: snapshots.clone(),
+            reactor: runtime.reactor.clone(),
+            timeout: config.request_timeout,
+        });
+        // One slot per tag of every device: each tag has exactly one queue
+        // command outstanding or being retried at a time.
+        let commands = manager
+            .device_count()
+            .checked_mul(usize::from(config.ublk.queue_depth))
+            .ok_or(Error::InvalidConfiguration)?;
+        let commands = runtime.reactor.reserve_commands(commands)?;
+        // Per-worker quotas: retained pages must leave room for reads.
+        let limits = runtime.admission.policy().limits();
+        Ok(Some(
+            crate::ublk::worker::UblkWorker::new(
+                q,
+                manager.clone(),
+                backend,
+                runtime.reactor.clone(),
+                Some(commands),
+            )
+            .with_window_quota(
+                limits.plaintext_bytes.get(),
+                limits.range_window_pages.get(),
+            ),
+        ))
     }
 
     /// Connect shared publication state to worker-local read and metadata services.
@@ -1895,6 +1985,10 @@ impl WorkerApplication {
             stage_result(worker, "cache-preparation", prepared)?;
         }
         self.poll_listeners(cx, budget)?;
+        if let Some(ublk) = &mut self.ublk {
+            // Keeps serving while stopping so STOP_DEV can abort every tag.
+            ublk.poll(cx);
+        }
         stage_result(worker, "writer", self.poll_writer(cx))?;
         if !self.stopping {
             stage_result(worker, "control", self.poll_control(cx))?;
@@ -2283,6 +2377,55 @@ impl WorkerApplication {
     }
 }
 
+/// Largest per-worker reactor queue that ublk headroom may produce. The ring
+/// has two submission entries per queue entry and the kernel caps a ring at
+/// 32768 entries.
+const MAX_UBLK_QUEUE_ENTRIES: usize = 16_384;
+
+/// Grow each worker's reactor queue and request-context quota for ublk.
+/// Every tag keeps a FETCH or COMMIT_AND_FETCH outstanding for the life of
+/// the device, and a request being served adds one write at a time. The
+/// first half of this headroom is then reserved for the queue commands (see
+/// `assemble_ublk`), so they can neither starve ordinary traffic nor be
+/// refused because of it. The writes share the rest with ordinary work.
+fn reserve_ublk_submissions(ublk: &crate::config::UblkConfig, limits: &mut Limits) -> Result<()> {
+    if !ublk.enabled() {
+        return Ok(());
+    }
+    let extra = ublk
+        .devices
+        .len()
+        .checked_mul(usize::from(ublk.queue_depth))
+        .and_then(|tags| tags.checked_mul(2))
+        .ok_or(Error::InvalidConfiguration)?;
+    let Some(entries) = limits
+        .queue_entries
+        .get()
+        .checked_add(extra)
+        .filter(|entries| *entries <= MAX_UBLK_QUEUE_ENTRIES)
+    else {
+        // Config parsing bounds the ublk share; the per-worker ordinary
+        // queue can still push the total over the cap. Say which sizes did.
+        eprintln!(
+            "racer: component=ublk stage=reserve error=reactor queue too large queue_entries={} ublk_entries={extra} limit={MAX_UBLK_QUEUE_ENTRIES}",
+            limits.queue_entries.get()
+        );
+        return Err(Error::InvalidConfiguration);
+    };
+    let bytes = extra
+        .checked_mul(uring_runtime::reactor::SUBMISSION_BYTES)
+        .and_then(|bytes| limits.request_context_bytes.get().checked_add(bytes))
+        .ok_or(Error::InvalidConfiguration)?;
+    limits.queue_entries = NonZeroUsize::new(entries).ok_or(Error::InvalidConfiguration)?;
+    limits.request_context_bytes = NonZeroUsize::new(bytes).ok_or(Error::InvalidConfiguration)?;
+    Ok(())
+}
+
+type UblkControl = (
+    Arc<crate::ublk::manager::Manager>,
+    std::thread::JoinHandle<()>,
+);
+
 impl Application {
     /// Resolve `RACER_ENABLE_GPU` into the process GPU slot; see
     /// [`gpu_slot`].
@@ -2296,6 +2439,32 @@ impl Application {
                 .then(|| self.node.native.link_node()),
             Box::new(racer_gpu::Gpu::load),
         )
+    }
+
+    /// Create the ublk device table and start the `ublk-control` thread.
+    /// Does nothing, and opens no device, when no ublk device is configured.
+    fn start_ublk(&mut self, workers: usize) -> Result<Option<UblkControl>> {
+        if !self.config.ublk.enabled() {
+            return Ok(None);
+        }
+        let queues = u16::try_from(workers)
+            .ok()
+            .filter(|queues| *queues <= crate::ublk::uapi::UBLK_MAX_NR_QUEUES)
+            .ok_or(Error::InvalidConfiguration)?;
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &self.config.ublk,
+            queues,
+            &self.config.device_directory,
+            self.config.shutdown_timeout,
+            self.config.request_timeout,
+        ));
+        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.ublk = Some(manager.clone());
+        let runner = manager.clone();
+        let thread = std::thread::Builder::new()
+            .name("ublk-control".into())
+            .spawn(move || runner.run())
+            .map_err(|_| Error::Internal)?;
+        Ok(Some((manager, thread)))
     }
 
     /// Allocate paired worker resources once before building service lanes.
@@ -2411,6 +2580,9 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
         self.stopping = true;
+        if let Some(manager) = &self.node.ublk {
+            manager.request_stop();
+        }
         if let Some(profiling) = self.node.profiling.get() {
             profiling.stop();
         }
@@ -2426,7 +2598,12 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 .transition(crate::telemetry::State::Draining)?;
         }
         self.clients.stop_admission();
-        if let Some(endpoint) = &self.endpoint {
+        self.release_ublk_quotas(false);
+        // ublk reads go through every worker's mailbox. STOP_DEV waits for
+        // them, so keep the mailbox open until the devices are stopped.
+        if !self.ublk_holds_reads()
+            && let Some(endpoint) = &self.endpoint
+        {
             endpoint.stop_admission();
         }
         if let Some(scope) = &self.listener_scope {
@@ -2457,7 +2634,9 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             let flights = self.flights.clone();
             let fence_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
             let mut client_drain = clients.drain(&deadline);
-            let mut flight_drain = flights.drain(&fence_scope);
+            // Flights fetch ublk pages from origin and peers, so their drain
+            // waits like the endpoint's until the devices are stopped.
+            let mut flight_drain = None;
             let mut clients_done = false;
             let mut flights_done = false;
             let mut first_error = None;
@@ -2467,6 +2646,13 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 {
                     first_error.get_or_insert(error);
                 }
+                if deadline.check().is_err()
+                    && let Some(ublk) = &mut self.ublk
+                {
+                    // The control thread did not stop the devices in time.
+                    ublk.abandon();
+                }
+                self.release_ublk_quotas(deadline.check().is_err());
                 if let Err(error) = self.poll_services(cx, 64) {
                     first_error.get_or_insert(error);
                 }
@@ -2476,13 +2662,20 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                     }
                     clients_done = true;
                 }
-                if !flights_done && let Poll::Ready(result) = flight_drain.as_mut().poll(cx) {
+                let holding = self.ublk_holds_reads() && deadline.check().is_ok();
+                if !holding && flight_drain.is_none() {
+                    flight_drain = Some(flights.drain(&fence_scope));
+                }
+                if !flights_done
+                    && let Some(drain) = &mut flight_drain
+                    && let Poll::Ready(result) = drain.as_mut().poll(cx)
+                {
                     if let Err(error) = result {
                         first_error.get_or_insert(error);
                     }
                     flights_done = true;
                 }
-                if let Some(endpoint) = &mut self.endpoint {
+                if !holding && let Some(endpoint) = &mut self.endpoint {
                     let mut drain = endpoint.drain(&deadline);
                     if let Poll::Ready(Err(error)) = drain.as_mut().poll(cx) {
                         first_error.get_or_insert(error);
@@ -2502,6 +2695,10 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                     && self.checkpoint_snapshot.is_none()
                     && self.checkpoint_generation == 0
                     && self.store.writer.is_idle()
+                    && self
+                        .ublk
+                        .as_ref()
+                        .is_none_or(crate::ublk::worker::UblkWorker::is_idle)
                 {
                     Poll::Ready(())
                 } else {
@@ -3235,6 +3432,274 @@ fn size_workers_policy(
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod ublk_tests {
+    //! ublk stays off without devices and reserves queue headroom with them.
+
+    use super::*;
+
+    fn ublk(devices: usize, queue_depth: u16) -> crate::config::UblkConfig {
+        crate::config::UblkConfig {
+            devices: (0..devices)
+                .map(|i| crate::config::UblkDeviceConfig {
+                    cache: format!("c{i}"),
+                    key: crate::model::CacheKey([i as u8; 32]),
+                    etag: None,
+                    id: None,
+                })
+                .collect(),
+            queue_depth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disabled_ublk_keeps_limits_and_starts_nothing() {
+        let config = crate::test_support::cluster::config(false);
+        assert!(!config.ublk.enabled());
+        let mut limits = config.limits.clone();
+        reserve_ublk_submissions(&config.ublk, &mut limits).unwrap();
+        assert_eq!(limits.queue_entries, config.limits.queue_entries);
+        assert_eq!(
+            limits.request_context_bytes,
+            config.limits.request_context_bytes
+        );
+        let mut application = Application::assemble(config).unwrap();
+        // No thread, no manager, and no access to /dev/ublk-control.
+        assert!(application.start_ublk(2).unwrap().is_none());
+        assert!(application.node.ublk.is_none());
+    }
+
+    #[test]
+    fn enabled_ublk_reserves_two_slots_per_tag() {
+        let config = crate::test_support::cluster::config(false);
+        let mut limits = config.limits.clone();
+        reserve_ublk_submissions(&ublk(3, 16), &mut limits).unwrap();
+        assert_eq!(
+            limits.queue_entries.get(),
+            config.limits.queue_entries.get() + 3 * 16 * 2
+        );
+        assert_eq!(
+            limits.request_context_bytes.get(),
+            config.limits.request_context_bytes.get()
+                + 3 * 16 * 2 * uring_runtime::reactor::SUBMISSION_BYTES
+        );
+    }
+
+    #[test]
+    fn largest_accepted_ublk_config_leaves_room_for_ordinary_queue() {
+        let tags = crate::config::MAX_UBLK_TAGS;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        // Half of the cap stays for the worker's ordinary queue.
+        limits.queue_entries = NonZeroUsize::new(MAX_UBLK_QUEUE_ENTRIES - 2 * tags).unwrap();
+        reserve_ublk_submissions(&ublk(1, tags as u16), &mut limits).unwrap();
+        assert_eq!(limits.queue_entries.get(), MAX_UBLK_QUEUE_ENTRIES);
+        // One more ordinary entry no longer fits and is refused, not clamped.
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.queue_entries = NonZeroUsize::new(MAX_UBLK_QUEUE_ENTRIES - 2 * tags + 1).unwrap();
+        let before = limits.clone();
+        assert_eq!(
+            reserve_ublk_submissions(&ublk(1, tags as u16), &mut limits),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(limits.queue_entries, before.queue_entries);
+        assert_eq!(limits.request_context_bytes, before.request_context_bytes);
+    }
+
+    #[test]
+    fn oversized_ublk_reservation_is_rejected() {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        assert_eq!(
+            reserve_ublk_submissions(&ublk(64, 4096), &mut limits),
+            Err(Error::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn enabled_ublk_starts_the_control_thread() {
+        let mut config = crate::test_support::cluster::config(false);
+        config.ublk = ublk(1, 4);
+        config.device_directory = "/nonexistent-ublk-test".into();
+        let mut application = Application::assemble(config).unwrap();
+        let (manager, thread) = application.start_ublk(2).unwrap().unwrap();
+        assert!(application.node.ublk.is_some());
+        assert_eq!(manager.queues(), 2);
+        // Opening the missing control device fails; the thread exits on its own.
+        thread.join().unwrap();
+    }
+
+    /// A real worker graph on worker 0 of the default two-worker node, with
+    /// its read endpoint installed as `start` would.
+    fn worker_with(
+        ublk: Option<(
+            Arc<crate::ublk::manager::Manager>,
+            crate::config::UblkConfig,
+        )>,
+    ) -> WorkerApplication {
+        let mut config = crate::test_support::cluster::config(false);
+        let ublk = ublk.map(|(manager, ublk)| {
+            reserve_ublk_submissions(&ublk, &mut config.limits).unwrap();
+            config.ublk = ublk;
+            manager
+        });
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            config.limits.clone(),
+        )));
+        let (io, _engine) = crate::security::pair(WorkerId(0), 0, config.limits.queue_entries);
+        let node = NodeState {
+            ublk,
+            ..Default::default()
+        };
+        let mut worker = WorkerApplication::assemble(
+            &config,
+            Arc::new(node),
+            WorkerId(0),
+            WorkerRuntime {
+                reactor: Rc::new(Reactor::new(admission.clone())),
+                admission,
+                crypto: Rc::new(crate::security::CryptoClient::new(io)),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        worker.endpoint = Some(
+            worker
+                .directory
+                .install(worker.worker, worker.coordinator.clone())
+                .unwrap(),
+        );
+        worker
+    }
+
+    fn admitting(worker: &WorkerApplication) -> bool {
+        worker
+            .endpoint
+            .as_ref()
+            .is_some_and(WorkerEndpoint::is_admitting)
+    }
+
+    #[test]
+    fn stop_admission_closes_reads_without_ublk() {
+        let mut worker = worker_with(None);
+        assert!(admitting(&worker));
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        assert!(!worker.ublk_holds_reads());
+        assert!(!admitting(&worker));
+    }
+
+    #[test]
+    fn stop_admission_keeps_ublk_reads_open_until_devices_stop() {
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &ublk(1, 4),
+            2,
+            std::path::Path::new("/nonexistent-ublk-test"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let mut worker = worker_with(Some((manager.clone(), ublk(1, 4))));
+        assert!(worker.ublk.is_some());
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        // STOP_DEV waits for in-flight reads, so the read path stays open and
+        // the ublk queue keeps being polled while the worker is stopping.
+        assert!(worker.stopping);
+        assert!(worker.ublk_holds_reads());
+        assert!(admitting(&worker));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let views = manager.view(0, cx.waker());
+        assert!(!views[0].resolve, "stop must end version lookups");
+        worker.ublk.as_mut().unwrap().poll(&mut cx);
+        // The control thread exits after stopping every device. Opening the
+        // missing control device fails, which ends the thread the same way.
+        manager.run();
+        assert!(manager.control_done());
+        assert!(!worker.ublk_holds_reads());
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        assert!(!admitting(&worker));
+    }
+
+    fn reserve_page(admission: &flow_control::Quotas<AdmissionPolicy>) -> Result<()> {
+        admission
+            .reserve(
+                None,
+                crate::admission::ResourceClass::Plaintext,
+                crate::model::PAGE_BYTES as usize,
+            )
+            .map(drop)
+            .map_err(Into::into)
+    }
+
+    /// Wrap the worker like `build_lane` so the I/O service stop runs too.
+    fn lane(
+        worker: WorkerApplication,
+    ) -> (
+        Box<dyn uring_runtime::group::Service<RequestScope>>,
+        Rc<flow_control::Quotas<AdmissionPolicy>>,
+    ) {
+        let admission = worker.runtime.admission.clone();
+        let runtime = WorkerRuntime {
+            reactor: worker.runtime.reactor.clone(),
+            admission: admission.clone(),
+            crypto: worker.runtime.crypto.clone(),
+        };
+        (
+            crate::worker::io_service(runtime, Box::new(worker)),
+            admission,
+        )
+    }
+
+    #[test]
+    fn stop_admission_stops_quotas_without_ublk() {
+        let (mut service, admission) = lane(worker_with(None));
+        assert!(!admission.policy().stop_deferred());
+        service.stop_admission().unwrap();
+        assert!(admission.is_stopped());
+        assert!(reserve_page(&admission).is_err());
+    }
+
+    #[test]
+    fn ublk_reads_reserve_plaintext_until_devices_stop() {
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &ublk(1, 4),
+            2,
+            std::path::Path::new("/nonexistent-ublk-test"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let worker = worker_with(Some((manager.clone(), ublk(1, 4))));
+        let (mut service, admission) = lane(worker);
+        service.stop_admission().unwrap();
+        // An uncached ublk page, local or filled for a peer, still needs a
+        // plaintext reservation while STOP_DEV waits for the read.
+        assert!(!admission.is_stopped());
+        reserve_page(&admission).expect("ublk read admitted during drain");
+        manager.run();
+        assert!(manager.control_done());
+        service.stop_admission().unwrap();
+        assert!(admission.is_stopped());
+        assert!(reserve_page(&admission).is_err());
+    }
+
+    #[test]
+    fn ublk_quotas_stop_at_drain_deadline() {
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &ublk(1, 4),
+            2,
+            std::path::Path::new("/nonexistent-ublk-test"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let mut worker = worker_with(Some((manager.clone(), ublk(1, 4))));
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        worker.release_ublk_quotas(false);
+        assert!(!worker.runtime.admission.is_stopped());
+        // Devices still hold reads, but the deadline forces the stop.
+        assert!(worker.ublk_holds_reads());
+        worker.release_ublk_quotas(true);
+        assert!(worker.runtime.admission.is_stopped());
+        assert!(!worker.runtime.admission.policy().stop_deferred());
+    }
+}
 
 #[cfg(test)]
 mod lifecycle_policy_tests {

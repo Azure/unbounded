@@ -5,6 +5,9 @@
 #[path = "process_restart/throughput.rs"]
 mod throughput;
 
+#[path = "process_restart/ublk.rs"]
+mod ublk;
+
 #[path = "support/subscription.rs"]
 mod subscription;
 
@@ -718,6 +721,13 @@ fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
     }
 }
 
+/// The dataplane executable. `RACER_TEST_DATAPLANE` overrides the Cargo path
+/// for runs outside the build tree, such as the ublk VM harness.
+fn dataplane_binary() -> PathBuf {
+    std::env::var_os("RACER_TEST_DATAPLANE")
+        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_racer")), PathBuf::from)
+}
+
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -727,7 +737,10 @@ impl Scratch {
             "requires root and mount namespaces"
         );
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let root = std::env::var_os("RACER_TEST_SCRATCH").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            PathBuf::from,
+        );
         fs::create_dir_all(&root).unwrap();
         let path = root.join(format!(
             "restart-{}-{}",
@@ -762,6 +775,16 @@ impl Process {
         incarnation: usize,
         profile: Option<&throughput::Profile>,
     ) -> (Self, Vec<Origin>) {
+        Self::launch(scratch, control, incarnation, profile, &[])
+    }
+    /// Starts the dataplane with `extra` variables applied after the defaults.
+    fn launch(
+        scratch: &Scratch,
+        control: &control::Control,
+        incarnation: usize,
+        profile: Option<&throughput::Profile>,
+        extra: &[(&str, String)],
+    ) -> (Self, Vec<Origin>) {
         let expected_plan = profile.map(|profile| profile_plan(profile.pairs));
         // This fixture gives each process fresh runtime sockets and shares identity/
         // and slabs/. It does not cover stale sockets on deployment's hostPath.
@@ -778,10 +801,11 @@ impl Process {
             fs::create_dir_all(cache.join("client")).unwrap();
             let directory = fs::File::open(&cache).unwrap();
             let alias = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-            origins.push(Origin::start_with(
+            origins.push(Origin::serve(
                 &alias.join("origin/socket"),
                 profile.map_or(LENGTH, |p| p.length),
                 profile.is_some(),
+                extra.iter().any(|(name, _)| *name == "RACER_UBLK_DEVICES"),
             ));
             cache_directories.push(directory);
         }
@@ -794,7 +818,7 @@ impl Process {
         .unwrap();
         let diagnostic = TcpListener::bind("127.0.0.1:0").unwrap();
         let diagnostics = diagnostic.local_addr().unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_racer"));
+        let mut command = Command::new(dataplane_binary());
         for (key, _) in std::env::vars_os() {
             if key.as_encoded_bytes().starts_with(b"RACER_") {
                 command.env_remove(key);
@@ -842,6 +866,7 @@ impl Process {
                 ("RACER_SHUTDOWN_TIMEOUT_MS", "10000"),
             ]);
         }
+        command.envs(extra.iter().map(|(name, value)| (name, value)));
         let source = CString::new(run.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: the child performs only async-signal-safe syscalls before exec.
         // Make propagation private before mounting worktree-local storage over /run.
@@ -1131,6 +1156,11 @@ struct Origin {
 }
 impl Origin {
     fn start_with(path: &Path, length: u64, distinct: bool) -> Self {
+        Self::serve(path, length, distinct, false)
+    }
+    /// `anonymous` also accepts fills without client credentials, as ublk
+    /// devices send; present credentials must still match.
+    fn serve(path: &Path, length: u64, distinct: bool, anonymous: bool) -> Self {
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1173,8 +1203,10 @@ impl Origin {
                                 assert_eq!(key.len(), 64);
                                 assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
                                 if !distinct { assert_eq!(key, "ab".repeat(32)); }
-                                assert_eq!(fields["authorization"], "fixture-credential");
-                                assert_eq!(fields["racer-metadata"], "fixture-metadata");
+                                if !(anonymous && !fields.contains_key("authorization") && !fields.contains_key("racer-metadata")) {
+                                    assert_eq!(fields["authorization"], "fixture-credential");
+                                    assert_eq!(fields["racer-metadata"], "fixture-metadata");
+                                }
                                 calls.lock().unwrap().push(Call { method: method.into(), pin: fields.get("if-match").cloned(), range: fields.get("range").cloned() });
                                 if offline.load(Ordering::Acquire) {
                                     let _ = write!(socket, "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n");
