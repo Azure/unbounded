@@ -145,8 +145,8 @@ library.
 
 - **G1.** One interface for hosting a Kubernetes node, with two
   implementations: `host` and `nspawn-container`.
-- **G2.** Feature parity with v1 ([v1 compatibility, section 1](08-v1-compatibility.md#1-parity-with-v1)), except for the intended
-  behavior changes listed in [v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1).
+- **G2.** The same features and outcomes as v1 ([v1 compatibility, section 1](08-v1-compatibility.md#1-parity-with-v1)), except for the
+  behavior changes listed, each with its reason, in [v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1).
 - **G3.** Consumers customize the agent binary through hook points. They do
   not link against agent Go packages.
 - **G4.** v1 behavior is unchanged, apart from the small changes listed in
@@ -195,10 +195,6 @@ this design was settled in design discussion and an earlier review round.
    (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Is the `current` link
    enough for v2's boot hooks, given the recovery unit restores `last-good` into
    `current`?
-6. **The `Decide` behavior change ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)).** v2 compares the observed
-   Node on every reconcile instead of reacting only to delete events. A Node
-   deleted while the daemon was down therefore triggers a repave when the
-   daemon returns. Is that the behavior we want?
 
 ## 4. Architecture overview
 

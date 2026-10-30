@@ -28,25 +28,37 @@ repository baseline, citation conventions and terms.
 
 ## 2. Behavior changes from v1
 
-Where v2 intentionally behaves differently from v1. Everything not listed
-here should match v1.
+v2 should have the same outcomes as v1. Each difference below has a reason
+that justifies it. Everything else matches v1.
 
-| Area | v1 | v2 | Section |
-|---|---|---|---|
-| Noticing a deleted Node | Reacts only to delete events, so it misses one deleted while the daemon is down | Compares the observed Node on every reconcile, and records its UID | [control and state, section 5](04-control-and-state.md#5-daemon-reconcile) (open: [overview, section 3](README.md#3-open-questions), question 6) |
-| A Node deleted and recreated | Not handled | Treated as a deletion; repaves if there is drift | [control and state, section 5](04-control-and-state.md#5-daemon-reconcile) |
-| A node that never registers | Stays as it is, with no report | Stays as it is, and reports `NodeNotRegistered` after 10 minutes | [control and state, section 5](04-control-and-state.md#5-daemon-reconcile) |
-| Repave commit | Saves the new configuration before kubelet is confirmed running (`cmd/agent/internal/daemon/nodeoperator.go:275-285`) | Commits only once the new node is ready | [lifecycles, section 2](05-lifecycles.md#2-repave) |
-| A crash during a repave unpack | Skips unpacking when the machine directory is not empty, so later attempts reuse a partial rootfs (`pkg/agent/phases/rootfs/oci/task.go:61-64`) | A slot is provisioned again unless its completion marker is present | [node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle) |
-| Active slot after a crash | `kube1` wins if both slots have a configuration file (`cmd/agent/internal/daemon/nodeoperator.go:77`) | The runtime reports the enabled slot; `Recover` reconciles by bundle digest | [control and state, section 4](04-control-and-state.md#4-state) |
-| Boot hooks | Regenerate configuration from the applied config | Read the bundle manifest saved at provision time | [node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle) |
-| Host network reset | Fixed names and a fixed WireGuard range | Names plus link kinds, any WireGuard port, and owned iptables chains removed on reset | [host changes, section 2](06-host-changes.md#2-host-network-reset) |
-| Reset | Leaves host preparation in place | Reverses it from the undo log | [host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal) |
-| MachineOperations without a handler | Ignored | Failed, if the kind belongs to the agent | [control and state, section 6](04-control-and-state.md#6-machineoperation-handling) |
-| Configuration | v1 JSON or environment variables | Versioned v2 file, or v1 JSON converted; environment variables dropped | [CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration), section 5 |
-| Install check | Fingerprints the Kubernetes version, OCI image and API server, and fails `start` on any change | Fingerprints install-time settings only; goal-setting changes are handled as drift | [CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration) |
-| Agent upgrade | Checks the candidate answers `version` | Also checks it answers `v2 version` | [lifecycles, section 4](05-lifecycles.md#4-agentupgrade) |
-| Extension points | `pkg/agent` as a library | Plugins, hooks and declarative extensions | [extensions](02-extensions.md) |
+| Situation | v1 outcome | v2 outcome | Why | Section |
+|---|---|---|---|---|
+| The node never registers | Nothing happens and nothing is reported | Nothing happens; status reports `NodeNotRegistered` after 10 minutes | Visibility only; the action is the same | [control and state, section 5](04-control-and-state.md#5-daemon-reconcile) |
+| The daemon restarts after it saw the Node deleted, but before the repave finished | The repave is forgotten. The operator has to bring the Node back and delete it again. | The repave continues, because the approval was saved to disk when the deletion was seen | Self-healing: the daemon finishes what it was approved to do | [control and state, section 4](04-control-and-state.md#4-state) |
+| The new node fails to start during a repave | v1 saves the new configuration before checking kubelet (`cmd/agent/internal/daemon/nodeoperator.go:279-282`). Repaving into `kube2`, it retries. Repaving into `kube1`, the retry finds `kube1` already configured, because v1 checks `kube1` first (`nodeoperator.go:77`). It reports success although kubelet never started, and leaves the old `kube2` on disk. | Retried until the new node is ready, and reported as `Failed` with reason `RepaveFailed` in the meantime | v1 can report a broken repave as successful | [lifecycles, section 2](05-lifecycles.md#2-repave) |
+| The host loses power while a repave unpacks the image | The next attempt skips unpacking because the machine directory is not empty, and starts from a partial image (`pkg/agent/phases/rootfs/oci/task.go:61-64`) | Unpacks again unless a completion marker exists, as v1's bootstrap already does (`pkg/agent/phases/rootfs/provision.go:23-27`) | v1 can start a corrupt node | [node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle) |
+| After a reset | Docker stays masked, swap stays off, and the sysctl file, nftables flush unit, apt drop-ins and masked host kubelet and containerd remain, although `reset --help` promises to restore the host (`cmd/agent/internal/cmd/reset.go:22-24`) | Every change the agent made is undone. Installed packages stay. | v1 does not do what it promises | [host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal) |
+| Network cleanup on repave and reset | Deletes fixed link names whatever their type. Cleans WireGuard links only from `wg51820` to `wg51899` (`pkg/agent/phases/reset/network.go:225-241`), though gateway ports have no upper limit (`internal/net/controller/gatewaypool_controller.go:411-415`). Leaves the `UNBOUNDED-*`, `KUBE-*` and `CNI-*` iptables chains after reset. | Removes all of these. A link with the right name but the wrong type is reported, not deleted. | v1 leaves state behind, and can delete a link that is not its own | [host changes, section 2](06-host-changes.md#2-host-network-reset) |
+| A MachineOperation kind the agent does not know, such as a newer agent operation sent to an older agent | Ignored, so it stays pending forever (`pkg/agent/daemon/machineoperation.go:114-116`) | Failed with `UnsupportedOperation`, if the kind starts with `Node` or `Agent` | An operation that stays pending forever blocks automation | [control and state, section 6](04-control-and-state.md#6-machineoperation-handling) (open question 1) |
+| Configuration through environment variables | Without a configuration file, v1 reads `KUBE_VERSION`, `BOOTSTRAP_TOKEN`, `NODE_LABELS` and others (`cmd/agent/internal/cmd/config.go:37-40,104-161`) | Configuration file only. v1 JSON files are still accepted. | One configuration source. `kubectl unbounded` always writes a file (`cmd/kubectl-unbounded/app/assets/node-bootstrap/script.sh:20-40`). | [CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration) |
+| A v2 host is upgraded to a binary without v2 | Not applicable | The candidate is rejected before the switch | Without the check, the switch happens, the daemon fails, and the recovery unit rolls back: the same end state, but slower and noisier | [lifecycles, section 4](05-lifecycles.md#4-agentupgrade) |
+
+v2 matches v1 on purpose in these places, where a different outcome was
+considered and rejected:
+
+- Only a Node deletion the daemon sees as it happens starts a repave. A Node
+  deleted while the daemon is not running is ignored, so stopping the daemon
+  is a safe way to keep a node as it is ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)).
+- A new goal version, and the Machine's `RepavePending` condition, are
+  recorded only when the daemon handles a Node deletion ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)).
+- Host devices are found again at every node start ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)).
+- The install check uses v1's fingerprint and v1's resume behavior ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).
+- A NodeReboot on `host` shows a new Node boot ID and a `Rebooted` event, as
+  on `nspawn-container` ([node runtime, section 5.2](03-node-runtime.md#52-host)).
+
+Moving from `pkg/agent` as a library to plugins, hooks and declarative
+extensions is the purpose of v2 ([extensions](02-extensions.md)), not a change to how a node
+behaves.
 
 ## 3. Code copied from v1
 

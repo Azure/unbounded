@@ -171,18 +171,22 @@ The configuration has two kinds of settings:
 | Install-time settings | `machine`, `runtime` (except `runtime.nspawnContainer.image`), `credentials`, `control`, `plugins`, `hooks`, `extensions` | The configuration file only | Reset, then `v2 start` with the new file. Running `v2 start` with different install-time settings on an installed host fails the install check. |
 | Goal settings (`config.GoalSettings`) | `cluster`, `kubelet`, `components`, `artifacts`, `runtime.nspawnContainer.image` | The configuration file at bootstrap, then the goal source | A goal with different goal settings; drift decides whether a repave is needed ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 
-The install check compares a fingerprint of the install-time settings only.
-v1's fingerprint also covers the Kubernetes version, OCI image and API server
-(`cmd/agent/internal/cmd/bootstrap.go:65-78`), which are goal settings in v2.
-Running `v2 start` again with different goal settings:
+The install check compares the machine name and a fingerprint of the
+install-time settings plus the three goal settings v1 fingerprints: the
+Kubernetes version, the OCI image and the API server
+(`cmd/agent/internal/cmd/bootstrap.go:65-78`). It then behaves as v1 does
+(`cmd/agent/internal/installstate/store.go:216-224`):
 
-- on a complete install, is accepted and changes nothing; the daemon handles
-  the difference as drift ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile));
-- on a resumed install where the node has not started yet, provisions from the
-  new file;
-- on a resumed install where the node already started, fails if the bundle
-  rendered from the new file has a different digest from the running slot's.
-  The operator must reset, as with any fingerprint mismatch in v1.
+- If the machine name or fingerprint differs from the install record's,
+  `v2 start` fails and asks for a reset.
+- On a complete install, `v2 start` verifies the node and the daemon, repairs
+  the daemon if needed, and ignores any other differences in the file.
+- On a resumed install, a node that has not started yet is provisioned from
+  the file. A node that is already running is kept as it is. Bootstrap
+  records the goal settings saved in its bundle manifest as applied, not the
+  file's ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)), so any other difference in the file, such
+  as a changed label, is not applied. v1's e2e suite checks exactly this
+  (`hack/agent/e2e-kind/e2e.py:3762-3803`).
 
 A goal source returns goal settings only. A plugin's `goal.get` response that
 contains any other field fails validation. In particular, a goal cannot change
