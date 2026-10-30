@@ -140,8 +140,10 @@ func passesKubeProxyImageFlag(entry Entry) bool {
 			continue
 		}
 
-		if replaced, ok := container["args"].([]any); ok {
-			args = append(args, replaced...)
+		for _, field := range []string{"command", "args"} {
+			if replaced, ok := container[field].([]any); ok {
+				args = append(args, replaced...)
+			}
 		}
 	}
 
