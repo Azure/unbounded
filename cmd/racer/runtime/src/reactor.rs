@@ -3503,7 +3503,7 @@ pub mod descriptor {
             assert_eq!(left.try_recv(&mut [0; 1]).unwrap(), 1);
             assert_eq!(left.shutdown(123), Err(Error::Os(libc::EINVAL)));
             drop(left);
-            assert!(right.peer_disconnected());
+            assert!(tests::eventually_disconnected(&right));
         }
     }
 
@@ -3572,7 +3572,54 @@ pub mod descriptor {
             assert!(!fd.peer_disconnected());
             assert_eq!(fd.try_send(b"response").unwrap(), 8);
             drop(right);
-            assert!(fd.peer_disconnected());
+            assert!(eventually_disconnected(&fd));
+        }
+
+        /// Wait up to 5s for a full peer close.
+        ///
+        /// Other tests spawn processes. A new child holds copies of the parent's
+        /// descriptors until exec, which closes those marked close-on-exec. So
+        /// dropping a test socket may not close it at once.
+        pub(super) fn eventually_disconnected(fd: &Descriptor) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if fd.peer_disconnected() {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        /// Report disconnect only after the last copy of the peer closes.
+        fn peer_disconnect_waits_for_every_peer_descriptor_copy() {
+            let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = Descriptor::from(left);
+            let copy = right.try_clone().unwrap();
+            drop(right);
+            assert!(!fd.peer_disconnected());
+            assert!(!fd.peer_read_closed());
+            drop(copy);
+            assert!(eventually_disconnected(&fd));
+        }
+
+        #[test]
+        /// Wait through a peer copy that another thread closes later.
+        fn eventually_disconnected_waits_for_late_peer_copy_close() {
+            let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = Descriptor::from(left);
+            let copy = right.try_clone().unwrap();
+            drop(right);
+            assert!(!fd.peer_disconnected());
+            let closer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(copy);
+            });
+            assert!(eventually_disconnected(&fd));
+            closer.join().unwrap();
         }
 
         #[cfg(feature = "simulation")]
