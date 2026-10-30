@@ -75,7 +75,7 @@ so v1 stays untouched and the copies can diverge.
 | `cmd/agent/internal/daemon/bootstrap_status.go` and Machine registration (`daemon.go:303-406`) | `internal/agentv2/control` (the `machina` providers) | Behind the goal and status interfaces |
 | `cmd/agent/internal/daemon/agentupgrade.go`, `hostupgrade.go` | `internal/agentv2/agentupgrade` | Verifies `v2` support in candidates |
 | The MachineOperation reconciler in `pkg/agent/daemon/machineoperation.go` | `internal/agentv2/control` | Fails unsupported operations that belong to the agent ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)) |
-| Rendering templates from `pkg/agent/phases/nodestart/assets` and `pkg/agent/phases/rootfs/assets` | `internal/agentv2/bundle` and `runtime/nspawn` | None at first; parity is enforced by golden tests ([implementation, section 3](09-implementation.md#3-testing-and-validation)) |
+| Rendering templates from `pkg/agent/phases/nodestart/assets` and `pkg/agent/phases/rootfs/assets` | `internal/agentv2/bundle` and `runtime/nspawn` | None at first; parity is enforced by golden tests ([testing, section 1](11-testing.md#1-unit-conformance-and-golden-tests)) |
 
 Each copied file starts with a comment naming its source path and the commit it
 was copied from. This list is kept current so v1 bug fixes can be checked

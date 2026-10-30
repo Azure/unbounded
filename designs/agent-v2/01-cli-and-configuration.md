@@ -16,6 +16,7 @@ repository baseline, citation conventions and terms.
 | `v2 agent-upgrade [--preflight]` | Activate a staged agent binary without a MachineOperation, for host delivery automation ([lifecycles, section 4](05-lifecycles.md#4-agentupgrade)) |
 | `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
 | `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
+| `v2 convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by tests and by operators preparing a `host` install. |
 | `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
 
 The `v2` group is listed in `unbounded-agent --help` as "Experimental v2 agent
@@ -23,6 +24,16 @@ The `v2` group is listed in `unbounded-agent --help` as "Experimental v2 agent
 
 > unbounded-agent v2 is experimental: configuration, plugin protocol and
 > on-host layout may change without notice; not supported for production use.
+
+`v2 status --output json` is a documented, versioned interface, so tests and
+tools never read v2's state files. It reports:
+
+- the install phase and install ID, the runtime, and any migration in
+  progress with its phase;
+- each slot's phase, whether it is enabled, and its bundle digest;
+- the applied goal version and a digest of the applied goal settings;
+- any pending repave, with its attempt count and last error;
+- the reported status phase and reason, and any cleanup leftovers.
 
 Configuration is read from `--config` or `UNBOUNDED_AGENT_CONFIG_FILE`, the
 variable cloud-init and Ignition already set

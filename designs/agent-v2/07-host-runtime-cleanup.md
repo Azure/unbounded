@@ -303,7 +303,7 @@ With `runtime.host.repave.retainContainerImages: true`, step 3 does not clear
    sandboxes, fall back to a full clear and log why.
 
 This option does not apply to `nspawn-container`, where a repave always
-unpacks a new rootfs. The mechanism needs a prototype (validation task V2 in [implementation, section 3](09-implementation.md#3-testing-and-validation)).
+unpacks a new rootfs. The mechanism needs a prototype (validation task V2 in [testing, section 7](11-testing.md#7-validation-tasks)).
 
 ## 9. Teardown
 
