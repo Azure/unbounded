@@ -1347,6 +1347,7 @@ func TestVirtualMediaMergeInstallerProgressCancelsPowerOffRetry(t *testing.T) {
 					LoaderStartedAt: started, ImageWritten: tt.imageWritten,
 				},
 			}
+
 			if tt.rebootStarted {
 				latest.BootMedia.RebootRequestedAt = ptrTo(metav1.NewTime(fixedNow().Add(time.Minute)))
 			}
@@ -1355,6 +1356,7 @@ func TestVirtualMediaMergeInstallerProgressCancelsPowerOffRetry(t *testing.T) {
 			updated.BootMedia.Phase = "Replacing"
 			updated.BootMedia.BootAttempts = 1
 			updated.Message = "host did not boot the virtual media; retrying (attempt 2)"
+
 			if tt.retryFailed {
 				updated.Phase = v1alpha3.OperationPhaseFailed
 				updated.CompletedAt = ptrTo(metav1.NewTime(fixedNow().Add(2 * time.Minute)))

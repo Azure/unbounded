@@ -695,6 +695,7 @@ func mergeMediaCallbacks(updated *v1alpha3.MachineOperationTargetStatus, latest 
 		updated.BootMedia.BootAttempts != latest.BootMedia.BootAttempts
 	retryFailed := updated.Phase == v1alpha3.OperationPhaseFailed &&
 		updated.Message == reasonTimedOut+": "+mediaNoLoaderTimeoutMessage
+
 	if (latest.BootMedia.ImageWritten || latest.BootMedia.RebootRequestedAt != nil) && (retryDecision || retryFailed) {
 		// A callback won the race with a power-off recovery decision. Preserve
 		// installer progress and never replace media after the image write or
