@@ -52,6 +52,19 @@
 //! referenced when the helper exits are leaked on purpose for the same
 //! reason.
 //!
+//! # Shared ciphertext across GPUs
+//!
+//! Staged and landed ciphertext is reference counted
+//! ([`SealedSource`] holds an `Arc`), so several requests may decrypt the
+//! same bytes. A request on the same GPU decrypts straight from the slot. A
+//! request on another GPU first copies the ciphertext into its own scratch
+//! slot 0: over NVLink or PCIe peer-to-peer when [`GpuHelper::peers`] allows
+//! it (`RACER_GPU_PEER=auto`), otherwise, or after a failed peer copy, by
+//! bouncing it through host memory. Each GPU still verifies the CRC and tag
+//! itself. A failed peer copy turns that GPU pair off for the life of the
+//! process. The job holds the source `Arc` until it has synchronized, so the
+//! source slot is never reused while a copy may read it.
+//!
 //! At startup the helper probes each GPU with a zero-length decrypt. A GPU
 //! whose shim has no decrypt kernels, or whose staging cap cannot hold the two
 //! scratch slots, gets plaintext pages only: the CPU decrypts as for a Get.
@@ -383,6 +396,24 @@ pub struct GpuCounters {
 
     /// Times cuFile was turned off, indexed by [`CufileDisable`].
     pub cufile_disabled: [AtomicU64; CufileDisable::ALL.len()],
+
+    /// Sealed pages whose ciphertext was copied from another GPU over a
+    /// peer path (NVLink or PCIe P2P).
+    pub peer_copies: AtomicU64,
+
+    /// Ciphertext bytes copied between GPUs over a peer path.
+    pub peer_copy_bytes: AtomicU64,
+
+    /// Peer copies that failed. Each failure turns its GPU pair off.
+    pub peer_failures: AtomicU64,
+
+    /// Sealed pages whose ciphertext moved from another GPU through host
+    /// memory, because the pair has no peer path or it was turned off.
+    pub peer_bounces: AtomicU64,
+
+    /// Sealed fetches that reused GPU ciphertext another request already
+    /// had, instead of fetching it again. See [`GpuHelper::record_joined`].
+    pub joined: AtomicU64,
 }
 
 /// Why cuFile was turned off.
@@ -413,6 +444,44 @@ impl GpuCounters {
     /// Count one cuFile turn-off.
     pub(crate) fn cufile_disabled(&self, reason: CufileDisable) {
         self.cufile_disabled[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Which GPU pairs may copy from each other over a peer path. Indexed by
+/// position in the usable GPU list, because ordinals need not be dense.
+/// Written once by the helper thread at startup; entries only turn off after.
+struct PeerMatrix {
+    ordinals: Vec<i32>,
+    /// `allowed[dst * n + src]`.
+    allowed: Vec<AtomicBool>,
+}
+
+impl PeerMatrix {
+    fn entry(&self, dst: i32, src: i32) -> Option<&AtomicBool> {
+        let position = |ordinal| self.ordinals.iter().position(|o| *o == ordinal);
+        let (dst, src) = (position(dst)?, position(src)?);
+        self.allowed.get(dst * self.ordinals.len() + src)
+    }
+}
+
+/// Startup options for [`GpuHelper`] beyond the mode.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuOptions {
+    /// Per-GPU staging cap (`RACER_GPU_STAGING_BYTES`).
+    pub staging_bytes: u64,
+    /// Ask cuFile to use PCI P2PDMA (`RACER_GPU_PCI_P2PDMA`).
+    pub pci_p2pdma: bool,
+    /// Enable GPU peer access (`RACER_GPU_PEER=auto`).
+    pub peer: bool,
+}
+
+impl Default for GpuOptions {
+    fn default() -> Self {
+        Self {
+            staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
+            pci_p2pdma: false,
+            peer: true,
+        }
     }
 }
 
@@ -483,16 +552,17 @@ pub struct GpuHelper {
     /// Live landing buffers, one per GPU at most. Weak: a buffer is freed
     /// once nothing registers or reads it, and made again on demand.
     landings: Mutex<HashMap<i32, Weak<GpuLanding>>>,
+    /// GPU pairs with a working peer path. Set before startup answers.
+    peers: Arc<std::sync::OnceLock<PeerMatrix>>,
 }
 
 impl GpuHelper {
     /// Resolve `mode` against hardware. Returns `None` when GPU mode is off.
-    pub fn start(mode: GpuMode, staging_bytes: u64, pci_p2pdma: bool) -> Result<Option<Arc<Self>>> {
+    pub fn start(mode: GpuMode, options: GpuOptions) -> Result<Option<Arc<Self>>> {
         Self::start_built(
             mode,
             cfg!(feature = "cuda"),
-            staging_bytes,
-            pci_p2pdma,
+            options,
             Box::new(racer_gpu::Gpu::load),
         )
     }
@@ -502,8 +572,7 @@ impl GpuHelper {
     pub fn start_built(
         mode: GpuMode,
         built: bool,
-        staging_bytes: u64,
-        pci_p2pdma: bool,
+        options: GpuOptions,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
         match mode {
@@ -512,7 +581,7 @@ impl GpuHelper {
                 eprintln!("racer: stage=gpu state=disabled reason=not-built");
                 Ok(None)
             }
-            _ => Self::start_with_options(mode, staging_bytes, pci_p2pdma, loader),
+            _ => Self::start_with_options(mode, options, loader),
         }
     }
 
@@ -527,17 +596,21 @@ impl GpuHelper {
         staging_bytes: u64,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
-        Self::start_with_options(mode, staging_bytes, false, loader)
+        let options = GpuOptions {
+            staging_bytes,
+            ..GpuOptions::default()
+        };
+        Self::start_with_options(mode, options, loader)
     }
 
-    /// Start the helper with a custom backend loader, a per-GPU staging cap,
-    /// and whether cuFile should use PCI P2PDMA.
+    /// Start the helper with a custom backend loader and options.
     pub fn start_with_options(
         mode: GpuMode,
-        staging_bytes: u64,
-        pci_p2pdma: bool,
+        options: GpuOptions,
         loader: Loader,
     ) -> Result<Option<Arc<Self>>> {
+        let staging_bytes = options.staging_bytes;
+        let pci_p2pdma = options.pci_p2pdma;
         if mode == GpuMode::Disabled {
             return Ok(None);
         }
@@ -548,7 +621,10 @@ impl GpuHelper {
         let counters = Arc::new(GpuCounters::default());
         let slots = staging_bytes / SLOT_BYTES;
         let kernels_off = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let peers = Arc::new(std::sync::OnceLock::new());
         let state = HelperState {
+            peer: options.peer,
+            peers: peers.clone(),
             leaked: leaked.clone(),
             cufile: cufile.clone(),
             counters: counters.clone(),
@@ -607,7 +683,28 @@ impl GpuHelper {
             counters,
             kernels_off,
             landings: Mutex::new(HashMap::new()),
+            peers,
         })))
+    }
+
+    /// Whether GPU `dst` may copy ciphertext from GPU `src` over a peer
+    /// path. True when they are the same GPU. False when
+    /// `RACER_GPU_PEER=off`, when the pair has no peer path, or after a peer
+    /// copy between them failed. Ciphertext on another GPU still works when
+    /// this is false: the helper moves it through host memory.
+    pub fn peers(&self, dst: i32, src: i32) -> bool {
+        dst == src
+            || self
+                .peers
+                .get()
+                .and_then(|matrix| matrix.entry(dst, src))
+                .is_some_and(|allowed| allowed.load(Ordering::Relaxed))
+    }
+
+    /// Count a sealed fetch that reused GPU ciphertext another request
+    /// already had instead of fetching it.
+    pub fn record_joined(&self) {
+        self.counters.joined.fetch_add(1, Ordering::Relaxed);
     }
 
     /// GPU decryption counters.
@@ -938,12 +1035,24 @@ impl Drop for GpuSink {
 /// One request's GPU objects. Field order matters: the stream drops first,
 /// which synchronizes it, then the import.
 struct Request {
-    stream: racer_gpu::Stream,
+    /// Shared with [`Helper::tainted`] while a failed write on it is unfenced.
+    stream: std::rc::Rc<racer_gpu::Stream>,
     import: racer_gpu::ImportedAllocation,
+}
+
+/// Ciphertext on a GPU other than the request's.
+struct Remote {
+    ordinal: i32,
+    /// The landing allocation holding it, or `None` for the staging buffer.
+    landed: Option<u64>,
+    offset: u64,
 }
 
 /// Shared handles the helper thread starts with.
 struct HelperState {
+    /// `RACER_GPU_PEER=auto`: try to enable peer access between GPUs.
+    peer: bool,
+    peers: Arc<std::sync::OnceLock<PeerMatrix>>,
     leaked: Arc<AtomicU64>,
     cufile: Arc<AtomicBool>,
     counters: Arc<GpuCounters>,
@@ -1042,6 +1151,15 @@ struct Helper {
     /// nothing refers to them; leaked if still referenced at exit, because
     /// a NIC may hold a registration over them.
     landing: HashMap<u64, racer_gpu::StagingBuffer>,
+    /// A stream per GPU for reading ciphertext back to the host when it
+    /// moves between GPUs without a peer path. Made on first use.
+    utility: HashMap<i32, racer_gpu::Stream>,
+    /// Request streams, by the GPU they write, whose failed sealed write
+    /// could not be fenced. Their queued copies or decrypts may still write
+    /// that GPU's scratch slots, so sealed writes there are refused until
+    /// every one of them synchronizes. Held here, a stream outlives its
+    /// request's release.
+    tainted: HashMap<i32, Vec<std::rc::Rc<racer_gpu::Stream>>>,
     state: HelperState,
 }
 
@@ -1059,6 +1177,7 @@ fn helper_main(
             // that loads cuFile.
             gpu.set_pci_p2pdma(state.pci_p2pdma);
             let decrypt = contexts.iter().map(probe_decrypt).collect();
+            let _ = state.peers.set(enable_peers(&contexts, state.peer));
             let (reads, queue) = mpsc::channel();
             let queue = Arc::new(Mutex::new(queue));
             let (finished, done) = mpsc::channel();
@@ -1096,6 +1215,8 @@ fn helper_main(
                 opener,
                 requests: HashMap::new(),
                 landing: HashMap::new(),
+                utility: HashMap::new(),
+                tainted: HashMap::new(),
                 state,
             }
         }
@@ -1153,6 +1274,40 @@ fn open_cufile(
             }
         })
         .ok()
+}
+
+/// Enable peer access for every ordered pair of usable GPUs, unless `enabled`
+/// is false, and log each pair once.
+fn enable_peers(contexts: &[racer_gpu::Context], enabled: bool) -> PeerMatrix {
+    let ordinals: Vec<i32> = contexts.iter().map(racer_gpu::Context::ordinal).collect();
+    let mut allowed = Vec::with_capacity(contexts.len() * contexts.len());
+    for dst in contexts {
+        for src in contexts {
+            let same = dst.ordinal() == src.ordinal();
+            let state = if same {
+                Ok(true)
+            } else if enabled {
+                dst.enable_peer(src)
+            } else {
+                Ok(false)
+            };
+            if !same {
+                let status = match (&state, enabled) {
+                    (_, false) => "off".to_string(),
+                    (Ok(true), _) => "enabled".to_string(),
+                    (Ok(false), _) => "unavailable".to_string(),
+                    (Err(error), _) => format!("failed reason={error}"),
+                };
+                eprintln!(
+                    "racer: stage=gpu ordinal={} peer={} state={status}",
+                    dst.ordinal(),
+                    src.ordinal()
+                );
+            }
+            allowed.push(AtomicBool::new(matches!(state, Ok(true))));
+        }
+    }
+    PeerMatrix { ordinals, allowed }
 }
 
 /// Queue a zero-length decrypt to learn whether the shim has working decrypt
@@ -1396,6 +1551,7 @@ impl Helper {
                         );
                     }
                     let stream = context.stream().map_err(import_error)?;
+                    let stream = std::rc::Rc::new(stream);
                     self.requests.insert(id, Request { stream, import });
                     return Ok(context.ordinal());
                 }
@@ -1412,7 +1568,14 @@ impl Helper {
     fn write(&mut self, id: u64, offset: u64, work: &Work) -> Result<()> {
         let plaintext = match work {
             Work::Plaintext(plaintext) => plaintext,
-            Work::Sealed(sealed) => return self.write_sealed(id, offset, sealed),
+            Work::Sealed(sealed) => {
+                let result = self.write_sealed(id, offset, sealed);
+                if result.is_err() {
+                    let fenced = self.fence_request(id);
+                    self.fence_source(fenced, &sealed.page.source);
+                }
+                return result;
+            }
         };
         let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let destination = racer_gpu::Destination::Import(&request.import);
@@ -1426,6 +1589,72 @@ impl Helper {
             .counters
             .plaintext
             .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// After a failed sealed write, make sure no queued GPU work still reads
+    /// the ciphertext's staged slot or landing page before the page drops
+    /// and the slot goes back for another cuFile read or NIC write. The
+    /// streams retain the GPU allocation, not the slot. If no fence
+    /// succeeds, the slot is quarantined for the life of the process.
+    /// `fenced` says whether the request stream synchronized.
+    fn fence_source(&mut self, mut fenced: bool, source: &SealedSource) {
+        let ordinal = match source {
+            SealedSource::Host(_) => return,
+            SealedSource::Staged { staged, .. } => staged.ordinal(),
+            SealedSource::Landed(landed) => landed.ordinal(),
+        };
+        if let Some(utility) = self.utility.get(&ordinal) {
+            fenced &= utility.synchronize().is_ok();
+        }
+        if fenced {
+            return;
+        }
+        eprintln!("racer: stage=gpu ordinal={ordinal} state=ciphertext-quarantined");
+        match source {
+            SealedSource::Host(_) => {}
+            SealedSource::Staged { staged, .. } => std::mem::forget(staged.clone()),
+            SealedSource::Landed(landed) => std::mem::forget(landed.clone()),
+        }
+    }
+
+    /// After a failed sealed write, wait for request `id`'s stream. If that
+    /// fails, a copy into or a decrypt out of the destination GPU's scratch
+    /// may still be queued, so that GPU's scratch is tainted until the
+    /// stream synchronizes. Returns whether the stream is fenced.
+    fn fence_request(&mut self, id: u64) -> bool {
+        let Some(request) = self.requests.get(&id) else {
+            return true;
+        };
+        if request.stream.synchronize().is_ok() {
+            return true;
+        }
+        let ordinal = request.import.ordinal();
+        let stream = request.stream.clone();
+        let held = self.tainted.entry(ordinal).or_default();
+        if held.is_empty() {
+            eprintln!("racer: stage=gpu ordinal={ordinal} state=scratch-tainted");
+        }
+        if !held.iter().any(|known| std::rc::Rc::ptr_eq(known, &stream)) {
+            held.push(stream);
+        }
+        false
+    }
+
+    /// Refuse to use GPU `ordinal`'s scratch while an unfenced failed write
+    /// may still write it. Each held stream is synchronized again first;
+    /// once all are fenced the taint clears and they are released.
+    fn check_scratch(&mut self, ordinal: i32) -> Result<()> {
+        let Some(held) = self.tainted.get_mut(&ordinal) else {
+            return Ok(());
+        };
+        held.retain(|stream| stream.synchronize().is_err());
+        if !held.is_empty() {
+            return Err(Error::Unavailable);
+        }
+        self.tainted.remove(&ordinal);
+        eprintln!("racer: stage=gpu ordinal={ordinal} state=scratch-fenced");
+        self.note_leaks();
         Ok(())
     }
 
@@ -1614,16 +1843,40 @@ impl Helper {
             .ok_or(Error::Internal)?
             .import
             .ordinal();
+        self.check_scratch(ordinal)?;
         self.staging(ordinal)?;
-        let staging = self.staging.get(&ordinal).ok_or(Error::Internal)?;
-        let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let page = &sealed.page;
         let length = u64::from(page.plaintext_length());
         if sealed.range.start >= sealed.range.end || sealed.range.end > length {
             return Err(Error::InvalidRange);
         }
+        if let SealedSource::Landed(landed) = &page.source
+            && landed.len() != length + 16
+        {
+            return Err(Error::Internal);
+        }
+        // Ciphertext on another GPU comes into this GPU's scratch first.
+        let remote = match &page.source {
+            SealedSource::Staged { staged, .. } if staged.ordinal() != ordinal => Some(Remote {
+                ordinal: staged.ordinal(),
+                landed: None,
+                offset: staged.offset(),
+            }),
+            SealedSource::Landed(landed) if landed.ordinal() != ordinal => Some(Remote {
+                ordinal: landed.ordinal(),
+                landed: Some(landed.allocation),
+                offset: landed.offset(),
+            }),
+            _ => None,
+        };
+        if let Some(remote) = &remote {
+            self.copy_remote(id, ordinal, remote, length + 16)?;
+        }
+        let staging = self.staging.get(&ordinal).ok_or(Error::Internal)?;
+        let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let stream = &request.stream;
         let (source_buffer, source) = match &page.source {
+            _ if remote.is_some() => (staging, CIPHERTEXT_SCRATCH),
             SealedSource::Host(copy) => {
                 let bytes = copy.copy.ciphertext.bytes();
                 if bytes.len() as u64 != length + 16 {
@@ -1640,16 +1893,8 @@ impl Helper {
                 }
                 (staging, CIPHERTEXT_SCRATCH)
             }
-            SealedSource::Staged { staged, .. } => {
-                if staged.ordinal() != ordinal {
-                    return Err(Error::Internal);
-                }
-                (staging, staged.offset())
-            }
+            SealedSource::Staged { staged, .. } => (staging, staged.offset()),
             SealedSource::Landed(landed) => {
-                if landed.ordinal() != ordinal || landed.len() != length + 16 {
-                    return Err(Error::Internal);
-                }
                 let buffer = self
                     .landing
                     .get(&landed.allocation)
@@ -1709,6 +1954,98 @@ impl Helper {
             self.state.counters.landed.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Copy `length` bytes of ciphertext from another GPU into GPU `dst`'s
+    /// ciphertext scratch slot for request `id`, and wait for it. Uses the
+    /// peer path when the pair allows it; on failure turns the pair off and
+    /// falls back to host memory, as it does for pairs without one.
+    fn copy_remote(&mut self, id: u64, dst: i32, source: &Remote, length: u64) -> Result<()> {
+        let src = source.ordinal;
+        let peer = self
+            .state
+            .peers
+            .get()
+            .and_then(|matrix| matrix.entry(dst, src));
+        if peer.is_some_and(|allowed| allowed.load(Ordering::Relaxed)) {
+            let copied = {
+                let request = self.requests.get(&id).ok_or(Error::Internal)?;
+                let staging = self.staging.get(&dst).ok_or(Error::Internal)?;
+                let buffer = self.source_buffer(source)?;
+                let queued = request.stream.copy_from_peer(
+                    racer_gpu::Destination::Staging(staging),
+                    CIPHERTEXT_SCRATCH,
+                    buffer,
+                    source.offset,
+                    length,
+                );
+                // Synchronize even after a failed queue call: part may run.
+                let synchronized = request.stream.synchronize();
+                queued.and(synchronized)
+            };
+            let counters = &self.state.counters;
+            match copied {
+                Ok(()) => {
+                    counters.peer_copies.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .peer_copy_bytes
+                        .fetch_add(length, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(error) => {
+                    counters.peer_failures.fetch_add(1, Ordering::Relaxed);
+                    if peer.is_some_and(|allowed| allowed.swap(false, Ordering::Relaxed)) {
+                        eprintln!(
+                            "racer: stage=gpu ordinal={dst} peer={src} state=peer-disabled reason={error}"
+                        );
+                    }
+                }
+            }
+        }
+        self.bounce(id, dst, source, length)
+    }
+
+    /// Move ciphertext from another GPU into `dst`'s scratch through host
+    /// memory, and wait for it.
+    fn bounce(&mut self, id: u64, dst: i32, source: &Remote, length: u64) -> Result<()> {
+        let src = source.ordinal;
+        if !self.utility.contains_key(&src) {
+            let context = self
+                .contexts
+                .iter()
+                .find(|context| context.ordinal() == src)
+                .ok_or(Error::Internal)?;
+            let stream = context.stream().map_err(gpu_error)?;
+            self.utility.insert(src, stream);
+        }
+        let mut bytes = vec![0; usize::try_from(length).map_err(|_| Error::Internal)?];
+        let utility = self.utility.get(&src).ok_or(Error::Internal)?;
+        utility
+            .read_staging(self.source_buffer(source)?, source.offset, &mut bytes)
+            .map_err(gpu_error)?;
+        let request = self.requests.get(&id).ok_or(Error::Internal)?;
+        let staging = self.staging.get(&dst).ok_or(Error::Internal)?;
+        let queued = request.stream.copy_from_host(
+            racer_gpu::Destination::Staging(staging),
+            CIPHERTEXT_SCRATCH,
+            bytes,
+        );
+        let synchronized = request.stream.synchronize();
+        queued.and(synchronized).map_err(gpu_error)?;
+        self.state
+            .counters
+            .peer_bounces
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The buffer that holds ciphertext on another GPU.
+    fn source_buffer(&self, source: &Remote) -> Result<&racer_gpu::StagingBuffer> {
+        match source.landed {
+            Some(allocation) => self.landing.get(&allocation),
+            None => self.staging.get(&source.ordinal),
+        }
+        .ok_or(Error::Internal)
     }
 
     /// Drop the stream (which synchronizes it), then the import.
@@ -1844,13 +2181,13 @@ pub(crate) mod testing {
         numa: &[Option<u32>],
         setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
     ) -> Arc<GpuHelper> {
-        helper_with_options(numa, false, setup)
+        helper_with_options(numa, GpuOptions::default(), setup)
     }
 
-    /// A helper as [`helper_with`] makes, with cuFile PCI P2PDMA set.
+    /// Like [`helper_with`], with startup options.
     pub(crate) fn helper_with_options(
         numa: &[Option<u32>],
-        pci_p2pdma: bool,
+        options: GpuOptions,
         setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
     ) -> Arc<GpuHelper> {
         let devices: Vec<racer_gpu::simulation::SimDevice> = numa
@@ -1864,8 +2201,7 @@ pub(crate) mod testing {
             .collect();
         GpuHelper::start_with_options(
             GpuMode::Required,
-            crate::config::DEFAULT_GPU_STAGING_BYTES,
-            pci_p2pdma,
+            options,
             Box::new(move || {
                 let simulation = racer_gpu::simulation::Simulation::new(devices);
                 setup(&simulation);
@@ -1909,6 +2245,21 @@ mod tests {
 
     /// A sealed page whose real ciphertext a NIC wrote at `at` in `landing`.
     fn landed(landing: &GpuLanding, at: u64, plaintext: &[u8], tamper: bool) -> Box<SealedPage> {
+        let (sealed, page) = seal(plaintext, tamper);
+        nic_write(landing, at, &sealed);
+        page(SealedSource::Landed(Arc::new(LandedCiphertext::for_test(
+            landing,
+            at,
+            sealed.len() as u64,
+        ))))
+    }
+
+    /// Seal `plaintext`. Returns the ciphertext and tag, and a builder for
+    /// the sealed page given where that ciphertext is.
+    fn seal(
+        plaintext: &[u8],
+        tamper: bool,
+    ) -> (Vec<u8>, impl FnOnce(SealedSource) -> Box<SealedPage>) {
         let metadata = metadata(plaintext.len() as u64);
         let envelope = PageEnvelope {
             cipher: PageCipher::Xaes256Gcm,
@@ -1927,21 +2278,19 @@ mod tests {
         if tamper {
             sealed[3] ^= 1;
         }
-        nic_write(landing, at, &sealed);
-        let page = Box::new(SealedPage {
-            metadata,
-            aad,
-            key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
-            expected_crc: None,
-            source: SealedSource::Landed(LandedCiphertext::for_test(
-                landing,
-                at,
-                sealed.len() as u64,
-            )),
-            envelope,
-        });
-        page.validate_for(&page.envelope.page.clone()).unwrap();
-        page
+        let build = move |source| {
+            let page = Box::new(SealedPage {
+                metadata,
+                aad,
+                key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
+                expected_crc: None,
+                source,
+                envelope,
+            });
+            page.validate_for(&page.envelope.page.clone()).unwrap();
+            page
+        };
+        (sealed, build)
     }
 
     #[test]
@@ -2007,8 +2356,8 @@ mod tests {
 
     #[test]
     /// A tampered landed page is rejected before anything is written; a page
-    /// on another GPU's landing buffer is refused.
-    fn tampered_or_misplaced_landed_ciphertext_is_rejected() {
+    /// on another GPU's landing buffer is copied over and decrypted.
+    fn tampered_landed_ciphertext_is_rejected_and_far_landed_is_copied() {
         let helper = helper(&[None, None]);
         let near = landing(&helper, 0, LENGTH).unwrap();
         let far = landing(&helper, 1, LENGTH).unwrap();
@@ -2023,11 +2372,14 @@ mod tests {
             vec![0; 100]
         );
         assert_eq!(helper.counters().rejected.load(Ordering::Relaxed), 1);
+        // A page on another GPU's landing buffer is copied over first.
+        write(&helper, 1, landed(&far, 0, &plaintext, false), 0..100).unwrap();
         assert_eq!(
-            write(&helper, 1, landed(&far, 0, &plaintext, false), 0..100),
-            Err(Error::Internal)
+            racer_gpu::simulation::read_allocation(&fd, 0, 100),
+            plaintext
         );
-        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 0);
+        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 1);
+        assert_eq!(helper.counters().peer_copies.load(Ordering::Relaxed), 1);
     }
 
     /// A memfd standing in for a slab file.
@@ -2047,8 +2399,19 @@ mod tests {
         offset: u64,
         length: u64,
     ) -> Result<StagedCiphertext> {
+        stage_on(helper, 0, fd, offset, length)
+    }
+
+    /// Stage `length` bytes at `offset` of `fd` on GPU `ordinal`, blocking.
+    fn stage_on(
+        helper: &GpuHelper,
+        ordinal: i32,
+        fd: &OwnedFd,
+        offset: u64,
+        length: u64,
+    ) -> Result<StagedCiphertext> {
         futures::executor::block_on(helper.stage_file(
-            0,
+            ordinal,
             fd.try_clone().unwrap(),
             offset,
             length,
@@ -2202,13 +2565,21 @@ mod tests {
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
     }
 
+    /// Default options with cuFile PCI P2PDMA set to `enabled`.
+    fn p2pdma(enabled: bool) -> GpuOptions {
+        GpuOptions {
+            pci_p2pdma: enabled,
+            ..GpuOptions::default()
+        }
+    }
+
     #[test]
     /// `RACER_GPU_PCI_P2PDMA` reaches the startup cuFile driver open, and is
     /// off by default.
     fn cufile_driver_opens_with_pci_p2pdma_setting() {
         use racer_gpu::simulation::Operation;
         for enabled in [false, true] {
-            let helper = helper_with_options(&[None], enabled, |_| {});
+            let helper = helper_with_options(&[None], p2pdma(enabled), |_| {});
             eventually(|| operations(&helper, Operation::FileOpen) == 1);
             assert_eq!(helper.run(|| simulation().pci_p2pdma()), Some(enabled));
             assert!(helper.cufile());
@@ -2220,7 +2591,7 @@ mod tests {
     /// use the host path.
     fn cufile_pci_p2pdma_open_failure_turns_cufile_off() {
         use racer_gpu::simulation::Operation;
-        let helper = helper_with_options(&[None], true, |simulation| {
+        let helper = helper_with_options(&[None], p2pdma(true), |simulation| {
             simulation.fault(Operation::FileOpen, -3)
         });
         eventually(|| !helper.cufile());
@@ -2250,5 +2621,405 @@ mod tests {
             Some(Error::Unavailable)
         );
         assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+    }
+
+    /// A sealed page whose ciphertext cuFile staged on GPU `ordinal`.
+    fn staged(helper: &GpuHelper, ordinal: i32, plaintext: &[u8]) -> Box<SealedPage> {
+        let (sealed, page) = seal(plaintext, false);
+        let fd = slab(&sealed);
+        let staged = stage_on(helper, ordinal, &fd, 0, sealed.len() as u64).unwrap();
+        page(SealedSource::Staged {
+            staged: Arc::new(staged),
+            token: crate::store::ReadToken::for_test(PageId {
+                version: metadata(0).version,
+                number: PageNumber(0),
+            }),
+        })
+    }
+
+    fn counter(value: &AtomicU64) -> u64 {
+        value.load(Ordering::Relaxed)
+    }
+
+    fn plaintext() -> Vec<u8> {
+        (0..5000).map(|i| (i % 249) as u8).collect()
+    }
+
+    #[test]
+    /// Staged ciphertext on the request's GPU decrypts straight from the
+    /// slot: no peer copy and no host copy.
+    fn same_gpu_staged_ciphertext_needs_no_copy() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        assert!(helper.peers(0, 0) && helper.peers(0, 1) && helper.peers(1, 0));
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 0);
+        let page = staged(&helper, 0, &plaintext);
+        let before = host_copies(&helper);
+        write(&helper, 1, page, 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(host_copies(&helper), before);
+        assert_eq!(operations(&helper, Operation::CopyPeer), 0);
+        assert_eq!(counter(&helper.counters().peer_copies), 0);
+        assert_eq!(counter(&helper.counters().peer_bounces), 0);
+    }
+
+    #[test]
+    /// Staged ciphertext on another GPU is copied over the peer path, then
+    /// decrypted on the request's GPU, whole or in part.
+    fn cross_gpu_staged_ciphertext_uses_a_peer_copy() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 1);
+        let before = host_copies(&helper);
+        write(&helper, 1, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(host_copies(&helper), before, "no host copy");
+        assert_eq!(operations(&helper, Operation::CopyPeer), 1);
+        assert_eq!(counter(&helper.counters().peer_copies), 1);
+        assert_eq!(counter(&helper.counters().peer_copy_bytes), 5016);
+        let fd = import(&helper, 2, 1);
+        write(&helper, 2, staged(&helper, 0, &plaintext), 100..200).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 100),
+            plaintext[100..200]
+        );
+        assert_eq!(counter(&helper.counters().peer_copies), 2);
+        assert_eq!(counter(&helper.counters().decrypted), 2);
+        assert_eq!(helper.free_slots(0), helper.free_slots(1));
+        assert_eq!(helper.leaked(), 0);
+        let text = scrape(&helper);
+        assert!(text.contains("racer_gpu_peer_copies_total 2\n"), "{text}");
+        let bytes = counter(&helper.counters().peer_copy_bytes);
+        assert!(bytes > 5016);
+        assert!(text.contains(&format!("racer_gpu_peer_copy_bytes_total {bytes}\n")));
+        assert!(text.contains("racer_gpu_peer_failures_total 0\n"));
+        assert!(text.contains("racer_gpu_peer_bounces_total 0\n"));
+        assert!(text.contains("racer_gpu_read_pages_total{decrypt=\"gpu\"} 2\n"));
+    }
+
+    /// Render the Prometheus text a worker scrape would produce.
+    fn scrape(helper: &Arc<GpuHelper>) -> String {
+        let metrics = crate::telemetry::Metrics::for_workers(2).unwrap();
+        metrics[0].gpu().attach_helper(helper.clone());
+        let mut text = String::new();
+        metrics[1].write_prometheus(&mut text).unwrap();
+        text
+    }
+
+    #[test]
+    /// Landed ciphertext on another GPU's landing buffer is copied over the
+    /// peer path and decrypted on the request's GPU.
+    fn cross_gpu_landed_ciphertext_uses_a_peer_copy() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let far = landing(&helper, 0, LENGTH).unwrap();
+        let plaintext = vec![9; 300];
+        let fd = import(&helper, 1, 1);
+        write(
+            &helper,
+            1,
+            landed(&far, SLOT_BYTES, &plaintext, false),
+            0..300,
+        )
+        .unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 300),
+            plaintext
+        );
+        assert_eq!(operations(&helper, Operation::CopyPeer), 1);
+        assert_eq!(counter(&helper.counters().peer_copy_bytes), 316);
+        assert_eq!(counter(&helper.counters().landed), 1);
+        // The receiving GPU still checks the tag.
+        assert_eq!(
+            write(&helper, 1, landed(&far, 0, &plaintext, true), 0..300),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(counter(&helper.counters().rejected), 1);
+    }
+
+    #[test]
+    /// A failed peer copy turns the pair off, the page still arrives through
+    /// host memory, and later pages skip the peer path.
+    fn failed_peer_copy_disables_the_pair_and_bounces() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 1);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| simulation().fault(Operation::CopyPeer, -5));
+        write(&helper, 1, page, 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert!(!helper.peers(1, 0));
+        assert!(helper.peers(0, 1), "only the failed direction turns off");
+        assert_eq!(counter(&helper.counters().peer_failures), 1);
+        assert_eq!(counter(&helper.counters().peer_bounces), 1);
+        assert_eq!(counter(&helper.counters().peer_copies), 0);
+        let attempts = operations(&helper, Operation::CopyPeer);
+        let fd = import(&helper, 2, 1);
+        write(&helper, 2, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(operations(&helper, Operation::CopyPeer), attempts);
+        assert_eq!(counter(&helper.counters().peer_bounces), 2);
+        assert_eq!(counter(&helper.counters().peer_failures), 1);
+        let text = scrape(&helper);
+        assert!(text.contains("racer_gpu_peer_failures_total 1\n"), "{text}");
+        assert!(text.contains("racer_gpu_peer_bounces_total 2\n"));
+        assert!(text.contains("racer_gpu_peer_copies_total 0\n"));
+    }
+
+    #[test]
+    /// A peer copy that fails to synchronize, then a failed bounce, leave
+    /// the source slot out of the pool when no fence succeeds afterward.
+    fn unfenced_failed_copy_quarantines_the_source_slot() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _fd = import(&helper, 1, 1);
+        let free = helper.free_slots(0);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| {
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::CopyD2h, -5);
+            simulation().fault(Operation::StreamSync, -5);
+        });
+        assert!(write(&helper, 1, page, 0..5000).is_err());
+        assert_eq!(counter(&helper.counters().peer_failures), 1);
+        assert_eq!(helper.free_slots(0), free - 1, "slot stays out");
+    }
+
+    #[test]
+    /// The same failures return the slot once a later fence succeeds.
+    fn fenced_failed_copy_returns_the_source_slot() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _fd = import(&helper, 1, 1);
+        let free = helper.free_slots(0);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| {
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::CopyD2h, -5);
+        });
+        assert!(write(&helper, 1, page, 0..5000).is_err());
+        assert_eq!(helper.free_slots(0), free);
+    }
+
+    /// Copies and decrypts that may write a GPU's scratch slots so far.
+    fn scratch_work(helper: &GpuHelper) -> usize {
+        use racer_gpu::simulation::Operation;
+        [Operation::CopyH2d, Operation::CopyPeer, Operation::Decrypt]
+            .into_iter()
+            .map(|operation| operations(helper, operation))
+            .sum()
+    }
+
+    /// Fail a cross-GPU write on request 1 (GPU 1) so that its stream is
+    /// never fenced: the peer copy and the bounce fail to synchronize, and
+    /// so does the fence after them.
+    fn taint_gpu_one(helper: &GpuHelper) {
+        use racer_gpu::simulation::Operation;
+        let page = staged(helper, 0, &plaintext());
+        helper.run(|| {
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::StreamSync, -5);
+            simulation().fault(Operation::StreamSync, -5);
+        });
+        assert_eq!(write(helper, 1, page, 0..5000), Err(Error::Unavailable));
+    }
+
+    #[test]
+    /// An unfenced failed write blocks later sealed writes on the same GPU,
+    /// from other requests too, without touching its scratch, until a fence
+    /// succeeds. Then writes succeed again.
+    fn unfenced_failed_write_blocks_scratch_until_fenced() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _first = import(&helper, 1, 1);
+        let fd = import(&helper, 2, 1);
+        taint_gpu_one(&helper);
+        // The retried fence fails: refused before any scratch work.
+        let page = staged(&helper, 0, &plaintext);
+        let before = scratch_work(&helper);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        assert_eq!(write(&helper, 2, page, 0..5000), Err(Error::Unavailable));
+        assert_eq!(scratch_work(&helper), before, "scratch untouched");
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            vec![0; 5000]
+        );
+        // The fence succeeds now: the write goes through, partial or whole.
+        write(&helper, 2, staged(&helper, 1, &plaintext), 10..20).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 10),
+            plaintext[10..20]
+        );
+        write(&helper, 2, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A taint on one GPU leaves another GPU's sealed writes alone and
+    /// stays on its own GPU.
+    fn scratch_taint_is_per_gpu() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _first = import(&helper, 1, 1);
+        let other = import(&helper, 2, 0);
+        taint_gpu_one(&helper);
+        write(&helper, 2, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&other, 0, 5000),
+            plaintext
+        );
+        // GPU 1 is still tainted: its next failed fence refuses.
+        let _third = import(&helper, 3, 1);
+        let page = staged(&helper, 1, &plaintext);
+        let before = scratch_work(&helper);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        assert_eq!(write(&helper, 3, page, 10..20), Err(Error::Unavailable));
+        assert_eq!(scratch_work(&helper), before);
+    }
+
+    #[test]
+    /// A tainting request may be released while its stream is unfenced: the
+    /// taint keeps the stream alive, nothing leaks, and the next fence on
+    /// it clears the taint.
+    fn released_tainting_request_keeps_its_stream_until_fenced() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None, None]);
+        let plaintext = plaintext();
+        let _first = import(&helper, 1, 1);
+        let fd = import(&helper, 2, 1);
+        taint_gpu_one(&helper);
+        let streams = helper.run(|| simulation().live().streams);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        let (reply, answer) = oneshot::channel();
+        helper
+            .send(Job::Release {
+                id: 1,
+                reply: Some(reply),
+            })
+            .unwrap();
+        assert_eq!(
+            futures::executor::block_on(answer).unwrap(),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(helper.run(|| simulation().live().streams), streams);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        let page = staged(&helper, 1, &plaintext);
+        assert_eq!(write(&helper, 2, page, 0..5000), Err(Error::Unavailable));
+        write(&helper, 2, staged(&helper, 1, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(helper.run(|| simulation().live().streams), streams - 1);
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A failed write whose stream fences does not taint the GPU.
+    fn fenced_failed_write_does_not_block_scratch() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 0);
+        let page = staged(&helper, 0, &plaintext);
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        assert_eq!(write(&helper, 1, page, 10..20), Err(Error::Unavailable));
+        helper.run(|| simulation().fault(Operation::StreamSync, -5));
+        // The fault now lands on the decrypt's own sync, not a taint check.
+        let page = staged(&helper, 0, &plaintext);
+        assert_eq!(write(&helper, 1, page, 0..5000), Err(Error::Unavailable));
+        write(&helper, 1, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+    }
+
+    #[test]
+    /// `RACER_GPU_PEER=off` never enables peer access; ciphertext on another
+    /// GPU moves through host memory.
+    fn peer_off_bounces_through_the_host() {
+        use racer_gpu::simulation::Operation;
+        let options = GpuOptions {
+            peer: false,
+            ..GpuOptions::default()
+        };
+        let helper = helper_with_options(&[None, None], options, |_| {});
+        assert!(!helper.peers(1, 0) && !helper.peers(0, 1));
+        assert!(helper.peers(1, 1));
+        assert_eq!(operations(&helper, Operation::Peer), 0);
+        let plaintext = plaintext();
+        let fd = import(&helper, 1, 1);
+        write(&helper, 1, staged(&helper, 0, &plaintext), 0..5000).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(operations(&helper, Operation::CopyPeer), 0);
+        assert_eq!(counter(&helper.counters().peer_bounces), 1);
+        assert_eq!(counter(&helper.counters().peer_failures), 0);
+    }
+
+    #[test]
+    /// A pair with no peer path is reported unreachable at startup.
+    fn unreachable_pair_is_not_peered() {
+        let helper = helper_with(&[None, None, None], |simulation| {
+            simulation.set_peer(1, 0, false)
+        });
+        assert!(!helper.peers(1, 0));
+        assert!(helper.peers(0, 1) && helper.peers(2, 0) && helper.peers(1, 2));
+        assert!(!helper.peers(0, 7), "unknown GPU");
+    }
+
+    #[test]
+    /// Two sealed pages sharing one staged slot keep it until both drop.
+    fn shared_staged_slot_returns_after_the_last_holder() {
+        let helper = helper(&[None]);
+        let free = helper.free_slots(0);
+        let first = staged(&helper, 0, &plaintext());
+        let SealedSource::Staged { staged, token } = &first.source else {
+            unreachable!()
+        };
+        let (shared, token) = (staged.clone(), token.clone());
+        let second = seal(&plaintext(), false).1(SealedSource::Staged {
+            staged: shared,
+            token,
+        });
+        assert_eq!(helper.free_slots(0), free - 1);
+        drop(first);
+        assert_eq!(helper.free_slots(0), free - 1);
+        drop(second);
+        assert_eq!(helper.free_slots(0), free);
+    }
+
+    #[test]
+    fn record_joined_counts() {
+        let helper = helper(&[None]);
+        helper.record_joined();
+        helper.record_joined();
+        assert_eq!(counter(&helper.counters().joined), 2);
     }
 }

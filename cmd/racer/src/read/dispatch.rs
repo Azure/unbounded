@@ -956,9 +956,10 @@ impl WorkerDirectory {
         let Ok(owner) = self.page_owner(&report.page) else {
             return;
         };
-        // A landed page has no host copy or disk mapping for its owner to act
-        // on, so its verdict is settled here and never takes a retained slot.
-        if self.is_local(owner) || !report.has_owner_state() {
+        // A passed landed page has nothing for its owner to act on, so its
+        // verdict is settled here and never takes a retained slot. A failed
+        // one goes to the owner, which may be sharing the landed copy.
+        if self.is_local(owner) || !report.has_owner_state(passed) {
             if let Ok(local) = self.local() {
                 local.fill.sealed_verdict(report, passed);
             }
@@ -1617,14 +1618,17 @@ mod tests {
             page: page.clone(),
             copy: None,
             token: Some(crate::store::ReadToken::for_test(page)),
+            landed: false,
         }
     }
-    /// A landed page's report: nothing for the owner to persist or drop.
+    /// A landed page's report: nothing for the owner to persist or drop,
+    /// but a failure must reach the owner's shared GPU copies.
     fn landed_report(page: PageId) -> super::super::sealed::SealedReport {
         super::super::sealed::SealedReport {
             page,
             copy: None,
             token: None,
+            landed: true,
         }
     }
     /// Deliver retained verdicts through the owner's endpoint and count them.
@@ -1695,8 +1699,9 @@ mod tests {
         }
         assert_eq!(directory.mailboxes[1].take_failed_verdicts().len(), 1);
     }
-    #[test]
-    fn failed_landed_verdict_settles_locally() {
+    /// Run `report_sealed` for a landed page owned by worker 1 from worker 0,
+    /// and return worker 0's new CorruptMiss count and worker 1's mailbox.
+    fn landed_verdict(passed: bool) -> (u64, usize) {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let workers = vec![WorkerId(0), WorkerId(1)];
@@ -1717,18 +1722,27 @@ mod tests {
             .count(crate::telemetry::Event::CorruptMiss);
         {
             let _local = directory.simulation_scope(Some((WorkerId(0), local.clone())));
-            directory.report_sealed(landed_report(page), false, &scope());
+            directory.report_sealed(landed_report(page), passed, &scope());
         }
-        assert_eq!(
-            local
-                .fill
-                .metrics
-                .count(crate::telemetry::Event::CorruptMiss)
-                - before,
-            1
-        );
-        assert_eq!(directory.mailboxes[1].outstanding(), 0);
+        let local_misses = local
+            .fill
+            .metrics
+            .count(crate::telemetry::Event::CorruptMiss)
+            - before;
+        let outstanding = directory.mailboxes[1].outstanding();
         assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
+        (local_misses, outstanding)
+    }
+    #[test]
+    /// The owner may share a landed copy with other sealed fetches, so a
+    /// failed verdict goes to it rather than settling on the reporter.
+    fn failed_landed_verdict_goes_to_the_owner() {
+        assert_eq!(landed_verdict(false), (0, 1));
+    }
+    #[test]
+    /// A passed landed page leaves the owner nothing to do.
+    fn passed_landed_verdict_settles_locally() {
+        assert_eq!(landed_verdict(true), (0, 0));
     }
     #[test]
     fn failed_sealed_verdicts_are_bounded() {

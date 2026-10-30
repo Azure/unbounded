@@ -80,6 +80,7 @@ struct gpu_context {
     int module_state; /* 0 untried, 1 loaded, -1 unavailable */
     CUmodule module;
     CUfunction partials, finalize, ctr;
+    uint64_t peers[RACER_GPU_MAX_PEER_ORDINAL / 64]; /* src ordinals enabled by racer_gpu_peer */
 };
 
 struct gpu_buffer {
@@ -544,6 +545,52 @@ int racer_gpu_copy_d2d(void *stream, void *dst, uint64_t dst_offset, void *src, 
     if (rc) return rc;
     if ((rc = push(s->context))) return rc;
     rc = drv(cu.cuMemcpyDtoDAsync(d->base + dst_offset, from->base + src_offset, length, s->stream));
+    pop();
+    return rc;
+}
+
+static int peer_enabled(const struct gpu_context *c, int32_t ordinal) {
+    return ordinal >= 0 && ordinal < RACER_GPU_MAX_PEER_ORDINAL &&
+           (c->peers[ordinal / 64] >> (ordinal % 64)) & 1u;
+}
+
+int racer_gpu_peer(void *dst, void *src, int *access) {
+    struct gpu_context *d = dst, *from = src;
+    if (!d || !from || !access) return RACER_GPU_EINVAL;
+    *access = 0;
+    if (from->ordinal < 0 || from->ordinal >= RACER_GPU_MAX_PEER_ORDINAL) return RACER_GPU_EINVAL;
+    uint64_t bit = 1ull << (from->ordinal % 64);
+    if (d == from || d->dev == from->dev) {
+        d->peers[from->ordinal / 64] |= bit;
+        *access = 1;
+        return RACER_GPU_OK;
+    }
+    int can = 0;
+    int rc = drv(cu.cuDeviceCanAccessPeer(&can, d->dev, from->dev));
+    if (rc || !can) return rc;
+    if ((rc = push(d))) return rc;
+    CUresult result = cu.cuCtxEnablePeerAccess(from->ctx, 0);
+    pop();
+    if (result != CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED && (rc = drv(result))) return rc;
+    d->peers[from->ordinal / 64] |= bit;
+    *access = 1;
+    return RACER_GPU_OK;
+}
+
+int racer_gpu_copy_peer(void *stream, void *dst, uint64_t dst_offset, void *src, uint64_t src_offset,
+                        uint64_t length) {
+    struct gpu_stream *s = stream;
+    struct gpu_buffer *d, *from;
+    if (!s || buffer(dst, &d) || buffer(src, &from) || from->kind != KIND_STAGING) return RACER_GPU_EINVAL;
+    if (d->context != s->context || from->context == s->context ||
+        !peer_enabled(s->context, from->context->ordinal))
+        return RACER_GPU_EDEVICE;
+    int rc = span(d, dst_offset, length);
+    if (!rc) rc = span(from, src_offset, length);
+    if (rc) return rc;
+    if ((rc = push(s->context))) return rc;
+    rc = drv(cu.cuMemcpyPeerAsync(d->base + dst_offset, s->context->ctx, from->base + src_offset,
+                                  from->context->ctx, length, s->stream));
     pop();
     return rc;
 }

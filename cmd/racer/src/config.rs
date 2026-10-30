@@ -117,6 +117,11 @@ pub struct Config {
     /// Ask cuFile to read local NVMe into GPU memory over PCI P2PDMA
     /// (`use_pci_p2pdma`) instead of nvidia-fs. Defaults off.
     pub gpu_pci_p2pdma: bool,
+    /// `RACER_GPU_PEER`: `auto` (default) lets one GPU copy another GPU's
+    /// sealed ciphertext over NVLink or PCIe peer-to-peer when the driver
+    /// allows it; `off` never enables peer access and moves such ciphertext
+    /// through host memory instead.
+    pub gpu_peer: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
     /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
@@ -209,6 +214,11 @@ impl Config {
         }
         // Per-worker limit defaults live with the admission rules in racer-core.
         let defaults = Limits::default();
+        let gpu_peer = match raw.gpu_peer.as_deref().unwrap_or("auto") {
+            "auto" => true,
+            "off" => false,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let mut config = Self {
             warm: crate::read::warm::Config {
                 max_ttl: Duration::from_secs(raw.warm_max_ttl_secs.unwrap_or(3600)),
@@ -269,6 +279,7 @@ impl Config {
             gpu_staging_bytes,
             gpu_landing_bytes,
             gpu_pci_p2pdma: raw.gpu_pci_p2pdma.unwrap_or(false),
+            gpu_peer,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
@@ -752,6 +763,7 @@ const ENV_NAMES: &[&str] = &[
     "GPU_STAGING_BYTES",
     "GPU_LANDING_BYTES",
     "GPU_PCI_P2PDMA",
+    "GPU_PEER",
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
@@ -833,6 +845,7 @@ struct RawConfig {
     #[serde(default, deserialize_with = "decimal")]
     gpu_landing_bytes: Option<u64>,
     gpu_pci_p2pdma: Option<bool>,
+    gpu_peer: Option<String>,
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
@@ -1570,6 +1583,16 @@ mod tests {
                 parse(&[("RACER_GPU_PCI_P2PDMA", value)]).is_err(),
                 "{value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn gpu_peer_parses_auto_and_off() {
+        assert!(parse(&[]).unwrap().gpu_peer);
+        assert!(parse(&[("RACER_GPU_PEER", "auto")]).unwrap().gpu_peer);
+        assert!(!parse(&[("RACER_GPU_PEER", "off")]).unwrap().gpu_peer);
+        for value in ["", "on", "true", "false", "AUTO", "Off"] {
+            assert!(parse(&[("RACER_GPU_PEER", value)]).is_err(), "{value:?}");
         }
     }
 

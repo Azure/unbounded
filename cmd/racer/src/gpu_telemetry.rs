@@ -225,6 +225,26 @@ impl GpuTelemetry {
                 load(&counters.cufile_unsupported),
             ),
             (
+                "racer_gpu_peer_copies_total",
+                "counter",
+                load(&counters.peer_copies),
+            ),
+            (
+                "racer_gpu_peer_copy_bytes_total",
+                "counter",
+                load(&counters.peer_copy_bytes),
+            ),
+            (
+                "racer_gpu_peer_failures_total",
+                "counter",
+                load(&counters.peer_failures),
+            ),
+            (
+                "racer_gpu_peer_bounces_total",
+                "counter",
+                load(&counters.peer_bounces),
+            ),
+            (
                 "racer_gpu_open_requests",
                 "gauge",
                 helper.open_requests() as u64,
@@ -379,6 +399,10 @@ mod tests {
             "racer_gpu_staging_exhausted_total",
             "racer_gpu_landed_pages_decrypted_total",
             "racer_gpu_cufile_unsupported_total",
+            "racer_gpu_peer_copies_total",
+            "racer_gpu_peer_copy_bytes_total",
+            "racer_gpu_peer_failures_total",
+            "racer_gpu_peer_bounces_total",
             "racer_gpu_open_requests",
             "racer_gpu_leaked_resources",
         ] {
@@ -389,6 +413,13 @@ mod tests {
         assert!(text.contains("racer_gpu_read_pages_total{decrypt=\"cpu\"} 2\n"));
         assert!(text.contains("racer_gpu_cufile_disabled_total{reason=\"file_open\"} 1\n"));
         assert!(text.contains("racer_gpu_cufile_disabled_total{reason=\"driver_open\"} 0\n"));
+        // Peer counters export once; `joined` exports only through
+        // racer_gpu_direct_joined_total.
+        assert_eq!(
+            text.matches("# TYPE racer_gpu_peer_copies_total ").count(),
+            1
+        );
+        assert!(!text.contains("racer_gpu_joined"));
         let uuid = helper.devices()[0].uuid_string();
         assert!(text.contains(&format!(
             "racer_gpu_decrypt_available{{ordinal=\"0\",uuid=\"{uuid}\"}} 1\n"

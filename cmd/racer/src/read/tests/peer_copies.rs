@@ -2986,11 +2986,44 @@ mod landing {
     /// Like [`landing`], but only the `call`th landing request (1-based)
     /// lands; the others go to the usual peer script.
     fn landing_on(ordinal: i32, call: Option<usize>) -> Landing {
+        landing_with(
+            ordinal,
+            move |n| call == Some(n),
+            crate::gpu::testing::helper(&[None, None]),
+        )
+    }
+
+    /// Like [`landing`], but every landing request lands.
+    fn landing_every(ordinal: i32) -> Landing {
+        landing_with(
+            ordinal,
+            |_| true,
+            crate::gpu::testing::helper(&[None, None]),
+        )
+    }
+
+    /// Like [`landing_on`], on the GPUs of `helper`, which has at least two.
+    /// The `n`th landing request (1-based) lands when `lands(n)`.
+    fn landing_with(
+        ordinal: i32,
+        lands: impl Fn(usize) -> bool + 'static,
+        helper: Arc<GpuHelper>,
+    ) -> Landing {
+        landing_with_buffer(ordinal, 0, lands, helper)
+    }
+
+    /// Like [`landing_with`], with the landing buffer on GPU `buffer`.
+    fn landing_with_buffer(
+        ordinal: i32,
+        buffer: i32,
+        lands: impl Fn(usize) -> bool + 'static,
+        helper: Arc<GpuHelper>,
+    ) -> Landing {
         let mut f = fixture();
         let copy = encrypted_copy(&mut f);
         let (peers, ordered) = install_peers(&mut f, None);
-        let helper = crate::gpu::testing::helper(&[None, None]);
-        let buffer = crate::gpu::testing::landing(&helper, 0, 2 * crate::gpu::SLOT_BYTES).unwrap();
+        let buffer =
+            crate::gpu::testing::landing(&helper, buffer, 2 * crate::gpu::SLOT_BYTES).unwrap();
         crate::gpu::testing::nic_write(&buffer, 0, copy.ciphertext.bytes());
         let asked = Rc::new(Cell::new(0));
         let envelope = copy.ciphertext.envelope().clone();
@@ -2999,7 +3032,7 @@ mod landing {
         let seen = asked.clone();
         let land: crate::peer::ScriptedLanding = Box::new(move |request| {
             seen.set(seen.get() + 1);
-            let lands = call == Some(seen.get());
+            let lands = lands(seen.get());
             assert!(matches!(
                 request.operation,
                 PeerOperation::Page {
@@ -3059,9 +3092,13 @@ mod landing {
     }
 
     fn acquire_sealed(l: &mut Landing) -> Result<Fetched> {
+        acquire_sealed_on(l, 0)
+    }
+
+    fn acquire_sealed_on(l: &mut Landing, ordinal: i32) -> Result<Fetched> {
         let target = SealedTarget {
             helper: l.helper.clone(),
-            ordinal: 0,
+            ordinal,
         };
         let mut budget = AcquisitionBudget::new(l.f.scope.deadline.0, 16, 32);
         let f = &mut l.f;
@@ -3077,6 +3114,81 @@ mod landing {
             &mut f.engine,
             &f.crypto,
         )
+    }
+
+    /// Sealed fetches of the page for each GPU in `ordinals`, run together.
+    fn acquire_sealed_together(l: &mut Landing, ordinals: &[i32]) -> Vec<Result<Fetched>> {
+        let f = &mut l.f;
+        let targets: Vec<SealedTarget> = ordinals
+            .iter()
+            .map(|&ordinal| SealedTarget {
+                helper: l.helper.clone(),
+                ordinal,
+            })
+            .collect();
+        let deadline = f.scope.deadline.0;
+        let fill = f.fill.clone();
+        let (page, membership, context, scope) =
+            (f.page.clone(), f.membership.clone(), &f.context, &f.scope);
+        let fetches = targets.iter().map(|target| {
+            let fill = fill.clone();
+            let page = page.clone();
+            let membership = membership.clone();
+            async move {
+                let mut budget = AcquisitionBudget::new(deadline, 16, 32);
+                fill.acquire_sealed(page, membership, context, scope, &mut budget, target)
+                    .await
+            }
+        });
+        drive(futures::future::join_all(fetches), &mut f.engine, &f.crypto)
+    }
+
+    /// Ready on the second poll, so a concurrent future runs in between.
+    fn yield_once() -> impl std::future::Future<Output = ()> {
+        let mut yielded = false;
+        std::future::poll_fn(move |cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+    }
+
+    fn sealed(fetched: Result<Fetched>) -> Box<crate::read::sealed::SealedPage> {
+        match fetched {
+            Ok(Fetched::Sealed(sealed)) => sealed,
+            Ok(Fetched::Page(_)) => panic!("expected a sealed page, got plaintext"),
+            Err(error) => panic!("expected a sealed page, got {error:?}"),
+        }
+    }
+
+    fn landed_arc(sealed: &crate::read::sealed::SealedPage) -> Arc<crate::gpu::LandedCiphertext> {
+        match &sealed.source {
+            SealedSource::Landed(landed) => landed.clone(),
+            _ => panic!("expected a landed page"),
+        }
+    }
+
+    fn joined_count(helper: &GpuHelper) -> u64 {
+        helper
+            .counters()
+            .joined
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Decrypt `sealed` on GPU `ordinal` as request `id` and check the bytes.
+    fn assert_decrypts(
+        helper: &GpuHelper,
+        id: u64,
+        ordinal: i32,
+        sealed: Box<crate::read::sealed::SealedPage>,
+    ) {
+        let fd = crate::gpu::testing::import(helper, id, ordinal);
+        crate::gpu::testing::write(helper, id, sealed, 0..3).unwrap();
+        assert_eq!(racer_gpu::simulation::read_allocation(&fd, 0, 3), b"abc");
     }
 
     fn landed_count(helper: &GpuHelper) -> u64 {
@@ -3236,6 +3348,368 @@ mod landing {
         assert_eq!(l.asked.get(), 2);
         assert!(l.peers.calls.borrow().len() >= 3);
         assert_eq!(landed_count(&l.helper), 0);
+    }
+
+    #[test]
+    /// Sealed fetches of one page for three GPUs that can copy from each
+    /// other make one landing request. The others reuse the landed
+    /// ciphertext, and each GPU still verifies and decrypts it itself.
+    fn concurrent_sealed_fetches_on_peer_gpus_share_one_landing() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_with(
+            0,
+            |n| n == 1,
+            crate::gpu::testing::helper(&[None, None, None]),
+        );
+        let fetched = acquire_sealed_together(&mut l, &[0, 1, 2]);
+        let pages: Vec<_> = fetched.into_iter().map(sealed).collect();
+        assert_eq!(l.asked.get(), 1, "one landing request");
+        assert!(l.peers.calls.borrow().is_empty());
+        let first = landed_arc(&pages[0]);
+        for page in &pages[1..] {
+            assert!(Arc::ptr_eq(&first, &landed_arc(page)));
+        }
+        drop(first);
+        assert_eq!(joined_count(&l.helper), 2);
+        assert_eq!(l.f.fill.metrics.count(Event::GpuDirectJoined), 2);
+        assert_eq!(l.f.fill.metrics.count(Event::PeerHit), 1);
+        assert_unpublished(&l.f);
+        for (id, (ordinal, page)) in [0, 1, 2].into_iter().zip(pages).enumerate() {
+            assert_decrypts(&l.helper, id as u64 + 1, ordinal, page);
+        }
+        // Each GPU decrypted the one landed ciphertext.
+        assert_eq!(landed_count(&l.helper), 3);
+        assert!(
+            l.helper
+                .counters()
+                .peer_copies
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 2
+        );
+        assert_eq!(l.helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Fetches for the same GPU share one landed page.
+    fn concurrent_sealed_fetches_on_one_gpu_share_one_landing() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        let mut pages: Vec<_> = acquire_sealed_together(&mut l, &[0, 0])
+            .into_iter()
+            .map(sealed)
+            .collect();
+        assert_eq!(l.asked.get(), 1);
+        assert!(Arc::ptr_eq(&landed_arc(&pages[0]), &landed_arc(&pages[1])));
+        assert_eq!(joined_count(&l.helper), 1);
+        let second = pages.pop().unwrap();
+        assert_decrypts(&l.helper, 1, 0, pages.pop().unwrap());
+        assert_decrypts(&l.helper, 2, 0, second);
+    }
+
+    #[test]
+    /// A GPU that cannot copy from the GPU holding the page fetches for
+    /// itself rather than move the page through host memory.
+    fn gpu_without_a_peer_path_fetches_for_itself() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
+            simulation.set_peer(1, 0, false)
+        });
+        let mut l = landing_with(0, |n| n == 1, helper);
+        let first = sealed(acquire_sealed_on(&mut l, 0));
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Copy(l.copy.clone())));
+        // GPU 1 has no landing buffer, so it takes the host path.
+        let second = sealed(acquire_sealed_on(&mut l, 1));
+        assert!(matches!(second.source, SealedSource::Host(_)));
+        assert_eq!(l.asked.get(), 1);
+        assert_eq!(l.peers.calls.borrow().len(), 1);
+        assert_eq!(joined_count(&l.helper), 0);
+        assert_eq!(l.f.fill.metrics.count(Event::GpuDirectJoined), 0);
+        assert_decrypts(&l.helper, 1, 0, first);
+        assert_decrypts(&l.helper, 2, 1, second);
+    }
+
+    #[test]
+    /// While a fetch is in flight on GPU 0, concurrent fetches on GPU 1,
+    /// which has no peer path to it, lead a flight of their own: the first
+    /// lands the page on GPU 1 and the second joins it.
+    fn gpus_without_a_peer_path_share_among_themselves() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let helper = crate::gpu::testing::helper_with(&[None, None], |simulation| {
+            simulation.set_peer(1, 0, false);
+            simulation.set_peer(0, 1, false);
+        });
+        let mut l = landing_with_buffer(1, 1, |n| n == 1, helper);
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let mut pages: Vec<_> = acquire_sealed_together(&mut l, &[1, 1])
+            .into_iter()
+            .map(sealed)
+            .collect();
+        lead.finish(crate::read::gpu_copies::Outcome::Nothing);
+        assert_eq!(l.asked.get(), 1, "one landing request");
+        assert!(l.peers.calls.borrow().is_empty());
+        assert!(Arc::ptr_eq(&landed_arc(&pages[0]), &landed_arc(&pages[1])));
+        assert_eq!(landed_arc(&pages[0]).ordinal(), 1);
+        assert_eq!(joined_count(&l.helper), 1);
+        assert_eq!(l.f.fill.metrics.count(Event::GpuDirectJoined), 1);
+        let second = pages.pop().unwrap();
+        assert_decrypts(&l.helper, 1, 1, pages.pop().unwrap());
+        assert_decrypts(&l.helper, 2, 1, second);
+        assert_eq!(l.helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A held copy is reused by a later fetch; once every holder dropped
+    /// it, the table keeps nothing alive and the page is fetched again.
+    fn shared_copy_lives_only_while_a_request_holds_it() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_every(0);
+        let first = sealed(acquire_sealed_on(&mut l, 0));
+        let second = sealed(acquire_sealed_on(&mut l, 1));
+        assert_eq!(l.asked.get(), 1);
+        assert_eq!(joined_count(&l.helper), 1);
+        let weak = Arc::downgrade(&landed_arc(&first));
+        drop(first);
+        drop(second);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "the table holds no strong reference"
+        );
+        let third = sealed(acquire_sealed_on(&mut l, 0));
+        assert_eq!(l.asked.get(), 2, "fetched again");
+        assert_eq!(joined_count(&l.helper), 1);
+        assert_eq!(l.f.fill.gpu_copies.len(), 1);
+        drop(third);
+        assert_eq!(l.helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A fetch waiting on another request's fetch gets its copy when it
+    /// finishes, without a request of its own.
+    fn waiting_fetch_gets_the_leaders_copy() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        let copy = sealed(acquire_sealed_on(&mut l, 0));
+        // Forget the copy, then stand in for a leader still fetching it.
+        l.f.fill.gpu_copies.forget(&l.f.page);
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let shared = crate::read::gpu_copies::SharedCopy::from_sealed(&copy).unwrap();
+        let target = SealedTarget {
+            helper: l.helper.clone(),
+            ordinal: 1,
+        };
+        let f = &mut l.f;
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
+        let fetch = f.fill.acquire_sealed(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+            &target,
+        );
+        let finish = async move {
+            yield_once().await;
+            lead.finish(crate::read::gpu_copies::Outcome::Copy(shared));
+        };
+        let (fetched, ()) = drive(
+            futures::future::join(fetch, finish),
+            &mut f.engine,
+            &f.crypto,
+        );
+        let joined = sealed(fetched);
+        assert!(Arc::ptr_eq(&landed_arc(&copy), &landed_arc(&joined)));
+        assert_eq!(l.asked.get(), 1);
+        assert_eq!(joined_count(&l.helper), 1);
+        assert_decrypts(&l.helper, 1, 1, joined);
+    }
+
+    #[test]
+    /// A leader that finishes with nothing sends a waiting fetch straight to
+    /// the host path without a GPU attempt of its own.
+    fn finished_lead_without_a_copy_skips_the_waiters_gpu_fetch() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Copy(l.copy.clone())));
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let target = SealedTarget {
+            helper: l.helper.clone(),
+            ordinal: 0,
+        };
+        let f = &mut l.f;
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
+        let fetch = f.fill.acquire_sealed(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+            &target,
+        );
+        let finish = async move {
+            yield_once().await;
+            lead.finish(crate::read::gpu_copies::Outcome::Nothing);
+        };
+        let (fetched, ()) = drive(
+            futures::future::join(fetch, finish),
+            &mut f.engine,
+            &f.crypto,
+        );
+        let fetched = fetched.unwrap();
+        assert!(!matches!(
+            fetched,
+            Fetched::Sealed(ref sealed) if matches!(sealed.source, SealedSource::Landed(_))
+        ));
+        assert_eq!(l.asked.get(), 0, "no landing attempt of its own");
+        assert_eq!(l.peers.calls.borrow().len(), 1, "one host fetch");
+        assert_eq!(joined_count(&l.helper), 0);
+    }
+
+    #[test]
+    /// When the leading request ends before its fetch does, a waiting
+    /// fetch looks again and fetches the page itself.
+    fn abandoned_lead_lets_the_waiting_fetch_fetch() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let target = SealedTarget {
+            helper: l.helper.clone(),
+            ordinal: 0,
+        };
+        let f = &mut l.f;
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 16, 32);
+        let fetch = f.fill.acquire_sealed(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+            &target,
+        );
+        let cancel = async move {
+            yield_once().await;
+            // The leading request was cancelled: its future is dropped.
+            drop(lead);
+        };
+        let (fetched, ()) = drive(
+            futures::future::join(fetch, cancel),
+            &mut f.engine,
+            &f.crypto,
+        );
+        let page = sealed(fetched);
+        assert!(matches!(page.source, SealedSource::Landed(_)));
+        assert_eq!(l.asked.get(), 1);
+        assert_eq!(joined_count(&l.helper), 0);
+        assert_decrypts(&l.helper, 1, 0, page);
+    }
+
+    #[test]
+    /// A cancelled leading fetch abandons its lead, and the next fetch
+    /// leads instead of waiting forever.
+    fn cancelled_leading_fetch_does_not_block_later_fetches() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        l.f.scope.cancellation.cancel().unwrap();
+        assert!(matches!(
+            acquire_sealed_on(&mut l, 0),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(l.f.fill.gpu_copies.len(), 0);
+        l.f.scope = RequestScope::new(l.f.scope.request, l.f.scope.deadline.0).unwrap();
+        let page = sealed(acquire_sealed_on(&mut l, 0));
+        assert_eq!(l.asked.get(), 1);
+        assert_decrypts(&l.helper, 1, 0, page);
+    }
+
+    #[test]
+    /// A GPU that rejects a shared copy makes the owner forget it, so the
+    /// next fetch does not reuse it even while another request holds it.
+    fn failed_verdict_forgets_the_shared_copy() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_every(0);
+        let first = sealed(acquire_sealed_on(&mut l, 0));
+        let report = first.report();
+        assert!(report.landed && report.has_owner_state(false) && !report.has_owner_state(true));
+        let misses = l.f.fill.metrics.count(Event::CorruptMiss);
+        l.f.fill.sealed_verdict(report, false);
+        assert_eq!(l.f.fill.metrics.count(Event::CorruptMiss), misses + 1);
+        let second = sealed(acquire_sealed_on(&mut l, 0));
+        assert_eq!(l.asked.get(), 2, "fetched again");
+        assert!(!Arc::ptr_eq(&landed_arc(&first), &landed_arc(&second)));
+        assert_eq!(joined_count(&l.helper), 0);
+        // A passed verdict keeps sharing.
+        l.f.fill.sealed_verdict(second.report(), true);
+        let third = sealed(acquire_sealed_on(&mut l, 0));
+        assert_eq!(l.asked.get(), 2);
+        assert!(Arc::ptr_eq(&landed_arc(&second), &landed_arc(&third)));
+    }
+
+    #[test]
+    /// A fetch in flight when a GPU rejects the page may carry the same
+    /// rejected ciphertext, so its copy is not shared once it finishes: the
+    /// next fetch fetches again.
+    fn failed_verdict_detaches_an_in_flight_fetch() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing_every(0);
+        let first = sealed(acquire_sealed_on(&mut l, 0));
+        // Stand in for a fetch that started before the verdict and will
+        // finish with the same ciphertext.
+        l.f.fill.gpu_copies.forget(&l.f.page);
+        let crate::read::gpu_copies::Lookup::Lead(lead) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 0)
+        else {
+            panic!("expected to lead");
+        };
+        let crate::read::gpu_copies::Lookup::Join(waiter) =
+            l.f.fill.gpu_copies.lookup(&l.f.page, &l.helper, 1)
+        else {
+            panic!("expected to join");
+        };
+        l.f.fill.sealed_verdict(first.report(), false);
+        let shared = crate::read::gpu_copies::SharedCopy::from_sealed(&first).unwrap();
+        lead.finish(crate::read::gpu_copies::Outcome::Copy(shared));
+        // The existing waiter still gets the leader's copy to check itself.
+        assert!(matches!(
+            futures::executor::block_on(waiter),
+            crate::read::gpu_copies::Outcome::Copy(_)
+        ));
+        let second = sealed(acquire_sealed_on(&mut l, 0));
+        assert_eq!(l.asked.get(), 2, "fetched again");
+        assert!(!Arc::ptr_eq(&landed_arc(&first), &landed_arc(&second)));
+        assert_eq!(joined_count(&l.helper), 0);
     }
 }
 
@@ -3492,7 +3966,7 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
             } else {
                 Reply::Stale
             };
-            peers.reply(&n, reply);
+            peers.reply(n, reply);
         }
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, attempts, links);
         let result = acquire(&mut f, &mut budget);
@@ -3563,7 +4037,7 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
                 } else {
                     Reply::Miss
                 };
-                peers.reply(&n, reply);
+                peers.reply(n, reply);
             }
             // Then version 1's other owner, which is not a current one. It
             // is also the member ranked fourth, a demoted target granted with
@@ -3654,7 +4128,7 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
                 } else {
                     Reply::Miss
                 };
-                peers.reply(&n, reply);
+                peers.reply(n, reply);
             }
         }
         // What a delegation carries: the origin credit and one link.
@@ -3911,7 +4385,7 @@ fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
             .iter()
             .filter(|n| **n != ordered[0] && **n != ordered[1])
         {
-            peers.reply(&node, Reply::Miss);
+            peers.reply(node, Reply::Miss);
         }
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
         let result = acquire(&mut f, &mut budget).unwrap();
