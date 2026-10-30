@@ -273,7 +273,7 @@ They are inactive once they finish, so every later start of a unit that
 requires them runs them again *(inference)*. That covers a host boot, a
 NodeReboot on `nspawn-container` (`systemctl restart systemd-nspawn@<m>`), and
 starting the node units again on a `host` restart. It is how v1's nftables
-flush already runs again on each machine start. Validation task V5 ([implementation, section 3](09-implementation.md#3-testing-and-validation)) confirms it.
+flush already runs again on each machine start. Validation task V5 ([testing, section 7](11-testing.md#7-validation-tasks)) confirms it.
 
 ```mermaid
 sequenceDiagram
@@ -339,7 +339,7 @@ The node runs directly on the host:
   therefore shows a new boot ID and a `Rebooted` event on the Node, as in v1,
   even though the host's kernel did not restart *(inference: kubelet reports
   the boot ID it reads from that file; validation task V6
-  ([implementation, section 3](09-implementation.md#3-testing-and-validation)))*.
+  ([testing, section 7](11-testing.md#7-validation-tasks)))*.
 
 NVIDIA Container Toolkit, as an artifact:
 
@@ -351,7 +351,7 @@ NVIDIA Container Toolkit, as an artifact:
 - Upstream distributes OS packages, so the release pipeline repackages the
   binaries CDI mode needs into a tarball. The expected set is
   `nvidia-container-runtime`, `nvidia-ctk` and `nvidia-cdi-hook` *(inference;
-  validation task V3 ([implementation, section 3](09-implementation.md#3-testing-and-validation)))*.
+  validation task V3 ([testing, section 7](11-testing.md#7-validation-tasks)))*.
 - Binaries are staged in `<slot>/nvidia/bin`. containerd's `nvidia` runtime
   `BinaryName` points there. The toolkit's configuration lives in the slot
   directory, so the host's `/etc/nvidia-container-runtime/config.toml` is never

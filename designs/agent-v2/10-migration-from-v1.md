@@ -235,3 +235,9 @@ pending AgentUpgrade whose operation has `agentMode: v2`, it starts
 (`cmd/agent/internal/daemon/controller_machineoperation.go:215-270`). It changes
 nothing for an operation without the parameter. This is listed with the other
 changes in [v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries).
+
+## 11. Testing
+
+The migration suite in [testing, section 4](11-testing.md#4-migration-suite) covers both ways of starting a
+migration, an interruption and a failure in every phase, rollback, the checks
+that refuse, and the move to the `host` runtime afterwards.
