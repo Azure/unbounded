@@ -59,7 +59,7 @@ account, create another ClusterCache.
 Wait for the cache to start:
 
 ```bash
-kubectl -n unbounded-system rollout status daemonset/racer-dataplane --timeout=5m
+kubectl -n unbounded-system rollout status daemonset/racer --timeout=5m
 kubectl -n unbounded-system rollout status daemonset/racer-origin-racer-object --timeout=5m
 ```
 

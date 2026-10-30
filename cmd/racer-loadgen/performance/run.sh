@@ -17,13 +17,13 @@ case "${1:-}" in
     export TMPDIR="${TMPDIR:-$out/tmp}"
     export CARGO_TARGET_DIR="$out/cargo"
     mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOTMPDIR" "$TMPDIR"
-    cargo build --locked --release -j 2 --manifest-path "$root/cmd/racer-dataplane/Cargo.toml" --bin racer-dataplane
+    cargo build --locked --release -j 2 --manifest-path "$root/cmd/racer/Cargo.toml" --bin racer
     cargo build --locked --release -j 2 --manifest-path "$root/cmd/racer-loadgen/performance/Cargo.toml"
     "${GOCMD:-go}" test -c -o "$out/loadgen.test" ./cmd/racer-loadgen
     {
       "${GOCMD:-go}" version
       rustc --version
-      sha256sum "$out/loadgen.test" "$out/cargo/release/racer-dataplane"
+      sha256sum "$out/loadgen.test" "$out/cargo/release/racer"
     } >"$out/build-info.txt"
     ;;
   run)
@@ -42,7 +42,7 @@ case "${1:-}" in
     chmod -R go-w "$run/runtime"
     mount --make-rprivate /
     mount --bind "$run/runtime" /run
-    export RACER_PERF_ROOT="$run" RACER_PERF_BIN="$out/cargo/release/racer-dataplane"
+    export RACER_PERF_ROOT="$run" RACER_PERF_BIN="$out/cargo/release/racer"
     export RACER_PERF_CONTROL="$out/cargo/release/racer-performance-control"
     export RACER_PERF_CONCURRENCY="${3:-32}" GOMAXPROCS=8 TMPDIR="$run"
     export RACER_PERF_START_SPACING="${4:-0s}"

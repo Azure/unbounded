@@ -235,7 +235,7 @@ func TestInstallCreatesStateBeforeDataplane(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, "racer-config"), &corev1.ConfigMap{})))
 
 	container := ds.Spec.Template.Spec.Containers[0]
-	require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", container.Image)
+	require.Equal(t, "mirror.test/unbounded/racer:v1", container.Image)
 	require.Equal(t, []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}, container.EnvFrom)
 
 	for _, e := range container.Env {
@@ -252,7 +252,7 @@ func TestInstallCreatesStateBeforeDataplane(t *testing.T) {
 	require.Len(t, policies.Items, 5)
 
 	for _, policy := range policies.Items {
-		require.Contains(t, policy.Spec.MatchConditions[0].Expression, "system:serviceaccount:custom-system:racer-dataplane")
+		require.Contains(t, policy.Spec.MatchConditions[0].Expression, "system:serviceaccount:custom-system:racer")
 	}
 }
 
@@ -326,7 +326,7 @@ func TestRuntimeOwnedStateIsNeverWritten(t *testing.T) {
 
 	lease := &coordinationv1.Lease{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, "racer-seat-0"), lease))
-	lease.Spec.HolderIdentity = ptr.To("racer-dataplane-abc")
+	lease.Spec.HolderIdentity = ptr.To("racer-abc")
 	lease.Annotations = map[string]string{"racer.unbounded-cloud.io/endpoint": "https://10.0.0.1:8443"}
 	require.NoError(t, env.Client.Update(t.Context(), lease))
 
@@ -425,20 +425,20 @@ func TestUnmanagedObjectsAreNotAdopted(t *testing.T) {
 func TestGuardContainment(t *testing.T) {
 	for name, damage := range map[string]func(*testing.T, *component.Env){
 		"deleted policy": func(t *testing.T, env *component.Env) {
-			require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-lease"}}))
+			require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-lease"}}))
 		},
 		"deleted binding": func(t *testing.T, env *component.Env) {
-			require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-state"}}))
+			require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: "racer-state"}}))
 		},
 		"tampered policy": func(t *testing.T, env *component.Env) {
 			policy := &admissionv1.ValidatingAdmissionPolicy{}
-			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-dataplane-pod-report"}, policy))
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-pod-report"}, policy))
 			policy.Spec.Validations = policy.Spec.Validations[:1]
 			require.NoError(t, env.Client.Update(t.Context(), policy))
 		},
 		"audit only binding": func(t *testing.T, env *component.Env) {
 			binding := &admissionv1.ValidatingAdmissionPolicyBinding{}
-			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-dataplane-webhook-configuration"}, binding))
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-webhook-configuration"}, binding))
 			binding.Spec.ValidationActions = []admissionv1.ValidationAction{admissionv1.Audit}
 			require.NoError(t, env.Client.Update(t.Context(), binding))
 		},
@@ -485,7 +485,7 @@ func TestContainmentLeavesUnmanagedBindings(t *testing.T) {
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: dataplaneName}, binding))
 	binding.Annotations = nil
 	require.NoError(t, env.Client.Update(t.Context(), binding))
-	require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-lease"}}))
+	require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-lease"}}))
 
 	plan := planPass(t, env)
 
@@ -522,15 +522,16 @@ func legacyObjects(ns string) []client.Object {
 		&admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: cluster("racer-node-write-restriction")},
 		// The retired controller's leader Lease was never operator-managed.
 		&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}},
-		// Old dataplane wiring is replaced in place.
+		// The retired installation ran its dataplane under the pre-rename
+		// name; it is removed once the renamed DaemonSet is planned.
 		&appsv1.DaemonSet{
-			ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns, UID: "old-dataplane", Annotations: map[string]string{managerAnnotation: component.FieldOwner, legacyInstallationUID: "marker-uid"}},
+			ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns, UID: "old-dataplane", Annotations: map[string]string{managerAnnotation: component.FieldOwner, legacyInstallationUID: "marker-uid"}},
 			Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 				Containers: []corev1.Container{{Name: dataplaneContainerName, Env: []corev1.EnvVar{{Name: "RACER_CLUSTER_ID", Value: "old"}, {Name: "RACER_CONTROL_ENDPOINT", Value: "https://racer-controller"}}}},
 				Volumes:    []corev1.Volume{{Name: "bootstrap"}},
 			}}},
 		},
-		&corev1.ServiceAccount{ObjectMeta: meta(dataplaneName)},
+		&corev1.ServiceAccount{ObjectMeta: meta(renamedDataplane)},
 		&admissionv1.MutatingWebhookConfiguration{
 			ObjectMeta: cluster(webhookConfigName),
 			Webhooks: []admissionv1.MutatingWebhook{{Name: "racer-object-sidecar.racer.unbounded-cloud.io", ClientConfig: admissionv1.WebhookClientConfig{
@@ -602,6 +603,8 @@ func TestLegacyControllerMigration(t *testing.T) {
 		require.False(t, exists(t, env, obj), "%T %s survived", obj, obj.GetName())
 	}
 
+	require.False(t, exists(t, env, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns}}))
+	require.False(t, exists(t, env, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns}}))
 	require.True(t, exists(t, env, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}))
 	require.True(t, exists(t, env, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "racer-bootstrap-trust-copy", Namespace: ns}}))
 
@@ -763,7 +766,7 @@ func TestClusterCachePredicate(t *testing.T) {
 
 func TestGuardPredicate(t *testing.T) {
 	p := guardPredicate()
-	require.True(t, p.Generic(event.GenericEvent{Object: &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-lease"}}}))
+	require.True(t, p.Generic(event.GenericEvent{Object: &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-lease"}}}))
 	require.False(t, p.Generic(event.GenericEvent{Object: &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "other"}}}))
 }
 
@@ -800,13 +803,16 @@ func TestLegacyMigrationRefusesDroppedWorkloadSettings(t *testing.T) {
 		data map[string]string
 		want string
 	}{
-		"peer port":       {data: map[string]string{"RACER_PEER_PORT": "9000"}, want: "RACER_PEER_PORT"},
-		"diagnostics":     {data: map[string]string{"RACER_DIAGNOSTICS_PORT": "9191"}, want: "RACER_DIAGNOSTICS_PORT"},
-		"host network":    {data: map[string]string{"RACER_HOST_NETWORK": "true"}, want: "RACER_HOST_NETWORK"},
-		"bad bool":        {data: map[string]string{"RACER_HOST_NETWORK": "yes"}, want: "RACER_HOST_NETWORK"},
-		"pod network":     {data: map[string]string{"RACER_POD_NETWORK_NODES": "a"}, want: "RACER_POD_NETWORK_NODES"},
-		"nvidia":          {data: map[string]string{"RACER_DATAPLANE_NVIDIA": "cdi"}, want: "RACER_DATAPLANE_NVIDIA"},
-		"defaults accept": {data: map[string]string{"RACER_PEER_PORT": "8082", "RACER_HOST_NETWORK": "false", "RACER_DATAPLANE_NVIDIA": "env"}},
+		"peer port":         {data: map[string]string{"RACER_PEER_PORT": "9000"}, want: "RACER_PEER_PORT"},
+		"diagnostics":       {data: map[string]string{"RACER_DIAGNOSTICS_PORT": "9191"}, want: "RACER_DIAGNOSTICS_PORT"},
+		"host network":      {data: map[string]string{"RACER_HOST_NETWORK": "true"}, want: "RACER_HOST_NETWORK"},
+		"bad bool":          {data: map[string]string{"RACER_HOST_NETWORK": "yes"}, want: "RACER_HOST_NETWORK"},
+		"pod network":       {data: map[string]string{"RACER_POD_NETWORK_NODES": "a"}, want: "RACER_POD_NETWORK_NODES"},
+		"nvidia":            {data: map[string]string{"RACER_NVIDIA": "cdi"}, want: "RACER_NVIDIA"},
+		"legacy nvidia":     {data: map[string]string{"RACER_DATAPLANE_NVIDIA": "off"}, want: "RACER_DATAPLANE_NVIDIA"},
+		"legacy nvidia cdi": {data: map[string]string{"RACER_DATAPLANE_NVIDIA": " cdi "}, want: "RACER_DATAPLANE_NVIDIA"},
+		"legacy env accept": {data: map[string]string{"RACER_DATAPLANE_NVIDIA": " env "}},
+		"defaults accept":   {data: map[string]string{"RACER_PEER_PORT": "8082", "RACER_HOST_NETWORK": "false", "RACER_NVIDIA": "env"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			objects := legacyObjects(ns)
@@ -921,7 +927,7 @@ func TestRetainedInstallStillContainsGuards(t *testing.T) {
 	env := testEnv(t, cacheObject("cache"))
 	initialize(t, env)
 	require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
-	require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-pod-report"}}))
+	require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-pod-report"}}))
 
 	plan, result := planResult(t, env)
 	require.Equal(t, reasonGuards, result.Reason)
@@ -933,7 +939,7 @@ func TestRetainedInstallStillContainsGuards(t *testing.T) {
 	persist(t, env, plan)
 	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, dataplaneName), &rbacv1.RoleBinding{})))
 	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKey{Name: dataplaneName}, &rbacv1.ClusterRoleBinding{})))
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-dataplane-pod-report"}, &admissionv1.ValidatingAdmissionPolicy{}))
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-pod-report"}, &admissionv1.ValidatingAdmissionPolicy{}))
 
 	// Retained mode never re-grants; a later cache restores the bindings.
 	plan, result = planResult(t, env)

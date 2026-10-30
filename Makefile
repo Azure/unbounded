@@ -375,7 +375,7 @@ help: ## Show this help
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
 	@echo "  racer-object | racer-object-build  Build racer-object (with/without focused tests)"
 	@echo "  racer-object-test                 Race-test racer-object"
-	@echo "  image-racer-dataplane-local       Build the racer-dataplane container image"
+	@echo "  image-racer-local       Build the racer container image"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo "  image-racer-object-local          Build the racer-object container image"
 	@echo ""
@@ -573,7 +573,7 @@ racer-go-test: ## Lint and race-test the Go Racer API and workload packages
 	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/...
 
 racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluster control plane
-	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace
+	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer/Cargo.toml --workspace
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
 
@@ -583,9 +583,9 @@ RACER_GPU_TESTS ?= require
 
 .PHONY: racer-gpu-test
 racer-gpu-test: ## Build the CUDA shim with kernels (needs nvcc) and run GPU hardware tests (needs a GPU)
-	RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 600s sh images/racer-dataplane/build-native-cuda.sh cmd/racer-dataplane/gpu/native "$(RACER_GPU_NATIVE)/libracer_gpu_cuda.so.1"
-	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --no-default-features --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
-	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --no-default-features --features native --test hardware -- --nocapture --test-threads=1
+	RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 600s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native "$(RACER_GPU_NATIVE)/libracer_gpu_cuda.so.1"
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --test hardware -- --nocapture --test-threads=1
 	@if [ -n "$$RACER_GPU_E2E_SOCKET" ]; then \
 		test -x "$(RACER_PY_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
 			timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q pytest; }; \
@@ -615,7 +615,7 @@ RACER_SIM_TIMEOUT ?= 7200s
 
 .PHONY: racer-sim
 racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
-	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-sim -- $(ARGS)
+	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -635,14 +635,14 @@ racer-envtest: ## Run real API-server tests for Racer APIs and operator restrict
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
 
-RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+RACER_IMAGE ?= $(CONTAINER_REGISTRY)/racer:$(VERSION_TAG)
 
-.PHONY: image-racer-dataplane-local
-image-racer-dataplane-local: ## Build the racer-dataplane container image locally (single-arch)
+.PHONY: image-racer-local
+image-racer-local: ## Build the racer container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
-		-t racer-dataplane:$(VERSION_TAG) -t $(RACER_DATAPLANE_IMAGE) \
-		-f ./images/racer-dataplane/Containerfile .
-	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
+		-t racer:$(VERSION_TAG) -t $(RACER_IMAGE) \
+		-f ./images/racer/Containerfile .
+	$(call trivy-maybe,$(RACER_IMAGE))
 
 RACER_LOADGEN_BIN=bin/racer-loadgen
 RACER_LOADGEN_CMD=./cmd/racer-loadgen

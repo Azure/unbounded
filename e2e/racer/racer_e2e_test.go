@@ -59,17 +59,17 @@ func TestObjectCacheFromAzureOrigin(t *testing.T) {
 
 // fetchPod returns a pod that reads the blob twice through the sidecar and
 // verifies its digest each time.
-// checkDataplaneHardware reads /debug/hardware from a racer-dataplane pod
+// checkDataplaneHardware reads /debug/hardware from a racer pod
 // through the API server pod proxy and checks the report shape. Kind nodes
 // always expose block devices, but RDMA devices are not expected.
 func (h *harness) checkDataplaneHardware() {
 	h.t.Helper()
 
 	pod := strings.TrimSpace(h.kubectl("-n", operatorNamespace, "get", "pods",
-		"-l", "app.kubernetes.io/name=racer-dataplane",
+		"-l", "app.kubernetes.io/name=racer",
 		"-o", "jsonpath={.items[0].metadata.name}"))
 	if pod == "" {
-		h.t.Fatal("no racer-dataplane pod found")
+		h.t.Fatal("no racer pod found")
 	}
 
 	port := strings.TrimSpace(h.kubectl("-n", operatorNamespace, "get", "pod", pod, "-o",

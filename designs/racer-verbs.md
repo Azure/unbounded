@@ -2,7 +2,7 @@
 
 Status: implemented. This file covers the verbs crate. Racer's signed setup
 and HTTP page protocol are in [racer-rdma-sessions.md](racer-rdma-sessions.md).
-Paths below are relative to `cmd/racer-dataplane/verbs/`.
+Paths below are relative to `cmd/racer/verbs/`.
 
 ## Contract
 

@@ -24,7 +24,7 @@ client falls back to host memory, then to a plain stream.
 
 ## 1. Check GPU Mode
 
-GPU mode is on by default. The `racer-dataplane` image is built with CUDA, and
+GPU mode is on by default. The `racer` image is built with CUDA, and
 `RACER_ENABLE_GPU` is `auto`. The dataplane does not touch the GPUs until the
 first GPU read, so vLLM's first load turns GPU mode on. After a load, check a
 dataplane log on the GPU node:
@@ -40,7 +40,7 @@ To make the dataplane set up the GPUs at startup and fail when it finds none,
 so a broken setup is not silent, set `RACER_ENABLE_GPU` to `true`:
 
 ```bash
-kubectl -n unbounded-system patch configmap racer-dataplane-config \
+kubectl -n unbounded-system patch configmap racer-settings \
   --type merge -p '{"data":{"RACER_ENABLE_GPU":"true"}}'
 ```
 
@@ -49,7 +49,7 @@ Storage. Without GPUDirect Storage on the host, disk reads go through host
 memory.
 
 The dataplane gets the NVIDIA driver libraries without requesting a GPU. This
-is on by default (`RACER_DATAPLANE_NVIDIA: env` in `racer-dataplane-config`). See
+is on by default (`RACER_NVIDIA: env` in `racer-settings`). See
 [GPU reads]({{< relref "reference/racer" >}}#gpu-reads).
 
 ## 2. Deploy vLLM

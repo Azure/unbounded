@@ -23,19 +23,19 @@ import (
 
 const (
 	dataplaneName          = workload.DataplaneDaemonSetName
-	dataplaneConfigName    = "racer-dataplane-config"
-	dataplaneImageName     = "racer-dataplane"
+	dataplaneConfigName    = "racer-settings"
+	dataplaneImageName     = "racer"
 	objectImageName        = "racer-object"
 	dataplaneContainerName = workload.ContainerName
-	dataplaneConfigHash    = "unbounded-cloud.io/racer-dataplane-config-hash"
+	dataplaneConfigHash    = "unbounded-cloud.io/racer-settings-hash"
 
 	// minThreads covers one I/O worker, one crypto helper, and the
 	// dedicated control plane thread.
 	minThreads = 3
 )
 
-// planDataplaneConfig creates racer-dataplane-config with defaults when it is
-// absent and otherwise reads it. Every key is administrator payload; its
+// planDataplaneConfig creates racer-settings when it is absent, seeded
+// from the owned pre-rename racer-dataplane-config or else with defaults, and otherwise reads it. Every key is administrator payload; its
 // hash rolls the DaemonSet.
 func planDataplaneConfig(ctx context.Context, env *component.Env, plan *component.Plan) (*corev1.ConfigMap, error) {
 	decoded, err := env.DecodeManifestFiles(manifests.Manifests, []string{"dataplane-config.yaml"}, nil)
@@ -57,6 +57,22 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 
 		config.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
 		markManaged(config)
+
+		// Carry settings over from the pre-rename ConfigMap the operator owns.
+		renamed, err := renamedConfigData(ctx, env)
+		if err != nil {
+			return nil, err
+		}
+
+		if renamed != nil {
+			// Reject bad carried-over values before the new DaemonSet rolls
+			// out, as for an existing racer-settings.
+			if err := validateDataplaneConfig(renamed); err != nil {
+				return nil, err
+			}
+
+			config.Data = renamed
+		}
 
 		plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(config), Component: name})
 
@@ -135,35 +151,39 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 // recordedStateUID returns the racer-state UID an existing installation runs
 // on, or empty when no managed dataplane object records one. The retired
 // controller's DaemonSet records none, so migration starts a new identity.
+// The pre-rename DaemonSet and ServiceAccount are read too, until
+// planRenamedCleanup removes them, so the rename keeps failing closed.
 func recordedStateUID(ctx context.Context, env *component.Env) (string, error) {
 	var uid string
 
-	for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
-		err := env.LiveReader().Get(ctx, objectKey(env, dataplaneName), obj)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
+	for _, objName := range []string{dataplaneName, renamedDataplane} {
+		for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
+			err := env.LiveReader().Get(ctx, objectKey(env, objName), obj)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
 
-		if err != nil {
-			return "", err
-		}
+			if err != nil {
+				return "", err
+			}
 
-		// A terminating object still records the identity its Pods may be
-		// running on, so it keeps failing closed until it is gone.
-		if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
-			continue
-		}
+			// A terminating object still records the identity its Pods may be
+			// running on, so it keeps failing closed until it is gone.
+			if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
+				continue
+			}
 
-		recorded := obj.GetAnnotations()[stateUIDAnnotation]
-		if recorded == "" {
-			continue
-		}
+			recorded := obj.GetAnnotations()[stateUIDAnnotation]
+			if recorded == "" {
+				continue
+			}
 
-		if uid != "" && uid != recorded {
-			return "", fmt.Errorf("racer dataplane ServiceAccount and DaemonSet record different racer-state UIDs")
-		}
+			if uid != "" && uid != recorded {
+				return "", fmt.Errorf("racer dataplane ServiceAccounts and DaemonSets (%s, %s) record different racer-state UIDs", dataplaneName, renamedDataplane)
+			}
 
-		uid = recorded
+			uid = recorded
+		}
 	}
 
 	return uid, nil

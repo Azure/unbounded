@@ -23,7 +23,7 @@ const (
 	racerStateSecret = "racer-state"
 	webhookName      = "racer-webhook"
 	webhookPort      = 9443
-	dataplaneLabel   = "app.kubernetes.io/name=racer-dataplane"
+	dataplaneLabel   = "app.kubernetes.io/name=racer"
 	// leaseSkew tolerates clock skew between the host and kind nodes when
 	// judging whether a Lease has expired.
 	leaseSkew = 5 * time.Second
@@ -44,7 +44,7 @@ func (l lease) unexpired(now time.Time) bool {
 	return l.Duration > 0 && !l.RenewTime.IsZero() && now.Before(l.RenewTime.Add(l.Duration+leaseSkew))
 }
 
-// dataplanePod is a racer-dataplane pod that may hold a seat.
+// dataplanePod is a racer pod that may hold a seat.
 type dataplanePod struct {
 	Name  string
 	UID   string
@@ -97,7 +97,7 @@ type podList struct {
 	}
 }
 
-// controlView reads the seat and primary Leases and the racer-dataplane pods.
+// controlView reads the seat and primary Leases and the racer pods.
 // Read errors yield an empty view so callers polling with waitFor retry.
 func (h *harness) controlView() controlView {
 	h.t.Helper()
@@ -229,7 +229,7 @@ func (v controlView) seatProblems() []string {
 	return problems
 }
 
-// readyPods counts ready racer-dataplane pods.
+// readyPods counts ready racer pods.
 func (v controlView) readyPods() int {
 	n := 0
 

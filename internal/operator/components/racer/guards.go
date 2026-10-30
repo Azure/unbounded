@@ -27,7 +27,7 @@ func decodePolicies(env *component.Env) ([]*unstructured.Unstructured, error) {
 
 func guardPredicate() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return strings.HasPrefix(obj.GetName(), "racer-dataplane-")
+		return strings.HasPrefix(obj.GetName(), "racer-")
 	})
 }
 

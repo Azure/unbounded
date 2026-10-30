@@ -23,7 +23,7 @@ func TestCollectorAbsentCargoFiles(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			root := t.TempDir()
 			if placeholder {
-				testutil.WriteTree(t, root, map[string]string{"cmd/racer-dataplane/README.md": "Placeholder"})
+				testutil.WriteTree(t, root, map[string]string{"cmd/racer/README.md": "Placeholder"})
 			}
 
 			c := New(filepath.Join(t.TempDir(), "nonexistent-cache"))
@@ -97,7 +97,7 @@ func TestCollectorCollectHermetic(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/racer-dataplane/Cargo.toml": `[dependencies]
+		"cmd/racer/Cargo.toml": `[dependencies]
 foo = "1"
 
 [build-dependencies]
@@ -109,7 +109,7 @@ linux-only = "3"
 [dev-dependencies]
 test-only = "4"
 `,
-		"cmd/racer-dataplane/Cargo.lock": `version = 4
+		"cmd/racer/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
@@ -128,7 +128,7 @@ name = "test-only"
 version = "4.0.0"
 
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 dependencies = [
  "build-helper",
@@ -185,7 +185,7 @@ version = "0.8.6"
 name = "rand"
 version = "0.9.2"
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 dependencies = [
  "rand 0.8.6",
@@ -216,11 +216,11 @@ func TestDirectDependenciesResolvesPackageAlias(t *testing.T) {
 func TestCollectorPrecheckAndCollectWithoutDependencies(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\n",
-		"cmd/racer-dataplane/Cargo.lock": `version = 4
+		"cmd/racer/Cargo.toml": "[dependencies]\n",
+		"cmd/racer/Cargo.lock": `version = 4
 
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 `,
 	})
@@ -239,15 +239,15 @@ version = "0.1.0"
 func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/racer-dataplane/Cargo.lock": `version = 4
+		"cmd/racer/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -265,15 +265,15 @@ func TestCollectorRejectsDuplicateRegistrySources(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/racer-dataplane/Cargo.lock": `version = 4
+		"cmd/racer/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -297,15 +297,15 @@ func TestCollectorCollectsMultipleLicenseFiles(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/racer-dataplane/Cargo.lock": `version = 4
+		"cmd/racer/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 dependencies = [
  "foo",
@@ -335,15 +335,15 @@ func TestCollectorUsesDeclaredLicenseWithoutLicenseFile(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/racer-dataplane/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/racer-dataplane/Cargo.lock": `version = 4
+		"cmd/racer/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 dependencies = [
  "foo",

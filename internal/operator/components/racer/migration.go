@@ -288,6 +288,20 @@ func planLegacyRestamp(ctx context.Context, env *component.Env, plan *component.
 		legacy(&admissionv1.MutatingWebhookConfiguration{ObjectMeta: objectMeta(webhookConfigName)}, admissionv1.SchemeGroupVersion.WithKind("MutatingWebhookConfiguration")),
 	}
 
+	// The retired installation applied its dataplane under the pre-rename
+	// names. planRenamedCleanup removes those; keep the anchors until it has.
+	for _, candidate := range named[:6] {
+		renamed, ok := candidate.obj.DeepCopyObject().(client.Object)
+		if !ok {
+			return false, errors.New("legacy anchor copy is not a client object")
+		}
+
+		renamed.SetName(renamedDataplane)
+		named = append(named, legacy(renamed, candidate.gvk))
+	}
+
+	named = append(named, legacy(&corev1.ConfigMap{ObjectMeta: objectMeta(renamedConfig)}, core.WithKind("ConfigMap")))
+
 	remaining := false
 
 	for _, candidate := range named {
@@ -470,6 +484,11 @@ func planOrphanClaim(ctx context.Context, env *component.Env, plan *component.Pl
 // settings the new installation no longer reads. The retired controller used
 // them to render the dataplane; dropping them silently would move a running
 // cluster to another peer port or off the host network.
+// legacyNVIDIAKey is the NVIDIA injection key the retired racer-controller
+// read from racer-config. It is independent of workload.NVIDIAKey, which was
+// renamed.
+const legacyNVIDIAKey = "RACER_DATAPLANE_NVIDIA"
+
 func checkLegacyConfig(ctx context.Context, env *component.Env) error {
 	config := &corev1.ConfigMap{}
 
@@ -494,12 +513,16 @@ func checkLegacyConfig(ctx context.Context, env *component.Env) error {
 
 	if value := strings.TrimSpace(config.Data["RACER_HOST_NETWORK"]); value != "" {
 		if enabled, err := strconv.ParseBool(value); err != nil || enabled {
-			unsupported = append(unsupported, "RACER_HOST_NETWORK (set spec.template.spec.hostNetwork through a racer-dataplane DaemonSet override)")
+			unsupported = append(unsupported, "RACER_HOST_NETWORK (set spec.template.spec.hostNetwork through a racer DaemonSet override)")
 		}
 	}
 
-	if value, ok := config.Data[workload.NVIDIAKey]; ok && strings.TrimSpace(value) != string(workload.NVIDIAEnv) {
-		unsupported = append(unsupported, workload.NVIDIAKey+" (set it in ConfigMap "+dataplaneConfigName+" instead)")
+	// The retired controller read the pre-rename key, so check that spelling
+	// explicitly; the renamed key is checked too in case it was set by hand.
+	for _, key := range []string{legacyNVIDIAKey, workload.NVIDIAKey} {
+		if value, ok := config.Data[key]; ok && strings.TrimSpace(value) != string(workload.NVIDIAEnv) {
+			unsupported = append(unsupported, key+" (set "+workload.NVIDIAKey+" in ConfigMap "+dataplaneConfigName+" instead)")
+		}
 	}
 
 	if strings.TrimSpace(config.Data["RACER_POD_NETWORK_NODES"]) != "" {

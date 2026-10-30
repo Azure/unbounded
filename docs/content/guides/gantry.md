@@ -369,10 +369,10 @@ DaemonSet in `unbounded-system`:
 - It mounts the Racer sockets from `/run/racer/gantry/client` and
   `/run/racer/gantry/origin`.
 - It copies node affinity, node selector, and tolerations from the
-  `racer-dataplane` DaemonSet. Gantry then runs on every Racer node, so each
+  `racer` DaemonSet. Gantry then runs on every Racer node, so each
   node can serve origin reads for the cache.
 
-The operator waits for `racer-dataplane` to exist before it makes these
+The operator waits for `racer` to exist before it makes these
 changes. The cache does not install Gantry. If no Site enables Gantry, the
 `gantry` cache is a plain Racer cache. The exception is a Gantry install the
 operator already manages. It stays in place after every Site turns Gantry off,
@@ -435,11 +435,11 @@ an image from a configured registry and check these metrics:
   does for any failed mirror host.
 - A `404` without a `Gantry-Racer-Request-ID` header means the registry is not
   in `upstream_registries`.
-- If Gantry pods stay not ready, check the `racer-dataplane` pod on the same
+- If Gantry pods stay not ready, check the `racer` pod on the same
   node and confirm that `/run/racer/gantry/client` and
   `/run/racer/gantry/origin` exist.
 - If the operator reports `RacerPending` for Gantry, it is waiting for the
-  `racer-dataplane` DaemonSet.
+  `racer` DaemonSet.
 
 ### Turn Off Racer Mode
 

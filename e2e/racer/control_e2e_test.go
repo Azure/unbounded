@@ -16,7 +16,7 @@ import (
 )
 
 // TestControlPlaneSeatsAndFailover checks the control plane embedded in the
-// racer-dataplane DaemonSet: no standalone controller is installed, enough
+// racer DaemonSet: no standalone controller is installed, enough
 // pods on distinct nodes hold unexpired seats, the primary holds a seat, the
 // state Secret and webhook wiring exist, and deleting the primary pod moves
 // the primary to another seat. Every dataplane must report the same fully
@@ -93,7 +93,7 @@ func TestControlPlaneSeatsAndFailover(t *testing.T) {
 		return rv != stateRV, "resourceVersion unchanged"
 	})
 
-	h.rollout("daemonset", "racer-dataplane", 10*time.Minute)
+	h.rollout("daemonset", "racer", 10*time.Minute)
 	h.waitHealthy("seats after failover")
 	h.waitWebhook()
 	h.assertWebhookAdmission(admissionNS)
@@ -117,7 +117,7 @@ func TestControlPlaneSeatsAndFailover(t *testing.T) {
 	})
 }
 
-// restartAllDataplanes deletes every racer-dataplane pod at once, so no
+// restartAllDataplanes deletes every racer pod at once, so no
 // process that held issuer keys in memory survives, then waits for
 // replacements to elect, become ready, and converge on a goal state no older
 // than floor from the same racer-state Secret. Nodes are left alone.
@@ -129,10 +129,10 @@ func (h *harness) restartAllDataplanes(stateUID string, floor membership) {
 		old[p.UID] = true
 	}
 
-	h.t.Logf("deleting all %d racer-dataplane pods", len(old))
+	h.t.Logf("deleting all %d racer pods", len(old))
 	h.kubectl("-n", operatorNamespace, "delete", "pod", "-l", dataplaneLabel, "--wait=false")
 
-	h.waitFor("every racer-dataplane pod replaced", 5*time.Minute, func() (bool, string) {
+	h.waitFor("every racer pod replaced", 5*time.Minute, func() (bool, string) {
 		v := h.controlView()
 		desired := h.dataplaneDesired()
 
@@ -146,7 +146,7 @@ func (h *harness) restartAllDataplanes(stateUID string, floor membership) {
 			fmt.Sprintf("ready new pods %d/%d of %d desired", v.readyPods(), len(v.Pods), desired)
 	})
 
-	h.rollout("daemonset", "racer-dataplane", 10*time.Minute)
+	h.rollout("daemonset", "racer", 10*time.Minute)
 	h.waitHealthy("election after restarting every dataplane")
 
 	goal, v := h.waitConverged("all dataplanes to converge after full restart")

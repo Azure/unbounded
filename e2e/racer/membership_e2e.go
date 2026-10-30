@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// diagnosticsPort is the fixed racer-dataplane diagnostics port that serves
+// diagnosticsPort is the fixed racer diagnostics port that serves
 // /debug/membership.
 const diagnosticsPort = 9090
 
@@ -23,7 +23,7 @@ const diagnosticsPort = 9090
 var errMembershipUnavailable = errors.New("membership unavailable")
 
 // membershipFields lists the /debug/membership keys in the order
-// MembershipDiagnostic::write in cmd/racer-dataplane/src/telemetry.rs
+// MembershipDiagnostic::write in cmd/racer/src/telemetry.rs
 // prints them.
 var membershipFields = []string{
 	"accepted_sequence", "accepted_membership", "accepted_membership_hash",
@@ -202,7 +202,7 @@ func (h *harness) podMembership(pod string) (membership, bool, string) {
 func (h *harness) dataplaneDesired() int {
 	h.t.Helper()
 
-	out, err := h.exec(time.Minute, nil, "kubectl", "-n", operatorNamespace, "get", "daemonset", "racer-dataplane",
+	out, err := h.exec(time.Minute, nil, "kubectl", "-n", operatorNamespace, "get", "daemonset", "racer",
 		"-o", "jsonpath={.status.desiredNumberScheduled}")
 	if err != nil {
 		return 0

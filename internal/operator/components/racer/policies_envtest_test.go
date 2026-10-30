@@ -80,8 +80,8 @@ func startAdmissionFixture(t *testing.T) *admissionFixture {
 	require.NoError(t, admin.Create(ctx, plan.Operations[0].Object))
 
 	fixture := &admissionFixture{admin: admin, env: env}
-	fixture.a = fixture.pod(t, rc, "racer-dataplane-a", "node-a")
-	fixture.b = fixture.pod(t, rc, "racer-dataplane-b", "node-b")
+	fixture.a = fixture.pod(t, rc, "racer-a2b4c", "node-a")
+	fixture.b = fixture.pod(t, rc, "racer-b6d8f", "node-b")
 
 	// Policies compile asynchronously. Wait until a foreign Pod write is denied.
 	require.Eventually(t, func() bool {
@@ -180,7 +180,7 @@ func TestEnvtestRacerAdmissionAndRBAC(t *testing.T) {
 			p.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: "x"}}
 		}))
 		// The policy's limit, which a Rust test ties to MAX_REPORT_BYTES in
-		// cmd/racer-dataplane/cluster-control/src/limits.rs.
+		// cmd/racer/cluster-control/src/limits.rs.
 		policy, err := fs.ReadFile(manifests.Manifests, "policies.yaml")
 		require.NoError(t, err)
 
@@ -332,6 +332,9 @@ func TestEnvtestRacerAdmissionAndRBAC(t *testing.T) {
 		}))
 		denied(t, update(t, f, a.client, slice, func(s *discoveryv1.EndpointSlice) { s.Endpoints = []discoveryv1.Endpoint{endpoint("api", ns)} }))
 		denied(t, update(t, f, a.client, slice, func(s *discoveryv1.EndpointSlice) {
+			s.Endpoints = []discoveryv1.Endpoint{endpoint("racer-origin-x7k2p", ns)}
+		}))
+		denied(t, update(t, f, a.client, slice, func(s *discoveryv1.EndpointSlice) {
 			s.Endpoints = []discoveryv1.Endpoint{endpoint(a.pod.Name, "default")}
 		}))
 		denied(t, update(t, f, a.client, slice, func(s *discoveryv1.EndpointSlice) { s.Ports[0].Port = ptr.To(int32(443)) }))
@@ -404,18 +407,18 @@ func TestEnvtestOperatorPreservesRuntimeState(t *testing.T) {
 	require.NoError(t, admin.Get(ctx, objectKey(env, stateName), state))
 	state.Annotations = map[string]string{"racer.unbounded-cloud.io/initialized": "v1", "racer.unbounded-cloud.io/cluster-id": string(state.UID)}
 	state.Data = map[string][]byte{"cluster": []byte(state.UID), "state": []byte("{}")}
-	require.NoError(t, admin.Update(ctx, state, client.FieldOwner("racer-dataplane")))
+	require.NoError(t, admin.Update(ctx, state, client.FieldOwner("racer")))
 
 	webhook := &admissionv1.MutatingWebhookConfiguration{}
 	require.NoError(t, admin.Get(ctx, client.ObjectKey{Name: webhookConfigName}, webhook))
 	base := webhook.DeepCopy()
 	webhook.Webhooks[0].ClientConfig.CABundle = []byte("runtime-ca")
-	require.NoError(t, admin.Patch(ctx, webhook, client.MergeFrom(base), client.FieldOwner("racer-dataplane")))
+	require.NoError(t, admin.Patch(ctx, webhook, client.MergeFrom(base), client.FieldOwner("racer")))
 
 	slice := &discoveryv1.EndpointSlice{}
 	require.NoError(t, admin.Get(ctx, objectKey(env, webhookName), slice))
 	slice.Endpoints = []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}}}
-	require.NoError(t, admin.Update(ctx, slice, client.FieldOwner("racer-dataplane")))
+	require.NoError(t, admin.Update(ctx, slice, client.FieldOwner("racer")))
 
 	// Drift the webhook so the operator really reapplies it.
 	require.NoError(t, admin.Get(ctx, client.ObjectKey{Name: webhookConfigName}, webhook))

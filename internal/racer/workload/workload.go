@@ -23,7 +23,7 @@ import (
 
 const (
 	// DataplaneDaemonSetName names the dataplane DaemonSet and its ServiceAccount.
-	DataplaneDaemonSetName = "racer-dataplane"
+	DataplaneDaemonSetName = "racer"
 
 	// ContainerName names the dataplane container.
 	ContainerName = "dataplane"
@@ -42,7 +42,7 @@ const (
 	WebhookPort = 9443
 
 	// ControlSeatsKey is the administrator seat policy, read from
-	// racer-dataplane-config: auto picks 1 to 16 seats, or a fixed count of
+	// racer-settings: auto picks 1 to 16 seats, or a fixed count of
 	// 1 to 16. It is never injected as explicit env so the ConfigMap wins.
 	ControlSeatsKey = "RACER_CONTROL_SEATS"
 	// MaxControlSeats bounds a fixed seat count.
@@ -73,18 +73,18 @@ const (
 
 const (
 	// NVIDIAKey selects the NVIDIAInjection mode, read from
-	// racer-dataplane-config by the operator. Unset selects NVIDIAEnv.
-	NVIDIAKey = "RACER_DATAPLANE_NVIDIA"
+	// racer-settings by the operator. Unset selects NVIDIAEnv.
+	NVIDIAKey = "RACER_NVIDIA"
 	// CDIAnnotation requests the NVIDIA CDI device on the dataplane Pod.
 	// containerd treats every key with the cdi.k8s.io/ prefix as a CDI request.
-	CDIAnnotation = "cdi.k8s.io/racer-dataplane"
+	CDIAnnotation = "cdi.k8s.io/racer"
 	// CDIAllGPUs is the fully qualified CDI name for every GPU on the node.
 	CDIAllGPUs = "nvidia.com/gpu=all"
 )
 
 const (
 	// CUFileLogDirectory is the logging.dir of the cufile.json in the
-	// dataplane image (images/racer-dataplane/cufile.json).
+	// dataplane image (images/racer/cufile.json).
 	CUFileLogDirectory = "/var/log/cufile"
 	// CUFileLogSizeLimit bounds the cuFile log emptyDir. cuFile logs at
 	// ERROR level only, so this is far above normal use.

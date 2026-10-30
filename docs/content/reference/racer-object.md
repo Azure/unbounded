@@ -34,7 +34,7 @@ name.
 
 Unbounded releases publish the image as `ghcr.io/azure/racer-object:vX.Y.Z`; use
 the same [release](https://github.com/Azure/unbounded/releases) tag as your
-operator's `racer-dataplane` image. Contributors can build
+operator's `racer` image. Contributors can build
 from source with `make racer-object` (binary at `bin/racer-object`) or
 `make image-racer-object-local`.
 
@@ -238,7 +238,7 @@ so the pod's namespace must allow hostPath volumes under Pod Security Admission.
 
 ### Automatic Injection
 
-Elected control seats in `racer-dataplane` run a mutating admission webhook that
+Elected control seats in `racer` run a mutating admission webhook that
 adds the sidecar to opted-in pods. The unbounded operator installs the
 `MutatingWebhookConfiguration` named `racer-object-sidecar-injector`. The elected
 primary maintains its CA bundle and the `racer-webhook` Service's endpoints.
@@ -313,7 +313,7 @@ The webhook makes these changes to the pod:
 
 - Adds an init container named `racer-object` with `restartPolicy: Always`, placed
   first. It uses the `racer-object` image of the same release as
-  `racer-dataplane`, and the args
+  `racer`, and the args
   `sidecar --cache=...` plus `--api` and `--listen`
   when set.
 - Sets the security context described below, with `RuntimeDefault` seccomp.

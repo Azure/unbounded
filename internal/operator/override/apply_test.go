@@ -20,7 +20,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 		map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}},
 	}
 	envFrom := []any{
-		map[string]any{"configMapRef": map[string]any{"name": "racer-dataplane-config"}},
+		map[string]any{"configMapRef": map[string]any{"name": "racer-settings"}},
 		map[string]any{"configMapRef": map[string]any{"name": "defaults"}, "prefix": "DEFAULT_"},
 	}
 
@@ -38,9 +38,9 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 		{name: "env field source", container: map[string]any{"env": []any{map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.name"}}}}}, wantError: "env"},
 		{name: "envFrom source", container: map[string]any{"envFrom": []any{map[string]any{"secretRef": map[string]any{"name": "other"}}}}, wantError: "envFrom"},
 		{name: "envFrom configMap name", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}, envFrom[1]}}, wantError: "envFrom"},
-		{name: "envFrom optional", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-dataplane-config", "optional": true}}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom optional", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-settings", "optional": true}}, envFrom[1]}}, wantError: "envFrom"},
 		{name: "envFrom order", container: map[string]any{"envFrom": []any{envFrom[1], envFrom[0]}}, wantError: "envFrom"},
-		{name: "envFrom prefix", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-dataplane-config"}, "prefix": "OTHER_"}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom prefix", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-settings"}, "prefix": "OTHER_"}, envFrom[1]}}, wantError: "envFrom"},
 		{name: "envFrom removal", container: map[string]any{"envFrom": []any{}}, wantError: "envFrom"},
 		{name: "container replacement removes env", container: map[string]any{"image": "racer:test"}, bypassValidate: true, wantError: "env"},
 		{name: "controller removal", container: map[string]any{"$patch": "delete"}, bypassValidate: true, wantError: "exactly one"},
@@ -54,7 +54,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 			}
 
 			workload := testWorkload("racer")
-			workload.SetName("racer-dataplane")
+			workload.SetName("racer")
 
 			if componentName == "racer" {
 				workload.SetKind("DaemonSet")
@@ -101,7 +101,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 
 			report := Apply(plan, entries, nil)
 			if tt.wantError != "" {
-				if !report.Failed() || !strings.Contains(report.Err().Error(), tt.wantError) || !strings.Contains(report.Err().Error(), "ConfigMap racer-dataplane-config") {
+				if !report.Failed() || !strings.Contains(report.Err().Error(), tt.wantError) || !strings.Contains(report.Err().Error(), "ConfigMap racer-settings") {
 					t.Fatalf("error = %v, want %q and tuning interface", report.Err(), tt.wantError)
 				}
 
@@ -109,7 +109,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 					t.Fatal("failed racer Deployment must be withheld without dropping unrelated operations")
 				}
 
-				if len(report.Withheld) != 1 || report.Withheld[0].Component != "racer" || report.Withheld[0].Ref.Name != "racer-dataplane" || report.Workloads[0].Hash == "" {
+				if len(report.Withheld) != 1 || report.Withheld[0].Component != "racer" || report.Withheld[0].Ref.Name != "racer" || report.Workloads[0].Hash == "" {
 					t.Fatalf("failure attribution = %+v", report)
 				}
 			} else {
@@ -139,7 +139,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 }
 
 func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
-	ds, err := workload.DaemonSet(workload.DefaultConfig("unbounded-system", "racer-dataplane:test", "racer-object:test"))
+	ds, err := workload.DaemonSet(workload.DefaultConfig("unbounded-system", "racer:test", "racer-object:test"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
 			}
 
 			if tt.wantError {
-				if len(plan.Operations) != 0 || len(report.Withheld) != 1 || !strings.Contains(report.Err().Error(), "ConfigMap racer-dataplane-config") {
+				if len(plan.Operations) != 0 || len(report.Withheld) != 1 || !strings.Contains(report.Err().Error(), "ConfigMap racer-settings") {
 					t.Fatalf("invalid manifest override was not withheld: %+v", report)
 				}
 

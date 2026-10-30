@@ -25,7 +25,7 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact images)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           token-refresher, orca, gantry, racer-dataplane,
+#                           token-refresher, orca, gantry, racer,
 #                           racer-object, racer-vllm,
 #                           host-ubuntu2404,
 #                           host-azurelinux3, host-azurelinux3-nvidia,
@@ -871,8 +871,8 @@ jobs:
             trivy: true
           # Includes GPU reads (CUDA shim and cuFile). The dataplane touches no
           # GPU until a client sends the first gpu-read.
-          - name: racer-dataplane
-            file: images/racer-dataplane/Containerfile
+          - name: racer
+            file: images/racer/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: racer-object

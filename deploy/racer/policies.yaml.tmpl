@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Admission limits for writes by the racer-dataplane ServiceAccount. RBAC
+# Admission limits for writes by the racer ServiceAccount. RBAC
 # selects which objects it may write; these policies limit what each write may
 # change. The caller Pod comes from the bound token's
 # authentication.kubernetes.io/pod-name and pod-uid extras, which kubelet
@@ -9,11 +9,11 @@
 #
 # Admission has no clock, so Lease expiry is enforced by the runtime, not
 # here. These policies only stop a Pod from writing on behalf of another Pod.
-{{- $user := printf "system:serviceaccount:%s:racer-dataplane" (.Namespace | default "unbounded-system") | toJson }}
+{{- $user := printf "system:serviceaccount:%s:racer" (.Namespace | default "unbounded-system") | toJson }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: racer-dataplane-pod-report
+  name: racer-pod-report
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -23,7 +23,7 @@ spec:
         operations: ["UPDATE"]
         resources: ["pods"]
   matchConditions:
-    - name: racer-dataplane
+    - name: racer
       expression: request.userInfo.username == {{ $user }}
   variables:
     - name: extra
@@ -77,15 +77,15 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: racer-dataplane-pod-report
+  name: racer-pod-report
 spec:
-  policyName: racer-dataplane-pod-report
+  policyName: racer-pod-report
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: racer-dataplane-lease
+  name: racer-lease
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -95,7 +95,7 @@ spec:
         operations: ["UPDATE"]
         resources: ["leases"]
   matchConditions:
-    - name: racer-dataplane
+    - name: racer
       expression: request.userInfo.username == {{ $user }}
   variables:
     - name: extra
@@ -192,15 +192,15 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: racer-dataplane-lease
+  name: racer-lease
 spec:
-  policyName: racer-dataplane-lease
+  policyName: racer-lease
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: racer-dataplane-state
+  name: racer-state
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -210,7 +210,7 @@ spec:
         operations: ["UPDATE"]
         resources: ["secrets"]
   matchConditions:
-    - name: racer-dataplane
+    - name: racer
       expression: request.userInfo.username == {{ $user }}
   variables:
     - name: annotations
@@ -273,15 +273,15 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: racer-dataplane-state
+  name: racer-state
 spec:
-  policyName: racer-dataplane-state
+  policyName: racer-state
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: racer-dataplane-webhook-configuration
+  name: racer-webhook-configuration
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -291,7 +291,7 @@ spec:
         operations: ["UPDATE"]
         resources: ["mutatingwebhookconfigurations"]
   matchConditions:
-    - name: racer-dataplane
+    - name: racer
       expression: request.userInfo.username == {{ $user }}
   variables:
     - name: oldHooks
@@ -320,15 +320,15 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: racer-dataplane-webhook-configuration
+  name: racer-webhook-configuration
 spec:
-  policyName: racer-dataplane-webhook-configuration
+  policyName: racer-webhook-configuration
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: racer-dataplane-webhook-endpoints
+  name: racer-webhook-endpoints
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -338,7 +338,7 @@ spec:
         operations: ["UPDATE"]
         resources: ["endpointslices"]
   matchConditions:
-    - name: racer-dataplane
+    - name: racer
       expression: request.userInfo.username == {{ $user }}
   validations:
     - expression: object.metadata.name == 'racer-webhook'
@@ -356,20 +356,22 @@ spec:
           (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
       message: Racer may not change EndpointSlice metadata
       reason: Forbidden
-    # Endpoints may only name dataplane Pods in this namespace, one per seat.
+    # Endpoints may only name racer DaemonSet Pods in this namespace, one per
+    # seat. The DaemonSet controller names them racer- plus a 5-character
+    # generated suffix, which excludes other racer-* Pods such as origins.
     - expression: >-
         !has(object.endpoints) ||
         (size(object.endpoints) <= 16 && object.endpoints.all(e,
           has(e.targetRef) && has(e.targetRef.kind) && e.targetRef.kind == 'Pod' &&
           has(e.targetRef.namespace) && e.targetRef.namespace == object.metadata.namespace &&
-          has(e.targetRef.name) && e.targetRef.name.startsWith('racer-dataplane-') && has(e.targetRef.uid)))
-      message: Racer webhook endpoints must reference up to 16 racer-dataplane Pods in its namespace
+          has(e.targetRef.name) && e.targetRef.name.matches('^racer-[a-z0-9]{5}$') && has(e.targetRef.uid)))
+      message: Racer webhook endpoints must reference up to 16 racer DaemonSet Pods in its namespace
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: racer-dataplane-webhook-endpoints
+  name: racer-webhook-endpoints
 spec:
-  policyName: racer-dataplane-webhook-endpoints
+  policyName: racer-webhook-endpoints
   validationActions: [Deny]

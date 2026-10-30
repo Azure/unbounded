@@ -323,7 +323,7 @@ func (h *harness) buildImages() {
 	images := []image{
 		{"image-unbounded-operator-local", "unbounded-operator"},
 		{"image-racer-object-local", "racer-object"},
-		{"image-racer-dataplane-local", "racer-dataplane"},
+		{"image-racer-local", "racer"},
 		{"image-gantry-local", "gantry"},
 	}
 
@@ -333,7 +333,7 @@ func (h *harness) buildImages() {
 	for _, img := range images {
 		ref := h.imageRegistry() + "/" + img.repo + ":" + imageTag
 
-		if !skipAll && (!skipDataplane || img.repo != "racer-dataplane") {
+		if !skipAll && (!skipDataplane || img.repo != "racer") {
 			h.t.Logf("building %s", ref)
 			h.run(60*time.Minute, "make", img.target, "CONTAINER_ENGINE=docker", "TRIVY=",
 				"VERSION="+imageTag, "CONTAINER_REGISTRY="+h.imageRegistry())
@@ -359,7 +359,7 @@ func (h *harness) install() {
 
 // installRacer waits for the operator to install Racer after a ClusterCache
 // is created, caps the dataplane threads for kind, waits for the
-// racer-dataplane DaemonSet to roll out, and waits for its embedded control
+// racer DaemonSet to roll out, and waits for its embedded control
 // plane to elect a primary. It is safe to call more than once.
 func (h *harness) installRacer() {
 	h.t.Helper()
@@ -367,12 +367,12 @@ func (h *harness) installRacer() {
 	// Automatic sizing scales with host cores. The operator seeds this
 	// ConfigMap once and preserves administrator edits, rolling the DaemonSet
 	// on change.
-	h.waitExists("configmap", "racer-dataplane-config", 5*time.Minute)
-	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-dataplane-config", "--type=merge",
+	h.waitExists("configmap", "racer-settings", 5*time.Minute)
+	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-settings", "--type=merge",
 		"-p", `{"data":{"RACER_MAX_THREADS":"3"}}`)
 
 	// The embedded control plane needs a dedicated thread, so 3 is the floor.
-	h.rollout("daemonset", "racer-dataplane", 10*time.Minute)
+	h.rollout("daemonset", "racer", 10*time.Minute)
 	h.waitFor("racer-primary lease held by a live seat", 5*time.Minute, func() (bool, string) {
 		v := h.controlView()
 		_, ok := v.primarySeat()
@@ -437,7 +437,7 @@ func (h *harness) dumpDiagnostics(namespaces ...string) {
 		{"-n", operatorNamespace, "get", "endpointslices", "-o", "wide"},
 		// Metadata only: racer-state holds key material and must not be logged.
 		{"-n", operatorNamespace, "get", "secret", racerStateSecret, "-o", "jsonpath={.metadata.uid} {.metadata.resourceVersion}"},
-		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer-dataplane", "--all-containers", "--tail=200", "--prefix"},
+		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer", "--all-containers", "--tail=200", "--prefix"},
 		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer-origin", "--all-containers", "--tail=200", "--prefix"},
 		{"get", "sites", "-o", "yaml"},
 		{"-n", operatorNamespace, "get", "ds/gantry", "cm/gantry-config", "-o", "yaml"},

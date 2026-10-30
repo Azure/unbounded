@@ -11,7 +11,7 @@ import (
 )
 
 func testConfig() Config {
-	return DefaultConfig("custom-system", "registry.test/racer-dataplane:v1", "registry.test/racer-object:v1")
+	return DefaultConfig("custom-system", "registry.test/racer:v1", "registry.test/racer-object:v1")
 }
 
 func envMap(t *testing.T, c corev1.Container) map[string]corev1.EnvVar {
@@ -36,7 +36,7 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 	}
 
 	pod := ds.Spec.Template.Spec
-	if pod.ServiceAccountName != "racer-dataplane" || pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+	if pod.ServiceAccountName != "racer" || pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
 		t.Fatalf("service account wiring = %q %v", pod.ServiceAccountName, pod.AutomountServiceAccountToken)
 	}
 

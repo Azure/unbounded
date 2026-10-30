@@ -3,7 +3,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: racer-dataplane-config
+  name: racer-settings
   namespace: {{ .Namespace | default "unbounded-system" }}
 data:
   # Existing administrator data is preserved.
@@ -18,11 +18,11 @@ data:
   RACER_ENABLE_RDMA: "auto"
   # NVIDIA driver libraries for the dataplane: off, env (default), or cdi.
   # env sets NVIDIA_VISIBLE_DEVICES=all and NVIDIA_DRIVER_CAPABILITIES=compute,utility.
-  # cdi also adds the Pod annotation cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all;
+  # cdi also adds the Pod annotation cdi.k8s.io/racer: nvidia.com/gpu=all;
   # containerd then fails the Pod on any node without an NVIDIA CDI spec.
   # The operator reads this key and changes the DaemonSet accordingly.
-  # RACER_DATAPLANE_NVIDIA: "env"
-  # GPU reads. The racer-dataplane image is built with CUDA. auto touches no
+  # RACER_NVIDIA: "env"
+  # GPU reads. The racer image is built with CUDA. auto touches no
   # GPU until the first gpu-read, then turns GPU mode on if a usable GPU is
   # found; true sets up the GPUs at startup and fails startup when none is
   # found; false turns it off.

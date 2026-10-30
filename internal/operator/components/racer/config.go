@@ -15,10 +15,10 @@ import (
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
-// gpuStagingUnit mirrors GPU_STAGING_UNIT in cmd/racer-dataplane/src/config.rs.
+// gpuStagingUnit mirrors GPU_STAGING_UNIT in cmd/racer/src/config.rs.
 const gpuStagingUnit = 2 << 20
 
-// Constants mirrored from cmd/racer-dataplane/src: MIB, MAX_BYTES, and
+// Constants mirrored from cmd/racer/src: MIB, MAX_BYTES, and
 // MAX_ENTRIES in config.rs, PAGE_BYTES in model, DUPLICATE_BYTES in
 // read/candidates.rs, and the storage record size checked in config.rs
 // (a page, a 16-byte tag, and MAX_HEADER_BYTES from store.rs).
@@ -32,7 +32,7 @@ const (
 )
 
 // The checks below mirror the startup parsing in
-// cmd/racer-dataplane/src/config.rs so that a value the dataplane would refuse
+// cmd/racer/src/config.rs so that a value the dataplane would refuse
 // fails the operator plan instead of rolling Pods into a crash loop. They
 // cover per-key syntax and ranges, not cross-key or hardware policy.
 var (
@@ -109,7 +109,7 @@ var (
 	}
 )
 
-// validateDataplaneConfig reports every racer-dataplane-config value the
+// validateDataplaneConfig reports every racer-settings value the
 // dataplane or operator would reject, sorted by key, in one error.
 func validateDataplaneConfig(data map[string]string) error {
 	var problems []string

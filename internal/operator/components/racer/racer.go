@@ -73,6 +73,22 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 			return nil, component.Result{}, err
 		}
 
+		renamed, err := planRenamedContainment(ctx, env)
+		if err != nil {
+			return nil, component.Result{}, err
+		}
+
+		// Pre-rename grants retained here are guarded the same way. The rename
+		// cleanup itself waits for a ClusterCache, consistent with retaining
+		// the existing installation.
+		if renamed != nil {
+			if containment == nil {
+				containment = component.NewPlan()
+			}
+
+			containment.Merge(renamed)
+		}
+
 		if containment != nil {
 			return containment, component.NotReadyAfter(reasonGuards, "revoking Racer dataplane permissions until its admission policies are restored", pendingRequeue), nil
 		}
@@ -97,6 +113,19 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 	containment, err := planContainment(ctx, env, policies)
 	if err != nil {
 		return nil, component.Result{}, err
+	}
+
+	renamed, err := planRenamedContainment(ctx, env)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if renamed != nil {
+		if containment == nil {
+			containment = component.NewPlan()
+		}
+
+		containment.Merge(renamed)
 	}
 
 	if containment != nil {
@@ -171,6 +200,16 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 		return nil, component.Result{}, err
 	}
 
+	// Remove what this operator applied under the pre-rename names once the
+	// new DaemonSet is observed live. A config with a UID was read live. The
+	// cleanup is staged across passes and the old objects are not watched, so
+	// a pending cleanup requeues shortly rather than waiting for the hourly
+	// resync.
+	cleaning, err := planRenamedCleanup(ctx, env, plan, config.UID != "")
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
 	invalid, waiting, err := planOrigins(ctx, env, plan)
 	if err != nil {
 		return nil, component.Result{}, err
@@ -181,7 +220,13 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 	}
 
 	if waiting {
-		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer-dataplane DaemonSet placement", 30*time.Second), nil
+		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer DaemonSet placement", 30*time.Second), nil
+	}
+
+	if cleaning {
+		// The new installation is in place; only pre-rename leftovers remain,
+		// so this stays ready and just re-checks soon.
+		return plan, component.ReconciledAfter("Racer dataplane installation reconciled; removing pre-rename objects", pendingRequeue), nil
 	}
 
 	return plan, component.ReconciledAfter("Racer dataplane installation reconciled", time.Hour), nil

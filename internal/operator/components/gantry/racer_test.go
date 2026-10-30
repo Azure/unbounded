@@ -27,9 +27,9 @@ func racerCache() *racerv1.ClusterCache {
 	return &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: RacerCacheName}}
 }
 
-// racerDataplane returns a dataplane DaemonSet whose placement differs from
+// racerDaemonSet returns a dataplane DaemonSet whose placement differs from
 // the Gantry manifest in every copied field.
-func racerDataplane() *appsv1.DaemonSet {
+func racerDaemonSet() *appsv1.DaemonSet {
 	return &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: workload.DataplaneDaemonSetName},
 		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
@@ -115,7 +115,7 @@ func TestRacerCacheNameMatchesAgent(t *testing.T) {
 }
 
 func TestPlanWithoutRacerCacheKeepsDefaultMode(t *testing.T) {
-	env := testEnv(t, racerDataplane())
+	env := testEnv(t, racerDaemonSet())
 
 	plan, res := planGantry(t, env, *siteWithGantry("edge", nil))
 	if !res.Ready {
@@ -128,12 +128,12 @@ func TestPlanWithoutRacerCacheKeepsDefaultMode(t *testing.T) {
 	}
 
 	if ds.Spec.Template.Spec.NodeSelector["pool"] == "cache" {
-		t.Fatal("placement copied from racer-dataplane without ClusterCache/gantry")
+		t.Fatal("placement copied from racer without ClusterCache/gantry")
 	}
 }
 
 func TestPlanWithRacerCacheConfiguresRacerBackend(t *testing.T) {
-	env := testEnv(t, racerCache(), racerDataplane())
+	env := testEnv(t, racerCache(), racerDaemonSet())
 
 	plan, res := planGantry(t, env, *siteWithGantry("edge", nil))
 	if !res.Ready {
@@ -191,21 +191,21 @@ func TestPlanWithRacerCacheConfiguresRacerBackend(t *testing.T) {
 
 	pod := ds.Spec.Template.Spec
 	if len(pod.NodeSelector) != 1 || pod.NodeSelector["pool"] != "cache" {
-		t.Fatalf("nodeSelector = %#v, want racer-dataplane selector", pod.NodeSelector)
+		t.Fatalf("nodeSelector = %#v, want racer selector", pod.NodeSelector)
 	}
 
 	if len(pod.Tolerations) != 1 || pod.Tolerations[0].Key != "dedicated" {
-		t.Fatalf("tolerations = %#v, want racer-dataplane tolerations", pod.Tolerations)
+		t.Fatalf("tolerations = %#v, want racer tolerations", pod.Tolerations)
 	}
 
 	if pod.Affinity == nil || pod.Affinity.NodeAffinity == nil || pod.Affinity.PodAntiAffinity != nil {
-		t.Fatalf("affinity = %#v, want racer-dataplane node affinity only", pod.Affinity)
+		t.Fatalf("affinity = %#v, want racer node affinity only", pod.Affinity)
 	}
 }
 
 func TestPlanWithRacerCacheDoesNotInstallGantry(t *testing.T) {
 	no := false
-	env := testEnv(t, racerCache(), racerDataplane())
+	env := testEnv(t, racerCache(), racerDaemonSet())
 
 	plan, res := planGantry(t, env, *siteWithGantry("edge", &no))
 	if res.Reason != component.ReasonDisabled {
@@ -235,7 +235,7 @@ func TestPlanWithRacerCacheWaitsForDataplane(t *testing.T) {
 	}
 
 	if _, ok := agentOperation(t, plan); ok {
-		t.Fatal("agent DaemonSet applied before the racer-dataplane placement is known")
+		t.Fatal("agent DaemonSet applied before the racer placement is known")
 	}
 
 	// Everything else is still reconciled.
@@ -248,7 +248,7 @@ func TestPlanRevertsWhenRacerCacheIsDeleting(t *testing.T) {
 	cache := racerCache()
 	cache.Finalizers = []string{"example.com/hold"}
 	cache.DeletionTimestamp = ptr.To(metav1.NewTime(time.Now()))
-	env := testEnv(t, cache, racerDataplane())
+	env := testEnv(t, cache, racerDaemonSet())
 
 	plan, res := planGantry(t, env, *siteWithGantry("edge", nil))
 	if !res.Ready {
@@ -264,7 +264,7 @@ func TestPlanRevertsWhenRacerCacheIsDeleting(t *testing.T) {
 func TestPlanRetainedInstallationFollowsRacerCache(t *testing.T) {
 	no := false
 	existing := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: daemonSetName}}
-	env := testEnv(t, existing, racerCache(), racerDataplane())
+	env := testEnv(t, existing, racerCache(), racerDaemonSet())
 
 	plan, _ := planGantry(t, env, *siteWithGantry("edge", &no))
 
@@ -366,7 +366,7 @@ func racerCacheWithOrigin() *racerv1.ClusterCache {
 }
 
 func TestPlanWithRacerCacheOriginKeepsDefaultMode(t *testing.T) {
-	env := testEnv(t, racerCacheWithOrigin(), racerDataplane())
+	env := testEnv(t, racerCacheWithOrigin(), racerDaemonSet())
 
 	plan, res := planGantry(t, env, *siteWithGantry("edge", nil))
 	if res.Ready || res.Reason != reasonRacerOriginConflict {
@@ -383,7 +383,7 @@ func TestPlanWithRacerCacheOriginKeepsDefaultMode(t *testing.T) {
 	}
 
 	if ds.Spec.Template.Spec.NodeSelector["pool"] == "cache" {
-		t.Fatal("placement copied from racer-dataplane despite the origin conflict")
+		t.Fatal("placement copied from racer despite the origin conflict")
 	}
 
 	for _, volume := range ds.Spec.Template.Spec.Volumes {

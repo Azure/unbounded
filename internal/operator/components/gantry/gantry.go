@@ -236,7 +236,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// ConfigMap edit.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
-	// The racer-dataplane DaemonSet supplies the agent placement in Racer mode.
+	// The racer DaemonSet supplies the agent placement in Racer mode.
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, workload.DataplaneDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),

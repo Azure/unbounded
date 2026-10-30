@@ -52,7 +52,7 @@ func racerSocketDir(role string) string {
 }
 
 // racerMode reports whether the Gantry Racer backend is requested and, when
-// it is, the node placement of the live racer-dataplane DaemonSet. Racer mode
+// it is, the node placement of the live racer DaemonSet. Racer mode
 // is requested while ClusterCache/gantry exists and is not being deleted. A
 // nil placement with requested=true means the dataplane DaemonSet does not
 // exist yet, so no safe placement is known and the caller must wait.
@@ -185,7 +185,7 @@ func setPlacement(podSpec map[string]any, placement *workload.NodePlacement) err
 	if placement.Affinity != nil && placement.Affinity.NodeAffinity != nil {
 		nodeAffinity, err := runtime.DefaultUnstructuredConverter.ToUnstructured(placement.Affinity.NodeAffinity)
 		if err != nil {
-			return fmt.Errorf("convert racer-dataplane node affinity: %w", err)
+			return fmt.Errorf("convert racer node affinity: %w", err)
 		}
 
 		if affinity == nil {
@@ -220,7 +220,7 @@ func setPlacement(podSpec map[string]any, placement *workload.NodePlacement) err
 		for i := range placement.Tolerations {
 			toleration, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&placement.Tolerations[i])
 			if err != nil {
-				return fmt.Errorf("convert racer-dataplane toleration: %w", err)
+				return fmt.Errorf("convert racer toleration: %w", err)
 			}
 
 			tolerations = append(tolerations, toleration)

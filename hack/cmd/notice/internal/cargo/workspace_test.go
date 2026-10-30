@@ -14,7 +14,7 @@ import (
 
 const workspaceLock = `version = 4
 [[package]]
-name = "racer-dataplane"
+name = "racer"
 version = "0.1.0"
 [[package]]
 name = "member"
@@ -34,7 +34,7 @@ func workspaceFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		cratePath + "/Cargo.toml":        "[package]\nname = 'racer-dataplane'\n[workspace]\nmembers = [\n '.', # root\n 'member',\n]\n",
+		cratePath + "/Cargo.toml":        "[package]\nname = 'racer'\n[workspace]\nmembers = [\n '.', # root\n 'member',\n]\n",
 		cratePath + "/Cargo.lock":        workspaceLock,
 		cratePath + "/member/Cargo.toml": "[package]\nname = 'member'\n[dependencies]\nfoo = '1'\n",
 		cratePath + "/member/Cargo.lock": "invalid stale lock",
@@ -70,7 +70,7 @@ func TestWorkspaceFailures(t *testing.T) {
 		{"exclude", "[workspace]\nexclude=['member']", workspaceLock, "exclude"},
 		{"unlisted path", "[dependencies]\nlocal={path='member'}", workspaceLock, "declared workspace member"},
 		{"missing root lock entry", "[workspace]\nmembers=['member']", "version=4\n", "package not found"},
-		{"missing member lock entry", "[workspace]\nmembers=['member']", "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n", "member package not found"},
+		{"missing member lock entry", "[workspace]\nmembers=['member']", "[[package]]\nname = \"racer\"\nversion = \"0.1.0\"\n", "member package not found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := workspaceFixture(t)
@@ -129,7 +129,7 @@ func TestWorkspaceDeduplicationAndConflicts(t *testing.T) {
 	for _, version := range []string{"1.2.3", "2.0.0"} {
 		t.Run(version, func(t *testing.T) {
 			root := workspaceFixture(t)
-			lock := strings.Replace(workspaceLock, "name = \"racer-dataplane\"\nversion = \"0.1.0\"", "name = \"racer-dataplane\"\nversion = \"0.1.0\"\ndependencies = [\n \"foo "+version+"\",\n]", 1)
+			lock := strings.Replace(workspaceLock, "name = \"racer\"\nversion = \"0.1.0\"", "name = \"racer\"\nversion = \"0.1.0\"\ndependencies = [\n \"foo "+version+"\",\n]", 1)
 			testutil.WriteTree(t, root, map[string]string{
 				cratePath + "/Cargo.toml": "[workspace]\nmembers=['member']\n[dependencies]\nfoo='1'\nlocal={path='member'}\n",
 				cratePath + "/Cargo.lock": lock,
@@ -269,11 +269,11 @@ ignored = { path = "missing" }
 
 func TestLockedPackageFailures(t *testing.T) {
 	for _, tc := range []struct{ lock, want string }{
-		{"[[package]]\nname='racer-dataplane'\nversion='1'\ndependencies=['foo 1']\n", "no lock entry"},
-		{"[[package]]\nname='racer-dataplane'\nversion='1'\ndependencies=['foo']\n", "no locked version"},
-		{"[[package]]\nname='racer-dataplane'\nversion='1'\n", "not found in root lock entry"},
-		{"[[package]]\nname='racer-dataplane'\n[[package]]\nname='racer-dataplane'\n", "ambiguous workspace"},
-		{"[[package]]\nname='racer-dataplane'\ndependencies=['foo']\n[[package]]\nname='foo'\nversion='1'\n[[package]]\nname='foo'\nversion='2'\n", "ambiguous locked"},
+		{"[[package]]\nname='racer'\nversion='1'\ndependencies=['foo 1']\n", "no lock entry"},
+		{"[[package]]\nname='racer'\nversion='1'\ndependencies=['foo']\n", "no locked version"},
+		{"[[package]]\nname='racer'\nversion='1'\n", "not found in root lock entry"},
+		{"[[package]]\nname='racer'\n[[package]]\nname='racer'\n", "ambiguous workspace"},
+		{"[[package]]\nname='racer'\ndependencies=['foo']\n[[package]]\nname='foo'\nversion='1'\n[[package]]\nname='foo'\nversion='2'\n", "ambiguous locked"},
 	} {
 		_, err := lockedDirectVersions(tc.lock, map[string]dependency{"foo": {packageName: "foo"}})
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
