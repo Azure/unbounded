@@ -196,7 +196,7 @@ type gatewayPeerInfo struct {
 	LearnedRoutes          map[string]unboundednetv1alpha1.GatewayNodeRoute
 	PodCIDRs               []string // Gateway node's podCIDRs for specific routing
 	SkipPodCIDRRoutes      bool     // Keep tunnel reachability host routes but skip explicit PodCIDR routes
-	UnmanagedCNISite       bool     // Gateway's Site has manageCniPlugin=false, so it never gets a podCIDR
+	UnmanagedCNISite       bool     // Gateway's Site has manageCniPlugin=false, so it may have no podCIDR
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
 	TransitTunnelMTU       int      // MTU imposed by an actual downstream GatewayPoolPeering path
