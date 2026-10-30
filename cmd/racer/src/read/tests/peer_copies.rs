@@ -5016,3 +5016,183 @@ fn refreshed_owner_order_keys_orphan_notice_and_failure_hold() {
         }
     }
 }
+
+/// In peers passthrough mode, readers on distinct non-owner nodes and the
+/// ranked owner's own reader share the owner's single origin flight, and no
+/// node retains the page afterward.
+#[test]
+fn passthrough_peers_coalesces_reads_from_distinct_nodes_on_the_owner() {
+    let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
+    let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
+    let (_, ordered) = install_peers(&mut fixtures[0], None);
+    let membership = fixtures[0].membership.clone();
+    let owner = (0..4).find(|i| node(*i) == ordered[0]).unwrap();
+    let mesh = Rc::new(Mesh {
+        signing: network(4).into_iter().map(Forwarding::new).collect(),
+        nodes: RefCell::new(Vec::new()),
+        calls: RefCell::new(Vec::new()),
+        unavailable: RefCell::new(Vec::new()),
+        admissions: fixtures
+            .iter()
+            .map(|f| f.fill.dependencies.admission.clone())
+            .collect(),
+    });
+    let mut endpoints = Vec::new();
+    for (i, f) in fixtures.iter_mut().enumerate() {
+        f.membership = membership.clone();
+        let peers = Rc::new(Peer {
+            mesh: mesh.clone(),
+            local: i,
+        });
+        let policy = CandidatePolicy::new(
+            node(i),
+            Rc::new(Placement::new(16)),
+            Requester::scripted(
+                peers,
+                Peer::direct_hedge_available,
+                Peer::request,
+                Peer::request_direct,
+            ),
+            f.fill.dependencies.credentials.clone(),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
+        );
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(policy);
+        f.fill = Fill::new(deps);
+        f.set_mode(racer_control_wire::CacheMode::PassthroughPeers);
+        f.origin.blocked_pages.borrow_mut().insert(0);
+        let (coordinator, endpoint, _) = f.read_graph(
+            Rc::new(f.fill.clone()),
+            &membership,
+            ReadGraphSettings {
+                name: "passthrough",
+                snapshots: 4,
+                metadata: 16,
+                window: 1,
+                stall: Duration::from_secs(10),
+                seed: None,
+            },
+        );
+        endpoints.push(endpoint);
+        mesh.nodes.borrow_mut().push(coordinator);
+    }
+
+    // Every node reads: the owner locally, the other three through the mesh.
+    let mut budgets: Vec<_> = fixtures
+        .iter()
+        .map(|f| AcquisitionBudget::new(f.scope.deadline.0, 8, 16))
+        .collect();
+    let contexts: Vec<_> = fixtures
+        .iter()
+        .map(|f| OriginContext {
+            object: f.context.object.clone(),
+            metadata: None,
+            authorization: None,
+        })
+        .collect();
+    let readers: Vec<_> = fixtures
+        .iter()
+        .map(|f| (f.fill.clone(), f.page.clone(), f.scope.clone()))
+        .collect();
+    let mut reads: Vec<_> = readers
+        .iter()
+        .zip(&contexts)
+        .zip(budgets.iter_mut())
+        .map(|(((fill, page, scope), context), budget)| {
+            Box::pin(fill.acquire(page.clone(), membership.clone(), context, scope, budget))
+        })
+        .collect();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut results: Vec<Option<Result<PageResult>>> = (0..4).map(|_| None).collect();
+    macro_rules! step {
+        () => {{
+            uring_runtime::drivers::poll(&mut cx, 64);
+            for f in fixtures.iter_mut() {
+                uring_runtime::group::Service::poll_budgeted(
+                    &mut f.engine,
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
+                f.crypto.poll_budgeted(64).unwrap();
+            }
+            for (i, read) in reads.iter_mut().enumerate() {
+                if results[i].is_none() {
+                    if let Poll::Ready(done) = read.as_mut().poll(&mut cx) {
+                        results[i] = Some(done);
+                    }
+                }
+            }
+        }};
+    }
+    for _ in 0..256 {
+        step!();
+    }
+    // While origin is blocked, every reader is still waiting and every
+    // non-owner has delegated to the owner.
+    assert!(results.iter().all(Option::is_none));
+    let mut expected = vec![0; 4];
+    expected[owner] = 1;
+    assert_eq!(
+        fixtures
+            .iter()
+            .map(|f| f.origin.calls.get())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for i in (0..4).filter(|i| *i != owner) {
+        assert!(
+            mesh.calls
+                .borrow()
+                .iter()
+                .any(|(from, to, _, _, _)| *from == node(i) && *to == node(owner)),
+            "node {i} did not ask the owner: {:?}",
+            mesh.calls.borrow()
+        );
+    }
+
+    for f in &fixtures {
+        f.origin.blocked_pages.borrow_mut().clear();
+    }
+    for _ in 0..512 {
+        if results.iter().all(Option::is_some) {
+            break;
+        }
+        step!();
+    }
+    drop(reads);
+    for (i, result) in results.into_iter().enumerate() {
+        let result = result
+            .unwrap_or_else(|| panic!("node {i} read did not finish"))
+            .unwrap_or_else(|e| panic!("node {i} read failed: {e:?}"));
+        assert_eq!(result.plaintext.bytes(), b"abc", "node {i}");
+    }
+    assert_eq!(
+        fixtures
+            .iter()
+            .map(|f| f.origin.calls.get())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for (i, f) in fixtures.iter().enumerate() {
+        let deps = &f.fill.dependencies;
+        assert!(deps.memory.get(&f.page).unwrap().is_none(), "node {i}");
+        assert!(
+            deps.memory.ciphertext(&f.page).unwrap().is_none(),
+            "node {i}"
+        );
+        assert!(
+            deps.memory.metadata(&f.page.version).unwrap().is_none(),
+            "node {i}"
+        );
+        assert_eq!(deps.writer.pending_count(), 0, "node {i}");
+        assert!(
+            deps.writer.index().lookup(&f.page).unwrap().is_none(),
+            "node {i}"
+        );
+        assert!(!f.fill.holds(&f.page), "node {i}");
+    }
+    drop(endpoints);
+}
