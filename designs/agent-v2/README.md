@@ -24,10 +24,11 @@ The design is split into the documents below. Read this README first.
 | [07. Host runtime cleanup](07-host-runtime-cleanup.md) | How the `host` runtime stops, cleans up and removes a node | Host and OS reviewers |
 | [08. v1 compatibility](08-v1-compatibility.md) | Parity with v1, intended behavior changes, copied code, changes outside `internal/agentv2`, converting a v1 configuration | v1 maintainers |
 | [09. Implementation](09-implementation.md) | Package layout, export policy, testing and validation, risks | Implementers |
+| [10. Migrating from v1](10-migration-from-v1.md) | How a v1 host, or a host built by another `pkg/agent` consumer, moves to v2 without replacing its node | v1 maintainers, AKS Flex Node maintainers, operators |
 
 Please focus review comments on the open questions (section 3), the external
-contract in documents 01 and 02, the interfaces in documents 03 and 04, and
-document 07.
+contract in documents 01 and 02, the interfaces in documents 03 and 04,
+document 07, and the migration path in document 10.
 
 Documents 01 and 02, and section 1 of document 06, are what a consumer builds
 against. Everything in them is versioned and experimental until the
@@ -153,13 +154,14 @@ library.
   [v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries). v2 is opt-in through `unbounded-agent v2 ...`.
 - **G5.** Code is internal by default. Exporting any of it is an explicit,
   recorded decision ([implementation, section 2](09-implementation.md#2-export-policy)).
+- **G6.** Existing v1 hosts move to v2 without replacing their node, started
+  either from the cluster or from the host ([migrating from v1](10-migration-from-v1.md)).
 
 ### 2.2 Non-goals
 
 - Other runtime kinds, including virtual machines. The runtime kind is an open
   set, but nothing in the interface is designed for a specific future kind.
 - Machina API changes.
-- In-place migration from v1 to v2. Switching a host requires a reset.
 - Changing `pkg/agent` behavior for its existing consumers, apart from the
   additive v2 detection check ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
 
@@ -181,7 +183,8 @@ this design was settled in design discussion and an earlier review round.
    `kubelet.service`, `containerd.service`, `localdns.service`,
    `nftables-flush.service` and the `kube1`/`kube2` machines. That is one reason
    v1 and v2 cannot be installed on the same host, and each refuses to install
-   over the other ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)). The alternative is to share v1's state and
+   over the other ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)). A host moves from one to the other
+   only through a migration ([migrating from v1](10-migration-from-v1.md)). The alternative is to share v1's state and
    daemon names too. Separate names avoid any confusion between the two, but the
    `-v2` names would need renaming if v2 later replaces v1.
 3. **Default runtime ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).** A configuration without `runtime.type` gets

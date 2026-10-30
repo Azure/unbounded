@@ -26,6 +26,7 @@ internal/agentv2/
   credentials/    bootstrap (static, tpm, plugin), kubelet, daemon (csr, kubeconfig, plugin)
   daemon/         controller wiring, startup gate, operation handlers, unit assets
   agentupgrade/   MachineOperation and CLI upgrade over pkg/agent/agentbinary
+  migrate/        v2 migrate: checks, conversion of v1 state, rollback
   plugin/         exec client, protocol types, describe negotiation
   hooks/          event runner
   extensions/     validation, resolution, merge into bundle and hostprep
