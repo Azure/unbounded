@@ -1,0 +1,89 @@
+# Ubuntu 24.04 GB200 access host image
+
+This ARM64-only MetalMan image derives from the previously qualified immutable
+GB200 host disk:
+
+```text
+ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
+```
+
+The derivative keeps that disk's NVIDIA stack, firmware, and image provenance,
+then installs the archived Ubuntu 24.04 kernel
+`6.14.0-1003-azure-nvidia` (`6.14.0-1003.3`) from a fixed Ubuntu snapshot. It
+removes the source image's newer kernel so the required version is the only
+installed boot kernel. The image also carries forward the validated lab
+installation's host settings: the IOMMU, SMMU, and allocation kernel
+parameters; an explicit nouveau blacklist; held versioned kernel packages; and
+removal of any John Cabaj package source. The image preserves default network
+interface naming for MetalMan's MAC-addressed network injection. It also omits
+`irqchip.gicv3_nolpi=y`: that option disables GICv3 LPIs and ITS, which provide
+PCI MSI/MSI-X interrupts, and is intended for kernels acting as bootloaders
+rather than a directly booted host OS. The image does not add the
+proposed-package source or perform a broad package upgrade.
+
+The image installs pinned `ssh-import-id` and adds a native cloud-init user
+fragment for the reviewed host access accounts. Passwords remain locked, shells
+are `/bin/bash`, and each account has passwordless sudo. `bcho` deliberately has
+no `ssh_import_id` entry because it currently has no published GitHub keys. The
+other accounts import keys from their same-named GitHub identities.
+
+The disk also embeds the exact ARM64 `unbounded-agent` release archive
+`v0.17.0-rc.1` at
+`/opt/unbounded/bootstrap/unbounded-agent-linux-arm64.tar.gz`. Configure the
+Machine's `spec.agent.url` as
+`file:///opt/unbounded/bootstrap/unbounded-agent-linux-arm64.tar.gz` so the
+existing MetalMan bootstrap uses the image-local archive. First boot therefore
+does not depend on GitHub or a temporary serving pod.
+
+The dedicated build script runs on a native ARM64 host. It mounts the qualified
+raw disk in a private mount namespace, performs the package and DKMS work in the
+disk's own ARM64 userspace, then boots a disposable overlay. It uses KVM when
+available and otherwise uses TCG to verify that the exact target kernel starts.
+Pull requests that change this image run the same native ARM64 disk build and
+boot verification without publishing an image. Full userspace and driver
+validation belongs on the separately authorized target-hardware canary. The
+build verifies:
+
+- the source and package checksums;
+- Ubuntu `24.04` and kernel `6.14.0-1003-azure-nvidia` package versions;
+- the validated lab kernel command line, package holds, nouveau blacklist, and
+  absence of the John Cabaj package source;
+- the boot kernel symlink and rebuilt NVIDIA DKMS module;
+- NVIDIA module loading and device-node initialization before cloud-final;
+- the exact reviewed user policy and real Noble cloud-init merge against the
+  rendered MetalMan vendor-data;
+- the installed `ssh-import-id` package version;
+- the embedded agent archive checksum, contents, ARM64 ELF architecture, and
+  reported version;
+- the EFI GRUB entries and exact target-kernel boot, reaching userspace when
+  compatible KVM is available;
+- empty machine identity and absent SSH host private keys; and
+- the final gzip stream and disk checksum.
+
+Build natively on ARM64:
+
+```bash
+sudo apt-get install -y pigz qemu-efi-aarch64 qemu-system-arm qemu-utils
+sudo images/host-ubuntu2404-gb200-access/build.sh
+docker build \
+  --platform linux/arm64 \
+  --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  -t host-ubuntu2404-gb200-access:test \
+  -f images/host-ubuntu2404-gb200-access/Containerfile .
+```
+
+## Activation prerequisite
+
+MetalMan omits its generic `unbounded-metal` vendor user only when the Machine
+image repository is exactly
+`ghcr.io/azure/host-ubuntu2404-gb200-access`. Generic images retain their
+current vendor user.
+
+Cloud-init user-data has higher precedence and can still replace the baked
+users. Before a separately authorized `HostReplace`, remove or replace any
+temporary Machine user-data ConfigMap reference whose cloud-config defines
+`users`. Also replace any temporary `spec.agent.url` with the image-local URL
+above and retain `spec.agent.version: v0.17.0-rc.1`.
+
+Building or publishing this artifact does not update a Machine, start a
+`HostReplace`, reboot a host, or otherwise activate the image.
