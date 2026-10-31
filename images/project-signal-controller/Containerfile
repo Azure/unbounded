@@ -1,0 +1,29 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM docker.io/library/golang:1.27.0-trixie AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
+
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
+    make project-signal-controller-build VERSION=${VERSION} \
+    ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /src/bin/project-signal-controller /project-signal-controller
+COPY LICENSE NOTICE /licenses/
+
+ENTRYPOINT ["/project-signal-controller"]
