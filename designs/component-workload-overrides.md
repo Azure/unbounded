@@ -141,6 +141,15 @@ Also not supported:
   configuration already has an escape hatch: the operator seeds each component
   ConfigMap only when absent and never overwrites user content
   (`net.go:156-187`, `machina.go:155-205`, `gantry.go:236-267`).
+
+  The one exception is `images.kubeProxy` ([§6.1](#61-document-schema)). The
+  managed kube-proxy DaemonSets are created by the net controller at runtime
+  rather than emitted by the operator, so no patch can reach their image, and
+  editing the net ConfigMap gives up everything this design adds: validation
+  before anything is written, scoped withholding and status. The field is
+  therefore delivered as a flag on the net controller Deployment, a workload
+  the operator does emit, and resolves, merges and fails exactly like an entry
+  targeting it.
 - Patching the operator's own Deployment, which is applied by
   `cmd/kubectl-unbounded/app/install.go` under a different field manager and is
   not operator-managed.
@@ -555,6 +564,30 @@ today: only `net` emits two workloads and they differ by kind. Users never have
 to reconstruct derived names such as `metalman-controller-<site>`.
 
 At least one of `patch` and `extraArgs` must be present.
+
+A document may also set `images`, alongside `overrides` or on its own:
+
+```yaml
+apiVersion: overrides.unbounded-cloud.io/v1alpha1
+images:
+  kubeProxy:
+    image: myregistry.example.com/kube-proxy
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `images.kubeProxy.image` | yes, when `kubeProxy` is set | Image of the managed kube-proxy DaemonSets. A reference with a tag or digest is used as-is; one without takes the tag of the image `kube-system/kube-proxy` runs, or the API server's version when that DaemonSet does not exist. |
+
+This is the only typed field, and [§5.2](#52-why-not-a-typed-override-struct)
+argues against typed fields as *the* mechanism, which is a different question.
+The managed kube-proxy DaemonSets are created by the net controller, not the
+operator, so no path allowlist over the operator's workloads could reach their
+image. The field becomes an entry targeting `net`/`Deployment` that appends
+`--managed-kube-proxy-image=<image>` to the `controller` container, so it is
+validated by the controller's own image parser, hashed into that Deployment's
+override, and withheld on failure like any entry naming it. Two keys setting
+different images conflict, and so does an entry passing the flag itself while
+the field is set.
 
 ### 6.2 Parsing rules
 
