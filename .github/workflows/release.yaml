@@ -25,13 +25,15 @@ name: unbounded release
 #     -> netboot-image     (PXE boot artifact images)
 #         -> metalman-image (stamped with the matching default netboot image)
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
-#                           token-refresher, orca, gantry, racer-controller,
-#                           racer-dataplane, racer-object, host-ubuntu2404,
+#                           token-refresher, orca, gantry, racer,
+#                           racer-object, racer-vllm,
+#                           host-ubuntu2404,
 #                           host-azurelinux3, host-azurelinux3-nvidia,
 #                           inventory-aggregator, inventory-inspector,
 #                           inventory-viewer)
 #         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
+#     -> python-packages   (racer-client and racer-vllm sdists and wheels)
 #     -> finalize          (attach extras + krew manifest)
 #
 # All artifacts land on a single GitHub release that is left as a draft.
@@ -373,7 +375,7 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -587,7 +589,7 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -656,7 +658,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -741,7 +743,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -867,18 +869,23 @@ jobs:
             file: images/gantry/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
-          - name: racer-controller
-            file: images/racer-controller/Containerfile
-            platforms: linux/amd64,linux/arm64
-            trivy: true
-          - name: racer-dataplane
-            file: images/racer-dataplane/Containerfile
+          # Includes GPU reads (CUDA shim and cuFile). The dataplane touches no
+          # GPU until a client sends the first gpu-read.
+          - name: racer
+            file: images/racer/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
           - name: racer-object
             file: images/racer-object/Containerfile
             platforms: linux/amd64,linux/arm64
             trivy: true
+          # vLLM with racer-client and racer-vllm. The upstream vLLM base is
+          # not ours to patch, so it is not gated on Trivy.
+          - name: racer-vllm
+            file: images/racer-vllm/Containerfile
+            platforms: linux/amd64
+            trivy: false
+            large: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
@@ -909,6 +916,14 @@ jobs:
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
+      - name: Free disk space for large images
+        # The vLLM base image alone is larger than a hosted runner's free disk.
+        if: matrix.component.large
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -919,7 +934,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1020,7 +1035,7 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1148,6 +1163,38 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # Build sdists and wheels for the Racer Python packages (racer-client and
+  # racer-vllm) and attach them to the draft release. The release is the only
+  # place they are published; nothing is uploaded to PyPI.
+  # ---------------------------------------------------------------------------
+  python-packages:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build sdists and wheels
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/build-venv"
+          "$RUNNER_TEMP/build-venv/bin/pip" install --quiet build==1.3.0
+          for package in racer racer-vllm; do
+            timeout --signal=TERM --kill-after=10s 300s \
+              "$RUNNER_TEMP/build-venv/bin/python" -m build --sdist --wheel \
+              --outdir dist/python "clients/python/$package"
+          done
+          ls -l dist/python
+
+      - name: Attach Python packages to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/python/* --clobber
+
+  # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
   # GoReleaser created and set release notes. The release stays a draft here;
   # the release-upgrade workflow publishes it after a successful soak.
@@ -1164,6 +1211,7 @@ jobs:
       - component-images
       - gantry-chart
       - manifests-tarball
+      - python-packages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

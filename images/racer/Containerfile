@@ -1,0 +1,189 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
+ARG RUNTIME_IMAGE=ubuntu:noble
+# Build stage
+# Build on the target platform: both Rust and the verbs adapter use its ABI.
+FROM ${RUST_IMAGE} AS builder
+ARG RACER_NATIVE_RDMA=true
+# Build the CUDA shim (libracer_gpu_cuda.so.1) and the `cuda` feature. On by
+# default so one image serves GPU and CPU nodes. The shim dlopens the driver at
+# runtime, so only nvcc (for the decrypt kernel PTX) is installed here; the
+# runtime image gets the driver from the NVIDIA runtime. With
+# RACER_ENABLE_GPU=auto (the default), the dataplane touches no GPU until the
+# first gpu-read, and turns GPU reads off then if no GPU is usable. Set false
+# for a smaller image without GPU reads.
+ARG RACER_NATIVE_CUDA=true
+ARG CUDA_NVCC_PACKAGE=cuda-nvcc-12-9
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+WORKDIR /src
+
+RUN case "$RACER_NATIVE_RDMA" in \
+        true) apt-get update && apt-get install -y --no-install-recommends \
+            libibverbs-dev pkg-config && rm -rf /var/lib/apt/lists/* ;; \
+        false) ;; \
+        *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
+    esac
+
+RUN set -eu; \
+    case "$RACER_NATIVE_CUDA" in \
+        true) \
+            case "$(uname -m)" in \
+                x86_64) repo=x86_64 ;; \
+                aarch64) repo=sbsa ;; \
+                *) echo "unsupported CUDA architecture $(uname -m)" >&2; exit 1 ;; \
+            esac; \
+            curl -fsSL -o /tmp/cuda-keyring.deb \
+                "https://developer.download.nvidia.com/compute/cuda/repos/debian12/$repo/cuda-keyring_1.1-1_all.deb"; \
+            dpkg -i /tmp/cuda-keyring.deb; \
+            rm /tmp/cuda-keyring.deb; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends "$CUDA_NVCC_PACKAGE"; \
+            rm -rf /var/lib/apt/lists/* ;; \
+        false) ;; \
+        *) echo "RACER_NATIVE_CUDA must be true or false" >&2; exit 1 ;; \
+    esac
+ENV PATH="${PATH}:/usr/local/cuda/bin"
+
+# Copy only build inputs, never host target trees or deployment credentials.
+COPY cmd/racer/Cargo.toml cmd/racer/Cargo.lock ./
+COPY cmd/racer/src ./src
+COPY cmd/racer/control-wire/Cargo.toml ./control-wire/Cargo.toml
+COPY cmd/racer/control-wire/src ./control-wire/src
+COPY cmd/racer/controlplane/Cargo.toml ./controlplane/Cargo.toml
+COPY cmd/racer/controlplane/src ./controlplane/src
+COPY cmd/racer/cluster-control/Cargo.toml ./cluster-control/Cargo.toml
+COPY cmd/racer/cluster-control/src ./cluster-control/src
+COPY cmd/racer/admission/Cargo.toml ./admission/Cargo.toml
+COPY cmd/racer/admission/src ./admission/src
+COPY cmd/racer/core/Cargo.toml ./core/Cargo.toml
+COPY cmd/racer/core/src ./core/src
+COPY cmd/racer/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
+COPY cmd/racer/peer-wire/src ./peer-wire/src
+COPY cmd/racer/object-wire/Cargo.toml ./object-wire/Cargo.toml
+COPY cmd/racer/object-wire/src ./object-wire/src
+COPY cmd/racer/runtime/Cargo.toml ./runtime/Cargo.toml
+COPY cmd/racer/runtime/src ./runtime/src
+COPY cmd/racer/alloc/Cargo.toml ./alloc/Cargo.toml
+COPY cmd/racer/alloc/src ./alloc/src
+COPY cmd/racer/flow/Cargo.toml ./flow/Cargo.toml
+COPY cmd/racer/flow/src ./flow/src
+COPY cmd/racer/crypto/Cargo.toml ./crypto/Cargo.toml
+COPY cmd/racer/crypto/src ./crypto/src
+COPY cmd/racer/verbs/Cargo.toml ./verbs/Cargo.toml
+COPY cmd/racer/verbs/src ./verbs/src
+COPY cmd/racer/verbs/native/verbs.c ./verbs/native/verbs.c
+COPY cmd/racer/gpu/Cargo.toml cmd/racer/gpu/build.rs ./gpu/
+COPY cmd/racer/gpu/src ./gpu/src
+COPY cmd/racer/gpu/native ./gpu/native
+COPY cmd/racer/http/Cargo.toml ./http/Cargo.toml
+COPY cmd/racer/http/src ./http/src
+COPY cmd/racer/http/tests ./http/tests
+COPY cmd/racer/topology/Cargo.toml ./topology/Cargo.toml
+COPY cmd/racer/topology/src ./topology/src
+COPY cmd/racer/telemetry/Cargo.toml ./telemetry/Cargo.toml
+COPY cmd/racer/telemetry/src ./telemetry/src
+COPY cmd/racer/uds-endpoint/Cargo.toml ./uds-endpoint/Cargo.toml
+COPY cmd/racer/uds-endpoint/src ./uds-endpoint/src
+COPY cmd/racer/wire-codec/Cargo.toml ./wire-codec/Cargo.toml
+COPY cmd/racer/wire-codec/src ./wire-codec/src
+COPY cmd/racer/wire-codec/tests ./wire-codec/tests
+COPY cmd/racer/sim/Cargo.toml ./sim/Cargo.toml
+COPY cmd/racer/sim/src ./sim/src
+COPY images/racer/build-native.sh ./build-native.sh
+COPY images/racer/build-native-cuda.sh ./build-native-cuda.sh
+COPY images/racer/check-debug-info.sh ./check-debug-info.sh
+RUN set -eu; \
+    mkdir -p /out/unbounded/bin /out/usr/local/lib; \
+    features=; \
+    if [ "$RACER_NATIVE_RDMA" = true ]; then features=rdma; fi; \
+    if [ "$RACER_NATIVE_CUDA" = true ]; then features="${features:+$features,}cuda"; fi; \
+    cargo build --locked --release --bin racer --no-default-features ${features:+--features "$features"}; \
+    if [ "$RACER_NATIVE_RDMA" = true ]; then \
+        sh ./build-native.sh verbs/native/verbs.c /out/usr/local/lib/librdma_verbs.so.1; \
+    fi; \
+    if [ "$RACER_NATIVE_CUDA" = true ]; then \
+        RACER_GPU_REQUIRE_PTX=1 sh ./build-native-cuda.sh gpu/native /out/usr/local/lib/libracer_gpu_cuda.so.1; \
+    fi; \
+    sh ./check-debug-info.sh target/release/racer; \
+    install -m 0755 target/release/racer /out/unbounded/bin/racer
+
+# Runtime stage
+# ubuntu:noble like the other component images. The Debian bookworm builder
+# links against an older glibc and libibverbs, and both keep backward-compatible
+# symbol versions, so the binary and verbs adapter run on noble's newer ones.
+FROM ${RUNTIME_IMAGE}
+ARG RACER_NATIVE_RDMA=true
+ARG RACER_NATIVE_CUDA=true
+# cuFile user-space library for GPUDirect Storage. The NVIDIA container runtime
+# injects driver libraries only, not the toolkit's libcufile.so.0, so the CUDA
+# image ships it. The repo matches RUNTIME_IMAGE (ubuntu:noble). cuFile loads
+# libnuma.so.1.0.0 at runtime to place its buffers; it is not a package
+# dependency.
+ARG CUDA_CUFILE_PACKAGE=libcufile-12-9
+ARG CUDA_RUNTIME_REPO=ubuntu2404
+RUN set -eu; \
+    case "$RACER_NATIVE_CUDA" in \
+        true) \
+            case "$(uname -m)" in \
+                x86_64) repo=x86_64 ;; \
+                aarch64) repo=sbsa ;; \
+                *) echo "unsupported CUDA architecture $(uname -m)" >&2; exit 1 ;; \
+            esac; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends ca-certificates curl; \
+            curl -fsSL -o /tmp/cuda-keyring.deb \
+                "https://developer.download.nvidia.com/compute/cuda/repos/$CUDA_RUNTIME_REPO/$repo/cuda-keyring_1.1-1_all.deb"; \
+            dpkg -i /tmp/cuda-keyring.deb; \
+            rm /tmp/cuda-keyring.deb; \
+            apt-get update; \
+            apt-get install -y --no-install-recommends "$CUDA_CUFILE_PACKAGE" libnuma1; \
+            test -e /usr/lib/"$(uname -m)"-linux-gnu/libnuma.so.1.0.0; \
+            apt-get purge -y --auto-remove curl; \
+            lib=$(dirname "$(find /usr/local -name 'libcufile.so.0' | head -n 1)"); \
+            test -n "$lib" && test "$lib" != .; \
+            echo "$lib" > /etc/ld.so.conf.d/racer-cufile.conf; \
+            ldconfig; \
+            ldconfig -p | grep -q 'libcufile.so.0'; \
+            apt-get clean; \
+            rm -rf /var/lib/apt/lists/* ;; \
+        false) ;; \
+        *) echo "RACER_NATIVE_CUDA must be true or false" >&2; exit 1 ;; \
+    esac
+RUN set -eu; \
+    case "$RACER_NATIVE_RDMA" in \
+        true) set -- libibverbs1 ibverbs-providers ;; \
+        false) set -- ;; \
+        *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get upgrade -y; \
+    apt-get install -y --no-install-recommends libgcc-s1 "$@"; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /run/racer /var/lib/racer/identity /var/lib/racer/slabs; \
+    chown -R 65532:65532 /run/racer /var/lib/racer; \
+    chmod 0700 /var/lib/racer/identity /var/lib/racer/slabs
+
+# Install /unbounded/bin/racer and, with RDMA or CUDA, the verbs
+# adapter and CUDA shim under /usr/local/lib where the dynamic loader finds it by soname.
+COPY --from=builder /out/ /
+COPY LICENSE NOTICE /unbounded/licenses/
+# cuFile reads its configuration from CUFILE_ENV_PATH_JSON. Images built
+# without CUDA never load cuFile, so the file and variable are inert there.
+COPY images/racer/cufile.json /etc/racer/cufile.json
+RUN ldconfig
+
+ENV CUFILE_ENV_PATH_JSON=/etc/racer/cufile.json
+ENV PATH="/unbounded/bin:${PATH}"
+
+WORKDIR /unbounded
+
+USER 65532:65532
+
+# Peer HTTP, diagnostics, and elected control listeners. Clients use mounted UDS paths.
+EXPOSE 7443 8082 8443 9443 9090
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/unbounded/bin/racer"]

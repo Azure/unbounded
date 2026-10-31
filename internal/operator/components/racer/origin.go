@@ -389,7 +389,7 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 }
 
 // planOrigin adds one cache's ServiceAccount and DaemonSet, or neither.
-func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, cache *racerv1.ClusterCache, spec originSpec, mirror originMirror) error {
+func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, cache *racerv1.ClusterCache, spec originSpec, mirror originMirror) error {
 	hash, err := spec.hash()
 	if err != nil {
 		return err
@@ -405,17 +405,17 @@ func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, m
 		AutomountServiceAccountToken: ptr.To(false),
 	}
 
-	accountOp, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(account), Component: name, FailureDomain: domain}, marker.UID)
+	accountOp, err := ownedOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(account), Component: name, FailureDomain: domain})
 	if err != nil {
 		return err
 	}
 
 	ds := originDaemonSet(env, cache, spec, hash, mirror)
 
-	dsOp, err := ownedRuntimeOperation(ctx, env, component.Operation{
+	dsOp, err := ownedOperation(ctx, env, component.Operation{
 		Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, FailureDomain: domain,
 		DependsOn: []component.ObjectRef{accountOp.Ref()},
-	}, marker.UID)
+	})
 	if err != nil {
 		return err
 	}
@@ -433,7 +433,7 @@ func planOrigin(ctx context.Context, env *component.Env, plan *component.Plan, m
 // waiting reports that some cache wants an origin but the dataplane DaemonSet
 // does not exist yet; no origin is applied until its placement is known, while
 // pruning still proceeds and existing origins of wanted caches are kept.
-func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap) (invalid []string, waiting bool, err error) {
+func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan) (invalid []string, waiting bool, err error) {
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches); err != nil {
 		return nil, false, err
@@ -483,7 +483,7 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 			continue
 		}
 
-		err = planOrigin(ctx, env, plan, marker, cache, spec, mirror.clone())
+		err = planOrigin(ctx, env, plan, cache, spec, mirror.clone())
 		if errors.Is(err, errNotOwned) {
 			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
 			continue
@@ -494,14 +494,14 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan, 
 		}
 	}
 
-	if err := pruneOrigins(ctx, env, plan, marker, wanted); err != nil {
+	if err := pruneOrigins(ctx, env, plan, wanted); err != nil {
 		return nil, false, err
 	}
 
 	return invalid, waiting, nil
 }
 
-func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, wanted map[string]bool) error {
+func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan, wanted map[string]bool) error {
 	opts := []client.ListOption{client.InNamespace(env.Namespace), client.MatchingLabels{"app.kubernetes.io/component": originAppName}}
 
 	daemonSets := &appsv1.DaemonSetList{}
@@ -529,7 +529,16 @@ func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan,
 	}
 
 	for _, obj := range stale {
-		if !strings.HasPrefix(obj.GetName(), originPrefix) || wanted[obj.GetName()] || validateRuntimeOwner(obj, marker.UID) != nil {
+		if !strings.HasPrefix(obj.GetName(), originPrefix) || wanted[obj.GetName()] {
+			continue
+		}
+
+		ok, err := adoptable(ctx, env, obj)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
 			continue
 		}
 

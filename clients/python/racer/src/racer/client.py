@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import array
 import contextlib
+import logging
 import os
+import re
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -33,12 +36,35 @@ FALLBACK_STATUSES = frozenset({400, 404, 405, 501})
 
 DEFAULT_STAGING_BYTES = 4 * wire.PAGE_SIZE
 
+# Seconds before a mode remembered as unsupported is tried again.
+DEFAULT_MODE_RETRY_SECONDS = 300.0
+
 _SUPPORTED = "supported"
 _UNSUPPORTED = "unsupported"
 
-# Mode support per socket path, kept until the process exits.
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class _ModeEntry:
+    state: str
+    since: float  # clock() when the state was recorded
+    socket_id: tuple | None  # (st_dev, st_ino) of the socket file then
+
+
+# Mode support per socket path. An entry is dropped when the socket file is
+# replaced (the dataplane restarted), and an unsupported entry also expires
+# after the client's mode_retry_seconds.
 _mode_lock = threading.Lock()
-_mode_state: dict[str, dict[str, str]] = {}
+_mode_state: dict[str, dict[str, _ModeEntry]] = {}
+
+
+def _socket_id(path: str) -> tuple | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
 
 
 def _dest_device(dest) -> int | None:
@@ -48,6 +74,30 @@ def _dest_device(dest) -> int | None:
         return device
     index = getattr(device, "index", None)
     return index if isinstance(index, int) else None
+
+
+_UUID = re.compile(r"GPU-[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def _dest_uuid(dest) -> str | None:
+    """Return the GPU UUID of a gpu-read destination, or None if unknown.
+
+    The dataplane uses it to pick its context for the client's GPU, because
+    device ordinals differ between containers. Without it the dataplane tries
+    each GPU, so failing to learn the UUID is never an error.
+    """
+    get = getattr(dest, "gpu_uuid", None)
+    if get is None:
+        return None
+    try:
+        uuid = get() if callable(get) else get
+    except Exception:
+        return None
+    if not isinstance(uuid, str):
+        return None
+    if not uuid.upper().startswith("GPU-"):
+        uuid = "GPU-" + uuid
+    return uuid if _UUID.fullmatch(uuid) else None
 
 
 def socket_path_for(cache: str | None = None, socket_path: str | None = None) -> str:
@@ -186,6 +236,8 @@ class Client:
         timeout: float | None = 60.0,
         staging_bytes: int = DEFAULT_STAGING_BYTES,
         pin_staging: bool = True,
+        mode_retry_seconds: float | None = DEFAULT_MODE_RETRY_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.socket_path = socket_path_for(cache, socket_path)
         self.timeout = timeout
@@ -193,18 +245,62 @@ class Client:
             raise RacerError("staging_bytes must be positive")
         self.staging_bytes = staging_bytes
         self.pin_staging = pin_staging
+        if mode_retry_seconds is not None and mode_retry_seconds < 0:
+            raise RacerError("mode_retry_seconds must not be negative")
+        # None keeps an unsupported mode until the socket file changes.
+        self.mode_retry_seconds = mode_retry_seconds
+        self._clock = clock
         self._pool: list = []
         self._pool_lock = threading.Lock()
 
     # Mode memory -----------------------------------------------------------
 
     def mode_state(self, mode: str) -> str | None:
-        with _mode_lock:
-            return _mode_state.get(self.socket_path, {}).get(mode)
+        """Return "supported", "unsupported", or None when unknown.
 
-    def _set_mode(self, mode: str, state: str) -> None:
+        Memory is dropped when the socket file was replaced since it was
+        recorded, and "unsupported" expires after mode_retry_seconds.
+        """
+        sid = _socket_id(self.socket_path)
         with _mode_lock:
-            _mode_state.setdefault(self.socket_path, {})[mode] = state
+            modes = _mode_state.get(self.socket_path)
+            if not modes:
+                return None
+            if any(e.socket_id != sid for e in modes.values()):
+                # The dataplane restarted (or the socket is gone): forget all.
+                _mode_state.pop(self.socket_path, None)
+                return None
+            e = modes.get(mode)
+            if e is None:
+                return None
+            if (
+                e.state == _UNSUPPORTED
+                and self.mode_retry_seconds is not None
+                and self._clock() - e.since >= self.mode_retry_seconds
+            ):
+                del modes[mode]
+                return None
+            return e.state
+
+    def _set_mode(self, mode: str, state: str, reason: str | None = None, next_mode: str | None = None) -> None:
+        sid = _socket_id(self.socket_path)
+        with _mode_lock:
+            modes = _mode_state.setdefault(self.socket_path, {})
+            prev = modes.get(mode)
+            modes[mode] = _ModeEntry(state, self._clock(), sid)
+        if state == _UNSUPPORTED and (prev is None or prev.state != _UNSUPPORTED):
+            log.warning(
+                "racer: %s-read is not available from %s (%s); falling back to %s until %s",
+                mode,
+                self.socket_path,
+                reason or "unsupported",
+                f"{next_mode} mode" if next_mode else "the next mode",
+                "the dataplane restarts"
+                if self.mode_retry_seconds is None
+                else f"a retry in {self.mode_retry_seconds:g}s or a dataplane restart",
+            )
+        elif state == _SUPPORTED and prev is not None and prev.state == _UNSUPPORTED:
+            log.info("racer: %s-read is available again from %s", mode, self.socket_path)
 
     # Staging pool ----------------------------------------------------------
 
@@ -421,6 +517,7 @@ class Client:
         if_match: str | None,
         on_frame: Callable[[int, int], None] | None,
         on_head: Callable[[], None] | None = None,
+        gpu_uuid: str | None = None,
     ) -> ReadResult:
         if dest_offset < 0 or dest_length <= 0:
             raise RacerError("invalid destination window")
@@ -432,6 +529,10 @@ class Client:
         head += f"Racer-Destination-Offset: {dest_offset}\r\nRacer-Destination-Length: {dest_length}\r\n"
         if allocation_size is not None:
             head += f"Racer-Allocation-Size: {allocation_size}\r\n"
+        if gpu_uuid is not None:
+            if not _UUID.fullmatch(gpu_uuid):
+                raise RacerError("invalid GPU UUID")
+            head += f"Racer-Gpu-Uuid: {gpu_uuid}\r\n"
         head += self._context_headers(request) + "\r\n"
         conn = self._connect()
         try:
@@ -489,11 +590,29 @@ class Client:
         length: int | None = None,
         if_match: str | None = None,
         on_page: OnPage = None,
+        gpu_uuid: str | None = None,
     ) -> ReadResult:
-        """One gpu-read RPC with no fallback. fd comes from cuMemExportToShareableHandle."""
+        """One gpu-read RPC with no fallback. fd comes from cuMemExportToShareableHandle.
+
+        gpu_uuid (``GPU-xxxxxxxx-...``, see racer.cuda.device_uuid) names the
+        GPU that holds the allocation. Send it when the process sees more than
+        one GPU or its device numbers may differ from the host's.
+        """
         if dest_offset + dest_length > allocation_size:
             raise RacerError("destination window is outside the allocation")
-        return self._rpc(GPU, request, fd, dest_offset, dest_length, allocation_size, offset, length, if_match, on_page)
+        return self._rpc(
+            GPU,
+            request,
+            fd,
+            dest_offset,
+            dest_length,
+            allocation_size,
+            offset,
+            length,
+            if_match,
+            on_page,
+            gpu_uuid=gpu_uuid,
+        )
 
     # Fallback driver -------------------------------------------------------
 
@@ -505,15 +624,17 @@ class Client:
         unsupported only once a later mode gets a 200 head, so a missing
         object (404 everywhere) does not disable a mode for good.
         """
-        pending: list[str] = []
+        pending: list[tuple[str, str]] = []
         last: StatusError | None = None
+        current = [""]
 
         def understood() -> None:
-            for m in pending:
-                self._set_mode(m, _UNSUPPORTED)
+            for m, why in pending:
+                self._set_mode(m, _UNSUPPORTED, why, current[0])
             pending.clear()
 
-        for mode, run in attempts:
+        for i, (mode, run) in enumerate(attempts):
+            current[0] = mode
             state = self.mode_state(mode) if mode != STREAM else _SUPPORTED
             if state == _UNSUPPORTED:
                 continue
@@ -524,13 +645,15 @@ class Client:
             except StatusError as exc:
                 if mode == STREAM or state is not None or exc.status not in FALLBACK_STATUSES:
                     raise
+                why = f"status {exc.status}: {exc}"
                 if exc.status == 501:
-                    self._set_mode(mode, _UNSUPPORTED)
+                    nxt = attempts[i + 1][0] if i + 1 < len(attempts) else None
+                    self._set_mode(mode, _UNSUPPORTED, why, nxt)
                 else:
-                    pending.append(mode)
+                    pending.append((mode, why))
                 last = exc
                 continue
-            if mode != STREAM:
+            if mode != STREAM and state != _SUPPORTED:
                 self._set_mode(mode, _SUPPORTED)
             return result
         if last is not None:  # pragma: no cover - stream always runs last
@@ -603,9 +726,9 @@ class Client:
 
         dest is a racer.cuda.GpuAllocation, a racer.tensors.TensorTarget, or
         any object with ``size``, ``copy_from_host(offset, data)`` and
-        optionally ``export_fd()``. Modes: gpu-read, then host-read into a
-        pinned staging memfd plus a host-to-device copy, then stream into the
-        staging buffer plus a copy. on_page(object_offset, length) runs once a
+        optionally ``export_fd()`` and ``gpu_uuid()``. Modes: gpu-read, then
+        host-read into a pinned staging memfd plus a host-to-device copy, then
+        stream into the staging buffer plus a copy. on_page(object_offset, length) runs once a
         page is in GPU memory.
         """
         window = dest.size - dest_offset
@@ -624,7 +747,18 @@ class Client:
                     raise _Skip() from None
                 try:
                     return self._rpc(
-                        GPU, request, fd, dest_offset, window, dest.size, offset, length, if_match, on_page, ok
+                        GPU,
+                        request,
+                        fd,
+                        dest_offset,
+                        window,
+                        dest.size,
+                        offset,
+                        length,
+                        if_match,
+                        on_page,
+                        ok,
+                        gpu_uuid=_dest_uuid(dest),
                     )
                 finally:
                     os.close(fd)

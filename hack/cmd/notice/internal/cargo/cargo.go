@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/racer-dataplane.
+// dependencies of cmd/racer.
 package cargo
 
 import (
@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	cratePath = "cmd/racer-dataplane"
-	crateName = "racer-dataplane"
+	cratePath = "cmd/racer"
+	crateName = "racer"
 )
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text

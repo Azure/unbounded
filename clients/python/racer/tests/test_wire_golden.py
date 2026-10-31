@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Golden bytes shared with the dataplane.
 
-Sources: cmd/racer-dataplane/object-wire/src/client.rs (RequestParser::parse,
+Sources: cmd/racer/object-wire/src/client.rs (RequestParser::parse,
 direct_head, frame) and object-wire/tests/direct.rs.
 """
 
@@ -94,6 +94,25 @@ def test_gpu_read_request_bytes():
         "Racer-Destination-Offset: 4096\r\nRacer-Destination-Length: 100\r\nRacer-Allocation-Size: 4196\r\n\r\n"
     ).encode()
     assert len(got["flags"]) == 1
+
+
+def test_gpu_read_request_bytes_with_gpu_uuid():
+    req = racer.Request(bytes.fromhex(KEY))
+    uuid = "GPU-00112233-4455-6677-8899-aabbccddeeff"
+    with racer.HostBuffer(1) as buf:
+        got = _capture("gpu", lambda c: c.gpu_read(req, buf.fileno(), 4196, 4096, 100, gpu_uuid=uuid))
+    assert got["head"] == (
+        f"POST /v1/objects/{KEY}/gpu-read HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"
+        "Racer-Destination-Offset: 4096\r\nRacer-Destination-Length: 100\r\nRacer-Allocation-Size: 4196\r\n"
+        f"Racer-Gpu-Uuid: {uuid}\r\n\r\n"
+    ).encode()
+
+
+def test_gpu_read_rejects_invalid_gpu_uuid():
+    req = racer.Request(bytes.fromhex(KEY))
+    with racer.HostBuffer(1) as buf:
+        with pytest.raises(racer.RacerError, match="UUID"):
+            racer.Client(socket_path="/nonexistent").gpu_read(req, buf.fileno(), 4196, 4096, 100, gpu_uuid="x\r\nEvil: 1")
 
 
 def test_direct_head_from_rust_is_accepted():

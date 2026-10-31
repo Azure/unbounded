@@ -364,19 +364,18 @@ help: ## Show this help
 	@echo "Documentation:"
 	@echo "  docs-serve                       Start local Hugo dev server"
 	@echo ""
-	@echo "Racer Controller:"
-	@echo "  racer-controller                 Test and build the Go controller"
-	@echo "  racer-controller-build           Build the Go controller without lint/test"
-	@echo "  racer-test                       Lint and race-test the controller and deployment contracts"
-	@echo "  racer-envtest                    Run controller API-server tests with KUBEBUILDER_ASSETS"
-	@echo "  racer-envtest-ci                 Provision pinned assets and run controller API-server tests"
+	@echo "Racer:"
+	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
+	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
+	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
 	@echo "  racer-object | racer-object-build  Build racer-object (with/without focused tests)"
 	@echo "  racer-object-test                 Race-test racer-object"
-	@echo "  image-racer-controller-local      Build the racer-controller container image"
-	@echo "  image-racer-dataplane-local       Build the racer-dataplane container image"
+	@echo "  image-racer-local       Build the racer container image"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
 	@echo "  image-racer-object-local          Build the racer-object container image"
 	@echo ""
@@ -568,18 +567,32 @@ e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-.PHONY: racer-controller racer-controller-build racer-test racer-server-test racer-envtest racer-envtest-ci racer-generate
-racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
+.PHONY: racer-test racer-go-test racer-rust-test racer-envtest racer-envtest-ci racer-generate
+racer-go-test: ## Lint and race-test the Go Racer API and workload packages
+	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/...
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/...
 
-racer-controller-build: ## Build the Racer controller without lint/test
-	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
+racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluster control plane
+	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer/Cargo.toml --workspace
 
-racer-server-test: ## Lint and race-test the Racer server
-	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+racer-test: racer-go-test racer-rust-test ## Check Racer
 
-racer-test: racer-server-test ## Check the Racer controller
+RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
+# 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
+RACER_GPU_TESTS ?= require
+
+.PHONY: racer-gpu-test
+racer-gpu-test: ## Build the CUDA shim with kernels (needs nvcc) and run GPU hardware tests (needs a GPU)
+	RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 600s sh images/racer/build-native-cuda.sh cmd/racer/gpu/native "$(RACER_GPU_NATIVE)/libracer_gpu_cuda.so.1"
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s cargo test --locked --manifest-path cmd/racer/Cargo.toml -p racer-gpu --no-default-features --features native --test hardware -- --nocapture --test-threads=1
+	@if [ -n "$$RACER_GPU_E2E_SOCKET" ]; then \
+		test -x "$(RACER_PY_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
+			timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q pytest; }; \
+		cd clients/python/racer && PYTHONPATH=src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider -m gpu -rs; \
+	elif [ "$$RACER_GPU_E2E" = require ]; then \
+		echo "RACER_GPU_E2E=require but RACER_GPU_E2E_SOCKET is unset" >&2; exit 1; \
+	else echo "RACER_GPU_E2E_SOCKET unset: skipping the Python gpu-read test against a live dataplane"; fi
 
 RACER_PY_VENV ?= $(CURDIR)/tmp/racer-python-venv
 
@@ -589,6 +602,20 @@ racer-python-test: ## Run the Racer Python client and vLLM plugin tests (no GPU 
 		timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q pytest; }
 	cd clients/python/racer && PYTHONPATH=src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider
 	cd clients/python/racer-vllm && PYTHONPATH=src:../racer/src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider
+
+.PHONY: racer-python-dist
+racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm into tmp/racer-python-dist
+	@test -x "$(RACER_PY_VENV)/bin/pyproject-build" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
+		timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q build; }
+	rm -rf tmp/racer-python-dist
+	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
+	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
+
+RACER_SIM_TIMEOUT ?= 7200s
+
+.PHONY: racer-sim
+racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
+	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
@@ -600,32 +627,22 @@ racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets a
 	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
 		$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"
 
-racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
+racer-envtest: ## Run real API-server tests for Racer APIs and operator restrictions
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/racer/v1alpha1 ./internal/racer ./internal/racer/authority ./deploy/racer ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/racer/v1alpha1 ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
 
-RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
-RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
+RACER_IMAGE ?= $(CONTAINER_REGISTRY)/racer:$(VERSION_TAG)
 
-.PHONY: image-racer-controller-local image-racer-dataplane-local
-image-racer-controller-local: ## Build the racer-controller container image locally (single-arch)
+.PHONY: image-racer-local
+image-racer-local: ## Build the racer container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t racer-controller:$(VERSION_TAG) -t $(RACER_CONTROLLER_IMAGE) \
-		-f ./images/racer-controller/Containerfile .
-	$(call trivy-maybe,$(RACER_CONTROLLER_IMAGE))
-
-image-racer-dataplane-local: ## Build the racer-dataplane container image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		-t racer-dataplane:$(VERSION_TAG) -t $(RACER_DATAPLANE_IMAGE) \
-		-f ./images/racer-dataplane/Containerfile .
-	$(call trivy-maybe,$(RACER_DATAPLANE_IMAGE))
+		-t racer:$(VERSION_TAG) -t $(RACER_IMAGE) \
+		-f ./images/racer/Containerfile .
+	$(call trivy-maybe,$(RACER_IMAGE))
 
 RACER_LOADGEN_BIN=bin/racer-loadgen
 RACER_LOADGEN_CMD=./cmd/racer-loadgen

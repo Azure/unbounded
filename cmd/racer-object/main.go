@@ -389,7 +389,7 @@ func runOrigin(ctx context.Context, o options) error {
 	defer closeResource(root)
 
 	if err := checkOriginDirectory(root, []string{"run", "racer", o.cache, "origin"}); err != nil {
-		return fmt.Errorf("unsafe or missing origin directory /run/racer/%s/origin (racer-dataplane creates it "+
+		return fmt.Errorf("unsafe or missing origin directory /run/racer/%s/origin (racer creates it "+
 			"owned by UID/GID %d with mode 0700; run the origin as UID %d and mount that directory): %w",
 			o.cache, originUID, originUID, err)
 	}
@@ -408,9 +408,9 @@ func runOrigin(ctx context.Context, o options) error {
 	return nil
 }
 
-// originUID is the UID/GID origins run as. The racer-dataplane creates
+// originUID is the UID/GID origins run as. The racer creates
 // /run/racer/<cache>/origin owned by this user with mode 0700
-// (ORIGIN_UID in cmd/racer-dataplane/src/client/origin_directory.rs).
+// (ORIGIN_UID in cmd/racer/src/client/origin_directory.rs).
 const originUID = 65532
 
 // errOriginDirectoryMissing reports that the dataplane has not created the

@@ -130,7 +130,7 @@ func TestCollectorDevelopmentPathsRequireDeclaredMembers(t *testing.T) {
 						members = "['.', 'member', 'helper']"
 					}
 
-					rootManifest := "[package]\nname='racer-dataplane'\n[workspace]\nmembers=" + members + "\n"
+					rootManifest := "[package]\nname='racer'\n[workspace]\nmembers=" + members + "\n"
 					memberManifest := "[package]\nname='member'\n[dependencies]\nfoo='1'\n"
 
 					path := "helper"
@@ -149,7 +149,7 @@ func TestCollectorDevelopmentPathsRequireDeclaredMembers(t *testing.T) {
 					if fromMember {
 						lock = strings.Replace(lock, " \"foo 1.2.3\",", " \"foo 1.2.3\",\n \"helper\",\n \"registry-dev\",", 1)
 					} else {
-						lock = strings.Replace(lock, "name = \"racer-dataplane\"\nversion = \"0.1.0\"", "name = \"racer-dataplane\"\nversion = \"0.1.0\"\ndependencies = ['helper', 'registry-dev']", 1)
+						lock = strings.Replace(lock, "name = \"racer\"\nversion = \"0.1.0\"", "name = \"racer\"\nversion = \"0.1.0\"\ndependencies = ['helper', 'registry-dev']", 1)
 					}
 
 					testutil.WriteTree(t, root, map[string]string{

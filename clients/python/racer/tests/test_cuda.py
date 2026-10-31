@@ -66,6 +66,11 @@ class _FakeLib:
         out._obj.value = ordinal
         return 0
 
+    def cuDeviceGetUuid_v2(self, out, dev):
+        self.calls.append(("uuid", dev))
+        out._obj.bytes[:] = list(range(dev, dev + 16))
+        return self._rc("cuDeviceGetUuid_v2")
+
     def cuDevicePrimaryCtxRetain(self, out, dev):
         out._obj.value = 100 + dev
         self.calls.append(("retain", dev))
@@ -258,3 +263,22 @@ def test_tensor_target_staging_on_tensor_device(fake, monkeypatch):
         assert ("register", 100) not in lib.calls
     finally:
         buf.close()
+
+
+def test_format_uuid():
+    assert cuda.format_uuid(bytes(range(16))) == "GPU-00010203-0405-0607-0809-0a0b0c0d0e0f"
+    with pytest.raises(ValueError):
+        cuda.format_uuid(b"short")
+
+
+def test_device_uuid_uses_the_requested_ordinal(fake):
+    lib = fake()
+    assert cuda.device_uuid(3) == "GPU-03040506-0708-090a-0b0c-0d0e0f101112"
+    assert ("uuid", 3) in lib.calls
+    assert _alloc(2).gpu_uuid() == cuda.format_uuid(bytes(range(2, 18)))
+
+
+def test_device_uuid_error(fake):
+    fake(fail="cuDeviceGetUuid_v2")
+    with pytest.raises(cuda.CudaError):
+        cuda.device_uuid(0)

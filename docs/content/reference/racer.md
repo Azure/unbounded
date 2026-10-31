@@ -124,7 +124,7 @@ Unset optional fields use the `racer-object` defaults.
 
 The operator names the DaemonSet and its ServiceAccount `racer-origin-<cache>`
 in the Racer namespace. It copies node affinity, node selector, tolerations, and
-image pull secrets from the `racer-dataplane` DaemonSet, and waits until that
+image pull secrets from the `racer` DaemonSet, and waits until that
 DaemonSet exists. The origin runs as UID and GID 65532 and serves
 `/run/racer/<cache>/origin/socket`, which the dataplane creates.
 
@@ -179,33 +179,44 @@ Keys below use the `racer.unbounded-cloud.io/` prefix unless shown in full.
 |-----|---------|
 | Label `exclude` | Presence excludes the node from membership and dataplane placement, regardless of value |
 | Label `unbounded-cloud.io/site` | Canonical Site boundary for RDMA; absent or empty means HTTP-only |
-| Annotation `shares` | Positive decimal `uint32` placement weight; overrides enrolled shares; default 4 |
+| Annotation `shares` | Positive decimal `uint32` placement weight; overrides reported shares; default 4 |
 | Annotation `rdma-nics` | Administrator NIC/rail policy; see [RDMA](#rdma); explicit `[]` disables eligibility |
 | Annotation `block-devices` | Startup-only regex selecting raw cache devices by `disk/by-id` basename; see [raw-device storage](#raw-device-storage) |
-| Annotations `enrolled-shares`, `enrolled-rdma-nics` | Controller-managed authenticated dataplane reports; do not edit |
-| Annotation `last-admitted-member` | Controller-managed, Node-UID-bound retained membership; do not edit |
+
+Each dataplane writes its shares and NIC report to its own Pod's
+`racer.unbounded-cloud.io/report` annotation. Control seats do not write Node
+annotations. Old `enrolled-shares`, `enrolled-rdma-nics`, and
+`last-admitted-member` annotations are no longer runtime state.
 
 Malformed membership annotations retain admitted attributes; invalid new nodes are omitted.
 Site uses current labels. Invalid `block-devices` selectors instead fall back to slab files.
 
 ## Dataplane configuration
 
-Tune `racer-dataplane-config` in the installation namespace (normally `unbounded-system`).
+Tune `racer-settings` in the installation namespace (normally `unbounded-system`).
 The operator preserves administrator data and hashes edits into managed rollouts.
 Explicit workload environment wiring takes precedence over ConfigMap imports.
 Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
+The operator checks each value with the same per-key rules the dataplane uses at
+startup: enum and boolean values, decimal syntax, nonzero and range limits, the
+2 MiB multiples of the GPU byte settings, and setting `RACER_IO_WORKERS` and
+`RACER_CRYPTO_HELPERS` together. When a value is invalid, reconciliation fails
+with an error that names every bad key, and the DaemonSet keeps its current
+configuration until the ConfigMap is fixed. Limits that depend on the node, such
+as CPU count or memory, are still checked only by the dataplane at startup.
 
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
-| `RACER_MAX_THREADS` | Unset (automatic) | Total userspace I/O and crypto threads; explicit value at least 2 |
-| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count; requires `RACER_CRYPTO_HELPERS` |
+| `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, and managed control threads; managed deployments need at least 3 |
+| `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count, 1..65,536; requires `RACER_CRYPTO_HELPERS` |
 | `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
-| `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
+| `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
+| `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
 | `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
@@ -224,40 +235,46 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
-| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
-| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments |
+| `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead (at least 16,797,712 bytes) |
+| `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments (at most 1,048,575) |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
-| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
-| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
+| `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps; each 1..65,536, and the per-neighbor cap at most the in-flight cap |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
 
-Exact sizing requires both count settings. Their sum must fit `RACER_MAX_THREADS`;
+Exact sizing requires both count settings. Their sum, plus the managed control
+thread, must fit `RACER_MAX_THREADS`;
 the cap is never raised implicitly. The first NUMA node in the normal placement
 preference order must be known and have enough eligible CPUs for the whole split.
 Other host NUMA nodes are allowed, but exact placement does not span nodes or skip
 an undersized preferred node. Insufficient CPU quota or per-I/O resource budgets
-fails startup rather than reducing counts. For an isolated 20-I/O comparison, use
-10 helpers with cap 30 or 20 helpers with cap 40. Keep all resource budgets fixed.
+fails startup rather than reducing counts. For a managed 20-I/O comparison, use
+10 helpers with cap 31 or 20 helpers with cap 41. Keep all resource budgets fixed.
 Omit both count settings to retain automatic sizing.
 Extra helpers change available crypto execution capacity, not I/O ownership or
 per-I/O budgets. They do not guarantee higher throughput; compare matched workloads
 before drawing a performance conclusion.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
+Without an explicit thread cap, one unpinned control thread runs alongside the
+automatically sized I/O and crypto workers. With a cap, it consumes one slot.
+Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
+can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
+divided among them. Admission budgets are not RSS limits:
+allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
 
 ### Raw-device storage
 
 Set the Node annotation `racer.unbounded-cloud.io/block-devices` to a regex over
-basenames in `/host/dev/disk/by-id`, not full paths. The controller accepts at most
-1 KiB (1,024 bytes) and validates with Go's `regexp.Compile`. Invalid or oversized
-values are ignored with a warning. The dataplane compiles the selector with Rust's
-`regex` crate; use syntax accepted by both engines. Matching is **unanchored**:
+basenames in `/host/dev/disk/by-id`, not full paths. The selector is limited to
+1 KiB (1,024 bytes) and compiled with Rust's `regex` crate. Invalid or oversized
+values fall back to file-backed slabs. Matching is **unanchored**:
 use `^` and `$` to avoid unintended substring and partition matches.
 
 Discovery runs once after startup enrollment. Changing or removing the annotation
@@ -391,8 +408,13 @@ Racer-Destination-Length: <length>
 - The descriptor comes from `cuMemExportToShareableHandle` with the POSIX file
   descriptor handle type. `Racer-Allocation-Size` is required and must be the
   size passed to `cuMemCreate`.
+- `Racer-Gpu-Uuid` is optional: the UUID of the GPU that holds the memory, as
+  `nvidia-smi` prints it (`GPU-xxxxxxxx-...`). Device numbers in the client's
+  container can differ from the dataplane's, so the dataplane uses the UUID to
+  find the GPU. Without it, the dataplane tries each GPU. The Python client
+  sends it.
 - The answer is 501 when GPU mode is off or the memory is on a GPU the
-  dataplane did not find. It is 400 when the size does not match the memory or
+  dataplane did not find, including an unknown `Racer-Gpu-Uuid`. It is 400 when the size does not match the memory or
   the window does not fit in it.
 - A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
   page is complete.
@@ -711,127 +733,123 @@ same routing implementation. Matching membership version numbers do not
 negotiate the algorithm, and mixed-version routing is not safe. **When upgrading,
 quiesce traffic until all dataplanes run the same version.**
 
-## Controller and workload wiring
+## Elected control plane
 
-`racer-config` holds controller settings and operator workload inputs. Listener changes
-also require matching Services, probes, network policy, and monitoring configuration.
+`racer` is both the cache daemon and the control-plane binary. There is
+no `racer-controller` Deployment, image, or control Service. Pods elect control
+seats with Leases named `racer-seat-0` through `racer-seat-15`. One seat also
+holds `racer-primary` and commits membership, catalog, keyring, and trust changes.
 
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `RACER_CONTROL_ADDRESS` | `:8443` | Controller HTTPS listener |
-| `RACER_HANDSHAKE_TIMEOUT` | `5s` | Controller TLS handshake deadline; positive duration |
-| `RACER_METRICS_ADDRESS` / `RACER_PROBE_ADDRESS` | `:8080` / `:8081` | Controller metrics / health and readiness listeners |
-| `RACER_PEER_PORT` | `8082` | Managed dataplane peer listener and membership publication; 1024..65535 |
-| `RACER_DIAGNOSTICS_PORT` | Unset | Managed dataplane defaults to 9090, or 9091 if peer port is 9090; explicit port must be 1024..65535 and distinct |
-| `RACER_HOST_NETWORK` | `false` | Explicit Racer host-network opt-in; not implied by RDMA |
-| `RACER_DATAPLANE_NVIDIA` | `env` | NVIDIA driver library injection for the dataplane: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
-| `RACER_POD_NETWORK_NODES` | Unset | Not supported by operator-managed installations; the controller only enrolls Pods of DaemonSet `racer-dataplane`, so a nonempty value fails reconciliation |
-| `RACER_SNAPSHOT_MAX_AGE` | `30s` | Maximum replicated snapshot age |
-| `RACER_CERTIFICATE_LIFETIME` | `24h` | Dataplane leaf lifetime; 2 minutes..24 hours |
-| `RACER_ROTATION_INTERVAL` / `RACER_ROTATION_PREPARE_FOR` / `RACER_ROTATION_RETAIN_FOR` | `24h` / `1h` / `48h` | Issuer/key rotation policy; interval must cover preparation and retention must cover leaf lifetime |
+Clients discover the seats through the Kubernetes API and verify their pinned
+TLS certificates before sending credentials. They try another seat if one is
+unavailable. They do not depend on a fixed controller DNS name or an
+operator-generated serving CA.
 
-Duration settings use Go syntax and positive whole seconds. Quiesce traffic for peer-port
-transitions; do not independently override the dataplane listener and published port.
+During managed startup, election keeps running while enrollment and the first
+goal state retry with bounded control requests. The pod stays unready while
+waiting. `RACER_REQUEST_TIMEOUT_MS` still limits data requests; it does not limit
+how long startup can wait for the control plane. SIGTERM stops startup.
 
-Controller HTTPS admission is per process, including replication traffic. The Go
-`Config.Limits` defaults allow `2 * wire.MaxMembers + 128` open connections (room
-for independent snapshot and keyring polls), 32 concurrent TLS handshakes, 32
-concurrent bearer-authenticated operations, and 128 concurrent response writes.
-These concurrency counts are programmatic limits, not environment tuning keys.
-A connection retains its slot until its socket closes, including silent TCP peers, TLS peers, idle
-keep-alives, and long polls. Handshakes retain a separate slot until success or
-failure and use `RACER_HANDSHAKE_TIMEOUT` (default `5s`). Excess connections or
-handshakes are closed before HTTP without a queued waiter or overload response. Completed TLS
-connections do not retain handshake slots. Request authentication and poll
-admission remain independent; shutdown forcibly closes all admitted sockets.
-Readiness also requires the cached serving certificate's DNS SANs to match the
-configured replication server name. A valid certificate for another service is
-not ready; reloading a correctly named certificate restores this readiness gate.
+```bash
+kubectl -n unbounded-system get leases -l racer.unbounded-cloud.io/control=true
+kubectl -n unbounded-system get daemonset racer
+kubectl -n unbounded-system get endpointslice racer-webhook
+```
 
-Restrict HTTPS ingress to required clients, dataplanes, and controller replicas;
-replication also needs direct controller Pod-to-Pod access. Preserve kubelet probe,
-monitoring, DNS, and Kubernetes API access. NetworkPolicy enforcement depends on
-the CNI, especially for host-network Pods and external clients. Use host or upstream
-network controls where Pod policy cannot enforce the boundary. The deployment
-does not impose a policy that would block these installation-specific paths.
+The `racer-state` Secret holds durable control state. Its UID is the cluster ID.
+Do not delete, replace, or clear it to repair a running installation. The
+operator creates it only for a new installation; it does not generate keys or
+reconcile the runtime's state back to an empty manifest. Back it up securely.
+Never log its data: it contains cache encryption keys.
 
-Standalone rendering creates an installation marker only with
-`InitializationState=fresh` and an explicit new `ClusterID` UUID. Initialization
-requires `staged-v1`. Later renders omit the marker: preserve the actual immutable
-controller-finalized object and its UID commitments, not a regenerated consumed
-manifest. Exclude it from pruning. Never recreate committed authority under the
-same UUID.
+Seats publish only committed state. A primary change preserves publication and
+keyring counters. Losing serving authority withdraws the seat rather than
+allowing an isolated former primary to keep writing. API access is needed for
+new elections and for confirming authority; an API outage is not permission to
+reset state or mint a new cluster.
 
-Go wire codec byte limits (64 KiB for bootstrap, 512 KiB for keyring bundles,
-and 64 MiB for publications) bound encoded documents, not total heap usage.
-The decoder buffers the bounded document, validates tokens against the schema,
-then decodes typed state. It rejects unknown or duplicate fields and wrong shapes
-without traversing their contents, and rejects excess members or RDMA NICs before
-consuming the next element. Validation does not retain a generic JSON tree.
-Buffers, individual tokens, base64 validation, typed collections, and subsequent
-semantic validation still allocate memory; the byte cap is not a process memory
-budget or a substitute for concurrency limits.
+Every dataplane pod can become a control seat and therefore has the Kubernetes
+permissions needed for that role. Lease ownership is a coordination rule, not
+an RBAC boundary. Treat compromise of a privileged dataplane node as compromise
+of Racer's cluster-wide control state and cache keys.
+
+Allow dataplane-to-seat HTTPS on port 8443 and API-server-to-seat webhook
+traffic on port 9443. Preserve peer traffic, diagnostics, DNS, and Kubernetes
+API access. The `racer-webhook` Service has no selector; the primary maintains
+its EndpointSlice and the injector's CA bundle. NetworkPolicy behavior depends
+on the CNI, especially with host-network Pods.
+
+The control protocol keeps its existing byte limits: 64 KiB for bootstrap,
+512 KiB for keyring bundles, and 64 MiB for publications. These are document
+limits, not process memory limits.
 
 ### Operator-managed dataplane
 
-When any `ClusterCache` exists, the operator applies ServiceAccount `racer-dataplane`,
-ConfigMap `racer-dataplane-config` (created with defaults only when absent), and
-DaemonSet `racer-dataplane`. The DaemonSet uses image `racer-dataplane` from the
-operator's registry and tag, connects to `https://racer-controller.<namespace>.svc:8443`,
-mounts `racer-bootstrap-trust`, and imports `racer-dataplane-config` with `envFrom`.
-A pod-template annotation carries the ConfigMap payload hash, so edits roll out.
+When any `ClusterCache` exists, the operator installs DaemonSet `racer`
+with its ServiceAccount, restricted RBAC, election Leases, initial state Secret,
+webhook resources, and ConfigMap `racer-settings`. The ConfigMap is seeded
+only when absent. The DaemonSet uses the operator's registry and tag and imports
+the ConfigMap with `envFrom`. A pod-template annotation carries its payload hash,
+so edits roll out.
 Existing resources with these names that the operator did not create are not
 adopted; reconciliation fails until they are removed. Deleting the last
-`ClusterCache` leaves the controller and dataplane installed.
+`ClusterCache` leaves the dataplane and its durable control state installed.
+The operator still checks the admission guards. If they drift or disappear, it
+revokes dataplane permissions and repairs the guards. It restores permissions
+only when a cache exists again.
+
+Earlier releases named these objects `racer-dataplane`, with ConfigMap
+`racer-dataplane-config`. On upgrade the operator seeds `racer-settings` from
+`racer-dataplane-config`, renaming `RACER_DATAPLANE_NVIDIA` to `RACER_NVIDIA`.
+Once the new DaemonSet is applied, it deletes the old objects it created: the
+DaemonSet, ServiceAccount, RBAC, and ConfigMap first, then the old admission
+policies. Old and new Pods may run side by side briefly. It leaves alone any
+old-named object it did not create.
+
+| Setting in `racer-settings` | Default | Purpose |
+|------------------------------------|---------|---------|
+| `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
+| `RACER_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
+
+Set `RACER_CONTROL_SEATS` in `racer-settings` to `auto` (the default) or
+an integer from 1 to 16. The active count cannot exceed the eligible node count.
+For example, to request three seats:
+
+```bash
+kubectl -n unbounded-system patch configmap racer-settings \
+  --type merge -p '{"data":{"RACER_CONTROL_SEATS":"3"}}'
+```
 
 Workload overrides may target `{component: racer, kind: DaemonSet}` to set, for
 example, `nodeSelector`, tolerations, `updateStrategy`, annotations, resources, or
 additional container `env` entries. Overrides cannot change or remove the
 operator-wired `env` entries, `envFrom`, volumes, or service account of the
-`dataplane` container.
+`dataplane` container. Set the seat count through the ConfigMap, not an override.
 
-The operator owns identity/wiring: cluster UUID, URL, images, service accounts, trust,
-replication identity, and durable resource names. These are not tuning keys. Node identity
-comes from verified enrollment/local recovery, not a supplied Node name/UID. Do not reset
-markers, credentials, or version counters to repair an existing identity.
-
-Before any manager runnable starts, controller startup recovery has a 30-second
-total deadline covering authoritative installation reads, initialization writes,
-and final version validation. Caller cancellation or an earlier caller deadline
-still applies. The competing-installer wait retains its own five-second limit
-within that total budget. Recovery failure aborts startup without granting serving
-authority; a timeout does not authorize resetting durable state.
+The operator wires Pod identity through the downward API and mounts two tokens:
+an API-audience token for Kubernetes and a `racer-control` token for enrollment.
+Automatic ServiceAccount token mounting remains disabled. Node identity comes
+from verified enrollment and local recovery, not a caller-supplied Node UID.
 
 The **bare binary** defaults `RACER_PEER_LISTEN` to `0.0.0.0:7443` and
 `RACER_DIAGNOSTICS_LISTEN` to `127.0.0.1:9090`. Managed workloads bind both to the Pod IP
-with the ports above. The operator also wires trust/token paths and
-`/var/lib/racer/identity/private`; standalone defaults do not replace managed wiring.
+with peer port 8082 and diagnostics port 9090. Managed control startup does not
+require `RACER_CLUSTER_ID`, `RACER_CONTROL_ENDPOINT`, or `RACER_TRUST_BUNDLE`.
+Static control endpoints remain available for standalone tests, not managed
+cluster discovery.
 
 ### Membership and credential reconciliation
 
-Endpoint selection uses the newest eligible Pod controlled by the current managed
-DaemonSet, breaking creation-time ties by Pod UID. Failed, Succeeded, terminating,
-and IP-less Pods are not eligible. Readiness does not gate membership. Pod phase
-changes trigger reconciliation; readiness-only changes do not. A previously admitted
-Node retains its last endpoint across discovery gaps, while a never-admitted Node
-with no eligible endpoint is omitted.
+Membership uses Nodes and live Pods owned by the current managed DaemonSet UID.
+The Pod report supplies shares and NICs unless an administrator Node annotation
+overrides them. ClusterCache UIDs remain cache identities; their names determine
+the local socket paths.
 
-A custom `RACER_DAEMONSET_NAME` must be a valid DNS subdomain and fit a Kubernetes
-label value (at most 63 characters), because it also identifies the workload's
-immutable instance selector.
-
-Issued leaves start validity one minute before issuance to tolerate modest clock
-skew, matching issuer roots. Expiration remains issuance time plus
-`RACER_CERTIFICATE_LIFETIME`; the skew allowance does not extend expiration or grant
-server-auth usage. Clocks must still be synchronized. A staged issuer must cover
-its actual activation, the full interval until its replacement activates, and the
-last issued leaf's lifetime. If that horizon no longer fits, the controller stages
-a fresh issuer and waits a complete preparation period instead of activating the
-stale issuer.
-
-Topology and keyring reconciliation retry dependency-local timeouts or cancellation
-errors while their reconcile context remains live. Cancellation or expiration of
-the reconcile context itself is terminal for that operation.
+Seats authenticate enrollment with TokenReview and live Pod, ServiceAccount,
+DaemonSet, and Node checks. Node private keys stay on the node. Issuer roots and
+cache keys are rotated without resetting version counters. Retired roots stay
+in durable state until certificates they could have issued expire. Keep node
+clocks synchronized.
 
 ## Diagnostics and metrics
 
@@ -897,7 +915,7 @@ For a standalone listener, save and inspect a profile with the matching binary:
 
 ```sh
 curl --fail --max-time 75 'http://127.0.0.1:9090/debug/pprof/profile?seconds=30' -o profile.pb
-go tool pprof -top ./racer-dataplane profile.pb
+go tool pprof -top ./racer profile.pb
 ```
 
 Keep the exact binary and its debug information for symbol resolution. Userspace
@@ -919,13 +937,68 @@ network access, especially with host networking.
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 
+### GPU metrics
+
+`/metrics` also reports `gpu-read` state. Labels have fixed values or come
+from the GPUs the dataplane found and the active RDMA rails.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_read_requests_total{outcome}` | counter | `gpu-read` requests by how the dataplane opened them: `gpu` (imported on a GPU; the read can still fail later), `not_enabled` (501, `gpu-read` is off), `wrong_device` (501, the memory is on a GPU the dataplane cannot use, or the `Racer-Gpu-Uuid` header names a GPU it did not find), `busy` (503), `invalid` (400), or `failed`. Requests the parser rejects before it knows the mode are not counted. |
+| `racer_gpu_enabled` | gauge | 1 when `gpu-read` is on and found a usable GPU, else 0. |
+| `racer_gpu_standby` | gauge | 1 while `auto` mode waits for the first `gpu-read` before it touches a GPU, else 0. |
+
+The rest are reported only when `racer_gpu_enabled` is 1:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_decrypt_available{ordinal,uuid}` | gauge | 1 when the GPU can decrypt sealed pages. 0 means pages for it are decrypted by the CPU. |
+| `racer_gpu_staging_slots_free{ordinal}` | gauge | Free cuFile staging slots on the GPU. |
+| `racer_gpu_cufile_enabled` | gauge | 1 while cuFile reads are on. A driver-level failure turns it off until restart. |
+| `racer_gpu_cufile_disabled_total{reason}` | counter | Times cuFile was turned off for the node: `driver_open`, `staging_register`, or `file_open` (a file registration error other than unsupported). |
+| `racer_gpu_cufile_unsupported_total` | counter | Devices (`st_dev`) whose files cuFile reported as unsupported. Files on such a device are read through host memory; cuFile stays on for other devices. |
+| `racer_gpu_read_pages_total{decrypt}` | counter | Pages written to GPU memory: `gpu` (decrypted on the GPU) or `cpu` (plaintext from host memory, decrypted by the CPU or already cached). |
+| `racer_gpu_pages_rejected_total` | counter | Sealed pages the GPU rejected for a CRC or tag mismatch. |
+| `racer_gpu_cufile_staged_pages_total` | counter | Pages cuFile read from disk straight into GPU staging. |
+| `racer_gpu_cufile_failures_total` | counter | cuFile reads or registrations that failed. The page is read through host memory instead. |
+| `racer_gpu_staging_exhausted_total` | counter | Disk reads that found no free staging slot and went through host memory. |
+| `racer_gpu_landed_pages_decrypted_total` | counter | Pages decrypted on the GPU from an RDMA landing buffer. |
+| `racer_gpu_open_requests` | gauge | `gpu-read` requests that hold GPU resources now. |
+| `racer_gpu_leaked_resources` | gauge | GPU resources leaked on purpose after a failed release. |
+
+When GPU landing is configured (GPU decrypt and RDMA both on), each active
+rail also reports the following. Each decrypting GPU's landing buffer is split
+into one slice per rail, so the `{rail,ordinal}` series are per slice.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `racer_gpu_landing_enabled{rail}` | gauge | 1 when at least one GPU landing slice is registered on the rail. |
+| `racer_gpu_landing_slots{rail,ordinal}` | gauge | NIC slots in GPU `ordinal`'s landing slice on the rail. |
+| `racer_gpu_landing_exhausted_total{rail,ordinal}` | counter | Landing grants for that slice that found no free slot. The page lands in host memory instead. |
+
 ## Upgrade and recovery
 
-Keep the operator, controller, dataplane, SDK, and origin adapters on matching
+Keep the operator, dataplane, SDK, and origin adapters on matching
 versions from the same Unbounded release. Keep cluster identity, version counters,
 credentials, and node identity state. Do not delete them to force a fresh start.
 Cached bytes are disposable; this installation state is not. Deleting and
 recreating a ClusterCache creates a new cache identity, even with the same name.
+
+The move from `racer-controller` to elected dataplane seats is a cold-cache alpha
+upgrade. Quiesce traffic and let the operator retire the old authority before
+the new one starts. Do not run old and new controllers together. Checkpoint
+recovery rejects the previous format and a different cluster ID rather than
+restoring entries under unrelated keys. Origins must remain available while
+caches refill. Never clear raw-device guards or unrelated host files as part of
+this upgrade.
+
+The operator refuses migration if the old `racer-config` requests a non-default
+peer port, a diagnostics port, host networking, a pod-network node split, or a
+non-default `RACER_NVIDIA`. Managed ports are now fixed at 8082 and
+9090. Review and remove these old settings before migration; use a DaemonSet
+override for host networking and set `RACER_NVIDIA` in
+`racer-config`. The operator does
+not silently discard them or stop the old controller first.
 
 Expect a cold cache after changing device layout,
 worker count, or storage geometry. Recovery does not scan payloads to rebuild
@@ -991,7 +1064,7 @@ directory read-only and tells the app where the socket is.
 |-----|---------|
 | Label `racer.unbounded-cloud.io/client-socket: enabled` | Turns on the mount |
 | Annotation `racer.unbounded-cloud.io/client-cache` | ClusterCache name. Required |
-| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated app container names. Default: every app container. Init containers are never changed |
+| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated init or app container names. Default: every init and app container, except the injected `racer-object` sidecar |
 | Annotation `racer.unbounded-cloud.io/client-socket-injected` | Set by the webhook to the cache name; do not edit |
 
 Each selected container gets:
@@ -1000,7 +1073,9 @@ Each selected container gets:
   mount still allows `connect` and `sendmsg` on the socket.
 - `RACER_SOCKET=/run/racer/<cache>/client/socket`.
 
-The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
+Init containers, including native sidecars (`restartPolicy: Always`), get the
+same mount, so an init container can fetch through the socket before the app
+starts. The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
 The hostPath type is `Directory`, so the pod waits until the dataplane has
 created the cache directory. Host networking is allowed.
 
@@ -1014,14 +1089,19 @@ container already sets `RACER_SOCKET` or mounts that path.
 GPU reads let a client on the node read an object straight into its own NVIDIA
 GPU memory. They need:
 
-- A dataplane image built with `--build-arg RACER_NATIVE_CUDA=true`.
+- A dataplane image built with CUDA. The released `racer` image is,
+  so no setup is needed. It runs on nodes without GPUs too. An image built with
+  `--build-arg RACER_NATIVE_CUDA=false` has no GPU reads.
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
-- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto` turns GPU mode off
-  when no usable GPU is found, or when the image was built without CUDA. `true`
-  makes startup fail instead. `false` turns it off.
+- `RACER_ENABLE_GPU` in `racer-settings`. `auto`, the default, does
+  not touch any GPU until a client sends the first `gpu-read`. Only then does
+  the dataplane load CUDA, look for GPUs, and turn GPU mode on, or off if it
+  finds no usable GPU. It does not try again until the pod restarts. `true`
+  sets up the GPUs at startup and makes startup fail when there is no usable
+  GPU. `false` turns it off.
 
-At startup the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
+When it sets up the GPUs, the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in
 `EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
 for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
@@ -1038,11 +1118,19 @@ Where the bytes come from decides who decrypts them:
 - A page on local disk is read straight from the disk into GPU memory with
   cuFile when it can be. Otherwise the CPU reads it and copies it to the GPU.
   This needs GPUDirect Storage on the host (`nvidia-fs`, or PCIe P2PDMA).
+  For PCI P2PDMA, set `RACER_GPU_PCI_P2PDMA=true`. cuFile then does not fall
+  back to `nvidia-fs`, and if it cannot turn P2PDMA on, the dataplane logs
+  `stage=gpu state=cufile-disabled` and reads through host memory. The
+  `stage=gpu state=enabled` line reports the setting as `pci_p2pdma=<bool>`.
   `racer_gpu_direct_disk_reads_total` and
   `racer_gpu_direct_disk_read_bytes_total` count these reads. After a cuFile
   driver or registration failure the dataplane logs
   `stage=gpu state=cufile-disabled` and reads through host memory until it
-  restarts.
+  restarts. When cuFile only rejects a file because its filesystem or device
+  is not supported, the dataplane logs
+  `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
+  for that device, reads files on that device through host memory until it
+  restarts, and keeps cuFile on for other devices.
 
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
@@ -1050,15 +1138,20 @@ Where the bytes come from decides who decrypts them:
 If the GPU finds a damaged page, the read fails and the dataplane drops that
 copy from memory or disk, as it does when the CPU finds one.
 
-When both GPU reads and RDMA are on, each GPU can get a landing buffer of
-`RACER_GPU_LANDING_BYTES`, split into page slots. Each RDMA rail gets at most
-one GPU's landing buffer, preferring a GPU on the rail's NUMA node. A GPU
-read that needs a page from a peer over that rail, on that GPU, asks the peer
-to write the encrypted page into a free slot. The GPU then checks and
-decrypts it. Such a page is used only by that read: it is not kept in memory,
-written to disk, or shared with other reads. When no slot is free, the GPUs
-do not match, or anything fails, the page comes through host memory as
-before. The dataplane logs `stage=gpu-landing` lines at RDMA activation, and
+When both GPU reads and RDMA are on, each GPU that can decrypt gets a landing
+buffer of `RACER_GPU_LANDING_BYTES` (per GPU, not per rail), split into page
+slots. The buffer is divided across the RDMA rails, so every GPU can land
+pages over every rail. If the buffer has fewer slots than there are rails,
+the rails on the GPU's NUMA node come first. A GPU read that needs a page
+from a peer asks up to two providers, in turn, to write the encrypted page
+into a free slot of that GPU's share on the link's rail. The GPU then checks
+and decrypts it. Such a page is used only by that read: it is not kept in
+memory, written to disk, or shared with other reads, because the host never
+has its bytes. When no slot is free or anything fails, the page comes through
+host memory as before. Landing buffers are registered when GPU mode turns
+on and at each RDMA activation, and freed when the RDMA node closes or when no rail could register
+them. They are not resized at runtime; changing the setting restarts the
+pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
@@ -1079,17 +1172,55 @@ against 2.44 seconds with the defaults. That is close to the drive's speed.
 
 The dataplane does not request `nvidia.com/gpu`. It is privileged, so it
 already sees `/dev/nvidia*`. It only needs the host driver libraries.
-`RACER_DATAPLANE_NVIDIA` in `racer-config` controls how it asks for them:
+`RACER_NVIDIA` in `racer-settings` controls how it asks for them.
+The operator reads it and changes the DaemonSet:
 
-| `RACER_DATAPLANE_NVIDIA` | Behavior |
+| `RACER_NVIDIA` | Behavior |
 |--------------------------|----------|
-| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
-| `cdi` | Also adds the Pod annotation `cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
-| `off` | Adds nothing |
+| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container, mounts the host `/run/udev` read-only at `/run/udev` (cuFile reads each slab device's filesystem type from the udev database), and mounts a 64 MiB `emptyDir` at `/var/log/cufile` for the cuFile log. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
+| `cdi` | Everything `env` adds, plus the Pod annotation `cdi.k8s.io/racer: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
+| `off` | Adds none of these: no NVIDIA variables, no CDI annotation, no `/run/udev` mount, and no cuFile log volume. Without driver libraries there is no GPU, so cuFile is not used |
+
+The dataplane image ships `/etc/racer/cufile.json` and sets
+`CUFILE_ENV_PATH_JSON` to it. It turns off cuFile compatibility mode, so
+cuFile fails instead of copying through host memory and Racer uses its own
+host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
+cuFile settings keep their built-in defaults. To use your own file, build an
+image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
+in `racer-settings`. Setting `CUFILE_ALLOW_COMPAT_MODE=true`
+turns compatibility mode back on.
 
 On nodes set up by the unbounded agent, the NVIDIA runtime is the default
 containerd runtime and runs in CDI mode, so `env` is enough there. These env
 entries are operator wiring: workload overrides cannot change them.
+
+### Testing on GPUs
+
+Regular CI has no GPU. It compiles the decrypt kernels with `nvcc` and runs
+them on the CPU through an emulation, but never loads them on a GPU. On a
+machine with an NVIDIA driver, `nvcc`, and Rust, run:
+
+```sh
+make racer-gpu-test
+```
+
+This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
+tests in `cmd/racer/gpu/tests/hardware.rs`: shim load, device
+discovery, import of an exported client allocation, GPU decrypt checked
+against the CPU, and cuFile reads. It fails when no GPU is found; pass
+`RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open
+or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
+`RACER_GPU_TESTS_CUFILE=require` to make that a failure. To also test
+`gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
+running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
+object it can serve (`RACER_GPU_E2E_METADATA` and
+`RACER_GPU_E2E_AUTHORIZATION` are optional). Without the socket, that test is
+skipped; set `RACER_GPU_E2E=require` to make it a failure.
+
+The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
+nightly and on demand. It runs only when the repository variable
+`RACER_GPU_RUNNER` holds the GPU runner labels as a JSON array, for example
+`["self-hosted", "linux", "gpu"]`.
 
 See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
 
@@ -1117,8 +1248,8 @@ The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entr
 `port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
 optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
 
-Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order, reported
-during authenticated enrollment/renewal and published from `enrolled-rdma-nics`. Explicit
+Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order,
+published from the dataplane's own Pod report. Explicit
 `[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
 or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
 
@@ -1144,6 +1275,6 @@ Verify from the actual Pod namespaces:
   The adapter uses **GID index 0**. Annotation `gid` is a matching constraint, not an index
   selector or RoCE configuration; retain HTTP when another index is required.
 
-Coordinate controller/dataplane upgrades and quiesce traffic; rolling updates
+Coordinate dataplane and origin-adapter upgrades and quiesce traffic; rolling updates
 do not make mixed versions safe.
 Validate transfers, HTTP fallback, and recovery on target hardware before relying on RDMA.

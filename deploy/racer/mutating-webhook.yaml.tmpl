@@ -5,7 +5,9 @@
 # socket into pods labeled racer.unbounded-cloud.io/client-socket=enabled.
 # Label selectors cannot express OR, so each label has its own webhook. Both
 # call the same handler, which applies both opt-ins idempotently.
-# The operator fills caBundle.
+# The operator never sets caBundle: the Racer primary publishes it and the
+# racer-webhook endpoints. Until then, opted-in Pod creation fails closed. The
+# operator namespace is excluded so the dataplane itself can always start.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -15,7 +17,7 @@ webhooks:
     admissionReviewVersions: ["v1"]
     clientConfig:
       service:
-        name: racer-controller
+        name: racer-webhook
         namespace: {{ .Namespace | default "unbounded-system" }}
         path: /mutate-racer-object-sidecar
         port: 9443
@@ -47,7 +49,7 @@ webhooks:
     admissionReviewVersions: ["v1"]
     clientConfig:
       service:
-        name: racer-controller
+        name: racer-webhook
         namespace: {{ .Namespace | default "unbounded-system" }}
         path: /mutate-racer-object-sidecar
         port: 9443

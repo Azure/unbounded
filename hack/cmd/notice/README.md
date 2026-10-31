@@ -1,7 +1,7 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml` plus
+`go.mod`, `frontend/package.json`, and `cmd/racer/Cargo.toml` plus
 the pinned libfabric and OpenSSL source versions in `Makefile`, when present.
 
 ## Usage
@@ -51,7 +51,7 @@ hack/cmd/notice/
 ### Cargo and native collectors
 
 The Cargo collector reads the Racer dataplane workspace under
-`cmd/racer-dataplane`. It reads the root package and its declared workspace
+`cmd/racer`. It reads the root package and its declared workspace
 members using the root lockfile. Collection is skipped when neither
 `Cargo.toml` nor `Cargo.lock` exists. A workspace without direct registry
 dependencies needs no Cargo registry cache.
@@ -100,7 +100,7 @@ To add a new ecosystem (e.g. PyPI, Cargo):
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
   reads license files from the local Cargo registry source cache for direct
   dependencies. When the Racer crate has dependencies, populate it with
-  `cargo fetch --manifest-path cmd/racer-dataplane/Cargo.toml --locked`.
+  `cargo fetch --manifest-path cmd/racer/Cargo.toml --locked`.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included. Local path dependencies must be declared
   workspace members, including paths in development and target-specific

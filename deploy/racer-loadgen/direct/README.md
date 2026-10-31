@@ -11,8 +11,8 @@ Service, or a Gantry Service. The parent deployment files are unchanged.
 
 - Install and configure the Unbounded operator, including the
   `racer.unbounded-cloud.io/v1alpha1` ClusterCache CRD. Any ClusterCache triggers
-  operator-managed Racer installation. Wait for the controller, node dataplane,
-  installation identity/trust, and required admission policies before starting load.
+  operator-managed Racer installation. Wait for the dataplane DaemonSet, its
+  elected control seats, and required admission policies before starting load.
 - Configure Racer's node storage and capacity before starting load. ClusterCache
   has no `spec` or `status`. Capacity is not configured through this object.
   It is not a PVC or a durability
@@ -93,7 +93,7 @@ are mounted read-write, using hostPath type `Directory`, not all of
 assumes trusted node administrators, Racer, and load-generator images. Treat
 permission to mount these paths as cache access.
 
-The racer-dataplane creates both directories when it publishes the cache. It
+The racer creates both directories when it publishes the cache. It
 creates the origin directory owned by UID/GID 65532 with mode `0700` and repairs
 the owner and mode if they drift. Until the directories exist, the pod stays in
 `ContainerCreating`; the load generator never creates them.

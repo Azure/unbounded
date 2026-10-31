@@ -44,7 +44,7 @@ ENV PATH="/unbounded/bin"
 
 WORKDIR /unbounded
 
-# The racer-dataplane creates /run/racer/<cache>/origin owned by 65532:65532
+# The racer creates /run/racer/<cache>/origin owned by 65532:65532
 # with mode 0700, so the UDS origin runs as that user. The privileged
 # dataplane can still connect to the origin's mode 0600 socket.
 USER 65532:65532

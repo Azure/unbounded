@@ -59,13 +59,19 @@ account, create another ClusterCache.
 Wait for the cache to start:
 
 ```bash
-kubectl -n unbounded-system rollout status deployment/racer-controller --timeout=5m
-kubectl -n unbounded-system rollout status daemonset/racer-dataplane --timeout=5m
+kubectl -n unbounded-system rollout status daemonset/racer --timeout=5m
 kubectl -n unbounded-system rollout status daemonset/racer-origin-racer-object --timeout=5m
 ```
 
 If a command reports that the workload does not exist, wait a few seconds and
 run it again.
+
+Racer elects its control seats from the dataplane pods. There is no separate
+controller Deployment to wait for. To inspect the election, run:
+
+```bash
+kubectl -n unbounded-system get leases -l racer.unbounded-cloud.io/control=true
+```
 
 ### Private Containers
 

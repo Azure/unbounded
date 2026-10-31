@@ -37,6 +37,7 @@ If-Match: "<etag>"                      optional, as for Get
 Racer-Destination-Offset: <u64>         required
 Racer-Destination-Length: <u64>         required, > 0
 Racer-Allocation-Size: <u64>            required for gpu-read only
+Racer-Gpu-Uuid: GPU-<uuid>              optional, gpu-read only
 ```
 
 - The client sends exactly one file descriptor with the request head, as
@@ -46,6 +47,13 @@ Racer-Allocation-Size: <u64>            required for gpu-read only
 - For `gpu-read` the descriptor comes from `cuMemExportToShareableHandle` with
   `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`. `Racer-Allocation-Size` is the size
   passed to `cuMemCreate`.
+- `Racer-Gpu-Uuid` is the UUID of the GPU that holds the allocation, from
+  `cuDeviceGetUuid`, in the `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form
+  `nvidia-smi` prints. The `GPU-` prefix is optional and hex is case
+  insensitive. Device numbers differ between the client's container and the
+  dataplane (a pod with one GPU sees it as device 0), but UUIDs do not, so the
+  dataplane uses the UUID to pick its own context for that GPU. Without it
+  (older clients), the dataplane tries each usable GPU in turn.
 - `Range`, `If-Match`, `Authorization` and `Racer-Metadata` mean the same as for
   Get. `Racer-Page-Credits` and `Racer-Byte-Credits` are ignored.
 
@@ -57,14 +65,19 @@ The dataplane rejects the request with 400, before writing anything, when:
 - a destination header is missing, duplicated, malformed, or
   `offset + length` overflows;
 - for `host-read`, the descriptor is not a regular file;
-- for `gpu-read`, `offset + length > Racer-Allocation-Size`.
+- for `gpu-read`, `offset + length > Racer-Allocation-Size`;
+- for `gpu-read`, `Racer-Gpu-Uuid` is malformed or duplicated.
 
 After resolving the range, the dataplane rejects with 400 if the destination
 length is smaller than the range length. Range and version errors keep their
 Get status codes (412, 416, and so on).
 
-`gpu-read` returns 501 when the dataplane has no usable GPU, or when the
-allocation is on a GPU the dataplane did not discover.
+`gpu-read` returns 501 when the dataplane has no usable GPU, when
+`Racer-Gpu-Uuid` names a GPU the dataplane cannot use (it logs
+`stage=gpu state=import-skipped reason=unknown-gpu-uuid uuid=<uuid>`), or when
+the allocation is on a GPU the dataplane did not discover. If the named GPU
+does not own the allocation, the dataplane tries the others and logs
+`stage=gpu state=uuid-mismatch` when another one does.
 
 ### Response
 
@@ -93,7 +106,10 @@ the kind 2 frame, as for Get. The destination may then hold partial data.
 
 1. The dataplane receives the descriptor with `recvmsg` and `MSG_CMSG_CLOEXEC`.
 2. For `gpu-read` it imports the handle, maps the whole allocation into its own
-   CUDA context, and grants itself read and write access.
+   CUDA context, and grants itself read and write access. Before mapping, the
+   shim checks that the allocation lives on the context's GPU. It resolves the
+   device the driver reports for the handle in the dataplane's own numbering
+   and compares GPU UUIDs, not ordinals.
 3. It writes pages.
 4. When the read ends for any reason, including a client disconnect, it waits
    for all GPU work that touches the allocation, then unmaps it, releases the
@@ -117,8 +133,10 @@ Clients try modes in order: GPU, then host, then stream.
   `recv`.
 - A new dataplane without a usable GPU answers `gpu-read` with 501.
 
-A client remembers an unsupported mode for the socket path until the process
-exits:
+A client remembers an unsupported mode for the socket path, logs one warning
+with the status, and tries the mode again after a retry interval (300 seconds
+by default in the Python client) or when the socket file is replaced by a
+restarted dataplane:
 
 - 501 marks the mode unsupported at once.
 - 400, 404 and 405 can also mean a bad request, so the client falls back for
@@ -153,7 +171,7 @@ plaintext slice from the `VerifiedPage` into the client's file with io_uring
 
 ### GPU mode
 
-A new crate, `cmd/racer-dataplane/gpu`, follows the `verbs` pattern:
+A new crate, `cmd/racer/gpu`, follows the `verbs` pattern:
 
 - A small C shim, `libracer_gpu_cuda.so.1`, wraps the CUDA driver API, NVML and
   cuFile. Racer loads it with `dlopen` and checks `racer_gpu_abi()`.
@@ -235,7 +253,16 @@ above:
 - The helper opens the cuFile driver on another thread at startup. Opening it
   probes every GPU and can take most of a second, which would otherwise delay
   the first disk read. A cuFile driver or registration failure turns cuFile off
-  until restart. A failed read only drops that file's registration.
+  until restart. When registration fails because cuFile does not support the
+  file, its filesystem, or its device (`CU_FILE_IO_NOT_SUPPORTED`,
+  `CU_FILE_DEVICE_NOT_SUPPORTED`, `CU_FILE_INVALID_FILE_TYPE`), only that
+  device (`st_dev`) skips cuFile until restart. A failed read only drops that
+  file's registration.
+- `RACER_GPU_PCI_P2PDMA=true` makes the shim set cuFile's `use_pci_p2pdma`
+  (`cuFileSetParameterBool`) before it opens the driver, so local NVMe reads
+  use PCI P2PDMA without `nvidia-fs`. If cuFile cannot set it, the open fails
+  and cuFile is off, as for any failed open. The flag is an argument of
+  `racer_gpu_file_open`, so the shim ABI is version 2.
 - At startup the helper runs a zero-length decrypt on each GPU. A GPU whose
   shim has no decrypt kernels, or a staging cap smaller than the two scratch
   slots, gets plaintext pages only.
@@ -249,24 +276,37 @@ above:
 
 ### GPUDirect RDMA landing
 
-When GPU decryption and RDMA are both on, each GPU can get one landing
-buffer: GPU memory separate from the staging buffer, sized by
-`RACER_GPU_LANDING_BYTES` (default 256 MiB per GPU, 0 turns landing off).
-The GPU helper allocates it once, exports it once as a dma-buf, and keeps it
-until the process exits. At each RDMA activation, every rail is matched with
-at most one GPU, and every GPU with at most one rail: a GPU on the rail's
-NUMA node first, then any free GPU (`assign_landing` in
-`src/rdma/links.rs`). PCI distance is not used; only NUMA nodes are known on
-both sides. The rail registers the landing buffer as its `rdma_verbs` device
-pool, so the buffer is split into page-sized slots. If allocation, export, or
-registration fails, the rail stays host-only.
+When GPU decryption and RDMA are both on, each decrypting GPU gets one
+landing buffer: GPU memory separate from the staging buffer, sized by
+`RACER_GPU_LANDING_BYTES` (default 256 MiB per GPU, not per rail; 0 turns
+landing off). At each RDMA activation the GPU helper allocates it and exports
+it once as a dma-buf. `plan_landing` in `src/rdma/links.rs` splits it into
+disjoint slices, one per rail, so every GPU can land over every rail and a
+node with more GPUs than rails leaves no GPU out. If the buffer has fewer
+page slots than there are rails, rails on the GPU's NUMA node come first,
+then the rest in rail order. PCI distance is not used; only NUMA nodes are
+known on both sides. Each slice is registered as its own `rdma_verbs` device
+pool on its rail, keyed by GPU ordinal, so a rail can hold one pool per GPU.
+If allocation, export, or registration fails, that rail and GPU stay
+host-only.
+
+Lifetime: the buffer is freed when nothing refers to it. NIC registrations
+and landed pages hold references, so it is freed after the RDMA node closes
+and drains (shutdown, or before a new activation round), or right away when
+no rail registered it. A registration `rdma_verbs` leaks on purpose (failed
+deregistration) keeps its reference, so that memory is never freed under the
+NIC. The next activation allocates and registers again. Buffers are not
+resized at runtime: `RACER_GPU_LANDING_BYTES` comes from the ConfigMap, and
+the operator restarts the pods when it changes.
 
 A `gpu-read` page then takes this path (`Fill::land_from_peer`):
 
 1. If this node is not a candidate for the page, has no local copy, and has
-   a landing buffer on the request's GPU, it sends one CopyOnly request to the
-   first provider in visit order, carrying the GPU ordinal.
-2. When the hop is RDMA and the rail's landing buffer is on that GPU, the
+   a landing buffer on the request's GPU, it sends a CopyOnly request,
+   carrying the GPU ordinal, to the first provider in visit order. On a miss
+   or failure it asks the next one, up to two providers
+   (`LANDING_PROVIDERS`), then takes the usual path.
+2. When the hop is RDMA and the rail has a landing slice for that GPU, the
    receiver grants a landing slot instead of a host buffer. If no slot is
    free, it grants host memory as usual.
 3. The sender writes the ciphertext into the slot. After the usual fence, the
@@ -281,9 +321,19 @@ A landed page is used once. It does not join or create a single flight, is
 not published to memory, and is not persisted, because there are no host
 bytes to share. The slot is held until the GPU job finishes. If the provider
 answers with a host page (no free slot, or HTTP), that page is used once in
-the same way, so it is not fetched twice. A miss, any failure, or a landing
-buffer on another GPU falls back to the usual path. Host-only nodes and
-non-GPU reads do not change. Relays never ask for landing.
+the same way, so it is not fetched twice. If every provider asked misses or
+fails, or the rail has no slice for that GPU, the read takes the usual path.
+Host-only nodes and non-GPU reads do not change. Relays never ask for
+landing.
+
+Not caching landed pages is a design choice, not a gap. The host memory and
+disk tiers are the cache. Putting a landed page there would need a
+device-to-host copy of the ciphertext, which is the cost landing exists to
+avoid. Keeping landed pages in GPU memory would hold scarce slots that peers
+need for new pages, and a page landed on one GPU is not usable by a read on
+another without a GPU-to-GPU copy. Concurrent reads of one page on the same
+GPU each land their own copy; that is rare, since a model's shards are
+usually read once per GPU.
 
 `racer_rdma_pages_landed_total` counts pages that landed, and the GPU
 helper's `landed` counter counts landed pages it decrypted. A landed page the
@@ -303,7 +353,7 @@ provider, and GPU decryption from a landing buffer.
 ### Disk layout v2
 
 The store already writes format version 2 records (see
-`cmd/racer-dataplane/src/store.rs`): the header and its SHA-256 digest, then zero
+`cmd/racer/src/store.rs`): the header and its SHA-256 digest, then zero
 padding up to `header_len`, then the ciphertext, then zero padding up to the
 extent. `header_len` and the ciphertext body are rounded up to the record unit.
 Readers treat other versions, including the old unpadded v1 layout, as cold
@@ -327,7 +377,7 @@ not aligned.
   NVIDIA runtime to inject them without requesting `nvidia.com/gpu`:
   `NVIDIA_VISIBLE_DEVICES=all` and
   `NVIDIA_DRIVER_CAPABILITIES=compute,utility`. The operator knob
-  `RACER_DATAPLANE_NVIDIA=off|env|cdi` (default `env`) controls this. `cdi`
+  `RACER_NVIDIA=off|env|cdi` (default `env`) controls this. `cdi`
   also adds the CDI annotation for `nvidia.com/gpu=all`. It is opt-in because
   containerd fails pod creation when a CDI device cannot be resolved, which
   would break the DaemonSet on nodes without NVIDIA GPUs. On other nodes the

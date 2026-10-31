@@ -6,6 +6,7 @@ from .client import (
     GPU,
     HOST,
     STREAM,
+    DEFAULT_MODE_RETRY_SECONDS,
     Client,
     Metadata,
     ReadResult,
@@ -26,6 +27,7 @@ from .host import HostBuffer
 from .keys import Request, canonical_json, object_key, object_request
 
 __all__ = [
+    "DEFAULT_MODE_RETRY_SECONDS",
     "GPU",
     "HOST",
     "PAGE_SIZE",

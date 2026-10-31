@@ -198,10 +198,10 @@ func (h *harness) checkGantryRacerSpec() {
 	const placement = `jsonpath={.spec.template.spec.nodeSelector}|{.spec.template.spec.tolerations}|{.spec.template.spec.affinity.nodeAffinity}`
 
 	gantry := h.kubectl("-n", operatorNamespace, "get", "daemonset", "gantry", "-o", placement)
-	dataplane := h.kubectl("-n", operatorNamespace, "get", "daemonset", "racer-dataplane", "-o", placement)
+	dataplane := h.kubectl("-n", operatorNamespace, "get", "daemonset", "racer", "-o", placement)
 
 	if gantry != dataplane {
-		h.t.Fatalf("Gantry placement does not follow racer-dataplane:\ngantry:    %s\ndataplane: %s", gantry, dataplane)
+		h.t.Fatalf("Gantry placement does not follow racer:\ngantry:    %s\ndataplane: %s", gantry, dataplane)
 	}
 }
 
