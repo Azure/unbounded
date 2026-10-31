@@ -24,7 +24,7 @@ import (
 
 const bootIDPath = "/proc/sys/kernel/random/boot_id"
 
-const hostOSRebootMessage = "rebooting host operating system"
+const hostSoftRebootMessage = "rebooting host operating system"
 
 func readBootID() (string, error) {
 	data, err := os.ReadFile(bootIDPath)
@@ -40,12 +40,12 @@ func readBootID() (string, error) {
 	return id, nil
 }
 
-func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+func (t *machineOperationTarget) reconcileHostSoftReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
 	// The host is already going down for a reboot this daemon issued. The
 	// daemon that starts after it reports that operation and picks up any
 	// other that is still Pending.
 	if t.rebootRequested.Load() {
-		t.log.Info("not starting a HostOSReboot: this host is already rebooting", "operation", op.Name)
+		t.log.Info("not starting a HostSoftReboot: this host is already rebooting", "operation", op.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -72,12 +72,12 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 
 	// The boot ID must be on the operation before the reboot is issued: the
 	// daemon that starts after the reboot reports the operation from it.
-	started, err := startHostOSReboot(ctx, t.Client, op.Name, t.machineName, machine.Generation, bootID)
+	started, err := startHostSoftReboot(ctx, t.Client, op.Name, t.machineName, machine.Generation, bootID)
 	if err != nil || !started {
 		return ctrl.Result{}, err
 	}
 
-	t.log.Info("rebooting host for HostOSReboot", "operation", op.Name, "bootID", bootID)
+	t.log.Info("rebooting host for HostSoftReboot", "operation", op.Name, "bootID", bootID)
 	t.rebootRequested.Store(true)
 
 	if err := t.nodeOperator.RebootHost(ctx, t.log); err != nil {
@@ -85,7 +85,7 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 		// the reboot has started. Leave the operation InProgress so the next
 		// daemon decides from the boot ID whether the reboot happened.
 		if ctx.Err() != nil {
-			t.log.Warn("daemon stopping while rebooting host; the next daemon reports HostOSReboot",
+			t.log.Warn("daemon stopping while rebooting host; the next daemon reports HostSoftReboot",
 				"operation", op.Name, "error", err)
 
 			return ctrl.Result{}, nil
@@ -93,7 +93,7 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 
 		t.rebootRequested.Store(false)
 
-		return ctrl.Result{}, finishHostOSReboot(ctx, t.Client, op.Name, t.machineName, daemon.MachineOperationResult[int64]{
+		return ctrl.Result{}, finishHostSoftReboot(ctx, t.Client, op.Name, t.machineName, daemon.MachineOperationResult[int64]{
 			Phase:   v1alpha3.OperationPhaseFailed,
 			Reason:  "Failed",
 			Message: err.Error(),
@@ -105,10 +105,10 @@ func (t *machineOperationTarget) reconcileHostOSReboot(ctx context.Context, stor
 	return ctrl.Result{}, nil
 }
 
-// startHostOSReboot marks the operation InProgress and records bootID in the
+// startHostSoftReboot marks the operation InProgress and records bootID in the
 // status of the target for machineName. It returns false, without error, if
 // the operation is already terminal.
-func startHostOSReboot(ctx context.Context, c client.Client, opName, machineName string, generation int64, bootID string) (bool, error) {
+func startHostSoftReboot(ctx context.Context, c client.Client, opName, machineName string, generation int64, bootID string) (bool, error) {
 	started := false
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -125,7 +125,7 @@ func startHostOSReboot(ctx context.Context, c client.Client, opName, machineName
 		now := metav1.Now()
 
 		latest.Status.Phase = v1alpha3.OperationPhaseInProgress
-		latest.Status.Message = hostOSRebootMessage
+		latest.Status.Message = hostSoftRebootMessage
 		latest.Status.ObservedMachineGeneration = generation
 
 		if latest.Status.StartedAt == nil {
@@ -136,18 +136,18 @@ func startHostOSReboot(ctx context.Context, c client.Client, opName, machineName
 			Type:               "Completed",
 			Status:             metav1.ConditionFalse,
 			Reason:             "InProgress",
-			Message:            hostOSRebootMessage,
+			Message:            hostSoftRebootMessage,
 			ObservedGeneration: latest.Generation,
 		})
 
-		target := hostOSRebootTarget(&latest.Status, machineName)
+		target := hostSoftRebootTarget(&latest.Status, machineName)
 		if target == nil {
 			latest.Status.Targets = append(latest.Status.Targets, v1alpha3.MachineOperationTargetStatus{MachineRef: machineName})
 			target = &latest.Status.Targets[len(latest.Status.Targets)-1]
 		}
 
 		target.Phase = v1alpha3.OperationPhaseInProgress
-		target.Message = hostOSRebootMessage
+		target.Message = hostSoftRebootMessage
 		target.StartedAt = &now
 		target.CompletedAt = nil
 		target.ObservedGeneration = generation
@@ -162,15 +162,15 @@ func startHostOSReboot(ctx context.Context, c client.Client, opName, machineName
 		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("record HostOSReboot boot ID: %w", err)
+		return false, fmt.Errorf("record HostSoftReboot boot ID: %w", err)
 	}
 
 	return started, nil
 }
 
-// finishHostOSReboot records result on the operation and on its target for
+// finishHostSoftReboot records result on the operation and on its target for
 // machineName.
-func finishHostOSReboot(ctx context.Context, c client.Client, opName, machineName string, result daemon.MachineOperationResult[int64]) error {
+func finishHostSoftReboot(ctx context.Context, c client.Client, opName, machineName string, result daemon.MachineOperationResult[int64]) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var latest v1alpha3.MachineOperation
 		if err := c.Get(ctx, client.ObjectKey{Name: opName}, &latest); err != nil {
@@ -180,7 +180,7 @@ func finishHostOSReboot(ctx context.Context, c client.Client, opName, machineNam
 		now := metav1.Now()
 		daemon.SetMachineOperationResult(&latest, result, now)
 
-		if target := hostOSRebootTarget(&latest.Status, machineName); target != nil {
+		if target := hostSoftRebootTarget(&latest.Status, machineName); target != nil {
 			target.Phase = result.Phase
 			target.Message = result.Message
 			target.CompletedAt = &now
@@ -190,7 +190,7 @@ func finishHostOSReboot(ctx context.Context, c client.Client, opName, machineNam
 	})
 }
 
-func hostOSRebootTarget(status *v1alpha3.MachineOperationStatus, machineName string) *v1alpha3.MachineOperationTargetStatus {
+func hostSoftRebootTarget(status *v1alpha3.MachineOperationStatus, machineName string) *v1alpha3.MachineOperationTargetStatus {
 	for i := range status.Targets {
 		if status.Targets[i].MachineRef == machineName {
 			return &status.Targets[i]
@@ -200,10 +200,10 @@ func hostOSRebootTarget(status *v1alpha3.MachineOperationStatus, machineName str
 	return nil
 }
 
-// publishHostOSReboots reports HostOSReboot operations that an earlier daemon
+// publishHostSoftReboots reports HostSoftReboot operations that an earlier daemon
 // on this machine issued. Each completes if the host has booted since its
 // reboot was issued and fails otherwise, so none stays InProgress.
-func publishHostOSReboots(ctx context.Context, log *slog.Logger, c client.Client, machineName string, currentBootID func() (string, error)) error {
+func publishHostSoftReboots(ctx context.Context, log *slog.Logger, c client.Client, machineName string, currentBootID func() (string, error)) error {
 	var ops v1alpha3.MachineOperationList
 	if err := c.List(ctx, &ops); err != nil {
 		return fmt.Errorf("list MachineOperations: %w", err)
@@ -216,11 +216,11 @@ func publishHostOSReboots(ctx context.Context, log *slog.Logger, c client.Client
 
 	for i := range ops.Items {
 		op := &ops.Items[i]
-		if op.Spec.OperationKind.Canonical() != v1alpha3.OperationHostOSReboot {
+		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot {
 			continue
 		}
 
-		target := hostOSRebootTarget(&op.Status, machineName)
+		target := hostSoftRebootTarget(&op.Status, machineName)
 		if target == nil || target.Phase != v1alpha3.OperationPhaseInProgress || target.BootID == "" {
 			continue
 		}
@@ -237,23 +237,23 @@ func publishHostOSReboots(ctx context.Context, log *slog.Logger, c client.Client
 		result := daemon.MachineOperationResult[int64]{
 			Phase:                     v1alpha3.OperationPhaseComplete,
 			Reason:                    "Succeeded",
-			Message:                   "HostOSReboot completed",
+			Message:                   "HostSoftReboot completed",
 			ObservedMachineGeneration: target.ObservedGeneration,
 		}
 		if target.BootID == bootID {
 			result = daemon.MachineOperationResult[int64]{
 				Phase:   v1alpha3.OperationPhaseFailed,
 				Reason:  "RebootNotObserved",
-				Message: "host did not reboot after HostOSReboot was issued",
+				Message: "host did not reboot after HostSoftReboot was issued",
 			}
 		}
 
-		if err := finishHostOSReboot(ctx, c, op.Name, machineName, result); err != nil {
-			errs = append(errs, fmt.Errorf("report HostOSReboot %s: %w", op.Name, err))
+		if err := finishHostSoftReboot(ctx, c, op.Name, machineName, result); err != nil {
+			errs = append(errs, fmt.Errorf("report HostSoftReboot %s: %w", op.Name, err))
 			continue
 		}
 
-		log.Info("reported HostOSReboot", "operation", op.Name, "phase", result.Phase)
+		log.Info("reported HostSoftReboot", "operation", op.Name, "phase", result.Phase)
 	}
 
 	return errors.Join(errs...)

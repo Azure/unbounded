@@ -314,7 +314,7 @@ Create a `MachineOperation`.
 | Name | Type | Description |
 |------|------|-------------|
 | `NAME` | argument | Name of the `MachineOperation` resource |
-| `--kind` | string | Operation kind: `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostOutOfBandReboot` (alias `HostOOBReboot`), `HostOSReboot`, `HostPowerOff`, `HostPowerOn`, or `HostReplace` |
+| `--kind` | string | Operation kind: `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostHardReboot`, `HostSoftReboot`, `HostPowerOff`, `HostPowerOn`, or `HostReplace` |
 | `--machine` or `--selector` | string | Target one Machine by name or select Machines by label selector |
 
 `AgentUpgrade` requires `--param downloadURL=<url>` and optionally accepts `--param sha256=<archive-sha256>`.
@@ -341,7 +341,7 @@ Create a host reboot operation:
 
 ```bash
 kubectl unbounded machine operation create reboot-worker-01 \
-  --kind HostOutOfBandReboot \
+  --kind HostHardReboot \
   --machine worker-01
 ```
 
@@ -407,8 +407,8 @@ name, default `--ttl 300`, and `--wait=true`.
 | Command | Operation kind | Notes |
 |---------|----------------|-------|
 | `kubectl unbounded machine node-reboot NAME` | `NodeReboot` | Restarts the nspawn-backed Kubernetes node. |
-| `kubectl unbounded machine host-out-of-band-reboot NAME` | `HostOutOfBandReboot` | Reboots or power-cycles the host through the owning backend. Alias: `host-oob-reboot`. |
-| `kubectl unbounded machine host-os-reboot NAME` | `HostOSReboot` | Reboots the host OS through the in-host agent (`systemctl reboot`). |
+| `kubectl unbounded machine host-hard-reboot NAME` | `HostHardReboot` | Reboots or power-cycles the host through the owning backend. |
+| `kubectl unbounded machine host-soft-reboot NAME` | `HostSoftReboot` | Reboots the host OS through the in-host agent (`systemctl reboot`). |
 | `kubectl unbounded machine power-off NAME` | `HostPowerOff` | Powers off the host. |
 | `kubectl unbounded machine power-on NAME` | `HostPowerOn` | Powers on the host. |
 | `kubectl unbounded machine agent-upgrade NAME --download-url URL [--sha256 DIGEST]` | `AgentUpgrade` | Upgrades the host-side agent binary. |

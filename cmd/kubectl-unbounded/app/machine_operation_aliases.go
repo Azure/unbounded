@@ -40,26 +40,23 @@ func newMachineNodeRebootCommand(rt *machineCommandRuntime) *cobra.Command {
 	)
 }
 
-func newMachineHostOutOfBandRebootCommand(rt *machineCommandRuntime) *cobra.Command {
-	cmd := newMachineOperationAliasCommand(
-		rt,
-		"host-out-of-band-reboot NAME",
-		"Power cycle the host out of band (BMC or cloud provider) through MachineOperation",
-		v1alpha3.OperationHostOutOfBandReboot,
-		"host-out-of-band-reboot",
-	)
-	cmd.Aliases = []string{"host-oob-reboot"}
-
-	return cmd
-}
-
-func newMachineHostOSRebootCommand(rt *machineCommandRuntime) *cobra.Command {
+func newMachineHostHardRebootCommand(rt *machineCommandRuntime) *cobra.Command {
 	return newMachineOperationAliasCommand(
 		rt,
-		"host-os-reboot NAME",
+		"host-hard-reboot NAME",
+		"Power cycle the host out of band (BMC or cloud provider) through MachineOperation",
+		v1alpha3.OperationHostHardReboot,
+		"host-hard-reboot",
+	)
+}
+
+func newMachineHostSoftRebootCommand(rt *machineCommandRuntime) *cobra.Command {
+	return newMachineOperationAliasCommand(
+		rt,
+		"host-soft-reboot NAME",
 		"Reboot the host operating system from the in-host agent through MachineOperation",
-		v1alpha3.OperationHostOSReboot,
-		"host-os-reboot",
+		v1alpha3.OperationHostSoftReboot,
+		"host-soft-reboot",
 	)
 }
 

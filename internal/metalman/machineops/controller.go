@@ -415,12 +415,12 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		target.ObservedGeneration = machine.Generation
 	}
 
-	switch op.Spec.OperationKind.Canonical() {
+	switch op.Spec.OperationKind {
 	case v1alpha3.OperationHostPowerOff:
 		return r.advancePowerOff(ctx, &machine, target, now)
 	case v1alpha3.OperationHostPowerOn:
 		return r.advancePowerOn(ctx, op, &machine, target, now)
-	case v1alpha3.OperationHostOutOfBandReboot:
+	case v1alpha3.OperationHostHardReboot:
 		return r.advanceReboot(ctx, op, &machine, target, now)
 	case v1alpha3.OperationHostReplace:
 		if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
@@ -538,7 +538,7 @@ func (r *Reconciler) advanceReboot(ctx context.Context, op *v1alpha3.MachineOper
 
 	case v1alpha3.OperationStagePoweringOn, v1alpha3.OperationStageWaitingOn:
 		if state == redfish.PowerOn {
-			return completeTarget(target, "HostOutOfBandReboot completed", now)
+			return completeTarget(target, "HostHardReboot completed", now)
 		}
 
 		if change, handled := r.waitForPowerAction(target, v1alpha3.OperationStageWaitingOn, "waiting for power on", "timed out waiting for reboot power on", now); handled {
@@ -1236,8 +1236,8 @@ func isExternalProviderMachine(machine *v1alpha3.Machine) bool {
 }
 
 func isHostOperation(operation v1alpha3.OperationKind) bool {
-	switch operation.Canonical() {
-	case v1alpha3.OperationHostOutOfBandReboot, v1alpha3.OperationHostPowerOff, v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostReplace:
+	switch operation {
+	case v1alpha3.OperationHostHardReboot, v1alpha3.OperationHostPowerOff, v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostReplace:
 		return true
 	default:
 		return false
