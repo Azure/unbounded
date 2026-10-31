@@ -111,7 +111,7 @@ func TestCollectSiteRoutingConfig(t *testing.T) {
 		}},
 	}
 
-	got, err := collectSiteRoutingConfig(sites, "local", true)
+	got, err := collectSiteRoutingConfig(sites, "local", true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestCollectSiteRoutingConfig(t *testing.T) {
 		t.Fatalf("gateway routing config=%+v, want %+v", got, want)
 	}
 
-	got, err = collectSiteRoutingConfig(sites, "local", false)
+	got, err = collectSiteRoutingConfig(sites, "local", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,8 +136,47 @@ func TestCollectSiteRoutingConfig(t *testing.T) {
 	}
 
 	sites["local"].Spec.LocalCIDRs = []string{"invalid"}
-	if _, err := collectSiteRoutingConfig(sites, "local", true); err == nil {
+	if _, err := collectSiteRoutingConfig(sites, "local", true, nil); err == nil {
 		t.Fatal("invalid local CIDR was accepted")
+	}
+}
+
+func TestCollectSiteRoutingConfigSkipsPeeredNodeCIDRs(t *testing.T) {
+	sites := map[string]*unboundedv1alpha3.Site{
+		"local": {Spec: unboundedv1alpha3.SiteSpec{
+			NodeCidrs: []string{"10.1.0.0/16"},
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
+				{CidrBlocks: []string{"10.244.0.0/16"}},
+			},
+		}},
+		"peered": {Spec: unboundedv1alpha3.SiteSpec{
+			NodeCidrs: []string{"10.2.0.0/16"},
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
+				{CidrBlocks: []string{"10.245.0.0/16"}},
+			},
+		}},
+		"remote": {Spec: unboundedv1alpha3.SiteSpec{
+			NodeCidrs: []string{"10.3.0.0/16"},
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{
+				{CidrBlocks: []string{"10.246.0.0/16"}},
+			},
+		}},
+	}
+
+	got, err := collectSiteRoutingConfig(sites, "local", true, map[string]bool{"local": true, "peered": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The peered Site keeps its pod pool and conntrack handling but its
+	// node network stays on the underlay; the unpeered Site is unchanged.
+	want := siteRoutingConfig{
+		gatewaySupernets:    []string{"10.244.0.0/16", "10.245.0.0/16", "10.246.0.0/16", "10.3.0.0/16"},
+		gatewayNotrackCIDRs: []string{"10.1.0.0/16", "10.2.0.0/16", "10.244.0.0/16", "10.245.0.0/16", "10.246.0.0/16", "10.3.0.0/16"},
+		gatewayReturnCIDRs:  []string{"10.1.0.0/16"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("gateway routing config=%+v, want %+v", got, want)
 	}
 }
 

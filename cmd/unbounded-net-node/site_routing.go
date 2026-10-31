@@ -21,7 +21,7 @@ type siteRoutingConfig struct {
 	gatewayReturnCIDRs  []string
 }
 
-func collectSiteRoutingConfig(sites map[string]*unboundedv1alpha3.Site, mySiteName string, isGateway bool) (siteRoutingConfig, error) {
+func collectSiteRoutingConfig(sites map[string]*unboundedv1alpha3.Site, mySiteName string, isGateway bool, networkPeeredSites map[string]bool) (siteRoutingConfig, error) {
 	var result siteRoutingConfig
 
 	if site := sites[mySiteName]; site != nil {
@@ -62,7 +62,11 @@ func collectSiteRoutingConfig(sites map[string]*unboundedv1alpha3.Site, mySiteNa
 		}
 
 		result.gatewayNotrackCIDRs = append(result.gatewayNotrackCIDRs, site.Spec.NodeCidrs...)
-		if name != mySiteName {
+
+		// A peered Site's nodes are reachable on the underlay and are tunnel
+		// endpoints, so routing them into unbounded0 would re-encapsulate
+		// tunnel traffic.
+		if name != mySiteName && !networkPeeredSites[name] {
 			result.gatewaySupernets = append(result.gatewaySupernets, site.Spec.NodeCidrs...)
 		}
 	}
