@@ -959,7 +959,7 @@ def run_operation_smoke_suite() -> None:
 
     reboot = create_machine_operation(
         "smoke-selector-host-reboot",
-        "HostReboot",
+        "HostOutOfBandReboot",
         machine_ref=None,
         site_selector=SITE,
     )
