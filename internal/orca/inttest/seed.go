@@ -39,11 +39,6 @@ func HugeBlob() SeedBlob {
 	return SeedBlob{Key: "sample-64chunk", Data: deterministicBytes(64*1024*1024, 0xd4)}
 }
 
-// AllBlobs returns the canonical seed set used across most tests.
-func AllBlobs() []SeedBlob {
-	return []SeedBlob{SmallBlob(), MediumBlob(), HugeBlob()}
-}
-
 // SeedS3 uploads each blob to the named bucket via the provided
 // S3-backend-friendly S3 client.
 func SeedS3(ctx context.Context, t *testing.T, cli *s3.Client, bucket string, blobs []SeedBlob) {
