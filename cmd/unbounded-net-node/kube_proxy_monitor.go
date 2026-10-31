@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,10 @@ type kubeProxyMonitor struct {
 
 	mu      sync.Mutex
 	warning string // empty when healthy
+}
+
+type kubeProxyHealthResponse struct {
+	Healthy bool `json:"healthy"`
 }
 
 // newKubeProxyMonitor creates a monitor that checks kube-proxy health at
@@ -82,9 +87,19 @@ func (m *kubeProxyMonitor) check() {
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256)) //nolint:errcheck
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		m.setWarning(fmt.Sprintf("read kube-proxy healthz response: %v", err))
+		return
+	}
 
-	if resp.StatusCode == http.StatusOK {
+	var health kubeProxyHealthResponse
+	if err := json.Unmarshal(body, &health); err != nil {
+		m.setWarning(fmt.Sprintf("parse kube-proxy healthz response: %v", err))
+		return
+	}
+
+	if health.Healthy {
 		m.clearWarning()
 		return
 	}
