@@ -49,6 +49,23 @@ func TestBuildMachineOperationWithMachineRef(t *testing.T) {
 	require.Equal(t, int32(3600), *op.Spec.TTLSecondsAfterFinished)
 }
 
+func TestBuildHostOSRebootOperation(t *testing.T) {
+	t.Parallel()
+
+	opts := &machineOperationCreateOptions{
+		name: "host-reboot", kind: v1alpha3.OperationHostOSReboot, machine: "worker-01",
+	}
+	require.NoError(t, opts.validate())
+	op, err := opts.build()
+	require.NoError(t, err)
+	require.Equal(t, v1alpha3.OperationHostOSReboot, op.Spec.OperationKind)
+	require.Equal(t, "worker-01", op.Spec.MachineRef)
+
+	opts.machine = ""
+	opts.selector = "role=worker"
+	require.ErrorContains(t, opts.validate(), "HostOSReboot requires --machine")
+}
+
 func TestBuildMachineOperationWithSelector(t *testing.T) {
 	t.Parallel()
 

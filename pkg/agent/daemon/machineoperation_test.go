@@ -304,6 +304,47 @@ func TestMachinaMachineOperationReconcilerIgnoresUnsupportedMatchingOperation(t 
 	}
 }
 
+func TestMachinaMachineOperationReconcilerWatchesHostOSRebootProgress(t *testing.T) {
+	t.Parallel()
+
+	r, err := NewMachinaMachineOperationReconciler(
+		fakeMachineOperationClient(), "machine-1", "node-1",
+		MachineOperationHandlers{
+			machinav1alpha3.OperationHostOSReboot: noopMachineOperationTarget,
+			machinav1alpha3.OperationNodeReboot:   noopMachineOperationTarget,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		kind    machinav1alpha3.OperationKind
+		phase   machinav1alpha3.OperationPhase
+		machine string
+		want    int
+	}{
+		{"pending", machinav1alpha3.OperationHostOSReboot, machinav1alpha3.OperationPhasePending, "machine-1", 1},
+		{"resume", machinav1alpha3.OperationHostOSReboot, machinav1alpha3.OperationPhaseInProgress, "machine-1", 1},
+		{"other host", machinav1alpha3.OperationHostOSReboot, machinav1alpha3.OperationPhaseInProgress, "machine-2", 0},
+		{"complete", machinav1alpha3.OperationHostOSReboot, machinav1alpha3.OperationPhaseComplete, "machine-1", 0},
+		{"failed", machinav1alpha3.OperationHostOSReboot, machinav1alpha3.OperationPhaseFailed, "machine-1", 0},
+		{"node reboot unchanged", machinav1alpha3.OperationNodeReboot, machinav1alpha3.OperationPhaseInProgress, "machine-1", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			op := &machinav1alpha3.MachineOperation{
+				ObjectMeta: metav1.ObjectMeta{Name: "reboot"},
+				Spec:       machinav1alpha3.MachineOperationSpec{MachineRef: tc.machine, OperationKind: tc.kind},
+				Status:     machinav1alpha3.MachineOperationStatus{Phase: tc.phase},
+			}
+			if got := len(r.mapMachineOperation(t.Context(), op)); got != tc.want {
+				t.Fatalf("queued %d operations, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func newTestMachinaMachineOperationReconciler(t *testing.T, c client.Client) *MachinaMachineOperationReconciler {
 	t.Helper()
 

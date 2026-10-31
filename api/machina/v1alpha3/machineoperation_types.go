@@ -51,7 +51,7 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostReboot;HostPowerOff;HostPowerOn;HostReplace
+// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostOSReboot;HostReboot;HostPowerOff;HostPowerOn;HostReplace
 type OperationKind string
 
 const (
@@ -68,6 +68,10 @@ const (
 	// OperationAgentReset resets the host by removing the unbounded-agent and
 	// all associated resources. Handled by the in-VM agent.
 	OperationAgentReset OperationKind = "AgentReset"
+
+	// OperationHostOSReboot reboots the host operating system through the
+	// host-side daemon agent, without an out-of-band power cycle.
+	OperationHostOSReboot OperationKind = "HostOSReboot"
 
 	// OperationHostReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
@@ -207,6 +211,7 @@ type ProviderMachineSnapshot struct {
 }
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
+// +kubebuilder:validation:XValidation:rule="self.operationKind != 'HostOSReboot' || (has(self.machineRef) && size(self.machineRef) > 0)",message="HostOSReboot requires machineRef"
 type MachineOperationSpec struct {
 	// MachineRef is the name of the Machine CR this operation targets.
 	// Either machineRef or machineSelector must be set.
@@ -266,6 +271,11 @@ type MachineOperationStatus struct {
 	// whether the operation acted on the expected machine state.
 	// +optional
 	ObservedMachineGeneration int64 `json:"observedMachineGeneration,omitempty"`
+
+	// HostBootID is the host boot ID observed before issuing HostOSReboot.
+	// The daemon completes the operation only after this ID changes.
+	// +optional
+	HostBootID string `json:"hostBootID,omitempty"`
 
 	// Targets records the per-machine execution state for this operation.
 	// For single-machine operations this contains one entry. For selector

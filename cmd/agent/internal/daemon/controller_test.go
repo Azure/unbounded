@@ -41,6 +41,12 @@ type fakeNodeOperator struct {
 	restartActive *ActiveMachine
 	restartErr    error
 
+	hostBootID       string
+	hostBootIDErr    error
+	hostRebootCalls  int
+	hostRebootErr    error
+	hostRebootDuring func()
+
 	resetCalled bool
 	resetErr    error
 
@@ -99,6 +105,19 @@ func (op *fakeNodeOperator) ResetAgentResources(context.Context, *slog.Logger) e
 	op.resetCalled = true
 
 	return op.resetErr
+}
+
+func (op *fakeNodeOperator) HostBootID() (string, error) {
+	return op.hostBootID, op.hostBootIDErr
+}
+
+func (op *fakeNodeOperator) RebootHost(context.Context, *slog.Logger) error {
+	op.hostRebootCalls++
+	if op.hostRebootDuring != nil {
+		op.hostRebootDuring()
+	}
+
+	return op.hostRebootErr
 }
 
 func (op *fakeNodeOperator) StopDaemon(context.Context, *slog.Logger) error {
@@ -169,6 +188,7 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 	target := &machineOperationTarget{
 		installation:         installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
 		Client:               c,
+		operationReader:      c,
 		log:                  discardLogger(),
 		machineName:          "test-machine",
 		nodeOperator:         op,
@@ -186,6 +206,7 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 		"test-node",
 		daemon.MachineOperationHandlers{
 			v1alpha3.OperationNodeReboot:   target.reconcileNodeReboot,
+			v1alpha3.OperationHostOSReboot: target.reconcileHostOSReboot,
 			v1alpha3.OperationAgentUpgrade: target.reconcileAgentUpgrade,
 			v1alpha3.OperationAgentReset:   target.reconcileAgentReset,
 		},

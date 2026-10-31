@@ -132,7 +132,9 @@ func (r *MachinaMachineOperationReconciler) mapMachineOperation(ctx context.Cont
 }
 
 func (r *MachinaMachineOperationReconciler) shouldEnqueue(ctx context.Context, op *machinav1alpha3.MachineOperation) bool {
-	if op.Status.Phase != "" && op.Status.Phase != machinav1alpha3.OperationPhasePending {
+	resumingHostReboot := op.Spec.OperationKind == machinav1alpha3.OperationHostOSReboot &&
+		op.Status.Phase == machinav1alpha3.OperationPhaseInProgress
+	if op.Status.Phase != "" && op.Status.Phase != machinav1alpha3.OperationPhasePending && !resumingHostReboot {
 		return false
 	}
 

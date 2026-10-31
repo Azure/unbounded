@@ -87,7 +87,7 @@ terminal phase.`,
 }
 
 func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreateOptions) {
-	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, HostReboot, HostPowerOff, HostPowerOn, or HostReplace")
+	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, HostOSReboot, HostReboot, HostPowerOff, HostPowerOn, or HostReplace")
 	cmd.Flags().StringVar(&o.machine, "machine", "", "Target Machine name")
 	cmd.Flags().StringVarP(&o.selector, "selector", "l", "", "Machine label selector")
 	cmd.Flags().StringArrayVar(&o.parameterArgs, "param", nil, "Operation parameter as key=value (repeatable)")
@@ -105,6 +105,7 @@ func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreat
 			string(v1alpha3.OperationNodeReboot),
 			string(v1alpha3.OperationAgentUpgrade),
 			string(v1alpha3.OperationAgentReset),
+			string(v1alpha3.OperationHostOSReboot),
 			string(v1alpha3.OperationHostReboot),
 			string(v1alpha3.OperationHostPowerOff),
 			string(v1alpha3.OperationHostPowerOn),
@@ -195,6 +196,10 @@ func (o *machineOperationCreateOptions) validate() error {
 
 	if (o.machine == "") == (o.selector == "") {
 		return fmt.Errorf("exactly one of --machine or --selector is required")
+	}
+
+	if o.kind == v1alpha3.OperationHostOSReboot && o.machine == "" {
+		return fmt.Errorf("HostOSReboot requires --machine")
 	}
 
 	if o.ttlSeconds < 0 && (o.ttlSeconds != -1 || o.ttlSet) {
