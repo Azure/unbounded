@@ -109,16 +109,22 @@ first, then `site init`.
 
 ### `kubectl unbounded site init`
 
-Initialize a new Unbounded site. This command:
+Initialize one Unbounded Site. This command:
 
 1. Validates inputs and kubeconfig access.
 2. Verifies `unbounded-operator` is installed: the cluster must serve the API
-   types `site init` applies (`Site` in `unbounded-cloud.io/v1alpha3`;
-   `GatewayPool` and `SiteGatewayPoolAssignment` in
-   `net.unbounded-cloud.io/v1alpha1`). This is checked via API discovery.
-3. Creates a cluster `Site`, a remote `Site`, and related net `GatewayPool` resources.
+   type `site init` applies (`Site` in `unbounded-cloud.io/v1alpha3`). This is
+   checked via API discovery.
+3. Creates or updates one `Site` with the given node and pod CIDRs.
 4. Records component choices in `Site.spec.components` for `unbounded-operator`.
-5. Creates a bootstrap token for the remote site.
+5. Creates a bootstrap token for the Site if it has no valid one, unless the Site
+   is named `cluster`. Re-running reuses a valid token; an expired one is
+   replaced.
+
+Run it once per Site: once with the reserved name `cluster` for the
+control-plane cluster's own nodes, then once for each remote site. The `cluster`
+Site gets no bootstrap token and does not enable the token refresher, because
+the token refresher ignores that Site.
 
 > **Prerequisite:** `site init` no longer bootstraps `unbounded-operator`. Run
 > [`kubectl unbounded install`](#kubectl-unbounded-install) first. If the cluster
@@ -127,19 +133,21 @@ Initialize a new Unbounded site. This command:
 > not yet rolled out, `site init` warns and proceeds (the operator reconciles the
 > Site once ready).
 
-Global components (`unbounded-net` and `machina`) are
-enabled on the cluster Site. `metalman` is per-site and is enabled on the remote
-Site when `--enable-metalman` is set.
+`site init` does not create gateway resources. Route Sites through gateway nodes
+by creating a `GatewayPool` and one `SiteGatewayPoolAssignment` per Site with
+`kubectl unbounded net create`, as in the example below.
+
+The operator deploys `unbounded-net` once any Site exists. `machina` runs
+cluster-wide when any Site enables it. `metalman` is per-site and runs for each
+Site that enables it.
 
 #### Required Flags
 
 | Flag | Type | Description |
 |------|------|-------------|
-| `--name` | `string` | Name of the site |
-| `--cluster-node-cidr` | `string` | Node CIDR of the control-plane cluster (e.g. `10.224.0.0/16`) |
-| `--cluster-pod-cidr` | `string` | Pod CIDR of the control-plane cluster (e.g. `10.244.0.0/16`) |
-| `--node-cidr` | `string` | Node CIDR for the new site (e.g. `10.100.0.0/24`) |
-| `--pod-cidr` | `string` | Pod CIDR for the new site (e.g. `10.101.0.0/24`) |
+| `--name` | `string` | Name of the Site. Use `cluster` for the control-plane cluster's own nodes. |
+| `--node-cidr` | `strings` | Comma-separated list of CIDRs that contain the Site's node IPs (e.g. `10.100.0.0/24,10.110.0.0/24`) |
+| `--pod-cidr` | `strings` | Comma-separated list of CIDRs to allocate the Site's pod IPs from (e.g. `10.101.0.0/24`) |
 
 #### Optional Flags
 
@@ -150,6 +158,14 @@ Site when `--enable-metalman` is set.
 | `--enable-machina` | `bool` | `true` | Enable machina in `Site.spec.components` |
 | `--enable-metalman` | `bool` | `false` | Enable metalman in `Site.spec.components` |
 
+> **Breaking change:** `site init` now creates exactly one Site per run. The
+> `--cluster-node-cidr` and `--cluster-pod-cidr` flags have been removed, and
+> `site init` no longer creates the `gw-main` `GatewayPool` or any
+> `SiteGatewayPoolAssignment`. Create the cluster Site with
+> `site init --name cluster` and the cluster's CIDRs, and create gateway
+> resources with `kubectl unbounded net create`. Gateway resources created by
+> earlier versions are left as they are.
+
 > **Breaking change:** the `--skip-install` and `--install-timeout` flags have
 > been removed. `site init` no longer installs the operator, so there is nothing
 > to skip or time out. Run `kubectl unbounded install` first. Automation passing
@@ -157,7 +173,12 @@ Site when `--enable-metalman` is set.
 
 #### Validation
 
+- `--node-cidr` and `--pod-cidr` each need at least one CIDR. Spaces around
+  entries are ignored; empty entries are rejected.
 - All CIDR values must be valid IPv4 CIDR notation.
+- A node CIDR may not be listed twice. Entries are compared by network, so
+  `10.0.0.5/24` repeats `10.0.0.0/24`.
+- Pod CIDRs may not overlap each other.
 - The kubeconfig must be readable.
 - `unbounded-operator` must be installed (the cluster must serve the required API types).
 
@@ -166,25 +187,39 @@ Site when `--enable-metalman` is set.
 ```bash
 kubectl unbounded install
 
+# The control-plane cluster's own nodes
+kubectl unbounded site init \
+  --name cluster \
+  --node-cidr 10.224.0.0/16 \
+  --pod-cidr 10.244.0.0/16
+
+# A remote site
 kubectl unbounded site init \
   --name my-edge-site \
-  --cluster-node-cidr 10.224.0.0/16 \
-  --cluster-pod-cidr 10.244.0.0/16 \
   --node-cidr 10.100.0.0/24 \
   --pod-cidr 10.101.0.0/24
+
+# Route both Sites through the nodes labeled as gateways
+kubectl unbounded net create gatewaypool gw-main \
+  --type External \
+  --node-selector unbounded-cloud.io/unbounded-net-gateway=true
+kubectl unbounded net create sitegatewaypoolassignment cluster \
+  --site cluster --gateway-pool gw-main
+kubectl unbounded net create sitegatewaypoolassignment my-edge-site \
+  --site my-edge-site --gateway-pool gw-main
 ```
 
-With optional components:
+With several CIDR ranges and optional components:
 
 ```bash
 kubectl unbounded site init \
   --name dc2 \
-  --cluster-node-cidr 10.224.0.0/16 \
-  --cluster-pod-cidr 10.244.0.0/16 \
-  --node-cidr 10.200.0.0/24 \
-  --pod-cidr 10.201.0.0/24 \
+  --node-cidr 10.200.0.0/24,10.210.0.0/24 \
+  --pod-cidr 10.201.0.0/24,10.211.0.0/24 \
   --enable-metalman \
   --kubeconfig ~/.kube/config
+kubectl unbounded net create sitegatewaypoolassignment dc2 \
+  --site dc2 --gateway-pool gw-main
 ```
 
 ---

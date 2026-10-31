@@ -30,32 +30,52 @@ First, bootstrap the Unbounded CRDs and `unbounded-operator`:
 kubectl unbounded install
 ```
 
-Then run `kubectl unbounded site init` to create a new site. It requires the
-operator to be installed (from the step above) and errors otherwise. This
-command handles:
+Then run `kubectl unbounded site init` to create the Sites. It requires the
+operator to be installed (from the step above) and errors otherwise. Each run
+handles one Site:
 
-- Creating site resources for both the cluster and the new site
+- Creating the Site with its node and pod CIDRs
 - Recording requested components in `Site.spec.components`
-- Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-cloud.io/site=<name>`)
+- Creating a **bootstrap token** Secret in `kube-system` (labeled `unbounded-cloud.io/site=<name>`), except for the `cluster` Site
 - Letting the operator deploy unbounded-net, machina, and optional components
+
+Run it once with the reserved name `cluster` for the cluster's own nodes, then
+once for the new site:
 
 ```bash
 kubectl unbounded site init \
+  --name cluster \
+  --node-cidr 10.240.0.0/16 \
+  --pod-cidr 10.244.0.0/16
+
+kubectl unbounded site init \
   --name mysite \
-  --cluster-node-cidr 10.240.0.0/16 \
-  --cluster-pod-cidr 10.244.0.0/16 \
   --node-cidr 10.1.0.0/24 \
   --pod-cidr 10.2.0.0/24
 ```
 
-All five flags above are required. Optional flags:
+`--name`, `--node-cidr`, and `--pod-cidr` are required. `--node-cidr` and
+`--pod-cidr` take comma-separated lists of CIDRs. Optional flags:
 
 | Flag | Description |
 |---|---|
 | `--kubeconfig` | Path to kubeconfig file |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
-| `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
+| `--enable-machina` | Enable machina in the Site spec (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
+
+`site init` does not create gateway resources. Route both Sites through the
+gateway nodes:
+
+```bash
+kubectl unbounded net create gatewaypool gw-main \
+  --type External \
+  --node-selector unbounded-cloud.io/unbounded-net-gateway=true
+kubectl unbounded net create sitegatewaypoolassignment cluster \
+  --site cluster --gateway-pool gw-main
+kubectl unbounded net create sitegatewaypoolassignment mysite \
+  --site mysite --gateway-pool gw-main
+```
 
 ## Creating Machines
 

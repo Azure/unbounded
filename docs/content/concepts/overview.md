@@ -136,8 +136,10 @@ The flow varies by provisioning path, but all paths share the same final steps:
 **SSH path:**
 
 1. **`kubectl unbounded install`** bootstraps `unbounded-operator` and its CRDs,
-   then **`kubectl unbounded site init`** creates Site and GatewayPool resources,
-   records enabled components, and generates a bootstrap token.
+   then **`kubectl unbounded site init`** creates a Site (run once per Site),
+   records enabled components, and generates a bootstrap token. A
+   `GatewayPool` and `SiteGatewayPoolAssignment` resources route the Sites
+   through gateway nodes.
 2. **`kubectl unbounded machine register`** creates a `Machine` resource with
    SSH connection details.
 3. **machina** SSHs into the host, runs the install script, and waits for the

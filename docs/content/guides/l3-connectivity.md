@@ -23,7 +23,7 @@ This guide uses Azure VPN Gateway and a Ubiquiti router as a concrete example, b
 3. **[Configure the Ubiquiti side](#3-configure-the-ubiquiti-side)** -- establish the IPsec tunnel from your router
 4. **[Verify the VPN connection](#4-verify-the-vpn-connection)** -- confirm L3 reachability between networks
 5. **[Prepare gateway nodes](#5-prepare-gateway-nodes)** -- label AKS nodes for unbounded-net
-6. **[Initialize the site](#6-initialize-the-site)** -- install unbounded-net and create site resources
+6. **[Initialize the Sites](#6-initialize-the-sites)** -- install the operator, create the Sites, and assign them to a gateway pool
 7. **[Configure direct L3 routing](#7-configure-direct-l3-routing)** -- disable WireGuard and route over the VPN
 8. **[Add remote machines](#8-add-remote-machines)** -- join machines from the Ubiquiti network
 9. **[Verify connectivity](#9-verify-connectivity)** -- test cross-site pod networking
@@ -335,10 +335,11 @@ kubectl get nodes -l unbounded-cloud.io/unbounded-net-gateway=true
 
 ---
 
-## 6. Initialize the Site
+## 6. Initialize the Sites
 
 Install `unbounded-operator` (if you haven't already), then run
-`kubectl unbounded site init` to create the site resources. `site init` requires
+`kubectl unbounded site init` once per Site: once with the reserved name
+`cluster` for the AKS nodes, then once for the remote site. `site init` requires
 the operator to be installed and errors otherwise. The CIDRs must match the
 networks reachable over the VPN:
 
@@ -346,34 +347,74 @@ networks reachable over the VPN:
 kubectl unbounded install
 
 kubectl unbounded site init \
+    --name cluster \
+    --node-cidr 10.224.0.0/16 \
+    --pod-cidr 10.244.0.0/16
+
+kubectl unbounded site init \
     --name ubiquiti-site \
-    --cluster-node-cidr 10.224.0.0/16 \
-    --cluster-pod-cidr 10.244.0.0/16 \
     --node-cidr 192.168.1.0/24 \
     --pod-cidr 10.245.0.0/16
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name` | Name for the remote site (used in Site and SitePeering resources) |
-| `--cluster-node-cidr` | CIDR of the AKS VNet node subnet |
-| `--cluster-pod-cidr` | Pod CIDR used by the AKS cluster |
-| `--node-cidr` | Subnet behind the Ubiquiti router (`192.168.1.0/24`) |
-| `--pod-cidr` | Pod CIDR for the remote site (must not overlap cluster CIDRs) |
+| `--name` | `cluster` for the AKS nodes, or a name for the remote site (used in Site and SitePeering resources) |
+| `--node-cidr` | For `cluster`, the AKS VNet node subnet; for the remote site, the subnet behind the Ubiquiti router (`192.168.1.0/24`) |
+| `--pod-cidr` | For `cluster`, the pod CIDR used by the AKS cluster; for the remote site, a pod CIDR that must not overlap the cluster CIDRs |
 
 {{< callout type="info" >}}
 **Clusters with an existing CNI** (e.g. Azure CNI, Cilium, Calico): Add `--manage-cni-plugin=false` so unbounded-net doesn't overwrite the existing CNI configuration. See [manageCniPlugin behavior]({{< relref "reference/networking/custom-resources#managecniplugin-behavior" >}}) for details.
 {{< /callout >}}
 
-This command creates:
+`site init` does not create gateway resources. Create a gateway pool that
+selects the labeled gateway nodes, and assign both Sites to it. The pool uses
+`type: Internal` because the Sites reach each other over the VPN (see
+[Why the GatewayPool is Internal](#why-the-gatewaypool-is-internal)):
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: GatewayPool
+metadata:
+  name: gw-main
+spec:
+  nodeSelector:
+    unbounded-cloud.io/unbounded-net-gateway: "true"
+  type: Internal
+---
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: SiteGatewayPoolAssignment
+metadata:
+  name: cluster
+spec:
+  sites:
+    - cluster
+  gatewayPools:
+    - gw-main
+---
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: SiteGatewayPoolAssignment
+metadata:
+  name: ubiquiti-site
+spec:
+  sites:
+    - ubiquiti-site
+  gatewayPools:
+    - gw-main
+EOF
+```
+
+These commands create:
 
 - The **unbounded-operator**, which deploys the enabled components
 - A **cluster** Site for the AKS nodes
 - A **ubiquiti-site** Site for the remote machines
+- A **bootstrap token** for the remote site
+- Component settings that enable the **machina** controller; the operator
+  deploys unbounded-net once a Site exists
 - A **GatewayPool** (`gw-main`) selecting labeled gateway nodes
 - **SiteGatewayPoolAssignments** linking both sites to the gateway pool
-- A **bootstrap token** for the remote site
-- Component settings that enable unbounded-net and the **machina** controller
 
 ---
 
@@ -382,7 +423,7 @@ This command creates:
 This is the key step that differentiates an L3 connectivity setup from the
 default WireGuard configuration. You'll create a `SitePeering` that tells
 unbounded-net to route directly over the VPN instead of building WireGuard
-tunnels, and update the gateway pool to use internal IPs.
+tunnels.
 
 ### Create the SitePeering
 
@@ -417,24 +458,26 @@ EOF
 Both approaches can coexist in the same cluster. For example, you could have this direct L3 peering for your Ubiquiti site while other remote sites still connect over WireGuard through the public internet. See [Externally Peered Sites]({{< relref "concepts/networking#externally-peered-sites" >}}) for more details.
 {{< /callout >}}
 
-### Update the GatewayPool type to Internal
+### Why the GatewayPool is Internal
 
-By default, `site init` creates the gateway pool with `type: External`, which
-means cross-site connections resolve to gateway nodes' external (public) IPs.
-Since VPN traffic uses internal IPs, change the pool type to `Internal`:
+The gateway pool from step 6 uses `type: Internal`, so cross-site connections
+resolve to the gateway nodes' internal IPs, which VPN traffic needs. A pool with
+`type: External` resolves to their external (public) IPs instead:
+
+| Pool Type | IP Used for Cross-Site | When to Use |
+|-----------|----------------------|-------------|
+| `External` | Public IPs | Sites connected over the public internet (WireGuard) |
+| `Internal` | Internal/private IPs | Sites connected over VPN, ExpressRoute, or Direct Connect |
+
+To switch a pool that was created as `External`:
 
 ```bash
 kubectl patch gatewaypool gw-main --type merge -p '{"spec":{"type":"Internal"}}'
 ```
 
-| Pool Type | IP Used for Cross-Site | When to Use |
-|-----------|----------------------|-------------|
-| `External` (default) | Public IPs | Sites connected over the public internet (WireGuard) |
-| `Internal` | Internal/private IPs | Sites connected over VPN, ExpressRoute, or Direct Connect |
-
-After applying these changes, unbounded-net routes cross-site traffic through
-the gateway nodes' internal IPs, which are reachable through the Azure VPN
-tunnel.
+With the SitePeering and the Internal pool in place, unbounded-net routes
+cross-site traffic through the gateway nodes' internal IPs, which are reachable
+through the Azure VPN tunnel.
 
 ---
 

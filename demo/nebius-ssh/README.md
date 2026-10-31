@@ -149,19 +149,31 @@ Install the CRDs and deploy `unbounded-operator` to your cluster:
 kubectl unbounded install
 ```
 
-### Step 2: Initialize the Site and generate SSH key
+### Step 2: Initialize the Sites and generate SSH key
 
-Create the Site resources and bootstrap token, then generate an Ed25519 SSH key
-pair. The public key is saved locally as `unbounded_ed25519.pub` and the private
-key is stored as a Secret in the `unbounded-system` namespace.
+Create the cluster Site, the Nebius Site and its bootstrap token, and the
+gateway resources that route between them. `site init` creates one Site per
+run, so run it once with the reserved name `cluster` for the AKS nodes and once
+for Nebius. Then generate an Ed25519 SSH key pair. The public key is saved
+locally as `unbounded_ed25519.pub` and the private key is stored as a Secret in
+the `unbounded-system` namespace.
 
 ```bash
 kubectl unbounded site init \
+  --name cluster \
+  --node-cidr <AKS_NODE_CIDR> \
+  --pod-cidr <AKS_POD_CIDR>
+kubectl unbounded site init \
   --name site-nebius \
-  --cluster-node-cidr <AKS_NODE_CIDR> \
-  --cluster-pod-cidr <AKS_POD_CIDR> \
   --node-cidr 172.20.0.0/16 \
   --pod-cidr 10.200.0.0/16
+kubectl unbounded net create gatewaypool gw-main \
+  --type External \
+  --node-selector unbounded-cloud.io/unbounded-net-gateway=true
+kubectl unbounded net create sitegatewaypoolassignment cluster \
+  --site cluster --gateway-pool gw-main
+kubectl unbounded net create sitegatewaypoolassignment site-nebius \
+  --site site-nebius --gateway-pool gw-main
 ssh-keygen -t ed25519 -f ./unbounded_ed25519 -N ""
 ```
 

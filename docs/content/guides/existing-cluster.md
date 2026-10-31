@@ -15,7 +15,7 @@ You'll label gateway nodes, initialize a site, and join remote machines.
 
 1. **[Install the prerequisites](#1-install-the-prerequisites)** -- kubectl and the unbounded plugin
 2. **[Prepare gateway nodes](#2-prepare-gateway-nodes)** -- label and open WireGuard ports
-3. **[Initialize a site](#3-initialize-a-site)** -- install the operator and create site resources
+3. **[Initialize Sites](#3-initialize-sites)** -- install the operator, create the cluster and remote Sites, and route them through the gateways
 4. **[Add machines](#4-add-machines)** -- register remote hosts for SSH provisioning
 5. **[Watch progress](#5-watch-progress)** -- monitor the provisioning lifecycle
 
@@ -68,12 +68,12 @@ kubectl label node <node-name> "unbounded-cloud.io/unbounded-net-gateway=true"
 ```
 
 {{< callout type="important" >}}
-`kubectl unbounded site init` creates a `GatewayPool` that selects this label. You must ensure UDP ports 51820-51899 are open on the gateway node's firewall; the init command does not open these ports for you.
+The `GatewayPool` you create in [step 3](#3-initialize-sites) selects this label. You must ensure UDP ports 51820-51899 are open on the gateway node's firewall; Unbounded does not open these ports for you.
 {{< /callout >}}
 
 ---
 
-## 3. Initialize a Site
+## 3. Initialize Sites
 
 First, bootstrap `unbounded-operator` on the cluster. This installs the CRDs and
 the operator that reconciles Unbounded components:
@@ -82,28 +82,33 @@ the operator that reconciles Unbounded components:
 kubectl unbounded install
 ```
 
-A **Site** represents a remote location where machines will run. The `site init`
-command requires the operator to already be installed (it errors otherwise). It
-creates site resources, records the requested components in
+A **Site** represents a location where nodes run. The `site init` command
+creates one Site per run. It requires the operator to already be installed (it
+errors otherwise). It creates the Site, records the requested components in
 `Site.spec.components`, and generates a bootstrap token. The operator deploys
 unbounded-net, machina, and optional components from the Site specs.
 
+Run it twice: once with the reserved name `cluster` for your cluster's own
+nodes, then once for the remote site. The `cluster` Site gets no bootstrap
+token, since no machines join through it.
+
 ```bash
 kubectl unbounded site init \
+    --name cluster \
+    --node-cidr 10.224.0.0/16 \
+    --pod-cidr 10.244.0.0/16
+
+kubectl unbounded site init \
     --name my-site \
-    --cluster-node-cidr 10.224.0.0/16 \
-    --cluster-pod-cidr 10.244.0.0/16 \
     --node-cidr 192.168.1.0/24 \
     --pod-cidr 10.245.0.0/16
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--name` | Name of the remote site |
-| `--cluster-node-cidr` | CIDR used by the cluster for node IPs |
-| `--cluster-pod-cidr` | CIDR used by the cluster for pod IPs |
-| `--node-cidr` | Subnet of your remote machines (e.g. `192.168.1.0/24`). Must not overlap with the cluster's node CIDR. |
-| `--pod-cidr` | Pod CIDR for the remote site (e.g. `10.245.0.0/16`). Must not overlap with the cluster's pod or service CIDRs. |
+| `--name` | Name of the Site: `cluster` for the cluster's own nodes, or a name for the remote site |
+| `--node-cidr` | Comma-separated CIDRs that contain the Site's node IPs. For `cluster`, the cluster's node subnet; for the remote site, the subnet of your remote machines (e.g. `192.168.1.0/24`), which must not overlap with the cluster's. |
+| `--pod-cidr` | Comma-separated CIDRs for the Site's pod IPs. For `cluster`, the cluster's pod CIDR; for the remote site, a range such as `10.245.0.0/16` that must not overlap with the cluster's pod or service CIDRs. |
 
 <details>
 <summary>Optional flags</summary>
@@ -112,10 +117,22 @@ kubectl unbounded site init \
 |------|-------------|
 | `--kubeconfig` | Path to kubeconfig file |
 | `--manage-cni-plugin` | Set to `false` when the cluster already has a CNI (default: `true`) |
-| `--enable-machina` | Enable machina on the cluster Site (default: `true`) |
+| `--enable-machina` | Enable machina in the Site spec (default: `true`) |
 | `--enable-metalman` | Enable the metalman component in the Site spec |
 
 </details>
+
+Then route both Sites through the gateway nodes you labeled in step 2:
+
+```bash
+kubectl unbounded net create gatewaypool gw-main \
+    --type External \
+    --node-selector unbounded-cloud.io/unbounded-net-gateway=true
+kubectl unbounded net create sitegatewaypoolassignment cluster \
+    --site cluster --gateway-pool gw-main
+kubectl unbounded net create sitegatewaypoolassignment my-site \
+    --site my-site --gateway-pool gw-main
+```
 
 {{< callout type="tip" >}}
 **AKS users:** The `aks-quickstart.sh setup` command can auto-detect your cluster's CIDRs and add a properly configured gateway node pool. See the [Getting Started]({{< relref "guides/getting-started" >}}) guide for details.
