@@ -34,9 +34,6 @@ type Collector struct {
 // Option configures a Collector.
 type Option func(*Collector)
 
-// WithFS injects a FileSystem. Defaults to the host filesystem.
-func WithFS(f FileSystem) Option { return func(c *Collector) { c.fs = f } }
-
 // New constructs a Collector with production defaults.
 func New(opts ...Option) *Collector {
 	c := &Collector{fs: osFS{}}
