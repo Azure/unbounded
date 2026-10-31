@@ -7,7 +7,7 @@ description: "Power management and host replacement operations."
 Host operations change the power state of the VM, PXE host, or bare-metal
 machine. They are handled by `machine-ops-controller` for cloud VMs and by
 `metalman` for PXE/bare-metal machines with BMC. The exception is
-`HostOSReboot`, which the `unbounded-agent` daemon on the host executes.
+`HostSoftReboot`, which the `unbounded-agent` daemon on the host executes.
 
 For metalman-managed bare-metal machines, host operations may target a single
 machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
@@ -28,28 +28,27 @@ Host operations require out-of-band management access to the machine through a
 cloud provider API or BMC. The controller executing the operation communicates
 directly with the provider rather than through the agent on the host.
 
-`HostOSReboot` is the exception: the agent reboots the host OS itself, so it
+`HostSoftReboot` is the exception: the agent reboots the host OS itself, so it
 works on any machine running the agent, including SSH-joined machines.
 
 Machines joined via SSH do not have a cloud provider or BMC backing them.
-`HostOutOfBandReboot`, `HostPowerOff`, `HostPowerOn`, and `HostReplace` cannot work
+`HostHardReboot`, `HostPowerOff`, `HostPowerOn`, and `HostReplace` cannot work
 for SSH-joined machines because there is no out-of-band API to power-cycle,
-power on, or recreate the machine. Use `HostOSReboot` to reboot them.
+power on, or recreate the machine. Use `HostSoftReboot` to reboot them.
 
 | Operation | Cloud VM | Bare metal (BMC) | SSH-joined |
 |-----------|----------|-------------------|------------|
-| `HostOutOfBandReboot` | Yes | Yes | Not supported |
-| `HostOSReboot` | Yes (agent) | Yes (agent) | Yes (agent) |
+| `HostHardReboot` | Yes | Yes | Not supported |
+| `HostSoftReboot` | Yes (agent) | Yes (agent) | Yes (agent) |
 | `HostPowerOff` | Yes | Yes | Not supported |
 | `HostPowerOn` | Yes | Yes | Not supported |
 | `HostReplace` | Yes | Yes | Not supported |
 
-## HostOutOfBandReboot
+## HostHardReboot
 
 Reboots or power-cycles the host through the provider or BMC. Use this when a
 host is unresponsive or you need to apply host-level changes that require a
-restart. `HostOOBReboot` is an accepted alias for `HostOutOfBandReboot`;
-controllers handle both kinds identically.
+restart.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -58,7 +57,7 @@ metadata:
   name: reboot-worker-01
 spec:
   machineRef: worker-01
-  operationKind: HostOutOfBandReboot
+  operationKind: HostHardReboot
 ```
 
 ```bash
@@ -67,10 +66,10 @@ kubectl get mop reboot-worker-01 -w
 ```
 
 ```
-NAME                KIND          MACHINE      PHASE        AGE
-reboot-worker-01    HostOutOfBandReboot    worker-01    Pending      0s
-reboot-worker-01    HostOutOfBandReboot    worker-01    InProgress   2s
-reboot-worker-01    HostOutOfBandReboot    worker-01    Complete     45s
+NAME                KIND              MACHINE      PHASE        AGE
+reboot-worker-01    HostHardReboot    worker-01    Pending      0s
+reboot-worker-01    HostHardReboot    worker-01    InProgress   2s
+reboot-worker-01    HostHardReboot    worker-01    Complete     45s
 ```
 
 ### Provider Behavior
@@ -81,26 +80,26 @@ reboot-worker-01    HostOutOfBandReboot    worker-01    Complete     45s
 | OCI Instance | `RESET` |
 | Bare metal (BMC) | Redfish power reset |
 
-## HostOSReboot
+## HostSoftReboot
 
 Reboots the host operating system from inside the host. The `unbounded-agent`
 daemon runs `systemctl reboot`, so systemd stops services in order before the
 host restarts. No cloud provider or BMC access is needed. Use this to apply
 kernel or OS changes on a healthy host. If the host is unresponsive, use
-`HostOutOfBandReboot` instead.
+`HostHardReboot` instead.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
 kind: MachineOperation
 metadata:
-  name: os-reboot-worker-01
+  name: soft-reboot-worker-01
 spec:
   machineRef: worker-01
-  operationKind: HostOSReboot
+  operationKind: HostSoftReboot
 ```
 
 ```bash
-kubectl unbounded machine host-os-reboot worker-01
+kubectl unbounded machine host-soft-reboot worker-01
 ```
 
 The agent marks the operation `InProgress` and records the current kernel boot

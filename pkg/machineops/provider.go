@@ -226,14 +226,13 @@ func (p *Provider) ProviderMachineKind() (schema.GroupKind, bool) {
 	return *p.providerMachineKind, true
 }
 
-// Operation returns the lifecycle strategy registered for kind. Kind aliases
-// resolve to the operation registered for their canonical kind.
+// Operation returns the lifecycle strategy registered for kind.
 func (p *Provider) Operation(kind unboundedv1alpha3.OperationKind) (*Operation, bool) {
 	if p == nil {
 		return nil, false
 	}
 
-	operation, ok := p.operations[kind.Canonical()]
+	operation, ok := p.operations[kind]
 
 	return operation, ok
 }
@@ -342,7 +341,6 @@ func configureOperation(
 }
 
 func registerOperation(provider *Provider, kind unboundedv1alpha3.OperationKind, operation *Operation) error {
-	kind = kind.Canonical()
 	if _, exists := provider.operations[kind]; exists {
 		return fmt.Errorf("operation %q is already registered for provider %q", kind, provider.name)
 	}

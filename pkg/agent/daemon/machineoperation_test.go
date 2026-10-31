@@ -131,7 +131,7 @@ func TestMachinaMachineOperationReconcilerSkipsTerminalAndIgnoresUnsupported(t *
 	}
 	unsupported := &machinav1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: "unsupported"},
-		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationHostOutOfBandReboot},
+		Spec:       machinav1alpha3.MachineOperationSpec{OperationKind: machinav1alpha3.OperationHostHardReboot},
 	}
 	target := &recordingMachineOperationTargetState{}
 
@@ -294,7 +294,7 @@ func TestMachinaMachineOperationReconcilerIgnoresUnsupportedMatchingOperation(t 
 		ObjectMeta: metav1.ObjectMeta{Name: "unsupported"},
 		Spec: machinav1alpha3.MachineOperationSpec{
 			MachineRef:    "machine-1",
-			OperationKind: machinav1alpha3.OperationHostOutOfBandReboot,
+			OperationKind: machinav1alpha3.OperationHostHardReboot,
 		},
 	}
 

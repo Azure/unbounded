@@ -36,18 +36,18 @@ type machineOperationTarget struct {
 	// restartRequested is set once this daemon has staged an AgentUpgrade and
 	// asked to be restarted for it; see reconcileAgentUpgrade.
 	restartRequested atomic.Bool
-	// rebootRequested is set once this daemon has issued a HostOSReboot;
-	// see reconcileHostOSReboot.
+	// rebootRequested is set once this daemon has issued a HostSoftReboot;
+	// see reconcileHostSoftReboot.
 	rebootRequested atomic.Bool
 }
 
 // handlers returns the MachineOperation handlers this daemon runs.
 func (t *machineOperationTarget) handlers() daemon.MachineOperationHandlers {
 	return daemon.MachineOperationHandlers{
-		v1alpha3.OperationNodeReboot:   t.unlessStopping(t.reconcileNodeReboot),
-		v1alpha3.OperationAgentUpgrade: t.unlessStopping(t.reconcileAgentUpgrade),
-		v1alpha3.OperationAgentReset:   t.unlessStopping(t.reconcileAgentReset),
-		v1alpha3.OperationHostOSReboot: t.unlessStopping(t.reconcileHostOSReboot),
+		v1alpha3.OperationNodeReboot:     t.unlessStopping(t.reconcileNodeReboot),
+		v1alpha3.OperationAgentUpgrade:   t.unlessStopping(t.reconcileAgentUpgrade),
+		v1alpha3.OperationAgentReset:     t.unlessStopping(t.reconcileAgentReset),
+		v1alpha3.OperationHostSoftReboot: t.unlessStopping(t.reconcileHostSoftReboot),
 	}
 }
 

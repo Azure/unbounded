@@ -19,20 +19,20 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
 
-func hostOSRebootOperation(name string) *v1alpha3.MachineOperation {
+func hostSoftRebootOperation(name string) *v1alpha3.MachineOperation {
 	return &v1alpha3.MachineOperation{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    "test-machine",
-			OperationKind: v1alpha3.OperationHostOSReboot,
+			OperationKind: v1alpha3.OperationHostSoftReboot,
 		},
 	}
 }
 
-// issuedHostOSRebootOperation returns an operation an earlier daemon on
+// issuedHostSoftRebootOperation returns an operation an earlier daemon on
 // machineName issued a reboot for while the host had bootID.
-func issuedHostOSRebootOperation(name, machineName, bootID string) *v1alpha3.MachineOperation {
-	op := hostOSRebootOperation(name)
+func issuedHostSoftRebootOperation(name, machineName, bootID string) *v1alpha3.MachineOperation {
+	op := hostSoftRebootOperation(name)
 	op.Spec.MachineRef = machineName
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
 	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
@@ -61,7 +61,7 @@ func getMachineOperation(t *testing.T, c client.Client, name string) v1alpha3.Ma
 func TestReconcileHostOSReboot_CompletesAfterReboot(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
 	op := &fakeNodeOperator{bootID: "boot-1"}
-	c := fakeStatusClient(machine, hostOSRebootOperation("op-1"))
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"))
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
 	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
@@ -78,11 +78,11 @@ func TestReconcileHostOSReboot_CompletesAfterReboot(t *testing.T) {
 	assert.Equal(t, "boot-1", updated.Status.Targets[0].BootID)
 
 	// The daemon that starts after the reboot observes a new boot ID.
-	require.NoError(t, publishHostOSReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
 
 	updated = getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
-	assert.Equal(t, "HostOSReboot completed", updated.Status.Message)
+	assert.Equal(t, "HostSoftReboot completed", updated.Status.Message)
 	assert.Equal(t, int64(4), updated.Status.ObservedMachineGeneration)
 	require.NotNil(t, updated.Status.CompletedAt)
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Targets[0].Phase)
@@ -92,7 +92,7 @@ func TestReconcileHostOSReboot_CompletesAfterReboot(t *testing.T) {
 func TestReconcileHostOSReboot_RebootsOnlyOnce(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
 	op := &fakeNodeOperator{bootID: "boot-1"}
-	c := fakeStatusClient(machine, hostOSRebootOperation("op-1"), hostOSRebootOperation("op-2"))
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"), hostSoftRebootOperation("op-2"))
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
 	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
@@ -110,7 +110,7 @@ func TestReconcileHostOSReboot_RebootsOnlyOnce(t *testing.T) {
 func TestReconcileHostOSReboot_RebootCommandFails(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
 	op := &fakeNodeOperator{bootID: "boot-1", rebootErr: errors.New("systemctl reboot: denied")}
-	c := fakeStatusClient(machine, hostOSRebootOperation("op-1"), hostOSRebootOperation("op-2"))
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"), hostSoftRebootOperation("op-2"))
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
 	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
@@ -128,7 +128,7 @@ func TestReconcileHostOSReboot_RebootCommandFails(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, op.rebootCalls)
 
-	require.NoError(t, publishHostOSReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
 	updated = getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 }
@@ -139,7 +139,7 @@ func TestReconcileHostOSReboot_StatusWriteFailsDoesNotReboot(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(fakeScheme()).
 		WithStatusSubresource(&v1alpha3.MachineOperation{}).
-		WithObjects(machine, hostOSRebootOperation("op-1")).
+		WithObjects(machine, hostSoftRebootOperation("op-1")).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
 				return errors.New("apiserver unavailable")
@@ -163,7 +163,7 @@ func TestReconcileHostOSReboot_DefersOtherOperations(t *testing.T) {
 		},
 	}
 	op := &fakeNodeOperator{bootID: "boot-1", active: &ActiveMachine{Name: "kube1"}}
-	c := fakeStatusClient(machine, hostOSRebootOperation("op-1"), nodeReboot)
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"), nodeReboot)
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
 	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
@@ -180,7 +180,7 @@ func TestReconcileHostOSReboot_DaemonStoppingLeavesInProgress(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
 	ctx, cancel := context.WithCancel(context.Background())
 	op := &fakeNodeOperator{bootID: "boot-1", rebootErr: errors.New("signal: terminated"), rebootDuring: cancel}
-	c := fakeStatusClient(machine, hostOSRebootOperation("op-1"))
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"))
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
 	_, err := reconciler.ReconcileMachineOperation(ctx, "op-1")
@@ -190,7 +190,7 @@ func TestReconcileHostOSReboot_DaemonStoppingLeavesInProgress(t *testing.T) {
 	assert.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase, "the next daemon decides from the boot ID")
 
 	// The reboot happened after all.
-	require.NoError(t, publishHostOSReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
 
 	updated = getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
@@ -199,7 +199,7 @@ func TestReconcileHostOSReboot_DaemonStoppingLeavesInProgress(t *testing.T) {
 func TestReconcileHostOSReboot_BootIDUnavailable(t *testing.T) {
 	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
 	op := &fakeNodeOperator{bootIDErr: errors.New("read boot ID: missing")}
-	c := fakeStatusClient(machine, hostOSRebootOperation("op-1"))
+	c := fakeStatusClient(machine, hostSoftRebootOperation("op-1"))
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
 	_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
@@ -212,9 +212,9 @@ func TestReconcileHostOSReboot_BootIDUnavailable(t *testing.T) {
 }
 
 func TestPublishHostOSReboots_SameBootFails(t *testing.T) {
-	c := fakeStatusClient(issuedHostOSRebootOperation("op-1", "test-machine", "boot-1"))
+	c := fakeStatusClient(issuedHostSoftRebootOperation("op-1", "test-machine", "boot-1"))
 
-	require.NoError(t, publishHostOSReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-1")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-1")))
 
 	updated := getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
@@ -225,9 +225,9 @@ func TestPublishHostOSReboots_SameBootFails(t *testing.T) {
 }
 
 func TestPublishHostOSReboots_IgnoresOtherOperations(t *testing.T) {
-	otherMachine := issuedHostOSRebootOperation("op-other-machine", "other-machine", "boot-1")
-	noBootID := issuedHostOSRebootOperation("op-no-boot-id", "test-machine", "")
-	otherKind := issuedHostOSRebootOperation("op-other-kind", "test-machine", "boot-1")
+	otherMachine := issuedHostSoftRebootOperation("op-other-machine", "other-machine", "boot-1")
+	noBootID := issuedHostSoftRebootOperation("op-no-boot-id", "test-machine", "")
+	otherKind := issuedHostSoftRebootOperation("op-other-kind", "test-machine", "boot-1")
 	otherKind.Spec.OperationKind = v1alpha3.OperationAgentUpgrade
 	c := fakeStatusClient(otherMachine, noBootID, otherKind)
 
@@ -237,7 +237,7 @@ func TestPublishHostOSReboots_IgnoresOtherOperations(t *testing.T) {
 		return "boot-2", nil
 	}
 
-	require.NoError(t, publishHostOSReboots(context.Background(), discardLogger(), c, "test-machine", currentBootID))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", currentBootID))
 	assert.Zero(t, bootIDCalls)
 
 	for _, name := range []string{"op-other-machine", "op-no-boot-id", "op-other-kind"} {
@@ -246,9 +246,9 @@ func TestPublishHostOSReboots_IgnoresOtherOperations(t *testing.T) {
 }
 
 func TestPublishHostOSReboots_LeavesInProgressWhenBootIDUnavailable(t *testing.T) {
-	c := fakeStatusClient(issuedHostOSRebootOperation("op-1", "test-machine", "boot-1"))
+	c := fakeStatusClient(issuedHostSoftRebootOperation("op-1", "test-machine", "boot-1"))
 
-	err := publishHostOSReboots(context.Background(), discardLogger(), c, "test-machine", func() (string, error) {
+	err := publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", func() (string, error) {
 		return "", errors.New("boot ID unavailable")
 	})
 	require.Error(t, err)

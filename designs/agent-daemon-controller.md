@@ -224,7 +224,7 @@ type MachineOperationStore[TGeneration comparable] interface {
 `FinishMachineOperation(ctx, client, op, result)` is also exported for delayed
 completion paths. The Unbounded `AgentUpgrade` flow uses it after the restarted
 daemon publishes success or failure from the signal file, and `SetMachineOperationResult`
-applies the same result to an object in memory. `HostOSReboot` uses it to finish the
+applies the same result to an object in memory. `HostSoftReboot` uses it to finish the
 operation and its target in one status write.
 
 Status condition `ObservedGeneration` is the `MachineOperation` object
@@ -281,7 +281,7 @@ The Unbounded agent daemon composes the shared package as follows:
   - `OperationNodeReboot`
   - `OperationAgentUpgrade`
   - `OperationAgentReset`
-  - `OperationHostOSReboot`
+  - `OperationHostSoftReboot`
 - Creates a `repaveReconciler` that watches local Node delete events and queues
   `NewRepaveRequest("node-delete")`.
 - Calls `daemon.SetupController("unbounded-agent-daemon", mgr, machineOps,

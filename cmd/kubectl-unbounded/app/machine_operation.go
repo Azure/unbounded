@@ -104,9 +104,8 @@ func isSupportedOperationKind(kind v1alpha3.OperationKind) bool {
 	case v1alpha3.OperationNodeReboot,
 		v1alpha3.OperationAgentUpgrade,
 		v1alpha3.OperationAgentReset,
-		v1alpha3.OperationHostOutOfBandReboot,
-		v1alpha3.OperationHostOOBReboot,
-		v1alpha3.OperationHostOSReboot,
+		v1alpha3.OperationHostHardReboot,
+		v1alpha3.OperationHostSoftReboot,
 		v1alpha3.OperationHostPowerOff,
 		v1alpha3.OperationHostPowerOn,
 		v1alpha3.OperationHostReplace:

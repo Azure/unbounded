@@ -36,7 +36,7 @@ func TestNewProviderRegistersMixedOperationStrategies(t *testing.T) {
 			RequiresReplaceUserData(),
 		),
 		WithLongRunningOperation(
-			unboundedv1alpha3.OperationHostOutOfBandReboot,
+			unboundedv1alpha3.OperationHostHardReboot,
 			begin,
 			poll,
 		),
@@ -51,18 +51,20 @@ func TestNewProviderRegistersMixedOperationStrategies(t *testing.T) {
 	require.True(t, immediate.ReplaySafe())
 	require.True(t, immediate.RequiresReplaceUserData())
 
-	longRunning, ok := provider.Operation(unboundedv1alpha3.OperationHostOutOfBandReboot)
+	longRunning, ok := provider.Operation(unboundedv1alpha3.OperationHostHardReboot)
 	require.True(t, ok)
 	require.Equal(t, OperationModeLongRunning, longRunning.Mode())
 	require.False(t, longRunning.ReplaySafe())
 	require.False(t, longRunning.RequiresReplaceUserData())
 
-	alias, ok := provider.Operation(unboundedv1alpha3.OperationHostOOBReboot)
-	require.True(t, ok)
-	require.Same(t, longRunning, alias)
-
 	_, ok = provider.Operation(unboundedv1alpha3.OperationNodeReboot)
 	require.False(t, ok)
+
+	// Removed reboot kinds are not resolved to HostHardReboot.
+	for _, removed := range []unboundedv1alpha3.OperationKind{"HostOutOfBandReboot", "HostOOBReboot"} {
+		_, ok = provider.Operation(removed)
+		require.False(t, ok, removed)
+	}
 }
 
 func TestNewProviderRejectsInvalidRegistrations(t *testing.T) {
@@ -112,13 +114,6 @@ func TestNewProviderRejectsInvalidRegistrations(t *testing.T) {
 				WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, execute),
 			)
 		}, message: "already registered"},
-		{name: "operation registered under kind and alias", make: func() (*Provider, error) {
-			return NewProvider(
-				"ExampleCloud",
-				WithImmediateOperation(unboundedv1alpha3.OperationHostOutOfBandReboot, execute),
-				WithImmediateOperation(unboundedv1alpha3.OperationHostOOBReboot, execute),
-			)
-		}, message: "already registered"},
 		{name: "nil immediate function", make: func() (*Provider, error) {
 			return NewProvider("ExampleCloud", WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, nil))
 		}, message: "execute"},
@@ -145,7 +140,7 @@ func TestNewProviderRejectsInvalidRegistrations(t *testing.T) {
 			return NewProvider(
 				"ExampleCloud",
 				WithLongRunningOperation(
-					unboundedv1alpha3.OperationHostOutOfBandReboot,
+					unboundedv1alpha3.OperationHostHardReboot,
 					func(context.Context, OperationRequest) (BeginResult, error) { return BeginResult{}, nil },
 					func(context.Context, OperationRequest, ProviderOperation) (PollResult, error) {
 						return PollResult{}, nil

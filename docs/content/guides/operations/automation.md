@@ -18,7 +18,7 @@ metadata:
   name: reboot-worker-01
 spec:
   machineRef: worker-01
-  operationKind: HostOutOfBandReboot
+  operationKind: HostHardReboot
   ttlSecondsAfterFinished: 3600
 ```
 
@@ -65,7 +65,7 @@ metadata:
   name: reboot-${machine}
 spec:
   machineRef: ${machine}
-  operationKind: HostOutOfBandReboot
+  operationKind: HostHardReboot
   ttlSecondsAfterFinished: 3600
 EOF
 done
@@ -231,7 +231,7 @@ operations:
 | Step | Operation | When to Use |
 |------|-----------|-------------|
 | 1 | `NodeReboot` | Kubelet or containerd is stuck. Restarts the nspawn container. |
-| 2 | `HostOutOfBandReboot` | Node reboot did not help. Reboots the entire host. |
+| 2 | `HostHardReboot` | Node reboot did not help. Reboots the entire host. |
 | 3 | Delete the Node | Host is running but the node needs a fresh rootfs. |
 | 4 | `HostReplace` | Host OS is corrupted or needs reimaging. |
 | 5 | `AgentReset` | Decommission the node entirely. |
@@ -266,7 +266,7 @@ metadata:
   name: troubleshoot-worker-01-step2
 spec:
   machineRef: worker-01
-  operationKind: HostOutOfBandReboot
+  operationKind: HostHardReboot
   ttlSecondsAfterFinished: 3600
 EOF
 ```
@@ -303,9 +303,9 @@ machine.unbounded-cloud.io/worker-01    AzureVM     Ready     7d
 machine.unbounded-cloud.io/worker-02    AzureVM     Ready     7d
 machine.unbounded-cloud.io/worker-03    AzureVM     Ready     7d
 
-NAME                                              KIND          MACHINE      PHASE      AGE
-machineoperation.unbounded-cloud.io/reboot-w01     HostOutOfBandReboot    worker-01    Complete   5m
-machineoperation.unbounded-cloud.io/upgrade-w02    AgentUpgrade  worker-02    Complete   3m
+NAME                                              KIND              MACHINE      PHASE      AGE
+machineoperation.unbounded-cloud.io/reboot-w01     HostHardReboot    worker-01    Complete   5m
+machineoperation.unbounded-cloud.io/upgrade-w02    AgentUpgrade      worker-02    Complete   3m
 ```
 
 ## Automatic Cleanup
