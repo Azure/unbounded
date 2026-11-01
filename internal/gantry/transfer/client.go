@@ -28,6 +28,10 @@ import (
 // Reuse a single Client across all peers - the underlying http.Transport
 // pools per-host connections internally.
 type Client struct {
+	// transport is the h2c transport hc reaches through its otelhttp wrapper.
+	// Kept alongside hc because otelhttp stores its base in an unexported
+	// field, so anything that needs to inspect the h2c tuning cannot reach it
+	// through hc.Transport.
 	transport   http.RoundTripper
 	hc          *http.Client
 	onBytesRead func(kind string, bytes int64)
@@ -98,6 +102,11 @@ func NewClient(opts ...ClientOption) *Client {
 	return &Client{
 		transport: tr,
 		hc: &http.Client{
+			// Wrap the h2c transport in otelhttp so a peer fetch is a span on
+			// the same trace as the mirror request that triggered it. The
+			// propagator injects traceparent, and the peer's own transfer
+			// handler continues from it, which is what makes a cross-node
+			// cascade readable as one trace instead of N unrelated ones.
 			Transport: otelhttp.NewTransport(
 				tr,
 				otelhttp.WithTracerProvider(tracing.Provider()),
@@ -109,6 +118,9 @@ func NewClient(opts ...ClientOption) *Client {
 	}
 }
 
+// peerSpanName names peer-fetch spans after the operation, not the URL. The
+// default names each span by the full URL, which given digest-addressed
+// paths yields one distinct span name per layer and defeats aggregation.
 func peerSpanName(_ string, r *http.Request) string {
 	if r.Method == http.MethodHead {
 		return "gantry.peer.head"

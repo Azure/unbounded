@@ -160,12 +160,21 @@ func New(store ifaces.LocalContentStore, opts ...Option) *Server {
 // ListenAndServe or use it directly (e.g., httptest in unit tests, where
 // HTTP/1.1 is sufficient because no client uses Range over multiplexed
 // streams).
+// Handler returns the peer-facing http.Handler.
+//
+// Wrapping the mux in otelhttp makes this node a link in the requester's
+// trace rather than a dead end: the requesting agent's transfer client
+// injects traceparent, and the propagator here extracts it so the serve span
+// becomes a child of the requester's fetch span. A swarm-wide cascade then
+// renders as one trace with one span per seeding hop.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/v2/", s.handleV2)
 	mux.HandleFunc("/v2", s.handleV2)
 
+	// /healthz is filtered out of spans for the same reason the mirror filters
+	// it: kubelet probe traffic would dominate the trace and the collector.
 	return otelhttp.NewHandler(
 		mux,
 		"gantry.transfer",
@@ -175,10 +184,15 @@ func (s *Server) Handler() http.Handler {
 	)
 }
 
+// isTransferTraceRequest reports whether a peer-facing request should produce a
+// span. otelhttp runs filters before extracting the traceparent, so a filtered
+// request neither spans nor continues an inbound trace.
 func isTransferTraceRequest(r *http.Request) bool {
 	return r.URL.Path != "/healthz"
 }
 
+// transferSpanName names peer-serve spans after the operation instead of the
+// digest-addressed URL, so a viewer aggregates layers into one row.
 func transferSpanName(_ string, r *http.Request) string {
 	if r.Method == http.MethodHead {
 		return "gantry.transfer.head"

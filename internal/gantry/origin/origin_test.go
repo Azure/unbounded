@@ -64,15 +64,17 @@ func newClient(t *testing.T, ur config.UpstreamRegistry) *Client {
 
 func TestRegistryHTTPClientUsesPhaseTimeouts(t *testing.T) {
 	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: "https://registry.example.com"})
-	hc := c.registries["reg"].hc
+	r := c.registries["reg"]
 
-	if hc.Timeout != 0 {
-		t.Fatalf("client timeout = %v; want no total request timeout", hc.Timeout)
+	if r.hc.Timeout != 0 {
+		t.Fatalf("client timeout = %v; want no total request timeout", r.hc.Timeout)
 	}
 
-	transport, ok := hc.Transport.(*http.Transport)
+	// r.hc.Transport is the otelhttp wrapper now; the phase timeouts under
+	// test live on the raw transport the registry keeps a handle on.
+	transport, ok := r.transport.(*http.Transport)
 	if !ok {
-		t.Fatalf("transport type = %T; want *http.Transport", hc.Transport)
+		t.Fatalf("transport type = %T; want *http.Transport", r.transport)
 	}
 
 	if transport.DialContext == nil {

@@ -223,7 +223,10 @@ func TestRequestMetricsAuthRedirectAndTransportFailure(t *testing.T) {
 	}
 
 	r := c.registries["reg"]
-	transport := r.hc.Transport.(meteredTransport)
+	// hc.Transport is the otelhttp wrapper now, so reach the metered layer
+	// through the registry's own handle on the raw transport instead of
+	// asserting on the client's outermost RoundTripper type.
+	transport := r.transport.(meteredTransport)
 	transport.RoundTripper = rangeRoundTripper(func(req *http.Request) (*http.Response, error) {
 		header := make(http.Header)
 		status, payload := 200, "0123"

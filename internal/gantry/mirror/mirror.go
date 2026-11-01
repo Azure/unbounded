@@ -685,6 +685,13 @@ func New(cfg *config.Config, store ifaces.LocalContentStore, origin ifaces.Origi
 }
 
 // Handler returns an http.Handler suitable for serving on cfg.MirrorListen.
+//
+// The whole mux is wrapped in otelhttp so Gantry continues the trace
+// containerd started. containerd's registry client is already wrapped in
+// otelhttp with the W3C TraceContext propagator, so the traceparent header
+// arriving here is the child of that node's PullImage span and every
+// downstream peer or origin hop hangs off the same trace ID. When tracing is
+// disabled the global provider is a no-op, so this wrapper spans nothing.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -696,6 +703,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v2/", s.drainGuard(s.startupGate(s.handleV2)))
 	mux.HandleFunc("/v2", s.drainGuard(s.startupGate(s.handleV2))) // some clients omit trailing slash
 
+	// Skip /healthz entirely: the kubelet probes it on a fixed interval, and
+	// because a root span with no traceparent is always sampled under our
+	// parent-based sampler, every probe would otherwise be exported. That is
+	// collector traffic unrelated to pulls, which is what this instrumentation
+	// exists to isolate.
 	return otelhttp.NewHandler(
 		mux,
 		"gantry.mirror",
@@ -705,10 +717,20 @@ func (s *Server) Handler() http.Handler {
 	)
 }
 
+// isMirrorTraceRequest reports whether a mirror request should produce a span.
+//
+// otelhttp evaluates filters before it extracts the incoming traceparent, so a
+// filtered request neither spans nor continues an inbound trace. That is
+// correct for /healthz: nothing propagates a trace through a kubelet probe.
 func isMirrorTraceRequest(r *http.Request) bool {
 	return r.URL.Path != "/healthz"
 }
 
+// mirrorSpanName names mirror spans after the operation they perform rather
+// than after the HTTP method, so a trace viewer shows one named span per
+// digest instead of a wall of identical "GET" rows. The digest is the
+// path's last segment on a /v2/.../blobs|manifests/<digest> request; anything
+// else keeps the generic name.
 func mirrorSpanName(_ string, r *http.Request) string {
 	_, _, ref, ok := oci.ParseV2Path(r.URL.Path)
 	if !ok || !strings.HasPrefix(ref, "sha256:") {
@@ -781,6 +803,9 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 
 	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
 
+	// Install the per-request byte accumulator before dispatching, so every
+	// serve path below shares one counter and a resumed live stream that spans
+	// several peers reports one total on the span rather than the last chunk.
 	r = withServeCounter(r)
 
 	path := r.URL.Path
@@ -906,6 +931,9 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		slog.String("kind", kind.String()),
 	)
 
+	// Describe this request on the span the mirror handler opened, before any
+	// branch runs, so a trace shows which digest produced it even when the
+	// request fails before a source is chosen.
 	tracing.SpanFromContext(ctx).SetAttributes(
 		tracing.Digest(d.String()),
 		tracing.Kind(kind.MetricLabel()),
@@ -1139,6 +1167,11 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
 
 		if r.Method == http.MethodHead {
+			// A HEAD is a cache hit too, and it is the request containerd issues
+			// when it already holds a partial layer. Without this the hit is
+			// invisible: the span would carry only the digest from serveDigest
+			// and no source, so a trace could not distinguish a cached HEAD from
+			// a miss that went to a peer.
 			tracing.SpanFromContext(ctx).SetAttributes(
 				tracing.Cache(true),
 				tracing.Source(tracing.SourceLocal),
@@ -1157,11 +1190,22 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 		if err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
 		} else {
+			// Only a completed copy is a cache response that finished.
 			s.fireMirrorResponseCompleted(d, kind, "cache")
 		}
 
+		// gantry.source and gantry.bytes come from fireMirrorBytesServed above,
+		// the single funnel every serve path reports through, so the span and
+		// the metric cannot disagree. gantry.bytes is therefore bytes actually
+		// written rather than the stored object's size: on a partial io.Copy,
+		// size would claim a complete transfer while the metric reported the
+		// truncated count.
 		attrs := []attribute.KeyValue{tracing.Cache(true)}
 
+		// The mirror has no media-type catalog of its own; the header it just
+		// wrote IS the resolved type, set by setStoredManifestContentType and
+		// writeBlobHeadersWithPrefix above. Reading it back reports the type
+		// actually served rather than a separate guess that could drift.
 		if mediaType := w.Header().Get("Content-Type"); mediaType != "" {
 			attrs = append(attrs, tracing.MediaType(mediaType))
 		}
@@ -3057,6 +3101,28 @@ func (s *Server) bumpCacheMiss() {
 	}
 }
 
+// fireMirrorBytesServed records bytes delivered to the requesting containerd
+// and annotates the active span with the source and running total.
+//
+// Span attributes are attached here rather than at each call site because this
+// is the single funnel every serve path already reports through: cache, peer,
+// and origin. A newly added serve path is therefore traced as soon as it is
+// metered.
+//
+// The metric receives the INCREMENTAL count and the span the CUMULATIVE total,
+// because they answer different questions and a single request does not always
+// produce one call. A live stream resumes across providers: a peer that stalls
+// partway is abandoned and a second peer serves the remainder from its offset
+// (TestMirror_PeerFallback_LiveStreamResumesFromAnotherPeer, which fetches at
+// offsets [0, 11]). The counter wants each chunk so cluster-wide bytes served
+// per source stay correct, but the span is one mirror request, so overwriting
+// its gantry.bytes with the last chunk would report 21 bytes delivered for a
+// 57-byte layer. Accumulating per request context gives the trace the total
+// while leaving the metric contract untouched.
+//
+// The metric bump keeps its original bytes > 0 guard so existing counter
+// behavior is unchanged; the span attributes are set regardless, because a
+// zero-byte serve is still a served response worth seeing in a trace.
 func (s *Server) fireMirrorBytesServed(ctx context.Context, kind ifaces.OriginRefKind, source string, bytes int64) {
 	if bytes > 0 && s.metrics.onMirrorBytesServed != nil {
 		s.metrics.onMirrorBytesServed(kind.MetricLabel(), source, bytes)
@@ -3068,11 +3134,21 @@ func (s *Server) fireMirrorBytesServed(ctx context.Context, kind ifaces.OriginRe
 	)
 }
 
+// serveCounter accumulates bytes delivered within one mirror request so the
+// span can report a total across multiple provider attempts.
+//
+// It travels in the request context rather than in a map keyed on the server.
+// A context-keyed accumulator is freed when the request ends, so it cannot grow
+// without bound the way a server-held map would, and it needs no pruning or
+// sweeping. The struct is allocated once per request in handleV2 and mutated
+// through the pointer, so every serve path on that request shares one counter.
 type serveCounter struct {
 	mu    sync.Mutex
 	bytes int64
 }
 
+// add adds n and returns the running total. Negative n is ignored so a
+// miscomputed chunk cannot make a later total smaller.
 func (c *serveCounter) add(n int64) int64 {
 	if c == nil || n < 0 {
 		return 0
@@ -3088,16 +3164,32 @@ func (c *serveCounter) add(n int64) int64 {
 
 type serveCounterKey struct{}
 
+// withServeCounter attaches a fresh accumulator to r, returning the updated
+// request so the whole handler chain downstream shares it.
 func withServeCounter(r *http.Request) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), serveCounterKey{}, &serveCounter{})) //nolint:staticcheck // private key type; this is request-scoped state, not a config value
 }
 
+// serveCounterFrom returns the accumulator on ctx, or nil when the request did
+// not install one. add on a nil counter reports the chunk alone, so a serve path
+// reached outside the instrumented handler still reports a byte count instead of
+// silently reporting zero.
 func serveCounterFrom(ctx context.Context) *serveCounter {
 	c, _ := ctx.Value(serveCounterKey{}).(*serveCounter) //nolint:errcheck // two-value type assertion returns ok, not an error
 
 	return c
 }
 
+// tracingSource maps the mirror's metric source label onto the span source
+// vocabulary.
+//
+// The metric and the span deliberately do not share strings. p2p_
+// gantry_mirror_bytes_served_total{source} is an existing dashboard contract
+// using cache|peer|origin and must not change; the trace vocabulary is
+// local|peer|upstream, which reads unambiguously next to gantry.registry on the
+// same span. Mapping here keeps one translation point instead of leaking the
+// metric spelling onto spans, and it is what stops the local-hit path (which
+// sets gantry.source directly) from disagreeing with the funnel.
 func tracingSource(source string) string {
 	switch source {
 	case "cache":
