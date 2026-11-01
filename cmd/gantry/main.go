@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/negcache"
 	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -95,6 +96,41 @@ func runAgent(args []string) error {
 		slog.String("arch", runtime.GOARCH),
 		slog.Any("config", c.Redacted()),
 	)
+
+	// Tracing is initialized on the common startup path, before the backend
+	// dispatch below, because BOTH backends build instrumented components.
+	// runRacerAgent constructs an origin client and a mirror server too, so
+	// initializing after the RacerEnabled return would leave the entire racer
+	// backend untraced and, worse, without the W3C propagator, so it could not
+	// even forward an existing trace context. Initializing here also puts
+	// tracing ahead of every component that resolves a provider and ahead of
+	// the mirror and transfer listeners, so the first request is instrumented.
+	// The context passed to Init scopes only exporter construction, not the
+	// agent's lifetime: the OTLP connection outlives it, and the final flush is
+	// handled by the deferred shutdown below. With OTEL_TRACES_EXPORTER unset
+	// this installs a no-op provider and an inert shutdown, so a default agent
+	// neither dials a collector nor pays span costs.
+	traceShutdown, err := tracing.Init(context.Background())
+	if err != nil {
+		// An unreachable collector is an observability outage, not a data-plane
+		// outage: log and keep serving pulls.
+		logger.Warn("tracing disabled", slog.Any("err", err))
+	} else {
+		defer func() {
+			// Detach from the signal context: during shutdown that context is
+			// already canceled, which would abort the final span flush.
+			// Bounding it by wall clock instead keeps a wedged collector from
+			// stalling agent exit past the DaemonSet terminationGracePeriod.
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), tracing.ShutdownTimeout)
+			defer cancelFlush()
+
+			if err := traceShutdown(flushCtx); err != nil {
+				logger.Warn("tracing shutdown", slog.Any("err", err))
+			}
+		}()
+
+		logger.Info("tracing enabled", slog.String("service", tracing.ServiceName()))
+	}
 
 	if c.RacerEnabled {
 		return runRacerAgent(c, logger)
