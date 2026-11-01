@@ -42,11 +42,14 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
 // MirroredHeader is the OCI-extension header peers MUST include on every
@@ -163,7 +166,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v2/", s.handleV2)
 	mux.HandleFunc("/v2", s.handleV2)
 
-	return mux
+	return otelhttp.NewHandler(
+		mux,
+		"gantry.transfer",
+		otelhttp.WithTracerProvider(tracing.Provider()),
+		otelhttp.WithSpanNameFormatter(transferSpanName),
+		otelhttp.WithFilter(isTransferTraceRequest),
+	)
+}
+
+func isTransferTraceRequest(r *http.Request) bool {
+	return r.URL.Path != "/healthz"
+}
+
+func transferSpanName(_ string, r *http.Request) string {
+	if r.Method == http.MethodHead {
+		return "gantry.transfer.head"
+	}
+
+	return "gantry.transfer.serve"
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

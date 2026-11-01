@@ -15,16 +15,20 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
 // Client implements ifaces.PeerDialer over HTTP/2 cleartext (h2c).
 // Reuse a single Client across all peers - the underlying http.Transport
 // pools per-host connections internally.
 type Client struct {
+	transport   http.RoundTripper
 	hc          *http.Client
 	onBytesRead func(kind string, bytes int64)
 }
@@ -92,12 +96,25 @@ func NewClient(opts ...ClientOption) *Client {
 	}
 
 	return &Client{
+		transport: tr,
 		hc: &http.Client{
-			Transport: tr,
-			Timeout:   o.requestTimeout,
+			Transport: otelhttp.NewTransport(
+				tr,
+				otelhttp.WithTracerProvider(tracing.Provider()),
+				otelhttp.WithSpanNameFormatter(peerSpanName),
+			),
+			Timeout: o.requestTimeout,
 		},
 		onBytesRead: o.onBytesRead,
 	}
+}
+
+func peerSpanName(_ string, r *http.Request) string {
+	if r.Method == http.MethodHead {
+		return "gantry.peer.head"
+	}
+
+	return "gantry.peer.fetch"
 }
 
 // HeadFromPeer implements ifaces.PeerMetadataDialer.

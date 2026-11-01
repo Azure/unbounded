@@ -43,11 +43,18 @@ import (
 	"time"
 
 	dockerauth "github.com/containerd/containerd/v2/core/remotes/docker/auth"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
 // Client is the concrete OriginPuller. It fans out to one *registry per
@@ -172,17 +179,18 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 			ur.CredentialsPath = ""
 		}
 
-		r, err := newRegistry(ur, c.logger)
+		transport := newRegistryTransport()
+		if c.metrics.onRequest != nil {
+			transport = meteredTransport{RoundTripper: transport, onRequest: c.metrics.onRequest}
+		}
+
+		r, err := newRegistry(ur, transport, c.logger)
 		if err != nil {
 			return nil, fmt.Errorf("origin: registry %q: %w", ur.Name, err)
 		}
 
 		if c.delegatedCredentialsOnly {
 			r.base.User = nil
-		}
-
-		if c.metrics.onRequest != nil {
-			r.hc.Transport = meteredTransport{RoundTripper: r.hc.Transport, onRequest: c.metrics.onRequest}
 		}
 
 		c.registries[ur.Name] = r
@@ -418,12 +426,13 @@ var (
 // ---------------------------------------------------------------------------
 
 type registry struct {
-	name     string
-	base     *url.URL // root of the OCI Distribution v2 API
-	username string
-	password string
-	hc       *http.Client
-	logger   *slog.Logger
+	name      string
+	base      *url.URL // root of the OCI Distribution v2 API
+	username  string
+	password  string
+	transport http.RoundTripper
+	hc        *http.Client
+	logger    *slog.Logger
 
 	// keeps a single most-recent token per registry. OCI registries
 	// usually issue tokens whose scope covers an entire repo's pulls, so one
@@ -456,7 +465,11 @@ const (
 	originIdleConnTimeout       = 90 * time.Second
 )
 
-func newRegistryHTTPClient() *http.Client {
+func originSpanName(_ string, r *http.Request) string {
+	return "gantry.origin " + r.Method
+}
+
+func newRegistryTransport() http.RoundTripper {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -471,10 +484,213 @@ func newRegistryHTTPClient() *http.Client {
 		ResponseHeaderTimeout: originResponseHeaderTimeout,
 	}
 
-	return &http.Client{Transport: transport, CheckRedirect: checkRedirect}
+	return transport
 }
 
-func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
+func newRegistryHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport:     &tracingRoundTripper{base: transport},
+		CheckRedirect: checkRedirect,
+	}
+}
+
+type tracingRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (rt *tracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, span := tracing.Tracer().Start(
+		req.Context(),
+		originSpanName("", req),
+		trace.WithSpanKind(trace.SpanKindClient),
+	)
+
+	ended := false
+
+	end := func() {
+		if !ended {
+			ended = true
+
+			span.End()
+		}
+	}
+
+	recorded := req.Clone(ctx)
+
+	redacted := false
+
+	if recorded.URL != nil {
+		if recorded.URL.User != nil {
+			recorded.URL.User = nil
+
+			redacted = true
+		}
+
+		if recorded.URL.RawQuery != "" {
+			redacted = redactQuery(recorded.URL) || redacted
+		}
+	}
+
+	span.SetAttributes(
+		attribute.String(string(semconv.HTTPRequestMethodKey), req.Method),
+		attribute.String(tracing.AttrURLFull, recorded.URL.String()),
+		attribute.Bool(tracing.AttrURLRedacted, redacted),
+	)
+
+	if target := registryHost(req); target != "" {
+		span.SetAttributes(attribute.String(tracing.AttrRegistry, target))
+	}
+
+	wire := req.Clone(ctx)
+	wire.Header = req.Header.Clone()
+
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(wire.Header))
+
+	resp, err := rt.base.RoundTrip(wire)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		end()
+
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int(string(semconv.HTTPResponseStatusCodeKey), resp.StatusCode))
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		span.SetStatus(codes.Error, http.StatusText(resp.StatusCode))
+	}
+
+	if resp.Body == nil || resp.Body == http.NoBody {
+		end()
+
+		return resp, nil
+	}
+
+	resp.Body = &endSpanOnClose{ReadCloser: resp.Body, span: span, end: end}
+
+	return resp, nil
+}
+
+type endSpanOnClose struct {
+	io.ReadCloser
+
+	span trace.Span
+	end  func()
+	once sync.Once
+}
+
+func (b *endSpanOnClose) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == nil {
+		return n, nil
+	}
+
+	if !errors.Is(err, io.EOF) {
+		b.span.SetStatus(codes.Error, err.Error())
+	}
+
+	b.finish()
+
+	return n, err
+}
+
+func (b *endSpanOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.finish()
+
+	return err
+}
+
+func (b *endSpanOnClose) finish() {
+	b.once.Do(b.end)
+}
+
+func registryHost(req *http.Request) string {
+	if req.Host != "" {
+		return req.Host
+	}
+
+	if req.URL != nil {
+		return req.URL.Host
+	}
+
+	return ""
+}
+
+var sensitiveQueryFragments = []string{
+	"sig",        // sig, signature, X-Amz-Signature, X-Goog-Signature
+	"credential", // X-Amz-Credential
+	"token",
+	"secret",
+	"password",
+	"apikey",
+	"api-key",
+	"expires", // X-Amz-Expires, X-Goog-Expires
+	"goog",    // X-Goog-*, GCS
+	"x-amz",   // X-Amz-*, S3
+}
+
+var sensitiveQueryExact = map[string]struct{}{
+	"se":  {}, // Azure SAS signed expiry
+	"sv":  {}, // Azure SAS signed version
+	"st":  {}, // Azure SAS signed start
+	"sr":  {}, // Azure SAS signed resource / GCS signed resource
+	"srt": {}, // Azure SAS signed resource type
+	"sp":  {}, // Azure SAS signed permissions
+	"sk":  {}, // Azure SAS signing key
+	"ss":  {}, // Azure SAS signed snapshot
+	"spr": {}, // Azure SAS signed protocol
+	"ska": {}, // Azure SAS signing algorithm
+}
+
+func redactQuery(u *url.URL) bool {
+	changed := false
+
+	q := u.Query()
+	for name := range q {
+		if !sensitiveQuery(name) {
+			continue
+		}
+
+		vals := q[name]
+		for i := range vals {
+			if vals[i] != redactedQueryValue {
+				vals[i] = redactedQueryValue
+				changed = true
+			}
+		}
+
+		q[name] = vals
+	}
+
+	if !changed {
+		return false
+	}
+
+	u.RawQuery = q.Encode()
+
+	return true
+}
+
+const redactedQueryValue = "REDACTED"
+
+func sensitiveQuery(name string) bool {
+	lower := strings.ToLower(name)
+
+	if _, ok := sensitiveQueryExact[lower]; ok {
+		return true
+	}
+
+	for _, frag := range sensitiveQueryFragments {
+		if strings.Contains(lower, frag) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func newRegistry(ur config.UpstreamRegistry, transport http.RoundTripper, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
 	if err != nil {
 		// Parse errors can include credentials in both the URL and the cause.
@@ -490,10 +706,11 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 	}
 
 	r := &registry{
-		name:   ur.Name,
-		base:   u,
-		hc:     newRegistryHTTPClient(),
-		logger: logger.With(slog.String("registry", ur.Name)),
+		name:      ur.Name,
+		base:      u,
+		transport: transport,
+		hc:        newRegistryHTTPClient(transport),
+		logger:    logger.With(slog.String("registry", ur.Name)),
 	}
 	if ur.CredentialsPath != "" {
 		b, err := os.ReadFile(ur.CredentialsPath) //#nosec G304 -- operator-supplied path

@@ -44,6 +44,8 @@ import (
 	"time"
 
 	"github.com/containerd/errdefs"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -54,6 +56,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
 const providerFailureSweepInterval = time.Minute
@@ -693,7 +696,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v2/", s.drainGuard(s.startupGate(s.handleV2)))
 	mux.HandleFunc("/v2", s.drainGuard(s.startupGate(s.handleV2))) // some clients omit trailing slash
 
-	return mux
+	return otelhttp.NewHandler(
+		mux,
+		"gantry.mirror",
+		otelhttp.WithTracerProvider(tracing.Provider()),
+		otelhttp.WithSpanNameFormatter(mirrorSpanName),
+		otelhttp.WithFilter(isMirrorTraceRequest),
+	)
+}
+
+func isMirrorTraceRequest(r *http.Request) bool {
+	return r.URL.Path != "/healthz"
+}
+
+func mirrorSpanName(_ string, r *http.Request) string {
+	_, _, ref, ok := oci.ParseV2Path(r.URL.Path)
+	if !ok || !strings.HasPrefix(ref, "sha256:") {
+		return "gantry.mirror"
+	}
+
+	return "gantry.mirror.serve_digest"
 }
 
 // drainGuard wraps a /v2/ handler so that once Drain has been called,
@@ -758,6 +780,8 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r = r.WithContext(registryauth.WithAuthorization(r.Context(), authorization))
+
+	r = withServeCounter(r)
 
 	path := r.URL.Path
 	if path == "/v2/" || path == "/v2" {
@@ -880,6 +904,13 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		slog.String("repo", repo),
 		slog.String("digest", d.String()),
 		slog.String("kind", kind.String()),
+	)
+
+	tracing.SpanFromContext(ctx).SetAttributes(
+		tracing.Digest(d.String()),
+		tracing.Kind(kind.MetricLabel()),
+		tracing.Registry(upstream),
+		tracing.Repository(repo),
 	)
 
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
@@ -1042,7 +1073,7 @@ func (s *Server) serveOriginRange(ctx context.Context, w http.ResponseWriter, d 
 	w.WriteHeader(http.StatusPartialContent)
 
 	written, copyErr := streamcopy.CopyN(w, rc, remaining)
-	s.fireMirrorBytesServed(kind, "origin", written)
+	s.fireMirrorBytesServed(ctx, kind, "origin", written)
 
 	if copyErr != nil {
 		logger.Debug("mirror: live origin range stream failed",
@@ -1108,19 +1139,34 @@ func (s *Server) serveLocalHit(ctx context.Context, w http.ResponseWriter, r *ht
 		writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
 
 		if r.Method == http.MethodHead {
+			tracing.SpanFromContext(ctx).SetAttributes(
+				tracing.Cache(true),
+				tracing.Source(tracing.SourceLocal),
+				tracing.MediaType(w.Header().Get("Content-Type")),
+				tracing.Bytes(0),
+			)
+
 			return true
 		}
 
 		s.firePrefetch(ctx, kind, upstream, repo, d)
 
 		written, err := io.Copy(w, br)
-		s.fireMirrorBytesServed(kind, "cache", written)
+		s.fireMirrorBytesServed(ctx, kind, "cache", written)
 
 		if err != nil {
 			logger.Debug("mirror: copy from cache failed", slog.Any("err", err))
 		} else {
 			s.fireMirrorResponseCompleted(d, kind, "cache")
 		}
+
+		attrs := []attribute.KeyValue{tracing.Cache(true)}
+
+		if mediaType := w.Header().Get("Content-Type"); mediaType != "" {
+			attrs = append(attrs, tracing.MediaType(mediaType))
+		}
+
+		tracing.SpanFromContext(ctx).SetAttributes(attrs...)
 
 		return true
 	}
@@ -1183,7 +1229,7 @@ func (s *Server) serveStartedLocalHit(ctx context.Context, w http.ResponseWriter
 	s.firePrefetch(ctx, kind, upstream, repo, d)
 
 	written, complete, err := stream.append(rc, d, size)
-	s.fireMirrorBytesServed(kind, "cache", written)
+	s.fireMirrorBytesServed(ctx, kind, "cache", written)
 
 	if err != nil || !complete {
 		logger.Debug("mirror: stream local content after response start failed", slog.Any("err", err))
@@ -1313,7 +1359,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 	if s.liveStreamThrough {
 		written, streamErr := streamDigestToClient(w, pr, d, psize, kind)
-		s.fireMirrorBytesServed(kind, "origin", written)
+		s.fireMirrorBytesServed(ctx, kind, "origin", written)
 
 		if streamErr != nil {
 			logger.Debug("mirror: live origin stream failed",
@@ -1386,7 +1432,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	writeBlobHeadersWithPrefix(w, d, psize, kind, sniff)
 
 	written, err := io.Copy(dest, prBuf)
-	s.fireMirrorBytesServed(kind, "origin", written)
+	s.fireMirrorBytesServed(ctx, kind, "origin", written)
 
 	if err != nil {
 		// Bytes already sent; we can't undo. Cache will be aborted by defer.
@@ -2465,7 +2511,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		}
 
 		written, complete, streamErr := stream.append(peerBody, d, psize)
-		s.fireMirrorBytesServed(kind, "peer", written)
+		s.fireMirrorBytesServed(ctx, kind, "peer", written)
 
 		if streamErr != nil {
 			if isDigestMismatchErr(streamErr) {
@@ -2597,7 +2643,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 	}
 
 	written, err := io.Copy(w, rcLocalBuf)
-	s.fireMirrorBytesServed(kind, "peer", written)
+	s.fireMirrorBytesServed(ctx, kind, "peer", written)
 
 	if err != nil {
 		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
@@ -3011,12 +3057,58 @@ func (s *Server) bumpCacheMiss() {
 	}
 }
 
-func (s *Server) fireMirrorBytesServed(kind ifaces.OriginRefKind, source string, bytes int64) {
-	if bytes <= 0 || s.metrics.onMirrorBytesServed == nil {
-		return
+func (s *Server) fireMirrorBytesServed(ctx context.Context, kind ifaces.OriginRefKind, source string, bytes int64) {
+	if bytes > 0 && s.metrics.onMirrorBytesServed != nil {
+		s.metrics.onMirrorBytesServed(kind.MetricLabel(), source, bytes)
 	}
 
-	s.metrics.onMirrorBytesServed(kind.MetricLabel(), source, bytes)
+	tracing.SpanFromContext(ctx).SetAttributes(
+		tracing.Source(tracingSource(source)),
+		tracing.Bytes(serveCounterFrom(ctx).add(bytes)),
+	)
+}
+
+type serveCounter struct {
+	mu    sync.Mutex
+	bytes int64
+}
+
+func (c *serveCounter) add(n int64) int64 {
+	if c == nil || n < 0 {
+		return 0
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.bytes += n
+
+	return c.bytes
+}
+
+type serveCounterKey struct{}
+
+func withServeCounter(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), serveCounterKey{}, &serveCounter{})) //nolint:staticcheck // private key type; this is request-scoped state, not a config value
+}
+
+func serveCounterFrom(ctx context.Context) *serveCounter {
+	c, _ := ctx.Value(serveCounterKey{}).(*serveCounter) //nolint:errcheck // two-value type assertion returns ok, not an error
+
+	return c
+}
+
+func tracingSource(source string) string {
+	switch source {
+	case "cache":
+		return tracing.SourceLocal
+	case "peer":
+		return tracing.SourcePeer
+	case "origin":
+		return tracing.SourceUpstream
+	default:
+		return source
+	}
 }
 
 func (s *Server) fireMirrorResponseCompleted(d digest.Digest, kind ifaces.OriginRefKind, source string) {

@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/negcache"
 	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -95,6 +96,22 @@ func runAgent(args []string) error {
 		slog.String("arch", runtime.GOARCH),
 		slog.Any("config", c.Redacted()),
 	)
+
+	traceShutdown, err := tracing.Init(context.Background())
+	if err != nil {
+		logger.Warn("tracing disabled", slog.Any("err", err))
+	} else {
+		defer func() {
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), tracing.ShutdownTimeout)
+			defer cancelFlush()
+
+			if err := traceShutdown(flushCtx); err != nil {
+				logger.Warn("tracing shutdown", slog.Any("err", err))
+			}
+		}()
+
+		logger.Info("tracing enabled", slog.String("service", tracing.ServiceName()))
+	}
 
 	if c.RacerEnabled {
 		return runRacerAgent(c, logger)
