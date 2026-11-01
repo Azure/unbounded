@@ -266,14 +266,27 @@ restarts, not a single recovered startup restart, as the failure signal.
 
 ## Validate Gantry Health And Logs
 
-Port-forward one Gantry pod and check health plus core metrics.
+List every Gantry pod, then port-forward a Ready pod for the cluster-level
+health and metrics sample. Selecting the first pod without checking readiness
+can anchor this validation to an isolated node even when the rest of the
+DaemonSet is healthy.
 
 ```bash
-GANTRY_POD=$(kubectl -n gantry-system get pods \
+kubectl -n "$GANTRY_NAMESPACE" get pods \
   -l app.kubernetes.io/name=gantry \
-  -o jsonpath='{.items[0].metadata.name}')
+  -o wide
 
-kubectl -n gantry-system port-forward "pod/${GANTRY_POD}" 9095:9095
+GANTRY_POD=$(kubectl -n "$GANTRY_NAMESPACE" get pods \
+  -l app.kubernetes.io/name=gantry \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready' \
+  --no-headers | awk '$2 == "true" {print $1; exit}')
+
+if [ -z "$GANTRY_POD" ]; then
+  echo "no Ready Gantry pod found" >&2
+  exit 1
+fi
+
+kubectl -n "$GANTRY_NAMESPACE" port-forward "pod/${GANTRY_POD}" 9095:9095
 ```
 
 In another shell:
@@ -288,10 +301,10 @@ curl -fsS http://127.0.0.1:9095/metrics | grep 'p2p_dht_health_score'
 Check recent logs for startup and obvious failures:
 
 ```bash
-kubectl -n gantry-system logs "pod/${GANTRY_POD}" --tail=200 | \
+kubectl -n "$GANTRY_NAMESPACE" logs "pod/${GANTRY_POD}" --tail=200 | \
   grep -Ei 'gantry starting|connected to containerd|storage backend|transfer endpoint listening|error|warn|fallback' || true
 
-kubectl -n gantry-system get pods \
+kubectl -n "$GANTRY_NAMESPACE" get pods \
   -l app.kubernetes.io/name=gantry \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].restartCount}{"\t"}{.status.containerStatuses[0].ready}{"\n"}{end}' | \
   awk '$2 != 0 || $3 != "true" {print}'
@@ -300,6 +313,35 @@ kubectl -n gantry-system get pods \
 The log line `NF5 origin-fallback wired` is normal startup wiring. It does not
 mean an origin fallback pull happened. Use `p2p_origin_fallback_total` to detect
 actual fallback pulls.
+
+Readiness is intentionally stricter than liveness. On a node with broken peer
+networking, `/livez` remains `200` while `/readyz` returns `503`, commonly with
+`dht routing table empty` in the response body. This marks the pod NotReady
+without restarting the process. Before Gantry first becomes ready, its mirror
+startup gate also returns `503` so containerd can fall through to the origin.
+Do not weaken the readiness probe. Repair pod-to-pod connectivity, including
+Gantry's libp2p, transfer, and chair-call TCP ports `4001`, `5001`, and `5002`.
+
+To inspect a NotReady pod, port-forward that specific pod and request the probe
+without curl's `--fail` option so the response body is visible:
+
+```bash
+NOT_READY_GANTRY_POD="<pod-name-from-the-list-above>"
+kubectl -n "$GANTRY_NAMESPACE" port-forward \
+  "pod/${NOT_READY_GANTRY_POD}" 9096:9095
+```
+
+In another shell:
+
+```bash
+curl -i http://127.0.0.1:9096/livez
+curl -i http://127.0.0.1:9096/readyz
+kubectl -n "$GANTRY_NAMESPACE" logs \
+  "pod/${NOT_READY_GANTRY_POD}" --tail=200
+```
+
+Stop this diagnostic port-forward before continuing because a later validation
+step reuses local port `9096`.
 
 ## Validate Private ACR Pull Through Gantry
 
@@ -383,14 +425,14 @@ If the first sampled Gantry pod does not show pull activity, inspect the Gantry
 pod on one of the validation nodes:
 
 ```bash
-GANTRY_NODE_POD=$(kubectl -n gantry-system get pods \
+GANTRY_NODE_POD=$(kubectl -n "$GANTRY_NAMESPACE" get pods \
   -l app.kubernetes.io/name=gantry \
   -o wide | awk -v node="$NODE_A" '$7 == node {print $1; exit}')
 
-kubectl -n gantry-system logs "pod/${GANTRY_NODE_POD}" --tail=200 | \
+kubectl -n "$GANTRY_NAMESPACE" logs "pod/${GANTRY_NODE_POD}" --tail=200 | \
   grep -Ei 'error|warn|origin|peer|fetch|pull|cache|fallback' || true
 
-kubectl -n gantry-system port-forward "pod/${GANTRY_NODE_POD}" 9096:9095
+kubectl -n "$GANTRY_NAMESPACE" port-forward "pod/${GANTRY_NODE_POD}" 9096:9095
 ```
 
 In another shell:
@@ -431,7 +473,7 @@ managed by AKS, so leave it in place. Optional Gantry peer identity state under
 | Symptom | Likely cause | Check |
 | --- | --- | --- |
 | Private ACR Pod fails before Gantry | Node kubelet identity or ACR role assignment is wrong, or the assignment has not propagated | `kubectl describe pod acr-provider-preflight` and confirm the `AcrPull` assignment |
-| Gantry pod is not Ready | containerd socket or namespace mismatch | Gantry pod logs and `/readyz` |
+| Gantry pod is not Ready and `/readyz` returns `503` | The response body identifies an unavailable containerd store, an empty DHT routing table caused by node isolation, no selectable Lease chair, or an undialable advertised address | Fetch the `/readyz` body from that pod, inspect its logs and node condition, and verify pod-to-pod TCP `4001`, `5001`, and `5002` |
 | Pulls bypass Gantry | containerd is not reading `certs.d` or `_default/hosts.toml` was not installed | Node `config_path` and `gantry-containerd-config` readiness |
 | Auth works before Gantry but fails after | ACR is not listed in Gantry `upstream_registries` or auth challenge relay failed | Gantry logs and ConfigMap |
 | NetworkPolicy breaks pulls | Mirror TCP/5000 does not allow node-source DNAT traffic | Temporarily remove policy, then fix node CIDR |

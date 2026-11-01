@@ -1,211 +1,352 @@
 ---
-title: "Distribute Container Images with Gantry"
+title: "Install and Operate Gantry"
 weight: 8
-description: "Deploy and operate Gantry as a peer-to-peer containerd registry mirror."
+description: "Install Gantry as a peer-to-peer containerd registry mirror and verify image distribution."
 ---
 
-Gantry is a decentralized, peer-to-peer OCI distribution layer for Kubernetes.
-It reduces duplicate origin-registry traffic during large rollouts by
-coordinating each digest fetch on a small number of nodes and serving the
-content from peers that already have it.
+Gantry is a peer-to-peer OCI distribution layer for Kubernetes clusters that
+run containerd. It reduces duplicate traffic to origin registries by reusing
+image manifests and layers already present in the containerd content stores of
+other nodes.
 
-Gantry runs as a DaemonSet and uses each node's existing containerd content
-store. It does not introduce a separate image cache or a central metadata
-service. Peer discovery uses libp2p and a distributed hash table (DHT), and
-containerd continues to verify every content digest before using it.
+Gantry runs one agent on each selected Linux node. The agent acts as a local
+containerd registry mirror, participates in a libp2p distributed hash table
+(DHT), serves content to peers, and coordinates cold pulls through a bounded
+set of Kubernetes Lease holders called chairs. Workloads continue to use
+normal image references, `imagePullSecrets`, and kubelet credential providers.
 
-After the node-level mirror configuration is installed, Gantry is transparent
-to workloads. Pods continue to use normal OCI image references,
-`imagePullSecrets`, and kubelet credential providers.
+Use Gantry when many nodes pull the same large images and origin bandwidth,
+registry rate limits, or rollout time are concerns. Gantry is not an image
+registry, an image-signing system, or a replacement for containerd's local
+content store.
 
-## Architecture
+For the component and request flows behind this guide, see
+[Gantry Architecture]({{< relref "concepts/gantry-architecture" >}}).
 
-![Gantry architecture: Requester node with Workload, containerd, and Gantry A; Gantry peer network containing the libp2p DHT and a Selected puller node with Gantry B and its containerd content store; Gantry A looks up providers in the DHT and coordinates pull plus streams image content with Gantry B, which fetches once from the Origin registry, while the requester containerd retains a direct fallback path to the Origin registry](../../img/gantry-architecture.svg)
+## Requirements
 
-The DHT contains provider records, not image data. Manifests and layers stream
-directly from the selected Gantry peer, while containerd remains responsible
-for digest verification and the node-local content store.
+Before installing Gantry, confirm the following on every selected node:
 
-## How Gantry Handles a Pull
+- The node runs Linux and containerd.
+- Containerd exposes its socket. The chart default is
+  `/run/containerd/containerd.sock`.
+- The CRI registry configuration points `config_path` at
+  `/etc/containerd/certs.d`.
+- Gantry pods can connect to each other on the libp2p, transfer, and chair
+  ports. The chart defaults are TCP `4001`, `5001`, and `5002`.
+- The cluster can create namespace-scoped Leases and the Gantry service
+  account can manage the configured chair Leases.
+- Each configured origin is reachable from every selected node because any
+  agent may hold a chair or use the last-resort origin fallback.
 
-1. Containerd resolves an image tag at the origin registry and obtains a
-   content digest.
-2. Containerd requests that digest through the node-local Gantry mirror.
-3. Gantry checks the local containerd content store and asks the DHT for peers
-   that already provide the digest.
-4. If no provider exists, Gantry uses deterministic highest-random-weight
-  (HRW) selection, a consistent-hashing algorithm, to choose one of a small
-  set of nodes to fetch the digest. Every agent reaches the same choice
-  without a consensus service.
-5. Other nodes stream the content from that peer. The requesting containerd
-   verifies and commits it to its own content store.
+Nodes provisioned by `unbounded-agent` already satisfy the containerd
+requirements: the agent configures `config_path`, writes the Gantry
+`_default/hosts.toml` route, and manages containerd. No additional containerd
+setup is required for the operator-managed installation.
 
-Gantry routes content by digest. Tag resolution still reaches the origin, so
-the exact reduction in registry requests depends on image composition and
-rollout size. Large layers distributed to many nodes receive the greatest
-benefit.
+For a standalone Helm installation, the chart's node-config DaemonSet writes
+and reconciles `_default/hosts.toml`, but it does not edit containerd's main
+configuration file or restart containerd. Containerd must already have
+`config_path` configured through the operating system or another
+node-provisioning system.
 
-## Installation
+If the containerd socket or `certs.d` directory is in a nonstandard location,
+set the corresponding `containerd.*` chart values. If the socket uses a
+dedicated group, set `containerd.socketGroup` to that group ID.
 
-### 1. Confirm Compatibility
+## Choose an Installation Model
 
-The standalone chart supports Linux nodes running containerd. Before installing,
-confirm that every selected node exposes `/run/containerd/containerd.sock` and
-that containerd reads registry host configuration from
-`/etc/containerd/certs.d`.
+Gantry has two mutually exclusive installation models:
 
-The chart does not modify or restart containerd. Provision the `certs.d`
-setting through your node-management system. For standalone installations, the
-chart runs a node-config DaemonSet that continuously reconciles the Gantry
-mirror route shown below. The Unbounded agent owns that route instead on
-operator-managed nodes, where the chart's node-config resources are disabled.
+| Model | Resource manager | Containerd mirror owner |
+| --- | --- | --- |
+| Standalone Helm | Helm | `DaemonSet/gantry-containerd-config` |
+| Unbounded operator | `unbounded-operator` | `unbounded-agent` |
 
-The default route written on each node is:
+Do not install the standalone chart on a cluster where the Unbounded operator
+manages Gantry. Both installers use `PriorityClass/gantry-low` to identify the
+active manager and reject ownership by the other installation model.
 
-```toml
-# /etc/containerd/certs.d/_default/hosts.toml
-[host."http://127.0.0.1:5000"]
-   capabilities = ["pull", "resolve"]
-   dial_timeout = "200ms"
-```
+## Standalone Helm Installation
 
-Containerd must already have its CRI registry `config_path` set to
-`/etc/containerd/certs.d`. The chart mounts the runtime directory and expects
-the socket at `/run/containerd/containerd.sock` by default; use the
-`containerd.*` chart values for a different layout.
+### Install Gantry
 
-Do not install the chart on a cluster where the Unbounded operator manages
-Gantry. Both paths check `PriorityClass/gantry-low` and reject ownership by the
-other manager.
+Choose a version from the
+[Unbounded releases](https://github.com/Azure/unbounded/releases) and omit the
+leading `v` when setting `GANTRY_VERSION`.
 
-### 2. Install the OCI Chart
-
-Find the release on the
-[Unbounded releases page](https://github.com/Azure/unbounded/releases). The
-chart version omits the release tag's leading `v`:
+The example below accelerates images from `registry.k8s.io` and uses the
+shipped defaults for everything else. To use your own registry, replace
+`registry.k8s.io` in both settings with its hostname, including the port if
+needed. Keep the `https://` prefix on the endpoint.
 
 ```bash
 export GANTRY_VERSION="<release-without-v>"
-export GANTRY_IMAGE_DIGEST="sha256:<digest-from-release-bom>"
 
-helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
-   --version "$GANTRY_VERSION" \
-   --namespace gantry-system \
-   --create-namespace \
-   --set image.digest="$GANTRY_IMAGE_DIGEST" \
-   --set gantry.upstreamRegistries[0].name=registry.example.com \
-   --set gantry.upstreamRegistries[0].endpoint=https://registry.example.com \
-   --wait \
-   --timeout 15m
+helm upgrade --install gantry \
+  "oci://ghcr.io/azure/charts/gantry" \
+  --version "$GANTRY_VERSION" \
+  --namespace gantry-system \
+  --create-namespace \
+  --set-string gantry.upstreamRegistries[0].name=registry.k8s.io \
+  --set-string gantry.upstreamRegistries[0].endpoint=https://registry.k8s.io \
+  --wait \
+  --timeout 15m
 ```
 
-The chart owns the Gantry ConfigMap, image, RBAC, PriorityClass, chair Leases,
-agent DaemonSet, and node-config DaemonSet. The node-config process checks its
-`_default/hosts.toml` every five seconds and atomically restores it after drift
-or a node upgrade reset. Upgrade those resources through `helm upgrade`, not
-direct edits. Set `nodeConfig.enabled=false` only when another node-management
-system owns mirror routing.
+No per-image configuration is needed. Workloads keep their existing image
+references, and Gantry accelerates pulls from the configured registry.
 
-During graceful disable or uninstall, the node-config pod removes
-`hosts.toml` only when it still matches the chart payload. Nodes unavailable
-during uninstall may retain the file and should be checked before the Gantry
-endpoint is considered fully removed.
+The chart deploys Gantry and a node-config DaemonSet that installs and
+maintains the containerd mirror route. You do not need to write `hosts.toml`
+yourself. For nonstandard environments, see
+[When the Defaults Do Not Fit](#when-the-defaults-do-not-fit).
 
-### 3. Configure Upstream Registries
+### Confirm the Rollout
 
-Set `gantry.upstreamRegistries` in your values file. This list is an opt-in allowlist: add only the
-origin registries whose image pulls you want Gantry to accelerate. Registries
-that are not configured here continue using containerd's normal direct-origin
-path and are not distributed through Gantry.
-
-```yaml
-gantry:
-   upstreamRegistries:
-      - name: registry.example.com
-         endpoint: https://registry.example.com
-```
-
-The `name` must match the registry host in the image reference and in
-containerd's `certs.d` directory. Include the port when the image reference
-uses a non-default port. Gantry requires at least one accelerated upstream
-registry.
-
-
-
-### 4. Private Registry Authentication
-
-#### Requester-Delegated Authentication
-
-The workload supplies credentials in the normal Kubernetes way, such as an
-`imagePullSecret` or a kubelet credential provider. For a private HTTPS
-registry, the flow is:
-
-1. Containerd sends an unauthenticated digest request to its local Gantry
-   agent.
-2. Gantry probes the registry's verified HTTPS `/v2/` endpoint and relays its
-   Basic or Bearer `WWW-Authenticate` challenge.
-3. Containerd answers the challenge using the credential supplied by kubelet
-   or CRI. For Bearer authentication, containerd exchanges that credential at
-   the registry's HTTPS token service and sends Gantry the scoped token.
-4. Gantry carries the request-scoped authorization to the selected origin
-   puller. The selected node does not need its own registry identity or access
-   to the requester's `imagePullSecret`.
-5. Gantry discards the authorization after the request. It does not persist
-   the credential or fall back to the puller's identity if the registry
-   rejects it.
-
-Requester-delegated private-registry authentication requires an HTTPS origin.
-Private plaintext HTTP registries are not supported by this mode.
-
-#### Shared-Identity Authentication
-
-Shared identity is a compatibility mode for environments where kubelet or CRI
-cannot provide a usable request credential. It gives every Gantry agent the
-same registry identity.
-
-To enable it, create `Secret/gantry-registry-credentials` in the release
-namespace and set the matching registry's `credentialsPath` chart value.
-The file contains a `username:password` pair keyed by the registry `name`.
-
-Gantry reads configured credential files eagerly during startup. A missing
-file causes the pod to fail, so do not add `credentials_path` unless the Secret
-is present. Prefer requester-delegated authentication when possible because it
-avoids distributing a shared registry credential to every node.
-
-### 5. Verify Distribution
-
-First verify one agent directly. Select a pod and forward its health and
-metrics listener:
+The install command waits for readiness. To check the rollout again:
 
 ```bash
-GANTRY_POD=$(kubectl -n gantry-system get pods \
-    -l app.kubernetes.io/name=gantry \
-    -o jsonpath='{.items[0].metadata.name}')
+kubectl -n gantry-system rollout status \
+  daemonset/gantry-containerd-config --timeout=15m
 
-kubectl -n gantry-system port-forward "pod/${GANTRY_POD}" 9095:9095
+kubectl -n gantry-system rollout status \
+  daemonset/gantry --timeout=15m
+```
+
+Once both DaemonSets are ready, [verify image distribution](#verify-the-installation).
+
+## Operator-Managed Installation
+
+Gantry is enabled by default when the Unbounded operator manages a `Site`.
+There is no separate Helm installation or Gantry image to choose. The operator
+deploys Gantry, and `unbounded-agent` configures containerd on the nodes it
+provisions.
+
+If you have not installed Unbounded yet, follow
+[Getting Started]({{< relref "guides/getting-started" >}}) or
+[Bring Your Own Cluster]({{< relref "guides/existing-cluster" >}}) first.
+
+### Choose the Registries to Accelerate
+
+Edit the Gantry ConfigMap in the operator's namespace, normally
+`unbounded-system`:
+
+```bash
+kubectl -n unbounded-system edit configmap gantry-config
+```
+
+Inside `data.config.yaml`, replace the example `upstream_registries` list with
+your registries. For example:
+
+```yaml
+upstream_registries:
+  - name: registry.k8s.io
+    endpoint: https://registry.k8s.io
+```
+
+Leave the other settings unchanged. The operator preserves your configuration
+and rolls out Gantry when it changes.
+
+### Confirm the Rollout
+
+```bash
+kubectl -n unbounded-system rollout status daemonset/gantry --timeout=15m
+```
+
+There is no separate node-config DaemonSet in this installation model. Once
+Gantry is ready, [verify image distribution](#verify-the-installation), using
+`unbounded-system` instead of `gantry-system` in those commands. If you installed
+the operator in a different namespace, use that namespace instead.
+
+## Private Registries
+
+Gantry supports requester-delegated credentials and an optional shared
+identity.
+
+### Requester-Delegated Credentials
+
+Requester delegation is the preferred model:
+
+1. Containerd requests a digest through the local Gantry mirror.
+2. Gantry discovers and relays the origin's authentication challenge.
+3. Containerd responds with credentials obtained from an `imagePullSecret` or
+   kubelet credential provider.
+4. Gantry carries that request-scoped authorization to the selected origin
+   puller.
+5. Gantry discards the authorization after the request.
+
+The selected puller does not need the requester's Kubernetes Secret. Gantry
+does not persist delegated credentials or replace rejected credentials with
+the puller's identity.
+
+Requester delegation requires an HTTPS origin. Validate that a private image
+pull succeeds without Gantry before enabling the mirror. This separates
+kubelet credential-provider or RBAC failures from Gantry failures.
+
+### Shared Registry Identity
+
+Use a shared identity only when containerd cannot provide a usable delegated
+credential. Create `Secret/gantry-registry-credentials` in the Gantry
+namespace and configure the matching upstream's `credentialsPath`.
+
+The mounted credential file contains a `username:password` pair. Gantry reads
+configured files during startup; a missing or unreadable file prevents the
+agent from starting. Distributing a shared registry identity to every Gantry
+pod expands its credential exposure, so prefer requester delegation.
+
+## Verify the Installation
+
+### Check Rollout and Health
+
+```bash
+kubectl -n gantry-system get daemonsets,pods -o wide
+
+GANTRY_POD=$(kubectl -n gantry-system get pods \
+  -l app.kubernetes.io/name=gantry \
+  -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready' \
+  --no-headers |
+  awk '$2 == "true" {print $1; exit}')
+
+test -n "$GANTRY_POD"
+
+kubectl -n gantry-system port-forward \
+  "pod/${GANTRY_POD}" 9095:9095
 ```
 
 In another shell:
 
 ```bash
+curl -fsS http://127.0.0.1:9095/livez
 curl -fsS http://127.0.0.1:9095/readyz
-curl -fsS http://127.0.0.1:9095/metrics
+curl -fsS http://127.0.0.1:9095/metrics |
+  grep -E 'gantry_storage_mode_info|p2p_dht_health_score'
 ```
 
-Roll out the same multi-layer image to at least two nodes, then inspect these
-metrics:
+`/livez` reports process health. `/readyz` also requires the local containerd
+store and peer-discovery prerequisites. A live agent may therefore be NotReady
+while the DHT is empty or the containerd socket is unavailable.
 
-| Signal | Expected result |
+### Verify Peer Reuse
+
+Roll out the same multi-layer image on at least two nodes. The first pull may
+fetch content from the origin. Subsequent pulls should use local or peer
+content.
+
+Useful signals include:
+
+| Signal | Interpretation |
 | --- | --- |
-| `p2p_dht_health_score` | Reaches at least `0.7` after the routing table forms. |
-| `gantry_storage_mode_info{mode="containerd"}` | Equals `1` on every agent. |
-| `p2p_cache_hit_total` | Increases when the local containerd store satisfies mirror requests. |
-| `p2p_peer_fetch_total{outcome="hit"}` | Increases when a node receives content from a peer. |
-| `p2p_origin_pull_total` | Increases only on designated origin pullers during a cold rollout. |
-| `gantry_origin_bytes_total{kind}` | Counts bytes read from upstream registries, including partial transfers and retries. |
-| `gantry_peer_fetch_bytes_total{kind}` | Counts bytes received from peer Gantry agents. |
-| `gantry_peer_serve_bytes_total{kind}` | Counts bytes transmitted to peers; range requests count only the transmitted range. |
-| `gantry_mirror_bytes_served_total{kind,source}` | Counts bytes served to local containerd, split by `cache`, `peer`, or `origin`. |
-| `p2p_origin_fallback_total` | Remains near zero during healthy operation. |
-| `gantry_advertise_reconcile_total` | Continues increasing as Gantry reconciles containerd content with the DHT. |
-| `gantry_containerd_lease_created_total` | Increases when coordinated background pulls ingest new content. |
+| `gantry_storage_mode_info{mode="containerd"}` | The supported storage backend is active |
+| `p2p_dht_health_score` | Peer-discovery health |
+| `p2p_cache_hit_total` | Mirror requests served from the local containerd store |
+| `p2p_peer_fetch_total{outcome="hit"}` | Content received from another Gantry agent |
+| `p2p_origin_pull_total` | Origin pulls performed by selected pullers |
+| `p2p_origin_fallback_total` | Last-resort direct-origin fallback |
+| `gantry_advertise_reconcile_total` | Local-content reconciliation with the DHT |
+| `gantry_containerd_lease_created_total` | Background ingests protected by containerd leases |
+
+A healthy rollout does not guarantee that one arbitrary pod reports every
+counter. Inspect the Gantry pod on the node that performed the image pull when
+the sampled pod shows no activity.
+
+## Upgrade
+
+Upgrade the standalone installation with `helm upgrade` and wait for both
+DaemonSets. Do not edit chart-owned resources directly.
+
+Chair-count upgrades from releases that understand only the original 64-chair
+set require two stages:
+
+1. Upgrade all Gantry pods while keeping `gantry.chairCount=64`.
+2. After the rollout completes, raise `gantry.chairCount` and
+   `gantry.chairSeedCount`.
+
+Combining these stages can let a new pod create Lease names that an old pod
+does not understand.
+
+## Uninstall
+
+```bash
+helm uninstall gantry --namespace gantry-system
+```
+
+During graceful shutdown, the node-config pod removes
+`_default/hosts.toml` only when its content still matches the chart-managed
+payload. Nodes that were unavailable during uninstall may retain the mirror
+route. Check those nodes before considering Gantry fully removed.
+
+Chair Leases carry Helm's keep policy and remain after uninstall. Delete them
+only after every Gantry pod has stopped:
+
+```bash
+kubectl -n gantry-system delete lease \
+  -l app.kubernetes.io/name=gantry
+```
+
+## Security Guidance
+
+- Keep the mirror reachable from containerd through node loopback. The chart's
+  host port binds to `127.0.0.1`, but the listener inside the pod still binds
+  to the pod network.
+- Restrict the mirror, transfer, chair, metrics, and libp2p ports with a
+  site-specific NetworkPolicy. The example overlay is not installed by
+  default because node and monitoring CIDRs vary by cluster.
+- Peer transfer uses plaintext HTTP/2 within the cluster. Use a service mesh
+  or another network encryption layer when the cluster network is not trusted.
+- Do not expose the optional pprof endpoint. Gantry requires it to bind to
+  loopback.
+- Continue using admission policy and signature-verification tooling for image
+  provenance. Gantry verifies content digests but does not establish publisher
+  identity.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Gantry pod remains Pending | Node selectors, taints, tolerations, resources, and containerd socket host path |
+| `/readyz` reports containerd unavailable | Socket path, socket group, mount, and containerd namespace |
+| `/readyz` reports an empty routing table | Pod-to-pod connectivity on TCP `4001`, `5001`, and `5002` |
+| Image pull bypasses Gantry | Containerd `config_path`, `_default/hosts.toml`, node-config rollout, and registry allowlist |
+| Private image returns `401` | Verify the same image pulls without Gantry, then inspect the relayed challenge and credential provider |
+| Agents restart repeatedly | Logs for startup timeout, invalid configuration, missing credentials, or inaccessible containerd |
+| Origin fallback rises | Peer reachability, DHT health, stale providers, chair availability, and origin errors |
+| Uninstall leaves a dead mirror route | Remove stale chart-owned `hosts.toml` from nodes unavailable during uninstall |
+
+When a specific pod is NotReady, port-forward that pod and request `/readyz`
+without curl's `--fail` option so its response body remains visible:
+
+```bash
+kubectl -n gantry-system port-forward \
+  "pod/<not-ready-pod>" 9096:9095
+
+curl -i http://127.0.0.1:9096/livez
+curl -i http://127.0.0.1:9096/readyz
+```
+
+## When the Defaults Do Not Fit
+
+Most installations should not change the Gantry runtime defaults. Override
+chart values only for a concrete environment requirement:
+
+| Scenario | Required change |
+| --- | --- |
+| The Unbounded operator manages Gantry | Do not install the standalone chart; use the operator-managed path |
+| Containerd does not read `/etc/containerd/certs.d` | Configure containerd before installing Gantry |
+| The containerd socket is not under `/run/containerd` | Set `containerd.hostPath`, `containerd.mountPath`, and `containerd.socketPath` |
+| Containerd uses a namespace other than `k8s.io` | Set `containerd.namespace` |
+| The socket is not accessible through group `0` | Set `containerd.socketGroup` to the socket's group ID |
+| Another system owns `_default/hosts.toml` | Set `nodeConfig.enabled=false` and configure the Gantry mirror route there |
+| You need to accelerate more than one registry | Add another `gantry.upstreamRegistries` entry for each registry |
+| Requester-delegated private-registry authentication is unavailable | Configure a [shared registry identity](#shared-registry-identity) |
+| Cluster policy requires different scheduling or resource limits | Override `nodeSelector`, `tolerations`, or `resources` |
+
+Do not change chair counts, timeouts, concurrency limits, or libp2p settings
+without an observed scaling or reliability reason.
+
+For operator-managed installations, use
+[component workload overrides]({{< relref "reference/workload-overrides" >}})
+for scheduling and resource changes. To opt a Site out of Gantry, set
+`spec.components.gantry.enabled: false`. All Sites must opt out to prevent
+installation; opting out does not remove an existing operator-managed Gantry
+installation.
