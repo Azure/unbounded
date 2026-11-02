@@ -134,8 +134,8 @@ node:
   fullSyncEvery: 120s
   healthFlapMaxBackoff: 120s
   kubeProxyHealthInterval: 30s
-  preferredPrivateEncap: GENEVE
-  preferredPublicEncap: WireGuard
+  preferredPrivateNetworkEncapsulation: GENEVE
+  preferredPublicNetworkEncapsulation: WireGuard
   vxlanPort: 4789
   vxlanSrcPortLow: 47891
   vxlanSrcPortHigh: 47922

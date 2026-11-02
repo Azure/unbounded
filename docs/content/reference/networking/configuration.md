@@ -90,8 +90,8 @@ node:
   healthPort: 9998
   tunnelDataplaneMapSize: 16384
   tunnelIPFamily: IPv4
-  preferredPrivateEncap: GENEVE
-  preferredPublicEncap: WireGuard
+  preferredPrivateNetworkEncapsulation: GENEVE
+  preferredPublicNetworkEncapsulation: WireGuard
   genevePort: 6081
   geneveVni: 1
   vxlanPort: 4789

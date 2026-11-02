@@ -89,28 +89,28 @@ spec:
                     default:
                       enabled: true
                     description: |-
-                      Gantry configures the gantry peer-to-peer OCI distribution agent for this
-                      site. Gantry defaults to enabled; set
-                      gantry.enabled to false to opt a site out. The apiserver defaults an
-                      omitted gantry block to enabled=true so the intent is explicit on read
-                      (for example the Gantry print column) whenever a components block is
-                      present. A site that omits the components block entirely is not defaulted.
+                      Gantry configures gantry, the peer-to-peer image distribution agent.
+                      Defaults to enabled. One gantry installation serves the whole cluster
+                      and runs while any Site leaves it enabled; setting enabled to false on
+                      every Site does not remove an existing installation.
                     properties:
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean
                     type: object
                   machina:
-                    description: Machina configures the machina controller for this
-                      site.
+                    description: |-
+                      Machina configures the machina controller for this site. Disabled unless
+                      enabled is true.
                     properties:
                       enabled:
                         description: Enabled controls whether the component is reconciled.
                         type: boolean
                     type: object
                   metalman:
-                    description: Metalman configures the Metalman PXE controller for
-                      this site.
+                    description: |-
+                      Metalman configures the Metalman PXE controller for this site. Disabled
+                      unless enabled is true.
                     properties:
                       dhcpAutoInterface:
                         description: DHCPAutoInterface lets Metalman choose the DHCP
@@ -140,8 +140,11 @@ spec:
                     type: object
                 type: object
               healthCheckSettings:
-                description: HealthCheckSettings controls health check settings for
-                  inter-site tunnel peers.
+                description: |-
+                  HealthCheckSettings sets health checks for tunnels between nodes in this
+                  site. Tunnels covered by a SitePeering, SiteGatewayPoolAssignment or
+                  GatewayPool use that object's settings instead, or the defaults if it
+                  sets none.
                 properties:
                   detectMultiplier:
                     description: |-

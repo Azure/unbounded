@@ -85,7 +85,10 @@ type SiteSpec struct {
 	// +optional
 	LocalCIDRs []string `json:"localCidrs,omitempty"`
 
-	// HealthCheckSettings controls health check settings for inter-site tunnel peers.
+	// HealthCheckSettings sets health checks for tunnels between nodes in this
+	// site. Tunnels covered by a SitePeering, SiteGatewayPoolAssignment or
+	// GatewayPool use that object's settings instead, or the defaults if it
+	// sets none.
 	// +optional
 	HealthCheckSettings *unboundednetv1alpha1.HealthCheckSettings `json:"healthCheckSettings,omitempty"`
 
@@ -126,20 +129,20 @@ func (s SiteSpec) PodCIDRAssignmentEnabled(assignment unboundednetv1alpha1.PodCi
 // component.ClusterComponent or component.SiteComponent in a package under
 // internal/operator/components, then register it in operator.DefaultRegistry.
 type SiteComponents struct {
-	// Machina configures the machina controller for this site.
+	// Machina configures the machina controller for this site. Disabled unless
+	// enabled is true.
 	// +optional
 	Machina *MachinaComponentSpec `json:"machina,omitempty"`
 
-	// Metalman configures the Metalman PXE controller for this site.
+	// Metalman configures the Metalman PXE controller for this site. Disabled
+	// unless enabled is true.
 	// +optional
 	Metalman *MetalmanComponentSpec `json:"metalman,omitempty"`
 
-	// Gantry configures the gantry peer-to-peer OCI distribution agent for this
-	// site. Gantry defaults to enabled; set
-	// gantry.enabled to false to opt a site out. The apiserver defaults an
-	// omitted gantry block to enabled=true so the intent is explicit on read
-	// (for example the Gantry print column) whenever a components block is
-	// present. A site that omits the components block entirely is not defaulted.
+	// Gantry configures gantry, the peer-to-peer image distribution agent.
+	// Defaults to enabled. One gantry installation serves the whole cluster
+	// and runs while any Site leaves it enabled; setting enabled to false on
+	// every Site does not remove an existing installation.
 	// +optional
 	// +kubebuilder:default={enabled: true}
 	Gantry *GantryComponentSpec `json:"gantry,omitempty"`
@@ -155,11 +158,9 @@ type SiteComponents struct {
 // into the unbounded-system namespace at the operator's own version, so neither
 // namespace nor image is configurable here.
 //
-// The generated Deployments and DaemonSets can be customized through workload
-// overrides, a cluster-scoped ConfigMap the operator reads. That surface is
-// deliberately separate from this one: it is cluster-scoped because the net,
-// machina and gantry singletons are shared across Sites, and write access to it
-// is equivalent to cluster-admin. See
+// The Deployments and DaemonSets created for a component can be customized with
+// workload overrides: one ConfigMap, in the operator's namespace, for the whole
+// cluster. Anyone who can edit it effectively has cluster-admin. See
 // docs/content/reference/workload-overrides.md.
 type SiteComponentSpec struct {
 	// Enabled controls whether the component is reconciled.
@@ -187,10 +188,8 @@ type MetalmanComponentSpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 }
 
-// GantryComponentSpec configures the gantry peer-to-peer OCI distribution agent
-// for a site. Gantry is a cluster-wide singleton and, unlike the other
-// components, defaults to enabled: it is reconciled unless a site explicitly
-// sets enabled to false.
+// GantryComponentSpec configures gantry, the peer-to-peer image distribution
+// agent.
 type GantryComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
 }
@@ -272,9 +271,9 @@ const (
 
 // OverrideStatus summarizes user-supplied workload overrides for one Site.
 //
-// Overrides live in a cluster-scoped ConfigMap and one document routinely
-// targets several components, so this is aggregated per Site rather than per
-// component; component-level detail stays in Conditions.
+// Overrides are kept in one ConfigMap for the whole cluster, and one override
+// often covers several components, so this status is per Site rather than per
+// component. Conditions have the per-component detail.
 type OverrideStatus struct {
 	// Phase is the aggregate state of override processing for this Site: one of
 	// None, Applied or Degraded.
@@ -346,8 +345,8 @@ type OverriddenWorkload struct {
 	State string `json:"state,omitempty"`
 }
 
-// ComponentEnabled reports whether a component spec enables a component.
-// Components default to disabled unless explicitly enabled.
+// ComponentEnabled reports whether a component is explicitly enabled. Use it
+// only for components that are off by default.
 func ComponentEnabled(component *SiteComponentSpec) bool {
 	return component != nil && component.Enabled != nil && *component.Enabled
 }

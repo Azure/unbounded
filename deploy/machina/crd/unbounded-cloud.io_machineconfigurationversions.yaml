@@ -38,12 +38,10 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          MachineConfigurationVersion is an immutable-once-deployed snapshot of a
-          MachineConfiguration's spec at a specific point in time. It acts like a
-          ReplicaSet to a Deployment: the MachineConfiguration controller
-          automatically creates and manages these objects. Versions remain
-          editable until they are deployed (referenced by a Machine). Once
-          deployed, the spec fields become immutable.
+          MachineConfigurationVersion is a numbered copy of a MachineConfiguration's
+          spec, created and managed by the system. Versions are not locked yet:
+          editing a MachineConfiguration rewrites its newest version in place, even
+          for Machines that use it.
         properties:
           apiVersion:
             description: |-
@@ -88,22 +86,49 @@ spec:
                           for this version.
                         properties:
                           clusterListenerIP:
+                            description: |-
+                              ClusterListenerIP is the address where the cache answers DNS queries
+                              from pods and passes them to the cluster DNS service. Defaults to
+                              169.254.10.11.
                             type: string
                           corefileTemplate:
+                            description: |-
+                              CorefileTemplate replaces the default CoreDNS configuration. It is a Go
+                              template that can use NodeListenerIP, ClusterListenerIP,
+                              NodeUpstreamIPs, NodeUpstreamIPsJoined, ClusterDNSServiceIP and
+                              MetricsAddress.
                             type: string
                           cpuLimitInMilliCores:
+                            description: CPULimitInMilliCores limits the cache's CPU.
+                              Defaults to 2000.
                             format: int32
                             type: integer
                           enabled:
+                            description: |-
+                              Enabled runs a CoreDNS cache on the node. The other fields apply only
+                              when it is true.
                             type: boolean
                           memoryLimitInMB:
+                            description: MemoryLimitInMB limits the cache's memory.
+                              Defaults to 128.
                             format: int32
                             type: integer
                           metricsAddress:
+                            description: |-
+                              MetricsAddress is the IPv4 address and port, such as 10.0.0.5:9253, on
+                              which the cache serves Prometheus metrics. Defaults to port 9253 on the
+                              node's IPv4 address.
                             type: string
                           nodeListenerIP:
+                            description: |-
+                              NodeListenerIP is the address where the cache answers DNS queries from
+                              the node itself and passes them to the host's DNS servers. Defaults to
+                              169.254.10.10.
                             type: string
                           requiredPlugins:
+                            description: |-
+                              RequiredPlugins lists extra CoreDNS plugins that the CoreDNS binary
+                              must include. Installation fails if one is missing.
                             items:
                               type: string
                             type: array
@@ -251,13 +276,13 @@ spec:
                 type: array
               deployed:
                 description: |-
-                  Deployed indicates whether any Machine has been provisioned
-                  using this version. Once true, the spec fields are immutable.
+                  Deployed is meant to show whether any Machine has used this version.
+                  Not set yet.
                 type: boolean
               deployedMachines:
                 description: |-
-                  DeployedMachines is the count of Machines currently referencing
-                  this version.
+                  DeployedMachines is meant to count the Machines using this version.
+                  Not set yet.
                 format: int32
                 type: integer
             type: object

@@ -44,17 +44,18 @@ top-level provider fields remain readable for existing Machines.
 `metalman` owns bare-metal host operations for PXE-managed machines. It uses
 Redfish/BMC control for power state and boot-order changes.
 
-`unbounded-agent` owns node and agent operations because it runs on the host
-alongside `machinectl`, systemd, and the nspawn rootfs.
+`unbounded-agent` owns node and agent operations, and `HostSoftReboot`, because
+it runs on the host alongside `machinectl`, systemd, and the nspawn rootfs.
 
 ## Creating an Operation
 
 Operations are created by applying a `MachineOperation` resource. Target a
 single machine with `spec.machineRef` or, for agent-handled operations
-(`NodeReboot`, `AgentUpgrade`, `AgentReset`) and metalman bare-metal host
-operations, a group of machines with `spec.machineSelector`. Bare-metal host
-selectors must be scoped to one metalman site with
-`unbounded-cloud.io/site=<site>`.
+(`NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostSoftReboot`) and metalman
+bare-metal host operations, a group of machines with `spec.machineSelector`
+(see [Automation Patterns]({{< relref "guides/operations/automation" >}}) for
+how agents share one selector operation). Bare-metal host selectors must be
+scoped to one metalman site with `unbounded-cloud.io/site=<site>`.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -116,8 +117,8 @@ kubectl describe mop reboot-worker-01
 Example output:
 
 ```
-NAME                KIND              MACHINE      PHASE       AGE
-reboot-worker-01    HostHardReboot    worker-01    Complete    2m
+NAME               MACHINE     OPERATION        PHASE      AGE
+reboot-worker-01   worker-01   HostHardReboot   Complete   2m
 ```
 
 ## Cleanup
@@ -129,6 +130,9 @@ operations:
 spec:
   ttlSecondsAfterFinished: 3600
 ```
+
+`machine-ops-controller` or metalman deletes expired operations. The agent does
+not, so the TTL has no effect in a cluster that runs neither controller.
 
 ## Next Steps
 

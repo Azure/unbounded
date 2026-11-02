@@ -12,15 +12,17 @@ machine. They are handled by `machine-ops-controller` for cloud VMs and by
 For metalman-managed bare-metal machines, host operations may target a single
 machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
 Selector-based bare-metal host operations must include
-`unbounded-cloud.io/site=<site>` so exactly one metalman instance owns the
-operation. The default unlabeled metalman instance supports `machineRef` host
-operations only.
+`unbounded-cloud.io/site=<site>`. The default unlabeled metalman instance
+supports `machineRef` host operations only.
 
 For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
 only executes operations whose target Machine has the matching
-`unbounded-cloud.io/site` label and `spec.provider`; other controllers ignore
-the operation.
+`unbounded-cloud.io/site` label and provider, and ignores the rest. Any
+`machine-ops-controller` still fails an operation whose Machine does not exist
+or has an invalid `spec.host`, whatever its site or provider. The provider is
+`AzureVM` for `spec.host.azure`, the value of `spec.host.external.provider`, or
+the legacy `spec.provider`.
 
 ## Provider Requirements
 
@@ -66,10 +68,10 @@ kubectl get mop reboot-worker-01 -w
 ```
 
 ```
-NAME                KIND              MACHINE      PHASE        AGE
-reboot-worker-01    HostHardReboot    worker-01    Pending      0s
-reboot-worker-01    HostHardReboot    worker-01    InProgress   2s
-reboot-worker-01    HostHardReboot    worker-01    Complete     45s
+NAME               MACHINE     OPERATION        PHASE        AGE
+reboot-worker-01   worker-01   HostHardReboot   Pending      0s
+reboot-worker-01   worker-01   HostHardReboot   InProgress   2s
+reboot-worker-01   worker-01   HostHardReboot   Complete     45s
 ```
 
 ### Provider Behavior
@@ -78,7 +80,7 @@ reboot-worker-01    HostHardReboot    worker-01    Complete     45s
 |----------|--------|
 | Azure VM | `VirtualMachinesClient.BeginRestart` |
 | OCI Instance | `RESET` |
-| Bare metal (BMC) | Redfish power reset |
+| Bare metal (BMC) | Redfish `ForceOff`, then `On` |
 
 ## HostSoftReboot
 
@@ -105,8 +107,11 @@ kubectl unbounded machine host-soft-reboot worker-01
 The agent marks the operation `InProgress` and records the current kernel boot
 ID in `status.targets[].bootID` before it issues the reboot. When the agent
 starts again, it marks the operation `Complete` if the boot ID changed, or
-`Failed` if the host did not reboot. The operation is reported only after the host comes back and the agent
-reconnects to the cluster.
+`Failed` if the host did not reboot. That result is reported only after the
+host comes back and the agent reconnects to the cluster; there is no timeout,
+so if the host never comes back the operation stays `InProgress`. If the agent
+cannot read the boot ID or start the reboot, it fails the operation straight
+away without rebooting.
 
 ## HostPowerOff
 
@@ -189,10 +194,10 @@ kubectl get mop replace-worker-01 -w
 ```
 
 ```
-NAME                 KIND           MACHINE      PHASE        AGE
-replace-worker-01    HostReplace    worker-01    Pending      0s
-replace-worker-01    HostReplace    worker-01    InProgress   3s
-replace-worker-01    HostReplace    worker-01    Complete     4m
+NAME                MACHINE     OPERATION     PHASE        AGE
+replace-worker-01   worker-01   HostReplace   Pending      0s
+replace-worker-01   worker-01   HostReplace   InProgress   3s
+replace-worker-01   worker-01   HostReplace   Complete     4m
 ```
 
 Operation completion means the replacement VM or host has been created. It does
@@ -212,8 +217,12 @@ Configure `machine-ops-controller --api-server-endpoint` with an API server
 address reachable from replaced hosts; the generated agent bootstrap config uses
 that value.
 
-**OCI Instance** - not currently supported. An identity-preserving OCI
-replacement flow with fresh `user_data` injection has not been verified.
+**OCI Instance** - stops the old instance, launches a replacement with fresh
+`user_data` in the same availability domain, subnet, shape and fault domain,
+updates `Machine.spec.host.external.providerID`, and then terminates the old
+instance. See the
+[CRD Reference]({{< relref "/reference/machina-crd" >}}) for what the
+replacement preserves.
 
 **Bare metal (PXE)** - metalman sets the PXE or HTTP boot override, force-restarts
 the machine through Redfish, writes the selected host OS image, installs or

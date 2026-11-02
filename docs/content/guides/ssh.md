@@ -183,10 +183,10 @@ Machines move through phases: **Pending** &rarr; **Provisioning** &rarr; **Joini
 |---|---|
 | **Pending** | SSH unreachable; retries every 30 s. |
 | **Provisioning** | SSH session active, install script running on target. |
-| **Joining** | Script succeeded; waiting for the Node to register with label `unbounded-cloud.io/machine=<name>` (polls every 30 s). |
+| **Joining** | Script succeeded; waiting for the Node named in `spec.kubernetes.nodeRef`, or named after the Machine, to register (polls every 30 s). |
 | **Ready** | Node exists and is tracked (re-checked every 5 min; reverts to Joining if the Node disappears). |
 | **Failed** | SSH or script error; retries every 60 s with no limit. |
-| **Rebooting** | Machine is undergoing a reboot operation (used by the metalman bare-metal controller). |
+| **Rebooting** | Defined in the API but not set yet. |
 
 Watch progress with:
 

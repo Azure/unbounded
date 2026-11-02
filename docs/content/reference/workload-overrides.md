@@ -460,10 +460,10 @@ kubectl describe configmap -n unbounded-system unbounded-component-overrides
 | `OverridesPartiallyApplied` | Warning. Entries resolved but one or more workloads could not be merged. |
 | `OverridesNotWritten` | Warning. The merge succeeded but the write did not reach the cluster. |
 
-This matters most when no Site exists yet: the ConfigMap is cluster-scoped, so
-there is no Site status to carry the verdict and the Event is the only report
-you get. Events fire when the observed `resourceVersion` or the verdict changes,
-so a steady state stays quiet.
+This matters most when no Site exists yet: the ConfigMap applies to the whole
+cluster rather than to one Site, so there is no Site status to carry the verdict
+and the Event is the only report you get. Events fire when the observed
+`resourceVersion` or the verdict changes, so a steady state stays quiet.
 
 ## Limits
 

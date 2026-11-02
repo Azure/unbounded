@@ -97,8 +97,9 @@ spec:
                     x-kubernetes-int-or-string: true
                 type: object
               meshNodes:
-                description: MeshNodes controls whether nodes in listed sites mesh
-                  directly.
+                description: |-
+                  MeshNodes controls whether nodes in listed sites mesh directly.
+                  Defaults to true.
                 type: boolean
               sites:
                 description: Sites is the list of site names that should be directly
@@ -118,8 +119,9 @@ spec:
                 description: |-
                   TunnelProtocol selects the tunnel protocol for this scope.
                   Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-                  Defaults to "Auto" when unset. When "Auto", links using external IPs
-                  use WireGuard and links using only internal IPs use GENEVE.
+                  Defaults to "Auto" when unset. With "Auto", links over external IPs use
+                  WireGuard and links over internal IPs use GENEVE, unless the
+                  unbounded-net configuration prefers other protocols.
                 enum:
                 - WireGuard
                 - IPIP

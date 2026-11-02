@@ -61,10 +61,10 @@ spec:
             properties:
               machineSelector:
                 description: |-
-                  MachineSelector selects machines that should automatically
-                  receive this configuration. If set, new machines matching the
-                  selector will be assigned the latest locked version of the
-                  highest priority configuration that matches.
+                  MachineSelector picks Machines that get this configuration
+                  automatically. A matching Machine without a configurationRef gets the
+                  newest version of the highest-priority matching configuration. The
+                  choice is not revisited once configurationRef is set.
                 properties:
                   matchExpressions:
                     description: matchExpressions is a list of label selector requirements.
@@ -121,11 +121,8 @@ spec:
               revisionHistoryLimit:
                 default: 10
                 description: |-
-                  RevisionHistoryLimit is the number of old
-                  MachineConfigurationVersions to retain for rollback. Versions
-                  that are still referenced by a Machine are never deleted
-                  regardless of this limit, so the actual number of retained
-                  versions may exceed this value.
+                  RevisionHistoryLimit is how many old MachineConfigurationVersions to
+                  keep. Not used yet.
                 format: int32
                 minimum: 0
                 type: integer
@@ -149,22 +146,49 @@ spec:
                           for this version.
                         properties:
                           clusterListenerIP:
+                            description: |-
+                              ClusterListenerIP is the address where the cache answers DNS queries
+                              from pods and passes them to the cluster DNS service. Defaults to
+                              169.254.10.11.
                             type: string
                           corefileTemplate:
+                            description: |-
+                              CorefileTemplate replaces the default CoreDNS configuration. It is a Go
+                              template that can use NodeListenerIP, ClusterListenerIP,
+                              NodeUpstreamIPs, NodeUpstreamIPsJoined, ClusterDNSServiceIP and
+                              MetricsAddress.
                             type: string
                           cpuLimitInMilliCores:
+                            description: CPULimitInMilliCores limits the cache's CPU.
+                              Defaults to 2000.
                             format: int32
                             type: integer
                           enabled:
+                            description: |-
+                              Enabled runs a CoreDNS cache on the node. The other fields apply only
+                              when it is true.
                             type: boolean
                           memoryLimitInMB:
+                            description: MemoryLimitInMB limits the cache's memory.
+                              Defaults to 128.
                             format: int32
                             type: integer
                           metricsAddress:
+                            description: |-
+                              MetricsAddress is the IPv4 address and port, such as 10.0.0.5:9253, on
+                              which the cache serves Prometheus metrics. Defaults to port 9253 on the
+                              node's IPv4 address.
                             type: string
                           nodeListenerIP:
+                            description: |-
+                              NodeListenerIP is the address where the cache answers DNS queries from
+                              the node itself and passes them to the host's DNS servers. Defaults to
+                              169.254.10.10.
                             type: string
                           requiredPlugins:
+                            description: |-
+                              RequiredPlugins lists extra CoreDNS plugins that the CoreDNS binary
+                              must include. Installation fails if one is missing.
                             items:
                               type: string
                             type: array
@@ -244,14 +268,17 @@ spec:
                 properties:
                   maxUnavailable:
                     description: |-
-                      MaxUnavailable is the maximum number of machines that can be
-                      unavailable during a RollingUpdate. Only used when Type is
-                      RollingUpdate. Can be an absolute number or a percentage.
+                      MaxUnavailable is how many machines a RollingUpdate may take down at
+                      once. Not used yet.
                     format: int32
                     type: integer
                   type:
                     default: OnDelete
-                    description: Type is the update strategy type.
+                    description: |-
+                      Type is OnDelete (the default) or RollingUpdate. With OnDelete, deleting
+                      a Machine's Node object applies the version in its configurationRef;
+                      Machines do not move to newer versions on their own. RollingUpdate is
+                      not used yet and behaves like OnDelete.
                     enum:
                     - OnDelete
                     - RollingUpdate
@@ -326,16 +353,14 @@ spec:
                 type: array
               currentVersion:
                 description: |-
-                  CurrentVersion is the version number of the latest non-deployed
-                  (editable) MachineConfigurationVersion. If all versions are
-                  deployed, this is 0.
+                  CurrentVersion is meant to hold the newest version that can still be
+                  edited. Not set yet.
                 format: int32
                 type: integer
               latestVersion:
                 description: |-
-                  LatestVersion is the highest version number that has been
-                  created for this MachineConfiguration. The controller uses this
-                  to avoid reusing version numbers when versions are deleted.
+                  LatestVersion is the newest version number made for this
+                  MachineConfiguration.
                 format: int32
                 type: integer
             type: object

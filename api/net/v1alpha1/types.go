@@ -197,7 +197,7 @@ const (
 	TunnelProtocolWireGuard TunnelProtocol = "WireGuard"
 
 	// TunnelProtocolIPIP selects IPIP (IP-in-IP) tunneling.
-	// IPIP has lower overhead than GENEVE and is preferred for private networks.
+	// IPIP has lower overhead than GENEVE.
 	TunnelProtocolIPIP TunnelProtocol = "IPIP"
 
 	// TunnelProtocolGENEVE selects GENEVE (unencrypted) tunneling.
@@ -212,10 +212,10 @@ const (
 	// internal IP as the gateway. Requires L3 reachability between nodes.
 	TunnelProtocolNone TunnelProtocol = "None"
 
-	// TunnelProtocolAuto lets the system choose based on link characteristics
-	// and the configured preferred encapsulation settings. By default, links
-	// using external/public IPs use WireGuard; links using only internal IPs
-	// use IPIP.
+	// TunnelProtocolAuto picks a protocol for each link: by default,
+	// WireGuard for links over external IPs and GENEVE for links over
+	// internal IPs. The unbounded-net configuration can change these
+	// preferences.
 	TunnelProtocolAuto TunnelProtocol = "Auto"
 )
 
@@ -241,13 +241,14 @@ type GatewayPool struct {
 // +k8s:deepcopy-gen=true
 type GatewayPoolSpec struct {
 	// Type controls how gateway nodes are selected and connected.
-	// Allowed values are "External" or "Internal".
+	// Allowed values are "External" or "Internal". An empty value means
+	// "External".
 	// +kubebuilder:validation:Enum=External;Internal;""
 	// +optional
 	Type string `json:"type,omitempty"`
 
-	// NodeSelector selects nodes to include in this gateway pool
-	// Only nodes with external IPs and WireGuard public keys will be included
+	// NodeSelector picks the nodes in this gateway pool. A node must have a
+	// WireGuard public key, and for an External pool, an external IP.
 	// +kubebuilder:validation:MinProperties=1
 	NodeSelector map[string]string `json:"nodeSelector"`
 
@@ -261,8 +262,11 @@ type GatewayPoolSpec struct {
 
 	// TunnelProtocol selects the tunnel protocol for this scope.
 	// Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-	// Defaults to "Auto" when unset. When "Auto", links using external IPs
-	// use WireGuard and links using only internal IPs use GENEVE.
+	// Defaults to "Auto" when unset. With "Auto", links over external IPs use
+	// WireGuard and links over internal IPs use GENEVE, unless the
+	// unbounded-net configuration prefers other protocols. For a gateway in
+	// the same site, an unset or "Auto" value uses the Site's tunnelProtocol
+	// if the Site sets one.
 	// +kubebuilder:validation:Enum=WireGuard;IPIP;GENEVE;VXLAN;None;Auto
 	// +optional
 	TunnelProtocol *TunnelProtocol `json:"tunnelProtocol,omitempty"`
@@ -322,10 +326,11 @@ type GatewayPoolNodeList struct {
 	Items           []GatewayPoolNode `json:"items"`
 }
 
-// GatewayNodeSpec defines immutable identity metadata for a GatewayNode.
+// GatewayNodeSpec identifies a GatewayPoolNode. The system sets it and updates
+// it when the node moves to another gateway pool or site.
 // +k8s:deepcopy-gen=true
 type GatewayNodeSpec struct {
-	// NodeName is the Kubernetes node name publishing this GatewayNode.
+	// NodeName is the Kubernetes node name publishing this GatewayPoolNode.
 	NodeName string `json:"nodeName"`
 
 	// GatewayPool is the owning gateway pool name.
@@ -501,6 +506,7 @@ type SitePeeringSpec struct {
 	Sites []string `json:"sites,omitempty"`
 
 	// MeshNodes controls whether nodes in listed sites mesh directly.
+	// Defaults to true.
 	// +optional
 	MeshNodes *bool `json:"meshNodes,omitempty"`
 
@@ -510,8 +516,9 @@ type SitePeeringSpec struct {
 
 	// TunnelProtocol selects the tunnel protocol for this scope.
 	// Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-	// Defaults to "Auto" when unset. When "Auto", links using external IPs
-	// use WireGuard and links using only internal IPs use GENEVE.
+	// Defaults to "Auto" when unset. With "Auto", links over external IPs use
+	// WireGuard and links over internal IPs use GENEVE, unless the
+	// unbounded-net configuration prefers other protocols.
 	// +kubebuilder:validation:Enum=WireGuard;IPIP;GENEVE;VXLAN;None;Auto
 	// +optional
 	TunnelProtocol *TunnelProtocol `json:"tunnelProtocol,omitempty"`
@@ -579,8 +586,11 @@ type SiteGatewayPoolAssignmentSpec struct {
 
 	// TunnelProtocol selects the tunnel protocol for this scope.
 	// Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-	// Defaults to "Auto" when unset. When "Auto", links using external IPs
-	// use WireGuard and links using only internal IPs use GENEVE.
+	// Defaults to "Auto" when unset. With "Auto", links over external IPs use
+	// WireGuard and links over internal IPs use GENEVE, unless the
+	// unbounded-net configuration prefers other protocols. For a gateway in
+	// the same site, an unset or "Auto" value uses the Site's tunnelProtocol
+	// if the Site sets one.
 	// +kubebuilder:validation:Enum=WireGuard;IPIP;GENEVE;VXLAN;None;Auto
 	// +optional
 	TunnelProtocol *TunnelProtocol `json:"tunnelProtocol,omitempty"`
@@ -633,8 +643,10 @@ type GatewayPoolPeeringSpec struct {
 
 	// TunnelProtocol selects the tunnel protocol for this scope.
 	// Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-	// Defaults to "Auto" when unset. When "Auto", links using external IPs
-	// use WireGuard and links using only internal IPs use GENEVE.
+	// With "Auto", links over external IPs use WireGuard and links over
+	// internal IPs use GENEVE, unless the unbounded-net configuration prefers
+	// other protocols. If unset, the other GatewayPool's tunnelProtocol is
+	// used, and then, for a gateway in the same site, the Site's.
 	// +kubebuilder:validation:Enum=WireGuard;IPIP;GENEVE;VXLAN;None;Auto
 	// +optional
 	TunnelProtocol *TunnelProtocol `json:"tunnelProtocol,omitempty"`

@@ -1,12 +1,12 @@
 ---
 title: "CRD Reference"
 weight: 2
-description: "API reference for the Machine custom resource."
+description: "API reference for the Machine and MachineOperation custom resources."
 ---
 
 API group: `unbounded-cloud.io/v1alpha3`
 
-This document describes the custom resource definitions shipped with machina: **Machine** and **MachineOperation**.
+This document describes two of the custom resource definitions machina uses: **Machine** and **MachineOperation**. It also shows **MachineOperationCredential** examples, but does not yet cover MachineConfiguration, MachineConfigurationVersion or Site; see the [Networking CRDs]({{< relref "reference/networking/custom-resources" >}}) for Site.
 
 ## Machine
 
@@ -36,9 +36,9 @@ SSH connection details. When `ssh` is nil, the machina controller skips the Mach
 | `ssh` | SSHSpec | No | - | SSH connection configuration. |
 | `ssh.host` | string | Yes | - | Hostname or IP, optionally with port (e.g. `1.2.3.4:2222`). Port 22 is assumed when omitted. |
 | `ssh.username` | string | No | `"azureuser"` | SSH username. |
-| `ssh.privateKeyRef` | SecretKeySelector | Yes | - | Reference to a Secret containing the SSH private key. Must reside in the `unbounded-system` namespace. |
+| `ssh.privateKeyRef` | SecretKeySelector | Yes | - | Reference to a Secret containing the SSH private key. machina reads it from its own namespace, normally `unbounded-system`. |
 | `ssh.privateKeyRef.name` | string | Yes | - | Secret name. |
-| `ssh.privateKeyRef.namespace` | string | Yes | - | Secret namespace (must be `unbounded-system`). |
+| `ssh.privateKeyRef.namespace` | string | Yes | - | Required by the schema but ignored: machina reads the Secret from its own namespace. |
 | `ssh.privateKeyRef.key` | string | No | `"ssh-privatekey"` | Key within the Secret's `data` map. |
 | `ssh.bastion` | BastionSSHSpec | No | - | Optional jump host for the SSH connection. |
 | `ssh.bastion.host` | string | Yes | - | Bastion hostname or IP, optionally with port. |
@@ -56,7 +56,7 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.image` | string | Yes | - | OCI machine image reference containing `/disk/disk.img.gz` (e.g. `"ghcr.io/azure/host-ubuntu2404:v1"`). |
 | `host.netboot.architecture` | string | No | `amd64` | Target CPU architecture for PXE boot artifacts and machine images. Allowed values: `amd64`, `arm64`. |
 | `host.netboot.netbootImage` | string | No | Metalman default | OCI netboot image reference containing PXE boot artifacts. |
-| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. Allowed values: `PXE`, `HTTP`. |
+| `host.netboot.bootProtocol` | string | No | `PXE` | Network boot trigger protocol for repaves. `PXE` uses DHCP/TFTP bootfile options. `HTTP` uses Redfish UEFI HTTP boot with a URL derived from the netboot image metadata. `VirtualMedia` mounts an operation-owned bootstrap ISO through Redfish; it requires `redfish`, and both `image` and `netbootImage` must be digest references. Allowed values: `PXE`, `HTTP`, `VirtualMedia`. |
 | `host.netboot.dhcpLeases` | []DHCPLease | No | - | Provisioning network settings. They are served as static DHCP leases during PXE boot and used for Redfish firmware, installer, NoCloud, and installed-system static configuration during HTTP boot. |
 | `host.netboot.dhcpLeases[].ipv4` | string | Yes | - | Static IPv4 address to assign. |
 | `host.netboot.dhcpLeases[].mac` | string | Yes | - | NIC MAC address (matched case-insensitively). |
@@ -68,7 +68,7 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
 | `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
-| `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
+| `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. Set `key`: it defaults to `ssh-privatekey`, the default for SSH keys. Unlike SSH keys, metalman reads this Secret from `namespace`. |
 | `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
 | `host.netboot.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
 | `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
@@ -84,7 +84,7 @@ Kubernetes join configuration.
 | `kubernetes` | KubernetesSpec | No | - | Kubernetes join settings. |
 | `kubernetes.version` | string | No | Cluster version | Desired Kubernetes version (e.g. `"v1.34.0"`). A `v` prefix is added automatically if missing. |
 | `kubernetes.nodeRef` | *LocalObjectReference | No | - | Reference to the corresponding Node object. Set by the controller. |
-| `kubernetes.nodeLabels` | map[string]string | No | - | Labels to apply to the Node (not yet propagated by the machina controller). |
+| `kubernetes.nodeLabels` | map[string]string | No | - | Labels to apply to the Node. Every install path passes them to the agent, which registers the Node with them. |
 | `kubernetes.bootstrapTokenRef.name` | string | Yes | - | Name of the bootstrap token Secret in `kube-system`. |
 
 ### spec.host
@@ -99,7 +99,7 @@ providers whose own CRD has meaningful schema, status, or reconciliation.
 | `host.image` | string | No | Preserve current image | Opaque image identifier interpreted by the selected provider. |
 | `host.netboot` | PXESpec | For new Metalman Machines | -- | Network boot image, DHCP, Redfish, and cloud-init settings owned by Metalman. |
 | `host.azure.resourceID` | string | For Azure VMs | -- | Immutable full Azure Resource Manager VM ID. The provider is inferred as `AzureVM`. |
-| `host.external.provider` | string | For external hosts | -- | Registered provider controller and credential key, such as `OCIInstance`, `ANS`, or a private provider. |
+| `host.external.provider` | string | For external hosts | -- | Registered provider controller and credential key, such as `OCIInstance` or a private provider. |
 | `host.external.providerID` | string | Provider-dependent | -- | Opaque provider identity; mutable only to support provider replacement handoff. |
 | `host.external.machineRef` | ProviderMachineReference | Provider-dependent | -- | Optional cluster-scoped provider-owned resource for rich provider state. |
 
@@ -140,8 +140,9 @@ them again until their operation handle has been persisted. `OperationRequest`
 contains the exact external machine resource UID and generation, resolved host
 image, and observed Machine generation frozen in target status. Providers
 receive the canonical `host.external.providerID` or Azure resource ID; legacy
-Machines continue to supply `Machine.spec.providerID`. Host operations targeting
-the same Machine are serialized.
+Machines continue to supply `Machine.spec.providerID`. Out-of-band host
+operations targeting the same Machine are serialized. `HostSoftReboot` is not
+serialized with them, because the in-host agent executes it.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
@@ -180,20 +181,20 @@ spec:
 | Scope | Cluster |
 | Status subresource | Yes |
 
-`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot` and agent operations such as `AgentReset`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
+`MachineOperation` is a job-like CR for discrete operations. The in-host agent handles Kubernetes node operations such as `NodeReboot`, agent operations such as `AgentReset`, and `HostSoftReboot`; `machine-ops-controller` handles out-of-band VM operations such as Azure VM power actions. PXE/BMC operations remain owned by metalman for now.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
-| `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Supported for agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`). Each matching agent independently picks up the operation. Not supported for host operations. |
+| `spec.machineRef` | string | No | Target `Machine` name. Set `machineRef` or `machineSelector`; if both are set, `machineRef` is used. The API server does not reject an operation that sets neither. |
+| `spec.machineSelector` | LabelSelector | No | Selects targets by label. No child operations are created. For agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostSoftReboot`), each agent matches the selector against its Node's labels, or its Machine's labels when the Node does not exist; all matching agents report into this one operation, and agents that have not started by the time it is terminal skip it. Metalman supports selectors for bare-metal host operations (see below). `machine-ops-controller` does not support selectors. |
 | `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostHardReboot`, `HostSoftReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
-| `spec.parameters` | map[string]string | No | Operation-specific parameters. |
-| `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. |
+| `spec.parameters` | map[string]string | No | Operation-specific parameters: `downloadURL` and `sha256` for `AgentUpgrade`, `imageID` and `sshAuthorizedKeys` for an OCI `HostReplace`. `imageID` is used only when neither the Machine nor its configuration sets a host image. |
+| `spec.ttlSecondsAfterFinished` | int32 | No | Delete completed or failed operations after this many seconds. `machine-ops-controller` and metalman each delete expired operations of every kind; the agent does not, so the field has no effect in a cluster without either controller. |
 | `status.phase` | string | No | `Pending`, `InProgress`, `Complete`, or `Failed`. |
 | `status.message` | string | No | Human-readable status message. |
 | `status.startedAt` | time | No | Operation start timestamp. |
 | `status.completedAt` | time | No | Terminal phase timestamp. |
-| `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by host operation controllers. |
+| `status.targets` | []TargetStatus | No | Per-Machine target status. `machine-ops-controller` and metalman record one entry per target. For `HostSoftReboot`, each agent adds its own entry. `NodeReboot`, `AgentUpgrade` and `AgentReset` do not record targets. |
 | `status.conditions` | []Condition | No | Operation conditions. `Completed` tracks terminal state. `BootLoaderDownloaded=True` is latched by metalman when a target first downloads the initial PXE boot loader, usually over TFTP. `BootImageWritten` starts as `Unknown` for metalman `HostReplace`, transitions to `False` when the PXE installer requests `disk.img.gz`, and transitions to `True` when the existing `/pxe/disable` completion signal is received. `CloudInitDone` starts as `Unknown`, transitions to `False` when first-boot cloud-init starts, and transitions to `True` on final cloud-init success or `False` with reason `Failed` and a summarized error when cloud-init reports a failure. |
 
 `AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL may use HTTP or HTTPS and must point to an `unbounded-agent` release tarball. The optional `spec.parameters.sha256` is the expected digest of the compressed archive. The agent verifies the digest when provided, stages the archive's exact `unbounded-agent` member as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
@@ -231,8 +232,8 @@ target one Machine with `spec.machineRef` or a site-scoped set of Machines with
 `spec.machineSelector`. Selector-based bare-metal host operations must select a
 single metalman site with `unbounded-cloud.io/site=<site>`.
 
-For host operations, `status.targets[]` is snapshotted when execution starts
-and remains authoritative even if labels later change. Metalman records its
+For out-of-band host operations, `status.targets[]` is snapshotted when
+execution starts and remains authoritative even if labels later change. Metalman records its
 state-machine progress directly in each target. Resumable external providers
 also store the provider operation handle on the target so polling can continue
 after a controller restart. Each entry includes:
@@ -274,7 +275,12 @@ after a controller restart. Each entry includes:
 | `SSHReachable` | machina | `True` / `False` based on a TCP probe to the SSH port. |
 | `Provisioning` | machina | `True` while the install script is running over SSH. `lastTransitionTime` records when provisioning started, used to detect stale provisioning attempts (e.g. after a controller restart). |
 | `Provisioned` | machina | `True` after successful SSH provisioning. `ObservedGeneration` tracks the spec generation. |
-| `CloudInitDone` | metalman | Observed first-boot cloud-init result for PXE machines. Metalman also mirrors cloud-init progress to active `HostReplace` `MachineOperation` conditions. |
+| `AgentBootstrapped` | agent | Result of the agent's initial node bootstrap: `False` with reason `Running` while it runs, `True` with reason `Succeeded`, or `False` with `RootFSFailed`, `NSpawnFailed`, `KubeletBootstrapFailed` or `Failed`. |
+| `ConfigurationPending` | machina | `True` while no MachineConfiguration is assigned to the Machine. |
+| `RepavePending` | agent | Set when the agent handles a deletion of the Node, right after it records the applied version: `False` with reason `Applied` when that version matches `configurationRef`, `True` with reason `Pending` otherwise. It is not set to `True` when `configurationRef` changes, so it is normally `False`. |
+
+Cloud-init progress for PXE machines is reported as the `CloudInitDone`
+condition on the `HostReplace` MachineOperation, not on the Machine.
 
 ### Phase lifecycle
 
@@ -282,12 +288,12 @@ The machina controller drives the following phases:
 
 | Phase | Meaning | Requeue interval |
 |-------|---------|------------------|
-| `Pending` | SSH is unreachable. | 30 s |
+| `Pending` | SSH is unreachable, or no MachineConfiguration is assigned. | 30 s |
 | `Provisioning` | Install script is running over SSH. | - |
-| `Joining` | Provisioned; waiting for a Node with the matching label. | 30 s |
+| `Joining` | Provisioned; waiting for the Node named in `spec.kubernetes.nodeRef`, or named after the Machine. | 30 s |
 | `Ready` | Node exists, or no `kubernetes` spec is present. | 5 min |
 | `Failed` | Provisioning encountered an error. | 60 s |
-| `Rebooting` | Reserved for metalman or provider controllers. | - |
+| `Rebooting` | Defined in the API but not set yet. | - |
 
 ### Labels and annotations
 
@@ -295,7 +301,6 @@ The machina controller drives the following phases:
 
 | Label | Applied to | Description |
 |-------|-----------|-------------|
-| `unbounded-cloud.io/machine` | Node | Maps the Node back to its Machine CR. Set during provisioning. |
 | `unbounded-cloud.io/site` | Machine | Scopes a metalman instance to a subset of Machines. |
 | `unbounded-cloud.io/default-bootstrap-token` | Secret | Marks a Secret as the default bootstrap token for auto-discovery. |
 
@@ -303,7 +308,7 @@ The machina controller drives the following phases:
 
 | Annotation | Description |
 |-----------|-------------|
-| `unbounded-cloud.io/provider` | Associates a Machine with a provider controller (extension point). |
+| `unbounded-cloud.io/provider` | Reserved. No component reads or sets it. |
 
 ### Examples
 
@@ -435,6 +440,7 @@ spec:
         passwordRef:
           name: bmc-password
           namespace: unbounded-system
+          key: password
       cloudInit:
         userDataConfigMapRef:
           name: my-cloud-init
@@ -519,7 +525,7 @@ omitted, metalman falls back to `dhcpBootImageName` for the UEFI HTTP boot URL.
 
 ## CRD relationships
 
-![Machine CRD relationships: Machine spec fields reference OCI Image, Secrets in unbounded-system and kube-system namespaces, with bidirectional Machine-Node link via label](../../img/machina-crd-relationships.svg)
+![Machine CRD relationships: Machine spec fields reference OCI Image, Secrets in unbounded-system and kube-system namespaces, with a bidirectional Machine-Node link](../../img/machina-crd-relationships.svg)
 
 ## See Also
 

@@ -35,6 +35,9 @@ func MachineConfigurationVersionName(configurationName string, version int32) st
 	return fmt.Sprintf("%s-v%d", configurationName, version)
 }
 
+// TODO(#1038): drop the "not locked yet" note once versions are locked when in
+// use.
+
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=mcv
 // +kubebuilder:subresource:status
@@ -44,12 +47,10 @@ func MachineConfigurationVersionName(configurationName string, version int32) st
 // +kubebuilder:printcolumn:name="Machines",type="integer",JSONPath=".status.deployedMachines"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
-// MachineConfigurationVersion is an immutable-once-deployed snapshot of a
-// MachineConfiguration's spec at a specific point in time. It acts like a
-// ReplicaSet to a Deployment: the MachineConfiguration controller
-// automatically creates and manages these objects. Versions remain
-// editable until they are deployed (referenced by a Machine). Once
-// deployed, the spec fields become immutable.
+// MachineConfigurationVersion is a numbered copy of a MachineConfiguration's
+// spec, created and managed by the system. Versions are not locked yet:
+// editing a MachineConfiguration rewrites its newest version in place, even
+// for Machines that use it.
 type MachineConfigurationVersion struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -85,12 +86,15 @@ type MachineConfigurationVersionSpec struct {
 // MachineConfigurationVersionStatus defines the observed state of a
 // MachineConfigurationVersion.
 type MachineConfigurationVersionStatus struct {
-	// Deployed indicates whether any Machine has been provisioned
-	// using this version. Once true, the spec fields are immutable.
+	// TODO(#1038): drop the "Not set yet" notes once versions are locked when
+	// in use.
+
+	// Deployed is meant to show whether any Machine has used this version.
+	// Not set yet.
 	Deployed bool `json:"deployed,omitempty"`
 
-	// DeployedMachines is the count of Machines currently referencing
-	// this version.
+	// DeployedMachines is meant to count the Machines using this version.
+	// Not set yet.
 	DeployedMachines int32 `json:"deployedMachines,omitempty"`
 
 	// Conditions represent the latest available observations.

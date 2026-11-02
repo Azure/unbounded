@@ -55,15 +55,16 @@ spec:
           metadata:
             type: object
           spec:
-            description: GatewayNodeSpec defines immutable identity metadata for a
-              GatewayNode.
+            description: |-
+              GatewayNodeSpec identifies a GatewayPoolNode. The system sets it and updates
+              it when the node moves to another gateway pool or site.
             properties:
               gatewayPool:
                 description: GatewayPool is the owning gateway pool name.
                 type: string
               nodeName:
                 description: NodeName is the Kubernetes node name publishing this
-                  GatewayNode.
+                  GatewayPoolNode.
                 type: string
               site:
                 description: Site is the site label of this gateway node.

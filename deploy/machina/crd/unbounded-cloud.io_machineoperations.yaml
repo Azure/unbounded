@@ -35,11 +35,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          MachineOperation represents a discrete operation to be performed on a
-          Machine. MachineOperations are created by CLI commands or controllers and
-          processed by the appropriate agent. The in-VM agent handles operations
-          like NodeReboot and HostSoftReboot, while cloud or PXE controllers handle
-          operations like HostHardReboot, HostPowerOff, and HostPowerOn.
+          MachineOperation asks for a one-time action on one or more Machines, such as
+          rebooting a node or powering off a host.
         properties:
           apiVersion:
             description: |-
@@ -63,15 +60,17 @@ spec:
             properties:
               machineRef:
                 description: |-
-                  MachineRef is the name of the Machine CR this operation targets.
-                  Either machineRef or machineSelector must be set.
+                  MachineRef is the name of the Machine to act on. Set either machineRef
+                  or machineSelector; if both are set, machineRef is used. Setting neither
+                  is not checked yet.
                 type: string
               machineSelector:
                 description: |-
-                  MachineSelector selects machines by labels. When set, the
-                  controller creates individual MachineOperation children for
-                  each matched machine. Either machineRef or machineSelector
-                  must be set.
+                  MachineSelector picks the Machines to act on by label. They all share
+                  this one MachineOperation. For kinds the agent runs, the selector is
+                  matched against Node labels, and the operation completes or fails when
+                  the first Machine finishes; Machines that have not started by then skip
+                  it. Not supported for hosts managed through a cloud provider.
                 properties:
                   matchExpressions:
                     description: matchExpressions is a list of label selector requirements.
@@ -117,8 +116,17 @@ spec:
                 type: object
                 x-kubernetes-map-type: atomic
               operationKind:
-                description: OperationKind is the operation to perform on the target
-                  machine.
+                description: |-
+                  OperationKind is the action to take. NodeReboot restarts the node,
+                  including kubelet, containerd and the containers running on it, without
+                  rebooting the host; the node is not drained first. AgentUpgrade upgrades
+                  the agent; AgentReset removes it and everything it set up.
+                  HostSoftReboot reboots the host's operating system through the agent and
+                  completes once the host is back; if the host does not come back, the
+                  operation stays InProgress, because it does not time out yet.
+                  HostHardReboot, HostPowerOff and HostPowerOn restart, stop or start the
+                  host through its BMC or cloud provider. HostReplace reinstalls the host
+                  so the node can rejoin.
                 enum:
                 - NodeReboot
                 - AgentUpgrade
@@ -133,18 +141,17 @@ spec:
                 additionalProperties:
                   type: string
                 description: |-
-                  Parameters is an optional set of key-value pairs passed to the
-                  operation executor. For example, RestartService uses "service" to
-                  specify the systemd unit name.
-                  need a richer type (e.g. runtime.RawExtension for arbitrary
-                  JSON, or a typed []OperationParameter struct).
+                  Parameters are extra settings for some kinds. AgentUpgrade needs
+                  "downloadURL" and accepts "sha256". HostReplace on OCI accepts
+                  "sshAuthorizedKeys", and "imageID", which is used only when neither the
+                  Machine nor its configuration sets a host image. Other kinds ignore
+                  them.
                 type: object
               ttlSecondsAfterFinished:
                 description: |-
-                  TTLSecondsAfterFinished limits the lifetime of a completed or failed
-                  MachineOperation. If set, the agent deletes the MachineOperation
-                  this many seconds after it reaches a terminal phase. If unset, the
-                  MachineOperation is kept indefinitely.
+                  TTLSecondsAfterFinished deletes the MachineOperation this many seconds
+                  after it completes or fails. If unset, it is kept.
+                  Not enforced without machine-ops-controller or metalman yet.
                 format: int32
                 minimum: 0
                 type: integer
@@ -225,25 +232,24 @@ spec:
                 type: string
               observedMachineGeneration:
                 description: |-
-                  ObservedMachineGeneration is the Machine's metadata.generation
-                  at the time the agent began executing the operation. Clients
-                  can compare this to the current Machine generation to determine
-                  whether the operation acted on the expected machine state.
+                  ObservedMachineGeneration is the Machine's metadata.generation that the
+                  operation acted on. Compare it with the current value to see whether the
+                  Machine has changed since. It may be empty for a failed operation, and
+                  is not set for bare-metal host operations yet.
                 format: int64
                 type: integer
               phase:
-                description: Phase is the current phase of the operation.
+                description: Phase is Pending, InProgress, Complete or Failed.
                 type: string
               startedAt:
-                description: StartedAt is when the agent began executing the operation.
+                description: StartedAt is when work on the operation began.
                 format: date-time
                 type: string
               targets:
                 description: |-
-                  Targets records the per-machine execution state for this operation.
-                  For single-machine operations this contains one entry. For selector
-                  operations, targets are snapshotted when execution begins and remain
-                  authoritative even if selector matches change later.
+                  Targets records progress for each Machine, by name. For actions run
+                  through a BMC or cloud provider, the list is fixed when the operation
+                  starts, even if labels change later. Not every kind records targets.
                 items:
                   description: MachineOperationTargetStatus records execution state
                     for one target Machine.
@@ -261,13 +267,14 @@ spec:
                         the current boot ID to decide whether the reboot happened.
                       type: string
                     bootMedia:
-                      description: BootMedia records immutable media ownership and
-                        cleanup progress.
+                      description: |-
+                        BootMedia is metalman's internal record of the boot media it used for
+                        this Machine. Do not rely on its fields.
                       properties:
                         abandoned:
                           description: |-
-                            Abandoned ends ownership after the installer never finished its
-                            handoff within the allowed time.
+                            Abandoned is true once metalman stops waiting for the installer and
+                            gives up the media.
                           type: boolean
                         bootAttempts:
                           description: BootAttempts counts power-on attempts used
@@ -275,33 +282,40 @@ spec:
                           format: int32
                           type: integer
                         certFingerprint:
+                          description: CertFingerprint is the fingerprint of the BMC's
+                            TLS certificate.
                           type: string
                         cleaned:
+                          description: |-
+                            Cleaned is true once the BMC is set to boot from disk and the media is
+                            unmounted.
                           type: boolean
                         cleanedAt:
-                          description: CleanedAt starts the bounded wait for installer
-                            reboot handoff.
+                          description: CleanedAt is when Cleaned became true.
                           format: date-time
                           type: string
                         id:
+                          description: ID identifies the boot media. It changes if
+                            the media is replaced.
                           type: string
                         imageWritten:
+                          description: ImageWritten is true once the installer has
+                            written the image to disk.
                           type: boolean
                         loaderStartedAt:
                           description: |-
-                            LoaderStartedAt is set when the bootloader on the media first fetches
-                            its install config. It proves the host booted the media.
+                            LoaderStartedAt is when the host, booted from the media, first fetched
+                            its install config.
                           format: date-time
                           type: string
                         machineUID:
-                          description: |-
-                            UID is a type that holds unique ID values, including UUIDs.  Because we
-                            don't ONLY use UUIDs, this is an alias to string.  Being a type captures
-                            intent and helps make sure that UIDs and names do not get conflated.
+                          description: MachineUID is the UID of the Machine the media
+                            was made for.
                           type: string
                         netboot:
-                          description: PXESpec defines PXE boot configuration for
-                            a Machine.
+                          description: |-
+                            Netboot is a copy of the Machine's netboot settings when the media was
+                            made.
                           properties:
                             architecture:
                               default: amd64
@@ -451,18 +465,24 @@ spec:
                                     It is ignored when the endpoint exposes a single system selected by its URL.
                                   type: string
                                 passwordRef:
-                                  description: PasswordRef references a secret containing
-                                    the Redfish password.
+                                  description: |-
+                                    PasswordRef points to the Secret that holds the Redfish password. Set
+                                    key, because it defaults to "ssh-privatekey".
                                   properties:
                                     key:
                                       default: ssh-privatekey
-                                      description: Key within the secret.
+                                      description: |-
+                                        Key within the Secret. Defaults to "ssh-privatekey"; set it when the
+                                        value is stored under another key, as it usually is for a Redfish
+                                        password.
                                       type: string
                                     name:
-                                      description: Name of the secret.
+                                      description: Name of the Secret.
                                       type: string
                                     namespace:
-                                      description: Namespace of the secret.
+                                      description: |-
+                                        Namespace of the Secret. Ignored for SSH and bastion keys, which must be
+                                        in machina's namespace.
                                       type: string
                                   required:
                                   - name
@@ -495,41 +515,45 @@ spec:
                             rule: '!has(self.bootProtocol) || self.bootProtocol !=
                               ''VirtualMedia'' || has(self.redfish)'
                         nodeName:
-                          description: NodeName preserves the expected Node across
-                            Machine edits.
+                          description: NodeName is the name of the Node the host is
+                            expected to join as.
                           type: string
                         phase:
+                          description: Phase is metalman's current step.
                           type: string
                         phaseStartedAt:
-                          description: PhaseStartedAt bounds active progress without
-                            spending retry attempts.
+                          description: PhaseStartedAt is when the current Phase started.
                           format: date-time
                           type: string
                         readinessStartedAt:
-                          description: ReadinessStartedAt gives AC recovery one fixed
-                            grace window per phase.
+                          description: |-
+                            ReadinessStartedAt is when the BMC first reported that it was not ready
+                            during the current Phase.
                           format: date-time
                           type: string
                         rebootRequestedAt:
-                          description: RebootRequestedAt is set by the successful
-                            installer ready callback.
+                          description: RebootRequestedAt is when the installer reported
+                            it was ready to reboot.
                           format: date-time
                           type: string
                         released:
-                          description: Released confirms local media removal after
-                            Cleaned revokes serving.
+                          description: Released is true once metalman has deleted
+                            its own copy of the media.
                           type: boolean
                         site:
-                          description: Site preserves controller ownership after the
-                            Machine is deleted.
+                          description: Site is the site of the metalman that owns
+                            the media.
                           type: string
                         sourceName:
+                          description: SourceName is the media's name on SourceServer.
                           type: string
                         sourceServer:
+                          description: SourceServer is the server the BMC loads the
+                            media from.
                           type: string
                         stagedDeleted:
-                          description: StagedDeleted confirms rack media deletion
-                            after safe boot is restored.
+                          description: StagedDeleted is true once the staged media
+                            file has been deleted.
                           type: boolean
                       required:
                       - id

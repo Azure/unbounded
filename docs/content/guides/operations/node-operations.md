@@ -10,9 +10,10 @@ handled by `unbounded-agent`.
 
 ## NodeReboot
 
-Stops kubelet and containerd inside the nspawn machine, stops the nspawn
-container, then restarts it and brings kubelet and containerd back up. The rootfs
-is not replaced.
+Restarts the nspawn machine with `systemctl restart systemd-nspawn@<machine>`.
+kubelet, containerd and the node's other services stop and start with the
+machine, and so do the containers running on it. The node is not drained
+first. The rootfs is not replaced.
 
 Use this when you need to restart Kubernetes components without touching the
 host, for example after applying node-level configuration changes or to clear
@@ -34,10 +35,10 @@ kubectl get mop node-reboot-worker-01 -w
 ```
 
 ```
-NAME                     KIND          MACHINE      PHASE        AGE
-node-reboot-worker-01    NodeReboot    worker-01    Pending      0s
-node-reboot-worker-01    NodeReboot    worker-01    InProgress   1s
-node-reboot-worker-01    NodeReboot    worker-01    Complete     30s
+NAME                    MACHINE     OPERATION    PHASE        AGE
+node-reboot-worker-01   worker-01   NodeReboot   Pending      0s
+node-reboot-worker-01   worker-01   NodeReboot   InProgress   1s
+node-reboot-worker-01   worker-01   NodeReboot   Complete     30s
 ```
 
 After the operation completes, the Node object remains and kubelet re-registers
@@ -48,13 +49,16 @@ with the API server.
 Recreating the node rootfs is not a MachineOperation. Instead, cordon and drain
 the Kubernetes Node, then delete the Node object and let the agent reconcile.
 
-When the agent observes that a Machine still exists but the corresponding Node
-does not, it:
+When the agent sees the Node being deleted, it:
 
-1. Resolves the desired `MachineConfiguration`
-2. Stops the old nspawn machine
-3. Creates a new nspawn machine from the desired configuration
-4. Lets kubelet join the cluster again
+1. Resolves the desired configuration from the Machine's `configurationRef`
+2. If it differs from the applied configuration, stops the old nspawn machine
+   and creates a new one from the desired configuration, then lets kubelet join
+   the cluster again
+3. Otherwise records the desired version as applied and changes nothing
+
+The agent reacts only to deletions it sees while its daemon is running. A Node
+deleted while the daemon is stopped is not acted on.
 
 The agent reacts to Node deletion; it does not evict pods or perform
 CNI-specific dataplane cleanup. Drain the node first so kubelet, containerd, and
@@ -74,17 +78,20 @@ kubectl delete node worker-01
 kubectl get machines worker-01 -w
 ```
 
-Use node recreation when you need to:
+Use node recreation to apply a changed configuration from the Machine's
+`configurationRef`, such as a new Kubernetes version, node labels, taints, agent
+image or local DNS settings. Make the change in the MachineConfiguration, or
+point `configurationRef.version` at a version that has it, before you delete the
+Node. This path does not read `spec.kubernetes.version` on the Machine.
 
-- Upgrade the Kubernetes version on a node
-- Apply rootfs-level changes from a new `MachineConfiguration`
-- Recover from nspawn container corruption
+Deleting the Node does not rebuild a node whose configuration has not changed,
+so it does not recover a corrupted rootfs. Use `HostReplace` for that.
 
 ### Why Not a MachineOperation?
 
 Rootfs recreation is a reconciliation workflow driven by desired state, not a
-discrete action. The agent already watches for a missing Node and reconciles
-automatically. Adding operation kinds like `NodeReimage`, `NodeUpgrade`, or
+discrete action. The agent already watches for Node deletion and applies the
+desired configuration. Adding operation kinds like `NodeReimage`, `NodeUpgrade`, or
 `NodeRecreate` would duplicate this declarative path.
 
 ## Choosing the Right Approach
@@ -92,8 +99,8 @@ automatically. Adding operation kinds like `NodeReimage`, `NodeUpgrade`, or
 | Symptom | Action | Why |
 |---------|--------|-----|
 | Kubelet or containerd is stuck | `NodeReboot` | Restarts the nspawn container without replacing the rootfs. |
-| Need a new Kubernetes version | Cordon, drain, then delete the Node | Agent recreates with the desired MachineConfiguration. |
-| Node rootfs is corrupted | Cordon, drain, then delete the Node | Agent replaces the rootfs entirely. |
+| Need a new Kubernetes version | Update the MachineConfiguration, then cordon, drain, and delete the Node | Agent recreates the node with the version in `configurationRef`. |
+| Node rootfs is corrupted | `HostReplace` | Reinstalls the host and the node. Deleting the Node does not rebuild an unchanged node. |
 | Host kernel or OS needs updating | `HostSoftReboot` or `HostReplace` | Requires host-level action. See [Host Operations]({{< relref "guides/operations/host-operations" >}}). |
 | Host is unresponsive | `HostHardReboot` | Out-of-band reboot through provider or BMC. |
 

@@ -28,9 +28,8 @@ namespace. Built on controller-runtime.
 - Watches `Machine` and `Node` resources.
 - Provisions remote hosts over SSH: TCP probe, SSH connect (direct or via
   bastion), copy and execute an install script.
-- Detects the corresponding Node by the label
-  `unbounded-cloud.io/machine=<name>` and transitions the Machine phase to
-  Ready.
+- Finds the corresponding Node by name (`spec.kubernetes.nodeRef`, or the
+  Machine name) and transitions the Machine phase to Ready.
 
 **Startup resolution:** resolves API server address from
 `KUBERNETES_SERVICE_HOST`, cluster CA from the `kube-root-ca.crt` ConfigMap,
@@ -106,21 +105,22 @@ Represents a host and drives its lifecycle.
 | Spec field            | Description |
 |-----------------------|-------------|
 | `spec.ssh`            | SSH connectivity (host, port, user, privateKeyRef) and optional bastion config. |
-| `spec.pxe`            | PXE config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. |
+| `spec.host.netboot`   | Netboot config: machine image reference, optional netboot image override, dhcpLeases, redfish settings. Replaces the legacy `spec.pxe`. |
 | `spec.kubernetes`     | Kubernetes version, bootstrapTokenRef, nodeRef, nodeLabels. |
 
-Status includes phase, message, conditions, SSH fingerprint, Redfish cert
-fingerprint, and TPM info. The API defines condition type constants including
-`Provisioned`, `SSHReachable`, `Provisioning`, `CloudInitDone`, and
+Status includes phase, message, conditions, Redfish cert fingerprint, and TPM
+info. The SSH host key fingerprint field is defined but not set yet. The API
+defines Machine condition types including
+`Provisioned`, `SSHReachable`, `Provisioning`, `AgentBootstrapped`, and
 `RepavePending`. Day-2 reboot and repave progress is tracked on
 `MachineOperation` objects rather than on the Machine itself.
 
 ### Netboot OCI Images
 
-Metalman uses two OCI images for PXE repaves. `Machine.spec.pxe.image` references
-the machine image containing `/disk/disk.img.gz`. `Machine.spec.pxe.netbootImage`
+Metalman uses two OCI images for PXE repaves. `Machine.spec.host.netboot.image` references
+the machine image containing `/disk/disk.img.gz`. `Machine.spec.host.netboot.netbootImage`
 optionally references the reusable PXE boot environment; when omitted, Metalman
-uses its configured default `netboot` image. `Machine.spec.pxe.architecture`
+uses its configured default `netboot` image. `Machine.spec.host.netboot.architecture`
 selects the OCI platform manifest for both images and defaults to `amd64`.
 
 Netboot images contain all files needed for PXE booting under `/disk/`. Files
@@ -129,7 +129,7 @@ with a `.tmpl` suffix are Go templates rendered per-machine at serve time. A
 
 ### Resource relationships
 
-![Resource relationships: Secrets and OCI Images referenced by Machine spec fields, with bidirectional Node-Machine link via label](../../img/architecture-resource-relationships.svg)
+![Resource relationships: Secrets and OCI Images referenced by Machine spec fields, with a bidirectional Node-Machine link](../../img/architecture-resource-relationships.svg)
 
 ## Network Architecture
 
@@ -167,7 +167,7 @@ For a walkthrough, see the [SSH Provisioning Guide]({{< ref "guides/ssh" >}}).
 
 ### PXE Path (metalman)
 
-1. `Machine` CR created with `spec.pxe`.
+1. `Machine` CR created with `spec.host.netboot`.
 2. A `HostReplace` `MachineOperation` requests a repave; metalman sets the PXE or HTTP boot override and force-restarts the host through Redfish.
 3. Host PXE-boots: DHCP (IP + boot filename) -> TFTP (bootloader) -> HTTP
    (kernel, initrd, configs).

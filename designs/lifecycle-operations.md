@@ -12,7 +12,8 @@ containerd, CNI plugins, and pod containers while leaving the host running.
 Operations are requested with `MachineOperation` and target a `Machine` by
 `spec.machineRef` or `spec.machineSelector`. Each operation is handled by the
 component that owns the relevant boundary. Controllers that do not own an
-operation ignore it.
+operation ignore it. Today there is an exception: any `machine-ops-controller`
+fails an operation whose Machine is missing or has an invalid `spec.host`.
 
 ## Proposed operations
 
@@ -23,14 +24,16 @@ operation ignore it.
 | `HostHardReboot` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal with BMC | Reboot, reset, or power-cycle the host through the provider or BMC. |
 | `HostSoftReboot` | Host | `unbounded-agent` on the host | Reboot the host operating system from inside the host with `systemctl reboot`. The agent records the boot ID before rebooting and completes the operation after it starts on a new boot. |
 | `HostReplace` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal | Delete and recreate the VM or reimage the physical host, inject bootstrap configuration through cloud-init or an equivalent first-boot mechanism, and have the agent recreate the node so it rejoins the cluster. |
-| `NodeReboot` | Node container | `unbounded-agent` on the host | Stop kubelet and containerd inside the nspawn machine, stop the nspawn machine, then restart it and bring kubelet and containerd back up without replacing the rootfs. |
+| `NodeReboot` | Node container | `unbounded-agent` on the host | Restart the nspawn machine with `systemctl restart systemd-nspawn@<machine>`, which stops and starts kubelet and containerd with it, without replacing the rootfs. |
 | `AgentUpgrade` | Host agent | `unbounded-agent`, with controller coordination | Replace the host-resident agent binary and restart it safely. |
 
 ## Component ownership
 
 `machine-ops-controller` owns cloud-provider host operations. Today it maps
-`HostPowerOff`, `HostPowerOn`, and `HostHardReboot` to Azure VM and OCI instance
-APIs based on `Machine.spec.provider` and `Machine.spec.providerID`. For
+`HostPowerOff`, `HostPowerOn`, `HostHardReboot`, and `HostReplace` to Azure
+VM and OCI instance APIs based on `Machine.spec.host.azure`,
+`Machine.spec.host.external`, or the legacy `Machine.spec.provider` and
+`Machine.spec.providerID`. For
 `HostReplace`, a cloud provider implementation should delete and recreate the VM
 using the provider's API and inject the bootstrap configuration through
 cloud-init or an equivalent first-boot mechanism.
@@ -40,9 +43,9 @@ Redfish/BMC control for power state and boot-order changes. For `HostReplace`,
 metalman should boot the machine through PXE, write the selected host OS image,
 install or configure the agent, and let the agent create the nspawn node.
 
-`unbounded-agent` owns node operations because it runs on the host next to
-`machinectl`, systemd, and the nspawn rootfs under `/var/lib/machines`. Node
-operations do not power the host on or off.
+`unbounded-agent` owns node operations, and `HostSoftReboot`, because it runs
+on the host next to `machinectl`, systemd, and the nspawn rootfs under
+`/var/lib/machines`. Node operations do not power the host on or off.
 
 ## Not MachineOperation values
 
@@ -51,6 +54,11 @@ reimage or upgrade a node, delete the Kubernetes `Node` object. The agent should
 observe that the `Machine` still exists but the corresponding `Node` does not,
 resolve the desired `MachineConfiguration`, delete the old nspawn rootfs, create
 a new nspawn machine, and let kubelet join the cluster again.
+
+Today the agent acts only on `Node` delete events it sees while its daemon is
+running, and recreates the nspawn machine only when the configuration from the
+Machine's `configurationRef` differs from the applied one. Deleting the `Node`
+of a node whose configuration has not changed does not rebuild it.
 
 This is distinct from `HostReplace`. `HostReplace` deletes and recreates the
 host itself. Node recreation replaces only the nspawn rootfs on an otherwise
@@ -77,7 +85,8 @@ provider operation handle in the matching `status.targets[]` entry and poll it
 one step per reconciliation. Begin callbacks must be idempotent for the stable
 `MachineOperation` UID because they may be repeated until the handle is
 persisted. Each provider request uses the provider ID from the current Machine.
-Host operations targeting the same Machine are serialized. This keeps provider
+Out-of-band host operations targeting the same Machine are serialized;
+`HostSoftReboot` is not serialized with them. This keeps provider
 operations resumable without changing the four-phase MachineOperation
 lifecycle.
 
