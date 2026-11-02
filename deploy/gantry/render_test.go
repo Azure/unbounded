@@ -157,6 +157,10 @@ func TestOverlayBDConfiguratorEnabled(t *testing.T) {
 
 	var daemonSet struct {
 		Spec struct {
+			UpdateStrategy struct {
+				Type          string `yaml:"type"`
+				RollingUpdate any    `yaml:"rollingUpdate"`
+			} `yaml:"updateStrategy"`
 			Selector struct {
 				MatchLabels map[string]string `yaml:"matchLabels"`
 			} `yaml:"selector"`
@@ -225,6 +229,10 @@ func TestOverlayBDConfiguratorEnabled(t *testing.T) {
 
 	if containers[1].Name != "configure" || containers[1].Image != "gantry-node-config:test" || !containers[1].SecurityContext.Privileged {
 		t.Fatalf("unexpected configurator container: %+v", containers[1])
+	}
+
+	if daemonSet.Spec.UpdateStrategy.Type != "OnDelete" || daemonSet.Spec.UpdateStrategy.RollingUpdate != nil {
+		t.Fatalf("snapshotter update strategy = %+v, want OnDelete without rolling replacement", daemonSet.Spec.UpdateStrategy)
 	}
 
 	foundBidirectional := false

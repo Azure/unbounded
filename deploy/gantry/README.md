@@ -253,9 +253,12 @@ The adapter DaemonSet runs `gantry snapshotter` beside the host configurator.
 The snapshotter owns both its remote metadata and its ordinary-image fallback
 state under `/var/lib/gantry/snapshotter`; it does not mount the host containerd
 socket or reuse the host's snapshot metadata.
-When updating the adapter image, bootstrap its replacement with native
-`overlayfs` on each affected node, verify the new adapter is ready, and then
-restore `gantry-overlaybd` for CRI image unpacking. The adapter cannot prepare
+The adapter DaemonSet uses `OnDelete`: a Helm or operator image update does not
+replace its pods automatically because the snapshotter owns live NBD devices.
+For each affected node, cordon and drain all workloads using the Gantry
+snapshotter before deleting that node's adapter pod. Bootstrap its replacement
+with native `overlayfs`, verify the new adapter is ready, restore
+`gantry-overlaybd` for CRI image unpacking, and only then uncordon the node. The adapter cannot prepare
 its own replacement container through its socket while that adapter is stopped;
 pre-pulling the replacement image alone does not remove this dependency.
 The configurator waits for `/artifact-streaming/readyz` and the host-visible
@@ -264,7 +267,11 @@ then snapshots the current containerd configuration under
 `/var/lib/gantry/snapshotter-config`, enables `/etc/containerd/conf.d/*.toml`
 through structured TOML, and writes a last-wins drop-in that registers
 `proxy_plugins.gantry-overlaybd` and selects it for CRI image unpacking.
-Containerd restarts only when effective configuration changes. A second writer
+Containerd restarts when effective configuration changes or when a previous
+activation failed. A pending-activation marker survives apply or restore failures;
+retries clear it only after a successful restart and service health check.
+Unchanged configuration still requires an active containerd service before the
+configurator reports readiness. A second writer
 is never overwritten: if either managed file differs from the recorded bytes,
 apply or rollback preserves it and reports the conflict.
 

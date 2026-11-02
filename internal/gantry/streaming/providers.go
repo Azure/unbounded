@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
@@ -26,9 +27,14 @@ type providerDigestKey struct {
 	addr   string
 }
 
+type providerRangeKey struct {
+	providerDigestKey
+	requested httprange.Range
+}
+
 type providerFailures struct {
 	mu          sync.Mutex
-	stale       map[providerDigestKey]time.Time
+	stale       map[providerRangeKey]time.Time
 	suspicious  map[providerDigestKey]time.Time
 	unavailable map[string]time.Time
 	now         func() time.Time
@@ -36,14 +42,14 @@ type providerFailures struct {
 
 func newProviderFailures() *providerFailures {
 	return &providerFailures{
-		stale:       map[providerDigestKey]time.Time{},
+		stale:       map[providerRangeKey]time.Time{},
 		suspicious:  map[providerDigestKey]time.Time{},
 		unavailable: map[string]time.Time{},
 		now:         time.Now,
 	}
 }
 
-func (f *providerFailures) filter(d digest.Digest, providers []ifaces.Provider, self ifaces.NodeID) []ifaces.Provider {
+func (f *providerFailures) filter(d digest.Digest, requested httprange.Range, providers []ifaces.Provider, self ifaces.NodeID) []ifaces.Provider {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -57,7 +63,7 @@ func (f *providerFailures) filter(d digest.Digest, providers []ifaces.Provider, 
 		}
 
 		key := providerDigestKey{digest: d, nodeID: provider.NodeID, addr: provider.Addr}
-		if now.Before(f.stale[key]) || now.Before(f.suspicious[key]) || now.Before(f.unavailable[provider.Addr]) {
+		if now.Before(f.stale[providerRangeKey{providerDigestKey: key, requested: requested}]) || now.Before(f.suspicious[key]) || now.Before(f.unavailable[provider.Addr]) {
 			continue
 		}
 
@@ -71,7 +77,7 @@ func (f *providerFailures) filter(d digest.Digest, providers []ifaces.Provider, 
 	return filtered
 }
 
-func (f *providerFailures) record(d digest.Digest, provider ifaces.Provider, err error) {
+func (f *providerFailures) record(d digest.Digest, requested httprange.Range, provider ifaces.Provider, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -82,7 +88,7 @@ func (f *providerFailures) record(d digest.Digest, provider ifaces.Provider, err
 
 	var notFound *ifaces.ErrNotFound
 	if errors.As(err, &notFound) {
-		f.stale[key] = now.Add(defaultStaleProviderTTL)
+		f.stale[providerRangeKey{providerDigestKey: key, requested: requested}] = now.Add(defaultStaleProviderTTL)
 
 		return
 	}
@@ -98,7 +104,7 @@ func (f *providerFailures) record(d digest.Digest, provider ifaces.Provider, err
 	if errors.As(err, &status) {
 		switch {
 		case status.StatusCode == http.StatusNotFound:
-			f.stale[key] = now.Add(defaultStaleProviderTTL)
+			f.stale[providerRangeKey{providerDigestKey: key, requested: requested}] = now.Add(defaultStaleProviderTTL)
 		case status.StatusCode == http.StatusTooManyRequests && status.RetryAfter > 0:
 			f.unavailable[provider.Addr] = now.Add(status.RetryAfter)
 		case status.StatusCode == http.StatusTooManyRequests || status.StatusCode >= http.StatusInternalServerError:

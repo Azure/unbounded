@@ -434,6 +434,19 @@ func (s *Server) serveCachedRange(w http.ResponseWriter, r *http.Request, d dige
 
 	defer func() { _ = body.Close() }() //nolint:errcheck // best-effort close
 
+	// Admit only after confirming the interval exists, so a cache miss remains
+	// a 404 even when the serving lane is saturated.
+	if r.Method == http.MethodGet {
+		release, ok := s.tryAcquireServe(r.Header.Get("Range"))
+		if !ok {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
+
+			return true
+		}
+		defer release()
+	}
+
 	w.Header().Set("Docker-Content-Digest", d.String())
 	w.Header().Set("Content-Type", contentTypeFor(kind, s.lookupMediaType(d), ""))
 	w.Header().Set("Accept-Ranges", "bytes")

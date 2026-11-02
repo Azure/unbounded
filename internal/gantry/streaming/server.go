@@ -45,17 +45,19 @@ type RangeCache interface {
 // Tuning values rather than operator configuration: changing one requires a
 // latency measurement, so they live in code with the behavior they affect.
 const (
-	defaultPeerLookupTimeout = 250 * time.Millisecond
-	defaultMaxPeerAttempts   = 3
+	defaultPeerLookupTimeout  = 250 * time.Millisecond
+	defaultPeerAttemptTimeout = 10 * time.Second
+	defaultMaxPeerAttempts    = 3
 )
 
 type Options struct {
 	URLPolicy              URLPolicy
 	ResolveCanonicalOrigin func(OriginURL) (OriginURL, bool)
 
-	// PeerLookupTimeout and MaxPeerAttempts fall back to defaults when zero.
-	PeerLookupTimeout time.Duration
-	MaxPeerAttempts   int
+	// PeerLookupTimeout, PeerAttemptTimeout, and MaxPeerAttempts use defaults when zero.
+	PeerLookupTimeout  time.Duration
+	PeerAttemptTimeout time.Duration
+	MaxPeerAttempts    int
 
 	SelfPeerID   ifaces.NodeID
 	StartupGated bool
@@ -99,6 +101,10 @@ func NewServer(local LocalRangeStore, discovery ProviderDiscovery, peer PeerRang
 
 	if opts.PeerLookupTimeout <= 0 {
 		opts.PeerLookupTimeout = defaultPeerLookupTimeout
+	}
+
+	if opts.PeerAttemptTimeout <= 0 {
+		opts.PeerAttemptTimeout = defaultPeerAttemptTimeout
 	}
 
 	if opts.MaxPeerAttempts < 1 {
@@ -178,6 +184,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Context().Err() != nil {
+		return
+	}
+
 	body, total, err := s.local.OpenRange(r.Context(), origin.Digest, requested)
 	if err == nil {
 		s.writeResponse(w, body, total, "application/octet-stream", requested, "local", started)
@@ -216,25 +226,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	cancel()
 
+	if r.Context().Err() != nil {
+		return
+	}
+
 	if lookupErr == nil {
 		attempts := 0
-		for _, provider := range s.failures.filter(origin.Digest, providers, s.opts.SelfPeerID) {
+
+		for _, provider := range s.failures.filter(origin.Digest, requested, providers, s.opts.SelfPeerID) {
+			if r.Context().Err() != nil {
+				return
+			}
+
 			if attempts >= s.opts.MaxPeerAttempts {
 				break
 			}
 
 			attempts++
 
-			peerBody, peerTotal, contentType, peerErr := s.peer.FetchRangeFromPeer(r.Context(), provider.Addr, origin.Digest, requested)
+			peerCtx, peerCancel := s.peerAttemptContext(r.Context())
+
+			peerBody, peerTotal, contentType, peerErr := s.peer.FetchRangeFromPeer(peerCtx, provider.Addr, origin.Digest, requested)
 			if peerErr != nil {
-				s.failures.record(origin.Digest, provider, peerErr)
+				peerCancel()
+
+				if r.Context().Err() != nil {
+					return
+				}
+
+				s.failures.record(origin.Digest, requested, provider, peerErr)
+
 				continue
 			}
+			defer peerCancel()
 
 			s.serveMaybeCaching(w, r, origin.Digest, peerBody, peerTotal, contentType, requested, "peer", started)
 
 			return
 		}
+	}
+
+	if r.Context().Err() != nil {
+		return
 	}
 
 	if origin.Canonical {
@@ -261,6 +294,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.serveMaybeCaching(w, r, origin.Digest, body, total, contentType, requested, "origin", started)
+}
+
+// peerAttemptContext bounds each peer read independently of bulk transfers and
+// reserves at least half of the remaining caller deadline for subsequent sources.
+func (s *Server) peerAttemptContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.opts.PeerAttemptTimeout
+	if deadline, ok := parent.Deadline(); ok {
+		timeout = min(timeout, time.Until(deadline)/2)
+	}
+
+	return context.WithTimeout(parent, timeout)
 }
 
 // serveMaybeCaching stores a small remote read before serving it. The bytes go

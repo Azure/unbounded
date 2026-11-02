@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
@@ -27,18 +28,18 @@ func TestProviderFailuresSuppressAndExpire(t *testing.T) {
 	suspicious := ifaces.Provider{NodeID: "bad", Addr: "10.0.0.3:5001"}
 	healthy := ifaces.Provider{NodeID: "healthy", Addr: "10.0.0.4:5001"}
 
-	failures.record(d, stale, &ifaces.ErrNotFound{Digest: d})
-	failures.record(d, unavailable, errors.New("connection refused"))
-	failures.record(d, suspicious, &ifaces.ErrPeerProtocol{PeerAddr: suspicious.Addr, Err: errors.New("invalid range")})
+	failures.record(d, httprange.Range{Start: 0, End: 3}, stale, &ifaces.ErrNotFound{Digest: d})
+	failures.record(d, httprange.Range{Start: 0, End: 3}, unavailable, errors.New("connection refused"))
+	failures.record(d, httprange.Range{Start: 0, End: 3}, suspicious, &ifaces.ErrPeerProtocol{PeerAddr: suspicious.Addr, Err: errors.New("invalid range")})
 
-	filtered := failures.filter(d, []ifaces.Provider{stale, unavailable, suspicious, healthy}, "self")
+	filtered := failures.filter(d, httprange.Range{Start: 0, End: 3}, []ifaces.Provider{stale, unavailable, suspicious, healthy}, "self")
 	if len(filtered) != 1 || filtered[0] != healthy {
 		t.Fatalf("filtered = %+v, want only healthy", filtered)
 	}
 
 	now = now.Add(defaultSuspiciousProviderTTL + time.Second)
 
-	filtered = failures.filter(d, []ifaces.Provider{stale, unavailable, suspicious, healthy}, "self")
+	filtered = failures.filter(d, httprange.Range{Start: 0, End: 3}, []ifaces.Provider{stale, unavailable, suspicious, healthy}, "self")
 	if len(filtered) != 4 {
 		t.Fatalf("after expiry filtered = %+v, want all providers", filtered)
 	}

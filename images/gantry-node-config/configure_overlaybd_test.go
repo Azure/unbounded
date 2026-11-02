@@ -31,16 +31,18 @@ func TestConfiguratorAppliesAndRestoresOnChange(t *testing.T) {
 func TestConfiguratorDoesNotRestartForUnchangedConfig(t *testing.T) {
 	fixture := newConfiguratorFixture(t)
 	fixture.run(t, "apply", "unchanged")
-	if calls := readLines(t, fixture.systemctlLog); len(calls) != 0 {
-		t.Fatalf("systemctl calls = %v", calls)
+	if calls := readLines(t, fixture.systemctlLog); len(calls) != 1 || calls[0] != "is-active --quiet containerd" {
+		t.Fatalf("systemctl calls = %v, want only health verification", calls)
 	}
 }
 
 type configuratorFixture struct {
-	env          []string
-	systemctlLog string
-	modprobeLog  string
-	listener     net.Listener
+	env               []string
+	systemctlLog      string
+	modprobeLog       string
+	listener          net.Listener
+	readyMarker       string
+	pendingActivation string
 }
 
 func newConfiguratorFixture(t *testing.T) configuratorFixture {
@@ -71,20 +73,26 @@ exec "$@"
 `)
 	writeExecutable(t, binDir, "curl", "#!/bin/sh\nexit 0\n")
 	writeExecutable(t, binDir, "modprobe", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_MODPROBE_LOG\"\n")
-	writeExecutable(t, binDir, "systemctl", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_SYSTEMCTL_LOG\"\n")
+	writeExecutable(t, binDir, "systemctl", `#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_SYSTEMCTL_LOG"
+[ "$1" != "${TEST_FAIL_SYSTEMCTL_ACTION:-}" ]
+`)
 	writeExecutable(t, binDir, "sh", `#!/bin/sh
 if [ "$1" = -c ]; then echo 64; exit 0; fi
 exec /bin/sh "$@"
 `)
 	configTool := writeExecutable(t, binDir, "gantry-node-config", `#!/bin/sh
 printf '%s\n' "$*" >> "$TEST_CONFIG_TOOL_LOG"
+[ "${TEST_CONFIG_FAIL:-false}" != true ] || exit 1
 printf '%s\n' "$TEST_CONFIG_RESULT"
 `)
 
 	return configuratorFixture{
-		systemctlLog: systemctlLog,
-		modprobeLog:  modprobeLog,
-		listener:     listener,
+		systemctlLog:      systemctlLog,
+		modprobeLog:       modprobeLog,
+		listener:          listener,
+		readyMarker:       filepath.Join(root, "configured"),
+		pendingActivation: filepath.Join(hostRoot, "var/lib/gantry/snapshotter-config/pending-activation"),
 		env: append(os.Environ(),
 			"HOST_ROOT="+hostRoot,
 			"CONFIG_TOOL="+configTool,

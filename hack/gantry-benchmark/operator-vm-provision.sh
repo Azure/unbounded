@@ -219,26 +219,9 @@ assign_role AcrPush "$gantry_acr_id"
 assign_role Reader "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$AZURE_RESOURCE_GROUP"
 assign_role "Log Analytics Reader" "$workspace_id"
 
-bootstrap_probe=$(az vm run-command invoke \
-  -g "$AZURE_RESOURCE_GROUP" \
-  -n "$OPERATOR_VM_NAME" \
-  --command-id RunShellScript \
-  --scripts \
-    "set -eu
-  . /etc/gantry-benchmark/env
-test \"\$BENCHMARK_NODE_COUNT\" = '$BENCHMARK_NODE_COUNT'
-test \"\$BENCHMARK_IMAGE_SIZE_MIB\" = '$BENCHMARK_IMAGE_SIZE_MIB'
-test \"\$BENCHMARK_IMAGE_LAYERS\" = '$BENCHMARK_IMAGE_LAYERS'
-systemctl cat gantry-benchmark-operator.service >/dev/null
-printf 'gantry-benchmark-bootstrap-ready\\n'" \
-  --only-show-errors \
-  --query 'value[0].message' \
-  -o tsv 2>/dev/null || true)
-
-if grep -Fq gantry-benchmark-bootstrap-ready <<<"$bootstrap_probe"; then
-  echo "operator VM bootstrap already matches the deployment contract"
-else
-  az vm run-command invoke \
+# Reconcile the checkout and every bootstrap setting on each provision. Matching
+# workload dimensions alone cannot prove the source revision or mode is current.
+az vm run-command invoke \
   -g "$AZURE_RESOURCE_GROUP" \
   -n "$OPERATOR_VM_NAME" \
   --command-id RunShellScript \
@@ -271,7 +254,6 @@ else
     "${BENCHMARK_NODE_POOL:--}" \
   --only-show-errors \
   -o json
-fi
 
 if [[ "$START_BENCHMARK" == true ]]; then
   az vm run-command invoke \

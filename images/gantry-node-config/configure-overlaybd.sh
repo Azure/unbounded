@@ -18,6 +18,7 @@ set -eu
 
 STATE_DIR="$HOST_ROOT$HOST_STATE_DIR"
 HOST_SOCKET="$HOST_ROOT$GANTRY_SNAPSHOTTER_ADDRESS"
+PENDING_ACTIVATION="$STATE_DIR/pending-activation"
 
 umask 077
 mkdir -p "$STATE_DIR" "$(dirname "$READY_MARKER")"
@@ -71,22 +72,35 @@ restart_containerd() {
 	host_exec systemctl is-active --quiet containerd
 }
 
+activate_config() {
+	pending=false
+	[ ! -f "$PENDING_ACTIVATION" ] || pending=true
+	# Persist intent before the tool can change files or remove restore state.
+	touch "$PENDING_ACTIVATION"
+	result=$(configure "$1")
+	case "$result" in
+	changed|unchanged) ;;
+	*) echo "unexpected configuration result: $result" >&2; return 1 ;;
+	esac
+	if [ "$result" = changed ] || [ "$pending" = true ]; then
+		restart_containerd
+	else
+		host_exec systemctl is-active --quiet containerd
+	fi
+	rm -f "$PENDING_ACTIVATION"
+}
+
 apply_config() {
+	rm -f "$READY_MARKER"
 	prepare_nbd
 	wait_for_services
-	result=$(configure apply)
-	if [ "$result" = changed ]; then
-		restart_containerd
-	fi
+	activate_config apply
 	touch "$READY_MARKER"
 }
 
 restore_config() {
 	rm -f "$READY_MARKER"
-	result=$(configure restore)
-	if [ "$result" = changed ]; then
-		restart_containerd
-	fi
+	activate_config restore
 }
 
 case "${1:-apply}" in

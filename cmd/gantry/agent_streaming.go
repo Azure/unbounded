@@ -38,8 +38,8 @@ func newCanonicalOriginResolver(registries []config.UpstreamRegistry) func(strea
 		}
 
 		target := *endpoint
-		target.Path = strings.TrimRight(endpoint.Path, "/") + canonical.Path
-		target.RawPath = ""
+		target.RawPath = strings.TrimRight(endpoint.EscapedPath(), "/") + canonical.EscapedPath()
+		target.Path, _ = url.PathUnescape(target.RawPath) //nolint:errcheck // EscapedPath always returns a valid escaped path.
 
 		return streamingapi.OriginURL{Raw: target.String(), Digest: origin.Digest}, true
 	}
