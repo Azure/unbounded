@@ -278,19 +278,26 @@ func unfinishedOutOfBandHostOperation(ctx context.Context, r client.Reader, mach
 }
 
 // hostOperationUnfinishedOn reports whether op has not finished on machine.
+// A target for machine that still holds boot media, or whose media boot is
+// unconfirmed, keeps the operation unfinished even after it reaches a
+// terminal phase, matching metalman.
 // Once a controller has recorded targets, they are authoritative: the
 // operation is unfinished on machine only while its target for machine is.
 // Before that, the operation is unfinished on machine if its spec selects it,
 // the way the controllers resolve targets: by spec.machineRef, or otherwise by
 // matching spec.machineSelector against the Machine labels.
 func hostOperationUnfinishedOn(op *v1alpha3.MachineOperation, machine *v1alpha3.Machine) bool {
+	target := operationTargetStatus(&op.Status, machine.Name)
+	// A finished HostReplace may still hold boot media while cleanup retries.
+	if target != nil && target.HasOutstandingBootMedia() {
+		return true
+	}
+
 	if op.Status.IsTerminal() {
 		return false
 	}
 
 	if len(op.Status.Targets) > 0 {
-		target := operationTargetStatus(&op.Status, machine.Name)
-
 		return target != nil && target.Phase != v1alpha3.OperationPhaseComplete && target.Phase != v1alpha3.OperationPhaseFailed
 	}
 

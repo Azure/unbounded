@@ -76,6 +76,40 @@ func TestReconcileHostSoftReboot_WaitsForOutOfBandOperation(t *testing.T) {
 	}
 }
 
+func TestReconcileHostSoftReboot_WaitsForFailedReplaceMediaCleanup(t *testing.T) {
+	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+	replace := outOfBandOperation("op-oob", "test-machine", v1alpha3.OperationHostReplace)
+	replace.Status.Phase = v1alpha3.OperationPhaseFailed
+	replace.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: "test-machine",
+		Phase:      v1alpha3.OperationPhaseFailed,
+		BootMedia:  &v1alpha3.MachineOperationBootMediaStatus{Phase: "Installing", ImageWritten: true},
+	}}
+	op := &fakeNodeOperator{bootID: "boot-1"}
+	c := fakeStatusClient(machine, replace, hostSoftRebootOperation("op-soft"))
+	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
+
+	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
+	require.NoError(t, err)
+	assert.Zero(t, op.rebootCalls, "the host must not reboot while HostReplace boot media is outstanding")
+	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+
+	// Media cleanup finishes and the installed OS reports cloud-init.
+	current := getMachineOperation(t, c, "op-oob")
+	current.Status.Targets[0].BootMedia.Cleaned = true
+	current.Status.Targets[0].BootMedia.Released = true
+	current.Status.Targets[0].Conditions = []metav1.Condition{{
+		Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue,
+		Reason: "Done", LastTransitionTime: metav1.Now(),
+	}}
+	require.NoError(t, c.Status().Update(context.Background(), &current))
+
+	result, err = reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Equal(t, 1, op.rebootCalls)
+}
+
 func TestReconcileHostSoftReboot_WaitsForNewerOutOfBandOperation(t *testing.T) {
 	// Out-of-band operations never wait for a HostSoftReboot, so a newer one
 	// may already be running; the HostSoftReboot still waits for it.
@@ -263,6 +297,13 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 		return op
 	}
 	siteSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"unbounded-cloud.io/site": "lab"}}
+	failedReplace := func(targets ...v1alpha3.MachineOperationTargetStatus) *v1alpha3.MachineOperation {
+		op := outOfBandOperation("op", "test-machine", v1alpha3.OperationHostReplace)
+		op.Status.Phase = v1alpha3.OperationPhaseFailed
+		op.Status.Targets = targets
+
+		return op
+	}
 
 	tests := []struct {
 		name string
@@ -314,6 +355,39 @@ func TestHostOperationUnfinishedOn(t *testing.T) {
 			name: "target for machine failed",
 			op: withTargets(outOfBandOperation("op", "test-machine", v1alpha3.OperationHostReplace),
 				v1alpha3.MachineOperationTargetStatus{MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed}),
+			want: false,
+		},
+		{
+			name: "failed replace with unreleased media",
+			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
+				MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed,
+				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Phase: "Installing"},
+			}),
+			want: true,
+		},
+		{
+			name: "failed replace with released media and confirmed boot",
+			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
+				MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed,
+				BootMedia:  &v1alpha3.MachineOperationBootMediaStatus{ImageWritten: true, Cleaned: true, Released: true},
+				Conditions: []metav1.Condition{{Type: v1alpha3.MachineOperationConditionCloudInitDone, Status: metav1.ConditionTrue}},
+			}),
+			want: false,
+		},
+		{
+			name: "terminal replace with released media and unconfirmed boot",
+			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
+				MachineRef: "test-machine", Phase: v1alpha3.OperationPhaseFailed,
+				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{ImageWritten: true, Cleaned: true, Released: true},
+			}),
+			want: true,
+		},
+		{
+			name: "outstanding media on another machine",
+			op: failedReplace(v1alpha3.MachineOperationTargetStatus{
+				MachineRef: "other-machine", Phase: v1alpha3.OperationPhaseFailed,
+				BootMedia: &v1alpha3.MachineOperationBootMediaStatus{Phase: "Installing"},
+			}),
 			want: false,
 		},
 		{

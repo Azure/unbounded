@@ -110,7 +110,9 @@ reconnects to the cluster.
 
 The agent does not start a `HostSoftReboot` while a `HostHardReboot`,
 `HostPowerOff`, `HostPowerOn`, or `HostReplace` targeting the same Machine is
-unfinished. The operation stays `Pending` and `status.message` names the
+unfinished. A `HostReplace` that still holds boot media, or has not confirmed
+the host booted from disk, counts as unfinished even after it fails or
+completes. The operation stays `Pending` and `status.message` names the
 operation it is waiting for. Out-of-band operations do not wait for a
 `HostSoftReboot`, so you can always use them to recover a host. If an
 out-of-band operation will never finish, for example because no controller

@@ -84,7 +84,9 @@ four-phase MachineOperation lifecycle.
 `HostSoftReboot` is executed by the agent, so the out-of-band controllers do not
 see it. The agent owns the check instead: it does not start a `HostSoftReboot`
 while any out-of-band host operation targeting the same Machine is unfinished,
-whatever its age. It stays `Pending`, names the operation it waits for in
+whatever its age. A `HostReplace` whose target still holds boot media, or has
+not confirmed a boot from disk, counts as unfinished even in a terminal phase,
+using the same predicate metalman uses. It stays `Pending`, names the operation it waits for in
 `status.message`, and checks again periodically. Out-of-band host operations do
 not wait for a `HostSoftReboot`. They are how an unresponsive host is recovered,
 so they must not depend on the agent on that host. An out-of-band operation
