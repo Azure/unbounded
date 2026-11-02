@@ -232,6 +232,16 @@ func waitPullDelay(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+// untilStart returns how long to wait from now until the Unix time startAt.
+// Zero or a past time means no wait.
+func untilStart(startAt int64, now time.Time) time.Duration {
+	if startAt <= 0 {
+		return 0
+	}
+
+	return max(time.Unix(startAt, 0).Sub(now), 0)
+}
+
 func (p *puller) pull(ctx context.Context) error {
 	return p.pullImage(ctx, p.img)
 }
