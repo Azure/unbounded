@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	testRegistry = "example.azurecr.io"
-	testUpstream = "upstream_registries:\n  - name: example.azurecr.io\n    endpoint: https://example.azurecr.io\n"
+	testRegistry       = "example.azurecr.io"
+	testUpstream       = "upstream_registries:\n  - name: example.azurecr.io\n    endpoint: https://example.azurecr.io\n"
+	testClientID       = "11111111-2222-3333-4444-555555555555"
+	testTenantID       = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	testIdentityPolicy = "mode: workloadIdentity\nclientID: " + testClientID + "\ntenantID: " + testTenantID + "\n"
 )
 
 func TestDerive(t *testing.T) {
@@ -22,20 +25,24 @@ func TestDerive(t *testing.T) {
 		want                   []string
 		wantMode, wantErr      string
 	}{
-		{name: "late ACR addition", upstream: testUpstream, want: []string{testRegistry}, wantMode: "auto"},
-		{name: "placeholder", upstream: "upstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com", wantMode: "auto"},
-		{name: "shared identity", upstream: testUpstream + "    credentials_path: /etc/gantry/registry/credentials\n", wantMode: "auto"},
+		{name: "no inferred identity", upstream: testUpstream, wantMode: "external"},
+		{name: "explicit federated identity", upstream: testUpstream, policy: testIdentityPolicy, want: []string{testRegistry}, wantMode: "workloadIdentity"},
+		{name: "late ACR addition", upstream: testUpstream, policy: testIdentityPolicy, want: []string{testRegistry}, wantMode: "workloadIdentity"},
+		{name: "placeholder", upstream: "upstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com", policy: testIdentityPolicy, wantMode: "workloadIdentity"},
+		{name: "shared identity", upstream: testUpstream + "    credentials_path: /etc/gantry/registry/credentials\n", policy: testIdentityPolicy, wantMode: "workloadIdentity"},
 		{name: "external", upstream: testUpstream, policy: "mode: external", wantMode: "external"},
-		{name: "unknown mode", upstream: testUpstream, policy: "mode: typo", wantErr: "mode must"},
+		{name: "unknown mode", upstream: testUpstream, policy: "mode: auto", wantErr: "mode must"},
 		{name: "unknown field", upstream: testUpstream, policy: "unknownField: typo", wantErr: "parse node-auth"},
-		{name: "invalid client", upstream: testUpstream, policy: "clientID: not-a-uuid", wantErr: "UUID"},
-		{name: "policy registry injection", upstream: testUpstream, policy: "registries: [other.azurecr.io]", wantErr: "must come from"},
-		{name: "insecure endpoint", upstream: strings.ReplaceAll(testUpstream, "https:", "http:"), wantErr: "matching HTTPS"},
-		{name: "mismatched endpoint", upstream: strings.Replace(testUpstream, "https://example.azurecr.io", "https://other.azurecr.io", 1), wantErr: "matching HTTPS"},
-		{name: "userinfo", upstream: strings.Replace(testUpstream, "https://", "https://user:password@", 1), wantErr: "matching HTTPS"},
-		{name: "probe", upstream: testUpstream, policy: "probeImage: example.azurecr.io/private/image:v1", want: []string{testRegistry}, wantMode: "auto"},
-		{name: "probe wrong upstream", upstream: testUpstream, policy: "probeImage: another.azurecr.io/private/image:v1", wantErr: "probeImage"},
-		{name: "malformed upstream", upstream: "upstream_registries: [", wantErr: "parse Gantry"},
+		{name: "missing client", upstream: testUpstream, policy: "mode: workloadIdentity\ntenantID: " + testTenantID, wantErr: "clientID"},
+		{name: "missing tenant", upstream: testUpstream, policy: "mode: workloadIdentity\nclientID: " + testClientID, wantErr: "tenantID"},
+		{name: "invalid client", upstream: testUpstream, policy: strings.Replace(testIdentityPolicy, testClientID, "not-a-uuid", 1), wantErr: "UUID"},
+		{name: "policy registry injection", upstream: testUpstream, policy: testIdentityPolicy + "registries: [other.azurecr.io]", wantErr: "must come from"},
+		{name: "insecure endpoint", upstream: strings.ReplaceAll(testUpstream, "https:", "http:"), policy: testIdentityPolicy, wantErr: "matching HTTPS"},
+		{name: "mismatched endpoint", upstream: strings.Replace(testUpstream, "https://example.azurecr.io", "https://other.azurecr.io", 1), policy: testIdentityPolicy, wantErr: "matching HTTPS"},
+		{name: "userinfo", upstream: strings.Replace(testUpstream, "https://", "https://user:password@", 1), policy: testIdentityPolicy, wantErr: "matching HTTPS"},
+		{name: "probe", upstream: testUpstream, policy: testIdentityPolicy + "probeImage: example.azurecr.io/private/image:v1", want: []string{testRegistry}, wantMode: "workloadIdentity"},
+		{name: "probe wrong upstream", upstream: testUpstream, policy: testIdentityPolicy + "probeImage: another.azurecr.io/private/image:v1", wantErr: "probeImage"},
+		{name: "malformed upstream", upstream: "upstream_registries: [", policy: testIdentityPolicy, wantErr: "parse Gantry"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,18 +54,17 @@ func TestDerive(t *testing.T) {
 
 			require.NoError(t, err)
 			require.Equal(t, tc.wantMode, cfg.Mode)
-
-			if tc.wantMode != "external" {
-				require.Equal(t, tc.want, cfg.Registries)
-			}
+			require.Equal(t, tc.want, cfg.Registries)
 		})
 	}
 }
 
 func TestDeriveSortsDeduplicatesAndPreservesClientID(t *testing.T) {
 	upstream := testUpstream + "  - name: other.azurecr.io\n    endpoint: https://other.azurecr.io\n  - name: example.azurecr.io\n    endpoint: https://example.azurecr.io\n"
-	cfg, err := Derive(upstream, "clientID: 11111111-2222-3333-4444-555555555555")
+	cfg, err := Derive(upstream, testIdentityPolicy)
 	require.NoError(t, err)
+	require.Equal(t, testClientID, cfg.ClientID)
+	require.Equal(t, testTenantID, cfg.TenantID)
 	require.Equal(t, []string{testRegistry, "other.azurecr.io"}, cfg.Registries)
 	data, err := cfg.ProviderConfig()
 	require.NoError(t, err)
@@ -80,7 +86,10 @@ func TestDeriveSortsDeduplicatesAndPreservesClientID(t *testing.T) {
 	require.Equal(t, ProviderName, wire.Providers[0].Name)
 	require.Equal(t, cfg.Registries, wire.Providers[0].MatchImages)
 	require.Equal(t, providerVersion, wire.Providers[0].APIVersion)
-	require.Equal(t, []string{"acr-credential-provider", "--client-id=" + cfg.ClientID, "--registry=" + testRegistry, "--registry=other.azurecr.io"}, wire.Providers[0].Args)
+	require.Equal(t, []string{"acr-credential-provider", "--socket=" + BrokerSocketPath, "--registry=" + testRegistry, "--registry=other.azurecr.io"}, wire.Providers[0].Args)
+	require.NotContains(t, string(data), "tokenAttributes", "application ServiceAccounts must not be enrolled")
+	require.NotContains(t, string(data), testClientID, "the host adapter must not have an Azure identity or assertion")
+	require.NotContains(t, string(data), "TOKEN_FILE")
 }
 
 func TestACRValidationAndImages(t *testing.T) {
@@ -102,7 +111,6 @@ func TestACRValidationAndImages(t *testing.T) {
 	require.Equal(t, testRegistry, host)
 	require.Equal(t, "private/image", repo)
 	require.Equal(t, "sha256:"+strings.Repeat("a", 64), ref)
-
 	_, taggedRepo, taggedRef, err := ParseImage("example.azurecr.io/private/image:v1@sha256:" + strings.Repeat("a", 64))
 	require.NoError(t, err)
 	require.Equal(t, repo, taggedRepo)

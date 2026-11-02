@@ -25,6 +25,14 @@ const (
 	ConfigKey = "node-auth.yaml"
 	// ProviderName is the executable name kubelet invokes.
 	ProviderName = "unbounded-acr-credential-provider"
+	// ServiceAccountName is the infrastructure identity, never an application's account.
+	ServiceAccountName = "registry-pull"
+	// FederatedAudience is the Azure token-exchange audience of the projected assertion.
+	FederatedAudience = "api://AzureADTokenExchange"
+	// FederatedTokenPath exists only in the broker Pod, not on the host.
+	FederatedTokenPath = "/var/run/secrets/unbounded-registry-auth/token"
+	// BrokerSocketPath is the protected node-local exec adapter endpoint.
+	BrokerSocketPath = "/run/unbounded-registry-auth/credential.sock"
 	// FlexNodeLabel and FlexNodeValue identify AKS Flex nodes, not native AKS nodes.
 	FlexNodeLabel = "kubernetes.azure.com/nodepool-type"
 	FlexNodeValue = "FlexNodes"
@@ -39,7 +47,9 @@ var (
 // Registries are never read from node-auth.yaml; gantry-config is authoritative.
 type Config struct {
 	Mode       string   `json:"mode,omitempty"`
+	Registry   string   `json:"registry,omitempty"`
 	ClientID   string   `json:"clientID,omitempty"`
+	TenantID   string   `json:"tenantID,omitempty"`
 	ProbeImage string   `json:"probeImage,omitempty"`
 	Registries []string `json:"registries,omitempty"`
 }
@@ -62,26 +72,41 @@ func Derive(gantry, policy string) (Config, error) {
 	}
 
 	if cfg.Mode == "" {
-		cfg.Mode = "auto"
+		cfg.Mode = "external"
 	}
 
-	if cfg.Mode != "auto" && cfg.Mode != "external" {
-		return Config{}, errors.New("node-auth mode must be auto or external")
+	if cfg.Mode != "workloadIdentity" && cfg.Mode != "external" {
+		return Config{}, errors.New("node-auth mode must be workloadIdentity or external")
 	}
 
-	if cfg.ClientID != "" {
+	if cfg.Mode == "workloadIdentity" {
 		if _, err := uuid.Parse(cfg.ClientID); err != nil {
-			return Config{}, errors.New("node-auth clientID must be a managed identity client UUID")
+			return Config{}, errors.New("node-auth workloadIdentity requires an explicit clientID UUID")
 		}
+
+		if _, err := uuid.Parse(cfg.TenantID); err != nil {
+			return Config{}, errors.New("node-auth workloadIdentity requires an explicit tenantID UUID")
+		}
+	}
+
+	if cfg.Registry != "" && !IsACR(cfg.Registry) {
+		return Config{}, errors.New("node-auth registry must be a public-cloud ACR login server")
 	}
 
 	if cfg.Mode == "external" {
 		if cfg.ProbeImage != "" {
-			return Config{}, errors.New("node-auth probeImage requires auto mode")
+			return Config{}, errors.New("node-auth probeImage requires workloadIdentity mode")
 		}
 
 		return cfg, nil
 	}
+
+	merged, _, err := EnsureUpstream(gantry, policy)
+	if err != nil {
+		return Config{}, err
+	}
+
+	gantry = merged
 
 	var upstreams struct {
 		Registries []struct {
@@ -95,6 +120,10 @@ func Derive(gantry, policy string) (Config, error) {
 	}
 
 	for _, upstream := range upstreams.Registries {
+		if cfg.Registry != "" && upstream.Name != cfg.Registry {
+			continue
+		}
+
 		if !IsACR(upstream.Name) || upstream.CredentialsPath != "" {
 			continue
 		}
@@ -113,7 +142,7 @@ func Derive(gantry, policy string) (Config, error) {
 	if cfg.ProbeImage != "" {
 		host, _, _, err := ParseImage(cfg.ProbeImage)
 		if err != nil || !slices.Contains(cfg.Registries, host) {
-			return Config{}, errors.New("node-auth probeImage must be an image in a configured managed-identity ACR upstream")
+			return Config{}, errors.New("node-auth probeImage must be an image in a configured federated ACR upstream")
 		}
 	}
 
@@ -160,10 +189,7 @@ func ParseImage(image string) (string, string, string, error) {
 
 // ProviderConfig renders kubelet's stable v1 exec provider configuration.
 func (c Config) ProviderConfig() ([]byte, error) {
-	args := []string{"acr-credential-provider"}
-	if c.ClientID != "" {
-		args = append(args, "--client-id="+c.ClientID)
-	}
+	args := []string{"acr-credential-provider", "--socket=" + BrokerSocketPath}
 
 	for _, registry := range c.Registries {
 		args = append(args, "--registry="+registry)

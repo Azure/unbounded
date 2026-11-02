@@ -116,7 +116,7 @@ func TestExchangeFailuresDoNotLeakTokensOrBodies(t *testing.T) {
 		return azcore.AccessToken{}, errors.New("private-token")
 	})
 	_, err := p.RefreshToken(t.Context(), testRegistry)
-	require.ErrorContains(t, err, "managed identity")
+	require.ErrorContains(t, err, "federated token")
 	require.NotContains(t, err.Error(), "private-token")
 	_, err = p.RefreshToken(t.Context(), "example.azurecr.io.evil.test")
 	require.ErrorContains(t, err, "non-ACR")

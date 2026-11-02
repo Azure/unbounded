@@ -123,6 +123,48 @@ After a few minutes your remote node appears with status **Ready**.
 For the full walkthrough including pod networking verification, see the
 [Getting Started Guide](https://unbounded-cloud.io/guides/getting-started/).
 
+### AKS Flex: create the entire cluster with one script
+
+For one AKS system node plus three Azure VMs joined to a FlexNodes pool with
+Unbounded-Net, use the self-contained, idempotent provisioning script:
+
+```bash
+bash hack/scripts/aks-flex-cluster.sh \
+    --name my-flex-cluster \
+    --location canadacentral \
+    --subscription "<subscription-uuid>" \
+    --yes
+```
+
+Rerun the same command to reuse the deployment. Bootstrap uses Azure VM Run
+Command by default; `--bootstrap-transport ssh` selects SSH instead. SSH ingress
+to the Flex VMs remains restricted to your public IPv4 `/32` with either
+transport. SSH commands and a private kubeconfig are saved under
+`tmp/aks-flex/my-flex-cluster/`. Add `--plan` to inspect the topology without
+creating resources. See the [deployment runbook](designs/aks-flex-cluster.md) for
+prerequisites, validation, and recovery boundaries. Run `make aks-flex-test` for
+the offline deployment tests; no Azure credentials are needed.
+
+For transparent private-image pulls from an existing shared ACR, the script can
+also provision one federated pull identity per cluster and configure the
+operator's node-wide broker:
+
+```bash
+bash hack/scripts/aks-flex-cluster.sh \
+    --name my-flex-cluster \
+    --location canadacentral \
+    --subscription "<subscription-uuid>" \
+    --acr sharedtestacr \
+    --yes
+```
+
+This requires an operator release containing the federated registry broker. The
+network-only `v0.8.0` baseline does not provide it; select a compatible published
+release with `--unbounded-version`, or preinstall a compatible operator before
+onboarding an existing cluster. The script checks capability before registry
+identity/role changes. Applications need no authentication-specific Pod or
+ServiceAccount edits. The shared ACR is never created, adopted, or deleted.
+
 ## Documentation
 
 Full documentation is available at **[unbounded-cloud.io](https://unbounded-cloud.io/)**.

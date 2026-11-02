@@ -23,6 +23,10 @@ import (
 const acrUpstream = "upstream_registries:\n  - name: example.azurecr.io\n    endpoint: https://example.azurecr.io\n"
 
 func authSource(policy string) *corev1.ConfigMap {
+	if !strings.HasPrefix(policy, "mode:") {
+		policy = "mode: workloadIdentity\nclientID: 11111111-2222-3333-4444-555555555555\ntenantID: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n" + policy
+	}
+
 	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: configName, Namespace: component.DefaultNamespace}, Data: map[string]string{"config.yaml": acrUpstream, registryauth.ConfigKey: policy}}
 }
 
@@ -48,7 +52,26 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 
 	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue}, ds.Spec.Template.Spec.NodeSelector, "must exclude native AKS nodes")
 	require.True(t, ds.Spec.Template.Spec.HostPID)
-	require.Equal(t, env.Config.Image("unbounded-operator"), ds.Spec.Template.Spec.Containers[0].Image)
+	require.Equal(t, env.Config.RegistryAuthNodeImage(), ds.Spec.Template.Spec.Containers[0].Image)
+	require.Equal(t, registryauth.ServiceAccountName, ds.Spec.Template.Spec.ServiceAccountName)
+
+	var projected bool
+
+	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		if volume.Projected == nil {
+			continue
+		}
+
+		for _, source := range volume.Projected.Sources {
+			if source.ServiceAccountToken != nil {
+				require.Equal(t, registryauth.FederatedAudience, source.ServiceAccountToken.Audience)
+
+				projected = true
+			}
+		}
+	}
+
+	require.True(t, projected, "the broker needs its own assertion, not an application's token")
 	require.Equal(t, []string{"registry-auth-node"}, ds.Spec.Template.Spec.Containers[0].Args)
 	require.Equal(t, int32(1), ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal)
 	require.Equal(t, []corev1.Capability{"SYS_CHROOT"}, ds.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities.Add)

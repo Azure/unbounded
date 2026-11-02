@@ -41,6 +41,7 @@ import (
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/racer/workload"
+	"github.com/Azure/unbounded/internal/registryauth"
 )
 
 const (
@@ -438,8 +439,9 @@ func stampConfigHash(obj *unstructured.Unstructured, annotation, hash string) er
 
 // planConfig hashes the gantry config payload and, when no config exists,
 // returns the operation that creates the embedded default. An existing
-// operator or user-managed payload (for example an edited upstream_registries
-// list) is never applied over, so the returned operation is create-if-absent.
+// operator or user-managed payload is preserved. An explicit node-auth registry
+// onboarding request merges only its upstream under an optimistic merge patch;
+// otherwise the returned operation is create-if-absent.
 //
 // See net.planConfig for why the hash is computed at plan time and what happens
 // if another writer wins the create.
@@ -449,7 +451,23 @@ func planConfig(ctx context.Context, env *component.Env) (string, *component.Ope
 
 	err := env.Client.Get(ctx, key, existing)
 	if err == nil {
-		return component.ConfigMapPayloadHash(existing), nil, nil
+		payload, changed, err := registryauth.EnsureUpstream(existing.Data["config.yaml"], existing.Data[registryauth.ConfigKey])
+		if err != nil {
+			return "", nil, err
+		}
+
+		if !changed {
+			return component.ConfigMapPayloadHash(existing), nil, nil
+		}
+
+		existing.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
+		desired := existing.DeepCopy()
+		desired.Data["config.yaml"] = payload
+
+		return component.ConfigMapPayloadHash(desired), &component.Operation{
+			Kind: component.OpMergePatch, Object: component.ToUnstructured(desired),
+			Base: component.ToUnstructured(existing), Component: Component{}.Name(),
+		}, nil
 	}
 
 	if !apierrors.IsNotFound(err) {

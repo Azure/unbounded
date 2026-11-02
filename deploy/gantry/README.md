@@ -165,9 +165,10 @@ entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
 the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
-Operator-managed Gantry separately reconciles ACR kubelet authentication on
-Linux AKS Flex nodes when a public ACR upstream is added. This does not change
-the containerd mirror route. See the operator-managed ACR section in
+Operator-managed Gantry can separately reconcile a node-wide federated ACR
+broker and kubelet adapter on Linux Flex nodes when an explicit pull identity is
+configured. Applications and their ServiceAccounts are unchanged; no VM identity
+or IMDS endpoint is required. This does not change the containerd mirror route. See the operator-managed ACR section in
 [`docs/content/guides/gantry.md`](../../docs/content/guides/gantry.md) for managed
 identity permissions, `node-auth.yaml`, private-image probes, and external mode.
 

@@ -96,16 +96,16 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 		operations = append(operations, op)
 	}
 
-	result := component.NotReadyAfter("RegistryAuthInstalling", "reconciling ACR credential providers on AKS Flex nodes; inspect DaemonSet/"+registryAuthName+" and its pod logs for identity or AcrPull errors", 10*time.Second)
+	result := component.NotReadyAfter("RegistryAuthInstalling", "reconciling federated ACR brokers on Flex nodes; inspect DaemonSet/"+registryAuthName+" and its pod logs for federation or registry-permission errors", 10*time.Second)
 
 	if existing.Spec.Template.Annotations[registryAuthHash] == digest && existing.Status.ObservedGeneration >= existing.Generation &&
 		existing.Status.UpdatedNumberScheduled == existing.Status.DesiredNumberScheduled && existing.Status.NumberAvailable == existing.Status.DesiredNumberScheduled &&
-		len(existing.Spec.Template.Spec.Containers) > 0 && existing.Spec.Template.Spec.Containers[0].Image == env.Config.Image("unbounded-operator") {
-		message := "ACR credential provider installed on AKS Flex nodes; private repository pull permission is unverified (set node-auth.yaml probeImage)"
+		len(existing.Spec.Template.Spec.Containers) > 0 && existing.Spec.Template.Spec.Containers[0].Image == env.Config.RegistryAuthNodeImage() {
+		message := "federated node-wide ACR broker installed; repository pull permission is unverified (set node-auth.yaml probeImage)"
 		if !active {
 			message = "operator-owned node authentication removed; registry authentication is externally managed"
 		} else if cfg.ProbeImage != "" {
-			message = "ACR credential provider installed; private-image authorization verified on AKS Flex nodes"
+			message = "federated node-wide ACR broker installed; private-image authorization verified on Flex nodes"
 		}
 
 		if existing.Status.DesiredNumberScheduled == 0 {
@@ -125,8 +125,9 @@ func registryAuthObjects(env *component.Env, payload []byte, hash string) ([]cli
 	}
 	config := &corev1.ConfigMap{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}, ObjectMeta: metadata(), Data: map[string]string{"config.json": string(payload)}}
 	account := &corev1.ServiceAccount{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"}, ObjectMeta: metadata()}
+	account.Name = registryauth.ServiceAccountName
 	role := &rbacv1.Role{TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"}, ObjectMeta: metadata(), Rules: []rbacv1.PolicyRule{{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, ResourceNames: []string{registryauth.RestartLeaseName}, Verbs: []string{"get", "update"}}}}
-	binding := &rbacv1.RoleBinding{TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"}, ObjectMeta: metadata(), RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: registryAuthName}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: registryAuthName, Namespace: env.Namespace}}}
+	binding := &rbacv1.RoleBinding{TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"}, ObjectMeta: metadata(), RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: registryAuthName}, Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: registryauth.ServiceAccountName, Namespace: env.Namespace}}}
 	lease := &coordinationv1.Lease{TypeMeta: metav1.TypeMeta{APIVersion: "coordination.k8s.io/v1", Kind: "Lease"}, ObjectMeta: metav1.ObjectMeta{Name: registryauth.RestartLeaseName, Namespace: env.Namespace, Labels: labels}}
 	workload := &appsv1.DaemonSet{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}, ObjectMeta: metadata(), Spec: appsv1.DaemonSetSpec{
 		Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": registryAuthName}},
@@ -134,9 +135,9 @@ func registryAuthObjects(env *component.Env, payload []byte, hash string) ([]cli
 		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: map[string]string{registryAuthHash: hash}}, Spec: corev1.PodSpec{
 			NodeSelector:       map[string]string{"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue},
 			Tolerations:        []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
-			ServiceAccountName: registryAuthName, HostPID: true, HostNetwork: true, DNSPolicy: corev1.DNSClusterFirstWithHostNet,
+			ServiceAccountName: registryauth.ServiceAccountName, HostPID: true, HostNetwork: true, DNSPolicy: corev1.DNSClusterFirstWithHostNet,
 			Containers: []corev1.Container{{
-				Name: "configure", Image: env.Config.Image("unbounded-operator"), ImagePullPolicy: corev1.PullIfNotPresent,
+				Name: "configure", Image: env.Config.RegistryAuthNodeImage(), ImagePullPolicy: corev1.PullIfNotPresent,
 				Args:            []string{"registry-auth-node"},
 				Env:             []corev1.EnvVar{{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}}, {Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}},
 				SecurityContext: &corev1.SecurityContext{RunAsUser: ptr.To(int64(0)), RunAsNonRoot: ptr.To(false), AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"SYS_CHROOT"}}, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
@@ -144,9 +145,13 @@ func registryAuthObjects(env *component.Env, payload []byte, hash string) ([]cli
 				ReadinessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromInt32(9096)}}, PeriodSeconds: 5},
 				LivenessProbe:   &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/livez", Port: intstr.FromInt32(9096)}}, InitialDelaySeconds: 10, PeriodSeconds: 10},
 				Resources:       corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("64Mi")}, Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("256Mi")}},
-				VolumeMounts:    []corev1.VolumeMount{{Name: "host", MountPath: "/host"}, {Name: "config", MountPath: "/etc/registry-auth", ReadOnly: true}},
+				VolumeMounts:    []corev1.VolumeMount{{Name: "host", MountPath: "/host"}, {Name: "config", MountPath: "/etc/registry-auth", ReadOnly: true}, {Name: "federated-token", MountPath: "/var/run/secrets/unbounded-registry-auth", ReadOnly: true}},
 			}},
-			Volumes: []corev1.Volume{{Name: "host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/", Type: ptr.To(corev1.HostPathDirectory)}}}, {Name: "config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: registryAuthName}}}}},
+			Volumes: []corev1.Volume{
+				{Name: "host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/", Type: ptr.To(corev1.HostPathDirectory)}}},
+				{Name: "config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: registryAuthName}}}},
+				{Name: "federated-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{DefaultMode: ptr.To(int32(0o400)), Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: registryauth.FederatedAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}}}}}},
+			},
 		}},
 	}}
 

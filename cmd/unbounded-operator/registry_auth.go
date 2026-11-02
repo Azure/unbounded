@@ -15,23 +15,18 @@ import (
 
 func registryAuthCommands() []*cobra.Command {
 	var (
-		clientID   string
+		socketPath string
 		registries []string
 	)
 
 	provider := &cobra.Command{
-		Use: "acr-credential-provider", Short: "Serve one kubelet ACR managed-identity credential request", Hidden: true,
+		Use: "acr-credential-provider", Short: "Forward one kubelet credential request to the node-local federated broker", Hidden: true,
 		Args: cobra.NoArgs, SilenceUsage: true, SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			p, err := registryauth.NewProvider(clientID)
-			if err != nil {
-				return err
-			}
-
-			return p.Run(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(), registries)
+			return registryauth.RunExec(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(), socketPath, registries)
 		},
 	}
-	provider.Flags().StringVar(&clientID, "client-id", "", "Optional user-assigned managed identity client ID")
+	provider.Flags().StringVar(&socketPath, "socket", registryauth.BrokerSocketPath, "Protected node-local broker socket")
 	provider.Flags().StringArrayVar(&registries, "registry", nil, "Allowed ACR login server (repeatable)")
 
 	var opts registryauth.NodeOptions
@@ -51,6 +46,7 @@ func registryAuthCommands() []*cobra.Command {
 	node.Flags().StringVar(&opts.Listen, "listen", ":9096", "Node-auth health listener")
 	node.Flags().StringVar(&opts.Namespace, "namespace", os.Getenv("POD_NAMESPACE"), "Restart Lease namespace")
 	node.Flags().StringVar(&opts.Identity, "identity", os.Getenv("POD_UID"), "Unique identity for restart coordination")
+	node.Flags().StringVar(&opts.TokenFile, "token-file", registryauth.FederatedTokenPath, "Projected infrastructure ServiceAccount assertion")
 
 	return []*cobra.Command{provider, node}
 }

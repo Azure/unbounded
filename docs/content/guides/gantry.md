@@ -273,56 +273,82 @@ registry, the flow is:
 Requester-delegated private-registry authentication requires an HTTPS origin.
 Private plaintext HTTP registries are not supported by this mode.
 
-#### Operator-Managed ACR Authentication on AKS Flex Nodes
+#### Transparent Operator-Managed ACR Authentication on Flex Nodes
 
-For operator-managed Gantry, adding a public Azure ACR upstream also reconciles
-kubelet managed-identity authentication on Linux AKS Flex nodes. This works for
-nodes that joined before the registry was configured and for nodes joining later.
-The node selector requires `kubernetes.azure.com/nodepool-type=FlexNodes`;
-native AKS nodes and their credential providers are not modified.
+The operator can install node-wide ACR credentials without changing application
+Pod specifications or ServiceAccounts. It uses a dedicated infrastructure
+ServiceAccount, `registry-pull`, in the operator namespace. All broker replicas
+federate that account to the explicitly configured Azure pull identity.
 
-Keep the upstream in the existing `gantry-config` ConfigMap's `config.yaml`:
-
-```yaml
-upstream_registries:
-  - name: example.azurecr.io
-    endpoint: https://example.azurecr.io
+```text
+unchanged application -> kubelet exec adapter -> local Unix-socket broker
+  -> infrastructure ServiceAccount federation -> ACR credentials
+  -> kubelet/containerd -> Gantry -> ACR or peers
 ```
 
-The operator creates `DaemonSet/gantry-acr-auth` using its own versioned image.
-The helper installs a kubelet exec credential provider and a dedicated systemd
-drop-in inside each Flex node. It preserves the agent's kubelet unit, existing
-arguments, and containerd mirror configuration. Kubelet restarts are serialized
-across nodes with a namespace-scoped Lease. Tokens are obtained through Azure
-managed identity and passed through kubelet/containerd to Gantry, not stored in
-node configuration or Kubernetes Secrets by this integration.
+The broker runs as `DaemonSet/gantry-acr-auth` on Linux nodes labeled
+`kubernetes.azure.com/nodepool-type=FlexNodes`. The label describes pool
+membership, not where the machine runs: no Azure VM identity, IMDS endpoint,
+application annotations, or application token projection is required. Native
+AKS nodes and their existing providers are not modified.
 
-**Azure authorization is still explicit.** By default the provider uses the
-Flex VM's system-assigned identity. Give each selected identity `AcrPull` on the
-registry, or the appropriate repository-reader role for an ABAC-enabled ACR.
-The operator never creates Azure role assignments, enables the ACR admin
-account, or borrows the native AKS kubelet identity. The identity must be
-available from IMDS inside the Flex node.
+The platform administrator or provisioning tool must prepare:
 
-Optional installation policy belongs in **`data.node-auth.yaml` alongside
-`data.config.yaml`**, not inside Gantry's runtime YAML:
+- A pull identity with `AcrPull` on the ACR, or the appropriate repository-reader
+  role for an ABAC-enabled registry. It does not need attachment to a VM.
+- Federation trust for the cluster's OIDC issuer, subject
+  `system:serviceaccount:<operator-namespace>:registry-pull`, and audience
+  `api://AzureADTokenExchange`.
+
+The broker Pod explicitly projects its own short-lived token; the Azure
+Workload Identity pod-mutation webhook is not required for this flow. The
+operator does not create Azure identities, trust bindings, or role assignments,
+and does not need Azure IAM-administrator permissions. It never falls back to
+IMDS or another identity when federation fails.
+
+Installation policy belongs in **`data.node-auth.yaml` alongside
+`data.config.yaml`** in `ConfigMap/gantry-config`:
 
 ```yaml
-mode: auto
-# Optional user-assigned managed identity client UUID. That identity must be
-# attached to every target Flex VM and have the required registry permission.
-# clientID: 11111111-2222-3333-4444-555555555555
+mode: workloadIdentity
+registry: example.azurecr.io
+clientID: 11111111-2222-3333-4444-555555555555
+tenantID: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+# Optional existing private image for an authorization probe.
 probeImage: example.azurecr.io/private/application:v1
 ```
 
-`mode: auto` is the default when this key is absent. `probeImage` is optional,
-but without it the operator explicitly reports that private repository pull
-permission is unverified. When supplied, the helper obtains a scoped pull token
-and performs an authenticated manifest HEAD for that image on each target node.
-This verifies image authorization without downloading layers; it is not an
-end-to-end Gantry distribution test.
+The optional `registry` field asks the operator to add that HTTPS upstream to
+Gantry. It replaces the untouched sole `registry.example.com` placeholder;
+other upstreams, settings, and comments are preserved under an optimistic merge
+patch. It also scopes the broker's credential provider to that selected server.
+Without `registry`, configure `upstream_registries` normally; eligible ACR entries
+then share the explicitly configured pull identity. Identity
+identifiers are not secrets. No identity is inferred from a registry hostname.
 
-Check installation and actionable authentication errors with:
+The deployment script `hack/scripts/aks-flex-cluster.sh --acr NAME` provisions
+one pull identity per cluster by default, prepares trust and the registry-scoped
+role, then hands this policy to the operator. An existing identity can instead
+be supplied explicitly with `--acr-pull-identity`. A shared ACR is never created,
+adopted, or deleted by that script. The operator release must contain this broker
+feature; the network-only `v0.8.0` baseline does not, and capability checks stop
+onboarding before registry grants when the operator is incompatible.
+
+The helper installs a credential-provider exec adapter and its separately owned
+kubelet systemd drop-in. It preserves the agent-generated unit, argument and
+environment expansions, and containerd mirror route. A narrow Lease coordinates
+kubelet restarts across nodes. The adapter only communicates over the root-only
+Unix socket: it has no Azure token file or identity and does not forward
+application ServiceAccount tokens. Registry credentials are not stored in host
+provider configuration, ConfigMaps, Kubernetes Secrets, or logs by this feature.
+
+The normal versioned operator image must be pullable before private ACR auth is
+installed; do not make the installer depend on the registry it is configuring.
+For development or separately published helpers, `--registry-auth-image` (or
+`UNBOUNDED_REGISTRY_AUTH_IMAGE`) selects an exact operator image containing the
+broker commands without changing unrelated component image settings.
+
+Check reconciliation with:
 
 ```bash
 kubectl -n unbounded-system rollout status daemonset/gantry-acr-auth
@@ -330,27 +356,27 @@ kubectl -n unbounded-system logs -l app.kubernetes.io/name=gantry-acr-auth
 kubectl get sites -o yaml
 ```
 
-`GantryReady` remains false while the helper rollout or node authentication is
-not ready. A running Gantry process alone does not establish that private pulls
-work. Missing identity/IMDS access, registry exchange failures, and failed
-private-image probes are reported in helper readiness and logs. A configured
-probe must name an image that actually exists.
+`GantryReady` remains false while configured federation or installation is not
+ready. The optional `probeImage` performs an authenticated manifest HEAD on each
+node. It verifies access to that image, not all repositories or end-to-end Gantry
+distribution. Without a probe, status explicitly reports repository permission
+as unverified. Missing trust, wrong client/tenant IDs, and rejected registry
+credentials fail visibly rather than switching identity.
 
-Use `mode: external` when workloads use `imagePullSecrets` or another system
-manages kubelet credentials. Existing external credential-provider settings and
-unmarked host files are never overwritten. Shared Gantry `credentials_path`
-upstreams do not install this ACR provider. Kubelet authentication is independent
-of Gantry's storage backend, so switching to Racer does not remove it.
-This initial integration supports public Azure ACR endpoints, not sovereign
-clouds or workload identity.
+`mode: external` is the default when no policy is supplied. Use it to retain
+normal `imagePullSecrets` or externally managed providers. Existing providers
+and unmarked host files are never overwritten. Shared Gantry `credentials_path`
+entries are not automatically migrated to federation. This node-wide model
+intentionally gives eligible workloads shared pull access; it does not add
+per-application or cached-content tenant isolation. Public Azure ACR is the
+initial supported cloud profile.
 
-The helper continuously repairs owned-file drift, including after node updates.
-Replacing a helper pod does not remove authentication. Explicit external mode,
-or removing the last eligible ACR upstream, makes retained helpers remove only
-their marked drop-in and provider files and restart kubelet under the same Lease.
-Ensure replacement authentication is available before doing this if workloads
-still pull private images. Wait for that cleanup before uninstalling the
-operator; offline nodes may retain owned files until their helper runs again.
+Owned-file drift is continuously repaired, including after node updates. Broker
+replacement does not remove authentication. Explicit external mode removes only
+owned adapter configuration under the same restart coordination. Prepare
+replacement authentication first if private pulls are still needed, and wait
+for cleanup before uninstalling the operator. Offline nodes may retain owned
+files until their helper can run again.
 
 #### Shared-Identity Authentication
 

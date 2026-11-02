@@ -211,8 +211,9 @@ endif
 CNI_PLUGINS_VERSION  ?= v1.9.1
 
 # Host architecture for local image builds (amd64 / arm64). Used to pick the
-# right CNI plugins tarball for the current machine.
-HOST_GOARCH := $(shell $(GOCMD) env GOARCH)
+# right CNI plugins tarball for the current machine. Skip this optional lookup
+# when Go is absent so non-Go targets can parse the Makefile without warnings.
+HOST_GOARCH := $(shell if command -v $(GOCMD) >/dev/null 2>&1; then $(GOCMD) env GOARCH; fi)
 
 # Kubernetes deploy knobs.
 NET_NAMESPACE           ?= $(UNBOUNDED_NAMESPACE)
@@ -258,6 +259,7 @@ help: ## Show this help
 	@echo "  lint                             Run golangci-lint and actionlint"
 	@echo "  lint-actions                     Run actionlint over .github/workflows"
 	@echo "  test                             Run all tests"
+	@echo "  aks-flex-test                    Run offline AKS Flex deployment tests (no Azure credentials or Go required)"
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck; fails only on vulnerabilities with final fixes"
@@ -556,6 +558,11 @@ test: lint machina-manifests token-refresher-manifests machine-ops-manifests pla
 	$(GOTEST) ./...
 
 endif
+
+.PHONY: aks-flex-test
+aks-flex-test: ## Run offline AKS Flex deployment tests (no Azure credentials or Go required)
+	bash -n hack/scripts/aks-flex-cluster.sh
+	python3 hack/scripts/aks-flex-cluster_test.py
 
 e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
@@ -870,7 +877,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
 unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
 

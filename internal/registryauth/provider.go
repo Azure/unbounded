@@ -43,22 +43,24 @@ type ProviderResponse struct {
 	Auth          map[string]Credential `json:"auth"`
 }
 
-// Provider exchanges managed-identity tokens at validated ACR endpoints only.
+// Provider exchanges the infrastructure identity's tokens at validated ACR endpoints only.
 type Provider struct {
 	Credential azcore.TokenCredential
 	HTTP       *http.Client
 }
 
-// NewProvider uses only managed identity, never an ambient CLI or developer identity.
-func NewProvider(clientID string) (*Provider, error) {
-	opts := &azidentity.ManagedIdentityCredentialOptions{}
-	if clientID != "" {
-		opts.ID = azidentity.ClientID(clientID)
+// NewProvider uses only the broker's explicit projected workload identity.
+// It never selects IMDS, application identities, CLI credentials, or an ambient chain.
+func NewProvider(cfg Config, tokenFile string) (*Provider, error) {
+	if cfg.ClientID == "" || cfg.TenantID == "" || tokenFile == "" {
+		return nil, errors.New("broker workload identity requires clientID, tenantID, and a projected token file")
 	}
 
-	credential, err := azidentity.NewManagedIdentityCredential(opts)
+	credential, err := azidentity.NewWorkloadIdentityCredential(&azidentity.WorkloadIdentityCredentialOptions{
+		ClientID: cfg.ClientID, TenantID: cfg.TenantID, TokenFilePath: tokenFile,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("initialize managed identity: %w", err)
+		return nil, errors.New("initialize broker workload identity: invalid identity configuration")
 	}
 
 	return &Provider{Credential: credential, HTTP: &http.Client{Timeout: 25 * time.Second}}, nil
@@ -111,7 +113,7 @@ func (p *Provider) RefreshToken(ctx context.Context, registry string) (string, e
 
 	token, err := p.Credential.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{"https://containerregistry.azure.net/.default"}})
 	if err != nil {
-		return "", errors.New("managed identity token acquisition failed; verify the Flex VM identity and IMDS connectivity")
+		return "", errors.New("federated token acquisition failed; verify clientID, tenantID, infrastructure ServiceAccount federation, and token projection")
 	}
 
 	parts := strings.Split(token.Token, ".")
@@ -121,12 +123,12 @@ func (p *Provider) RefreshToken(ctx context.Context, registry string) (string, e
 	}
 
 	if len(parts) != 3 {
-		return "", errors.New("managed identity returned a malformed token")
+		return "", errors.New("federated identity returned a malformed token")
 	}
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil || json.Unmarshal(payload, &claims) != nil || claims.Tenant == "" {
-		return "", errors.New("managed identity token has no tenant")
+		return "", errors.New("federated identity token has no tenant")
 	}
 
 	var result struct {
@@ -219,7 +221,7 @@ func (p *Provider) post(ctx context.Context, registry, path string, form url.Val
 	defer closeQuietly(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ACR token exchange returned HTTP %d; verify the selected managed identity and AcrPull or repository-reader assignment", resp.StatusCode)
+		return fmt.Errorf("ACR token exchange returned HTTP %d; verify the configured federated pull identity and AcrPull or repository-reader assignment", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))

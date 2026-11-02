@@ -76,6 +76,7 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
 	cmd.Flags().StringVar(&cfg.imageRegistry, "image-registry", envStringDefault("UNBOUNDED_IMAGE_REGISTRY", "ghcr.io/azure"), "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images (defaults to $UNBOUNDED_IMAGE_REGISTRY or ghcr.io/azure)")
+	cmd.Flags().StringVar(&cfg.registryAuthImage, "registry-auth-image", os.Getenv("UNBOUNDED_REGISTRY_AUTH_IMAGE"), "Exact operator image for the node-auth helper; defaults to the version-matched operator image")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.AddCommand(registryAuthCommands()...)
@@ -92,6 +93,7 @@ type config struct {
 	leaderElectionNamespace string
 	namespace               string
 	imageRegistry           string
+	registryAuthImage       string
 	apiServerEndpoint       string
 	reapLegacyResources     bool
 }
@@ -230,6 +232,7 @@ func run(ctx context.Context, cfg config) error {
 		Config: operator.Config{
 			ImageRegistry:     cfg.imageRegistry,
 			ImageTag:          version.Version,
+			RegistryAuthImage: cfg.registryAuthImage,
 			APIServerEndpoint: cfg.apiServerEndpoint,
 		},
 	}).SetupWithManager(mgr); err != nil {

@@ -1,0 +1,75 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package registryauth
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
+)
+
+func TestExplicitRegistryOnboardingPreservesOtherRuntimeConfiguration(t *testing.T) {
+	original := "# administrator comment\nmirror_listen: 0.0.0.0:5000\ncustom_setting: preserve\nupstream_registries:\n  - name: other.example\n    endpoint: https://other.example\n"
+	policy := testIdentityPolicy + "registry: " + testRegistry + "\n"
+	merged, changed, err := EnsureUpstream(original, policy)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Contains(t, merged, "# administrator comment")
+
+	var got map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(merged), &got))
+	require.Equal(t, "preserve", got["custom_setting"])
+	require.Equal(t, "0.0.0.0:5000", got["mirror_listen"])
+	entries := got["upstream_registries"].([]any)
+	require.Len(t, entries, 2)
+	require.Equal(t, "other.example", entries[0].(map[string]any)["name"])
+	require.Equal(t, testRegistry, entries[1].(map[string]any)["name"])
+	require.Equal(t, "https://"+testRegistry, entries[1].(map[string]any)["endpoint"])
+
+	again, changed, err := EnsureUpstream(merged, policy)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, merged, again)
+
+	cfg, err := Derive(original, policy)
+	require.NoError(t, err)
+	require.Equal(t, []string{testRegistry}, cfg.Registries, "the auth plan must use the same desired registry as the runtime merge")
+}
+
+func TestExplicitRegistryReplacesOnlyUntouchedDefaultPlaceholder(t *testing.T) {
+	original := "mirror_listen: 0.0.0.0:5000\nupstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com\n"
+	merged, changed, err := EnsureUpstream(original, testIdentityPolicy+"registry: "+testRegistry)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NotContains(t, merged, "registry.example.com")
+	require.Contains(t, merged, testRegistry)
+}
+
+func TestExplicitRegistryDoesNotEnrollUnrelatedACRUpstreams(t *testing.T) {
+	runtime := testUpstream + "  - name: other.azurecr.io\n    endpoint: https://other.azurecr.io\n"
+	policy := testIdentityPolicy + "registry: " + testRegistry
+	cfg, err := Derive(runtime, policy)
+	require.NoError(t, err)
+	require.Equal(t, []string{testRegistry}, cfg.Registries)
+
+	unchanged, changed, err := EnsureUpstream(runtime, policy)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, runtime, unchanged)
+}
+
+func TestRegistryOnboardingRefusesAmbiguousOrConflictingConfiguration(t *testing.T) {
+	policy := testIdentityPolicy + "registry: " + testRegistry
+	for _, runtime := range []string{"", "upstream_registries: {}", "upstream_registries: []\nupstream_registries: []", testUpstream + "    credentials_path: /shared/credentials\n"} {
+		_, _, err := EnsureUpstream(runtime, policy)
+		require.Error(t, err, runtime)
+	}
+
+	original := testUpstream
+	merged, changed, err := EnsureUpstream(original, "")
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, original, merged)
+}
