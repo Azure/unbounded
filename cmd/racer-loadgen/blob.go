@@ -73,7 +73,7 @@ func newBlobCatalog(ctx context.Context, repository, seed string, count int, siz
 	return newBlobCatalogWithWorkers(ctx, repository, seed, count, size, 1)
 }
 
-func newBlobCatalogWithWorkers(ctx context.Context, repository, seed string, count int, size int64, workers int) (*blobCatalog, error) {
+func newBlobCatalogWithWorkers(ctx context.Context, repository, seed string, count int, size int64, workers int, trusted ...digest.Digest) (*blobCatalog, error) {
 	lastLog := time.Now()
 	progress := func(completed int) {
 		if completed == count || time.Since(lastLog) >= 5*time.Second {
@@ -85,6 +85,10 @@ func newBlobCatalogWithWorkers(ctx context.Context, repository, seed string, cou
 	}
 
 	return buildBlobCatalog(ctx, repository, count, size, workers, func(ctx context.Context, index int, buffer []byte) (blobSource, error) {
+		if index < len(trusted) {
+			return trustedCatalogBlob(seed, index, size, trusted[index])
+		}
+
 		return hashCatalogBlob(ctx, seed, index, size, buffer)
 	}, progress)
 }
@@ -168,6 +172,27 @@ func buildBlobCatalog(ctx context.Context, repository string, count int, size in
 	}
 
 	return catalog, nil
+}
+
+// trustedCatalogBlob builds a catalog entry from a digest computed earlier for
+// the same seed, index, and size, skipping the startup hash. A wrong digest is
+// not detected here; readers with --verify report it as a digest mismatch.
+func trustedCatalogBlob(seed string, index int, size int64, want digest.Digest) (blobSource, error) {
+	if err := want.Validate(); err != nil {
+		return blobSource{}, fmt.Errorf("trusted blob digest: %w", err)
+	}
+
+	key := sha256.Sum256(fmt.Appendf(nil, "racer-loadgen/blob/v1/%d/%s", index, seed))
+
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return blobSource{}, err
+	}
+
+	data := &virtualLayer{payloadBytes: size, size: size, block: block}
+	desc := ocispec.Descriptor{MediaType: "application/octet-stream", Digest: want, Size: size}
+
+	return blobSource{descriptor: desc, data: data}, nil
 }
 
 func hashCatalogBlob(ctx context.Context, seed string, index int, size int64, buffer []byte) (blobSource, error) {
