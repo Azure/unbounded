@@ -25,6 +25,7 @@ type loadMetrics struct {
 	originRequests     *prometheus.CounterVec
 	originBytes        prometheus.Counter
 	originDuration     prometheus.Histogram
+	rangeResumes       prometheus.Counter
 }
 
 func newMetrics(reg *prometheus.Registry) *loadMetrics {
@@ -43,10 +44,11 @@ func newMetrics(reg *prometheus.Registry) *loadMetrics {
 		requestDuration:    prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "request_duration_seconds", Help: "Blob acquisition latency through body consumption.", Buckets: buckets}, []string{"kind", "result"}),
 		originRequests:     prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "origin_requests_total", Help: "Synthetic HTTP requests or SDK origin callbacks; SDK callback failures use code=error."}, []string{"method", "code"}),
 		originBytes:        prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "origin_bytes_total", Help: "Bytes written to HTTP or read by SDK from the synthetic origin; not cache or network delivery accounting."}),
+		rangeResumes:       prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "range_resumes_total", Help: "Ranged reads resumed after a mid-transfer failure (range-bytes mode)."}),
 		originDuration:     prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "origin_request_duration_seconds", Help: "Synthetic HTTP request or SDK callback/body lifetime.", Buckets: buckets}),
 	}
 	reg.MustRegister(m.pulls, m.pullFailures, m.pullDuration, m.inFlight, m.appliedConcurrency, m.receivedBytes, m.verifiedBytes, m.requests, m.requestDuration,
-		m.originRequests, m.originBytes, m.originDuration, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		m.originRequests, m.originBytes, m.originDuration, m.rangeResumes, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	return m
 }
