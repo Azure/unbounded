@@ -108,6 +108,14 @@ starts again, it marks the operation `Complete` if the boot ID changed, or
 `Failed` if the host did not reboot. The operation is reported only after the host comes back and the agent
 reconnects to the cluster.
 
+The agent does not start a `HostSoftReboot` while a `HostHardReboot`,
+`HostPowerOff`, `HostPowerOn`, or `HostReplace` targeting the same Machine is
+unfinished. The operation stays `Pending` and `status.message` names the
+operation it is waiting for. Out-of-band operations do not wait for a
+`HostSoftReboot`, so you can always use them to recover a host. If an
+out-of-band operation will never finish, for example because no controller
+handles it, delete it to let the `HostSoftReboot` run.
+
 ## HostPowerOff
 
 Powers off the VM or physical host. The machine remains registered but stops

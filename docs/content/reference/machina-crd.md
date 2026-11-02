@@ -140,8 +140,11 @@ them again until their operation handle has been persisted. `OperationRequest`
 contains the exact external machine resource UID and generation, resolved host
 image, and observed Machine generation frozen in target status. Providers
 receive the canonical `host.external.providerID` or Azure resource ID; legacy
-Machines continue to supply `Machine.spec.providerID`. Host operations targeting
-the same Machine are serialized.
+Machines continue to supply `Machine.spec.providerID`. Out-of-band host
+operations targeting the same Machine are serialized in creation order. A
+`HostSoftReboot` does not start while an out-of-band host operation on its
+Machine is unfinished. Out-of-band host operations do not wait for a
+`HostSoftReboot`.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3
