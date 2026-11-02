@@ -337,7 +337,9 @@ func (e *env) confirm(yes bool) error {
 // updateApproved applies fn to the Node's approved list and writes it with
 // Update, whose resourceVersion check fails with a Conflict if the Node
 // changed since the read; conflicts are retried. It reports whether the
-// Node changed.
+// Node changed. If the existing annotation is invalid, the dataplane approves
+// no disks, so any result other than clearing it is refused rather than
+// turning its entries into effective approval.
 func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn func([]string) []string) (bool, error) {
 	changed := false
 
@@ -351,6 +353,12 @@ func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn
 
 		old, had := n.Annotations[disks.Annotation]
 		newIDs := fn(disks.ParseAnnotation(old))
+
+		if had && len(newIDs) > 0 {
+			if err := disks.ValidateAnnotation(old); err != nil {
+				return fmt.Errorf("existing annotation on Node %s is invalid and approves no disks; clear it with 'revoke --all' first: %w", node, err)
+			}
+		}
 
 		if len(newIDs) == 0 {
 			if !had {

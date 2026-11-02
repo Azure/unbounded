@@ -134,6 +134,30 @@ func ParseAnnotation(value string) []string {
 	return out
 }
 
+// ValidateAnnotation reports whether the dataplane would accept value. Like
+// the dataplane, it rejects values over MaxAnnotationBytes, any invalid entry,
+// or more than MaxDisks distinct entries; a rejected value approves no disks.
+func ValidateAnnotation(value string) error {
+	if len(value) > MaxAnnotationBytes {
+		return fmt.Errorf("annotation %s is %d bytes, max %d", Annotation, len(value), MaxAnnotationBytes)
+	}
+
+	ids := ParseAnnotation(value)
+	for _, id := range ids {
+		if err := ValidateID(id); err != nil {
+			return err
+		}
+	}
+
+	slices.Sort(ids)
+
+	if n := len(slices.Compact(ids)); n > MaxDisks {
+		return fmt.Errorf("annotation %s lists %d disks, max %d", Annotation, n, MaxDisks)
+	}
+
+	return nil
+}
+
 // FormatAnnotation dedupes, sorts, and joins ids. It fails if any id is
 // invalid or the result exceeds MaxAnnotationBytes.
 func FormatAnnotation(ids []string) (string, error) {

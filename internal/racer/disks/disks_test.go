@@ -117,3 +117,23 @@ func TestAnnotationRoundTrip(t *testing.T) {
 		t.Fatal("want nil")
 	}
 }
+
+func TestValidateAnnotation(t *testing.T) {
+	many := make([]string, MaxDisks+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("d%d", i)
+	}
+
+	for v, ok := range map[string]bool{
+		"":                               true,
+		"a,,b, a":                        true,
+		strings.Repeat("a,", MaxDisks+5): true,
+		"a" + strings.Repeat(",", MaxAnnotationBytes): false,
+		"a,b/c":                 false,
+		strings.Join(many, ","): false,
+	} {
+		if err := ValidateAnnotation(v); (err == nil) != ok {
+			t.Errorf("ValidateAnnotation(%.20q...) = %v, want ok=%v", v, err, ok)
+		}
+	}
+}

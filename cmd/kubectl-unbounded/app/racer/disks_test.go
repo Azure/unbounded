@@ -397,6 +397,36 @@ func TestRevokeAll(t *testing.T) {
 	}
 }
 
+func TestMutationsRefuseInvalidExisting(t *testing.T) {
+	ctx := context.Background()
+	oversized := "wwn-old" + strings.Repeat(",", disks.MaxAnnotationBytes)
+
+	for name, old := range map[string]string{
+		"oversized":     oversized,
+		"invalid entry": "wwn-old,bad/id",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness("", false, node("n", map[string]string{disks.Annotation: old}))
+			if err := h.e.allow(ctx, "n", []string{"wwn-new"}, allowOpts{yes: true, force: true}); err == nil || !strings.Contains(err.Error(), "revoke --all") {
+				t.Fatalf("allow: want invalid existing error, got %v", err)
+			}
+
+			if v, _ := h.annotation(t, "n"); v != old {
+				t.Fatal("allow modified annotation")
+			}
+
+			// Clearing is always permitted.
+			if err := h.e.revoke(ctx, "n", nil, true, true); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, ok := h.annotation(t, "n"); ok {
+				t.Fatal("annotation still present")
+			}
+		})
+	}
+}
+
 func TestAllowLegacyWarning(t *testing.T) {
 	h := newHarness("", false, node("n", map[string]string{disks.LegacyBlockDevicesAnnotation: "nvme.*"}), pod("p", "n", fixture(t)))
 	if err := h.e.allow(context.Background(), "n", []string{"nvme-eui.0025385b71b2c3d4"}, allowOpts{yes: true}); err != nil {
