@@ -129,8 +129,8 @@ func TestParseRangeFlags(t *testing.T) {
 		t.Fatal("range-bytes with verify must fail")
 	}
 
-	if _, err := parseOptions([]string{"--range-parallel=0"}, io.Discard); err == nil {
-		t.Fatal("range-parallel=0 must fail")
+	if _, err := parseOptions([]string{"--range-parallel=-1"}, io.Discard); err == nil {
+		t.Fatal("range-parallel=-1 must fail")
 	}
 
 	if _, err := parseOptions([]string{"--backend=uds", "--cache=c", "--catalog-blobs=1", "--range-bytes=1024", "--range-parallel=4"}, io.Discard); err != nil {
