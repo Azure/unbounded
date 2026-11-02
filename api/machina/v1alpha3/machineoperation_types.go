@@ -76,7 +76,9 @@ const (
 
 	// OperationHostSoftReboot reboots the host operating system from inside
 	// the host (systemctl reboot). Handled by the in-VM agent, which reports
-	// completion after it starts again on a new boot.
+	// completion after it starts again on a new boot. The agent does not start
+	// it while an out-of-band host operation targeting the same Machine is
+	// unfinished; out-of-band host operations do not wait for it.
 	OperationHostSoftReboot OperationKind = "HostSoftReboot"
 
 	// OperationHostPowerOff powers off the host through an out-of-band provider.

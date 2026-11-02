@@ -1235,6 +1235,10 @@ func isExternalProviderMachine(machine *v1alpha3.Machine) bool {
 	return machine.Spec.Host != nil && (machine.Spec.Host.Azure != nil || machine.Spec.Host.External != nil)
 }
 
+// isHostOperation reports whether metalman executes operation. HostSoftReboot
+// is executed by the agent on the host, which does not start it while one of
+// these operations is unfinished on the same Machine. These operations do not
+// wait for a HostSoftReboot.
 func isHostOperation(operation v1alpha3.OperationKind) bool {
 	switch operation {
 	case v1alpha3.OperationHostHardReboot, v1alpha3.OperationHostPowerOff, v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostReplace:
