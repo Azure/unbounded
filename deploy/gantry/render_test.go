@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -98,6 +99,162 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 
 	if hostPath != "/run/containerd" || hostPathType != "Directory" {
 		t.Fatalf("containerd runtime hostPath = %q type %q, want /run/containerd type Directory", hostPath, hostPathType)
+	}
+}
+
+func TestArtifactStreamingDefaultsRenderDisabled(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderTemplates(t)
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered configmap: %v", err)
+	}
+
+	var configMap struct {
+		Data map[string]string `yaml:"data"`
+	}
+	if err := yaml.Unmarshal(raw, &configMap); err != nil {
+		t.Fatalf("unmarshal rendered configmap: %v", err)
+	}
+
+	config := configMap.Data["config.yaml"]
+	for _, expected := range []string{
+		"artifact_streaming_enabled: false",
+		".data.mcr.microsoft.com",
+		".blob.core.windows.net",
+	} {
+		if !strings.Contains(config, expected) {
+			t.Errorf("rendered config missing %q:\n%s", expected, config)
+		}
+	}
+}
+
+func TestOverlayBDConfiguratorIsOptIn(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderStandaloneTemplates(t)
+	if _, err := os.Stat(filepath.Join(outputDir, "overlaybd-config.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("overlaybd-config.yaml exists by default; err=%v", err)
+	}
+}
+
+func TestOverlayBDConfiguratorEnabled(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderChart(t, false,
+		"--set", "overlaybdConfig.enabled=true",
+		"--set", "gantry.artifactStreaming.enabled=true",
+		"--set-string", "overlaybdConfig.image.reference=gantry-node-config:test",
+		"--set-string", "overlaybdConfig.nodeSelector.kubernetes\\.azure\\.com/host-os=AzureLinux",
+	)
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "overlaybd-config.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered OverlayBD configurator: %v", err)
+	}
+
+	var daemonSet struct {
+		Spec struct {
+			UpdateStrategy struct {
+				Type          string `yaml:"type"`
+				RollingUpdate any    `yaml:"rollingUpdate"`
+			} `yaml:"updateStrategy"`
+			Selector struct {
+				MatchLabels map[string]string `yaml:"matchLabels"`
+			} `yaml:"selector"`
+			Template struct {
+				Metadata struct {
+					Labels map[string]string `yaml:"labels"`
+				} `yaml:"metadata"`
+				Spec struct {
+					HostPID      bool              `yaml:"hostPID"`
+					NodeSelector map[string]string `yaml:"nodeSelector"`
+					Containers   []struct {
+						Name            string   `yaml:"name"`
+						Image           string   `yaml:"image"`
+						Args            []string `yaml:"args"`
+						SecurityContext struct {
+							Privileged bool `yaml:"privileged"`
+						} `yaml:"securityContext"`
+						VolumeMounts []struct {
+							Name             string `yaml:"name"`
+							MountPath        string `yaml:"mountPath"`
+							MountPropagation string `yaml:"mountPropagation"`
+							ReadOnly         bool   `yaml:"readOnly"`
+						} `yaml:"volumeMounts"`
+					} `yaml:"containers"`
+					Volumes []struct {
+						Name     string `yaml:"name"`
+						HostPath struct {
+							Path string `yaml:"path"`
+							Type string `yaml:"type"`
+						} `yaml:"hostPath"`
+					} `yaml:"volumes"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &daemonSet); err != nil {
+		t.Fatalf("unmarshal OverlayBD configurator: %v", err)
+	}
+
+	if !daemonSet.Spec.Template.Spec.HostPID {
+		t.Error("hostPID = false, want true")
+	}
+
+	for key, value := range daemonSet.Spec.Selector.MatchLabels {
+		if daemonSet.Spec.Template.Metadata.Labels[key] != value {
+			t.Errorf("selector label %s=%q does not match pod label %q", key, value, daemonSet.Spec.Template.Metadata.Labels[key])
+		}
+	}
+
+	if got := daemonSet.Spec.Template.Spec.NodeSelector["kubernetes.azure.com/host-os"]; got != "AzureLinux" {
+		t.Errorf("node selector = %q, want AzureLinux", got)
+	}
+
+	if len(daemonSet.Spec.Template.Spec.Containers) != 2 {
+		t.Fatalf("unexpected configurator container: %+v", daemonSet.Spec.Template.Spec.Containers)
+	}
+
+	containers := daemonSet.Spec.Template.Spec.Containers
+	if containers[0].Name != "snapshotter" || !containers[0].SecurityContext.Privileged {
+		t.Fatalf("unexpected snapshotter container: %+v", containers[0])
+	}
+
+	if !slices.Contains(containers[0].Args, "--fallback-snapshotter=overlayfs") {
+		t.Fatalf("snapshotter args = %v, want overlayfs fallback", containers[0].Args)
+	}
+
+	if containers[1].Name != "configure" || containers[1].Image != "gantry-node-config:test" || !containers[1].SecurityContext.Privileged {
+		t.Fatalf("unexpected configurator container: %+v", containers[1])
+	}
+
+	if daemonSet.Spec.UpdateStrategy.Type != "OnDelete" || daemonSet.Spec.UpdateStrategy.RollingUpdate != nil {
+		t.Fatalf("snapshotter update strategy = %+v, want OnDelete without rolling replacement", daemonSet.Spec.UpdateStrategy)
+	}
+
+	foundBidirectional := false
+
+	for _, volumeMount := range containers[0].VolumeMounts {
+		if volumeMount.Name == "snapshotter-state" && volumeMount.MountPropagation == "Bidirectional" {
+			foundBidirectional = true
+		}
+
+		if volumeMount.Name == "containerd-runtime" {
+			t.Fatal("snapshotter must not access the host snapshot service")
+		}
+	}
+
+	if !foundBidirectional {
+		t.Fatal("snapshotter state mount is not bidirectionally propagated")
+	}
+
+	for _, volume := range daemonSet.Spec.Template.Spec.Volumes {
+		if volume.Name == "containerd-runtime" {
+			t.Fatal("snapshotter must not mount the host containerd runtime directory")
+		}
 	}
 }
 
@@ -575,7 +732,9 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	manifest := string(raw)
 	for _, fragment := range []string{
 		"path: /etc/containerd/certs.d",
-		"target_file=\"$target_dir/hosts.toml\"",
+		"path: _default/hosts.toml",
+		"for source_file in /config/*/hosts.toml; do",
+		"relative_path=${source_file#/config/}",
 		"while true; do",
 		"if ! cmp -s \"$source_file\" \"$target_file\"; then",
 		"mv \"$temp_file\" \"$target_file\"",
@@ -638,15 +797,21 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	}
 
 	hostRoot := t.TempDir()
+	sourceRoot := t.TempDir()
 	targetDir := filepath.Join(hostRoot, "_default")
 
-	sourceFile := filepath.Join(t.TempDir(), "hosts.toml")
+	sourceDir := filepath.Join(sourceRoot, "_default")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("create source directory: %v", err)
+	}
+
+	sourceFile := filepath.Join(sourceDir, "hosts.toml")
 	if err := os.WriteFile(sourceFile, []byte(hostsConfig), 0o644); err != nil {
 		t.Fatalf("write source hosts config: %v", err)
 	}
 
-	reconcileScript = strings.Replace(reconcileScript, "target_dir=/host-certs/_default", fmt.Sprintf("target_dir=%q", targetDir), 1)
-	reconcileScript = strings.Replace(reconcileScript, "source_file=/config/hosts.toml", fmt.Sprintf("source_file=%q", sourceFile), 1)
+	reconcileScript = strings.ReplaceAll(reconcileScript, "/host-certs", hostRoot)
+	reconcileScript = strings.ReplaceAll(reconcileScript, "/config", sourceRoot)
 	reconcileScript = strings.Replace(reconcileScript, "sleep 5", "sleep 0.05", 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -673,6 +838,99 @@ func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
 	waitForFileContent(t, targetFile, hostsConfig)
 }
 
+func TestArtifactStreamingUsesAKSMirrorChain(t *testing.T) {
+	t.Parallel()
+
+	const registry = "gantrystreamacr1.azurecr.io"
+
+	outputDir := renderChart(t, false,
+		"--set", "gantry.artifactStreaming.enabled=true",
+		"--set-string", "gantry.upstreamRegistries[0].name="+registry,
+		"--set-string", "gantry.upstreamRegistries[0].endpoint=http://127.0.0.1:8578?ns="+registry,
+	)
+
+	daemonSetRaw, err := os.ReadFile(filepath.Join(outputDir, "daemonset.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered daemonset: %v", err)
+	}
+
+	var daemonSet struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					HostNetwork bool   `yaml:"hostNetwork"`
+					DNSPolicy   string `yaml:"dnsPolicy"`
+					Containers  []struct {
+						Name  string `yaml:"name"`
+						Ports []struct {
+							Name     string `yaml:"name"`
+							HostPort int    `yaml:"hostPort"`
+						} `yaml:"ports"`
+					} `yaml:"containers"`
+				} `yaml:"spec"`
+			} `yaml:"template"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(daemonSetRaw, &daemonSet); err != nil {
+		t.Fatalf("unmarshal rendered daemonset: %v", err)
+	}
+
+	if !daemonSet.Spec.Template.Spec.HostNetwork {
+		t.Fatal("artifact-streaming Gantry hostNetwork = false, want true")
+	}
+
+	if got := daemonSet.Spec.Template.Spec.DNSPolicy; got != "ClusterFirstWithHostNet" {
+		t.Fatalf("artifact-streaming Gantry dnsPolicy = %q", got)
+	}
+
+	for _, container := range daemonSet.Spec.Template.Spec.Containers {
+		if container.Name != "gantry" {
+			continue
+		}
+
+		for _, port := range container.Ports {
+			if port.Name == "mirror" && port.HostPort != 0 {
+				t.Fatalf("host-networked mirror hostPort = %d, want omitted", port.HostPort)
+			}
+		}
+	}
+
+	configRaw, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered configmap: %v", err)
+	}
+
+	for _, fragment := range []string{
+		`mirror_listen: "127.0.0.1:5000"`,
+		`endpoint: "http://127.0.0.1:8578?ns=` + registry + `"`,
+	} {
+		if !strings.Contains(string(configRaw), fragment) {
+			t.Fatalf("artifact-streaming config missing %q:\n%s", fragment, configRaw)
+		}
+	}
+
+	nodeConfigRaw, err := os.ReadFile(filepath.Join(outputDir, "node-config.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered node config: %v", err)
+	}
+
+	manifest := string(nodeConfigRaw)
+	for _, fragment := range []string{
+		`server = "https://` + registry + `"`,
+		`[host."http://127.0.0.1:5000"]`,
+		`[host."http://127.0.0.1:8578"]`,
+		"path: " + registry + "/hosts.toml",
+	} {
+		if !strings.Contains(manifest, fragment) {
+			t.Fatalf("AKS node config missing %q:\n%s", fragment, manifest)
+		}
+	}
+
+	if strings.Contains(manifest, "path: _default/hosts.toml") {
+		t.Fatalf("AKS node config overwrites _default:\n%s", manifest)
+	}
+}
+
 func waitForFileContent(t *testing.T, path, want string) {
 	t.Helper()
 
@@ -696,6 +954,13 @@ func TestStandaloneAndOperatorProfilesShareCoreResources(t *testing.T) {
 	standaloneObjects := renderedObjects(t, renderStandaloneTemplates(t))
 
 	delete(operatorObjects, "Namespace//unbounded-system")
+
+	const overlayBDConfigKey = "DaemonSet/unbounded-system/gantry-overlaybd-config"
+	if _, ok := operatorObjects[overlayBDConfigKey]; !ok {
+		t.Fatalf("operator profile is missing %s", overlayBDConfigKey)
+	}
+
+	delete(operatorObjects, overlayBDConfigKey)
 	delete(standaloneObjects, "ConfigMap/unbounded-system/gantry-containerd-hosts")
 	delete(standaloneObjects, "DaemonSet/unbounded-system/gantry-containerd-config")
 

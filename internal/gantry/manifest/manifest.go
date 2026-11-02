@@ -61,6 +61,10 @@ const (
 	overlayBDBlobSizeAnnotation   = "containerd.io/snapshot/overlaybd/blob-size"
 )
 
+// IsOverlayBDStreamingManifest reports whether every layer is an ACR
+// Artifact Streaming descriptor. Requiring matching digest and size
+// annotations keeps ordinary OCI manifests on the existing pull path and makes
+// partially annotated manifests fail closed.
 func IsOverlayBDStreamingManifest(body []byte) bool {
 	var m schema
 	if err := json.Unmarshal(body, &m); err != nil || len(m.Layers) == 0 {
@@ -270,6 +274,8 @@ func ChildDigests(body []byte) ([]digest.Digest, error) {
 type TypedChild struct {
 	Digest digest.Digest
 	Kind   ifaces.OriginRefKind
+	// Size is the descriptor's byte length, or 0 when absent. Locating a
+	// layer's trailing index requires it.
 	Size int64
 }
 

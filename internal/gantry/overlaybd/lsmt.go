@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package overlaybd
 
 import (
@@ -22,6 +25,7 @@ var (
 	magic1 = [16]byte{0x65, 0x7e, 0x63, 0xd2, 0x94, 0x44, 0x08, 0x4c, 0xa2, 0xd2, 0xc8, 0xec, 0x4f, 0xcf, 0xae, 0x8a}
 )
 
+// Mapping maps logical sectors to sectors in one sealed LSMT blob.
 type Mapping struct {
 	Offset  uint64
 	Length  uint32
@@ -31,12 +35,14 @@ type Mapping struct {
 
 func (m Mapping) end() uint64 { return m.Offset + uint64(m.Length) }
 
+// LSMTLayer is one validated read-only OverlayBD v0.1.0 layer.
 type LSMTLayer struct {
 	reader      io.ReaderAt
 	virtualSize int64
 	mappings    []Mapping
 }
 
+// OpenLSMTLayer validates and opens one complete ACR-produced OverlayBD layer.
 func OpenLSMTLayer(reader io.ReaderAt, size int64) (*LSMTLayer, error) {
 	if reader == nil || size < 512 {
 		return nil, fmt.Errorf("overlaybd LSMT: invalid layer size %d", size)
@@ -180,6 +186,8 @@ func (l *LSMTLayer) mapping(sector uint64) (Mapping, bool) {
 	return l.mappings[index], true
 }
 
+// LSMTImage overlays ACR layers in manifest order. Later layers have higher
+// precedence, matching OverlayBD's open_files_ro behavior.
 type LSMTImage struct {
 	layers      []*LSMTLayer
 	virtualSize int64
@@ -215,6 +223,7 @@ func NewLSMTImage(layers ...*LSMTLayer) (*LSMTImage, error) {
 
 func (i *LSMTImage) Size() int64 { return i.virtualSize }
 
+// ReadAt reads the merged virtual disk. Holes and zero mappings read as zero.
 func (i *LSMTImage) ReadAt(p []byte, offset int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil

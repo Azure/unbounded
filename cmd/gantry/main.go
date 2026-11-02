@@ -5,9 +5,10 @@
 //
 // Subcommands:
 //
-//	gantry agent    run the full agent (mirror + transfer + libp2p + ...)
-//	gantry init     prepare the libp2p identity directory
-//	gantry version  print build information and exit
+//	gantry agent       run the full agent (mirror + transfer + libp2p + ...)
+//	gantry init        prepare the libp2p identity directory
+//	gantry snapshotter run the ACR OverlayBD compatibility snapshotter
+//	gantry version     print build information and exit
 package main
 
 import (
@@ -195,6 +196,9 @@ func runAgent(args []string) error {
 		}),
 	)
 
+	// Ranges fetched for OverlayBD are kept so peers can be served from them.
+	// A cold image has no complete blob anywhere, so without this every node's
+	// index reads go to origin at once.
 	var rangeCache *rangecache.Cache
 
 	if c.ArtifactStreamingEnabled && c.RangeCacheDir != "" {
@@ -204,7 +208,7 @@ func runAgent(args []string) error {
 
 			rangeCache = nil
 		} else {
-			defer func() { _ = rangeCache.Close() }()
+			defer func() { _ = rangeCache.Close() }() //nolint:errcheck // best-effort close
 
 			logger.Info("range cache ready",
 				slog.String("dir", c.RangeCacheDir),
@@ -440,6 +444,7 @@ func runAgent(args []string) error {
 	var layerSeed *layerSeeder
 
 	if c.ArtifactStreamingEnabled {
+		// Origin is deliberately nil unless opted in: see LayerSeedOriginFallback.
 		var layerSeedOrigin ifaces.OriginPuller
 		if c.LayerSeedOriginFallback {
 			layerSeedOrigin = pullOriginClient
@@ -459,6 +464,8 @@ func runAgent(args []string) error {
 		})
 	}
 
+	// Warms the head and trailing index of every layer so the first TCMU
+	// mount attempt succeeds instead of waiting out kubelet's backoff.
 	var indexPrefetch *indexPrefetcher
 
 	if c.ArtifactStreamingEnabled && rangeCache != nil {
@@ -802,6 +809,7 @@ func runAgent(args []string) error {
 			streamingOpts.Cache = rangeCache
 			streamingOpts.MaxCachedRangeBytes = c.MaxCachedRangeBytes
 			streamingOpts.OnCached = func(d digest.Digest) {
+				// Announce once per digest; the reconcile pass keeps it alive.
 				if adv.IsAnnounced(d) {
 					return
 				}
@@ -1679,12 +1687,13 @@ func (p *layerPrefetchAdapter) onManifestServed(baseCtx context.Context, registr
 		if p.streamingReconciler == nil || !isACRRegistry(registry) {
 			return
 		}
-	// Use a fresh deadline so the prefetch survives the request
-	// context that just finished; cap at 30s so a stuck prefetch
-	// can't pin a goroutine forever.
 	} else if p.resolver == nil && p.onManifest == nil && p.streamingReconciler == nil {
 		return
 	}
+	// Use a fresh deadline so the prefetch survives the request
+	// context that just finished; cap at 30s so a stuck prefetch
+	// can't pin a goroutine forever. Seeding moves whole layers, so it runs
+	// off baseCtx under its own budget.
 	ctx, cancel := context.WithTimeout(baseCtx, 30*time.Second)
 	defer cancel()
 
@@ -1744,6 +1753,8 @@ func (p *layerPrefetchAdapter) onManifestServed(baseCtx context.Context, registr
 		return
 	}
 
+	// Warm the mount-critical regions first. Everything below moves whole
+	// layers, which the container does not wait on.
 	if streamingManifest && p.indexes != nil {
 		go p.indexes.Prefetch(baseCtx, registry, repository, manifestDigest, children)
 	}

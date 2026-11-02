@@ -33,8 +33,12 @@ type Client struct {
 	// Kept alongside hc because otelhttp stores its base in an unexported
 	// field, so anything that needs to inspect the h2c tuning cannot reach it
 	// through hc.Transport.
-	transport   http.RoundTripper
-	hc          *http.Client
+	transport http.RoundTripper
+	hc        *http.Client
+	// rangeHC carries FetchRangeFromPeer on its own transport, and therefore
+	// its own h2 connections. Sharing hc would put latency-critical range
+	// reads behind bulk layer streams on one connection, where they contend
+	// for the same flow-control window and share its idle-ping fate.
 	rangeHC     *http.Client
 	onBytesRead func(kind string, bytes int64)
 }
@@ -62,7 +66,8 @@ func WithDialTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.dialTimeout = d }
 }
 
-// WithRequestTimeout caps total time per request.
+// WithRequestTimeout caps total time per bulk or metadata request.
+// Exact-range requests use a separate, shorter timeout.
 func WithRequestTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.requestTimeout = d }
 }
@@ -238,12 +243,15 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
 	default:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
 		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
 	}
 }
 
+// FetchRangeFromPeer fetches one exact byte range from a peer holding a
+// complete, committed blob. Registry authorization is deliberately not
+// forwarded: digest and range are sufficient at the peer boundary.
 func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error) {
 	if _, err := httprange.New(requested.Start, requested.End); err != nil {
 		return nil, 0, "", err
@@ -273,14 +281,14 @@ func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d dige
 	case http.StatusPartialContent:
 		size, err := httprange.ValidateResponse(requested, resp.Header.Get("Content-Range"), resp.ContentLength)
 		if err != nil {
-			_ = resp.Body.Close()
+			_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
 			return nil, 0, "", &ifaces.ErrPeerProtocol{PeerAddr: peerAddr, Err: err}
 		}
 
 		return c.responseBody(resp, ifaces.KindBlob), size, resp.Header.Get("Content-Type"), nil
 	case http.StatusNotFound:
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: d}
 	default:

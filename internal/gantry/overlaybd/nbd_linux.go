@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package overlaybd
 
 import (
@@ -49,6 +52,7 @@ type sizedReaderAt interface {
 	Size() int64
 }
 
+// NBDDevice exposes a read-only virtual disk through a Linux NBD device.
 type NBDDevice struct {
 	path       string
 	device     *os.File
@@ -59,6 +63,7 @@ type NBDDevice struct {
 	closeOnce  sync.Once
 }
 
+// AttachNBD binds reader to an unused /dev/nbdN device until Close is called.
 func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	if reader == nil || reader.Size() <= 0 || reader.Size()%sectorSize != 0 {
 		return nil, fmt.Errorf("overlaybd NBD: invalid virtual size")
@@ -71,16 +76,16 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 
 	sockets, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
-		_ = device.Close()
+		_ = device.Close() //nolint:errcheck // socketpair error is the actionable failure
 		return nil, fmt.Errorf("overlaybd NBD: socketpair: %w", err)
 	}
 
 	server := os.NewFile(uintptr(sockets[0]), "overlaybd-nbd-server")
 	kernelSocket := os.NewFile(uintptr(sockets[1]), "overlaybd-nbd-kernel")
 	cleanup := func() {
-		_ = server.Close()
-		_ = kernelSocket.Close()
-		_ = device.Close()
+		_ = server.Close()       //nolint:errcheck // cleanup after an earlier setup failure
+		_ = kernelSocket.Close() //nolint:errcheck // cleanup after an earlier setup failure
+		_ = device.Close()       //nolint:errcheck // cleanup after an earlier setup failure
 	}
 
 	if err := ioctlSetInt(device.Fd(), nbdSetSocket, sockets[1]); err != nil {
@@ -89,7 +94,7 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	}
 
 	if err := ioctlSetInt(device.Fd(), nbdSetBlockSize, int(sectorSize)); err != nil {
-		_ = ioctl(device.Fd(), nbdClearSocket)
+		_ = ioctl(device.Fd(), nbdClearSocket) //nolint:errcheck // rollback after an earlier setup failure
 
 		cleanup()
 
@@ -97,7 +102,7 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	}
 
 	if err := ioctlSetInt(device.Fd(), nbdSetSizeBlock, int(reader.Size()/sectorSize)); err != nil {
-		_ = ioctl(device.Fd(), nbdClearSocket)
+		_ = ioctl(device.Fd(), nbdClearSocket) //nolint:errcheck // rollback after an earlier setup failure
 
 		cleanup()
 
@@ -105,7 +110,7 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	}
 
 	if err := ioctlSetInt(device.Fd(), nbdSetTimeout, nbdTimeout); err != nil {
-		_ = ioctl(device.Fd(), nbdClearSocket)
+		_ = ioctl(device.Fd(), nbdClearSocket) //nolint:errcheck // rollback after an earlier setup failure
 
 		cleanup()
 
@@ -113,7 +118,7 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	}
 
 	if err := ioctlSetInt(device.Fd(), nbdSetFlags, nbdFlagHasFlags|nbdFlagReadOnly); err != nil {
-		_ = ioctl(device.Fd(), nbdClearSocket)
+		_ = ioctl(device.Fd(), nbdClearSocket) //nolint:errcheck // rollback after an earlier setup failure
 
 		cleanup()
 
@@ -121,7 +126,7 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	}
 
 	if err := kernelSocket.Close(); err != nil {
-		_ = ioctl(device.Fd(), nbdClearSocket)
+		_ = ioctl(device.Fd(), nbdClearSocket) //nolint:errcheck // rollback after an earlier setup failure
 
 		cleanup()
 
@@ -132,7 +137,7 @@ func AttachNBD(path string, reader sizedReaderAt) (*NBDDevice, error) {
 	go nbd.run(reader)
 
 	if err := waitNBDReady(nbd); err != nil {
-		_ = nbd.Close()
+		_ = nbd.Close() //nolint:errcheck // activation error is the actionable failure
 		return nil, err
 	}
 
@@ -146,10 +151,10 @@ func (d *NBDDevice) run(reader sizedReaderAt) {
 	go func() { serveDone <- serveNBD(d.server, reader) }()
 
 	d.doItError = ioctl(d.device.Fd(), nbdDoIt)
-	_ = d.server.Close()
+	_ = d.server.Close() //nolint:errcheck // wakes the protocol loop after NBD_DO_IT exits
 	d.serveError = <-serveDone
-	_ = ioctl(d.device.Fd(), nbdClearQueue)
-	_ = ioctl(d.device.Fd(), nbdClearSocket)
+	_ = ioctl(d.device.Fd(), nbdClearQueue)  //nolint:errcheck // best-effort kernel teardown
+	_ = ioctl(d.device.Fd(), nbdClearSocket) //nolint:errcheck // best-effort kernel teardown
 	close(d.done)
 }
 
@@ -183,10 +188,10 @@ func valueIsPositive(value string) bool {
 
 func (d *NBDDevice) Close() error {
 	d.closeOnce.Do(func() {
-		_ = ioctl(d.device.Fd(), nbdDisconnect)
-		_ = d.server.Close()
+		_ = ioctl(d.device.Fd(), nbdDisconnect) //nolint:errcheck // either path may already be disconnected
+		_ = d.server.Close()                    //nolint:errcheck // wakes the protocol loop if still active
 		<-d.done
-		_ = d.device.Close()
+		_ = d.device.Close() //nolint:errcheck // loop errors below are more actionable
 	})
 
 	if d.doItError != nil && !errors.Is(d.doItError, unix.EPIPE) {

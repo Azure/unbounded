@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -20,6 +23,9 @@ type streamingLayerReconcilerOptions struct {
 	DispatchTimeout time.Duration
 }
 
+// streamingLayerReconciler owns durable whole-layer convergence for manifests
+// identified as ACR Artifact Streaming images. Regular OCI manifests never
+// enter this component and retain the existing request-driven pull behavior.
 type streamingLayerReconciler struct {
 	resolver        streamingManifestPrefetchResolver
 	store           ifaces.LocalContentStore

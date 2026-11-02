@@ -93,8 +93,13 @@ type Config struct {
 	// for the full opt-in checklist.
 	MirrorBindAllowNonLoopback bool `yaml:"mirror_bind_allow_non_loopback"`
 
+	// ArtifactStreamingEnabled enables the node-local OverlayBD range endpoint
+	// on /blobs/ under MirrorListen.
 	ArtifactStreamingEnabled bool `yaml:"artifact_streaming_enabled"`
 
+	// ArtifactStreamingAllowedHostSuffixes limits signed-origin requests to
+	// approved Azure data endpoints. A leading dot denotes a DNS suffix; values
+	// without a leading dot are exact hosts.
 	ArtifactStreamingAllowedHostSuffixes []string `yaml:"artifact_streaming_allowed_host_suffixes"`
 
 	// TransferListen is the peer-facing HTTP/2 endpoint (the design doc). The bind is
@@ -301,23 +306,31 @@ type Config struct {
 	// except by the number of eligible nodes.
 	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
 
-	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
-	// to a deterministic HRW-ranked subset of manifest consumers. Local
-	// self-selected pulls still run on every consumer. The default is 3.
+	// PrefetchCoordinatorReplicas limits Artifact Streaming convergence
+	// dispatch to a deterministic HRW-ranked subset of manifest consumers.
+	// The default is 3.
 	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
 
-	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
-	// per manifest. Group dispatch is best effort and target-side deduplicated.
+	// PrefetchMaxConcurrentGroups caps simultaneous outbound Artifact Streaming
+	// prefetch groups per manifest. Dispatch is best effort and target-side
+	// deduplicated.
 	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
 
-	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
-	// node derives a stable delay in [0, jitter) from itself and the manifest.
+	// PrefetchDispatchJitter spreads Artifact Streaming prefetch across
+	// requesters. Each node derives a stable delay in [0, jitter) from itself
+	// and the manifest.
 	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
 
+	// LayerSeedConcurrency caps simultaneous local layer downloads started by
+	// Artifact Streaming reconciliation.
 	LayerSeedConcurrency int `yaml:"layer_seed_concurrency"`
 
+	// LayerSeedPeerPatience is how long a seeding node waits for a peer to
+	// advertise a layer before falling back to origin. It exists so a large
+	// rollout does not convert into one origin pull per node.
 	LayerSeedPeerPatience time.Duration `yaml:"layer_seed_peer_patience"`
 
+	// LayerSeedBudget bounds total local seeding time for one manifest.
 	LayerSeedBudget time.Duration `yaml:"layer_seed_budget"`
 
 	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
@@ -391,21 +404,51 @@ type Config struct {
 	// retries Gantry rather than falling through to origin.
 	TransferMaxConcurrentServes int `yaml:"transfer_max_concurrent_serves"`
 
+	// TransferMaxConcurrentRangeServes caps concurrent serves of small bounded
+	// ranges, admitted separately from full blob streams. Artifact Streaming
+	// reads OverlayBD indexes as a few KiB at a time; those reads are on the
+	// container-start critical path and cost almost no bandwidth, so they must
+	// not consume the scarce slots that TransferMaxConcurrentServes reserves
+	// for large-layer streams. Zero leaves ranges on the blob cap.
 	TransferMaxConcurrentRangeServes int `yaml:"transfer_max_concurrent_range_serves"`
 
+	// LayerSeedOriginFallback lets a seeding node pull a layer straight from
+	// origin when no peer has it. Leave this off at fleet scale: every node
+	// seeds every layer, so an origin fallback turns one cold image into
+	// nodes x layers concurrent origin pulls, which saturates the registry and
+	// starves the latency-critical range reads that gate container start.
+	// Bootstrap is the chair prefetch path's job.
 	LayerSeedOriginFallback bool `yaml:"layer_seed_origin_fallback"`
 
+	// RangeCacheDir holds Artifact Streaming ranges fetched from peers or origin.
+	// It defaults to a subdirectory of the libp2p hostPath because that is the
+	// only node-backed writable mount the agent already has; the container root
+	// is read-only and /tmp is an emptyDir subject to ephemeral-storage eviction.
+	// Empty disables range caching.
 	RangeCacheDir string `yaml:"range_cache_dir"`
 
+	// RangeCacheMaxBytes caps the on-disk range cache. Once reached the cache
+	// stops admitting new blobs rather than evicting, so a steady read pattern
+	// keeps its working set.
 	RangeCacheMaxBytes int64 `yaml:"range_cache_max_bytes"`
 
+	// MaxCachedRangeBytes is the largest single range worth caching. Index
+	// reads are a few KiB; anything large is bulk layer traffic that would
+	// evict the small reads that actually gate container start.
 	MaxCachedRangeBytes int64 `yaml:"max_cached_range_bytes"`
 
+	// IndexPrefetchHeadBytes and IndexPrefetchTailBytes bound the regions
+	// warmed when a manifest is served. OverlayBD reads a layer's head and its
+	// trailing index at mount time and nothing else, so these cover container
+	// start at a fraction of a percent of the image.
 	IndexPrefetchHeadBytes int64 `yaml:"index_prefetch_head_bytes"`
 	IndexPrefetchTailBytes int64 `yaml:"index_prefetch_tail_bytes"`
 
+	// IndexPrefetchConcurrency caps simultaneous layer warms per node.
 	IndexPrefetchConcurrency int `yaml:"index_prefetch_concurrency"`
 
+	// IndexPrefetchJitter spreads the fleet's first wave so a cold image does
+	// not put every node on origin in the same instant.
 	IndexPrefetchJitter time.Duration `yaml:"index_prefetch_jitter"`
 
 	// AdvertiseReconcileInterval is the cadence of the background
@@ -579,13 +622,15 @@ func NewDefault() *Config {
 		PrefetchMaxConcurrentGroups: 64,
 		PrefetchDispatchJitter:      time.Second,
 		LayerSeedConcurrency:        8,
-		LayerSeedPeerPatience:       45 * time.Minute,
+		LayerSeedPeerPatience:       45 * time.Minute, // peer-only seeding keeps polling the swarm instead of giving up
 		LayerSeedBudget:             time.Hour,
 		RangeCacheDir:               "/var/lib/gantry/libp2p/rangecache",
 		RangeCacheMaxBytes:          4 << 30,
 		MaxCachedRangeBytes:         4 << 20,
 		IndexPrefetchHeadBytes:      256 << 10,
 		IndexPrefetchTailBytes:      2 << 20,
+		// Measured at 1000 nodes: concurrency 16 with 500ms spread moved p90
+		// from 15s to 42s. Warming harder makes the nodes fight each other.
 		IndexPrefetchConcurrency: 8,
 		IndexPrefetchJitter:      2 * time.Second,
 		HRWTopologyScope:         "cluster",
@@ -600,6 +645,8 @@ func NewDefault() *Config {
 		PeerRediscoverBudget:        5 * time.Minute, // re-discovery cascade on by default (validated at 300 nodes)
 		PeerRediscoverBackoff:       time.Second,     // pause between re-discovery rounds
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
+		// Index reads are small and on the start path; the bound here exists
+		// only to keep goroutines and disk seeks finite, not to ration bandwidth.
 		TransferMaxConcurrentRangeServes: 512,
 		AdvertiseReconcileInterval:       time.Minute,
 

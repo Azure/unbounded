@@ -527,6 +527,8 @@ func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactS
 	}
 }
 
+// applyArtifactStreamingMode puts the range listener in the same network
+// namespace as the host snapshotter and any node-local upstream registry proxy.
 func applyArtifactStreamingMode(obj *unstructured.Unstructured) error {
 	if err := unstructured.SetNestedField(obj.Object, true, "spec", "template", "spec", "hostNetwork"); err != nil {
 		return err

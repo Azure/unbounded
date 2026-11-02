@@ -41,7 +41,6 @@ type ChairClaimer interface {
 type ChairOptions struct {
 	Chairs                      ChairSnapshotCache
 	Discovery                   Discovery
-	// PeerMetadata verifies DHT candidates before they can complete polling.
 	Coord                       ifaces.ChairCoordinator
 	LocalPull                   ifaces.LocalChairPullStarter
 	Inflight                    *inflight.Map
@@ -60,6 +59,7 @@ type ChairOptions struct {
 	PrefetchMaxConcurrentGroups int
 	PrefetchDispatchJitter      time.Duration
 	TrustedFailureClasses       []ifaces.FailureClass
+	// PeerMetadata verifies DHT candidates before they can complete polling.
 	PeerMetadata ifaces.PeerMetadataDialer
 	// OnSeedRecruit reports one completed seed-recruitment pass: how many chairs
 	// were selectable, how many were contacted, and how many accepted. contacted
@@ -416,6 +416,8 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, manifestDi
 	return r.prefetchManifestChildren(ctx, manifestDigest, children, registry, repository, false)
 }
 
+// PrefetchStreamingManifestChildren coordinates durable streaming convergence
+// through a bounded subset of active chair holders.
 func (r *ChairResolver) PrefetchStreamingManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []ChildDigest, registry, repository string) error {
 	return r.prefetchManifestChildren(ctx, manifestDigest, children, registry, repository, true)
 }

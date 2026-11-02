@@ -42,8 +42,13 @@ type Store struct {
 	now    func() time.Time
 }
 
+// StoreOption configures a Store.
 type StoreOption func(*Store)
 
+// WithStoreClock overrides the clock used to stamp snapshot fetch times.
+// Callers that drive the chair manager with an injected clock must use the
+// same one here, otherwise lease expiry is evaluated against a different
+// timeline than the one that issued the leases.
 func WithStoreClock(now func() time.Time) StoreOption {
 	return func(s *Store) {
 		if now != nil {

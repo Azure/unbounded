@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package streaming
 
 import (
@@ -119,6 +122,8 @@ func (f *providerFailures) record(d digest.Digest, requested httprange.Range, pr
 }
 
 func (f *providerFailures) sweep(now time.Time) {
+	// Filtering checks expiration directly. Reclaim old entries periodically,
+	// rather than scanning a growing history for every concurrent range read.
 	if now.Before(f.nextSweep) {
 		return
 	}

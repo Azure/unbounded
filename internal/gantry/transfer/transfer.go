@@ -69,14 +69,22 @@ type Server struct {
 	// channel means the server is at capacity and further blob GETs are
 	// shed with 429 so the requester re-discovers another provider.
 	serveSem chan struct{}
+	// rangeSem, when non-nil, admits small bounded ranges independently of
+	// serveSem so index reads are never queued behind bulk layer streams.
 	rangeSem chan struct{}
+	// ranges, when set, answers range requests for blobs this node has only
+	// partially fetched. Without it a peer cannot serve any part of a layer
+	// until it holds all of it, which is why a cold image has no peer source.
 	ranges RangeSource
 }
 
+// RangeSource serves byte ranges of blobs that are not present in full.
 type RangeSource interface {
 	OpenRange(ctx context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error)
 }
 
+// fastRangeMaxBytes bounds the range lane. Anything larger is a bulk transfer
+// wearing a Range header and stays on the blob cap.
 const fastRangeMaxBytes = 1 << 20
 
 // Describer is an optional capability that callers (typically the
@@ -152,6 +160,11 @@ func WithMaxConcurrentServes(n int) Option {
 	}
 }
 
+// WithMaxConcurrentRangeServes caps concurrent serves of small, explicitly
+// bounded ranges separately from full-blob streams. Artifact Streaming issues
+// these for OverlayBD index reads: they are tiny and latency-critical, so the
+// per-stream bandwidth guard that WithMaxConcurrentServes exists to provide is
+// the wrong control for them. n <= 0 leaves small ranges on the blob cap.
 func WithMaxConcurrentRangeServes(n int) Option {
 	return func(s *Server) {
 		if n > 0 {
@@ -160,6 +173,8 @@ func WithMaxConcurrentRangeServes(n int) Option {
 	}
 }
 
+// WithRangeSource lets the server answer Range requests for blobs it holds
+// only partially, so cached OverlayBD index reads become peer-servable.
 func WithRangeSource(rs RangeSource) Option {
 	return func(s *Server) {
 		s.ranges = rs
@@ -435,6 +450,8 @@ func (s *Server) bumpServe() {
 	}
 }
 
+// serveCachedRange answers an exact Range request from partially-held content.
+// It reports whether it wrote a response.
 func (s *Server) serveCachedRange(w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind) bool {
 	if s.ranges == nil || kind != ifaces.KindBlob {
 		return false
@@ -450,8 +467,10 @@ func (s *Server) serveCachedRange(w http.ResponseWriter, r *http.Request, d dige
 		return false
 	}
 
-	defer func() { _ = body.Close() }()
+	defer func() { _ = body.Close() }() //nolint:errcheck // best-effort close
 
+	// Admit only after confirming the interval exists, so a cache miss remains
+	// a 404 even when the serving lane is saturated.
 	if r.Method == http.MethodGet {
 		release, ok := s.tryAcquireServe(r.Header.Get("Range"))
 		if !ok {
@@ -500,9 +519,9 @@ func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {
 
 // tryAcquireServe reserves a serve slot without blocking. The returned release
 // func MUST be called when the serve completes. ok is false when the server is
-// already at its configured serve cap; callers should shed the request (429)
-// rather than block. When no cap is configured (serveSem nil), it always
-// succeeds with a no-op release.
+// already at the cap for the request's class; callers should shed the request
+// (429) rather than block. When no cap applies, it always succeeds with a
+// no-op release.
 func (s *Server) tryAcquireServe(rangeHeader string) (release func(), ok bool) {
 	sem := s.serveSem
 	if s.rangeSem != nil && isFastRange(rangeHeader) {
@@ -521,6 +540,10 @@ func (s *Server) tryAcquireServe(rangeHeader string) (release func(), ok bool) {
 	}
 }
 
+// isFastRange reports whether value is a single range with both bounds present
+// and a length within fastRangeMaxBytes. Open-ended and suffix forms are
+// excluded because their length is not knowable from the header alone, so an
+// unbounded transfer cannot claim the range lane.
 func isFastRange(value string) bool {
 	spec, found := strings.CutPrefix(strings.TrimSpace(value), "bytes=")
 	if !found || strings.Contains(spec, ",") {

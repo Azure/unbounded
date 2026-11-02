@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -11,6 +14,14 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/rangecache"
 )
 
+// rangeAwareInventory lets a node advertise blobs it holds only in part.
+//
+// The advertiser proves a digest is serveable by opening it in the content
+// store, and reconciles announcements against that same inventory. A
+// partially fetched blob satisfies neither, so without this wrapper a node
+// caching OverlayBD index ranges stays invisible to the swarm and every peer
+// keeps going to origin - which is the whole problem the range cache exists
+// to solve.
 type rangeAwareInventory struct {
 	inv   advertise.Inventory
 	open  advertise.Openable
@@ -18,6 +29,8 @@ type rangeAwareInventory struct {
 }
 
 func (r rangeAwareInventory) Inventory(ctx context.Context) ([]digest.Digest, error) {
+	// A failure here must propagate: the advertiser deliberately pauses
+	// rather than withdrawing everything when containerd is unavailable.
 	base, err := r.inv.Inventory(ctx)
 	if err != nil {
 		return nil, err
@@ -52,6 +65,8 @@ func (r rangeAwareInventory) Open(ctx context.Context, d digest.Digest) (io.Read
 	}
 
 	if r.cache != nil && r.cache.HasAny(d) {
+		// The advertiser only uses this to prove serveability, and range
+		// requests are answered from the cache by the transfer endpoint.
 		return io.NopCloser(bytes.NewReader(nil)), 0, nil
 	}
 

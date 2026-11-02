@@ -96,7 +96,7 @@ func newCmdSnapshotter(runSnapshotter func(args []string) error) *cobra.Command 
 	cmd.SetHelpFunc(func(cmd *cobra.Command, _ []string) {
 		fs := buildSnapshotterFlagSet()
 		fs.SetOutput(cmd.OutOrStdout())
-		_, _ = fmt.Fprint(cmd.OutOrStdout(), "Usage: gantry snapshotter [flags]\n\nFlags:\n")
+		_, _ = fmt.Fprint(cmd.OutOrStdout(), "Usage: gantry snapshotter [flags]\n\nFlags:\n") //nolint:errcheck // best-effort write
 
 		fs.PrintDefaults()
 	})

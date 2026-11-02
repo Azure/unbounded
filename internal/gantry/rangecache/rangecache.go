@@ -1,3 +1,15 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package rangecache stores byte ranges of blobs the node has already fetched.
+//
+// The containerd content store is all-or-nothing: a blob is either committed
+// whole or absent, so a peer cannot serve any part of a 1 GiB layer until it
+// holds all of it. Under Artifact Streaming that makes a cold image
+// unserveable between peers - every node reads a few KiB of OverlayBD index
+// and every one of those reads has to go to origin. This cache holds the
+// ranges a node actually fetched so they can be answered locally and served to
+// peers long before any layer is complete.
 package rangecache
 
 import (
@@ -15,8 +27,10 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
+// span is an inclusive byte interval.
 type span struct{ start, end int64 }
 
+// spans is kept sorted and non-overlapping.
 type spans []span
 
 func (s spans) covers(start, end int64) bool {
@@ -33,6 +47,7 @@ func (s spans) covers(start, end int64) bool {
 	return false
 }
 
+// insert adds [start,end] and merges anything it touches or overlaps.
 func (s spans) insert(start, end int64) spans {
 	out := make(spans, 0, len(s)+1)
 	added := false
@@ -73,6 +88,9 @@ type entry struct {
 	have  spans
 }
 
+// Cache is a disk-backed store of partial blob content. It is intentionally
+// non-durable: entries are discarded on restart rather than revalidated,
+// because a stale range served as authoritative would corrupt an image.
 type Cache struct {
 	root     string
 	maxBytes int64
@@ -83,6 +101,8 @@ type Cache struct {
 	full    bool
 }
 
+// New prepares an empty cache rooted at dir. Any previous contents are removed:
+// the interval index lives in memory, so leftover files cannot be trusted.
 func New(dir string, maxBytes int64) (*Cache, error) {
 	if dir == "" {
 		return nil, errors.New("rangecache: empty directory")
@@ -103,6 +123,7 @@ func (c *Cache) path(d digest.Digest) string {
 	return filepath.Join(c.root, strings.ReplaceAll(d.String(), ":", "_"))
 }
 
+// lookup returns the existing entry for d, or nil.
 func (c *Cache) lookup(d digest.Digest) *entry {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -110,6 +131,9 @@ func (c *Cache) lookup(d digest.Digest) *entry {
 	return c.entries[d]
 }
 
+// OpenRange satisfies streaming.LocalRangeStore. It returns ifaces.ErrNotFound
+// unless the whole requested interval is cached, so a partial hit never
+// produces a short body.
 func (c *Cache) OpenRange(_ context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error) {
 	e := c.lookup(d)
 	if e == nil {
@@ -127,6 +151,7 @@ func (c *Cache) OpenRange(_ context.Context, d digest.Digest, requested httprang
 	return io.NopCloser(io.NewSectionReader(e.file, requested.Start, requested.Length())), total, nil
 }
 
+// Has reports whether the full interval is already cached.
 func (c *Cache) Has(d digest.Digest, requested httprange.Range) bool {
 	e := c.lookup(d)
 	if e == nil {
@@ -139,6 +164,8 @@ func (c *Cache) Has(d digest.Digest, requested httprange.Range) bool {
 	return e.have.covers(requested.Start, requested.End)
 }
 
+// HasAny reports whether any range of d is cached, which is enough to make
+// this node a useful provider for it.
 func (c *Cache) HasAny(d digest.Digest) bool {
 	e := c.lookup(d)
 	if e == nil {
@@ -151,6 +178,9 @@ func (c *Cache) HasAny(d digest.Digest) bool {
 	return len(e.have) > 0
 }
 
+// Put stores data read from r at start. total is the blob's full size, used for
+// Content-Range on later reads. Put reports the number of bytes stored; a
+// truncated read still records what landed.
 func (c *Cache) Put(d digest.Digest, total, start int64, r io.Reader) (int64, error) {
 	if start < 0 {
 		return 0, fmt.Errorf("rangecache: negative offset %d", start)
@@ -162,7 +192,7 @@ func (c *Cache) Put(d digest.Digest, total, start int64, r io.Reader) (int64, er
 	}
 
 	if e == nil {
-		return 0, nil
+		return 0, nil // cache is full; caller still gets its bytes from r
 	}
 
 	written, err := copyAt(e.file, r, start)
@@ -184,6 +214,8 @@ func (c *Cache) Put(d digest.Digest, total, start int64, r io.Reader) (int64, er
 	return written, err
 }
 
+// entryFor returns the entry for d, creating it when there is room. A nil
+// entry with a nil error means the cache is at capacity.
 func (c *Cache) entryFor(d digest.Digest) (*entry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -208,6 +240,7 @@ func (c *Cache) entryFor(d digest.Digest) (*entry, error) {
 	return e, nil
 }
 
+// Full reports whether the cache stopped admitting new blobs.
 func (c *Cache) Full() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -215,6 +248,7 @@ func (c *Cache) Full() bool {
 	return c.full
 }
 
+// Digests lists blobs with at least one cached range.
 func (c *Cache) Digests() []digest.Digest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -227,12 +261,13 @@ func (c *Cache) Digests() []digest.Digest {
 	return out
 }
 
+// Close releases the open files.
 func (c *Cache) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, e := range c.entries {
-		_ = e.file.Close()
+		_ = e.file.Close() //nolint:errcheck // best-effort close
 	}
 
 	c.entries = map[digest.Digest]*entry{}

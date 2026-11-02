@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -15,10 +18,13 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/rangecache"
 )
 
+// rangePeerFetcher is the bounded-range half of the peer dialer.
 type rangePeerFetcher interface {
 	FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error)
 }
 
+// indexPrefetcher warms mount-critical head and tail regions in parallel so
+// container creation does not have to fetch each layer's metadata sequentially.
 type indexPrefetcher struct {
 	cache      *rangecache.Cache
 	dht        providerLookup
@@ -98,6 +104,7 @@ func newIndexPrefetcher(o indexPrefetchOptions) *indexPrefetcher {
 	return p
 }
 
+// Prefetch warms the index regions for every sized layer in children.
 func (p *indexPrefetcher) Prefetch(ctx context.Context, registry, repository string, manifestDigest digest.Digest, children []manifest.TypedChild) {
 	if p == nil || p.cache == nil || len(children) == 0 {
 		return
@@ -120,9 +127,11 @@ func (p *indexPrefetcher) Prefetch(ctx context.Context, registry, repository str
 	)
 	logger.Info("index prefetch started", slog.Int("children", len(children)))
 
+	// Spread the fleet's first wave; 1000 nodes asking origin in the same
+	// instant is what produces 429s.
 	if p.maxJitter > 0 {
 		select {
-		case <-time.After(time.Duration(rand.Int63n(int64(p.maxJitter)))):
+		case <-time.After(time.Duration(rand.Int63n(int64(p.maxJitter)))): //nolint:gosec // jitter, not security
 		case <-ctx.Done():
 			logger.Warn("index prefetch stopped before warmup",
 				slog.Duration("duration", time.Since(started)),
@@ -227,6 +236,8 @@ func (p *indexPrefetcher) warm(ctx context.Context, registry, repository string,
 	}
 }
 
+// regions returns the head and tail intervals worth warming, clamped and
+// de-duplicated for layers smaller than head+tail.
 func (p *indexPrefetcher) regions(size int64) []httprange.Range {
 	if size <= 0 {
 		return nil
@@ -279,7 +290,7 @@ func (p *indexPrefetcher) fromPeers(ctx context.Context, d digest.Digest, want h
 		}
 
 		stored, putErr := p.cache.Put(d, total, want.Start, io.LimitReader(body, want.Length()))
-		_ = body.Close()
+		_ = body.Close() //nolint:errcheck // best-effort close
 
 		if putErr == nil && stored == want.Length() {
 			p.announce(d)
@@ -296,6 +307,8 @@ func (p *indexPrefetcher) fromOrigin(ctx context.Context, registry, repository s
 		return
 	}
 
+	// Pull streams from Offset to the end of the blob; for the tail that is
+	// exactly the region, and for the head we stop reading after Length.
 	body, _, err := p.origin.Pull(ctx, ifaces.OriginRef{
 		Registry:   registry,
 		Repository: repository,
@@ -314,7 +327,7 @@ func (p *indexPrefetcher) fromOrigin(ctx context.Context, registry, repository s
 	}
 
 	stored, putErr := p.cache.Put(c.Digest, c.Size, want.Start, io.LimitReader(body, want.Length()))
-	_ = body.Close()
+	_ = body.Close() //nolint:errcheck // stop the transfer once the region is in
 
 	if putErr != nil || stored != want.Length() {
 		p.logger.Debug("index prefetch store incomplete",

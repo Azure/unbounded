@@ -306,6 +306,8 @@ func (s *Store) Open(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int6
 	}, size, nil
 }
 
+// OpenRange returns a reader over an exact range of a committed digest. The
+// total object size is returned separately for Content-Range construction.
 func (s *Store) OpenRange(ctx context.Context, d gdigest.Digest, requested httprange.Range) (io.ReadCloser, int64, error) {
 	desc := ocispec.Descriptor{Digest: godigest.Digest(d.String())}
 
@@ -336,7 +338,7 @@ func (s *Store) OpenRange(ctx context.Context, d gdigest.Digest, requested httpr
 
 	size := ra.Size()
 	if err := requested.ValidateSize(size); err != nil {
-		_ = ra.Close()
+		_ = ra.Close() //nolint:errcheck // best-effort close
 
 		return nil, size, err
 	}

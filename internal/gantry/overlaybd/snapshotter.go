@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package overlaybd
 
 import (
@@ -28,6 +31,7 @@ const (
 	remoteSnapshotValue    = "remote snapshot"
 )
 
+// RemoteLayer describes one ACR-produced OverlayBD layer in manifest order.
 type RemoteLayer struct {
 	Digest   digest.Digest
 	Size     int64
@@ -35,10 +39,14 @@ type RemoteLayer struct {
 	FSType   string
 }
 
+// BlockMounter exposes a bottom-to-top remote layer chain as one mounted
+// read-only filesystem. Closing the result tears down the mount and device.
 type BlockMounter interface {
 	Mount(context.Context, string, []RemoteLayer, string) (io.Closer, error)
 }
 
+// Snapshotter implements the containerd remote snapshot protocol for the
+// existing ACR OverlayBD v0.1.0 contract.
 type Snapshotter struct {
 	root         string
 	store        *storage.MetaStore

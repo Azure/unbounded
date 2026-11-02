@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package overlaybd
 
 import (
@@ -19,6 +22,7 @@ import (
 	"github.com/distribution/reference"
 )
 
+// NBDMounter mounts stacked LSMT images through a pool of Linux NBD devices.
 type NBDMounter struct {
 	endpoint   string
 	client     *http.Client
@@ -101,14 +105,14 @@ func (m *NBDMounter) Mount(ctx context.Context, id string, remoteLayers []Remote
 	}
 
 	if err := os.MkdirAll(mountpoint, 0o700); err != nil {
-		_ = device.Close()
+		_ = device.Close() //nolint:errcheck // directory error is the actionable failure
 		m.release(device.Path())
 
 		return nil, err
 	}
 
 	if err := mount.UnmountAll(mountpoint, 0); err != nil {
-		_ = device.Close()
+		_ = device.Close() //nolint:errcheck // stale unmount error is the actionable failure
 		m.release(device.Path())
 
 		return nil, fmt.Errorf("overlaybd block mounter: clear stale mount %s: %w", id, err)
@@ -116,7 +120,7 @@ func (m *NBDMounter) Mount(ctx context.Context, id string, remoteLayers []Remote
 
 	mountOptions = append(mountOptions, "ro")
 	if err := mount.All([]mount.Mount{{Source: device.Path(), Type: filesystem, Options: mountOptions}}, mountpoint); err != nil {
-		_ = device.Close()
+		_ = device.Close() //nolint:errcheck // mount error is the actionable failure
 		m.release(device.Path())
 
 		return nil, fmt.Errorf("overlaybd block mounter: mount %s: %w", id, err)

@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -36,12 +39,14 @@ func newCanonicalOriginResolver(registries []config.UpstreamRegistry) func(strea
 
 		target := *endpoint
 		target.RawPath = strings.TrimRight(endpoint.EscapedPath(), "/") + canonical.EscapedPath()
-		target.Path, _ = url.PathUnescape(target.RawPath)
+		target.Path, _ = url.PathUnescape(target.RawPath) //nolint:errcheck // EscapedPath always returns a valid escaped path.
 
 		return streamingapi.OriginURL{Raw: target.String(), Digest: origin.Digest}, true
 	}
 }
 
+// routeNodeLocalHandlers dispatches /blobs/ before the mirror's ServeMux can
+// clean repeated slashes in the embedded origin URL.
 func routeNodeLocalHandlers(streamingHandler, mirrorHandler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.RequestURI, streamingapi.HandlerPrefix) || r.URL.Path == streamingapi.ReadinessPath {

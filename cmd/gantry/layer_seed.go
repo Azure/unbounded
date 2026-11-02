@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -14,12 +17,22 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
+// errSeedNoProvider means no peer advertised the digest before the peer
+// patience budget expired.
 var errSeedNoProvider = errors.New("layer seed: no peer provider")
 
+// providerLookup is the DHT subset the seeder needs.
 type providerLookup interface {
 	FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error)
 }
 
+// layerSeeder downloads every child digest of an Artifact Streaming manifest
+// into this node's own containerd content store. Chair prefetch seeds a bounded
+// cohort from origin; the seeder is what makes every other node converge to
+// complete local content instead of reaching back over the network per read.
+//
+// Peers are preferred and origin is used only after the peer patience budget
+// expires, so a 1000-node rollout does not turn into 1000 origin pulls.
 type layerSeeder struct {
 	store       ifaces.LocalContentStore
 	dht         providerLookup
@@ -99,6 +112,8 @@ func newLayerSeeder(opts layerSeederOptions) *layerSeeder {
 	}
 }
 
+// Seed fetches every child into the local store. It blocks until all children
+// are resolved or the budget expires, so callers run it in their own goroutine.
 func (s *layerSeeder) Seed(ctx context.Context, registry, repository string, children []coldstart.ChildDigest) {
 	if s == nil || s.store == nil || len(children) == 0 {
 		return
@@ -187,6 +202,9 @@ func (s *layerSeeder) seedOne(ctx context.Context, registry, repository string, 
 	s.observe("origin")
 }
 
+// seedFromPeers polls the DHT until a provider serves the digest or the peer
+// patience budget expires. Chairs are pulling concurrently, so an empty
+// provider set early in a rollout is expected rather than terminal.
 func (s *layerSeeder) seedFromPeers(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) error {
 	deadline := time.Now().Add(s.peerPatience)
 
@@ -242,7 +260,7 @@ func (s *layerSeeder) fetchFromPeer(ctx context.Context, provider ifaces.Provide
 		return err
 	}
 
-	defer func() { _ = body.Close() }()
+	defer func() { _ = body.Close() }() //nolint:errcheck // best-effort close
 
 	return s.commit(fetchCtx, registry, repository, d, body)
 }
@@ -258,11 +276,14 @@ func (s *layerSeeder) seedFromOrigin(ctx context.Context, registry, repository s
 		return err
 	}
 
-	defer func() { _ = body.Close() }()
+	defer func() { _ = body.Close() }() //nolint:errcheck // best-effort close
 
 	return s.commit(fetchCtx, registry, repository, d, body)
 }
 
+// commit streams body into the content store under a containerd lease so the
+// seeded blob is not reclaimed before a snapshot references it. Commit fails
+// if the bytes do not hash to d.
 func (s *layerSeeder) commit(ctx context.Context, registry, repository string, d digest.Digest, body io.Reader) error {
 	var leaseGuard *containerdstore.LeaseGuard
 
@@ -285,7 +306,7 @@ func (s *layerSeeder) commit(ctx context.Context, registry, repository string, d
 		}
 
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = leaseGuard.Release(releaseCtx)
+		_ = leaseGuard.Release(releaseCtx) //nolint:errcheck // best-effort release
 
 		releaseCancel()
 	}
@@ -298,7 +319,7 @@ func (s *layerSeeder) commit(ctx context.Context, registry, repository string, d
 	}
 
 	if _, err := io.Copy(writer, body); err != nil {
-		_ = writer.Abort(ctx)
+		_ = writer.Abort(ctx) //nolint:errcheck // best-effort abort
 
 		releaseLease()
 
@@ -306,7 +327,7 @@ func (s *layerSeeder) commit(ctx context.Context, registry, repository string, d
 	}
 
 	if err := writer.Commit(ctx); err != nil {
-		_ = writer.Abort(ctx)
+		_ = writer.Abort(ctx) //nolint:errcheck // best-effort abort
 
 		releaseLease()
 
@@ -332,6 +353,8 @@ func (s *layerSeeder) has(ctx context.Context, d digest.Digest) bool {
 	return err == nil && has
 }
 
+// claim keeps concurrent manifest serves on the same node from downloading the
+// same digest twice.
 func (s *layerSeeder) claim(d digest.Digest) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

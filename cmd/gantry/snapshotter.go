@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -70,6 +73,8 @@ func runSnapshotter(args []string) (returnErr error) {
 		return err
 	}
 
+	// The proxy's garbage collector must only see snapshots owned by this proxy,
+	// never the host snapshot service's independently managed snapshots.
 	snapshotter, err := gantryoverlaybd.NewSnapshotter(options.root, mounter)
 	if err != nil {
 		return err
@@ -87,8 +92,8 @@ func runSnapshotter(args []string) (returnErr error) {
 		return err
 	}
 	defer func() {
-		_ = listener.Close()
-		_ = os.Remove(options.address)
+		_ = listener.Close()           //nolint:errcheck // server shutdown owns listener errors
+		_ = os.Remove(options.address) //nolint:errcheck // stale sockets are safely replaced on start
 	}()
 
 	server := grpc.NewServer()
@@ -150,7 +155,7 @@ func listenSnapshotter(address string) (net.Listener, error) {
 	}
 
 	if err := os.Chmod(address, 0o660); err != nil {
-		_ = listener.Close()
+		_ = listener.Close() //nolint:errcheck // chmod error is the actionable failure
 		return nil, fmt.Errorf("gantry snapshotter: set socket permissions: %w", err)
 	}
 

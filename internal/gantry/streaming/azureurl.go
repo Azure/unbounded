@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package streaming
 
 import (
@@ -18,17 +21,23 @@ const (
 
 var digestHexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// URLPolicy limits signed-origin requests to operator-approved HTTPS hosts.
 type URLPolicy struct {
 	AllowedHostSuffixes []string
 	AllowHTTP           bool
 }
 
+// OriginURL is a validated origin capability extracted from an OverlayBD
+// request. Raw is retained for the outbound request and must never be logged.
 type OriginURL struct {
 	Raw       string
 	Digest    digest.Digest
 	Canonical bool
 }
 
+// OriginURLFromRequest reconstructs and validates the URL embedded by
+// OverlayBD after /blobs/. RequestURI is used so signed query bytes are not
+// decoded and re-encoded.
 func OriginURLFromRequest(r *http.Request, policy URLPolicy) (OriginURL, error) {
 	requestTarget := r.RequestURI
 	if requestTarget == "" {
@@ -42,6 +51,8 @@ func OriginURLFromRequest(r *http.Request, policy URLPolicy) (OriginURL, error) 
 	return ParseOriginURL(strings.TrimPrefix(requestTarget, HandlerPrefix), policy)
 }
 
+// ParseOriginURL validates a raw absolute origin URL and extracts its blob
+// digest without rewriting the signed query.
 func ParseOriginURL(raw string, policy URLPolicy) (OriginURL, error) {
 	if raw == "" {
 		return OriginURL{}, fmt.Errorf("streaming origin: empty URL")
@@ -75,6 +86,8 @@ func ParseOriginURL(raw string, policy URLPolicy) (OriginURL, error) {
 	}, nil
 }
 
+// ValidateURL validates scheme and host without requiring the URL to carry a
+// digest. Redirect targets use this narrower check.
 func (p URLPolicy) ValidateURL(u *url.URL) error {
 	if u == nil || !u.IsAbs() || u.Host == "" || u.Opaque != "" {
 		return fmt.Errorf("streaming origin: absolute hierarchical URL required")

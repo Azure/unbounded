@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package overlaybd
 
 import (
@@ -12,12 +15,15 @@ import (
 	"strings"
 )
 
+// RangeReader exposes one immutable ACR OverlayBD blob through Gantry's
+// node-local exact-range endpoint.
 type RangeReader struct {
 	client     *http.Client
 	requestURL string
 	size       int64
 }
 
+// NewRangeReader validates the local Gantry endpoint and immutable origin URL.
 func NewRangeReader(client *http.Client, endpoint, origin string, size int64) (*RangeReader, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -58,12 +64,14 @@ func parseGantryEndpoint(endpoint string) (*url.URL, error) {
 	return endpointURL, nil
 }
 
+// Size returns the immutable remote object size.
 func (r *RangeReader) Size() int64 { return r.size }
 
 func (r *RangeReader) ReadAt(p []byte, offset int64) (int, error) {
 	return r.ReadAtContext(context.Background(), p, offset)
 }
 
+// ReadAtContext reads one exact range and validates Gantry's response framing.
 func (r *RangeReader) ReadAtContext(ctx context.Context, p []byte, offset int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -98,7 +106,7 @@ func (r *RangeReader) ReadAtContext(ctx context.Context, p []byte, offset int64)
 	if err != nil {
 		return 0, fmt.Errorf("overlaybd range reader: request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // response body is fully consumed below
 
 	if resp.StatusCode != http.StatusPartialContent {
 		return 0, fmt.Errorf("overlaybd range reader: status %d", resp.StatusCode)

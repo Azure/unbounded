@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package containerdconfig manages the containerd proxy snapshotter drop-in.
 package containerdconfig
 
 import (
@@ -375,20 +379,20 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	}
 
 	temporaryPath := temporary.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
+	defer func() { _ = os.Remove(temporaryPath) }() //nolint:errcheck // rename removes the path on success
 
 	if err := temporary.Chmod(mode); err != nil {
-		_ = temporary.Close()
+		_ = temporary.Close() //nolint:errcheck // chmod error is the actionable failure
 		return err
 	}
 
 	if _, err := temporary.Write(data); err != nil {
-		_ = temporary.Close()
+		_ = temporary.Close() //nolint:errcheck // write error is the actionable failure
 		return err
 	}
 
 	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
+		_ = temporary.Close() //nolint:errcheck // sync error is the actionable failure
 		return err
 	}
 

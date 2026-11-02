@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package overlaybd
 
 import (
@@ -155,6 +158,7 @@ func validateZFileHeader(data []byte, header bool) error {
 }
 
 func zfileChecksum(data []byte, seed uint32) uint32 {
+	// ZFile stores the uncomplemented CRC32C accumulator.
 	return ^crc32.Update(^seed, zfileCRC32, data)
 }
 

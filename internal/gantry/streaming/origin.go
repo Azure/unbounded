@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 package streaming
 
 import (
@@ -21,10 +24,13 @@ const (
 	defaultOriginTLSHandshakeTimeout = 10 * time.Second
 	defaultOriginIdleConnTimeout     = 90 * time.Second
 
+	// Origin range reads are bounded separately from complete chair pulls so a
+	// slow registry cannot starve them.
 	maxConcurrentOriginReads    = 32
 	originResponseHeaderTimeout = 30 * time.Second
 )
 
+// OriginStatusError reports a non-206 response from the signed origin.
 type OriginStatusError struct {
 	StatusCode int
 	RetryAfter time.Duration
@@ -34,6 +40,7 @@ func (e *OriginStatusError) Error() string {
 	return fmt.Sprintf("streaming origin returned HTTP %d", e.StatusCode)
 }
 
+// OriginClient fetches exact ranges from validated signed origin URLs.
 type OriginClient struct {
 	hc  *http.Client
 	sem chan struct{}
@@ -41,6 +48,7 @@ type OriginClient struct {
 
 type redirectDigestContextKey struct{}
 
+// NewOriginClient constructs a client with independent origin concurrency.
 func NewOriginClient(policy URLPolicy) *OriginClient {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -82,6 +90,8 @@ func NewOriginClient(policy URLPolicy) *OriginClient {
 	return &OriginClient{hc: hc, sem: make(chan struct{}, maxConcurrentOriginReads)}
 }
 
+// FetchRange fetches exactly requested from origin and returns the complete
+// object size reported by Content-Range.
 func (c *OriginClient) FetchRange(ctx context.Context, origin OriginURL, requested httprange.Range) (io.ReadCloser, int64, string, error) {
 	if _, err := httprange.New(requested.Start, requested.End); err != nil {
 		return nil, 0, "", err
@@ -120,7 +130,7 @@ func (c *OriginClient) FetchRange(ctx context.Context, origin OriginURL, request
 
 	if resp.StatusCode != http.StatusPartialContent {
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() //nolint:errcheck // best-effort close
 
 		release()
 
@@ -128,7 +138,7 @@ func (c *OriginClient) FetchRange(ctx context.Context, origin OriginURL, request
 	}
 
 	if resp.ContentLength < 0 {
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() //nolint:errcheck // best-effort close
 
 		release()
 
@@ -137,7 +147,7 @@ func (c *OriginClient) FetchRange(ctx context.Context, origin OriginURL, request
 
 	total, err := httprange.ValidateResponse(requested, resp.Header.Get("Content-Range"), resp.ContentLength)
 	if err != nil {
-		_ = resp.Body.Close()
+		_ = resp.Body.Close() //nolint:errcheck // best-effort close
 
 		release()
 

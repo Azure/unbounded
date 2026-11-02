@@ -1,3 +1,7 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package httprange parses and validates exact HTTP byte ranges.
 package httprange
 
 import (
@@ -13,11 +17,13 @@ var (
 	ErrUnsatisfiable = errors.New("unsatisfiable byte range")
 )
 
+// Range is an exact inclusive byte range.
 type Range struct {
 	Start int64
 	End   int64
 }
 
+// New constructs a validated exact range.
 func New(start, end int64) (Range, error) {
 	if start < 0 || end < start || end-start == math.MaxInt64 {
 		return Range{}, fmt.Errorf("%w: %d-%d", ErrInvalid, start, end)
@@ -26,6 +32,8 @@ func New(start, end int64) (Range, error) {
 	return Range{Start: start, End: end}, nil
 }
 
+// ParseExact parses a single bytes=N-M range. Open-ended, suffix, and
+// multipart ranges are deliberately rejected.
 func ParseExact(value string) (Range, error) {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "bytes=") {
@@ -55,12 +63,15 @@ func ParseExact(value string) (Range, error) {
 	return New(start, end)
 }
 
+// Length returns the number of bytes in the range.
 func (r Range) Length() int64 { return r.End - r.Start + 1 }
 
+// HeaderValue returns the HTTP Range header value.
 func (r Range) HeaderValue() string {
 	return fmt.Sprintf("bytes=%d-%d", r.Start, r.End)
 }
 
+// ValidateSize verifies that the entire range is within an object of size.
 func (r Range) ValidateSize(size int64) error {
 	if size < 0 {
 		return fmt.Errorf("%w: negative object size %d", ErrInvalid, size)
@@ -73,11 +84,13 @@ func (r Range) ValidateSize(size int64) error {
 	return nil
 }
 
+// ContentRange is a satisfied HTTP Content-Range value.
 type ContentRange struct {
 	Range Range
 	Size  int64
 }
 
+// ParseContentRange parses Content-Range: bytes N-M/TOTAL.
 func ParseContentRange(value string) (ContentRange, error) {
 	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(value, "bytes ") {
@@ -106,6 +119,8 @@ func ParseContentRange(value string) (ContentRange, error) {
 	return ContentRange{Range: r, Size: size}, nil
 }
 
+// ValidateResponse verifies that a partial response exactly matches the
+// requested range and body length.
 func ValidateResponse(requested Range, value string, contentLength int64) (int64, error) {
 	got, err := ParseContentRange(value)
 	if err != nil {
@@ -125,4 +140,5 @@ func ValidateResponse(requested Range, value string, contentLength int64) (int64
 	return got.Size, nil
 }
 
+// UnsatisfiedContentRange returns the Content-Range value for a 416 response.
 func UnsatisfiedContentRange(size int64) string { return fmt.Sprintf("bytes */%d", size) }

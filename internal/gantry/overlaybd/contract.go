@@ -1,3 +1,8 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package overlaybd implements the ACR Artifact Streaming compatibility
+// contract currently consumed by the OverlayBD snapshotter.
 package overlaybd
 
 import (
@@ -21,6 +26,7 @@ const (
 
 var ErrNotArtifactStreaming = errors.New("not an ACR OverlayBD streaming manifest")
 
+// Layer is one immutable ACR-produced OverlayBD lower, in manifest order.
 type Layer struct {
 	DescriptorDigest digest.Digest
 	DataDigest       digest.Digest
@@ -29,11 +35,16 @@ type Layer struct {
 	Version          string
 }
 
+// Manifest is the validated subset of the ACR Artifact Streaming contract
+// needed to construct a read-only snapshot.
 type Manifest struct {
 	ConfigDigest digest.Digest
 	Layers       []Layer
 }
 
+// ParseManifest validates the current ACR OverlayBD descriptor contract.
+// Missing optional version and filesystem annotations retain the snapshotter's
+// existing defaults; malformed or partially annotated manifests fail closed.
 func ParseManifest(body []byte) (Manifest, error) {
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(body, &manifest); err != nil {
