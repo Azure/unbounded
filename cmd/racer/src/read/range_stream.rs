@@ -424,6 +424,15 @@ fn window_error(error: flow_control::Error) -> Error {
 }
 
 /// Client range progress admits independent pages under bounded child allowances.
+/// Bench knob: `RACER_RANGE_SELECTIONS=false` makes range reads fill every
+/// page directly instead of also selecting pages from peer providers.
+fn selections_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("RACER_RANGE_SELECTIONS").is_ok_and(|value| value == "false")
+    })
+}
+
 /// Restarts of one page's direct fill after transient failures. Each restart
 /// gets a fresh page budget, so this bounds total attempts per page.
 const PAGE_RETRIES: u8 = 16;
@@ -1165,7 +1174,10 @@ impl RangeStream {
     /// fan-out. While a warm job runs for the version, reads only fetch pages
     /// directly, each waiting for the warm job to finish that page.
     fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
-        if self.passthrough || self.directory.warm.contains(&self.metadata.version) {
+        if self.passthrough
+            || selections_disabled()
+            || self.directory.warm.contains(&self.metadata.version)
+        {
             return Ok(None);
         }
         let Some(lease) = self.lease.as_ref() else {
