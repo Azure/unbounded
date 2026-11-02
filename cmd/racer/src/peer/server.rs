@@ -82,6 +82,22 @@ pub(crate) const fn hot_page_threshold() -> usize {
     racer_core::read::budget::hot_page_bodies(crate::model::PAGE_BYTES)
 }
 
+/// The shedding threshold in effect: `RACER_HOT_PAGE_BODIES` when set (0
+/// turns hot-page shedding off), else [`hot_page_threshold`].
+fn effective_hot_page_threshold() -> Option<usize> {
+    static THRESHOLD: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        match std::env::var("RACER_HOT_PAGE_BODIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            Some(0) => None,
+            Some(bodies) => Some(bodies),
+            None => Some(hot_page_threshold()),
+        }
+    })
+}
+
 /// Counts one page body being written until dropped.
 struct Streaming {
     pages: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
@@ -405,7 +421,9 @@ impl PeerServer {
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
         use racer_core::read::budget::{is_helper, shed_hot_page};
-        let threshold = hot_page_threshold();
+        let Some(threshold) = effective_hot_page_threshold() else {
+            return false;
+        };
         let (streaming, all) = self.streaming(page);
         if streaming < threshold {
             return false;
