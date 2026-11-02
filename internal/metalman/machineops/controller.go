@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -149,6 +150,13 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, op *v1alpha3.Machin
 	}
 
 	if !isHostOperation(op.Spec.OperationKind) {
+		return ctrl.Result{}, nil
+	}
+
+	if owned, err := r.ownsOperation(ctx, op); err != nil {
+		return ctrl.Result{}, err
+	} else if !owned {
+		logger.DebugContext(ctx, "operation is owned by another metalman site", "site", r.Site)
 		return ctrl.Result{}, nil
 	}
 
@@ -306,17 +314,95 @@ func (r *Reconciler) validateSelectorScope(selector *metav1.LabelSelector) error
 		return operationError{reason: reasonInvalidTargetScope, message: "selector-based host operations require a non-empty metalman site"}
 	}
 
-	if selector.MatchLabels != nil && selector.MatchLabels[siteLabel] == r.Site {
+	sites := selectorSites(selector)
+	if len(sites) > 1 {
+		return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector names more than one %s: %s", siteLabel, strings.Join(sites, ", "))}
+	}
+
+	if len(sites) == 1 && sites[0] == r.Site {
 		return nil
 	}
 
-	for _, expr := range selector.MatchExpressions {
-		if expr.Key == siteLabel && expr.Operator == metav1.LabelSelectorOpIn && len(expr.Values) == 1 && expr.Values[0] == r.Site {
-			return nil
+	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
+}
+
+// ownsOperation reports whether this metalman instance may write status for
+// op. Operations that belong to a site are owned by exactly one instance:
+//   - an operation with boot media is owned by the site that installed it;
+//   - a machineRef operation is owned by the site of its Machine, read live;
+//   - a selector operation is owned by the one site its selector names.
+//
+// No instance can own an operation that names no site, names more than one
+// site, or targets a Machine that does not exist. Every instance fails such an
+// operation, because the result is the same whichever instance writes it.
+func (r *Reconciler) ownsOperation(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
+	if sites := mediaSites(op); len(sites) > 0 {
+		return slices.Contains(sites, r.Site), nil
+	}
+
+	if op.Spec.MachineRef != "" {
+		var machine v1alpha3.Machine
+		if err := r.reader().Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, fmt.Errorf("get Machine %s for ownership: %w", op.Spec.MachineRef, err)
+		}
+
+		return r.ownsMachine(&machine), nil
+	}
+
+	if op.Spec.MachineSelector != nil {
+		sites := selectorSites(op.Spec.MachineSelector)
+		if len(sites) != 1 {
+			return true, nil
+		}
+
+		return sites[0] == r.Site, nil
+	}
+
+	return true, nil
+}
+
+// selectorSites returns the sorted, distinct non-empty site names that
+// selector requires, from matchLabels and from single-value In expressions.
+// Other expressions do not name a site because they can match more than one.
+func selectorSites(selector *metav1.LabelSelector) []string {
+	var sites []string
+
+	add := func(site string) {
+		if site != "" && !slices.Contains(sites, site) {
+			sites = append(sites, site)
 		}
 	}
 
-	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
+	if site, ok := selector.MatchLabels[siteLabel]; ok {
+		add(site)
+	}
+
+	for _, expr := range selector.MatchExpressions {
+		if expr.Key == siteLabel && expr.Operator == metav1.LabelSelectorOpIn && len(expr.Values) == 1 {
+			add(expr.Values[0])
+		}
+	}
+
+	sort.Strings(sites)
+
+	return sites
+}
+
+// mediaSites returns the distinct sites that installed boot media for op.
+func mediaSites(op *v1alpha3.MachineOperation) []string {
+	var sites []string
+
+	for _, target := range op.Status.Targets {
+		if target.BootMedia != nil && !slices.Contains(sites, target.BootMedia.Site) {
+			sites = append(sites, target.BootMedia.Site)
+		}
+	}
+
+	return sites
 }
 
 func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOperation, failedCleanup map[string]struct{}) ([]targetChange, time.Duration) {
