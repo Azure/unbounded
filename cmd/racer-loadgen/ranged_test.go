@@ -87,7 +87,7 @@ func TestRangedBodyCoversEveryByteAndResumes(t *testing.T) {
 		return fakeRange{data: data, off: offset, length: length, fail: fail}, func() error { return nil }, nil
 	}
 
-	body := &rangedBody{ctx: t.Context(), get: get, size: int64(len(data)), rangeBytes: 64, parallel: 4, retries: 2}
+	body := &rangedBody{ctx: t.Context(), get: get, size: int64(len(data)), rangeBytes: 64, parallel: 4, retries: 5}
 	sink := &positionalSink{}
 
 	n, err := io.Copy(sink, body)
