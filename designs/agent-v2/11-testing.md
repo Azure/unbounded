@@ -134,8 +134,12 @@ Before installing, and again after reset, the harness records:
 
 After a v2 reset, the two snapshots must match apart from an allowlist of
 things the agent does not own, such as the journal, package manager caches,
-cloud-init state and SSH host keys. Installed packages are listed in the reset
-report and allowed. This tests [host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal) and
+cloud-init state and SSH host keys. The allowlist also covers `sysctl` keys
+that change on their own, without the agent: for example `kernel.random.uuid`,
+which is different on every read, `kernel.random.entropy_avail`,
+`kernel.ns_last_pid`, `fs.dentry-state`, `fs.inode-nr`, `fs.inode-state` and
+`fs.file-nr`. Without it, the comparison fails on every run. Installed packages
+are listed in the reset report and allowed. This tests [host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal) and
 [host runtime cleanup](07-host-runtime-cleanup.md) directly.
 
 On a host migrated from v1, the difference must be exactly the v1 host
@@ -191,6 +195,7 @@ using a build of N and a build of N+1
 | Cutover failure | Make the migration fail at N+1. The recovery unit returns the binary to N, N's daemon restores v1, the node is unchanged, and the AgentUpgrade is `Failed`. |
 | Downgrade in the window | After the cutover, an AgentUpgrade back to N restores v1. After a repave, an AgentUpgrade to N is refused. |
 | Skipping N | An AgentUpgrade from a release older than N straight to N+1 fails with the message to upgrade to N first, and the host keeps running the older release. |
+| Crash loop after the window | After the cutover and a repave, make the v2 daemon fail repeatedly. The recovery unit restores a v2 binary, not N, and the daemon runs again once the fault is removed ([migrating from v1, section 8](10-migration-from-v1.md#8-finishing-and-rollback)). |
 
 ## 5. Further end-to-end tests
 
@@ -204,7 +209,9 @@ These cover what v1 never had, so the v1 suites cannot:
 - Repave with `retainContainerImages: true`: images present, no containers or
   sandboxes, kubelet starts cleanly.
 - A Node deleted while the daemon is stopped: the daemon must not repave when
-  it starts. Deleting the Node again after kubelet registers it must repave.
+  it starts. A NodeReboot then restarts kubelet, which registers the Node
+  again *(inference: kubelet registers only when it starts)*, and deleting the
+  Node again must repave.
 - A daemon restart after it saw a Node deleted, but before the new slot is
   rendered: the repave must finish without another deletion.
 - GPU coverage on `hack/agent/azure-gpu-vm`.
@@ -220,6 +227,12 @@ These cover what v1 never had, so the v1 suites cannot:
 Each job stays within the matrix's existing time limits
 (`agent-e2e-kind.yaml:98-104`). The `host` runtime joins the immutable-host
 (`acl`) entry only after validation task V7.
+
+From the first official v2 release, the build has no v1 commands, so the
+`AGENT_PROFILE=v1` jobs can no longer run against it. The v2 jobs become the
+required ones in their place, and `AGENT_PROFILE` defaults to `v2`. The
+`migration-v2` suite then installs v1 only from `LEGACY_AGENT_VERSION`
+(section 4).
 
 ## 7. Validation tasks
 

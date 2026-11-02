@@ -199,6 +199,12 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
 - The digest covers every artifact, unit and non-secret file, but only the path
   and mode of secret files. A refreshed bootstrap token therefore does not
   change the digest.
+- `Provision` always writes the secret files, even when the slot already holds
+  a bundle with the same digest. Leaving secrets out of the digest keeps a new
+  token from causing a wipe on `host`; rewriting them is what puts the new
+  token in the slot, for example when a repave is retried after the token it
+  first used has expired. Everything else in a slot with the same digest is
+  left as it is.
 - The manifest also records the goal settings it was rendered from. A resumed
   bootstrap uses them to record what an already running node was actually
   built from ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).
@@ -222,7 +228,7 @@ timeouts. A timeout fails the step like any other error.
 stateDiagram-v2
   [*] --> Absent
   Absent --> Provisioned: Provision saves the manifest
-  Provisioned --> Provisioned: Provision, same digest is a no-op
+  Provisioned --> Provisioned: Provision, same digest rewrites only secret files
   Provisioned --> Running: Start enables the slot, fresh node state
   Running --> Running: Restart, persistent state kept
   Running --> Stopped: Stop disables the slot

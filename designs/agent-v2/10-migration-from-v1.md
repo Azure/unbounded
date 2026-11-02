@@ -50,16 +50,22 @@ AgentUpgrade completes when the migration commits.
 
 Rollback:
 
-- **Automatic.** If the migration fails, N+1's daemon exits with an error, and
-  after repeated failures the recovery unit restores the previous binary, N, as
-  for any failed AgentUpgrade ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). N's daemon finds the
-  unfinished migration, restores v1 from the backup (section 8) and reports the
-  AgentUpgrade as `Failed`.
+- **Automatic.** If the migration fails, N+1's daemon exits with an ordinary
+  failure code. It never rolls the migration back itself: N+1 has no v1
+  commands, so starting v1's daemon would only start N+1 again. After repeated
+  failures, systemd's start limit triggers the recovery unit
+  (`cmd/agent/internal/daemon/assets/unbounded-agent-daemon.service:8-10`),
+  which restores the previous binary, N, as for any failed AgentUpgrade
+  ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). N's daemon finds the unfinished migration, restores
+  v1 from the backup (section 8) and reports the AgentUpgrade as `Failed`. The
+  exit code must not be the deferred exit code, which the unit treats as
+  success and so never escalates to the recovery unit (`:21-22`).
 - **On request.** While the rollback window is open, until v2's first repave,
   an AgentUpgrade back to N restores v1 the same way.
 - **After the window,** v2's daemon refuses an AgentUpgrade to any release
   older than N+1, as it refuses any candidate that cannot run the host
-  ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
+  ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)), and the binary rollback slot holds a v2 binary
+  (section 8).
 - **Upgrades go through N.** A rollback has to land on a binary that can undo
   the migration. N+1 therefore refuses to migrate a host whose previous binary
   is older than N: its daemon fails, the recovery unit restores the previous
@@ -141,7 +147,7 @@ sequenceDiagram
 |---|---|
 | v1's install record has phase `complete` | An unfinished v1 install has to finish or be reset first |
 | Exactly one machine is running and enabled, and it is the only one with an applied config | A second applied config means a v1 repave was interrupted ([v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1)) |
-| No v1 MachineOperation is in progress other than the AgentUpgrade that started the migration | The migration stops v1's daemon |
+| No v1 MachineOperation is in progress on this host, other than the AgentUpgrade that started the migration | The migration stops v1's daemon. The check uses only what can be tied to this host: v1's install lock, which every v1 handler holds while it works (`cmd/agent/internal/daemon/controller_machineoperation.go:73,127,199`, `hostosreboot.go:52`) and which the migration takes first; v1's AgentUpgrade signal file; this Machine's `machineRef` operations; and this Machine's target entry in `HostOSReboot` operations (`hostosreboot.go:143-154`). It does not read the status of other selector operations, which every matching agent shares (issue #1040). |
 | v1's own move of the agent's files into `/opt/unbounded/agent` has finished (`cmd/agent/internal/daemon/daemon.go:120-122`) | Migration expects the current v1 layout |
 | The machine's applied config converts to a v2 configuration ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)) | v2 has to be able to manage the node |
 | At N+1: the previous binary is N or later | A rollback must land on a binary that can undo the migration (section 2) |
@@ -180,10 +186,10 @@ sequenceDiagram
   MG->>MG: phase Committed, disable unbounded-agent-migrate.service
 ```
 
-The binary rollback slot (`last-good`) must always hold a binary that can undo
-the migration. For an early migration, that is the running binary, so the
-migration points the slot at it before changing anything. At N+1, it is N,
-which the AgentUpgrade left there.
+The binary rollback slot (`last-good`) must hold a binary that can undo the
+migration until the rollback window closes (section 8). For an early
+migration, that is the running binary, so the migration points the slot at it
+before changing anything. At N+1, it is N, which the AgentUpgrade left there.
 
 | Phase in the record | What has happened | After a crash or reboot |
 |---|---|---|
@@ -200,9 +206,10 @@ Failures:
   seconds, within 30 seconds (`cmd/agent/internal/daemon/hostupgrade.go:23-26,110-145`).
   Its startup `Recover` must also find the enabled slot consistent with the
   applied state.
-- **Any failure before `Committed` rolls back to v1 automatically**
-  (section 8). The node is untouched at every phase, so rolling back only swaps
-  the agent back.
+- **Any failure before `Committed` rolls back to v1.** An early migration
+  rolls back automatically (section 8). At N+1, the daemon only exits, and N's
+  daemon rolls back after the recovery unit restores N (section 2). The node is
+  untouched at every phase, so rolling back only swaps the agent back.
 - The machine stays enabled throughout. If the host reboots while the
   migration is in progress, the node starts with whichever boot wiring is in
   place, v1's before `Switched` and v2's from then on, and both start the same
@@ -237,8 +244,8 @@ When the migration commits, v1's files and units move to
 `/var/lib/unbounded/agent-v2/migration/v1-backup/`. The backup is what makes
 rollback possible.
 
-A rollback, whether from `v2 migrate --rollback`, after a failure, or by N's
-daemon after a binary rollback from N+1:
+A rollback, whether from `v2 migrate --rollback`, after an early migration
+fails, or by N's daemon after a binary rollback from N+1:
 
 1. Stop v2's daemon.
 2. Restore v1's files, unit files and boot wiring from the backup. v1's daemon
@@ -252,6 +259,16 @@ Rollback is possible until v2's first repave commits. That repave replaces the
 machine with one v1 never configured, so it deletes the backup, and a rollback
 then refuses. From that point, the way back to v1 is `v2 reset` and a v1
 install.
+
+When it deletes the backup, the repave also points the binary rollback slot
+(`last-good`) at the running v2 binary. The recovery unit restores `last-good`
+after any repeated daemon failure, not only during an upgrade
+(`cmd/agent/internal/daemon/assets/unbounded-agent-daemon.service:8`,
+`unbounded-agent-daemon-recovery.sh:11,26`). After a cutover, `last-good` is N,
+and N's `daemon` command is v1's daemon, which refuses a v2 host (section 11).
+Without this step, a daemon crash loop after the window would leave the host
+with no working agent; with it, the recovery unit restarts a v2 binary that
+can recover from a temporary fault.
 
 ## 9. Hosts built by other `pkg/agent` consumers
 
@@ -297,10 +314,16 @@ These are listed with the other changes in [v1 compatibility, section 4](08-v1-c
 - **Refusing to act on a v2 host.** v1's `start`, `daemon` and `reset` refuse
   on a host with a v2 install record. v1 and v2 share the daemon unit names,
   so v1's `reset` would otherwise remove v2's daemon unit.
+- **Documenting `agentMode`.** The AgentUpgrade parameter is added wherever the
+  AgentUpgrade parameters are documented: the `MachineOperationSpec.parameters`
+  API comment, and so the generated CRD description, and the MachineOperation
+  reference page (`docs/content/reference/machina-crd.md`). Older daemons read
+  only `downloadURL` and `sha256` (`cmd/agent/internal/daemon/agentupgrade.go:51-61`)
+  and ignore it.
 
 ## 12. Testing
 
 The migration suite in [testing, section 4](11-testing.md#4-migration-suite) covers both ways of starting an
 early migration, the cutover at N+1, an interruption and a failure in every
-phase, rollback, the checks that refuse, and the move to the `host` runtime
-afterwards.
+phase, rollback, the checks that refuse, a daemon crash loop after the
+rollback window, and the move to the `host` runtime afterwards.
