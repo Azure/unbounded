@@ -47,6 +47,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	gdigest "github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
@@ -301,6 +302,51 @@ func (s *Store) Open(ctx context.Context, d gdigest.Digest) (io.ReadCloser, int6
 
 	return &readerAtCloser{
 		SectionReader: io.NewSectionReader(ra, 0, size),
+		closer:        ra,
+	}, size, nil
+}
+
+func (s *Store) OpenRange(ctx context.Context, d gdigest.Digest, requested httprange.Range) (io.ReadCloser, int64, error) {
+	desc := ocispec.Descriptor{Digest: godigest.Digest(d.String())}
+
+	ra, err := s.cs.ReaderAt(s.withNS(ctx), desc)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+
+		if errors.Is(err, cerrdefs.ErrNotFound) {
+			if s.metrics.OnMiss != nil {
+				s.metrics.OnMiss()
+			}
+
+			return nil, 0, &ifaces.ErrNotFound{Digest: d}
+		}
+
+		if s.metrics.OnUnavailable != nil {
+			s.metrics.OnUnavailable()
+		}
+
+		if s.metrics.OnOpenError != nil {
+			s.metrics.OnOpenError()
+		}
+
+		return nil, 0, &ifaces.ErrUnavailable{Op: "ReaderAt(range)", Cause: err}
+	}
+
+	size := ra.Size()
+	if err := requested.ValidateSize(size); err != nil {
+		_ = ra.Close()
+
+		return nil, size, err
+	}
+
+	if s.metrics.OnHit != nil {
+		s.metrics.OnHit()
+	}
+
+	return &readerAtCloser{
+		SectionReader: io.NewSectionReader(ra, requested.Start, requested.Length()),
 		closer:        ra,
 	}, size, nil
 }

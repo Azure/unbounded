@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -34,13 +35,17 @@ type Client struct {
 	// through hc.Transport.
 	transport   http.RoundTripper
 	hc          *http.Client
+	rangeHC     *http.Client
 	onBytesRead func(kind string, bytes int64)
 }
 
 // peerMaxReadFrameSize pairs with streamcopy.BufferSize. Large peer response
 // writes can then cross HTTP/2 in one frame instead of being split into the
 // RFC-default 16 KiB frames. The value is within HTTP/2's 16 KiB-16 MiB range.
-const peerMaxReadFrameSize = 1 << 20
+const (
+	peerMaxReadFrameSize       = 1 << 20
+	defaultRangeRequestTimeout = 10 * time.Second
+)
 
 // ClientOption tweaks Client construction.
 type ClientOption func(*clientOptions)
@@ -84,10 +89,36 @@ func NewClient(opts ...ClientOption) *Client {
 		fn(&o)
 	}
 
+	tr := newPeerTransport(o)
+
+	return &Client{
+		transport: tr,
+		hc: &http.Client{
+			// Keep peer fetches on the mirror request's cross-node trace.
+			Transport: otelhttp.NewTransport(
+				tr,
+				otelhttp.WithTracerProvider(tracing.Provider()),
+				otelhttp.WithSpanNameFormatter(peerSpanName),
+			),
+			Timeout: o.requestTimeout,
+		},
+		rangeHC: &http.Client{
+			Transport: otelhttp.NewTransport(
+				newPeerTransport(o),
+				otelhttp.WithTracerProvider(tracing.Provider()),
+				otelhttp.WithSpanNameFormatter(peerSpanName),
+			),
+			Timeout: defaultRangeRequestTimeout,
+		},
+		onBytesRead: o.onBytesRead,
+	}
+}
+
+func newPeerTransport(o clientOptions) *http.Transport {
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
 
-	tr := &http.Transport{
+	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: o.dialTimeout}
 			return d.DialContext(ctx, network, addr)
@@ -97,24 +128,6 @@ func NewClient(opts ...ClientOption) *Client {
 			SendPingTimeout:  o.readIdleTimeout,
 			MaxReadFrameSize: peerMaxReadFrameSize,
 		},
-	}
-
-	return &Client{
-		transport: tr,
-		hc: &http.Client{
-			// Wrap the h2c transport in otelhttp so a peer fetch is a span on
-			// the same trace as the mirror request that triggered it. The
-			// propagator injects traceparent, and the peer's own transfer
-			// handler continues from it, which is what makes a cross-node
-			// cascade readable as one trace instead of N unrelated ones.
-			Transport: otelhttp.NewTransport(
-				tr,
-				otelhttp.WithTracerProvider(tracing.Provider()),
-				otelhttp.WithSpanNameFormatter(peerSpanName),
-			),
-			Timeout: o.requestTimeout,
-		},
-		onBytesRead: o.onBytesRead,
 	}
 }
 
@@ -223,6 +236,53 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		_ = resp.Body.Close()
+
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
+	}
+}
+
+func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error) {
+	if _, err := httprange.New(requested.Start, requested.End); err != nil {
+		return nil, 0, "", err
+	}
+
+	url, err := buildPeerURL(peerAddr, ifaces.OriginRef{Digest: d, Kind: ifaces.KindBlob})
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Range", requested.HeaderValue())
+	req.URL.Scheme = "http"
+
+	resp, err := c.rangeHC.Do(req)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		size, err := httprange.ValidateResponse(requested, resp.Header.Get("Content-Range"), resp.ContentLength)
+		if err != nil {
+			_ = resp.Body.Close()
+
+			return nil, 0, "", &ifaces.ErrPeerProtocol{PeerAddr: peerAddr, Err: err}
+		}
+
+		return c.responseBody(resp, ifaces.KindBlob), size, resp.Header.Get("Content-Type"), nil
+	case http.StatusNotFound:
+		_ = resp.Body.Close()
+
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: d}
 	default:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close

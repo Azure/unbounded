@@ -541,3 +541,14 @@ type ErrPeerHTTPStatus struct {
 func (e *ErrPeerHTTPStatus) Error() string {
 	return fmt.Sprintf("peer %s returned %d", e.PeerAddr, e.StatusCode)
 }
+
+type ErrPeerProtocol struct {
+	PeerAddr string
+	Err      error
+}
+
+func (e *ErrPeerProtocol) Error() string {
+	return fmt.Sprintf("peer %s protocol error: %v", e.PeerAddr, e.Err)
+}
+
+func (e *ErrPeerProtocol) Unwrap() error { return e.Err }

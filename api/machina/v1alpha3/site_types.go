@@ -194,6 +194,14 @@ type MetalmanComponentSpec struct {
 // sets enabled to false.
 type GantryComponentSpec struct {
 	SiteComponentSpec `json:",inline"`
+
+	ArtifactStreaming *GantryArtifactStreamingSpec `json:"artifactStreaming,omitempty"`
+}
+
+type GantryArtifactStreamingSpec struct {
+	Enabled bool `json:"enabled,omitempty"`
+
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 }
 
 // TokenRefresherComponentSpec configures bootstrap token refresh for a Site.
