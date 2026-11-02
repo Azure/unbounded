@@ -246,12 +246,16 @@ with no target in between:
 | Started at boot through | The enabled machine (`machinectl enable`) | `unbounded-node.target`, enabled by `Start`, which wants `containerd.service`, `kubelet.service` and `localdns.service` |
 | Boot unit | `systemd-nspawn@<m>.service` for the enabled slot | `unbounded-node-prestart.service`, a oneshot that the three node units each `Requires=` and are ordered after |
 | How prerequisites attach | `RequiredBy=systemd-nspawn@.service` in the prerequisite, which covers both slots, plus `After=` in the machine's unit override, as v1 does (`pkg/agent/phases/host/assets/nftables-flush.service:20-21`, `pkg/agent/phases/rootfs/assets/service-override.conf:39`). A `Before=` on the template would not reach the instances (`nftables-flush.service:3-5`). | `RequiredBy=` and `Before=unbounded-node-prestart.service` in the prerequisite |
+| How `nodeDependencies.requires` units attach | `Requires=` and `After=` in the machine's unit override | `Requires=` and `After=` in `unbounded-node-prestart.service` |
 | Pre-start boot hook | A separate oneshot unit, `unbounded-node-boot-hook@<m>.service`, that the machine's override `Requires=` and is ordered after, as v1's config-regeneration unit is (`service-override.conf:37-38`) | Run by `unbounded-node-prestart.service` |
 | Post-start boot hook | `ExecStartPost=` in the machine's override, as in v1 (`service-override.conf:48`) | None: the NVIDIA CDI spec is generated in the pre-start boot hook |
 
 The prerequisites are the same for both runtimes: the nftables flush, the
 LocalDNS network helper, extension host units with `orderBeforeNode`, and
-`nodeDependencies.requires` units.
+`nodeDependencies.requires` units. The agent writes the wiring into the
+prerequisites it owns. `nodeDependencies.requires` units belong to the host or
+the consumer, and the agent never edits host units it does not own
+([extensions, section 2](02-extensions.md#2-declarative-extensions)), so the boot unit requires them instead.
 
 The LocalDNS network unit is not host preparation. Its settings come from the
 goal, and the host network reset removes it during a repave. The node manager
@@ -305,7 +309,7 @@ manifest, and can always read it ([control and state, section 4](04-control-and-
 | Slot | `/var/lib/machines/kube1`, `kube2` | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Provision | Unpack the OCI image; write the bundle, `.nspawn` file and unit override | Stage binaries and rendered files into the slot directory |
 | Start | `machinectl start`, then boot steps through `systemd-run -M` | Install units and configuration from the slot, then start `unbounded-node.target` (section 4) |
-| Enabled at boot | `machinectl enable` on `Start`, as v1 does (`pkg/agent/phases/nodestart/nspawn.go:99`), and `machinectl disable` on `Stop` (`pkg/agent/phases/reset/machine.go:39`) | The node units are enabled on `Start` and disabled on `Stop` |
+| Enabled at boot | `machinectl enable` on `Start`, as v1 does (`pkg/agent/phases/nodestart/nspawn.go:99`), and `machinectl disable` on `Stop` (`pkg/agent/phases/reset/machine.go:39`) | `unbounded-node.target` is enabled on `Start` and disabled on `Stop` (section 4) |
 | Fresh state | A new rootfs | Wipe the owned paths ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-wipe-and-slot-changes)) |
 | `NodeAccess` | `systemd-run -M` | Direct |
 | NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start boot hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start boot hook, writing `/run/cdi/nvidia.yaml`, which containerd also reads as `/var/run/cdi` *(inference: containerd's default CDI directories)* |

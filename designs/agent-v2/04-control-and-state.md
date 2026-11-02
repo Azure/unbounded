@@ -38,10 +38,14 @@ type StatusReporter interface {
 
 Built-in providers:
 
-- `machina`: registers the Machine, reads the goal settings from the Machine
-  and its MachineConfigurationVersion as v1 does
-  (`cmd/agent/internal/daemon/controller_node.go:75-105`), and writes Machine
-  status.
+- `machina`: registers the Machine, builds the goal settings as v1 does, and
+  writes Machine status. v1 starts from the running node's applied
+  configuration and overlays the template of the MachineConfigurationVersion
+  that the Machine's `spec.configurationRef` names: the Kubernetes version,
+  node labels, taints, agent image and LocalDNS settings
+  (`cmd/agent/internal/daemon/controller_node.go:75-105,143-167`). Without a
+  `configurationRef`, the goal settings are the applied ones. Other edits to
+  the Machine's spec never change the goal.
 - `static`: the goal settings in the agent's copy of the configuration file,
   `/etc/unbounded/agent-v2/config.json`, are the goal; the version is their
   digest. The daemon watches the file. An operator changes the goal by editing
@@ -104,7 +108,8 @@ type Manager interface {
 }
 
 // Trigger is why the daemon is reconciling: NodeDeleted when it saw this
-// node's Node object being deleted, otherwise GoalChanged, Poll or Startup.
+// node's Node object being deleted, NodeChanged when the Node's status
+// changed, otherwise GoalChanged, Poll or Startup.
 type Trigger string
 
 type Action string // Steady, Wait, Repave, Reset
@@ -126,10 +131,10 @@ type Applied struct {
 	Settings     *config.GoalSettings // the goal settings the running node was built from
 	BundleDigest string               // digest of that node's saved bundle manifest
 	StartedAt    time.Time            // when that node started, for the registration timeout
-	Pending      *Pending             // non-nil from the moment a repave is approved
+	Repave       *Repave              // non-nil from the moment a repave is approved
 }
 
-type Pending struct {
+type Repave struct {
 	ApprovedAt   time.Time    // when the daemon saw the Node deleted
 	Slot         runtime.Slot // empty until the new slot's bundle is rendered
 	GoalVersion  string
@@ -140,7 +145,7 @@ type Pending struct {
 }
 ```
 
-The daemon saves `Pending` as soon as it handles a Node deletion that needs a
+The daemon saves `Repave` as soon as it handles a Node deletion that needs a
 repave, before it resolves the node spec or downloads anything. Once saved, a
 repave survives any restart of the daemon or the host: `Recover` continues it,
 and an operator never has to approve it again. v1 keeps the approval only in
@@ -156,9 +161,9 @@ slot, as reported by `Inspect`, with the digests in this record:
 
 | Enabled slot's digest | Meaning | `Recover` does |
 |---|---|---|
-| Matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Pending.Slot` empty) | Continues or retries the pending repave, if any, from the beginning of its first unfinished step |
-| Matches `Pending.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
-| No slot is enabled, and `Pending` is set | The old slot was stopped, but the new one was not started | Continues the pending repave from starting the new slot |
+| Matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Repave.Slot` empty) | Continues or retries the approved repave, if any, from the beginning of its first unfinished step |
+| Matches `Repave.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
+| No slot is enabled, and `Repave` is set | The old slot was stopped, but the new one was not started | Continues the approved repave from starting the new slot |
 | Any other case | The record and the host disagree | Reports `StateMismatch` and changes nothing |
 
 The runtime kind is an install-time setting, so it lives in the install
@@ -179,8 +184,10 @@ saved bundle manifests.
 - If a file has an unknown `schemaVersion` or fails its checksum, the daemon
   makes no changes and reports `StateCorrupt`. `v2 reset` still runs, using the
   conservative paths described in [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown).
-- Files under `/var/lib/unbounded/agent-v2/` and `/etc/unbounded/agent-v2/`
-  have mode 0600. The configuration copy can hold a bootstrap token.
+- The state files listed above, the configuration copy and daemon credentials
+  under `/etc/unbounded/agent-v2/`, and every file the bundle marks as secret
+  have mode 0600. The configuration copy can hold a bootstrap token. Slot
+  binaries and the artifact cache keep the modes they need to run.
 
 ## 5. Daemon reconcile
 
@@ -194,7 +201,7 @@ flowchart TD
   G -- no --> RQ["Requeue"]
   G -- yes --> L{"Install lock acquired?"}
   L -- no --> RQ
-  L -- yes --> P{"Pending repave in state?"}
+  L -- yes --> P{"Approved repave in state?"}
   P -- yes --> RF["nodemanager.Recover: finish the interrupted repave"]
   P -- no --> K{"Request kind"}
   K -- operation --> OP["NodeReboot, AgentUpgrade, AgentReset or HostOSReboot handler"]
@@ -218,7 +225,7 @@ being deleted, as v1 does: v1 watches only Node delete events
 | Trigger | Goal `delete` | Drift | Action |
 |---|---|---|---|
 | Any | `true` | Any | Reset |
-| `NodeDeleted` | `false` | Yes | Repave: save `Pending`, then `Apply` |
+| `NodeDeleted` | `false` | Yes | Repave: save `Repave`, then `Apply` |
 | `NodeDeleted` | `false` | No | Steady; record the goal version as applied, as v1 does (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
 | Any other | `false` | Yes | Wait: a repave is pending until the Node is deleted |
 | Any other | `false` | No | Steady |

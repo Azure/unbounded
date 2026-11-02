@@ -96,7 +96,7 @@ implementation rather than a switch added to v1.
 | Host preparation | Masks the host `containerd` and `kubelet` units, which a host runtime needs | `bootstrap.go:111`, `pkg/agent/phases/host/disable_systemd_unit.go:36-43` |
 | Daemon | Defaults to the nspawn operator, and hardcodes it in `RepairDaemon`; repave alternates `kube1` and `kube2` | `cmd/agent/internal/daemon/daemon.go:101`, `lifecycle.go:461`, `nodeoperator.go:262-310` |
 | Reset | Hardcodes `kube1` and `kube2` and the nspawn teardown | `cmd/agent/internal/daemon/reset.go:168-195` |
-| Lifecycle hooks | Around `systemd-nspawn@<m>`, systemd runs `nspawn-lifecycle pre-start` as a separate oneshot unit and `post-start` as `ExecStartPost` | Wiring: `pkg/agent/phases/rootfs/assets/service-override.conf:37-38,48`, `config-regeneration.service:11`. Code: `pkg/agent/nspawnlifecycle/lifecycle.go:67-129` |
+| Boot hooks | Around `systemd-nspawn@<m>`, systemd runs `nspawn-lifecycle pre-start` as a separate oneshot unit and `post-start` as `ExecStartPost` | Wiring: `pkg/agent/phases/rootfs/assets/service-override.conf:37-38,48`, `config-regeneration.service:11`. Code: `pkg/agent/nspawnlifecycle/lifecycle.go:67-129` |
 
 ### 1.3 How AKS Flex Node consumes v1 today
 
@@ -134,13 +134,28 @@ library.
 | Node | The Kubernetes worker: kubelet, containerd, LocalDNS and the pods they run. In v1 it always runs in an nspawn container on the host. |
 | Runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). [Node runtime, section 1](03-node-runtime.md#1-node-runtime) defines the interface. |
 | Slot | One of two places, `a` and `b`, where a runtime keeps a node's content. One slot holds the running node; the other is used to build a replacement during a repave. For `nspawn-container`, a slot is a whole machine, v1's `kube1` or `kube2`, including the node's state. For `host`, a slot holds only staged binaries and rendered files; the node's state lives in shared host paths and is wiped on a slot change. |
-| Repave | Replacing the node with a new one, built from the desired configuration in the other slot. The new node registers with Kubernetes as a fresh Node. A repave is triggered by deleting the Kubernetes Node object ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). |
-| Goal | The desired configuration for this machine, from machina, a plugin or the configuration file. Its version is an opaque value that changes whenever the goal does. |
+| Repave | Replacing the node with a new one, built from the desired configuration in the other slot. The new node registers with Kubernetes as a fresh Node. A repave is triggered by deleting the Kubernetes Node object ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). Not to be confused with `kubectl unbounded machine repave`, which creates a `HostReplace` MachineOperation (`cmd/kubectl-unbounded/app/machine_repave.go:24-25,47`). |
+| Goal | The desired configuration for this machine, from machina, a plugin or the configuration file. It carries only goal settings, not install-time settings ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). Its version is an opaque label from the goal source, compared for equality only. Whether to repave depends on the settings, not the version: a machina version can be edited in place (issue #1038). |
 | Drift | A difference between the goal and the applied configuration that needs a repave to take effect, such as a new Kubernetes version. |
 | Bundle | The rendered description of one node: files, binaries, units and start order ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). Not related to v1's offline artifact bundles. |
 | Node manager | The runtime-independent component that drives bootstrap, repave, reboot and reset by calling the runtime ([control and state, section 3](04-control-and-state.md#3-node-manager)). |
 | Reset | Removing the node, the agent and everything they created from the host ([lifecycles, section 6](05-lifecycles.md#6-reset)). The runtime's part of a reset is its `Teardown` method; [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown) describes it for the `host` runtime. |
 | Slot change | For the `host` runtime, starting a slot whose content differs from what last ran. The runtime wipes node state first ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-wipe-and-slot-changes)). |
+| Enabled slot | The slot systemd starts at boot. `Start` enables a slot and `Stop` disables it ([node runtime, section 1](03-node-runtime.md#1-node-runtime)). |
+| Old and new slot | During a repave, the slot the running node is in and the slot its replacement is built in ([lifecycles, section 2](05-lifecycles.md#2-repave)). |
+| Bundle manifest | The record of a provisioned bundle, saved in its slot by `Provision`, from which boot hooks and `Recover` work without rendering again ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). |
+| Boot unit | The unit that must start before a runtime's node does, and that host-side prerequisites attach to ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
+| Boot hook | Runtime-owned work that systemd runs around the boot unit, through `v2 boot-hook`. Not a lifecycle hook ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
+| Lifecycle hook | A plugin call at a fixed point in a lifecycle, such as `node.start.after` ([extensions, section 1](02-extensions.md#lifecycle-hook-events)). |
+| Install-time and goal settings | The two parts of the configuration. Install-time settings, such as the runtime and plugins, change only through a reset; goal settings can come from a goal source ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). |
+| Applied state | `state.Applied`: the goal version, settings and bundle digest of the running node, and any approved repave ([control and state, section 4](04-control-and-state.md#4-state)). |
+| Approved repave | A repave the daemon has approved by seeing the Node deleted with drift, saved as `state.Applied.Repave` until it commits ([control and state, section 4](04-control-and-state.md#4-state)). |
+| Install record | v2's record of its installation, `/var/lib/unbounded/agent-v2/install.json`, which also tells v1 and v2 apart on a host ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). |
+| Undo log | The host preparation undo log, replayed by reset ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). |
+| Host network reset | The node manager's cleanup of links, routes, rules and firewall state after a node stops ([host changes, section 2](06-host-changes.md#2-host-network-reset)). |
+| Ownership record and active-slot record | The `host` runtime's records of the host paths it owns and of the slot installed into them ([host runtime cleanup, sections 3 and 8](07-host-runtime-cleanup.md#3-ownership-and-adoption)). |
+| Leftover | Something a cleanup could not remove, reported rather than ignored ([host runtime cleanup, section 10](07-host-runtime-cleanup.md#10-post-conditions)). |
+| Release N and the first official v2 release | The last v1 release, and the release after it, which replaces v1 with v2 ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
 
 ## 2. Goals and non-goals
 
@@ -184,7 +199,7 @@ flowchart TB
     EXT["Declarative extensions"]
   end
   subgraph Agent["unbounded-agent v2 (internal/agentv2)"]
-    CLI["cli: start, preflight, daemon, reset, status, agent-upgrade, boot-hook"]
+    CLI["cli: start, preflight, daemon, reset, status, migrate, agent-upgrade, version, boot-hook, convert-config"]
     BOOT["bootstrap coordinator"]
     DAE["daemon: serialized controller"]
     NM["nodemanager"]

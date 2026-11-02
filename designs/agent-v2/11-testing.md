@@ -17,7 +17,7 @@ This document specifies how v2 is tested. It has two priorities:
 - One test per row of the `Decide` table, with each trigger, including a Node
   deleted while the daemon is stopped, which must be ignored.
 - `Recover` after a simulated crash between every two steps of a repave,
-  including after `Pending` is saved but before the bundle is rendered.
+  including after `Repave` is saved but before the bundle is rendered.
 - Golden tests showing the `nspawn-container` runtime renders kubelet,
   containerd, `.nspawn` and unit-override files identical to v1's goldens
   (`pkg/agent/phases/rootfs/testdata`).

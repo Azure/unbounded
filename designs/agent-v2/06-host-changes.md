@@ -65,8 +65,8 @@ because nothing outside the agent depends on them.
 
 ## 2. Host network reset
 
-The node manager runs this after `Stop(old)` during a repave, and during
-Teardown, for both runtimes. It hardens v1's `CleanupNetwork`
+The node manager runs this after `Stop(old)` during a repave, and after
+`Teardown` during a reset, for both runtimes. It hardens v1's `CleanupNetwork`
 (`pkg/agent/phases/reset/network.go:48-54`).
 
 | Step | v1 | v2 |

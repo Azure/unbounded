@@ -19,7 +19,7 @@ runtime has no container, so it has to provide each guarantee itself.
 | kubelet, containerd and CNI state | A repave unpacks a new rootfs | Wipe the owned paths (section 8) |
 | Pod hostPath data | hostPaths resolve inside the rootfs, e.g. `/etc/wireguard`, `/opt/cni/bin` (`deploy/net/node/03-daemonset.yaml.tmpl:135-155`) and `/var/lib/gantry/libp2p` (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Wipe the known and declared paths, report the rest (sections 8 and 12) |
 | Network: links, routes, rules, nftables and iptables | Nothing: the network namespace is already shared (`pkg/agent/phases/rootfs/assets/nspawn.conf:20-21`) | The same network reset as today ([host changes, section 2](06-host-changes.md#2-host-network-reset)) |
-| eBPF pins | Each machine gets its own bpffs (`nspawn.conf:27-29`) | Pins land in the host's bpffs; only declared pins are cleaned (section 12) |
+| eBPF pins | Each machine gets its own bpffs (`nspawn.conf:27-29`) | Pins land in the host's bpffs; only declared pins are cleaned (sections 12 and 13) |
 
 ## 2. Principles
 
@@ -68,8 +68,8 @@ and synced to disk, with a `.sha256` sidecar.
 
 The runtime takes ownership of each path on the first slot change (section 8). It
 records the path before creating anything there. Original sysctl values are not
-kept here; the host preparation undo log keeps them for both runtimes (main
-doc, section 12).
+kept here; the host preparation undo log keeps them for both runtimes
+([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)).
 
 | State of the path when the runtime takes ownership | Result |
 |---|---|
@@ -232,7 +232,8 @@ Unmount runs only after Terminate has verified that no node processes remain.
 
 The active-slot record,
 `/var/lib/unbounded/agent-v2/host-runtime/active-slot.json`, holds
-`{slot, bundleDigest, phase}`. When `Start` is called with a slot or bundle
+`{schemaVersion, slot, bundleDigest, phase}` and follows the rules for state
+files in [control and state, section 4](04-control-and-state.md#4-state). When `Start` is called with a slot or bundle
 digest that differs from the record, the runtime is making a *slot change*, and
 it wipes node state first. This is how the `host` runtime keeps rule 4 of the
 [node runtime, section 1](03-node-runtime.md#1-node-runtime): the first time a slot starts after its content was
@@ -309,16 +310,18 @@ unpacks a new rootfs. The mechanism needs a prototype (validation task V2 in [te
 
 ```mermaid
 flowchart TD
-  A["Mark install Resetting"] --> B["Terminate, Unmount, Wipe, best effort"]
-  B --> C["Host network reset, teardown scope"]
-  C --> D["Stop, disable and remove installed units, daemon-reload, reset-failed"]
+  B["Terminate, Unmount, Wipe, best effort"] --> D["Stop, disable and remove installed units, daemon-reload, reset-failed"]
   D --> E["Remove installed files, content checked against the manifest"]
   E --> F["Owned paths: remove created ones, restore Preserve backups, clear the rest"]
   F --> G["Revert file edits: rt_tables lines"]
-  G --> H["Replay the host preparation undo log, host changes doc, section 3"]
-  H --> I["Remove slots, the active-slot record and the ownership record"]
-  I --> J["Report leftovers, exit non-zero if any"]
+  G --> I["Remove slots, the active-slot record and the ownership record"]
+  I --> J["Return leftovers"]
 ```
+
+Teardown covers only what the runtime owns. The node manager marks the install
+as resetting before it calls Teardown, and runs the host network reset and
+replays the host preparation undo log after it
+([lifecycles, section 6](05-lifecycles.md#6-reset)).
 
 - A file whose content no longer matches the manifest is still removed, because
   the path is owned. The mismatch is logged.
@@ -331,12 +334,12 @@ Without an ownership record, Teardown is conservative:
 - It removes only paths and units unique to v2: slot directories,
   `unboundednode.slice`, `unbounded-node.target`,
   `unbounded-node-prestart.service` and v2 state. Host preparation units, such
-  as `nftables-flush.service`, are reversed by the undo log below.
+  as `nftables-flush.service`, are reversed by the undo log after Teardown.
 - Every non-empty standard path in section 4 is reported as a leftover.
 - `v2 reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.
-- Host preparation, including the original sysctl values, is still reversed
-  from its own undo log ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). If that log is missing too, the
+- The node manager still reverses host preparation, including the original
+  sysctl values, from its own undo log ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). If that log is missing too, the
   sysctl keys that could not be restored are reported.
 
 ## 10. Post-conditions
@@ -436,11 +439,10 @@ func (c *cleaner) Verify(ctx context.Context, lvl Level) ([]runtime.Leftover, er
 // Fakes drive unit tests for ordering and safety.
 type SystemOps interface {
 	Systemd() Systemd // Stop, Disable, DaemonReload, ResetFailed
-	Cgroups() Cgroups // Signal, Kill, Populated, Procs
+	Cgroups() Cgroups // Kill, Populated, Procs
 	Mounts() Mounts   // List, Unmount
 	FS() SafeFS       // ClearContents, RemoveTree, WriteDurable; never crosses st_dev or follows symlinks
 	Netns() Netns     // List with a prefix, Remove
 	CRI() CRI         // container mount sources, for observedHostPaths
-	Sysctl() Sysctl   // Read, Write
 }
 ```

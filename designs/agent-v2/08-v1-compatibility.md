@@ -17,7 +17,7 @@ repository baseline, citation conventions and terms.
 | TPM attestation | `cmd/agent/internal/attest` | `credentials`, the `tpm` provider |
 | Machine registration and status | `cmd/agent/internal/daemon/daemon.go:307-410`, `bootstrap_status.go` | `control`, the `machina` providers |
 | NVIDIA, AMD and host devices | `pkg/agent/goalstates`, `pkg/agent/phases/nodestart/nvidia.go` | Discovery in `nodespec`; each runtime makes the devices available to the node |
-| nspawn lifecycle hooks | `pkg/agent/nspawnlifecycle` | `runtime.BootHook` and `v2 boot-hook` |
+| nspawn boot hooks (v1's `nspawn-lifecycle` command) | `pkg/agent/nspawnlifecycle` | `runtime.BootHook` and `v2 boot-hook` |
 | Daemon CSR credentials | `pkg/agent/daemoncred` | `credentials`, the `csr` provider |
 | Repave on Node delete with drift detection | `cmd/agent/internal/daemon/controller_node.go`, `nodeoperator.go` | `daemon`, `nodemanager` |
 | NodeReboot, AgentUpgrade, AgentReset | `cmd/agent/internal/daemon/controller_machineoperation.go` | `daemon`, `agentupgrade`, `nodemanager` |
@@ -141,6 +141,6 @@ and converted field by field:
 | `NSpawnLifecycle` | Not converted. v2 always runs its own boot hooks, so a v1 configuration that sets it is rejected with an explanation. |
 
 A converted configuration gets the v1 defaults for everything v1 did not
-configure: `runtime.type` is `nspawn-container`, the goal source, status reporter
-and MachineOperations are `machina`, and there are no plugins, hooks or
-extensions.
+configure: `runtime.type` is `nspawn-container`, the goal source and status
+reporter are `machina`, MachineOperations are enabled, and there are no
+plugins, hooks or extensions.

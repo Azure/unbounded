@@ -56,11 +56,11 @@ sequenceDiagram
   participant St as node state
   participant Px as providers and hooks
   participant RT as NodeRuntime
-  D->>St: sees the Node deleted with drift, saves Pending
+  D->>St: sees the Node deleted with drift, saves Repave
   D->>NM: Apply goal
   NM->>Px: hook node.repave.before, credentials.bootstrap
   NM->>NM: resolve NodeSpec, cache artifacts, render the bundle for the new slot
-  NM->>St: record the new slot and its bundle digest in Pending
+  NM->>St: record the new slot and its bundle digest in Repave
   NM->>Px: hook node.provision.before new
   NM->>RT: Provision new and save its manifest
   NM->>Px: hook node.provision.after new
@@ -72,7 +72,7 @@ sequenceDiagram
   NM->>RT: Start new, which enables it
   NM->>RT: Access new, wait for readiness
   NM->>Px: hook node.start.after new
-  NM->>St: commit the applied goal and digest, clear Pending
+  NM->>St: commit the applied goal and digest, clear Repave
   NM->>RT: Destroy old
   NM->>Px: hook node.repave.after, status.report Provisioning
 ```
@@ -88,26 +88,26 @@ When a repave fails, it is retried, matching v1:
 - Retries never stop. They use controller-runtime's default per-item backoff,
   as v1 does: v1 configures no rate limiter of its own
   (`pkg/agent/daemon/setup.go:45-50`). Unlike v1, they also continue after a
-  daemon or host restart, because `Pending` was saved when the deletion was
+  daemon or host restart, because `Repave` was saved when the deletion was
   seen.
 - Every attempt reads the goal again, as v1 does
   (`cmd/agent/internal/daemon/controller_node.go:43`). A goal change also
   queues an attempt at once, so a corrected goal does not wait out the backoff.
 - Each failed attempt is reported as `Failed` with reason `RepaveFailed`, the
-  attempt count and the last error (`Pending.Attempts`, `Pending.LastError`).
+  attempt count and the last error (`Repave.Attempts`, `Repave.LastError`).
 - There is no rollback. The old slot stays stopped and intact until a later
   attempt succeeds, and is destroyed only then. Starting the old node again is
   not useful: the control plane deleted its Node to approve the repave, and its
   workloads are already gone.
-- If stopping the old slot fails, for example with `ErrNodeBusy` or
-  `ErrMountsRemain` on `host`, the attempt ends there and the new slot is not
+- If stopping the old slot returns any error, such as the `host` runtime's
+  `ErrNodeBusy` or `ErrMountsRemain` ([host runtime cleanup, section 10](07-host-runtime-cleanup.md#10-post-conditions)), the attempt ends there and the new slot is not
   started. The node stays down until a retry succeeds, as in v1.
 
 If the goal changes while a repave is in progress:
 
-- Before the new slot has been started, the next attempt replaces `Pending`
+- Before the new slot has been started, the next attempt replaces `Repave`
   and provisions the new slot again from the new goal. If the new goal no
-  longer has drift, the attempt clears `Pending` and records the goal version
+  longer has drift, the attempt clears `Repave` and records the goal version
   as applied, as for a deletion with no drift.
 - Once the new slot has been started, the repave finishes and commits the goal
   it started with. The newer goal is then ordinary drift and needs another Node
@@ -133,7 +133,7 @@ sequenceDiagram
 `Restart` per runtime:
 
 - `nspawn-container`: `systemctl restart systemd-nspawn@<m>`, which runs the
-  hooks again, matching v1
+  boot hooks again, matching v1
   (`pkg/agent/phases/nodestart/nspawn_lifecycle.go:36-40`).
 - `host`: Terminate and Unmount ([host runtime cleanup](07-host-runtime-cleanup.md), sections 6 and 7), then start
   the node units again. Starting them runs the prerequisites and the pre-start

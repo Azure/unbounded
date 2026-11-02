@@ -214,9 +214,9 @@ the agent cannot handle is failed on the operation itself, with reason
 
 Operational rules:
 
-- **`describe`** is called when `v2 start`, `v2 daemon` or `v2 preflight` starts.
-  If a plugin configured as a provider does not list a method the
-  configuration uses, startup fails.
+- **`describe`** is called when `v2 start`, `v2 daemon`, `v2 preflight` or
+  `v2 reset` starts. If a plugin configured as a provider does not list a
+  method the configuration uses, startup fails, except for `v2 reset` (below).
 - **Timeouts** are set per method in `plugins[].timeouts`. The defaults are 10
   seconds for `describe` and 60 seconds for every other method. A hook's
   timeout is set only by its `hooks[].timeout`, which also defaults to 60

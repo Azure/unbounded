@@ -34,7 +34,7 @@ tools never read v2's state files. It reports:
   progress with its phase;
 - each slot's phase, whether it is enabled, and its bundle digest;
 - the applied goal version and a digest of the applied goal settings;
-- any pending repave, with its attempt count and last error;
+- any approved repave in progress, with its attempt count and last error;
 - the reported status phase and reason, and any cleanup leftovers.
 
 Configuration is read from `--config` or `UNBOUNDED_AGENT_CONFIG_FILE`, the
@@ -171,10 +171,11 @@ Validation rules:
 - Extensions follow the rules in [extensions, section 2](02-extensions.md#2-declarative-extensions).
 
 The LocalDNS Corefile template variables become a documented contract:
-`NodeListenerIP`, `ClusterListenerIP`, `NodeUpstreamIPsJoined`,
-`ClusterDNSServiceIP` and `MetricsAddress`
-(`pkg/agent/goalstates/assets/default-localdns.Corefile.tmpl:2-33`). Flex's
-LocalDNS rendering depends on these names.
+`NodeListenerIP`, `ClusterListenerIP`, `NodeUpstreamIPs`,
+`NodeUpstreamIPsJoined`, `ClusterDNSServiceIP` and `MetricsAddress`
+(`pkg/agent/goalstates/localdns.go:101-108`). The default template uses all but
+`NodeUpstreamIPs` (`pkg/agent/goalstates/assets/default-localdns.Corefile.tmpl:2-33`).
+Flex's LocalDNS rendering depends on these names.
 
 ### Install-time settings and goal settings
 
