@@ -188,6 +188,7 @@ runs a privileged UID 0 container with these host paths:
 | `/var/lib/racer/slabs` | Slab files and checkpoints; must stay writable in device mode too |
 | `/run/racer` | Client and origin sockets |
 | `/dev`, mounted read-only at `/host/dev` | Optional [raw cache devices](#raw-device-storage) |
+| `/proc/1/mountinfo`, mounted read-only at `/host/proc/1/mountinfo` | Host mount table, so disks mounted on the host are reported as in use |
 
 Do not turn off cluster-wide admission protections. Authorize these workloads
 narrowly. RDMA is optional; see [RDMA](#rdma).
@@ -276,6 +277,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments (at most 1,048,575) |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
+| `RACER_MOUNTINFO` | `/proc/self/mountinfo` | Mount table used to report disks as in use; managed workloads set `/host/proc/1/mountinfo` so host mounts count |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |

@@ -539,7 +539,7 @@ impl Application {
                 .unwrap_or_default(),
             approvals,
             segment_bytes: self.config.segment_bytes,
-            mountinfo: None,
+            mountinfo: Some(self.config.mountinfo.clone()),
         });
         if devices.is_none() {
             let workers: Vec<_> = plan.pairs.iter().map(|p| p.worker).collect();

@@ -62,6 +62,7 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 		"RACER_DIAGNOSTICS_LISTEN":    "[$(RACER_POD_IP)]:9090",
 		"RACER_OBJECT_IMAGE":          "registry.test/racer-object:v1",
 		"RACER_SERVICE_ACCOUNT_TOKEN": "/var/run/racer-token/token",
+		"RACER_MOUNTINFO":             "/host/proc/1/mountinfo",
 	} {
 		if env[name].Value != value {
 			t.Fatalf("%s = %q, want %q", name, env[name].Value, value)
@@ -121,6 +122,22 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 		if mounts[name] == "" {
 			t.Fatalf("missing mount %s", name)
 		}
+	}
+
+	// Disks mounted only on the host must be classified as in use.
+	host := volumes["host-mountinfo"].HostPath
+	if host == nil || host.Path != "/proc/1/mountinfo" || host.Type == nil || *host.Type != corev1.HostPathFile {
+		t.Fatalf("host mountinfo volume = %+v", host)
+	}
+
+	for _, m := range pod.Containers[0].VolumeMounts {
+		if m.Name == "host-mountinfo" && (!m.ReadOnly || m.MountPath != HostMountinfoPath) {
+			t.Fatalf("host mountinfo mount = %+v", m)
+		}
+	}
+
+	if mounts["host-mountinfo"] == "" {
+		t.Fatal("missing mount host-mountinfo")
 	}
 
 	ports := map[string]int32{}

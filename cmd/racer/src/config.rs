@@ -151,6 +151,9 @@ pub struct Config {
     pub enrollment_directory: Option<PathBuf>,
     pub slab_directory: PathBuf,
     pub device_directory: PathBuf,
+    /// Mount table used to classify disks as in use. Managed workloads point
+    /// it at the host's table, since the container's omits host-only mounts.
+    pub mountinfo: PathBuf,
     /// Startup bound for retrying selected devices whose exclusive open reports
     /// EBUSY, such as a predecessor process still releasing its claim. Zero
     /// disables waiting.
@@ -323,6 +326,10 @@ impl Config {
             device_directory: raw
                 .device_directory
                 .unwrap_or_else(|| "/host/dev".into())
+                .into(),
+            mountinfo: raw
+                .mountinfo
+                .unwrap_or_else(|| "/proc/self/mountinfo".into())
                 .into(),
             device_busy_wait: Duration::from_secs(raw.device_busy_wait_secs.unwrap_or(120)),
             slab_bytes: raw.slab_bytes.unwrap_or(16 * 1024 * MIB),
@@ -558,6 +565,7 @@ impl Config {
             &self.identity_directory,
             &self.slab_directory,
             &self.device_directory,
+            &self.mountinfo,
         ];
         for path in paths {
             validate_path(path)?;
@@ -779,6 +787,7 @@ const ENV_NAMES: &[&str] = &[
     "IDENTITY_DIRECTORY",
     "SLAB_DIRECTORY",
     "DEVICE_DIRECTORY",
+    "MOUNTINFO",
     "DEVICE_BUSY_WAIT_SECS",
     "ADMISSION_MODE",
     "MAX_THREADS",
@@ -861,6 +870,7 @@ struct RawConfig {
     identity_directory: Option<String>,
     slab_directory: Option<String>,
     device_directory: Option<String>,
+    mountinfo: Option<String>,
     admission_mode: Option<String>,
     send_crc_pair: Option<String>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1314,12 +1324,16 @@ mod tests {
             4
         );
         assert!(parse(&[("RACER_MAX_THREADS", &format!("{}4", "0".repeat(4096)))]).is_err());
+        let config = parse(&[("RACER_DEVICE_DIRECTORY", "/host/é space")]).unwrap();
+        assert_eq!(config.device_directory, Path::new("/host/é space"));
+        assert_eq!(config.mountinfo, Path::new("/proc/self/mountinfo"));
         assert_eq!(
-            parse(&[("RACER_DEVICE_DIRECTORY", "/host/é space")])
+            parse(&[("RACER_MOUNTINFO", "/host/proc/1/mountinfo")])
                 .unwrap()
-                .device_directory,
-            Path::new("/host/é space")
+                .mountinfo,
+            Path::new("/host/proc/1/mountinfo")
         );
+        assert!(parse(&[("RACER_MOUNTINFO", "relative")]).is_err());
     }
 
     #[cfg(unix)]
