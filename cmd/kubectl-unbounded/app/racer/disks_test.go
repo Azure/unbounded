@@ -380,6 +380,53 @@ func TestRevoke(t *testing.T) {
 	}
 }
 
+func TestRevokeAliases(t *testing.T) {
+	ctx := context.Background()
+	pref := "wwn-0x5000c500a1b2c3d4"
+	alias := "nvme-Samsung_SSD_980_S64ANS0T123456"
+
+	cases := []struct {
+		name, approved, revoke, want string
+		noPod                        bool
+		wantErr                      bool
+	}{
+		{name: "preferred ID with only alias approved", approved: alias + ",b", revoke: pref, want: "b"},
+		{name: "preferred ID with both approved", approved: pref + "," + alias + ",b", revoke: pref, want: "b"},
+		{name: "alias with both approved", approved: pref + "," + alias + ",b", revoke: alias, want: "b"},
+		{name: "alias directly", approved: alias + ",b", revoke: alias, want: "b"},
+		{name: "no report exact match", approved: alias + ",b", revoke: alias, want: "b", noPod: true},
+		{name: "no report other name", approved: alias + ",b", revoke: pref, noPod: true, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objs := []runtime.Object{node("n", map[string]string{disks.Annotation: tc.approved})}
+			if !tc.noPod {
+				objs = append(objs, pod("p", "n", fixture(t)))
+			}
+
+			h := newHarness("", false, objs...)
+
+			err := h.e.revoke(ctx, "n", []string{tc.revoke}, false, true)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("want error")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if v, _ := h.annotation(t, "n"); v != tc.want {
+				t.Fatalf("annotation %q, want %q", v, tc.want)
+			}
+		})
+	}
+}
+
 func TestRevokeAll(t *testing.T) {
 	h := newHarness("", false, node("n", map[string]string{disks.Annotation: "a,b"}))
 	if err := h.e.revoke(context.Background(), "n", nil, true, true); err != nil {

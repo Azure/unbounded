@@ -637,16 +637,24 @@ func (e *env) revoke(ctx context.Context, node string, ids []string, all, yes bo
 		remove = slices.Clone(nd.Approved)
 	} else {
 		for _, id := range ids {
-			switch {
-			case slices.Contains(nd.Approved, id):
-				remove = append(remove, id)
-			default:
-				d, ok := nd.report.Find(id)
-				if !ok || !slices.Contains(nd.Approved, d.ID) {
-					return fmt.Errorf("%s is not approved on %s", id, node)
-				}
+			// A disk may be approved under its preferred ID or any alias.
+			// Remove every approved name for it so consent is fully withdrawn.
+			names := []string{id}
+			if d, ok := nd.report.Find(id); ok {
+				names = append([]string{d.ID}, d.Aliases...)
+			}
 
-				remove = append(remove, d.ID)
+			found := false
+
+			for _, n := range names {
+				if slices.Contains(nd.Approved, n) {
+					remove = append(remove, n)
+					found = true
+				}
+			}
+
+			if !found {
+				return fmt.Errorf("%s is not approved on %s", id, node)
 			}
 		}
 	}
