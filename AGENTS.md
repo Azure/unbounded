@@ -9,8 +9,8 @@ and at the edge, without being limited by the location of your control plane.
 unbounded-kube is organized into several directories:
 
 - `api/` - where API definitions for custom resources are located.
-  - `machina/v1alpha3/` - Machine CRD types (unbounded-cloud.io group).
-  - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): Site, GatewayPool, SitePeering, etc.
+  - `machina/v1alpha3/` - Machine, MachineOperation, MachineOperationCredential, MachineConfiguration, MachineConfigurationVersion and Site CRD types (unbounded-cloud.io group).
+  - `net/v1alpha1/` - Net CRD types (net.unbounded-cloud.io group): GatewayPool, SitePeering, SiteGatewayPoolAssignment, etc.
 - `bin/` - where generated binary artifacts should be placed.
 - `bpf/` - eBPF C programs for network encapsulation (compiled with clang).
 - `cmd/` - where the sources for each binary artifact are located. Each subdirectory corresponds to a binary artifact.
@@ -78,6 +78,8 @@ unbounded-kube is organized into several directories:
   deliberate, it needs an exclusion in `.golangci.yaml` or the next `make fmt` will silently undo it.
   Exceptions are external contracts only, such as the GitHub Actions `cancelled()` expression and the
   `LICENCE` filename patterns in `hack/cmd/notice` that match upstream third-party files.
+- Doc comments in `api/` become CRD descriptions. Follow `api/AGENTS.md`: describe the API contract, not how the
+  controllers implement it. The same applies to user-facing CLI help text, such as `kubectl unbounded` commands.
 
 ## Testing Standards
 

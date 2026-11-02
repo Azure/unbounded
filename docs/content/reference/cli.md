@@ -374,10 +374,13 @@ kubectl unbounded machine operation create upgrade-worker-01 \
   --param sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-Selector support is implemented at the CRD level. Agent operations support
-selectors. Metalman bare-metal host operations support selectors when the
-selector includes `unbounded-cloud.io/site=<site>`. Cloud VM host operations
-currently require one operation per Machine.
+Selector support depends on what runs the operation. For agent operations, each
+agent matches the selector against its Node's labels, and the operation
+finishes when the first agent finishes; agents that have not started by then
+skip it, so create one operation per Machine to act on a whole group. Metalman
+bare-metal host operations support selectors when the selector includes
+`unbounded-cloud.io/site=<site>`. Cloud VM host operations currently require one
+operation per Machine.
 
 ---
 
@@ -427,16 +430,19 @@ Common flags:
 
 ---
 
-### Legacy Machine Operation Commands
+### Other Machine Operation Commands
 
-The older counter-backed commands remain available for compatibility:
+These older commands also create `MachineOperation` resources. Unlike the
+convenience commands above, each always names the operation
+`<machine>-<command>-<unix time>` and always waits for the result. The only flag
+is `--ttl` (default `300`).
 
-| Command | Mechanism |
-|---------|-----------|
-| `kubectl unbounded machine reboot NAME` | Patches `Machine.spec.operations.rebootCounter`. |
-| `kubectl unbounded machine repave NAME` | Patches `Machine.spec.operations.repaveCounter` and `rebootCounter`. |
-
-These commands do not create `MachineOperation` resources.
+| Command | Operation kind | Notes |
+|---------|----------------|-------|
+| `kubectl unbounded machine reboot NAME` | `HostHardReboot` | Requires the Machine to have Redfish configuration. |
+| `kubectl unbounded machine hard-reboot NAME` | `HostHardReboot` | |
+| `kubectl unbounded machine soft-reboot NAME` | `HostSoftReboot` | Reboots the host OS through the in-host agent. |
+| `kubectl unbounded machine repave NAME` | `HostReplace` | |
 
 ---
 

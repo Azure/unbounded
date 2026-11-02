@@ -54,10 +54,10 @@ type MachineConfigurationSpec struct {
 	// +kubebuilder:validation:Required
 	Template MachineConfigurationTemplate `json:"template"`
 
-	// MachineSelector selects machines that should automatically
-	// receive this configuration. If set, new machines matching the
-	// selector will be assigned the latest locked version of the
-	// highest priority configuration that matches.
+	// MachineSelector picks Machines that get this configuration
+	// automatically. A matching Machine without a configurationRef gets the
+	// newest version of the highest-priority matching configuration. The
+	// choice is not revisited once configurationRef is set.
 	// +optional
 	MachineSelector *metav1.LabelSelector `json:"machineSelector,omitempty"`
 
@@ -74,11 +74,11 @@ type MachineConfigurationSpec struct {
 	// +optional
 	UpdateStrategy MachineConfigurationUpdateStrategy `json:"updateStrategy,omitempty"`
 
-	// RevisionHistoryLimit is the number of old
-	// MachineConfigurationVersions to retain for rollback. Versions
-	// that are still referenced by a Machine are never deleted
-	// regardless of this limit, so the actual number of retained
-	// versions may exceed this value.
+	// TODO(#1038): describe cleanup once new versions are made, and keep
+	// versions a Machine still uses.
+
+	// RevisionHistoryLimit is how many old MachineConfigurationVersions to
+	// keep. Not used yet.
 	// +optional
 	// +kubebuilder:default=10
 	// +kubebuilder:validation:Minimum=0
@@ -150,27 +150,25 @@ type MachineConfigurationAgent struct {
 type MachineConfigurationUpdateStrategyType string
 
 const (
-	// OnDeleteUpdateStrategy requires the operator to manually
-	// cordon, drain, and delete the Node object to trigger a repave
-	// with the new configuration.
+	// OnDeleteUpdateStrategy applies configurationRef when the Node object is deleted.
 	OnDeleteUpdateStrategy MachineConfigurationUpdateStrategyType = "OnDelete"
 
-	// RollingUpdateStrategy automates the cordon/drain/delete cycle
-	// across machines, respecting maxUnavailable. Reserved for future
-	// implementation.
+	// RollingUpdateStrategy is meant to repave nodes a few at a time. Not used yet.
 	RollingUpdateStrategy MachineConfigurationUpdateStrategyType = "RollingUpdate"
 )
 
 // MachineConfigurationUpdateStrategy defines the strategy for applying
 // configuration updates.
 type MachineConfigurationUpdateStrategy struct {
-	// Type is the update strategy type.
+	// Type is OnDelete (the default) or RollingUpdate. With OnDelete, deleting
+	// a Machine's Node object applies the version in its configurationRef;
+	// Machines do not move to newer versions on their own. RollingUpdate is
+	// not used yet and behaves like OnDelete.
 	// +kubebuilder:default=OnDelete
 	Type MachineConfigurationUpdateStrategyType `json:"type,omitempty"`
 
-	// MaxUnavailable is the maximum number of machines that can be
-	// unavailable during a RollingUpdate. Only used when Type is
-	// RollingUpdate. Can be an absolute number or a percentage.
+	// MaxUnavailable is how many machines a RollingUpdate may take down at
+	// once. Not used yet.
 	// +optional
 	MaxUnavailable *int32 `json:"maxUnavailable,omitempty"`
 }
@@ -178,14 +176,15 @@ type MachineConfigurationUpdateStrategy struct {
 // MachineConfigurationStatus defines the observed state of a
 // MachineConfiguration.
 type MachineConfigurationStatus struct {
-	// LatestVersion is the highest version number that has been
-	// created for this MachineConfiguration. The controller uses this
-	// to avoid reusing version numbers when versions are deleted.
+	// LatestVersion is the newest version number made for this
+	// MachineConfiguration.
 	LatestVersion int32 `json:"latestVersion,omitempty"`
 
-	// CurrentVersion is the version number of the latest non-deployed
-	// (editable) MachineConfigurationVersion. If all versions are
-	// deployed, this is 0.
+	// TODO(#1038): drop the "Not set yet" note once versions are locked when
+	// in use.
+
+	// CurrentVersion is meant to hold the newest version that can still be
+	// edited. Not set yet.
 	CurrentVersion int32 `json:"currentVersion,omitempty"`
 
 	// Conditions represent the latest available observations of the

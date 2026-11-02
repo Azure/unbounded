@@ -234,22 +234,49 @@ spec:
                       the nspawn machine.
                     properties:
                       clusterListenerIP:
+                        description: |-
+                          ClusterListenerIP is the address where the cache answers DNS queries
+                          from pods and passes them to the cluster DNS service. Defaults to
+                          169.254.10.11.
                         type: string
                       corefileTemplate:
+                        description: |-
+                          CorefileTemplate replaces the default CoreDNS configuration. It is a Go
+                          template that can use NodeListenerIP, ClusterListenerIP,
+                          NodeUpstreamIPs, NodeUpstreamIPsJoined, ClusterDNSServiceIP and
+                          MetricsAddress.
                         type: string
                       cpuLimitInMilliCores:
+                        description: CPULimitInMilliCores limits the cache's CPU.
+                          Defaults to 2000.
                         format: int32
                         type: integer
                       enabled:
+                        description: |-
+                          Enabled runs a CoreDNS cache on the node. The other fields apply only
+                          when it is true.
                         type: boolean
                       memoryLimitInMB:
+                        description: MemoryLimitInMB limits the cache's memory. Defaults
+                          to 128.
                         format: int32
                         type: integer
                       metricsAddress:
+                        description: |-
+                          MetricsAddress is the IPv4 address and port, such as 10.0.0.5:9253, on
+                          which the cache serves Prometheus metrics. Defaults to port 9253 on the
+                          node's IPv4 address.
                         type: string
                       nodeListenerIP:
+                        description: |-
+                          NodeListenerIP is the address where the cache answers DNS queries from
+                          the node itself and passes them to the host's DNS servers. Defaults to
+                          169.254.10.10.
                         type: string
                       requiredPlugins:
+                        description: |-
+                          RequiredPlugins lists extra CoreDNS plugins that the CoreDNS binary
+                          must include. Installation fails if one is missing.
                         items:
                           type: string
                         type: array
@@ -268,12 +295,11 @@ spec:
                 type: object
               configurationRef:
                 description: |-
-                  ConfigurationRef references a MachineConfiguration (and
-                  optionally a specific version) that defines the configuration
-                  profile for this machine. If a specific version is set, that
-                  version is used at provisioning time; otherwise the latest
-                  locked version is used and the version field is set by the
-                  controller.
+                  ConfigurationRef names the MachineConfiguration, and optionally the
+                  version, that this Machine uses. If empty, it is set automatically when
+                  a MachineConfiguration's machineSelector matches. The version's node
+                  settings are applied when the Node object is deleted, and its host image
+                  by HostReplace; they are not used at first install yet.
                 properties:
                   name:
                     description: Name is the name of the MachineConfiguration.
@@ -281,9 +307,9 @@ spec:
                     type: string
                   version:
                     description: |-
-                      Version is the specific MachineConfigurationVersion number to
-                      use. If omitted, the controller selects the latest locked
-                      (deployed) version and populates this field.
+                      Version is the MachineConfigurationVersion number to use. If empty, it
+                      is set to the newest version. It does not move to newer versions on its
+                      own.
                     format: int32
                     type: integer
                 required:
@@ -362,8 +388,10 @@ spec:
                       rule: self.provider == oldSelf.provider
                   image:
                     description: |-
-                      Image is an opaque provider-interpreted image identifier. If omitted,
-                      HostReplace preserves the host's current image.
+                      Image is an opaque provider-interpreted image identifier that HostReplace
+                      installs. If empty, HostReplace uses the host image from the version in
+                      configurationRef, or keeps the current image. Not used for netboot
+                      hosts, which use netboot.image.
                     type: string
                   netboot:
                     description: |-
@@ -515,18 +543,24 @@ spec:
                               It is ignored when the endpoint exposes a single system selected by its URL.
                             type: string
                           passwordRef:
-                            description: PasswordRef references a secret containing
-                              the Redfish password.
+                            description: |-
+                              PasswordRef points to the Secret that holds the Redfish password. Set
+                              key, because it defaults to "ssh-privatekey".
                             properties:
                               key:
                                 default: ssh-privatekey
-                                description: Key within the secret.
+                                description: |-
+                                  Key within the Secret. Defaults to "ssh-privatekey"; set it when the
+                                  value is stored under another key, as it usually is for a Redfish
+                                  password.
                                 type: string
                               name:
-                                description: Name of the secret.
+                                description: Name of the Secret.
                                 type: string
                               namespace:
-                                description: Namespace of the secret.
+                                description: |-
+                                  Namespace of the Secret. Ignored for SSH and bastion keys, which must be
+                                  in machina's namespace.
                                 type: string
                             required:
                             - name
@@ -792,18 +826,24 @@ spec:
                           It is ignored when the endpoint exposes a single system selected by its URL.
                         type: string
                       passwordRef:
-                        description: PasswordRef references a secret containing the
-                          Redfish password.
+                        description: |-
+                          PasswordRef points to the Secret that holds the Redfish password. Set
+                          key, because it defaults to "ssh-privatekey".
                         properties:
                           key:
                             default: ssh-privatekey
-                            description: Key within the secret.
+                            description: |-
+                              Key within the Secret. Defaults to "ssh-privatekey"; set it when the
+                              value is stored under another key, as it usually is for a Redfish
+                              password.
                             type: string
                           name:
-                            description: Name of the secret.
+                            description: Name of the Secret.
                             type: string
                           namespace:
-                            description: Namespace of the secret.
+                            description: |-
+                              Namespace of the Secret. Ignored for SSH and bastion keys, which must be
+                              in machina's namespace.
                             type: string
                         required:
                         - name
@@ -860,13 +900,18 @@ spec:
                         properties:
                           key:
                             default: ssh-privatekey
-                            description: Key within the secret.
+                            description: |-
+                              Key within the Secret. Defaults to "ssh-privatekey"; set it when the
+                              value is stored under another key, as it usually is for a Redfish
+                              password.
                             type: string
                           name:
-                            description: Name of the secret.
+                            description: Name of the Secret.
                             type: string
                           namespace:
-                            description: Namespace of the secret.
+                            description: |-
+                              Namespace of the Secret. Ignored for SSH and bastion keys, which must be
+                              in machina's namespace.
                             type: string
                         required:
                         - name
@@ -891,13 +936,18 @@ spec:
                     properties:
                       key:
                         default: ssh-privatekey
-                        description: Key within the secret.
+                        description: |-
+                          Key within the Secret. Defaults to "ssh-privatekey"; set it when the
+                          value is stored under another key, as it usually is for a Redfish
+                          password.
                         type: string
                       name:
-                        description: Name of the secret.
+                        description: Name of the Secret.
                         type: string
                       namespace:
-                        description: Namespace of the secret.
+                        description: |-
+                          Namespace of the Secret. Ignored for SSH and bastion keys, which must be
+                          in machina's namespace.
                         type: string
                     required:
                     - name
@@ -929,8 +979,9 @@ spec:
                 properties:
                   image:
                     description: |-
-                      Image is the OCI image reference that was applied to the
-                      nspawn machine.
+                      Image is the agent image from spec.agent.image, recorded when the
+                      machine is set up over SSH. It is empty for the default image and does
+                      not change on repave.
                     type: string
                 type: object
               bootstrap:
@@ -1019,8 +1070,8 @@ spec:
                 type: array
               configuration:
                 description: |-
-                  Configuration records the MachineConfigurationVersion that was
-                  applied to this machine during the most recent provisioning.
+                  Configuration is the configuration version last applied to the node,
+                  recorded when the Node object is deleted. Not set at first install yet.
                 properties:
                   name:
                     description: Name is the MachineConfiguration name.
@@ -1049,8 +1100,8 @@ spec:
                 type: string
               phase:
                 description: |-
-                  Phase is the current phase of the machine. Intended for human
-                  consumption; follows the state machine rather than driving it.
+                  Phase is the machine's current stage: Pending, Provisioning, Joining,
+                  Ready or Failed. It is set by the system; conditions give more detail.
                 type: string
               redfish:
                 description: Redfish holds observed Redfish state.
@@ -1066,8 +1117,8 @@ spec:
                 properties:
                   fingerprint:
                     description: |-
-                      Fingerprint is the SSH host key fingerprint discovered on
-                      first connection. Subsequent connections must match this value.
+                      Fingerprint is meant to hold the SSH host key seen on first connection.
+                      Not set yet, and SSH host keys are not checked.
                     type: string
                 type: object
               tpm:

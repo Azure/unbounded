@@ -111,8 +111,11 @@ spec:
                 description: |-
                   TunnelProtocol selects the tunnel protocol for this scope.
                   Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-                  Defaults to "Auto" when unset. When "Auto", links using external IPs
-                  use WireGuard and links using only internal IPs use GENEVE.
+                  Defaults to "Auto" when unset. With "Auto", links over external IPs use
+                  WireGuard and links over internal IPs use GENEVE, unless the
+                  unbounded-net configuration prefers other protocols. For a gateway in
+                  the same site, an unset or "Auto" value uses the Site's tunnelProtocol
+                  if the Site sets one.
                 enum:
                 - WireGuard
                 - IPIP

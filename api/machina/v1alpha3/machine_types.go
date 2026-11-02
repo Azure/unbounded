@@ -69,18 +69,15 @@ const (
 	// attempts (e.g. after a controller restart).
 	MachineConditionProvisioning = "Provisioning"
 
-	// MachineConditionAgentBootstrapped indicates whether the unbounded
-	// agent completed initial node bootstrap. Status is False with Reason
-	// "Running" while the agent is preparing the nspawn node, False with
-	// a failure reason when nspawn startup or kubelet TLS bootstrap fails,
-	// and True with Reason "Succeeded" once the kubelet has bootstrapped.
+	// MachineConditionAgentBootstrapped reports whether the agent has
+	// finished setting up the node. Reason is "Running" while it works and
+	// "Succeeded" when done. On failure, Reason is "RootFSFailed" (preparing
+	// the node's files), "NSpawnFailed" (starting the node),
+	// "KubeletBootstrapFailed" (starting kubelet or joining the cluster) or
+	// "Failed" (anything else).
 	MachineConditionAgentBootstrapped = "AgentBootstrapped"
 
-	// MachineConditionNodeUpdated indicates the result of a node
-	// update performed by the agent daemon. Status is True with
-	// Reason "Succeeded" after a successful update, and False with
-	// Reason "Failed" when the update fails. While the update is in
-	// progress the status is False with Reason "InProgress".
+	// MachineConditionNodeUpdated is meant to report node updates. Not set yet.
 	MachineConditionNodeUpdated = "NodeUpdated"
 
 	// MachineConditionConfigurationPending indicates that no
@@ -90,22 +87,27 @@ const (
 	// configuration is assigned.
 	MachineConditionConfigurationPending = "ConfigurationPending"
 
-	// MachineConditionRepavePending indicates that the Machine's desired
-	// configuration version has not yet been applied to the running Node.
-	// For OnDelete updates this remains True until the operator deletes
-	// the Node and the agent repaves with the desired version.
+	// TODO(#1039): drop the "Not set to True" note once a configurationRef
+	// change marks the repave as pending.
+
+	// MachineConditionRepavePending is meant to be True with Reason "Pending"
+	// while the node must be repaved to use the version in configurationRef,
+	// and False with Reason "Applied" once it has. It is set only when the
+	// Node object is deleted, so it is normally False.
+	// Not set to True when configurationRef changes yet.
 	MachineConditionRepavePending = "RepavePending"
 )
 
 // Annotation keys.
 const (
-	// AnnotationProvider associates a Machine with a provider's
-	// controller for reboot/repave operations.
+	// AnnotationProvider is meant to link a Machine to its provider's
+	// controller. Not used yet.
 	AnnotationProvider = "unbounded-cloud.io/provider"
 
-	// AnnotationConfigurationVersion is set on the Kubernetes Node
-	// object to record which MachineConfigurationVersion was used to
-	// bootstrap the machine.
+	// AnnotationConfigurationVersion is meant to record, on the Node object,
+	// which configuration version set up the machine. Not set yet.
+	// MachineConfigurationVersions use the same key as a label
+	// (MCVVersionLabelKey).
 	AnnotationConfigurationVersion = "unbounded-cloud.io/machine-configuration-version"
 )
 
@@ -152,12 +154,14 @@ type MachineSpec struct {
 	// +optional
 	Host *HostSpec `json:"host,omitempty"`
 
-	// ConfigurationRef references a MachineConfiguration (and
-	// optionally a specific version) that defines the configuration
-	// profile for this machine. If a specific version is set, that
-	// version is used at provisioning time; otherwise the latest
-	// locked version is used and the version field is set by the
-	// controller.
+	// TODO(#1039): drop the "not used at first install yet" note once
+	// provisioning uses the referenced version.
+
+	// ConfigurationRef names the MachineConfiguration, and optionally the
+	// version, that this Machine uses. If empty, it is set automatically when
+	// a MachineConfiguration's machineSelector matches. The version's node
+	// settings are applied when the Node object is deleted, and its host image
+	// by HostReplace; they are not used at first install yet.
 	// +optional
 	ConfigurationRef *MachineConfigurationRef `json:"configurationRef,omitempty"`
 }
@@ -188,8 +192,10 @@ type ProviderMachineReference struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.azure) || has(self.azure)",message="azure host ownership is immutable once set"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.external) || has(self.external)",message="external host ownership is immutable once set"
 type HostSpec struct {
-	// Image is an opaque provider-interpreted image identifier. If omitted,
-	// HostReplace preserves the host's current image.
+	// Image is an opaque provider-interpreted image identifier that HostReplace
+	// installs. If empty, HostReplace uses the host image from the version in
+	// configurationRef, or keeps the current image. Not used for netboot
+	// hosts, which use netboot.image.
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -301,9 +307,9 @@ type MachineConfigurationRef struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Version is the specific MachineConfigurationVersion number to
-	// use. If omitted, the controller selects the latest locked
-	// (deployed) version and populates this field.
+	// Version is the MachineConfigurationVersion number to use. If empty, it
+	// is set to the newest version. It does not move to newer versions on its
+	// own.
 	// +optional
 	Version *int32 `json:"version,omitempty"`
 }
@@ -387,7 +393,10 @@ type RedfishSpec struct {
 	// +kubebuilder:default="1"
 	DeviceID string `json:"deviceID,omitempty"`
 
-	// PasswordRef references a secret containing the Redfish password.
+	// TODO(#1042): update once passwordRef has its own key default.
+
+	// PasswordRef points to the Secret that holds the Redfish password. Set
+	// key, because it defaults to "ssh-privatekey".
 	// +kubebuilder:validation:Required
 	PasswordRef SecretKeySelector `json:"passwordRef"`
 }
@@ -595,20 +604,39 @@ type AgentSpec struct {
 
 // LocalDNSSpec configures machine-local CoreDNS.
 type LocalDNSSpec struct {
+	// Enabled runs a CoreDNS cache on the node. The other fields apply only
+	// when it is true.
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
+	// NodeListenerIP is the address where the cache answers DNS queries from
+	// the node itself and passes them to the host's DNS servers. Defaults to
+	// 169.254.10.10.
 	// +optional
 	NodeListenerIP string `json:"nodeListenerIP,omitempty"`
+	// ClusterListenerIP is the address where the cache answers DNS queries
+	// from pods and passes them to the cluster DNS service. Defaults to
+	// 169.254.10.11.
 	// +optional
 	ClusterListenerIP string `json:"clusterListenerIP,omitempty"`
+	// MetricsAddress is the IPv4 address and port, such as 10.0.0.5:9253, on
+	// which the cache serves Prometheus metrics. Defaults to port 9253 on the
+	// node's IPv4 address.
 	// +optional
 	MetricsAddress string `json:"metricsAddress,omitempty"`
+	// CPULimitInMilliCores limits the cache's CPU. Defaults to 2000.
 	// +optional
 	CPULimitInMilliCores *int32 `json:"cpuLimitInMilliCores,omitempty"`
+	// MemoryLimitInMB limits the cache's memory. Defaults to 128.
 	// +optional
 	MemoryLimitInMB *int32 `json:"memoryLimitInMB,omitempty"`
+	// RequiredPlugins lists extra CoreDNS plugins that the CoreDNS binary
+	// must include. Installation fails if one is missing.
 	// +optional
 	RequiredPlugins []string `json:"requiredPlugins,omitempty"`
+	// CorefileTemplate replaces the default CoreDNS configuration. It is a Go
+	// template that can use NodeListenerIP, ClusterListenerIP,
+	// NodeUpstreamIPs, NodeUpstreamIPsJoined, ClusterDNSServiceIP and
+	// MetricsAddress.
 	// +optional
 	CorefileTemplate string `json:"corefileTemplate,omitempty"`
 }
@@ -694,13 +722,16 @@ type NamespacedSecretReference struct {
 
 // SecretKeySelector selects a key from a Secret.
 type SecretKeySelector struct {
-	// Name of the secret.
+	// Name of the Secret.
 	Name string `json:"name"`
 
-	// Namespace of the secret.
+	// Namespace of the Secret. Ignored for SSH and bastion keys, which must be
+	// in machina's namespace.
 	Namespace string `json:"namespace"`
 
-	// Key within the secret.
+	// Key within the Secret. Defaults to "ssh-privatekey"; set it when the
+	// value is stored under another key, as it usually is for a Redfish
+	// password.
 	// +kubebuilder:default=ssh-privatekey
 	Key string `json:"key,omitempty"`
 }
@@ -711,8 +742,8 @@ type MachineStatus struct {
 	// It does not override desired replacement image settings.
 	// +optional
 	ObservedProvisioningFormat ProvisioningFormat `json:"observedProvisioningFormat,omitempty"`
-	// Phase is the current phase of the machine. Intended for human
-	// consumption; follows the state machine rather than driving it.
+	// Phase is the machine's current stage: Pending, Provisioning, Joining,
+	// Ready or Failed. It is set by the system; conditions give more detail.
 	Phase MachinePhase `json:"phase,omitempty"`
 
 	// Message provides additional status information.
@@ -739,8 +770,11 @@ type MachineStatus struct {
 	// +optional
 	Agent *AgentStatus `json:"agent,omitempty"`
 
-	// Configuration records the MachineConfigurationVersion that was
-	// applied to this machine during the most recent provisioning.
+	// TODO(#1039): drop the "Not set at first install yet" note once
+	// provisioning records the applied version.
+
+	// Configuration is the configuration version last applied to the node,
+	// recorded when the Node object is deleted. Not set at first install yet.
 	// +optional
 	Configuration *MachineConfigurationRefStatus `json:"configuration,omitempty"`
 
@@ -768,7 +802,7 @@ type MachinePhase string
 
 const (
 	MachinePhasePending      MachinePhase = "Pending"
-	MachinePhaseRebooting    MachinePhase = "Rebooting"
+	MachinePhaseRebooting    MachinePhase = "Rebooting" // Not set yet.
 	MachinePhaseProvisioning MachinePhase = "Provisioning"
 	MachinePhaseJoining      MachinePhase = "Joining"
 	MachinePhaseReady        MachinePhase = "Ready"
@@ -777,8 +811,11 @@ const (
 
 // SSHStatus holds observed SSH state.
 type SSHStatus struct {
-	// Fingerprint is the SSH host key fingerprint discovered on
-	// first connection. Subsequent connections must match this value.
+	// TODO(#1041): drop the "Not set yet" note once host keys are recorded and
+	// checked.
+
+	// Fingerprint is meant to hold the SSH host key seen on first connection.
+	// Not set yet, and SSH host keys are not checked.
 	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
@@ -820,7 +857,8 @@ type BootstrapStatus struct {
 
 // AgentStatus holds the applied agent settings for the machine.
 type AgentStatus struct {
-	// Image is the OCI image reference that was applied to the
-	// nspawn machine.
+	// Image is the agent image from spec.agent.image, recorded when the
+	// machine is set up over SSH. It is empty for the default image and does
+	// not change on repave.
 	Image string `json:"image,omitempty"`
 }

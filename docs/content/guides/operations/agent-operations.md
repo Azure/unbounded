@@ -32,10 +32,10 @@ kubectl get mop upgrade-agent-worker-01 -w
 ```
 
 ```
-NAME                       KIND            MACHINE      PHASE        AGE
-upgrade-agent-worker-01    AgentUpgrade    worker-01    Pending      0s
-upgrade-agent-worker-01    AgentUpgrade    worker-01    InProgress   2s
-upgrade-agent-worker-01    AgentUpgrade    worker-01    Complete     15s
+NAME                      MACHINE     OPERATION      PHASE        AGE
+upgrade-agent-worker-01   worker-01   AgentUpgrade   Pending      0s
+upgrade-agent-worker-01   worker-01   AgentUpgrade   InProgress   2s
+upgrade-agent-worker-01   worker-01   AgentUpgrade   Complete     15s
 ```
 
 ### How It Works
@@ -123,10 +123,10 @@ kubectl get mop reset-worker-01 -w
 ```
 
 ```
-NAME               KIND          MACHINE      PHASE        AGE
-reset-worker-01    AgentReset    worker-01    Pending      0s
-reset-worker-01    AgentReset    worker-01    InProgress   1s
-reset-worker-01    AgentReset    worker-01    Complete     10s
+NAME              MACHINE     OPERATION    PHASE        AGE
+reset-worker-01   worker-01   AgentReset   Pending      0s
+reset-worker-01   worker-01   AgentReset   InProgress   1s
+reset-worker-01   worker-01   AgentReset   Complete     10s
 ```
 
 The daemon marks the operation complete before stopping its own running unit.

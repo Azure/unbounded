@@ -26,11 +26,8 @@ func init() {
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
-// MachineOperation represents a discrete operation to be performed on a
-// Machine. MachineOperations are created by CLI commands or controllers and
-// processed by the appropriate agent. The in-VM agent handles operations
-// like NodeReboot and HostSoftReboot, while cloud or PXE controllers handle
-// operations like HostHardReboot, HostPowerOff, and HostPowerOn.
+// MachineOperation asks for a one-time action on one or more Machines, such as
+// rebooting a node or powering off a host.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -48,45 +45,34 @@ type MachineOperationList struct {
 	Items           []MachineOperation `json:"items"`
 }
 
-// OperationKind identifies the kind of operation to perform. Predefined
-// operations cover common lifecycle actions; custom operations may be
-// supported by individual cloud controllers.
+// OperationKind is the action to take. The enum lists every kind; there are no
+// custom kinds.
 // +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostHardReboot;HostSoftReboot;HostPowerOff;HostPowerOn;HostReplace
 type OperationKind string
 
 const (
-	// OperationNodeReboot restarts the nspawn-backed node in place without
-	// reprovisioning the rootfs. Services are stopped, the nspawn container
-	// is restarted, and services are brought back up. Handled by the
-	// in-VM agent.
+	// OperationNodeReboot restarts the node and its containers, not the host.
 	OperationNodeReboot OperationKind = "NodeReboot"
 
-	// OperationAgentUpgrade upgrades the host-side unbounded-agent binary.
-	// Handled by the in-VM agent.
+	// OperationAgentUpgrade upgrades the agent on the host.
 	OperationAgentUpgrade OperationKind = "AgentUpgrade"
 
-	// OperationAgentReset resets the host by removing the unbounded-agent and
-	// all associated resources. Handled by the in-VM agent.
+	// OperationAgentReset removes the agent and everything it set up.
 	OperationAgentReset OperationKind = "AgentReset"
 
-	// OperationHostHardReboot triggers a full hardware power cycle of the host
-	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
-	// controller.
+	// OperationHostHardReboot restarts the host through its BMC or cloud provider.
 	OperationHostHardReboot OperationKind = "HostHardReboot"
 
-	// OperationHostSoftReboot reboots the host operating system from inside
-	// the host (systemctl reboot). Handled by the in-VM agent, which reports
-	// completion after it starts again on a new boot.
+	// OperationHostSoftReboot reboots the host's operating system through the agent.
 	OperationHostSoftReboot OperationKind = "HostSoftReboot"
 
-	// OperationHostPowerOff powers off the host through an out-of-band provider.
+	// OperationHostPowerOff powers off the host through its BMC or cloud provider.
 	OperationHostPowerOff OperationKind = "HostPowerOff"
 
-	// OperationHostPowerOn powers on the host through an out-of-band provider.
+	// OperationHostPowerOn powers on the host through its BMC or cloud provider.
 	OperationHostPowerOn OperationKind = "HostPowerOn"
 
-	// OperationHostReplace replaces the host VM through an out-of-band provider
-	// and reinstalls the unbounded-agent so the node can rejoin the cluster.
+	// OperationHostReplace reinstalls the host so the node can rejoin the cluster.
 	OperationHostReplace OperationKind = "HostReplace"
 )
 
@@ -141,7 +127,7 @@ const (
 	OperationStageWaitingOff       OperationStage = "WaitingOff"
 	OperationStagePoweringOn       OperationStage = "PoweringOn"
 	OperationStageWaitingOn        OperationStage = "WaitingOn"
-	OperationStageRepaveRequested  OperationStage = "RepaveRequested"
+	OperationStageRepaveRequested  OperationStage = "RepaveRequested" // Not set yet.
 	OperationStageWaitingRepave    OperationStage = "WaitingRepave"
 	OperationStageWaitingCloudInit OperationStage = "WaitingCloudInit"
 	OperationStageWaitingNode      OperationStage = "WaitingNode"
@@ -213,35 +199,54 @@ type ProviderMachineSnapshot struct {
 
 // MachineOperationSpec defines the desired state of a MachineOperation.
 type MachineOperationSpec struct {
-	// MachineRef is the name of the Machine CR this operation targets.
-	// Either machineRef or machineSelector must be set.
+	// MachineRef is the name of the Machine to act on. Set either machineRef
+	// or machineSelector; if both are set, machineRef is used. Setting neither
+	// is not checked yet.
 	// +optional
 	MachineRef string `json:"machineRef,omitempty"`
 
-	// MachineSelector selects machines by labels. When set, the
-	// controller creates individual MachineOperation children for
-	// each matched machine. Either machineRef or machineSelector
-	// must be set.
+	// TODO(#1040): revisit once agent-run selector operations report
+	// per-Machine status and match Machine labels.
+
+	// MachineSelector picks the Machines to act on by label. They all share
+	// this one MachineOperation. For kinds the agent runs, the selector is
+	// matched against Node labels, and the operation completes or fails when
+	// the first Machine finishes; Machines that have not started by then skip
+	// it. Not supported for hosts managed through a cloud provider.
 	// +optional
 	MachineSelector *metav1.LabelSelector `json:"machineSelector,omitempty"`
 
-	// OperationKind is the operation to perform on the target machine.
+	// OperationKind is the action to take. NodeReboot restarts the node,
+	// including kubelet, containerd and the containers running on it, without
+	// rebooting the host; the node is not drained first. AgentUpgrade upgrades
+	// the agent; AgentReset removes it and everything it set up.
+	// HostSoftReboot reboots the host's operating system through the agent and
+	// completes once the host is back; if the host does not come back, the
+	// operation stays InProgress, because it does not time out yet.
+	// HostHardReboot, HostPowerOff and HostPowerOn restart, stop or start the
+	// host through its BMC or cloud provider. HostReplace reinstalls the host
+	// so the node can rejoin.
 	// +kubebuilder:validation:Required
 	OperationKind OperationKind `json:"operationKind"`
 
-	// Parameters is an optional set of key-value pairs passed to the
-	// operation executor. For example, RestartService uses "service" to
-	// specify the systemd unit name.
 	// TODO: Revisit whether map[string]string is sufficient or if we
 	// need a richer type (e.g. runtime.RawExtension for arbitrary
 	// JSON, or a typed []OperationParameter struct).
+
+	// Parameters are extra settings for some kinds. AgentUpgrade needs
+	// "downloadURL" and accepts "sha256". HostReplace on OCI accepts
+	// "sshAuthorizedKeys", and "imageID", which is used only when neither the
+	// Machine nor its configuration sets a host image. Other kinds ignore
+	// them.
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
 
-	// TTLSecondsAfterFinished limits the lifetime of a completed or failed
-	// MachineOperation. If set, the agent deletes the MachineOperation
-	// this many seconds after it reaches a terminal phase. If unset, the
-	// MachineOperation is kept indefinitely.
+	// TODO(#1043): drop the "Not enforced" note once every installation
+	// deletes expired operations.
+
+	// TTLSecondsAfterFinished deletes the MachineOperation this many seconds
+	// after it completes or fails. If unset, it is kept.
+	// Not enforced without machine-ops-controller or metalman yet.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
@@ -249,14 +254,14 @@ type MachineOperationSpec struct {
 
 // MachineOperationStatus defines the observed state of a MachineOperation.
 type MachineOperationStatus struct {
-	// Phase is the current phase of the operation.
+	// Phase is Pending, InProgress, Complete or Failed.
 	Phase OperationPhase `json:"phase,omitempty"`
 
 	// Message is a human-readable description of the current state.
 	// +optional
 	Message string `json:"message,omitempty"`
 
-	// StartedAt is when the agent began executing the operation.
+	// StartedAt is when work on the operation began.
 	// +optional
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 
@@ -265,17 +270,16 @@ type MachineOperationStatus struct {
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 
-	// ObservedMachineGeneration is the Machine's metadata.generation
-	// at the time the agent began executing the operation. Clients
-	// can compare this to the current Machine generation to determine
-	// whether the operation acted on the expected machine state.
+	// ObservedMachineGeneration is the Machine's metadata.generation that the
+	// operation acted on. Compare it with the current value to see whether the
+	// Machine has changed since. It may be empty for a failed operation, and
+	// is not set for bare-metal host operations yet.
 	// +optional
 	ObservedMachineGeneration int64 `json:"observedMachineGeneration,omitempty"`
 
-	// Targets records the per-machine execution state for this operation.
-	// For single-machine operations this contains one entry. For selector
-	// operations, targets are snapshotted when execution begins and remain
-	// authoritative even if selector matches change later.
+	// Targets records progress for each Machine, by name. For actions run
+	// through a BMC or cloud provider, the list is fixed when the operation
+	// starts, even if labels change later. Not every kind records targets.
 	// +optional
 	// +listType=map
 	// +listMapKey=machineRef
@@ -289,7 +293,8 @@ type MachineOperationStatus struct {
 
 // MachineOperationTargetStatus records execution state for one target Machine.
 type MachineOperationTargetStatus struct {
-	// BootMedia records immutable media ownership and cleanup progress.
+	// BootMedia is metalman's internal record of the boot media it used for
+	// this Machine. Do not rely on its fields.
 	// +optional
 	BootMedia *MachineOperationBootMediaStatus `json:"bootMedia,omitempty"`
 
@@ -354,40 +359,53 @@ type MachineOperationTargetStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// MachineOperationBootMediaStatus persists media ownership before BMC changes.
+// MachineOperationBootMediaStatus is metalman's internal record of the boot
+// media it made for one Machine.
 type MachineOperationBootMediaStatus struct {
-	ID              string    `json:"id"`
-	SourceServer    string    `json:"sourceServer,omitempty"`
-	SourceName      string    `json:"sourceName,omitempty"`
-	Phase           string    `json:"phase"`
-	MachineUID      types.UID `json:"machineUID"`
-	Netboot         *PXESpec  `json:"netboot"`
-	CertFingerprint string    `json:"certFingerprint,omitempty"`
-	ImageWritten    bool      `json:"imageWritten,omitempty"`
-	Cleaned         bool      `json:"cleaned,omitempty"`
-	// StagedDeleted confirms rack media deletion after safe boot is restored.
+	// ID identifies the boot media. It changes if the media is replaced.
+	ID string `json:"id"`
+	// SourceServer is the server the BMC loads the media from.
+	SourceServer string `json:"sourceServer,omitempty"`
+	// SourceName is the media's name on SourceServer.
+	SourceName string `json:"sourceName,omitempty"`
+	// Phase is metalman's current step.
+	Phase string `json:"phase"`
+	// MachineUID is the UID of the Machine the media was made for.
+	MachineUID types.UID `json:"machineUID"`
+	// Netboot is a copy of the Machine's netboot settings when the media was
+	// made.
+	Netboot *PXESpec `json:"netboot"`
+	// CertFingerprint is the fingerprint of the BMC's TLS certificate.
+	CertFingerprint string `json:"certFingerprint,omitempty"`
+	// ImageWritten is true once the installer has written the image to disk.
+	ImageWritten bool `json:"imageWritten,omitempty"`
+	// Cleaned is true once the BMC is set to boot from disk and the media is
+	// unmounted.
+	Cleaned bool `json:"cleaned,omitempty"`
+	// StagedDeleted is true once the staged media file has been deleted.
 	StagedDeleted bool `json:"stagedDeleted,omitempty"`
-	// CleanedAt starts the bounded wait for installer reboot handoff.
+	// CleanedAt is when Cleaned became true.
 	CleanedAt *metav1.Time `json:"cleanedAt,omitempty"`
-	// RebootRequestedAt is set by the successful installer ready callback.
+	// RebootRequestedAt is when the installer reported it was ready to reboot.
 	RebootRequestedAt *metav1.Time `json:"rebootRequestedAt,omitempty"`
-	// Released confirms local media removal after Cleaned revokes serving.
+	// Released is true once metalman has deleted its own copy of the media.
 	Released bool `json:"released,omitempty"`
-	// Site preserves controller ownership after the Machine is deleted.
+	// Site is the site of the metalman that owns the media.
 	Site string `json:"site,omitempty"`
-	// NodeName preserves the expected Node across Machine edits.
+	// NodeName is the name of the Node the host is expected to join as.
 	NodeName string `json:"nodeName,omitempty"`
-	// PhaseStartedAt bounds active progress without spending retry attempts.
+	// PhaseStartedAt is when the current Phase started.
 	PhaseStartedAt *metav1.Time `json:"phaseStartedAt,omitempty"`
-	// ReadinessStartedAt gives AC recovery one fixed grace window per phase.
+	// ReadinessStartedAt is when the BMC first reported that it was not ready
+	// during the current Phase.
 	ReadinessStartedAt *metav1.Time `json:"readinessStartedAt,omitempty"`
-	// LoaderStartedAt is set when the bootloader on the media first fetches
-	// its install config. It proves the host booted the media.
+	// LoaderStartedAt is when the host, booted from the media, first fetched
+	// its install config.
 	LoaderStartedAt *metav1.Time `json:"loaderStartedAt,omitempty"`
 	// BootAttempts counts power-on attempts used to boot the media.
 	BootAttempts int32 `json:"bootAttempts,omitempty"`
-	// Abandoned ends ownership after the installer never finished its
-	// handoff within the allowed time.
+	// Abandoned is true once metalman stops waiting for the installer and
+	// gives up the media.
 	Abandoned bool `json:"abandoned,omitempty"`
 }
 

@@ -92,8 +92,8 @@ spec:
                 additionalProperties:
                   type: string
                 description: |-
-                  NodeSelector selects nodes to include in this gateway pool
-                  Only nodes with external IPs and WireGuard public keys will be included
+                  NodeSelector picks the nodes in this gateway pool. A node must have a
+                  WireGuard public key, and for an External pool, an external IP.
                 minProperties: 1
                 type: object
               routedCidrs:
@@ -113,8 +113,11 @@ spec:
                 description: |-
                   TunnelProtocol selects the tunnel protocol for this scope.
                   Valid values are "WireGuard", "IPIP", "GENEVE", "VXLAN", "None", or "Auto".
-                  Defaults to "Auto" when unset. When "Auto", links using external IPs
-                  use WireGuard and links using only internal IPs use GENEVE.
+                  Defaults to "Auto" when unset. With "Auto", links over external IPs use
+                  WireGuard and links over internal IPs use GENEVE, unless the
+                  unbounded-net configuration prefers other protocols. For a gateway in
+                  the same site, an unset or "Auto" value uses the Site's tunnelProtocol
+                  if the Site sets one.
                 enum:
                 - WireGuard
                 - IPIP
@@ -126,7 +129,8 @@ spec:
               type:
                 description: |-
                   Type controls how gateway nodes are selected and connected.
-                  Allowed values are "External" or "Internal".
+                  Allowed values are "External" or "Internal". An empty value means
+                  "External".
                 enum:
                 - External
                 - Internal

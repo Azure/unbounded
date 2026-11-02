@@ -144,28 +144,27 @@
       ],
       // Slide 2: Manage with Kubernetes
       [
-        {type:'comment', text:'# Soft-reboot a machine'},
+        {type:'comment', text:'# Reboot a machine\'s host OS'},
         {type:'cmd', text:'kubectl unbounded machine soft-reboot gpu-node-1'},
         {type:'output', text:'  --> Soft-rebooting Machine gpu-node-1...'},
-        {type:'output', text:'  operation         gpu-node-1-softreboot-1776734492'},
-        {type:'output', text:'  --> Operation SoftReboot: completed'},
+        {type:'output', text:'  operation          gpu-node-1-soft-reboot-1776734492'},
+        {type:'output', text:'  --> Operation HostSoftReboot: gpu-node-1-soft-reboot-1776734492 completed'},
         {type:'output', text:'  ready'},
         {type:'blank'},
-        {type:'comment', text:'# Upgrade Kubernetes by patching the Machine CR'},
-        {type:'cmd', text:'kubectl patch machine gpu-node-1 --type merge \\'},
-        {type:'cmd-cont', text:'    -p \'{"spec":{"kubernetesVersion":"v1.33.0"}}\''},
-        {type:'output', text:'machine.unbounded-cloud.io/gpu-node-1 patched'},
+        {type:'comment', text:'# Upgrade Kubernetes in the MachineConfiguration'},
+        {type:'cmd', text:'kubectl patch mc gpu --type merge \\'},
+        {type:'cmd-cont', text:'    -p \'{"spec":{"template":{"kubernetes":{"version":"v1.33.0"}}}}\''},
+        {type:'output', text:'machineconfiguration.unbounded-cloud.io/gpu patched'},
         {type:'blank'},
-        {type:'cmd', text:'kubectl get machines'},
-        {type:'header', text:'NAME          HOST          PHASE      K8S VERSION   AGE'},
-        {type:'output', text:'gpu-node-1    10.0.50.12    Updating   v1.33.0       5h'},
-        {type:'output', text:'gpu-node-2    10.0.50.13    Ready      v1.32.3       4h'},
+        {type:'comment', text:'# Drain and delete the Node; the agent repaves it'},
+        {type:'cmd', text:'kubectl drain gpu-node-1 --ignore-daemonsets'},
+        {type:'cmd', text:'kubectl delete node gpu-node-1'},
+        {type:'output', text:'node "gpu-node-1" deleted'},
         {type:'blank'},
-        {type:'comment', text:'# Agent detects drift and blue/green swaps the node'},
-        {type:'cmd', text:'kubectl get machines'},
-        {type:'header', text:'NAME          HOST          PHASE   K8S VERSION   AGE'},
-        {type:'output', text:'gpu-node-1    10.0.50.12    Ready   v1.33.0       5h'},
-        {type:'output', text:'gpu-node-2    10.0.50.13    Ready   v1.32.3       4h'}
+        {type:'cmd', text:'kubectl get nodes'},
+        {type:'header', text:'NAME          STATUS   ROLES    AGE   VERSION'},
+        {type:'output', text:'gpu-node-1    Ready    <none>   1m    v1.33.0'},
+        {type:'output', text:'gpu-node-2    Ready    <none>   4h    v1.32.3'}
       ]
     ];
 

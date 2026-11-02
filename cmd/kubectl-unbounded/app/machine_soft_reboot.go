@@ -28,16 +28,12 @@ func machineSoftRebootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "soft-reboot NAME",
 		Short: "Soft-reboot an agent-managed machine (reboots the host operating system)",
-		Long: `Soft-reboot reboots the host operating system from inside the host
-(systemctl reboot) through a HostSoftReboot MachineOperation. No BMC or
-cloud provider access is required.
+		Long: `Soft-reboot creates a HostSoftReboot MachineOperation, which reboots the
+host's operating system through the agent on the host. No BMC or cloud provider
+access is required. The operation's status becomes "Complete" or "Failed" once
+the host is back.
 
-This command creates a MachineOperation CR that the agent daemon watches.
-The agent issues the reboot and, once it starts again on the new boot,
-updates the MachineOperation status to "Complete" or "Failed".
-
-To restart only the nspawn-backed node without rebooting the host, use
-"node-reboot".`,
+To restart only the node without rebooting the host, use "node-reboot".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()

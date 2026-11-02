@@ -22,9 +22,9 @@ func machineHardRebootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hard-reboot NAME",
 		Short: "Hard-reboot a machine through MachineOperation",
-		Long: `Hard-reboot creates a HostHardReboot MachineOperation CR requesting a
-full out-of-band host power cycle. The machina controller or cloud controller processes the
-operation and updates MachineOperation status to "Complete" or "Failed".`,
+		Long: `Hard-reboot creates a HostHardReboot MachineOperation, which restarts the
+host from outside its operating system, for example through its BMC or cloud provider.
+The operation's status becomes "Complete" or "Failed" when it finishes.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()

@@ -21,7 +21,7 @@ spec:
     - "10.0.0.0/16"
     - "10.1.0.0/16"
 
-  # Optional: Pod CIDR assignment rules for this site
+  # Pod CIDR assignment rules for this site (at least one required)
   podCidrAssignments:
     - assignmentEnabled: true
       cidrBlocks:
@@ -51,7 +51,7 @@ status:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `spec.nodeCidrs` | `[]string` | Yes | CIDR blocks containing internal IPs of nodes at this site. At least one required. |
-| `spec.podCidrAssignments` | `[]PodCidrAssignment` | No | Pod CIDR allocation rules for this site. |
+| `spec.podCidrAssignments` | `[]PodCidrAssignment` | Yes | Pod CIDR allocation rules for this site. At least one required. |
 | `spec.manageCniPlugin` | `*bool` | No | Controls CNI and WireGuard behavior. Defaults to `true`. See below. |
 | `spec.nonMasqueradeCIDRs` | `[]string` | No | CIDRs that should NOT be masqueraded when traffic leaves via the default gateway. See below. |
 | `spec.localCidrs` | `[]string` | No | CIDR blocks considered local to this site. Traffic to these CIDRs is never routed via gateway pools. |
@@ -66,7 +66,7 @@ status:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `assignmentEnabled` | `*bool` | No | Enables this assignment. When omitted, inherits `manageCniPlugin` (default: `true`). Explicit `true` or `false` overrides that default. |
-| `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
+| `cidrBlocks` | `[]string` | Yes | CIDR pools to allocate from (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24` when IPv4 pools exist). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: first IPv6 pool prefix + 16). |
 | `nodeRegex` | `[]string` | No | Regex patterns to match node names. If empty, no regex filtering is applied. |
@@ -376,10 +376,16 @@ A node is included in a GatewayPool status when it:
 flowchart TD
     N[Node] --> L{Matches nodeSelector?}
     L -->|No| X1[Not included]
-    L -->|Yes| W{Has WireGuard Key?}
+    L -->|Yes| E{External pool?}
+    E -->|Yes| I{Has external IP?}
+    I -->|No| X2[Not included]
+    I -->|Yes| W{Has WireGuard Key?}
+    E -->|No| W
     W -->|No| X3[Not included]
     W -->|Yes| OK[Included in Pool Status]
 ```
+
+An empty `type` means `External`.
 
 A node that matches the `nodeSelector` of any GatewayPool is left out of SiteNodeSlices, even when a SitePeering with `meshNodes: true` covers its Site. Other nodes can reach it only as a gateway peer of the pool it is assigned to. A node that matches several pools is assigned to the first one by name. A selector that matches every node of a Site therefore leaves the Site with no SiteNodeSlices and no mesh peers. Select gateway nodes with a dedicated label, such as `unbounded-cloud.io/unbounded-net-gateway: "true"`.
 
