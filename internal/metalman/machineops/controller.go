@@ -21,10 +21,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
@@ -94,8 +97,7 @@ type Reconciler struct {
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("metalman-machineoperation").
-		For(&v1alpha3.MachineOperation{}).
-		WithEventFilter(predicate.Funcs{
+		For(&v1alpha3.MachineOperation{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
 				op, ok := e.Object.(*v1alpha3.MachineOperation)
 				return ok && shouldReconcile(op)
@@ -109,9 +111,43 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 				op, ok := e.Object.(*v1alpha3.MachineOperation)
 				return ok && shouldReconcile(op)
 			},
-		}).
+		})).
+		// The manager caches only this site's Machines, so a Machine that moves
+		// into this site arrives as a create event. Its machineRef operations
+		// change owner at that point, and the previous owner stops polling them.
+		Watches(&v1alpha3.Machine{},
+			handler.EnqueueRequestsFromMapFunc(r.operationsForMachine),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return true },
+				UpdateFunc:  func(event.UpdateEvent) bool { return false },
+				DeleteFunc:  func(event.DeleteEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+			})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
+}
+
+// operationsForMachine returns the in-progress host operations that name obj
+// in spec.machineRef, so the instance that now owns the Machine resumes them.
+func (r *Reconciler) operationsForMachine(ctx context.Context, obj client.Object) []reconcile.Request {
+	var ops v1alpha3.MachineOperationList
+	if err := r.List(ctx, &ops); err != nil {
+		slog.ErrorContext(ctx, "list MachineOperations for Machine", "machine", obj.GetName(), "error", err)
+		return nil
+	}
+
+	var requests []reconcile.Request
+
+	for i := range ops.Items {
+		op := &ops.Items[i]
+		if op.Spec.MachineRef != obj.GetName() || !isHostOperation(op.Spec.OperationKind) || op.Status.IsTerminal() {
+			continue
+		}
+
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(op)})
+	}
+
+	return requests
 }
 
 func shouldReconcile(op *v1alpha3.MachineOperation) bool {

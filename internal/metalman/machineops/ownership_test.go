@@ -15,6 +15,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
@@ -501,4 +502,112 @@ func TestReconcilerDoesNotSetObservedMachineGenerationOnFailure(t *testing.T) {
 	updated := getOperation(t, c, op.Name)
 	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase, updated.Status.Message)
 	require.Zero(t, updated.Status.ObservedMachineGeneration)
+}
+
+func TestOperationsForMachineEnqueuesInProgressMachineRefOperations(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-a", "rack-a")
+
+	inProgress := testOperation("op-in-progress", v1alpha3.OperationHostPowerOff)
+	inProgress.Spec.MachineRef = machine.Name
+	inProgress.Status.Phase = v1alpha3.OperationPhaseInProgress
+
+	pending := testOperation("op-pending", v1alpha3.OperationHostHardReboot)
+	pending.Spec.MachineRef = machine.Name
+
+	complete := testOperation("op-complete", v1alpha3.OperationHostPowerOff)
+	complete.Spec.MachineRef = machine.Name
+	complete.Status.Phase = v1alpha3.OperationPhaseComplete
+
+	otherMachine := testOperation("op-other-machine", v1alpha3.OperationHostPowerOff)
+	otherMachine.Spec.MachineRef = "machine-b"
+
+	selector := testOperation("op-selector", v1alpha3.OperationHostPowerOff)
+	selector.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+
+	nonHost := testOperation("op-non-host", v1alpha3.OperationAgentUpgrade)
+	nonHost.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, inProgress, pending, complete, otherMachine, selector, nonHost).
+		WithStatusSubresource(inProgress, pending, complete, otherMachine, selector, nonHost).
+		Build()
+	r := siteReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	var names []string
+	for _, req := range r.operationsForMachine(context.Background(), machine) {
+		names = append(names, req.Name)
+	}
+
+	require.ElementsMatch(t, []string{inProgress.Name, pending.Name}, names)
+}
+
+func TestOperationsForMachineReturnsNothingWhenListFails(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-a", "rack-a")
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+				return errors.New("list failed")
+			},
+		}).
+		Build()
+	r := siteReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	require.Empty(t, r.operationsForMachine(context.Background(), machine))
+}
+
+func TestMachineSiteChangeHandsOperationToNewSite(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-a", "rack-a")
+	op := testOperation("op-ref", v1alpha3.OperationHostPowerOff)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{pendingTarget(machine.Name)}
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, op, testRedfishSecret()).
+		WithStatusSubresource(op).
+		Build()
+	powerA := &recordingPowerClient{}
+	powerB := &recordingPowerClient{}
+	siteA := siteReconciler(c, powerA, "rack-a")
+	siteB := siteReconciler(c, powerB, "rack-b")
+
+	// rack-b ignores the operation while rack-a owns the Machine.
+	reconcileOnce(t, siteB, op.Name)
+	require.Equal(t, op.ResourceVersion, getOperation(t, c, op.Name).ResourceVersion)
+
+	var moved v1alpha3.Machine
+	require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(machine), &moved))
+	moved.Labels[siteLabel] = "rack-b"
+	require.NoError(t, c.Update(context.Background(), &moved))
+
+	// rack-a no longer owns the Machine and leaves the operation alone.
+	reconcileOnce(t, siteA, op.Name)
+	require.Equal(t, op.ResourceVersion, getOperation(t, c, op.Name).ResourceVersion)
+	require.Empty(t, powerA.calls)
+
+	// The Machine now appears in rack-b's cache, which enqueues the operation.
+	requests := siteB.operationsForMachine(context.Background(), &moved)
+	require.Len(t, requests, 1)
+	require.Equal(t, op.Name, requests[0].Name)
+
+	for range 3 {
+		reconcileOnce(t, siteB, requests[0].Name)
+	}
+
+	updated := getOperation(t, c, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, updated.Status.Message)
+	require.Equal(t, []string{"machine-a:ForceOff"}, powerB.calls)
+	require.Empty(t, powerA.calls)
 }
