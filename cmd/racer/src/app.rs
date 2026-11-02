@@ -825,24 +825,29 @@ fn bootstrap(
     result.and_then(|identity| shutdown_result.map(|()| identity))
 }
 
-/// End `operation` with `Cancelled` as soon as a process stop is requested.
+/// End `operation` with `Cancelled` as soon as a process stop is requested,
+/// or with `DiskApprovalChanged` once the disk monitor requests a restart.
 ///
-/// The lifecycle driver re-polls startup periodically, so a stop request is
+/// The lifecycle driver re-polls startup periodically, so either request is
 /// observed promptly even while the operation waits on a long control turn.
 /// Dropping the operation leaves reactor and CQE fencing to normal teardown.
 async fn stoppable<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    stoppable_by(&STOP_REQUESTED, operation).await
+    stoppable_by(&STOP_REQUESTED, disk_monitor::restart_requested, operation).await
 }
 
-/// [`stoppable`] with an explicit stop flag.
+/// [`stoppable`] with an explicit stop flag and disk restart check.
 async fn stoppable_by<T>(
     stop: &AtomicBool,
+    disk_restart: impl Fn() -> bool,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     let mut operation = std::pin::pin!(operation);
     std::future::poll_fn(|cx| {
         if stop.load(Ordering::Relaxed) {
             return Poll::Ready(Err(Error::Cancelled));
+        }
+        if disk_restart() {
+            return Poll::Ready(Err(Error::DiskApprovalChanged));
         }
         operation.as_mut().poll(cx)
     })
@@ -3362,7 +3367,11 @@ mod lifecycle_policy_tests {
         let stop = AtomicBool::new(false);
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut pending = Box::pin(stoppable_by(&stop, std::future::pending::<Result<()>>()));
+        let mut pending = Box::pin(stoppable_by(
+            &stop,
+            || false,
+            std::future::pending::<Result<()>>(),
+        ));
         assert!(pending.as_mut().poll(&mut cx).is_pending());
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
@@ -3370,12 +3379,43 @@ mod lifecycle_policy_tests {
             Poll::Ready(Err(Error::Cancelled))
         );
         let clear = AtomicBool::new(false);
-        let mut done = Box::pin(stoppable_by(&clear, async {
+        let mut done = Box::pin(stoppable_by(&clear, || false, async {
             Err::<(), _>(Error::Unauthorized)
         }));
         assert_eq!(
             done.as_mut().poll(&mut cx),
             Poll::Ready(Err(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn stoppable_startup_ends_on_disk_approval_restart() {
+        let stop = AtomicBool::new(false);
+        let restart = AtomicBool::new(false);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = Box::pin(stoppable_by(
+            &stop,
+            || restart.load(Ordering::Relaxed),
+            std::future::pending::<Result<()>>(),
+        ));
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        restart.store(true, Ordering::Relaxed);
+        assert_eq!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::DiskApprovalChanged))
+        );
+        drop(pending);
+        // A process stop takes precedence over a disk restart request.
+        stop.store(true, Ordering::Relaxed);
+        let mut both = Box::pin(stoppable_by(
+            &stop,
+            || restart.load(Ordering::Relaxed),
+            std::future::pending::<Result<()>>(),
+        ));
+        assert_eq!(
+            both.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
         );
     }
 
