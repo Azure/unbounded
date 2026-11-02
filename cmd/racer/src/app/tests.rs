@@ -5071,3 +5071,60 @@ fn prune_stale_slab_files_ignores_symlinked_directories() {
     assert!(!stale.exists());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// Embedded control stub whose latest approval is fixed.
+struct FixedApproval(Option<Vec<String>>);
+
+impl crate::control::managed::ClusterControl for FixedApproval {
+    fn bootstrap(
+        &self,
+        _: Duration,
+    ) -> std::result::Result<
+        crate::control::managed::Bootstrapped,
+        crate::control::managed::BootstrapError,
+    > {
+        Err(crate::control::managed::BootstrapError::Fatal)
+    }
+
+    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+        Default::default()
+    }
+
+    fn report(&self, _: u32, _: Vec<racer_control_wire::RailMapping>) {}
+
+    fn approved_disks(&self) -> Option<Vec<String>> {
+        self.0.clone()
+    }
+}
+
+fn managed_with(control: Option<FixedApproval>) -> crate::control::Managed {
+    crate::control::Managed {
+        endpoints: Default::default(),
+        report: std::sync::Arc::new(|_, _| {}),
+        disks: vec!["bootstrap".into()],
+        control: control.map(|c| std::sync::Arc::new(c) as _),
+    }
+}
+
+#[test]
+fn discovery_uses_latest_approval_over_bootstrap_snapshot() {
+    // Revoked during enrollment: the bootstrap disk must not be used.
+    let revoked = managed_with(Some(FixedApproval(Some(vec![]))));
+    assert!(super::current_approval(&revoked).is_empty());
+    let changed = managed_with(Some(FixedApproval(Some(vec!["later".into()]))));
+    assert_eq!(super::current_approval(&changed), vec!["later".to_owned()]);
+}
+
+#[test]
+fn discovery_falls_back_to_bootstrap_without_latest_approval() {
+    let unknown = managed_with(Some(FixedApproval(None)));
+    assert_eq!(
+        super::current_approval(&unknown),
+        vec!["bootstrap".to_owned()]
+    );
+    let absent = managed_with(None);
+    assert_eq!(
+        super::current_approval(&absent),
+        vec!["bootstrap".to_owned()]
+    );
+}

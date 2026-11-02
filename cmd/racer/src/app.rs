@@ -511,9 +511,10 @@ impl Application {
             bootstrap(&self.config, &self.node, &self.limits, &scope)?
         };
         // Managed bootstrap read the Node itself; enrollment carries the same
-        // annotation for standalone control.
+        // annotation for standalone control. Enrollment can wait indefinitely, so
+        // read the latest approval now; the monitor baselines on this same set.
         let approved = match &self.config.managed_control {
-            Some(managed) => managed.disks.clone(),
+            Some(managed) => current_approval(managed),
             None => enrolled_disks,
         };
         let discovery = devices::discover(&self.config, &approved, plan.pairs.len());
@@ -576,6 +577,16 @@ impl Application {
             result => result,
         }
     }
+}
+
+/// Latest approved disks from embedded control, falling back to the bootstrap
+/// snapshot when control is absent or has no approval yet.
+fn current_approval(managed: &crate::control::Managed) -> Vec<String> {
+    managed
+        .control
+        .as_ref()
+        .and_then(|control| control.approved_disks())
+        .unwrap_or_else(|| managed.disks.clone())
 }
 
 /// Whether `error` is the cancellation a requested SIGTERM/SIGINT produces, so the
