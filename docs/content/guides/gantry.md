@@ -340,6 +340,17 @@ Gantry still serves the local registry mirror, and it reads from upstream
 registries when Racer asks for content it does not have. Gantry does not use
 containerd storage or its own peer network in this mode.
 
+Racer mode gives image distribution the same benefits as other Racer caches:
+
+- Image data is encrypted and authenticated between nodes and on disk, so no
+  cleartext peer transfer port needs to be fenced off.
+- Large layers are split into 16 MiB pages spread across many nodes, so many
+  nodes serve one layer in parallel.
+- Only each page's owners read from the registry, which keeps registry load
+  low during large rollouts.
+- Images share node cache space with model and dataset caches, weighted by
+  each cache's `spec.priority`.
+
 Racer mode needs the operator-managed Gantry install and the Racer
 [node requirements]({{< relref "reference/racer" >}}#node-requirements). The
 standalone Helm chart does not support Racer mode.

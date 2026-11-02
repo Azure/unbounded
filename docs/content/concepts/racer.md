@@ -1,7 +1,7 @@
 ---
 title: "Racer Distributed Cache"
 weight: 4
-description: "How Racer lets nodes share cached object data and reduce repeated reads from its source."
+description: "How Racer turns cluster nodes into one shared cache, when to use it, and how it works."
 ---
 
 ## Why Racer?
@@ -23,6 +23,89 @@ An integration can provide this adapter, or you can write one with the SDK.
 Sharing and combining reads reduces source traffic; it does not guarantee
 exactly one source read. Retries, eviction, expiry, and node failures can cause
 another fetch.
+
+### What Racer Gives You
+
+- **No cache servers to run.** Racer pools the memory and local disks of the
+  nodes you already have into one cache. There is no separate cache fleet to
+  buy, size, or patch, and no controller Deployment. The operator installs
+  Racer when you create a `ClusterCache`.
+- **Capacity and bandwidth that grow with the cluster.** Every node stores
+  pages and serves them to other nodes. Adding nodes adds cache space and
+  serving bandwidth. Racer places each 16 MiB page on its own owners, so the
+  pages of one large file are spread across many nodes and served in parallel.
+- **Low, bounded source load.** Only a page's owners, at most three nodes,
+  read it from the source. All other nodes get the page from those owners. A
+  rollout to a thousand nodes reads each page from the source a few times at
+  most in normal operation, not a thousand times.
+- **Any source.** Racer reads from any store you can write an origin for.
+  Ready-made origins read S3, S3-compatible stores, Azure Blob Storage, and
+  OCI registries. Racer runs on Linux nodes in any cloud, on-premises, or at
+  the edge.
+- **No code changes for most apps.** The
+  [`racer-object` sidecar]({{< relref "reference/racer-object" >}}) serves an
+  S3 or Azure Blob API on pod loopback. A webhook adds it to labeled pods.
+  Existing S3 and Azure SDK clients change only settings: the endpoint, plus
+  [path-style addressing and checksum settings]({{< relref "reference/racer-object#s3-api" >}})
+  for S3. vLLM and
+  containerd have their own integrations.
+- **Encrypted and verified data.** Pages are encrypted and authenticated with
+  a per-cache key between nodes and on disk. Nodes sign their requests. The
+  SDK holds back the last byte of each range until Racer confirms the whole
+  range arrived intact. Data streams to the app as it arrives, so an app
+  that needs all-or-nothing input should wait for the read to complete
+  before using it. Racer rejects a corrupt or tampered cached page and
+  fetches a good copy from another node or the origin, so an app never
+  completes a read with bad data.
+- **One cache for images, models, and datasets.** Several caches share each
+  node's capacity by priority. Gantry can store container images in Racer, and
+  apps can warm and hold specific model or dataset versions ahead of a job.
+- **Consistent versions.** Every page of a read comes from the same version.
+  Readers never get a mix of old and new bytes while the source changes.
+- **Fast paths for GPU nodes.** Racer can move pages over RDMA within a Site
+  and write objects straight into NVIDIA GPU memory.
+
+## When to Choose Racer
+
+Racer fits best when many nodes read the same data and you want the cache to
+scale with the cluster instead of running a separate cache tier.
+
+| Use case | Why Racer fits |
+|----------|----------------|
+| Scale-out of a large job, such as hundreds of inference replicas loading the same model | Source reads depend on the number of pages, not the number of nodes. Serving bandwidth grows with each node that joins, so the cache does not become the bottleneck as the job grows. |
+| GPU or storage-dense nodes with unused local NVMe | Racer turns local disk you already pay for into shared cache. You need no extra machines. |
+| Hybrid, multi-cloud, or edge clusters | The same DaemonSet and API work on every Linux node in the cluster. S3-compatible support covers on-premises object stores. Nothing depends on one cloud's managed services. |
+| Internal or custom data sources | An origin answers two requests, HEAD and GET, through the Go SDK. A new source needs a small adapter, not a new cache product. |
+| Rate-limited, throttled, or costly sources | Only page owners read from the source, and Racer does not silently send reads to the source when the cache fails. Source load stays bounded during both rollouts and failures. |
+| Data that must stay encrypted and verified | Pages are encrypted on node disks and on the wire, and a read only completes if every page passed checks. |
+| Container images, models, and datasets in one cluster | One cache layer serves all three. Priority decides how they share node capacity. |
+| Fast model loads on NVIDIA GPU nodes | The [vLLM integration]({{< relref "guides/racer-vllm" >}}) reads weights straight into GPU memory, and RDMA speeds node-to-node transfers. |
+
+### Racer Compared With a Dedicated Cache Tier
+
+| | Racer | Dedicated cache servers |
+|---|---|---|
+| Extra machines | None | Cache servers to buy, size, and run |
+| Cache capacity | Grows as nodes join | Grows only when you add cache servers |
+| Serving bandwidth | Every node serves; total grows with the cluster | Limited by the cache servers' network links |
+| Where cache work runs | On cluster nodes; you set each node's share | On separate machines |
+| New data sources | Write an origin adapter | Limited to the sources the tier supports |
+
+### Planning Considerations
+
+- Racer uses some disk, memory, CPU, and network on each node in the cache.
+  The [dataplane settings]({{< relref "reference/racer#dataplane-configuration" >}})
+  size it on each node: the thread cap (`RACER_MAX_THREADS`), the
+  `RACER_*_BYTES` memory budgets, and the slab files or raw devices it is
+  given. The `exclude` label keeps Racer off a node: no dataplane runs there
+  and the node is not a cache member. The `shares` annotation and
+  `spec.priority` only weight which nodes hold pages and how capacity is split
+  between caches. They do not cap Racer's use of a node.
+- Racer does not fall back to the source on errors, which keeps source load
+  predictable. The caller decides what to do. Containerd moves to its next
+  mirror host, and apps can retry or read the source directly.
+- Every node in the cache stores and forwards encrypted pages for the whole
+  cache. Share a cache only among nodes and readers that may read its data.
 
 ## Architecture
 
@@ -177,8 +260,9 @@ protections:
   with a projected ServiceAccount token. The seat checks that the pod
   belongs to the Racer DaemonSet, then issues a short-lived certificate
   (24 hours by default).
-- **Encryption** -- Pages are encrypted with a per-cache key, both between
-  nodes and on disk. The elected control plane creates and rotates these keys.
+- **Encryption** -- Pages are encrypted and authenticated (XAES-256-GCM) with
+  a per-cache key, both between nodes and on disk. The elected control plane
+  creates and rotates these keys.
 - **Signed requests** -- Every node signs each request it sends or forwards to
   another node.
 - **Credentials** -- `Authorization` and `Metadata` are sealed
