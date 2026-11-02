@@ -435,6 +435,13 @@ func TestMachineAllocationStatusWriteOnce(t *testing.T) {
 			}}, "conditions"),
 		},
 		{
+			name:   "label added with status set",
+			stored: storedWithStatus,
+			mutate: func(t *testing.T, obj map[string]any) {
+				setField(t, obj, "x", "metadata", "labels", "team")
+			},
+		},
+		{
 			name:   "change nodeRef",
 			stored: storedWithStatus,
 			mutate: setStatus(map[string]any{"name": "node-a", "uid": "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"}, "nodeRef"),
@@ -446,18 +453,45 @@ func TestMachineAllocationStatusWriteOnce(t *testing.T) {
 			mutate: setStatus("ubuntu-26.04", "snapshot", "hostImage"),
 			want:   []string{"status.snapshot", "snapshot is immutable"},
 		},
-		{name: "remove snapshot", stored: storedWithStatus, mutate: removeStatus("snapshot"), want: []string{"snapshot cannot be removed"}},
+		{
+			name:   "remove snapshot",
+			stored: storedWithStatus,
+			mutate: removeStatus("snapshot"),
+			want:   []string{"status.snapshot: Invalid value", "snapshot cannot be removed"},
+		},
+		{
+			name:   "remove whole status",
+			stored: storedWithStatus,
+			mutate: func(_ *testing.T, obj map[string]any) {
+				unstructured.RemoveNestedField(obj, "status")
+			},
+			want: []string{
+				"status.snapshot: Invalid value", "snapshot cannot be removed",
+				"status.providerID: Invalid value", "providerID is immutable once set",
+			},
+		},
+		{
+			name:   "null status",
+			stored: storedWithStatus,
+			mutate: func(_ *testing.T, obj map[string]any) {
+				obj["status"] = nil
+			},
+			want: []string{
+				"status.snapshot: Invalid value", "snapshot cannot be removed",
+				"status.providerID: Invalid value", "providerID is immutable once set",
+			},
+		},
 		{
 			name:   "change providerID",
 			stored: storedWithStatus,
 			mutate: setStatus(AllocationProviderIDPrefix+"other", "providerID"),
-			want:   []string{"status: Invalid value", "providerID is immutable once set"},
+			want:   []string{"status.providerID: Invalid value", "providerID is immutable once set"},
 		},
 		{
 			name:   "remove providerID",
 			stored: storedWithStatus,
 			mutate: removeStatus("providerID"),
-			want:   []string{"status: Invalid value", "providerID is immutable once set"},
+			want:   []string{"status.providerID: Invalid value", "providerID is immutable once set"},
 		},
 		{name: "failureReason Timeout", mutate: setStatus("Timeout", "failureReason"), want: []string{"status.failureReason: Unsupported value"}},
 		{name: "capacityType Reserved", mutate: setStatus("Reserved", "capacityType"), want: []string{"status.capacityType: Unsupported value"}},
