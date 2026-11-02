@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -178,6 +179,31 @@ func TestReconcileHostSoftReboot_UsesAPIReader(t *testing.T) {
 	blocker, err = unfinishedOutOfBandHostOperation(context.Background(), target.reader(), machine)
 	require.NoError(t, err)
 	assert.Empty(t, blocker)
+}
+
+func TestReconcileHostSoftReboot_ReadsMachineFromAPIReader(t *testing.T) {
+	// The cached Machine lacks the label that the API server has, so only
+	// the fresh Machine matches the pending selector-based operation.
+	cached := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 4}}
+	fresh := cached.DeepCopy()
+	fresh.Labels = map[string]string{"rack": "a"}
+	outOfBand := outOfBandOperation("op-oob", "", v1alpha3.OperationHostPowerOff)
+	outOfBand.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
+
+	op := &fakeNodeOperator{bootID: "boot-1"}
+	c := fakeStatusClient(cached, hostSoftRebootOperation("op-soft"))
+	apiReader := fakeStatusClient(fresh, outOfBand)
+	reconciler := newTestMachinaMachineOperationReconcilerWithLockPath(
+		t, c, op, filepath.Join(t.TempDir(), "agent-upgrade.lock"), apiReader)
+
+	result, err := reconciler.ReconcileMachineOperation(context.Background(), "op-soft")
+	require.NoError(t, err)
+	assert.Zero(t, op.rebootCalls, "the host must not reboot while an out-of-band operation is pending")
+	assert.Equal(t, hostSoftRebootWaitInterval, result.RequeueAfter)
+
+	waiting := getMachineOperation(t, c, "op-soft")
+	assert.Equal(t, v1alpha3.OperationPhasePending, waiting.Status.Phase)
+	assert.Equal(t, "waiting for out-of-band host operation op-oob", waiting.Status.Message)
 }
 
 func TestUnfinishedOutOfBandHostOperation_ReturnsOldest(t *testing.T) {

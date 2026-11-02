@@ -184,6 +184,7 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 	c client.Client,
 	op nodeOperator,
 	lockPath string,
+	apiReader ...client.Reader,
 ) *daemon.MachinaMachineOperationReconciler {
 	t.Helper()
 
@@ -194,6 +195,7 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 		machineName:          "test-machine",
 		nodeOperator:         op,
 		agentUpgradeLockPath: lockPath,
+		apiReader:            firstReader(apiReader),
 		requestRestart: func() {
 			if fake, ok := op.(*fakeNodeOperator); ok {
 				fake.restartRequests++
@@ -210,6 +212,14 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 	require.NoError(t, err)
 
 	return reconciler
+}
+
+func firstReader(readers []client.Reader) client.Reader {
+	if len(readers) == 0 {
+		return nil
+	}
+
+	return readers[0]
 }
 
 func setAgentUpgradeSignalPath(t *testing.T) string {

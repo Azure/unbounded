@@ -67,7 +67,9 @@ func (t *machineOperationTarget) reconcileHostSoftReboot(ctx context.Context, st
 
 	defer releaseInstallationLock(t.log, lock)
 
-	machine, err := getLocalMachine(ctx, t.Client, t.machineName)
+	// Read the Machine from the API server: stale cached labels could hide
+	// a selector-based out-of-band operation.
+	machine, err := getLocalMachine(ctx, t.reader(), t.machineName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
