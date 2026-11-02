@@ -121,6 +121,17 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.sha }}
 
+      - name: Stage net frontend and CNI plugins (bench)
+        if: inputs.image == 'net'
+        run: |
+          set -euo pipefail
+          (cd frontend && npm ci --no-audit && npm run build)
+          rm -rf internal/net/html/dist && mkdir -p internal/net/html/dist
+          cp -R frontend/dist/. internal/net/html/dist/
+          mkdir -p resources
+          curl -fsSL "https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-amd64-v1.9.1.tgz" \
+            -o resources/cni-plugins-linux-amd64-v1.9.1.tgz
+
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/amd64,linux/arm64
