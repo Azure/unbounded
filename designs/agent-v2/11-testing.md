@@ -225,8 +225,13 @@ These cover what v1 never had, so the v1 suites cannot:
 | Nightly | The v1 suites under `AGENT_PROFILE=v2` across the full host matrix (`.github/workflows/agent-e2e-kind.yaml:98-116`) for both runtimes, the configuration suite for both runtimes, every `migration-v2` variant, and section 5 |
 
 Each job stays within the matrix's existing time limits
-(`agent-e2e-kind.yaml:98-104`). The `host` runtime joins the immutable-host
-(`acl`) entry only after validation task V7.
+(`agent-e2e-kind.yaml:98-104`).
+
+Every host in the matrix, including the immutable-host (`acl`) entry, runs both
+runtimes' capability probes ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)) and checks each result
+against what is expected for that host. A runtime's lifecycle suites run on a
+host only where its probes pass; where they fail, the job checks that `v2 start`
+refuses with the failing probe in its error.
 
 From the first official v2 release, the build has no v1 commands, so the
 `AGENT_PROFILE=v1` jobs can no longer run against it. The v2 jobs become the
@@ -243,7 +248,6 @@ Each needs a prototype before the feature it covers is built:
 | V1 | Every DaemonSet and component we ship works with kubelet `cgroupRoot: /unboundednode`: unbounded-net, gantry, racer, kube-proxy, the NVIDIA device plugin and node-problem-detector. Nothing may assume `/kubepods.slice`. |
 | V2 | The image-preserving containerd reset ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-wipe-and-slot-changes)) against containerd 2.1.8 (`pkg/agent/goalstates/constants.go:121`), including the CRI plugin's state directory layout. |
 | V3 | The minimal NVIDIA Container Toolkit binary set for CDI mode, and how the toolkit finds its configuration in the slot directory without editing the host's. |
-| V4 | SELinux labels for binaries executed from the slot directories on Azure Linux 3. |
-| V5 | The oneshot prerequisites and pre-start boot hook run again on every start of the boot unit: after a host reboot, on `systemctl restart systemd-nspawn@<m>`, and when the `host` node units start again after a restart ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
-| V6 | On `host`, kubelet reports the boot ID mounted over `/proc/sys/kernel/random/boot_id` for `kubelet.service`, a NodeReboot produces a new Node boot ID and a `Rebooted` event, and nothing else on the node depends on kubelet's boot ID matching the kernel's. |
-| V7 | The `host` runtime on an immutable host, where `/usr` is read-only: the slot layout, units and owned paths all live on writable filesystems. |
+| V4 | The SELinux labels the `host` runtime gives binaries in the slot directories on hosts with an enforcing policy, such as Azure Linux 3, so the exec capability probe passes ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). |
+| V5 | The oneshot prerequisites and pre-start boot hook run once per node start, and only then: after a host reboot, on `systemctl restart systemd-nspawn@<m>`, and on a `host` `Start` or `Restart`. On `host`, killing kubelet or containerd so that systemd restarts it must not run the nftables flush or the pre-start boot hook ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
+| V6 | On `host`, kubelet reports the boot ID mounted over `/proc/sys/kernel/random/boot_id` for `kubelet.service`, a NodeReboot produces a new Node boot ID and a `Rebooted` event, a kubelet that systemd restarts on its own keeps the same boot ID, and nothing else on the node depends on kubelet's boot ID matching the kernel's. |

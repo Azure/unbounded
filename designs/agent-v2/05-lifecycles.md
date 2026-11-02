@@ -135,9 +135,10 @@ sequenceDiagram
 - `nspawn-container`: `systemctl restart systemd-nspawn@<m>`, which runs the
   boot hooks again, matching v1
   (`pkg/agent/phases/nodestart/nspawn_lifecycle.go:36-40`).
-- `host`: Terminate and Unmount ([host runtime cleanup](07-host-runtime-cleanup.md), sections 6 and 7), then start
-  the node units again. Starting them runs the prerequisites and the pre-start
-  boot hook again first ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). The pre-start boot hook gives
+- `host`: Terminate and Unmount ([host runtime cleanup](07-host-runtime-cleanup.md), sections 6 and 7), then restart
+  `unbounded-node-prestart.service`, which runs the prerequisites and the
+  pre-start boot hook again, then start the node units
+  ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). The pre-start boot hook gives
   kubelet a new boot ID, so the Node shows the same reboot signals as on
   `nspawn-container` ([node runtime, section 5.2](03-node-runtime.md#52-host)).
 

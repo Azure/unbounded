@@ -148,9 +148,9 @@ flowchart LR
 | Method | `host` runtime behavior |
 |---|---|
 | `Stop(slot)` | Terminate, then Unmount, then disable `unbounded-node.target` |
-| `Restart(slot)` | Terminate, Unmount, then start the node units again; starting them runs the prerequisites and the pre-start boot hook first ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
-| `Start(slot)`, same slot and bundle as last time | Enable `unbounded-node.target` and start it. No wipe. |
-| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, then enable and start `unbounded-node.target` (section 8) |
+| `Restart(slot)` | Terminate, Unmount, then restart `unbounded-node-prestart.service`, which runs the prerequisites and the pre-start boot hook again, then start the node units ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
+| `Start(slot)`, same slot and bundle as last time | Enable `unbounded-node.target`, restart `unbounded-node-prestart.service`, and start the target. No wipe. |
+| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, then enable `unbounded-node.target`, restart `unbounded-node-prestart.service` and start the target (section 8) |
 | `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotEnabled` for the enabled slot. |
 | `Teardown()` | Every level through Uninstall (section 9) |
 
@@ -205,11 +205,11 @@ sequenceDiagram
   leaves the cgroup populated. Terminate then fails, and Wipe never runs over
   live state.
 
-Preflight for the `host` runtime requires the unified cgroup v2 hierarchy and
-`cgroup.kill`, which needs Linux 5.14 or later *(inference: kernel cgroup v2
-interface)*. Every supported host kernel has it: Ubuntu 24.04 ships 6.8 and
-Azure Linux 3 ships 6.6 *(inference)*. v1 only checks that `/sys/fs/cgroup`
-exists (`pkg/agent/phases/host/preflight_host.go:476-491`).
+The `host` runtime's capability probes require the unified cgroup v2
+hierarchy and `cgroup.kill`, which needs Linux 5.14 or later *(inference:
+kernel cgroup v2 interface)*. The probe checks for the file itself
+([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). v1 only checks that `/sys/fs/cgroup` exists
+(`pkg/agent/phases/host/preflight_host.go:476-491`).
 
 ## 7. Unmount
 

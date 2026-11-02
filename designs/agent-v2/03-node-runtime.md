@@ -32,10 +32,13 @@ const (
 type NodeRuntime interface {
 	Kind() Kind
 
-	// HostRequirements reports what the host must provide or give up:
-	// packages, commands, units to mask or own, kernel modules.
+	// HostRequirements reports what the runtime needs from the host: the
+	// capabilities preflight probes for (section 5.3), the packages and
+	// commands it may install, and the units it masks or owns.
 	HostRequirements(spec *nodespec.NodeSpec) HostRequirements
-	// Preflight returns read-only runtime checks.
+	// Preflight returns read-only runtime checks, including one probe per
+	// required capability. A runtime is supported on a host exactly when its
+	// probes pass.
 	Preflight(spec *nodespec.NodeSpec) []preflight.Checker
 	// OwnedResources lists every unit, path and link the runtime may create.
 	OwnedResources() OwnedResources
@@ -198,7 +201,10 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
   nspawn rootfs, or under the slot directory with mode 0600 on `host`).
 - The digest covers every artifact, unit and non-secret file, but only the path
   and mode of secret files. A refreshed bootstrap token therefore does not
-  change the digest.
+  change the digest. On `nspawn-container` it also covers the OCI image
+  reference, which is the node's root filesystem. Without it, a repave that
+  changes only the image would give the old and new slots the same digest,
+  because the nspawn layout is the same for both slots.
 - `Provision` always writes the secret files, even when the slot already holds
   a bundle with the same digest. Leaving secrets out of the digest keeps a new
   token from causing a wipe on `host`; rewriting them is what puts the new
@@ -249,8 +255,8 @@ with no target in between:
 
 | | `nspawn-container` | `host` |
 |---|---|---|
-| Started at boot through | The enabled machine (`machinectl enable`) | `unbounded-node.target`, enabled by `Start`, which wants `containerd.service`, `kubelet.service` and `localdns.service` |
-| Boot unit | `systemd-nspawn@<m>.service` for the enabled slot | `unbounded-node-prestart.service`, a oneshot that the three node units each `Requires=` and are ordered after |
+| Started at boot through | The enabled machine (`machinectl enable`) | `unbounded-node.target`, enabled by `Start`. It `Requires=` `unbounded-node-prestart.service` and wants `containerd.service`, `kubelet.service` and `localdns.service`. |
+| Boot unit | `systemd-nspawn@<m>.service` for the enabled slot | `unbounded-node-prestart.service`, a oneshot with `RemainAfterExit=yes`. The three node units each have `Requisite=` and `After=` on it, not `Requires=`. |
 | How prerequisites attach | `RequiredBy=systemd-nspawn@.service` in the prerequisite, which covers both slots, plus `After=` in the machine's unit override, as v1 does (`pkg/agent/phases/host/assets/nftables-flush.service:20-21`, `pkg/agent/phases/rootfs/assets/service-override.conf:39`). A `Before=` on the template would not reach the instances (`nftables-flush.service:3-5`). | `RequiredBy=` and `Before=unbounded-node-prestart.service` in the prerequisite |
 | How `nodeDependencies.requires` units attach | `Requires=` and `After=` in the machine's unit override | `Requires=` and `After=` in `unbounded-node-prestart.service` |
 | Pre-start boot hook | A separate oneshot unit, `unbounded-node-boot-hook@<m>.service`, that the machine's override `Requires=` and is ordered after, as v1's config-regeneration unit is (`service-override.conf:37-38`) | Run by `unbounded-node-prestart.service` |
@@ -278,12 +284,34 @@ therefore visible inside the node without a repave. These are the runtime's
 host-side files, not node content, so they are not in the bundle digest and
 never cause a repave. On `host`, the node sees the host's devices directly.
 
-The prerequisite and pre-start units are oneshots with `RemainAfterExit=no`.
-They are inactive once they finish, so every later start of a unit that
-requires them runs them again *(inference)*. That covers a host boot, a
-NodeReboot on `nspawn-container` (`systemctl restart systemd-nspawn@<m>`), and
-starting the node units again on a `host` restart. It is how v1's nftables
-flush already runs again on each machine start. Validation task V5 ([testing, section 7](11-testing.md#7-validation-tasks)) confirms it.
+The prerequisites, and the pre-start boot hook unit on `nspawn-container`, are
+oneshots with `RemainAfterExit=no`. They are inactive once they finish, so a
+start of a unit that requires them runs them again *(inference)*. The
+prerequisites and pre-start boot hook must run once per node start, and never
+because a single node service restarted on its own:
+
+- **`nspawn-container`.** The machine unit is the only unit that requires them,
+  so they run again on every machine start: a host boot, a NodeReboot
+  (`systemctl restart systemd-nspawn@<m>`), or the machine restarting after a
+  failure (`service-override.conf:43`). This is how v1's nftables flush already
+  works. Restarting kubelet or containerd inside the machine does not touch
+  the host's units.
+- **`host`.** kubelet and containerd restart themselves after a failure
+  (`pkg/agent/phases/nodestart/assets/kubelet.service:8`,
+  `containerd.service:12`). If they required `unbounded-node-prestart.service`,
+  every such restart would run the nftables flush on a live node and give
+  kubelet a new boot ID, which the Node reports as a reboot. v1 never does
+  either. So `unbounded-node-prestart.service` stays active after it succeeds
+  (`RemainAfterExit=yes`), and the node units use `Requisite=` on it, which
+  checks that it is active without starting it. A node unit that restarts on
+  its own therefore runs nothing else, and a failed pre-start still keeps the
+  node units from starting. At boot, `unbounded-node.target` requires the
+  pre-start unit, so it runs once before the node units. `Start` and `Restart`
+  restart it explicitly, which runs the prerequisites again through their
+  `RequiredBy=`.
+
+Validation task V5 ([testing, section 7](11-testing.md#7-validation-tasks)) confirms both behaviors, including a
+kubelet restart on `host` that must not run the flush or change the boot ID.
 
 ```mermaid
 sequenceDiagram
@@ -299,6 +327,20 @@ sequenceDiagram
   U->>N: node starts
   N->>N: nspawn-container only, ExecStartPost runs v2 boot-hook post-start
   SD->>D: start daemon, Recover, then reconcile
+```
+
+On `host`, a node service that restarts on its own stops at the boot unit:
+
+```mermaid
+sequenceDiagram
+  participant SD as systemd
+  participant K as kubelet.service
+  participant U as unbounded-node-prestart.service
+  participant P as prerequisite oneshots
+  K->>K: exits, Restart=always
+  SD->>U: Requisite check: active, RemainAfterExit=yes
+  Note over U,P: nothing is started, so no flush and no new boot ID
+  SD->>K: start kubelet again
 ```
 
 The boot hooks run `/opt/unbounded/agent/bin/unbounded-agent-boot-hook`, not
@@ -325,7 +367,7 @@ manifest, and can always read it ([control and state, section 4](04-control-and-
 | Shared host paths | Bind mounts | The paths themselves; `hostPath` must equal `nodePath` |
 | Kubelet exec credential command | Bind-mounted read-only at the same path | The path itself |
 | Resolver | Writes the node's `/etc/resolv.conf` | Never touches the host's `/etc/resolv.conf`. When LocalDNS is enabled, kubelet's `resolvConf` setting points at the LocalDNS resolver file (`pkg/agent/goalstates/resolve.go:163-166`, `pkg/agent/phases/nodestart/kubelet.go:129-130`); otherwise kubelet uses the host's resolver. |
-| Host requirements | `systemd-container`; mask the host's containerd and kubelet | Own `containerd.service` and `kubelet.service`; mask docker; check for conflicting packages |
+| Host requirements | The capabilities in section 5.3; mask the host's containerd and kubelet | The capabilities in section 5.3; own `containerd.service` and `kubelet.service`; mask docker |
 
 ### 5.1 `nspawn-container`
 
@@ -343,8 +385,8 @@ The node runs directly on the host:
   standard names and run in `unboundednode.slice` ([host runtime cleanup, section 6](07-host-runtime-cleanup.md#6-terminate)).
 - Binaries live in the enabled slot's directory; units point at them. A repave
   stages the new slot, then rewrites the units when it switches to that slot.
-- Preflight adds a `conflicting-packages` check for distro packages that ship
-  kubelet, containerd or docker's containerd.
+- A host-owned kubelet or containerd that cannot be disabled is refused by the
+  capability probes (section 5.3).
 - kubelet gets a boot ID of its own that changes at every node start, as it
   does in an nspawn container. The pre-start boot hook writes a random ID to
   `/run/unbounded-node/boot_id`, and `kubelet.service` mounts it over
@@ -376,3 +418,42 @@ The workloads on a `host` node see the real host rather than a container. For
 example, racer's `/dev` hostPath is the host's whole `/dev`
 (`internal/racer/workload/workload.go:269`), and unbounded-net's init container
 reaches the real init with `nsenter -t 1` (`images/net/node-agent-init.sh:17`).
+
+### 5.3 Host capabilities
+
+Whether a runtime can run on a host is decided by what the host can do, not
+by a list of operating systems. Each runtime declares the capabilities it
+needs; preflight probes each one, and the runtime is supported on a host
+exactly when every probe passes. A failing probe names what is missing, for
+example "`/opt/cni/bin` is on a read-only filesystem".
+
+v1 already works this way for most of what it needs: it checks for root, a
+package manager and its packages, writable and executable install directories,
+`systemd-nspawn`, an active docker, containerd or kubelet, swap, disk space and
+cgroups (`pkg/agent/phases/host/preflight_host.go:80-98`), and probes the
+nearest existing parent of a directory it will create rather than the
+directory itself (`preflight_host.go:236-251`). v2 keeps those checks and adds
+the ones each runtime needs:
+
+| Capability | `nspawn-container` | `host` |
+|---|---|---|
+| cgroup v2, unified hierarchy | Required | Required, and `cgroup.kill` must exist ([host runtime cleanup, section 6](07-host-runtime-cleanup.md#6-terminate)); the probe checks the file, not the kernel version |
+| systemd features the units use: `Requisite=`, `Type=notify`, `BindReadOnlyPaths=`, slice delegation | Required | Required |
+| `systemd-nspawn` and `machinectl` | Present, or installable through a working package manager, as v1 installs `systemd-container` (`pkg/agent/phases/host/os.go:21-34`) | Not needed |
+| `nft`, `mountpoint`, `curl` | Present or installable | Present or installable |
+| Writable locations | `/var/lib/machines` and the agent's own directories | The slot directories, `/etc/systemd/system`, the agent's own directories and every path the runtime owns ([host runtime cleanup, section 4](07-host-runtime-cleanup.md#4-owned-resources)), such as `/var/lib/kubelet`, `/etc/kubernetes`, `/opt/cni/bin` and `/etc/cni/net.d` |
+| Programs run from the slot directories | Not needed | The filesystem is not mounted `noexec`, and a test binary staged in a slot directory actually runs, which also covers an enforcing SELinux policy |
+| The host's own containerd and kubelet | Masked, as v1 does | None that cannot be disabled, such as a containerd shipped in a read-only operating system image and enabled there; if present, the probe fails |
+| NVIDIA driver, when GPUs are present | Required, as in v1 | Required, plus the toolkit artifact (section 5.2) |
+
+The probes are the support decision; the end-to-end host matrix only tests
+that each probe gives the expected result on each operating system
+([testing, section 6](11-testing.md#6-ci)). An immutable host, such as Azure Container Linux, is not named
+anywhere: it is supported for a runtime exactly when that runtime's probes pass
+on it.
+
+A Machine that asks for a runtime its host cannot run fails at bootstrap with
+the failing probe in the error, and the Machine's `AgentBootstrapped` condition
+is `False` with reason `RuntimeUnsupported` ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). Provisioning
+cannot know a host's capabilities in advance, so this is where the mismatch
+becomes visible.

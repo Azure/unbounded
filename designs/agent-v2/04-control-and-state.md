@@ -156,14 +156,16 @@ A single `Applied` record replaces v1's per-slot applied-configuration files
 ([v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1)).
 
 The record does not say which slot is enabled or running; only the runtime
-knows that ([node runtime, section 1](03-node-runtime.md#1-node-runtime)). `Recover` compares the bundle digest of the enabled
-slot, as reported by `Inspect`, with the digests in this record:
+knows that ([node runtime, section 1](03-node-runtime.md#1-node-runtime)). `Recover` compares the enabled slot, and its bundle
+digest as reported by `Inspect`, with this record. It checks both the slot and
+the digest, so a repave whose new bundle happens to match the old one is never
+mistaken for no repave:
 
-| Enabled slot's digest | Meaning | `Recover` does |
+| Enabled slot | Meaning | `Recover` does |
 |---|---|---|
-| Matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Repave.Slot` empty) | Continues or retries the approved repave, if any, from the beginning of its first unfinished step |
-| Matches `Repave.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
-| No slot is enabled, and `Repave` is set | The old slot was stopped, but the new one was not started | Continues the approved repave from starting the new slot |
+| Not `Repave.Slot`, digest matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Repave.Slot` empty) | Continues or retries the approved repave, if any, from the beginning of its first unfinished step |
+| `Repave.Slot`, digest matches `Repave.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
+| None, and `Repave` is set | The old slot was stopped, but the new one was not started | Continues the approved repave from starting the new slot |
 | Any other case | The record and the host disagree | Reports `StateMismatch` and changes nothing |
 
 The runtime kind is an install-time setting, so it lives in the install
