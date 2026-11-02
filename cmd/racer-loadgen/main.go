@@ -16,11 +16,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -36,6 +38,7 @@ type options struct {
 	startDelay     time.Duration
 	duration       time.Duration
 	startAt        int64
+	blobDigests    string
 	catalogImages  int
 	catalogBlobs   int
 	catalogWorkers int
@@ -83,6 +86,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.BoolVar(&opts.pull.DiagnoseIntegrity, "diagnose-integrity", false, "Compare deterministic bytes and retain bounded page hashes on integrity failure (requires verify)")
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
+	f.StringVar(&opts.blobDigests, "trusted-blob-digests", "", "Comma-separated digests computed earlier for the first catalog blobs (same seed and size); skips hashing them at startup")
 	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {
@@ -290,7 +294,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	if opts.pull.Backend == "s3" {
 		catalog, err = newBlobCatalog(startupCtx, "benchmark/s3", opts.image.Seed, opts.s3.Count, opts.s3.Bytes)
 	} else if opts.catalogBlobs > 0 {
-		catalog, err = newBlobCatalogWithWorkers(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes, opts.catalogWorkers)
+		catalog, err = newBlobCatalogWithWorkers(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes, opts.catalogWorkers, splitDigests(opts.blobDigests)...)
 	} else {
 		catalog, err = newCatalog(startupCtx, opts.image, opts.catalogImages)
 	}
@@ -383,4 +387,17 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	}
 
 	return err
+}
+
+// splitDigests parses a comma-separated digest list; empty yields none.
+func splitDigests(list string) []digest.Digest {
+	var out []digest.Digest
+
+	for _, field := range strings.Split(list, ",") {
+		if field = strings.TrimSpace(field); field != "" {
+			out = append(out, digest.Digest(field))
+		}
+	}
+
+	return out
 }

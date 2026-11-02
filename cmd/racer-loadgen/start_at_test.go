@@ -34,3 +34,37 @@ func TestParseRejectsNegativeStartAt(t *testing.T) {
 		t.Fatal("expected an error for a negative start-at")
 	}
 }
+
+func TestTrustedBlobDigestMatchesHash(t *testing.T) {
+	ctx := t.Context()
+
+	hashed, err := newBlobCatalogWithWorkers(ctx, "benchmark/image", "seed", 2, 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := hashed.batches[0].blobs[0].descriptor.Digest
+
+	trusted, err := newBlobCatalogWithWorkers(ctx, "benchmark/image", "seed", 2, 1<<20, 1, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := trusted.batches[0].blobs[0].descriptor.Digest; got != want {
+		t.Fatalf("trusted digest = %s, want %s", got, want)
+	}
+
+	if _, err := newBlobCatalogWithWorkers(ctx, "benchmark/image", "seed", 1, 1<<20, 1, "bogus"); err == nil {
+		t.Fatal("expected an invalid trusted digest to fail")
+	}
+}
+
+func TestSplitDigests(t *testing.T) {
+	if got := splitDigests(""); len(got) != 0 {
+		t.Fatalf("empty list = %v", got)
+	}
+
+	if got := splitDigests(" a , ,b"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("split = %v", got)
+	}
+}
