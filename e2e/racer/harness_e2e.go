@@ -369,9 +369,10 @@ func (h *harness) installRacer() {
 	// on change.
 	h.waitExists("configmap", "racer-settings", 5*time.Minute)
 	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-settings", "--type=merge",
-		"-p", `{"data":{"RACER_MAX_THREADS":"3"}}`)
+		"-p", `{"data":{"RACER_MAX_THREADS":"4"}}`)
 
-	// The embedded control plane needs a dedicated thread, so 3 is the floor.
+	// The embedded control plane and disk monitor each need a dedicated
+	// thread, so 4 is the floor.
 	h.rollout("daemonset", "racer", 10*time.Minute)
 	h.waitFor("racer-primary lease held by a live seat", 5*time.Minute, func() (bool, string) {
 		v := h.controlView()
