@@ -152,12 +152,12 @@ type MachineClassBootstrap struct {
 
 // AgentArtifact identifies a digest-pinned agent tarball.
 type AgentArtifact struct {
-	// URL is the agent tarball location: an https URL with a DNS name or IPv4
-	// host and an optional port, or a local file:/// path. It must not embed
-	// credentials, a query, or a fragment.
+	// URL is the agent tarball location: an https URL whose host is a DNS name
+	// or dotted IPv4 address with an optional port from 1 to 65535, or a local
+	// file:/// path. It must not embed credentials, a query, or a fragment.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MaxLength=2048
-	// +kubebuilder:validation:Pattern=`^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?|file://)(/[A-Za-z0-9._~%+=,:-]+)+$`
+	// +kubebuilder:validation:Pattern=`^(https://[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?|file://)(/[A-Za-z0-9._~%+=,:-]+)+$`
 	URL string `json:"url"`
 
 	// SHA256 is the lowercase hex SHA-256 digest of the tarball.
