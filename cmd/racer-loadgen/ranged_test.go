@@ -165,3 +165,26 @@ func TestRangedBodyRotationStillCoversEveryRange(t *testing.T) {
 		t.Fatalf("starts = %v", starts)
 	}
 }
+
+func TestTrailingNumber(t *testing.T) {
+	for in, want := range map[string]int64{"node-0017": 17, "w9": 9} {
+		if got, ok := trailingNumber(in); !ok || got != want {
+			t.Fatalf("trailingNumber(%q) = %d, %v", in, got, ok)
+		}
+	}
+
+	for _, in := range []string{"", "node", "n1234567890123456789"} {
+		if _, ok := trailingNumber(in); ok {
+			t.Fatalf("trailingNumber(%q) should fail", in)
+		}
+	}
+}
+
+func TestRangeCohortRotation(t *testing.T) {
+	p := &puller{opts: pullOptions{RangeBytes: 10, RangeCohorts: 4, NodeName: "w0006"}}
+
+	// 100 ranges, cohort 6 % 4 = 2, so start at range 50.
+	if got := p.rangeRotation(1000); got != 50 {
+		t.Fatalf("rotation = %d, want 50", got)
+	}
+}
