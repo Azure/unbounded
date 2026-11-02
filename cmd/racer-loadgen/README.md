@@ -200,6 +200,28 @@ bounds catalog hashing and origin startup; UDS origin readiness also has a
 dataplane has successfully acquired data. The UDS readiness probe talks directly
 to the origin and does not warm measured objects in Racer.
 
+### Large blobs and coordinated starts
+
+These flags help when many nodes load one very large blob, such as 1 TB:
+
+- `--trusted-blob-digests=sha256:...` (comma-separated, one per catalog index,
+  starting at 0) skips startup hashing for those blobs. Use digests computed
+  earlier for the same seed, index, and size. A wrong digest is not detected
+  at startup.
+- `--start-at=<unix seconds>` waits until that time after `--start-delay`, so
+  pods that become ready at different times start together.
+- `--page-credits=N` (UDS only, 0-64) sets how many pages Racer may send ahead
+  of each read. The dataplane's fetch window for a read is the smaller of this
+  and `RACER_RANGE_WINDOW_PAGES`; 0 keeps the SDK default of 2.
+- `--range-bytes=N` (UDS only, requires `--verify=false`) reads each blob as
+  byte ranges pinned to one ETag. `--range-parallel` ranges run at once (raise
+  `--blob-concurrency` to at least the same value, since it sizes the SDK
+  connection pool). A range that fails mid-transfer resumes at its first
+  unread byte, up to `--range-retries` times, and counts in
+  `racer_loadgen_range_resumes_total`. `--range-rotate` starts each pod at a
+  range derived from its host name, so nodes do not all request the same
+  pages at the same moment.
+
 ## Memory and measurement
 
 By default, reads drain with `io.Copy` to an open `/dev/null` file reused for the
