@@ -424,6 +424,10 @@ fn window_error(error: flow_control::Error) -> Error {
 }
 
 /// Client range progress admits independent pages under bounded child allowances.
+/// Restarts of one page's direct fill after transient failures. Each restart
+/// gets a fresh page budget, so this bounds total attempts per page.
+const PAGE_RETRIES: u8 = 16;
+
 enum RangeBudget {
     ClientPages {
         deadline: Instant,
@@ -599,6 +603,9 @@ pub struct RangeStream {
     sealed: Option<SealedTarget>,
 
     terminated: bool,
+
+    /// Direct fills restarted after a transient failure, per page.
+    retries: BTreeMap<u64, u8>,
 }
 
 impl RangeStreams {
@@ -670,6 +677,7 @@ impl RangeStreams {
             spill: None,
             sealed: None,
             terminated: false,
+            retries: BTreeMap::new(),
         })
     }
 }
@@ -871,6 +879,47 @@ impl RangeStream {
         self.slots.get_mut(index)
     }
 
+    /// The slot for a finished direct fill. A fill that failed only because
+    /// owners and helpers were busy (`Overloaded`) or its attempts ran out
+    /// (`Unavailable`) is fetched again with a fresh page budget, up to
+    /// [`PAGE_RETRIES`] times per page, rather than ending the whole read.
+    /// Under heavy fan-in these failures are transient: the page's owners
+    /// shed readers to helpers, and a later attempt usually succeeds.
+    fn retry_or(&mut self, number: PageNumber, result: Result<PageResult>) -> Slot {
+        match result {
+            Err(Error::Overloaded | Error::Unavailable)
+                if self.per_page_budget()
+                    && self.scope.check().is_ok()
+                    && self.retry_page(number) =>
+            {
+                Slot::Missing { select: false }
+            }
+            result => Slot::Ready(result),
+        }
+    }
+
+    /// Whether every page fill gets its own fresh budget, so a restart does
+    /// not spend credits other pages need.
+    fn per_page_budget(&self) -> bool {
+        matches!(
+            self.budget,
+            RangeBudget::ClientPages { .. } | RangeBudget::ProgressingPages { .. }
+        )
+    }
+
+    /// Count one restart of `number`'s fill; false once its retries are spent.
+    fn retry_page(&mut self, number: PageNumber) -> bool {
+        // Pages behind the delivery cursor never come back.
+        let next = self.next;
+        self.retries.retain(|page, _| *page >= next);
+        let count = self.retries.entry(number.0).or_insert(0);
+        if *count >= PAGE_RETRIES {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
     fn poll_slots(&mut self, cx: &mut Context<'_>) -> Result<bool> {
         let mut changed = false;
         for index in 0..self.slots.len() {
@@ -895,9 +944,10 @@ impl RangeStream {
                         if let (Ok(page), Some(lease)) = (&result, &self.lease) {
                             lease.offer(page);
                         }
-                        Slot::Ready(self.budget.complete(remaining).and(result))
+                        let result = self.budget.complete(remaining).and(result);
+                        self.retry_or(number, result)
                     }
-                    Poll::Ready(Err(error)) => Slot::Ready(Err(error)),
+                    Poll::Ready(Err(error)) => self.retry_or(number, Err(error)),
                 },
                 Slot::FetchingSealed(fetch) => match fetch.as_mut().poll(cx) {
                     Poll::Pending => continue,
@@ -2263,6 +2313,50 @@ pub(super) mod tests {
         stream.budget = budget;
         stream
     }
+    #[test]
+    fn transient_fill_failures_are_refetched_until_retries_run_out() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let failing = |error| -> Slot {
+            let budget = AcquisitionBudget::new(deadline, 8, 16);
+            Slot::Fetching(Box::pin(async move { Ok((Err(error), budget)) }))
+        };
+        stream.inject(failing(Error::Overloaded));
+        stream.poll_slots(&mut cx).unwrap();
+        assert!(matches!(stream.slots[0], Slot::Missing { select: false }));
+        for _ in 1..PAGE_RETRIES {
+            stream.slots[0] = failing(Error::Unavailable);
+            stream.poll_slots(&mut cx).unwrap();
+            assert!(matches!(stream.slots[0], Slot::Missing { select: false }));
+        }
+        // The page's retries are spent: the failure now reaches the reader.
+        stream.slots[0] = failing(Error::Overloaded);
+        stream.poll_slots(&mut cx).unwrap();
+        assert!(matches!(
+            stream.slots[0],
+            Slot::Ready(Err(Error::Overloaded))
+        ));
+    }
+
+    #[test]
+    fn non_transient_fill_failures_are_not_refetched() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let budget = AcquisitionBudget::new(deadline, 8, 16);
+        stream.inject(Slot::Fetching(Box::pin(async move {
+            Ok((Err(Error::CorruptRecord), budget))
+        })));
+        stream.poll_slots(&mut cx).unwrap();
+        assert!(matches!(
+            stream.slots[0],
+            Slot::Ready(Err(Error::CorruptRecord))
+        ));
+    }
+
     #[test]
     fn out_of_order_completion_waits_for_front_and_returns_only_unused_credits() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
