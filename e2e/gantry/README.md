@@ -13,11 +13,12 @@ peer fetch.
 - ✅ Pull-through + warm peer reuse - installs `hosts.toml`, pulls
    `registry.k8s.io/e2e-test-images/agnhost:2.39` on two workers, and
    asserts advertise + peer-fetch metrics increase.
-- ✅ Multi-arch index digest with missing media-type metadata - seeds a real
-   index and node-platform graph on one node, removes its image metadata,
-   restarts the seed Gantry process, verifies the peer response labels the
-   remaining bare index correctly, then pulls the digest through Gantry from a
-   nonexistent repository so origin fallback cannot hide a failure.
+- ✅ Multi-arch index digest with missing media-type metadata - builds a local
+   amd64/arm64 scratch-image fixture, imports its OCI archive on one node,
+   removes image metadata, restarts the seed Gantry process, and verifies the
+   bare index response. A side-loaded HTTPS registry answers auth probes but
+   returns 404 for all image content, so origin fallback cannot hide a failure.
+   This scenario does not contact `registry.k8s.io` for setup or authentication.
 - ✅ Cold-start designated origin puller - two concurrent pulls
    across two workers, asserts the **per-digest HRW invariant**: every
    blob's `please_pull served` log line appears on at most one pod (no
@@ -87,7 +88,7 @@ prereq CLIs:
 | `waitForRollout()` | polls `kubectl rollout status ds/gantry -n unbounded-system` |
 | `checkReadyz()` | port-forwards one Gantry pod and curls `/readyz` on port 9095 |
 | pull-through check | installs `hosts.toml` on each kind node, removes the test image from node-local containerd, schedules a pull on worker A, waits for advertise metrics, evicts the seed copy that cold start left on worker B, then schedules the same image on worker B and waits for `p2p_peer_fetch_total{outcome="hit"}` on worker B's Gantry pod |
-| multi-arch cache-miss check | stores a real multi-platform graph, removes its image record, restarts the seed Gantry pod, verifies the index response from the seed's transfer endpoint, then pulls the index digest from another node using a nonexistent origin repository |
+| multi-arch cache-miss check | builds static pause binaries for amd64 and arm64, creates a deterministic OCI archive, imports it only on the seed, labels its graph as GC roots, removes the image record, and restarts the seed Gantry pod. Verifies the index response, then pulls from another node through a local HTTPS registry that serves auth probes but never image content |
 | `teardown()` | `kind delete cluster` (skipped when `E2E_KEEP=1`) |
 
 The smoke test also installs a `hosts.toml` mirror entry for
@@ -100,10 +101,35 @@ The kind config (`kind-config.yaml`) declares one control-plane + two
 worker nodes - enough to exercise multi-peer coord paths in future
 scenarios.
 
+### Local multi-arch fixtures
+
+`fixture/` builds OCI indexes, manifests, configs, and executable layers without
+public base images. Tar timestamps, JSON encoding, and architecture ordering are
+fixed; Go binaries are built with `CGO_ENABLED=0`, `-trimpath`, and an empty build
+ID. The same source and Go toolchain produce the same image digests.
+
+The workload archive is imported directly into the seed's containerd. The local
+registry uses a separately side-loaded scratch image with a disjoint content
+graph, so loading the registry cannot warm the requester. Its generated TLS
+certificate is trusted by both Gantry and node-local containerd; production
+authentication behavior is unchanged. It answers `/v2/` with anonymous success
+and rejects every content request with 404.
+
+The multi-arch scenario is registry-independent after normal kind/Gantry image
+setup. Other scenarios still use the public agnhost image. Cold setup still
+needs the normal kind node image, Gantry build dependencies, and image bases.
+
+Pure fixture tests do not require a cluster:
+
+```sh
+go test ./e2e/gantry/fixture/...
+```
+
 ## Build tag
 
-All e2e files carry `//go:build e2e`. Default `go test ./...` skips
-them. Run with:
+The integration harness and cluster scenarios carry `//go:build e2e`.
+Default `go test ./...` skips the cluster suite but runs the pure fixture tests.
+Run the integration suite with:
 
 ```sh
 go test -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
