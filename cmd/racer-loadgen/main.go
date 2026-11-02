@@ -35,6 +35,7 @@ type options struct {
 	metricsListen  string
 	startDelay     time.Duration
 	duration       time.Duration
+	startAt        int64
 	catalogImages  int
 	catalogBlobs   int
 	catalogWorkers int
@@ -82,6 +83,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.BoolVar(&opts.pull.DiagnoseIntegrity, "diagnose-integrity", false, "Compare deterministic bytes and retain bounded page hashes on integrity failure (requires verify)")
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
+	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {
 		return opts, err
@@ -140,8 +142,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, fmt.Errorf("catalog-workers must be in [1, %d]", maxCatalogWorkers)
 	}
 
-	if opts.startDelay < 0 || opts.duration < 0 {
-		return opts, errors.New("start-delay and duration must be nonnegative")
+	if opts.startDelay < 0 || opts.duration < 0 || opts.startAt < 0 {
+		return opts, errors.New("start-delay, duration, and start-at must be nonnegative")
 	}
 
 	if opts.catalogImages < 1 || opts.catalogImages > maxCatalogImages {
@@ -356,7 +358,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 		ready.Store(catalog)
 		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "cache", p.opts.Cache, "concurrency", opts.pull.Concurrency)
 
-		if waitPullDelay(ctx, opts.startDelay) {
+		if waitPullDelay(ctx, opts.startDelay) && waitPullDelay(ctx, untilStart(opts.startAt, time.Now())) {
 			loadCtx := ctx
 
 			if opts.duration > 0 {
