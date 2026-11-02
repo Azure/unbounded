@@ -390,8 +390,9 @@ fn is_busy(error: &io::Error) -> bool {
 
 /// Opens every candidate once in order, then retries only busy candidates
 /// under one shared deadline so devices wait concurrently, not sequentially.
-/// Non-busy errors, and busy errors when `wait` is zero, are skipped
-/// immediately. Returns the candidates still busy at the deadline.
+/// Non-busy errors are skipped immediately. Returns the candidates still busy
+/// at the deadline, or after the first pass when `wait` is zero, so the caller
+/// records them as busy rather than missing.
 fn open_with_busy_wait<C: Candidate>(
     candidates: Vec<C>,
     wait: Duration,
@@ -402,13 +403,22 @@ fn open_with_busy_wait<C: Candidate>(
     for candidate in candidates {
         match open(&candidate) {
             Ok(()) => {}
-            Err(error) if is_busy(&error) && !wait.is_zero() => busy.push(candidate),
+            Err(error) if is_busy(&error) => busy.push(candidate),
             Err(error) => {
                 eprintln!("racer: skipping block device {:?}: {error}", candidate.id());
             }
         }
     }
     if busy.is_empty() {
+        return busy;
+    }
+    if wait.is_zero() {
+        for candidate in &busy {
+            eprintln!(
+                "racer: skipping block device {:?}: busy and busy wait is disabled",
+                candidate.id()
+            );
+        }
         return busy;
     }
     eprintln!(
@@ -1080,12 +1090,23 @@ pub(super) mod tests {
     fn zero_wait_disables_busy_retry() {
         let mut clock = FakeClock(Duration::ZERO);
         let mut calls = 0;
-        let left = open_with_busy_wait(candidates(&["a"]), Duration::ZERO, &mut clock, |_| {
-            calls += 1;
-            Err(busy())
-        });
-        assert!(left.is_empty());
-        assert_eq!(calls, 1);
+        let left = open_with_busy_wait(
+            candidates(&["a", "b", "c"]),
+            Duration::ZERO,
+            &mut clock,
+            |(id, _)| {
+                calls += 1;
+                match id.as_str() {
+                    "a" => Err(busy()),
+                    "b" => Err(io::Error::from_raw_os_error(libc::EIO)),
+                    _ => Ok(()),
+                }
+            },
+        );
+        // Busy devices are returned so discovery reports them as busy, not
+        // missing; other failures and successes are not.
+        assert_eq!(left, candidates(&["a"]));
+        assert_eq!(calls, 3);
         assert_eq!(clock.0, Duration::ZERO);
     }
 
