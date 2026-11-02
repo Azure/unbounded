@@ -59,7 +59,7 @@ struct Outer {
     report: Mutex<Option<String>>,
     report_parts: Mutex<ReportParts>,
     report_generation: AtomicU64,
-    approved_disks: Mutex<Option<Vec<String>>>,
+    approved_disks: Mutex<Option<crate::disks::Approval>>,
     stop: AtomicBool,
     diagnostics: Mutex<Diagnostics>,
 }
@@ -69,6 +69,7 @@ struct Outer {
 struct ReportParts {
     base: Option<Report>,
     disks: Vec<crate::disks::DiskStatus>,
+    disks_revision: Option<String>,
 }
 
 /// Owner of the control thread. Dropping it stops and joins the thread.
@@ -321,21 +322,23 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
                 );
             }
             let rv = str_at(&node, &["metadata", "resourceVersion"]).to_owned();
+            let approval = crate::disks::Approval::from_annotations(&annotations);
             Ok((
                 Bootstrap {
                     cluster: racer_control_wire::ClusterId(uid),
-                    disks: crate::disks::approved(&annotations),
+                    disks: approval.disks.clone(),
                 },
+                approval,
                 rv,
             ))
         }
         .await;
         match result {
-            Ok((b, rv)) => {
+            Ok((b, approval, rv)) => {
                 *outer
                     .approved_disks
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(b.disks.clone());
+                    .unwrap_or_else(|e| e.into_inner()) = Some(approval);
                 if exec::spawn(follow_node(shared.clone(), outer.clone(), rv)).is_err() {
                     eprintln!("racer-control: cannot follow Node disk approvals");
                 }
@@ -370,14 +373,16 @@ async fn follow_node(shared: Rc<Shared>, outer: Arc<Outer>, mut rv: String) {
         crate::kube::escape(&format!("metadata.name={node}"))
     );
     let publish = |object: &serde_json::Value| {
-        let disks =
-            crate::disks::approved(&crate::kube::map_at(object, &["metadata", "annotations"]));
+        let approval = crate::disks::Approval::from_annotations(&crate::kube::map_at(
+            object,
+            &["metadata", "annotations"],
+        ));
         let mut approved = outer
             .approved_disks
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if approved.as_ref() != Some(&disks) {
-            *approved = Some(disks);
+        if approved.as_ref() != Some(&approval) {
+            *approved = Some(approval);
         }
     };
     let mut backoff = 1u64;
@@ -565,12 +570,35 @@ impl Handle {
         self.publish_report(&parts)
     }
 
+    /// Report the approval revision the published disk states reflect. The
+    /// caller must only pass the revision of an approval whose disk set it
+    /// has applied; `None` withdraws it.
+    pub fn report_disks_revision(&self, revision: Option<String>) -> Result<(), Error> {
+        if revision
+            .as_deref()
+            .is_some_and(|v| !crate::disks::valid_revision(v))
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut parts = self
+            .outer
+            .report_parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if parts.disks_revision == revision {
+            return Ok(());
+        }
+        parts.disks_revision = revision;
+        self.publish_report(&parts)
+    }
+
     fn publish_report(&self, parts: &ReportParts) -> Result<(), Error> {
         let Some(base) = &parts.base else {
             return Ok(());
         };
-        let encoded = rails::encode_report_with_disks(base, &parts.disks)
-            .map_err(|_| Error::InvalidConfiguration)?;
+        let encoded =
+            rails::encode_report_full(base, &parts.disks, parts.disks_revision.as_deref())
+                .map_err(|_| Error::InvalidConfiguration)?;
         *self.outer.report.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoded);
         self.outer.report_generation.fetch_add(1, Ordering::SeqCst);
         self.notifier.notify();
@@ -580,6 +608,12 @@ impl Handle {
     /// Latest approved disks from this Node, followed by a watch after
     /// bootstrap. `None` before bootstrap has read the Node.
     pub fn approved_disks(&self) -> Option<Vec<String>> {
+        self.approval().map(|a| a.disks)
+    }
+
+    /// Latest approved disks and approval revision from this Node, read
+    /// together. `None` before bootstrap has read the Node.
+    pub fn approval(&self) -> Option<crate::disks::Approval> {
         self.outer
             .approved_disks
             .lock()

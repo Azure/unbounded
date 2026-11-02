@@ -1,6 +1,7 @@
 {
   "shares": 4,
   "rdma_nics": [],
+  "disks_revision": "rev-1",
   "disks": [
     {
       "id": "wwn-0x5000c500a1b2c3d4",

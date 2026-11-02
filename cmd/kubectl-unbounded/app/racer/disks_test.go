@@ -311,11 +311,24 @@ func TestAllowWait(t *testing.T) {
 			return false, nil, nil
 		}
 
-		return true, &corev1.PodList{Items: []corev1.Pod{*pod("p2", "n", setState(t, fixture(t), id, "claimed", ""))}}, nil
+		// Read through the tracker; calling the clientset here would deadlock.
+		o, err := h.c.Tracker().Get(corev1.SchemeGroupVersion.WithResource("nodes"), "", "n")
+		if err != nil {
+			return true, nil, err
+		}
+
+		rev := o.(*corev1.Node).Annotations[disks.RevisionAnnotation]
+		report := withRevision(t, setState(t, fixture(t), id, "claimed", ""), rev)
+
+		return true, &corev1.PodList{Items: []corev1.Pod{*pod("p2", "n", report)}}, nil
 	})
 
 	if err := h.e.allow(ctx, "n", []string{id}, allowOpts{yes: true, wait: true, timeout: 5 * time.Second}); err != nil {
 		t.Fatal(err)
+	}
+
+	if lists.Load() < 3 {
+		t.Fatalf("accepted a report before the new revision: %d lists", lists.Load())
 	}
 
 	if !strings.Contains(h.out.String(), id+": claimed") {
@@ -328,16 +341,81 @@ func TestAllowWait(t *testing.T) {
 		return true, &corev1.PodList{Items: []corev1.Pod{*pod("p", "n", setState(t, fixture(t), id, "rejected", "wipe-failed"))}}, nil
 	})
 
-	err := h.e.waitClaimed(ctx, h.c, ns, "n", []string{id}, 5*time.Second)
+	err := h.e.waitClaimed(ctx, h.c, ns, "n", "", []string{id}, 5*time.Second)
 	if err == nil || !strings.Contains(h.out.String(), "rejected (wipe-failed)") {
 		t.Fatalf("rejected: %v %s", err, h.out)
 	}
 
 	// Timeout: stays available.
 	h = newHarness("", false, node("n", nil), pod("p", "n", fixture(t)))
-	if err := h.e.waitClaimed(ctx, h.c, ns, "n", []string{id}, 20*time.Millisecond); err == nil || !strings.Contains(err.Error(), "timed out") {
+	if err := h.e.waitClaimed(ctx, h.c, ns, "n", "", []string{id}, 20*time.Millisecond); err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("timeout: %v", err)
 	}
+}
+
+func TestAllowWaitIgnoresStaleRevision(t *testing.T) {
+	ctx := context.Background()
+	id := "wwn-0x2222"
+
+	// A report from before the approval change, here a stale rejection,
+	// must not satisfy the wait even though its state is terminal.
+	stale := withRevision(t, fixture(t), "old")
+	h := newHarness("", false, node("n", nil), pod("p", "n", stale))
+
+	err := h.e.waitClaimed(ctx, h.c, ns, "n", "new", []string{id}, 50*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "timed out") || strings.Contains(h.out.String(), "rejected") {
+		t.Fatalf("stale: %v %s", err, h.out)
+	}
+
+	// The same report is accepted once it carries the requested revision.
+	h = newHarness("", false, node("n", nil), pod("p", "n", withRevision(t, fixture(t), "new")))
+
+	err = h.e.waitClaimed(ctx, h.c, ns, "n", "new", []string{id}, 5*time.Second)
+	if err == nil || !strings.Contains(h.out.String(), "rejected (too-small)") {
+		t.Fatalf("current: %v %s", err, h.out)
+	}
+}
+
+func TestUpdateApprovedSetsRevision(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness("", false, node("n", nil))
+
+	add := func(cur []string) []string { return append(cur, "wwn-1") }
+
+	r1, err := updateApproved(ctx, h.c, "n", add)
+	if err != nil || r1 == "" {
+		t.Fatalf("first: %q %v", r1, err)
+	}
+
+	n, err := h.c.CoreV1().Nodes().Get(ctx, "n", metav1.GetOptions{})
+	if err != nil || n.Annotations[disks.RevisionAnnotation] != r1 {
+		t.Fatalf("annotation: %v %v", n.Annotations, err)
+	}
+
+	// No change leaves the revision alone.
+	if r, err := updateApproved(ctx, h.c, "n", func(cur []string) []string { return cur }); err != nil || r != "" {
+		t.Fatalf("unchanged: %q %v", r, err)
+	}
+
+	// Revoking everything still records a new revision.
+	r2, err := updateApproved(ctx, h.c, "n", func([]string) []string { return nil })
+	if err != nil || r2 == "" || r2 == r1 {
+		t.Fatalf("revoke: %q %q %v", r1, r2, err)
+	}
+}
+
+func withRevision(t *testing.T, report, rev string) string {
+	t.Helper()
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(report), &m); err != nil {
+		t.Fatal(err)
+	}
+
+	m["disks_revision"] = rev
+	b, _ := json.Marshal(m)
+
+	return string(b)
 }
 
 func TestRevoke(t *testing.T) {

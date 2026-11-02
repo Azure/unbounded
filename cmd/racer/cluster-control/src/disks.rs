@@ -48,6 +48,44 @@ pub fn approved(annotations: &BTreeMap<String, String>) -> Vec<String> {
     })
 }
 
+/// Largest accepted [`DISKS_REVISION`](crate::annotations::DISKS_REVISION) value.
+pub const MAX_REVISION_BYTES: usize = 64;
+
+/// Approval revision from Node annotations. `None` when absent or not
+/// 1 to [`MAX_REVISION_BYTES`] ASCII letters, digits, `.`, `_`, or `-`.
+pub fn revision(annotations: &BTreeMap<String, String>) -> Option<String> {
+    let value = annotations.get(crate::annotations::DISKS_REVISION)?;
+    valid_revision(value).then(|| value.clone())
+}
+
+/// Whether `value` is a well-formed approval revision.
+pub fn valid_revision(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_REVISION_BYTES
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Disk approval read from a Node.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Approval {
+    /// Approved disk IDs; see [`approved`].
+    pub disks: Vec<String>,
+    /// Approval revision; see [`revision`].
+    pub revision: Option<String>,
+}
+
+impl Approval {
+    /// Approval from Node annotations.
+    pub fn from_annotations(annotations: &BTreeMap<String, String>) -> Self {
+        Self {
+            disks: approved(annotations),
+            revision: revision(annotations),
+        }
+    }
+}
+
 /// Whether the retired regex selector annotation is still set.
 pub fn has_legacy_selector(annotations: &BTreeMap<String, String>) -> bool {
     annotations.contains_key(crate::annotations::LEGACY_BLOCK_DEVICES)
@@ -197,6 +235,28 @@ mod tests {
             "nvme".into(),
         );
         assert!(has_legacy_selector(&a));
+    }
+
+    #[test]
+    fn revisions_are_short_tokens() {
+        let mut a = BTreeMap::new();
+        assert_eq!(revision(&a), None);
+        a.insert(crate::annotations::DISKS.into(), "wwn-1".into());
+        a.insert(crate::annotations::DISKS_REVISION.into(), "r-1.a_B".into());
+        assert_eq!(
+            Approval::from_annotations(&a),
+            Approval {
+                disks: vec!["wwn-1".into()],
+                revision: Some("r-1.a_B".into()),
+            }
+        );
+        let long = "a".repeat(MAX_REVISION_BYTES);
+        assert!(valid_revision(&long));
+        for bad in ["", "a b", "a/b", "\u{e9}", "a\"b", &format!("{long}a")] {
+            assert!(!valid_revision(bad), "{bad}");
+            a.insert(crate::annotations::DISKS_REVISION.into(), bad.into());
+            assert_eq!(revision(&a), None, "{bad}");
+        }
     }
 
     #[test]

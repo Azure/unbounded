@@ -7,6 +7,8 @@
 package disks
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,12 @@ const (
 	// basenames, comma separated. Approving a disk consents to Racer wiping
 	// its first and last 1 MiB.
 	Annotation = "racer.unbounded-cloud.io/disks"
+
+	// RevisionAnnotation is the Node annotation holding an opaque token that
+	// changes with every Annotation change made by kubectl-unbounded. The
+	// dataplane echoes it in Report.DisksRevision once the disk set it
+	// applied matches Annotation.
+	RevisionAnnotation = "racer.unbounded-cloud.io/disks-revision"
 
 	// ReportAnnotation is the dataplane Pod annotation holding the JSON report.
 	ReportAnnotation = "racer.unbounded-cloud.io/report"
@@ -65,6 +73,20 @@ type Disk struct {
 // when the dataplane predates disk reporting.
 type Report struct {
 	Disks []Disk `json:"disks"`
+
+	// DisksRevision is the RevisionAnnotation value whose approved set the
+	// reported disk states reflect. Empty when unknown.
+	DisksRevision string `json:"disks_revision,omitempty"`
+}
+
+// NewRevision returns a fresh random RevisionAnnotation value.
+func NewRevision() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate disk approval revision: %w", err)
+	}
+
+	return hex.EncodeToString(b), nil
 }
 
 // ParseReport decodes a report annotation value. Unknown fields are ignored.

@@ -38,6 +38,18 @@ pub trait ClusterControl: Send + Sync + 'static {
     fn approved_disks(&self) -> Option<Vec<String>> {
         None
     }
+
+    /// Latest approved disks and approval revision, read together.
+    fn approval(&self) -> Option<racer_cluster_control::disks::Approval> {
+        self.approved_disks()
+            .map(|disks| racer_cluster_control::disks::Approval {
+                disks,
+                revision: None,
+            })
+    }
+
+    /// Enqueue the approval revision the reported disk states reflect.
+    fn report_disks_revision(&self, _revision: Option<String>) {}
 }
 
 /// Cluster state returned once cluster control has initialized or joined it.

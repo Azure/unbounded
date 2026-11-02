@@ -10,6 +10,11 @@
 //!   [`DEBOUNCE`] (the latest value wins, and reverting cancels), or
 //! - an approved disk that was missing at startup appears.
 //!
+//! While the latest approved set equals the startup set, the monitor echoes
+//! the Node's approval revision in the Pod report, so a writer can tell that
+//! the reported states reflect its change. It stops echoing once a restart is
+//! requested, so a draining process never vouches for a newer approval.
+//!
 //! A restart drains workers through the normal shutdown path and exits with
 //! [`Error::DiskApprovalChanged`](crate::error::Error::DiskApprovalChanged), so
 //! the DaemonSet restarts the container and storage is planned again. The
@@ -84,6 +89,17 @@ impl Debounce {
     }
 }
 
+/// Revision to report for `latest`: `Some` only when its disk set is the one
+/// applied at startup. A changed set keeps the last reported revision.
+fn applied_revision(
+    debounce: &Debounce,
+    latest: Option<racer_cluster_control::disks::Approval>,
+) -> Option<Option<String>> {
+    latest
+        .filter(|a| same_set(&a.disks, &debounce.startup))
+        .map(|a| a.revision)
+}
+
 /// Approved IDs missing at startup that now resolve to a block device.
 fn appeared(context: &Context, device_directory: &Path) -> Option<String> {
     context
@@ -153,14 +169,18 @@ fn run(
                 return;
             }
         }
-        let latest = control.approved_disks();
-        if debounce.observe(now, latest.as_deref()) {
+        let latest = control.approval();
+        let disks = latest.as_ref().map(|a| a.disks.as_slice());
+        if debounce.observe(now, disks) {
             eprintln!(
                 "racer: approved disks changed to {:?}; restarting to apply (this node's cache is dropped)",
-                latest.unwrap_or_default()
+                latest.map(|a| a.disks).unwrap_or_default()
             );
             RESTART_REQUESTED.store(true, Ordering::Relaxed);
             return;
+        }
+        if let Some(revision) = applied_revision(&debounce, latest) {
+            control.report_disks_revision(revision);
         }
         std::thread::park_timeout(TICK);
     }
@@ -219,6 +239,29 @@ mod tests {
         assert!(!d.observe(at(20), Some(&ids(&["a"]))));
         assert!(!d.observe(at(20), Some(&ids(&[]))));
         assert!(d.observe(at(30), Some(&ids(&[]))));
+    }
+
+    #[test]
+    fn revisions_are_echoed_only_for_the_applied_set() {
+        use racer_cluster_control::disks::Approval;
+        let d = Debounce::new(ids(&["a", "b"]));
+        let approval = |v: &[&str], r: Option<&str>| Approval {
+            disks: ids(v),
+            revision: r.map(str::to_owned),
+        };
+        assert_eq!(applied_revision(&d, None), None);
+        assert_eq!(
+            applied_revision(&d, Some(approval(&["b", "a"], Some("r2")))),
+            Some(Some("r2".into()))
+        );
+        assert_eq!(
+            applied_revision(&d, Some(approval(&["a", "b"], None))),
+            Some(None)
+        );
+        assert_eq!(
+            applied_revision(&d, Some(approval(&["a"], Some("r3")))),
+            None
+        );
     }
 
     #[test]

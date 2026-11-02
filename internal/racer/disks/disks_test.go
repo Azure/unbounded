@@ -11,6 +11,23 @@ import (
 	"testing"
 )
 
+func TestNewRevision(t *testing.T) {
+	a, err := NewRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := NewRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The dataplane accepts 1 to 64 bytes of [A-Za-z0-9._-].
+	if a == b || len(a) != 32 || strings.Trim(a, "0123456789abcdef") != "" {
+		t.Fatalf("revisions %q %q", a, b)
+	}
+}
+
 func TestParseReportFixture(t *testing.T) {
 	b, err := os.ReadFile("../testdata/disk-report.json")
 	if err != nil {
@@ -22,8 +39,8 @@ func TestParseReportFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(r.Disks) != 5 {
-		t.Fatalf("got %d disks", len(r.Disks))
+	if len(r.Disks) != 5 || r.DisksRevision != "rev-1" {
+		t.Fatalf("got %d disks, revision %q", len(r.Disks), r.DisksRevision)
 	}
 
 	d := r.Disks[0]

@@ -321,13 +321,20 @@ fn cold_start_elects_commits_serves_and_fails_closed() {
     cluster.inspect(async |k| {
         k.merge_patch(
             "/api/v1/nodes/n1",
-            &json!({"metadata":{"annotations":{annotations::DISKS:"wwn-0x9"}}}),
+            &json!({"metadata":{"annotations":{
+                annotations::DISKS:"wwn-0x9",
+                annotations::DISKS_REVISION:"r9",
+            }}}),
         )
         .await
         .unwrap()
     });
     assert!(wait_for(Duration::from_secs(20), || {
-        h1.approved_disks().as_deref() == Some(&["wwn-0x9".to_owned()][..])
+        h1.approval()
+            == Some(crate::disks::Approval {
+                disks: vec!["wwn-0x9".into()],
+                revision: Some("r9".into()),
+            })
     }));
     cluster.inspect(async |k| {
         k.merge_patch(

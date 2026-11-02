@@ -340,6 +340,13 @@ not be `.` or `..`. The value is limited to 4 KiB and 256 disks. If any entry is
 files. Each ID must name a whole disk; a partition is rejected. Several IDs for
 the same disk are used once.
 
+Each change made by the plugin also sets the Node annotation
+`racer.unbounded-cloud.io/disks-revision` to a new random token. While a
+dataplane's applied disk set matches the Node, it echoes that token as
+`disks_revision` in its report, and stops echoing once it starts restarting.
+`allow --wait` only accepts states from a report carrying the token it wrote,
+so it never reads the result of an earlier approval.
+
 **Upgrade note:** the old `racer.unbounded-cloud.io/block-devices` regex is no
 longer honored, because it never granted consent to wipe. Racer logs a warning
 when it is still set. Approve the same disks with

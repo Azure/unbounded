@@ -336,15 +336,16 @@ func (e *env) confirm(yes bool) error {
 
 // updateApproved applies fn to the Node's approved list and writes it with
 // Update, whose resourceVersion check fails with a Conflict if the Node
-// changed since the read; conflicts are retried. It reports whether the
-// Node changed. If the existing annotation is invalid, the dataplane approves
-// no disks, so any result other than clearing it is refused rather than
-// turning its entries into effective approval.
-func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn func([]string) []string) (bool, error) {
-	changed := false
+// changed since the read; conflicts are retried. Every change also sets
+// disks.RevisionAnnotation to a fresh token, which it returns; it returns ""
+// when the Node did not change. If the existing annotation is invalid, the
+// dataplane approves no disks, so any result other than clearing it is
+// refused rather than turning its entries into effective approval.
+func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn func([]string) []string) (string, error) {
+	changed := ""
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		changed = false
+		changed = ""
 
 		n, err := c.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
 		if err != nil {
@@ -383,11 +384,22 @@ func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn
 			n.Annotations[disks.Annotation] = v
 		}
 
+		rev, err := disks.NewRevision()
+		if err != nil {
+			return err
+		}
+
+		if n.Annotations == nil {
+			n.Annotations = map[string]string{}
+		}
+
+		n.Annotations[disks.RevisionAnnotation] = rev
+
 		if _, err := c.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{}); err != nil {
 			return err
 		}
 
-		changed = true
+		changed = rev
 
 		return nil
 	})
@@ -508,7 +520,7 @@ The Racer pod on %s will restart and drop its cache.
 		return err
 	}
 
-	_, err = updateApproved(ctx, c, node, func(cur []string) []string {
+	rev, err := updateApproved(ctx, c, node, func(cur []string) []string {
 		for _, d := range fresh {
 			cur = append(cur, d.ID)
 		}
@@ -530,11 +542,15 @@ The Racer pod on %s will restart and drop its cache.
 		want = append(want, d.ID)
 	}
 
-	return e.waitClaimed(ctx, c, ns, node, want, o.timeout)
+	return e.waitClaimed(ctx, c, ns, node, rev, want, o.timeout)
 }
 
-// waitClaimed polls until every id is claimed or rejected.
-func (e *env) waitClaimed(ctx context.Context, c kubernetes.Interface, ns, node string, ids []string, timeout time.Duration) error {
+// waitClaimed polls until every id is claimed or rejected in a report whose
+// DisksRevision is rev. A report with another revision may predate the
+// approval change, for example from a process that is still restarting, so
+// its states are ignored. An empty rev means the Node was unchanged and any
+// report is current.
+func (e *env) waitClaimed(ctx context.Context, c kubernetes.Interface, ns, node, rev string, ids []string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -546,6 +562,10 @@ func (e *env) waitClaimed(ctx context.Context, c kubernetes.Interface, ns, node 
 		if err == nil {
 			nd := &nodeDisks{Node: node}
 			nd.fillReport(pickPod(pods))
+
+			if rev != "" && (nd.report == nil || nd.report.DisksRevision != rev) {
+				nd.report = nil
+			}
 
 			done, rejected := 0, 0
 
@@ -584,7 +604,7 @@ func (e *env) waitClaimed(ctx context.Context, c kubernetes.Interface, ns, node 
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timed out waiting for disks on %s to be claimed", node)
+			return fmt.Errorf("timed out waiting for disks on %s to be claimed (the Racer pod reports the approval revision it applied; older dataplanes do not)", node)
 		case <-t.C:
 		}
 	}

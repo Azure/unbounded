@@ -71,6 +71,9 @@ struct ReportDto {
     rdma_nics: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     disks: Value,
+    /// Approval revision the reported disk states reflect; informational.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    disks_revision: Value,
 }
 
 /// Values a Pod reports for its own Node.
@@ -105,11 +108,28 @@ pub fn encode_report(r: &Report) -> Result<String, wire::Error> {
 /// are written in ID order. Fails only when the report without disks does
 /// not fit.
 pub fn encode_report_with_disks(r: &Report, disks: &[DiskStatus]) -> Result<String, wire::Error> {
+    encode_report_full(r, disks, None)
+}
+
+/// Encode a report annotation with per-disk status and the approval revision
+/// those states reflect. See [`encode_report_with_disks`]. The revision is
+/// counted as part of the report without disks; an invalid one is rejected.
+pub fn encode_report_full(
+    r: &Report,
+    disks: &[DiskStatus],
+    revision: Option<&str>,
+) -> Result<String, wire::Error> {
+    let disks_revision = match revision {
+        Some(v) if crate::disks::valid_revision(v) => Value::String(v.to_owned()),
+        Some(_) => return Err(wire::Error::InvalidRequest),
+        None => Value::Null,
+    };
     let rdma_nics = encode_nics(&r.rdma_nics)?;
     let base = serde_json::to_string(&ReportDto {
         shares: r.shares.get(),
         rdma_nics: rdma_nics.clone(),
         disks: Value::Null,
+        disks_revision: disks_revision.clone(),
     })
     .map_err(|_| wire::Error::InvalidRequest)?;
     if base.len() > crate::limits::MAX_REPORT_BYTES {
@@ -137,6 +157,7 @@ pub fn encode_report_with_disks(r: &Report, disks: &[DiskStatus]) -> Result<Stri
         shares: r.shares.get(),
         rdma_nics,
         disks: serde_json::to_value(&kept).map_err(|_| wire::Error::InvalidRequest)?,
+        disks_revision,
     })
     .map_err(|_| wire::Error::InvalidRequest)?;
     if s.len() > crate::limits::MAX_REPORT_BYTES {
@@ -341,6 +362,29 @@ pub(crate) mod tests {
         sorted.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(parse_report_disks(&encoded).unwrap(), sorted);
         assert_eq!(parse_report(&encoded).unwrap(), report);
+        assert_eq!(original["disks_revision"], "rev-1");
+        let revised = encode_report_full(&report, &disks, Some("rev-1")).unwrap();
+        let revised: Value = serde_json::from_str(&revised).unwrap();
+        assert_eq!(revised["disks_revision"], "rev-1");
+    }
+
+    #[test]
+    fn disk_revisions_are_optional_and_validated() {
+        let r = Report {
+            shares: NonZeroU32::new(2).unwrap(),
+            rdma_nics: vec![],
+        };
+        assert_eq!(
+            encode_report_full(&r, &[], None).unwrap(),
+            encode_report(&r).unwrap()
+        );
+        let s = encode_report_full(&r, &[], Some("abc")).unwrap();
+        assert_eq!(s, r#"{"shares":2,"rdma_nics":[],"disks_revision":"abc"}"#);
+        assert_eq!(parse_report(&s).unwrap(), r);
+        assert_eq!(
+            encode_report_full(&r, &[], Some("a b")),
+            Err(wire::Error::InvalidRequest)
+        );
     }
 
     #[test]

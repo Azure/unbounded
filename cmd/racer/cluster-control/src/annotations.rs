@@ -81,6 +81,12 @@ pub const RDMA_NICS: &str = "racer.unbounded-cloud.io/rdma-nics";
 /// basenames of whole disks Racer may wipe and use as cache storage.
 pub const DISKS: &str = "racer.unbounded-cloud.io/disks";
 
+/// Node annotation: opaque token that the writer of [`DISKS`] changes with
+/// every approval change. A dataplane echoes it as `disks_revision` in its
+/// Pod report once its applied disk set matches [`DISKS`], so a writer can
+/// wait for a report that reflects its own change.
+pub const DISKS_REVISION: &str = "racer.unbounded-cloud.io/disks-revision";
+
 /// Retired Node annotation that held a regex disk selector. It is no longer
 /// honored because it never granted consent to wipe; use [`DISKS`].
 pub const LEGACY_BLOCK_DEVICES: &str = "racer.unbounded-cloud.io/block-devices";

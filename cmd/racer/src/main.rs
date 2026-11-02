@@ -63,6 +63,16 @@ impl ClusterControl for Embedded {
     fn approved_disks(&self) -> Option<Vec<String>> {
         self.0.approved_disks()
     }
+
+    fn approval(&self) -> Option<racer_cluster_control::disks::Approval> {
+        self.0.approval()
+    }
+
+    fn report_disks_revision(&self, revision: Option<String>) {
+        if let Err(error) = self.0.report_disks_revision(revision) {
+            eprintln!("racer: stage=cluster-report-disks-revision error={error}");
+        }
+    }
 }
 
 fn run() -> std::result::Result<(), (&'static str, Error)> {
