@@ -166,11 +166,11 @@ in Flex, such as Flex's static routes with
 
 ## 3. Plugin protocol
 
-A plugin is an executable owned by the consumer. The agent runs
-`<command...> <method>` with a JSON request on stdin and reads a JSON response
-from stdout. A non-zero exit or an `error` object means failure. stderr goes to
-the agent log, size-bounded. Secrets travel only on stdin, never in arguments
-or the environment.
+A plugin is a compiled executable owned by the consumer. The agent runs it
+with its configured arguments and the method name, a JSON request on stdin, and
+reads a JSON response from stdout. A non-zero exit or an `error` object means
+failure. stderr goes to the agent log, size-bounded. Secrets travel only on
+stdin, never in arguments or the environment.
 
 ```json
 {
@@ -219,6 +219,10 @@ Operational rules:
 - **`describe`** is called when `v2 start`, `v2 daemon`, `v2 preflight` or
   `v2 reset` starts. If a plugin configured as a provider does not list a
   method the configuration uses, startup fails, except for `v2 reset` (below).
+  For the daemon this happens before its startup gate opens
+  ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)), so a plugin set that does not fit a newly
+  upgraded binary keeps the daemon from reporting ready, and the recovery unit
+  rolls both back ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
 - **Timeouts** are set per method in `plugins[].timeouts`. The defaults are 10
   seconds for `describe` and 60 seconds for every other method. A hook's
   timeout is set only by its `hooks[].timeout`, which also defaults to 60
@@ -226,14 +230,60 @@ Operational rules:
   after 5 seconds.
 - **Output limits:** a response larger than 1 MiB on stdout is a failure. Only
   the first 64 KiB of stderr is logged.
-- **Ownership:** the plugin's executable path must be absolute. The file and
-  every parent directory must be owned by root and not writable by group or
-  others. Plugins run as root.
+- **Pinned executables.** Every plugin has a `sha256` in the configuration,
+  and the agent runs only an executable with that digest. The executable and
+  every parent directory must also be owned by root and not writable by group
+  or others.
+- **What is checked is what runs.** The agent starts each call as a transient
+  systemd service (`systemd-run --pipe --wait --collect`), named
+  `unbounded-agent-plugin-<name>-<id>.service`, whose command is the agent's
+  own hidden `v2 plugin-exec`. Inside the sandbox, `plugin-exec` opens the
+  stored plugin, hashes it through the open file descriptor, and replaces
+  itself with that same descriptor through `execveat(2)` with `AT_EMPTY_PATH`.
+  A file swapped after the check is never the one that runs.
+- **Compiled executables only.** `plugin-exec` refuses a file that is not ELF.
+  A `#!` script cannot be run safely from a descriptor: its interpreter either
+  reopens the script by path or cannot reach it at all, and the interpreter
+  and everything it loads are not pinned (`execveat(2)` manual page). Only the
+  executable itself is pinned, so a dynamically linked plugin still loads the
+  host's shared libraries. Plugins should be linked statically, and
+  `v2 preflight` warns about one that is not.
+- **Sandboxed and unprivileged by default.** Each call's unit applies these
+  settings. A plugin asks for more only through `plugins[].permissions`, which
+  is an install-time setting ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)):
+
+  | | Default | Declared with |
+  |---|---|---|
+  | User | A dynamic unprivileged user (`DynamicUser=yes`) | `root: true` runs it as root, with every other setting unchanged |
+  | Capabilities | None (an empty `CapabilityBoundingSet=`, and `NoNewPrivileges=yes`) | `capabilities`, granted as bounding and ambient capabilities |
+  | Filesystem | The OS read-only (`ProtectSystem=strict`), no home directories (`ProtectHome=yes`), a private `/tmp` and no devices. The agent's and the node's private paths are inaccessible: `/etc/unbounded`, `/var/lib/unbounded`, `/etc/kubernetes`, `/var/lib/kubelet` and `/var/lib/machines`. | `paths`: `read` makes a path readable that would otherwise be inaccessible, and `write` makes a path writable. The agent's own credentials and state can never be granted. |
+  | Network | Allowed, because providers call cloud and cluster APIs | Not configurable |
+  | Run time | `RuntimeMaxSec=` set to the call's timeout, and `TimeoutStopSec=5s` | `plugins[].timeouts` and `hooks[].timeout` |
+
+- **A clean environment.** The plugin's environment holds only `PATH`, set to
+  `/usr/sbin:/usr/bin:/sbin:/bin`, `LANG=C.UTF-8`, and the literal values in
+  `plugins[].env`, such as proxy settings. Nothing from the agent's own
+  environment passes through.
+- **An audit log.** Every call writes one line to the agent's log: the plugin,
+  the method, the SHA-256 that was run, the unit name, the user, the granted
+  capabilities and writable paths, the duration, the exit status and the
+  response size. It never includes the request or the response, which can hold
+  secrets.
 - **Reset never fails because of a plugin.** During `v2 reset` and other
   resets, `describe` failures, provider failures and hook failures are logged
   and reset continues. This is why the reset events default to `Ignore`.
-- **Upgrades:** the agent never upgrades plugins. Compatibility is negotiated
-  through `describe`.
+- **Plugins change only with the agent.** The agent keeps one plugin set
+  beside each of its blue and green binaries, under
+  `/opt/unbounded/agent/plugins/{blue,green}/`, with a manifest of each
+  plugin's name and SHA-256, and runs the set beside the binary that `current`
+  resolves to. `v2 start` fills it at first install from each plugin's
+  `command[0]`, after checking its `sha256`. After that, only an AgentUpgrade
+  changes it: one with a plugin manifest stages the new executables beside the
+  new binary, and one without copies the running set. Switching `current`, or
+  restoring `last-good`, therefore always switches binary and plugins
+  together ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). The plugin's name, permissions, environment,
+  timeouts and hooks stay install-time settings, so an upgrade replaces a
+  plugin's code but never widens what it may do.
 
 Goal changes from a plugin goal source are picked up by polling plus Node
 events ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)).

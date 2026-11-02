@@ -15,6 +15,8 @@ This is the complete list of what v2 creates or changes on a host, and what
 |---|---|
 | Agent binary, shared with v1 | `/opt/unbounded/agent/bin/unbounded-agent{,-blue,-green,-current,-last-good}` |
 | Binary activation lock, shared with v1 | `/run/unbounded-agent-upgrade.lock` |
+| Plugin sets, one beside each of the blue and green binaries, each with a manifest of plugin names and SHA-256 digests | `/opt/unbounded/agent/plugins/{blue,green}/` ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
+| Transient units, one per plugin call, gone when the call ends | `unbounded-agent-plugin-<name>-<id>.service` |
 | Install record and install lock | `/var/lib/unbounded/agent-v2/install.json`, `/run/unbounded-agent-v2-install.lock` |
 | Node state | `/var/lib/unbounded/agent-v2/node-state.json` and `.sha256` |
 | Artifact cache | `/var/lib/unbounded/agent-v2/artifacts/<sha256>` |

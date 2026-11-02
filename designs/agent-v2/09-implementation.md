@@ -56,9 +56,19 @@ internal/agentv2/
   stop pods, unmount volumes and remove state explicitly. Mistakes leave stuck
   mounts or orphaned processes. This area needs the most end-to-end coverage.
 - **Workloads see the real host** on the `host` runtime ([node runtime, section 5.2](03-node-runtime.md#52-host)).
-- **Plugins run as root.** Path and ownership checks are the main defense.
-- **Agent and plugin versions can skew.** Only protocol negotiation guards
-  against it.
+- **Plugins run consumer code on every host.** Each runs only with the
+  SHA-256 pinned in the configuration, from the descriptor that was checked,
+  in a sandboxed unit as an unprivileged user unless it declares more, with a
+  clean environment and an audit line per call. A plugin that declares
+  `root: true` or capabilities is trusted with them
+  ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
+- **A plugin's shared libraries are not pinned.** Only the executable is.
+  Statically linked plugins avoid this, and `v2 preflight` warns about the
+  others.
+- **Agent and plugin versions could skew.** Plugins change only with an
+  AgentUpgrade, which stages and rolls them back with the binary, and the
+  daemon checks each plugin with `describe` before it reports ready
+  ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
 - **Experimental code ships in the production binary.** It is reachable only
   through `v2` commands.
 - **Copied code drifts from v1.** The list in [v1 compatibility, section 3](08-v1-compatibility.md#3-code-copied-from-v1) is the mitigation.

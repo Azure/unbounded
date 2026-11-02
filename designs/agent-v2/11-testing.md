@@ -36,7 +36,16 @@ This document specifies how v2 is tested. It has two priorities:
   before and after the first repave, and the conversion of v1's applied config,
   credentials, Machine status and host preparation.
 - Plugin protocol tests with a reference plugin: timeouts, errors, oversized
-  output and permission checks.
+  output and ownership checks. `plugin-exec` refuses a file whose SHA-256 does
+  not match, a `#!` script and any other file that is not ELF, and runs the
+  descriptor it checked even when the file is replaced between the check and
+  the exec. The unit properties for each combination of `permissions`, the
+  clean environment, and an audit line that never contains the request or
+  response.
+- Plugin sets in AgentUpgrade: staging from a manifest, copying the running
+  set without one, and refusing a manifest with a wrong digest or with a
+  plugin added or dropped. `v2 start` with changed plugins on an installed host
+  is refused, and with the original file after a plugin upgrade is not.
 - Host cleanup with a fake `SystemOps`: order of operations, `ErrNodeBusy` on a
   hung process, refusal to cross a bind mount inside `/var/lib/kubelet/pods`,
   refusal when an owned path is replaced by a symlink, keeping
@@ -221,7 +230,17 @@ These cover what v1 never had, so the v1 suites cannot:
 - A daemon restart after it saw a Node deleted, but before the new slot is
   rendered: the repave must finish without another deletion.
 - GPU coverage on `hack/agent/azure-gpu-vm`.
-- A sample Flex-like plugin as a fixture.
+- A sample Flex-like plugin as a fixture, statically linked, with the
+  following checks:
+  - Run with default permissions, it cannot read `/etc/unbounded/agent-v2` or
+    write outside its declared paths, and runs as a dynamic user with no
+    capabilities.
+  - An AgentUpgrade with a plugin manifest updates it with the binary. A
+    second upgrade, whose plugin no longer answers a method the configuration
+    uses, never reports ready, and the recovery unit restores the previous
+    binary and plugin together.
+  - A plugin changed in place in the store fails every call with a digest
+    error, and the audit log records it.
 
 ## 6. CI
 

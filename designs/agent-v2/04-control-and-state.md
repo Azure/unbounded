@@ -243,7 +243,9 @@ flowchart TD
 ```
 
 The startup gate opens when the Machine is registered, `Recover` has found the
-host consistent with the state (section 4), and the caches have synced. The
+host consistent with the state (section 4), every configured plugin has
+answered `describe` with the methods the configuration uses
+([extensions, section 3](02-extensions.md#3-plugin-protocol)), and the caches have synced. The
 daemon then tells systemd it is ready: the daemon unit is `Type=notify`, and the
 daemon sends `READY=1` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). It then publishes pending AgentUpgrade and
 HostOSReboot results, as v1 publishes them when its daemon starts

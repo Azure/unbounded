@@ -186,6 +186,7 @@ sequenceDiagram
   D->>D: install lock, binary activation lock, MarkInProgress
   D->>D: hook agent.upgrade.before
   D->>AB: download, verify sha256, install into the inactive blue or green binary
+  D->>AB: stage the plugin set beside it, from the plugin manifest or a copy of the running set
   AB->>AB: candidate must answer version and v2 version
   AB->>AB: switch current link, keep last-good
   D->>D: write upgrade signal
@@ -224,6 +225,29 @@ This is v1's mechanism
   command is rejected before the switch. The daemon unit's `ExecStartPre=`
   repeats the check at every start, so the recovery unit cannot start such a
   binary either ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)).
+- **Plugins move with the binary.** The optional parameters
+  `pluginManifestURL` and `pluginManifestSHA256` name a plugin manifest:
+
+  ```json
+  {
+    "apiVersion": "plugin.agent.unbounded-cloud.io/v1alpha1",
+    "kind": "PluginManifest",
+    "plugins": [
+      { "name": "aks", "url": "https://example.com/aks-flex-node-plugin", "sha256": "4b1e...07" }
+    ]
+  }
+  ```
+
+  The old daemon downloads the manifest and every plugin in it, verifies each
+  against its SHA-256, and stages them in the plugin set beside the inactive
+  binary ([extensions, section 3](02-extensions.md#3-plugin-protocol)). Without a manifest, it copies the running set
+  there. The manifest must name exactly the plugins the configuration declares;
+  one that adds or drops a plugin is rejected before the switch, because which
+  plugins exist, and what they may do, are install-time settings. Switching
+  `current` then activates binary and plugins together, and the recovery unit
+  restoring `last-good` rolls both back. The new daemon checks every plugin
+  with `describe` before its startup gate opens, so a plugin that does not fit
+  the new binary is rolled back with it.
 - On a host migrated from v1, a candidate whose daemon would be v1's, or an
   operation with `agentMode: v1`, is a downgrade while the rollback window is
   open: v2 puts v1 back from its backup, then switches to the candidate. After
@@ -240,8 +264,10 @@ MachineOperation, as v1's hidden `agent-upgrade` command is run
 install into the inactive blue or green binary, switch the `current` link,
 restart the daemon unit and wait for it to report ready, rolling back if it does
 not (`pkg/agent/agentbinary/activation.go:83-246`). The `agent.upgrade.before`
-and `agent.upgrade.after` events fire on this path too. It never downgrades to
-v1; on the host, that is `v2 migrate --rollback --binary <path>`
+and `agent.upgrade.after` events fire on this path too, and
+`--plugin-manifest` with `--plugin-manifest-sha256` stage a new plugin set as
+the parameters do. It never downgrades to v1; on the host, that is
+`v2 migrate --rollback --binary <path>`
 ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)).
 
 ## 6. Reset

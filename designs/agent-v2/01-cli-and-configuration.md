@@ -13,9 +13,10 @@ repository baseline, citation conventions and terms.
 | `v2 reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
 | `v2 status [--output json]` | New. Runtime, slots, applied goal version, node readiness and any cleanup leftovers |
 | `v2 migrate [--rollback [--binary <path>]] [--adopt-machine]` | Move a v1 host, or a machine another `pkg/agent` consumer built, to v2 without replacing its node, or roll that back, switching to the given v1 binary if there is one ([migrating from v1](10-migration-from-v1.md)) |
-| `v2 agent-upgrade [--preflight]` | Activate a staged agent binary without a MachineOperation, for host delivery automation ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
+| `v2 agent-upgrade [--preflight] [--plugin-manifest <url> --plugin-manifest-sha256 <hex>]` | Activate a staged agent binary, and optionally a new plugin set, without a MachineOperation, for host delivery automation ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
 | `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
 | `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
+| `v2 plugin-exec` (hidden) | Runs inside a plugin's sandboxed unit: verifies the stored plugin and replaces itself with it ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
 | `v2 convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by operators preparing a configuration by hand for a host without a Machine. |
 | `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
 
@@ -96,6 +97,16 @@ provisioning works unchanged.
     {
       "name": "aks",
       "command": ["/opt/aks-flex-node/bin/aks-flex-node-plugin"],
+      "sha256": "9f2c...e1",
+      "permissions": {
+        "paths": [
+          { "path": "/etc/aks-flex-node", "access": "read" },
+          { "path": "/var/lib/aks-flex-node", "access": "write" }
+        ],
+        "capabilities": [],
+        "root": false
+      },
+      "env": { "HTTPS_PROXY": "http://proxy.example:3128" },
       "timeouts": { "goal.get": "60s" }
     }
   ],
@@ -132,6 +143,9 @@ Enumerated fields:
 | `control.status.type` | `machina`, `none`, `plugin` |
 | `control.operations.enabled` | `true` (default): handle MachineOperations through machina. `false`: ignore them. |
 | `hooks[].failurePolicy` | `Fail`, `Ignore`. If omitted, each event's default ([extensions, section 1](02-extensions.md#1-extension-mechanisms)). |
+| `plugins[].permissions.paths[].access` | `read`, `write` ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
+| `plugins[].permissions.capabilities` | Linux capability names, such as `CAP_NET_ADMIN`. Default none. |
+| `plugins[].permissions.root` | `false` (default): the plugin runs as an unprivileged dynamic user. `true`: it runs as root, still sandboxed and still limited to its declared capabilities. |
 | `runtime.host.adoptExistingPaths[].policy` | `Preserve`, `Discard` ([host runtime cleanup, section 3](07-host-runtime-cleanup.md#3-ownership-and-adoption)). Required. |
 | `runtime.host.adoptPreserveMaxBytes` | The largest `Preserve` backup allowed for any one path. Default 1 GiB. |
 
@@ -169,6 +183,15 @@ Validation rules:
   reserves, including `authorization.mode`
   (`pkg/agent/config/config.go:604-623`).
 - Extensions follow the rules in [extensions, section 2](02-extensions.md#2-declarative-extensions).
+- Every plugin has a `sha256`, the lowercase hex SHA-256 of its executable.
+  `command[0]` is where `v2 start` reads the executable from at first install,
+  and the rest of `command` are its arguments. `env` holds literal values only
+  and never secrets, which travel on stdin
+  ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
+- `plugins[].permissions.paths` cannot name anything under `/etc/unbounded`
+  or `/var/lib/unbounded`, which hold the agent's credentials and state, and
+  cannot grant `write` under `/opt/unbounded`, which holds the agent and plugin
+  executables.
 
 The LocalDNS Corefile template variables become a documented contract:
 `NodeListenerIP`, `ClusterListenerIP`, `NodeUpstreamIPs`,
@@ -207,6 +230,17 @@ A goal source returns goal settings only. A plugin's `goal.get` response that
 contains any other field fails validation. In particular, a goal cannot change
 the runtime, the plugins, the hooks or the extensions. Removing or changing an
 extension needs a reset and a new install.
+
+Plugins are the one install-time setting with a second way to change: an
+AgentUpgrade can replace their executables, though not their names,
+permissions, environment, timeouts or hooks
+([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). The `command[0]` and `sha256` values in the file are
+therefore used only at first install. After it, the plugin set stored beside
+the agent binary is what runs ([extensions, section 3](02-extensions.md#3-plugin-protocol)). The file's
+plugins are part of the install check's fingerprint, so `v2 start` with
+changed plugins on an installed host is refused like any other changed
+install-time setting, while `v2 start` again with the original file is not
+affected by later plugin upgrades.
 
 ### Choosing the runtime
 
