@@ -392,9 +392,39 @@ func TestUpdateApprovedSetsRevision(t *testing.T) {
 		t.Fatalf("annotation: %v %v", n.Annotations, err)
 	}
 
-	// No change leaves the revision alone.
-	if r, err := updateApproved(ctx, h.c, "n", func(cur []string) []string { return cur }); err != nil || r != "" {
-		t.Fatalf("unchanged: %q %v", r, err)
+	// No change leaves the revision alone and returns it, so --wait still
+	// filters stale reports.
+	same := func(cur []string) []string { return cur }
+	if r, err := updateApproved(ctx, h.c, "n", same); err != nil || r != r1 {
+		t.Fatalf("unchanged: %q %q %v", r1, r, err)
+	}
+
+	// An unchanged list with a missing or invalid token gets a fresh one.
+	for _, bad := range []string{"", "not valid"} {
+		n, err := h.c.CoreV1().Nodes().Get(ctx, "n", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if bad == "" {
+			delete(n.Annotations, disks.RevisionAnnotation)
+		} else {
+			n.Annotations[disks.RevisionAnnotation] = bad
+		}
+
+		if _, err := h.c.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := updateApproved(ctx, h.c, "n", same)
+		if err != nil || !disks.ValidRevision(r) || r == r1 {
+			t.Fatalf("repair %q: %q %v", bad, r, err)
+		}
+
+		n, err = h.c.CoreV1().Nodes().Get(ctx, "n", metav1.GetOptions{})
+		if err != nil || n.Annotations[disks.RevisionAnnotation] != r || n.Annotations[disks.Annotation] != "wwn-1" {
+			t.Fatalf("repair %q annotations: %v %v", bad, n.Annotations, err)
+		}
 	}
 
 	// Revoking everything still records a new revision.

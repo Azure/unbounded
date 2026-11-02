@@ -89,6 +89,23 @@ func NewRevision() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// ValidRevision reports whether value is a RevisionAnnotation the dataplane
+// accepts and echoes: 1 to 64 ASCII letters, digits, '.', '_', or '-'.
+func ValidRevision(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+
+	for _, r := range value {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-'
+		if !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
 // ParseReport decodes a report annotation value. Unknown fields are ignored.
 func ParseReport(value string) (*Report, error) {
 	var r Report

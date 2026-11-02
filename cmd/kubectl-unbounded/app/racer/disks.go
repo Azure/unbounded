@@ -337,8 +337,11 @@ func (e *env) confirm(yes bool) error {
 // updateApproved applies fn to the Node's approved list and writes it with
 // Update, whose resourceVersion check fails with a Conflict if the Node
 // changed since the read; conflicts are retried. Every change also sets
-// disks.RevisionAnnotation to a fresh token, which it returns; it returns ""
-// when the Node did not change. If the existing annotation is invalid, the
+// disks.RevisionAnnotation to a fresh token, which it returns. When the
+// approved list is unchanged it returns the Node's existing token, writing a
+// fresh one only if that token is absent or invalid; a token-only change does
+// not restart the dataplane. It returns "" only when nothing is approved
+// before or after. If the existing annotation is invalid, the
 // dataplane approves no disks, so any result other than clearing it is
 // refused rather than turning its entries into effective approval.
 func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn func([]string) []string) (string, error) {
@@ -374,7 +377,11 @@ func updateApproved(ctx context.Context, c kubernetes.Interface, node string, fn
 			}
 
 			if had && v == old {
-				return nil
+				if cur := n.Annotations[disks.RevisionAnnotation]; disks.ValidRevision(cur) {
+					changed = cur
+
+					return nil
+				}
 			}
 
 			if n.Annotations == nil {
@@ -548,8 +555,7 @@ The Racer pod on %s will restart and drop its cache.
 // waitClaimed polls until every id is claimed or rejected in a report whose
 // DisksRevision is rev. A report with another revision may predate the
 // approval change, for example from a process that is still restarting, so
-// its states are ignored. An empty rev means the Node was unchanged and any
-// report is current.
+// its states are ignored. An empty rev disables the check.
 func (e *env) waitClaimed(ctx context.Context, c kubernetes.Interface, ns, node, rev string, ids []string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

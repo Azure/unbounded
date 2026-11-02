@@ -154,3 +154,19 @@ func TestValidateAnnotation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidRevision(t *testing.T) {
+	for v, want := range map[string]bool{
+		"":                      false,
+		"r-1.a_B":               true,
+		strings.Repeat("a", 64): true,
+		strings.Repeat("a", 65): false,
+		"a b":                   false,
+		"a/b":                   false,
+		"\u00e9":                false,
+	} {
+		if got := ValidRevision(v); got != want {
+			t.Errorf("ValidRevision(%q) = %v, want %v", v, got, want)
+		}
+	}
+}
