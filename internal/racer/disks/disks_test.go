@@ -5,6 +5,7 @@ package disks
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -66,13 +67,13 @@ func TestParseReportEdge(t *testing.T) {
 }
 
 func TestValidateID(t *testing.T) {
-	for _, id := range []string{"wwn-0x1", "nvme-eui.00", "a"} {
+	for _, id := range []string{"wwn-0x1", "nvme-eui.00", "a", strings.Repeat("x", MaxIDBytes)} {
 		if err := ValidateID(id); err != nil {
 			t.Errorf("%q: %v", id, err)
 		}
 	}
 
-	for _, id := range []string{"", ".", "..", "a/b", "a,b", "a b", "a\tb", "\n"} {
+	for _, id := range []string{"", ".", "..", "a/b", "a,b", "a b", "a\tb", "\n", "caf\u00e9", "a\x7f", strings.Repeat("x", MaxIDBytes+1)} {
 		if err := ValidateID(id); !errors.Is(err, ErrInvalidID) {
 			t.Errorf("%q: got %v", id, err)
 		}
@@ -94,8 +95,22 @@ func TestAnnotationRoundTrip(t *testing.T) {
 		t.Fatal("want invalid")
 	}
 
-	if _, err := FormatAnnotation([]string{strings.Repeat("x", MaxAnnotationBytes+1)}); err == nil {
+	long := make([]string, 0, 20)
+	for i := range 20 {
+		long = append(long, fmt.Sprintf("%03d-%s", i, strings.Repeat("x", 250)))
+	}
+
+	if _, err := FormatAnnotation(long); err == nil {
 		t.Fatal("want too long")
+	}
+
+	many := make([]string, 0, MaxDisks+1)
+	for i := range MaxDisks + 1 {
+		many = append(many, fmt.Sprintf("d%d", i))
+	}
+
+	if _, err := FormatAnnotation(many); err == nil {
+		t.Fatal("want too many")
 	}
 
 	if ParseAnnotation("") != nil {

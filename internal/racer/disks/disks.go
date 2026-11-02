@@ -29,6 +29,12 @@ const (
 
 	// MaxAnnotationBytes bounds the Annotation value.
 	MaxAnnotationBytes = 4096
+
+	// MaxIDBytes bounds a single disk ID, matching the dataplane.
+	MaxIDBytes = 255
+
+	// MaxDisks bounds the number of approved disks, matching the dataplane.
+	MaxDisks = 256
 )
 
 // Disk states reported by the dataplane.
@@ -92,22 +98,26 @@ func (r *Report) Find(name string) (Disk, bool) {
 	return Disk{}, false
 }
 
-// ValidateID checks a single disk ID.
+// ValidateID checks a single disk ID using the same rules as the dataplane:
+// 1 to MaxIDBytes printable non-space ASCII bytes, without '/' or ',', and
+// not "." or "..".
 func ValidateID(id string) error {
 	switch {
 	case id == "":
 		return fmt.Errorf("%w: empty", ErrInvalidID)
+	case len(id) > MaxIDBytes:
+		return fmt.Errorf("%w %q: longer than %d bytes", ErrInvalidID, id, MaxIDBytes)
 	case id == "." || id == "..":
 		return fmt.Errorf("%w %q", ErrInvalidID, id)
-	case strings.ContainsAny(id, "/,") || strings.IndexFunc(id, isSpace) >= 0:
-		return fmt.Errorf("%w %q: must not contain '/', ',' or whitespace", ErrInvalidID, id)
+	}
+
+	for i := range len(id) {
+		if b := id[i]; b <= ' ' || b > '~' || b == '/' || b == ',' {
+			return fmt.Errorf("%w %q: must be printable ASCII without '/', ',' or whitespace", ErrInvalidID, id)
+		}
 	}
 
 	return nil
-}
-
-func isSpace(r rune) bool {
-	return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\v' || r == '\f'
 }
 
 // ParseAnnotation splits an Annotation value into its trimmed, non-empty
@@ -135,6 +145,10 @@ func FormatAnnotation(ids []string) (string, error) {
 		if err := ValidateID(id); err != nil {
 			return "", err
 		}
+	}
+
+	if len(s) > MaxDisks {
+		return "", fmt.Errorf("annotation %s would list %d disks, max %d", Annotation, len(s), MaxDisks)
 	}
 
 	v := strings.Join(s, ",")
