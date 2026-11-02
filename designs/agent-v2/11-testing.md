@@ -153,49 +153,55 @@ A new `migration-v2` suite follows the existing host-root `migration` suite
 
 1. Stage host files, as the existing suite does, and take the host snapshot.
 2. Install v1: the release in `LEGACY_AGENT_VERSION`, or this build's v1
-   commands.
+   commands. Record a checksum of every v1 file and unit.
 3. Wait for the node, run the workload, and record the Node UID, the machine's
    PID, and the workload pods' UIDs and restart counts.
 4. Migrate with an AgentUpgrade with `agentMode: v2`. A variant runs
    `v2 migrate` on the host instead.
 5. Check that:
-   - the operation is `Complete`;
+   - the operation is `Complete`, and was published only after the v2 daemon
+     reported ready;
    - the Node UID, machine PID, pod UIDs and restart counts are unchanged;
    - v1's detection files are gone ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)), so v1
      `start` refuses the host;
+   - `last-good` names the v2 binary;
    - `v2 status` shows a complete install on `nspawn-container`, with the
      running machine as the enabled slot;
    - the staged files are untouched.
 6. Reboot the host. The node comes back through v2's boot wiring.
 7. Run the v1 lifecycle steps under the `v2` profile: NodeReboot,
    AgentUpgrade in place, AgentUpgrade rollback, the workload and a repave.
-   After the repave, the v1 backup is gone and `v2 migrate --rollback`
-   refuses.
+   After the repave, the v1 backup is gone, and both `v2 migrate --rollback`
+   and an AgentUpgrade with `agentMode: v1` are refused.
 8. Reset, and compare with the snapshot (section 3).
 
 Variants:
 
 | Variant | What it checks |
 |---|---|
-| Rollback | Migrate, then `v2 migrate --rollback`. v1's daemon runs, v1's files are back, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. |
-| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), a helper on the host watches the migration record and kills the migrate unit, or reboots the host, when the phase is reached. The migration must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
-| Failed | A v2 path is made unwritable in each phase. The migration must roll back to a working v1 automatically, and the operation must be `Failed` with the reason. |
-| Refused | `v2 migrate` on a v1 host with an unfinished install, or with two applied configs, changes nothing. `v2 start` on a v1 host that was not migrated is refused. |
+| Rollback | Migrate, then `v2 migrate --rollback`; in a second run, an AgentUpgrade with `agentMode: v1`. v1's daemon runs, v1's files match the checksums from step 2, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. |
+| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), and each step of the commit and of the restore, a helper on the host watches the migration record and kills the migrating process, or reboots the host, when the step is reached. The node must keep running, or boot with one complete machine override, and the migration or restore must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
+| Failed | In each step before the commit, a v2 path is made unwritable, or the startup checks are made to fail. The host must return to a working v1 whose files match the checksums from step 2, and the operation must be `Failed` with the reason. A second variant makes the v2 daemon fail to report ready after an early migration commits: the host must end `RolledBack`, with the operation `Failed`. |
+| Refused | `v2 migrate` changes nothing on a v1 host with an unfinished install, with two applied configs, or on a release older than the oldest supported one. `v2 start` on a v1 host that was not migrated is refused. |
 | To `host` | After migrating, set the Machine's `spec.agent.runtime` to `host` and check that `RuntimeChangePending` is `True`. Then `v2 reset`, bootstrap again with `manual-bootstrap --runtime host`, check that `RuntimeChangePending` is `False` and `status.agent.runtime` is `host`, and run the lifecycle suite under `NODE_RUNTIME=host`. |
 | Immutable host | The cluster-started migration on an Ignition host (`HOST_BASE_OS=acl`), which needs no access to the host |
 | Adopted machine | `v2 migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |
 
-The cutover at the first official v2 release (N+1) gets its own variants,
-using a build of N and a build of N+1
-([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)):
+The cutover at the first official v2 release gets its own variants
+([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). They run against two kinds of build. Before that
+release exists, a build tag that only test builds set makes a development build
+behave as it will, with v2's commands at the top level, so the cutover is
+tested on every change. Once release builds exist, the same variants also run
+against them, because the tag cannot prove that the released binary behaves
+the same.
 
 | Variant | What it checks |
 |---|---|
-| Cutover | Install an older v1 release, upgrade it to N, then to N+1 with an ordinary AgentUpgrade. The host migrates with the checks in step 5, and the AgentUpgrade completes when the migration commits. |
-| Cutover failure | Make the migration fail at N+1. The recovery unit returns the binary to N, N's daemon restores v1, the node is unchanged, and the AgentUpgrade is `Failed`. |
-| Downgrade in the window | After the cutover, an AgentUpgrade back to N restores v1. After a repave, an AgentUpgrade to N is refused. |
-| Skipping N | An AgentUpgrade from a release older than N straight to N+1 fails with the message to upgrade to N first, and the host keeps running the older release. |
-| Crash loop after the window | After the cutover and a repave, make the v2 daemon fail repeatedly. The recovery unit restores a v2 binary, not N, and the daemon runs again once the fault is removed ([migrating from v1, section 8](10-migration-from-v1.md#8-finishing-and-rollback)). |
+| Cutover matrix | For each v1 release from the oldest supported one to the last experimental release, install it, run the workload, then upgrade to the first official v2 release with an ordinary AgentUpgrade. The host migrates with the checks in step 5. The oldest release in this matrix is the oldest supported v1 release. |
+| Cutover failure | Make the migration fail at each step before the commit. The daemon returns `current` to the v1 binary, v1's daemon runs, v1's files match their checksums, the node is unchanged, and the AgentUpgrade is `Failed` with reason `MigrationFailed`. A variant blocks the API server while it fails: v1's daemon then publishes the failure from its signal. |
+| Downgrade in the window | After the cutover, an AgentUpgrade to the release the host ran before restores v1 and completes. A variant makes that v1 daemon fail: the recovery unit restores the v2 binary, the downgrade is `Failed`, and the host migrates again. After a repave, the same AgentUpgrade is rejected before the switch. |
+| Crash loop after the commit | After the cutover, make the v2 daemon fail repeatedly, then do the same after a repave. Each time, the recovery unit restores a v2 binary, never the v1 one, and the daemon runs again once the fault is removed ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
+| Readiness timeout | After the cutover, make an AgentUpgrade's new daemon hang before its startup gate opens. The start times out three times, the recovery unit restores the previous binary, and the operation is `Failed` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
 
 ## 5. Further end-to-end tests
 

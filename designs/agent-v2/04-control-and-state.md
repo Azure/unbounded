@@ -193,7 +193,7 @@ mistaken for no repave:
 | Not `Repave.Slot`, digest matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Repave.Slot` empty) | Continues or retries the approved repave, if any, from the beginning of its first unfinished step |
 | `Repave.Slot`, digest matches `Repave.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
 | None, and `Repave` is set | The old slot was stopped, but the new one was not started | Continues the approved repave from starting the new slot |
-| Any other case | The record and the host disagree | Reports `StateMismatch` and changes nothing |
+| Any other case | The record and the host disagree | Reports `StateMismatch`, changes nothing, and keeps the daemon from reporting ready (section 5) |
 
 The runtime kind is an install-time setting, so it lives in the install
 record, not here.
@@ -201,8 +201,8 @@ record, not here.
 ### State files
 
 The rules for every v2 state file: the install record, node state, the host
-preparation undo log, the host runtime's ownership and active-slot records, and
-saved bundle manifests.
+preparation undo log, the host runtime's ownership and active-slot records,
+saved bundle manifests, and the migration record on a host migrated from v1.
 
 - Each file has a `schemaVersion`, is written and synced to disk before it is
   used, and has a `.sha256` sidecar.
@@ -242,10 +242,22 @@ flowchart TD
   D -- Steady --> S["status.report Ready, or Provisioning while the Node does not exist"]
 ```
 
-The startup gate opens after pending AgentUpgrade and HostOSReboot results are
-published, as v1 publishes them when its daemon starts
-(`cmd/agent/internal/daemon/daemon.go:170-176`), `Recover` has finished, and
-the caches have synced.
+The startup gate opens when the Machine is registered, `Recover` has found the
+host consistent with the state (section 4), and the caches have synced. The
+daemon then tells systemd it is ready: the daemon unit is `Type=notify`, and the
+daemon sends `READY=1` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). It then publishes pending AgentUpgrade and
+HostOSReboot results, as v1 publishes them when its daemon starts
+(`cmd/agent/internal/daemon/daemon.go:170-176`), and starts taking requests from
+the queue. An approved repave that `Recover` found is finished from the queue,
+after the gate opens, so a long repave never delays readiness.
+
+A daemon whose `Recover` finds the state inconsistent or corrupt
+(`StateMismatch`, `StateCorrupt`) reports it on the Machine and exits with a
+failure code instead of reporting ready, as v1's daemon exits when it cannot
+make sense of the host's machines (`daemon.go:137-140`). After an AgentUpgrade,
+this rolls the binary back. When the state itself is at fault, the `last-good`
+binary that the recovery unit starts fails the same way, and the host needs
+`v2 reset` on the host or a HostReplace.
 
 `Decide` repaves only when the daemon itself sees this node's Node object
 being deleted, as v1 does: v1 watches only Node delete events

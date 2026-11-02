@@ -188,33 +188,61 @@ sequenceDiagram
   D->>AB: download, verify sha256, install into the inactive blue or green binary
   AB->>AB: candidate must answer version and v2 version
   AB->>AB: switch current link, keep last-good
-  D->>D: write upgrade signal, re-exec current
-  N->>N: startup gate publishes Complete from the signal
-  N->>N: hook agent.upgrade.after
-  SD-->>SD: on repeated failure the recovery unit restores last-good, whose daemon publishes Failed and fires agent.upgrade.after
+  D->>D: write upgrade signal
+  D->>SD: restart the daemon unit
+  SD->>N: start, Type=notify
+  N->>SD: READY=1 once the startup gate opens
+  N->>N: publish Complete from the signal, hook agent.upgrade.after
+  SD-->>SD: if starts keep failing or timing out, the recovery unit restores last-good, whose daemon publishes Failed and fires agent.upgrade.after
 ```
 
 This is v1's mechanism
 (`cmd/agent/internal/daemon/controller_machineoperation.go:110-196`,
 `pkg/agent/agentbinary/upgrade.go:193-273`) with these additions:
 
+- **The operation completes only when the new daemon is ready.** The daemon
+  unit is `Type=notify`, and the daemon sends `READY=1` only when its startup
+  gate opens ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). The old daemon therefore restarts the
+  unit through systemd, so that the new daemon's start is held to the start
+  timeout, rather than running the new binary in the same process as v1 does
+  (`cmd/agent/internal/cmd/daemon.go:50-59`). v1 has no such check on this
+  path: the new daemon reports the operation `Complete` as soon as it has
+  registered the Machine (`cmd/agent/internal/daemon/daemon.go:166-172`). Only
+  v1's host-driven activation waits, for a process that stays up for 3 seconds
+  (`cmd/agent/internal/daemon/hostupgrade.go:23-26,110-146`).
+- **A daemon that never becomes ready is rolled back like one that crashes.**
+  The unit sets `TimeoutStartSec=60s`, `RestartSec=10s`, `StartLimitBurst=3` and
+  `StartLimitIntervalSec=5min`. Three starts that time out take at most 200
+  seconds, inside the interval, so the start limit trips and the recovery unit
+  runs. v1's unit allows three starts in 60 seconds
+  (`cmd/agent/internal/daemon/assets/unbounded-agent-daemon.service:9-10,16`),
+  which three 60-second timeouts would never reach. Five minutes is the
+  longest interval v1's recovery script accepts
+  (`unbounded-agent-daemon-recovery.sh:61-64`), and v2's keeps that limit.
 - A candidate binary is checked with `v2 version` as well as `version`
   (`pkg/agent/agentbinary/agentbinary.go:125`), so a binary without the `v2`
-  command is rejected before the switch.
-- On a host migrated from v1, once the migration can no longer be rolled
-  back, a candidate older than the first official v2 release is also rejected
-  ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)).
+  command is rejected before the switch. The daemon unit's `ExecStartPre=`
+  repeats the check at every start, so the recovery unit cannot start such a
+  binary either ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)).
+- On a host migrated from v1, a candidate whose daemon would be v1's, or an
+  operation with `agentMode: v1`, is a downgrade while the rollback window is
+  open: v2 puts v1 back from its backup, then switches to the candidate. After
+  the window, it is rejected before the switch
+  ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)).
 - The daemon unit runs `<current> v2 daemon` in the experimental releases, and
-  `<current> daemon` from the first official v2 release.
+  `<current> daemon` from the first official v2 release, which rewrites the
+  unit when its daemon first starts.
 
 The `v2 agent-upgrade` command is the other way in. Host delivery automation
 runs it on the host, from a separately staged candidate binary, without a
 MachineOperation, as v1's hidden `agent-upgrade` command is run
 (`cmd/agent/internal/cmd/agentupgrade.go:63-70`). It uses the same activation:
-install into the inactive blue or green binary, switch the `current` link, restart the daemon
-unit and wait until it is healthy, rolling back if it is not
-(`pkg/agent/agentbinary/activation.go:86-246`). The `agent.upgrade.before` and
-`agent.upgrade.after` events fire on this path too.
+install into the inactive blue or green binary, switch the `current` link,
+restart the daemon unit and wait for it to report ready, rolling back if it does
+not (`pkg/agent/agentbinary/activation.go:83-246`). The `agent.upgrade.before`
+and `agent.upgrade.after` events fire on this path too. It never downgrades to
+v1; on the host, that is `v2 migrate --rollback --binary <path>`
+([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)).
 
 ## 6. Reset
 

@@ -63,6 +63,13 @@ internal/agentv2/
   through `v2` commands.
 - **Copied code drifts from v1.** The list in [v1 compatibility, section 3](08-v1-compatibility.md#3-code-copied-from-v1) is the mitigation.
 - **Migration takes over running production nodes.** A bug could disrupt a
-  node that was working. Automatic rollback before commit, the rollback window
-  until the first repave, and the migration suite are the mitigations
+  node that was working. Before the commit, v2 changes nothing of v1's, so a
+  failure returns the host to whichever v1 binary ran it. The commit is short,
+  local and always finished. The rollback window lasts until the first repave,
+  and the migration suite runs every phase, interrupted and failed, from every
+  supported v1 release
   ([migrating from v1](10-migration-from-v1.md), [testing, section 4](11-testing.md#4-migration-suite)).
+- **v1's on-host formats differ between releases.** The conversion reads what
+  each supported release writes. The migration test matrix sets the oldest
+  supported v1 release, and an older host is refused before anything changes
+  ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)).

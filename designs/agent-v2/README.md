@@ -155,7 +155,9 @@ library.
 | Host network reset | The node manager's cleanup of links, routes, rules and firewall state after a node stops ([host changes, section 2](06-host-changes.md#2-host-network-reset)). |
 | Ownership record and active-slot record | The `host` runtime's records of the host paths it owns and of the slot installed into them ([host runtime cleanup, sections 3 and 8](07-host-runtime-cleanup.md#3-ownership-and-adoption)). |
 | Leftover | Something a cleanup could not remove, reported rather than ignored ([host runtime cleanup, section 10](07-host-runtime-cleanup.md#10-post-conditions)). |
-| Release N and the first official v2 release | The last v1 release, and the release after it, which replaces v1 with v2 ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
+| First official v2 release | The release that replaces v1 with v2. Its daemon migrates every v1 host it starts on ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
+| Oldest supported v1 release | The oldest v1 release a host can migrate from, set by the releases the migration test matrix covers ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
+| Rollback window | From a migration's commit until v2's first repave on that host. Inside it, v2 can put v1 back ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)). |
 
 ## 2. Goals and non-goals
 
@@ -174,8 +176,9 @@ library.
   recorded decision ([implementation, section 2](09-implementation.md#2-export-policy)).
 - **G6.** Existing v1 hosts move to v2 without replacing their node, with a
   safe rollback: early, started from the cluster or the host, or at the first
-  official v2 release, when every remaining v1 host moves
-  ([migrating from v1](10-migration-from-v1.md)).
+  official v2 release, when every remaining v1 host moves. Any release since
+  the oldest supported v1 release can migrate, and no v1 release needs a change
+  to be rolled back to ([migrating from v1](10-migration-from-v1.md)).
 
 ### 2.2 Non-goals
 
