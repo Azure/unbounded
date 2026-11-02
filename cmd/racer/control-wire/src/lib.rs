@@ -488,6 +488,32 @@ mod definitions {
 
         /// Relative weight, 0 through `MAX_PRIORITY`, for sharing node disk and memory.
         pub priority: u16,
+
+        /// Whether nodes retain this cache's pages and metadata.
+        pub mode: CacheMode,
+    }
+
+    /// How a cache treats object data. Only `Cached` retains pages or metadata.
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+    pub enum CacheMode {
+        /// Retain pages in memory and on disk under the usual admission policy.
+        #[default]
+        Cached,
+
+        /// Retain nothing; route each page to its owners, which share one origin
+        /// fill among concurrent readers.
+        PassthroughPeers,
+
+        /// Retain nothing; each reading node calls its own local origin socket
+        /// and never asks peers.
+        PassthroughLocal,
+    }
+
+    impl CacheMode {
+        /// Whether pages and metadata of this cache are never retained.
+        pub fn passthrough(self) -> bool {
+            self != Self::Cached
+        }
     }
 
     impl KeyId {
@@ -1158,6 +1184,50 @@ mod codec {
 
         // Required: field order must match Go's canonical content.
         priority: u16,
+
+        // Optional and omitted for cached caches, so their canonical bytes are unchanged.
+        #[serde(default, skip_serializing_if = "ModeDto::is_cached")]
+        mode: ModeDto,
+    }
+
+    /// Wire spelling of `CacheMode`. `Cached` is never written or accepted: a
+    /// cached cache omits the field, which keeps one canonical encoding.
+    #[derive(Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    enum ModeDto {
+        #[default]
+        #[serde(skip)]
+        Cached,
+
+        PassthroughPeers,
+
+        PassthroughLocal,
+    }
+
+    impl ModeDto {
+        fn is_cached(&self) -> bool {
+            *self == Self::Cached
+        }
+    }
+
+    impl From<ModeDto> for CacheMode {
+        fn from(mode: ModeDto) -> Self {
+            match mode {
+                ModeDto::Cached => Self::Cached,
+                ModeDto::PassthroughPeers => Self::PassthroughPeers,
+                ModeDto::PassthroughLocal => Self::PassthroughLocal,
+            }
+        }
+    }
+
+    impl From<CacheMode> for ModeDto {
+        fn from(mode: CacheMode) -> Self {
+            match mode {
+                CacheMode::Cached => Self::Cached,
+                CacheMode::PassthroughPeers => Self::PassthroughPeers,
+                CacheMode::PassthroughLocal => Self::PassthroughLocal,
+            }
+        }
     }
 
     /// Full publication with decimal-string cursors for cross-language precision.
@@ -1226,6 +1296,7 @@ mod codec {
                 client_socket: c.client_socket.into(),
                 origin_socket: c.origin_socket.into(),
                 priority: c.priority,
+                mode: c.mode.into(),
             })
             .collect();
         validate_definitions(&caches)?;
@@ -1270,6 +1341,7 @@ mod codec {
                     .ok_or(Error::InvalidRequest)?
                     .into(),
                 priority: c.priority,
+                mode: c.mode.into(),
             });
         }
         caches.sort_by(|a, b| a.id.cmp(&b.id));

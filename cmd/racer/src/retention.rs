@@ -22,6 +22,11 @@ impl Observation {
     pub fn eligible(self) -> bool {
         self.eligible
     }
+
+    /// A decision that never admits the page to disk, for caches that retain nothing.
+    pub fn never() -> Self {
+        Self { eligible: false }
+    }
 }
 
 /// One token per logical page interest, retained across retries and handoffs.
@@ -689,6 +694,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
+            mode: racer_control_wire::CacheMode::Cached,
         };
         // "u" holds payload but is unpublished; "e" is published but empty.
         let _held = [
@@ -737,6 +743,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
+            mode: racer_control_wire::CacheMode::Cached,
         };
         // Reference: a fresh full count over the current resident set.
         let check = |policy: &Retention| {
@@ -829,6 +836,7 @@ mod tests {
             client_socket: "/client".into(),
             origin_socket: "/origin".into(),
             priority,
+            mode: racer_control_wire::CacheMode::Cached,
         };
         const CACHES: usize = 2000;
         const LIMIT: usize = 64;

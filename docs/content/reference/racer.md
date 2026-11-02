@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; no `status` |
+| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -83,6 +83,41 @@ reservation, and nodes do not coordinate.
 Priority 0 has no weighted share when competing with positive-priority caches.
 The cache keeps its working allowance, is preferred for eviction, and is still
 cached while capacity is idle.
+
+### Passthrough
+
+Set `spec.passthrough` to turn off caching for a cache. Racer still serves
+reads through the client socket, but proxies them to the origin and keeps no
+data:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: artifacts
+spec:
+  passthrough:
+    route: Peers
+```
+
+| `route` | Behavior |
+|---------|----------|
+| `Peers` (default) | Each page goes to its owner nodes through the mesh, as for a cached cache. The owner reads from its local origin. Concurrent reads of the same page anywhere in the cluster share one origin read, and many pages are in flight at once. |
+| `Local` | The reading node reads from its own local origin and never asks peers. Concurrent reads of the same page on one node still share one origin read. Every node that reads needs an origin; a managed `spec.origin` runs one per dataplane node. |
+
+- Pages are not written to disk and stay in memory only while concurrent
+  readers share an in-flight origin read.
+- Object metadata (ETag, size, expiry) is not reused across reads, so each read
+  revalidates with the origin. One read still pins one object version for all
+  of its pages.
+- Retention is refused. A HEAD that asks for retention still returns metadata,
+  but without `Racer-Retain-Until`, and counts in `racer_warm_refused_total`.
+  Owners refuse hold and warm fill requests for the cache.
+- `spec.priority` still weights in-flight memory use.
+- With the `Local` route, `racer_passthrough_local_origin_fills_total` counts
+  pages that a node read from its own origin.
+- `spec.passthrough` can be added, changed, or removed at any time. When a cache
+  switches to passthrough, data previously cached for it is dropped.
 
 The controller and dataplane must run the same version. A mismatched pair
 rejects the cache catalog.

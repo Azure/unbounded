@@ -87,6 +87,7 @@ impl Control {
                         client_socket,
                         origin_socket,
                         priority: racer_control_wire::DEFAULT_PRIORITY,
+                        mode: racer_control_wire::CacheMode::Cached,
                     }
                 })
                 .collect(),

@@ -599,6 +599,7 @@ pub(crate) mod tests {
             name: format!("c{n}"),
             client_socket: client,
             priority: wire::DEFAULT_PRIORITY,
+            mode: wire::CacheMode::Cached,
             origin_socket: origin,
         }
     }
