@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -135,7 +136,7 @@ func (p *puller) udsRangedAcquirer(client *racersdk.Client) func(context.Context
 // rangeRotation picks this process's first range from its host name when
 // range-rotate is set, spreading concurrent readers across the object.
 func (p *puller) rangeRotation(size int64) int64 {
-	if !p.opts.RangeRotate || p.opts.RangeBytes <= 0 {
+	if (!p.opts.RangeRotate && p.opts.RangeCohorts <= 1) || p.opts.RangeBytes <= 0 {
 		return 0
 	}
 
@@ -148,6 +149,34 @@ func (p *puller) rangeRotation(size int64) int64 {
 	_, _ = h.Write([]byte(name)) //nolint:errcheck // hash.Hash never fails.
 
 	ranges := (size + p.opts.RangeBytes - 1) / p.opts.RangeBytes
+	if p.opts.RangeCohorts > 1 {
+		// Nodes in one cohort start together; cohorts start evenly apart.
+		cohort := int64(h.Sum64() % uint64(p.opts.RangeCohorts))
+		if n, ok := trailingNumber(p.opts.NodeName); ok {
+			// Numbered nodes get exactly balanced cohorts.
+			cohort = n % int64(p.opts.RangeCohorts)
+		}
+
+		return cohort * ranges / int64(p.opts.RangeCohorts)
+	}
 
 	return int64(h.Sum64() % uint64(ranges))
+}
+
+// trailingNumber parses the decimal suffix of name, such as 17 in "node-0017".
+func trailingNumber(name string) (int64, bool) {
+	end := len(name)
+	start := end
+
+	for start > 0 && name[start-1] >= '0' && name[start-1] <= '9' {
+		start--
+	}
+
+	if start == end || end-start > 18 {
+		return 0, false
+	}
+
+	n, err := strconv.ParseInt(name[start:end], 10, 64)
+
+	return n, err == nil
 }

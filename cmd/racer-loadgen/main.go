@@ -92,6 +92,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.IntVar(&opts.pull.RangeParallel, "range-parallel", 0, "UDS only: concurrent ranges per blob with range-bytes (0 means 1)")
 	f.IntVar(&opts.pull.RangeRetries, "range-retries", 0, "UDS only: resumes allowed per range with range-bytes")
 	f.BoolVar(&opts.pull.RangeRotate, "range-rotate", false, "UDS only: start each process at a host-name-derived range with range-bytes")
+	f.IntVar(&opts.pull.RangeCohorts, "range-cohorts", 0, "UDS only: split processes into this many cohorts by host name; a cohort starts at the same range and cohorts start evenly spaced across the blob (overrides range-rotate)")
 	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {
@@ -151,7 +152,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, fmt.Errorf("catalog-workers must be in [1, %d]", maxCatalogWorkers)
 	}
 
-	if opts.pull.RangeBytes < 0 || opts.pull.RangeParallel < 0 || opts.pull.RangeRetries < 0 {
+	if opts.pull.RangeBytes < 0 || opts.pull.RangeParallel < 0 || opts.pull.RangeRetries < 0 || opts.pull.RangeCohorts < 0 {
 		return opts, errors.New("range-bytes, range-parallel, and range-retries must be nonnegative")
 	}
 
