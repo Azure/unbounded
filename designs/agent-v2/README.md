@@ -23,7 +23,7 @@ The design is split into the documents below. Read this README first.
 | [06. Host changes](06-host-changes.md) | Everything v2 creates on a host, the host network reset, host preparation and how reset reverses it | Consumers, and host and OS reviewers |
 | [07. Host runtime cleanup](07-host-runtime-cleanup.md) | How the `host` runtime stops, cleans up and removes a node | Host and OS reviewers |
 | [08. v1 compatibility](08-v1-compatibility.md) | Parity with v1, intended behavior changes, copied code, changes outside `internal/agentv2`, converting a v1 configuration | v1 maintainers |
-| [09. Implementation](09-implementation.md) | Package layout, export policy, risks | Implementers |
+| [09. Implementation](09-implementation.md) | Package layout, export policy, risks, and the exit criteria for the first official v2 release | Implementers, release owners |
 | [10. Migrating from v1](10-migration-from-v1.md) | How a v1 host, or a host built by another `pkg/agent` consumer, moves to v2 without replacing its node, and the cutover at the first official v2 release | v1 maintainers, AKS Flex Node maintainers, operators |
 | [11. Testing](11-testing.md) | Unit and golden tests, running the v1 end-to-end suites on v2, the migration suite, checking reset with a host snapshot, CI and validation tasks | Everyone |
 
@@ -33,7 +33,9 @@ document 10, and the testing plan in document 11.
 
 Documents 01 and 02, and section 1 of document 06, are what a consumer builds
 against. Everything in them is versioned and experimental until the
-[export policy](09-implementation.md#2-export-policy) promotes it.
+[export policy](09-implementation.md#2-export-policy) promotes it. Experimental describes only these interfaces: the
+code is built to production standard from the start, and
+[implementation, section 4](09-implementation.md#4-production-readiness) lists what must hold before v2 replaces v1.
 
 Code citations are `file:line` against the baseline above. Statements that rely
 on upstream behavior (Kubernetes, containerd, CNI, systemd, the kernel) rather

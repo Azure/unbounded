@@ -246,8 +246,12 @@ These cover what v1 never had, so the v1 suites cannot:
 
 | When | Runs |
 |---|---|
-| Pull requests that touch `internal/agentv2`, `cmd/agent`, `pkg/agent` or `hack/agent/e2e-kind` | The existing v1 jobs, unchanged and still required. On ubuntu2404: the v1 suites under `AGENT_PROFILE=v2` for both runtimes, and the `migration-v2` suite. While v2 is experimental, the v2 jobs report but do not block a merge. |
-| Nightly | The v1 suites under `AGENT_PROFILE=v2` across the full host matrix (`.github/workflows/agent-e2e-kind.yaml:98-116`) for both runtimes, the configuration suite for both runtimes, every `migration-v2` variant, and section 5 |
+| Pull requests that touch `internal/agentv2`, `cmd/agent`, `pkg/agent` or `hack/agent/e2e-kind` | The existing v1 jobs, unchanged. On ubuntu2404: the v1 suites under `AGENT_PROFILE=v2` for both runtimes, and the `migration-v2` suite, including the cutover variants on a test build (section 4). All of these are required to merge, from the first pull request that adds v2 code. |
+| Nightly | The v1 suites under `AGENT_PROFILE=v2` across the full host matrix (`.github/workflows/agent-e2e-kind.yaml:98-116`) for both runtimes, the configuration suite for both runtimes, every `migration-v2` variant, and section 5. Once release builds of the first official v2 release exist, the cutover variants also run against them. |
+
+The v2 jobs are required from the start, not only once v2 is official. The
+experimental releases are what operators migrate early, and v2 code that
+breaks a v1 job, or a v2 job, would otherwise reach them.
 
 Each job stays within the matrix's existing time limits
 (`agent-e2e-kind.yaml:98-104`).
@@ -259,10 +263,10 @@ host only where its probes pass; where they fail, the job checks that `v2 start`
 refuses with the failing probe in its error.
 
 From the first official v2 release, the build has no v1 commands, so the
-`AGENT_PROFILE=v1` jobs can no longer run against it. The v2 jobs become the
-required ones in their place, and `AGENT_PROFILE` defaults to `v2`. The
-`migration-v2` suite then installs v1 only from `LEGACY_AGENT_VERSION`
-(section 4).
+`AGENT_PROFILE=v1` jobs can no longer run against it and are removed. The v2
+jobs stay required and replace them, and `AGENT_PROFILE` defaults to `v2`. The
+`migration-v2` suite then installs v1 only from `LEGACY_AGENT_VERSION`, and
+the test build tag for the cutover is no longer needed (section 4).
 
 ## 7. Validation tasks
 
