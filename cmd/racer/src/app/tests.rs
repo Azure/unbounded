@@ -224,7 +224,7 @@ impl EnrollmentHandler {
             &node.0,
             not_before,
         );
-        response.block_devices = Some("nvme-cache".into());
+        response.disks = vec!["nvme-cache".into()];
         (200, wire::encode_enrollment_response(&response).unwrap())
     }
 }
@@ -2782,8 +2782,8 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
             &scope(Duration::from_secs(5)).unwrap(),
         )
     };
-    let (old, selector) = start().unwrap();
-    assert_eq!(selector.as_deref(), Some("nvme-cache"));
+    let (old, disks) = start().unwrap();
+    assert_eq!(disks, ["nvme-cache"]);
     let committed = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
     let new = NodeId("99999999-9999-4999-8999-999999999999".into());
     *fixture.binding.lock().unwrap() = new.clone();

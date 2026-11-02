@@ -1,0 +1,11 @@
+[
+  {"name":"absent","fields":"","disks":[],"code":""},
+  {"name":"empty","fields":",\"disks\":[]","disks":[],"code":""},
+  {"name":"valid","fields":",\"disks\":[\"wwn-0x5000c500a1b2c3d4\",\"nvme-eui.0025385b71b2c3d4\"]","disks":["wwn-0x5000c500a1b2c3d4","nvme-eui.0025385b71b2c3d4"],"code":""},
+  {"name":"null","fields":",\"disks\":null","disks":[],"code":"invalid_request"},
+  {"name":"string","fields":",\"disks\":\"wwn-1\"","disks":[],"code":"invalid_request"},
+  {"name":"slash","fields":",\"disks\":[\"../sda\"]","disks":[],"code":"invalid_request"},
+  {"name":"comma","fields":",\"disks\":[\"a,b\"]","disks":[],"code":"invalid_request"},
+  {"name":"duplicate","fields":",\"disks\":[\"a\"],\"disks\":[\"b\"]","disks":[],"code":"invalid_request"},
+  {"name":"legacy selector ignored","fields":",\"block_devices\":\"nvme-.*\"","disks":[],"code":""}
+]

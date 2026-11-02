@@ -1,11 +1,14 @@
-//! Startup-only raw-device discovery. Only reserved guards are read; nothing is written.
+//! Startup-only raw-device discovery on administrator-approved whole disks.
+//!
+//! Only the reserved guard regions are read. They are written only to wipe an
+//! approved disk whose guards are not already zero.
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 use page_alloc::Alignment;
-use regex::Regex;
+use racer_cluster_control::disks::DiskReason;
+use racer_control_wire::valid_disk_id;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -20,7 +23,7 @@ mod loop_test;
 pub const MAX_SEGMENTS: u64 = 1_000_000;
 const MAX_PAGES: u64 = 1_000_000;
 const MAX_CHECKPOINT: usize = 512 * 1024 * 1024;
-const GUARD_BYTES: u64 = 1024 * 1024;
+pub(crate) const GUARD_BYTES: u64 = 1024 * 1024;
 
 pub struct Device {
     file: Arc<File>,
@@ -72,61 +75,289 @@ impl Plan {
     }
 }
 
-pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Option<Plan> {
-    let selector = selector.filter(|s| !s.is_empty())?;
-    let result = (|| {
-        if selector.len() > 1024 {
-            return Err(io::Error::other("selector exceeds 1024 bytes"));
-        }
-        let regex = Regex::new(selector).map_err(io::Error::other)?;
-        let root = fs::canonicalize(&config.device_directory)?;
-        let mut paths = fs::read_dir(root.join("disk/by-id"))?.collect::<io::Result<Vec<_>>>()?;
-        paths.sort_by_key(|entry| entry.file_name());
-        let candidates = paths
-            .into_iter()
-            .filter_map(|entry| {
-                let id = entry.file_name().to_str()?.to_owned();
-                regex.is_match(&id).then(|| (id, entry.path()))
-            })
-            .collect();
-        let mut seen = HashSet::new();
-        let mut devices = Vec::new();
-        let mut failure = None;
-        open_with_busy_wait(
-            candidates,
-            config.device_busy_wait,
-            &mut SystemClock(std::time::Instant::now()),
-            |(id, path): &(String, std::path::PathBuf)| {
-                // Avoid reopening an alias while the first exclusive claim is held.
-                if fs::metadata(path).is_ok_and(|m| seen.contains(&m.rdev())) {
-                    return Ok(());
-                }
-                let device = open_device(&root, path, id, config.segment_bytes)?;
-                match device.file.metadata() {
-                    Ok(metadata) => {
-                        if seen.insert(metadata.rdev()) {
-                            devices.push(device);
-                        }
-                    }
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                    }
-                }
-                Ok(())
-            },
-        );
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        plan(devices, config, workers).map_err(io::Error::other)
-    })();
-    match result {
-        Ok(plan) => Some(plan),
-        Err(error) => {
-            eprintln!("racer: block device discovery failed; using slab files: {error}");
-            None
+/// What discovery did with one approved disk ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    /// Opened, validated, and used as cache storage.
+    Claimed,
+    /// Present, but refused for the reason given.
+    Rejected(DiskReason),
+    /// No `disk/by-id` entry with this name.
+    Missing,
+}
+
+/// One approved disk ID and its discovery outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Approval {
+    /// Approved `disk/by-id` basename.
+    pub id: String,
+    /// Device number the ID resolved to, when it resolved.
+    pub rdev: Option<u64>,
+    pub outcome: Outcome,
+}
+
+impl Approval {
+    /// The `/debug/hardware` and Pod report view of this outcome.
+    pub fn hardware(&self) -> crate::hardware::Approved {
+        use racer_cluster_control::disks::DiskState;
+        let (state, reason) = match self.outcome {
+            Outcome::Claimed => (DiskState::Claimed, None),
+            Outcome::Rejected(reason) => (DiskState::Rejected, Some(reason)),
+            Outcome::Missing => (DiskState::Missing, None),
+        };
+        crate::hardware::Approved {
+            id: self.id.clone(),
+            dev: self.rdev.map(crate::hardware::format_dev),
+            state,
+            reason,
         }
     }
+}
+
+/// Startup discovery result: the storage plan, if any disk was usable, and
+/// the outcome of every approved ID.
+#[derive(Default)]
+pub struct Discovery {
+    pub plan: Option<Plan>,
+    pub approvals: Vec<Approval>,
+}
+
+/// A refused disk: the reported reason and the underlying error for logs.
+#[derive(Debug)]
+struct Refusal {
+    reason: DiskReason,
+    error: io::Error,
+}
+
+impl Refusal {
+    fn new(reason: DiskReason, error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self {
+            reason,
+            error: io::Error::other(error),
+        }
+    }
+
+    fn io(reason: DiskReason) -> impl FnOnce(io::Error) -> Self {
+        move |error| Self { reason, error }
+    }
+}
+
+/// Open, prepare, and plan storage on the approved whole disks.
+///
+/// Each approved ID must be an exact `disk/by-id` basename under the device
+/// directory. Aliases of one disk are opened once. Approval is consent to
+/// wipe: a disk whose guard regions are not zero has them zeroed (see
+/// [`prepare_guards`]). Disks that are mounted, held, read-only, too small,
+/// busy, or partitions are refused. When no disk is usable, the plan is
+/// `None` and storage falls back to slab files.
+pub fn discover(config: &Config, approved: &[String], workers: usize) -> Discovery {
+    let mut ids: Vec<&String> = Vec::new();
+    for id in approved {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Discovery::default();
+    }
+    let mut approvals: Vec<Approval> = ids
+        .iter()
+        .map(|id| Approval {
+            id: (*id).clone(),
+            rdev: None,
+            outcome: Outcome::Missing,
+        })
+        .collect();
+    let root = match fs::canonicalize(&config.device_directory) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!(
+                "racer: device directory {:?} unavailable; using slab files: {error}",
+                config.device_directory
+            );
+            return Discovery {
+                plan: None,
+                approvals,
+            };
+        }
+    };
+    let sys = Path::new(SYS_DEV_BLOCK);
+    // Resolve every approved ID without opening anything.
+    let mut candidates = Vec::new();
+    let mut wwids: Vec<(String, u64)> = Vec::new();
+    let mut first_by_rdev: Vec<(u64, usize)> = Vec::new();
+    for (index, approval) in approvals.iter_mut().enumerate() {
+        if !valid_disk_id(&approval.id) {
+            approval.outcome = Outcome::Rejected(DiskReason::NotWholeDisk);
+            continue;
+        }
+        let path = root.join("disk/by-id").join(&approval.id);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("racer: disk {:?}: {error}", approval.id);
+                approval.outcome = Outcome::Rejected(DiskReason::IoError);
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!("racer: disk {:?}: {error}", approval.id);
+                approval.outcome = if error.kind() == io::ErrorKind::NotFound {
+                    Outcome::Missing
+                } else {
+                    Outcome::Rejected(DiskReason::IoError)
+                };
+                continue;
+            }
+        };
+        if !metadata.file_type().is_block_device() {
+            eprintln!("racer: disk {:?}: not a block device", approval.id);
+            approval.outcome = Outcome::Rejected(DiskReason::NotWholeDisk);
+            continue;
+        }
+        let rdev = metadata.rdev();
+        approval.rdev = Some(rdev);
+        if first_by_rdev.iter().any(|(seen, _)| *seen == rdev) {
+            // An alias of an earlier approved ID; it takes that outcome below.
+            approval.outcome = Outcome::Rejected(DiskReason::Duplicate);
+            continue;
+        }
+        first_by_rdev.push((rdev, index));
+        let wwid = sys_text(&sys.join(dev_number(rdev)).join("wwid"))
+            .or_else(|| sys_text(&sys.join(dev_number(rdev)).join("device/wwid")));
+        if let Some(wwid) = wwid {
+            if wwids
+                .iter()
+                .any(|(seen, other)| *seen == wwid && *other != rdev)
+            {
+                eprintln!(
+                    "racer: disk {:?} is another path to an approved disk; refusing it",
+                    approval.id
+                );
+                approval.outcome = Outcome::Rejected(DiskReason::Duplicate);
+                continue;
+            }
+            wwids.push((wwid, rdev));
+        }
+        candidates.push((approval.id.clone(), path));
+    }
+    let mut devices = Vec::new();
+    let mut refused: Vec<(String, DiskReason)> = Vec::new();
+    let still_busy = open_with_busy_wait(
+        candidates,
+        config.device_busy_wait,
+        &mut SystemClock(std::time::Instant::now()),
+        |(id, path): &(String, std::path::PathBuf)| match open_device(
+            &root,
+            sys,
+            path,
+            id,
+            config.segment_bytes,
+        ) {
+            Ok(device) => {
+                devices.push(device);
+                Ok(())
+            }
+            Err(refusal) if refusal.reason == DiskReason::Busy && is_busy(&refusal.error) => {
+                Err(refusal.error)
+            }
+            Err(refusal) => {
+                refused.retain(|(other, _)| other != id);
+                refused.push((id.clone(), refusal.reason));
+                Err(refusal.error)
+            }
+        },
+    );
+    for (id, _) in still_busy {
+        refused.push((id, DiskReason::Busy));
+    }
+    let set = |approvals: &mut Vec<Approval>, id: &str, outcome: Outcome| {
+        if let Some(approval) = approvals.iter_mut().find(|a| a.id == id) {
+            approval.outcome = outcome;
+        }
+    };
+    for (id, reason) in refused {
+        set(&mut approvals, &id, Outcome::Rejected(reason));
+    }
+    let claimed: Vec<String> = devices.iter().map(|d| d.id.clone()).collect();
+    let plan = if devices.is_empty() {
+        None
+    } else {
+        match plan(devices, config, workers) {
+            Ok(plan) => {
+                for id in &claimed {
+                    set(&mut approvals, id, Outcome::Claimed);
+                }
+                Some(plan)
+            }
+            Err(error) => {
+                eprintln!(
+                    "racer: approved disks cannot hold the cache layout; using slab files: {error}"
+                );
+                for id in &claimed {
+                    set(&mut approvals, id, Outcome::Rejected(DiskReason::TooSmall));
+                }
+                None
+            }
+        }
+    };
+    // Aliases share the outcome of the first approved ID for the same disk.
+    for index in 0..approvals.len() {
+        let Some(rdev) = approvals[index].rdev else {
+            continue;
+        };
+        if let Some((_, first)) = first_by_rdev.iter().find(|(seen, _)| *seen == rdev)
+            && *first != index
+            && approvals[index].outcome == Outcome::Rejected(DiskReason::Duplicate)
+        {
+            approvals[index].outcome = approvals[*first].outcome;
+        }
+    }
+    for approval in &approvals {
+        match approval.outcome {
+            Outcome::Claimed => {}
+            Outcome::Missing => eprintln!(
+                "racer: approved disk {:?} not found under {}",
+                approval.id,
+                root.join("disk/by-id").display()
+            ),
+            Outcome::Rejected(reason) => eprintln!(
+                "racer: approved disk {:?} rejected: {}",
+                approval.id,
+                reason_name(reason)
+            ),
+        }
+    }
+    if plan.is_none() {
+        eprintln!("racer: no approved disk is usable; using slab files");
+    }
+    Discovery { plan, approvals }
+}
+
+/// Wire name of a reason, for logs.
+pub fn reason_name(reason: DiskReason) -> String {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Sysfs directory of block devices by `MAJ:MIN`.
+const SYS_DEV_BLOCK: &str = "/sys/dev/block";
+
+/// `MAJ:MIN` for a device number.
+fn dev_number(rdev: u64) -> String {
+    format!("{}:{}", libc::major(rdev), libc::minor(rdev))
+}
+
+/// Trimmed, nonempty sysfs attribute text.
+fn sys_text(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// Interval between exclusive-open retries for busy devices.
@@ -231,17 +462,27 @@ impl Candidate for (String, std::path::PathBuf) {
     }
 }
 
-fn open_device(root: &Path, path: &Path, id: &str, segment_bytes: u64) -> io::Result<Device> {
-    let path = fs::canonicalize(path)?;
-    let relative = path.strip_prefix(root).map_err(io::Error::other)?;
-    let metadata = fs::metadata(&path)?;
+fn open_device(
+    root: &Path,
+    sys: &Path,
+    path: &Path,
+    id: &str,
+    segment_bytes: u64,
+) -> std::result::Result<Device, Refusal> {
+    let io_error = Refusal::io(DiskReason::IoError);
+    let path = fs::canonicalize(path).map_err(Refusal::io(DiskReason::IoError))?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|e| Refusal::new(DiskReason::IoError, e))?;
+    let metadata = fs::metadata(&path).map_err(Refusal::io(DiskReason::IoError))?;
     if !metadata.file_type().is_block_device() {
-        return Err(io::Error::other("not a block device"));
+        return Err(Refusal::new(DiskReason::NotWholeDisk, "not a block device"));
     }
     let dev = metadata.rdev();
-    check_unused(Path::new("/sys/dev/block"), dev)?;
-    let root_fd = File::open(root)?;
-    let relative = std::ffi::CString::new(relative.as_os_str().as_encoded_bytes())?;
+    check_unused(sys, dev)?;
+    let root_fd = File::open(root).map_err(Refusal::io(DiskReason::IoError))?;
+    let relative = std::ffi::CString::new(relative.as_os_str().as_encoded_bytes())
+        .map_err(|e| Refusal::new(DiskReason::IoError, e))?;
     // openat2 prevents a renamed parent or symlink from escaping the device root.
     #[repr(C)]
     struct OpenHow {
@@ -265,31 +506,140 @@ fn open_device(root: &Path, path: &Path, id: &str, segment_bytes: u64) -> io::Re
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        let reason = match error.raw_os_error() {
+            Some(libc::EBUSY) => DiskReason::Busy,
+            Some(libc::EROFS) => DiskReason::ReadOnly,
+            _ => DiskReason::IoError,
+        };
+        return Err(Refusal { reason, error });
     }
     // SAFETY: openat2 returned a new owned descriptor.
     let file = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) };
-    let opened = file.metadata()?;
+    let opened = file.metadata().map_err(Refusal::io(DiskReason::IoError))?;
     if !opened.file_type().is_block_device() || opened.rdev() != dev {
-        return Err(io::Error::other("device changed while opening"));
+        return Err(Refusal::new(
+            DiskReason::IoError,
+            "device changed while opening",
+        ));
     }
-    check_unused(Path::new("/sys/dev/block"), dev)?;
+    // Recheck under the exclusive claim.
+    let partitions = check_unused(sys, dev)?;
     let mut bytes = 0u64;
     // SAFETY: BLKGETSIZE64 writes one u64 into valid storage.
     if unsafe { libc::ioctl(file.as_raw_fd(), 0x80081272, &mut bytes) } < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io_error(io::Error::last_os_error()));
     }
-    let alignment = device_alignment(&file)?;
-    guarded_capacity(bytes, segment_bytes, alignment).map_err(io::Error::other)?;
-    validate_guards(bytes, alignment, |buffer, offset| {
-        file.read_at(buffer, offset)
-    })?;
+    let alignment = device_alignment(&file).map_err(Refusal::io(DiskReason::IoError))?;
+    guarded_capacity(bytes, segment_bytes, alignment)
+        .map_err(|e| Refusal::new(DiskReason::TooSmall, e))?;
+    prepare_guards(&BlockGuards(&file), id, bytes, alignment, partitions)?;
     Ok(Device {
         file: Arc::new(file),
         id: id.into(),
         bytes,
         alignment,
     })
+}
+
+/// Guard-region I/O on an exclusively opened disk. Tests substitute files.
+trait GuardIo {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+    fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize>;
+    fn sync(&self) -> io::Result<()>;
+    /// Ask the kernel to reread the partition table (`BLKRRPART`).
+    fn reread_partitions(&self) -> io::Result<()>;
+}
+
+struct BlockGuards<'a>(&'a File);
+
+impl GuardIo for BlockGuards<'_> {
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.0.read_at(buffer, offset)
+    }
+
+    fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
+        self.0.write_at(buffer, offset)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.0.sync_data()
+    }
+
+    fn reread_partitions(&self) -> io::Result<()> {
+        const BLKRRPART: libc::c_ulong = 0x125f;
+        // SAFETY: BLKRRPART takes no argument.
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), BLKRRPART as _, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Ensure both guard regions are zero, wiping them when they are not.
+///
+/// Approval is consent to wipe. Zeroing the first and last [`GUARD_BYTES`]
+/// destroys partition tables (MBR and both GPT copies) and the filesystem,
+/// LVM, and RAID signatures kept there. Guards that are already zero are not
+/// written, so restarts never rewrite a disk. When the kernel still lists
+/// partitions, the partition table is reread so stale partitions disappear;
+/// a busy reread refuses the disk.
+fn prepare_guards(
+    disk: &impl GuardIo,
+    id: &str,
+    bytes: u64,
+    alignment: Alignment,
+    partitions: bool,
+) -> std::result::Result<(), Refusal> {
+    guarded_capacity(bytes, GUARD_BYTES, alignment)
+        .map_err(|e| Refusal::new(DiskReason::TooSmall, e))?;
+    let mut buffer = alignment
+        .allocate(GUARD_BYTES as usize, ())
+        .map_err(|e| Refusal::new(DiskReason::IoError, e))?;
+    let mut dirty = Vec::new();
+    for offset in [0, bytes - GUARD_BYTES] {
+        buffer.as_mut_slice().fill(0xff);
+        let n = disk
+            .read_at(buffer.as_mut_slice(), offset)
+            .map_err(Refusal::io(DiskReason::IoError))?;
+        if n != GUARD_BYTES as usize {
+            return Err(Refusal::new(DiskReason::IoError, "short guard read"));
+        }
+        if buffer.as_slice().iter().any(|b| *b != 0) {
+            dirty.push(offset);
+        }
+    }
+    if !dirty.is_empty() {
+        eprintln!(
+            "racer: wiping approved disk {id:?}: zeroing the first and last {GUARD_BYTES} bytes (partition table and signatures)"
+        );
+        buffer.as_mut_slice().fill(0);
+        for offset in dirty {
+            let n = disk
+                .write_at(buffer.as_slice(), offset)
+                .map_err(Refusal::io(DiskReason::WipeFailed))?;
+            if n != GUARD_BYTES as usize {
+                return Err(Refusal::new(DiskReason::WipeFailed, "short guard write"));
+            }
+        }
+        disk.sync().map_err(Refusal::io(DiskReason::WipeFailed))?;
+    }
+    if partitions {
+        match disk.reread_partitions() {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                return Err(Refusal::new(
+                    DiskReason::Busy,
+                    format!("partition table reread: {error}"),
+                ));
+            }
+            Err(error) => return Err(Refusal::io(DiskReason::WipeFailed)(error)),
+        }
+    }
+    validate_guards(bytes, alignment, |buffer, offset| {
+        disk.read_at(buffer, offset)
+    })
+    .map_err(Refusal::io(DiskReason::WipeFailed))
 }
 
 fn guarded_capacity(bytes: u64, segment: u64, alignment: Alignment) -> Result<u64> {
@@ -336,31 +686,72 @@ fn validate_guards(
     Ok(())
 }
 
-fn check_unused(sys: &Path, dev: u64) -> io::Result<()> {
-    check_device_state(sys, dev, &fs::read_to_string("/proc/self/mountinfo")?)
+/// Refuse a disk in use; returns whether the kernel lists partitions on it.
+fn check_unused(sys: &Path, dev: u64) -> std::result::Result<bool, Refusal> {
+    let mounts =
+        fs::read_to_string("/proc/self/mountinfo").map_err(Refusal::io(DiskReason::IoError))?;
+    check_device_state(sys, dev, &mounts)
 }
 
-fn check_device_state(sys: &Path, dev: u64, mounts: &str) -> io::Result<()> {
-    let path = sys.join(format!("{}:{}", libc::major(dev), libc::minor(dev)));
-    if fs::read_to_string(path.join("ro"))?.trim() != "0"
-        || fs::read_dir(path.join("holders"))?.next().is_some()
-    {
-        return Err(io::Error::other("read-only device or active holders"));
+/// Whether `MAJ:MIN` is the source of any mount in `mountinfo` text.
+pub(crate) fn is_mounted(mounts: &str, number: &str) -> bool {
+    mounts
+        .lines()
+        .any(|line| line.split_whitespace().nth(2) == Some(number))
+}
+
+/// Refuse a read-only, held, or mounted disk, or one with a held or mounted
+/// partition, and refuse partitions themselves. Idle partitions are allowed,
+/// because approval is consent to wipe them. Returns whether the disk has
+/// partitions.
+fn check_device_state(sys: &Path, dev: u64, mounts: &str) -> std::result::Result<bool, Refusal> {
+    let number = dev_number(dev);
+    let path = sys.join(&number);
+    let io = Refusal::io(DiskReason::IoError);
+    if path.join("partition").try_exists().map_err(io)? {
+        return Err(Refusal::new(
+            DiskReason::NotWholeDisk,
+            "device is a partition",
+        ));
     }
-    for child in fs::read_dir(&path)? {
-        let child = child?;
-        if child.file_type()?.is_dir() && child.path().join("partition").try_exists()? {
-            return Err(io::Error::other("device has child partitions"));
+    if fs::read_to_string(path.join("ro"))
+        .map_err(Refusal::io(DiskReason::IoError))?
+        .trim()
+        != "0"
+    {
+        return Err(Refusal::new(DiskReason::ReadOnly, "read-only device"));
+    }
+    let held = |dir: &Path| -> std::result::Result<bool, Refusal> {
+        match fs::read_dir(dir.join("holders")) {
+            Ok(mut entries) => Ok(entries.next().is_some()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(Refusal::io(DiskReason::IoError)(error)),
+        }
+    };
+    if held(&path)? {
+        return Err(Refusal::new(DiskReason::Held, "device has holders"));
+    }
+    if is_mounted(mounts, &number) {
+        return Err(Refusal::new(DiskReason::Mounted, "device is mounted"));
+    }
+    let mut partitions = false;
+    for child in fs::read_dir(&path).map_err(Refusal::io(DiskReason::IoError))? {
+        let child = child.map_err(Refusal::io(DiskReason::IoError))?;
+        let child = child.path();
+        if !child.is_dir() || !child.join("partition").try_exists().unwrap_or(false) {
+            continue;
+        }
+        partitions = true;
+        if held(&child)? {
+            return Err(Refusal::new(DiskReason::Held, "a partition has holders"));
+        }
+        if let Some(number) = sys_text(&child.join("dev"))
+            && is_mounted(mounts, &number)
+        {
+            return Err(Refusal::new(DiskReason::Mounted, "a partition is mounted"));
         }
     }
-    let number = format!("{}:{}", libc::major(dev), libc::minor(dev));
-    if mounts
-        .lines()
-        .any(|line| line.split_whitespace().nth(2) == Some(number.as_str()))
-    {
-        return Err(io::Error::other("device is mounted"));
-    }
-    Ok(())
+    Ok(partitions)
 }
 
 fn device_alignment(file: &File) -> io::Result<Alignment> {
@@ -572,8 +963,9 @@ pub(super) fn recovery_layout_fixture() -> Vec<crate::store::checkpoint::Checkpo
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     struct FakeClock(Duration);
 
@@ -1036,20 +1428,12 @@ mod tests {
         assert!(plan(Vec::new(), &c, 1).is_err());
         assert!(plan(vec![device("a", 2, s)], &c, 1).is_err());
         assert!(plan(vec![device("a", 5, s)], &c, 2).is_err());
-        assert!(discover(&c, None, 1).is_none());
-        assert!(discover(&c, Some(""), 1).is_none());
-        assert!(discover(&c, Some("["), 1).is_none());
+        assert!(discover(&c, &[], 1).plan.is_none());
+        assert!(discover(&c, &[], 1).approvals.is_empty());
         c.device_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("nonexistent-device-root");
-        assert!(discover(&c, Some("nvme"), 1).is_none());
-    }
-
-    #[test]
-    fn regex_matches_unanchored_basename_and_allows_partitions() {
-        let r = Regex::new("nvme.*cache").unwrap();
-        assert!(r.is_match("prefix-nvme-cache-part1"));
-        assert!(!r.is_match("ata-system"));
-        let r = Regex::new("^nvme-cache$").unwrap();
-        assert!(!r.is_match("nvme-cache-part1"));
+        let d = discover(&c, &["nvme-a".into()], 1);
+        assert!(d.plan.is_none());
+        assert_eq!(d.approvals[0].outcome, Outcome::Missing);
     }
 
     #[test]
@@ -1081,13 +1465,17 @@ mod tests {
     #[test]
     fn non_block_device_and_escaped_path_are_rejected_before_open() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(open_device(root, &root.join("Cargo.toml"), "file", 4096).is_err());
-        assert!(open_device(root, Path::new("/dev/null"), "escape", 4096).is_err());
+        let sys = Path::new(SYS_DEV_BLOCK);
+        let Err(refusal) = open_device(root, sys, &root.join("Cargo.toml"), "file", 4096) else {
+            panic!("a regular file must be refused");
+        };
+        assert_eq!(refusal.reason, DiskReason::NotWholeDisk);
+        assert!(open_device(root, sys, Path::new("/dev/null"), "escape", 4096).is_err());
     }
 
-    pub(super) struct Fixture(pub(super) std::path::PathBuf);
+    pub(crate) struct Fixture(pub(crate) std::path::PathBuf);
     impl Fixture {
-        pub(super) fn new() -> Self {
+        pub(crate) fn new() -> Self {
             use std::os::unix::fs::DirBuilderExt;
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             // The repo tmp/ directory is gitignored, so it is absent on a fresh
@@ -1109,25 +1497,192 @@ mod tests {
         }
     }
 
+    fn reason(result: std::result::Result<bool, Refusal>) -> Option<DiskReason> {
+        result.err().map(|refusal| refusal.reason)
+    }
+
     #[test]
-    fn rejects_children_holders_read_only_and_mounts_but_allows_partition_itself() {
+    fn refuses_in_use_disks_and_partitions_but_allows_idle_partitions() {
         let f = Fixture::new();
-        let dev = libc::makedev(7, 1);
-        let path = f.0.join("7:1");
+        let dev = libc::makedev(7, 0);
+        let path = f.0.join("7:0");
         fs::create_dir_all(path.join("holders")).unwrap();
         fs::write(path.join("ro"), "0\n").unwrap();
-        fs::write(path.join("partition"), "1\n").unwrap();
-        assert!(check_device_state(&f.0, dev, "").is_ok());
-        assert!(check_device_state(&f.0, dev, "1 0 7:1 / /data rw - ext4 /dev/loop1 rw").is_err());
+        assert!(!check_device_state(&f.0, dev, "").unwrap());
+        // Mounted, read-only, and held disks are refused even when approved.
+        assert_eq!(
+            reason(check_device_state(
+                &f.0,
+                dev,
+                "1 0 7:0 / /data rw - ext4 /dev/loop0 rw"
+            )),
+            Some(DiskReason::Mounted)
+        );
         fs::write(path.join("ro"), "1\n").unwrap();
-        assert!(check_device_state(&f.0, dev, "").is_err());
+        assert_eq!(
+            reason(check_device_state(&f.0, dev, "")),
+            Some(DiskReason::ReadOnly)
+        );
         fs::write(path.join("ro"), "0\n").unwrap();
         fs::write(path.join("holders/dm-0"), "").unwrap();
-        assert!(check_device_state(&f.0, dev, "").is_err());
+        assert_eq!(
+            reason(check_device_state(&f.0, dev, "")),
+            Some(DiskReason::Held)
+        );
         fs::remove_file(path.join("holders/dm-0")).unwrap();
-        fs::create_dir(path.join("child")).unwrap();
-        fs::write(path.join("child/partition"), "1\n").unwrap();
-        assert!(check_device_state(&f.0, dev, "").is_err());
+        // An idle partition is consented-to wipe.
+        let part = path.join("loop0p1");
+        fs::create_dir_all(part.join("holders")).unwrap();
+        fs::write(part.join("partition"), "1\n").unwrap();
+        fs::write(part.join("dev"), "7:1\n").unwrap();
+        assert!(check_device_state(&f.0, dev, "").unwrap());
+        // A mounted or held partition is not.
+        assert_eq!(
+            reason(check_device_state(
+                &f.0,
+                dev,
+                "1 0 7:1 / /data rw - ext4 /dev/loop0p1 rw"
+            )),
+            Some(DiskReason::Mounted)
+        );
+        fs::write(part.join("holders/md0"), "").unwrap();
+        assert_eq!(
+            reason(check_device_state(&f.0, dev, "")),
+            Some(DiskReason::Held)
+        );
+        // A partition itself is never a whole disk.
+        let partition = f.0.join("7:1");
+        fs::create_dir_all(partition.join("holders")).unwrap();
+        fs::write(partition.join("ro"), "0\n").unwrap();
+        fs::write(partition.join("partition"), "1\n").unwrap();
+        assert_eq!(
+            reason(check_device_state(&f.0, libc::makedev(7, 1), "")),
+            Some(DiskReason::NotWholeDisk)
+        );
+    }
+
+    /// File-backed guard I/O that records writes and fakes `BLKRRPART`.
+    struct FileGuards {
+        file: File,
+        writes: std::cell::Cell<usize>,
+        rereads: std::cell::Cell<usize>,
+        reread: fn() -> io::Result<()>,
+    }
+
+    impl FileGuards {
+        fn new(path: &Path, reread: fn() -> io::Result<()>) -> Self {
+            Self {
+                file: fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap(),
+                writes: Default::default(),
+                rereads: Default::default(),
+                reread,
+            }
+        }
+    }
+
+    impl GuardIo for FileGuards {
+        fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+            self.file.read_at(buffer, offset)
+        }
+
+        fn write_at(&self, buffer: &[u8], offset: u64) -> io::Result<usize> {
+            self.writes.set(self.writes.get() + 1);
+            self.file.write_at(buffer, offset)
+        }
+
+        fn sync(&self) -> io::Result<()> {
+            self.file.sync_data()
+        }
+
+        fn reread_partitions(&self) -> io::Result<()> {
+            self.rereads.set(self.rereads.get() + 1);
+            (self.reread)()
+        }
+    }
+
+    fn guarded_image(f: &Fixture, dirty: bool) -> (std::path::PathBuf, Vec<u8>) {
+        let path = f.0.join("disk");
+        let mut data = vec![0; 4 * GUARD_BYTES as usize];
+        data[GUARD_BYTES as usize..3 * GUARD_BYTES as usize].fill(42);
+        if dirty {
+            data[0..512].fill(0x55);
+            let end = data.len();
+            data[end - 1] = 1;
+        }
+        fs::write(&path, &data).unwrap();
+        (path, data)
+    }
+
+    #[test]
+    fn nonzero_guards_are_wiped_then_accepted_without_touching_the_payload() {
+        let f = Fixture::new();
+        let (path, data) = guarded_image(&f, true);
+        let disk = FileGuards::new(&path, || Ok(()));
+        let a = Alignment::new(4096, 4096, 4096).unwrap();
+        prepare_guards(&disk, "wwn-1", data.len() as u64, a, false).unwrap();
+        assert_eq!(disk.writes.get(), 2);
+        assert_eq!(disk.rereads.get(), 0);
+        let after = fs::read(&path).unwrap();
+        assert!(after[..GUARD_BYTES as usize].iter().all(|b| *b == 0));
+        assert!(after[3 * GUARD_BYTES as usize..].iter().all(|b| *b == 0));
+        assert_eq!(
+            after[GUARD_BYTES as usize..3 * GUARD_BYTES as usize],
+            data[GUARD_BYTES as usize..3 * GUARD_BYTES as usize]
+        );
+    }
+
+    #[test]
+    fn zero_guards_are_never_rewritten() {
+        let f = Fixture::new();
+        let (path, data) = guarded_image(&f, false);
+        let disk = FileGuards::new(&path, || Ok(()));
+        let a = Alignment::new(4096, 4096, 4096).unwrap();
+        prepare_guards(&disk, "wwn-1", data.len() as u64, a, false).unwrap();
+        prepare_guards(&disk, "wwn-1", data.len() as u64, a, false).unwrap();
+        assert_eq!(disk.writes.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), data);
+    }
+
+    #[test]
+    fn partitioned_disks_reread_the_table_and_busy_rereads_refuse() {
+        let f = Fixture::new();
+        let a = Alignment::new(4096, 4096, 4096).unwrap();
+        let (path, data) = guarded_image(&f, true);
+        let disk = FileGuards::new(&path, || Ok(()));
+        prepare_guards(&disk, "wwn-1", data.len() as u64, a, true).unwrap();
+        assert_eq!(disk.rereads.get(), 1);
+        let (path, data) = guarded_image(&f, true);
+        let busy = FileGuards::new(&path, || Err(io::Error::from_raw_os_error(libc::EBUSY)));
+        let refusal = prepare_guards(&busy, "wwn-1", data.len() as u64, a, true).unwrap_err();
+        assert_eq!(refusal.reason, DiskReason::Busy);
+        assert!(!is_busy(&refusal.error));
+        let (path, data) = guarded_image(&f, false);
+        let failed = FileGuards::new(&path, || Err(io::Error::from_raw_os_error(libc::ENOTTY)));
+        let refusal = prepare_guards(&failed, "wwn-1", data.len() as u64, a, true).unwrap_err();
+        assert_eq!(refusal.reason, DiskReason::WipeFailed);
+    }
+
+    #[test]
+    fn wipe_and_size_failures_have_reasons() {
+        let f = Fixture::new();
+        let a = Alignment::new(4096, 4096, 4096).unwrap();
+        let (path, data) = guarded_image(&f, true);
+        // A read-only descriptor cannot wipe.
+        let disk = FileGuards {
+            file: File::open(&path).unwrap(),
+            writes: Default::default(),
+            rereads: Default::default(),
+            reread: || Ok(()),
+        };
+        let refusal = prepare_guards(&disk, "wwn-1", data.len() as u64, a, false).unwrap_err();
+        assert_eq!(refusal.reason, DiskReason::WipeFailed);
+        assert_eq!(fs::read(&path).unwrap(), data);
+        let refusal = prepare_guards(&disk, "wwn-1", GUARD_BYTES, a, false).unwrap_err();
+        assert_eq!(refusal.reason, DiskReason::TooSmall);
     }
 
     #[test]
@@ -1136,10 +1691,37 @@ mod tests {
         fs::create_dir_all(f.0.join("disk/by-id")).unwrap();
         fs::write(f.0.join("payload"), "do not overwrite").unwrap();
         std::os::unix::fs::symlink("../../payload", f.0.join("disk/by-id/cache")).unwrap();
+        std::os::unix::fs::symlink("../../payload", f.0.join("disk/by-id/cache-alias")).unwrap();
         let mut c = config();
         c.device_directory = f.0.clone();
-        assert!(discover(&c, Some("missing"), 1).is_none());
-        assert!(discover(&c, Some("cache"), 1).is_none());
+        let d = discover(&c, &["missing".into()], 1);
+        assert!(d.plan.is_none());
+        assert_eq!(d.approvals[0].outcome, Outcome::Missing);
+        // Exact names only: a prefix of an entry does not match it.
+        let d = discover(&c, &["cach".into()], 1);
+        assert_eq!(d.approvals[0].outcome, Outcome::Missing);
+        let d = discover(
+            &c,
+            &[
+                "cache".into(),
+                "cache".into(),
+                "cache-alias".into(),
+                "../payload".into(),
+            ],
+            1,
+        );
+        assert!(d.plan.is_none());
+        assert_eq!(
+            d.approvals
+                .iter()
+                .map(|a| (a.id.as_str(), a.outcome))
+                .collect::<Vec<_>>(),
+            [
+                ("cache", Outcome::Rejected(DiskReason::NotWholeDisk)),
+                ("cache-alias", Outcome::Rejected(DiskReason::NotWholeDisk)),
+                ("../payload", Outcome::Rejected(DiskReason::NotWholeDisk)),
+            ]
+        );
         assert_eq!(fs::read(f.0.join("payload")).unwrap(), b"do not overwrite");
     }
 

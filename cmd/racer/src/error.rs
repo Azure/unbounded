@@ -57,6 +57,9 @@ boundary_errors! {
     Unauthorized,
     /// Authenticated Node binding changed; drain the entire graph and restart.
     NodeIdentityChanged,
+    /// This node's approved raw cache disks changed; drain and restart so
+    /// storage is rebuilt from the new approval.
+    DiskApprovalChanged,
     /// The origin rejected only the credentials of the supplying caller.
     OriginRejected,
     /// The origin forbids this caller; this is not evidence of page absence.

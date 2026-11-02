@@ -77,8 +77,13 @@ pub const SHARES: &str = "racer.unbounded-cloud.io/shares";
 /// Node annotation set by an administrator. Overrides the Pod report.
 pub const RDMA_NICS: &str = "racer.unbounded-cloud.io/rdma-nics";
 
-/// Node annotation: block device pattern returned by bootstrap.
-pub const BLOCK_DEVICES: &str = "racer.unbounded-cloud.io/block-devices";
+/// Node annotation set by an administrator: comma-separated `/dev/disk/by-id`
+/// basenames of whole disks Racer may wipe and use as cache storage.
+pub const DISKS: &str = "racer.unbounded-cloud.io/disks";
+
+/// Retired Node annotation that held a regex disk selector. It is no longer
+/// honored because it never granted consent to wipe; use [`DISKS`].
+pub const LEGACY_BLOCK_DEVICES: &str = "racer.unbounded-cloud.io/block-devices";
 
 /// Node label that removes a Node from membership.
 pub const EXCLUDE: &str = "racer.unbounded-cloud.io/exclude";

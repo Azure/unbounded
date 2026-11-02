@@ -1,6 +1,7 @@
 //! Opt-in root test. Only newly configured, autoclearing loop devices are written.
 
 use super::*;
+use std::collections::HashSet;
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
 use std::rc::Rc;
@@ -143,6 +144,10 @@ fn drive<T>(reactor: &crate::runtime::Reactor, mut operation: crate::error::Oper
     }
 }
 
+fn approved(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
+}
+
 #[test]
 #[ignore = "requires root, loop-control, CAP_SYS_ADMIN, CAP_MKNOD and io_uring; uses only disposable loops"]
 fn disposable_loop_devices_read_only_bind_restart() {
@@ -216,7 +221,8 @@ fn disposable_loop_devices_read_only_bind_restart() {
             .raw_os_error(),
         Some(libc::EROFS)
     );
-    let plan = discover(&config, Some("cache-"), 2)
+    let plan = discover(&config, &approved(&["cache-a", "cache-b"]), 2)
+        .plan
         .expect("both disposable loops must be usable through read-only bind");
     assert_eq!(
         plan.workers
@@ -238,7 +244,9 @@ fn disposable_loop_devices_read_only_bind_restart() {
         2
     );
     assert!(
-        discover(&config, Some("cache-"), 2).is_none(),
+        discover(&config, &approved(&["cache-a", "cache-b"]), 2)
+            .plan
+            .is_none(),
         "second exclusive claim must fail"
     );
     let slab = page_alloc::Slab::<()>::from_devices(
@@ -371,7 +379,9 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let digests: Vec<_> = plan.workers.iter().map(|w| w.digest).collect();
     drop(slab);
     drop(plan);
-    let restarted = discover(&config, Some("cache-"), 2).unwrap();
+    let restarted = discover(&config, &approved(&["cache-a", "cache-b"]), 2)
+        .plan
+        .unwrap();
     for (file, bytes) in [(&first, 5 * segment), (&second, 6 * segment)] {
         validate_guards(
             bytes + 2 * GUARD_BYTES,
@@ -406,7 +416,9 @@ fn disposable_loop_devices_read_only_bind_restart() {
     )
     .unwrap();
     config.device_directory = root.join("dev");
-    let changed = discover(&config, Some("cache-"), 2).unwrap();
+    let changed = discover(&config, &approved(&["cache-a", "cache-c"]), 2)
+        .plan
+        .unwrap();
     assert_ne!(changed.workers[0].digest, digests[0]);
     assert_ne!(changed.workers[1].digest, digests[1]);
     let (_, mut recovered) = crate::store::checkpoint::read_candidates(&config.slab_directory)

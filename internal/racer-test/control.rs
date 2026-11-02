@@ -192,7 +192,7 @@ impl Control {
                     (
                         200,
                         wire::encode_enrollment_response(&wire::EnrollmentResponse {
-                            block_devices: None,
+                            disks: Vec::new(),
                             schema_version: 1,
                             cluster: request.cluster,
                             node: NodeId(node.into()),

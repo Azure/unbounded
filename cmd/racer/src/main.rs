@@ -32,7 +32,7 @@ impl ClusterControl for Embedded {
         match self.0.bootstrap(timeout) {
             Ok(bootstrap) => Ok(Bootstrapped {
                 cluster: bootstrap.cluster,
-                block_devices: bootstrap.block_devices,
+                disks: bootstrap.disks,
             }),
             Err(racer_cluster_control::Error::Unavailable) => Err(BootstrapError::Retry),
             Err(racer_cluster_control::Error::Timeout) => Err(BootstrapError::Pending),
@@ -52,6 +52,16 @@ impl ClusterControl for Embedded {
         if let Err(error) = self.0.report(shares, rails) {
             eprintln!("racer: stage=cluster-report error={error}");
         }
+    }
+
+    fn report_disks(&self, disks: Vec<racer_cluster_control::disks::DiskStatus>) {
+        if let Err(error) = self.0.report_disks(disks) {
+            eprintln!("racer: stage=cluster-report-disks error={error}");
+        }
+    }
+
+    fn approved_disks(&self) -> Option<Vec<String>> {
+        self.0.approved_disks()
     }
 }
 

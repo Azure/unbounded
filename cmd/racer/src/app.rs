@@ -109,6 +109,8 @@ use std::time::UNIX_EPOCH;
 use uring_runtime::drivers::poll_task;
 
 mod devices;
+mod disk_monitor;
+pub(crate) use devices::{GUARD_BYTES, is_mounted};
 mod native;
 mod recovery;
 
@@ -487,7 +489,7 @@ impl Application {
             // Managed mode has no static endpoint; startup must attach control first.
             return Err(Error::InvalidConfiguration);
         }
-        let (identity, enrolled_selector) = if self.config.managed() {
+        let (identity, enrolled_disks) = if self.config.managed() {
             // Election and enrollment outlive any data request deadline; keep the
             // embedded control alive and retry bounded attempts until stopped.
             let enrolled = retry_enrollment(
@@ -508,13 +510,19 @@ impl Application {
             let scope = scope(self.config.request_timeout)?;
             bootstrap(&self.config, &self.node, &self.limits, &scope)?
         };
-        let selector = self
-            .config
-            .managed_control
-            .as_ref()
-            .and_then(|managed| managed.block_devices.clone())
-            .or(enrolled_selector);
-        let devices = devices::discover(&self.config, selector.as_deref(), plan.pairs.len());
+        // Managed bootstrap read the Node itself; enrollment carries the same
+        // annotation for standalone control.
+        let approved = match &self.config.managed_control {
+            Some(managed) => managed.disks.clone(),
+            None => enrolled_disks,
+        };
+        let discovery = devices::discover(&self.config, &approved, plan.pairs.len());
+        let approvals = discovery
+            .approvals
+            .iter()
+            .map(devices::Approval::hardware)
+            .collect::<Vec<_>>();
+        let devices = discovery.plan;
         if let Some(devices) = &devices {
             Arc::get_mut(&mut self.config)
                 .ok_or(Error::Internal)?
@@ -523,17 +531,36 @@ impl Application {
         }
         let node = Arc::get_mut(&mut self.node).ok_or(Error::Internal)?;
         node.hardware = Arc::new(crate::hardware::Context {
-            block_device_selector: selector.clone(),
+            approved_disks: approved.clone(),
             claimed_disks: devices
                 .as_ref()
                 .map(devices::Plan::claimed_disks)
                 .unwrap_or_default(),
+            approvals,
+            segment_bytes: self.config.segment_bytes,
+            mountinfo: None,
         });
         if devices.is_none() {
             let workers: Vec<_> = plan.pairs.iter().map(|p| p.worker).collect();
             prune_stale_slab_files(&self.config.slab_directory, &workers);
         }
         node.devices = devices;
+        // Reports disk status and restarts on approval changes. Dropped before
+        // returning, so embedded control is never kept alive past `run`.
+        let _disk_monitor = self
+            .config
+            .managed_control
+            .as_ref()
+            .and_then(|managed| managed.control.clone())
+            .map(|control| {
+                disk_monitor::Monitor::start(
+                    control,
+                    node.hardware.clone(),
+                    self.config.device_directory.clone(),
+                    approved,
+                )
+            })
+            .transpose()?;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
@@ -712,7 +739,7 @@ fn bootstrap(
     node: &NodeState,
     limits: &Limits,
     startup: &RequestScope,
-) -> Result<(NodeId, Option<String>)> {
+) -> Result<(NodeId, Vec<String>)> {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         limits.clone(),
     )));
@@ -740,7 +767,7 @@ fn bootstrap(
             node.keys.clone(),
         ));
         control.bind_keyring(keys)?;
-        Ok((identity.node().clone(), control.block_devices()))
+        Ok((identity.node().clone(), control.disks()))
     });
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -2422,6 +2449,9 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         }
         if STOP_REQUESTED.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
+        }
+        if disk_monitor::restart_requested() {
+            return Err(Error::DiskApprovalChanged);
         }
         self.poll_services(cx, work_budget)
     }

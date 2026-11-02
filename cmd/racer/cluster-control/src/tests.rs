@@ -75,7 +75,7 @@ fn seed(api: &fake::FakeApi, pods: usize) {
     for i in 1..=pods {
         api.put_object(
             &format!("/api/v1/nodes/n{i}"),
-            json!({"metadata":{"name":format!("n{i}"),"uid":node_uid(i),"annotations":{annotations::BLOCK_DEVICES:"nvme-.*"}}}),
+            json!({"metadata":{"name":format!("n{i}"),"uid":node_uid(i),"annotations":{annotations::DISKS:" wwn-0x1, nvme-eui.2,"}}}),
         );
         api.put_object(
             &format!("/api/v1/namespaces/{NS}/pods/p{i}"),
@@ -315,7 +315,31 @@ fn cold_start_elects_commits_serves_and_fails_closed() {
     let h2 = crate::start(cluster.config(2)).unwrap();
     let b = h1.bootstrap(Duration::from_secs(20)).unwrap();
     assert_eq!(b.cluster.0, SECRET_UID);
-    assert_eq!(b.block_devices.as_deref(), Some("nvme-.*"));
+    assert_eq!(b.disks, ["wwn-0x1", "nvme-eui.2"]);
+    assert_eq!(h1.approved_disks().unwrap(), ["wwn-0x1", "nvme-eui.2"]);
+    // The Node watch delivers approval changes after bootstrap.
+    cluster.inspect(async |k| {
+        k.merge_patch(
+            "/api/v1/nodes/n1",
+            &json!({"metadata":{"annotations":{annotations::DISKS:"wwn-0x9"}}}),
+        )
+        .await
+        .unwrap()
+    });
+    assert!(wait_for(Duration::from_secs(20), || {
+        h1.approved_disks().as_deref() == Some(&["wwn-0x9".to_owned()][..])
+    }));
+    cluster.inspect(async |k| {
+        k.merge_patch(
+            "/api/v1/nodes/n1",
+            &json!({"metadata":{"annotations":{annotations::DISKS:"wwn-0x1,nvme-eui.2"}}}),
+        )
+        .await
+        .unwrap()
+    });
+    assert!(wait_for(Duration::from_secs(20), || {
+        h1.approved_disks().unwrap() == ["wwn-0x1", "nvme-eui.2"]
+    }));
 
     // Both Pods take seats on distinct Nodes; one becomes primary; both get
     // ready and are published as endpoints.
@@ -409,7 +433,7 @@ fn cold_start_elects_commits_serves_and_fails_closed() {
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&out));
         let response = wire::decode_enrollment_response(&out).unwrap();
         assert_eq!(response.node.0, node_uid(1));
-        assert_eq!(response.block_devices.as_deref(), Some("nvme-.*"));
+        assert_eq!(response.disks, ["wwn-0x1", "nvme-eui.2"]);
 
         // Bad token: unauthenticated.
         let (status, _) = call(

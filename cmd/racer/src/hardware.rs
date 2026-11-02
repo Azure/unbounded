@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use racer_cluster_control::disks::{DiskReason, DiskState, DiskStatus};
 use serde::Serialize;
 
 /// Working-memory budget for one discovery.
@@ -192,6 +193,7 @@ pub struct Partition {
     pub dev: Option<String>,
     pub size_bytes: Option<u64>,
     pub by_id: Vec<String>,
+    pub holders: Vec<String>,
 }
 
 /// One entry under `<sys>/class/infiniband`.
@@ -220,8 +222,11 @@ pub struct RdmaPort {
 /// Racer's own view of the hardware it uses.
 #[derive(Debug, Default, Serialize)]
 pub struct Racer {
-    pub block_device_selector: Option<String>,
+    /// Approved disk IDs from this node's `disks` annotation at startup.
+    pub approved_disks: Vec<String>,
     pub claimed_disks: Vec<ClaimedDisk>,
+    /// Status of every whole disk with a by-id name, as in the Pod report.
+    pub disks: Vec<DiskStatus>,
     pub rdma_rails: Option<Rails>,
 }
 
@@ -249,11 +254,27 @@ pub struct Rail {
     pub numa_node: Option<usize>,
 }
 
+/// Startup outcome of one approved disk ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Approved {
+    pub id: String,
+    /// `MAJ:MIN` the ID resolved to at startup, if it resolved.
+    pub dev: Option<String>,
+    /// `Claimed`, `Rejected`, or `Missing`.
+    pub state: DiskState,
+    pub reason: Option<DiskReason>,
+}
+
 /// Startup-fixed inputs for the Racer section of the report.
 #[derive(Clone, Debug, Default)]
 pub struct Context {
-    pub block_device_selector: Option<String>,
+    pub approved_disks: Vec<String>,
     pub claimed_disks: Vec<ClaimedDisk>,
+    pub approvals: Vec<Approved>,
+    /// Segment size; a disk smaller than its guards and one segment is too small.
+    pub segment_bytes: u64,
+    /// Mount table to classify disks; `None` reads `/proc/self/mountinfo`.
+    pub mountinfo: Option<std::path::PathBuf>,
 }
 
 /// Build the full report, including Racer's selector, claimed disks, and rails.
@@ -314,7 +335,8 @@ pub fn report_with_snapshot(
             None
         }
     };
-    for value in context.block_device_selector.iter() {
+    walk.charge_slots::<String>(context.approved_disks.len())?;
+    for value in &context.approved_disks {
         walk.charge_string(value)?;
     }
     // `Vec::clone` allocates exactly `len` slots.
@@ -325,12 +347,122 @@ pub fn report_with_snapshot(
             walk.charge_string(dev)?;
         }
     }
+    let mounts = fs::read_to_string(
+        context
+            .mountinfo
+            .as_deref()
+            .unwrap_or(Path::new("/proc/self/mountinfo")),
+    )
+    .unwrap_or_default();
+    let disks = classify_disks(&report.block_devices, &mounts, context);
+    walk.charge_slots::<DiskStatus>(disks.len())?;
+    for disk in &disks {
+        walk.charge(disk.id.len() + ENTRY_OVERHEAD)?;
+        for alias in &disk.aliases {
+            walk.charge_string(alias)?;
+        }
+    }
     report.racer = Some(Racer {
-        block_device_selector: context.block_device_selector.clone(),
+        approved_disks: context.approved_disks.clone(),
         claimed_disks: context.claimed_disks.clone(),
+        disks,
         rdma_rails,
     });
     Ok(report)
+}
+
+/// By-id names that identify a disk itself, not a device-mapper, MD, or LVM
+/// mapping stacked on it.
+fn disk_alias(name: &str) -> bool {
+    !["dm-", "md-", "lvm-"].iter().any(|p| name.starts_with(p))
+}
+
+/// Status of every whole disk with a by-id name, sorted by ID.
+///
+/// Approved disks take their startup outcome. Other disks are classified from
+/// sysfs and the mount table only; they are never opened. Approved IDs that
+/// did not resolve to a whole disk in `devices` are listed under their own ID.
+pub fn classify_disks(devices: &[BlockDevice], mounts: &str, context: &Context) -> Vec<DiskStatus> {
+    let mut disks = Vec::new();
+    let mut matched = vec![false; context.approvals.len()];
+    for device in devices {
+        let mut aliases: Vec<String> = device
+            .by_id
+            .iter()
+            .filter(|name| disk_alias(name))
+            .cloned()
+            .collect();
+        aliases.sort();
+        let Some(id) = racer_cluster_control::disks::preferred_id(&aliases).cloned() else {
+            continue;
+        };
+        let approval = device.dev.as_ref().and_then(|dev| {
+            context
+                .approvals
+                .iter()
+                .position(|a| a.dev.as_ref() == Some(dev))
+        });
+        let (state, reason) = match approval {
+            Some(index) => {
+                for (i, other) in context.approvals.iter().enumerate() {
+                    if other.dev == context.approvals[index].dev {
+                        matched[i] = true;
+                    }
+                }
+                let a = &context.approvals[index];
+                (a.state, a.reason)
+            }
+            None => match unavailable(device, mounts, context.segment_bytes) {
+                Some(reason) => (DiskState::Unavailable, Some(reason)),
+                None => (DiskState::Available, None),
+            },
+        };
+        disks.push(DiskStatus {
+            id,
+            aliases,
+            dev: Some(device.name.clone()),
+            size_bytes: device.size_bytes,
+            model: device.model.clone(),
+            serial: device.serial.clone(),
+            state,
+            reason,
+        });
+    }
+    for (approval, matched) in context.approvals.iter().zip(matched) {
+        if matched || disks.iter().any(|d| d.aliases.contains(&approval.id)) {
+            continue;
+        }
+        disks.push(DiskStatus {
+            state: approval.state,
+            reason: approval.reason,
+            ..DiskStatus::missing(approval.id.clone())
+        });
+    }
+    disks.sort_by(|a, b| a.id.cmp(&b.id));
+    disks.dedup_by(|a, b| a.id == b.id);
+    disks
+}
+
+/// Why an unapproved disk could not be used, from sysfs and the mount table.
+fn unavailable(device: &BlockDevice, mounts: &str, segment_bytes: u64) -> Option<DiskReason> {
+    let mounted = |dev: &Option<String>| {
+        dev.as_deref()
+            .is_some_and(|dev| crate::app::is_mounted(mounts, dev))
+    };
+    if mounted(&device.dev) || device.partitions.iter().any(|p| mounted(&p.dev)) {
+        return Some(DiskReason::Mounted);
+    }
+    if !device.holders.is_empty() || device.partitions.iter().any(|p| !p.holders.is_empty()) {
+        return Some(DiskReason::Held);
+    }
+    if device.read_only == Some(true) {
+        return Some(DiskReason::ReadOnly);
+    }
+    let minimum = segment_bytes.saturating_add(2 * crate::app::GUARD_BYTES);
+    if device.size_bytes.is_none_or(|size| size < minimum) {
+        return Some(DiskReason::TooSmall);
+    }
+    None
 }
 
 /// Discover block and RDMA devices from sysfs (`sys_root`) and by-id links (`dev_root`).
@@ -567,6 +699,7 @@ fn block_devices(
                 dev: text(walk, &part.join("dev"))?,
                 size_bytes: sectors(walk, &part.join("size"))?,
                 by_id: by_id_for(walk, by_id, &child)?,
+                holders: list_or_empty(walk, &part.join("holders"))?,
                 name: child,
             });
         }
@@ -1059,13 +1192,15 @@ mod tests {
     fn shared_context_is_not_copied_and_report_copy_is_charged() {
         let f = Fixture::new();
         let context = Arc::new(Context {
-            block_device_selector: Some("^nvme-".into()),
+            approved_disks: vec!["nvme-eui.0001".into()],
+            mountinfo: Some(f.sys().join("no-mountinfo")),
             claimed_disks: (0..4)
                 .map(|i| ClaimedDisk {
                     id: format!("nvme-disk-{i}"),
                     dev: Some(format!("259:{i}")),
                 })
                 .collect(),
+            ..Default::default()
         });
         // Each request clones the pointer, so repeated requests share one context.
         let request = Arc::clone(&context);
@@ -1077,7 +1212,6 @@ mod tests {
 
         // A context larger than the walk budget still aborts as too large.
         let big = Arc::new(Context {
-            block_device_selector: None,
             claimed_disks: vec![
                 ClaimedDisk {
                     id: "x".repeat(WORKING_BYTES),
@@ -1085,12 +1219,142 @@ mod tests {
                 };
                 1
             ],
+            ..Default::default()
         });
         let shared = Arc::clone(&big);
         assert!(matches!(
             report_with_snapshot(&walk(), &f.sys(), &f.dev(), &shared, snapshot()),
             Err(Abort::TooLarge)
         ));
+    }
+
+    fn disk(name: &str, dev: &str, by_id: &[&str]) -> BlockDevice {
+        BlockDevice {
+            name: name.into(),
+            dev: Some(dev.into()),
+            size_bytes: Some(1 << 40),
+            read_only: Some(false),
+            by_id: by_id.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classifies_unapproved_disks_from_sysfs_and_mounts_only() {
+        let mut mounted = disk("sda", "8:0", &["wwn-0x1111", "ata-X_1"]);
+        mounted.partitions.push(Partition {
+            name: "sda1".into(),
+            dev: Some("8:1".into()),
+            ..Default::default()
+        });
+        let mut held = disk("sdb", "8:16", &["wwn-0x2222"]);
+        held.partitions.push(Partition {
+            name: "sdb1".into(),
+            dev: Some("8:17".into()),
+            holders: vec!["md0".into()],
+            ..Default::default()
+        });
+        let mut ro = disk("sdc", "8:32", &["scsi-3"]);
+        ro.read_only = Some(true);
+        let mut small = disk("sdd", "8:48", &["ata-small"]);
+        small.size_bytes = Some(1);
+        let mut idle = disk("nvme1n1", "259:4", &["nvme-Model_SN", "nvme-eui.0025"]);
+        idle.partitions.push(Partition {
+            name: "nvme1n1p1".into(),
+            dev: Some("259:5".into()),
+            ..Default::default()
+        });
+        let devices = vec![
+            mounted,
+            held,
+            ro,
+            small,
+            idle,
+            // Stacked mappings and disks without by-id names are omitted.
+            disk("dm-0", "253:0", &["dm-name-vg-lv", "dm-uuid-LVM-x"]),
+            disk("loop0", "7:0", &[]),
+            disk("nvme0n1", "259:0", &["nvme-eui.claimed", "wwn-0x5000"]),
+            disk("sde", "8:64", &["wwn-0x9999"]),
+        ];
+        let approved = |id: &str, dev: Option<&str>, state, reason| Approved {
+            id: id.into(),
+            dev: dev.map(str::to_owned),
+            state,
+            reason,
+        };
+        let context = Context {
+            approvals: vec![
+                // Approved under a non-preferred alias.
+                approved("nvme-eui.claimed", Some("259:0"), DiskState::Claimed, None),
+                approved(
+                    "wwn-0x9999",
+                    Some("8:64"),
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy),
+                ),
+                approved("wwn-0x3333", None, DiskState::Missing, None),
+                approved(
+                    "wwn-0x9999-part1",
+                    Some("8:65"),
+                    DiskState::Rejected,
+                    Some(DiskReason::NotWholeDisk),
+                ),
+            ],
+            segment_bytes: 64 << 20,
+            ..Default::default()
+        };
+        let mounts = "36 1 8:1 / /boot rw - ext4 /dev/sda1 rw\n";
+        let disks = classify_disks(&devices, mounts, &context);
+        let summary: Vec<_> = disks
+            .iter()
+            .map(|d| (d.id.as_str(), d.dev.as_deref(), d.state, d.reason))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "ata-small",
+                    Some("sdd"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::TooSmall)
+                ),
+                ("nvme-eui.0025", Some("nvme1n1"), DiskState::Available, None),
+                (
+                    "scsi-3",
+                    Some("sdc"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::ReadOnly)
+                ),
+                (
+                    "wwn-0x1111",
+                    Some("sda"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::Mounted)
+                ),
+                (
+                    "wwn-0x2222",
+                    Some("sdb"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::Held)
+                ),
+                ("wwn-0x3333", None, DiskState::Missing, None),
+                ("wwn-0x5000", Some("nvme0n1"), DiskState::Claimed, None),
+                (
+                    "wwn-0x9999",
+                    Some("sde"),
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy)
+                ),
+                (
+                    "wwn-0x9999-part1",
+                    None,
+                    DiskState::Rejected,
+                    Some(DiskReason::NotWholeDisk)
+                ),
+            ]
+        );
+        assert_eq!(disks[3].aliases, ["ata-X_1", "wwn-0x1111"]);
+        assert!(disks[5].aliases.is_empty() && disks[5].size_bytes.is_none());
     }
 
     #[test]
@@ -1100,11 +1364,19 @@ mod tests {
         rdma_tree(&f);
         let inventory = crate::rdma::Inventory::default();
         let context = Context {
-            block_device_selector: Some("^nvme-".into()),
+            approved_disks: vec!["nvme-eui.0001".into()],
             claimed_disks: vec![ClaimedDisk {
-                id: "nvme-Microsoft_NVMe_SN123".into(),
+                id: "nvme-eui.0001".into(),
                 dev: Some("259:0".into()),
             }],
+            approvals: vec![Approved {
+                id: "nvme-eui.0001".into(),
+                dev: Some("259:0".into()),
+                state: DiskState::Claimed,
+                reason: None,
+            }],
+            segment_bytes: 64 << 20,
+            mountinfo: Some(f.sys().join("no-mountinfo")),
         };
         let report = report(&walk(), &f.sys(), &f.dev(), &context, &inventory).unwrap();
         let value: serde_json::Value =
@@ -1139,7 +1411,7 @@ mod tests {
         );
         assert_eq!(
             keys(&value["block_devices"][1]["partitions"][0]),
-            ["by_id", "dev", "name", "size_bytes"]
+            ["by_id", "dev", "holders", "name", "size_bytes"]
         );
         assert_eq!(
             keys(&value["rdma_devices"][0]["ports"][0]),
@@ -1156,7 +1428,20 @@ mod tests {
         );
         assert_eq!(
             keys(&value["racer"]),
-            ["block_device_selector", "claimed_disks", "rdma_rails"]
+            ["approved_disks", "claimed_disks", "disks", "rdma_rails"]
+        );
+        assert_eq!(value["racer"]["approved_disks"][0], "nvme-eui.0001");
+        assert_eq!(
+            value["racer"]["disks"],
+            serde_json::json!([{
+                "id": "nvme-eui.0001",
+                "aliases": ["nvme-Microsoft_NVMe_SN123", "nvme-eui.0001"],
+                "dev": "nvme0n1",
+                "size_bytes": 7501476528u64 * 512,
+                "model": "Microsoft NVMe Direct Disk",
+                "serial": "SN123",
+                "state": "claimed"
+            }])
         );
         assert_eq!(value["racer"]["claimed_disks"][0]["dev"], "259:0");
         assert_eq!(value["racer"]["rdma_rails"]["generation"], 0);

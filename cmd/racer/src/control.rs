@@ -66,6 +66,7 @@ pub mod session;
 use controlplane::Published;
 #[cfg(test)]
 use publication::PublicationTarget;
+pub(crate) use session::same_disks;
 
 // HTTPS enrollment, snapshot polling, and independent network keyring delivery.
 // Bounded long polls, accepted cursors, jittered retry; no node/status reporting.
@@ -97,8 +98,12 @@ pub struct Managed {
     /// Background Pod report of shares and discovered rails.
     pub report: Report,
 
-    /// Device selector from control bootstrap; preferred over the enrollment copy.
-    pub block_devices: Option<String>,
+    /// Approved disks from control bootstrap; preferred over the enrollment copy.
+    pub disks: Vec<String>,
+
+    /// Embedded control, for disk approval changes and disk status reports.
+    /// Absent in fixtures without embedded control.
+    pub control: Option<std::sync::Arc<dyn managed::ClusterControl>>,
 }
 
 /// Reject overlapping owner-local operations without retaining a borrow.
@@ -860,6 +865,71 @@ pub(crate) mod tests {
                     std::fs::read(d.0.join("identity/identity.json")).unwrap(),
                     committed
                 );
+            }
+        }
+        #[test]
+        fn changed_disk_approval_at_renewal_latches_restart() {
+            for (startup, renewed, restart) in [
+                (vec!["a", "b"], vec!["b", "a"], false),
+                (vec!["a"], vec!["a", "b"], true),
+                (vec!["a"], vec![], true),
+                (vec![], vec![], false),
+            ] {
+                let Some(r) = testing::reactor() else { return };
+                let d = testing::Directory::new();
+                let client = client(&d, r.clone());
+                let (ca, key) = testing::ca();
+                client
+                    .auth
+                    .enrollment
+                    .set_peer_trust_roots(vec![ca.der().to_vec()])
+                    .unwrap();
+                let scope = testing::scope();
+                let node = "22222222-2222-4222-8222-222222222222";
+                let request = testing::drive(
+                    &r,
+                    client
+                        .auth
+                        .enrollment
+                        .prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+                )
+                .unwrap();
+                let old = testing::drive(
+                    &r,
+                    client
+                        .auth
+                        .enrollment
+                        .accept_response(testing::issue(&request, &ca, &key, node), &scope),
+                )
+                .unwrap();
+                *client.auth.identity.borrow_mut() = Some(old);
+                *client.disks.borrow_mut() = startup.iter().map(|s| s.to_string()).collect();
+                client.auth.started.set(true);
+                let request = testing::drive(
+                    &r,
+                    client
+                        .auth
+                        .enrollment
+                        .prepare(vec![], NonZeroU32::new(4).unwrap(), &scope),
+                )
+                .unwrap();
+                let mut response = testing::issue(&request, &ca, &key, node);
+                response.disks = renewed.iter().map(|s| s.to_string()).collect();
+                let result = testing::drive(&r, Box::pin(client.accept_renewal(response, &scope)));
+                if restart {
+                    assert_eq!(result, Err(Error::DiskApprovalChanged));
+                    assert!(matches!(
+                        testing::drive(&r, client.progress(&scope)),
+                        Err(Error::DiskApprovalChanged)
+                    ));
+                } else {
+                    // Key installation is outside this fixture; only the latch matters.
+                    assert_ne!(result, Err(Error::DiskApprovalChanged));
+                    assert!(client.auth.check().is_ok());
+                }
+                // The startup approval is never replaced by renewal.
+                assert_eq!(client.disks(), startup);
+                testing::drive(&r, r.fence_matching(|_| true)).unwrap();
             }
         }
         #[test]

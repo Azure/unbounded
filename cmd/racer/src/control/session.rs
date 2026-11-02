@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 /// Owner-local session. Only generic Sync owns cursors, retry, and preparation jobs.
 pub struct Session {
-    block_devices: RefCell<Option<String>>,
+    pub(super) disks: RefCell<Vec<String>>,
     rails: RailJournal,
 
     shares: std::num::NonZeroU32,
@@ -102,22 +102,29 @@ pub(super) struct Authentication {
 
     binding_check: Cell<bool>,
 
-    restart_required: Cell<bool>,
+    /// Set once a renewal requires a process restart, with the error to report.
+    restart_required: Cell<Option<Error>>,
 
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
 }
 
 impl Authentication {
     /// Reject every new submission after stop or authenticated node replacement.
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         if self.stopped.get() {
             return Err(Error::Cancelled);
         }
-        if self.restart_required.get() {
-            return Err(Error::NodeIdentityChanged);
+        if let Some(error) = self.restart_required.get() {
+            return Err(error);
         }
         Ok(())
     }
+}
+
+/// Whether two approved disk lists name the same set of IDs.
+pub(crate) fn same_disks(a: &[String], b: &[String]) -> bool {
+    let set = |v: &[String]| v.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    set(a) == set(b)
 }
 
 /// Borrow a driver by ownership so diagnostics never borrow across a long poll.
@@ -411,7 +418,7 @@ impl Session {
             serving: std::cell::Cell::new(false),
             endpoint,
             enrollment_transport,
-            block_devices: RefCell::new(None),
+            disks: RefCell::new(Vec::new()),
             auth: Rc::new(Authentication {
                 enrollment,
                 keys: RefCell::new(keys),
@@ -420,7 +427,7 @@ impl Session {
                 started: Cell::new(false),
                 stopped: Cell::new(false),
                 binding_check: Cell::new(false),
-                restart_required: Cell::new(false),
+                restart_required: Cell::new(None),
                 startup_bundle: RefCell::new(None),
             }),
             snapshots,
@@ -655,13 +662,13 @@ impl Session {
             .prepare(nics, self.shares, scope)
             .await?;
         let response = self.enroll(&request, scope).await?;
-        let block_devices = response.block_devices.clone();
+        let disks = response.disks.clone();
         let identity = self
             .auth
             .enrollment
             .accept_response(response, scope)
             .await?;
-        *self.block_devices.borrow_mut() = block_devices;
+        *self.disks.borrow_mut() = disks;
         *self.auth.identity.borrow_mut() = Some(identity.clone());
         self.auth.started.set(true);
         self.renewal_next.set(None);
@@ -702,9 +709,11 @@ impl Session {
         self.auth.identity.borrow().clone()
     }
 
-    /// Startup selector only. Renewal never changes a live device layout.
-    pub fn block_devices(&self) -> Option<String> {
-        self.block_devices.borrow().clone()
+    /// Approved disks from startup enrollment. Renewal never changes a live
+    /// device layout; a renewal with a different approval set requires a
+    /// restart instead (see [`Self::accept_renewal`]).
+    pub fn disks(&self) -> Vec<String> {
+        self.disks.borrow().clone()
     }
 
     /// One publication Sync turn, concurrent with independent renewal policy.
@@ -808,7 +817,9 @@ impl Session {
                     driver.status().error
                 });
             match result {
-                Err(Error::NodeIdentityChanged | Error::Cancelled) => result,
+                Err(Error::NodeIdentityChanged | Error::DiskApprovalChanged | Error::Cancelled) => {
+                    result
+                }
                 _ if self.auth.started.get() => scope.check(),
                 _ => result,
             }
@@ -892,11 +903,25 @@ impl Session {
             .identity()
             .is_some_and(|old| old.node() != &response.node);
         if changed {
-            self.auth.restart_required.set(true);
+            self.auth
+                .restart_required
+                .set(Some(Error::NodeIdentityChanged));
+        }
+        // Approval changes are latched like a node change: the live device
+        // layout is never changed in place, so the graph drains and restarts.
+        let disks_changed = !same_disks(&self.disks.borrow(), &response.disks);
+        if disks_changed && !changed {
+            eprintln!("racer: approved disks changed at credential renewal; restarting to apply");
+            self.auth
+                .restart_required
+                .set(Some(Error::DiskApprovalChanged));
         }
         let accepted = self.auth.enrollment.accept_response(response, scope).await;
         if changed {
             return Err(Error::NodeIdentityChanged);
+        }
+        if disks_changed {
+            return Err(Error::DiskApprovalChanged);
         }
         let identity = accepted?;
         let keys = self.auth.keys.borrow();

@@ -29,7 +29,8 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct Bootstrap {
     pub cluster: racer_control_wire::ClusterId,
-    pub block_devices: Option<String>,
+    /// Approved disks from this Node's [`annotations::DISKS`] at bootstrap.
+    pub disks: Vec<String>,
 }
 
 /// Role of this Pod.
@@ -56,9 +57,18 @@ struct Outer {
     bootstrap: Mutex<Option<Result<Bootstrap, Error>>>,
     bootstrapped: Condvar,
     report: Mutex<Option<String>>,
+    report_parts: Mutex<ReportParts>,
     report_generation: AtomicU64,
+    approved_disks: Mutex<Option<Vec<String>>>,
     stop: AtomicBool,
     diagnostics: Mutex<Diagnostics>,
+}
+
+/// Latest report inputs; the report is published once shares are known.
+#[derive(Default)]
+struct ReportParts {
+    base: Option<Report>,
+    disks: Vec<crate::disks::DiskStatus>,
 }
 
 /// Owner of the control thread. Dropping it stops and joins the thread.
@@ -87,7 +97,9 @@ pub fn start(config: Config) -> Result<Handle, Error> {
         bootstrap: Mutex::new(None),
         bootstrapped: Condvar::new(),
         report: Mutex::new(None),
+        report_parts: Mutex::new(ReportParts::default()),
         report_generation: AtomicU64::new(0),
+        approved_disks: Mutex::new(None),
         stop: AtomicBool::new(false),
         diagnostics: Mutex::new(Diagnostics::default()),
     });
@@ -266,7 +278,7 @@ fn update_diagnostics(shared: &Shared, outer: &Outer) {
     }
 }
 
-/// Read the cluster ID and this Node's block device pattern once.
+/// Read the cluster ID and this Node's approved disks, then follow the Node.
 async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
     let mut backoff = 1;
     loop {
@@ -300,16 +312,33 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
                 .lease_api
                 .get(&paths::node(&shared.config.node_name))
                 .await?;
-            let block =
-                server::block_devices(&crate::kube::map_at(&node, &["metadata", "annotations"]));
-            Ok(Bootstrap {
-                cluster: racer_control_wire::ClusterId(uid),
-                block_devices: block,
-            })
+            let annotations = crate::kube::map_at(&node, &["metadata", "annotations"]);
+            if crate::disks::has_legacy_selector(&annotations) {
+                eprintln!(
+                    "racer-control: Node annotation {} is no longer honored; approve disks with {} (kubectl unbounded racer disks allow)",
+                    annotations::LEGACY_BLOCK_DEVICES,
+                    annotations::DISKS
+                );
+            }
+            let rv = str_at(&node, &["metadata", "resourceVersion"]).to_owned();
+            Ok((
+                Bootstrap {
+                    cluster: racer_control_wire::ClusterId(uid),
+                    disks: crate::disks::approved(&annotations),
+                },
+                rv,
+            ))
         }
         .await;
         match result {
-            Ok(b) => {
+            Ok((b, rv)) => {
+                *outer
+                    .approved_disks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(b.disks.clone());
+                if exec::spawn(follow_node(shared.clone(), outer.clone(), rv)).is_err() {
+                    eprintln!("racer-control: cannot follow Node disk approvals");
+                }
                 *shared.cluster.borrow_mut() = b.cluster.0.clone();
                 *outer.bootstrap.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(b));
                 outer.bootstrapped.notify_all();
@@ -325,6 +354,75 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
             Err(_) => {
                 exec::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
+            }
+        }
+    }
+}
+
+/// Watch this Node and publish its approved disks for [`Handle::approved_disks`].
+///
+/// Reconnects with backoff and refetches the Node whenever the watch cannot
+/// resume. Annotation parsing matches bootstrap.
+async fn follow_node(shared: Rc<Shared>, outer: Arc<Outer>, mut rv: String) {
+    let node = shared.config.node_name.clone();
+    let query = format!(
+        "fieldSelector={}",
+        crate::kube::escape(&format!("metadata.name={node}"))
+    );
+    let publish = |object: &serde_json::Value| {
+        let disks =
+            crate::disks::approved(&crate::kube::map_at(object, &["metadata", "annotations"]));
+        let mut approved = outer
+            .approved_disks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if approved.as_ref() != Some(&disks) {
+            *approved = Some(disks);
+        }
+    };
+    let mut backoff = 1u64;
+    while !shared.stopping.get() {
+        if rv.is_empty() {
+            match shared.lease_api.get(&paths::node(&node)).await {
+                Ok(object) => {
+                    publish(&object);
+                    rv = str_at(&object, &["metadata", "resourceVersion"]).to_owned();
+                }
+                Err(_) => {
+                    exec::sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(30);
+                    continue;
+                }
+            }
+        }
+        let Ok(mut watch) = shared.api.watch(paths::NODES, &query, &rv).await else {
+            rv.clear();
+            exec::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+            continue;
+        };
+        backoff = 1;
+        loop {
+            if shared.stopping.get() {
+                return;
+            }
+            match watch.next().await {
+                Ok(Some(e)) if e.kind == "BOOKMARK" => {
+                    rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
+                }
+                Ok(Some(e)) if e.kind == "DELETED" || e.kind == "ERROR" => {
+                    rv.clear();
+                    break;
+                }
+                Ok(Some(e)) => {
+                    publish(&e.object);
+                    rv = str_at(&e.object, &["metadata", "resourceVersion"]).to_owned();
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    rv.clear();
+                    break;
+                }
             }
         }
     }
@@ -394,7 +492,7 @@ async fn reporter(shared: Rc<Shared>, outer: Arc<Outer>, signal: Signal) {
 }
 
 impl Handle {
-    /// Wait for the cluster ID and block device pattern. Does not wait for
+    /// Wait for the cluster ID and approved disks. Does not wait for
     /// dataplane enrollment.
     pub fn bootstrap(&self, timeout: Duration) -> Result<Bootstrap, Error> {
         let deadline = Instant::now() + timeout;
@@ -438,11 +536,55 @@ impl Handle {
             shares: NonZeroU32::new(shares).ok_or(Error::InvalidConfiguration)?,
             rdma_nics,
         };
-        let encoded = rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?;
+        // Reject an unencodable report before it replaces the last good one.
+        rails::encode_report(&report).map_err(|_| Error::InvalidConfiguration)?;
+        let mut parts = self
+            .outer
+            .report_parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        parts.base = Some(report);
+        self.publish_report(&parts)
+    }
+
+    /// Report per-disk status in this Pod's report annotation. The disks are
+    /// published with the next or last shares and RDMA NIC report.
+    pub fn report_disks(&self, disks: Vec<crate::disks::DiskStatus>) -> Result<(), Error> {
+        let mut parts = self
+            .outer
+            .report_parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if parts.disks == disks {
+            return Ok(());
+        }
+        parts.disks = disks;
+        if parts.base.is_none() {
+            return Ok(());
+        }
+        self.publish_report(&parts)
+    }
+
+    fn publish_report(&self, parts: &ReportParts) -> Result<(), Error> {
+        let Some(base) = &parts.base else {
+            return Ok(());
+        };
+        let encoded = rails::encode_report_with_disks(base, &parts.disks)
+            .map_err(|_| Error::InvalidConfiguration)?;
         *self.outer.report.lock().unwrap_or_else(|e| e.into_inner()) = Some(encoded);
         self.outer.report_generation.fetch_add(1, Ordering::SeqCst);
         self.notifier.notify();
         Ok(())
+    }
+
+    /// Latest approved disks from this Node, followed by a watch after
+    /// bootstrap. `None` before bootstrap has read the Node.
+    pub fn approved_disks(&self) -> Option<Vec<String>> {
+        self.outer
+            .approved_disks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn diagnostics(&self) -> Diagnostics {
