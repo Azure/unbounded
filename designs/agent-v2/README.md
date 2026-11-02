@@ -24,13 +24,12 @@ The design is split into the documents below. Read this README first.
 | [07. Host runtime cleanup](07-host-runtime-cleanup.md) | How the `host` runtime stops, cleans up and removes a node | Host and OS reviewers |
 | [08. v1 compatibility](08-v1-compatibility.md) | Parity with v1, intended behavior changes, copied code, changes outside `internal/agentv2`, converting a v1 configuration | v1 maintainers |
 | [09. Implementation](09-implementation.md) | Package layout, export policy, risks | Implementers |
-| [10. Migrating from v1](10-migration-from-v1.md) | How a v1 host, or a host built by another `pkg/agent` consumer, moves to v2 without replacing its node | v1 maintainers, AKS Flex Node maintainers, operators |
+| [10. Migrating from v1](10-migration-from-v1.md) | How a v1 host, or a host built by another `pkg/agent` consumer, moves to v2 without replacing its node, and the cutover at the first official v2 release | v1 maintainers, AKS Flex Node maintainers, operators |
 | [11. Testing](11-testing.md) | Unit and golden tests, running the v1 end-to-end suites on v2, the migration suite, checking reset with a host snapshot, CI and validation tasks | Everyone |
 
-Please focus review comments on the open questions (section 3), the external
-contract in documents 01 and 02, the interfaces in documents 03 and 04,
-document 07, the migration path in document 10, and the testing plan in
-document 11.
+Please focus review comments on the external contract in documents 01 and 02,
+the interfaces in documents 03 and 04, document 07, the migration path in
+document 10, and the testing plan in document 11.
 
 Documents 01 and 02, and section 1 of document 06, are what a consumer builds
 against. Everything in them is versioned and experimental until the
@@ -139,7 +138,7 @@ library.
 | Drift | A difference between the goal and the applied configuration that needs a repave to take effect, such as a new Kubernetes version. |
 | Bundle | The rendered description of one node: files, binaries, units and start order ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). Not related to v1's offline artifact bundles. |
 | Node manager | The runtime-independent component that drives bootstrap, repave, reboot and reset by calling the runtime ([control and state, section 3](04-control-and-state.md#3-node-manager)). |
-| Reset | Removing the node, the agent and everything they created from the host ([lifecycles, section 5](05-lifecycles.md#5-reset)). The runtime's part of a reset is its `Teardown` method; [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown) describes it for the `host` runtime. |
+| Reset | Removing the node, the agent and everything they created from the host ([lifecycles, section 6](05-lifecycles.md#6-reset)). The runtime's part of a reset is its `Teardown` method; [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown) describes it for the `host` runtime. |
 | Slot change | For the `host` runtime, starting a slot whose content differs from what last ran. The runtime wipes node state first ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-wipe-and-slot-changes)). |
 
 ## 2. Goals and non-goals
@@ -153,11 +152,14 @@ library.
 - **G3.** Consumers customize the agent binary through hook points. They do
   not link against agent Go packages.
 - **G4.** v1 behavior is unchanged, apart from the small changes listed in
-  [v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries). v2 is opt-in through `unbounded-agent v2 ...`.
+  [v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries). v2 is opt-in through `unbounded-agent v2 ...` until
+  the first official v2 release, which replaces v1.
 - **G5.** Code is internal by default. Exporting any of it is an explicit,
   recorded decision ([implementation, section 2](09-implementation.md#2-export-policy)).
-- **G6.** Existing v1 hosts move to v2 without replacing their node, started
-  either from the cluster or from the host ([migrating from v1](10-migration-from-v1.md)).
+- **G6.** Existing v1 hosts move to v2 without replacing their node, with a
+  safe rollback: early, started from the cluster or the host, or at the first
+  official v2 release, when every remaining v1 host moves
+  ([migrating from v1](10-migration-from-v1.md)).
 
 ### 2.2 Non-goals
 
@@ -169,37 +171,7 @@ library.
 
 ## 3. Open questions
 
-These are still open. Please focus review comments here. Everything else in
-this design was settled in design discussion and an earlier review round.
-
-1. **MachineOperation scoping ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)).** Is "fail only kinds that belong
-   to the agent, meaning the current three plus any `Node*` or `Agent*` kind"
-   the right rule? It relies on a naming convention for future kinds that the
-   API does not currently document. The `OperationKind` enum is closed
-   (`api/machina/v1alpha3/machineoperation_types.go:54`), although its comment
-   says custom operations may be supported by individual cloud controllers
-   (`:51-53`).
-2. **Separate v2 state ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)).** v2 uses its own state directories,
-   daemon units and locks, and shares the agent binary layout under
-   `/opt/unbounded/agent/bin`. Some node-level names are the same as v1's:
-   `kubelet.service`, `containerd.service`, `localdns.service`,
-   `nftables-flush.service` and the `kube1`/`kube2` machines. That is one reason
-   v1 and v2 cannot be installed on the same host, and each refuses to install
-   over the other ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)). A host moves from one to the other
-   only through a migration ([migrating from v1](10-migration-from-v1.md)). The alternative is to share v1's state and
-   daemon names too. Separate names avoid any confusion between the two, but the
-   `-v2` names would need renaming if v2 later replaces v1.
-3. **Default runtime ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).** A configuration without `runtime.type` gets
-   `nspawn-container`, which keeps machina provisioning unchanged. Should the
-   field be required instead?
-4. **Rendering templates ([v1 compatibility, section 3](08-v1-compatibility.md#3-code-copied-from-v1)).** v2 copies v1's templates and relies on
-   golden tests for parity. The alternative is to add exported, render-only
-   functions to `pkg/agent`, which avoids the copy but changes a public package.
-5. **Boot hook binary ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)).** v1 runs its systemd hooks through a
-   separate binary copy so they survive an upgrade rollback
-   (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Is the `current` link
-   enough for v2's boot hooks, given the recovery unit restores `last-good` into
-   `current`?
+No questions are open at the moment.
 
 ## 4. Architecture overview
 

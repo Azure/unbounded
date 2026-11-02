@@ -96,7 +96,7 @@ themselves do not change:
 
 | Check | v1 | v2, `nspawn-container` | v2, `host` |
 |---|---|---|---|
-| Daemon unit and binary layout (`e2e.py:1407-1444,5615-5649`) | `unbounded-agent-daemon.service` | `unbounded-agent-v2-daemon.service`; the binary layout is the same | Same as `nspawn-container` |
+| Daemon unit and binary layout (`e2e.py:1407-1444,5615-5649`) | `unbounded-agent-daemon.service` runs `<current> daemon` | The same unit, running `<current> v2 daemon`; the binary layout is the same | Same as `nspawn-container` |
 | Install record (`e2e.py:3737-3797,6480`) | `install-state.json`: phase and install ID | `v2 status`: install phase and install ID | Same |
 | Applied config unchanged by a resumed bootstrap (`e2e.py:3762-3803`) | Hash of `kube1-applied-config.json` | `v2 status`: digest of the applied settings | Same |
 | Failure injected during bootstrap (`e2e.py:3735-3741`) | Blocks v1's daemon recovery script | Blocks v2's daemon recovery script | Same |
@@ -140,7 +140,7 @@ report and allowed. This tests [host changes, section 3](06-host-changes.md#3-ho
 
 On a host migrated from v1, the difference must be exactly the v1 host
 preparation changes that the reset reports as left in place
-([migrating from v1, section 6](10-migration-from-v1.md#6-converting-v1s-state)).
+([migrating from v1, section 7](10-migration-from-v1.md#7-converting-v1s-state)).
 
 ## 4. Migration suite
 
@@ -174,14 +174,23 @@ Variants:
 | Variant | What it checks |
 |---|---|
 | Rollback | Migrate, then `v2 migrate --rollback`. v1's daemon runs, v1's files are back, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. |
-| Interrupted | For each phase in [migrating from v1, section 5](10-migration-from-v1.md#5-steps), a helper on the host watches the migration record and kills the migrate unit, or reboots the host, when the phase is reached. The migration must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
+| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), a helper on the host watches the migration record and kills the migrate unit, or reboots the host, when the phase is reached. The migration must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
 | Failed | A v2 path is made unwritable in each phase. The migration must roll back to a working v1 automatically, and the operation must be `Failed` with the reason. |
 | Refused | `v2 migrate` on a v1 host with an unfinished install, or with two applied configs, changes nothing. `v2 start` on a v1 host that was not migrated is refused. |
 | To `host` | After migrating, `v2 reset`, then `v2 start` with the `host` runtime, then the lifecycle suite under `NODE_RUNTIME=host`. |
 | Immutable host | The cluster-started migration on an Ignition host (`HOST_BASE_OS=acl`), which needs no access to the host |
+| Adopted machine | `v2 migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |
 
-`--adopt-machine` gets its own variant, with a fixture that mimics a
-Flex-built host, once it is implemented.
+The cutover at the first official v2 release (N+1) gets its own variants,
+using a build of N and a build of N+1
+([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)):
+
+| Variant | What it checks |
+|---|---|
+| Cutover | Install an older v1 release, upgrade it to N, then to N+1 with an ordinary AgentUpgrade. The host migrates with the checks in step 5, and the AgentUpgrade completes when the migration commits. |
+| Cutover failure | Make the migration fail at N+1. The recovery unit returns the binary to N, N's daemon restores v1, the node is unchanged, and the AgentUpgrade is `Failed`. |
+| Downgrade in the window | After the cutover, an AgentUpgrade back to N restores v1. After a repave, an AgentUpgrade to N is refused. |
+| Skipping N | An AgentUpgrade from a release older than N straight to N+1 fails with the message to upgrade to N first, and the host keeps running the older release. |
 
 ## 5. Further end-to-end tests
 
@@ -205,7 +214,7 @@ These cover what v1 never had, so the v1 suites cannot:
 
 | When | Runs |
 |---|---|
-| Pull requests that touch `internal/agentv2`, `cmd/agent`, `pkg/agent` or `hack/agent/e2e-kind` | The existing v1 jobs, unchanged. On ubuntu2404: the v1 suites under `AGENT_PROFILE=v2` for both runtimes, and the `migration-v2` suite. |
+| Pull requests that touch `internal/agentv2`, `cmd/agent`, `pkg/agent` or `hack/agent/e2e-kind` | The existing v1 jobs, unchanged and still required. On ubuntu2404: the v1 suites under `AGENT_PROFILE=v2` for both runtimes, and the `migration-v2` suite. While v2 is experimental, the v2 jobs report but do not block a merge. |
 | Nightly | The v1 suites under `AGENT_PROFILE=v2` across the full host matrix (`.github/workflows/agent-e2e-kind.yaml:98-116`) for both runtimes, the configuration suite for both runtimes, every `migration-v2` variant, and section 5 |
 
 Each job stays within the matrix's existing time limits

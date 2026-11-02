@@ -291,9 +291,12 @@ sequenceDiagram
   SD->>D: start daemon, Recover, then reconcile
 ```
 
-v1 runs its hooks through a separate copy of the binary that survives an
-upgrade rollback (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`). Whether
-v2 can use the `current` link instead is open question 5 ([overview, section 3](README.md#3-open-questions)).
+The boot hooks run `/opt/unbounded/agent/bin/unbounded-agent-boot-hook`, not
+the `current` link. As v1 does with its lifecycle helper
+(`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`), `Provision` writes this
+copy of the running binary every time, and a binary rollback does not revert
+it. It is therefore at least as new as the binary that saved the slot's
+manifest, and can always read it ([control and state, section 4](04-control-and-state.md#4-state)).
 
 ## 5. Runtimes
 

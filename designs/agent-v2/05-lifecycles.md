@@ -40,7 +40,7 @@ sequenceDiagram
     NM->>RT: Access a, wait for readiness
     NM->>St: save applied state from a's saved manifest, with an empty goal version
     NM->>Px: hook node.start.after
-    CLI->>SD: install and start unbounded-agent-v2-daemon
+    CLI->>SD: install and start unbounded-agent-daemon
     CLI->>Px: hook agent.install.after
     CLI->>St: mark install complete
   end
@@ -144,7 +144,26 @@ sequenceDiagram
 There is no host network reset on reboot, matching v1's `RestartNode`
 (`cmd/agent/internal/daemon/nodeoperator.go:224-229`).
 
-## 4. AgentUpgrade
+## 4. HostOSReboot
+
+`HostOSReboot` was added on `main` after this design's baseline, splitting
+v1's `HostReboot` into `HostOutOfBandReboot` and `HostOSReboot`. v2 handles it
+as v1 does (`cmd/agent/internal/daemon/hostosreboot.go:43-154` at
+`e132dfada`):
+
+1. The daemon records the host's boot ID in its target entry in the
+   operation's status, and marks the operation `InProgress`.
+2. It runs `systemctl reboot`. If it cannot read the boot ID or start the
+   reboot, it fails the operation without rebooting.
+3. After the reboot, systemd starts the enabled slot, as after any host reboot
+   ([node runtime, section 1](03-node-runtime.md#1-node-runtime), rule 6), and then the daemon.
+4. The daemon compares the current boot ID with the recorded one when it starts
+   and reports the operation `Complete` or `Failed`
+   (`cmd/agent/internal/daemon/daemon.go:174` at `e132dfada`).
+
+No lifecycle hooks fire, because systemd starts the node at boot.
+
+## 5. AgentUpgrade
 
 ```mermaid
 sequenceDiagram
@@ -165,12 +184,16 @@ sequenceDiagram
 
 This is v1's mechanism
 (`cmd/agent/internal/daemon/controller_machineoperation.go:79-165`,
-`pkg/agent/agentbinary/upgrade.go:193-273`) with two additions:
+`pkg/agent/agentbinary/upgrade.go:193-273`) with these additions:
 
 - A candidate binary is checked with `v2 version` as well as `version`
   (`pkg/agent/agentbinary/agentbinary.go:125`), so a binary without the `v2`
   command is rejected before the switch.
-- The daemon unit runs `<current> v2 daemon`.
+- On a host migrated from v1, once the migration can no longer be rolled
+  back, a candidate older than the first official v2 release is also rejected
+  ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)).
+- The daemon unit runs `<current> v2 daemon` in the experimental releases, and
+  `<current> daemon` from the first official v2 release.
 
 The `v2 agent-upgrade` command is the other way in. Host delivery automation
 runs it on the host, from a separately staged candidate binary, without a
@@ -181,7 +204,7 @@ unit and wait until it is healthy, rolling back if it is not
 (`pkg/agent/agentbinary/activation.go:86-246`). The `agent.upgrade.before` and
 `agent.upgrade.after` events fire on this path too.
 
-## 5. Reset
+## 6. Reset
 
 Reset is triggered by `v2 reset`, an `AgentReset` MachineOperation, or a goal
 with `delete: true`.
@@ -219,7 +242,7 @@ The agent binary directory is removed because v1 cannot be installed alongside
 v2 ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)), so nothing else uses it. v1's reset removes it the same way
 (`cmd/agent/internal/daemon/lifecycle.go:343-351`).
 
-## 6. Migration from v1
+## 7. Migration from v1
 
 A v1 host becomes a v2 host without replacing its node: v2 takes over the
 running nspawn machine as its slot and replaces only the agent around it. The

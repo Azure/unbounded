@@ -174,7 +174,7 @@ saved bundle manifests.
   used, and has a `.sha256` sidecar.
 - New fields are only ever added, never renamed or removed, and older readers
   ignore fields they don't know. An upgrade can roll back to the `last-good`
-  binary ([lifecycles, section 4](05-lifecycles.md#4-agentupgrade)), which must still be able to read what the newer binary
+  binary ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)), which must still be able to read what the newer binary
   wrote.
 - If a file has an unknown `schemaVersion` or fails its checksum, the daemon
   makes no changes and reports `StateCorrupt`. `v2 reset` still runs, using the
@@ -244,21 +244,27 @@ visible. Recovery is manual, as in v1: an `AgentReset` operation or
 
 ## 6. MachineOperation handling
 
-`OperationKind` is a closed enum that mixes operations the agent handles with
-operations other controllers handle
-(`api/machina/v1alpha3/machineoperation_types.go:54`). `NodeReboot`,
-`AgentUpgrade` and `AgentReset` belong to the agent. `HostReboot`,
-`HostPowerOff`, `HostPowerOn` and `HostReplace` belong to the
-machine-ops-controller and metalman.
+`OperationKind` is a closed enum (`api/machina/v1alpha3/machineoperation_types.go:54`).
+There are no custom kinds: consumers customize the agent through plugins,
+hooks and declarative extensions ([extensions](02-extensions.md)) instead. Each kind is
+executed by one component. On `main` at `e132dfada`, after this design's
+baseline, `HostReboot` was split into `HostOutOfBandReboot` (alias
+`HostOOBReboot`) and `HostOSReboot`:
+
+- The agent executes `NodeReboot`, `AgentUpgrade`, `AgentReset` and
+  `HostOSReboot` (`cmd/agent/internal/daemon/controller_machineoperation.go:45-51`
+  at `e132dfada`; [lifecycles, section 4](05-lifecycles.md#4-hostosreboot)).
+- machine-ops-controller and metalman execute the other `Host*` kinds, and
+  ignore `HostOSReboot` (`internal/machineops/controller.go:382-391` at
+  `e132dfada`).
 
 v2 fails a matching operation with reason `UnsupportedOperation` only when its
 kind belongs to the agent and v2 has no handler for it. The kinds that belong
-to the agent are the three above plus any future kind beginning with `Node` or
+to the agent are the four above plus any future kind beginning with `Node` or
 `Agent`, so a newer agent operation reaching an older agent fails instead of
-staying pending. `Host*` kinds are always ignored, as
-`designs/lifecycle-operations.md:12-15` describes.
+staying pending. Other `Host*` kinds are always ignored.
 
 This differs from v1, which ignores every operation without a handler
 (`pkg/agent/daemon/machineoperation.go:114-118,139-141`). v2 implements it in
 its own copy of the reconciler, so `pkg/agent/daemon` is unchanged for v1 and
-Flex. The scoping is open question 1 ([overview, section 3](README.md#3-open-questions)).
+Flex.

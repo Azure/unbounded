@@ -78,8 +78,9 @@ The order of events in each lifecycle:
 | Bootstrap ([lifecycles, section 1](05-lifecycles.md#1-bootstrap-v2-start)) | `agent.install.before`, `host.prepare.before`, `host.prepare.after`, `node.provision.before`, `node.provision.after`, `node.start.before`, `node.start.after`, `agent.install.after` |
 | Repave ([lifecycles, section 2](05-lifecycles.md#2-repave)) | `node.repave.before`, `node.provision.before` (new), `node.provision.after` (new), `node.stop.before` (old), `node.stop.after` (old), `node.start.before` (new), `node.start.after` (new), `node.repave.after` |
 | NodeReboot ([lifecycles, section 3](05-lifecycles.md#3-nodereboot)) | `node.restart.before`, `node.restart.after` |
-| AgentUpgrade ([lifecycles, section 4](05-lifecycles.md#4-agentupgrade)) | `agent.upgrade.before` in the old daemon or the CLI, `agent.upgrade.after` in the new daemon |
-| Reset ([lifecycles, section 5](05-lifecycles.md#5-reset)) | `agent.reset.before`, `node.stop.before` and `node.stop.after` if a node is running, `agent.reset.after` |
+| HostOSReboot ([lifecycles, section 4](05-lifecycles.md#4-hostosreboot)) | None: the host reboots, and systemd starts the node at boot |
+| AgentUpgrade ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) | `agent.upgrade.before` in the old daemon or the CLI, `agent.upgrade.after` in the new daemon |
+| Reset ([lifecycles, section 6](05-lifecycles.md#6-reset)) | `agent.reset.before`, `node.stop.before` and `node.stop.after` if a node is running, `agent.reset.after` |
 
 NodeReboot has its own `restart` pair rather than stop and start events,
 because for `nspawn-container` a restart is a single unit restart.
@@ -275,5 +276,5 @@ type Client interface {
 | AKS LocalDNS template | `components.localDNS.corefileTemplate` plus the variable contract |
 | `machineOperationMode: disable` | `control.operations.enabled: false` |
 | Startup gate around its reconcilers | Built in ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
-| Own blue/green upgrade, signal file, recovery unit and unit names | Built in ([lifecycles, section 4](05-lifecycles.md#4-agentupgrade)) |
+| Own blue/green upgrade, signal file, recovery unit and unit names | Built in ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
 | Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `v2 reset` plus the documented list of what v2 creates ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)) |

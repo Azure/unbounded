@@ -9,18 +9,20 @@ repository baseline, citation conventions and terms.
 |---|---|
 | `v2 start` | Bootstrap: install check, host preparation, provision, start the node, install the daemon |
 | `v2 preflight [--output json] [--ignore-errors]` | Read-only checks: built-in, runtime, extension and plugin checks |
-| `v2 daemon` | Long-running reconciler, run by `unbounded-agent-v2-daemon.service` |
+| `v2 daemon` | Long-running reconciler, run by `unbounded-agent-daemon.service` |
 | `v2 reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
 | `v2 status [--output json]` | New. Runtime, slots, applied goal version, node readiness and any cleanup leftovers |
 | `v2 migrate [--rollback] [--adopt-machine]` | Move a v1 host, or a machine another `pkg/agent` consumer built, to v2 without replacing its node, or roll that back ([migrating from v1](10-migration-from-v1.md)) |
-| `v2 agent-upgrade [--preflight]` | Activate a staged agent binary without a MachineOperation, for host delivery automation ([lifecycles, section 4](05-lifecycles.md#4-agentupgrade)) |
+| `v2 agent-upgrade [--preflight]` | Activate a staged agent binary without a MachineOperation, for host delivery automation ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
 | `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
 | `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
 | `v2 convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by tests and by operators preparing a `host` install. |
 | `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
 
 The `v2` group is listed in `unbounded-agent --help` as "Experimental v2 agent
-(unstable)". Every `v2` command logs this warning as its first line of output:
+(unstable)". At the first official v2 release, these commands move to the top
+level, replacing v1's, and `v2` stays as a hidden alias
+([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). Every `v2` command logs this warning as its first line of output:
 
 > unbounded-agent v2 is experimental: configuration, plugin protocol and
 > on-host layout may change without notice; not supported for production use.
@@ -124,7 +126,7 @@ Enumerated fields:
 
 | Field | Values |
 |---|---|
-| `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container` *(open: [overview, section 3](README.md#3-open-questions), question 3)*. |
+| `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container`, which keeps machina provisioning unchanged. |
 | `control.goal.type` | `machina`, `static` (the goal settings in the configuration file are the goal), `plugin` |
 | `control.goal.pollInterval` | A duration. Default `10m`. Only for the `plugin` source ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). |
 | `control.status.type` | `machina`, `none`, `plugin` |
