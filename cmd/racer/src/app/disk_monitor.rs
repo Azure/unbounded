@@ -189,7 +189,25 @@ fn run(
 /// Classify every disk and publish the result in the Pod report.
 fn report(control: &dyn ClusterControl, context: &Context, device_directory: &Path) {
     let walk = Walk::new(Arc::new(AtomicBool::new(false)), WORKING_BYTES);
-    match crate::hardware::discover(&walk, Path::new("/sys"), device_directory) {
+    control.report_disks(statuses(
+        &walk,
+        Path::new("/sys"),
+        device_directory,
+        context,
+    ));
+}
+
+/// Per-disk status from one bounded scan. When the scan exceeds its working
+/// budget, for example on a host with many loop devices, the optional
+/// inventory is dropped but approved disks still report the outcome recorded
+/// at startup, so a writer waiting on a claim or rejection still sees it.
+fn statuses(
+    walk: &Walk,
+    sys_root: &Path,
+    device_directory: &Path,
+    context: &Context,
+) -> Vec<racer_cluster_control::disks::DiskStatus> {
+    match crate::hardware::discover(walk, sys_root, device_directory) {
         Ok(found) => {
             let mounts = std::fs::read_to_string(
                 context
@@ -198,13 +216,12 @@ fn report(control: &dyn ClusterControl, context: &Context, device_directory: &Pa
                     .unwrap_or(Path::new("/proc/self/mountinfo")),
             )
             .unwrap_or_default();
-            control.report_disks(crate::hardware::classify_disks(
-                &found.block_devices,
-                &mounts,
-                context,
-            ));
+            crate::hardware::classify_disks(&found.block_devices, &mounts, context)
         }
-        Err(abort) => eprintln!("racer: disk status scan stopped: {abort:?}"),
+        Err(abort) => {
+            eprintln!("racer: disk status scan stopped: {abort:?}; reporting approved disks only");
+            crate::hardware::classify_disks(&[], "", context)
+        }
     }
 }
 
@@ -291,5 +308,41 @@ mod tests {
             std::os::unix::fs::symlink(block.path(), f.0.join("disk/by-id/wwn-late")).unwrap();
             assert_eq!(appeared(&context, &f.0).as_deref(), Some("wwn-late"));
         }
+    }
+
+    #[test]
+    fn exhausted_scan_still_reports_approved_outcomes() {
+        let f = super::super::devices::tests::Fixture::new();
+        let context = Context {
+            approvals: vec![
+                crate::hardware::Approved {
+                    id: "wwn-claimed".into(),
+                    dev: Some("259:0".into()),
+                    state: DiskState::Claimed,
+                    reason: None,
+                },
+                crate::hardware::Approved {
+                    id: "wwn-late".into(),
+                    dev: None,
+                    state: DiskState::Missing,
+                    reason: None,
+                },
+            ],
+            ..Default::default()
+        };
+        // A zero budget aborts discovery before any device is read.
+        let walk = Walk::new(Arc::default(), 0);
+        let disks = statuses(&walk, &f.0.join("sys"), &f.0, &context);
+        let got: Vec<_> = disks.iter().map(|d| (d.id.as_str(), d.state)).collect();
+        assert_eq!(
+            got,
+            [
+                ("wwn-claimed", DiskState::Claimed),
+                ("wwn-late", DiskState::Missing)
+            ]
+        );
+        // Without approvals the fallback is empty rather than an error.
+        let walk = Walk::new(Arc::default(), 0);
+        assert!(statuses(&walk, &f.0.join("sys"), &f.0, &Context::default()).is_empty());
     }
 }
