@@ -37,6 +37,12 @@ type ClientConfig struct {
 	// Stat. Each lane has a bounded queue; calls fail with [ErrUnavailable] if
 	// it is full or the wait times out.
 	MaxConnections int
+	// PageCredits is how many pages Racer may send ahead of the reader on
+	// each [Client.Get]. Racer's fetch window for a read is the smaller of
+	// this and its RACER_RANGE_WINDOW_PAGES, so it bounds single-read
+	// throughput. Zero means 2; the maximum is 64. Each credit lets Racer hold
+	// one more 16 MiB page for the read.
+	PageCredits int
 }
 
 // Internal limits. Stat and small-object reads have their own lanes so they
@@ -53,8 +59,11 @@ const (
 	// and Get always dials, so a burst of Stats must not leave the pool
 	// holding the slots a later Get needs.
 	statIdleConnections = 4
-	// pageCredits is the number of pages Racer may send ahead of the reader.
-	pageCredits = 2
+	// defaultPageCredits is the number of pages Racer may send ahead of the
+	// reader when ClientConfig.PageCredits is zero.
+	defaultPageCredits = 2
+	// maxPageCredits is the largest credit window Racer accepts.
+	maxPageCredits = 64
 )
 
 type clientLimits struct {
@@ -81,6 +90,7 @@ type Client struct {
 	path    string
 	limits  clientLimits
 	maxIdle int
+	credits int
 
 	bulk, small, stat lane
 
@@ -125,11 +135,20 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		config.MaxConnections = defaultMaxConnections
 	}
 
+	if config.PageCredits < 0 || config.PageCredits > maxPageCredits {
+		return nil, invalid("client config", errors.New("PageCredits must be in [0, 64]"))
+	}
+
+	if config.PageCredits == 0 {
+		config.PageCredits = defaultPageCredits
+	}
+
 	ctx, cancel := context.WithCancelCause(context.Background())
 
 	return &Client{
 		path:    path,
 		limits:  defaultClientLimits,
+		credits: config.PageCredits,
 		maxIdle: min(statIdleConnections, config.MaxConnections),
 		bulk:    newLane(config.MaxConnections, bulkQueue),
 		small:   newLane(smallConnections, smallQueue),
@@ -366,8 +385,8 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 	subscription := wire.SubscriptionOptions{
 		Offset:      uint64(o.Offset),
 		Length:      uint64(o.Length),
-		PageCredits: pageCredits,
-		ByteCredits: pageCredits * PageSize,
+		PageCredits: c.credits,
+		ByteCredits: uint64(c.credits) * PageSize,
 		SmallObject: o.SmallObject,
 		Pin:         o.ETag,
 	}
