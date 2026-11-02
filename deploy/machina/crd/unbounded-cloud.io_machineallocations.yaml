@@ -1,0 +1,889 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: machineallocations.unbounded-cloud.io
+spec:
+  group: unbounded-cloud.io
+  names:
+    kind: MachineAllocation
+    listKind: MachineAllocationList
+    plural: machineallocations
+    shortNames:
+    - malloc
+    singular: machineallocation
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.classRef.name
+      name: Class
+      type: string
+    - jsonPath: .spec.lifecycle
+      name: Lifecycle
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Allocated')].status
+      name: Allocated
+      type: string
+    - jsonPath: .status.nodeRef.name
+      name: Node
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha3
+    schema:
+      openAPIV3Schema:
+        description: |-
+          MachineAllocation is one consumer-owned request for one machine from a
+          MachineClass. Its UID owns every remote effect made on its behalf.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              MachineAllocationSpec defines the requested machine. Every field except
+              lifecycle is immutable.
+            properties:
+              classRef:
+                description: ClassRef identifies the exact MachineClass the allocation
+                  is made from.
+                properties:
+                  name:
+                    description: Name is the object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the object UID.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+              consumerRef:
+                description: ConsumerRef identifies the object that requested this
+                  allocation.
+                properties:
+                  apiGroup:
+                    description: |-
+                      APIGroup is the consumer API group. An empty value means the core API
+                      group.
+                    type: string
+                  kind:
+                    description: Kind is the consumer kind.
+                    minLength: 1
+                    type: string
+                  name:
+                    description: Name is the consumer name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is the consumer UID. A consumer with another UID is a different
+                      object.
+                    minLength: 1
+                    type: string
+                required:
+                - apiGroup
+                - kind
+                - name
+                - uid
+                type: object
+              lifecycle:
+                default: Active
+                description: Lifecycle authorizes release. It moves only from Active
+                  to Released.
+                enum:
+                - Active
+                - Released
+                type: string
+                x-kubernetes-validations:
+                - message: lifecycle cannot return to Active
+                  rule: oldSelf == 'Active' || self == 'Released'
+              nodeTemplate:
+                description: NodeTemplate is applied to the Node at registration.
+                properties:
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: Labels are added to the Node at registration.
+                    type: object
+                  startupTaints:
+                    description: |-
+                      StartupTaints are added at registration and removed by their owners
+                      once the Node is initialized.
+                    items:
+                      description: |-
+                        The node this Taint is attached to has the "effect" on
+                        any pod that does not tolerate the Taint.
+                      properties:
+                        effect:
+                          description: |-
+                            Required. The effect of the taint on pods
+                            that do not tolerate the taint.
+                            Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: Required. The taint key to be applied to a
+                            node.
+                          type: string
+                        timeAdded:
+                          description: TimeAdded represents the time at which the
+                            taint was added.
+                          format: date-time
+                          type: string
+                        value:
+                          description: The taint value corresponding to the taint
+                            key.
+                          type: string
+                      required:
+                      - effect
+                      - key
+                      type: object
+                    type: array
+                  taints:
+                    description: Taints are added to the Node at registration.
+                    items:
+                      description: |-
+                        The node this Taint is attached to has the "effect" on
+                        any pod that does not tolerate the Taint.
+                      properties:
+                        effect:
+                          description: |-
+                            Required. The effect of the taint on pods
+                            that do not tolerate the taint.
+                            Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: Required. The taint key to be applied to a
+                            node.
+                          type: string
+                        timeAdded:
+                          description: TimeAdded represents the time at which the
+                            taint was added.
+                          format: date-time
+                          type: string
+                        value:
+                          description: The taint value corresponding to the taint
+                            key.
+                          type: string
+                      required:
+                      - effect
+                      - key
+                      type: object
+                    type: array
+                type: object
+              requirements:
+                description: Requirements constrain the offering labels the allocation
+                  may use.
+                items:
+                  description: MachineAllocationRequirement constrains one offering
+                    label.
+                  properties:
+                    key:
+                      description: Key is the label key.
+                      minLength: 1
+                      type: string
+                    minValues:
+                      description: |-
+                        MinValues is the consumer's flexibility floor: at least this many
+                        distinct values of Key must remain among the current offerings that
+                        satisfy every requirement, or the allocation fails with
+                        InsufficientCapacity. The allocation then resolves to one of them.
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    operator:
+                      description: Operator is the requirement operator.
+                      enum:
+                      - In
+                      - NotIn
+                      - Exists
+                      - DoesNotExist
+                      - Gt
+                      - Lt
+                      type: string
+                    values:
+                      description: Values are the operator values.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - key
+                  - operator
+                  type: object
+                type: array
+              resources:
+                additionalProperties:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+                description: Resources are the minimum requested resources.
+                type: object
+            required:
+            - classRef
+            - consumerRef
+            type: object
+            x-kubernetes-validations:
+            - message: consumerRef is immutable
+              rule: self.consumerRef == oldSelf.consumerRef
+            - message: classRef is immutable
+              rule: self.classRef == oldSelf.classRef
+            - message: resources is immutable
+              rule: has(self.resources) == has(oldSelf.resources) && (!has(self.resources)
+                || self.resources == oldSelf.resources)
+            - message: requirements is immutable
+              rule: has(self.requirements) == has(oldSelf.requirements) && (!has(self.requirements)
+                || self.requirements == oldSelf.requirements)
+            - message: nodeTemplate is immutable
+              rule: has(self.nodeTemplate) == has(oldSelf.nodeTemplate) && (!has(self.nodeTemplate)
+                || self.nodeTemplate == oldSelf.nodeTemplate)
+          status:
+            description: MachineAllocationStatus reports the observed allocation state.
+            properties:
+              allocatable:
+                additionalProperties:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+                description: |-
+                  Allocatable is observed from the Node once registered, otherwise
+                  capacity minus overhead.
+                type: object
+              capacity:
+                additionalProperties:
+                  anyOf:
+                  - type: integer
+                  - type: string
+                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                  x-kubernetes-int-or-string: true
+                description: Capacity is the machine capacity.
+                type: object
+              capacityType:
+                description: CapacityType is the launched purchase model.
+                enum:
+                - OnDemand
+                - Spot
+                type: string
+              conditions:
+                description: Conditions represent the latest available observations.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              failureMessage:
+                description: FailureMessage describes the terminal launch failure.
+                type: string
+              failureReason:
+                description: FailureReason is a normalized terminal launch failure
+                  category.
+                enum:
+                - InsufficientCapacity
+                - QuotaExceeded
+                - InvalidRequest
+                - AuthFailed
+                - ProviderConflict
+                - ProviderFailed
+                type: string
+              image:
+                description: Image is the launched host image.
+                type: string
+              instanceType:
+                description: InstanceType is the launched instance type.
+                type: string
+              labels:
+                additionalProperties:
+                  type: string
+                description: Labels are the labels the Node registers with.
+                type: object
+              machineRef:
+                description: MachineRef identifies the Machine created for this allocation.
+                properties:
+                  name:
+                    description: Name is the object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the object UID.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+              nodeRef:
+                description: NodeRef identifies the first Node registered for this
+                  allocation.
+                properties:
+                  name:
+                    description: Name is the object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the object UID.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+              observedGeneration:
+                description: ObservedGeneration is the allocation generation last
+                  reconciled.
+                format: int64
+                type: integer
+              operations:
+                description: Operations identifies the durable allocation operations.
+                properties:
+                  allocate:
+                    description: Allocate is the MachineOperation that launches the
+                      host.
+                    properties:
+                      name:
+                        description: Name is the object name.
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: UID is the object UID.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - uid
+                    type: object
+                  release:
+                    description: Release is the MachineOperation that releases the
+                      host.
+                    properties:
+                      name:
+                        description: Name is the object name.
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: UID is the object UID.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - uid
+                    type: object
+                type: object
+              ownedResources:
+                description: |-
+                  OwnedResources are the provider resources the allocate operation
+                  confirmed as created for this allocation, with provider-native identity
+                  proving ownership. Release is limited to these resources.
+                items:
+                  description: ProviderOwnedResource is a provider resource owned
+                    by one allocation.
+                  properties:
+                    id:
+                      description: ID is the provider resource identifier.
+                      minLength: 1
+                      type: string
+                    nativeID:
+                      description: |-
+                        NativeID is the provider-assigned instance identity. A resource
+                        recreated under the same ID has a different NativeID.
+                      minLength: 1
+                      type: string
+                  required:
+                  - id
+                  - nativeID
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              providerID:
+                description: |-
+                  ProviderID is the exact Node.spec.providerID the machine registers with.
+                  It cannot change or be removed once set.
+                type: string
+              providerResourceID:
+                description: ProviderResourceID is the provider-native host identifier.
+                type: string
+              snapshot:
+                description: |-
+                  Snapshot is the frozen input for every remote effect made for this
+                  allocation. It is set by the allocation controller and cannot change or
+                  be removed once set.
+                properties:
+                  agentArtifact:
+                    description: AgentArtifact is the digest-pinned agent tarball.
+                    properties:
+                      sha256:
+                        description: SHA256 is the lowercase hex SHA-256 digest of
+                          the tarball.
+                        pattern: ^[a-f0-9]{64}$
+                        type: string
+                      url:
+                        description: |-
+                          URL is the agent tarball location: an https URL with a DNS name or IPv4
+                          host and an optional port, or a local file:/// path. It must not embed
+                          credentials, a query, or a fragment.
+                        maxLength: 2048
+                        pattern: ^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?|file://)(/[A-Za-z0-9._~%+=,:-]+)+$
+                        type: string
+                    required:
+                    - sha256
+                    - url
+                    type: object
+                  bootstrapFiles:
+                    description: BootstrapFiles is the exact bootstrap files content.
+                    properties:
+                      hash:
+                        description: Hash is the SHA-256 of the object content.
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        type: string
+                      namespace:
+                        description: Namespace is the object namespace.
+                        type: string
+                      uid:
+                        description: UID detects deletion and recreation of the object.
+                        type: string
+                    required:
+                    - hash
+                    - name
+                    - namespace
+                    - uid
+                    type: object
+                  classGeneration:
+                    description: ClassGeneration is the class generation the snapshot
+                      was taken from.
+                    format: int64
+                    type: integer
+                  classRevision:
+                    description: ClassRevision is the class resolved revision.
+                    type: string
+                  classUID:
+                    description: ClassUID is the class UID the snapshot was taken
+                      from.
+                    type: string
+                  configuration:
+                    description: Configuration identifies the configuration version
+                      content.
+                    properties:
+                      hash:
+                        description: Hash is the SHA-256 of the configuration template.
+                        type: string
+                      name:
+                        description: Name is the MachineConfiguration name.
+                        type: string
+                      uid:
+                        description: UID is the MachineConfigurationVersion UID.
+                        type: string
+                      version:
+                        description: Version is the MachineConfiguration version.
+                        format: int32
+                        type: integer
+                      versionName:
+                        description: VersionName is the MachineConfigurationVersion
+                          object name.
+                        type: string
+                    required:
+                    - hash
+                    - name
+                    - uid
+                    - version
+                    - versionName
+                    type: object
+                  configurationTemplate:
+                    description: |-
+                      ConfigurationTemplate is the frozen configuration content for Machines
+                      of this allocation, copied from the configuration version.
+                    properties:
+                      agent:
+                        description: |-
+                          Agent contains settings for the unbounded node agent (e.g. the
+                          OCI image reference for the nspawn machine).
+                        properties:
+                          image:
+                            description: |-
+                              Image is the OCI image reference used for provisioning the
+                              nspawn machine (e.g. "ghcr.io/org/repo:tag").
+                            type: string
+                          localDNS:
+                            description: LocalDNS configures the optional CoreDNS
+                              cache for this version.
+                            properties:
+                              clusterListenerIP:
+                                type: string
+                              corefileTemplate:
+                                type: string
+                              cpuLimitInMilliCores:
+                                format: int32
+                                type: integer
+                              enabled:
+                                type: boolean
+                              memoryLimitInMB:
+                                format: int32
+                                type: integer
+                              metricsAddress:
+                                type: string
+                              nodeListenerIP:
+                                type: string
+                              requiredPlugins:
+                                items:
+                                  type: string
+                                type: array
+                            type: object
+                        required:
+                        - image
+                        type: object
+                      host:
+                        description: Host contains provider-neutral desired host settings.
+                        properties:
+                          image:
+                            description: Image is an opaque provider-interpreted image
+                              identifier.
+                            type: string
+                          provisioningFormat:
+                            description: ProvisioningFormat declares the first-boot
+                              payload understood by Image.
+                            enum:
+                            - CloudInit
+                            - Ignition
+                            type: string
+                        type: object
+                      kubernetes:
+                        description: |-
+                          Kubernetes contains Kubernetes-specific configuration such as
+                          the target version, node labels, and taints.
+                        properties:
+                          nodeLabels:
+                            additionalProperties:
+                              type: string
+                            description: NodeLabels are labels passed to kubelet's
+                              --node-labels flag.
+                            type: object
+                          registerWithTaints:
+                            description: |-
+                              RegisterWithTaints are taints passed to kubelet's
+                              --register-with-taints flag.
+                            items:
+                              description: |-
+                                The node this Taint is attached to has the "effect" on
+                                any pod that does not tolerate the Taint.
+                              properties:
+                                effect:
+                                  description: |-
+                                    Required. The effect of the taint on pods
+                                    that do not tolerate the taint.
+                                    Valid effects are NoSchedule, PreferNoSchedule and NoExecute.
+                                  type: string
+                                key:
+                                  description: Required. The taint key to be applied
+                                    to a node.
+                                  type: string
+                                timeAdded:
+                                  description: TimeAdded represents the time at which
+                                    the taint was added.
+                                  format: date-time
+                                  type: string
+                                value:
+                                  description: The taint value corresponding to the
+                                    taint key.
+                                  type: string
+                              required:
+                              - effect
+                              - key
+                              type: object
+                            type: array
+                          version:
+                            description: Version is the Kubernetes version to install
+                              (e.g. "v1.34.0").
+                            type: string
+                        type: object
+                    type: object
+                  credential:
+                    description: |-
+                      Credential is the exact MachineOperationCredential instance frozen
+                      before any effect. A credential recreated under the same name has a
+                      different UID.
+                    properties:
+                      name:
+                        description: Name is the object name.
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: UID is the object UID.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - uid
+                    type: object
+                  hostImage:
+                    description: HostImage is the provider-interpreted host image.
+                    type: string
+                  hostProviderID:
+                    description: |-
+                      HostProviderID is the provider-specific host ID planned before the
+                      host exists. It becomes the Machine's host.external.providerID.
+                    minLength: 1
+                    type: string
+                  offering:
+                    description: Offering is the selected offering.
+                    properties:
+                      availability:
+                        description: Availability is the observed availability.
+                        enum:
+                        - Available
+                        - Unavailable
+                        - Unknown
+                        type: string
+                      capacity:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: Capacity is the machine capacity before overhead.
+                        type: object
+                      capacityType:
+                        description: CapacityType is the purchase model.
+                        enum:
+                        - OnDemand
+                        - Spot
+                        type: string
+                      instanceType:
+                        description: InstanceType is the provider instance type.
+                        type: string
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: Labels are the well-known labels Nodes from this
+                          offering register with.
+                        type: object
+                      name:
+                        description: Name uniquely identifies the offering within
+                          the class.
+                        minLength: 1
+                        type: string
+                      observedAt:
+                        description: ObservedAt is when availability and capacity
+                          were observed.
+                        format: date-time
+                        type: string
+                      overhead:
+                        description: Overhead is the capacity reserved from workloads.
+                        properties:
+                          evictionThreshold:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: EvictionThreshold is the hard eviction threshold.
+                            type: object
+                          kubeReserved:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: KubeReserved is reserved for Kubernetes node
+                              components.
+                            type: object
+                          systemReserved:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: SystemReserved is reserved for operating
+                              system daemons.
+                            type: object
+                        type: object
+                      price:
+                        description: Price is the observed or configured price, when
+                          known.
+                        properties:
+                          currency:
+                            description: Currency is the ISO 4217 currency code.
+                            pattern: ^[A-Z]{3}$
+                            type: string
+                          observedAt:
+                            description: ObservedAt is when the price was observed.
+                            format: date-time
+                            type: string
+                          perHour:
+                            description: PerHour is the decimal price per instance
+                              hour.
+                            pattern: ^[0-9]+(\.[0-9]+)?$
+                            type: string
+                          source:
+                            description: Source documents where the price came from
+                              and what it includes.
+                            type: string
+                        required:
+                        - currency
+                        - perHour
+                        type: object
+                      validUntil:
+                        description: |-
+                          ValidUntil is when this observation expires. An expired offering must
+                          not be used to launch a machine.
+                        format: date-time
+                        type: string
+                      zone:
+                        description: Zone is the provider zone, or empty for regional
+                          capacity.
+                        type: string
+                    required:
+                    - availability
+                    - capacityType
+                    - instanceType
+                    - name
+                    type: object
+                  provider:
+                    description: Provider is the provider adapter name.
+                    type: string
+                  providerConfig:
+                    description: ProviderConfig is the exact provider config content.
+                    properties:
+                      hash:
+                        description: Hash is the SHA-256 of the object content.
+                        type: string
+                      name:
+                        description: Name is the object name.
+                        type: string
+                      namespace:
+                        description: Namespace is the object namespace.
+                        type: string
+                      uid:
+                        description: UID detects deletion and recreation of the object.
+                        type: string
+                    required:
+                    - hash
+                    - name
+                    - namespace
+                    - uid
+                    type: object
+                  siteName:
+                    description: SiteName is the Site the machine joins.
+                    type: string
+                  siteUID:
+                    description: |-
+                      SiteUID is the exact Site instance frozen before any effect. A Site
+                      recreated under the same name has a different UID.
+                    type: string
+                required:
+                - classGeneration
+                - classRevision
+                - classUID
+                - configuration
+                - configurationTemplate
+                - credential
+                - hostImage
+                - hostProviderID
+                - offering
+                - provider
+                - providerConfig
+                - siteName
+                - siteUID
+                type: object
+                x-kubernetes-validations:
+                - message: snapshot is immutable
+                  rule: self == oldSelf
+              zone:
+                description: Zone is the launched zone.
+                type: string
+            type: object
+            x-kubernetes-validations:
+            - message: snapshot cannot be removed
+              rule: '!has(oldSelf.snapshot) || has(self.snapshot)'
+            - message: providerID is immutable once set
+              rule: '!has(oldSelf.providerID) || (has(self.providerID) && self.providerID
+                == oldSelf.providerID)'
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
