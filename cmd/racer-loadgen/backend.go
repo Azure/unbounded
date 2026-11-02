@@ -69,6 +69,9 @@ func (p *puller) configureUDS(capacity int) error {
 
 	p.closeBackend = client.Close
 	p.acquire = udsAcquirer(client)
+	if p.opts.RangeBytes > 0 {
+		p.acquire = p.udsRangedAcquirer(client)
+	}
 
 	return nil
 }
@@ -91,5 +94,36 @@ func udsAcquirer(client *racersdk.Client) func(context.Context, string, ocispec.
 		etag := value.Metadata().ETag
 
 		return blobResponse{body: value, success: true, totalSize: &size, etag: &etag}, nil
+	}
+}
+
+// udsRangedAcquirer reads large blobs as pinned, resumable, parallel ranges.
+func (p *puller) udsRangedAcquirer(client *racersdk.Client) func(context.Context, string, ocispec.Descriptor) (blobResponse, error) {
+	return func(ctx context.Context, _ string, desc ocispec.Descriptor) (blobResponse, error) {
+		key, err := racersdk.ParseKey(desc.Digest.Encoded())
+		if err != nil {
+			return blobResponse{}, err
+		}
+
+		metadata, err := client.Stat(ctx, racersdk.Request{Key: key})
+		if err != nil {
+			return blobResponse{}, err
+		}
+
+		size, etag := metadata.Size, metadata.ETag
+		body := &rangedBody{
+			ctx:        ctx,
+			get:        sdkRangeGet(client, key, etag),
+			size:       size,
+			rangeBytes: p.opts.RangeBytes,
+			parallel:   p.opts.RangeParallel,
+			retries:    p.opts.RangeRetries,
+			retryDelay: p.opts.RetryDelay,
+			onResume: func() {
+				p.metrics.rangeResumes.Inc()
+			},
+		}
+
+		return blobResponse{body: body, success: true, totalSize: &size, etag: &etag}, nil
 	}
 }

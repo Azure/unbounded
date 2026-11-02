@@ -88,6 +88,9 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
 	f.StringVar(&opts.blobDigests, "trusted-blob-digests", "", "Comma-separated digests computed earlier for the first catalog blobs (same seed and size); skips hashing them at startup")
 	f.IntVar(&opts.pull.PageCredits, "page-credits", 0, "UDS only: pages Racer may send ahead of each read, 0-64 (0 uses the SDK default of 2); bounds Racer's per-read fetch window")
+	f.Int64Var(&opts.pull.RangeBytes, "range-bytes", 0, "UDS only: read each blob as pinned byte ranges of this size, resuming a failed range at its first unread byte (0 reads whole objects); requires verify=false")
+	f.IntVar(&opts.pull.RangeParallel, "range-parallel", 1, "UDS only: concurrent ranges per blob with range-bytes")
+	f.IntVar(&opts.pull.RangeRetries, "range-retries", 20, "UDS only: resumes allowed per range with range-bytes")
 	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {
@@ -145,6 +148,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	if opts.catalogWorkers < 1 || opts.catalogWorkers > maxCatalogWorkers {
 		return opts, fmt.Errorf("catalog-workers must be in [1, %d]", maxCatalogWorkers)
+	}
+
+	if opts.pull.RangeBytes < 0 || opts.pull.RangeParallel < 1 || opts.pull.RangeRetries < 0 {
+		return opts, errors.New("range-bytes and range-retries must be nonnegative and range-parallel positive")
+	}
+
+	if opts.pull.RangeBytes > 0 && (opts.pull.Backend != "uds" || opts.pull.Verify || opts.pull.DiagnoseIntegrity) {
+		return opts, errors.New("range-bytes requires backend=uds and verify=false")
 	}
 
 	if opts.startDelay < 0 || opts.duration < 0 || opts.startAt < 0 {

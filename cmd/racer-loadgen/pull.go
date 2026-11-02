@@ -44,6 +44,9 @@ type pullOptions struct {
 	Verify            bool
 	DiagnoseIntegrity bool
 	PageCredits       int
+	RangeBytes        int64
+	RangeParallel     int
+	RangeRetries      int
 }
 
 type puller struct {
