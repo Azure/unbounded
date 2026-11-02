@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -335,6 +336,12 @@ func (h *harness) deployAuthRegistry(ctx context.Context) {
 func newAuthRegistryCertificate(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 
+	return newRegistryCertificate(t, authRegistryHost)
+}
+
+func newRegistryCertificate(t *testing.T, host string) ([]byte, []byte) {
+	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate auth registry key: %v", err)
@@ -348,14 +355,19 @@ func newAuthRegistryCertificate(t *testing.T) ([]byte, []byte) {
 	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: authRegistryHost},
-		DNSNames:              []string{authRegistryHost},
+		Subject:               pkix.Name{CommonName: host},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IsCA:                  true,
 		BasicConstraintsValid: true,
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{host}
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
@@ -379,6 +391,12 @@ func newAuthRegistryCertificate(t *testing.T) ([]byte, []byte) {
 func (h *harness) configureGantryAuthRegistryCA(ctx context.Context) {
 	h.t.Helper()
 
+	h.configureGantryRegistryCA(ctx, authRegistryName)
+}
+
+func (h *harness) configureGantryRegistryCA(ctx context.Context, registryName string) {
+	h.t.Helper()
+
 	patch, err := json.Marshal(map[string]any{
 		"spec": map[string]any{
 			"template": map[string]any{
@@ -398,7 +416,7 @@ func (h *harness) configureGantryAuthRegistryCA(ctx context.Context) {
 					"volumes": []any{map[string]any{
 						"name": "auth-registry-ca",
 						"secret": map[string]any{
-							"secretName": authRegistryName + "-tls",
+							"secretName": registryName + "-tls",
 							"items": []any{map[string]any{
 								"key":  "ca.crt",
 								"path": "ca.crt",
@@ -571,10 +589,19 @@ func (h *harness) installMirrorHostsFor(ctx context.Context, registryHost, serve
 	}
 }
 
-// applyPullPodWithImage is applyPullPod parameterized on image. Used by
-// the auth registry test which pulls from the in-cluster registry.
-func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, image string) {
+// applyPullPodWithImage allows a fixture image and an optional command. The
+// default command preserves the agnhost workload used by the auth test.
+func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, image string, command ...string) {
 	h.t.Helper()
+
+	if len(command) == 0 {
+		command = []string{"/agnhost", "pause"}
+	}
+
+	encodedCommand, err := json.Marshal(command)
+	if err != nil {
+		h.t.Fatalf("marshal pull pod command: %v", err)
+	}
 
 	manifest := strings.Join([]string{
 		"apiVersion: v1",
@@ -593,7 +620,7 @@ func (h *harness) applyPullPodWithImage(ctx context.Context, name, nodeName, ima
 		"    - name: agnhost",
 		"      image: " + image,
 		"      imagePullPolicy: Always",
-		"      command: [\"/agnhost\", \"pause\"]",
+		"      command: " + string(encodedCommand),
 		"",
 	}, "\n")
 	if err := h.runWithInput(ctx, manifest, "kubectl", "apply", "-f", "-"); err != nil {
