@@ -387,9 +387,10 @@ type RedfishSpec struct {
 	// +kubebuilder:default="1"
 	DeviceID string `json:"deviceID,omitempty"`
 
-	// PasswordRef references a secret containing the Redfish password.
+	// PasswordRef references a secret containing the Redfish password. Its key
+	// defaults to "password".
 	// +kubebuilder:validation:Required
-	PasswordRef SecretKeySelector `json:"passwordRef"`
+	PasswordRef RedfishPasswordSelector `json:"passwordRef"`
 }
 
 // PXESpec defines PXE boot configuration for a Machine.
@@ -703,6 +704,35 @@ type SecretKeySelector struct {
 	// Key within the secret.
 	// +kubebuilder:default=ssh-privatekey
 	Key string `json:"key,omitempty"`
+}
+
+// DefaultRedfishPasswordKey is the Secret key that holds a Redfish password
+// when RedfishPasswordSelector.Key is not set.
+const DefaultRedfishPasswordKey = "password"
+
+// RedfishPasswordSelector selects the key of a Secret that holds a Redfish
+// password. It differs from SecretKeySelector only in its key default.
+type RedfishPasswordSelector struct {
+	// Name of the secret.
+	Name string `json:"name"`
+
+	// Namespace of the secret.
+	Namespace string `json:"namespace"`
+
+	// Key within the secret. Defaults to "password".
+	// +kubebuilder:default=password
+	Key string `json:"key,omitempty"`
+}
+
+// KeyOrDefault returns Key, or DefaultRedfishPasswordKey when Key is empty.
+// The API server applies the default on admission, but objects built in Go
+// without going through it can still carry an empty key.
+func (s RedfishPasswordSelector) KeyOrDefault() string {
+	if s.Key == "" {
+		return DefaultRedfishPasswordKey
+	}
+
+	return s.Key
 }
 
 // MachineStatus defines the observed state of a Machine.
