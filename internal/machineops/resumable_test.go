@@ -728,3 +728,52 @@ func (p *recordingLongRunningProvider) Poll(_ context.Context, request Operation
 
 	return publicmachineops.PollResult{State: publicmachineops.ProviderOperationStateInProgress}, nil
 }
+
+func TestHostOperationDoesNotWaitForAllocationOperation(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []unboundedv1alpha3.OperationKind{
+		unboundedv1alpha3.OperationHostAllocate,
+		unboundedv1alpha3.OperationHostRelease,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+
+			machine, newer, credential := newResumableTestObjects("machine-1", "op-b")
+			newer.CreationTimestamp = fixedOperationNow()
+			older := newAllocationOperation("op-a", machine.Name, kind)
+			older.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-time.Minute))
+			older.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+
+			allocation := &allocationCallRecorder{}
+			hostReboot := &recordingLongRunningProvider{beginResults: []publicmachineops.BeginResult{{
+				Operation: publicmachineops.ProviderOperation{OperationID: "provider-op-1"},
+			}}}
+			registration, err := publicmachineops.NewProvider(
+				testLongRunningProviderName,
+				publicmachineops.WithLongRunningOperation(kind, allocation.Begin, allocation.Poll),
+				publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostHardReboot, hostReboot.Begin, hostReboot.Poll),
+			)
+			require.NoError(t, err)
+
+			c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, older, newer, credential).WithStatusSubresource(older, newer).Build()
+			reconciler := &MachineOperationReconciler{
+				Client:                      c,
+				Providers:                   []*Provider{registration},
+				ProviderPollInterval:        time.Millisecond,
+				ProviderStallAfter:          time.Hour,
+				ProviderStalledPollInterval: 5 * time.Minute,
+				Now:                         fixedOperationNow,
+			}
+
+			reconcileOperation(t, reconciler, newer.Name)
+
+			var updated unboundedv1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: newer.Name}, &updated))
+			require.Equal(t, 1, hostReboot.beginCalls)
+			require.NotContains(t, updated.Status.Message, "waiting for older host operation")
+			require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
+			require.Zero(t, allocation.beginCalls)
+		})
+	}
+}

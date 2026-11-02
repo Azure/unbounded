@@ -1139,3 +1139,258 @@ func testClusterInfo() *ClusterInfo {
 func metav1ObjectMeta(name string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: name}
 }
+
+// allocationCallRecorder counts provider callbacks registered for an
+// allocation operation kind.
+type allocationCallRecorder struct {
+	executeCalls int
+	beginCalls   int
+	pollCalls    int
+	cleanupCalls int
+}
+
+func (r *allocationCallRecorder) Execute(context.Context, OperationRequest) (OperationResult, error) {
+	r.executeCalls++
+	return OperationResult{}, nil
+}
+
+func (r *allocationCallRecorder) Begin(context.Context, OperationRequest) (publicmachineops.BeginResult, error) {
+	r.beginCalls++
+	return publicmachineops.BeginResult{Operation: publicmachineops.ProviderOperation{OperationID: "provider-op-1"}}, nil
+}
+
+func (r *allocationCallRecorder) Poll(context.Context, OperationRequest, publicmachineops.ProviderOperation) (publicmachineops.PollResult, error) {
+	r.pollCalls++
+	return publicmachineops.PollResult{State: publicmachineops.ProviderOperationStateSucceeded}, nil
+}
+
+func (r *allocationCallRecorder) Cleanup(context.Context, OperationRequest, OperationResult) error {
+	r.cleanupCalls++
+	return nil
+}
+
+func newAllocationOperation(name, machineRef string, kind unboundedv1alpha3.OperationKind) *unboundedv1alpha3.MachineOperation {
+	op := newMachineOperation(name, machineRef, kind)
+	op.UID = types.UID(name + "-uid")
+	op.Spec.AllocationRef = &unboundedv1alpha3.UIDReference{Name: "alloc-1", UID: "alloc-1-uid"}
+
+	return op
+}
+
+func TestMachineOperationReconciler_IgnoresAllocationOperations(t *testing.T) {
+	t.Parallel()
+
+	kinds := []unboundedv1alpha3.OperationKind{
+		unboundedv1alpha3.OperationHostAllocate,
+		unboundedv1alpha3.OperationHostRelease,
+	}
+
+	registrations := []struct {
+		name    string
+		options func(unboundedv1alpha3.OperationKind, *allocationCallRecorder) []publicmachineops.ProviderOption
+	}{
+		{
+			name: "kind not registered",
+			options: func(_ unboundedv1alpha3.OperationKind, recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
+				return []publicmachineops.ProviderOption{
+					publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostHardReboot, recorder.Begin, recorder.Poll),
+				}
+			},
+		},
+		{
+			name: "kind registered as immediate",
+			options: func(kind unboundedv1alpha3.OperationKind, recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
+				return []publicmachineops.ProviderOption{
+					publicmachineops.WithImmediateOperation(kind, recorder.Execute, publicmachineops.WithCleanup(recorder.Cleanup)),
+				}
+			},
+		},
+		{
+			name: "kind registered as long-running",
+			options: func(kind unboundedv1alpha3.OperationKind, recorder *allocationCallRecorder) []publicmachineops.ProviderOption {
+				return []publicmachineops.ProviderOption{
+					publicmachineops.WithLongRunningOperation(kind, recorder.Begin, recorder.Poll, publicmachineops.WithCleanup(recorder.Cleanup)),
+				}
+			},
+		},
+	}
+
+	ttl := int32(0)
+	startedAt := metav1.NewTime(fixedOperationNow().Add(-time.Hour))
+	completedAt := metav1.NewTime(fixedOperationNow().Add(-time.Minute))
+
+	states := []struct {
+		name   string
+		mutate func(*unboundedv1alpha3.MachineOperation)
+	}{
+		{name: "new", mutate: func(*unboundedv1alpha3.MachineOperation) {}},
+		{
+			name: "in progress with provider operation",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) {
+				op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+				op.Status.StartedAt = &startedAt
+				op.Status.Targets = []unboundedv1alpha3.MachineOperationTargetStatus{{
+					MachineRef:        op.Spec.MachineRef,
+					Phase:             unboundedv1alpha3.OperationPhaseInProgress,
+					Stage:             unboundedv1alpha3.OperationStageWaitingProvider,
+					StartedAt:         &startedAt,
+					LastAttemptAt:     &startedAt,
+					Attempts:          1,
+					ProviderOperation: &unboundedv1alpha3.ProviderOperationStatus{Provider: testLongRunningProviderName, OperationID: "provider-op-1"},
+				}}
+			},
+		},
+		{
+			name: "complete with expired ttl",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) {
+				op.Spec.TTLSecondsAfterFinished = &ttl
+				op.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
+				op.Status.StartedAt = &startedAt
+				op.Status.CompletedAt = &completedAt
+			},
+		},
+		{
+			name:   "new without machineRef",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) { op.Spec.MachineRef = "" },
+		},
+		{
+			name:   "machineRef names a missing Machine",
+			mutate: func(op *unboundedv1alpha3.MachineOperation) { op.Spec.MachineRef = "missing-machine" },
+		},
+	}
+
+	for _, kind := range kinds {
+		for _, registration := range registrations {
+			for _, state := range states {
+				t.Run(fmt.Sprintf("%s/%s/%s", kind, registration.name, state.name), func(t *testing.T) {
+					t.Parallel()
+
+					machine, _, credential := newResumableTestObjects("machine-1", "op-1")
+					op := newAllocationOperation("op-1", machine.Name, kind)
+					state.mutate(op)
+
+					recorder := &allocationCallRecorder{}
+					provider, err := publicmachineops.NewProvider(testLongRunningProviderName, registration.options(kind, recorder)...)
+					require.NoError(t, err)
+
+					writes := 0
+					countWrite := func() { writes++ }
+					c := fake.NewClientBuilder().
+						WithScheme(newOperationTestScheme(t)).
+						WithObjects(machine, op, credential).
+						WithStatusSubresource(op).
+						WithInterceptorFuncs(interceptor.Funcs{
+							Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+								countWrite()
+								return c.Create(ctx, obj, opts...)
+							},
+							Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+								countWrite()
+								return c.Update(ctx, obj, opts...)
+							},
+							Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+								countWrite()
+								return c.Patch(ctx, obj, patch, opts...)
+							},
+							Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+								countWrite()
+								return c.Delete(ctx, obj, opts...)
+							},
+							SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+								countWrite()
+								return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+							},
+							SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+								countWrite()
+								return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+							},
+						}).
+						Build()
+					reconciler := &MachineOperationReconciler{
+						Client:                      c,
+						Providers:                   []*Provider{provider},
+						ProviderPollInterval:        time.Millisecond,
+						ProviderStallAfter:          time.Hour,
+						ProviderStalledPollInterval: 5 * time.Minute,
+						Now:                         fixedOperationNow,
+					}
+
+					var before unboundedv1alpha3.MachineOperation
+					require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &before))
+
+					var machineBefore unboundedv1alpha3.Machine
+					require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &machineBefore))
+
+					result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+					require.NoError(t, err)
+					require.Equal(t, ctrl.Result{}, result)
+
+					require.Zero(t, recorder.executeCalls, "Execute calls")
+					require.Zero(t, recorder.beginCalls, "Begin calls")
+					require.Zero(t, recorder.pollCalls, "Poll calls")
+					require.Zero(t, recorder.cleanupCalls, "Cleanup calls")
+					require.Zero(t, writes, "API writes")
+
+					var after unboundedv1alpha3.MachineOperation
+					require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: op.Name}, &after))
+					require.Equal(t, before.Status, after.Status)
+					require.Equal(t, before.ResourceVersion, after.ResourceVersion)
+
+					var machineAfter unboundedv1alpha3.Machine
+					require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: machine.Name}, &machineAfter))
+					require.Equal(t, machineBefore, machineAfter)
+				})
+			}
+		}
+	}
+}
+
+func TestShouldReconcileOperationIgnoresAllocationOperations(t *testing.T) {
+	t.Parallel()
+
+	ttl := int32(30)
+	completedAt := fixedOperationNow()
+
+	for _, kind := range []unboundedv1alpha3.OperationKind{
+		unboundedv1alpha3.OperationHostAllocate,
+		unboundedv1alpha3.OperationHostRelease,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
+
+			op := newAllocationOperation("op-1", "machine-1", kind)
+			require.False(t, shouldReconcileOperation(op), "non-terminal")
+
+			op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
+			require.False(t, shouldReconcileOperation(op), "in progress")
+
+			terminal := op.DeepCopy()
+			terminal.Spec.TTLSecondsAfterFinished = &ttl
+			terminal.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
+			terminal.Status.CompletedAt = &completedAt
+			require.False(t, shouldReconcileOperation(terminal), "terminal with ttl and completion time")
+			require.False(t, shouldReconcileOperationUpdate(op, terminal), "update to terminal with ttl")
+		})
+	}
+}
+
+func TestIsHostOperationExcludesAllocationOperations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		kind unboundedv1alpha3.OperationKind
+		want bool
+	}{
+		{unboundedv1alpha3.OperationHostAllocate, false},
+		{unboundedv1alpha3.OperationHostRelease, false},
+		{unboundedv1alpha3.OperationHostSoftReboot, false},
+		{unboundedv1alpha3.OperationHostHardReboot, true},
+		{unboundedv1alpha3.OperationHostPowerOff, true},
+		{unboundedv1alpha3.OperationHostPowerOn, true},
+		{unboundedv1alpha3.OperationHostReplace, true},
+	}
+
+	for _, tt := range tests {
+		require.Equal(t, tt.want, isHostOperation(tt.kind), "isHostOperation(%s)", tt.kind)
+	}
+}
