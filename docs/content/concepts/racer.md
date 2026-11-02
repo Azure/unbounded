@@ -252,8 +252,9 @@ caches above their share, within bounded scans. Among pages in the same state,
 hotter pages and pages this node owns stay longer. A cache can use idle space
 beyond its share.
 
-The default storage is slab files under `/var/lib/racer/slabs`, with
-raw block devices as an alternative. Checkpoints let a node
+The default storage is slab files under `/var/lib/racer/slabs`. An
+administrator can approve whole disks per node for raw-device storage instead;
+approval allows Racer to wipe them. Checkpoints let a node
 recover cached pages after a restart. The cache is not durable storage; keep
 the source available to refill missing pages.
 

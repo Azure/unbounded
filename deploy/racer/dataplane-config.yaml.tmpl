@@ -105,14 +105,16 @@ data:
   RACER_RETAINED_SEGMENT_PERCENT: "50"
   # File slab size is per worker. Byte admission budgets above are node-wide
   # only when set explicitly; unset ones are per-worker defaults scaled up.
-  # Optional Node annotation racer.unbounded-cloud.io/block-devices selects raw
-  # devices by regex on /host/dev/disk/by-id basenames. Use ^ and $ anchors.
-  # The 1 KiB selector must compile in Rust. Invalid/no usable matches
-  # fall back to slab files. Annotation changes take effect only after restart.
-  # WARNING: selected devices are overwritten without a signature check.
-  # Partitions are allowed, including unmounted OS partitions if matched.
-  # Devices with child partitions, holders, read-only state, mounts, or failed
-  # exclusive opens are skipped. These checks do not prove a device is disposable.
+  # Raw-device storage uses only whole disks approved in the Node annotation
+  # racer.unbounded-cloud.io/disks: comma-separated /host/dev/disk/by-id
+  # basenames (manage it with `kubectl unbounded racer disks allow|revoke`).
+  # Approval is consent to wipe: nonzero first/last 1 MiB guards are zeroed,
+  # destroying partition tables and filesystem, LVM, and RAID signatures.
+  # Approved disks that are mounted, held (dm/md/LVM), read-only, too small,
+  # busy, or partitions are still refused. Approval changes restart the
+  # dataplane automatically and drop this node's cache. With no usable
+  # approved disk, storage falls back to slab files. The retired
+  # racer.unbounded-cloud.io/block-devices regex is ignored.
   # Host /dev is mounted read-only at /host/dev, but raw writes are intentional.
   # Device mode splits all whole segments across workers, subject to hard caps;
   # subsegment tails are unusable. Reserves, headers, AEAD, and alignment still apply.
