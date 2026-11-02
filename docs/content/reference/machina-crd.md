@@ -68,12 +68,21 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
 | `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
-| `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
+| `host.netboot.redfish.passwordRef` | RedfishPasswordSelector | Yes | - | Secret containing the Redfish password. |
+| `host.netboot.redfish.passwordRef.name` | string | Yes | - | Secret name. |
+| `host.netboot.redfish.passwordRef.namespace` | string | Yes | - | Secret namespace. |
+| `host.netboot.redfish.passwordRef.key` | string | No | `"password"` | Key within the Secret's `data` map. |
 | `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
 | `host.netboot.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
 | `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
 | `host.netboot.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
 | `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
+
+> **Migration note:** `redfish.passwordRef.key` used to default to
+> `"ssh-privatekey"`. It now defaults to `"password"`. Existing Machines keep
+> the key that was stored when they were created. New or replaced Machines
+> that omit `key` read the `password` key. If your Redfish password Secret
+> stores the password under `ssh-privatekey`, set `key: ssh-privatekey`.
 
 ### spec.kubernetes
 
