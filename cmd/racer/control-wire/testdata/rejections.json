@@ -439,5 +439,47 @@
     "old": "\"priority\":250",
     "new": "\"priority\":65536",
     "code": "invalid_request"
+  },
+  {
+    "name": "null cache mode",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250,\"mode\":null",
+    "code": "invalid_request"
+  },
+  {
+    "name": "explicit cached cache mode",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250,\"mode\":\"cached\"",
+    "code": "invalid_request"
+  },
+  {
+    "name": "unknown cache mode",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250,\"mode\":\"passthrough\"",
+    "code": "invalid_request"
+  },
+  {
+    "name": "wrong case cache mode",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250,\"mode\":\"PassthroughPeers\"",
+    "code": "invalid_request"
+  },
+  {
+    "name": "numeric cache mode",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250,\"mode\":1",
+    "code": "invalid_request"
+  },
+  {
+    "name": "object cache mode",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250,\"mode\":{\"route\":\"Peers\"}",
+    "code": "invalid_request"
   }
 ]

@@ -1830,12 +1830,31 @@ impl WorkerApplication {
         if self.snapshot_sequence == Some(snapshot.sequence) {
             return Ok(());
         }
-        for old in &self.caches {
-            if !snapshot.caches.iter().any(|new| new.id == old.id) {
-                self.memory.remove_cache(&old.id)?;
-                self.store.writer.remove_cache(&old.id)?;
-            }
-        }
+        let removed: std::collections::HashSet<_> = self
+            .caches
+            .iter()
+            .filter(|old| !snapshot.caches.iter().any(|new| new.id == old.id))
+            .map(|old| old.id.clone())
+            .collect();
+        self.memory.remove_caches(&removed)?;
+        self.store.writer.remove_caches(&removed)?;
+        // Passthrough caches drop whatever this worker retained for them,
+        // including records left from before a restart. Reads observe each
+        // publication directly, but this worker may skip intermediate ones
+        // (passthrough, cached, passthrough), so purge on every changed
+        // snapshot rather than only on an observed transition. Purges are
+        // idempotent and passthrough reads retain nothing, so repeats are safe.
+        // All passthrough caches are purged together so each table is scanned
+        // once per snapshot rather than once per cache.
+        let passthrough: std::collections::HashSet<_> = snapshot
+            .caches
+            .iter()
+            .filter(|new| new.mode.passthrough())
+            .map(|new| new.id.clone())
+            .collect();
+        self.memory.remove_caches(&passthrough)?;
+        self.store.writer.remove_caches(&passthrough)?;
+        self.node.workers.warm.forget_caches(&passthrough);
         current_scope.check()?;
         // Priority changes apply live: memory shares are recomputed now, disk
         // shares on the next ranking pass.
@@ -3684,21 +3703,20 @@ pub(crate) fn gpu_slot(
             telemetry.attach_links(links);
         }
     };
-    let (mode, staging, p2pdma) = (
-        config.enable_gpu,
-        config.gpu_staging_bytes,
-        config.gpu_pci_p2pdma,
-    );
+    let mode = config.enable_gpu;
+    let options = crate::gpu::GpuOptions {
+        staging_bytes: config.gpu_staging_bytes,
+        pci_p2pdma: config.gpu_pci_p2pdma,
+        peer: config.gpu_peer,
+    };
     if mode == GpuMode::Auto && built {
         eprintln!("racer: stage=gpu state=standby start=first-gpu-read");
         return Ok(Arc::new(crate::gpu_slot::GpuSlot::lazy(
-            Box::new(move || {
-                crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)
-            }),
+            Box::new(move || crate::gpu::GpuHelper::start_built(mode, built, options, loader)),
             Box::new(on_start),
         )));
     }
-    let gpu = crate::gpu::GpuHelper::start_built(mode, built, staging, p2pdma, loader)?;
+    let gpu = crate::gpu::GpuHelper::start_built(mode, built, options, loader)?;
     if let Some(gpu) = &gpu {
         on_start(gpu);
     }

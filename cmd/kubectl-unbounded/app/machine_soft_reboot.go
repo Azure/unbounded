@@ -29,7 +29,7 @@ func machineSoftRebootCommand() *cobra.Command {
 		Use:   "soft-reboot NAME",
 		Short: "Soft-reboot an agent-managed machine (reboots the host operating system)",
 		Long: `Soft-reboot reboots the host operating system from inside the host
-(systemctl reboot) through a HostOSReboot MachineOperation. No BMC or
+(systemctl reboot) through a HostSoftReboot MachineOperation. No BMC or
 cloud provider access is required.
 
 This command creates a MachineOperation CR that the agent daemon watches.
@@ -60,7 +60,7 @@ To restart only the nspawn-backed node without rebooting the host, use
 func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
 	opName := fmt.Sprintf("%s-soft-reboot-%d", name, time.Now().Unix())
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostOSReboot, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostSoftReboot, ttlSeconds); err != nil {
 		return err
 	}
 

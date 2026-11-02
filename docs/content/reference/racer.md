@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; no `status` |
+| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -83,6 +83,41 @@ reservation, and nodes do not coordinate.
 Priority 0 has no weighted share when competing with positive-priority caches.
 The cache keeps its working allowance, is preferred for eviction, and is still
 cached while capacity is idle.
+
+### Passthrough
+
+Set `spec.passthrough` to turn off caching for a cache. Racer still serves
+reads through the client socket, but proxies them to the origin and keeps no
+data:
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: artifacts
+spec:
+  passthrough:
+    route: Peers
+```
+
+| `route` | Behavior |
+|---------|----------|
+| `Peers` (default) | Each page goes to its owner nodes through the mesh, as for a cached cache. The owner reads from its local origin. Concurrent reads of the same page anywhere in the cluster share one origin read, and many pages are in flight at once. |
+| `Local` | The reading node reads from its own local origin and never asks peers. Concurrent reads of the same page on one node still share one origin read. Every node that reads needs an origin; a managed `spec.origin` runs one per dataplane node. |
+
+- Pages are not written to disk and stay in memory only while concurrent
+  readers share an in-flight origin read.
+- Object metadata (ETag, size, expiry) is not reused across reads, so each read
+  revalidates with the origin. One read still pins one object version for all
+  of its pages.
+- Retention is refused. A HEAD that asks for retention still returns metadata,
+  but without `Racer-Retain-Until`, and counts in `racer_warm_refused_total`.
+  Owners refuse hold and warm fill requests for the cache.
+- `spec.priority` still weights in-flight memory use.
+- With the `Local` route, `racer_passthrough_local_origin_fills_total` counts
+  pages that a node read from its own origin.
+- `spec.passthrough` can be added, changed, or removed at any time. When a cache
+  switches to passthrough, data previously cached for it is dropped.
 
 The controller and dataplane must run the same version. A mismatched pair
 rejects the cache catalog.
@@ -216,6 +251,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
+| `RACER_GPU_PEER` | `auto` | `auto` lets one GPU copy an encrypted page another GPU already holds over NVLink or PCIe peer-to-peer where the driver allows it; `off` turns peer access off, so requests on different GPUs do not share encrypted copies and any page that must move between GPUs goes through host memory. Other values fail startup. Each GPU still checks the page itself |
 | `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
@@ -963,6 +999,10 @@ The rest are reported only when `racer_gpu_enabled` is 1:
 | `racer_gpu_cufile_failures_total` | counter | cuFile reads or registrations that failed. The page is read through host memory instead. |
 | `racer_gpu_staging_exhausted_total` | counter | Disk reads that found no free staging slot and went through host memory. |
 | `racer_gpu_landed_pages_decrypted_total` | counter | Pages decrypted on the GPU from an RDMA landing buffer. |
+| `racer_gpu_peer_copies_total` | counter | Encrypted pages copied from another GPU over NVLink or PCIe peer-to-peer. |
+| `racer_gpu_peer_copy_bytes_total` | counter | Encrypted bytes copied between GPUs over a peer path. |
+| `racer_gpu_peer_failures_total` | counter | Peer copies that failed. Each turns that GPU pair's peer path off until restart. |
+| `racer_gpu_peer_bounces_total` | counter | Encrypted pages moved from another GPU through host memory, because the pair has no peer path or it was turned off. |
 | `racer_gpu_open_requests` | gauge | `gpu-read` requests that hold GPU resources now. |
 | `racer_gpu_leaked_resources` | gauge | GPU resources leaked on purpose after a failed release. |
 
@@ -1131,12 +1171,25 @@ Where the bytes come from decides who decrypts them:
   `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
   for that device, reads files on that device through host memory until it
   restarts, and keeps cuFile on for other devices.
+- When several `gpu-read` requests want the same page at once, such as every
+  GPU loading the same model weights, the page is read from disk or a peer
+  only once. A request for the same GPU, or for a GPU that can copy from it
+  directly (peer access), reuses that encrypted copy. GPUs that cannot copy
+  from each other, such as with `RACER_GPU_PEER=off`, each read the page
+  once and share it among requests for that GPU. Each GPU still checks
+  and decrypts the page itself. The copy is reused only while some request
+  still holds it. `racer_gpu_direct_joined_total` counts reused copies.
 
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
 
 If the GPU finds a damaged page, the read fails and the dataplane drops that
 copy from memory or disk, as it does when the CPU finds one.
+
+When a shared GPU fetch finishes without putting the page in GPU memory, the
+requests waiting on it read the page through host memory rather than each
+trying cuFile or a landing again. If the fetching request is cancelled, a
+waiting request tries the GPU fetch itself.
 
 When both GPU reads and RDMA are on, each GPU that can decrypt gets a landing
 buffer of `RACER_GPU_LANDING_BYTES` (per GPU, not per rail), split into page
@@ -1145,10 +1198,10 @@ pages over every rail. If the buffer has fewer slots than there are rails,
 the rails on the GPU's NUMA node come first. A GPU read that needs a page
 from a peer asks up to two providers, in turn, to write the encrypted page
 into a free slot of that GPU's share on the link's rail. The GPU then checks
-and decrypts it. Such a page is used only by that read: it is not kept in
-memory, written to disk, or shared with other reads, because the host never
-has its bytes. When no slot is free or anything fails, the page comes through
-host memory as before. Landing buffers are registered when GPU mode turns
+and decrypts it. Such a page is not kept in memory or written to disk,
+because the host never has its bytes, but concurrent GPU reads of the same
+page may share it while any of them still holds it. When no slot is free or
+anything fails, the page comes through host memory as before. Landing buffers are registered when GPU mode turns
 on and at each RDMA activation, and freed when the RDMA node closes or when no rail could register
 them. They are not resized at runtime; changing the setting restarts the
 pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and

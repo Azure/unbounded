@@ -12,6 +12,9 @@ pub struct CacheInfo {
     pub name: String,
     /// spec.priority; None when unset or not an integer.
     pub priority: Option<i64>,
+    /// spec.passthrough as written; None when unset. Parsed by `build` so an
+    /// invalid value fails the catalog instead of silently caching.
+    pub passthrough: Option<Value>,
 }
 
 impl CacheInfo {
@@ -20,7 +23,26 @@ impl CacheInfo {
             uid: kube::str_at(v, &["metadata", "uid"]).into(),
             name: kube::str_at(v, &["metadata", "name"]).into(),
             priority: v.pointer("/spec/priority").and_then(Value::as_i64),
+            passthrough: v
+                .pointer("/spec/passthrough")
+                .filter(|p| !p.is_null())
+                .cloned(),
         }
+    }
+}
+
+/// Map spec.passthrough to a cache mode. Absence caches; an object without a
+/// route uses the CRD default, Peers. Anything else is invalid.
+fn mode(passthrough: Option<&Value>) -> Result<wire::CacheMode, wire::Error> {
+    let Some(passthrough) = passthrough else {
+        return Ok(wire::CacheMode::Cached);
+    };
+    let fields = passthrough.as_object().ok_or(wire::Error::InvalidRequest)?;
+    match fields.get("route") {
+        None | Some(Value::Null) => Ok(wire::CacheMode::PassthroughPeers),
+        Some(Value::String(route)) if route == "Peers" => Ok(wire::CacheMode::PassthroughPeers),
+        Some(Value::String(route)) if route == "Local" => Ok(wire::CacheMode::PassthroughLocal),
+        Some(_) => Err(wire::Error::InvalidRequest),
     }
 }
 
@@ -45,6 +67,7 @@ pub fn build(caches: &[CacheInfo]) -> Result<Vec<CacheDefinition>, wire::Error> 
             client_socket: client,
             origin_socket: origin,
             priority: priority as u16,
+            mode: mode(c.passthrough.as_ref())?,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -60,6 +83,7 @@ mod tests {
             uid: uid.into(),
             name: name.into(),
             priority: None,
+            passthrough: None,
         }
     }
 
@@ -116,6 +140,62 @@ mod tests {
             let mut x = c(u, "a");
             x.priority = Some(p);
             assert_eq!(build(&[x]).is_ok(), ok, "priority {p}");
+        }
+    }
+
+    #[test]
+    fn passthrough_route_maps_to_mode() {
+        let u = "11111111-1111-4111-8111-111111111111";
+        let parse = |spec: Value| {
+            let info = CacheInfo::from_json(
+                &serde_json::json!({"metadata":{"uid":u,"name":"a"},"spec":spec}),
+            );
+            build(&[info]).map(|out| out[0].mode)
+        };
+        assert_eq!(parse(serde_json::json!({})), Ok(wire::CacheMode::Cached));
+        assert_eq!(
+            parse(serde_json::json!({"passthrough":null})),
+            Ok(wire::CacheMode::Cached)
+        );
+        assert_eq!(
+            build(&[c(u, "a")]).unwrap()[0].mode,
+            wire::CacheMode::Cached
+        );
+        for (spec, mode) in [
+            (serde_json::json!({}), wire::CacheMode::PassthroughPeers),
+            (
+                serde_json::json!({"route":null}),
+                wire::CacheMode::PassthroughPeers,
+            ),
+            (
+                serde_json::json!({"route":"Peers"}),
+                wire::CacheMode::PassthroughPeers,
+            ),
+            (
+                serde_json::json!({"route":"Local"}),
+                wire::CacheMode::PassthroughLocal,
+            ),
+        ] {
+            assert_eq!(
+                parse(serde_json::json!({"passthrough":spec})),
+                Ok(mode),
+                "{spec}"
+            );
+        }
+        for bad in [
+            serde_json::json!({"route":"peers"}),
+            serde_json::json!({"route":"local"}),
+            serde_json::json!({"route":""}),
+            serde_json::json!({"route":"Mesh"}),
+            serde_json::json!({"route":1}),
+            serde_json::json!(true),
+            serde_json::json!("Peers"),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                parse(serde_json::json!({"passthrough":bad.clone()})).is_err(),
+                "{bad}"
+            );
         }
     }
 

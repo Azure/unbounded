@@ -121,11 +121,10 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 		{"poweron boot", v1alpha3.OperationHostPowerOn, "disable", redfish.PowerOff, ""},
 		{"poweron state", v1alpha3.OperationHostPowerOn, "state", redfish.PowerOff, ""},
 		{"poweron reset", v1alpha3.OperationHostPowerOn, "On", redfish.PowerOff, ""},
-		{"reboot boot", v1alpha3.OperationHostOutOfBandReboot, "disable", redfish.PowerOn, ""},
-		{"reboot state", v1alpha3.OperationHostOutOfBandReboot, "state", redfish.PowerOn, ""},
-		{"reboot off", v1alpha3.OperationHostOutOfBandReboot, "ForceOff", redfish.PowerOn, ""},
-		{"reboot on", v1alpha3.OperationHostOutOfBandReboot, "On", redfish.PowerOff, v1alpha3.OperationStagePoweringOn},
-		{"reboot alias off", v1alpha3.OperationHostOOBReboot, "ForceOff", redfish.PowerOn, ""},
+		{"reboot boot", v1alpha3.OperationHostHardReboot, "disable", redfish.PowerOn, ""},
+		{"reboot state", v1alpha3.OperationHostHardReboot, "state", redfish.PowerOn, ""},
+		{"reboot off", v1alpha3.OperationHostHardReboot, "ForceOff", redfish.PowerOn, ""},
+		{"reboot on", v1alpha3.OperationHostHardReboot, "On", redfish.PowerOff, v1alpha3.OperationStagePoweringOn},
 		{"repave factory", v1alpha3.OperationHostReplace, "factory", redfish.PowerOff, ""},
 		{"repave state", v1alpha3.OperationHostReplace, "state", redfish.PowerOff, ""},
 		{"repave off", v1alpha3.OperationHostReplace, "ForceOff", redfish.PowerOn, ""},
@@ -217,7 +216,7 @@ func TestReconcilerWaitsForRedfishReadiness(t *testing.T) {
 func TestReconcilerReadinessDefersExpiredStageTimeout(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostOutOfBandReboot, v1alpha3.OperationHostReplace} {
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostHardReboot, v1alpha3.OperationHostReplace} {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
 
@@ -290,7 +289,7 @@ func TestRetryTargetPreservesReadinessBudget(t *testing.T) {
 func TestReconcilerOrdinaryRedfishErrorsStillRetryAndFail(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostOutOfBandReboot, v1alpha3.OperationHostReplace} {
+	for _, kind := range []v1alpha3.OperationKind{v1alpha3.OperationHostPowerOn, v1alpha3.OperationHostHardReboot, v1alpha3.OperationHostReplace} {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
 
@@ -335,7 +334,7 @@ func TestReconcilerDoesNotCompleteRebootPowerOnForTransientState(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	op := testOperation("op-reboot", v1alpha3.OperationHostOutOfBandReboot)
+	op := testOperation("op-reboot", v1alpha3.OperationHostHardReboot)
 	op.Spec.MachineRef = machine.Name
 	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
 		MachineRef:    machine.Name,
@@ -550,7 +549,7 @@ func TestReconcilerIgnoresHostOSReboot(t *testing.T) {
 
 	s := testScheme(t)
 	machine := testBareMetalMachine("machine-1", "rack-a")
-	op := testOperation("op-soft", v1alpha3.OperationHostOSReboot)
+	op := testOperation("op-soft", v1alpha3.OperationHostSoftReboot)
 	op.Spec.MachineRef = machine.Name
 
 	require.False(t, shouldReconcile(op))

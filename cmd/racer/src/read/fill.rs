@@ -97,6 +97,8 @@ pub struct Fill {
     pub(super) local_copies: Rc<LocalCopies>,
     pub(super) local_plaintext: Rc<LocalPlaintext>,
     local_plaintext_keys: Rc<LocalPlaintextKeys>,
+    /// GPU copies of sealed ciphertext that concurrent sealed fetches share.
+    pub(super) gpu_copies: Rc<super::gpu_copies::GpuCopies>,
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
@@ -149,6 +151,9 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
 /// Bound on retries after a joined local plaintext job fails under its
 /// starter's inherited scope.
 const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
+/// Bound on looking again after a shared GPU fetch that this sealed fetch
+/// waited for was abandoned by the request that started it.
+const GPU_COPY_JOIN_RETRIES: usize = 2;
 
 /// Providers a `gpu-read` asks, in visit order, to land a page in GPU
 /// memory before it takes the usual path. Each is one CopyOnly request
@@ -157,6 +162,38 @@ const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
 const LANDING_PROVIDERS: usize = 2;
 
 impl Fill {
+    /// Published mode of `cache`.
+    pub(crate) fn mode(
+        &self,
+        cache: &racer_control_wire::CacheId,
+    ) -> racer_control_wire::CacheMode {
+        self.dependencies.memory.availability().mode(cache)
+    }
+
+    /// Whether `cache` retains no pages or metadata on this node.
+    pub(crate) fn passthrough(&self, cache: &racer_control_wire::CacheId) -> bool {
+        self.mode(cache).passthrough()
+    }
+
+    /// The reader's retention decision for `page`: second-sight history when
+    /// `observe`, else ownership only. Passthrough caches never persist and do
+    /// not record history.
+    fn retention_observation(
+        &self,
+        page: &PageId,
+        interest: &crate::retention::Interest,
+        observe: bool,
+    ) -> crate::retention::Observation {
+        let retention = self.dependencies.writer.retention();
+        if self.passthrough(&page.version.object.cache) {
+            crate::retention::Observation::never()
+        } else if observe {
+            retention.observe(page, interest)
+        } else {
+            retention.owned_only(page)
+        }
+    }
+
     pub(super) async fn warm_local(
         &self,
         page: &PageId,
@@ -438,12 +475,24 @@ impl Fill {
         if version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        match self
+        // A subscription opened while the cache was cached can outlive a
+        // switch to passthrough. Passthrough caches retain nothing, so a warm
+        // job or provider cannot hold a usable copy, and the local route must
+        // never contact peers. Fill only the head through the ordinary page
+        // flight, which applies the current mode.
+        if self.passthrough(&version.object.cache) {
+            return self
+                .dependencies
+                .metadata_owner
+                .acquire_unobserved(head, membership, context, scope, budget)
+                .await;
+        }
+        let warmed = self
             .dependencies
             .metadata_owner
             .warmed_page(&head, scope)
-            .await?
-        {
+            .await?;
+        match warmed {
             super::dispatch::Warmed::Local(page) => return Ok(*page),
             super::dispatch::Warmed::Unwarmed => {}
             // A warm job holds the head on a remote owner. Fill only that page
@@ -545,14 +594,7 @@ impl Fill {
         copy.validate_metadata()?;
         let page = copy.ciphertext.envelope().page.clone();
         let interest = crate::retention::Interest::default();
-        let observation = if observe {
-            self.dependencies
-                .writer
-                .retention()
-                .observe(&page, &interest)
-        } else {
-            self.dependencies.writer.retention().owned_only(&page)
-        };
+        let observation = self.retention_observation(&page, &interest, observe);
         if !self
             .dependencies
             .admission
@@ -828,6 +870,7 @@ impl Fill {
             local_copies: Rc::new(LocalCopies::default()),
             local_plaintext: Rc::new(LocalPlaintext::default()),
             local_plaintext_keys: Rc::default(),
+            gpu_copies: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
         }
@@ -845,6 +888,9 @@ impl Fill {
     ) -> Operation<'a, Option<crate::model::VersionMetadata>> {
         Box::pin(async move {
             scope.check()?;
+            if self.passthrough(&version.object.cache) {
+                return Ok(None);
+            }
             let mut found = None;
             for descriptor in [
                 self.dependencies.memory.metadata(version)?,
@@ -901,11 +947,20 @@ impl Fill {
     }
 
     /// Acquire one page for direct GPU delivery: verified plaintext when a
-    /// reader still holds it on the CPU, otherwise ciphertext (from memory
-    /// first, then disk, peers or origin) for the GPU to verify and
-    /// decrypt. Network and disk copies keep the usual single-flight sharing,
-    /// memory publication and disk persistence; only the CPU decrypt and the
-    /// plaintext publication are skipped.
+    /// reader still holds it on the CPU, otherwise ciphertext for the GPU to
+    /// verify and decrypt.
+    ///
+    /// Ciphertext kept in memory is sealed from host memory. Otherwise the
+    /// page is read from local disk into GPU staging with cuFile, or landed
+    /// by a peer straight into GPU memory. Those GPU copies are shared among
+    /// concurrent sealed fetches of the page through `gpu_copies`: a fetch
+    /// for the same GPU, or for a GPU that can copy from it over a peer
+    /// path, reuses a live copy or waits for the fetch in progress instead
+    /// of reading the page again. GPU copies are never published to memory
+    /// or shared with plaintext readers. When no GPU copy can be made, the
+    /// page takes the usual path through host memory, which keeps the usual
+    /// single-flight sharing, memory publication and disk persistence; only
+    /// the CPU decrypt and the plaintext publication are skipped.
     pub(crate) async fn acquire_sealed(
         &self,
         page: PageId,
@@ -928,35 +983,17 @@ impl Fill {
         // plaintext. A cached copy skips the disk and peer paths and is sealed
         // for the GPU from host memory below.
         let cached = self.dependencies.memory.unverified(&page)?.is_some();
+        // Passthrough never serves a retained copy, so a residual disk copy
+        // awaiting the worker purge is not staged, and a local-route read
+        // never contacts peers.
+        let mode = self.mode(&page.version.object.cache);
         if !cached
-            && target.helper.cufile()
-            && self
-                .dependencies
-                .writer
-                .copy_only(&page)
-                .ok()
-                .flatten()
-                .is_none()
+            && mode != racer_control_wire::CacheMode::PassthroughLocal
+            && let Some(fetched) = self
+                .shared_gpu_copy(&page, membership.clone(), context, scope, budget, target)
+                .await?
         {
-            match self.stage_from_disk(&page, scope, target).await {
-                Ok(Some(sealed)) => return Ok(Fetched::Sealed(sealed)),
-                Ok(None) => {}
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-                // Any other failure reads the page through host memory.
-                Err(_) => {}
-            }
-        }
-        if !cached {
-            match self
-                .land_from_peer(&page, membership.clone(), context, scope, budget, target)
-                .await
-            {
-                Ok(Some(fetched)) => return Ok(fetched),
-                Ok(None) => {}
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-                // Any other failure takes the usual path through host memory.
-                Err(_) => {}
-            }
+            return Ok(fetched);
         }
         let acquired = self
             .acquire_with_prefetch(
@@ -984,10 +1021,166 @@ impl Fill {
         }
     }
 
+    /// A GPU copy of `page` for `target`, shared with concurrent sealed
+    /// fetches: a live copy on a reachable GPU, the result of a reachable
+    /// fetch in progress, or a fetch of our own that others may then share,
+    /// tracked alongside any fetch in progress on a GPU this one cannot reach.
+    /// None means use the path through host memory. A waiter whose leader
+    /// finished without a GPU copy returns None rather than retrying the
+    /// GPU fetch itself; a waiter whose leader was abandoned looks again.
+    async fn shared_gpu_copy(
+        &self,
+        page: &PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<Option<super::sealed::Fetched>> {
+        use super::gpu_copies::Lookup;
+        use super::gpu_copies::Outcome;
+        let mut retries = GPU_COPY_JOIN_RETRIES;
+        loop {
+            scope.check()?;
+            match self.gpu_copies.lookup(page, &target.helper, target.ordinal) {
+                Lookup::Live(copy) => {
+                    if let Some(fetched) = self.joined_gpu_copy(page, &copy, target) {
+                        return Ok(Some(fetched));
+                    }
+                    return self
+                        .private_gpu_copy(page, membership, context, scope, budget, target)
+                        .await;
+                }
+                Lookup::Join(receive) => match self.await_gpu_copy(receive, scope).await? {
+                    Outcome::Copy(copy) => {
+                        if let Some(fetched) = self.joined_gpu_copy(page, &copy, target) {
+                            return Ok(Some(fetched));
+                        }
+                        return self
+                            .private_gpu_copy(page, membership, context, scope, budget, target)
+                            .await;
+                    }
+                    // The leader finished without a GPU copy: cuFile and the
+                    // landing failed or did not apply, its GPU had no free
+                    // slot, or the page came through host memory. Repeating
+                    // its attempt would likely fail the same way, once per
+                    // waiter, so take the host single flight instead. This
+                    // includes slot exhaustion on the leader's GPU even when
+                    // this request's GPU differs and might have a free slot:
+                    // the host path is always correct, and it is cheaper than
+                    // N repeated disk or landing attempts under load.
+                    Outcome::Nothing => return Ok(None),
+                    Outcome::Abandoned if retries > 0 => retries -= 1,
+                    Outcome::Abandoned => {
+                        return self
+                            .private_gpu_copy(page, membership, context, scope, budget, target)
+                            .await;
+                    }
+                },
+                Lookup::Lead(lead) => {
+                    // Dropping `lead` on cancellation tells waiters to look again.
+                    let result = self
+                        .private_gpu_copy(page, membership, context, scope, budget, target)
+                        .await;
+                    lead.finish(match &result {
+                        Ok(Some(super::sealed::Fetched::Sealed(sealed))) => {
+                            super::gpu_copies::SharedCopy::from_sealed(sealed)
+                                .map_or(Outcome::Nothing, Outcome::Copy)
+                        }
+                        Err(Error::Cancelled | Error::DeadlineExceeded) => Outcome::Abandoned,
+                        _ => Outcome::Nothing,
+                    });
+                    return result;
+                }
+                Lookup::Private => {
+                    return self
+                        .private_gpu_copy(page, membership, context, scope, budget, target)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Wait for another request's GPU fetch, or for this request to end.
+    async fn await_gpu_copy(
+        &self,
+        mut receive: super::gpu_copies::Receiver,
+        scope: &RequestScope,
+    ) -> Result<super::gpu_copies::Outcome> {
+        use std::future::Future;
+        let cancellation = scope.cancellation.subscribe()?;
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            let outcome = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
+            std::task::Poll::Ready(Ok(outcome))
+        })
+        .await
+    }
+
+    /// A sealed page around a copy another request fetched, counted as joined.
+    /// None when the copy cannot be used here.
+    fn joined_gpu_copy(
+        &self,
+        page: &PageId,
+        copy: &super::gpu_copies::SharedCopy,
+        target: &super::sealed::SealedTarget,
+    ) -> Option<super::sealed::Fetched> {
+        let sealed = copy.sealed(&self.dependencies.crypto, page).ok()?;
+        target.helper.record_joined();
+        self.metrics.record(Event::GpuDirectJoined, 1);
+        Some(super::sealed::Fetched::Sealed(sealed))
+    }
+
+    /// This request's own GPU fetch: cuFile from local disk, then a peer
+    /// landing. None means use the path through host memory.
+    async fn private_gpu_copy(
+        &self,
+        page: &PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<Option<super::sealed::Fetched>> {
+        if !self.passthrough(&page.version.object.cache)
+            && target.helper.cufile()
+            && self
+                .dependencies
+                .writer
+                .copy_only(page)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            match self.stage_from_disk(page, scope, target).await {
+                Ok(Some(sealed)) => return Ok(Some(super::sealed::Fetched::Sealed(sealed))),
+                Ok(None) => {}
+                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                // Any other failure reads the page through host memory.
+                Err(_) => {}
+            }
+        }
+        if self.mode(&page.version.object.cache) == racer_control_wire::CacheMode::PassthroughLocal
+        {
+            return Ok(None);
+        }
+        match self
+            .land_from_peer(page, membership, context, scope, budget, target)
+            .await
+        {
+            Ok(fetched) => Ok(fetched),
+            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => Err(error),
+            // Any other failure takes the usual path through host memory.
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Fetch a page from a peer straight into a GPU landing buffer (GPUDirect
-    /// RDMA). This is a private fetch for one sealed read: it does not join
-    /// or create a shared single flight, and a landed page is never published
-    /// to memory or persisted, because there are no host bytes to share.
+    /// RDMA). It does not join or create the host single flight, and a landed
+    /// page is never published to memory or persisted, because there are no
+    /// host bytes. Concurrent sealed fetches share the landed copy through
+    /// `gpu_copies` instead.
     ///
     /// Up to [`LANDING_PROVIDERS`] providers are asked in visit order, one
     /// CopyOnly request each; a miss or failure moves on to the next. None
@@ -1099,7 +1292,7 @@ impl Fill {
             expected_crc: None,
             metadata,
             envelope,
-            source: super::sealed::SealedSource::Landed(landed),
+            source: super::sealed::SealedSource::Landed(Arc::new(landed)),
         });
         sealed.validate_for(page)?;
         self.metrics.record(Event::PeerHit, 1);
@@ -1197,7 +1390,10 @@ impl Fill {
             aad,
             key,
             expected_crc: Some(checksum),
-            source: super::sealed::SealedSource::Staged { staged, token },
+            source: super::sealed::SealedSource::Staged {
+                staged: Arc::new(staged),
+                token,
+            },
         });
         sealed.validate_for(page)?;
         self.metrics.record(Event::DiskHit, 1);
@@ -1211,12 +1407,15 @@ impl Fill {
     /// rejected copy is dropped from memory and disk, as a failed CPU decrypt
     /// would drop it; an authenticated network copy may now be persisted.
     pub(crate) fn sealed_verdict(&self, report: super::sealed::SealedReport, passed: bool) {
-        let super::sealed::SealedReport { page, copy, token } = report;
+        let super::sealed::SealedReport {
+            page, copy, token, ..
+        } = report;
         if passed {
             if let Some(copy) = copy
                 && copy.disk_token.is_none()
             {
-                let observation = self.dependencies.writer.retention().owned_only(&page);
+                let interest = crate::retention::Interest::default();
+                let observation = self.retention_observation(&page, &interest, false);
                 self.persist_copy(copy.copy, observation);
             }
             return;
@@ -1231,6 +1430,8 @@ impl Fill {
         if let Some(token) = &token {
             let _ = self.dependencies.disk.invalidate(token);
         }
+        // Later sealed fetches must not reuse the rejected GPU copy.
+        self.gpu_copies.forget(&page);
     }
 
     /// Warm gates own transfer exclusion until accepted acquisition work is fenced.
@@ -1328,12 +1529,7 @@ impl Fill {
             {
                 result.validate_for(&page)?;
                 self.metrics.record(Event::MemoryHit, 1);
-                let retention = self.dependencies.writer.retention();
-                let observation = if observe {
-                    retention.observe(&page, &interest)
-                } else {
-                    retention.owned_only(&page)
-                };
+                let observation = self.retention_observation(&page, &interest, observe);
                 self.persist_verified(&result, observation);
                 self.refresh_verified_background(&result, observation, scope);
                 return Ok(result.into());
@@ -1346,14 +1542,7 @@ impl Fill {
                 .refresh_ownership_scoped(&page, scope)
                 .await;
             scope.check()?;
-            let observation = if observe {
-                self.dependencies
-                    .writer
-                    .retention()
-                    .observe(&page, &interest)
-            } else {
-                self.dependencies.writer.retention().owned_only(&page)
-            };
+            let observation = self.retention_observation(&page, &interest, observe);
             let joined = if plaintext && prefetch.is_none() {
                 self.dependencies
                     .flights
@@ -1678,19 +1867,30 @@ impl Fill {
         {
             return Err(Error::CorruptRecord);
         }
-        let candidates = self
-            .call(
-                DriverStage::CandidateCompositeCall,
-                self.dependencies.candidates.candidates_scoped(
-                    membership,
-                    &page.version.object,
-                    page.number,
-                    scope,
-                ),
-            )
-            .await?;
-        if !self.dependencies.candidates.is_candidate(&candidates) {
-            return Err(Error::Unauthorized);
+        let mode = self.mode(&page.version.object.cache);
+        if mode == racer_control_wire::CacheMode::PassthroughLocal {
+            // A local-route bootstrap comes from this node's own origin.
+            self.dependencies.candidates.local_authority(
+                membership,
+                &page.version.object,
+                page.number,
+                mode,
+            )?;
+        } else {
+            let candidates = self
+                .call(
+                    DriverStage::CandidateCompositeCall,
+                    self.dependencies.candidates.candidates_scoped(
+                        membership,
+                        &page.version.object,
+                        page.number,
+                        scope,
+                    ),
+                )
+                .await?;
+            if !self.dependencies.candidates.is_candidate(&candidates) {
+                return Err(Error::Unauthorized);
+            }
         }
         let ciphertext =
             self.observe_reservation(scope, page, FillAdmissionSite::OriginCiphertext, || {
@@ -1727,9 +1927,11 @@ impl Fill {
     /// Lookup errors count as not held.
     pub(crate) fn holds(&self, page: &PageId) -> bool {
         let deps = &self.dependencies;
-        deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
-            || deps.writer.copy_only(page).is_ok_and(|c| c.is_some())
-            || deps.writer.index().lookup(page).is_ok_and(|c| c.is_some())
+        // A passthrough page is never retained, so it is never offered.
+        !self.passthrough(&page.version.object.cache)
+            && (deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
+                || deps.writer.copy_only(page).is_ok_and(|c| c.is_some())
+                || deps.writer.index().lookup(page).is_ok_and(|c| c.is_some()))
     }
 
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -1753,18 +1955,24 @@ impl Fill {
     ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
         Box::pin(async move {
             scope.check()?;
-            if let Some(copy) = self.metrics.lookup(
-                LookupTier::Ciphertext,
-                self.dependencies.memory.ciphertext(page),
-            )? {
+            // A passthrough page can only be shared while it is in flight.
+            let retained = !self.passthrough(&page.version.object.cache);
+            if retained
+                && let Some(copy) = self.metrics.lookup(
+                    LookupTier::Ciphertext,
+                    self.dependencies.memory.ciphertext(page),
+                )?
+            {
                 validate_copy(&copy, page)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
-            if let Some(copy) = self.metrics.lookup(
-                LookupTier::Pending,
-                self.dependencies.writer.copy_only(page),
-            )? {
+            if retained
+                && let Some(copy) = self.metrics.lookup(
+                    LookupTier::Pending,
+                    self.dependencies.writer.copy_only(page),
+                )?
+            {
                 validate_copy(&copy, page)?;
                 self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
@@ -1814,6 +2022,9 @@ impl Fill {
     ) -> Result<Option<UnverifiedPage>> {
         use std::future::Future;
         scope.check()?;
+        if self.passthrough(&page.version.object.cache) {
+            return Ok(None);
+        }
         let _waiter = self.dependencies.admission.reserve(
             Some(&page.version.object.cache),
             ResourceClass::Waiter,
@@ -1894,6 +2105,10 @@ impl Fill {
         source_key: Option<&std::cell::Cell<Option<racer_control_wire::KeyId>>>,
     ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
+        // Residual copies from before a switch to passthrough are never served.
+        if self.passthrough(&page.version.object.cache) {
+            return Ok(None);
+        }
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
         // The memory cache retains only ciphertext, so a page whose plaintext
@@ -2062,6 +2277,20 @@ impl Fill {
     ) -> Result<AcquiredPage> {
         use racer_core::read::Source;
         use racer_core::read::walk::{Action, Event as FillEvent};
+        let mode = self.mode(&page.version.object.cache);
+        if mode == racer_control_wire::CacheMode::PassthroughLocal {
+            return self
+                .acquire_local_origin(
+                    page,
+                    membership,
+                    context,
+                    scope,
+                    budget,
+                    want_plaintext,
+                    mode,
+                )
+                .await;
+        }
         if let Some(local) = self.acquire_local_copy(page, scope, want_plaintext).await? {
             return Ok(local);
         }
@@ -2295,6 +2524,65 @@ impl Fill {
         }
     }
 
+    /// Fill `page` from this node's own origin socket, never asking peers. Only a
+    /// passthrough cache on the local route reaches here; concurrent readers on
+    /// this worker already share this call through the page flight.
+    #[allow(clippy::too_many_arguments)] // Mirrors acquire_once's borrowed inputs.
+    async fn acquire_local_origin(
+        &self,
+        page: &PageId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        want_plaintext: bool,
+        mode: racer_control_wire::CacheMode,
+    ) -> Result<AcquiredPage> {
+        let authority = self.dependencies.candidates.local_authority(
+            membership,
+            &page.version.object,
+            page.number,
+            mode,
+        )?;
+        authority.validate(&context.object, page.number)?;
+        let plaintext = if want_plaintext {
+            self.call(
+                DriverStage::PlaintextReclaim,
+                self.reserve_network_plaintext(scope, page),
+            )
+            .await?
+        } else {
+            self.observe_reservation(scope, page, FillAdmissionSite::OriginPlaintext, || {
+                self.reserve_bootstrap(&context.object.cache)
+            })?
+        };
+        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+        scope.check()?;
+        let ciphertext =
+            self.observe_reservation(scope, page, FillAdmissionSite::OriginCiphertext, || {
+                self.reserve_with_reclamation(
+                    &context.object.cache,
+                    ResourceClass::Ciphertext,
+                    PAGE_BYTES as usize + 16,
+                )
+            })?;
+        let origin = self
+            .call(
+                DriverStage::OriginCall,
+                self.dependencies
+                    .origin
+                    .page_reserved(&authority, context, page, plaintext, scope),
+            )
+            .await?;
+        let result = self
+            .encrypt_origin_page(page, origin, ciphertext, scope)
+            .await?;
+        result.validate_for(page)?;
+        self.metrics.record(Event::OriginFill, 1);
+        self.metrics.record(Event::PassthroughLocalOrigin, 1);
+        Ok(result.into())
+    }
+
     async fn encrypt_origin_page(
         &self,
         page: &PageId,
@@ -2454,9 +2742,10 @@ impl Fill {
     }
 
     pub(crate) fn observe_verified(&self, result: &PageResult, _scope: &RequestScope) {
-        let observation = self.dependencies.writer.retention().observe(
+        let observation = self.retention_observation(
             result.plaintext.page(),
             &crate::retention::Interest::default(),
+            true,
         );
         self.persist_verified(result, observation);
     }
@@ -2467,12 +2756,13 @@ impl Fill {
         observation: crate::retention::Observation,
         scope: &RequestScope,
     ) {
-        if self
-            .dependencies
-            .writer
-            .retention()
-            .owned_only(result.plaintext.page())
-            .eligible()
+        if self.passthrough(&result.metadata.version.object.cache)
+            || self
+                .dependencies
+                .writer
+                .retention()
+                .owned_only(result.plaintext.page())
+                .eligible()
         {
             return;
         }
@@ -2525,6 +2815,11 @@ impl Fill {
         observation: crate::retention::Observation,
     ) {
         if !observation.eligible() || copy.validate_metadata().is_err() {
+            return;
+        }
+        // Defense in depth: a passthrough cache never writes to disk, even
+        // under a decision latched before its mode changed.
+        if self.passthrough(&copy.metadata.version.object.cache) {
             return;
         }
         let id = &copy.ciphertext.envelope().page.clone();
@@ -2736,6 +3031,11 @@ impl Fill {
         scope: &RequestScope,
     ) -> Result<()> {
         result.validate_metadata()?;
+        // Passthrough pages reach their readers through the flight only; no
+        // memory entry, descriptor catalog entry, or disk write retains them.
+        if self.passthrough(&result.metadata.version.object.cache) {
+            return Ok(());
+        }
         if let Some(existing) = self
             .retained_metadata(&result.metadata.version, scope)
             .await?

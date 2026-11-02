@@ -22,7 +22,7 @@ func machineRebootCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "reboot NAME",
-		Short: "Reboot a Machine via a HostOutOfBandReboot operation",
+		Short: "Reboot a Machine via a HostHardReboot operation",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()
@@ -52,7 +52,7 @@ func runReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds 
 	}
 
 	opName := fmt.Sprintf("%s-reboot-%d", name, time.Now().Unix())
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostOutOfBandReboot, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostHardReboot, ttlSeconds); err != nil {
 		return err
 	}
 

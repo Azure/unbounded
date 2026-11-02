@@ -962,6 +962,7 @@ fn definition() -> CacheDefinition {
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
         priority: racer_control_wire::DEFAULT_PRIORITY,
+        mode: racer_control_wire::CacheMode::Cached,
     }
 }
 fn scope() -> RequestScope {
@@ -1140,8 +1141,13 @@ impl Fixture {
     /// budget of two reserves one turn for accept and drives one connection
     /// per pass, so connections that become ready together submit their I/O
     /// one at a time and the reactor reaps it before the next connection runs.
+    ///
+    /// The deadline only catches hangs. Simulated GPU decrypts run the
+    /// bit-serial host GCM emulation on the single helper thread, roughly
+    /// 0.4-0.7s per page on one CPU, so a multi-page exchange on a shared CI
+    /// runner can legitimately take several seconds.
     fn receive_budgeted(&self, socket: &mut UnixStream, eof: bool, budget: usize) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut output = Vec::new();
         loop {
             self.pump(budget);
@@ -2845,6 +2851,7 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
                 origin_socket: format!("/run/racer/{name}/origin/socket").into(),
                 name,
                 priority: racer_control_wire::DEFAULT_PRIORITY,
+                mode: racer_control_wire::CacheMode::Cached,
             }
         })
         .collect();
@@ -2853,12 +2860,18 @@ fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
         .iter()
         .map(|cache| Rc::as_ptr(&fixture.listeners.listeners.borrow()[&cache.id]))
         .collect();
-    for cache in &mut caches {
+    for (n, cache) in caches.iter_mut().enumerate() {
         cache.priority = 7;
+        // Mode changes in either direction reuse the socket too.
+        cache.mode = [
+            racer_control_wire::CacheMode::PassthroughPeers,
+            racer_control_wire::CacheMode::PassthroughLocal,
+            racer_control_wire::CacheMode::Cached,
+        ][n % 3];
     }
     let prepared =
         futures::executor::block_on(fixture.listeners.prepare(&caches, &scope())).unwrap();
-    // The publication carries the new priorities even though sockets are reused.
+    // The publication carries the new priorities and modes even though sockets are reused.
     assert_eq!(prepared.definitions(), caches.as_slice());
     prepared.commit();
     for (cache, old) in caches.iter().zip(&before) {
@@ -2883,6 +2896,13 @@ fn listener_reuse_ignores_only_priority() {
     let mut next = definition();
     next.priority = 0;
     assert!(same_endpoint(&current, &next));
+    for mode in [
+        racer_control_wire::CacheMode::PassthroughPeers,
+        racer_control_wire::CacheMode::PassthroughLocal,
+    ] {
+        next.mode = mode;
+        assert!(same_endpoint(&current, &next));
+    }
     let changes: [fn(&mut CacheDefinition); 4] = [
         |d| d.id = CacheId("00000000-0000-4000-8000-000000000fff".into()),
         |d| d.name = "other".into(),

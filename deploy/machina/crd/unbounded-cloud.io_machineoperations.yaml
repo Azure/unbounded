@@ -38,8 +38,8 @@ spec:
           MachineOperation represents a discrete operation to be performed on a
           Machine. MachineOperations are created by CLI commands or controllers and
           processed by the appropriate agent. The in-VM agent handles operations
-          like NodeReboot and HostOSReboot, while cloud or PXE controllers handle
-          operations like HostOutOfBandReboot, HostPowerOff, and HostPowerOn.
+          like NodeReboot and HostSoftReboot, while cloud or PXE controllers handle
+          operations like HostHardReboot, HostPowerOff, and HostPowerOn.
         properties:
           apiVersion:
             description: |-
@@ -123,9 +123,8 @@ spec:
                 - NodeReboot
                 - AgentUpgrade
                 - AgentReset
-                - HostOutOfBandReboot
-                - HostOOBReboot
-                - HostOSReboot
+                - HostHardReboot
+                - HostSoftReboot
                 - HostPowerOff
                 - HostPowerOn
                 - HostReplace
@@ -258,7 +257,7 @@ spec:
                     bootID:
                       description: |-
                         BootID is the host kernel boot ID the agent observed before it issued
-                        a HostOSReboot. The agent that starts after the reboot compares it with
+                        a HostSoftReboot. The agent that starts after the reboot compares it with
                         the current boot ID to decide whether the reboot happened.
                       type: string
                     bootMedia:

@@ -25,7 +25,7 @@ func TestProviderExecute(t *testing.T) {
 		operation unboundedv1alpha3.OperationKind
 		wantCall  string
 	}{
-		{name: "out-of-band reboot", operation: unboundedv1alpha3.OperationHostOutOfBandReboot, wantCall: "RESET:ocid1.instance.oc1.test"},
+		{name: "out-of-band reboot", operation: unboundedv1alpha3.OperationHostHardReboot, wantCall: "RESET:ocid1.instance.oc1.test"},
 		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCall: "STOP:ocid1.instance.oc1.test"},
 		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCall: "START:ocid1.instance.oc1.test"},
 	}

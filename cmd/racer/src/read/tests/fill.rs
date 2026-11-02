@@ -713,6 +713,7 @@ fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
         client_socket: "/c".into(),
         origin_socket: "/o".into(),
         priority,
+        mode: racer_control_wire::CacheMode::Cached,
     };
     let weigh = |under_priority, over_priority| {
         policy.weights().update(&[
@@ -2791,6 +2792,7 @@ mod pressure {
                 client_socket: "/c".into(),
                 origin_socket: "/o".into(),
                 priority,
+                mode: racer_control_wire::CacheMode::Cached,
             };
             let weigh = |under_priority, over_priority| {
                 admission.policy().weights().update(&[
@@ -3022,6 +3024,8 @@ pub(super) struct TestOrigin {
     pub(super) version_unavailable: Cell<bool>,
     pub(super) blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
     pub(super) started_pages: RefCell<Vec<u64>>,
+    /// Answer metadata refreshes with `metadata` instead of panicking.
+    pub(super) serve_metadata: Cell<bool>,
 }
 impl Origin for TestOrigin {
     fn bootstrap_reserved<'a>(
@@ -3040,7 +3044,16 @@ impl Origin for TestOrigin {
         _: crate::model::MetadataSelector,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
-        Box::pin(async { panic!("pinned page fill must not refresh metadata") })
+        Box::pin(async move {
+            assert!(
+                self.serve_metadata.get(),
+                "pinned page fill must not refresh metadata"
+            );
+            Ok(MetadataReply {
+                metadata: self.metadata.clone(),
+                page_zero: None,
+            })
+        })
     }
     fn page_reserved<'a>(
         &'a self,
@@ -3118,7 +3131,16 @@ impl Drop for Fixture {
     }
 }
 impl Fixture {
-    fn metadata_index(&self, capacity: usize) -> Rc<Index> {
+    /// Republish this fixture's cache in `mode`, as a ClusterCache edit would.
+    pub(super) fn set_mode(&self, mode: racer_control_wire::CacheMode) {
+        self.fill
+            .dependencies
+            .memory
+            .availability()
+            .publish_modes(vec![(self.context.object.cache.clone(), mode)]);
+    }
+
+    pub(super) fn metadata_index(&self, capacity: usize) -> Rc<Index> {
         Rc::new(Index::new(
             WorkerId(0),
             capacity,
@@ -3134,7 +3156,7 @@ impl Fixture {
         self.metadata_service_with_index(origin, capacity, self.metadata_index(4))
     }
 
-    fn metadata_service_with_index(
+    pub(super) fn metadata_service_with_index(
         &self,
         origin: Rc<dyn Origin>,
         capacity: usize,
@@ -3206,6 +3228,7 @@ impl Fixture {
                     client_socket,
                     origin_socket,
                     priority: racer_control_wire::DEFAULT_PRIORITY,
+                    mode: racer_control_wire::CacheMode::Cached,
                 }],
             })
             .unwrap();
@@ -3395,6 +3418,7 @@ fn fixture_with_caches(
         fail_once: Cell::new(false),
         version_unavailable: Cell::new(false),
         blocked_pages: RefCell::new(Default::default()),
+        serve_metadata: Cell::new(false),
         started_pages: RefCell::new(Vec::new()),
     });
     let (port, engine) = security::pair(worker, 0, config.limits.queue_entries);
@@ -3482,7 +3506,7 @@ pub(super) fn drive<T>(
     panic!("bounded test executor did not complete");
 }
 
-fn adapter_client(
+pub(super) fn adapter_client(
     f: &Fixture,
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
@@ -3517,6 +3541,7 @@ fn adapter_client(
                 client_socket,
                 origin_socket,
                 priority: racer_control_wire::DEFAULT_PRIORITY,
+                mode: racer_control_wire::CacheMode::Cached,
             }],
         })
         .unwrap();

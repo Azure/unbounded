@@ -370,7 +370,7 @@ func TestPullRangeHTTP1PoolReuse(t *testing.T) {
 
 	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
 
-	transport := c.registries["reg"].hc.Transport.(*http.Transport)
+	transport := c.registries["reg"].transport.(*http.Transport)
 	defer transport.CloseIdleConnections()
 
 	if !transport.DisableCompression || !transport.ForceAttemptHTTP2 || transport.MaxConnsPerHost <= 0 || transport.MaxIdleConnsPerHost < parallel {

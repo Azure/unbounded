@@ -179,6 +179,30 @@ spec:
                 x-kubernetes-validations:
                 - message: azure is required
                   rule: has(self.azure)
+              passthrough:
+                description: |-
+                  Passthrough, when set, turns off caching for this cache: Racer proxies
+                  reads to the origin and keeps no data. Pages are not written to disk and
+                  are held in memory only while concurrent readers share an in-flight
+                  origin read. Object metadata (ETag, size, expiry) is not reused across
+                  reads, so each read revalidates with the origin; one read still pins one
+                  object version for all of its pages. Warm and hold (pinning) requests are
+                  rejected. Priority still weights in-flight memory use. Passthrough may be
+                  added, changed, or removed at any time; when a cache switches to
+                  passthrough, data previously cached for it is dropped.
+                properties:
+                  route:
+                    default: Peers
+                    description: |-
+                      Route selects which node's origin serves a read. Peers routes pages to
+                      their owner nodes and shares origin reads cluster-wide. Local reads from
+                      the reading node's own origin, so every reading node needs an origin
+                      (a managed spec.origin runs one per dataplane node). When unset, Peers.
+                    enum:
+                    - Peers
+                    - Local
+                    type: string
+                type: object
               priority:
                 description: |-
                   Priority is the relative weight used to share node cache capacity among

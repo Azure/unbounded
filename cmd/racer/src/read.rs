@@ -35,6 +35,7 @@ pub mod candidates;
 pub mod dispatch;
 pub mod fill;
 pub mod flight;
+pub(crate) mod gpu_copies;
 pub mod metadata;
 pub mod range_stream;
 pub mod sealed;
@@ -163,6 +164,10 @@ impl Coordinator {
         membership: &crate::topology::Membership,
         copy_only: bool,
     ) {
+        // Successor hints assume the successor keeps its copy.
+        if self.fill.passthrough(&page.version.object.cache) {
+            return;
+        }
         let candidates = &self.fill.dependencies.candidates;
         let local = &candidates.node;
         let owners = || {
@@ -198,6 +203,9 @@ impl Coordinator {
         scope: &RequestScope,
     ) -> bool {
         use racer_core::read::hints::{MAX_DEFERRALS, defer_allowed, successor_deferral};
+        if self.fill.passthrough(&page.version.object.cache) {
+            return false;
+        }
         if !defer_allowed(self.fill.dependencies.flights.acquiring(page)) {
             return false;
         }
@@ -417,6 +425,7 @@ impl Coordinator {
                     }
                     let range =
                         resolve_range(range.unwrap_or(ByteRange::From(0)), metadata.length)?;
+                    let passthrough = self.fill.passthrough(&origin.object.cache);
                     let mut body = self.streams.open(
                         metadata.clone(),
                         range,
@@ -424,6 +433,9 @@ impl Coordinator {
                         membership,
                         scope.clone(),
                     )?;
+                    if passthrough {
+                        body.set_passthrough();
+                    }
                     body.configure_subscription(page_credits, byte_credits)?;
                     Ok(ReadResponse {
                         retain_until: None,
@@ -432,7 +444,15 @@ impl Coordinator {
                     })
                 }
                 ReadKind::Head | ReadKind::HeadPinned { .. } => {
-                    let retain_until = if let Some(ttl) = retain {
+                    let passthrough = self.fill.passthrough(&origin.object.cache);
+                    if passthrough && retain.is_some() {
+                        // Passthrough caches hold nothing: refuse the warm
+                        // request and answer the HEAD without retain_until.
+                        self.fill
+                            .metrics
+                            .warm_event(crate::telemetry::WarmEvent::Refused);
+                    }
+                    let retain_until = if let Some(ttl) = retain.filter(|_| !passthrough) {
                         match self.credentials.local_context(&origin, scope) {
                             Ok(context) => warm::admit(
                                 directory.clone(),

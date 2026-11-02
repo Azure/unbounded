@@ -1340,6 +1340,10 @@ pub struct AuthorityFacts<'a> {
     pub predecessor_evidence: usize,
     /// Whether the authority's node is still a member of its membership.
     pub member: bool,
+    /// A node's own grant for a cache whose readers call their local origin
+    /// (passthrough with the local route). It rests on no ranking, so it must
+    /// claim rank 0 with no predecessor evidence.
+    pub local: bool,
 }
 
 /// Validate an origin authority for `object`/`page`. Private construction follows a recomputed
@@ -1353,6 +1357,9 @@ pub fn validate_origin_authority(
         return Err(Error::Unauthorized);
     }
     if facts.rank >= 3 || facts.predecessor_evidence != facts.rank || !facts.member {
+        return Err(Error::Unauthorized);
+    }
+    if facts.local && (facts.rank != 0 || facts.predecessor_evidence != 0) {
         return Err(Error::Unauthorized);
     }
     Ok(())
@@ -1678,6 +1685,7 @@ mod candidates_tests {
             rank,
             predecessor_evidence: evidence,
             member,
+            local: false,
         };
         assert_eq!(
             validate_origin_authority(facts(1, 1, true), &a, PageNumber(3)),
@@ -1701,6 +1709,30 @@ mod candidates_tests {
         );
         assert_eq!(
             validate_origin_authority(facts(0, 0, false), &a, PageNumber(3)),
+            Err(Error::Unauthorized)
+        );
+        // A local grant is rank 0 without evidence, and still needs membership
+        // and the exact object and page.
+        let local = |rank, evidence, member| AuthorityFacts {
+            local: true,
+            ..facts(rank, evidence, member)
+        };
+        assert_eq!(
+            validate_origin_authority(local(0, 0, true), &a, PageNumber(3)),
+            Ok(())
+        );
+        for (rank, evidence, member) in [(1, 1, true), (2, 2, true), (0, 0, false)] {
+            assert_eq!(
+                validate_origin_authority(local(rank, evidence, member), &a, PageNumber(3)),
+                Err(Error::Unauthorized)
+            );
+        }
+        assert_eq!(
+            validate_origin_authority(local(0, 0, true), &object(2), PageNumber(3)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            validate_origin_authority(local(0, 0, true), &a, PageNumber(4)),
             Err(Error::Unauthorized)
         );
     }

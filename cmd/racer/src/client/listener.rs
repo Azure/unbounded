@@ -1582,8 +1582,9 @@ fn temporary_name(name: &str) -> bool {
 }
 
 /// Whether a bound listener can serve `next` unchanged. Priority only weights
-/// disk and memory sharing, so a priority-only change must not replace the socket
-/// or consume a retirement slot. A reused listener keeps its original priority,
+/// disk and memory sharing, and mode only changes retention and routing, so a
+/// priority- or mode-only change must not replace the socket or consume a
+/// retirement slot. A reused listener keeps its original priority and mode,
 /// which listener code never reads.
 pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -> bool {
     let CacheDefinition {
@@ -1592,6 +1593,7 @@ pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -
         client_socket,
         origin_socket,
         priority: _,
+        mode: _,
     } = current;
     *id == next.id
         && *name == next.name
