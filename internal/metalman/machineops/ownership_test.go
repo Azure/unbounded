@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
 
 // siteCacheClient stands in for metalman's manager cache, which only holds
@@ -435,4 +436,69 @@ func TestSelectorSites(t *testing.T) {
 			require.Equal(t, tt.want, selectorSites(&tt.selector))
 		})
 	}
+}
+
+func TestReconcilerSetsObservedMachineGenerationOnCompletion(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-a", "rack-a")
+	machine.Generation = 7
+	refOp := testOperation("op-ref", v1alpha3.OperationHostPowerOff)
+	refOp.Spec.MachineRef = machine.Name
+	selectorOp := testOperation("op-selector", v1alpha3.OperationHostPowerOn)
+	selectorOp.CreationTimestamp = metav1.NewTime(fixedNow().Add(1))
+	selectorOp.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{siteLabel: "rack-a"}}
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(machine, refOp, selectorOp, testRedfishSecret()).
+		WithStatusSubresource(refOp, selectorOp).
+		Build()
+	power := &recordingPowerClient{states: map[string]redfish.PowerState{machine.Name: redfish.PowerOn}}
+	r := siteReconciler(c, power, "rack-a")
+
+	reconcileOnce(t, r, refOp.Name)
+
+	updated := getOperation(t, c, refOp.Name)
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase, updated.Status.Message)
+	require.Zero(t, updated.Status.ObservedMachineGeneration, "set before completion")
+
+	reconcileOnce(t, r, refOp.Name)
+
+	updated = getOperation(t, c, refOp.Name)
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, updated.Status.Message)
+	require.Equal(t, machine.Generation, updated.Status.ObservedMachineGeneration)
+
+	for range 3 {
+		reconcileOnce(t, r, selectorOp.Name)
+	}
+
+	updated = getOperation(t, c, selectorOp.Name)
+	require.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase, updated.Status.Message)
+	require.Equal(t, machine.Generation, updated.Status.Targets[0].ObservedGeneration)
+	require.Zero(t, updated.Status.ObservedMachineGeneration)
+}
+
+func TestReconcilerDoesNotSetObservedMachineGenerationOnFailure(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-a", "rack-a")
+	machine.Generation = 3
+	op := testOperation("op-ref", v1alpha3.OperationHostPowerOff)
+	op.Spec.MachineRef = machine.Name
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op).Build()
+	power := &recordingPowerClient{methodErrors: map[string]error{"factory": errors.New("bmc unreachable")}}
+	r := siteReconciler(c, power, "rack-a")
+	r.MaxAttempts = 1
+
+	for range 4 {
+		reconcileOnce(t, r, op.Name)
+	}
+
+	updated := getOperation(t, c, op.Name)
+	require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase, updated.Status.Message)
+	require.Zero(t, updated.Status.ObservedMachineGeneration)
 }

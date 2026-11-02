@@ -1043,6 +1043,7 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 		}
 
 		op.Status.Phase = v1alpha3.OperationPhaseComplete
+		setObservedMachineGeneration(op)
 		setCompletedCondition(op, metav1.ConditionTrue, reasonSucceeded, message)
 
 		return
@@ -1050,6 +1051,22 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
 	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
+}
+
+// setObservedMachineGeneration records the generation of the Machine a
+// completed machineRef operation acted on. Selector operations act on several
+// Machines, so only their per-target observedGeneration is set.
+func setObservedMachineGeneration(op *v1alpha3.MachineOperation) {
+	if op.Spec.MachineRef == "" {
+		return
+	}
+
+	for _, target := range op.Status.Targets {
+		if target.MachineRef == op.Spec.MachineRef && target.ObservedGeneration > 0 {
+			op.Status.ObservedMachineGeneration = target.ObservedGeneration
+			return
+		}
+	}
 }
 
 func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
