@@ -582,6 +582,64 @@ func TestMutationsRefuseInvalidExisting(t *testing.T) {
 	}
 }
 
+func TestRevokeAllClearsAnnotationWithNoIDs(t *testing.T) {
+	ctx := context.Background()
+
+	for name, old := range map[string]string{
+		"all commas oversized": strings.Repeat(",", disks.MaxAnnotationBytes+1),
+		"empty string":         "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness("", false, node("n", map[string]string{disks.Annotation: old}))
+			if old != "" {
+				if err := h.e.allow(ctx, "n", []string{"wwn-new"}, allowOpts{yes: true, force: true}); err == nil || !strings.Contains(err.Error(), "revoke --all") {
+					t.Fatalf("allow: want invalid existing error, got %v", err)
+				}
+			}
+
+			if err := h.e.revoke(ctx, "n", nil, true, true); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, ok := h.annotation(t, "n"); ok {
+				t.Fatal("annotation still present")
+			}
+
+			n, err := h.c.CoreV1().Nodes().Get(ctx, "n", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if n.Annotations[disks.RevisionAnnotation] == "" {
+				t.Fatal("revision not written")
+			}
+
+			// The recovery leaves allow usable.
+			if err := h.e.allow(ctx, "n", []string{"wwn-new"}, allowOpts{yes: true, force: true}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRevokeAllAbsentAnnotationNoop(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness("", false, node("n", nil))
+
+	if err := h.e.revoke(ctx, "n", nil, true, true); err != nil || !strings.Contains(h.out.String(), "Nothing to do") {
+		t.Fatalf("%v %s", err, h.out)
+	}
+
+	n, err := h.c.CoreV1().Nodes().Get(ctx, "n", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := n.Annotations[disks.RevisionAnnotation]; ok {
+		t.Fatal("revision written for no-op")
+	}
+}
+
 func TestAllowLegacyWarning(t *testing.T) {
 	h := newHarness("", false, node("n", map[string]string{disks.LegacyBlockDevicesAnnotation: "nvme.*"}), pod("p", "n", fixture(t)))
 	if err := h.e.allow(context.Background(), "n", []string{"nvme-eui.0025385b71b2c3d4"}, allowOpts{yes: true}); err != nil {

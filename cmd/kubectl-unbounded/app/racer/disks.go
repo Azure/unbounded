@@ -41,6 +41,9 @@ type nodeDisks struct {
 
 	report *disks.Report
 	legacy bool
+	// annotated reports whether the approval annotation is present, even if
+	// it parses to no IDs.
+	annotated bool
 }
 
 // dataplanePods returns dataplane Pods, optionally restricted to a Node.
@@ -120,11 +123,13 @@ func (nd *nodeDisks) fillReport(p *corev1.Pod) {
 
 func fromNode(n *corev1.Node) *nodeDisks {
 	_, legacy := n.Annotations[disks.LegacyBlockDevicesAnnotation]
+	v, annotated := n.Annotations[disks.Annotation]
 
 	return &nodeDisks{
-		Node:     n.Name,
-		Approved: disks.ParseAnnotation(n.Annotations[disks.Annotation]),
-		legacy:   legacy,
+		Node:      n.Name,
+		Approved:  disks.ParseAnnotation(v),
+		legacy:    legacy,
+		annotated: annotated,
 	}
 }
 
@@ -685,7 +690,11 @@ func (e *env) revoke(ctx context.Context, node string, ids []string, all, yes bo
 		}
 	}
 
-	if len(remove) == 0 {
+	// --all also clears an annotation that is present but approves no IDs,
+	// such as an empty or invalid value, so it is always a recovery path.
+	clearOnly := all && len(remove) == 0 && nd.annotated
+
+	if len(remove) == 0 && !clearOnly {
 		printLine(e.out, "Nothing to do.")
 		return nil
 	}
@@ -693,7 +702,11 @@ func (e *env) revoke(ctx context.Context, node string, ids []string, all, yes bo
 	slices.Sort(remove)
 	remove = slices.Compact(remove)
 
-	printf(e.out, "Disks to revoke on node %s:\n  %s\n\n", node, strings.Join(remove, "\n  "))
+	if clearOnly {
+		printf(e.out, "The %s annotation on node %s approves no disks and will be removed.\n\n", disks.Annotation, node)
+	} else {
+		printf(e.out, "Disks to revoke on node %s:\n  %s\n\n", node, strings.Join(remove, "\n  "))
+	}
 	printf(e.out, "Racer stops using these disks. Nothing is erased; existing data is left on disk.\nThe Racer pod on %s will restart and drop its cache.\n\n", node)
 
 	if err := e.confirm(yes); err != nil {
@@ -701,6 +714,10 @@ func (e *env) revoke(ctx context.Context, node string, ids []string, all, yes bo
 	}
 
 	_, err = updateApproved(ctx, c, node, func(cur []string) []string {
+		if all {
+			return nil
+		}
+
 		return slices.DeleteFunc(cur, func(s string) bool { return slices.Contains(remove, s) })
 	})
 	if err != nil {
