@@ -19,6 +19,7 @@ const (
 	defaultStaleProviderTTL       = 3 * time.Minute
 	defaultUnavailableProviderTTL = 30 * time.Second
 	defaultSuspiciousProviderTTL  = 5 * time.Minute
+	providerFailureSweepInterval  = 30 * time.Second
 )
 
 type providerDigestKey struct {
@@ -38,6 +39,7 @@ type providerFailures struct {
 	suspicious  map[providerDigestKey]time.Time
 	unavailable map[string]time.Time
 	now         func() time.Time
+	nextSweep   time.Time
 }
 
 func newProviderFailures() *providerFailures {
@@ -120,6 +122,14 @@ func (f *providerFailures) record(d digest.Digest, requested httprange.Range, pr
 }
 
 func (f *providerFailures) sweep(now time.Time) {
+	// Filtering checks expiration directly. Reclaim old entries periodically,
+	// rather than scanning a growing history for every concurrent range read.
+	if now.Before(f.nextSweep) {
+		return
+	}
+
+	f.nextSweep = now.Add(providerFailureSweepInterval)
+
 	for key, until := range f.stale {
 		if !now.Before(until) {
 			delete(f.stale, key)

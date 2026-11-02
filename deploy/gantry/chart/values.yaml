@@ -42,7 +42,9 @@ metricsService:
 
 overlaybdConfig:
   enabled: false
+  # The socket must be directly inside the shared /run/gantry-overlaybd directory.
   address: /run/gantry-overlaybd/gantry-overlaybd.sock
+  # Both snapshotter reads and configurator readiness use this listener.
   gantryEndpoint: http://127.0.0.1:5000/blobs
   snapshotterRoot: /var/lib/gantry/snapshotter
   fallbackSnapshotter: overlayfs

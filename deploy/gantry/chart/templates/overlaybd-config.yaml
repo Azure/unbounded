@@ -74,6 +74,8 @@ spec:
           env:
             - name: GANTRY_SNAPSHOTTER_ADDRESS
               value: {{ .Values.overlaybdConfig.address | quote }}
+            - name: GANTRY_STREAMING_READYZ
+              value: {{ printf "%s/artifact-streaming/readyz" (trimSuffix "/blobs" .Values.overlaybdConfig.gantryEndpoint) | quote }}
             - name: GANTRY_NBD_MAX_DEVICES
               value: {{ .Values.overlaybdConfig.nbdMaxDevices | quote }}
             - name: GANTRY_NBD_MIN_DEVICES

@@ -36,8 +36,11 @@
 {{- if and .Values.overlaybdConfig.enabled (empty .Values.overlaybdConfig.nodeSelector) -}}
 {{- fail "overlaybdConfig.enabled requires an explicit overlaybdConfig.nodeSelector" -}}
 {{- end -}}
-{{- if not (hasPrefix "/" .Values.overlaybdConfig.address) -}}
-{{- fail "overlaybdConfig.address must be an absolute Unix socket path" -}}
+{{- if not (regexMatch "^/run/gantry-overlaybd/[A-Za-z0-9_-][A-Za-z0-9._-]*$" .Values.overlaybdConfig.address) -}}
+{{- fail "overlaybdConfig.address must be a socket file directly under /run/gantry-overlaybd" -}}
+{{- end -}}
+{{- if not (regexMatch "^http://(127\\.0\\.0\\.1|localhost):[0-9]+/blobs$" .Values.overlaybdConfig.gantryEndpoint) -}}
+{{- fail "overlaybdConfig.gantryEndpoint must be a loopback HTTP /blobs endpoint" -}}
 {{- end -}}
 {{- if not (hasPrefix "/" .Values.overlaybdConfig.snapshotterRoot) -}}
 {{- fail "overlaybdConfig.snapshotterRoot must be an absolute path" -}}

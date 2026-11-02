@@ -58,7 +58,8 @@ func WithDialTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.dialTimeout = d }
 }
 
-// WithRequestTimeout caps total time per request.
+// WithRequestTimeout caps total time per bulk or metadata request.
+// Exact-range requests use a separate, shorter timeout.
 func WithRequestTimeout(d time.Duration) ClientOption {
 	return func(o *clientOptions) { o.requestTimeout = d }
 }

@@ -261,8 +261,10 @@ with native `overlayfs`, verify the new adapter is ready, restore
 `gantry-overlaybd` for CRI image unpacking, and only then uncordon the node. The adapter cannot prepare
 its own replacement container through its socket while that adapter is stopped;
 pre-pulling the replacement image alone does not remove this dependency.
-The configurator waits for `/artifact-streaming/readyz` and the host-visible
-snapshotter socket, loads the `nbd` module, and verifies device capacity. It
+The configurator waits for `/artifact-streaming/readyz` on the listener selected
+by `overlaybdConfig.gantryEndpoint` and for the host-visible snapshotter socket,
+loads the `nbd` module, and verifies device capacity. A custom socket filename
+must remain directly under the shared `/run/gantry-overlaybd` directory. It
 then snapshots the current containerd configuration under
 `/var/lib/gantry/snapshotter-config`, enables `/etc/containerd/conf.d/*.toml`
 through structured TOML, and writes a last-wins drop-in that registers
