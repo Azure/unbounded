@@ -1,7 +1,8 @@
 //! Managed-mode disk status reporting and approval-change restarts.
 //!
 //! Raw-device storage is planned once at startup. This monitor runs on one
-//! unpinned, mostly sleeping thread beside embedded control. It republishes
+//! unpinned, mostly sleeping thread beside embedded control; managed mode
+//! reserves a thread-cap slot for it. It republishes
 //! per-disk status in the Pod report every [`RESCAN`], so newly attached disks
 //! appear without a restart, and it requests a process restart when:
 //!

@@ -30,8 +30,8 @@ const (
 	dataplaneConfigHash    = "unbounded-cloud.io/racer-settings-hash"
 
 	// minThreads covers one I/O worker, one crypto helper, and the
-	// dedicated control plane thread.
-	minThreads = 3
+	// dedicated control plane and disk monitor threads.
+	minThreads = 4
 )
 
 // planDataplaneConfig creates racer-settings when it is absent, seeded

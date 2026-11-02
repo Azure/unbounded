@@ -28,8 +28,11 @@ pub const UNRESOLVED_NODE_ID: &str = "";
 pub const UNRESOLVED_CLUSTER_ID: &str = "";
 /// Projected control-audience token used by managed deployments.
 pub const MANAGED_SERVICE_ACCOUNT_TOKEN: &str = "/var/run/racer-token/token";
-/// Smallest explicit thread cap in managed mode: I/O, crypto, and cluster control.
-pub const MANAGED_MIN_THREADS: usize = 3;
+/// Threads managed mode runs beside workers: cluster control and the disk monitor.
+pub const MANAGED_CONTROL_THREADS: usize = 2;
+/// Smallest explicit thread cap in managed mode: I/O, crypto, cluster control,
+/// and the disk monitor.
+pub const MANAGED_MIN_THREADS: usize = 2 + MANAGED_CONTROL_THREADS;
 const MIB: u64 = 1024 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_ENTRIES: usize = 1_048_576;
@@ -681,12 +684,12 @@ impl Config {
         self.control_endpoint.is_none()
     }
 
-    /// Withhold one thread from an explicit cap for the cluster-control thread.
+    /// Withhold threads from an explicit cap for cluster control and the disk monitor.
     ///
-    /// The control thread is unpinned and mostly blocked on network I/O. With
-    /// no explicit cap, worker sizing is already bounded by eligible CPUs, so
-    /// nothing is withheld. An explicit cap must leave at least one I/O and one
-    /// crypto thread, so managed mode requires a cap of at least three.
+    /// Both threads are unpinned and mostly blocked on network I/O or sleeping.
+    /// With no explicit cap, worker sizing is already bounded by eligible CPUs,
+    /// so nothing is withheld. An explicit cap must leave at least one I/O and
+    /// one crypto thread, so managed mode requires a cap of at least four.
     pub fn reserve_control_thread(&mut self) -> Result<()> {
         if !self.managed() {
             return Err(Error::InvalidConfiguration);
@@ -697,8 +700,8 @@ impl Config {
         if self.max_threads < MANAGED_MIN_THREADS {
             return Err(Error::InvalidConfiguration);
         }
-        let reserved = self.max_threads - 1;
-        // An exact worker pair must still fit beside the control thread.
+        let reserved = self.max_threads - MANAGED_CONTROL_THREADS;
+        // An exact worker pair must still fit beside the managed threads.
         if let (Some(io), Some(helpers)) = (self.io_workers, self.crypto_helpers)
             && io.checked_add(helpers).is_none_or(|n| n > reserved)
         {
@@ -1679,25 +1682,34 @@ mod tests {
     }
 
     #[test]
-    fn managed_mode_reserves_one_thread_for_cluster_control() {
+    fn managed_mode_reserves_threads_for_control_and_disk_monitor() {
         let mut unlimited = parse_managed(&[]).unwrap();
         unlimited.reserve_control_thread().unwrap();
         assert_eq!(unlimited.max_threads, DEFAULT_MAX_THREADS);
-        let mut capped = parse_managed(&[("RACER_MAX_THREADS", "3")]).unwrap();
+        let mut capped = parse_managed(&[("RACER_MAX_THREADS", "4")]).unwrap();
         capped.reserve_control_thread().unwrap();
         assert_eq!(capped.max_threads, 2);
-        let mut minimal = parse_managed(&[("RACER_MAX_THREADS", "2")]).unwrap();
+        let mut minimal = parse_managed(&[("RACER_MAX_THREADS", "3")]).unwrap();
         assert!(minimal.reserve_control_thread().is_err());
-        assert_eq!(minimal.max_threads, 2);
+        assert_eq!(minimal.max_threads, 3);
         // An exact pair that no longer fits after reservation is rejected unchanged.
         let mut exact = parse_managed(&[
-            ("RACER_MAX_THREADS", "4"),
+            ("RACER_MAX_THREADS", "5"),
             ("RACER_IO_WORKERS", "2"),
             ("RACER_CRYPTO_HELPERS", "2"),
         ])
         .unwrap();
         assert!(exact.reserve_control_thread().is_err());
-        assert_eq!(exact.max_threads, 4);
+        assert_eq!(exact.max_threads, 5);
+        // An exact pair that fits exactly beside both managed threads is accepted.
+        let mut fits = parse_managed(&[
+            ("RACER_MAX_THREADS", "6"),
+            ("RACER_IO_WORKERS", "2"),
+            ("RACER_CRYPTO_HELPERS", "2"),
+        ])
+        .unwrap();
+        fits.reserve_control_thread().unwrap();
+        assert_eq!(fits.max_threads, 4);
         assert!(parse(&[]).unwrap().reserve_control_thread().is_err());
     }
 

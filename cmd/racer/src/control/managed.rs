@@ -470,7 +470,7 @@ mod tests {
     fn start_retries_until_bootstrap_then_binds_endpoints_and_report() {
         let d = Directory::new("start");
         let mut config = managed_config(&d.0);
-        config.max_threads = 3;
+        config.max_threads = 4;
         let control = std::sync::Arc::new(Scripted::new(vec![
             Err(BootstrapError::Retry),
             Err(BootstrapError::Retry),
@@ -505,7 +505,7 @@ mod tests {
             Err(Error::Cancelled)
         );
         let mut config = managed_config(&d.0);
-        config.max_threads = 2;
+        config.max_threads = 3;
         assert_eq!(
             start(&mut config, never, &|| false),
             Err(Error::InvalidConfiguration)

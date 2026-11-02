@@ -243,7 +243,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
-| `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, and managed control threads; managed deployments need at least 3 |
+| `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, managed control, and disk monitor threads; managed deployments need at least 4 |
 | `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count, 1..65,536; requires `RACER_CRYPTO_HELPERS` |
 | `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
@@ -286,21 +286,22 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
 
 Exact sizing requires both count settings. Their sum, plus the managed control
-thread, must fit `RACER_MAX_THREADS`;
+and disk monitor threads, must fit `RACER_MAX_THREADS`;
 the cap is never raised implicitly. The first NUMA node in the normal placement
 preference order must be known and have enough eligible CPUs for the whole split.
 Other host NUMA nodes are allowed, but exact placement does not span nodes or skip
 an undersized preferred node. Insufficient CPU quota or per-I/O resource budgets
 fails startup rather than reducing counts. For a managed 20-I/O comparison, use
-10 helpers with cap 31 or 20 helpers with cap 41. Keep all resource budgets fixed.
+10 helpers with cap 32 or 20 helpers with cap 42. Keep all resource budgets fixed.
 Omit both count settings to retain automatic sizing.
 Extra helpers change available crypto execution capacity, not I/O ownership or
 per-I/O budgets. They do not guarantee higher throughput; compare matched workloads
 before drawing a performance conclusion.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
-Without an explicit thread cap, one unpinned control thread runs alongside the
-automatically sized I/O and crypto workers. With a cap, it consumes one slot.
+Without an explicit thread cap, one unpinned control thread and one unpinned disk
+monitor thread run alongside the automatically sized I/O and crypto workers. With
+a cap, they consume two slots.
 Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
 can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
 divided among them. Admission budgets are not RSS limits:
