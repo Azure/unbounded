@@ -47,6 +47,7 @@ type pullOptions struct {
 	RangeBytes        int64
 	RangeParallel     int
 	RangeRetries      int
+	RangeRotate       bool
 }
 
 type puller struct {

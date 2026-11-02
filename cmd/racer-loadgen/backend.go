@@ -5,9 +5,11 @@ package main
 
 import (
 	"context"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -119,6 +121,7 @@ func (p *puller) udsRangedAcquirer(client *racersdk.Client) func(context.Context
 			parallel:   p.opts.RangeParallel,
 			retries:    p.opts.RangeRetries,
 			retryDelay: p.opts.RetryDelay,
+			rotate:     p.rangeRotation(size),
 			onResume: func() {
 				p.metrics.rangeResumes.Inc()
 			},
@@ -126,4 +129,24 @@ func (p *puller) udsRangedAcquirer(client *racersdk.Client) func(context.Context
 
 		return blobResponse{body: body, success: true, totalSize: &size, etag: &etag}, nil
 	}
+}
+
+// rangeRotation picks this process's first range from its host name when
+// range-rotate is set, spreading concurrent readers across the object.
+func (p *puller) rangeRotation(size int64) int64 {
+	if !p.opts.RangeRotate || p.opts.RangeBytes <= 0 {
+		return 0
+	}
+
+	name, err := os.Hostname()
+	if err != nil {
+		return 0
+	}
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name)) //nolint:errcheck // hash.Hash never fails.
+
+	ranges := (size + p.opts.RangeBytes - 1) / p.opts.RangeBytes
+
+	return int64(h.Sum64() % uint64(ranges))
 }

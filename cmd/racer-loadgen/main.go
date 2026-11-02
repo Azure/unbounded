@@ -91,6 +91,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.Int64Var(&opts.pull.RangeBytes, "range-bytes", 0, "UDS only: read each blob as pinned byte ranges of this size, resuming a failed range at its first unread byte (0 reads whole objects); requires verify=false")
 	f.IntVar(&opts.pull.RangeParallel, "range-parallel", 0, "UDS only: concurrent ranges per blob with range-bytes (0 means 1)")
 	f.IntVar(&opts.pull.RangeRetries, "range-retries", 0, "UDS only: resumes allowed per range with range-bytes")
+	f.BoolVar(&opts.pull.RangeRotate, "range-rotate", false, "UDS only: start each process at a host-name-derived range with range-bytes")
 	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {
