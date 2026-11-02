@@ -2,18 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Metalman machine image for Azure Linux 3.0 with the NVIDIA open GPU driver.
-# It uses the HWE kernel because Azure Linux ships the arm64 driver only for it.
-# Fabric Manager and IMEX are not included.
+# ARM64 contains both kernel tracks and defaults unconditionally to kernel-hwe.
+# AMD64 keeps the existing single-HWE-kernel behavior.
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS rootfs
+ARG TARGETARCH
 ARG KERNEL_PACKAGE=kernel-hwe
 ARG NVIDIA=1
+ARG IMAGE_VARIANT=nvidia
+ARG NVIDIA_DRIVER_SOURCE=nvidia-localrepo
 COPY images/host-azurelinux3/assets/rootfs.sh /usr/local/bin/build-rootfs
-RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" sh /usr/local/bin/build-rootfs install
-RUN KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" sh /usr/local/bin/build-rootfs finish
+COPY images/host-azurelinux3/assets/10_azure_nvidia /usr/local/share/unbounded/10_azure_nvidia
+COPY images/host-azurelinux3/assets/51-azure-nvidia.cfg /usr/local/share/unbounded/51-azure-nvidia.cfg
+COPY images/host-azurelinux3-nvidia/versions.env /usr/local/share/unbounded/versions.env
+RUN set -a && . /usr/local/share/unbounded/versions.env && set +a && \
+    TARGETARCH="${TARGETARCH}" KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" \
+    IMAGE_VARIANT="${IMAGE_VARIANT}" NVIDIA_DRIVER_SOURCE="${NVIDIA_DRIVER_SOURCE}" \
+    sh /usr/local/bin/build-rootfs install
+RUN set -a && . /usr/local/share/unbounded/versions.env && set +a && \
+    TARGETARCH="${TARGETARCH}" KERNEL_PACKAGE="${KERNEL_PACKAGE}" NVIDIA="${NVIDIA}" \
+    IMAGE_VARIANT="${IMAGE_VARIANT}" NVIDIA_DRIVER_SOURCE="${NVIDIA_DRIVER_SOURCE}" \
+    sh /usr/local/bin/build-rootfs finish
 
 FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:24.04 AS build
 ARG TARGETARCH
+ARG IMAGE_VARIANT=nvidia
 RUN apt-get update && \
     ok=false && \
     for attempt in 1 2 3 4 5; do \
@@ -26,9 +39,11 @@ RUN apt-get update && \
       apt-get update; \
     done && $ok && \
     rm -rf /var/lib/apt/lists/*
-COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY --from=rootfs /rootfs.tar /rootfs.kernels /
 COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
-RUN TARGETARCH="${TARGETARCH}" sh /usr/local/bin/build-disk && rm /rootfs.tar
+COPY images/host-azurelinux3/assets/grub-config.sh /usr/local/bin/write-grub-config
+RUN TARGETARCH="${TARGETARCH}" IMAGE_VARIANT="${IMAGE_VARIANT}" \
+    sh /usr/local/bin/build-disk && rm /rootfs.tar
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \

@@ -235,7 +235,7 @@ REACT_DEV ?= false
 
 .PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
-.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
+.PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push image-host-azurelinux3-nvidia-local verify-host-azurelinux3-nvidia images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 
 ##@ General
@@ -1081,6 +1081,19 @@ image-machina-local: ## Build the machina container image locally (single-arch)
 		-t machina:$(VERSION_TAG) -t $(MACHINA_IMAGE) \
 		-f ./images/machina/Containerfile .
 	$(call trivy-maybe,$(MACHINA_IMAGE))
+
+image-host-azurelinux3-nvidia-local: ## Build the Azure Linux NVIDIA R580.178.04 ARM64 host image locally
+	$(CONTAINER_ENGINE) build --platform linux/arm64 \
+		-t host-azurelinux3-nvidia:$(VERSION_TAG) \
+		-f ./images/host-azurelinux3-nvidia/Containerfile .
+
+verify-host-azurelinux3-nvidia: image-host-azurelinux3-nvidia-local ## Offline-inspect the Azure Linux NVIDIA R580.178.04 ARM64 disk
+	@mkdir -p tmp/host-azurelinux3-nvidia
+	@set -eu; \
+	cid=$$($(CONTAINER_ENGINE) create host-azurelinux3-nvidia:$(VERSION_TAG)); \
+	trap '$(CONTAINER_ENGINE) rm -f "$$cid" >/dev/null' EXIT; \
+	$(CONTAINER_ENGINE) cp "$$cid:/disk/disk.img.gz" tmp/host-azurelinux3-nvidia/disk.img.gz; \
+	sh images/host-azurelinux3/assets/verify-disk.sh tmp/host-azurelinux3-nvidia/disk.img.gz
 
 # Retained for backwards compatibility with external callers (release pipelines).
 machina-oci: image-machina-local ## Alias for image-machina-local

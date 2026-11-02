@@ -95,7 +95,7 @@ jobs:
   build:
     needs: resolve
     if: needs.resolve.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.resolve.outputs.platforms == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Normalize container registry
         run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
@@ -103,6 +103,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: needs.resolve.outputs.platforms != 'linux/arm64'
         with:
           platforms: linux/amd64,linux/arm64
 
