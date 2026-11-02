@@ -43,7 +43,7 @@ func newCmdRoot(runAgent func(args []string) error, prepare func(dir string, log
 
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.AddCommand(newCmdAgent(runAgent), newCmdInit(prepare), newCmdVersion())
+	root.AddCommand(newCmdAgent(runAgent), newCmdInit(prepare), newCmdSnapshotter(runSnapshotter), newCmdVersion())
 
 	return root
 }
@@ -82,6 +82,26 @@ func writeAgentHelp(w io.Writer) {
 	_, _ = fmt.Fprint(w, "Usage: gantry agent [flags]\n\nFlags:\n") //nolint:errcheck // best-effort write
 
 	fs.PrintDefaults()
+}
+
+func newCmdSnapshotter(runSnapshotter func(args []string) error) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:                "snapshotter [flags]",
+		Short:              "Run the ACR OverlayBD compatibility snapshotter",
+		DisableFlagParsing: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			return runSnapshotter(args)
+		},
+	}
+	cmd.SetHelpFunc(func(cmd *cobra.Command, _ []string) {
+		fs := buildSnapshotterFlagSet()
+		fs.SetOutput(cmd.OutOrStdout())
+		_, _ = fmt.Fprint(cmd.OutOrStdout(), "Usage: gantry snapshotter [flags]\n\nFlags:\n") //nolint:errcheck // best-effort write
+
+		fs.PrintDefaults()
+	})
+
+	return cmd
 }
 
 func newCmdInit(prepare func(dir string, logger *slog.Logger) error) *cobra.Command {

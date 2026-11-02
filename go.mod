@@ -37,12 +37,14 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/containerd/containerd/api v1.12.0
 	github.com/containerd/containerd/v2 v2.4.2
+	github.com/containerd/continuity v0.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/platforms v1.0.0-rc.5
 	github.com/containerd/typeurl/v2 v2.3.0
 	github.com/containernetworking/cni v1.3.1
 	github.com/containernetworking/plugins v1.9.1
 	github.com/coreos/go-iptables v0.8.0
+	github.com/distribution/reference v0.6.0
 	github.com/dustin/go-humanize v1.1.0
 	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/fatih/color v1.19.0
@@ -60,6 +62,7 @@ require (
 	github.com/insomniacslk/dhcp v0.0.0-20260220084031-5adc3eb26f91
 	github.com/ipfs/go-cid v0.6.2
 	github.com/ipfs/go-datastore v0.9.2
+	github.com/klauspost/compress v1.20.1
 	github.com/lib/pq v1.12.3
 	github.com/libp2p/go-libp2p v0.49.0
 	github.com/libp2p/go-libp2p-kad-dht v0.42.2
@@ -71,6 +74,7 @@ require (
 	github.com/opencontainers/umoci v0.6.0
 	github.com/oracle/oci-go-sdk/v65 v65.128.0
 	github.com/pelletier/go-toml/v2 v2.4.3
+	github.com/pierrec/lz4/v4 v4.1.28
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/pion/stun/v3 v3.1.7
 	github.com/prometheus/client_golang v1.25.0
@@ -143,7 +147,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect
-	github.com/containerd/continuity v0.5.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/fifo v1.1.0 // indirect
 	github.com/containerd/log v0.2.0 // indirect
@@ -156,7 +159,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
-	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
@@ -207,7 +209,6 @@ require (
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/koron/go-ssdp v0.9.1 // indirect
@@ -272,7 +273,6 @@ require (
 	github.com/opencontainers/runtime-spec v1.3.0 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
-	github.com/pierrec/lz4/v4 v4.1.28 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v3 v3.1.5 // indirect
 	github.com/pion/ice/v4 v4.0.10 // indirect
@@ -322,6 +322,7 @@ require (
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
+	go.etcd.io/bbolt v1.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
 	go.opentelemetry.io/otel v1.46.0 // indirect

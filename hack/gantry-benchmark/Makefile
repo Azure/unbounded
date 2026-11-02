@@ -2,7 +2,7 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 ENV_FILE ?= $(CURDIR)/env.local
 DEPLOY_CONFIG ?= $(CURDIR)/deploy.env
 
-.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
+.PHONY: help test monitor profile-gantry deploy deploy-plan deploy-scale deploy-recreate-pool deploy-destroy deploy-status operator-vm-check operator-vm-provision operator-vm-status operator-vm-watch operator-vm-stop operator-vm-prebuild operator-vm-run-full operator-vm-run-pool operator-vm-run-fresh operator-vm-run-standalone operator-vm-ensure-fail-open operator-vm-deploy-runtime-run operator-vm-deploy-runtime-status operator-vm-deploy-runtime-watch operator-vm-deploy-runtime-fast operator-vm-image-pool-status operator-vm-sync-benchmark-source operator-vm-sync-benchmark-source-status operator-vm-sync-benchmark-source-cleanup operator-vm-status-snapshot-start operator-vm-status-snapshot-result operator-vm-status-snapshot-cleanup operator-vm-verify-streaming-layers operator-vm-verify-streaming-layers-status operator-vm-verify-streaming-layers-cleanup operator-vm-prune-images operator-vm-prune-images-status proxy-image proxy-push image-pool-status prebuild-gantry enable prepare prepare-adopt prepare-gantry prepare-gantry-fresh prepare-gantry-standalone prepare-gantry-standalone-adopt prepare-gantry-adopt prepare-gantry-pool preflight run run-gantry status disable recover-direct-config
 
 help: ## Show benchmark targets
 	@echo ""
@@ -14,11 +14,14 @@ help: ## Show benchmark targets
 	@echo "  deploy       Idempotently deploy the complete benchmark stack"
 	@echo "  deploy-plan  Print the resolved deployment contract without mutation"
 	@echo "  deploy-scale Resize the existing AKS node pool and wait for Ready nodes"
+	@echo "  deploy-recreate-pool  Replace the streaming worker pool with cold nodes"
+	@echo "  deploy-destroy  Submit nonblocking deletion of the benchmark resource group"
 	@echo "  deploy-status  Report deployment readiness without mutation"
 	@echo "  operator-vm-check      Validate operator VM scripts"
 	@echo "  operator-vm-provision  Provision/bootstrap the private operator VM"
 	@echo "  operator-vm-status     Print one live operator VM progress snapshot"
 	@echo "  operator-vm-watch      Follow operator VM progress until completion"
+	@echo "  operator-vm-stop       Stop the active operator lifecycle and run cleanup"
 	@echo "  operator-vm-prebuild   Start an asynchronous operator-VM pool build"
 	@echo "  operator-vm-run-full   Start full lifecycle; optional ADOPT_* values reuse images"
 	@echo "  operator-vm-run-pool   Start Gantry-only using the next compatible pool image"
@@ -30,6 +33,15 @@ help: ## Show benchmark targets
 	@echo "  operator-vm-deploy-runtime-watch  Follow fixed Gantry deployment progress"
 	@echo "  operator-vm-deploy-runtime-fast  Raise active Gantry rollout parallelism"
 	@echo "  operator-vm-image-pool-status  Show operator-VM pool builder and entries"
+	@echo "  operator-vm-sync-benchmark-source  Submit validated benchmark source sync"
+	@echo "  operator-vm-sync-benchmark-source-status  Read benchmark source sync status"
+	@echo "  operator-vm-sync-benchmark-source-cleanup  Delete benchmark source sync resource"
+	@echo "  operator-vm-status-snapshot-start  Submit a nonblocking persisted operator status snapshot"
+	@echo "  operator-vm-status-snapshot-result  Read the persisted operator status snapshot"
+	@echo "  operator-vm-status-snapshot-cleanup  Delete the persisted operator status snapshot"
+	@echo "  operator-vm-verify-streaming-layers  Submit nonblocking host content verification"
+	@echo "  operator-vm-verify-streaming-layers-status  Read managed execution and persisted results"
+	@echo "  operator-vm-verify-streaming-layers-cleanup  Delete the managed verification resource"
 	@echo "  operator-vm-prune-images  Asynchronously prune unused operator-VM images"
 	@echo "  operator-vm-prune-images-status  Show operator-VM image-prune progress"
 	@echo "  proxy-image  Build BENCHMARK_PROXY_IMAGE"
@@ -71,12 +83,30 @@ profile-gantry: operator-vm-check
 		hack/gantry-benchmark/profile-gantry.sh
 
 operator-vm-check:
-	bash -n deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-watch.sh
-	./deploy.sh plan deploy.env.example >/dev/null
+	@for script in deploy.sh profile-gantry.sh operator-vm-provision.sh operator-vm-bootstrap.sh operator-vm-build-images.sh operator-vm-deploy-runtime.sh operator-vm-run.sh operator-vm-prebuild-images.sh operator-vm-image-pool.sh operator-vm-prune-images-remote.sh operator-vm-status.sh operator-vm-verify-streaming-layers-remote.sh operator-vm-watch.sh; do \
+		bash -n "$$script"; \
+	done
+	./deploy.sh plan deploy.env.example | grep -Fq 'Artifact Streaming:  false'
+	@stream_config=$$(mktemp); \
+	trap 'rm -f "$$stream_config"' EXIT; \
+	sed -e 's/BENCHMARK_ARTIFACT_STREAMING="false"/BENCHMARK_ARTIFACT_STREAMING="true"/' \
+		deploy.env.example >"$$stream_config"; \
+	./deploy.sh plan "$$stream_config" | grep -Fq 'Artifact Streaming:  true'; \
+	./deploy.sh plan "$$stream_config" | grep -Fq 'benchmark pool:      stream (1000 x Standard_D8s_v3)'; \
+	./deploy.sh plan "$$stream_config" | grep -Fq 'system pool:         system (1 x Standard_D4s_v5)'
 	! grep -Eq 'az acr login|podman (build|push|login|pull|tag)' deploy.sh
 	! grep -Eq '^[[:space:]]*az login([[:space:]]|$$)' deploy.sh
 	! grep -Eq '^[[:space:]]*export START_BENCHMARK=false' deploy.sh
-	grep -Fq '"$$repo_root/bin/helm" upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
+	grep -Fq 'local helm_args=(' deploy.sh
+	grep -Fq '[[ "$$legacy" == true ]] || return 0' deploy.sh
+	grep -Fq '[[ "$$aks_state" == Failed || "$$aks_state" == Deleting ]]' deploy.sh
+	grep -Fq 'az vmss rolling-upgrade cancel' deploy.sh
+	grep -Fq 'upgrade --install gantry "$$repo_root/deploy/gantry/chart"' deploy.sh
+	grep -Fq '"$$repo_root/bin/helm" "$${helm_args[@]}"' deploy.sh
+	grep -Fq -- '--enable-artifact-streaming' deploy.sh
+	grep -Fq -- '--set gantry.artifactStreaming.enabled=true' deploy.sh
+	grep -Fq -- '--set overlaybdConfig.enabled=true' deploy.sh
+	grep -Fq 'endpoint=http://127.0.0.1:8578?ns=$$GANTRY_ACR_LOGIN_SERVER' deploy.sh
 	! grep -Fq '"$$repo_root/bin/helm" template gantry' deploy.sh
 	! grep -Fq 'ensure_chair_leases' deploy.sh
 	grep -Fq 'git archive "$$source_revision" | tar -x -C "$$source_context"' deploy.sh
@@ -91,6 +121,12 @@ deploy-plan: operator-vm-check
 deploy-scale: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh scale "$(DEPLOY_CONFIG)"
 
+deploy-recreate-pool: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh recreate-pool "$(DEPLOY_CONFIG)"
+
+deploy-destroy: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh destroy "$(DEPLOY_CONFIG)"
+
 deploy-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/deploy.sh status "$(DEPLOY_CONFIG)"
 
@@ -102,6 +138,9 @@ operator-vm-status: operator-vm-check
 
 operator-vm-watch: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-watch.sh --follow
+
+operator-vm-stop: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh stop
 
 operator-vm-prebuild: operator-vm-check
 	@test -n "$(GANTRY_IMAGE_POOL_COUNT)" || { echo "GANTRY_IMAGE_POOL_COUNT is required" >&2; exit 2; }
@@ -138,6 +177,34 @@ operator-vm-deploy-runtime-fast: operator-vm-check
 
 operator-vm-image-pool-status: operator-vm-check
 	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status
+
+operator-vm-sync-benchmark-source: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh sync-benchmark-source
+
+operator-vm-sync-benchmark-source-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh sync-benchmark-source-status
+
+operator-vm-sync-benchmark-source-cleanup: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh sync-benchmark-source-cleanup
+
+operator-vm-status-snapshot-start: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status-snapshot-start
+
+operator-vm-status-snapshot-result: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status-snapshot-result
+
+operator-vm-status-snapshot-cleanup: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh status-snapshot-cleanup
+
+operator-vm-verify-streaming-layers: operator-vm-check
+	@test -n "$(STREAMING_IMAGE)" || { echo "STREAMING_IMAGE is required" >&2; exit 2; }
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers "$(STREAMING_IMAGE)"
+
+operator-vm-verify-streaming-layers-status: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers-status
+
+operator-vm-verify-streaming-layers-cleanup: operator-vm-check
+	cd "$(REPO_ROOT)" && hack/gantry-benchmark/operator-vm-image-pool.sh verify-streaming-layers-cleanup
 
 operator-vm-prune-images: operator-vm-check
 	@test "$(CONFIRM_PRUNE_UNUSED_IMAGES)" = yes || { echo "set CONFIRM_PRUNE_UNUSED_IMAGES=yes to prune every unused operator-VM image" >&2; exit 2; }
@@ -228,6 +295,17 @@ prepare-gantry-standalone:
 	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
 	set +a; \
 	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone
+
+prepare-gantry-standalone-adopt:
+	@test -n "$(GANTRY_ONLY_STANDALONE_IMAGE)" || { echo "GANTRY_ONLY_STANDALONE_IMAGE is required" >&2; exit 2; }
+	@test -n "$(GANTRY_ONLY_STANDALONE_STREAMING_IMAGE)" || { echo "GANTRY_ONLY_STANDALONE_STREAMING_IMAGE is required" >&2; exit 2; }
+	@test -n "$(GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256)" || { echo "GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256 is required" >&2; exit 2; }
+	set -a; \
+	[ ! -f "$(ENV_FILE)" ] || . "$(ENV_FILE)"; \
+	set +a; \
+	cd "$(REPO_ROOT)" && GOTOOLCHAIN=auto go run ./hack/cmd/gantry-benchmark prepare-gantry-standalone-adopt \
+		"$(GANTRY_ONLY_STANDALONE_IMAGE)" "$(GANTRY_ONLY_STANDALONE_STREAMING_IMAGE)" \
+		"$(GANTRY_ONLY_STANDALONE_PAYLOAD_SHA256)"
 
 prepare-gantry-adopt:
 	@test -n "$(GANTRY_ONLY_BASELINE_RUN_ID)" || { echo "GANTRY_ONLY_BASELINE_RUN_ID is required" >&2; exit 2; }

@@ -20,9 +20,11 @@ new content from the origin, and nodes that finish a pull become providers for
 other nodes.
 
 Gantry runs as a DaemonSet and uses each node's existing containerd content
-store. It does not introduce a separate image cache or a central metadata
-service. Peer discovery uses libp2p and a distributed hash table (DHT), and
-containerd continues to verify every content digest before using it.
+store for complete blobs. Artifact Streaming additionally uses a bounded cache
+of partial byte ranges; neither path needs a central metadata service. Peer
+discovery uses libp2p and a distributed hash table (DHT). Containerd verifies
+complete OCI content digests, while streamed OverlayBD reads validate range
+framing and any checksums carried by ZFile layers.
 
 After the node-level mirror configuration is installed, Gantry is transparent
 to workloads. Pods continue to use normal OCI image references,
@@ -38,13 +40,38 @@ all 1,000 pods.
 See [Gantry Performance at Scale](/guides/gantry-benchmark/) for raw run values,
 methodology, calculations, and limitations.
 
+### Artifact Streaming startup
+
+ACR Artifact Streaming removes the requirement to download and unpack the
+entire image before starting a container. Gantry serves the required image
+ranges from local content, peers, or origin and prefetches mount-critical
+metadata, while whole-layer distribution can continue in the background.
+
+The 1,000-node, 40 GiB/40-layer results are:
+
+| Pod-start latency | Gantry full-image pull, three-run mean | Gantry + Artifact Streaming, five-run mean | Observed reduction |
+| --- | ---: | ---: | ---: |
+| P50 | 636.100s | **8.000s** | **98.7%** |
+| P95 | 712.667s | **20.200s** | **97.2%** |
+| P100 | 803.933s | **49.000s** | **93.9%** |
+
+All five streaming runs on October 22, 2026 completed **1,000/1,000 pods** each
+with a fresh random payload. Values are means of per-run percentiles, not
+pooled percentiles; the maximum across all 5,000 pods was **67 seconds**.
+The full-image and streaming cohorts are historical, unpaired measurements,
+not a controlled A/B test. Streaming times measure startup, not a complete
+payload download or read; shared base layers may already be cached.
+
+See the [Artifact Streaming benchmark details](/guides/gantry-benchmark/#artifact-streaming-startup-benchmarks)
+for individual runs, the metadata-prefetch optimization, and measurement limits.
+
 ## Design principles
 
 | Principle | Behavior |
 | --- | --- |
 | Transparent to workloads | Pods keep their normal image references, pull policies, and credentials. |
 | Decentralized | There is no central Gantry content server or cluster-wide catalog. |
-| No separate cache | Gantry reads and writes the containerd content store already used by kubelet. |
+| Reuse node storage | Complete blobs use containerd's content store; Artifact Streaming also caches bounded partial ranges. |
 | Digest addressed | Discovery and transfer operate on immutable OCI digests rather than tags. |
 | Horizontally supplied | A node that completes a pull can immediately serve the same content to other nodes. |
 | Registry fallback | Retriable mirror responses let containerd continue through its configured registry host chain. |
@@ -248,7 +275,59 @@ containerd's `certs.d` directory. Include the port when the image reference
 uses a non-default port. Gantry requires at least one accelerated upstream
 registry.
 
-### 4. Private Registry Authentication
+### 4. Optional: Enable ACR Artifact Streaming
+
+ACR Artifact Streaming support consumes the existing ACR OverlayBD v0.1.0
+artifact contract without running the OverlayBD daemon or snapshotter. Use a
+Linux node pool with NBD and the filesystem support required by the converted
+image. AKS initially selects the native `overlaybd` snapshotter; Gantry's
+managed drop-in switches CRI to the distinct `gantry-overlaybd` proxy while
+leaving that native plugin registered.
+Converted ACR layers use Gantry's NBD data path. Ordinary OCI layers delegate
+to containerd's built-in `overlayfs` snapshotter through a read-only mount of
+the host containerd runtime directory.
+
+For the standalone chart, set both feature gates and select only the AKS
+streaming node pool:
+
+```yaml
+gantry:
+   artifactStreaming:
+      enabled: true
+
+overlaybdConfig:
+   enabled: true
+   nodeSelector:
+      kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+For operator-managed Gantry, use the `Site` API instead:
+
+```yaml
+spec:
+   components:
+      gantry:
+         enabled: true
+         artifactStreaming:
+            enabled: true
+            nodeSelector:
+               kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+Every Site that enables the cluster-wide feature must specify the same
+selector. The node configurator records the previous containerd configuration,
+does not restart containerd on a no-op, and restores its previous value on
+graceful removal only when no other writer changed the managed files.
+
+To roll back, drain active streaming workloads first. Operator-managed installs
+then set `spec.components.gantry.artifactStreaming.enabled` to `false`; the
+operator removes the configurator before rolling Gantry back without the range
+endpoint. Standalone installs first set `overlaybdConfig.enabled=false` while
+leaving `gantry.artifactStreaming.enabled=true`, wait for
+`DaemonSet/gantry-overlaybd-config` to be deleted, and only then disable the
+Gantry endpoint.
+
+### 5. Private Registry Authentication
 
 #### Requester-Delegated Authentication
 
@@ -288,7 +367,7 @@ file causes the pod to fail, so do not add `credentials_path` unless the Secret
 is present. Prefer requester-delegated authentication when possible because it
 avoids distributing a shared registry credential to every node.
 
-### 5. Verify Distribution
+### 6. Verify Distribution
 
 First verify one agent directly. Select a pod and forward its health and
 metrics listener:

@@ -1,0 +1,124 @@
+{{- if or .Values.overlaybdConfig.enabled .Values.overlaybdConfig.renderOnly }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gantry-overlaybd-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gantry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: overlaybd-config
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gantry
+      app.kubernetes.io/component: overlaybd-config
+  # The snapshotter owns live NBD devices. Replace pods only on drained nodes.
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        {{- include "gantry.labels" . | nindent 8 }}
+        app.kubernetes.io/component: overlaybd-config
+      annotations:
+        gantry.unbounded-cloud.io/overlaybd-address: {{ .Values.overlaybdConfig.address | quote }}
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: gantry-low
+      nodeSelector:
+        {{- toYaml .Values.overlaybdConfig.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.overlaybdConfig.tolerations | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: snapshotter
+          image: {{ include "gantry.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - snapshotter
+            - --root={{ .Values.overlaybdConfig.snapshotterRoot }}
+            - --address={{ .Values.overlaybdConfig.address }}
+            - --gantry-endpoint={{ .Values.overlaybdConfig.gantryEndpoint }}
+            - --nbd-devices={{ .Values.overlaybdConfig.nbdDeviceGlob }}
+            - --fallback-snapshotter={{ .Values.overlaybdConfig.fallbackSnapshotter }}
+          resources:
+            {{- toYaml .Values.resources.overlaybdSnapshotter | nindent 12 }}
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            exec:
+              command: ["test", "-S", {{ .Values.overlaybdConfig.address | quote }}]
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          volumeMounts:
+            - name: snapshotter-state
+              mountPath: {{ .Values.overlaybdConfig.snapshotterRoot }}
+              mountPropagation: Bidirectional
+            - name: snapshotter-run
+              mountPath: /run/gantry-overlaybd
+            - name: host-dev
+              mountPath: /dev
+        - name: configure
+          image: {{ include "gantry.overlaybdConfigImage" . }}
+          imagePullPolicy: {{ .Values.overlaybdConfig.image.pullPolicy }}
+          env:
+            - name: GANTRY_SNAPSHOTTER_ADDRESS
+              value: {{ .Values.overlaybdConfig.address | quote }}
+            - name: GANTRY_STREAMING_READYZ
+              value: {{ printf "%s/artifact-streaming/readyz" (trimSuffix "/blobs" .Values.overlaybdConfig.gantryEndpoint) | quote }}
+            - name: GANTRY_NBD_MAX_DEVICES
+              value: {{ .Values.overlaybdConfig.nbdMaxDevices | quote }}
+            - name: GANTRY_NBD_MIN_DEVICES
+              value: {{ .Values.overlaybdConfig.nbdMinDevices | quote }}
+          resources:
+            {{- toYaml .Values.resources.overlaybdConfig | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/usr/local/bin/configure-overlaybd.sh", "restore"]
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/run/gantry-overlaybd/configured"]
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+            - name: snapshotter-run
+              mountPath: /run/gantry-overlaybd
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: snapshotter-state
+          hostPath:
+            path: {{ .Values.overlaybdConfig.snapshotterRoot }}
+            type: DirectoryOrCreate
+        - name: snapshotter-run
+          hostPath:
+            path: /run/gantry-overlaybd
+            type: DirectoryOrCreate
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+{{- end }}
