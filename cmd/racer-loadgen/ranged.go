@@ -35,6 +35,9 @@ type rangedBody struct {
 	retryDelay time.Duration
 	resumes    atomic.Int64
 	onResume   func()
+	// rotate shifts which range each reader starts with, so many nodes
+	// reading the same object do not all request the same pages at once.
+	rotate int64
 }
 
 func (b *rangedBody) Read([]byte) (int, error) {
@@ -63,11 +66,14 @@ func (b *rangedBody) WriteTo(w io.Writer) (int64, error) {
 
 	for range max(1, b.parallel) {
 		wg.Go(func() {
+			ranges := (b.size + b.rangeBytes - 1) / b.rangeBytes
 			for {
-				start := next.Add(b.rangeBytes) - b.rangeBytes
-				if start >= b.size || ctx.Err() != nil {
+				index := next.Add(1) - 1
+				if index >= ranges || ctx.Err() != nil {
 					return
 				}
+
+				start := ((index + b.rotate) % ranges) * b.rangeBytes
 
 				end := min(start+b.rangeBytes, b.size)
 				if err := b.copyRange(ctx, w, start, end, &total); err != nil {
