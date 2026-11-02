@@ -31,11 +31,11 @@ import (
 const machinaCRDDir = "../../../deploy/machina/crd"
 
 // crdValidator validates custom resources in process against a generated CRD
-// the same way the API server does: CRD validation, structural pruning and
-// defaulting, OpenAPI schema validation, list-type validation, and CEL rules
-// including transition rules, with validation ratcheting on update.
+// the same way the API server does: CRD validation, structural pruning, null
+// pruning and defaulting, OpenAPI schema validation, list-type validation,
+// and CEL rules including transition rules, with validation ratcheting on
+// update.
 type crdValidator struct {
-	crd             *apiextensions.CustomResourceDefinition
 	structural      *structuralschema.Structural
 	schemaValidator apiservervalidation.SchemaValidator
 	celValidator    *cel.Validator
@@ -106,17 +106,17 @@ func newCRDValidator(t *testing.T, file string) *crdValidator {
 	}
 
 	return &crdValidator{
-		crd:             crd,
 		structural:      structural,
 		schemaValidator: schemaValidator,
 		celValidator:    cel.NewValidator(structural, true, celconfig.PerCallLimit),
 	}
 }
 
-// admit prunes and defaults obj in place, as the API server does when it
-// decodes a request body.
+// admit prunes unknown fields and non-nullable nulls, then defaults obj in
+// place, as the API server does when it decodes a request body.
 func (v *crdValidator) admit(obj map[string]any) {
 	structuralpruning.Prune(obj, v.structural, true)
+	structuraldefaulting.PruneNonNullableNullsWithoutDefaults(obj, v.structural)
 	structuraldefaulting.Default(obj, v.structural)
 }
 

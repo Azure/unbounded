@@ -103,6 +103,24 @@ func TestCapacityCRDs(t *testing.T) {
 		}
 	})
 
+	// The status write-once rules must sit on the root: a rule on the status
+	// node is skipped when an update drops the whole status.
+	t.Run("allocation status write-once rules on root", func(t *testing.T) {
+		t.Parallel()
+
+		crd, _ := loadCRD(t, "unbounded-cloud.io_machineallocations.yaml")
+
+		root := *crd.Spec.Versions[0].Schema.OpenAPIV3Schema
+		assertSchemaValidations(t, root, map[string]string{
+			"!has(oldSelf.status) || !has(oldSelf.status.snapshot) || (has(self.status) && has(self.status.snapshot))":                                                            "snapshot cannot be removed",
+			"!has(oldSelf.status) || !has(oldSelf.status.providerID) || (has(self.status) && has(self.status.providerID) && self.status.providerID == oldSelf.status.providerID)": "providerID is immutable once set",
+		})
+
+		if status := root.Properties["status"]; len(status.XValidations) > 0 {
+			t.Errorf("status has validation rules %v, want them on the root", status.XValidations)
+		}
+	})
+
 	t.Run("class providerConfigRef shape", func(t *testing.T) {
 		t.Parallel()
 

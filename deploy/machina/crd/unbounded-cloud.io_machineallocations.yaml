@@ -699,7 +699,8 @@ spec:
                   hostProviderID:
                     description: |-
                       HostProviderID is the provider-specific host ID planned before the
-                      host exists. It becomes the Machine's host.external.providerID.
+                      host exists. It is intended to become the Machine's
+                      host.external.providerID.
                     minLength: 1
                     type: string
                   offering:
@@ -874,15 +875,18 @@ spec:
                 description: Zone is the launched zone.
                 type: string
             type: object
-            x-kubernetes-validations:
-            - message: snapshot cannot be removed
-              rule: '!has(oldSelf.snapshot) || has(self.snapshot)'
-            - message: providerID is immutable once set
-              rule: '!has(oldSelf.providerID) || (has(self.providerID) && self.providerID
-                == oldSelf.providerID)'
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - fieldPath: .status.snapshot
+          message: snapshot cannot be removed
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.snapshot) || (has(self.status)
+            && has(self.status.snapshot))'
+        - fieldPath: .status.providerID
+          message: providerID is immutable once set
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.providerID) || (has(self.status)
+            && has(self.status.providerID) && self.status.providerID == oldSelf.status.providerID)'
     served: true
     storage: true
     subresources:

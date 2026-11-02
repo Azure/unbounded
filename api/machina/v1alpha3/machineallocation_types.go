@@ -51,6 +51,10 @@ const (
 // +kubebuilder:printcolumn:name="Allocated",type="string",JSONPath=".status.conditions[?(@.type=='Allocated')].status"
 // +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".status.nodeRef.name"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// The status write-once rules sit on the root, not on status, because a rule on
+// the status node is skipped when an update drops the whole status.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.snapshot) || (has(self.status) && has(self.status.snapshot))",message="snapshot cannot be removed",fieldPath=".status.snapshot"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.providerID) || (has(self.status) && has(self.status.providerID) && self.status.providerID == oldSelf.status.providerID)",message="providerID is immutable once set",fieldPath=".status.providerID"
 
 // MachineAllocation is one consumer-owned request for one machine from a
 // MachineClass. Its UID owns every remote effect made on its behalf.
@@ -266,8 +270,6 @@ const (
 )
 
 // MachineAllocationStatus reports the observed allocation state.
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.snapshot) || has(self.snapshot)",message="snapshot cannot be removed"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.providerID) || (has(self.providerID) && self.providerID == oldSelf.providerID)",message="providerID is immutable once set"
 type MachineAllocationStatus struct {
 	// ObservedGeneration is the allocation generation last reconciled.
 	// +optional
@@ -427,7 +429,8 @@ type MachineAllocationSnapshot struct {
 	HostImage string `json:"hostImage"`
 
 	// HostProviderID is the provider-specific host ID planned before the
-	// host exists. It becomes the Machine's host.external.providerID.
+	// host exists. It is intended to become the Machine's
+	// host.external.providerID.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	HostProviderID string `json:"hostProviderID"`
