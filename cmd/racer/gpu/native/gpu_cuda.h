@@ -126,6 +126,19 @@ int racer_gpu_copy_h2d(void *stream, void *dst, uint64_t offset, const void *src
 /* Queue a device copy. `src` must be a staging buffer. */
 int racer_gpu_copy_d2d(void *stream, void *dst, uint64_t dst_offset, void *src, uint64_t src_offset,
                        uint64_t length);
+/* Let `dst` read memory owned by `src` (cuCtxEnablePeerAccess). Sets
+ * *access to 1 when `dst` can now read `src` staging memory and 0 when the
+ * pair has no peer path, which is not an error. The same context, or two
+ * contexts on one device, report 1. Ordinals must be below
+ * RACER_GPU_MAX_PEER_ORDINAL. */
+#define RACER_GPU_MAX_PEER_ORDINAL 256
+int racer_gpu_peer(void *dst, void *src, int *access);
+/* Queue a device copy from a staging buffer on another context, which the
+ * stream's context must have enabled with racer_gpu_peer. `dst` must be on
+ * the stream's context, as for racer_gpu_copy_d2d. Use racer_gpu_copy_d2d
+ * when both are on the stream's context; this returns RACER_GPU_EDEVICE. */
+int racer_gpu_copy_peer(void *stream, void *dst, uint64_t dst_offset, void *src, uint64_t src_offset,
+                        uint64_t length);
 /* Copy staging bytes to the host and wait. Imports are never read. */
 int racer_gpu_copy_d2h(void *stream, void *dst, void *src, uint64_t src_offset, uint64_t length);
 

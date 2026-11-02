@@ -306,13 +306,9 @@ fn gpu_mode_resolves_against_hardware() {
     // Without the cuda feature, auto never loads a backend.
     if !cfg!(feature = "cuda") {
         assert!(
-            GpuHelper::start(
-                GpuMode::Auto,
-                crate::config::DEFAULT_GPU_STAGING_BYTES,
-                false
-            )
-            .unwrap()
-            .is_none()
+            GpuHelper::start(GpuMode::Auto, crate::gpu::GpuOptions::default())
+                .unwrap()
+                .is_none()
         );
     }
 }
@@ -555,6 +551,50 @@ fn gpu_read_disk_pages_go_through_cufile_and_gpu_decrypt() {
     assert_eq!(counter(&helper.counters().decrypted), 3);
     assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskRead), 3);
     assert!(worker(&fixture).metric(Event::GpuDirectDiskReadBytes) >= length as u64);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+#[test]
+/// Two concurrent `gpu-read`s on two GPUs that can copy from each other
+/// read each disk page once with cuFile. The second GPU copies the staged
+/// ciphertext from the first and decrypts it itself.
+fn concurrent_gpu_reads_on_peer_gpus_share_cufile_reads() {
+    let length = 2 * PAGE_BYTES as usize + 4099;
+    let helper = start(GpuMode::Required, 2).unwrap();
+    let data = body(length);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 3, length as u64, false, true);
+    let reads = worker(&fixture).metric(Event::GpuDirectDiskRead);
+    let mark = trace_len(&helper);
+    let size = (length as u64 + 64).next_multiple_of(GRANULE);
+    let allocations = [allocate(&helper, 0, size), allocate(&helper, 1, size)];
+    let request = direct_request("gpu-read", &fields("", 64, length as u64, size));
+    let mut sockets: Vec<_> = allocations
+        .iter()
+        .map(|allocation| {
+            let socket = fixture.connect();
+            send_with_fds(&socket, &request, &[allocation.as_raw_fd()]);
+            socket
+        })
+        .collect();
+    for (socket, allocation) in sockets.iter_mut().zip(&allocations) {
+        let output = fixture.receive(socket, true);
+        let (head, body) = split(&output);
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert_eq!(frames(body).len(), 4);
+        assert!(read_allocation(allocation, 64, length) == data);
+    }
+    settle(&fixture);
+    // One cuFile read per page; the other read joined each one.
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskRead) - reads, 3);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 3);
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectJoined), 3);
+    assert_eq!(counter(&helper.counters().joined), 3);
+    assert_eq!(counter(&helper.counters().peer_copies), 3);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 6);
+    assert_eq!(calls(&helper, mark, Operation::CopyH2d), 0);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    drop(allocations);
     assert_idle(&fixture, &helper, default_slots());
 }
 

@@ -418,6 +418,22 @@ impl Context {
         self.0.shared.leaks.get()
     }
 
+    /// Enable peer access so streams on this context can copy from `src`'s
+    /// staging memory with [`Stream::copy_from_peer`]. Returns `false` when
+    /// the two GPUs have no peer path (no NVLink or PCIe P2P), which is not
+    /// an error. Returns `true` for the same GPU. Idempotent.
+    pub fn enable_peer(&self, src: &Context) -> Result<bool> {
+        if !Rc::ptr_eq(&self.0.shared, &src.0.shared) {
+            return Err(Error::InvalidRequest);
+        }
+        let shared = &self.0.shared;
+        let mut access: c_int = 0;
+        shared.check(unsafe {
+            (shared.api.peer)(self.0.raw.as_ptr(), src.0.raw.as_ptr(), &mut access)
+        })?;
+        Ok(access != 0)
+    }
+
     /// Create a non-blocking stream.
     pub fn stream(&self) -> Result<Stream> {
         let shared = &self.0.shared;
@@ -802,25 +818,82 @@ impl Stream {
         self.shared().check(rc)
     }
 
+    /// Queue a device copy from staging memory on another GPU, over NVLink or
+    /// PCIe P2P. `dst` is on this stream's context, as for
+    /// [`Stream::copy_from_staging`]; `src` is on a context this one has
+    /// enabled with [`Context::enable_peer`]. Fails with
+    /// [`Error::WrongDevice`] if `src` is on this stream's context (use
+    /// `copy_from_staging`) or peer access is not enabled. Both buffers are
+    /// held until [`Stream::synchronize`].
+    pub fn copy_from_peer(
+        &self,
+        dst: Destination<'_>,
+        dst_offset: u64,
+        src: &StagingBuffer,
+        src_offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        if length == 0 {
+            return Err(Error::InvalidRange);
+        }
+        let inner = &src.0;
+        if Rc::ptr_eq(&inner.context.0, &self.context.0)
+            || !Rc::ptr_eq(&inner.context.0.shared, self.shared())
+        {
+            return Err(Error::WrongDevice);
+        }
+        let end = src_offset.checked_add(length).ok_or(Error::InvalidRange)?;
+        if end > inner.size {
+            return Err(Error::InvalidRange);
+        }
+        let (raw_dst, dst_hold) = self.destination(dst, dst_offset, length)?;
+        inner.in_flight.set(inner.in_flight.get() + 1);
+        let src_hold = Retained::Staging(inner.clone());
+        let rc = unsafe {
+            (self.shared().api.copy_peer)(
+                self.raw.as_ptr(),
+                raw_dst,
+                dst_offset,
+                inner.raw.as_ptr(),
+                src_offset,
+                length,
+            )
+        };
+        self.retain([dst_hold, src_hold]);
+        self.shared().check(rc)
+    }
+
     /// Copy staging bytes to the host and wait for this stream. Client
     /// imports can never be read.
+    ///
+    /// The copy lands in a host buffer the stream owns, and `out` is filled
+    /// only after the copy completes. If the call fails, the copy may still
+    /// be queued, so the stream keeps that buffer until a later successful
+    /// [`Stream::synchronize`] or leaks it if the stream is dropped first.
     pub fn read_staging(&self, src: &StagingBuffer, offset: u64, out: &mut [u8]) -> Result<()> {
         if out.is_empty() {
             return Err(Error::InvalidRange);
         }
         let (raw, hold) = self.source(src, offset, out.len() as u64)?;
+        let mut landing = vec![0u8; out.len()].into_boxed_slice();
+        let ptr = landing.as_mut_ptr();
         let rc = unsafe {
             (self.shared().api.copy_d2h)(
                 self.raw.as_ptr(),
-                out.as_mut_ptr().cast(),
+                ptr.cast(),
                 raw,
                 offset,
                 out.len() as u64,
             )
         };
         self.retain([hold]);
-        self.shared().check(rc)?;
-        // copy_d2h synchronized the stream.
+        if rc != 0 {
+            // The copy may still be queued and write the buffer later.
+            self.retain([Retained::Host(Box::new(landing))]);
+            return self.shared().check(rc);
+        }
+        // copy_d2h synchronized the stream, so the landing buffer is final.
+        out.copy_from_slice(&landing);
         self.retained.borrow_mut().clear();
         Ok(())
     }

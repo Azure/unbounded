@@ -35,6 +35,7 @@ typedef struct CUfunc_st *CUfunction;
 typedef struct { char bytes[16]; } CUuuid;
 
 #define CUDA_SUCCESS 0
+#define CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED 704
 
 /* CUdevice_attribute */
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_MODE 20
@@ -123,6 +124,12 @@ _Static_assert(sizeof(CUmemAccessDesc) == 12, "CUmemAccessDesc layout");
       (CUdeviceptr dst, const void *src, size_t n, CUstream stream)) \
     X(cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2", CUresult, \
       (CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream stream)) \
+    X(cuMemcpyPeerAsync, "cuMemcpyPeerAsync", CUresult, \
+      (CUdeviceptr dst, CUcontext dst_ctx, CUdeviceptr src, CUcontext src_ctx, size_t n, \
+       CUstream stream)) \
+    X(cuDeviceCanAccessPeer, "cuDeviceCanAccessPeer", CUresult, \
+      (int *can, CUdevice dev, CUdevice peer)) \
+    X(cuCtxEnablePeerAccess, "cuCtxEnablePeerAccess", CUresult, (CUcontext peer, unsigned int flags)) \
     X(cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2", CUresult, \
       (void *dst, CUdeviceptr src, size_t n, CUstream stream)) \
     X(cuMemsetD8Async, "cuMemsetD8Async", CUresult, \

@@ -34,6 +34,10 @@ data:
   # (GPUDirect RDMA), in bytes: a multiple of 2 MiB, default 256 MiB. 0 turns
   # it off. Used only when both GPU reads and RDMA are on.
   # RACER_GPU_LANDING_BYTES: "268435456"
+  # GPU-to-GPU copies of encrypted pages over NVLink or PCIe peer-to-peer:
+  # auto (default) uses them where the driver allows; off moves such pages
+  # through host memory instead.
+  # RACER_GPU_PEER: "auto"
   # No thread cap by default: eligible physical cores, CPU quota, and resource budgets apply.
   # I/O shards share NUMA-local crypto threads at approximately 2:1, using leftovers:
   # without an explicit cap, eight eligible cores on one NUMA node give five I/O
