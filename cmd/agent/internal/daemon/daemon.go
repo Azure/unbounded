@@ -139,7 +139,8 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return fmt.Errorf("find active machine: %w", err)
 	}
 
-	log.Info("daemon starting",
+	log.Info(
+		"daemon starting",
 		"machine_cr", active.Config.MachineName,
 		"nspawn_machine", active.Name,
 		"applied_version", active.Config.Cluster.Version,
@@ -156,7 +157,8 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return fmt.Errorf("build kube client: %w", err)
 	}
 
-	log.Info("daemon controller kube client ready",
+	log.Info(
+		"daemon controller kube client ready",
 		"api_server", active.Config.Kubelet.ApiServer,
 	)
 
@@ -171,8 +173,8 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	if err := publishHostOSReboots(ctx, log, kubeClient, active.Config.MachineName, runOpts.NodeOperator.BootID); err != nil {
-		log.Warn("failed to report HostOSReboot operations", "error", err)
+	if err := publishHostSoftReboots(ctx, log, kubeClient, active.Config.MachineName, runOpts.NodeOperator.BootID); err != nil {
+		log.Warn("failed to report HostSoftReboot operations", "error", err)
 	}
 
 	// After the upgrade is reported, so a move never runs before this binary
@@ -225,7 +227,8 @@ func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installsta
 			// A bootstrap is holding ownership for longer than a normal handoff.
 			// It starts the daemon again when it finishes, so waiting longer
 			// buys nothing and exiting as a failure would look like a crash.
-			log.Warn("bootstrap still holds installation ownership; daemon is standing down until it completes",
+			log.Warn(
+				"bootstrap still holds installation ownership; daemon is standing down until it completes",
 				"waited", installationLockWaitTimeout,
 			)
 
@@ -319,7 +322,8 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 
 	var machine v1alpha3.Machine
 	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err == nil {
-		log.Info("Machine CR already exists, skipping registration",
+		log.Info(
+			"Machine CR already exists, skipping registration",
 			slog.String("machine", machineName),
 			slog.String("machineID", string(machine.UID)),
 		)
@@ -342,7 +346,8 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		return fmt.Errorf("create Machine CR %q: %w", machineName, err)
 	}
 
-	log.Info("Machine CR created",
+	log.Info(
+		"Machine CR created",
 		slog.String("machine", machineName),
 		slog.String("machineID", string(machine.UID)),
 	)

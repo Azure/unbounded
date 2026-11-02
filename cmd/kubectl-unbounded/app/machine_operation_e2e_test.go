@@ -33,7 +33,7 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "wait-complete"},
 		Spec: v1alpha3.MachineOperationSpec{
 			MachineRef:    "worker-01",
-			OperationKind: v1alpha3.OperationHostOutOfBandReboot,
+			OperationKind: v1alpha3.OperationHostHardReboot,
 		},
 		Status: v1alpha3.MachineOperationStatus{
 			Phase: v1alpha3.OperationPhaseComplete,
@@ -84,15 +84,15 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 
 	out, err = executeKubectlUnboundedMachineCommand(
 		ctx, rt,
-		"machine", "host-out-of-band-reboot", "worker-01",
-		"--operation-name", "worker-01-host-out-of-band-reboot",
+		"machine", "host-hard-reboot", "worker-01",
+		"--operation-name", "worker-01-host-hard-reboot",
 		"--wait=false",
 	)
 	require.NoError(t, err)
-	require.Equal(t, "machineoperations/worker-01-host-out-of-band-reboot created\n", out)
-	assertMachineOperation(t, ctx, c, "worker-01-host-out-of-band-reboot", func(op v1alpha3.MachineOperation) {
+	require.Equal(t, "machineoperations/worker-01-host-hard-reboot created\n", out)
+	assertMachineOperation(t, ctx, c, "worker-01-host-hard-reboot", func(op v1alpha3.MachineOperation) {
 		require.Equal(t, "worker-01", op.Spec.MachineRef)
-		require.Equal(t, v1alpha3.OperationHostOutOfBandReboot, op.Spec.OperationKind)
+		require.Equal(t, v1alpha3.OperationHostHardReboot, op.Spec.OperationKind)
 		require.NotNil(t, op.Spec.TTLSecondsAfterFinished)
 		require.Equal(t, int32(defaultTTLSeconds), *op.Spec.TTLSecondsAfterFinished)
 		require.Len(t, op.OwnerReferences, 1)
@@ -102,39 +102,27 @@ func TestMachineOperationCommandsEndToEnd(t *testing.T) {
 
 	out, err = executeKubectlUnboundedMachineCommand(
 		ctx, rt,
-		"machine", "host-oob-reboot", "worker-01",
-		"--operation-name", "worker-01-host-oob-reboot",
-		"--wait=false",
-	)
-	require.NoError(t, err)
-	require.Equal(t, "machineoperations/worker-01-host-oob-reboot created\n", out)
-	assertMachineOperation(t, ctx, c, "worker-01-host-oob-reboot", func(op v1alpha3.MachineOperation) {
-		require.Equal(t, v1alpha3.OperationHostOutOfBandReboot, op.Spec.OperationKind)
-	})
-
-	out, err = executeKubectlUnboundedMachineCommand(
-		ctx, rt,
-		"machine", "operation", "create", "oob-reboot-worker-01",
-		"--kind", string(v1alpha3.OperationHostOOBReboot),
+		"machine", "operation", "create", "hard-reboot-worker-01",
+		"--kind", string(v1alpha3.OperationHostHardReboot),
 		"--machine", "worker-01",
 	)
 	require.NoError(t, err)
-	require.Equal(t, "machineoperations/oob-reboot-worker-01 created\n", out)
-	assertMachineOperation(t, ctx, c, "oob-reboot-worker-01", func(op v1alpha3.MachineOperation) {
-		require.Equal(t, v1alpha3.OperationHostOOBReboot, op.Spec.OperationKind)
+	require.Equal(t, "machineoperations/hard-reboot-worker-01 created\n", out)
+	assertMachineOperation(t, ctx, c, "hard-reboot-worker-01", func(op v1alpha3.MachineOperation) {
+		require.Equal(t, v1alpha3.OperationHostHardReboot, op.Spec.OperationKind)
 	})
 
 	out, err = executeKubectlUnboundedMachineCommand(
 		ctx, rt,
-		"machine", "host-os-reboot", "worker-01",
-		"--operation-name", "worker-01-host-os-reboot",
+		"machine", "host-soft-reboot", "worker-01",
+		"--operation-name", "worker-01-host-soft-reboot",
 		"--wait=false",
 	)
 	require.NoError(t, err)
-	require.Equal(t, "machineoperations/worker-01-host-os-reboot created\n", out)
-	assertMachineOperation(t, ctx, c, "worker-01-host-os-reboot", func(op v1alpha3.MachineOperation) {
+	require.Equal(t, "machineoperations/worker-01-host-soft-reboot created\n", out)
+	assertMachineOperation(t, ctx, c, "worker-01-host-soft-reboot", func(op v1alpha3.MachineOperation) {
 		require.Equal(t, "worker-01", op.Spec.MachineRef)
-		require.Equal(t, v1alpha3.OperationHostOSReboot, op.Spec.OperationKind)
+		require.Equal(t, v1alpha3.OperationHostSoftReboot, op.Spec.OperationKind)
 	})
 
 	out, err = executeKubectlUnboundedMachineCommand(

@@ -30,7 +30,7 @@ func TestBuildMachineOperationWithMachineRef(t *testing.T) {
 
 	opts := &machineOperationCreateOptions{
 		name:       "reboot-worker-01",
-		kind:       v1alpha3.OperationHostOutOfBandReboot,
+		kind:       v1alpha3.OperationHostHardReboot,
 		machine:    "worker-01",
 		ttlSeconds: 3600,
 		output:     operationOutputName,
@@ -44,7 +44,7 @@ func TestBuildMachineOperationWithMachineRef(t *testing.T) {
 	require.Equal(t, "reboot-worker-01", op.Name)
 	require.Equal(t, "worker-01", op.Spec.MachineRef)
 	require.Nil(t, op.Spec.MachineSelector)
-	require.Equal(t, v1alpha3.OperationHostOutOfBandReboot, op.Spec.OperationKind)
+	require.Equal(t, v1alpha3.OperationHostHardReboot, op.Spec.OperationKind)
 	require.NotNil(t, op.Spec.TTLSecondsAfterFinished)
 	require.Equal(t, int32(3600), *op.Spec.TTLSecondsAfterFinished)
 }
@@ -147,7 +147,7 @@ func TestValidateWaitRejectsStructuredOutput(t *testing.T) {
 
 			opts := &machineOperationCreateOptions{
 				name:    "reboot-worker-01",
-				kind:    v1alpha3.OperationHostOutOfBandReboot,
+				kind:    v1alpha3.OperationHostHardReboot,
 				machine: "worker-01",
 				wait:    true,
 				output:  output,
@@ -213,7 +213,7 @@ func TestMachineOperationCreateCommandRejectsNegativeTTLFlag(t *testing.T) {
 	out, err := executeMachineOperationCreateCommand(
 		t,
 		"reboot-worker-01",
-		"--kind", string(v1alpha3.OperationHostOutOfBandReboot),
+		"--kind", string(v1alpha3.OperationHostHardReboot),
 		"--machine", "worker-01",
 		"--ttl=-1",
 		"--dry-run=client",
@@ -222,6 +222,50 @@ func TestMachineOperationCreateCommandRejectsNegativeTTLFlag(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "--ttl must be 0 or greater")
 	require.Empty(t, out)
+}
+
+func TestMachineOperationCreateRejectsRemovedKinds(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []string{"HostOutOfBandReboot", "HostOOBReboot", "HostOSReboot"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+
+			require.False(t, isSupportedOperationKind(v1alpha3.OperationKind(kind)))
+
+			out, err := executeMachineOperationCreateCommand(
+				t,
+				"reboot-worker-01",
+				"--kind", kind,
+				"--machine", "worker-01",
+				"--dry-run=client",
+			)
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), `unsupported operation kind "`+kind+`"`)
+			require.Empty(t, out)
+		})
+	}
+}
+
+func TestMachineHostRebootCommandNames(t *testing.T) {
+	t.Parallel()
+
+	names := map[string]bool{}
+
+	for _, cmd := range newMachineCommandGroup(&machineCommandRuntime{}).Commands() {
+		names[cmd.Name()] = true
+		for _, alias := range cmd.Aliases {
+			names[alias] = true
+		}
+	}
+
+	require.True(t, names["host-hard-reboot"])
+	require.True(t, names["host-soft-reboot"])
+
+	for _, removed := range []string{"host-out-of-band-reboot", "host-oob-reboot", "host-os-reboot"} {
+		require.False(t, names[removed], removed)
+	}
 }
 
 func TestMachineOperationCreateSmokeCreatesMachineRefOperation(t *testing.T) {
@@ -310,10 +354,10 @@ func TestMachineOperationAliasSmokeCreatesOwnedOperation(t *testing.T) {
 	var out bytes.Buffer
 
 	createOptions := newMachineOperationAliasCreateOptions(machineOperationAliasOptions{
-		kind:              v1alpha3.OperationHostOutOfBandReboot,
-		operationNamePart: "host-out-of-band-reboot",
+		kind:              v1alpha3.OperationHostHardReboot,
+		operationNamePart: "host-hard-reboot",
 		machine:           "worker-01",
-		operationName:     "worker-01-host-out-of-band-reboot",
+		operationName:     "worker-01-host-hard-reboot",
 		ttlSeconds:        defaultTTLSeconds,
 		wait:              false,
 	}, &out, time.Date(2026, 7, 8, 15, 30, 12, 0, time.UTC))
@@ -324,12 +368,12 @@ func TestMachineOperationAliasSmokeCreatesOwnedOperation(t *testing.T) {
 	require.NoError(t, createOptions.runWithClient(ctx, c, op))
 
 	var got v1alpha3.MachineOperation
-	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: "worker-01-host-out-of-band-reboot"}, &got))
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: "worker-01-host-hard-reboot"}, &got))
 	require.Equal(t, "worker-01", got.Spec.MachineRef)
-	require.Equal(t, v1alpha3.OperationHostOutOfBandReboot, got.Spec.OperationKind)
+	require.Equal(t, v1alpha3.OperationHostHardReboot, got.Spec.OperationKind)
 	require.NotNil(t, got.Spec.TTLSecondsAfterFinished)
 	require.Equal(t, int32(defaultTTLSeconds), *got.Spec.TTLSecondsAfterFinished)
-	require.Equal(t, "machineoperations/worker-01-host-out-of-band-reboot created\n", out.String())
+	require.Equal(t, "machineoperations/worker-01-host-hard-reboot created\n", out.String())
 	require.Len(t, got.OwnerReferences, 1)
 	require.Equal(t, "Machine", got.OwnerReferences[0].Kind)
 	require.Equal(t, "worker-01", got.OwnerReferences[0].Name)
@@ -341,8 +385,8 @@ func TestGenerateMachineOperationName(t *testing.T) {
 
 	now := time.Date(2026, 7, 8, 15, 30, 12, 0, time.UTC)
 
-	require.Equal(t, "worker-01-host-out-of-band-reboot-20260708-153012",
-		generateMachineOperationName("worker-01", "host-out-of-band-reboot", now))
+	require.Equal(t, "worker-01-host-hard-reboot-20260708-153012",
+		generateMachineOperationName("worker-01", "host-hard-reboot", now))
 }
 
 func TestConfirmAgentReset(t *testing.T) {

@@ -29,8 +29,8 @@ func init() {
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
 // processed by the appropriate agent. The in-VM agent handles operations
-// like NodeReboot and HostOSReboot, while cloud or PXE controllers handle
-// operations like HostOutOfBandReboot, HostPowerOff, and HostPowerOn.
+// like NodeReboot and HostSoftReboot, while cloud or PXE controllers handle
+// operations like HostHardReboot, HostPowerOff, and HostPowerOn.
 type MachineOperation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -51,7 +51,7 @@ type MachineOperationList struct {
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be
 // supported by individual cloud controllers.
-// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostOutOfBandReboot;HostOOBReboot;HostOSReboot;HostPowerOff;HostPowerOn;HostReplace
+// +kubebuilder:validation:Enum=NodeReboot;AgentUpgrade;AgentReset;HostHardReboot;HostSoftReboot;HostPowerOff;HostPowerOn;HostReplace
 type OperationKind string
 
 const (
@@ -69,19 +69,15 @@ const (
 	// all associated resources. Handled by the in-VM agent.
 	OperationAgentReset OperationKind = "AgentReset"
 
-	// OperationHostOutOfBandReboot triggers a full hardware power cycle of the host
+	// OperationHostHardReboot triggers a full hardware power cycle of the host
 	// via BMC (e.g. Redfish). Handled by the machina controller or cloud
 	// controller.
-	OperationHostOutOfBandReboot OperationKind = "HostOutOfBandReboot"
+	OperationHostHardReboot OperationKind = "HostHardReboot"
 
-	// OperationHostOOBReboot is an alias of OperationHostOutOfBandReboot.
-	// Controllers treat both kinds identically; see OperationKind.Canonical.
-	OperationHostOOBReboot OperationKind = "HostOOBReboot"
-
-	// OperationHostOSReboot reboots the host operating system from inside
+	// OperationHostSoftReboot reboots the host operating system from inside
 	// the host (systemctl reboot). Handled by the in-VM agent, which reports
 	// completion after it starts again on a new boot.
-	OperationHostOSReboot OperationKind = "HostOSReboot"
+	OperationHostSoftReboot OperationKind = "HostSoftReboot"
 
 	// OperationHostPowerOff powers off the host through an out-of-band provider.
 	OperationHostPowerOff OperationKind = "HostPowerOff"
@@ -93,17 +89,6 @@ const (
 	// and reinstalls the unbounded-agent so the node can rejoin the cluster.
 	OperationHostReplace OperationKind = "HostReplace"
 )
-
-// Canonical returns the canonical kind for k, resolving aliases such as
-// OperationHostOOBReboot to OperationHostOutOfBandReboot. Kinds without an
-// alias are returned unchanged.
-func (k OperationKind) Canonical() OperationKind {
-	if k == OperationHostOOBReboot {
-		return OperationHostOutOfBandReboot
-	}
-
-	return k
-}
 
 // OperationPhase represents the current phase of a MachineOperation.
 type OperationPhase string
@@ -337,7 +322,7 @@ type MachineOperationTargetStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// BootID is the host kernel boot ID the agent observed before it issued
-	// a HostOSReboot. The agent that starts after the reboot compares it with
+	// a HostSoftReboot. The agent that starts after the reboot compares it with
 	// the current boot ID to decide whether the reboot happened.
 	// +optional
 	BootID string `json:"bootID,omitempty"`
