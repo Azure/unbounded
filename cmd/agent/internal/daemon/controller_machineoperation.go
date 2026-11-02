@@ -36,6 +36,37 @@ type machineOperationTarget struct {
 	// restartRequested is set once this daemon has staged an AgentUpgrade and
 	// asked to be restarted for it; see reconcileAgentUpgrade.
 	restartRequested atomic.Bool
+	// rebootRequested is set once this daemon has issued a HostOSReboot;
+	// see reconcileHostOSReboot.
+	rebootRequested atomic.Bool
+}
+
+// handlers returns the MachineOperation handlers this daemon runs.
+func (t *machineOperationTarget) handlers() daemon.MachineOperationHandlers {
+	return daemon.MachineOperationHandlers{
+		v1alpha3.OperationNodeReboot:   t.unlessStopping(t.reconcileNodeReboot),
+		v1alpha3.OperationAgentUpgrade: t.unlessStopping(t.reconcileAgentUpgrade),
+		v1alpha3.OperationAgentReset:   t.unlessStopping(t.reconcileAgentReset),
+		v1alpha3.OperationHostOSReboot: t.unlessStopping(t.reconcileHostOSReboot),
+	}
+}
+
+// unlessStopping defers every operation once this daemon has issued a host
+// reboot or staged an agent restart. systemd stops the daemon shortly after
+// either, which would interrupt a handler partway through and could leave its
+// operation InProgress with nothing to report it. Deferred operations stay
+// Pending, and the next daemon picks them up when it starts watching.
+func (t *machineOperationTarget) unlessStopping(handler daemon.MachineOperationHandler[int64]) daemon.MachineOperationHandler[int64] {
+	return func(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {
+		if t.rebootRequested.Load() || t.restartRequested.Load() {
+			t.log.Info("deferring MachineOperation: this daemon is stopping for a host reboot or agent restart",
+				"operation", op.Name, "kind", op.Kind)
+
+			return ctrl.Result{}, nil
+		}
+
+		return handler(ctx, store, op)
+	}
 }
 
 func (t *machineOperationTarget) reconcileNodeReboot(ctx context.Context, store daemon.MachineOperationStore[int64], op daemon.MachineOperation) (ctrl.Result, error) {

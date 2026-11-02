@@ -227,6 +227,7 @@ mod tests {
             client_socket: c,
             origin_socket: o,
             priority: wire::DEFAULT_PRIORITY,
+            mode: wire::CacheMode::Cached,
         }
     }
 
@@ -262,6 +263,33 @@ mod tests {
         assert_eq!(p2.record.membership_version, p1.record.membership_version);
         assert_eq!(p2.record.membership_hash, p1.record.membership_hash);
         assert_eq!(p2.publication.caches[0].priority, 900);
+    }
+
+    #[test]
+    fn mode_change_republishes_without_membership_change() {
+        let mut record = prepare(&Record::default(), C, [member(1, 4)], vec![cache()])
+            .unwrap()
+            .record;
+        let mut hashes = vec![record.content_hash.clone()];
+        // Into each passthrough route, between them, and back to cached.
+        for mode in [
+            wire::CacheMode::PassthroughPeers,
+            wire::CacheMode::PassthroughLocal,
+            wire::CacheMode::Cached,
+        ] {
+            let mut edited = cache();
+            edited.mode = mode;
+            let next = prepare(&record, C, [member(1, 4)], vec![edited]).unwrap();
+            assert_eq!(next.record.sequence, record.sequence + 1);
+            assert_ne!(next.record.content_hash, record.content_hash);
+            assert_eq!(next.record.membership_version, record.membership_version);
+            assert_eq!(next.record.membership_hash, record.membership_hash);
+            assert_eq!(next.publication.caches[0].mode, mode);
+            hashes.push(next.record.content_hash.clone());
+            record = next.record;
+        }
+        // Returning to cached restores the original canonical content.
+        assert_eq!(hashes[0], hashes[3]);
     }
 
     #[test]

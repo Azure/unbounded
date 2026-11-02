@@ -221,33 +221,38 @@ func FinishMachineOperation(ctx context.Context, c client.Client, op MachineOper
 			return client.IgnoreNotFound(err)
 		}
 
-		now := metav1.Now()
-		if latest.Status.StartedAt == nil {
-			latest.Status.StartedAt = &now
-		}
-
-		latest.Status.Phase = result.Phase
-		latest.Status.Message = result.Message
-
-		latest.Status.CompletedAt = &now
-		if result.ObservedMachineGeneration > 0 {
-			latest.Status.ObservedMachineGeneration = result.ObservedMachineGeneration
-		}
-
-		conditionStatus := metav1.ConditionTrue
-		if result.Phase == machinav1alpha3.OperationPhaseFailed {
-			conditionStatus = metav1.ConditionFalse
-		}
-
-		apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:               "Completed",
-			Status:             conditionStatus,
-			Reason:             result.Reason,
-			Message:            result.Message,
-			ObservedGeneration: latest.Generation,
-		})
+		SetMachineOperationResult(&latest, result, metav1.Now())
 
 		return c.Status().Update(ctx, &latest)
+	})
+}
+
+// SetMachineOperationResult applies result to the status of op, as
+// FinishMachineOperation does, without writing it.
+func SetMachineOperationResult(op *machinav1alpha3.MachineOperation, result MachineOperationResult[int64], now metav1.Time) {
+	if op.Status.StartedAt == nil {
+		op.Status.StartedAt = &now
+	}
+
+	op.Status.Phase = result.Phase
+	op.Status.Message = result.Message
+
+	op.Status.CompletedAt = &now
+	if result.ObservedMachineGeneration > 0 {
+		op.Status.ObservedMachineGeneration = result.ObservedMachineGeneration
+	}
+
+	conditionStatus := metav1.ConditionTrue
+	if result.Phase == machinav1alpha3.OperationPhaseFailed {
+		conditionStatus = metav1.ConditionFalse
+	}
+
+	apimeta.SetStatusCondition(&op.Status.Conditions, metav1.Condition{
+		Type:               "Completed",
+		Status:             conditionStatus,
+		Reason:             result.Reason,
+		Message:            result.Message,
+		ObservedGeneration: op.Generation,
 	})
 }
 

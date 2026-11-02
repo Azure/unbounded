@@ -367,7 +367,7 @@ func TestLongRunningOperationWaitsForOlderConflictingOperation(t *testing.T) {
 	machine, older, credential := newResumableTestObjects("machine-1", "op-a")
 	older.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-time.Minute))
 	older.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
-	newer := newMachineOperation("op-b", machine.Name, unboundedv1alpha3.OperationHostReboot)
+	newer := newMachineOperation("op-b", machine.Name, unboundedv1alpha3.OperationHostOutOfBandReboot)
 	newer.CreationTimestamp = fixedOperationNow()
 	provider := &recordingLongRunningProvider{}
 	c := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(machine, older, newer, credential).WithStatusSubresource(older, newer).Build()
@@ -394,11 +394,11 @@ func TestMixedOperationStrategiesSerializeConflicts(t *testing.T) {
 		{
 			name:      "long-running waits for immediate",
 			olderKind: unboundedv1alpha3.OperationHostPowerOn,
-			newerKind: unboundedv1alpha3.OperationHostReboot,
+			newerKind: unboundedv1alpha3.OperationHostOutOfBandReboot,
 		},
 		{
 			name:      "immediate waits for long-running",
-			olderKind: unboundedv1alpha3.OperationHostReboot,
+			olderKind: unboundedv1alpha3.OperationHostOutOfBandReboot,
 			newerKind: unboundedv1alpha3.OperationHostPowerOn,
 		},
 	}
@@ -429,7 +429,7 @@ func TestMixedOperationStrategiesSerializeConflicts(t *testing.T) {
 					},
 				),
 				publicmachineops.WithLongRunningOperation(
-					unboundedv1alpha3.OperationHostReboot,
+					unboundedv1alpha3.OperationHostOutOfBandReboot,
 					longRunning.Begin,
 					longRunning.Poll,
 				),
@@ -462,7 +462,7 @@ func TestImmediateConflictWaitPreservesUnknownInProgressOutcome(t *testing.T) {
 	t.Parallel()
 
 	machine, older, credential := newResumableTestObjects("machine-1", "op-a")
-	older.Spec.OperationKind = unboundedv1alpha3.OperationHostReboot
+	older.Spec.OperationKind = unboundedv1alpha3.OperationHostOutOfBandReboot
 	older.CreationTimestamp = metav1.NewTime(fixedOperationNow().Add(-time.Minute))
 	older.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	current := newMachineOperation("op-b", machine.Name, unboundedv1alpha3.OperationHostPowerOn)
@@ -482,7 +482,7 @@ func TestImmediateConflictWaitPreservesUnknownInProgressOutcome(t *testing.T) {
 			},
 		),
 		publicmachineops.WithLongRunningOperation(
-			unboundedv1alpha3.OperationHostReboot,
+			unboundedv1alpha3.OperationHostOutOfBandReboot,
 			longRunning.Begin,
 			longRunning.Poll,
 		),
@@ -639,7 +639,7 @@ func newResumableTestObjects(machineName, operationName string) (*unboundedv1alp
 	machine := newExternalMachine(machineName, testLongRunningProviderName)
 	machine.Spec.ProviderID = "test:///nodes/" + machineName
 	machine.Generation = 4
-	op := newMachineOperation(operationName, machineName, unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation(operationName, machineName, unboundedv1alpha3.OperationHostOutOfBandReboot)
 	op.UID = types.UID(operationName + "-uid")
 	credential := newWorkloadIdentityCredential("test-credential", "site-a", testLongRunningProviderName)
 
@@ -650,7 +650,7 @@ func newResumableTestReconciler(c client.Client, provider *recordingLongRunningP
 	registration, err := publicmachineops.NewProvider(
 		testLongRunningProviderName,
 		publicmachineops.WithLongRunningOperation(
-			unboundedv1alpha3.OperationHostReboot,
+			unboundedv1alpha3.OperationHostOutOfBandReboot,
 			provider.Begin,
 			provider.Poll,
 		),

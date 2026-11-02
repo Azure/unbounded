@@ -27,15 +27,17 @@ func machineSoftRebootCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "soft-reboot NAME",
-		Short: "Soft-reboot an agent-managed machine (restarts nspawn container in place)",
-		Long: `Soft-reboot restarts the nspawn machine on the target node without
-reprovisioning the rootfs. The kubelet and containerd services are
-stopped, the nspawn container is restarted, and services are brought
-back up.
+		Short: "Soft-reboot an agent-managed machine (reboots the host operating system)",
+		Long: `Soft-reboot reboots the host operating system from inside the host
+(systemctl reboot) through a HostOSReboot MachineOperation. No BMC or
+cloud provider access is required.
 
 This command creates a MachineOperation CR that the agent daemon watches.
-The agent processes the operation and updates the MachineOperation status
-to "Complete" or "Failed".`,
+The agent issues the reboot and, once it starts again on the new boot,
+updates the MachineOperation status to "Complete" or "Failed".
+
+To restart only the nspawn-backed node without rebooting the host, use
+"node-reboot".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()
@@ -56,9 +58,9 @@ to "Complete" or "Failed".`,
 }
 
 func runSoftReboot(ctx context.Context, c client.WithWatch, name string, ttlSeconds int32, out io.Writer) error {
-	opName := fmt.Sprintf("%s-reboot-%d", name, time.Now().Unix())
+	opName := fmt.Sprintf("%s-soft-reboot-%d", name, time.Now().Unix())
 
-	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationNodeReboot, ttlSeconds); err != nil {
+	if err := createMachineOperation(ctx, c, name, opName, v1alpha3.OperationHostOSReboot, ttlSeconds); err != nil {
 		return err
 	}
 

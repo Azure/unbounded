@@ -3366,6 +3366,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::SilencePingAnswered => "racer_silence_pings_answered_total",
             Self::SilencePeerSilent => "racer_silence_peers_silent_total",
             Self::GpuDirectJoined => "racer_gpu_direct_joined_total",
+            Self::PassthroughLocalOrigin => "racer_passthrough_local_origin_fills_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",

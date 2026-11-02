@@ -94,8 +94,8 @@ automatically. Adding operation kinds like `NodeReimage`, `NodeUpgrade`, or
 | Kubelet or containerd is stuck | `NodeReboot` | Restarts the nspawn container without replacing the rootfs. |
 | Need a new Kubernetes version | Cordon, drain, then delete the Node | Agent recreates with the desired MachineConfiguration. |
 | Node rootfs is corrupted | Cordon, drain, then delete the Node | Agent replaces the rootfs entirely. |
-| Host kernel or OS needs updating | `HostReboot` or `HostReplace` | Requires host-level action. See [Host Operations]({{< relref "guides/operations/host-operations" >}}). |
-| Host is unresponsive | `HostReboot` | Out-of-band reboot through provider or BMC. |
+| Host kernel or OS needs updating | `HostOSReboot` or `HostReplace` | Requires host-level action. See [Host Operations]({{< relref "guides/operations/host-operations" >}}). |
+| Host is unresponsive | `HostOutOfBandReboot` | Out-of-band reboot through provider or BMC. |
 
 ## See Also
 

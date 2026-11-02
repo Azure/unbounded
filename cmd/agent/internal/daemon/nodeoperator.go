@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -48,6 +49,11 @@ type nodeOperator interface {
 	ResetAgentResources(context.Context, *slog.Logger) error
 	// StopDaemon stops, disables, and removes the unbounded-agent-daemon unit.
 	StopDaemon(context.Context, *slog.Logger) error
+	// BootID returns the kernel boot ID of the current host boot.
+	BootID() (string, error)
+	// RebootHost asks systemd to reboot the host operating system. It returns
+	// once the reboot is queued; systemd then stops this daemon.
+	RebootHost(context.Context, *slog.Logger) error
 	// RepaveNode performs the nspawn machine update:
 	//  1. Provision a new rootfs on the alternate machine
 	//  2. Stop the old machine (graceful service shutdown + nspawn teardown)
@@ -243,6 +249,14 @@ func (nspawnNodeOperator) ResetAgentResources(ctx context.Context, log *slog.Log
 
 func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
 	return StopDaemon(log).Do(ctx)
+}
+
+func (nspawnNodeOperator) BootID() (string, error) {
+	return readBootID()
+}
+
+func (nspawnNodeOperator) RebootHost(ctx context.Context, log *slog.Logger) error {
+	return daemon.RebootHost(ctx, log)
 }
 
 func (nspawnNodeOperator) RepaveNode(

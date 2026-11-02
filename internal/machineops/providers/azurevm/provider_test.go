@@ -89,7 +89,7 @@ func TestProviderExecute(t *testing.T) {
 		operation unboundedv1alpha3.OperationKind
 		wantCalls []string
 	}{
-		{name: "hard reboot", operation: unboundedv1alpha3.OperationHostReboot, wantCalls: []string{"restart:rg/vm1"}},
+		{name: "out-of-band reboot", operation: unboundedv1alpha3.OperationHostOutOfBandReboot, wantCalls: []string{"restart:rg/vm1"}},
 		{name: "power off", operation: unboundedv1alpha3.OperationHostPowerOff, wantCalls: []string{"powerOff:rg/vm1"}},
 		{name: "power on", operation: unboundedv1alpha3.OperationHostPowerOn, wantCalls: []string{"start:rg/vm1"}},
 		{name: "replace", operation: unboundedv1alpha3.OperationHostReplace, wantCalls: []string{"replace:rg/vm1:cloud-init:"}},

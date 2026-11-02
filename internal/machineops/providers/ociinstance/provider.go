@@ -73,7 +73,7 @@ func (p *Provider) Name() string {
 func (p *Provider) Registration() (*publicmachineops.Provider, error) {
 	return publicmachineops.NewProvider(
 		p.Name(),
-		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostReboot, p.Execute),
+		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostOutOfBandReboot, p.Execute),
 		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOff, p.Execute),
 		publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostPowerOn, p.Execute),
 		publicmachineops.WithImmediateOperation(
@@ -182,7 +182,7 @@ func (p *Provider) client(auth *machineops.OperationAuth) (computeClient, error)
 
 func actionForOperation(operation unboundedv1alpha3.OperationKind) (string, error) {
 	switch operation {
-	case unboundedv1alpha3.OperationHostReboot:
+	case unboundedv1alpha3.OperationHostOutOfBandReboot:
 		return instanceActionReset, nil
 	case unboundedv1alpha3.OperationHostPowerOff:
 		return instanceActionStop, nil

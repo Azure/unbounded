@@ -138,7 +138,7 @@ the network.
 
 metalman supports day-2 host operations through `MachineOperation` resources:
 
-- **HostReboot** -- Restarts the machine through Redfish.
+- **HostOutOfBandReboot** -- Restarts the machine through Redfish.
 - **HostReplace** -- Sets the PXE or HTTP boot override, force-restarts the
   machine, writes the selected image, and waits for first-boot cloud-init and
   the Kubernetes Node object.

@@ -61,7 +61,7 @@ func newMachineOperationCreateCommand(rt *machineCommandRuntime) *cobra.Command 
 Machine selector. Use --wait to stream status until the operation reaches a
 terminal phase.`,
 		Example: `  kubectl unbounded machine operation create reboot-worker-01 \
-    --kind HostReboot --machine worker-01
+    --kind HostOutOfBandReboot --machine worker-01
 
   kubectl unbounded machine operation create reboot-gpu \
     --kind NodeReboot --selector role=gpu --wait
@@ -87,7 +87,7 @@ terminal phase.`,
 }
 
 func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreateOptions) {
-	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, HostReboot, HostPowerOff, HostPowerOn, or HostReplace")
+	cmd.Flags().StringVar((*string)(&o.kind), "kind", "", "Operation kind: NodeReboot, AgentUpgrade, AgentReset, HostOutOfBandReboot (alias HostOOBReboot), HostOSReboot, HostPowerOff, HostPowerOn, or HostReplace")
 	cmd.Flags().StringVar(&o.machine, "machine", "", "Target Machine name")
 	cmd.Flags().StringVarP(&o.selector, "selector", "l", "", "Machine label selector")
 	cmd.Flags().StringArrayVar(&o.parameterArgs, "param", nil, "Operation parameter as key=value (repeatable)")
@@ -105,7 +105,9 @@ func addMachineOperationCreateFlags(cmd *cobra.Command, o *machineOperationCreat
 			string(v1alpha3.OperationNodeReboot),
 			string(v1alpha3.OperationAgentUpgrade),
 			string(v1alpha3.OperationAgentReset),
-			string(v1alpha3.OperationHostReboot),
+			string(v1alpha3.OperationHostOutOfBandReboot),
+			string(v1alpha3.OperationHostOOBReboot),
+			string(v1alpha3.OperationHostOSReboot),
 			string(v1alpha3.OperationHostPowerOff),
 			string(v1alpha3.OperationHostPowerOn),
 			string(v1alpha3.OperationHostReplace),

@@ -27,7 +27,8 @@ remove the host-resident agent binary and its managed resources.
 |-----------|----------|-----------------------|-------------|
 | `HostPowerOff` | Host | `machine-ops-controller` / `metalman` | Power off the VM or physical host. |
 | `HostPowerOn` | Host | `machine-ops-controller` / `metalman` | Power on or start the VM or physical host. |
-| `HostReboot` | Host | `machine-ops-controller` / `metalman` | Reboot or power-cycle the host. |
+| `HostOutOfBandReboot` | Host | `machine-ops-controller` / `metalman` | Reboot or power-cycle the host out of band. Alias: `HostOOBReboot`. |
+| `HostOSReboot` | Host | `unbounded-agent` | Reboot the host OS from inside the host (`systemctl reboot`). |
 | `HostReplace` | Host | `machine-ops-controller` / `metalman` | Delete and recreate the VM or reimage the physical host. |
 | `NodeReboot` | Node | `unbounded-agent` | Restart the nspawn container without replacing the rootfs. |
 | `AgentUpgrade` | Agent | `unbounded-agent` | Replace the host agent binary using blue-green staging. |
@@ -36,7 +37,7 @@ remove the host-resident agent binary and its managed resources.
 ## Component Ownership
 
 `machine-ops-controller` owns cloud-provider host operations. It maps
-`HostPowerOff`, `HostPowerOn`, `HostReboot`, and `HostReplace` to provider APIs
+`HostPowerOff`, `HostPowerOn`, `HostOutOfBandReboot`, and `HostReplace` to provider APIs
 based on `Machine.spec.host.azure` or `Machine.spec.host.external`. Deprecated
 top-level provider fields remain readable for existing Machines.
 
@@ -62,7 +63,7 @@ metadata:
   name: reboot-worker-01
 spec:
   machineRef: worker-01
-  operationKind: HostReboot
+  operationKind: HostOutOfBandReboot
 ```
 
 ```bash
@@ -74,7 +75,7 @@ imperatively:
 
 ```bash
 kubectl unbounded machine operation create reboot-worker-01 \
-  --kind HostReboot \
+  --kind HostOutOfBandReboot \
   --machine worker-01
 ```
 
@@ -82,7 +83,8 @@ Convenience commands are also available for common single-machine operations:
 
 ```bash
 kubectl unbounded machine node-reboot worker-01
-kubectl unbounded machine host-reboot worker-01
+kubectl unbounded machine host-out-of-band-reboot worker-01   # alias: host-oob-reboot
+kubectl unbounded machine host-os-reboot worker-01
 kubectl unbounded machine power-off worker-01
 kubectl unbounded machine power-on worker-01
 kubectl unbounded machine agent-upgrade worker-01 --download-url https://example.com/agent.tar.gz
@@ -115,7 +117,7 @@ Example output:
 
 ```
 NAME                KIND          MACHINE      PHASE       AGE
-reboot-worker-01    HostReboot    worker-01    Complete    2m
+reboot-worker-01    HostOutOfBandReboot    worker-01    Complete    2m
 ```
 
 ## Cleanup

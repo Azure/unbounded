@@ -30,36 +30,46 @@ import (
 func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	t.Parallel()
 
-	s := newOperationTestScheme(t)
-	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	machine.Generation = 3
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
-	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
-		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
-	}}
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
-	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	// The HostOOBReboot alias must reach the provider as the canonical kind.
+	for _, kind := range []unboundedv1alpha3.OperationKind{
+		unboundedv1alpha3.OperationHostOutOfBandReboot,
+		unboundedv1alpha3.OperationHostOOBReboot,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
-	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+			s := newOperationTestScheme(t)
+			machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+			machine.Generation = 3
+			machine.Spec.Provider = ""
+			machine.Spec.ProviderID = ""
+			machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
+				ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
+			}}
+			op := newMachineOperation("op-1", "machine-1", kind)
+			credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
+			provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ignored", Name: "op-1"}})
-	require.NoError(t, err)
-	require.Equal(t, ctrl.Result{}, result)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
+			reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
 
-	var updated unboundedv1alpha3.MachineOperation
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
-	require.NotNil(t, updated.Status.StartedAt)
-	require.NotNil(t, updated.Status.CompletedAt)
-	require.Equal(t, machine.Generation, updated.Status.ObservedMachineGeneration)
-	require.Equal(t, []string{"HostReboot:machine-1:azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1"}, provider.calls)
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ignored", Name: "op-1"}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
 
-	cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
-	require.NotNil(t, cond)
-	require.Equal(t, metav1.ConditionTrue, cond.Status)
+			var updated unboundedv1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+			require.Equal(t, unboundedv1alpha3.OperationPhaseComplete, updated.Status.Phase)
+			require.NotNil(t, updated.Status.StartedAt)
+			require.NotNil(t, updated.Status.CompletedAt)
+			require.Equal(t, machine.Generation, updated.Status.ObservedMachineGeneration)
+			require.Equal(t, []string{"HostOutOfBandReboot:machine-1:azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1"}, provider.calls)
+
+			cond := apimeta.FindStatusCondition(updated.Status.Conditions, OperationConditionCompleted)
+			require.NotNil(t, cond)
+			require.Equal(t, metav1.ConditionTrue, cond.Status)
+		})
+	}
 }
 
 func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.T) {
@@ -182,12 +192,12 @@ func TestMachineOperationReconciler_RejectsMismatchedProviderRefKind(t *testing.
 		},
 	}
 
-	op := newMachineOperation("op-1", machine.Name, unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", machine.Name, unboundedv1alpha3.OperationHostOutOfBandReboot)
 	groupKind := schema.GroupKind{Group: "infrastructure.example.io", Kind: "ExampleMachine"}
 	provider := &recordingProvider{
 		provider:            machine.Spec.Host.External.Provider,
 		providerMachineKind: &groupKind,
-		supported:           map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true},
+		supported:           map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true},
 	}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
@@ -208,8 +218,8 @@ func TestMachineOperationReconciler_SkipsOperationForDifferentSite(t *testing.T)
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{
@@ -236,8 +246,8 @@ func TestMachineOperationReconciler_SkipsOperationForDifferentProviderScope(t *t
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{
@@ -266,7 +276,7 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credential := &unboundedv1alpha3.MachineOperationCredential{
 		ObjectMeta: metav1ObjectMeta("site-a-azure"),
 		Spec: unboundedv1alpha3.MachineOperationCredentialSpec{
@@ -289,7 +299,7 @@ func TestMachineOperationReconciler_ResolvesSiteCredential(t *testing.T) {
 			"clientSecret": []byte("secret"),
 		},
 	}
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential, secret).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -353,8 +363,8 @@ func TestMachineOperationReconciler_FailsMachineWithoutSiteLabel(t *testing.T) {
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Labels = nil
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -379,8 +389,8 @@ func TestMachineOperationReconciler_FailsMissingSiteCredential(t *testing.T) {
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -404,9 +414,9 @@ func TestMachineOperationReconciler_PassesWorkloadIdentityCredentialToProvider(t
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credential := newWorkloadIdentityCredential("site-a-azure", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -423,10 +433,10 @@ func TestMachineOperationReconciler_FailsAmbiguousSiteCredential(t *testing.T) {
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credentialA := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credentialB := newMachineOperationCredential("cred-b", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credentialA, credentialB).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -453,9 +463,9 @@ func TestMachineOperationReconciler_FailsMissingCredentialSecret(t *testing.T) {
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -479,10 +489,10 @@ func TestMachineOperationReconciler_FailsExternalPluginWithoutSecretRef(t *testi
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credential.Spec.Auth.SecretRef = nil
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -506,10 +516,10 @@ func TestMachineOperationReconciler_FailsCredentialWithEmptyAuthMode(t *testing.
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credential.Spec.Auth.Mode = ""
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -533,10 +543,10 @@ func TestMachineOperationReconciler_FailsCredentialSecretOutsideAllowedNamespace
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	credential := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credential.Spec.Auth.SecretRef.Namespace = "other"
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credential).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{
@@ -616,10 +626,10 @@ func TestMachineOperationReconciler_DoesNotReexecuteInProgressOperation(t *testi
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -640,12 +650,12 @@ func TestMachineOperationReconciler_DoesNotResolveAuthForSkippedInProgressOperat
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.StartedAt = ptrTo(fixedOperationNow())
 	credentialA := newMachineOperationCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
 	credentialB := newMachineOperationCredential("cred-b", "site-a", unboundedv1alpha3.ExternalProviderAzureVM)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, credentialA, credentialB).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -759,22 +769,32 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) {
 	t.Parallel()
 
-	s := newOperationTestScheme(t)
-	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationNodeReboot)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	for _, kind := range []unboundedv1alpha3.OperationKind{
+		unboundedv1alpha3.OperationNodeReboot,
+		// HostOSReboot is executed by the in-host agent, not the provider.
+		unboundedv1alpha3.OperationHostOSReboot,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			t.Parallel()
 
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
-	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+			s := newOperationTestScheme(t)
+			machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
+			op := newMachineOperation("op-1", "machine-1", kind)
+			provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
-	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
-	require.NoError(t, err)
-	require.Equal(t, ctrl.Result{}, result)
-	require.Empty(t, provider.calls)
+			c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+			reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
 
-	var updated unboundedv1alpha3.MachineOperation
-	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
-	require.Empty(t, updated.Status.Phase)
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+			require.NoError(t, err)
+			require.Equal(t, ctrl.Result{}, result)
+			require.Empty(t, provider.calls)
+
+			var updated unboundedv1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+			require.Empty(t, updated.Status.Phase)
+		})
+	}
 }
 
 func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing.T) {
@@ -803,9 +823,9 @@ func TestMachineOperationReconciler_SelectorOperationIsIgnored(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
-	op := newMachineOperation("op-1", "", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	op.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"rack": "a"}}
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReboot: true}}
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostOutOfBandReboot: true}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -824,7 +844,7 @@ func TestMachineOperationReconciler_FailsMissingMachine(t *testing.T) {
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
-	op := newMachineOperation("op-1", "missing", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "missing", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Now: fixedOperationNow}
 
@@ -845,7 +865,7 @@ func TestMachineOperationReconciler_DeletesExpiredTerminalOperation(t *testing.T
 	s := newOperationTestScheme(t)
 	completedAt := metav1.NewTime(time.Date(2026, 4, 28, 10, 0, 0, 0, time.UTC))
 	ttl := int32(30)
-	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	op.Spec.TTLSecondsAfterFinished = &ttl
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseComplete
 	op.Status.CompletedAt = &completedAt
@@ -878,7 +898,7 @@ func TestShouldReconcileOperation(t *testing.T) {
 	}{
 		{
 			name: "non terminal",
-			op:   newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot),
+			op:   newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot),
 			want: true,
 		},
 		{
@@ -921,7 +941,7 @@ func TestShouldReconcileOperation(t *testing.T) {
 func TestShouldReconcileOperationUpdateIgnoresNonterminalStatusWrites(t *testing.T) {
 	t.Parallel()
 
-	oldOperation := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReboot)
+	oldOperation := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOutOfBandReboot)
 	oldOperation.Generation = 3
 	oldOperation.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 
@@ -986,7 +1006,7 @@ func newRecordingProviderRegistration(provider *recordingProvider) *Provider {
 
 	for _, kind := range []unboundedv1alpha3.OperationKind{
 		unboundedv1alpha3.OperationNodeReboot,
-		unboundedv1alpha3.OperationHostReboot,
+		unboundedv1alpha3.OperationHostOutOfBandReboot,
 		unboundedv1alpha3.OperationHostPowerOff,
 		unboundedv1alpha3.OperationHostPowerOn,
 		unboundedv1alpha3.OperationHostReplace,
@@ -1009,7 +1029,7 @@ func newRecordingProviderRegistration(provider *recordingProvider) *Provider {
 	}
 
 	if len(options) == 0 {
-		options = append(options, publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostReboot, provider.Execute))
+		options = append(options, publicmachineops.WithImmediateOperation(unboundedv1alpha3.OperationHostOutOfBandReboot, provider.Execute))
 	}
 
 	name := provider.provider

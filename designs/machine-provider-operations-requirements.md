@@ -22,7 +22,7 @@ existing provider RPCs, SDK calls, Redfish actions, HMC commands, or internal
 workflows. Method names and JSON messages in this document are illustrative.
 
 A provider may support any subset of capabilities. For example, an integration
-that supports only `HostReboot` is useful and valid. Supporting one operation
+that supports only `HostOutOfBandReboot` is useful and valid. Supporting one operation
 does not imply support for power control, replacement, diagnostics, console, or
 DPU maintenance.
 
@@ -59,7 +59,7 @@ The provider-facing host operations currently represented by
 |---|---|---|
 | `HostPowerOn` | Start the host and observe it powered on. | Yes |
 | `HostPowerOff` | Stop the host and observe it powered off. | Yes |
-| `HostReboot` | Restart the host through an out-of-band provider mechanism. | Yes |
+| `HostOutOfBandReboot` | Restart the host through an out-of-band provider mechanism. | Yes |
 | `HostReplace` | Recreate a VM or provision/reimage a physical host with fresh bootstrap configuration. | Yes |
 
 `RepaveNode` is not a provider-facing `MachineOperation`. It replaces the node
@@ -101,7 +101,7 @@ Example for a reboot-only integration:
 ```json
 {
   "operations": {
-    "HostReboot": {
+    "HostOutOfBandReboot": {
       "supported": true,
       "implementation": "provider-managed-reset",
       "longRunning": true,
@@ -192,13 +192,13 @@ spec:
       providerID: example:///regions/region-1/instances/worker-01
 ```
 
-Create a `HostReboot` request with the plugin's convenience command. The
+Create a `HostOutOfBandReboot` request with the plugin's convenience command. The
 explicit operation name makes subsequent status commands predictable. The
 `MachineOperation` is the object users watch; they do not call the provider API
 directly.
 
 ```bash
-kubectl unbounded machine host-reboot worker-01 \
+kubectl unbounded machine host-out-of-band-reboot worker-01 \
   --operation-name reboot-worker-01 \
   --ttl 300 \
   --wait=false
@@ -212,7 +212,7 @@ The equivalent resource-oriented plugin command is:
 
 ```bash
 kubectl unbounded machine operation create reboot-worker-01 \
-  --kind HostReboot \
+  --kind HostOutOfBandReboot \
   --machine worker-01 \
   --ttl 300
 ```
@@ -230,7 +230,7 @@ kubectl get mop reboot-worker-01
 
 ```text
 NAME               MACHINE     OPERATION    PHASE    AGE
-reboot-worker-01   worker-01   HostReboot            1s
+reboot-worker-01   worker-01   HostOutOfBandReboot            1s
 ```
 
 Watch the operation as the controller invokes the provider. Short-lived states
@@ -242,8 +242,8 @@ kubectl get mop reboot-worker-01 --watch
 
 ```text
 NAME               MACHINE     OPERATION    PHASE        AGE
-reboot-worker-01   worker-01   HostReboot   InProgress   2s
-reboot-worker-01   worker-01   HostReboot   Complete     45s
+reboot-worker-01   worker-01   HostOutOfBandReboot   InProgress   2s
+reboot-worker-01   worker-01   HostOutOfBandReboot   Complete     45s
 ```
 
 For a long-running provider registration, the `InProgress` YAML includes the
@@ -263,7 +263,7 @@ metadata:
   name: reboot-worker-01
 spec:
   machineRef: worker-01
-  operationKind: HostReboot
+  operationKind: HostOutOfBandReboot
   ttlSecondsAfterFinished: 300
 status:
   phase: InProgress
@@ -294,7 +294,7 @@ status:
   - type: Completed
     status: "False"
     reason: InProgress
-    message: executing HostReboot via ExampleCloud
+    message: executing HostOutOfBandReboot via ExampleCloud
     observedGeneration: 1
     lastTransitionTime: "2026-08-06T14:00:03Z"
 ```
@@ -317,9 +317,9 @@ Example plugin output, with terminal styling omitted, is:
 
 ```text
   --> Target worker-01: InProgress/WaitingProviderOperation - provider reboot task is running
-  --> Operation HostReboot: reboot-worker-01 in progress...
-  --> Target worker-01: Complete/WaitingProviderOperation - HostReboot completed via ExampleCloud
-  --> Operation HostReboot: reboot-worker-01 completed
+  --> Operation HostOutOfBandReboot: reboot-worker-01 in progress...
+  --> Target worker-01: Complete/WaitingProviderOperation - HostOutOfBandReboot completed via ExampleCloud
+  --> Operation HostOutOfBandReboot: reboot-worker-01 completed
 
   ready
 ```
@@ -332,11 +332,11 @@ metadata:
   name: reboot-worker-01
 spec:
   machineRef: worker-01
-  operationKind: HostReboot
+  operationKind: HostOutOfBandReboot
   ttlSecondsAfterFinished: 300
 status:
   phase: Complete
-  message: HostReboot completed via ExampleCloud
+  message: HostOutOfBandReboot completed via ExampleCloud
   startedAt: "2026-08-06T14:00:03Z"
   completedAt: "2026-08-06T14:00:45Z"
   observedMachineGeneration: 1
@@ -344,7 +344,7 @@ status:
   - machineRef: worker-01
     phase: Complete
     stage: WaitingProviderOperation
-    message: HostReboot completed via ExampleCloud
+    message: HostOutOfBandReboot completed via ExampleCloud
     startedAt: "2026-08-06T14:00:03Z"
     completedAt: "2026-08-06T14:00:45Z"
     observedGeneration: 1
@@ -366,7 +366,7 @@ status:
   - type: Completed
     status: "True"
     reason: Succeeded
-    message: HostReboot completed via ExampleCloud
+    message: HostOutOfBandReboot completed via ExampleCloud
     observedGeneration: 1
     lastTransitionTime: "2026-08-06T14:00:45Z"
 ```
@@ -418,7 +418,7 @@ provider, err := machineops.NewProvider(
         Kind:  "ProviderMachine",
     }),
     machineops.WithLongRunningOperation(
-        v1alpha3.OperationHostReboot,
+        v1alpha3.OperationHostOutOfBandReboot,
         beginReboot,
         pollReboot,
     ),
@@ -436,7 +436,7 @@ provider, err := machineops.NewProvider(
 `WithLongRunningOperation` receives idempotent `Begin` and resumable `Poll`
 callbacks. Cleanup and replacement bootstrap data are optional operation
 settings. `NewProvider` requires at least one registered operation, so a
-provider that registers only `HostReboot` is valid.
+provider that registers only `HostOutOfBandReboot` is valid.
 
 `WithProviderMachineKind` is needed only when the provider accepts a
 provider-owned resource through `Machine.spec.host.external.machineRef`. A
@@ -461,7 +461,7 @@ MachineOperation
   -> mark MachineOperation Complete or Failed
 ```
 
-For example, an adapter might map `HostReboot` to an existing cloud SDK restart
+For example, an adapter might map `HostOutOfBandReboot` to an existing cloud SDK restart
 call, a Redfish reset action, an HMC RPC, or a provider's internal orchestration
 job. The provider registration does not require that the native API use
 Unbounded names or request schemas.
@@ -573,7 +573,7 @@ offers graceful mode **MUST NOT** silently escalate to force-off unless allowed.
 }
 ```
 
-### 5.4 HostReboot
+### 5.4 HostOutOfBandReboot
 
 Illustrative call:
 
@@ -586,7 +586,7 @@ RebootMachine(machineId, mode, timeout, commonContext) -> OperationResult
 | `mode` | Provider-supported restart mode, such as reset or power cycle. |
 | `timeout` | Maximum time to wait for the provider's completion signal. |
 
-If `HostReboot` is supported, success **MUST** mean that the provider restart
+If `HostOutOfBandReboot` is supported, success **MUST** mean that the provider restart
 action completed according to the provider's documented postcondition. The
 integration SHOULD observe a new boot attempt or an `ON` to `OFF` to `ON` power
 cycle when the underlying interface exposes that evidence. Existing reset APIs
@@ -705,7 +705,7 @@ error, and correlation to boot or provisioning attempts.
 ### 6.1 Cancellation
 
 Cancellation is optional and independent for every operation. An integration
-may advertise `HostReboot` while declaring cancellation unsupported.
+may advertise `HostOutOfBandReboot` while declaring cancellation unsupported.
 
 Upstream `b4a8a7df` can observe that an existing provider task reached
 `Canceled`, but `MachineOperation` has no cancellation request field and the Go

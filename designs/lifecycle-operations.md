@@ -20,7 +20,8 @@ operation ignore it.
 |---|---|---|---|
 | `HostPowerOff` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal with BMC | Power off the VM or physical host through the provider or BMC. |
 | `HostPowerOn` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal with BMC | Power on or start the VM or physical host through the provider or BMC. |
-| `HostReboot` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal with BMC | Reboot, reset, or power-cycle the host through the provider or BMC. |
+| `HostOutOfBandReboot` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal with BMC | Reboot, reset, or power-cycle the host through the provider or BMC. `HostOOBReboot` is an alias that controllers resolve to this kind. |
+| `HostOSReboot` | Host | `unbounded-agent` on the host | Reboot the host operating system from inside the host with `systemctl reboot`. The agent records the boot ID before rebooting and completes the operation after it starts on a new boot. |
 | `HostReplace` | Host | `machine-ops-controller` for cloud VMs; `metalman` for PXE/bare metal | Delete and recreate the VM or reimage the physical host, inject bootstrap configuration through cloud-init or an equivalent first-boot mechanism, and have the agent recreate the node so it rejoins the cluster. |
 | `NodeReboot` | Node container | `unbounded-agent` on the host | Stop kubelet and containerd inside the nspawn machine, stop the nspawn machine, then restart it and bring kubelet and containerd back up without replacing the rootfs. |
 | `AgentUpgrade` | Host agent | `unbounded-agent`, with controller coordination | Replace the host-resident agent binary and restart it safely. |
@@ -28,7 +29,7 @@ operation ignore it.
 ## Component ownership
 
 `machine-ops-controller` owns cloud-provider host operations. Today it maps
-`HostPowerOff`, `HostPowerOn`, and `HostReboot` to Azure VM and OCI instance
+`HostPowerOff`, `HostPowerOn`, and `HostOutOfBandReboot` to Azure VM and OCI instance
 APIs based on `Machine.spec.provider` and `Machine.spec.providerID`. For
 `HostReplace`, a cloud provider implementation should delete and recreate the VM
 using the provider's API and inject the bootstrap configuration through

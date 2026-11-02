@@ -171,6 +171,10 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
+	if err := publishHostOSReboots(ctx, log, kubeClient, active.Config.MachineName, runOpts.NodeOperator.BootID); err != nil {
+		log.Warn("failed to report HostOSReboot operations", "error", err)
+	}
+
 	// After the upgrade is reported, so a move never runs before this binary
 	// has shown it can start, and so the signal it waits for is gone.
 	if reconcileHostRootUnderLock(ctx, log, runOpts.installation, runOpts.NodeOperator, active) {

@@ -23,6 +23,7 @@ pub(super) fn admission_coordinator() -> (Rc<Coordinator>, impl Sized) {
     (local, (endpoint, f))
 }
 mod hot_reads;
+mod passthrough;
 mod peer_copies;
 mod persist_policy;
 mod remote;
