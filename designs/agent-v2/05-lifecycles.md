@@ -142,14 +142,13 @@ sequenceDiagram
   `nspawn-container` ([node runtime, section 5.2](03-node-runtime.md#52-host)).
 
 There is no host network reset on reboot, matching v1's `RestartNode`
-(`cmd/agent/internal/daemon/nodeoperator.go:224-229`).
+(`cmd/agent/internal/daemon/nodeoperator.go:230-235`).
 
 ## 4. HostOSReboot
 
-`HostOSReboot` was added on `main` after this design's baseline, splitting
-v1's `HostReboot` into `HostOutOfBandReboot` and `HostOSReboot`. v2 handles it
-as v1 does (`cmd/agent/internal/daemon/hostosreboot.go:43-154` at
-`e132dfada`):
+v1 has two host reboot kinds: `HostOutOfBandReboot`, which machine-ops-controller
+and metalman execute, and `HostOSReboot`, which the agent executes. v2 handles
+`HostOSReboot` as v1 does (`cmd/agent/internal/daemon/hostosreboot.go:43-154`):
 
 1. The daemon records the host's boot ID in its target entry in the
    operation's status, and marks the operation `InProgress`.
@@ -159,7 +158,7 @@ as v1 does (`cmd/agent/internal/daemon/hostosreboot.go:43-154` at
    ([node runtime, section 1](03-node-runtime.md#1-node-runtime), rule 6), and then the daemon.
 4. The daemon compares the current boot ID with the recorded one when it starts
    and reports the operation `Complete` or `Failed`
-   (`cmd/agent/internal/daemon/daemon.go:174` at `e132dfada`).
+   (`cmd/agent/internal/daemon/daemon.go:174`).
 
 No lifecycle hooks fire, because systemd starts the node at boot.
 
@@ -183,7 +182,7 @@ sequenceDiagram
 ```
 
 This is v1's mechanism
-(`cmd/agent/internal/daemon/controller_machineoperation.go:79-165`,
+(`cmd/agent/internal/daemon/controller_machineoperation.go:110-196`,
 `pkg/agent/agentbinary/upgrade.go:193-273`) with these additions:
 
 - A candidate binary is checked with `v2 version` as well as `version`

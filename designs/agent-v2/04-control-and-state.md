@@ -113,7 +113,7 @@ func Decide(t Trigger, obs control.Observation, g *control.Goal, drift func(appl
 ```
 
 The drift function starts from v1's `hasDrift`
-(`cmd/agent/internal/daemon/nodeoperator.go:134-187`). Fields that only matter
+(`cmd/agent/internal/daemon/nodeoperator.go:140-193`). Fields that only matter
 for one runtime, such as the nspawn OCI image, are contributed by that runtime.
 
 ## 4. State
@@ -197,7 +197,7 @@ flowchart TD
   L -- yes --> P{"Pending repave in state?"}
   P -- yes --> RF["nodemanager.Recover: finish the interrupted repave"]
   P -- no --> K{"Request kind"}
-  K -- operation --> OP["NodeReboot, AgentUpgrade or AgentReset handler"]
+  K -- operation --> OP["NodeReboot, AgentUpgrade, AgentReset or HostOSReboot handler"]
   K -- reconcile --> O["Observe Node, goal, applied state and runtime state"]
   O --> D{"Decide"}
   D -- Reset --> RS["Reset, then stop daemon"]
@@ -206,12 +206,14 @@ flowchart TD
   D -- Steady --> S["status.report Ready, or Provisioning while the Node does not exist"]
 ```
 
-The startup gate opens after a pending AgentUpgrade result is published,
-`Recover` has finished, and the caches have synced.
+The startup gate opens after pending AgentUpgrade and HostOSReboot results are
+published, as v1 publishes them when its daemon starts
+(`cmd/agent/internal/daemon/daemon.go:170-176`), `Recover` has finished, and
+the caches have synced.
 
 `Decide` repaves only when the daemon itself sees this node's Node object
 being deleted, as v1 does: v1 watches only Node delete events
-(`cmd/agent/internal/daemon/controller.go:155-160`).
+(`cmd/agent/internal/daemon/controller.go:151-156`).
 
 | Trigger | Goal `delete` | Drift | Action |
 |---|---|---|---|
@@ -247,16 +249,14 @@ visible. Recovery is manual, as in v1: an `AgentReset` operation or
 `OperationKind` is a closed enum (`api/machina/v1alpha3/machineoperation_types.go:54`).
 There are no custom kinds: consumers customize the agent through plugins,
 hooks and declarative extensions ([extensions](02-extensions.md)) instead. Each kind is
-executed by one component. On `main` at `e132dfada`, after this design's
-baseline, `HostReboot` was split into `HostOutOfBandReboot` (alias
-`HostOOBReboot`) and `HostOSReboot`:
+executed by one component:
 
 - The agent executes `NodeReboot`, `AgentUpgrade`, `AgentReset` and
-  `HostOSReboot` (`cmd/agent/internal/daemon/controller_machineoperation.go:45-51`
-  at `e132dfada`; [lifecycles, section 4](05-lifecycles.md#4-hostosreboot)).
-- machine-ops-controller and metalman execute the other `Host*` kinds, and
-  ignore `HostOSReboot` (`internal/machineops/controller.go:382-391` at
-  `e132dfada`).
+  `HostOSReboot` (`cmd/agent/internal/daemon/controller_machineoperation.go:45-51`;
+  [lifecycles, section 4](05-lifecycles.md#4-hostosreboot)).
+- machine-ops-controller and metalman execute the other `Host*` kinds, and do
+  not execute `HostOSReboot` (`internal/machineops/controller.go:382-391`,
+  `internal/metalman/machineops/controller.go:1238-1245`).
 
 v2 fails a matching operation with reason `UnsupportedOperation` only when its
 kind belongs to the agent and v2 has no handler for it. The kinds that belong

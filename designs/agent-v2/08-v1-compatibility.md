@@ -15,13 +15,13 @@ repository baseline, citation conventions and terms.
 | containerd, kubelet and LocalDNS configuration | `pkg/agent/phases/nodestart` | `bundle` |
 | Kubelet authentication modes | `pkg/agent/phases/nodestart/kubelet.go:282-379` | `credentials` and `bundle` |
 | TPM attestation | `cmd/agent/internal/attest` | `credentials`, the `tpm` provider |
-| Machine registration and status | `cmd/agent/internal/daemon/daemon.go:303-406`, `bootstrap_status.go` | `control`, the `machina` providers |
+| Machine registration and status | `cmd/agent/internal/daemon/daemon.go:307-410`, `bootstrap_status.go` | `control`, the `machina` providers |
 | NVIDIA, AMD and host devices | `pkg/agent/goalstates`, `pkg/agent/phases/nodestart/nvidia.go` | Discovery in `nodespec`; each runtime makes the devices available to the node |
 | nspawn lifecycle hooks | `pkg/agent/nspawnlifecycle` | `runtime.BootHook` and `v2 boot-hook` |
 | Daemon CSR credentials | `pkg/agent/daemoncred` | `credentials`, the `csr` provider |
 | Repave on Node delete with drift detection | `cmd/agent/internal/daemon/controller_node.go`, `nodeoperator.go` | `daemon`, `nodemanager` |
 | NodeReboot, AgentUpgrade, AgentReset | `cmd/agent/internal/daemon/controller_machineoperation.go` | `daemon`, `agentupgrade`, `nodemanager` |
-| HostOSReboot, added on `main` after this design's baseline | `cmd/agent/internal/daemon/hostosreboot.go` at `e132dfada` | `daemon` ([lifecycles, section 4](05-lifecycles.md#4-hostosreboot)) |
+| HostOSReboot | `cmd/agent/internal/daemon/hostosreboot.go` | `daemon` ([lifecycles, section 4](05-lifecycles.md#4-hostosreboot)) |
 | Daemon recovery unit | `cmd/agent/internal/daemon/assets` | `daemon` |
 | First-boot unit removal on reset | `cmd/agent/internal/daemon/reset.go:191` | Reset |
 | Host-root move from `/usr/local` | `internal/hostroot` | Not carried over: v2 only installs fresh |
@@ -36,7 +36,7 @@ that justifies it. Everything else matches v1.
 |---|---|---|---|---|
 | The node never registers | Nothing happens and nothing is reported | Nothing happens; status reports `NodeNotRegistered` after 10 minutes | Visibility only; the action is the same | [control and state, section 5](04-control-and-state.md#5-daemon-reconcile) |
 | The daemon restarts after it saw the Node deleted, but before the repave finished | The repave is forgotten. The operator has to bring the Node back and delete it again. | The repave continues, because the approval was saved to disk when the deletion was seen | Self-healing: the daemon finishes what it was approved to do | [control and state, section 4](04-control-and-state.md#4-state) |
-| The new node fails to start during a repave | v1 saves the new configuration before checking kubelet (`cmd/agent/internal/daemon/nodeoperator.go:279-282`). Repaving into `kube2`, it retries. Repaving into `kube1`, the retry finds `kube1` already configured, because v1 checks `kube1` first (`nodeoperator.go:77`). It reports success although kubelet never started, and leaves the old `kube2` on disk. | Retried until the new node is ready, and reported as `Failed` with reason `RepaveFailed` in the meantime | v1 can report a broken repave as successful | [lifecycles, section 2](05-lifecycles.md#2-repave) |
+| The new node fails to start during a repave | v1 saves the new configuration before checking kubelet (`cmd/agent/internal/daemon/nodeoperator.go:293-296`). Repaving into `kube2`, it retries. Repaving into `kube1`, the retry finds `kube1` already configured, because v1 checks `kube1` first (`nodeoperator.go:83`). It reports success although kubelet never started, and leaves the old `kube2` on disk. | Retried until the new node is ready, and reported as `Failed` with reason `RepaveFailed` in the meantime | v1 can report a broken repave as successful | [lifecycles, section 2](05-lifecycles.md#2-repave) |
 | The host loses power while a repave unpacks the image | The next attempt skips unpacking because the machine directory is not empty, and starts from a partial image (`pkg/agent/phases/rootfs/oci/task.go:61-64`) | Unpacks again unless a completion marker exists, as v1's bootstrap already does (`pkg/agent/phases/rootfs/provision.go:23-27`) | v1 can start a corrupt node | [node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle) |
 | After a reset | Docker stays masked, swap stays off, and the sysctl file, nftables flush unit, apt drop-ins and masked host kubelet and containerd remain, although `reset --help` promises to restore the host (`cmd/agent/internal/cmd/reset.go:22-24`) | Every change the agent made is undone. Installed packages stay. | v1 does not do what it promises | [host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal) |
 | Network cleanup on repave and reset | Deletes fixed link names whatever their type. Cleans WireGuard links only from `wg51820` to `wg51899` (`pkg/agent/phases/reset/network.go:225-241`), though gateway ports have no upper limit (`internal/net/controller/gatewaypool_controller.go:411-415`). Leaves the `UNBOUNDED-*`, `KUBE-*` and `CNI-*` iptables chains after reset. | Removes all of these. A link with the right name but the wrong type is reported, not deleted. | v1 leaves state behind, and can delete a link that is not its own | [host changes, section 2](06-host-changes.md#2-host-network-reset) |
@@ -74,8 +74,9 @@ so v1 stays untouched and the copies can diverge.
 | `cmd/agent/internal/bootstrap` | `internal/agentv2/bootstrap` | Stages renamed for runtime-neutral work |
 | `cmd/agent/internal/attest` | `internal/agentv2/credentials` (the `tpm` provider) | Wrapped as a bootstrap credential provider |
 | `cmd/agent/internal/daemon` unit and recovery assets, enable, stop and repair logic | `internal/agentv2/daemon` | Unit runs `<current> v2 daemon` |
-| `cmd/agent/internal/daemon/bootstrap_status.go` and Machine registration (`daemon.go:303-406`) | `internal/agentv2/control` (the `machina` providers) | Behind the goal and status interfaces |
+| `cmd/agent/internal/daemon/bootstrap_status.go` and Machine registration (`daemon.go:307-410`) | `internal/agentv2/control` (the `machina` providers) | Behind the goal and status interfaces |
 | `cmd/agent/internal/daemon/agentupgrade.go`, `hostupgrade.go` | `internal/agentv2/agentupgrade` | Verifies `v2` support in candidates |
+| `cmd/agent/internal/daemon/hostosreboot.go` | `internal/agentv2/daemon` | None at first. It keeps using `RebootHost` and `SetMachineOperationResult` from `pkg/agent/daemon` (`reboot.go:22`, `machineoperation.go:232`). |
 | The MachineOperation reconciler in `pkg/agent/daemon/machineoperation.go` | `internal/agentv2/control` | Fails unsupported operations that belong to the agent ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)) |
 | Rendering templates from `pkg/agent/phases/nodestart/assets` and `pkg/agent/phases/rootfs/assets` | `internal/agentv2/bundle` and `runtime/nspawn` | None at first; parity is enforced by golden tests ([testing, section 1](11-testing.md#1-unit-conformance-and-golden-tests)) |
 
@@ -88,8 +89,9 @@ against the copies.
 v2 imports these unchanged: `pkg/agent/phases`, `pkg/agent/preflight`,
 `pkg/agent/agentbinary`, `pkg/agent/daemoncred`, `pkg/agent/artifactsource`,
 `pkg/agent/bootstrapartifacts`, the resolvers in `pkg/agent/goalstates`, the
-OCI unpack in `pkg/agent/phases/rootfs/oci`, `pkg/agent/daemon` (controller
-shell only), `internal/executil`, `internal/fsutil` and `internal/hostroot`.
+OCI unpack in `pkg/agent/phases/rootfs/oci`, `pkg/agent/daemon` (the controller
+shell, `RebootHost` and `SetMachineOperationResult`), `internal/executil`,
+`internal/fsutil` and `internal/hostroot`.
 
 Changes outside `internal/agentv2`:
 
@@ -98,7 +100,7 @@ Changes outside `internal/agentv2`:
 | Register the `v2` command group in `cmd/agent/internal/cmd/cmd.go:30-39` | Delivery: the `v2` command group ([CLI and configuration, section 1](01-cli-and-configuration.md#1-cli)) | None; v1 commands are unchanged |
 | In `pkg/agent/phases/host/preflight_existing_deployment.go:130-139`, also detect v2's install record | Without it, v1 `start` on a v2 `host` runtime would mask v2's `kubelet` and `containerd` units | Additive; it only fires on hosts with v2 installed. AKS Flex Node calls `host.Preflight`, so it sees the check too. |
 | v1's `daemon` and `reset` refuse on a host with a v2 install record | v1 and v2 share the daemon unit names, so v1's `reset` would remove v2's daemon unit ([migrating from v1, section 11](10-migration-from-v1.md#11-changes-outside-internalagentv2)) | Additive; only fires on hosts with v2 installed |
-| In the v1 daemon's startup gate (`cmd/agent/internal/daemon/controller_machineoperation.go:215-270`), start a migration when the pending AgentUpgrade has the parameter `agentMode: v2` | Starting an early migration from the cluster ([migrating from v1, section 4.2](10-migration-from-v1.md#42-from-the-cluster)) | Additive; an operation without the parameter is handled as today |
+| In the v1 daemon's startup gate (`cmd/agent/internal/daemon/controller_machineoperation.go:246-300`), start a migration when the pending AgentUpgrade has the parameter `agentMode: v2` | Starting an early migration from the cluster ([migrating from v1, section 4.2](10-migration-from-v1.md#42-from-the-cluster)) | Additive; an operation without the parameter is handled as today |
 | In release N, the last v1 release, the daemon rolls back a migration it finds on startup | Safe rollback from the first official v2 release ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)) | Only acts on hosts with a migration record |
 | Add the NVIDIA Container Toolkit artifact to `hack/cmd/agent-artifacts-builder` | The `host` runtime ships the toolkit as an artifact ([node runtime, section 5.2](03-node-runtime.md#52-host)) | Offline artifact bundles gain an artifact that v1 ignores |
 

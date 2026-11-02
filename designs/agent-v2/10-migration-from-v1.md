@@ -125,7 +125,7 @@ sequenceDiagram
   migration starts straight away.
 - The new binary's v1 daemon publishes AgentUpgrade results from the upgrade
   signal when it starts (`cmd/agent/internal/daemon/daemon.go:170`,
-  `controller_machineoperation.go:215-270`). When the operation has
+  `controller_machineoperation.go:246-300`). When the operation has
   `agentMode: v2`, it starts the migration instead (section 11).
 - If the migration fails and rolls back (section 6), v1's daemon publishes
   `Failed` with the reason.
@@ -289,7 +289,7 @@ These are listed with the other changes in [v1 compatibility, section 4](08-v1-c
   startup gate finds a pending AgentUpgrade whose operation has
   `agentMode: v2`, it starts `unbounded-agent-migrate.service` instead of
   publishing the result
-  (`cmd/agent/internal/daemon/controller_machineoperation.go:215-270`). It
+  (`cmd/agent/internal/daemon/controller_machineoperation.go:246-300`). It
   changes nothing for an operation without the parameter.
 - **Undoing a migration, in release N.** When N's daemon starts and finds a
   migration record with a backup, it rolls the migration back (section 8)

@@ -5,8 +5,8 @@
 | Status | Draft for review |
 | Scope | A new, experimental implementation of the unbounded agent with a defined interface for hosting kubelet, and a binary-level extension model for downstream consumers |
 | Audience | Maintainers, AKS Flex Node maintainers, and reviewers of agent lifecycle changes |
-| Repository baseline | `main` at `dca6c964d1d4d03614fe190fcd60ce49c380e914` |
-| Date | 2026-10-29 |
+| Repository baseline | `main` at `e132dfada0f40270a93abbd11ed4d70717e30010` |
+| Date | 2026-11-02 |
 
 ## Documents
 
@@ -76,10 +76,11 @@ v1 is organized in four layers:
   Work is composed from `phases.Task` values (`pkg/agent/phases/phases.go:17-20`)
   with `Serial` (`:62`) and `Parallel` (`:87`).
 - **Daemon.** A controller-runtime manager that repaves when its Node is
-  deleted and handles the `NodeReboot`, `AgentUpgrade` and `AgentReset`
-  MachineOperations (`cmd/agent/internal/daemon/controller.go:95-99`). Node
-  work goes through an unexported `nodeOperator` interface
-  (`cmd/agent/internal/daemon/nodeoperator.go:37-70`).
+  deleted and handles the `NodeReboot`, `AgentUpgrade`, `AgentReset` and
+  `HostOSReboot` MachineOperations (`cmd/agent/internal/daemon/controller.go:95`,
+  `controller_machineoperation.go:45-51`). Node work goes through an
+  unexported `nodeOperator` interface
+  (`cmd/agent/internal/daemon/nodeoperator.go:38-76`).
 
 ### 1.2 Where nspawn is built in
 
@@ -93,7 +94,7 @@ implementation rather than a switch added to v1.
 | Running commands in the node | Every command goes through `systemd-run --machine=<m> --pipe --wait` | `internal/executil/exec.go:258-267` |
 | Bootstrap | Always targets `kube1`, and skips building the rootfs when `machinectl list` shows the machine is registered. The same check decides whether to save the applied config. | `cmd/agent/internal/cmd/bootstrap.go:92` (target), `:161` (rootfs), `:220` (applied config), `pkg/agent/phases/reset/machine.go:256` (`machinectl list`) |
 | Host preparation | Masks the host `containerd` and `kubelet` units, which a host runtime needs | `bootstrap.go:111`, `pkg/agent/phases/host/disable_systemd_unit.go:36-43` |
-| Daemon | Defaults to the nspawn operator, and hardcodes it in `RepairDaemon`; repave alternates `kube1` and `kube2` | `cmd/agent/internal/daemon/daemon.go:101`, `lifecycle.go:461`, `nodeoperator.go:248-296` |
+| Daemon | Defaults to the nspawn operator, and hardcodes it in `RepairDaemon`; repave alternates `kube1` and `kube2` | `cmd/agent/internal/daemon/daemon.go:101`, `lifecycle.go:461`, `nodeoperator.go:262-310` |
 | Reset | Hardcodes `kube1` and `kube2` and the nspawn teardown | `cmd/agent/internal/daemon/reset.go:168-195` |
 | Lifecycle hooks | Around `systemd-nspawn@<m>`, systemd runs `nspawn-lifecycle pre-start` as a separate oneshot unit and `post-start` as `ExecStartPost` | Wiring: `pkg/agent/phases/rootfs/assets/service-override.conf:37-38,48`, `config-regeneration.service:11`. Code: `pkg/agent/nspawnlifecycle/lifecycle.go:67-129` |
 
