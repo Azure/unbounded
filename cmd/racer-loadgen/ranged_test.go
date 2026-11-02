@@ -137,3 +137,29 @@ func TestParseRangeFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRangedBodyRotationStillCoversEveryRange(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		starts []int64
+	)
+
+	get := func(_ context.Context, offset, length int64) (io.WriterTo, func() error, error) {
+		mu.Lock()
+		starts = append(starts, offset)
+		mu.Unlock()
+
+		return fakeRange{data: make([]byte, 105), off: offset, length: length, fail: -1}, func() error { return nil }, nil
+	}
+
+	body := &rangedBody{ctx: t.Context(), get: get, size: 105, rangeBytes: 10, parallel: 1, rotate: 7}
+
+	n, err := body.WriteTo(io.Discard)
+	if err != nil || n != 105 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+
+	if len(starts) != 11 || starts[0] != 70 || starts[3] != 100 || starts[4] != 0 {
+		t.Fatalf("starts = %v", starts)
+	}
+}
