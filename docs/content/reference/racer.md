@@ -315,22 +315,27 @@ Approve disks with the `kubectl unbounded racer disks` plugin:
 
 ```sh
 # Show every disk Racer sees, with its state. Add -o wide or -o json for more.
-kubectl unbounded racer disks list [NODE...]
+kubectl unbounded racer disks list [NODE...] [-o wide|json]
 
 # Approve disks by ID. Asks for confirmation unless --yes is set.
-# --wait waits (up to --timeout) until each disk is claimed or rejected.
-kubectl unbounded racer disks allow NODE ID... [--yes] [--wait] [--timeout DURATION]
+# --force approves disks that are unavailable or not reported.
+# --wait waits (up to --timeout, default 5m) until each disk is claimed or rejected.
+kubectl unbounded racer disks allow NODE ID... [--yes] [--force] [--wait] [--timeout DURATION]
 
 # Remove approvals.
-kubectl unbounded racer disks revoke NODE (ID...|--all)
+kubectl unbounded racer disks revoke NODE (ID...|--all) [--yes]
 ```
+
+All commands accept `-n NAMESPACE` for the Racer pods' namespace, which defaults
+to `unbounded-system`. See the
+**[CLI reference]({{< relref "reference/cli" >}})** for every flag.
 
 The plugin edits the Node annotation `racer.unbounded-cloud.io/disks`. You can
 also set it directly. It is a comma-separated list of basenames in
 `/dev/disk/by-id`, such as `wwn-0x5000c500a1b2c3d4,nvme-eui.0025385b71b2c3d4`.
-Spaces around entries and empty entries are ignored. An entry must not contain
-`/`, `,`, or whitespace, and must not be `.` or `..`. The value is limited to
-4 KiB. If any entry is invalid, Racer ignores the whole annotation and uses slab
+Spaces around entries and empty entries are ignored. An entry is 1 to 255
+printable ASCII characters, must not contain `/`, `,`, or whitespace, and must
+not be `.` or `..`. The value is limited to 4 KiB and 256 disks. If any entry is invalid, Racer ignores the whole annotation and uses slab
 files. Each ID must name a whole disk; a partition is rejected. Several IDs for
 the same disk are used once.
 
