@@ -30,6 +30,7 @@ func TestClientPageCredits(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer c.Close()
 
 			if c.credits != tc.want {
