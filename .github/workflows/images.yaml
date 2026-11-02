@@ -18,6 +18,22 @@ on:
         description: "Platforms to build, e.g. linux/amd64 or linux/amd64,linux/arm64"
         required: false
         type: string
+      source_ref:
+        description: "Bench only: commit to build (default: the dispatched ref)"
+        required: false
+        type: string
+      tag:
+        description: "Bench only: image tag and VERSION (default: the commit SHA)"
+        required: false
+        type: string
+      target:
+        description: "Bench only: Containerfile target stage"
+        required: false
+        type: string
+      publish_name:
+        description: "Bench only: published image name (default: image)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -57,7 +73,7 @@ jobs:
           else
             # workflow_dispatch
             name="${{ inputs.image }}"
-            tag="${{ github.sha }}"
+            tag="${{ inputs.tag || github.sha }}"
           fi
 
           file="images/${name}/Containerfile"
@@ -79,7 +95,8 @@ jobs:
             platforms="linux/amd64,linux/arm64"
           fi
 
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          publish="${{ inputs.publish_name || '' }}"
+          echo "name=${publish:-$name}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "file=${file}" >> "$GITHUB_OUTPUT"
           echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
@@ -101,6 +118,8 @@ jobs:
         run: echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
@@ -146,6 +165,7 @@ jobs:
         with:
           context: .
           file: ${{ needs.resolve.outputs.file }}
+          target: ${{ inputs.target || '' }}
           platforms: ${{ needs.resolve.outputs.platforms }}
           push: true
           tags: ${{ env.CONTAINER_REGISTRY }}/${{ needs.resolve.outputs.name }}:${{ needs.resolve.outputs.tag }}
@@ -153,4 +173,5 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ needs.resolve.outputs.tag }}
+            GIT_COMMIT=${{ inputs.source_ref || github.sha }}
             CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}
