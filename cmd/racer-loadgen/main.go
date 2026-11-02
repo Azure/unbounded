@@ -87,6 +87,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
 	f.StringVar(&opts.blobDigests, "trusted-blob-digests", "", "Comma-separated digests computed earlier for the first catalog blobs (same seed and size); skips hashing them at startup")
+	f.IntVar(&opts.pull.PageCredits, "page-credits", 0, "UDS only: pages Racer may send ahead of each read, 0-64 (0 uses the SDK default of 2); bounds Racer's per-read fetch window")
 	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {

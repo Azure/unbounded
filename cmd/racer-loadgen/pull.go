@@ -43,6 +43,7 @@ type pullOptions struct {
 	Interval          time.Duration
 	Verify            bool
 	DiagnoseIntegrity bool
+	PageCredits       int
 }
 
 type puller struct {
