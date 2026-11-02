@@ -70,6 +70,7 @@ func TestRangedBodyCoversEveryByteAndResumes(t *testing.T) {
 		defer mu.Unlock()
 
 		fail := int64(-1)
+
 		if failures > 0 && length > 10 {
 			failures--
 			fail = length / 2
@@ -146,6 +147,7 @@ func TestRangedBodyRotationStillCoversEveryRange(t *testing.T) {
 
 	get := func(_ context.Context, offset, length int64) (io.WriterTo, func() error, error) {
 		mu.Lock()
+
 		starts = append(starts, offset)
 		mu.Unlock()
 

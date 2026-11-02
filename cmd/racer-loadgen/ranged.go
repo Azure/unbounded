@@ -67,6 +67,7 @@ func (b *rangedBody) WriteTo(w io.Writer) (int64, error) {
 	for range max(1, b.parallel) {
 		wg.Go(func() {
 			ranges := (b.size + b.rangeBytes - 1) / b.rangeBytes
+
 			for {
 				index := next.Add(1) - 1
 				if index >= ranges || ctx.Err() != nil {

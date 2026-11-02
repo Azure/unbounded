@@ -71,6 +71,7 @@ func (p *puller) configureUDS(capacity int) error {
 
 	p.closeBackend = client.Close
 	p.acquire = udsAcquirer(client)
+
 	if p.opts.RangeBytes > 0 {
 		p.acquire = p.udsRangedAcquirer(client)
 	}
