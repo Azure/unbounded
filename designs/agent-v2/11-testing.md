@@ -80,10 +80,10 @@ themselves do not change:
   For `v2`, the harness rewrites them to `v2 start` and `v2 preflight`, as it
   already rewrites the script to add preflight (`e2e.py:3709-3719`). It also
   owns the `version` and `agent-upgrade` commands it runs on the host.
-- **Configuration.** For `nspawn-container`, the v1 JSON the script carries is
-  used as it is, because v2 converts it. For `host`, the harness converts it
-  with `v2 convert-config --runtime host`
-  ([CLI and configuration, section 1](01-cli-and-configuration.md#1-cli)).
+- **Configuration.** The harness generates the configuration with
+  `kubectl unbounded machine manual-bootstrap`, passing `--runtime` for the
+  runtime under test ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)). v2 converts the v1 JSON
+  the script carries.
 - **State.** For `v2`, the harness reads install and node state from
   `v2 status --output json`, not from v2's files
   ([CLI and configuration, section 1](01-cli-and-configuration.md#1-cli)).
@@ -181,7 +181,7 @@ Variants:
 | Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), a helper on the host watches the migration record and kills the migrate unit, or reboots the host, when the phase is reached. The migration must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
 | Failed | A v2 path is made unwritable in each phase. The migration must roll back to a working v1 automatically, and the operation must be `Failed` with the reason. |
 | Refused | `v2 migrate` on a v1 host with an unfinished install, or with two applied configs, changes nothing. `v2 start` on a v1 host that was not migrated is refused. |
-| To `host` | After migrating, `v2 reset`, then `v2 start` with the `host` runtime, then the lifecycle suite under `NODE_RUNTIME=host`. |
+| To `host` | After migrating, set the Machine's `spec.agent.runtime` to `host` and check that `RuntimeChangePending` is `True`. Then `v2 reset`, bootstrap again with `manual-bootstrap --runtime host`, check that `RuntimeChangePending` is `False` and `status.agent.runtime` is `host`, and run the lifecycle suite under `NODE_RUNTIME=host`. |
 | Immutable host | The cluster-started migration on an Ignition host (`HOST_BASE_OS=acl`), which needs no access to the host |
 | Adopted machine | `v2 migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |
 

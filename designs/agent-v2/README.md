@@ -132,7 +132,7 @@ library.
 |---|---|
 | Host | The machine the agent runs on: a virtual machine or a bare-metal server. |
 | Node | The Kubernetes worker: kubelet, containerd, LocalDNS and the pods they run. In v1 it always runs in an nspawn container on the host. |
-| Runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). [Node runtime, section 1](03-node-runtime.md#1-node-runtime) defines the interface. |
+| Runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). [Node runtime, section 1](03-node-runtime.md#1-node-runtime) defines the interface. A Machine chooses it with `spec.agent.runtime` ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)). |
 | Slot | One of two places, `a` and `b`, where a runtime keeps a node's content. One slot holds the running node; the other is used to build a replacement during a repave. For `nspawn-container`, a slot is a whole machine, v1's `kube1` or `kube2`, including the node's state. For `host`, a slot holds only staged binaries and rendered files; the node's state lives in shared host paths and is wiped on a slot change. |
 | Repave | Replacing the node with a new one, built from the desired configuration in the other slot. The new node registers with Kubernetes as a fresh Node. A repave is triggered by deleting the Kubernetes Node object ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). Not to be confused with `kubectl unbounded machine repave`, which creates a `HostReplace` MachineOperation (`cmd/kubectl-unbounded/app/machine_repave.go:24-25,47`). |
 | Goal | The desired configuration for this machine, from machina, a plugin or the configuration file. It carries only goal settings, not install-time settings ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). Its version is an opaque label from the goal source, compared for equality only. Whether to repave depends on the settings, not the version: a machina version can be edited in place (issue #1038). |
@@ -181,7 +181,10 @@ library.
 
 - Other runtime kinds, including virtual machines. The runtime kind is an open
   set, but nothing in the interface is designed for a specific future kind.
-- Machina API changes.
+- Machina API changes, apart from the Machine's runtime field, its two new
+  conditions and two new `AgentBootstrapped` reasons ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
+  The runtime must survive a reinstall, which wipes the host, so it has to be
+  stored in the cluster ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)).
 - Changing `pkg/agent` behavior for its existing consumers, apart from the
   additive v2 detection check ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
 

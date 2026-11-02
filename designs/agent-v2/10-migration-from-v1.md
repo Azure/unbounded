@@ -292,11 +292,13 @@ the v2 binary needs it, so it is part of the first implementation:
 
 ## 10. Moving to the `host` runtime
 
-The runtime is an install-time setting ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)). A
-migrated host moves to the `host` runtime with `v2 reset` and then `v2 start`
-with `runtime.type: host`. The Node registers again under the same name, and
-its pods are rescheduled, as in a repave. Changing the runtime through a
-repave, without a reset, is a possible later improvement.
+The runtime is an install-time setting, chosen by the Machine's
+`spec.agent.runtime` ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)). A migrated host moves
+to the `host` runtime the same way any host changes runtime: set the field to
+`host`, then reinstall the host, either with a HostReplace or with `v2 reset`
+followed by `v2 start` with the configuration provisioning generates. Until
+then the Machine shows `RuntimeChangePending=True`. The Node registers again
+under the same name, and its pods are rescheduled, as in a repave.
 
 ## 11. Changes outside `internal/agentv2`
 

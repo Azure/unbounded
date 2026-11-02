@@ -95,6 +95,10 @@ When a repave fails, it is retried, matching v1:
   queues an attempt at once, so a corrected goal does not wait out the backoff.
 - Each failed attempt is reported as `Failed` with reason `RepaveFailed`, the
   attempt count and the last error (`Repave.Attempts`, `Repave.LastError`).
+  The `machina` status reporter shows it on the Machine as `AgentHealthy=False`
+  with reason `RepaveFailed` ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). v1 reports nothing on the
+  Machine; the only sign is machina showing the Machine as `Joining` while its
+  Node is missing (`cmd/machina/machina/controller/machine_controller.go:819-823,851-855`).
 - There is no rollback. The old slot stays stopped and intact until a later
   attempt succeeds, and is destroyed only then. Starting the old node again is
   not useful: the control plane deleted its Node to approve the repave, and its
@@ -162,6 +166,14 @@ and metalman execute, and `HostOSReboot`, which the agent executes. v2 handles
    (`cmd/agent/internal/daemon/daemon.go:174`).
 
 No lifecycle hooks fire, because systemd starts the node at boot.
+
+As in v1, the agent does not wait for out-of-band host operations, such as a
+`HostOutOfBandReboot` or `HostReplace`, running on the same Machine:
+machine-ops-controller and metalman leave `HostOSReboot` out of their conflict
+checks (`internal/machineops/controller.go:141-146`,
+`internal/metalman/machineops/controller.go:151-155`), and the agent checks
+nothing (`hostosreboot.go:43-106`). Where that should be fixed is open in
+issue #1044; v2 follows whatever it decides.
 
 ## 5. AgentUpgrade
 

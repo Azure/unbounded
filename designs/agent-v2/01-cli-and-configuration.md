@@ -16,7 +16,7 @@ repository baseline, citation conventions and terms.
 | `v2 agent-upgrade [--preflight]` | Activate a staged agent binary without a MachineOperation, for host delivery automation ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
 | `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
 | `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
-| `v2 convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by tests and by operators preparing a `host` install. |
+| `v2 convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by operators preparing a configuration by hand for a host without a Machine. |
 | `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
 
 The `v2` group is listed in `unbounded-agent --help` as "Experimental v2 agent
@@ -126,7 +126,7 @@ Enumerated fields:
 
 | Field | Values |
 |---|---|
-| `runtime.type` | `host`, `nspawn-container`. Defaults to `nspawn-container`, which keeps machina provisioning unchanged. |
+| `runtime.type` | `host`, `nspawn-container`. Every provisioning path writes it explicitly from the Machine's `spec.agent.runtime` (below). It defaults to `nspawn-container` only for a file that does not set it, such as a v1 configuration from an older provisioner. |
 | `control.goal.type` | `machina`, `static` (the goal settings in the configuration file are the goal), `plugin` |
 | `control.goal.pollInterval` | A duration. Default `10m`. Only for the `plugin` source ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). |
 | `control.status.type` | `machina`, `none`, `plugin` |
@@ -208,9 +208,56 @@ contains any other field fails validation. In particular, a goal cannot change
 the runtime, the plugins, the hooks or the extensions. Removing or changing an
 extension needs a reset and a new install.
 
-A v1 configuration converts to the `nspawn-container` runtime. Machina
-generates v1 configurations and machina API changes are a non-goal, so a
-machina-provisioned host always gets `nspawn-container`. Using the `host`
-runtime needs a configuration file written by hand, for example through
-`kubectl unbounded` manual bootstrap or a custom first-boot configuration,
-until machina adds a way to choose the runtime.
+### Choosing the runtime
+
+A reinstall wipes the host, so the runtime has to be stored in the cluster, or
+a replaced host could come back with a different runtime than its node had.
+Falling back to `nspawn-container` on a host built for `host` would run host
+preparation that masks the host's kubelet and containerd and installs
+`systemd-container` (`pkg/agent/phases/host/os.go:21-34`), which fails, or
+breaks the host, where those packages are missing or cannot be installed.
+
+The runtime is therefore a field on the Machine:
+
+- **`spec.agent.runtime`** takes `nspawn-container`, the default, or `host`,
+  next to the existing `spec.agent.image` and `spec.agent.version`
+  (`api/machina/v1alpha3/machine_types.go:558-583`). The CRD validates it.
+- **Every provisioning path writes it into the agent configuration.**
+  `provision.BuildAgentConfig` (`internal/provision/agent_config.go:141`)
+  builds the configuration for machina's SSH provisioning
+  (`cmd/machina/machina/controller/machine_controller.go:576`), HostReplace on
+  Azure and OCI (`internal/machineops/bootstrap.go:122`), metalman's network
+  installs (`internal/metalman/netboot/netboot.go:228`) and
+  `kubectl unbounded machine manual-bootstrap`
+  (`cmd/kubectl-unbounded/app/machine_manual_bootstrap.go:491`). It gains a
+  `Runtime` field, which converts to `runtime.type`
+  ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), and runs v2's `start` for a `host` Machine.
+  `manual-bootstrap` builds its Machine from flags
+  (`machine_manual_bootstrap.go:474-486`), so it gains a `--runtime` flag.
+- **A Machine the daemon creates records the runtime.** When the daemon
+  registers a Machine that does not exist yet, as v1 does for hosts installed
+  outside machina (`cmd/agent/internal/daemon/daemon.go:307-350`), it sets
+  `spec.agent.runtime` to the installed runtime, so a later reinstall keeps it.
+- **Old agent binaries are blocked.** v1 reads its configuration with plain
+  `json.Unmarshal` (`cmd/agent/internal/cmd/config.go:94`), so a binary that
+  does not know the field would ignore it and install `nspawn-container`.
+  Provisioning refuses, with a clear reason, a `host` Machine whose
+  `spec.agent.version` pins a release that cannot run `host`, and v1 builds
+  from this design on refuse a configuration that asks for `host`.
+- **A change takes effect at the next reinstall.** The runtime is an
+  install-time setting, so editing the field never changes a running host.
+  Until a HostReplace, or a reset followed by `v2 start`, reinstalls the host,
+  the Machine shows `RuntimeChangePending=True`, and `status.agent.runtime`
+  shows the runtime actually installed ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). Moving a
+  fleet between runtimes is: set the field, then replace each Machine.
+- **Upgrade order.** The CRD and every provisioning component (machina,
+  machine-ops-controller, metalman and `kubectl unbounded`) must understand the
+  field before any Machine is set to `host`. A component that does not would
+  ignore it and install `nspawn-container`. The operator deploys these
+  together, and the release notes state the order.
+- **Whether the host can run it** is checked on the host by the runtime's
+  capability probes ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). A host that cannot fails bootstrap with
+  `AgentBootstrapped=False` and reason `RuntimeUnsupported`.
+
+A configuration file written by hand, for a host without a Machine, sets
+`runtime.type` directly.

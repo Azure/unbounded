@@ -45,7 +45,13 @@ Built-in providers:
   node labels, taints, agent image and LocalDNS settings
   (`cmd/agent/internal/daemon/controller_node.go:75-105,143-167`). Without a
   `configurationRef`, the goal settings are the applied ones. Other edits to
-  the Machine's spec never change the goal.
+  the Machine's spec never change the goal. On the `host` runtime, the
+  template's agent image is ignored with a logged warning and left out of
+  drift: it is an nspawn root filesystem image, which means nothing without
+  nspawn, and the API requires one in every version
+  (`api/machina/v1alpha3/machineconfiguration_types.go:137-140`). Counting it
+  as drift would repave, and wipe, a `host` node for nothing. The template's
+  LocalDNS settings still apply.
 - `static`: the goal settings in the agent's copy of the configuration file,
   `/etc/unbounded/agent-v2/config.json`, are the goal; the version is their
   digest. The daemon watches the file. An operator changes the goal by editing
@@ -62,9 +68,30 @@ version is recorded only when the daemon handles a Node deletion (section 5),
 as in v1, which never records a version at bootstrap
 (`cmd/agent/internal/daemon/controller_node.go:43-68`).
 
-The `machina` status reporter writes `Machine.status.configuration` and the
-Machine's `RepavePending` condition at the same moments v1 does: only when the
-daemon handles a Node deletion (`controller_node.go:54-68,116-133`).
+The `machina` status reporter writes what v1 writes, at the same moments, and
+adds two conditions and one status field. It never writes `status.phase`:
+machina owns that field and branches on it, and a Machine in `Pending`,
+`Failed`, `Ready` or no phase can go down machina's provisioning path
+(`cmd/machina/machina/controller/machine_controller.go:276-303`).
+
+| Machine field | Written | As in v1 |
+|---|---|---|
+| `AgentBootstrapped` condition | During bootstrap: `Running`, then `Succeeded`, or a failure reason. v2 adds two reasons: `NodeStartFailed` when the `host` runtime cannot start the node, where v1's `NSpawnFailed` would be misleading, and `RuntimeUnsupported` when the host fails a capability probe for the requested runtime ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). | Yes, plus the two reasons (`cmd/agent/internal/cmd/bootstrap.go:260-272`, `cmd/agent/internal/daemon/bootstrap_status.go:85-112`) |
+| `RepavePending` condition and `status.configuration` | Only when the daemon handles a Node deletion | Yes (`controller_node.go:54-68,116-133`) |
+| `status.observedProvisioningFormat` | When the daemon starts and registers the Machine | Yes (`cmd/agent/internal/daemon/daemon.go:327,340,350`) |
+| `AgentHealthy` condition | `True` with reason `Healthy` while the daemon works normally; `False` with reason `NodeNotRegistered`, `RepaveFailed`, `StateMismatch` or `StateCorrupt`, with the attempt count and last error in the message where they apply | New |
+| `RuntimeChangePending` condition | `True` when `spec.agent.runtime` differs from the runtime installed on the host, until a reinstall applies it ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)) | New |
+| `status.agent.runtime` | The runtime installed on the host, when the daemon starts | New |
+
+A requested runtime change is not a health problem, which is why it has its own
+condition rather than a reason on `AgentHealthy`. The daemon can already update
+Machine status (`deploy/machina/07-bootstrapper-rbac.yaml.tmpl:17-19`), so none
+of this needs new permissions. The phases the status reporter receives
+([extensions, section 3](02-extensions.md#3-plugin-protocol)), such as `Pending`, are not written to the Machine: the
+Machine's `RepavePending` condition keeps v1's meaning and timing. Provisioning
+does not apply `configurationRef` yet (issue #1039), so a Machine whose
+referenced version differs from what its node was built from would otherwise
+show a pending repave right after bootstrap.
 
 ## 2. Credentials
 
@@ -250,8 +277,8 @@ are saved with the version and take effect at the next provision.
 A node that never registers is reported but not repaved, because there is no
 Node to delete. This matches v1, where such a node also stays as it is. The
 `NodeNotRegistered` status, counted from `Applied.StartedAt`, makes the problem
-visible. Recovery is manual, as in v1: an `AgentReset` operation or
-`v2 reset`, then `v2 start`.
+visible, including on the Machine as `AgentHealthy=False` (section 1). Recovery
+is manual, as in v1: an `AgentReset` operation or `v2 reset`, then `v2 start`.
 
 ## 6. MachineOperation handling
 
@@ -267,13 +294,30 @@ executed by one component:
   not execute `HostOSReboot` (`internal/machineops/controller.go:382-391`,
   `internal/metalman/machineops/controller.go:1238-1245`).
 
-v2 fails a matching operation with reason `UnsupportedOperation` only when its
-kind belongs to the agent and v2 has no handler for it. The kinds that belong
-to the agent are the four above plus any future kind beginning with `Node` or
-`Agent`, so a newer agent operation reaching an older agent fails instead of
-staying pending. Other `Host*` kinds are always ignored.
+v2 ignores an operation whose kind it has no handler for, as v1 does
+(`pkg/agent/daemon/machineoperation.go:114-118,139-141`). Failing such
+operations instead was considered and rejected:
 
-This differs from v1, which ignores every operation without a handler
-(`pkg/agent/daemon/machineoperation.go:114-118,139-141`). v2 implements it in
-its own copy of the reconciler, so `pkg/agent/daemon` is unchanged for v1 and
-Flex.
+- The kind list is closed by the CRD, so an agent only meets a kind it does not
+  know when the CRD is newer than the agent.
+- No naming rule identifies the agent's kinds: the agent executes
+  `HostOSReboot`, a `Host*` kind.
+- A selector operation has one status shared by every matching agent, and
+  agents skip it once it is terminal
+  (`pkg/agent/daemon/machineoperation.go:105-107`). One out-of-date agent
+  failing it would fail it for every agent (issue #1040).
+
+v2 also deletes expired operations, which v1 never does. When an operation
+aimed at this Machine with `machineRef`, and run by this agent, has
+`ttlSecondsAfterFinished` set, the daemon deletes it that many seconds after it
+completes or fails, as metalman does
+(`internal/metalman/machineops/controller.go:1128-1145`). Without it, a cluster
+that runs neither machine-ops-controller nor metalman keeps agent operations
+forever (issue #1043), and the daemon lists every operation each time it starts
+to report `HostOSReboot` results (`cmd/agent/internal/daemon/hostosreboot.go:207-210`).
+Selector operations are left to the controllers, so agents never race to delete
+a shared operation. The daemon's role already allows deleting operations
+(`deploy/machina/07-bootstrapper-rbac.yaml.tmpl:23-25`).
+
+v2 implements both in its own copy of the reconciler, so `pkg/agent/daemon` is
+unchanged for v1 and Flex.

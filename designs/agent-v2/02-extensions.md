@@ -209,8 +209,10 @@ or the environment.
 
 `attempts` is set while a repave is being retried, and `leftovers` lists
 anything reset could not remove, as `{kind, id, reason}`. A MachineOperation
-the agent cannot handle is failed on the operation itself, with reason
-`UnsupportedOperation` ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)); it does not change the node's phase.
+the agent has no handler for is ignored, as in v1 ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)); it
+does not change the node's phase. The built-in `machina` status reporter maps
+these phases onto the Machine's conditions rather than its phase
+([control and state, section 1](04-control-and-state.md#1-control-plane-integration)).
 
 Operational rules:
 
