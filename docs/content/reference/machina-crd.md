@@ -141,7 +141,10 @@ contains the exact external machine resource UID and generation, resolved host
 image, and observed Machine generation frozen in target status. Providers
 receive the canonical `host.external.providerID` or Azure resource ID; legacy
 Machines continue to supply `Machine.spec.providerID`. Out-of-band host
-operations targeting the same Machine are serialized in creation order. A
+operations targeting the same Machine are serialized in creation order, except
+that metalman runs an operation still holding boot media, or whose boot from
+disk after media release is unconfirmed, ahead of others, even if it is
+terminal. A
 `HostSoftReboot` does not start while an out-of-band host operation on its
 Machine is unfinished. Out-of-band host operations do not wait for a
 `HostSoftReboot`.

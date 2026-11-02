@@ -78,7 +78,9 @@ one step per reconciliation. Begin callbacks must be idempotent for the stable
 `MachineOperation` UID because they may be repeated until the handle is
 persisted. Each provider request uses the provider ID from the current Machine.
 Out-of-band host operations targeting the same Machine are serialized in
-creation order. This keeps provider operations resumable without changing the
+creation order. Metalman makes one exception: an operation that still holds boot
+media, or whose boot from disk after media release is unconfirmed, is ordered
+ahead of the others regardless of age, and blocks them even once terminal. This keeps provider operations resumable without changing the
 four-phase MachineOperation lifecycle.
 
 `HostSoftReboot` is executed by the agent, so the out-of-band controllers do not
