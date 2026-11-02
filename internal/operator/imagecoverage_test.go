@@ -61,7 +61,7 @@ import (
 var componentImages = map[string][]string{
 	"net":             {"unbounded-net-controller", "unbounded-net-node"},
 	"machina":         {"machina"},
-	"gantry":          {"gantry"},
+	"gantry":          {"gantry", "unbounded-operator"},
 	"metalman":        {"metalman"},
 	"token-refresher": {"token-refresher"},
 	"racer":           {"racer", "racer-object"},
@@ -75,7 +75,8 @@ var imagelessComponents = map[string]struct{}{
 
 // releaseBOMSource is the tool whose hardcoded image list feeds the signed
 // release BOM. It legitimately carries images the operator does not manage
-// (netboot, orca, the operator itself), so it is checked for containment.
+// (netboot and orca), so it is checked for containment. The operator image also
+// runs the Gantry node-auth helper and is covered by componentImages.
 const releaseBOMSource = "hack/cmd/release-bom/main.go"
 
 // releaseBOMVar is the variable in that file holding the image list.

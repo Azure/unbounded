@@ -273,6 +273,85 @@ registry, the flow is:
 Requester-delegated private-registry authentication requires an HTTPS origin.
 Private plaintext HTTP registries are not supported by this mode.
 
+#### Operator-Managed ACR Authentication on AKS Flex Nodes
+
+For operator-managed Gantry, adding a public Azure ACR upstream also reconciles
+kubelet managed-identity authentication on Linux AKS Flex nodes. This works for
+nodes that joined before the registry was configured and for nodes joining later.
+The node selector requires `kubernetes.azure.com/nodepool-type=FlexNodes`;
+native AKS nodes and their credential providers are not modified.
+
+Keep the upstream in the existing `gantry-config` ConfigMap's `config.yaml`:
+
+```yaml
+upstream_registries:
+  - name: example.azurecr.io
+    endpoint: https://example.azurecr.io
+```
+
+The operator creates `DaemonSet/gantry-acr-auth` using its own versioned image.
+The helper installs a kubelet exec credential provider and a dedicated systemd
+drop-in inside each Flex node. It preserves the agent's kubelet unit, existing
+arguments, and containerd mirror configuration. Kubelet restarts are serialized
+across nodes with a namespace-scoped Lease. Tokens are obtained through Azure
+managed identity and passed through kubelet/containerd to Gantry, not stored in
+node configuration or Kubernetes Secrets by this integration.
+
+**Azure authorization is still explicit.** By default the provider uses the
+Flex VM's system-assigned identity. Give each selected identity `AcrPull` on the
+registry, or the appropriate repository-reader role for an ABAC-enabled ACR.
+The operator never creates Azure role assignments, enables the ACR admin
+account, or borrows the native AKS kubelet identity. The identity must be
+available from IMDS inside the Flex node.
+
+Optional installation policy belongs in **`data.node-auth.yaml` alongside
+`data.config.yaml`**, not inside Gantry's runtime YAML:
+
+```yaml
+mode: auto
+# Optional user-assigned managed identity client UUID. That identity must be
+# attached to every target Flex VM and have the required registry permission.
+# clientID: 11111111-2222-3333-4444-555555555555
+probeImage: example.azurecr.io/private/application:v1
+```
+
+`mode: auto` is the default when this key is absent. `probeImage` is optional,
+but without it the operator explicitly reports that private repository pull
+permission is unverified. When supplied, the helper obtains a scoped pull token
+and performs an authenticated manifest HEAD for that image on each target node.
+This verifies image authorization without downloading layers; it is not an
+end-to-end Gantry distribution test.
+
+Check installation and actionable authentication errors with:
+
+```bash
+kubectl -n unbounded-system rollout status daemonset/gantry-acr-auth
+kubectl -n unbounded-system logs -l app.kubernetes.io/name=gantry-acr-auth
+kubectl get sites -o yaml
+```
+
+`GantryReady` remains false while the helper rollout or node authentication is
+not ready. A running Gantry process alone does not establish that private pulls
+work. Missing identity/IMDS access, registry exchange failures, and failed
+private-image probes are reported in helper readiness and logs. A configured
+probe must name an image that actually exists.
+
+Use `mode: external` when workloads use `imagePullSecrets` or another system
+manages kubelet credentials. Existing external credential-provider settings and
+unmarked host files are never overwritten. Shared Gantry `credentials_path`
+upstreams do not install this ACR provider. Kubelet authentication is independent
+of Gantry's storage backend, so switching to Racer does not remove it.
+This initial integration supports public Azure ACR endpoints, not sovereign
+clouds or workload identity.
+
+The helper continuously repairs owned-file drift, including after node updates.
+Replacing a helper pod does not remove authentication. Explicit external mode,
+or removing the last eligible ACR upstream, makes retained helpers remove only
+their marked drop-in and provider files and restart kubelet under the same Lease.
+Ensure replacement authentication is available before doing this if workloads
+still pull private images. Wait for that cleanup before uninstalling the
+operator; offline nodes may retain owned files until their helper runs again.
+
 #### Shared-Identity Authentication
 
 Shared identity is a compatibility mode for environments where kubelet or CRI

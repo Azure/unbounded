@@ -49,6 +49,13 @@ for command usage, exit behavior, and the current check list.
 }
 ```
 
+For operator-managed Gantry on AKS Flex nodes, the operator can install and
+reconcile public ACR authentication after the node has joined, without setting
+these provider paths in the bootstrap configuration. See
+[operator-managed ACR authentication](../../guides/gantry.md#operator-managed-acr-authentication-on-aks-flex-nodes).
+Use Gantry's external node-auth mode if these paths already select a provider
+owned by another system.
+
 ## Fields
 
 | Field | Description |
