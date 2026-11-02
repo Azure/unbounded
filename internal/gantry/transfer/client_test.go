@@ -94,9 +94,11 @@ func TestClientDefaultRequestTimeout(t *testing.T) {
 func TestClientConfiguresHTTP2Transport(t *testing.T) {
 	client := NewClient()
 
-	transport, ok := client.hc.Transport.(*http.Transport)
+	// client.hc.Transport is the otelhttp wrapper; the h2c tuning under test
+	// lives on the raw transport the client keeps a handle on.
+	transport, ok := client.transport.(*http.Transport)
 	if !ok {
-		t.Fatalf("transport = %T, want *http.Transport", client.hc.Transport)
+		t.Fatalf("transport = %T, want *http.Transport", client.transport)
 	}
 
 	if transport.HTTP2.MaxReadFrameSize != peerMaxReadFrameSize {

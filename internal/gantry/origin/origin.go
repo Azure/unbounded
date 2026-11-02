@@ -43,11 +43,18 @@ import (
 	"time"
 
 	dockerauth "github.com/containerd/containerd/v2/core/remotes/docker/auth"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	"github.com/Azure/unbounded/internal/gantry/tracing"
 )
 
 // Client is the concrete OriginPuller. It fans out to one *registry per
@@ -172,17 +179,23 @@ func New(cfg *config.Config, opts ...Option) (*Client, error) {
 			ur.CredentialsPath = ""
 		}
 
-		r, err := newRegistry(ur, c.logger)
+		// Build the raw transport first and layer request metering onto it
+		// BEFORE tracing is wrapped on, so the metered counter sits inside the
+		// trace span and reports the same request the span describes. Wrapping
+		// in the other order would leave the metered transport unreachable
+		// behind an opaque RoundTripper.
+		transport := newRegistryTransport()
+		if c.metrics.onRequest != nil {
+			transport = meteredTransport{RoundTripper: transport, onRequest: c.metrics.onRequest}
+		}
+
+		r, err := newRegistry(ur, transport, c.logger)
 		if err != nil {
 			return nil, fmt.Errorf("origin: registry %q: %w", ur.Name, err)
 		}
 
 		if c.delegatedCredentialsOnly {
 			r.base.User = nil
-		}
-
-		if c.metrics.onRequest != nil {
-			r.hc.Transport = meteredTransport{RoundTripper: r.hc.Transport, onRequest: c.metrics.onRequest}
 		}
 
 		c.registries[ur.Name] = r
@@ -422,8 +435,14 @@ type registry struct {
 	base     *url.URL // root of the OCI Distribution v2 API
 	username string
 	password string
-	hc       *http.Client
-	logger   *slog.Logger
+	// transport is the transport hc reaches through its otelhttp wrapper: the
+	// raw *http.Transport, or meteredTransport around it when request metrics
+	// are wired. Kept alongside hc because otelhttp stores its base in an
+	// unexported field, so anything that needs to name or replace the inner
+	// transport cannot reach it via hc.Transport.
+	transport http.RoundTripper
+	hc        *http.Client
+	logger    *slog.Logger
 
 	// keeps a single most-recent token per registry. OCI registries
 	// usually issue tokens whose scope covers an entire repo's pulls, so one
@@ -456,7 +475,27 @@ const (
 	originIdleConnTimeout       = 90 * time.Second
 )
 
-func newRegistryHTTPClient() *http.Client {
+// originSpanName names upstream spans after the registry operation they
+// perform. The default otelhttp name is the full URL, which floods a trace
+// with one uniquely-named span per digest and makes aggregation useless.
+func originSpanName(_ string, r *http.Request) string {
+	return "gantry.origin " + r.Method
+}
+
+// newRegistryTransport builds the per-registry transport.
+//
+// It returns the concrete *http.Transport unwrapped. Tracing is applied in
+// newRegistryHTTPClient, on the way into the http.Client, and NOT onto this
+// value. That distinction is load-bearing: in-protocol wiring (the metered
+// transport) and transport tuning both operate on the raw type, so a caller that
+// reaches for the transport still gets the real one, while every request that
+// actually leaves the process still gets traced.
+//
+// otelhttp injects the W3C traceparent header, which is what lets an
+// instrumented upstream registry join the same trace, and it is the hop that
+// shows where cold-start time went when the bytes came from outside the
+// cluster.
+func newRegistryTransport() http.RoundTripper {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
@@ -471,10 +510,351 @@ func newRegistryHTTPClient() *http.Client {
 		ResponseHeaderTimeout: originResponseHeaderTimeout,
 	}
 
-	return &http.Client{Transport: transport, CheckRedirect: checkRedirect}
+	return transport
 }
 
-func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
+// newRegistryHTTPClient returns the client that performs every upstream request.
+//
+// The transport is tracingRoundTripper rather than otelhttp.NewTransport, and
+// that substitution is deliberate rather than incidental. See
+// tracingRoundTripper for the reason, which is a credential leak otelhttp cannot
+// be configured around.
+func newRegistryHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport:     &tracingRoundTripper{base: transport},
+		CheckRedirect: checkRedirect,
+	}
+}
+
+// tracingRoundTripper traces each upstream request while keeping pre-signed
+// credentials off the trace.
+//
+// It replaces otelhttp.NewTransport for this client. otelhttp records url.full
+// from the request it is given, strips URL user information and nothing else,
+// and then sends that same request. Blob fetches follow registry redirects to
+// storage endpoints whose credential is the query string (sv/sig/se for Azure
+// Blob Storage, X-Amz-* for S3, X-Goog-* for Google Cloud Storage), so a
+// pre-signed signature lands on the redirect span, readable by anyone with
+// collector access and replayable until it expires.
+//
+// No wrapper of otelhttp fixes this, and three placements were tried:
+//
+//   - Outside otelhttp, rewriting the request: otelhttp builds its attributes
+//     before delegating, so a scrubber upstream is invisible to the span.
+//   - Inside otelhttp: the request handed to the wrapped transport is the
+//     request that reaches the socket, so scrubbing there redacts the wire URL
+//     and storage rejects the pull.
+//   - After the fact with span.SetAttributes: the wrapper's own span is the
+//     parent, so the child carries the clean value while the parent still
+//     reports the signature.
+//
+// otelhttp v0.71.0 exposes no hook to override url.full, and v0.72.0 does not
+// add one while forcing otel v1.46.0 to v1.47.0 across the module, which is a
+// fleet-wide change out of proportion to this fix. So this type is hand-rolled.
+//
+// The two URLs are therefore separated on purpose: the span and the outgoing
+// traceparent carry the redacted URL, and the socket carries the original. The
+// request the caller passed in is never modified.
+//
+// The tradeoff is real and worth stating: http.Client builds each automatic
+// redirect hop without a parent context, so hops the client follows by itself
+// are separate root spans rather than children of the first hop. Requests Gantry
+// issues itself, including the auth retry and range requests, still share one
+// trace. Chained redirect spans would need the caller to follow redirects
+// manually, which changes retry, auth, and cancellation behavior across every
+// blob fetch to spare one hop of trace nesting.
+//
+// Metrics otelhttp would have emitted are not emitted here. Gantry's upstream
+// observability comes from its own counters, so nothing currently reads those.
+type tracingRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (rt *tracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, span := tracing.Tracer().Start(
+		req.Context(),
+		originSpanName("", req),
+		trace.WithSpanKind(trace.SpanKindClient),
+	)
+
+	// The span is ended explicitly on every return path rather than deferred,
+	// because for a successful GET the interesting work happens after this
+	// function returns. Ending it here would record a streamed multi-gigabyte
+	// layer as the time to first byte, which is precisely the latency a
+	// "why was this pull slow" trace is read to answer. Ownership transfers to
+	// the response body wrapper on that path; see endSpanOnClose.
+	ended := false
+
+	end := func() {
+		if !ended {
+			ended = true
+
+			span.End()
+		}
+	}
+
+	// The span and the propagation header both describe the redacted URL. They
+	// are built from one clone so what a trace shows and what a downstream peer
+	// is told cannot diverge.
+	recorded := req.Clone(ctx)
+
+	redacted := false
+
+	if recorded.URL != nil {
+		// URL user information is a second credential channel, independent of the
+		// query string, and clearing the query says nothing about it. Supported
+		// legacy endpoints may carry Basic credentials in the registry endpoint,
+		// and urlWithPath copies r.base including its User, so every derived
+		// request URL holds the configured username and password.
+		//
+		// Only the recorded copy is cleared. The wire request keeps its User
+		// because that is how those endpoints authenticate, so this cannot change
+		// whether a pull is authorized.
+		if recorded.URL.User != nil {
+			recorded.URL.User = nil
+
+			redacted = true
+		}
+
+		if recorded.URL.RawQuery != "" {
+			redacted = redactQuery(recorded.URL) || redacted
+		}
+	}
+
+	span.SetAttributes(
+		attribute.String(string(semconv.HTTPRequestMethodKey), req.Method),
+		attribute.String(tracing.AttrURLFull, recorded.URL.String()),
+		attribute.Bool(tracing.AttrURLRedacted, redacted),
+	)
+
+	if target := registryHost(req); target != "" {
+		span.SetAttributes(attribute.String(tracing.AttrRegistry, target))
+	}
+
+	// The wire request is a separate clone carrying the original URL. Header is
+	// cloned rather than shared so injecting traceparent here cannot write into
+	// the caller's header map.
+	wire := req.Clone(ctx)
+	wire.Header = req.Header.Clone()
+
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(wire.Header))
+
+	resp, err := rt.base.RoundTrip(wire)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		end()
+
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int(string(semconv.HTTPResponseStatusCodeKey), resp.StatusCode))
+
+	// Transport errors and HTTP status are different failures, and only the
+	// first produces an error here. A 401, 429, or 500 comes back as a
+	// successful round trip, so without this the span stays Unset and the failed
+	// upstream hop is dropped from every error-filtered trace view. That is the
+	// common case for this client: the auth handshake expects a 401 and callers
+	// reject non-200 responses, so the spans most worth reading are the ones this
+	// would otherwise hide.
+	//
+	// 3xx is not marked. Redirects are routine, handled by http.Client, and are
+	// not failures the caller acts on.
+	if resp.StatusCode >= http.StatusBadRequest {
+		span.SetStatus(codes.Error, http.StatusText(resp.StatusCode))
+	}
+
+	if resp.Body == nil || resp.Body == http.NoBody {
+		end()
+
+		return resp, nil
+	}
+
+	// Ownership of the span moves to the body. It ends when the body is fully
+	// read or closed, whichever happens first, so the recorded duration covers
+	// the download rather than the round-trip headers.
+	resp.Body = &endSpanOnClose{ReadCloser: resp.Body, span: span, end: end}
+
+	return resp, nil
+}
+
+// endSpanOnClose ends the owning span when the response body is done.
+//
+// "Done" is EOF or Close, whichever comes first. Both are needed. Callers that
+// read to completion and then close end the span at EOF, which is where the
+// transfer actually finished; callers that abandon a body early, which the
+// mirror does when a peer wins the race, end it at Close. Watching only Close
+// would let a body left dangling by a garbage collector decide when the span
+// ended, putting a duration no request experienced on the trace.
+type endSpanOnClose struct {
+	io.ReadCloser
+
+	span trace.Span
+	end  func()
+	once sync.Once
+}
+
+func (b *endSpanOnClose) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == nil {
+		return n, nil
+	}
+
+	// io.EOF is the normal end of the body. Any other error is a real read
+	// failure and belongs on the span: a truncated download is exactly what a
+	// trace gets consulted for, and it never surfaces as a transport error from
+	// RoundTrip because the headers had already arrived by then.
+	if !errors.Is(err, io.EOF) {
+		b.span.SetStatus(codes.Error, err.Error())
+	}
+
+	b.finish()
+
+	return n, err
+}
+
+func (b *endSpanOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.finish()
+
+	return err
+}
+
+// finish ends the span at most once. Close can be called repeatedly, and
+// http.Client closes the body itself on some paths in addition to the caller.
+func (b *endSpanOnClose) finish() {
+	b.once.Do(b.end)
+}
+
+// registryHost returns the host the request is actually going to, preferring an
+// explicit Host header the same way net/http does.
+func registryHost(req *http.Request) string {
+	if req.Host != "" {
+		return req.Host
+	}
+
+	if req.URL != nil {
+		return req.URL.Host
+	}
+
+	return ""
+}
+
+// sensitiveQueryFragments are the query parameter name substrings that mark a
+// value as a credential. Matching is substring and case-insensitive because the
+// signed-parameter vocabulary differs per storage provider and several are
+// opaque short names (sv, sig, se, rsc) that an exact-match list would miss.
+//
+// Substring matching is deliberately narrow and multi-character. A fragment like
+// "st" or "se" matches a large family of ordinary names: last, first, range,
+// name, test. Redacting a tags-list "last" cursor or a "range" makes a trace
+// actively misleading about a request that carried no credential at all, so
+// those short names are matched exactly instead, in sensitiveQueryExact.
+//
+// Within that limit, over-redaction is the preferred direction: a swallowed
+// diagnostic parameter costs trace detail, while a missed credential publishes a
+// usable secret. The upstream request is untouched either way, so
+// this can only ever reduce what the trace shows, never what the registry sees.
+var sensitiveQueryFragments = []string{
+	"sig",        // sig, signature, X-Amz-Signature, X-Goog-Signature
+	"credential", // X-Amz-Credential
+	"token",
+	"secret",
+	"password",
+	"apikey",
+	"api-key",
+	"expires", // X-Amz-Expires, X-Goog-Expires
+	"goog",    // X-Goog-*, GCS
+	"x-amz",   // X-Amz-*, S3
+}
+
+// sensitiveQueryExact are opaque signed parameter names too short to match on
+// substring. Bare "st", "se", "sv", and "sr" collide with common English words
+// as substrings, so they match only when the whole parameter name is one of them.
+var sensitiveQueryExact = map[string]struct{}{
+	"se":  {}, // Azure SAS signed expiry
+	"sv":  {}, // Azure SAS signed version
+	"st":  {}, // Azure SAS signed start
+	"sr":  {}, // Azure SAS signed resource / GCS signed resource
+	"srt": {}, // Azure SAS signed resource type
+	"sp":  {}, // Azure SAS signed permissions
+	"sk":  {}, // Azure SAS signing key
+	"ss":  {}, // Azure SAS signed snapshot
+	"spr": {}, // Azure SAS signed protocol
+	"ska": {}, // Azure SAS signing algorithm
+}
+
+// redactQuery replaces sensitive query values in u with a placeholder and
+// reports whether it changed anything. u is expected to be a copy.
+func redactQuery(u *url.URL) bool {
+	changed := false
+
+	q := u.Query()
+	for name := range q {
+		if !sensitiveQuery(name) {
+			continue
+		}
+
+		vals := q[name]
+		for i := range vals {
+			if vals[i] != redactedQueryValue {
+				vals[i] = redactedQueryValue
+				changed = true
+			}
+		}
+
+		q[name] = vals
+	}
+
+	if !changed {
+		return false
+	}
+
+	// Encode re-sorts the parameters, so the recorded URL differs in ordering
+	// from the one sent. That is acceptable: url.full is a diagnostic attribute,
+	// and the ordering is not something the trace consumer can depend on.
+	u.RawQuery = q.Encode()
+
+	return true
+}
+
+// redactedQueryValue replaces any query value judged sensitive.
+const redactedQueryValue = "REDACTED"
+
+// sensitiveQuery reports whether a query parameter name can carry a credential.
+//
+// Known limit, accepted deliberately: matching is on the decoded name, so a
+// parameter whose name is mangled into something that no longer contains a
+// credential fragment slips through, and "si%6Fg" decoding to "sigo" is the
+// example. This is not a weakness specific to the substring approach; an
+// exact-match list is equally exposed. No name-based matcher closes it. The
+// providers also do not emit names like this: ACR, S3, and GCS write fixed
+// parameter names, and Gantry does not construct these URLs at all, it follows a
+// Location header the provider wrote. Redacting every query value would close it
+// at the cost of stripping the cursor from a tags/list and the range from a blob
+// fetch, which is the detail a trace is read for. TestRedactQueryEscapedInteriorName
+// pins the behavior so a change here is noticed rather than assumed.
+//
+// No memoization: this runs over the handful of parameters one signed URL
+// carries, once per request, and the whole check is a map lookup against
+// sensitiveQueryExact plus at most ten substring comparisons. Caching the verdict
+// would cost more in synchronization and type assertions than it saves.
+func sensitiveQuery(name string) bool {
+	lower := strings.ToLower(name)
+
+	if _, ok := sensitiveQueryExact[lower]; ok {
+		return true
+	}
+
+	for _, frag := range sensitiveQueryFragments {
+		if strings.Contains(lower, frag) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func newRegistry(ur config.UpstreamRegistry, transport http.RoundTripper, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
 	if err != nil {
 		// Parse errors can include credentials in both the URL and the cause.
@@ -490,10 +870,11 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 	}
 
 	r := &registry{
-		name:   ur.Name,
-		base:   u,
-		hc:     newRegistryHTTPClient(),
-		logger: logger.With(slog.String("registry", ur.Name)),
+		name:      ur.Name,
+		base:      u,
+		transport: transport,
+		hc:        newRegistryHTTPClient(transport),
+		logger:    logger.With(slog.String("registry", ur.Name)),
 	}
 	if ur.CredentialsPath != "" {
 		b, err := os.ReadFile(ur.CredentialsPath) //#nosec G304 -- operator-supplied path

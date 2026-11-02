@@ -664,6 +664,51 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/vishvananda/netns/blob/v0.0.5/LICENSE
+  - dependency: go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/open-telemetry/opentelemetry-go-contrib/blob/instrumentation/net/http/otelhttp/v0.71.0/LICENSE
+      - name: BSD 3-Clause License
+        link: https://github.com/open-telemetry/opentelemetry-go-contrib/blob/instrumentation/net/http/otelhttp/v0.71.0/LICENSE
+  - dependency: go.opentelemetry.io/otel
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/v1.46.0/LICENSE
+      - name: BSD 3-Clause License
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/v1.46.0/LICENSE
+  - dependency: go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.46.0/LICENSE
+      - name: BSD 3-Clause License
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/exporters/otlp/otlptrace/otlptracegrpc/v1.46.0/LICENSE
+  - dependency: go.opentelemetry.io/otel/sdk
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.46.0/LICENSE
+      - name: BSD 3-Clause License
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.46.0/LICENSE
+  - dependency: go.opentelemetry.io/otel/trace
+    ecosystem: go
+    copyright:
+      - Copyright 2009 The Go Authors.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.46.0/LICENSE
+      - name: BSD 3-Clause License
+        link: https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.46.0/LICENSE
   - dependency: golang.org/x/crypto
     ecosystem: go
     copyright:
