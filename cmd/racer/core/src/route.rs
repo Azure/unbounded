@@ -319,9 +319,8 @@ pub enum Outcome {
     Bootstrap,
     Selected,
     NotFound,
-    Held,
-    Warmed,
-    Released,
+    /// Per-page results of a `prefetch` operation.
+    Prefetch,
     /// Failure outcomes any hop may report (`unavailable`, `overloaded`, ...).
     Other,
 }
@@ -334,9 +333,7 @@ impl Outcome {
             "bootstrap" => Self::Bootstrap,
             "selected" => Self::Selected,
             "not-found" => Self::NotFound,
-            "held" => Self::Held,
-            "warmed" => Self::Warmed,
-            "released" => Self::Released,
+            "prefetch" => Self::Prefetch,
             _ => Self::Other,
         }
     }
@@ -347,14 +344,9 @@ impl Outcome {
         !matches!(self, Self::Other)
     }
 
-    /// The warm action this outcome answers, if it is a warm outcome.
-    pub fn warm_action(self) -> Option<&'static str> {
-        match self {
-            Self::Held => Some("hold"),
-            Self::Warmed => Some("fill"),
-            Self::Released => Some("release"),
-            _ => None,
-        }
+    /// Whether this outcome answers only a `prefetch` operation.
+    pub fn is_prefetch(self) -> bool {
+        matches!(self, Self::Prefetch)
     }
 
     /// Outcomes that must echo the requested operation name.
@@ -722,9 +714,10 @@ mod tests {
             ("bootstrap", true),
             ("selected", true),
             ("not-found", true),
-            ("held", true),
-            ("warmed", true),
-            ("released", true),
+            ("prefetch", true),
+            ("held", false),
+            ("warmed", false),
+            ("released", false),
             ("unavailable", false),
             ("overloaded", false),
             ("stale-membership", false),
@@ -732,10 +725,8 @@ mod tests {
             let outcome = Outcome::from_wire(wire);
             assert_eq!(outcome.asserts_success(), success, "{wire}");
         }
-        assert_eq!(Outcome::Held.warm_action(), Some("hold"));
-        assert_eq!(Outcome::Warmed.warm_action(), Some("fill"));
-        assert_eq!(Outcome::Released.warm_action(), Some("release"));
-        assert_eq!(Outcome::Page.warm_action(), None);
+        assert!(Outcome::Prefetch.is_prefetch());
+        assert!(!Outcome::Page.is_prefetch());
         assert!(Outcome::Bootstrap.echoes_operation());
         assert!(!Outcome::Selected.echoes_operation());
         assert!(not_found_ok("metadata", "acquire", "fresh"));

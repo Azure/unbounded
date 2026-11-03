@@ -2063,7 +2063,6 @@ fn actual_uds_empty_bootstrap_and_canceled_success() {
                     byte_credits: 2 * PAGE_BYTES,
                 },
                 Ok(ReadResponse {
-                    retain_until: None,
                     metadata: metadata.clone(),
                     payload: ReadPayload::Empty,
                 }),
@@ -2297,7 +2296,6 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
         )
         .unwrap();
     let response = ReadResponse {
-        retain_until: None,
         metadata,
         payload: ReadPayload::Stream(stream),
     };
@@ -2325,7 +2323,6 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
         Err(Error::BadGateway)
     );
     let mut empty = ReadResponse {
-        retain_until: None,
         metadata: body_metadata(0),
         payload: ReadPayload::Empty,
     };
@@ -2403,7 +2400,6 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         let output = fixture.result_output(
             kind,
             Ok(ReadResponse {
-                retain_until: None,
                 metadata,
                 payload: ReadPayload::Empty,
             }),

@@ -439,19 +439,9 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     let restored = index.hold_epoch(&id.version).unwrap();
     assert_ne!(restored, before);
     let page = std::iter::once(id.number).collect();
-    index.release_hold_pages(
-        &id.version,
-        &page,
-        before,
-        crate::store::holds::HolderKind::Reader,
-    );
+    index.release_hold_pages(&id.version, &page, before);
     assert_eq!(index.hold_holders(&id), 1);
-    index.release_hold_pages(
-        &id.version,
-        &page,
-        restored,
-        crate::store::holds::HolderKind::Reader,
-    );
+    index.release_hold_pages(&id.version, &page, restored);
     assert_eq!(index.hold_holders(&id), 0);
     assert_eq!(index.hold_expiry(&id.version), None);
     let mut image = checkpoint::decode(&bytes).unwrap();

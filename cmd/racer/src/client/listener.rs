@@ -963,9 +963,28 @@ async fn serve_connection(
         let scope = new_scope(timeout, cancellation.clone())?;
         deadline.set(scope.deadline.0);
         let scope = &scope;
+        // Prefetch tickets have their own JSON route and close the connection.
+        let value = match received.value {
+            Ok(request) if super::prefetch::is_prefetch(&request.head) => {
+                let head = request.head;
+                drop(request.descriptors);
+                return super::prefetch::serve(
+                    connection,
+                    head,
+                    cache,
+                    parser.header_limit(),
+                    reads,
+                    io,
+                    timeout,
+                    cancellation.clone(),
+                )
+                .await;
+            }
+            other => other,
+        };
         // Every descriptor must be claimed by a direct read; the rest close here.
         let mut gpu_read = false;
-        let parsed = received.value.and_then(|received| {
+        let parsed = value.and_then(|received| {
             let request = parser.parse(cache, received.head)?;
             gpu_read = matches!(request.kind, crate::client::ReadKind::GpuRead { .. });
             Ok((request, received.descriptors))

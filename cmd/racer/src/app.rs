@@ -464,7 +464,8 @@ impl Application {
             self.limits.queue_entries.get(),
             self.config.peer_admission,
         )?);
-        self.node.workers.warm.configure(self.config.warm)?;
+        self.node.workers.configure_spill(self.config.spill)?;
+        self.node.workers.prefetch.configure(self.config.prefetch)?;
         Arc::get_mut(&mut self.node)
             .ok_or(Error::Internal)?
             .publications = Arc::new(Published::new(Snapshot::retention(
@@ -1867,7 +1868,14 @@ impl WorkerApplication {
             .collect();
         self.memory.remove_caches(&passthrough)?;
         self.store.writer.remove_caches(&passthrough)?;
-        self.node.workers.warm.forget_caches(&passthrough);
+        // Prefetch tickets end with their cache: a passthrough switch cancels
+        // them with `passthrough`, and removal or a UID change (a new cache
+        // id) with `cache_removed`.
+        self.node.workers.prefetch.passthrough_caches(&passthrough);
+        self.node
+            .workers
+            .prefetch
+            .retain_caches(|cache| snapshot.caches.iter().any(|new| &new.id == cache));
         current_scope.check()?;
         // Priority changes apply live: memory shares are recomputed now, disk
         // shares on the next ranking pass.
@@ -2863,9 +2871,6 @@ impl WorkerApplication {
     /// Report this worker's current resources and credential lifetime.
     fn observe_health(&self) -> Result<()> {
         let node = &self.node;
-        self.telemetry
-            .metrics
-            .observe_warm(node.workers.warm.snapshot());
         self.telemetry
             .metrics
             .observe_held(self.store.writer.index().held_snapshot());

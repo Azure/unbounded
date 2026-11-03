@@ -5,7 +5,6 @@
 
 use super::Coordinator;
 use super::flight::AcquisitionBudget;
-use super::warm::WarmWait;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -27,7 +26,7 @@ use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
-use crate::store::holds::{HoldEpoch, HoldPages, HolderKind};
+use crate::store::holds::{HoldEpoch, HoldPages};
 use std::cell::RefCell;
 #[cfg(test)]
 use std::future::Future;
@@ -102,7 +101,9 @@ impl std::ops::Deref for Mailbox {
 /// The map is immutable for the lifetime of this directory. Construct a replacement
 /// only after all endpoints and completion receipts have drained.
 pub struct WorkerDirectory {
-    pub warm: super::warm::WarmRegistry,
+    /// Node-wide prefetch tickets, scheduler, and owner budget.
+    pub prefetch: Arc<crate::prefetch::service::Prefetch>,
+    spill: std::sync::Mutex<super::spill::Config>,
     pub(crate) subscriptions: Arc<super::range_stream::Scheduler>,
     map: Arc<WorkerMap>,
     mailboxes: Vec<Arc<Mailbox>>,
@@ -110,16 +111,26 @@ pub struct WorkerDirectory {
 }
 
 enum Work {
-    Hold(ObjectVersion, HoldPages, std::time::SystemTime, HolderKind),
+    Hold(ObjectVersion, HoldPages, std::time::SystemTime),
     /// Drop one holder from each page of this worker's hold for the version.
-    Release(ObjectVersion, HoldPages, HoldEpoch, HolderKind),
-    Warm(
+    Release(ObjectVersion, HoldPages, HoldEpoch),
+    /// Fill a spilled page a read holds and persist it under that hold.
+    SpillFill(
         PageId,
         crate::model::VersionMetadata,
         Arc<crate::topology::Membership>,
         PeerOriginContext,
     ),
     WarmLocal(PageId),
+    /// Fill one prefetch page on its owning worker and persist it normally.
+    PrefetchFill(
+        PageId,
+        crate::model::VersionMetadata,
+        Arc<crate::topology::Membership>,
+        PeerOriginContext,
+    ),
+    /// Whether this worker's disk index holds the page.
+    Probe(PageId),
     Select(
         ObjectVersion,
         super::range_stream::Selection,
@@ -140,7 +151,7 @@ enum Work {
         PeerOriginContext,
     ),
     AcquireUnobserved(PageId, Arc<crate::topology::Membership>, PeerOriginContext),
-    /// One read window page: the warm hold first, then ordinary Fill.
+    /// One read window page through ordinary Fill.
     Fetch(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
@@ -161,7 +172,7 @@ enum Work {
     Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
 }
 enum Value {
-    Held(bool, std::time::SystemTime, HoldEpoch),
+    Held(HoldEpoch),
     Metadata(ObjectMetadata),
     Page(PageResult),
     Fetched(super::sealed::Fetched),
@@ -169,6 +180,8 @@ enum Value {
     Published,
     Retained(Option<VersionMetadata>),
     Peer(PeerResponse),
+    Prefetched(racer_core::prefetch::PageResult),
+    Resident(bool),
 }
 /// Runtime executor specialized to application work results and acquisition credits.
 type Executor = mailbox::executor::Executor<Value, AcquisitionBudget, RequestScope>;
@@ -209,43 +222,7 @@ pub struct WorkerEndpoint {
     active: Executor,
 }
 
-/// Outcome of waiting for an active warm job to reach one page.
-pub(super) enum Warmed {
-    /// No warm job covers the version, or the job was abandoned.
-    Unwarmed,
-    /// Warm has published the page on a remote primary owner. Only this page
-    /// may be filled; warm completes pages in any order, so later pages may
-    /// still be pending.
-    Remote,
-    /// Warm has published the page locally and this is its held copy.
-    Local(Box<PageResult>),
-}
-
 impl WorkerDirectory {
-    #[cfg(test)]
-    pub(crate) fn test_warm_command(
-        &self,
-        worker: WorkerId,
-        local: Rc<Coordinator>,
-    ) -> Option<Operation<'static, ()>> {
-        let command = self.mailbox(worker).unwrap().pop()?;
-        Some(Box::pin(async move {
-            let Command {
-                generation,
-                work,
-                scope,
-                mut budget,
-                reply,
-                permit,
-            } = command;
-            let value = execute(&local, work, &scope, budget.as_mut()).await;
-            reply
-                .complete(generation, Completion { value, budget })
-                .unwrap();
-            drop(permit);
-            Ok(())
-        }))
-    }
     #[cfg(test)]
     pub(super) fn test_observation_mailbox(&self) -> usize {
         for mailbox in &self.mailboxes {
@@ -394,7 +371,8 @@ impl WorkerDirectory {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            warm: super::warm::WarmRegistry::new(capacity.saturating_mul(workers.len())),
+            prefetch: Arc::new(crate::prefetch::service::Prefetch::new()),
+            spill: std::sync::Mutex::new(super::spill::Config::default()),
             subscriptions: super::range_stream::Scheduler::new(
                 capacity.saturating_mul(workers.len()),
             ),
@@ -423,7 +401,7 @@ impl WorkerDirectory {
             .dependencies
             .writer
             .index()
-            .set_hold_capacity_percent(self.warm.config().retained_percent)?;
+            .set_hold_capacity_percent(self.spill_config().retained_percent)?;
         let mailbox = self.mailbox(worker)?.clone();
         let key = Arc::as_ptr(self) as usize;
         LOCALS.with(|locals| {
@@ -452,6 +430,10 @@ impl WorkerDirectory {
             .iter()
             .find(|m| m.worker == worker)
             .ok_or(Error::InvalidConfiguration)
+    }
+    /// This worker's read coordinator.
+    pub(crate) fn local_coordinator(&self) -> Result<Rc<Coordinator>> {
+        self.local()
     }
     pub(super) fn local(&self) -> Result<Rc<Coordinator>> {
         LOCALS
@@ -489,102 +471,15 @@ impl WorkerDirectory {
         self.map.owner(page)
     }
 
-    /// Largest object page count this node admits for warm planning or holds.
-    pub(super) fn max_warm_pages(&self) -> u64 {
-        1_048_576u64.saturating_mul(self.mailboxes.len() as u64)
-    }
-
-    pub(super) fn workers(&self) -> Vec<WorkerId> {
-        self.mailboxes
-            .iter()
-            .map(|mailbox| mailbox.worker)
-            .collect()
-    }
-
-    /// Hold exactly `pages[worker]` on every local worker. Workers absent from
-    /// `pages` still renew any hold they already have for the version.
-    pub(super) async fn reserve_warm(
-        &self,
-        version: &ObjectVersion,
-        pages: &std::collections::BTreeMap<u16, HoldPages>,
-        until: std::time::SystemTime,
-        scope: &RequestScope,
-        fresh: &mut Vec<WorkerId>,
-    ) -> Result<std::time::SystemTime> {
-        scope.check()?;
-        let mut accepted = until;
-        for mailbox in &self.mailboxes {
-            let held = pages.get(&mailbox.worker.0).cloned().unwrap_or_default();
-            let receipt = self.submit(
-                mailbox.worker,
-                Work::Hold(version.clone(), held, until, HolderKind::Warm),
-                scope,
-                None,
-            )?;
-            match std::future::poll_fn(|cx| receipt.poll_completion(cx))
-                .await?
-                .value?
-            {
-                Value::Held(_created, expiry, _epoch) => {
-                    fresh.push(mailbox.worker);
-                    accepted = accepted.max(expiry);
-                }
-                _ => return Err(Error::StaleFlight),
-            }
-        }
-        // All workers must honor the same expiry, including recovered longer holds.
-        if accepted > until {
-            for mailbox in &self.mailboxes {
-                let held = pages.get(&mailbox.worker.0).cloned().unwrap_or_default();
-                let receipt = self.submit(
-                    mailbox.worker,
-                    Work::Hold(version.clone(), held, accepted, HolderKind::Warm),
-                    scope,
-                    None,
-                )?;
-                std::future::poll_fn(|cx| receipt.poll_completion(cx))
-                    .await?
-                    .value?;
-            }
-        }
-        Ok(accepted)
-    }
-
-    /// Drop one holder from `pages[worker]` on each listed local worker, under
-    /// the epoch that worker's `Work::Hold` returned. Pages whose last holder
-    /// leaves become evictable. Workers absent from `pages` are untouched.
-    /// Pair with one warm `Work::Hold` per page set, as [`Self::reserve_warm`]
-    /// takes; the release drops warm holders only.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the per-read fetch job in a later change")
-    )]
-    pub(super) async fn release_hold_pages(
-        &self,
-        version: &ObjectVersion,
-        pages: &std::collections::BTreeMap<u16, (HoldPages, HoldEpoch)>,
-        scope: &RequestScope,
-    ) -> Result<()> {
-        scope.check()?;
-        for (worker, (held, epoch)) in pages {
-            if held.is_empty() {
-                continue;
-            }
-            let receipt = self.submit(
-                WorkerId(*worker),
-                Work::Release(version.clone(), held.clone(), *epoch, HolderKind::Warm),
-                scope,
-                None,
-            )?;
-            match std::future::poll_fn(|cx| receipt.poll_completion(cx))
-                .await?
-                .value?
-            {
-                Value::Published => {}
-                _ => return Err(Error::StaleFlight),
-            }
-        }
+    /// Apply read spill settings. Call before installing workers.
+    pub fn configure_spill(&self, config: super::spill::Config) -> Result<()> {
+        config.validate()?;
+        *self.spill.lock().unwrap() = config;
         Ok(())
+    }
+
+    pub fn spill_config(&self) -> super::spill::Config {
+        *self.spill.lock().unwrap()
     }
 
     /// Add one holder to `page` on its owning worker only, until `until`.
@@ -600,7 +495,7 @@ impl WorkerDirectory {
         let pages = std::iter::once(page.number).collect::<HoldPages>();
         let receipt = self.submit(
             owner,
-            Work::Hold(page.version.clone(), pages, until, HolderKind::Reader),
+            Work::Hold(page.version.clone(), pages, until),
             scope,
             None,
         )?;
@@ -608,7 +503,7 @@ impl WorkerDirectory {
             .await?
             .value?
         {
-            Value::Held(_, _, epoch) => Ok(epoch),
+            Value::Held(epoch) => Ok(epoch),
             _ => Err(Error::StaleFlight),
         }
     }
@@ -636,12 +531,12 @@ impl WorkerDirectory {
         for ((owner, epoch), held) in owners {
             if self.is_local(owner) {
                 if let Ok(local) = self.local() {
-                    local.fill.dependencies.writer.index().release_hold_pages(
-                        version,
-                        &held,
-                        epoch,
-                        HolderKind::Reader,
-                    );
+                    local
+                        .fill
+                        .dependencies
+                        .writer
+                        .index()
+                        .release_hold_pages(version, &held, epoch);
                 }
                 continue;
             }
@@ -656,7 +551,7 @@ impl WorkerDirectory {
             };
             if let Ok(receipt) = self.submit(
                 owner,
-                Work::Release(version.clone(), held, epoch, HolderKind::Reader),
+                Work::Release(version.clone(), held, epoch),
                 &scope,
                 None,
             ) {
@@ -668,9 +563,9 @@ impl WorkerDirectory {
         }
     }
 
-    /// Start a warm-path fill of a page a read holds: the owner fills it and
-    /// persists it under the hold. The context is sealed before returning.
-    pub(super) fn start_warm_page(
+    /// Start a fill of a page a read holds: the owner fills it and persists it
+    /// under the hold. The context is sealed before returning.
+    pub(super) fn start_spill_page(
         &self,
         page: PageId,
         metadata: crate::model::VersionMetadata,
@@ -679,7 +574,7 @@ impl WorkerDirectory {
         scope: &RequestScope,
     ) -> Result<Operation<'static, ()>> {
         let owner = self.page_owner(&page)?;
-        let work = Work::Warm(page, metadata, membership, self.seal(context, scope)?);
+        let work = Work::SpillFill(page, metadata, membership, self.seal(context, scope)?);
         let receipt = self.submit(owner, work, scope, Some(super::default_budget(scope)))?;
         Ok(Box::pin(async move {
             match std::future::poll_fn(|cx| receipt.poll_completion(cx))
@@ -728,52 +623,42 @@ impl WorkerDirectory {
         }
     }
 
-    pub(super) async fn warm_page(
+    /// Fill one prefetch page on its owning worker. Errors are whole-page
+    /// failures for the caller to classify.
+    pub(crate) async fn prefetch_page(
         &self,
         page: PageId,
         metadata: crate::model::VersionMetadata,
         membership: Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
-    ) -> Result<()> {
+    ) -> Result<racer_core::prefetch::PageResult> {
         let owner = self.page_owner(&page)?;
-        let work = Work::Warm(page, metadata, membership, self.seal(context, scope)?);
+        let work = Work::PrefetchFill(page, metadata, membership, self.seal(context, scope)?);
         let receipt = self.submit(owner, work, scope, Some(super::default_budget(scope)))?;
         match std::future::poll_fn(|cx| receipt.poll_completion(cx))
             .await?
             .value?
         {
-            Value::Published => Ok(()),
+            Value::Prefetched(result) => Ok(result),
             _ => Err(Error::StaleFlight),
         }
     }
 
-    /// Waits for any active warm job to publish `page` before it is acquired.
-    pub(super) async fn warmed_page(&self, page: &PageId, scope: &RequestScope) -> Result<Warmed> {
-        match self.warm.wait(page, scope).await? {
-            WarmWait::Unwarmed => return Ok(Warmed::Unwarmed),
-            // Pages held by a remote primary owner are read through normal Fill,
-            // which routes to that owner's held copy under the usual topology.
-            // Only this page is known to be complete; warm finishes pages in any
-            // order, so callers must not widen the fill beyond it.
-            WarmWait::Remote => return Ok(Warmed::Remote),
-            WarmWait::Local => {}
+    /// Whether the page's owning worker has it on disk.
+    pub(crate) async fn probe_page(&self, page: PageId, scope: &RequestScope) -> Result<bool> {
+        let owner = self.page_owner(&page)?;
+        if self.is_local(owner) {
+            return probe(&*self.local()?, &page);
         }
-        let owner = self.page_owner(page)?;
-        let result = if self.is_local(owner) {
-            self.local()?.fill.warm_local(page, scope).await
-        } else {
-            match self
-                .submit(owner, Work::WarmLocal(page.clone()), scope, None)?
-                .await?
-                .value?
-            {
-                Value::Page(page) => Ok(page),
-                _ => Err(Error::StaleFlight),
-            }
-        };
-        // A lost held copy is an error, not permission to race the active warm job.
-        result.map(|page| Warmed::Local(Box::new(page)))
+        match self
+            .submit(owner, Work::Probe(page), scope, None)?
+            .await?
+            .value?
+        {
+            Value::Resident(resident) => Ok(resident),
+            _ => Err(Error::StaleFlight),
+        }
     }
 
     fn submit(
@@ -1092,17 +977,9 @@ impl WorkerDirectory {
                 crate::peer::protocol::Operation::Metadata { object, .. } => {
                     self.metadata_owner(object)?
                 }
-                // Fill runs on the page's local worker; hold and release fan out
-                // from the object's metadata worker to every local worker.
-                crate::peer::protocol::Operation::Warm {
-                    version,
-                    action: crate::peer::protocol::WarmAction::Fill { page, .. },
-                    ..
-                } => self.page_owner(&PageId {
-                    version: version.clone(),
-                    number: *page,
-                })?,
-                crate::peer::protocol::Operation::Warm { version, .. } => {
+                // Prefetch fans out from the object's metadata worker to each
+                // page's owning worker.
+                crate::peer::protocol::Operation::Prefetch { version, .. } => {
                     self.metadata_owner(&version.object)?
                 }
             };
@@ -1155,11 +1032,11 @@ impl WorkerEndpoint {
         }
     }
     pub fn stop_admission(&self) {
-        self.directory.warm.stop();
+        self.directory.prefetch.stop();
         self.mailbox.stop_admission();
     }
     pub fn is_drained(&self) -> bool {
-        self.mailbox.outstanding() == 0 && self.directory.warm.drained(self.mailbox.worker)
+        self.mailbox.outstanding() == 0
     }
     /// Close admission and continue reaping every accepted command. An expired
     /// shutdown scope requests cancellation but never substitutes for completion.
@@ -1167,33 +1044,14 @@ impl WorkerEndpoint {
         self.stop_admission();
         Box::pin(std::future::poll_fn(move |cx| {
             self.apply_failed_verdicts();
-            self.directory.warm.poll_releases(
-                self.mailbox.worker,
-                self.local.fill.dependencies.writer.index(),
-                cx,
-            )?;
-            match self
-                .active
+            self.active
                 .poll_drain(&self.mailbox, scope, cx, self.local.clone())
-            {
-                std::task::Poll::Ready(Ok(()))
-                    if !self.directory.warm.drained(self.mailbox.worker) =>
-                {
-                    std::task::Poll::Pending
-                }
-                other => other,
-            }
         }))
     }
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         self.apply_failed_verdicts();
-        self.directory.warm.poll_deadlines();
-        self.directory.warm.poll_releases(
-            self.mailbox.worker,
-            self.local.fill.dependencies.writer.index(),
-            cx,
-        )?;
+        self.directory.prefetch.tick();
         self.active
             .poll(&self.mailbox, cx, work_budget, self.local.clone())
     }
@@ -1246,6 +1104,17 @@ impl mailbox::executor::Handler<Work, Value, AcquisitionBudget, RequestScope> fo
     }
 }
 
+/// Whether this worker's disk index holds `page`.
+fn probe(local: &Coordinator, page: &PageId) -> Result<bool> {
+    Ok(local
+        .fill
+        .dependencies
+        .writer
+        .index()
+        .lookup(page)?
+        .is_some())
+}
+
 async fn execute(
     local: &Coordinator,
     work: Work,
@@ -1254,38 +1123,71 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
-        // Holds and warm fills retain pages, which a passthrough cache never does.
+        // Holds and spill fills retain pages, which a passthrough cache never does.
         Work::Hold(version, ..) if local.fill.passthrough(&version.object.cache) => {
             Err(Error::Unavailable)
         }
-        Work::Warm(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
+        Work::SpillFill(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
             Err(Error::Unavailable)
         }
-        Work::Hold(version, pages, until, kind) => {
-            let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
-            let epoch = local
-                .fill
-                .dependencies
-                .writer
-                .index()
-                .reserve_hold_kind(&version, &pages, until, kind)?;
-            Ok(Value::Held(
-                previous.is_none(),
-                previous.map_or(until, |old| old.max(until)),
-                epoch,
-            ))
+        Work::PrefetchFill(page, ..) if local.fill.passthrough(&page.version.object.cache) => {
+            Ok(Value::Prefetched(racer_core::prefetch::PageResult::Failed(
+                racer_core::prefetch::FailCode::Unavailable,
+            )))
         }
-        Work::Release(version, pages, epoch, kind) => {
+        Work::Hold(version, pages, until) => local
+            .fill
+            .dependencies
+            .writer
+            .index()
+            .reserve_hold_pages(&version, &pages, until)
+            .map(Value::Held),
+        Work::Release(version, pages, epoch) => {
             local
                 .fill
                 .dependencies
                 .writer
                 .index()
-                .release_hold_pages(&version, &pages, epoch, kind);
+                .release_hold_pages(&version, &pages, epoch);
             Ok(Value::Published)
         }
         Work::WarmLocal(page) => local.fill.warm_local(&page, scope).await.map(Value::Page),
-        Work::Warm(page, metadata, membership, envelope) => {
+        Work::Probe(page) => probe(local, &page).map(Value::Resident),
+        Work::PrefetchFill(page, metadata, membership, envelope) => {
+            if probe(local, &page)? {
+                return Ok(Value::Prefetched(
+                    racer_core::prefetch::PageResult::Resident,
+                ));
+            }
+            let context = local.open_context(envelope)?;
+            let result = local
+                .fill
+                .acquire_warm(
+                    page,
+                    membership,
+                    &context,
+                    scope,
+                    budget.ok_or(Error::StaleFlight)?,
+                )
+                .await?;
+            // Never persist or acknowledge a same-ETag copy whose immutable
+            // metadata disagrees with the requester's admitted metadata.
+            if !metadata.compatible(&result.metadata.immutable()) {
+                return Ok(Value::Prefetched(racer_core::prefetch::PageResult::Failed(
+                    racer_core::prefetch::FailCode::VersionChanged,
+                )));
+            }
+            local
+                .fill
+                .dependencies
+                .writer
+                .persist_prefetched(result.copy(), scope)
+                .await?;
+            Ok(Value::Prefetched(
+                racer_core::prefetch::PageResult::Admitted,
+            ))
+        }
+        Work::SpillFill(page, metadata, membership, envelope) => {
             let context = local.open_context(envelope)?;
             let result = local
                 .fill
@@ -1379,13 +1281,8 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Fetch(page, membership, envelope) => {
-            // Passthrough caches retain nothing, so skip stale warm state.
-            if !local.fill.passthrough(&page.version.object.cache)
-                && let Warmed::Local(result) =
-                    local.streams.directory().warmed_page(&page, scope).await?
-            {
-                return Ok(Value::Page(*result));
-            }
+            // A demand read joining a prefetch flight promotes it.
+            let _promoted = local.streams.directory().prefetch.promote(&page);
             let context = local.open_context(envelope)?;
             local
                 .fill
@@ -1400,13 +1297,8 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::FetchSealed(page, membership, envelope, target) => {
-            // Passthrough caches retain nothing, so skip stale warm state.
-            if !local.fill.passthrough(&page.version.object.cache)
-                && let Warmed::Local(result) =
-                    local.streams.directory().warmed_page(&page, scope).await?
-            {
-                return Ok(Value::Fetched(super::sealed::Fetched::Page(*result)));
-            }
+            // A demand read joining a prefetch flight promotes it.
+            let _promoted = local.streams.directory().prefetch.promote(&page);
             let context = local.open_context(envelope)?;
             local
                 .fill
@@ -1494,160 +1386,6 @@ mod tests {
     use racer_control_wire::CacheId;
     use std::time::Duration;
     use std::time::Instant;
-    #[test]
-    fn head_admission_returns_before_body_and_survives_caller_cancel() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
-        let _queue = queue.enter();
-        let directory = Arc::new(directory(4));
-        let (local, _fixture) = crate::read::tests::admission_coordinator();
-        let _local = directory.simulation_scope(Some((WorkerId(0), local.clone())));
-        let caller = scope();
-        let mut version = version();
-        version.object.cache =
-            racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
-        let origin = OriginContext {
-            object: version.object.clone(),
-            metadata: None,
-            authorization: None,
-        };
-        let context = local.credentials.local_context(&origin, &caller).unwrap();
-        let metadata = ObjectMetadata {
-            version,
-            length: 3,
-            content_type: None,
-            expires_at: crate::model::ExpiresAt::test_time(
-                std::time::SystemTime::now() + Duration::from_secs(60),
-            ),
-        };
-        let membership = Arc::new(
-            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
-                .unwrap(),
-        );
-        let mut head = Box::pin(super::super::warm::admit(
-            directory.clone(),
-            metadata,
-            membership,
-            context,
-            Duration::from_secs(60),
-            &caller,
-        ));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(head.as_mut().poll(&mut cx).is_pending());
-        for mailbox in &directory.mailboxes {
-            queue.poll(&mut cx, 64);
-            let command = mailbox.pop().expect("hold command");
-            assert!(matches!(command.work, Work::Hold(..)));
-            let Work::Hold(_, _, until, _) = &command.work else {
-                unreachable!()
-            };
-            command
-                .reply
-                .complete(
-                    command.generation,
-                    Completion {
-                        value: Ok(Value::Held(true, *until, HoldEpoch::default())),
-                        budget: None,
-                    },
-                )
-                .unwrap();
-        }
-        queue.poll(&mut cx, 64);
-        assert!(matches!(head.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
-        drop(head);
-        caller.cancel().unwrap();
-        assert_eq!(queue.pending(), 1, "body driver survives HEAD");
-        let command = directory
-            .mailboxes
-            .iter()
-            .find_map(|mailbox| mailbox.pop())
-            .expect("warm body command");
-        assert!(matches!(command.work, Work::Warm(..)));
-        assert!(
-            command.scope.check().is_ok(),
-            "fresh warm cancellation domain"
-        );
-        command
-            .reply
-            .complete(
-                command.generation,
-                Completion {
-                    value: Err(Error::Unavailable),
-                    budget: None,
-                },
-            )
-            .unwrap();
-        drop(command);
-        queue.poll(&mut cx, 64);
-        assert_eq!(queue.pending(), 0);
-        assert_eq!(directory.warm.snapshot(), (0, 0));
-    }
-    #[test]
-    fn fetch_and_select_commands_wait_behind_unstarted_warm_pages() {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
-        let _queue = queue.enter();
-        let (local, _fixture) = crate::read::tests::admission_coordinator();
-        let directory = local.streams.directory();
-        let caller = scope();
-        let mut version = version();
-        version.object.cache =
-            racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
-        let (job, _) = directory.warm.begin(&version).unwrap();
-        let context = OriginContext {
-            object: version.object.clone(),
-            metadata: None,
-            authorization: None,
-        };
-        let membership = Arc::new(
-            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
-                .unwrap(),
-        );
-        for fetch in [true, false] {
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let envelope = local
-                .credentials
-                .seal(&context, AttemptId([3; 16]), &caller)
-                .unwrap();
-            let work = if fetch {
-                Work::Fetch(
-                    PageId {
-                        version: version.clone(),
-                        number: crate::model::PageNumber(8),
-                    },
-                    membership.clone(),
-                    envelope,
-                )
-            } else {
-                let demand = racer_core::subscriptions::Demand::new(vec![
-                    flow_control::subscriptions::Interval { start: 8, end: 10 },
-                ])
-                .unwrap();
-                Work::Select(
-                    version.clone(),
-                    super::super::range_stream::Selection::for_test(
-                        &directory.subscriptions,
-                        version.clone(),
-                        demand,
-                    ),
-                    membership.clone(),
-                    envelope,
-                )
-            };
-            let mut budget = super::super::default_budget(&caller);
-            let mut command = Box::pin(execute(&local, work, &caller, Some(&mut budget)));
-            for _ in 0..3 {
-                assert!(command.as_mut().poll(&mut cx).is_pending());
-            }
-            assert_eq!(directory.warm.snapshot().1, 1);
-            assert_eq!(
-                queue.pending(),
-                0,
-                "no Fill driver or outbound acquisition may start"
-            );
-            drop(command);
-            assert_eq!(directory.warm.snapshot().1, 0);
-        }
-        job.stop();
-    }
     /// A page owned by `worker` in the two-worker test map.
     fn page_owned_by(directory: &WorkerDirectory, worker: WorkerId) -> PageId {
         (0..1024)
