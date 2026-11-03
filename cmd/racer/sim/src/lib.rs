@@ -79,9 +79,10 @@ pub const SCENARIOS: &[&str] = &[
     "churn",
     "faults",
     "empty",
-    "mesh",
-    "mesh-selector",
 ];
+
+/// Topology-only mesh v2 scenarios ([`mesh::MeshScenario`]): no traffic, any cluster size.
+pub const MESH_SCENARIOS: &[&str] = &["mesh", "mesh-selector"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -146,6 +147,7 @@ impl Options {
                 "--scenario" => {
                     let s = value()?;
                     if !SCENARIOS.contains(&s.as_str())
+                        && !MESH_SCENARIOS.contains(&s.as_str())
                         && !control::SCENARIOS.contains(&s.as_str())
                         && !combined::SCENARIOS.contains(&s.as_str())
                     {
@@ -287,7 +289,7 @@ pub fn run(options: &Options) -> Result<Value, String> {
     }
     #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
     let started = std::time::Instant::now();
-    let mut report = if scenario == "mesh" || scenario == "mesh-selector" {
+    let mut report = if MESH_SCENARIOS.contains(&scenario) {
         mesh_scenario(scenario, &config, options.seed).run()
     } else if combined::SCENARIOS.contains(&scenario) {
         combined::run(

@@ -369,14 +369,8 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     );
 }
 
-/// One warm page read by 512 nodes within a millisecond over 32 MiB/s NICs: in a
-/// 2 s attempt the page's 3 owners can send about 192 copies, so without fan-out readers queue on
-/// the owners until their attempts time out and some reads fail. With fan-out, owners already
-/// streaming `hot_page_bodies` bodies of the page shed further readers with `Overloaded`, and a
-/// shed reader asks one of the page's helpers, which the owners always serve. Every read completes,
-/// readers get copies from helpers, and the page still reaches the origin once.
-#[test]
-fn hot_page_readers_fan_out_through_helpers() {
+/// One warm page read by 512 nodes within a millisecond over 32 MiB/s NICs.
+fn hot_page_storm() -> Config {
     let nodes = 512;
     let mut config = quiet(nodes);
     config.pages_per_object = 1;
@@ -386,6 +380,20 @@ fn hot_page_readers_fan_out_through_helpers() {
         Storm::new(0, 0, 1, 1),
         Storm::new(5 * SECONDS, 0, nodes, MILLIS),
     ];
+    config
+}
+
+/// [`hot_page_storm`] under the v1 helper rule (`mesh_helpers` off): in a
+/// 2 s attempt the page's 3 owners can send about 192 copies, so without fan-out readers queue on
+/// the owners until their attempts time out and some reads fail. With fan-out, owners already
+/// streaming `hot_page_bodies` bodies of the page shed further readers with `Overloaded`, and a
+/// shed reader asks one of the page's helpers, which the owners always serve. Every read completes,
+/// readers get copies from helpers, and the page still reaches the origin once.
+#[test]
+fn hot_page_readers_fan_out_through_helpers() {
+    let mut config = hot_page_storm();
+    let nodes = config.nodes;
+    config.node.mesh_helpers = false;
     let on = run(config.clone(), 5);
     config.node.fanout = false;
     // Without fan-out, owners whose flight is full shed readers too; since a shed reader's retry
@@ -406,6 +414,37 @@ fn hot_page_readers_fan_out_through_helpers() {
         max_ns(&on, "read_ns"),
         max_ns(&off, "read_ns")
     );
+}
+
+/// [`hot_page_storm`] under the mesh v2 rule: owners never shed their own column, and a shed
+/// reader asks the middle node of its primary path, a column mate of the owner that shed it. The
+/// page reaches origin once and helpers serve copies. An owner's fan-in for the page is bounded by
+/// its column (at most `3T / 2` members) plus the other owners and the bodies it streams before it
+/// starts shedding, which is about twice the v1 bound here (`T` = 32 against about 22 hashed
+/// helpers): on these slow NICs a few reads time out.
+#[test]
+fn mesh_hot_page_readers_fan_out_through_column_helpers() {
+    let config = hot_page_storm();
+    let reads = u64::from(config.nodes) + 1;
+    let threshold = racer_core::read::budget::hot_page_bodies(config.page_bytes) as u64;
+    let mut v1 = config.clone();
+    v1.node.mesh_helpers = false;
+    let report = run(config, 5);
+    let v1 = run(v1, 5);
+    assert_eq!(counter(&report, "origin_requests"), 1, "{report}");
+    assert!(counter(&report, "hot_page_sheds") > 0, "{report}");
+    assert!(counter(&report, "helper_copies") > 0, "{report}");
+    let failed = counter(&report, "reads_failed");
+    assert_eq!(counter(&report, "reads_completed") + failed, reads);
+    assert!(failed * 25 <= reads, "{failed} of {reads} failed: {report}");
+    let mesh = &report["mesh"];
+    let column = mesh["default_pool"]["target_column_size"].as_u64().unwrap();
+    let fanin = mesh["page_peak_fanin"].as_u64().unwrap();
+    let bound = column * 3 / 2 + topology::REPLICAS as u64 + threshold;
+    assert!(fanin <= bound, "fan-in {fanin} over {bound}: {mesh}");
+    // The v1 rule for comparison (reported, not asserted): its bound is the hashed helper set.
+    let v1_fanin = v1["mesh"]["page_peak_fanin"].as_u64().unwrap();
+    eprintln!("page fan-in: mesh v2 {fanin}, v1 {v1_fanin}");
 }
 
 /// With the origin far slower than the demand, rank 0's request for a page

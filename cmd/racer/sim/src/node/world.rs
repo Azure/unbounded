@@ -22,6 +22,7 @@ use racer_core::liveness::{
 use racer_core::read::Error;
 use racer_core::read::Source;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
+use racer_core::read::budget::{fanout_helper, is_helper};
 use racer_core::read::budget::{hot_page_bodies, mesh_helper, shed_hot_page};
 use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
@@ -640,6 +641,79 @@ fn column_mates(members: &Members, a: u32, b: u32) -> bool {
         .is_some_and(|pool| pool.same_column(a, b))
 }
 
+/// Largest cluster whose membership changes are compared edge by edge for
+/// `mesh_edges_changed` (each comparison walks every member's neighbors).
+pub const MESH_CHURN_MAX: usize = 8192;
+
+/// Mesh v2 measurements of a run (`designs/racer-mesh-v2.md`, "Simulator").
+#[derive(Default)]
+struct MeshMetrics {
+    /// Most page bodies one node streamed at once (its fan-in of answered page requests).
+    node_fanin: u64,
+    /// Most bodies of one page one node streamed at once, and where.
+    page_fanin: u64,
+    page_fanin_at: Option<(u32, u64)>,
+    /// The 1 s window `egress` and `page_egress` count.
+    window: u64,
+    /// Page bytes each node sent (as owner or relay) in `window`.
+    egress: HashMap<u32, u64, Fixed>,
+    /// Bytes of one page each owner sent in `window`.
+    page_egress: HashMap<(u32, u64), u64, Fixed>,
+    /// Most bytes a node sent in one window, and one page from its owner, and where.
+    egress_peak: u64,
+    egress_peak_at: Option<u32>,
+    page_egress_peak: u64,
+    page_egress_peak_at: Option<(u32, u64)>,
+    /// RDMA peers per (membership version, position), for the newest few versions.
+    rdma: HashMap<(u64, usize), Vec<usize>, Fixed>,
+    rdma_version: u64,
+}
+
+impl MeshMetrics {
+    /// `from` streams `page` with `page_bodies` bodies of it in flight, `bodies` in all.
+    fn fanin(&mut self, from: u32, page: u64, page_bodies: u64, bodies: u64) {
+        self.node_fanin = self.node_fanin.max(bodies);
+        if page_bodies > self.page_fanin {
+            self.page_fanin = page_bodies;
+            self.page_fanin_at = Some((from, page));
+        }
+    }
+
+    /// A page body of `bytes` leaves `route[0]` (its owner) and every relay at about `now`.
+    fn egress(&mut self, now: Nanos, route: &[u32], page: u64, bytes: u64) {
+        let window = now / SECONDS;
+        if window != self.window {
+            self.window = window;
+            self.egress.clear();
+            self.page_egress.clear();
+        }
+        for hop in route.windows(2) {
+            let sent = self.egress.entry(hop[0]).or_default();
+            *sent += bytes;
+            if *sent > self.egress_peak {
+                self.egress_peak = *sent;
+                self.egress_peak_at = Some(hop[0]);
+            }
+        }
+        let sent = self.page_egress.entry((route[0], page)).or_default();
+        *sent += bytes;
+        if *sent > self.page_egress_peak {
+            self.page_egress_peak = *sent;
+            self.page_egress_peak_at = Some((route[0], page));
+        }
+    }
+
+    fn approximate_bytes(&self) -> usize {
+        self.egress.capacity() * 16
+            + self.page_egress.capacity() * 24
+            + self
+                .rdma
+                .values()
+                .map(|v| 48 + v.capacity() * 8)
+                .sum::<usize>()
+    }
+}
+
 /// Bodies in `map[key]` still streaming at `now`; drops finished ones.
 fn live_ends<K: std::hash::Hash + Eq>(
     map: &mut HashMap<K, Vec<Nanos>, Fixed>,
@@ -718,6 +792,8 @@ pub struct NodeWorld {
     streaming: HashMap<(u32, u64), Vec<Nanos>, Fixed>,
     /// End times of all page bodies each node is still streaming.
     bodies: HashMap<u32, Vec<Nanos>, Fixed>,
+    /// Mesh v2 measurements (fan-in, egress, RDMA links).
+    mesh: MeshMetrics,
     origin_per_page: HashMap<u64, u32, Fixed>,
     /// Per page, origin requests classified `origin_repeats_after_failure` (the previous request
     /// for the page failed); the report's
@@ -833,6 +909,7 @@ impl NodeWorld {
             last_hops: HashMap::default(),
             pings: HashMap::default(),
             bodies: HashMap::default(),
+            mesh: MeshMetrics::default(),
             origin_per_page: HashMap::default(),
             failure_retries_per_page: HashMap::default(),
             origin_wake: None,
@@ -930,10 +1007,12 @@ impl NodeWorld {
     /// Combined mode: the control plane committed membership `number` with `members` (node ids) at
     /// `now`. Prunes versions no live node needs.
     pub fn commit_membership(&mut self, number: u64, members: Vec<u32>, now: Nanos) {
+        let before = (self.versions.history_len() > 0).then(|| self.versions.latest_number());
         let added = self.versions.commit(number, members, now);
         if !added {
             return;
         }
+        self.note_mesh_churn(before);
         self.metrics.incr("membership_publications");
         self.engine.trace.record(now, 15, number, 0);
         self.prune_versions();
@@ -1087,7 +1166,9 @@ impl NodeWorld {
     fn publish(&mut self) {
         self.publish_scheduled = false;
         let now = self.now();
+        let before = (self.versions.history_len() > 0).then(|| self.versions.latest_number());
         let dropped = self.versions.publish(now);
+        self.note_mesh_churn(before);
         self.metrics.incr("membership_publications");
         if dropped {
             self.shared.phantom.forget(&self.versions.identities());
@@ -3519,23 +3600,105 @@ impl NodeWorld {
     }
 
     /// The member fill `id`'s node asks to acquire its page (production
-    /// `CandidatePolicy::fanout_helper`): the middle node of its primary mesh path to an owner,
-    /// never an owner or the node itself. The simulator has one default pool.
+    /// `CandidatePolicy::fanout_helper`): with `node.mesh_helpers` (v2) the middle node of its
+    /// primary mesh path to an owner, else (v1) one of the page's hashed helpers; never an owner
+    /// or the node itself. The simulator has one default pool.
     fn fanout_helper(&self, id: u64) -> Option<u32> {
         let fill = &self.fills[&id];
-        let node = fill.node;
+        let (node, page) = (fill.node, fill.page);
         let members = &self.versions.get(fill.core.version)?.members;
-        let pool = members.pools().first()?;
-        let me = members.position(&node.to_be_bytes())?;
+        let me = members.position(&node.to_be_bytes());
+        let at = |p: usize| members.members()[p].node;
         let owners: Vec<u32> = fill.core.owners.iter().copied().collect();
-        mesh_helper(
-            &owners,
-            |owner| {
-                let owner = members.position(&owner.to_be_bytes())?;
-                pool.helper(me, owner).map(|p| members.members()[p].node)
-            },
-            |n| *n == node || owners.contains(n),
+        if self.config.node.mesh_helpers {
+            // Mesh v2: the middle node of this reader's primary path to an owner.
+            let pool = members.pools().first()?;
+            let me = me?;
+            return mesh_helper(
+                &owners,
+                |owner| {
+                    let owner = members.position(&owner.to_be_bytes())?;
+                    pool.helper(me, owner).map(at)
+                },
+                |n| *n == node || owners.contains(n),
+            );
+        }
+        fanout_helper(
+            &self.ids.object(page),
+            self.ids.number(page),
+            self.ids.node(node),
+            members.members().len(),
+            |p| at(p) == node || owners.contains(&at(p)),
+            |p| me.is_some_and(|me| members.is_neighbor(me, p)),
         )
+        .map(at)
+    }
+
+    /// A page body leaves `route[0]` for `route.last()` at `now`: fan-in, egress, and links by
+    /// transport (RDMA when both ends share a Site and took the edge among their
+    /// `topology::RDMA_PEERS` best ranked edges; production `Membership::is_rdma_edge`).
+    fn note_body(&mut self, now: Nanos, route: &[u32], page: u64, version: u64, bytes: u64) {
+        let from = route[0];
+        let page_bodies = live_ends(&mut self.streaming, (from, page), now) as u64;
+        let bodies = live_ends(&mut self.bodies, from, now) as u64;
+        self.mesh.fanin(from, page, page_bodies, bodies);
+        self.metrics.observe("page_fanin", page_bodies);
+        self.mesh.egress(now, route, page, bytes);
+        let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
+            return;
+        };
+        let (mut rdma, mut tcp) = (0, 0);
+        for hop in route.windows(2) {
+            if self.rdma_edge(version, &members, hop[0], hop[1]) {
+                rdma += 1;
+            } else {
+                tcp += 1;
+            }
+        }
+        self.metrics.add("links_rdma", rdma);
+        self.metrics.add("links_tcp", tcp);
+        let links = rdma + tcp;
+        self.metrics.observe(
+            if tcp == 0 {
+                "hops_rdma_only"
+            } else {
+                "hops_with_tcp"
+            },
+            links,
+        );
+    }
+
+    /// Whether the edge `a - b` of membership `version` uses RDMA.
+    fn rdma_edge(&mut self, version: u64, members: &Members, a: u32, b: u32) -> bool {
+        let site = &self.fabric.site;
+        if site[a as usize] != site[b as usize] {
+            return false;
+        }
+        let (Some(pa), Some(pb)) = (
+            members.position(&a.to_be_bytes()),
+            members.position(&b.to_be_bytes()),
+        ) else {
+            return false;
+        };
+        if !members.is_neighbor(pa, pb) {
+            return false;
+        }
+        if version > self.mesh.rdma_version {
+            // Keep the newest few versions.
+            self.mesh.rdma_version = version;
+            self.mesh.rdma.retain(|(v, _), _| v + 4 > version);
+        }
+        let eligible = |x: usize, y: usize| {
+            site[members.members()[x].node as usize] == site[members.members()[y].node as usize]
+        };
+        let mut takes = |p: usize, q: usize| {
+            self.mesh
+                .rdma
+                .entry((version, p))
+                .or_insert_with(|| members.rdma_peers(p, topology::RDMA_PEERS, eligible))
+                .contains(&q)
+        };
+        takes(pa, pb) && takes(pb, pa)
     }
 
     /// Bodies of one page an owner streams before it may shed (production `hot_page_threshold`).
@@ -3567,7 +3730,17 @@ impl NodeWorld {
         let Some(members) = self.versions.get(version).map(|v| &v.members) else {
             return false;
         };
-        let column_mate = || column_mates(members, dest, requester);
+        let mesh = self.config.node.mesh_helpers;
+        let column_mate = || {
+            if mesh {
+                // Mesh v2: never shed a requester in this owner's own column.
+                return column_mates(members, dest, requester);
+            }
+            members.position(&requester.to_be_bytes()).is_some_and(|p| {
+                let (object, number) = (self.ids.object(page), self.ids.number(page));
+                is_helper(&object, number, p, members.members().len())
+            })
+        };
         shed_hot_page(
             &owners,
             &dest,
@@ -3856,6 +4029,7 @@ impl NodeWorld {
             }
             self.metrics.add("peer_bytes", bytes * links);
             self.metrics.observe("hops", links);
+            self.note_body(now, &route, m.page, m.version, bytes);
             done
         } else {
             let mut t = self.fabric.crypto(ready, from, costs.sign_ns);
@@ -4960,6 +5134,7 @@ impl NodeWorld {
                 + self.bodies.len() * 64
                 + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
+        list.push(("mesh_metrics", self.mesh.approximate_bytes()));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));
         list.push((
             "failure_retries_per_page",
@@ -4981,6 +5156,74 @@ impl NodeWorld {
         }
         out.insert("keys".into(), json!(counts[ResourceClass::ALL.len()]));
         Value::Object(out)
+    }
+
+    /// Mesh v2 measurements: peers per node of the newest membership, its default pool's layout,
+    /// fan-in and egress peaks, links by transport, and edges changed by membership changes.
+    pub fn mesh_report(&self) -> Value {
+        let c = |k: &str| self.metrics.get(k);
+        let links = c("links_rdma") + c("links_tcp");
+        let histogram = |k: &str| {
+            self.metrics
+                .histogram(k)
+                .map_or_else(|| json!({"count": 0}), |h| h.to_json())
+        };
+        let (degree, layout) = match self.versions.history_len() {
+            0 => (json!(null), json!(null)),
+            _ => {
+                let members = &self.versions.latest().members;
+                let layout = members.pools().first().map(|pool| {
+                    let (columns, size) = pool.target();
+                    json!({
+                        "columns": pool.columns(),
+                        "target_columns": columns,
+                        "target_column_size": size,
+                    })
+                });
+                (crate::mesh::degrees(members, None).to_json(), json!(layout))
+            }
+        };
+        json!({
+            "degree": degree,
+            "default_pool": layout,
+            "owner_peak_fanin": self.mesh.node_fanin,
+            "page_peak_fanin": self.mesh.page_fanin,
+            "page_peak_fanin_at": self.mesh.page_fanin_at.map(|(n, p)| json!({"node": n, "page": p})),
+            "owner_peak_egress_bytes_per_s": self.mesh.egress_peak,
+            "owner_peak_egress_at": self.mesh.egress_peak_at,
+            "page_peak_egress_bytes_per_s": self.mesh.page_egress_peak,
+            "page_peak_egress_at": self.mesh.page_egress_peak_at.map(|(n, p)| json!({"node": n, "page": p})),
+            "links_rdma": c("links_rdma"),
+            "links_tcp": c("links_tcp"),
+            "rdma_fraction": if links == 0 { 0.0 } else { c("links_rdma") as f64 / links as f64 },
+            "hops_rdma_only": histogram("hops_rdma_only"),
+            "hops_with_tcp": histogram("hops_with_tcp"),
+            "edges_changed_per_publication": histogram("mesh_edges_changed"),
+            "edges_changed_per_event": histogram("mesh_edges_changed_per_event"),
+        })
+    }
+
+    /// Record the edges the newest membership changed from the one before it, if both are
+    /// retained and the cluster is at most [`MESH_CHURN_MAX`] members (the comparison walks every
+    /// member's neighbors).
+    fn note_mesh_churn(&mut self, before: Option<u64>) {
+        let Some(before) = before.filter(|_| self.versions.history_len() > 0) else {
+            return;
+        };
+        let latest = self.versions.latest();
+        if latest.number == before || latest.members.members().len() > MESH_CHURN_MAX {
+            return;
+        }
+        let Some(old) = self.versions.get(before).map(|v| v.members.clone()) else {
+            return;
+        };
+        let new = latest.members.clone();
+        let (edges, events) = crate::mesh::churn(&old, &new);
+        self.metrics.observe("mesh_edges_changed", edges);
+        if let Some(per_event) = edges.checked_div(events) {
+            self.metrics
+                .observe("mesh_edges_changed_per_event", per_event);
+        }
     }
 
     pub fn report(&self, scenario: &str, seed: u64) -> Value {
@@ -5047,6 +5290,7 @@ impl NodeWorld {
                     .collect::<serde_json::Map<_, _>>(),
             },
             "rejections": self.rejections(),
+            "mesh": self.mesh_report(),
             "membership": {
                 "placement_memo_entries": self.shared.phantom.memo_len(),
             },
@@ -5122,12 +5366,14 @@ mod shed_tests {
     #[test]
     fn owner_without_a_cached_ranking_sheds_a_hot_page() {
         let nodes = 256;
-        let config = Config {
+        let mut config = Config {
             nodes,
             request_rate: 0.0,
             pages_per_object: 1,
             ..Config::default()
         };
+        // The v1 helper rule; `mesh_owner_exempts_its_column` covers mesh v2.
+        config.node.mesh_helpers = false;
         let mut world = NodeWorld::new(config, 1);
         let page = 0;
         let w = world.ids.worker(page);
@@ -5168,5 +5414,58 @@ mod shed_tests {
             .streaming
             .insert((owner, page), vec![SECONDS; threshold - 1]);
         assert!(!world.shed_hot(owner, reader, page), "below the threshold");
+    }
+
+    /// Mesh v2 hot keys: an owner never sheds a requester in its own column, sheds other readers
+    /// past the threshold, and a shed reader's helper is the middle node of its primary path, a
+    /// column mate of the owner.
+    #[test]
+    fn mesh_owner_exempts_its_column() {
+        let nodes = 256;
+        let config = Config {
+            nodes,
+            request_rate: 0.0,
+            pages_per_object: 1,
+            ..Config::default()
+        };
+        let mut world = NodeWorld::new(config, 1);
+        let page = 0;
+        let w = world.ids.worker(page);
+        let members = world
+            .versions
+            .get(world.nodes[0].version)
+            .unwrap()
+            .members
+            .clone();
+        let pool = members.pools()[0].clone();
+        let pos = |n: u32| members.position(&n.to_be_bytes()).unwrap();
+        let ranker = (0..nodes)
+            .find(|n| !world.owners_at(*n, w, page, true).contains(n))
+            .unwrap();
+        let owners = world.owners_at(ranker, w, page, true);
+        let owner = owners[0];
+        let mate = (0..nodes)
+            .find(|n| !owners.contains(n) && pool.same_column(pos(*n), pos(owner)))
+            .unwrap();
+        let reader = (0..nodes)
+            .find(|n| !owners.contains(n) && !pool.same_column(pos(*n), pos(owner)))
+            .unwrap();
+        let threshold = world.hot_page_threshold();
+        let busy = vec![SECONDS; threshold];
+        world.streaming.insert((owner, page), busy.clone());
+        world.bodies.insert(owner, busy);
+        assert!(world.shed_hot(owner, reader, page));
+        assert!(
+            !world.shed_hot(owner, mate, page),
+            "column mates are exempt"
+        );
+        assert!(!world.shed_hot(owner, owners[1], page), "owners are exempt");
+        let helper = pool.helper(pos(reader), pos(owner)).unwrap();
+        assert!(pool.same_column(helper, pos(owner)));
+        let helper = members.members()[helper].node;
+        assert!(
+            owners.contains(&helper) || !world.shed_hot(owner, helper, page),
+            "a helper is never shed"
+        );
     }
 }

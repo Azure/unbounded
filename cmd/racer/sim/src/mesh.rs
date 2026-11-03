@@ -98,6 +98,18 @@ fn neighbor_ids<M: Member>(membership: &Membership<M>) -> HashMap<u64, Vec<u64>>
         .collect()
 }
 
+/// Edges changed from `old` to `new` ([`edges_changed`]) and members that joined or left.
+pub fn churn<M: Member>(old: &Membership<M>, new: &Membership<M>) -> (u64, u64) {
+    let ids = |m: &Membership<M>| {
+        let mut ids: Vec<u64> = m.members().iter().map(|x| id_key(x.id())).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let (a, b) = (ids(old), ids(new));
+    let members = sorted_difference(&a, &b) + sorted_difference(&b, &a);
+    (edges_changed(old, new), members)
+}
+
 /// Edges added plus edges removed from `old` to `new`, matching members by ID. An edge to a member
 /// that joined or left counts too.
 pub fn edges_changed<M: Member>(old: &Membership<M>, new: &Membership<M>) -> u64 {
@@ -339,7 +351,8 @@ impl MeshScenario {
         }
     }
 
-    fn members(&self, change: Change) -> Vec<MeshMember> {
+    /// Members after `change`, in node order.
+    pub fn members(&self, change: Change) -> Vec<MeshMember> {
         let joined = match change {
             Change::Join(n) => Some(n),
             _ => None,
@@ -363,7 +376,8 @@ impl MeshScenario {
             .collect()
     }
 
-    fn pools(&self, change: Change) -> Vec<PoolSpec> {
+    /// Pool specs after `change`.
+    pub fn pools(&self, change: Change) -> Vec<PoolSpec> {
         let mut pools = vec![PoolSpec::default_pool()];
         if self.selector > 0 {
             pools.push(PoolSpec {

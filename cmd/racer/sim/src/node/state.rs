@@ -625,6 +625,11 @@ impl Versions {
     }
 
     /// Latest version number, 0 before any (combined mode).
+    /// Versions retained.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
     pub fn latest_number(&self) -> u64 {
         self.history.back().map_or(0, |v| v.number)
     }
