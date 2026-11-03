@@ -846,6 +846,15 @@ mod send_in_place {
         w.a.links.record_http_fallback();
         assert_eq!(ma.count(Event::RdmaHttpFallback), 1);
     }
+
+    #[test]
+    fn overflow_is_counted_apart_from_http_fallback() {
+        let w = world();
+        let (w, ma, _) = metered(w);
+        w.a.links.record_fallback_overflow();
+        assert_eq!(ma.count(Event::RdmaFallbackOverflow), 1);
+        assert_eq!(ma.count(Event::RdmaHttpFallback), 0);
+    }
 }
 
 #[test]

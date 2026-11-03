@@ -758,6 +758,23 @@ pub(crate) fn link_allowed(
         && theirs.rails.iter().any(|m| m.rail == rail)
 }
 
+/// Whether the responder refuses a link setup from `peer` on `rail`: an
+/// error when the pair fails [`link_allowed`] (no membership, Site, or rail),
+/// and `403` when the edge is not an RDMA edge of the membership because at
+/// least one end did not take it among its `RDMA_PEERS` best. The initiator
+/// backs off on `403` and pages use HTTP.
+pub(crate) fn link_refusal(
+    membership: Option<&crate::topology::Membership>,
+    local: &NodeId,
+    peer: &NodeId,
+    rail: RailId,
+) -> Result<Option<u16>> {
+    let Some(membership) = membership.filter(|m| link_allowed(m, local, peer, rail)) else {
+        return Err(Error::Unauthorized);
+    };
+    Ok((!crate::rdma::is_rdma_edge(membership, local, peer)).then_some(403))
+}
+
 /// Initiator side of one link setup on an authenticated connection: open the
 /// link, send the signed `RdmaLink` request, verify the signed response, and
 /// connect. Any failure breaks the attempt, which backs the link off.
@@ -786,7 +803,8 @@ pub(crate) async fn link_exchange(
         let received = io.receive_head(connection, scope).await?;
         if !matches!(received.value.start, StartLine::Response { status: 200 }) {
             // 409: our offer lost the tie-break; the peer's offer replaces it.
-            // 429 and 503: try again after backoff.
+            // 403 (not an RDMA edge in the responder's membership), 429 and
+            // 503: try again after backoff.
             return Err(Error::Unavailable);
         }
         let mut connection = received.connection;
@@ -874,7 +892,8 @@ impl Transfers {
 
     /// Responder side of an `RdmaLink` setup: verify the signed offer, check
     /// membership, rate limit and tie-break, accept, and answer signed. Declined
-    /// offers get `409` (our concurrent offer wins), `429` (rate limit or
+    /// offers get `403` (the edge is not an RDMA edge), `409` (our concurrent
+    /// offer wins), `429` (rate limit or
     /// overload), or `503` (no RDMA here) and never reach the owner.
     pub(crate) async fn serve_link(
         &self,
@@ -900,8 +919,11 @@ impl Transfers {
         let local = self.signatures.node();
         let reply = match &self.links {
             None => link_status(503),
-            Some(_) if !membership.is_ok_and(|m| link_allowed(&m, local, &peer, rail)) => {
-                return Err(Error::Unauthorized);
+            Some(_)
+                if let Some(status) =
+                    link_refusal(membership.ok().as_deref(), local, &peer, rail)? =>
+            {
+                link_status(status)
             }
             Some(links) => match links.admit_setup(&peer, rail) {
                 crate::rdma::SetupAdmission::Conflict => link_status(409),
@@ -1274,6 +1296,13 @@ impl Transfers {
             if native.is_some() {
                 self.record_rdma_stage(Event::RdmaGrantCount, Event::RdmaGrantNs, granting);
             }
+            if plan == TransportPlan::Http
+                && let (Some(links), Some(membership)) = (&self.links, &membership)
+                && let Some(page) = super::rail_hint(&request.request.operation)
+                && crate::rdma::is_overflow(membership, &page, self.signatures.node(), &peer)
+            {
+                links.record_fallback_overflow();
+            }
             if let TransportPlan::Rdma { rail } = plan
                 && membership.is_some()
                 && self
@@ -1574,6 +1603,37 @@ pub(crate) async fn relay_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn link_refusal_admits_only_rdma_edges() {
+        let rail = RailId(7);
+        let small = crate::rdma::tests::rails_tests::mesh(8);
+        let a = &small.members()[0].node;
+        let b = &small.members()[1].node;
+        assert_eq!(link_refusal(Some(&small), a, b, rail), Ok(None));
+        assert_eq!(link_refusal(None, a, b, rail), Err(Error::Unauthorized));
+        assert_eq!(
+            link_refusal(Some(&small), a, b, RailId(99)),
+            Err(Error::Unauthorized)
+        );
+        // Over the peer budget, an eligible edge one end did not take gets 403.
+        let large = crate::rdma::tests::rails_tests::mesh_with_budget(40, 16);
+        let nodes: Vec<_> = large.members().iter().map(|m| m.node.clone()).collect();
+        let (mut refused, mut admitted) = (0, 0);
+        for b in &nodes[1..] {
+            match link_refusal(Some(&large), &nodes[0], b, rail).unwrap() {
+                None => {
+                    assert!(crate::rdma::is_rdma_edge(&large, &nodes[0], b));
+                    admitted += 1;
+                }
+                Some(status) => {
+                    assert_eq!(status, 403);
+                    assert!(!crate::rdma::is_rdma_edge(&large, &nodes[0], b));
+                    refused += 1;
+                }
+            }
+        }
+        assert!(admitted > 0 && refused > 0);
+    }
     #[test]
     fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
         let scope = RequestScope::new(
