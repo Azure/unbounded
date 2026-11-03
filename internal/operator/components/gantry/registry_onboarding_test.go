@@ -16,7 +16,6 @@ func TestRegistryAuthPolicyDoesNotModifyGantryConfiguration(t *testing.T) {
 	for _, mode := range []string{"managed", "external", "registry-only"} {
 		t.Run(mode, func(t *testing.T) {
 			source := authSource("")
-
 			switch mode {
 			case "external":
 				source.Data["node-auth.yaml"] = "mode: external\nregistry: example.azurecr.io\n"

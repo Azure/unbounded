@@ -8,7 +8,6 @@ All temporary files stay inside the repository. No Azure calls or remote host
 commands are executed; the fake tools persist a small Azure/Kubernetes model.
 """
 
-import hashlib
 import io
 import json
 import os
@@ -368,117 +367,6 @@ class DeploymentTests(unittest.TestCase):
         self.assert_no_acr_wiring()
         self.assertEqual(list(state_dir.glob("registry-*")), [])
 
-    def make_snapshot(self, commit="a" * 40):
-        snapshot = self.root / "snapshot"
-        snapshot.mkdir(exist_ok=True)
-        images = {name: "sha256:" + "b" * 64 for name in (
-            "unbounded-operator", "gantry", "unbounded-net-controller",
-            "unbounded-net-node", "machina", "token-refresher")}
-        manifest = {"schemaVersion": 1, "version": "snapshot-" + commit,
-                    "gitCommit": commit, "imageRegistry": "ghcr.io/azure",
-                    "platforms": ["linux/amd64"], "images": images}
-        (snapshot / "snapshot.json").write_text(json.dumps(manifest))
-        digest = hashlib.sha256(MOCK.encode()).hexdigest()
-        checksums = []
-        for os_name in ("linux", "darwin"):
-            for arch in ("amd64", "arm64"):
-                asset = f"kubectl-unbounded-{os_name}-{arch}"
-                (snapshot / asset).write_text(MOCK)
-                checksums.append(f"{digest}  {asset}\n")
-        (snapshot / "checksums.txt").write_text("".join(checksums))
-        return snapshot
-
-    def test_snapshot_installs_matching_plugin_without_release_download(self):
-        snapshot = self.make_snapshot()
-        self.run_script(["--snapshot-dir", str(snapshot), "--flex-count", "1"])
-        self.run_script(["--snapshot-dir", str(snapshot), "--flex-count", "1"])
-        intent = json.loads((self.root / "state/intent.json").read_text())
-        self.assertEqual(intent["unboundedVersion"], "snapshot-" + "a" * 40)
-        self.assertEqual(intent["snapshotGitCommit"], "a" * 40)
-        self.assertEqual(intent["snapshotRegistry"], "ghcr.io/azure")
-        installed = self.root / "state/bin" / intent["unboundedVersion"] / "kubectl-unbounded"
-        self.assertEqual(installed.read_text(), MOCK)
-        self.assertEqual(installed.stat().st_mode & 0o777, 0o700)
-        self.assertFalse(any(call[0] == "curl" and any("Azure/unbounded/releases" in arg for arg in call) for call in self.calls()))
-        self.assertEqual(sum(call[0] == "kubectl-unbounded" for call in self.calls()), 1)
-        self.assert_no_acr_wiring()
-
-    def test_snapshot_plan_is_offline_and_does_not_write_state(self):
-        snapshot = self.make_snapshot()
-        result = self.run_script(["--snapshot-dir", str(snapshot), "--plan"])
-        self.assertIn("snapshot-" + "a" * 40, result.stdout)
-        self.assertIn("unsigned", result.stdout)
-        self.assertEqual(self.calls(), [])
-        self.assertFalse((self.root / "state").exists())
-
-    def test_invalid_snapshots_fail_before_cloud_calls_or_state_writes(self):
-        snapshot = self.make_snapshot()
-        original = (snapshot / "snapshot.json").read_text()
-        mutations = [{"schemaVersion": 2}, {"gitCommit": "bad"},
-                     {"version": "snapshot-" + "c" * 40},
-                     {"imageRegistry": "../other"}, {"platforms": ["linux/arm64"]},
-                     {"images": {}}]
-        for mutation in mutations:
-            with self.subTest(mutation=mutation):
-                manifest = json.loads(original)
-                manifest.update(mutation)
-                (snapshot / "snapshot.json").write_text(json.dumps(manifest))
-                result = self.run_script(["--snapshot-dir", str(snapshot)], success=False)
-                self.assertIn("invalid or incomplete snapshot manifest", result.stderr)
-                self.assertEqual(self.calls(), [])
-                self.assertFalse((self.root / "state").exists())
-
-    def test_snapshot_rejects_conflicting_release_pin(self):
-        snapshot = self.make_snapshot()
-        result = self.run_script(["--snapshot-dir", str(snapshot), "--unbounded-version", "v0.8.0"], success=False)
-        self.assertIn("mutually exclusive", result.stderr)
-        self.assertEqual(self.calls(), [])
-
-    def test_snapshot_rejects_missing_or_corrupt_plugin(self):
-        snapshot = self.make_snapshot()
-        for file in snapshot.glob("kubectl-unbounded-*"):
-            file.write_text("corrupt")
-        result = self.run_script(["--snapshot-dir", str(snapshot)], success=False)
-        self.assertIn("checksum mismatch", result.stderr)
-        for file in snapshot.glob("kubectl-unbounded-*"):
-            file.unlink()
-        result = self.run_script(["--snapshot-dir", str(snapshot)], success=False)
-        self.assertIn("plugin or checksums.txt missing", result.stderr)
-        self.assertEqual(self.calls(), [])
-        self.assertFalse((self.root / "state").exists())
-
-    def test_snapshot_rejects_duplicate_checksum_entries(self):
-        snapshot = self.make_snapshot()
-        checksums = snapshot / "checksums.txt"
-        checksums.write_text(checksums.read_text() * 2)
-        result = self.run_script(["--snapshot-dir", str(snapshot)], success=False)
-        self.assertIn("no unique SHA-256", result.stderr)
-        self.assertEqual(self.calls(), [])
-
-    def test_snapshot_workflow_excludes_all_cluster_jobs(self):
-        workflow = (ROOT / ".github/workflows/nightly.yaml").read_text()
-        entrypoint = (ROOT / ".github/workflows/snapshot.yaml").read_text()
-        self.assertIn('"snapshots/*"', entrypoint)
-        self.assertIn("uses: ./.github/workflows/nightly.yaml", entrypoint)
-        self.assertIn("      build_only: true", entrypoint)
-        self.assertIn("      ref: ${{ github.sha }}", entrypoint)
-        self.assertNotIn("secrets: inherit", entrypoint)
-        self.assertIn("  workflow_call:", workflow)
-        dispatch = workflow.split("  workflow_dispatch:", 1)[1].split("\npermissions:", 1)[0]
-        self.assertNotIn("build_only:", dispatch)
-        jobs = dict(re.findall(r"^  ([a-z][a-z-]+):\n(.*?)(?=^  [a-z][a-z-]+:|\Z)", workflow, re.M | re.S))
-        for name in ("deploy", "deploy-orca", "smoke-discover", "smoke-tests"):
-            with self.subTest(job=name):
-                condition = next(line for line in jobs[name].splitlines() if line.startswith("    if:"))
-                self.assertIn("!inputs.build_only", condition)
-        for name in ("resolve", "net-images", "component-images", "snapshot-artifacts"):
-            self.assertNotIn("secrets.KUBECONFIG", jobs[name])
-            self.assertNotIn("    environment:", jobs[name])
-        self.assertIn("needs: [resolve, net-images, component-images]", jobs["snapshot-artifacts"])
-        self.assertIn("TAG=\"snapshot-${SHA}\"", jobs["resolve"])
-        self.assertIn("format('build-snapshot-{0}'", workflow)
-        self.assertIn("cancel-in-progress: ${{ !inputs.build_only }}", workflow)
-
     def test_waits_for_asynchronous_operator_workload_creation(self):
         self.modify(get_missing={"deployment/unbounded-net-controller":2,"daemonset/unbounded-net-node":1,
                                  "daemonset/unbounded-net-kube-proxy-flex-site":1})
@@ -750,8 +638,6 @@ class DeploymentTests(unittest.TestCase):
             for block in re.findall(r"```bash\n(.*?)```", document.read_text(), re.DOTALL):
                 if "bash hack/scripts/aks-flex-cluster.sh" in block:
                     command = block.replace("\\\n", "").replace("<subscription-uuid>", SUBSCRIPTION)
-                    if "<snapshot-dir>" in command:
-                        command = command.replace("<snapshot-dir>", str(self.make_snapshot()))
                     arguments = shlex.split(command)
                     arguments[1] = str(SCRIPT)
                     result = subprocess.run([*arguments, "--plan"], cwd=ROOT, env=self.env, text=True, capture_output=True, timeout=5)

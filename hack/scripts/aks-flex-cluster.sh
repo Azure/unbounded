@@ -17,11 +17,6 @@ VM_SIZE="Standard_D4s_v6"
 SYSTEM_VM_SIZE="Standard_D4s_v6"
 KUBERNETES_VERSION=""
 UNBOUNDED_VERSION="v0.8.0"
-UNBOUNDED_VERSION_EXPLICIT=false
-SNAPSHOT_DIR=""
-SNAPSHOT_COMMIT=""
-SNAPSHOT_REGISTRY=""
-SNAPSHOT_PLUGIN=""
 AGENT_VERSION="v0.2.0"
 VNET_CIDR="10.91.0.0/16"
 CLUSTER_POD_CIDR="10.93.0.0/16"
@@ -67,7 +62,6 @@ Options:
   --system-vm-size SKU        AKS system VM size (default: Standard_D4s_v6)
   --kubernetes-version V      Initial AKS version (default: AKS default)
   --unbounded-version TAG     Pinned plugin/operator release (default: v0.8.0)
-  --snapshot-dir PATH         Downloaded build-only snapshot artifact, instead of a release
   --agent-version TAG         Pinned Flex agent release (default: v0.2.0)
   --vnet-cidr CIDR            IPv4 VNet, /16 through /23 (default: 10.91.0.0/16)
   --cluster-pod-cidr CIDR     System-site pods (default: 10.93.0.0/16)
@@ -96,7 +90,7 @@ parse_args() {
       --plan) PLAN_ONLY=true; shift ;;
       --yes) ASSUME_YES=true; shift ;;
       -h|--help) usage; exit 0 ;;
-      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--snapshot-dir|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--bootstrap-transport|--state-dir|--timeout)
+      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--bootstrap-transport|--state-dir|--timeout)
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
         case "$1" in
           --name) NAME="$2" ;;
@@ -107,8 +101,7 @@ parse_args() {
           --vm-size) VM_SIZE="$2" ;;
           --system-vm-size) SYSTEM_VM_SIZE="$2" ;;
           --kubernetes-version) KUBERNETES_VERSION="$2" ;;
-          --unbounded-version) UNBOUNDED_VERSION="$2"; UNBOUNDED_VERSION_EXPLICIT=true ;;
-          --snapshot-dir) SNAPSHOT_DIR="$2" ;;
+          --unbounded-version) UNBOUNDED_VERSION="$2" ;;
           --agent-version) AGENT_VERSION="$2" ;;
           --vnet-cidr) VNET_CIDR="$2" ;;
           --cluster-pod-cidr) CLUSTER_POD_CIDR="$2" ;;
@@ -141,7 +134,6 @@ validate_args() {
   for tag in "$UNBOUNDED_VERSION" "$AGENT_VERSION"; do
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] || die "release versions must be pinned vX.Y.Z tags (optionally prerelease)"
   done
-  if [[ -n "$SNAPSHOT_DIR" ]]; then load_snapshot; fi
   if [[ -n "$SUBSCRIPTION" ]]; then validate_subscription; fi
   if [[ -n "$SSH_SOURCE_IP" ]]; then validate_ssh_ip; fi
   local network
@@ -174,34 +166,6 @@ PY
   DNS_SERVICE_IP=$(jq -r .dns <<<"$network")
 }
 
-load_snapshot() {
-  [[ "$UNBOUNDED_VERSION_EXPLICIT" != true ]] || die "--snapshot-dir and --unbounded-version are mutually exclusive"
-  [[ -d "$SNAPSHOT_DIR" ]] || die "snapshot directory not found: $SNAPSHOT_DIR"
-  SNAPSHOT_DIR="$(cd "$SNAPSHOT_DIR" && pwd)"
-  local manifest="$SNAPSHOT_DIR/snapshot.json" os arch asset digest
-  [[ -r "$manifest" ]] || die "snapshot.json not readable in $SNAPSHOT_DIR"
-  jq -e '
-    .schemaVersion == 1 and (.gitCommit | test("^[0-9a-f]{40}$"))
-    and .version == ("snapshot-" + .gitCommit)
-    and (.imageRegistry | test("^ghcr[.]io/[a-z0-9._-]+$"))
-    and (.platforms | index("linux/amd64") != null)
-    and (.images as $images | all(
-      ["unbounded-operator", "gantry", "unbounded-net-controller", "unbounded-net-node", "machina", "token-refresher"][];
-      $images[.] | test("^sha256:[0-9a-f]{64}$")))
-  ' "$manifest" >/dev/null || die "invalid or incomplete snapshot manifest"
-  UNBOUNDED_VERSION=$(jq -r .version "$manifest")
-  SNAPSHOT_COMMIT=$(jq -r .gitCommit "$manifest")
-  SNAPSHOT_REGISTRY=$(jq -r .imageRegistry "$manifest")
-  case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "unsupported workstation OS" ;; esac
-  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "unsupported workstation architecture" ;; esac
-  asset="kubectl-unbounded-$os-$arch"
-  SNAPSHOT_PLUGIN="$SNAPSHOT_DIR/$asset"
-  [[ -r "$SNAPSHOT_PLUGIN" && -r "$SNAPSHOT_DIR/checksums.txt" ]] || die "snapshot plugin or checksums.txt missing for $os/$arch"
-  digest=$(awk -v asset="$asset" '$2 == asset { print $1 }' "$SNAPSHOT_DIR/checksums.txt")
-  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "no unique SHA-256 for snapshot plugin $asset"
-  [[ "$(sha256 "$SNAPSHOT_PLUGIN")" == "$digest" ]] || die "snapshot plugin checksum mismatch"
-}
-
 validate_subscription() {
   [[ "$SUBSCRIPTION" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "subscription must be a UUID"
 }
@@ -227,10 +191,6 @@ print_plan() {
   printf '  VM sizes:                 system=%s flex=%s\n' "$SYSTEM_VM_SIZE" "$VM_SIZE"
   printf '  Initial Kubernetes:       %s\n' "${KUBERNETES_VERSION:-AKS default}"
   printf '  Operator / Flex agent:    %s / %s\n' "$UNBOUNDED_VERSION" "$AGENT_VERSION"
-  if [[ -n "$SNAPSHOT_DIR" ]]; then
-    printf '  Evaluation snapshot:      %s (%s)\n' "$SNAPSHOT_COMMIT" "$SNAPSHOT_REGISTRY"
-    printf '  Snapshot artifact:        %s (unsigned, Linux amd64 images)\n' "$SNAPSHOT_DIR"
-  fi
   printf '  Node subnets:             %s / %s\n' "$SYSTEM_NODE_CIDR" "$FLEX_NODE_CIDR"
   printf '  Pod CIDRs:                %s / %s\n' "$CLUSTER_POD_CIDR" "$FLEX_POD_CIDR"
   printf '  Services / DNS:           %s / %s\n' "$SERVICE_CIDR" "$DNS_SERVICE_IP"
@@ -321,15 +281,13 @@ prepare_state() {
     --arg location "$LOCATION" --argjson count "$FLEX_COUNT" --arg vm "$VM_SIZE" \
     --arg systemVM "$SYSTEM_VM_SIZE" --arg k8s "$KUBERNETES_VERSION" \
     --arg unbounded "$UNBOUNDED_VERSION" --arg agent "$AGENT_VERSION" \
-    --arg snapshot "$SNAPSHOT_COMMIT" --arg snapshotRegistry "$SNAPSHOT_REGISTRY" \
     --arg vnet "$VNET_CIDR" --arg clusterPods "$CLUSTER_POD_CIDR" \
     --arg flexPods "$FLEX_POD_CIDR" --arg services "$SERVICE_CIDR" \
     --rawfile sshKey "$STATE_DIR/ssh.pub" \
     '{subscription:$subscription,name:$name,resourceGroup:$rg,location:$location,
       flexCount:$count,vmSize:$vm,systemVMSize:$systemVM,kubernetesVersion:$k8s,
       unboundedVersion:$unbounded,agentVersion:$agent,vnetCIDR:$vnet,
-      clusterPodCIDR:$clusterPods,flexPodCIDR:$flexPods,serviceCIDR:$services,sshKey:$sshKey}
-      | if $snapshot != "" then . + {snapshotGitCommit:$snapshot,snapshotRegistry:$snapshotRegistry} else . end' \
+      clusterPodCIDR:$clusterPods,flexPodCIDR:$flexPods,serviceCIDR:$services,sshKey:$sshKey}' \
     > "$STATE_DIR/intent.next.json"
   if [[ -f "$STATE_DIR/intent.json" ]]; then
     cmp -s "$STATE_DIR/intent.json" "$STATE_DIR/intent.next.json" || die "provisioning arguments differ from $STATE_DIR/intent.json; this script does not scale, resize, rotate keys, or upgrade existing clusters"
@@ -520,19 +478,9 @@ release_digest() {
 
 install_plugin() {
   local os arch asset archive digest bin_dir
-  mkdir -p "$STATE_DIR/cache"
-  if [[ -n "$SNAPSHOT_DIR" ]]; then
-    # Revalidate before copying, not just during argument validation.
-    load_snapshot
-    bin_dir="$STATE_DIR/bin/$UNBOUNDED_VERSION"
-    mkdir -p "$bin_dir"
-    cp "$SNAPSHOT_PLUGIN" "$bin_dir/kubectl-unbounded"
-    chmod 0700 "$bin_dir/kubectl-unbounded"
-    export PATH="$bin_dir:$PATH"
-    return
-  fi
   case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "unsupported workstation OS" ;; esac
   case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) die "unsupported workstation architecture" ;; esac
+  mkdir -p "$STATE_DIR/cache"
   asset="kubectl-unbounded-$os-$arch.tar.gz"
   archive="$STATE_DIR/cache/$UNBOUNDED_VERSION-$asset"
   digest=$(release_digest Azure/unbounded "$UNBOUNDED_VERSION" "$asset")
@@ -873,11 +821,11 @@ main() {
     [[ "$confirmation" == y || "$confirmation" == Y ]] || die "deployment canceled"
   fi
   prepare_state
-  install_plugin
   ensure_features
   ensure_group
   ensure_network
   ensure_cluster
+  install_plugin
   setup_cni
   ensure_flex_pool
   AGENT_DIGEST=$(release_digest Azure/AKSFlexNode "$AGENT_VERSION" aks-flex-node-linux-amd64.tar.gz)
