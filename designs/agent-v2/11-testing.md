@@ -180,15 +180,15 @@ A new `migration-v2` suite follows the existing host-root `migration` suite
 6. Reboot the host. The node comes back through v2's boot wiring.
 7. Run the v1 lifecycle steps under the `v2` profile: NodeReboot,
    AgentUpgrade in place, AgentUpgrade rollback, the workload and a repave.
-   After the repave, the v1 backup is gone, and both `v2 migrate --rollback`
-   and an AgentUpgrade with `agentMode: v1` are refused.
+   After the repave, the v1 backup is gone and `v2 migrate --rollback` is
+   refused.
 8. Reset, and compare with the snapshot (section 3).
 
 Variants:
 
 | Variant | What it checks |
 |---|---|
-| Rollback | Migrate, then `v2 migrate --rollback`; in a second run, an AgentUpgrade with `agentMode: v1`. v1's daemon runs, v1's files match the checksums from step 2, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. |
+| Rollback | Migrate, then `v2 migrate --rollback`. v1's daemon runs, v1's files and the binary match the checksums from step 2, `current` and `last-good` name that binary, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. |
 | Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), and each step of the commit and of the restore, a helper on the host watches the migration record and kills the migrating process, or reboots the host, when the step is reached. The node must keep running, or boot with one complete machine override, and the migration or restore must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
 | Failed | In each step before the commit, a v2 path is made unwritable, or the startup checks are made to fail. The host must return to a working v1 whose files match the checksums from step 2, and the operation must be `Failed` with the reason. A second variant makes the v2 daemon fail to report ready after an early migration commits: the host must end `RolledBack`, with the operation `Failed`. |
 | Refused | `v2 migrate` changes nothing on a v1 host with an unfinished install, with two applied configs, or on a release older than the oldest supported one. `v2 start` on a v1 host that was not migrated is refused. |
@@ -208,7 +208,7 @@ the same.
 |---|---|
 | Cutover matrix | For each v1 release from the oldest supported one to the last experimental release, install it, run the workload, then upgrade to the first official v2 release with an ordinary AgentUpgrade. The host migrates with the checks in step 5. The oldest release in this matrix is the oldest supported v1 release. |
 | Cutover failure | Make the migration fail at each step before the commit. The daemon returns `current` to the v1 binary, v1's daemon runs, v1's files match their checksums, the node is unchanged, and the AgentUpgrade is `Failed` with reason `MigrationFailed`. A variant blocks the API server while it fails: v1's daemon then publishes the failure from its signal. |
-| Downgrade in the window | After the cutover, an AgentUpgrade to the release the host ran before restores v1 and completes. A variant makes that v1 daemon fail: the recovery unit restores the v2 binary, the downgrade is `Failed`, and the host migrates again. After a repave, the same AgentUpgrade is rejected before the switch. |
+| Rollback after the cutover | After the cutover, `v2 migrate --rollback` restores v1 and the v1 binary the host ran before. An AgentUpgrade to that v1 release is rejected before the switch, both inside the window and after a repave. A variant makes the restored v1 daemon fail repeatedly: the recovery unit restarts v1, never v2. |
 | Crash loop after the commit | After the cutover, make the v2 daemon fail repeatedly, then do the same after a repave. Each time, the recovery unit restores a v2 binary, never the v1 one, and the daemon runs again once the fault is removed ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
 | Readiness timeout | After the cutover, make an AgentUpgrade's new daemon hang before its startup gate opens. The start times out three times, the recovery unit restores the previous binary, and the operation is `Failed` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
 

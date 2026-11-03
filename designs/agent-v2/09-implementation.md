@@ -75,7 +75,7 @@ internal/agentv2/
 - **Migration takes over running production nodes.** A bug could disrupt a
   node that was working. Before the commit, v2 changes nothing of v1's, so a
   failure returns the host to whichever v1 binary ran it. The commit is short,
-  local and always finished. The rollback window lasts until the first repave,
+  local and always finished. Rollback on the host is possible until the first repave,
   and the migration suite runs every phase, interrupted and failed, from every
   supported v1 release
   ([migrating from v1](10-migration-from-v1.md), [testing, section 4](11-testing.md#4-migration-suite)).

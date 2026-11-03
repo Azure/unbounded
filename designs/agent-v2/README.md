@@ -159,7 +159,7 @@ library.
 | Leftover | Something a cleanup could not remove, reported rather than ignored ([host runtime cleanup, section 10](07-host-runtime-cleanup.md#10-post-conditions)). |
 | First official v2 release | The release that replaces v1 with v2. Its daemon migrates every v1 host it starts on ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
 | Oldest supported v1 release | The oldest v1 release a host can migrate from, set by the releases the migration test matrix covers ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
-| Rollback window | From a migration's commit until v2's first repave on that host. Inside it, v2 can put v1 back ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)). |
+| Rollback window | From a migration's commit until v2's first repave on that host. Inside it, `v2 migrate --rollback` on the host can put v1 back ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)). |
 
 ## 2. Goals and non-goals
 

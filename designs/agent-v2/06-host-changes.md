@@ -26,7 +26,7 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Boot hook binary, which a binary rollback does not revert | `/opt/unbounded/agent/bin/unbounded-agent-boot-hook` ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
 | First-boot unit, if a provisioning tool installed one | For example v1's Ignition unit, `unbounded-agent-bootstrap.service` (`internal/provision/script.go:13`) |
 | Extension host units and files | As declared in each extension ([extensions, section 2](02-extensions.md#2-declarative-extensions)) |
-| On a host migrated from v1: the migration record, v2's staged files until the commit, and v1's files from the commit until v2's first repave | `/var/lib/unbounded/agent-v2/migration.json`, `/var/lib/unbounded/agent-v2/migration/staged/`, `/var/lib/unbounded/agent-v2/migration/v1-backup/` ([migrating from v1, sections 6 and 8](10-migration-from-v1.md#6-steps)) |
+| On a host migrated from v1: the migration record, v2's staged files until the commit, and v1's files and binary from the commit until v2's first repave | `/var/lib/unbounded/agent-v2/migration.json`, `/var/lib/unbounded/agent-v2/migration/staged/`, `/var/lib/unbounded/agent-v2/migration/v1-backup/` ([migrating from v1, sections 6 and 8](10-migration-from-v1.md#6-steps)) |
 | While an early migration, or a rollback started on the host, is in progress | `unbounded-agent-migrate.service` |
 
 **Host preparation (section 3), for both runtimes:**

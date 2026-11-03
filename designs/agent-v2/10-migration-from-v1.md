@@ -26,9 +26,9 @@ v2 takes over the running machine as its slot.
    does not.
 5. **No v1 release has to know about v2.** Until the migration commits, any v1
    binary can run the host, because nothing of v1's has changed. After the
-   commit, only v2 runs it, and v2 itself puts v1 back if asked (section 8).
-6. **A migration can be rolled back to v1** until v2 first changes the node,
-   which is its first repave.
+   commit, only v2 runs it.
+6. **A migration can be rolled back to v1 on the host** until v2 first changes
+   the node, which is its first repave (section 8).
 7. **A finished migration leaves no v1 state**, so v1's tools treat the host as
    a v2 host ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
 8. **Every v1 host moves at the first official v2 release**, from any release
@@ -50,7 +50,8 @@ boot wiring and install record as they were, so whichever v1 binary ran the
 host before can run it again. The commit starts by pointing the binary
 rollback slot, `last-good`, at the v2 binary. From then on systemd's recovery
 unit can only start v2, so a v1 binary never runs on a host that v2 has
-changed. Going back to v1 after the commit is done by v2 (section 8).
+changed. After the commit, the way back to v1 is `v2 migrate --rollback` on the
+host (section 8).
 
 **The oldest supported v1 release** is the oldest release the migration test
 matrix installs and migrates ([testing, section 4](11-testing.md#4-migration-suite)). The release notes name it.
@@ -147,9 +148,9 @@ sequenceDiagram
 
 After the commit, the host is a v2 host. A v2 daemon that keeps failing is
 handled like any other: the recovery unit restores `last-good`, which is now
-v2. Until the rollback window closes, the way back to v1 is section 8. If v2's
-daemon cannot start at all, `v2 migrate --rollback` still works from the host,
-because it does not need the daemon.
+v2. Until the rollback window closes, the way back to v1 is
+`v2 migrate --rollback` on the host (section 8), which works even when v2's
+daemon cannot start, because it does not need the daemon.
 
 ## 3. What changes on the host
 
@@ -162,7 +163,7 @@ names ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-hos
 |---|---|---|
 | The running node | The `kube1` or `kube2` machine, its rootfs and its state | Unchanged. `kube1` becomes slot `a`, `kube2` slot `b`. |
 | Machine and Node objects | | Unchanged |
-| Agent binary | `/opt/unbounded/agent/bin/unbounded-agent*` | The layout is shared. `last-good` names a v2 binary from the commit on. |
+| Agent binary | `/opt/unbounded/agent/bin/unbounded-agent*` | The layout is shared. `last-good` names a v2 binary from the commit on, and the v1 binary that ran before the migration is kept in the backup. |
 | Daemon units | `unbounded-agent-daemon.service` and `unbounded-agent-daemon-recovery.service` (`pkg/agent/goalstates/constants.go:24,27`) | Same names, replaced by v2's at the commit. v2's daemon unit is `Type=notify` and only starts a binary that includes v2 ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). In an experimental release it runs `<current> v2 daemon`; from the first official v2 release, `<current> daemon`, as v1's does. |
 | Install record | `/var/lib/unbounded/agent/install-state.json` (`cmd/agent/internal/installstate/store.go:21,85`) | `/var/lib/unbounded/agent-v2/install.json` |
 | Configuration | `/etc/unbounded/agent/`, including `kube{1,2}-applied-config.json` (`pkg/agent/goalstates/constants.go:17,97-101`) | `/etc/unbounded/agent-v2/config.json`, node state and the slot's saved bundle manifest |
@@ -275,7 +276,7 @@ stateDiagram-v2
   Preparing --> Abandoned: a step or the startup check fails
   Prepared --> Committing
   Committing --> Committed: always finished, even after a crash
-  Committed --> Restoring: rollback or downgrade inside the window, or an early migration whose daemon is not ready
+  Committed --> Restoring: v2 migrate --rollback inside the window, or an early migration whose daemon is not ready
   Restoring --> RolledBack: always finished, even after a crash
   Abandoned --> [*]
   RolledBack --> [*]
@@ -321,8 +322,11 @@ The commit:
 1. Record `Committing`.
 2. Point `last-good` at the v2 binary.
 3. Copy v1's files and units into
-   `/var/lib/unbounded/agent-v2/migration/v1-backup/`. v1's upgrade signal is
-   not copied, because its operation is already in the record.
+   `/var/lib/unbounded/agent-v2/migration/v1-backup/`, together with the v1
+   binary that ran before the migration and its SHA-256: at the cutover, the
+   binary `last-good` named before step 2; in an early migration, the running
+   binary. v1's upgrade signal is not copied, because its operation is already
+   in the record.
 4. Install v2's units and the boot hook binary, replacing v1's daemon and
    recovery units, which have the same names, and reload systemd.
 5. Rename v2's staged machine override over v1's, in one step. The machine
@@ -370,7 +374,7 @@ it does anything else, whether its unit runs v1's daemon or v2's:
   operation that started the migration:** it does not migrate again. It
   publishes `Failed` with the record's error, and at the cutover it then
   returns to `last-good` as in section 2.1. A signal that names another
-  operation, such as a downgrade's, is handled as v1 handles it
+  operation is handled as v1 handles it
   (`controller_machineoperation.go:257-297`), by v2's daemon too.
 
 What a host reboot does in each phase:
@@ -407,77 +411,78 @@ log v2 writes for a migrated host therefore reverses only what is certain:
 | `/etc/sysctl.d/99-kubernetes.conf`, `nftables-flush.service` and `nftables-clear.nft`, the apt drop-ins | Removed, as for a v2 install. Only the agent uses these files. |
 | Sysctl values, `iptables: false` in `/etc/docker/daemon.json`, swap entries commented out in `/etc/fstab`, masked docker, swap, host containerd and host kubelet units | Left as they are and listed in the reset report. v1 changed them without a backup, and comments swap entries without a tag (`pkg/agent/phases/host/disable_swap.go`, `pkg/agent/phases/host/configure_docker.go:30-66`), so v2 cannot tell what the host had before. This is the same outcome as a v1 reset. |
 
-## 8. Rollback and downgrade
+## 8. Rollback
 
-v1's files stay in the backup until v2's first repave commits. Until then, the
-*rollback window*, v2 can put v1 back:
+v1's files, and the v1 binary that ran before the migration, stay in the backup
+until v2's first repave commits. Until then, the *rollback window*, v2 can put
+v1 back, but only on the host:
 
-| Started by | Binary afterward |
+| Started by | When |
 |---|---|
-| An AgentUpgrade with a v1 candidate, or with `agentMode: v1` | The candidate, which must be a release before the first official v2 release |
-| `v2 migrate --rollback [--binary <path>]` on the host | The given binary, installed as for an AgentUpgrade. Without `--binary`, the running binary, which works only if it still has v1's commands, as after an early migration. |
-| The migrate unit, when an early migration's v2 daemon does not report ready after the commit (section 4.2) | Unchanged |
+| `v2 migrate --rollback` on the host | Any time in the window |
+| The migrate unit | An early migration whose v2 daemon does not report ready after the commit (section 4.2) |
 
-A *v1 candidate* is one whose daemon would be v1's: it has no `v2` command, or
-the daemon unit runs `<current> daemon` and the candidate is older than the
-first official v2 release. After the window, v2 rejects a v1 candidate, and
-`agentMode: v1`, before it switches anything ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
+There is no rollback from the cluster. v2 rejects an AgentUpgrade to any binary
+whose daemon would be v1's, inside the window or after it, before it switches
+anything ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). A v1 binary is one with no `v2` command, or, on
+a host whose daemon unit runs `<current> daemon`, one older than the first
+official v2 release. A rollback returns the host to exactly the state it had
+before the migration, so it never needs a binary from anywhere else.
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant Op as operator
-  participant MO as AgentUpgrade
-  participant D2 as v2 daemon
-  participant H as host
+  participant MG as unbounded-agent-migrate.service
   participant SD as systemd
+  participant H as host
   participant D1 as v1 daemon
-  Op->>MO: AgentUpgrade with a v1 candidate
-  D2->>H: locks, then install and verify the candidate in the inactive blue or green binary
-  D2->>H: phase Restoring, with the downgrade's operation and the candidate
-  D2->>H: restore v1's files, units and install record from the backup, except the daemon units
-  D2->>H: rename v1's machine override back, in one step
-  D2->>H: write v1's upgrade signal for the operation
-  D2->>H: remove v2's state, including its install record, but not the migration record or the backup
-  D2->>H: point current at the candidate and last-good at the v2 binary
-  D2->>H: rename v1's daemon and recovery units back
-  D2->>H: phase RolledBack, delete the backup
-  D2->>SD: restart the daemon unit
+  Op->>MG: v2 migrate --rollback
+  MG->>SD: stop v2's daemon
+  MG->>H: locks, phase Restoring
+  MG->>H: restore v1's files, units and install record from the backup, except the daemon units
+  MG->>H: rename v1's machine override back, in one step
+  MG->>H: remove v2's state, including its install record, but not the migration record or the backup
+  MG->>H: install the backed-up v1 binary and point current at it, last-good still names v2
+  MG->>H: rename v1's daemon and recovery units back
+  MG->>H: point last-good at the v1 binary
+  MG->>H: phase RolledBack, delete the backup
+  MG->>SD: start the daemon unit
   SD->>D1: start current daemon
-  D1->>MO: Complete, from its upgrade signal
 ```
 
-Every way in runs these steps. The host-side rollback and the migrate unit
-first stop v2's daemon, and skip the binary steps when the binary does not
-change. v1's signal is written only when there is an operation to report: the
-downgrade's, which v1's daemon then reports `Complete`, or, after an early
-migration whose daemon was not ready, the operation that started the
-migration, which v1's daemon reports `Failed` (section 6.3). The order is what
-keeps a crash safe:
+The migrate unit runs the same steps after an early migration whose daemon was
+not ready. There the binary does not change, because the one that ran before
+the migration is the one running, and v1's signal is written back with the
+operation that started the migration, which v1's daemon then reports `Failed`
+(section 6.3). The order is what keeps a crash safe:
 
 - **Until the daemon units are renamed back, only v2 can run as the daemon.**
   v2's daemon unit does not start a binary without v2
-  ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). After a crash or reboot, a v1 candidate without v2 fails
-  to start, and the recovery unit restores `last-good`, the v2 binary, which
-  finishes the restore. A candidate that includes v2 finishes it itself
-  (section 6.3).
+  ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). After a crash or reboot, the v1 binary fails to start
+  under it, and the recovery unit restores `last-good`, which still names the
+  v2 binary until the units are back. v2 then finishes the rollback. A v1
+  binary that includes v2 finishes it itself (section 6.3).
 - **Renaming v1's daemon unit back hands the host to v1.** A v2 process that
   finds the record in `Restoring` with v1's daemon unit in place, which it
   tells from v2's by the missing `ExecStartPre=` check, records `RolledBack`
   and changes nothing else, because v1 may already have run.
-- **A v1 daemon that keeps failing afterward** is handled as for any failed
-  AgentUpgrade. v1's recovery unit restores `last-good`, the v2 binary, after
-  asking it to record the failure in the upgrade signal
-  (`unbounded-agent-daemon-recovery.sh:19-26`). On a host without a v2 install
-  record, v2's `record-agent-upgrade-failure-signal` writes v1's signal, so
-  the v2 daemon publishes the downgrade as `Failed`. A first official v2
-  release, or a later one, then migrates the host again, as at the cutover.
+- **`last-good` names the v1 binary afterward,** as it did before the
+  migration. If v1's daemon then keeps failing, the recovery unit restarts v1,
+  never v2, so v2 never migrates the host again on its own.
 
 Rollback is possible until v2's first repave commits. That repave replaces the
-machine with one v1 never configured, so it deletes the backup, and a rollback
-then refuses. From that point, the way back to v1 is `v2 reset` and a v1
-install. `last-good` has named a v2 binary since the commit, so after the
-window the recovery unit still only ever starts v2.
+machine with one v1 never configured, so v1's backed-up files no longer
+describe it: the repave deletes the backup, and a rollback then refuses. From
+that point, the way back to v1 is `v2 reset` and a v1 install.
+
+v2 does not try to rebuild v1's files from its own state to keep rollback
+possible after a repave. It could, because the `nspawn-container` runtime
+builds the machine as v1 does, but v2 would have to write v1's formats and
+units exactly as each supported v1 release expects, and that conversion would
+only ever run during an incident. The window has no timer: it closes only when
+a Node is deleted with drift and v2 repaves, so an operator who wants to keep
+the way back open holds off on repaves.
 
 ## 9. Hosts built by other `pkg/agent` consumers
 
@@ -531,8 +536,8 @@ host, and after it no v1 release does (section 2).
 - **Refusing to act on a v2 host.** v1's `start`, `daemon` and `reset` refuse
   on a host with a v2 install record. v1 and v2 share the daemon unit names,
   so v1's `reset` would otherwise remove v2's daemon unit.
-- **Documenting `agentMode`.** The AgentUpgrade parameter and its values, `v2`
-  and `v1`, are added wherever the AgentUpgrade parameters are documented: the
+- **Documenting `agentMode`.** The AgentUpgrade parameter, with its one value
+  `v2`, is added wherever the AgentUpgrade parameters are documented: the
   `MachineOperationSpec.parameters` API comment, and so the generated CRD
   description, and the MachineOperation reference page
   (`docs/content/reference/machina-crd.md`). Older daemons read only
@@ -543,6 +548,6 @@ host, and after it no v1 release does (section 2).
 
 The migration suite in [testing, section 4](11-testing.md#4-migration-suite) covers both ways of starting an
 early migration, the cutover from each v1 release in the matrix, a crash, a
-reboot and a failure in every phase, rollback and downgrade, the checks that
+reboot and a failure in every phase, rollback, the checks that
 refuse, a daemon crash loop after the rollback window, and the move to the
 `host` runtime afterward.

@@ -248,11 +248,10 @@ This is v1's mechanism
   restoring `last-good` rolls both back. The new daemon checks every plugin
   with `describe` before its startup gate opens, so a plugin that does not fit
   the new binary is rolled back with it.
-- On a host migrated from v1, a candidate whose daemon would be v1's, or an
-  operation with `agentMode: v1`, is a downgrade while the rollback window is
-  open: v2 puts v1 back from its backup, then switches to the candidate. After
-  the window, it is rejected before the switch
-  ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)).
+- A candidate whose daemon would be v1's is always rejected before the switch.
+  On a host migrated from v1, the way back to v1 is `v2 migrate --rollback` on
+  the host, while the rollback window is open
+  ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)).
 - The daemon unit runs `<current> v2 daemon` in the experimental releases, and
   `<current> daemon` from the first official v2 release, which rewrites the
   unit when its daemon first starts.
@@ -266,9 +265,8 @@ restart the daemon unit and wait for it to report ready, rolling back if it does
 not (`pkg/agent/agentbinary/activation.go:83-246`). The `agent.upgrade.before`
 and `agent.upgrade.after` events fire on this path too, and
 `--plugin-manifest` with `--plugin-manifest-sha256` stage a new plugin set as
-the parameters do. It never downgrades to v1; on the host, that is
-`v2 migrate --rollback --binary <path>`
-([migrating from v1, section 8](10-migration-from-v1.md#8-rollback-and-downgrade)).
+the parameters do. Like an AgentUpgrade, it never installs a binary whose
+daemon would be v1's.
 
 ## 6. Reset
 
