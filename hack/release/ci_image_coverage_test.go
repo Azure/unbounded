@@ -55,9 +55,17 @@ func (b imageBuild) String() string {
 // is an allowlist rather than a denylist: metadata values reference steps,
 // env, and github contexts the test cannot resolve, and a new metadata arg
 // must not make every release build look uncovered. A new arg that selects a
-// stage or variant belongs here.
+// stage or variant belongs here, including feature flags such as
+// RACER_NATIVE_CUDA that skip parts of the build (images/racer/Containerfile).
+//
+// Values are compared literally: an arg set explicitly to its Containerfile
+// default is treated as different from omitting it. That can only report a
+// false miss, never a false match, and no workflow relies on the equivalence
+// today, so the defaults are not parsed out of the Containerfiles.
 var buildDefiningArgs = map[string]bool{
-	"INSTALLER_KERNEL": true,
+	"INSTALLER_KERNEL":  true,
+	"RACER_NATIVE_CUDA": true,
+	"RACER_NATIVE_RDMA": true,
 }
 
 // conditionalArg matches a `${{ matrix.x && format('KEY={0}', matrix.x) || ... }}`
@@ -475,6 +483,67 @@ func TestCIBuildsEveryReleaseImage(t *testing.T) {
 	if missing := missingBuilds(release, ci); len(missing) > 0 {
 		t.Errorf("ci.yaml does not build these release images; add them to its release-images job:\n  %s",
 			strings.Join(missing, "\n  "))
+	}
+}
+
+func TestMissingBuildsRacerFeatureFlags(t *testing.T) {
+	t.Parallel()
+
+	release, err := imageBuilds([]byte(`
+jobs:
+  racer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/racer/Containerfile
+          platforms: linux/arm64
+          build-args: |
+            VERSION=${{ github.ref_name }}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ci, err := imageBuilds([]byte(`
+jobs:
+  racer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/racer/Containerfile
+          platforms: linux/arm64
+          build-args: |
+            RACER_NATIVE_CUDA=false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	missing := missingBuilds(release, ci)
+	if len(missing) != 1 || !strings.Contains(missing[0], "images/racer/Containerfile (linux/arm64)") {
+		t.Errorf("missingBuilds = %q, want the default racer build reported missing", missing)
+	}
+
+	ciRDMA, err := imageBuilds([]byte(`
+jobs:
+  racer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/racer/Containerfile
+          platforms: linux/arm64
+          build-args: |
+            RACER_NATIVE_RDMA=false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if missing := missingBuilds(release, ciRDMA); len(missing) != 1 {
+		t.Errorf("missingBuilds with RDMA disabled = %q, want one miss", missing)
 	}
 }
 
