@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """In-memory prefetch tickets for the fake Racer (designs/racer-prefetch.md).
 
-This mirrors pkg/racersdk/internal/fakeracer/prefetch.go. It is not a
-compatibility oracle: there are no pages, owners, or scheduling.
+This mirrors pkg/racersdk/internal/fakeracer/prefetch.go and follows the
+Rust server's client-socket contract (validation, error codes, idempotency,
+expiry, retention, and JSON shapes). It has no pages, owners, or scheduling:
+refs move from pending to an outcome as the outcome hook decides, and an
+unsettled ticket reports RUNNING, never QUEUED.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import re
@@ -22,7 +24,9 @@ PAGE = 16 * 1024 * 1024
 MAX_COUNTER = (1 << 53) - 1
 _ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _KEY = re.compile(r"[0-9a-f]{64}")
-_WAIT = re.compile(r"(\d+)(ms|s|m)")
+_WAIT_PART = re.compile(r"(\d*)(?:\.(\d*))?(ns|us|\u00b5s|\u03bcs|ms|s|m|h)")
+_WAIT_UNITS = {"ns": 1, "us": 1_000, "\u00b5s": 1_000, "\u03bcs": 1_000, "ms": 1_000_000, "s": 10**9, "m": 60 * 10**9, "h": 3600 * 10**9}
+_CURSOR = re.compile(r"[A-Za-z0-9._-]{1,256}")
 _TOP = {"cache_uid", "priority", "generation", "sequence", "ttl_seconds", "max_pending_bytes", "refs"}
 _REF = {"key", "etag", "offset", "length", "metadata"}
 
@@ -45,6 +49,9 @@ class Outcome:
     error: str | None = None
     etag: str | None = None
     size: int = 0
+    # empty marks a zero-length object: a ref with offset 0 and no length
+    # succeeds with no pages, any other ref fails invalid_range.
+    empty: bool = False
 
 
 @dataclass
@@ -68,6 +75,9 @@ class _Ticket:
     updated: float = 0.0
     expires: float = 0.0
     canceled: str | None = None
+    # released: canceled or expired; outcomes are frozen until remove_at.
+    released: bool = False
+    remove_at: float = 0.0
     refs: list = field(default_factory=list)
 
 
@@ -111,18 +121,20 @@ class FakePrefetches:
             if f.retry_after:
                 extra.append(("Retry-After", str(f.retry_after)))
         raw = json.dumps(data).encode()
-        return status, extra + [("Content-Type", "application/json"), ("Content-Length", str(len(raw)))], raw
+        # Racer closes the connection after every prefetch response.
+        headers = [("Content-Type", "application/json"), ("Content-Length", str(len(raw))), ("Connection", "close")]
+        return status, extra + headers, raw
 
     def _route(self, method, path, query, headers, body):
         if path == PATH:
             if method != "GET":
-                raise Fail(405, "invalid_request", "method not allowed")
+                raise Fail(405, "method_not_allowed", "method not allowed")
             self._no_body(headers, body)
             if query:
                 raise _bad("list takes no parameters")
             return 200, self._list()
         if method not in ("GET", "PUT", "DELETE"):
-            raise Fail(405, "invalid_request", "method not allowed")
+            raise Fail(405, "method_not_allowed", "method not allowed")
         pid = path[len(PATH) + 1 :]
         if not _ID.fullmatch(pid) or pid in (".", ".."):
             raise _bad("invalid id")
@@ -157,43 +169,58 @@ class FakePrefetches:
             raise _bad("missing body")
         if int(declared) > self.max_body:
             raise Fail(413, "too_large", "body too large")
-        request = self._decode(body)
+        # Racer rejects a passthrough cache before it parses the body.
         if self.passthrough:
             raise Fail(409, "passthrough", "cache is passthrough")
+        request, canonical = self._decode(body)
         if self.cache_uid and request.get("cache_uid") and request["cache_uid"] != self.cache_uid:
             raise Fail(409, "cache_uid_mismatch", "cache uid mismatch")
-        if self.admit:
-            fail = self.admit(pid, request)
-            if fail:
-                raise fail
+        # Like Racer, the hash covers the body as sent (absent fields omitted,
+        # defaults not applied) plus the presence of Authorization.
         auth = "authorization" in headers
-        digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode() + (b"\1" if auth else b"\0")).digest()
+        digest = hashlib.sha256(canonical + (b"\1" if auth else b"\0")).digest()
         g, s = request["generation"], request["sequence"]
         with self.lock:
             now = self.now()
             self._gc(now)
             t = self.tickets.get(pid)
+            if t is not None:
+                if g < t.generation:
+                    raise Fail(409, "stale_generation", f"generation {g} is older than current {t.generation}")
+                if g == t.generation and s < t.sequence:
+                    raise Fail(409, "stale_sequence", f"sequence {s} is older than current {t.sequence}")
+                if (g, s) == (t.generation, t.sequence):
+                    if digest != t.hash:
+                        raise Fail(409, "payload_mismatch", f"generation {g} sequence {s} was submitted with another payload")
+                    # A replay renews the TTL of a live ticket only.
+                    if not t.released:
+                        t.expires = now + t.ttl
+                    return 200, self._render(t, {})
+            if self.admit:
+                fail = self.admit(pid, request)
+                if fail:
+                    raise fail
             code = 200
             if t is None:
-                if len(self.tickets) >= self.max_tickets:
-                    raise Fail(429, "ticket_limit", "ticket limit", 1)
+                if len(self.tickets) >= self.max_tickets and not self._evict_oldest_released():
+                    raise Fail(429, "ticket_limit", "node prefetch ticket limit reached", 5)
                 t = _Ticket(pid, now)
                 self.tickets[pid] = t
                 code = 201
-            elif (g, s) == (t.generation, t.sequence):
-                if digest != t.hash:
-                    raise Fail(409, "payload_mismatch", f"payload differs at {g}/{s}")
-                if t.canceled is None:
-                    t.expires, t.updated = now + t.ttl, now
-                return 200, self._render(t, {})
-            elif g < t.generation:
-                raise Fail(409, "stale_generation", f"generation {g} is older than current {t.generation}")
-            elif g == t.generation and s < t.sequence:
-                raise Fail(409, "stale_sequence", f"sequence {s} is older than current {t.sequence}")
             t.priority, t.generation, t.sequence, t.hash = request["priority"], g, s, digest
             t.ttl, t.updated, t.expires, t.canceled = request["ttl_seconds"], now, now + request["ttl_seconds"], None
+            t.released, t.remove_at = False, 0.0
             t.refs = [_Ref(r, etag=r.get("etag"), length=r.get("length", 0)) for r in request["refs"]]
             return code, self._render(t, {})
+
+    def _evict_oldest_released(self):
+        """Drop the retained ticket due for removal first, as Racer does
+        before answering 429 ticket_limit."""
+        released = [t for t in self.tickets.values() if t.released]
+        if not released:
+            return False
+        del self.tickets[min(released, key=lambda t: t.remove_at).id]
+        return True
 
     def _decode(self, body):
         try:
@@ -202,11 +229,22 @@ class FakePrefetches:
             raise _bad("invalid JSON") from None
         if not isinstance(r, dict) or set(r) - _TOP:
             raise _bad("unknown field")
+        if not isinstance(r.get("refs"), list) or any(not isinstance(ref, dict) for ref in r["refs"]):
+            raise _bad("invalid refs")
+        # Canonical form: present fields in Racer's field order, compact.
+        canonical = json.dumps(
+            {k: r[k] for k in ("cache_uid", "priority", "generation", "sequence", "ttl_seconds", "max_pending_bytes") if k in r}
+            | {"refs": [{k: ref[k] for k in ("key", "etag", "offset", "length", "metadata") if k in ref} for ref in r["refs"]]},
+            separators=(",", ":"),
+        ).encode()
+        r = json.loads(body)
         refs = r.get("refs")
         if not isinstance(refs, list) or not refs:
             raise _bad("refs must not be empty")
         if len(refs) > self.max_refs:
             raise Fail(413, "too_large", "too many refs")
+        if "cache_uid" in r and (not isinstance(r["cache_uid"], str) or not 0 < len(r["cache_uid"]) <= 64):
+            raise _bad("invalid cache_uid")
         r.setdefault("priority", "normal")
         if r["priority"] not in ("high", "normal", "low"):
             raise _bad("invalid priority")
@@ -229,19 +267,31 @@ class FakePrefetches:
                 raise _bad("invalid offset")
             if "etag" in ref and not (isinstance(ref["etag"], str) and len(ref["etag"]) >= 2 and ref["etag"][0] == ref["etag"][-1] == '"'):
                 raise _bad("invalid etag")
-        return r
+            if "metadata" in ref and not _opaque(ref["metadata"]):
+                raise _bad("invalid metadata")
+        return r, canonical
 
     # Tickets -----------------------------------------------------------
 
     def _gc(self, now):
+        """TTL expiry like Racer: an unsettled ticket becomes CANCELLED
+        (expired), a settled one keeps its outcome; retention counts from
+        expiry or cancel."""
         for pid, t in list(self.tickets.items()):
-            if t.canceled is None and now >= t.expires:
-                t.canceled, t.updated = "expired", t.expires
-            if t.canceled is not None and now >= t.updated + self.retention:
+            if not t.released and now >= t.expires:
+                self._evaluate(t)
+                if not self._settled(t):
+                    t.canceled, t.updated = "expired", t.expires
+                self._release(t, t.expires)
+            if t.released and now >= t.remove_at:
                 del self.tickets[pid]
 
+    def _release(self, t, at):
+        if not t.released:
+            t.released, t.remove_at = True, at + self.retention
+
     def _evaluate(self, t):
-        if t.canceled is not None:
+        if t.released:
             return
         for r in t.refs:
             if r.outcome != "pending":
@@ -253,7 +303,11 @@ class FakePrefetches:
                 r.etag = o.etag
             off = r.ref.get("offset", 0)
             error = o.error
-            if o.size:
+            if o.empty:
+                r.length = 0
+                if off or "length" in r.ref:
+                    error = error or "invalid_range"
+            elif o.size:
                 if off >= o.size:
                     error = error or "invalid_range"
                 else:
@@ -262,7 +316,7 @@ class FakePrefetches:
 
     @staticmethod
     def _settled(t):
-        return t.canceled is not None or all(r.outcome != "pending" for r in t.refs)
+        return t.released or all(r.outcome != "pending" for r in t.refs)
 
     def _render(self, t, q):
         self._evaluate(t)
@@ -289,7 +343,7 @@ class FakePrefetches:
                 b["fetched_from_origin"] += aligned
             elif r.outcome == "failed":
                 b["failed"] += aligned
-            elif t.canceled is None:
+            elif not t.released:
                 b["in_flight"] += aligned
         if t.canceled is not None:
             state = "CANCELLED"
@@ -297,12 +351,13 @@ class FakePrefetches:
             state = "RUNNING"
         elif counts["failed"] == 0:
             state = "SUCCEEDED"
-        elif counts["succeeded"] == 0:
+        elif counts["failed"] == len(t.refs):
             state = "FAILED"
         else:
             state = "PARTIAL"
         out = {
             "id": t.id,
+            "cache_uid": self.cache_uid or "",
             "state": state,
             "reason": t.canceled,
             "priority": t.priority,
@@ -319,38 +374,23 @@ class FakePrefetches:
             "refs_pending": counts["pending"],
             "bytes": b,
         }
-        if self.cache_uid:
-            out["cache_uid"] = self.cache_uid
         if q.get("coverage"):
             out["coverage"] = {"resident_bytes": b["admitted"], "observed_at_ms": int(self.now() * 1000)}
         if q.get("refs"):
+            # Like Racer, the cursor is an offset into the filtered refs.
             start = q.get("start", 0)
-            items, cursor = [], None
-            for i in range(start, len(t.refs)):
-                r = t.refs[i]
-                if q["refs"] == "failed" and r.outcome != "failed":
-                    continue
-                if len(items) == self.refs_page:
-                    cursor = self._cursor(t.generation, t.sequence, i)
-                    break
-                items.append(
-                    {
-                        "index": i,
-                        "key": r.ref["key"],
-                        "etag": r.etag,
-                        "offset": r.ref.get("offset", 0),
-                        "length": r.length,
-                        "outcome": r.outcome,
-                        "error": r.error,
-                    }
-                )
+            selected = [(i, r) for i, r in enumerate(t.refs) if q["refs"] == "all" or r.outcome == "failed"]
+            page = selected[start : start + self.refs_page]
+            items = []
+            for i, r in page:
+                item = {"index": i, "key": r.ref["key"], "etag": r.etag, "offset": r.ref.get("offset", 0), "length": r.length, "outcome": r.outcome}
+                if r.error:
+                    item["error"] = r.error
+                items.append(item)
+            more = len(selected) > start + self.refs_page
             out["refs"] = items
-            out["next_cursor"] = cursor
+            out["next_cursor"] = f"{t.generation}.{t.sequence}.{start + self.refs_page}" if more else None
         return out
-
-    @staticmethod
-    def _cursor(g, s, n):
-        return base64.urlsafe_b64encode(f"{g}.{s}.{n}".encode()).decode().rstrip("=")
 
     def _status(self, pid, query):
         q = self._query(query)
@@ -364,10 +404,10 @@ class FakePrefetches:
                 if "cursor" in q:
                     g, s, n = q["cursor"]
                     if (g, s) != (t.generation, t.sequence):
-                        raise _bad("cursor from another window")
+                        raise _bad("cursor belongs to another generation or sequence")
                     q["start"] = n
                 self._evaluate(t)
-                if self._settled(t) or time.monotonic() >= deadline:
+                if self._settled(t) or time.monotonic() >= deadline or not q.get("wait"):
                     return 200, self._render(t, q)
             time.sleep(0.005)
 
@@ -382,26 +422,25 @@ class FakePrefetches:
                 raise _bad("duplicate parameter")
             v = v[0]
             if name == "wait":
-                m = _WAIT.fullmatch(v)
-                if not m:
+                seconds = _parse_wait(v)
+                if seconds is None:
                     raise _bad("invalid wait")
-                seconds = int(m.group(1)) * {"ms": 0.001, "s": 1, "m": 60}[m.group(2)]
                 if seconds > self.max_wait:
                     raise _bad("wait too long")
                 q["wait"] = seconds
             elif name == "coverage":
-                if v not in ("0", "1"):
+                if v not in ("0", "1", "true", "false"):
                     raise _bad("invalid coverage")
-                q["coverage"] = v == "1"
+                q["coverage"] = v in ("1", "true")
             elif name == "refs":
                 if v not in ("failed", "all"):
                     raise _bad("invalid refs")
                 q["refs"] = v
             elif name == "cursor":
-                try:
-                    g, s, n = (int(x) for x in base64.urlsafe_b64decode(v + "=" * (-len(v) % 4)).decode().split("."))
-                except ValueError:
-                    raise _bad("invalid cursor") from None
+                parts = v.split(".")
+                if not _CURSOR.fullmatch(v) or len(parts) < 3 or not all(x.isdigit() for x in parts[:3]):
+                    raise _bad("invalid cursor")
+                g, s, n = (int(x) for x in parts[:3])
                 q["cursor"] = (g, s, n)
             else:
                 raise _bad("unknown parameter")
@@ -416,16 +455,43 @@ class FakePrefetches:
             t = self.tickets.get(pid)
             if t is None:
                 raise Fail(404, "not_found", f"no prefetch {pid}")
+            # An already canceled ticket keeps its reason.
             if t.canceled is None:
                 self._evaluate(t)
                 t.canceled, t.updated = "client", now
+                self._release(t, now)
             return 200, self._render(t, {})
 
     def _list(self):
         with self.lock:
             self._gc(self.now())
             out = []
-            for pid in sorted(self.tickets):
+            for pid in sorted(self.tickets)[:1024]:
                 s = self._render(self.tickets[pid], {})
                 out.append({k: s[k] for k in ("id", "state", "reason", "priority", "generation", "sequence", "settled", "expires_at_ms", "bytes")})
             return {"prefetches": out}
+
+
+def _opaque(v):
+    return isinstance(v, str) and 0 < len(v) <= 8192 and v[0] != " " and v[-1] != " " and all(ord(c) >= 0x20 and ord(c) != 0x7F for c in v)
+
+
+def _parse_wait(v):
+    """Parse a Go-style duration as Racer does; return seconds or None."""
+    if v == "0":
+        return 0.0
+    if not v:
+        return None
+    nanos, pos = 0, 0
+    while pos < len(v):
+        m = _WAIT_PART.match(v, pos)
+        if not m or (not m.group(1) and not m.group(2)):
+            return None
+        per = _WAIT_UNITS[m.group(3)]
+        nanos += int(m.group(1) or 0) * per
+        scale = per
+        for digit in (m.group(2) or "")[:18]:
+            scale //= 10
+            nanos += int(digit) * scale
+        pos = m.end()
+    return nanos / 1e9

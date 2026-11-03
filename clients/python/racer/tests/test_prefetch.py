@@ -226,8 +226,11 @@ def test_idempotency_table(client, server):
         assert exc.value.status == 409 and exc.value.code == code
     assert client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_B)], generation=1, sequence=6)).sequence == 6
     assert client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=2)).generation == 2
-    # Explicit defaults hash the same as omitted ones.
-    assert client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=2, priority="normal", ttl_seconds=600)).generation == 2
+    # Like Racer, the hash covers the body as sent: an explicit default
+    # differs from an omitted field.
+    with pytest.raises(PrefetchError) as exc:
+        client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=2, priority="normal", ttl_seconds=600))
+    assert exc.value.code == "payload_mismatch"
 
     s = client.cancel_prefetch("w")
     assert s.state == "CANCELLED" and s.reason == "client"
@@ -263,7 +266,12 @@ def test_limits(client, server):
     client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
     with pytest.raises(PrefetchError) as exc:
         client.prefetch("q", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
-    assert exc.value.status == 429 and exc.value.code == "ticket_limit" and exc.value.retry_after == 1.0
+    assert exc.value.status == 429 and exc.value.code == "ticket_limit" and exc.value.retry_after == 5.0
+    # A retained finished ticket makes room before 429.
+    client.cancel_prefetch("p")
+    assert client.prefetch("q", PrefetchSpec(refs=[PrefetchRef(KEY_A)])).created
+    with pytest.raises(PrefetchError):
+        client.prefetch_status("p")
 
     server.prefetches.admit = lambda pid, body: Fail(429, "pending_limit", "busy", 9)
     with pytest.raises(PrefetchError) as exc:
@@ -278,11 +286,48 @@ def test_ttl_expiry(client, server):
     s = client.prefetch("t", PrefetchSpec(refs=[PrefetchRef(KEY_A)], ttl_seconds=3600))
     assert s.ttl_seconds == 10 and s.expires_at_ms == 1_010_000
     clock[0] += 11
+    # A settled ticket keeps its outcome at expiry.
     s = client.prefetch_status("t")
-    assert s.state == "CANCELLED" and s.reason == "expired"
-    clock[0] += 301
-    with pytest.raises(PrefetchError):
+    assert s.state == "SUCCEEDED" and s.reason is None and s.settled
+    # Retention counts from expiry (1010).
+    clock[0] = 1309.0
+    assert client.prefetch_status("t").state == "SUCCEEDED"
+    clock[0] = 1310.0
+    with pytest.raises(PrefetchError) as exc:
         client.prefetch_status("t")
+    assert exc.value.status == 404
+
+
+def test_ttl_expiry_cancels_unsettled(client, server):
+    clock = [1000.0]
+    server.prefetches.now = lambda: clock[0]
+    server.prefetches.outcome = lambda pid, ref: Outcome(pending=True)
+    client.prefetch("u", PrefetchSpec(refs=[PrefetchRef(KEY_A)], ttl_seconds=5))
+    clock[0] += 5
+    s = client.prefetch_status("u")
+    assert s.state == "CANCELLED" and s.reason == "expired" and s.settled and s.bytes.in_flight == 0
+    assert client.cancel_prefetch("u").reason == "expired"
+
+
+def test_empty_object_and_wire_shapes(client, server):
+    server.prefetches.outcome = lambda pid, ref: Outcome(empty=True, etag='"e"')
+    refs = [PrefetchRef(KEY_A), PrefetchRef(KEY_A, offset=1), PrefetchRef(KEY_A, length=1)]
+    s = client.prefetch("e", PrefetchSpec(refs=refs))
+    assert s.state == "PARTIAL" and s.refs_succeeded == 1 and s.refs_failed == 2 and s.bytes.aligned_requested == 0
+    status, headers, body = server.prefetches.handle("GET", "/v1/prefetches/e", {"host": "racer"}, b"")
+    data = json.loads(body)
+    assert ("Connection", "close") in headers
+    for name in ("cache_uid", "reason", "ttl_seconds", "created_at_ms", "refs_total", "refs_pending", "bytes"):
+        assert name in data
+    assert not {"refs", "next_cursor", "coverage"} & set(data)
+    _, _, body = server.prefetches.handle("GET", "/v1/prefetches/e?refs=all&wait=0.5s&coverage=true", {"host": "racer"}, b"")
+    data = json.loads(body)
+    assert data["next_cursor"] is None and "error" not in data["refs"][0] and data["refs"][1]["error"] == "invalid_range"
+    status, headers, body = server.prefetches.handle("POST", "/v1/prefetches/e", {"host": "racer"}, b"")
+    assert status == 405 and json.loads(body)["code"] == "method_not_allowed"
+    for query in ("wait=%2B1s", "wait=1", "wait=61s", "refs=all&cursor=a%2Fb", "cursor=0.0.1"):
+        status, _, _ = server.prefetches.handle("GET", "/v1/prefetches/e?" + query, {"host": "racer"}, b"")
+        assert status == 400, query
 
 
 def test_wait_coverage_and_paging(client, server):
