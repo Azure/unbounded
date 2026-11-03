@@ -77,9 +77,24 @@ provider operation handle in the matching `status.targets[]` entry and poll it
 one step per reconciliation. Begin callbacks must be idempotent for the stable
 `MachineOperation` UID because they may be repeated until the handle is
 persisted. Each provider request uses the provider ID from the current Machine.
-Host operations targeting the same Machine are serialized. This keeps provider
-operations resumable without changing the four-phase MachineOperation
-lifecycle.
+Out-of-band host operations targeting the same Machine are serialized in
+creation order. Metalman makes one exception: an operation that still holds boot
+media, or whose boot from disk after media release is unconfirmed, is ordered
+ahead of the others regardless of age, and blocks them even once terminal. This keeps provider operations resumable without changing the
+four-phase MachineOperation lifecycle.
+
+`HostSoftReboot` is executed by the agent, so the out-of-band controllers do not
+see it. The agent owns the check instead: it does not start a `HostSoftReboot`
+while any out-of-band host operation targeting the same Machine is unfinished,
+whatever its age. A `HostReplace` whose target still holds boot media, or has
+not confirmed a boot from disk, counts as unfinished even in a terminal phase,
+using the same predicate metalman uses. It stays `Pending`, names the operation it waits for in
+`status.message`, and checks again periodically. Out-of-band host operations do
+not wait for a `HostSoftReboot`. They are how an unresponsive host is recovered,
+so they must not depend on the agent on that host. An out-of-band operation
+created after the agent has issued the reboot can run while the host is going
+down. The agent reports the `HostSoftReboot` from the boot ID when it starts
+again.
 
 ## Risks and open questions
 

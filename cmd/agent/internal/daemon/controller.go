@@ -80,6 +80,7 @@ func runController(
 	machineOperations := &machineOperationTarget{
 		installation:         installation,
 		Client:               c,
+		apiReader:            mgr.GetAPIReader(),
 		log:                  log,
 		machineName:          machineName,
 		nodeOperator:         nodeOperator,

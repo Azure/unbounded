@@ -104,7 +104,7 @@ func resolveDesiredRepaveConfig(
 	return &desired, appliedRef, nil
 }
 
-func getLocalMachine(ctx context.Context, c client.Client, machineName string) (*v1alpha3.Machine, error) {
+func getLocalMachine(ctx context.Context, c client.Reader, machineName string) (*v1alpha3.Machine, error) {
 	var machine v1alpha3.Machine
 	if err := c.Get(ctx, client.ObjectKey{Name: machineName}, &machine); err != nil {
 		return nil, fmt.Errorf("get Machine %s: %w", machineName, err)

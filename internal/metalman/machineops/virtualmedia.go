@@ -46,29 +46,15 @@ func (r *Reconciler) reader() client.Reader {
 }
 
 func outstandingMedia(target v1alpha3.MachineOperationTargetStatus) bool {
-	return target.BootMedia != nil && (!target.BootMedia.Released || mediaBootUnconfirmed(target))
+	return target.HasOutstandingBootMedia()
 }
 
 func mediaBootUnconfirmed(target v1alpha3.MachineOperationTargetStatus) bool {
-	b := target.BootMedia
-	if b == nil || b.Abandoned || cloudInitReported(target) {
-		return false
-	}
-
-	// After cleanup the media config serves halt, so only a loader that
-	// already started can still be running an installer.
-	return b.ImageWritten || b.LoaderStartedAt != nil ||
-		(!b.Cleaned && (b.Phase == "PoweringOn" || b.Phase == "Installing" || b.Phase == "Installed"))
+	return target.BootMediaBootUnconfirmed()
 }
 
-// cloudInitReported reports whether the installed OS has reported a final
-// cloud-init result. A failure also proves the host left the installer and
-// booted from disk, so the media no longer needs to be held.
 func cloudInitReported(target v1alpha3.MachineOperationTargetStatus) bool {
-	cond := apimeta.FindStatusCondition(target.Conditions, v1alpha3.MachineOperationConditionCloudInitDone)
-
-	return cond != nil && (cond.Status == metav1.ConditionTrue ||
-		(cond.Status == metav1.ConditionFalse && cond.Reason == "Failed"))
+	return target.CloudInitReported()
 }
 
 func hasOutstandingMedia(op *v1alpha3.MachineOperation) bool {

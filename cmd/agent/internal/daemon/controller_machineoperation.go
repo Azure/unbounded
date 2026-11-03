@@ -26,6 +26,10 @@ const agentUpgradeLockRetryDelay = 2 * time.Second
 type machineOperationTarget struct {
 	installation *installstate.Store
 	client.Client
+	// apiReader reads from the API server rather than the cache. It is used
+	// where a stale cache could start a host reboot that must wait; see
+	// reconcileHostSoftReboot. Client is used when it is nil.
+	apiReader            client.Reader
 	log                  *slog.Logger
 	machineName          string
 	nodeOperator         nodeOperator
