@@ -167,17 +167,20 @@ impl AzureTransport for PoolTransport {
     ) -> Operation<'a, PoolExchange> {
         Box::pin(async move {
             scope.check()?;
-            let endpoint = self.endpoint(url)?;
-            let Endpoint::Remote(remote) = &endpoint else {
+            let Endpoint::Remote(remote) = self.endpoint(url)? else {
                 return Err(Error::Internal);
             };
             remote.resolve(&*self.resolver, scope).await?;
+            // This exchange's own walk over the addresses, so concurrent
+            // checkouts rotating the shared cursor cannot make a retry repeat
+            // an address it already tried while skipping a healthy one.
+            let endpoint = Endpoint::Remote(remote.address_sequence());
             let is_head =
                 matches!(&head.start, StartLine::Request { method, .. } if method == "HEAD");
             // HEAD may use the endpoint's priority headroom, so metadata checks
             // are not starved by page reads.
-            // Each fresh connect takes the endpoint's next rotated address, so
-            // a connect or TLS failure retries on the remaining resolved
+            // The first fresh connect takes the endpoint's next rotated address
+            // and each retry the following resolved address, so a connect or TLS failure retries on the remaining resolved
             // addresses (nothing has been sent yet) within the request scope.
             let attempts = remote.address_count().max(1);
             let mut attempt = 0;

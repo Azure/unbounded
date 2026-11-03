@@ -437,3 +437,30 @@ fn pooled_remote_endpoint_range_reads() {
         server.join().unwrap();
     }
 }
+
+#[test]
+fn overlapping_exchanges_each_try_every_address() {
+    let Some(reactor) = reactor() else { return };
+    let endpoint = RemoteEndpoint::http("origin.example", 80).unwrap();
+    let refused: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let healthy: SocketAddr = "10.0.0.2:80".parse().unwrap();
+    let resolver = MapResolver::new(vec![refused, healthy]);
+    drive(&reactor, Box::pin(endpoint.resolve(&resolver, &scope()))).unwrap();
+    let a = endpoint.address_sequence();
+    let b = endpoint.address_sequence();
+    assert!(a == endpoint && b == endpoint);
+    // A connects first and is refused, B connects in between, then A retries:
+    // A must move on to the healthy address rather than follow the shared
+    // cursor back to the refused one.
+    assert_eq!(a.address().unwrap(), refused);
+    assert_eq!(b.address().unwrap(), healthy);
+    assert_eq!(a.address().unwrap(), healthy);
+    // Starting addresses still rotate across exchanges.
+    assert_eq!(endpoint.address().unwrap(), refused);
+    let c = endpoint.address_sequence();
+    assert_eq!(c.address().unwrap(), healthy);
+    assert_eq!(c.address().unwrap(), refused);
+    // A sequence that never connects (idle reuse) leaves the rotation alone.
+    let _unused = endpoint.address_sequence();
+    assert_eq!(endpoint.address().unwrap(), refused);
+}

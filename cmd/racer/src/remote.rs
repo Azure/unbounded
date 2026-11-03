@@ -76,8 +76,20 @@ impl Resolver for DnsResolver {
 }
 
 /// Host, port, and optional TLS policy; equality and order ignore resolved state.
+///
+/// A clone made by [`Self::address_sequence`] shares the resolved addresses but
+/// walks them with its own cursor; it still compares equal to the original.
 #[derive(Clone)]
-pub struct RemoteEndpoint(Arc<Inner>);
+pub struct RemoteEndpoint(Arc<Inner>, Option<Arc<Mutex<Option<Sequence>>>>);
+
+/// Per-exchange walk over the resolved addresses: the shared rotation picks
+/// `start` on the first connect, later connects take `start + 1`, `start + 2`, ...
+#[derive(Clone, Copy)]
+struct Sequence {
+    start: usize,
+
+    taken: usize,
+}
 
 struct Inner {
     host: String,
@@ -123,13 +135,16 @@ impl RemoteEndpoint {
         if port == 0 {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self(Arc::new(Inner {
-            literal: host.parse().ok(),
-            host: host.to_ascii_lowercase(),
-            port,
-            tls,
-            cache: Mutex::default(),
-        })))
+        Ok(Self(
+            Arc::new(Inner {
+                literal: host.parse().ok(),
+                host: host.to_ascii_lowercase(),
+                port,
+                tls,
+                cache: Mutex::default(),
+            }),
+            None,
+        ))
     }
 
     /// Host without IPv6 brackets.
@@ -221,9 +236,35 @@ impl RemoteEndpoint {
         if cache.addresses.is_empty() {
             return Err(Error::Unavailable);
         }
+        let index = match &self.1 {
+            None => Self::rotate(&mut cache),
+            Some(sequence) => {
+                let mut sequence = sequence.lock().unwrap_or_else(|e| e.into_inner());
+                let current = sequence.get_or_insert_with(|| Sequence {
+                    start: Self::rotate(&mut cache),
+                    taken: 0,
+                });
+                let index = current.start.wrapping_add(current.taken);
+                current.taken = current.taken.wrapping_add(1);
+                index
+            }
+        };
+        Ok(cache.addresses[index % cache.addresses.len()])
+    }
+
+    fn rotate(cache: &mut Addresses) -> usize {
         let index = cache.next % cache.addresses.len();
         cache.next = cache.next.wrapping_add(1);
-        Ok(cache.addresses[index])
+        index
+    }
+
+    /// Clone for one exchange's connect attempts. Its first connect takes the
+    /// shared rotation's next address; each retry takes the following resolved
+    /// address, so [`Self::address_count`] attempts try every address once even
+    /// while other exchanges rotate the shared cursor concurrently. Reused idle
+    /// connections take no address and leave the shared rotation untouched.
+    pub fn address_sequence(&self) -> Self {
+        Self(self.0.clone(), Some(Arc::default()))
     }
 
     /// Number of distinct addresses a connect may try: 1 for IP literals,
