@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,10 +21,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
@@ -93,8 +97,7 @@ type Reconciler struct {
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("metalman-machineoperation").
-		For(&v1alpha3.MachineOperation{}).
-		WithEventFilter(predicate.Funcs{
+		For(&v1alpha3.MachineOperation{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
 				op, ok := e.Object.(*v1alpha3.MachineOperation)
 				return ok && shouldReconcile(op)
@@ -108,9 +111,43 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 				op, ok := e.Object.(*v1alpha3.MachineOperation)
 				return ok && shouldReconcile(op)
 			},
-		}).
+		})).
+		// The manager caches only this site's Machines, so a Machine that moves
+		// into this site arrives as a create event. Its machineRef operations
+		// change owner at that point, and the previous owner stops polling them.
+		Watches(&v1alpha3.Machine{},
+			handler.EnqueueRequestsFromMapFunc(r.operationsForMachine),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return true },
+				UpdateFunc:  func(event.UpdateEvent) bool { return false },
+				DeleteFunc:  func(event.DeleteEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+			})).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
+}
+
+// operationsForMachine returns the in-progress host operations that name obj
+// in spec.machineRef, so the instance that now owns the Machine resumes them.
+func (r *Reconciler) operationsForMachine(ctx context.Context, obj client.Object) []reconcile.Request {
+	var ops v1alpha3.MachineOperationList
+	if err := r.List(ctx, &ops); err != nil {
+		slog.ErrorContext(ctx, "list MachineOperations for Machine", "machine", obj.GetName(), "error", err)
+		return nil
+	}
+
+	var requests []reconcile.Request
+
+	for i := range ops.Items {
+		op := &ops.Items[i]
+		if op.Spec.MachineRef != obj.GetName() || !isHostOperation(op.Spec.OperationKind) || op.Status.IsTerminal() {
+			continue
+		}
+
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(op)})
+	}
+
+	return requests
 }
 
 func shouldReconcile(op *v1alpha3.MachineOperation) bool {
@@ -149,6 +186,13 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, op *v1alpha3.Machin
 	}
 
 	if !isHostOperation(op.Spec.OperationKind) {
+		return ctrl.Result{}, nil
+	}
+
+	if owned, err := r.ownsOperation(ctx, op); err != nil {
+		return ctrl.Result{}, err
+	} else if !owned {
+		logger.DebugContext(ctx, "operation is owned by another metalman site", "site", r.Site)
 		return ctrl.Result{}, nil
 	}
 
@@ -306,17 +350,95 @@ func (r *Reconciler) validateSelectorScope(selector *metav1.LabelSelector) error
 		return operationError{reason: reasonInvalidTargetScope, message: "selector-based host operations require a non-empty metalman site"}
 	}
 
-	if selector.MatchLabels != nil && selector.MatchLabels[siteLabel] == r.Site {
+	sites := selectorSites(selector)
+	if len(sites) > 1 {
+		return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector names more than one %s: %s", siteLabel, strings.Join(sites, ", "))}
+	}
+
+	if len(sites) == 1 && sites[0] == r.Site {
 		return nil
 	}
 
-	for _, expr := range selector.MatchExpressions {
-		if expr.Key == siteLabel && expr.Operator == metav1.LabelSelectorOpIn && len(expr.Values) == 1 && expr.Values[0] == r.Site {
-			return nil
+	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
+}
+
+// ownsOperation reports whether this metalman instance may write status for
+// op. Operations that belong to a site are owned by exactly one instance:
+//   - an operation with boot media is owned by the site that installed it;
+//   - a machineRef operation is owned by the site of its Machine, read live;
+//   - a selector operation is owned by the one site its selector names.
+//
+// No instance can own an operation that names no site, names more than one
+// site, or targets a Machine that does not exist. Every instance fails such an
+// operation, because the result is the same whichever instance writes it.
+func (r *Reconciler) ownsOperation(ctx context.Context, op *v1alpha3.MachineOperation) (bool, error) {
+	if sites := mediaSites(op); len(sites) > 0 {
+		return slices.Contains(sites, r.Site), nil
+	}
+
+	if op.Spec.MachineRef != "" {
+		var machine v1alpha3.Machine
+		if err := r.reader().Get(ctx, client.ObjectKey{Name: op.Spec.MachineRef}, &machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, fmt.Errorf("get Machine %s for ownership: %w", op.Spec.MachineRef, err)
+		}
+
+		return r.ownsMachine(&machine), nil
+	}
+
+	if op.Spec.MachineSelector != nil {
+		sites := selectorSites(op.Spec.MachineSelector)
+		if len(sites) != 1 {
+			return true, nil
+		}
+
+		return sites[0] == r.Site, nil
+	}
+
+	return true, nil
+}
+
+// selectorSites returns the sorted, distinct non-empty site names that
+// selector requires, from matchLabels and from single-value In expressions.
+// Other expressions do not name a site because they can match more than one.
+func selectorSites(selector *metav1.LabelSelector) []string {
+	var sites []string
+
+	add := func(site string) {
+		if site != "" && !slices.Contains(sites, site) {
+			sites = append(sites, site)
 		}
 	}
 
-	return operationError{reason: reasonInvalidTargetScope, message: fmt.Sprintf("machineSelector must include %s=%s", siteLabel, r.Site)}
+	if site, ok := selector.MatchLabels[siteLabel]; ok {
+		add(site)
+	}
+
+	for _, expr := range selector.MatchExpressions {
+		if expr.Key == siteLabel && expr.Operator == metav1.LabelSelectorOpIn && len(expr.Values) == 1 {
+			add(expr.Values[0])
+		}
+	}
+
+	sort.Strings(sites)
+
+	return sites
+}
+
+// mediaSites returns the distinct sites that installed boot media for op.
+func mediaSites(op *v1alpha3.MachineOperation) []string {
+	var sites []string
+
+	for _, target := range op.Status.Targets {
+		if target.BootMedia != nil && !slices.Contains(sites, target.BootMedia.Site) {
+			sites = append(sites, target.BootMedia.Site)
+		}
+	}
+
+	return sites
 }
 
 func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOperation, failedCleanup map[string]struct{}) ([]targetChange, time.Duration) {
@@ -957,6 +1079,7 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 		}
 
 		op.Status.Phase = v1alpha3.OperationPhaseComplete
+		setObservedMachineGeneration(op)
 		setCompletedCondition(op, metav1.ConditionTrue, reasonSucceeded, message)
 
 		return
@@ -964,6 +1087,22 @@ func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
 
 	op.Status.Phase = v1alpha3.OperationPhaseInProgress
 	setCompletedCondition(op, metav1.ConditionFalse, "InProgress", message)
+}
+
+// setObservedMachineGeneration records the generation of the Machine a
+// completed machineRef operation acted on. Selector operations act on several
+// Machines, so only their per-target observedGeneration is set.
+func setObservedMachineGeneration(op *v1alpha3.MachineOperation) {
+	if op.Spec.MachineRef == "" {
+		return
+	}
+
+	for _, target := range op.Status.Targets {
+		if target.MachineRef == op.Spec.MachineRef && target.ObservedGeneration > 0 {
+			op.Status.ObservedMachineGeneration = target.ObservedGeneration
+			return
+		}
+	}
 }
 
 func (r *Reconciler) olderConflictingOperation(ctx context.Context, op *v1alpha3.MachineOperation) (string, error) {
