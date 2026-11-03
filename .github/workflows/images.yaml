@@ -61,11 +61,6 @@ jobs:
             tag="${{ github.sha }}"
           fi
 
-          if [[ "$name" == host-ubuntu2404-gb200-test ]]; then
-            echo "::error::Use the dedicated GB200 test image publishing workflow."
-            exit 1
-          fi
-
           file="images/${name}/Containerfile"
 
           if [[ ( "$name" == playpen || "$name" == playpen-* ) && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
