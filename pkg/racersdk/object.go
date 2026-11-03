@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -65,6 +66,9 @@ type Object struct {
 	final      [1]byte
 	finalReady bool
 	completed  bool
+
+	// Bytes handed to the caller so far, readable from any goroutine.
+	progress atomic.Int64
 }
 
 // Metadata describes the version being read. Size is the whole object, not
@@ -87,6 +91,7 @@ func (o *Object) Read(p []byte) (int, error) {
 	}
 
 	n, err := o.read(p)
+	o.progress.Add(int64(n))
 
 	return n, o.finish("read", err)
 }
@@ -143,6 +148,13 @@ func (o *Object) WriteTo(w io.Writer) (int64, error) {
 	}
 
 	return n, err
+}
+
+// Progress returns how many bytes of the object Read and WriteTo have handed
+// to the caller so far. It is safe to call from any goroutine, including while
+// WriteTo runs, so callers can report progress on long reads.
+func (o *Object) Progress() int64 {
+	return o.progress.Load()
 }
 
 // Close stops the read and closes its Racer connection. It is safe to call more
@@ -302,6 +314,7 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 		if o.finalReady {
 			n, err := dst.write(o.final[:])
 			written += n
+		o.progress.Add(n)
 
 			if err != nil {
 				return written, err
@@ -316,6 +329,7 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 		if o.conn.r.Buffered() == 0 && unix && dst.rf != nil {
 			n, err := o.splice(dst, raw)
 			written += n
+		o.progress.Add(n)
 
 			if err != nil {
 				return written, err
@@ -330,6 +344,7 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 
 		n, err := o.copy(dst, buffer[:])
 		written += n
+		o.progress.Add(n)
 
 		if err != nil {
 			return written, err

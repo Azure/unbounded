@@ -155,6 +155,10 @@ func TestGetRanges(t *testing.T) {
 					t.Fatalf("%s: n=%d err=%v; want %d bytes", mode, n, err, want)
 				}
 
+				if got := o.Progress(); got != want {
+					t.Fatalf("%s: Progress() = %d, want %d", mode, got, want)
+				}
+
 				if err := o.Close(); err != nil {
 					t.Fatal(err)
 				}
