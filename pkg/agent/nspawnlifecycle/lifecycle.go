@@ -115,6 +115,8 @@ func (l *Lifecycle) PostStart(ctx context.Context, machineName string) error {
 		return fmt.Errorf("wait for machine %s: %w", machineName, err)
 	}
 
+	// The nspawn-lifecycle helper is nspawn-only and must not change (rollback
+	// stability), so it keeps filling the nspawn goal state field directly.
 	nodeStart := &goalstates.NodeStart{
 		MachineName: machineName,
 		MachineDir:  "/var/lib/machines/" + machineName,

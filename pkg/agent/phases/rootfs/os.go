@@ -7,7 +7,6 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"path/filepath"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
@@ -41,6 +40,11 @@ var archSources = map[string][]byte{
 	"amd64": sourcesAmd64,
 	"arm64": sourcesArm64,
 }
+
+// KubernetesModulesConfig returns the modules-load.d content that lists the
+// kernel modules the node needs. A host-native backend installs it on the host,
+// where the nspawn machine would have loaded the same modules at boot.
+func KubernetesModulesConfig() []byte { return append([]byte(nil), kubernetesModulesConfig...) }
 
 // osConfigFile describes a configuration file to write into the machine rootfs.
 type osConfigFile struct {
@@ -82,7 +86,7 @@ func (c *configureOS) Do(_ context.Context) error {
 	}
 
 	for _, f := range configs {
-		dest := filepath.Join(c.goalState.MachineDir, f.path)
+		dest := c.goalState.Root().Path(f.path)
 		if err := utilio.WriteFile(dest, f.content, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dest, err)
 		}

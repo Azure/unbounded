@@ -38,7 +38,7 @@ func (d *disableResolved) Name() string { return "disable-resolved" }
 
 func (d *disableResolved) Do(_ context.Context) error {
 	// Mask systemd-resolved so it never starts inside the container.
-	maskedService := filepath.Join(d.goalState.MachineDir, "etc/systemd/system/systemd-resolved.service")
+	maskedService := d.goalState.Root().Path("etc/systemd/system/systemd-resolved.service")
 	if err := os.MkdirAll(filepath.Dir(maskedService), 0o755); err != nil {
 		return fmt.Errorf("create directory for masked service: %w", err)
 	}
@@ -61,7 +61,7 @@ func (d *disableResolved) Do(_ context.Context) error {
 		hostResolvConf = localDNSResolvConf(hostResolvConf, d.goalState.LocalDNS.NodeListenerIP.String())
 	}
 
-	dest := filepath.Join(d.goalState.MachineDir, "etc/resolv.conf")
+	dest := d.goalState.Root().Path("etc/resolv.conf")
 	if err := utilio.WriteFile(dest, hostResolvConf, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", dest, err)
 	}

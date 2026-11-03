@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -120,7 +121,7 @@ func (t *cleanupLocalDNSRules) Do(ctx context.Context) error {
 		filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit),
 		goalstates.ResolveHostPaths().LocalDNSNetworkHelper,
 	} {
-		if err := removeFileIfExists(t.log, path); err != nil {
+		if err := utilio.RemoveFileIfExists(t.log, path); err != nil {
 			return err
 		}
 	}
@@ -178,7 +179,7 @@ func (t *removeWireGuardKeys) Do(_ context.Context) error {
 		"/etc/wireguard/server.priv",
 		"/etc/wireguard/server.pub",
 	} {
-		if err := removeFileIfExists(t.log, path); err != nil {
+		if err := utilio.RemoveFileIfExists(t.log, path); err != nil {
 			return err
 		}
 	}

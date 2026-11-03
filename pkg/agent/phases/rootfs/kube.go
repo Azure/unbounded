@@ -45,7 +45,7 @@ func DownloadKubeBinaries(log *slog.Logger, goalState *goalstates.RootFS) phases
 func (d *downloadKubeBinaries) Name() string { return "download-kube-binaries" }
 
 func (d *downloadKubeBinaries) Do(ctx context.Context) error {
-	destDir := filepath.Join(d.goalState.MachineDir, goalstates.BinDir)
+	destDir := d.goalState.Root().Path(goalstates.BinDir)
 	kubeOverride := kubernetesDownloadSource(d.goalState)
 	crictlOverride := crictlDownloadSource(d.goalState)
 	kubernetesVersion := downloadSourceVersion(d.goalState.KubernetesVersion, kubeOverride)
