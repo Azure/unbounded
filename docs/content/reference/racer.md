@@ -537,12 +537,15 @@ can always send one page.
 
 Each ticket stores the `(generation, sequence)` of its last accepted `PUT`, here
 `(G, S)`. Racer also stores a hash of the body and of whether `Authorization` was
-present.
+present. The hash ignores whitespace and field order but not omitted fields: an
+explicit default such as `"ttl_seconds": 600` is a different body from leaving
+the field out. The SDKs always encode the same request the same way, so their
+retries match.
 
 | Incoming `(g, s)` | Result |
 |-------------------|--------|
 | No ticket | Created, `201` |
-| `g == G`, `s == S`, same body | `200` with current status; renews the TTL |
+| `g == G`, `s == S`, same body | `200` with current status; renews the TTL of a ticket that has not expired or been canceled |
 | `g == G`, `s == S`, different body | `409 payload_mismatch` |
 | `g == G`, `s > S` | Replaces the wanted set, `200` |
 | `g == G`, `s < S` | `409 stale_sequence` |
@@ -681,10 +684,10 @@ bodies.
 |--------|--------|------|
 | `400` | `invalid_request` | Bad JSON, field, id, query, or header |
 | `404` | `not_found` | Unknown id on `GET` or `DELETE` |
-| `405` | | Method not allowed |
+| `405` | `method_not_allowed` | Method not allowed. The `Allow` header lists the allowed methods |
 | `409` | `cache_uid_mismatch`, `payload_mismatch`, `stale_sequence`, `stale_generation`, `passthrough` | See above. A `PUT` to a [passthrough](#passthrough) cache is `409 passthrough` |
 | `413` | `too_large` | Body over `RACER_PREFETCH_MAX_BODY_BYTES` or refs over `RACER_PREFETCH_MAX_REFS` |
-| `429` | `ticket_limit`, `pending_limit` | Node ticket or pending-byte limit. `Retry-After` gives 1 to 60 seconds |
+| `429` | `ticket_limit`, `pending_limit` | Node ticket or pending-byte limit. `Retry-After` gives the seconds to wait (currently 5) |
 | `503` | `unavailable` | Node is draining or the cache is not ready |
 
 Before answering `429 ticket_limit`, Racer drops the oldest finished ticket to
