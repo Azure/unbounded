@@ -305,11 +305,11 @@ static void cm_stop(struct rdma_verbs_device *d) {
     pthread_mutex_lock(&cm->lock);
     cm->running = 0;
     pthread_mutex_unlock(&cm->lock);
-    /* Destroying the listener wakes nothing by itself; close the channel's
-     * fd side by destroying the listener, then cancel the blocked read. */
-    rdma_destroy_id(cm->listener);
+    /* Stop the event thread first: it is only cancelable while waiting, with
+     * every event acknowledged, so destroying the listener cannot block. */
     pthread_cancel(cm->thread);
     pthread_join(cm->thread, NULL);
+    rdma_destroy_id(cm->listener);
     rdma_destroy_event_channel(cm->channel);
     free(cm->qps);
     free(cm);
@@ -411,9 +411,15 @@ static void cm_request(struct rdma_verbs_device *d, struct rdma_cm_event *ev) {
 /* Event thread: accept requests; flush QPs whose peer disconnected. */
 static void *cm_thread(void *arg) {
     struct rdma_verbs_device *d = arg;
+    /* cm_stop cancels this thread. Allow that only while it waits for an
+     * event, so it never dies holding a lock or an unacknowledged event. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     for (;;) {
         struct rdma_cm_event *ev;
-        if (rdma_get_cm_event(d->cm->channel, &ev)) {
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+        int rc = rdma_get_cm_event(d->cm->channel, &ev);
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+        if (rc) {
             if (errno == EINTR) continue;
             return NULL;
         }
