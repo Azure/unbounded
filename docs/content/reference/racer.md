@@ -308,7 +308,11 @@ allocator, TLS, and filesystem cache are additional. Invalid combinations fail v
 ### Raw-device storage
 
 Set the Node annotation `racer.unbounded-cloud.io/block-devices` to a regex over
-basenames in `/host/dev/disk/by-id`, not full paths. The selector is limited to
+basenames in `/host/dev/disk/by-id`, not full paths. On nodes without udev, where
+`/host/dev/disk/by-id` does not exist, the selector instead matches the kernel
+names in `/sys/block` (such as `nvme1n1`) and, for NVMe devices, the name udev
+would give them (`nvme-<model>_<serial>`, whitespace replaced by `_`), so the
+same selector works on both. The selector is limited to
 1 KiB (1,024 bytes) and compiled with Rust's `regex` crate. Invalid or oversized
 values fall back to file-backed slabs. Matching is **unanchored**:
 use `^` and `$` to avoid unintended substring and partition matches.
