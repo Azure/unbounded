@@ -89,10 +89,7 @@ fn mutate_sidecar(
 ) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
-    if get_str(p.labels, ENABLED_LABEL) != Some(ENABLED_VALUE) {
-        return Ok(());
-    }
-    if has_name(p.init_containers, CONTAINER_NAME) || has_name(p.containers, CONTAINER_NAME) {
+    if !p.wants_sidecar() {
         return Ok(());
     }
     // With host networking the loopback listener would be shared with every
@@ -156,12 +153,7 @@ fn mutate_client_socket(
 ) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
-    if get_str(p.labels, CLIENT_SOCKET_LABEL) != Some(ENABLED_VALUE) {
-        return Ok(());
-    }
-    if p.annotations
-        .is_some_and(|a| a.contains_key(CLIENT_SOCKET_INJECTED_ANNOTATION))
-    {
+    if !p.wants_client_socket() {
         return Ok(());
     }
 

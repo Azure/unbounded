@@ -172,30 +172,23 @@ impl Review {
         Ok(Review { uid, req })
     }
 
-    /// Names of the ClusterCaches the opted-in pod names, valid names only,
-    /// without duplicates. Empty when no lookup is needed.
+    /// Names of the ClusterCaches the mutation will look up, valid names
+    /// only, without duplicates. A path the mutation skips, such as an
+    /// already injected sidecar, contributes nothing. Empty when no lookup is
+    /// needed or the pod is malformed, which the mutation rejects anyway.
     pub fn caches(&self) -> Vec<String> {
-        let annotations = self
-            .req
-            .get("object")
-            .and_then(|o| o.get("metadata"))
-            .and_then(|m| m.get("annotations"))
-            .and_then(Value::as_object);
-        let labels = self
-            .req
-            .get("object")
-            .and_then(|o| o.get("metadata"))
-            .and_then(|m| m.get("labels"))
-            .and_then(Value::as_object);
+        let Some(Ok(p)) = self.req.get("object").map(Pod::read) else {
+            return Vec::new();
+        };
         let mut out: Vec<String> = Vec::new();
-        for (label, annotation) in [
-            (ENABLED_LABEL, CACHE_ANNOTATION),
-            (CLIENT_SOCKET_LABEL, CLIENT_CACHE_ANNOTATION),
+        for (wanted, annotation) in [
+            (p.wants_sidecar(), CACHE_ANNOTATION),
+            (p.wants_client_socket(), CLIENT_CACHE_ANNOTATION),
         ] {
-            if get_str(labels, label) != Some(ENABLED_VALUE) {
+            if !wanted {
                 continue;
             }
-            if let Some(c) = get_str(annotations, annotation)
+            if let Some(c) = get_str(p.annotations, annotation)
                 && valid_cache(c)
                 && !out.iter().any(|o| o == c)
             {
@@ -372,6 +365,24 @@ fn get_str<'a>(m: Option<&'a Map<String, Value>>, key: &str) -> Option<&'a str> 
 }
 
 impl<'a> Pod<'a> {
+    /// Whether the sidecar path acts on the pod: opted in and no
+    /// racer-object container yet. Shared by the mutation and
+    /// [`Review::caches`] so the two cannot drift.
+    fn wants_sidecar(&self) -> bool {
+        get_str(self.labels, ENABLED_LABEL) == Some(ENABLED_VALUE)
+            && !has_name(self.init_containers, CONTAINER_NAME)
+            && !has_name(self.containers, CONTAINER_NAME)
+    }
+
+    /// Whether the client socket path acts on the pod: opted in and not
+    /// yet marked with [`CLIENT_SOCKET_INJECTED_ANNOTATION`].
+    fn wants_client_socket(&self) -> bool {
+        get_str(self.labels, CLIENT_SOCKET_LABEL) == Some(ENABLED_VALUE)
+            && !self
+                .annotations
+                .is_some_and(|a| a.contains_key(CLIENT_SOCKET_INJECTED_ANNOTATION))
+    }
+
     fn read(pod: &'a Value) -> Result<Self, Reject> {
         let pod = pod
             .as_object()

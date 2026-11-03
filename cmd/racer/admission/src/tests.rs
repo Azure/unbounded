@@ -1334,3 +1334,67 @@ fn invalid_selector_is_denied() {
         }
     }
 }
+
+/// Both opt-ins naming different caches.
+fn both_pod() -> Value {
+    let mut p = pod(json!({CLIENT_CACHE_ANNOTATION: "other"}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    p
+}
+
+#[test]
+fn review_caches_skips_injected_sidecar() {
+    for list in ["initContainers", "containers"] {
+        let mut p = both_pod();
+        if p["spec"][list].is_null() {
+            p["spec"][list] = json!([]);
+        }
+        p["spec"][list]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": CONTAINER_NAME, "image": "x"}));
+        let r = Review::parse(&review("CREATE", &p)).unwrap();
+        assert_eq!(r.caches(), vec!["other".to_owned()], "{list}");
+        // A cache missing from the lookup result is still unavailable, not
+        // silently allowed.
+        let resp = run_with(&p, &|c| match c {
+            "other" => CacheLookup::Found(None),
+            _ => CacheLookup::Unavailable,
+        });
+        assert_eq!(resp["allowed"], json!(true), "{list}");
+        let resp = run_with(&p, &|_| CacheLookup::Unavailable);
+        assert_eq!(resp["allowed"], json!(false), "{list}");
+    }
+}
+
+#[test]
+fn review_caches_skips_injected_client_socket() {
+    let mut p = both_pod();
+    p["metadata"]["annotations"][CLIENT_SOCKET_INJECTED_ANNOTATION] = json!("true");
+    let r = Review::parse(&review("CREATE", &p)).unwrap();
+    assert_eq!(r.caches(), vec![CACHE.to_owned()]);
+}
+
+#[test]
+fn review_caches_empty_when_nothing_mutates() {
+    let mut p = both_pod();
+    p["metadata"]["annotations"][CLIENT_SOCKET_INJECTED_ANNOTATION] = json!("true");
+    p["spec"]["containers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": CONTAINER_NAME, "image": "x"}));
+    let r = Review::parse(&review("CREATE", &p)).unwrap();
+    assert!(r.caches().is_empty());
+    let resp = run_with(&p, &|_| panic!("no lookup expected"));
+    assert_eq!(resp["allowed"], json!(true));
+    assert!(resp.get("patch").is_none());
+    // A malformed pod needs no lookup; the mutation rejects it.
+    let mut bad = both_pod();
+    bad["spec"]["hostNetwork"] = json!("yes");
+    assert!(
+        Review::parse(&review("CREATE", &bad))
+            .unwrap()
+            .caches()
+            .is_empty()
+    );
+}
