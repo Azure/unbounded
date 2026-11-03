@@ -12,6 +12,7 @@
 //! are read and dropped; larger ones abandon the connection.
 
 use super::{AzureExchange, AzureTransport};
+use crate::admission::AdmissionPolicy;
 use crate::error::{Error, Operation, Result};
 use crate::http::{ConnectionLease, Endpoint, HttpIo, HttpPool};
 use crate::memory::PlaintextBuffer;
@@ -193,6 +194,7 @@ impl AzureTransport for PoolTransport {
             Ok(PoolExchange {
                 head: response.value,
                 lease: response.connection,
+                _decoded: response._decoded,
                 io: self.io.clone(),
                 is_head,
             })
@@ -204,6 +206,10 @@ impl AzureTransport for PoolTransport {
 pub struct PoolExchange {
     head: MessageHead,
     lease: ConnectionLease,
+    /// Admission charge for the decoded header storage owned by `head`. It
+    /// lives exactly as long as the exchange holds the head, so headers stay
+    /// inside the RequestContext budget through `read_body` and `discard`.
+    _decoded: Option<flow_control::Charge<AdmissionPolicy>>,
     io: Rc<HttpIo>,
     is_head: bool,
 }

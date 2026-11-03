@@ -457,3 +457,85 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
     storage_server.join().unwrap();
     login_server.join().unwrap();
 }
+
+#[test]
+fn decoded_response_head_stays_charged_while_the_exchange_lives() {
+    let Some(reactor) = reactor() else { return };
+    let blobs = Arc::new(Mutex::new(Blobs {
+        etag: "\"v1\"".into(),
+    }));
+    let state = blobs.clone();
+    let (address, accepted, server) = serve(None, 1, move |head, _| azure(head, &state));
+    let url = format!("http://127.0.0.1:{}/account/models", address.port());
+    let f = fixture(
+        reactor.clone(),
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![]),
+        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    let container = AzureContainerUrl::parse(&url).unwrap();
+    let request = |method: &str, key: &str, range: bool| {
+        let mut headers = vec![
+            http1::Header::new("Host", container.host_header().as_bytes()),
+            http1::Header::new("x-ms-version", b"2026-12-06"),
+        ];
+        if range {
+            headers.push(http1::Header::new("x-ms-range", b"bytes=0-4"));
+        }
+        MessageHead {
+            start: StartLine::Request {
+                method: method.into(),
+                target: format!("/account/models/{key}"),
+            },
+            headers,
+        }
+    };
+    let admission = reactor.admission().clone();
+    let used = || admission.used(ResourceClass::RequestContext);
+    let scope = scope();
+    let exchange = |method: &str, key: &str, range: bool| {
+        drive(
+            &reactor,
+            f.origin
+                .transport
+                .exchange(&container, request(method, key, range), &scope),
+        )
+        .unwrap()
+    };
+    // Prime the pool so connection and staging buffers are already counted.
+    exchange("HEAD", "small", false).finish().unwrap();
+    let baseline = used();
+
+    // finish
+    let held = exchange("HEAD", "small", false);
+    assert!(used() > baseline);
+    held.finish().unwrap();
+    assert_eq!(used(), baseline);
+
+    // read_body
+    let held = exchange("GET", "small", true);
+    assert!(used() > baseline);
+    let buffer = f.origin.buffers.plaintext(f.reserve(), 5).unwrap();
+    let body = drive(&reactor, held.read_body(buffer, &scope)).unwrap();
+    assert_eq!(body.bytes().unwrap(), &[0, 1, 2, 3, 4]);
+    drop(body);
+    assert_eq!(used(), baseline);
+
+    // discard of an error body
+    let held = exchange("GET", "missing", true);
+    assert!(used() > baseline);
+    drive(&reactor, held.discard(&scope)).unwrap();
+    assert_eq!(used(), baseline);
+
+    // drop without finishing closes the connection and releases the head.
+    let held = exchange("HEAD", "small", false);
+    assert!(used() > baseline);
+    drop(held);
+    assert!(used() <= baseline);
+
+    assert!(accepted.load(Ordering::SeqCst) <= 2);
+    drop(f);
+    server.join().unwrap();
+}
