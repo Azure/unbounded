@@ -1755,6 +1755,8 @@ mod tests {
             /// Responder starts its own setup first (simultaneous offers).
             responder_opens: bool,
             sites: [&'static str; 2],
+            /// Responder membership override; `sites` builds it otherwise.
+            membership: Option<std::sync::Arc<crate::topology::Membership>>,
         }
 
         fn link_setup(
@@ -1768,7 +1770,10 @@ mod tests {
         ) {
             use crate::rdma::links::tests::world_for;
             let signers = crate::peer::tests::signers();
-            let membership = test_membership(&signers, &[0, 2], &case.sites);
+            let membership = case
+                .membership
+                .clone()
+                .unwrap_or_else(|| test_membership(&signers, &[0, 2], &case.sites));
             let responder = 2 - case.initiator;
             let mut w = world_for(
                 [
@@ -1892,6 +1897,7 @@ mod tests {
                     responder_links: true,
                     responder_opens: false,
                     sites: ["site1", "site1"],
+                    membership: None,
                 });
                 client.unwrap();
                 serve.unwrap();
@@ -1919,6 +1925,7 @@ mod tests {
                 responder_links: true,
                 responder_opens: true,
                 sites: ["site1", "site1"],
+                membership: None,
             });
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
@@ -1945,6 +1952,7 @@ mod tests {
                 responder_links: false,
                 responder_opens: false,
                 sites: ["site1", "site1"],
+                membership: None,
             });
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
@@ -1955,6 +1963,7 @@ mod tests {
                     responder_links: true,
                     responder_opens: false,
                     sites,
+                    membership: None,
                 });
                 assert!(client.is_err());
                 assert_eq!(serve, Err(Error::Unauthorized));
@@ -1965,6 +1974,69 @@ mod tests {
                     "rejected offers never reach the owner"
                 );
             }
+        }
+
+        /// Members 0 and 2 of the test signers in one Site and rail, plus
+        /// `fillers` more, with each node taking at most `budget` RDMA peers.
+        fn budget_membership(
+            signers: &[Rc<Signatures>],
+            fillers: usize,
+            budget: usize,
+        ) -> std::sync::Arc<crate::topology::Membership> {
+            let base = test_membership(signers, &[0, 2], &["site1", "site1"]);
+            let template = base.members()[0].clone();
+            let mut members = base.members().to_vec();
+            for i in 0..fillers {
+                let mut member = template.clone();
+                member.node = NodeId(format!("filler-{i}"));
+                member.peer_endpoint = format!("127.0.0.1:{}", 10_000 + i);
+                members.push(member);
+            }
+            let mut membership =
+                crate::topology::Membership::validate(MembershipVersion(1), members).unwrap();
+            membership.rdma_edges = crate::rdma::RdmaEdges::with_budget(budget);
+            std::sync::Arc::new(membership)
+        }
+
+        #[test]
+        fn signed_link_setup_refuses_a_qualifying_non_rdma_edge() {
+            let signers = crate::peer::tests::signers();
+            let (a, b) = (signers[0].node(), signers[2].node());
+            let refused = (8..64)
+                .map(|fillers| budget_membership(&signers, fillers, 1))
+                .find(|m| !crate::rdma::is_rdma_edge(m, a, b))
+                .expect("some mesh leaves the edge out");
+            // The same Site and rail under the default budget is an RDMA edge.
+            let admitted = budget_membership(&signers, 8, crate::topology::RDMA_PEERS);
+            assert!(crate::rdma::is_rdma_edge(&admitted, a, b));
+            assert_eq!(link_refusal(Some(&refused), a, b, RailId(7)), Ok(Some(403)));
+            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                initiator: 0,
+                responder_links: true,
+                responder_opens: false,
+                sites: ["site1", "site1"],
+                membership: Some(refused),
+            });
+            assert_eq!(client, Err(Error::Unavailable));
+            serve.unwrap();
+            assert!(w.a.links.ready(&peer, RailId(7)).is_none());
+            assert_eq!(
+                w.b.links.state(&local, RailId(7)),
+                rdma_verbs::LinkState::Idle,
+                "refused offers never reach the owner"
+            );
+            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                initiator: 0,
+                responder_links: true,
+                responder_opens: false,
+                sites: ["site1", "site1"],
+                membership: Some(admitted),
+            });
+            client.unwrap();
+            serve.unwrap();
+            let (_, ours) = w.a.links.ready(&peer, RailId(7)).expect("initiator ready");
+            let (_, theirs) = w.b.links.ready(&local, RailId(7)).expect("responder ready");
+            assert_eq!(ours, theirs);
         }
 
         #[test]
