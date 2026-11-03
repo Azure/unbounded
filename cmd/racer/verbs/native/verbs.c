@@ -369,9 +369,11 @@ static void cm_params(struct rdma_conn_param *p, struct rdma_verbs_cm_req *req) 
     /* No RDMA reads or atomics are posted; MANA requires a nonzero depth. */
     p->responder_resources = 1; p->initiator_depth = 1;
     /* A missing receive fails rather than stalls, like window mode. Transport
-     * retries are at the maximum: under fan-in a lost packet is congestion,
-     * and a link broken by retry exhaustion falls back to HTTP for a while. */
-    p->retry_count = 7; p->rnr_retry_count = 0;
+     * retries are high because under fan-in a lost packet is congestion, and a
+     * link broken by retry exhaustion falls back to HTTP for a while. Not 7:
+     * MANA treats 7 as retry forever, so a write to a peer that went away
+     * would never complete. */
+    p->retry_count = 6; p->rnr_retry_count = 0;
 }
 
 /* Accept a connection request for a registered responder QP whose expected
@@ -603,6 +605,9 @@ static int cm_connect(struct rdma_verbs_qp *q, const struct rdma_verbs_endpoint 
         struct rdma_conn_param p;
         cm_params(&p, &req);
         rc = rdma_connect(id, &p) ? (errno ? errno : EIO) : 0;
+        /* Deliver this connection's later events (a peer's disconnect) to
+         * the event thread, which flushes the QP so the link breaks promptly. */
+        if (!rc && rdma_migrate_id(id, q->dev->cm->channel)) rc = errno ? errno : EIO;
     }
     if (rc) {
         pthread_mutex_lock(&q->lock);
