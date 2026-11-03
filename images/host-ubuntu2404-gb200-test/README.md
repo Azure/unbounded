@@ -47,4 +47,9 @@ docker build \
   -f images/host-ubuntu2404-gb200-test/Containerfile .
 ```
 
+Publishing is isolated in the `Publish GB200 test host image` workflow. It runs
+on a native ARM64 runner for matching
+`images/host-ubuntu2404-gb200-test/<version>` tags or a manual dispatch. The
+generic image workflow explicitly does not publish this disk image.
+
 Building or publishing the artifact does not update or reboot a live machine.

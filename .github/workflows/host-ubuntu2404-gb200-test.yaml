@@ -1,0 +1,64 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish GB200 test host image
+
+on:
+  push:
+    tags:
+      - "images/host-ubuntu2404-gb200-test/*"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CONTAINER_REGISTRY: ghcr.io/${{ github.repository_owner }}
+  IMAGE_NAME: host-ubuntu2404-gb200-test
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Resolve image tag
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            image_tag="${GITHUB_REF_NAME#images/"${IMAGE_NAME}"/}"
+          else
+            image_tag="$GITHUB_SHA"
+          fi
+
+          echo "CONTAINER_REGISTRY=${CONTAINER_REGISTRY,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build test host disk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pigz
+          sudo images/host-ubuntu2404-gb200-test/build.sh
+
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/host-ubuntu2404-gb200-test/Containerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=host-ubuntu2404-gb200-test
+          cache-to: type=gha,scope=host-ubuntu2404-gb200-test,mode=max
+          build-args: |
+            VERSION=${{ env.IMAGE_TAG }}
