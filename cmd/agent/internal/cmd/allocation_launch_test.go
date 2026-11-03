@@ -116,6 +116,7 @@ func TestAuthorizeNSpawnStart(t *testing.T) {
 			}
 
 			require.ErrorIs(t, err, daemon.ErrAllocationLaunchRefused)
+			require.True(t, daemon.IsFinalAllocationLaunchRefusal(err), "final: %v", err)
 
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)

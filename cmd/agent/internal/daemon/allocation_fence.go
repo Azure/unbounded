@@ -64,6 +64,14 @@ var (
 	errAllocationLaunchUnconfirmed = errors.New("allocation could not be confirmed")
 )
 
+// IsFinalAllocationLaunchRefusal reports whether err is a refusal that reading
+// again cannot change: the cluster answered no, or the host cannot ask. It is
+// false for a refusal because no read answered within the budget or the
+// context ended, and for any error that is not a refusal.
+func IsFinalAllocationLaunchRefusal(err error) bool {
+	return errors.Is(err, ErrAllocationLaunchRefused) && !errors.Is(err, errAllocationLaunchUnconfirmed)
+}
+
 // AllocationUID reports whether cfg belongs to a host launched for a
 // MachineAllocation, and that allocation's UID. A host is allocation-backed
 // when its kubelet providerID carries v1alpha3.AllocationProviderIDPrefix. A

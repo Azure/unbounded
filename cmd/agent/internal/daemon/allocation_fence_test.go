@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
@@ -318,6 +319,7 @@ func TestVerifyAllocationMachine(t *testing.T) {
 
 			require.ErrorIs(t, err, ErrAllocationLaunchRefused)
 			assert.Equal(t, !tc.wantFinal, errors.Is(err, errAllocationLaunchUnconfirmed), "unconfirmed: %v", err)
+			assert.Equal(t, tc.wantFinal, IsFinalAllocationLaunchRefusal(err), "final: %v", err)
 
 			if tc.wantCause != nil {
 				require.ErrorIs(t, err, tc.wantCause)
@@ -426,6 +428,7 @@ func TestVerifyAllocationLaunch_TokenCheck(t *testing.T) {
 
 			require.ErrorIs(t, err, ErrAllocationLaunchRefused)
 			assert.Equal(t, !tc.wantFinal, errors.Is(err, errAllocationLaunchUnconfirmed), "unconfirmed: %v", err)
+			assert.Equal(t, tc.wantFinal, IsFinalAllocationLaunchRefusal(err), "final: %v", err)
 
 			if tc.failures != nil {
 				require.ErrorIs(t, err, tc.failures[0])
@@ -460,6 +463,7 @@ func TestVerifyAllocationLaunch_TokenCheckMisconfigured(t *testing.T) {
 			require.ErrorIs(t, err, ErrAllocationLaunchRefused)
 			require.ErrorContains(t, err, tc.want)
 			assert.NotErrorIs(t, err, errAllocationLaunchUnconfirmed)
+			assert.True(t, IsFinalAllocationLaunchRefusal(err), "final: %v", err)
 		})
 	}
 }
@@ -696,4 +700,55 @@ func TestAllocationLaunchConfig(t *testing.T) {
 		require.ErrorContains(t, err, "decode allocation launch config")
 		assert.False(t, found)
 	})
+}
+
+func TestIsFinalAllocationLaunchRefusal(t *testing.T) {
+	t.Parallel()
+
+	refusal := func(cause error) error {
+		return refuseAllocationLaunch(discardLogger(), allocationConfig(t, testAllocationUID), testAllocationUID, allocationCredentialDaemonCertificate, cause)
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var reads atomic.Int32
+
+	canceled := verifyAllocationMachine(canceledCtx, discardLogger(), countingReader(nil, &reads, nil),
+		allocationConfig(t, testAllocationUID), testAllocationLaunchOptions(t))
+	require.ErrorIs(t, canceled, context.Canceled)
+
+	fenced := allocationMachine(testAllocationUID)
+	fenced.Spec.Fenced = true
+	fencedErr := verifyAllocationMachine(context.Background(), discardLogger(), countingReader([]client.Object{fenced}, &reads, nil),
+		allocationConfig(t, testAllocationUID), testAllocationLaunchOptions(t))
+	require.ErrorIs(t, fencedErr, errAllocationMachineFenced)
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil},
+		{name: "plain error", err: errors.New("boom")},
+		{name: "unconfirmed refusal", err: refusal(fmt.Errorf("%w: %w", errAllocationLaunchUnconfirmed, context.DeadlineExceeded))},
+		{name: "canceled context refusal", err: canceled},
+		{name: "bare refusal", err: fmt.Errorf("record: %w", ErrAllocationLaunchRefused), want: true},
+		{name: "fenced from verifyAllocationMachine", err: fencedErr, want: true},
+		{name: "fenced", err: refusal(errAllocationMachineFenced), want: true},
+		{name: "deleting", err: refusal(errAllocationMachineDeleting), want: true},
+		{name: "foreign", err: refusal(errAllocationMachineForeign), want: true},
+		{name: "malformed identity", err: refusal(errAllocationIdentityMalformed), want: true},
+		{name: "not found", err: refusal(apierrors.NewNotFound(schema.GroupResource{Resource: "machines"}, "test-machine")), want: true},
+		{name: "unauthorized", err: refusal(apierrors.NewUnauthorized("rejected")), want: true},
+		{name: "forbidden", err: refusal(apierrors.NewForbidden(schema.GroupResource{Resource: "machines"}, "test-machine", errors.New("denied"))), want: true},
+		{name: "no bootstrap config", err: refusal(errors.New("build bootstrap rest config: applied config has no bootstrap token")), want: true},
+		{name: "stored certificate unreadable", err: refusal(errors.New("load stored daemon controller certificate: bad PEM")), want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tc.want, IsFinalAllocationLaunchRefusal(tc.err))
+		})
+	}
 }
