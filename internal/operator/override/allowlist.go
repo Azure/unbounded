@@ -429,6 +429,28 @@ func ProtectedPaths() []string {
 	return out
 }
 
+// componentProtectedExceptions lifts protection from a path for one component,
+// where host namespace membership is that component's documented choice.
+//
+// The racer dataplane needs the host network namespace for RDMA devices that
+// connect queue pairs through the RDMA connection manager (such as Azure
+// MANA), and its migration check tells administrators to set hostNetwork
+// through a racer DaemonSet override. ValidateDataplaneOverride in the racer
+// component accepts it too.
+var componentProtectedExceptions = map[string]map[string]bool{
+	"racer": {"spec.template.spec.hostNetwork": true},
+}
+
+// protectedReasonFor is protectedReason with componentProtectedExceptions
+// applied. An excepted path is a boolean leaf the allowlist does not list.
+func protectedReasonFor(component, path string) (string, bool) {
+	if componentProtectedExceptions[component][path] {
+		return "", false
+	}
+
+	return protectedReason(path)
+}
+
 // protectedReason reports whether path is protected, and why.
 func protectedReason(path string) (string, bool) {
 	for _, entry := range protectedPaths {
