@@ -214,7 +214,9 @@ the Machine live with it and allows the start only when the Machine's
 `allocationRef.uid` is this allocation's UID, `fenced` is not set, and the
 Machine is not being deleted. Before that certificate exists, it checks that
 the API server still accepts its bootstrap token. It never falls back from the
-certificate to the token.
+certificate to the token. The agent picks the credential again before every
+read, so a certificate that expires while the agent is still checking moves the
+check to the bootstrap token.
 
 The agent refuses closed. A fenced, deleting, missing, or foreign Machine, or a
 rejected credential, refuses at once. Other failures are read again every 10
