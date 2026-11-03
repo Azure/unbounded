@@ -81,6 +81,10 @@ func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 		}
 
 		if fields["name"] != cfg.Registry {
+			if fields["ns_alias"] == cfg.Registry {
+				return "", false, fmt.Errorf("registry %q collides with upstream %q ns_alias; resolve the alias before attachment", cfg.Registry, fields["name"])
+			}
+
 			if len(upstreams.Content) == 1 && len(fields) == 2 && fields["name"] == "registry.example.com" && fields["endpoint"] == "https://registry.example.com" {
 				upstreams.Content = nil
 			}

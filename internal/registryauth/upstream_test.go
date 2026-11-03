@@ -11,7 +11,7 @@ import (
 )
 
 func TestExplicitRegistryOnboardingPreservesOtherRuntimeConfiguration(t *testing.T) {
-	original := "# administrator comment\nmirror_listen: 0.0.0.0:5000\ncustom_setting: preserve\nupstream_registries:\n  - name: other.example\n    endpoint: https://other.example\n"
+	original := "# administrator comment\nmirror_listen: 0.0.0.0:5000\ncustom_setting: preserve\nupstream_registries:\n  - name: other.example\n    endpoint: https://other.example\n    ns_alias: mirror.example\n"
 	policy := testIdentityPolicy + "registry: " + testRegistry + "\n"
 	merged, changed, err := EnsureUpstream(original, policy)
 	require.NoError(t, err)
@@ -25,6 +25,7 @@ func TestExplicitRegistryOnboardingPreservesOtherRuntimeConfiguration(t *testing
 	entries := got["upstream_registries"].([]any)
 	require.Len(t, entries, 2)
 	require.Equal(t, "other.example", entries[0].(map[string]any)["name"])
+	require.Equal(t, "mirror.example", entries[0].(map[string]any)["ns_alias"])
 	require.Equal(t, testRegistry, entries[1].(map[string]any)["name"])
 	require.Equal(t, "https://"+testRegistry, entries[1].(map[string]any)["endpoint"])
 
@@ -90,6 +91,21 @@ func TestRegistryAttachmentResolvesMergedAndAliasedNames(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, changed, "an effective existing name must not be duplicated")
 		require.Equal(t, runtime, merged)
+	}
+}
+
+func TestRegistryAttachmentRejectsUpstreamAliasCollisions(t *testing.T) {
+	for _, mode := range []string{ExternalMode, IdentityBindingMode} {
+		t.Run(mode, func(t *testing.T) {
+			for _, entry := range []string{
+				"- name: other.example\n  endpoint: https://other.example\n  ns_alias: " + testRegistry + "\n",
+				"- <<: &upstream\n    name: other.example\n    endpoint: https://other.example\n    ns_alias: " + testRegistry + "\n",
+			} {
+				_, changed, err := EnsureUpstream("upstream_registries:\n"+entry, "mode: "+mode+"\nregistry: "+testRegistry)
+				require.ErrorContains(t, err, "ns_alias")
+				require.False(t, changed)
+			}
+		})
 	}
 }
 

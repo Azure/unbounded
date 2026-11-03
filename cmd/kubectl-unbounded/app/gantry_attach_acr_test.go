@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -123,7 +124,7 @@ func attachTestCA(t *testing.T) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: data}))
 }
 
-func managedAttachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]string) {
+func managedAttachFixture(t *testing.T, bundles ...corev1.ClusterTrustBundleProjection) (*attachACRHandler, *fake.Clientset, *[]string) {
 	t.Helper()
 	h, client, calls := attachFixture(t)
 	h.authMode = registryauth.IdentityBindingMode
@@ -132,6 +133,15 @@ func managedAttachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]
 		ObjectMeta: metav1.ObjectMeta{Name: "proxy-ca", Namespace: h.namespace}, Data: map[string]string{"ca.crt": ca},
 	}, metav1.CreateOptions{})
 	require.NoError(t, err)
+
+	caProjection := corev1.VolumeProjection{ConfigMap: &corev1.ConfigMapProjection{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "proxy-ca"},
+		Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca-cert/ca.crt"}},
+	}}
+	if len(bundles) > 0 {
+		caProjection = corev1.VolumeProjection{ClusterTrustBundle: &bundles[0]}
+	}
+
 	client.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		create := action.(k8stesting.CreateAction)
 		require.Equal(t, []string{metav1.DryRunAll}, action.(k8stesting.CreateActionImpl).GetCreateOptions().DryRun)
@@ -149,7 +159,7 @@ func managedAttachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]
 		pod.Spec.Volumes = []corev1.Volume{{Name: "identity", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			Sources: []corev1.VolumeProjection{
 				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Path: "token", Audience: "api://binding"}},
-				{ConfigMap: &corev1.ConfigMapProjection{LocalObjectReference: corev1.LocalObjectReference{Name: "proxy-ca"}, Items: []corev1.KeyToPath{{Key: "ca.crt", Path: "ca-cert/ca.crt"}}}},
+				caProjection,
 			},
 		}}}}
 
@@ -247,6 +257,154 @@ func TestGantryAttachACRExternalPreservesCustomerAuthentication(t *testing.T) {
 			}
 
 			require.NoError(t, h.execute(t.Context()))
+		})
+	}
+}
+
+func TestGantryAttachACRRejectsUpstreamAliasCollisionsBeforeWrites(t *testing.T) {
+	for _, mode := range []string{registryauth.ExternalMode, registryauth.IdentityBindingMode} {
+		t.Run(mode, func(t *testing.T) {
+			h, client, calls := attachFixture(t)
+			h.authMode = mode
+			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			source.Data["config.yaml"] += "  ns_alias: central.azurecr.io\n"
+			_, err = client.CoreV1().ConfigMaps(h.namespace).Update(t.Context(), source, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			client.ClearActions()
+
+			require.ErrorContains(t, h.execute(t.Context()), "ns_alias")
+			require.Len(t, *calls, 1)
+
+			for _, action := range client.Actions() {
+				require.Equal(t, "get", action.GetVerb(), "a collision must fail before Kubernetes writes")
+			}
+
+			current, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), source.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, source.Data, current.Data)
+		})
+	}
+}
+
+func TestGantryAttachACRABACRoleSelection(t *testing.T) {
+	const readerRole = "55555555-2222-3333-4444-555555555555"
+
+	for _, tc := range []struct {
+		name    string
+		roles   []map[string]string
+		wantErr bool
+	}{
+		{name: "repository reader", roles: []map[string]string{{"name": readerRole, "roleType": "BuiltInRole"}}},
+		{name: "unavailable", wantErr: true},
+		{name: "ambiguous", roles: []map[string]string{{"name": readerRole, "roleType": "BuiltInRole"}, {"name": attachClientID, "roleType": "BuiltInRole"}}, wantErr: true},
+		{name: "custom role", roles: []map[string]string{{"name": readerRole, "roleType": "CustomRole"}}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, client, calls := managedAttachFixture(t)
+			run := h.runAzure
+			h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+				command := strings.Join(args, " ")
+				if strings.HasPrefix(command, "role definition list") {
+					*calls = append(*calls, command)
+
+					return json.Marshal(tc.roles)
+				}
+
+				data, err := run(ctx, args...)
+				if err != nil || !strings.HasPrefix(command, "acr show") {
+					return data, err
+				}
+
+				var registry map[string]string
+				require.NoError(t, json.Unmarshal(data, &registry))
+				registry["roleAssignmentMode"] = "AbacRepositoryPermissions"
+
+				return json.Marshal(registry)
+			}
+
+			err := h.execute(t.Context())
+			source, readErr := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+			require.NoError(t, readErr)
+
+			if tc.wantErr {
+				require.ErrorContains(t, err, "repository-reader role is unavailable or ambiguous")
+				require.Empty(t, source.Data[registryauth.ConfigKey])
+
+				for _, call := range *calls {
+					require.NotContains(t, call, "role assignment create")
+				}
+			} else {
+				require.NoError(t, err)
+				_, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
+				require.NoError(t, err)
+				require.Contains(t, *calls, "role assignment create --assignee-object-id "+attachPrincipalID+
+					" --assignee-principal-type ServicePrincipal --role "+readerRole+" --scope "+attachACRID)
+			}
+		})
+	}
+}
+
+func TestGantryAttachACRClusterTrustBundleSelection(t *testing.T) {
+	selected, missing, signer := "selected", "missing", "example.com/identity-binding"
+
+	unrelatedCA := attachTestCA(t)
+	for _, tc := range []struct {
+		name       string
+		projection corev1.ClusterTrustBundleProjection
+		wantErr    bool
+	}{
+		{name: "named bundle", projection: corev1.ClusterTrustBundleProjection{Name: &selected}},
+		{name: "signer and labels", projection: corev1.ClusterTrustBundleProjection{
+			SignerName: &signer, LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"purpose": "acr"}},
+		}},
+		{name: "empty match", projection: corev1.ClusterTrustBundleProjection{Name: &missing}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.projection.Path = "ca-cert/ca.crt"
+			h, client, calls := managedAttachFixture(t, tc.projection)
+			fixtureCA, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "proxy-ca", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			ca := fixtureCA.Data["ca.crt"]
+			for _, bundle := range []certificatesv1beta1.ClusterTrustBundle{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: selected, Labels: map[string]string{"purpose": "acr"}},
+					Spec:       certificatesv1beta1.ClusterTrustBundleSpec{SignerName: signer, TrustBundle: ca},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "other-signer", Labels: map[string]string{"purpose": "acr"}},
+					Spec:       certificatesv1beta1.ClusterTrustBundleSpec{SignerName: "example.com/other", TrustBundle: unrelatedCA},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "other-label", Labels: map[string]string{"purpose": "other"}},
+					Spec:       certificatesv1beta1.ClusterTrustBundleSpec{SignerName: signer, TrustBundle: unrelatedCA},
+				},
+			} {
+				_, err := client.CertificatesV1beta1().ClusterTrustBundles().Create(t.Context(), &bundle, metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+
+			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+			require.NoError(t, err)
+			err = h.execute(t.Context())
+			current, readErr := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), source.Name, metav1.GetOptions{})
+			require.NoError(t, readErr)
+
+			if tc.wantErr {
+				require.ErrorContains(t, err, "incomplete AKS identity-binding admission metadata")
+				require.Equal(t, source.Data, current.Data)
+
+				for _, call := range *calls {
+					require.NotContains(t, call, "role assignment create")
+				}
+			} else {
+				require.NoError(t, err)
+				cfg, err := registryauth.Derive(current.Data["config.yaml"], current.Data[registryauth.ConfigKey])
+				require.NoError(t, err)
+				require.Equal(t, ca, cfg.CACert)
+			}
 		})
 	}
 }
