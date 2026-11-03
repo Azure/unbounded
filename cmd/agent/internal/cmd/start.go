@@ -31,8 +31,7 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			cmdCtx.Setup()
 
-			cmdCtx.Logger.Info(
-				"starting unbounded-agent",
+			cmdCtx.Logger.Info("starting unbounded-agent",
 				"version", version.Version,
 				"commit", version.GitCommit,
 			)

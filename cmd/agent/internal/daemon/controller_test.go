@@ -871,6 +871,7 @@ func TestReconcileNodeReboot_AllocationLaunch(t *testing.T) {
 		// reader is the live API reader; nil serves the cached Machine.
 		reader      func(t *testing.T) client.Reader
 		cfg         func(t *testing.T) *provision.AgentConfig
+		restartErr  error
 		wantRestart bool
 		wantPhase   v1alpha3.OperationPhase
 		wantReason  string
@@ -909,6 +910,17 @@ func TestReconcileNodeReboot_AllocationLaunch(t *testing.T) {
 			wantPhase:   v1alpha3.OperationPhaseComplete,
 			wantReason:  "Succeeded",
 		},
+		{
+			// The check allowed, then the fence landed and the restarted
+			// machine's pre-start refused for good, so the restart failed.
+			name:        "restart refused after the check allowed",
+			cached:      allocationMachine(testAllocationUID),
+			cfg:         func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+			restartErr:  errors.New("systemctl restart systemd-nspawn@kube1.service: exit status 1"),
+			wantRestart: true,
+			wantPhase:   v1alpha3.OperationPhaseFailed,
+			wantReason:  "ExecutionFailed",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := fakeStatusClient(tc.cached, nodeRebootOperation())
@@ -918,7 +930,7 @@ func TestReconcileNodeReboot_AllocationLaunch(t *testing.T) {
 				reader = tc.reader(t)
 			}
 
-			op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: tc.cfg(t)}}
+			op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: tc.cfg(t)}, restartErr: tc.restartErr}
 			reconciler := newAllocationMachineOperationReconciler(t, c, reader, op)
 
 			_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
@@ -935,6 +947,10 @@ func TestReconcileNodeReboot_AllocationLaunch(t *testing.T) {
 			if tc.wantReason == AllocationLaunchRefusedReason {
 				assert.Contains(t, updated.Status.Message, ErrAllocationLaunchRefused.Error())
 				assert.Contains(t, updated.Status.Message, errAllocationMachineFenced.Error())
+			}
+
+			if tc.restartErr != nil {
+				assert.Equal(t, tc.restartErr.Error(), updated.Status.Message)
 			}
 		})
 	}
