@@ -21,12 +21,20 @@ inputs:
     description: Comma-separated list of .trivyignore files.
     required: false
     default: ""
+outputs:
+  setup-outcome:
+    description: Outcome of the Trivy setup step (success, failure, or skipped).
+    value: ${{ steps.setup.outcome }}
+  scan-outcome:
+    description: Outcome of the Trivy scan step (success, failure, or skipped).
+    value: ${{ steps.scan.outcome }}
 runs:
   using: composite
   steps:
     # Idempotent: reuses the binary when already installed in this job, and
     # Trivy skips the DB download when the cached DB is fresh.
     - name: Set up Trivy
+      id: setup
       shell: bash
       env:
         TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
@@ -37,6 +45,7 @@ runs:
     # anything itself. setup-trivy.sh exported TRIVY_SKIP_DB_UPDATE=true, so
     # the scan uses the DB downloaded above.
     - name: Scan with Trivy
+      id: scan
       uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
       with:
         image-ref: ${{ inputs['image-ref'] }}

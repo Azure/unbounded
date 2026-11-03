@@ -75,21 +75,31 @@ jobs:
           severity: CRITICAL
           exit-code: "1"
 
-      # The gating scan must fail because of findings, not because the setup
-      # broke, so confirm the findings with the installed binary directly.
-      - name: Verify findings
+      # Ignoring the only CRITICAL finding must make the same gating scan pass,
+      # which shows the failure above came from findings, not a scanner error.
+      - name: Write ignore file
+        run: printf 'CVE-2021-36159\n' > "${RUNNER_TEMP}/trivyignore"
+
+      - name: Scan again (gating, findings ignored)
+        uses: ./.github/actions/trivy-scan
+        with:
+          image-ref: ${{ env.SCAN_IMAGE }}
+          severity: CRITICAL
+          exit-code: "1"
+          trivyignores: ${{ runner.temp }}/trivyignore
+
+      - name: Verify gating outcome
         env:
-          GATING_OUTCOME: ${{ steps.gating.outcome }}
+          SETUP_OUTCOME: ${{ steps.gating.outputs.setup-outcome }}
+          SCAN_OUTCOME: ${{ steps.gating.outputs.scan-outcome }}
         run: |
           set -euo pipefail
-          if [[ "${GATING_OUTCOME}" != "failure" ]]; then
-            echo "::error::gating scan outcome was '${GATING_OUTCOME}', want 'failure'"
+          if [[ "${SETUP_OUTCOME}" != "success" ]]; then
+            echo "::error::gating setup outcome was '${SETUP_OUTCOME}', want 'success'"
+            exit 1
+          fi
+          if [[ "${SCAN_OUTCOME}" != "failure" ]]; then
+            echo "::error::gating scan outcome was '${SCAN_OUTCOME}', want 'failure'"
             exit 1
           fi
           test "${TRIVY_SKIP_DB_UPDATE}" = "true"
-          rc=0
-          timeout --kill-after=10s 300s trivy image --quiet --severity CRITICAL --exit-code 3 "${SCAN_IMAGE}" >/dev/null || rc=$?
-          if [[ "${rc}" -ne 3 ]]; then
-            echo "::error::trivy exited ${rc}, want 3 (CRITICAL findings)"
-            exit 1
-          fi
