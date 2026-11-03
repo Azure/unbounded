@@ -21,8 +21,9 @@ and the [break-glass paths](#break-glass).
 | 3. Soak and publish | `release-upgrade.yaml` | automatic, on phase 2 completing | deploys to `unbounded-stable`, smokes it, flips the draft to published |
 
 The split exists so phase 2 runs in the tag's context. Keyless cosign signatures
-carry the identity `release.yaml@refs/tags/vX.Y.Z`, and phase 3 verifies exactly
-that. A build dispatched from a branch would sign as `@refs/heads/main` and fail
+carry the identity `release.yaml@refs/tags/vX.Y.Z` (images built through the
+`multiarch-image.yaml` reusable workflow carry `multiarch-image.yaml@refs/tags/vX.Y.Z`),
+and phase 3 verifies exactly that. A build dispatched from a branch would sign as `@refs/heads/main` and fail
 verification, which is why `release.yaml` deliberately has **no** manual
 trigger.
 
