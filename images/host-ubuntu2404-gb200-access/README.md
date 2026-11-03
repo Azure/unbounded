@@ -21,6 +21,12 @@ PCI MSI/MSI-X interrupts, and is intended for kernels acting as bootloaders
 rather than a directly booted host OS. The image does not add the
 proposed-package source or perform a broad package upgrade.
 
+The image installs
+`/etc/modprobe.d/99-nvidia-disable-nvlink.conf` and rebuilds the target
+kernel's initramfs so `NVreg_NvLinkDisable=1` is applied before the GPU driver
+loads. This deliberately disables NVLink and NVLS. Local CUDA workloads and
+fallback collectives remain available.
+
 The image installs pinned `ssh-import-id` and adds a native cloud-init user
 fragment for the reviewed host access accounts. Passwords remain locked, shells
 are `/bin/bash`, and each account has passwordless sudo. `bcho` deliberately has
@@ -48,6 +54,7 @@ build verifies:
 - Ubuntu `24.04` and kernel `6.14.0-1003-azure-nvidia` package versions;
 - the validated lab kernel command line, package holds, nouveau blacklist, and
   absence of the John Cabaj package source;
+- the exact GPU NVLink policy in both the rootfs and generated initramfs;
 - the boot kernel symlink and rebuilt NVIDIA DKMS module;
 - NVIDIA module loading and device-node initialization before cloud-final;
 - the exact reviewed user policy and real Noble cloud-init merge against the

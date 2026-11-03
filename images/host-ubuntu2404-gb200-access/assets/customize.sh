@@ -16,6 +16,21 @@ fail() {
     exit 1
 }
 
+nvlink_disable_value() {
+    modprobe -C "$1" -c |
+        awk '
+            $1 == "options" && $2 == "nvidia" {
+                for (field = 3; field <= NF; field++) {
+                    if ($field ~ /^NVreg_NvLinkDisable=/) {
+                        split($field, option, "=")
+                        value = option[2]
+                    }
+                }
+            }
+            END { print value }
+        '
+}
+
 dpkg --install \
     /tmp/packages/wget_1.21.4-1ubuntu4.5_arm64.deb \
     /tmp/packages/ssh-import-id_5.11-0ubuntu2.24.04.1_all.deb
@@ -131,13 +146,40 @@ test -d "/lib/modules/${kernel_release}/updates/dkms" ||
 find "/lib/modules/${kernel_release}/updates/dkms" \
     -name 'nvidia.ko*' -print -quit | grep -q . ||
     fail "nvidia.ko is missing from the target kernel"
+
+echo "Rebuilding initramfs with the GPU NVLink policy."
+update-initramfs -u -k "${kernel_release}"
+initramfs_verify_dir="$(mktemp -d /var/lib/unbounded-initramfs.XXXXXX)"
+trap 'rm -rf "${initramfs_verify_dir}"' EXIT
+unmkinitramfs "/boot/initrd.img-${kernel_release}" "${initramfs_verify_dir}"
+initramfs_nvlink_configs="$(
+    find "${initramfs_verify_dir}" -type f \
+        -path '*/etc/modprobe.d/99-nvidia-disable-nvlink.conf' -print
+)"
+initramfs_nvlink_config_count="$(
+    printf '%s\n' "${initramfs_nvlink_configs}" |
+        awk 'NF { count++ } END { print count + 0 }'
+)"
+test "${initramfs_nvlink_config_count}" -eq 1 ||
+    fail "initramfs GPU NVLink policy is missing or duplicated"
+test "$(nvlink_disable_value /etc/modprobe.d)" = 1 ||
+    fail "rootfs effective GPU NVLink policy is not disabled"
+test "$(
+    nvlink_disable_value "$(dirname "${initramfs_nvlink_configs}")"
+)" = 1 ||
+    fail "initramfs effective GPU NVLink policy is not disabled"
+
 echo "Validating cloud-init access policy."
 cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
 python3 /tmp/verify.py \
     --image-config /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg \
     --vendor-template /tmp/vendor-data.tmpl \
     --dpkg-status /var/lib/dpkg/status \
-    --agent-archive "${agent_archive}"
+    --agent-archive "${agent_archive}" \
+    --rootfs-nvidia-config /etc/modprobe.d/99-nvidia-disable-nvlink.conf \
+    --initramfs-nvidia-config "${initramfs_nvlink_configs}"
+rm -rf "${initramfs_verify_dir}"
+trap - EXIT
 mkdir -p /var/lib/unbounded
 agent_verify_dir="$(mktemp -d /var/lib/unbounded/verify-agent.XXXXXX)"
 trap 'rm -rf "${agent_verify_dir}"' EXIT

@@ -32,6 +32,7 @@ AGENT_ARCHIVE_SHA256 = (
 )
 AGENT_ARCHIVE_MEMBERS = ["LICENSE", "NOTICE", "unbounded-agent"]
 ELF_MACHINE_AARCH64 = 183
+NVIDIA_NVLINK_CONFIG = b"options nvidia NVreg_NvLinkDisable=1\n"
 GENERIC_USERS = """users:
 - name: unbounded-metal
   lock_passwd: true
@@ -167,16 +168,29 @@ def validate_agent_archive(
         raise RuntimeError("agent archive binary is not ARM64")
 
 
+def validate_nvidia_nvlink_config(path: Path, location: str) -> None:
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{location} GPU NVLink policy is missing") from error
+    if content != NVIDIA_NVLINK_CONFIG:
+        raise RuntimeError(f"{location} GPU NVLink policy changed")
+
+
 def verify(
     image_config_path: Path,
     vendor_template_path: Path,
     status_path: Path,
     agent_archive_path: Path,
+    rootfs_nvidia_config_path: Path,
+    initramfs_nvidia_config_path: Path,
 ) -> None:
     image_config = load_mapping(image_config_path)
     validate_users(image_config)
     verify_merge(image_config, vendor_template_path)
     validate_agent_archive(agent_archive_path)
+    validate_nvidia_nvlink_config(rootfs_nvidia_config_path, "rootfs")
+    validate_nvidia_nvlink_config(initramfs_nvidia_config_path, "initramfs")
     packages = installed_packages(status_path)
     if packages.get("ssh-import-id") != SSH_IMPORT_ID_VERSION:
         raise RuntimeError("pinned ssh-import-id package is not installed")
@@ -188,12 +202,16 @@ def main() -> None:
     parser.add_argument("--vendor-template", type=Path, required=True)
     parser.add_argument("--dpkg-status", type=Path, required=True)
     parser.add_argument("--agent-archive", type=Path, required=True)
+    parser.add_argument("--rootfs-nvidia-config", type=Path, required=True)
+    parser.add_argument("--initramfs-nvidia-config", type=Path, required=True)
     args = parser.parse_args()
     verify(
         args.image_config,
         args.vendor_template,
         args.dpkg_status,
         args.agent_archive,
+        args.rootfs_nvidia_config,
+        args.initramfs_nvidia_config,
     )
 
 

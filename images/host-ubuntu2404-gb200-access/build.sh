@@ -70,6 +70,8 @@ customize_disk() {
         "${root}/etc/default/grub.d/60-gb200-lab-kernel.cfg"
     cp "${script_dir}/assets/blacklist-nouveau.conf" \
         "${root}/etc/modprobe.d/blacklist-nouveau.conf"
+    cp "${script_dir}/assets/99-nvidia-disable-nvlink.conf" \
+        "${root}/etc/modprobe.d/99-nvidia-disable-nvlink.conf"
     cp "${script_dir}/assets/verify.py" "${root}/tmp/verify.py"
     cp "${script_dir}/../netboot/assets/vendor-data.tmpl" \
         "${root}/tmp/vendor-data.tmpl"
@@ -105,6 +107,8 @@ customize_disk() {
         "${root}/etc/default/grub.d/60-gb200-lab-kernel.cfg"
     cmp "${script_dir}/assets/blacklist-nouveau.conf" \
         "${root}/etc/modprobe.d/blacklist-nouveau.conf"
+    cmp "${script_dir}/assets/99-nvidia-disable-nvlink.conf" \
+        "${root}/etc/modprobe.d/99-nvidia-disable-nvlink.conf"
     if grep -Rqi john-cabaj \
         "${root}/etc/apt/sources.list" \
         "${root}/etc/apt/sources.list.d" 2>/dev/null; then

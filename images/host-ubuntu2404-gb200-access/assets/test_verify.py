@@ -80,6 +80,28 @@ class VerifyTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "members changed"):
                 verify.validate_agent_archive(archive, digest)
 
+    def test_nvidia_nvlink_policy_requires_exact_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "99-nvidia-disable-nvlink.conf"
+            config.write_bytes(verify.NVIDIA_NVLINK_CONFIG)
+
+            verify.validate_nvidia_nvlink_config(config, "rootfs")
+
+    def test_nvidia_nvlink_policy_rejects_missing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "99-nvidia-disable-nvlink.conf"
+
+            with self.assertRaisesRegex(RuntimeError, "rootfs.*missing"):
+                verify.validate_nvidia_nvlink_config(config, "rootfs")
+
+    def test_nvidia_nvlink_policy_rejects_wrong_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "99-nvidia-disable-nvlink.conf"
+            config.write_text("options nvidia NVreg_NvLinkDisable=0\n")
+
+            with self.assertRaisesRegex(RuntimeError, "initramfs.*changed"):
+                verify.validate_nvidia_nvlink_config(config, "initramfs")
+
     @staticmethod
     def write_agent_archive(
         path: Path, *, machine: int = verify.ELF_MACHINE_AARCH64, include_notice=True
