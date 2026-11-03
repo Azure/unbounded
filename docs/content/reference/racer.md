@@ -377,7 +377,8 @@ Even when approved, Racer refuses a disk that is:
 - read-only;
 - too small for both guards and one segment;
 - busy: another process holds it open exclusively, or the partition table
-  reread fails with `EBUSY`.
+  reread fails with `EBUSY` because a partition is open. Racer rereads the
+  table before writing either guard, so a busy disk is refused unwiped.
 
 Idle partitions do not block approval; they are wiped. Racer opens disks with
 `O_RDWR | O_DIRECT | O_EXCL`. An open that fails with `EBUSY`, for example while a

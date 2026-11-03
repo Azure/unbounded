@@ -592,8 +592,11 @@ impl GuardIo for BlockGuards<'_> {
 /// destroys partition tables (MBR and both GPT copies) and the filesystem,
 /// LVM, and RAID signatures kept there. Guards that are already zero are not
 /// written, so restarts never rewrite a disk. When the kernel still lists
-/// partitions, the partition table is reread so stale partitions disappear;
-/// a busy reread refuses the disk.
+/// partitions, the partition table is reread before any write: a partition
+/// held open without `O_EXCL` passes the mount, holder, and exclusive-open
+/// checks, but makes the reread fail with `EBUSY`, so a busy disk is refused
+/// before it is wiped. After a wipe the table is reread again so stale
+/// partitions disappear.
 fn prepare_guards(
     disk: &impl GuardIo,
     id: &str,
@@ -619,7 +622,11 @@ fn prepare_guards(
             dirty.push(offset);
         }
     }
-    if !dirty.is_empty() {
+    if partitions {
+        reread_partitions(disk)?;
+    }
+    let wiped = !dirty.is_empty();
+    if wiped {
         eprintln!(
             "racer: wiping approved disk {id:?}: zeroing the first and last {GUARD_BYTES} bytes (partition table and signatures)"
         );
@@ -634,22 +641,25 @@ fn prepare_guards(
         }
         disk.sync().map_err(Refusal::io(DiskReason::WipeFailed))?;
     }
-    if partitions {
-        match disk.reread_partitions() {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
-                return Err(Refusal::new(
-                    DiskReason::Busy,
-                    format!("partition table reread: {error}"),
-                ));
-            }
-            Err(error) => return Err(Refusal::io(DiskReason::WipeFailed)(error)),
-        }
+    if wiped && partitions {
+        reread_partitions(disk)?;
     }
     validate_guards(bytes, alignment, |buffer, offset| {
         disk.read_at(buffer, offset)
     })
     .map_err(Refusal::io(DiskReason::WipeFailed))
+}
+
+/// Reread the partition table, refusing the disk as busy on `EBUSY`.
+fn reread_partitions(disk: &impl GuardIo) -> std::result::Result<(), Refusal> {
+    match disk.reread_partitions() {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => Err(Refusal::new(
+            DiskReason::Busy,
+            format!("partition table reread: {error}"),
+        )),
+        Err(error) => Err(Refusal::io(DiskReason::WipeFailed)(error)),
+    }
 }
 
 fn guarded_capacity(bytes: u64, segment: u64, alignment: Alignment) -> Result<u64> {
@@ -1675,16 +1685,30 @@ pub(super) mod tests {
         let (path, data) = guarded_image(&f, true);
         let disk = FileGuards::new(&path, || Ok(()));
         prepare_guards(&disk, "wwn-1", data.len() as u64, a, true).unwrap();
-        assert_eq!(disk.rereads.get(), 1);
+        // Once before the wipe to prove no partition is open, once after.
+        assert_eq!(disk.rereads.get(), 2);
+        assert_eq!(disk.writes.get(), 2);
+        // Clean guards need only the pre-check.
+        let (path, data) = guarded_image(&f, false);
+        let clean = FileGuards::new(&path, || Ok(()));
+        prepare_guards(&clean, "wwn-1", data.len() as u64, a, true).unwrap();
+        assert_eq!(clean.rereads.get(), 1);
+        assert_eq!(clean.writes.get(), 0);
+        // A partition opened without O_EXCL makes the reread busy; the
+        // disk is refused before either guard is written.
         let (path, data) = guarded_image(&f, true);
         let busy = FileGuards::new(&path, || Err(io::Error::from_raw_os_error(libc::EBUSY)));
         let refusal = prepare_guards(&busy, "wwn-1", data.len() as u64, a, true).unwrap_err();
         assert_eq!(refusal.reason, DiskReason::Busy);
         assert!(!is_busy(&refusal.error));
-        let (path, data) = guarded_image(&f, false);
+        assert_eq!(busy.writes.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), data);
+        let (path, data) = guarded_image(&f, true);
         let failed = FileGuards::new(&path, || Err(io::Error::from_raw_os_error(libc::ENOTTY)));
         let refusal = prepare_guards(&failed, "wwn-1", data.len() as u64, a, true).unwrap_err();
         assert_eq!(refusal.reason, DiskReason::WipeFailed);
+        assert_eq!(failed.writes.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), data);
     }
 
     #[test]
