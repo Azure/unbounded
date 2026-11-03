@@ -3230,6 +3230,11 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PeerLocalPressure => "racer_peer_local_pressure_total",
             Self::Request => "racer_requests_total",
             Self::RequestError => "racer_request_errors_total",
+            Self::RequestErrorOverloaded => "racer_request_errors_overloaded_total",
+            Self::RequestErrorUnavailable => "racer_request_errors_unavailable_total",
+            Self::RequestErrorDeadline => "racer_request_errors_deadline_total",
+            Self::RequestErrorCancelled => "racer_request_errors_cancelled_total",
+            Self::RequestErrorOther => "racer_request_errors_other_total",
             Self::MemoryHit => "racer_memory_hits_total",
             Self::DiskHit => "racer_disk_hits_total",
             Self::PeerHit => "racer_peer_hits_total",
@@ -3426,6 +3431,8 @@ pub(crate) struct RequestMetrics {
     metrics: Metrics,
     succeeded: bool,
     overloaded: bool,
+    /// The first reported failure, which names why the request ended.
+    failure: Option<crate::error::Error>,
 }
 impl RequestMetrics {
     pub(crate) fn success(&mut self) {
@@ -3436,15 +3443,59 @@ impl RequestMetrics {
             self.metrics.record(Event::Overload, 1);
             self.overloaded = true;
         }
+        self.failure.get_or_insert(error);
     }
 }
 impl Drop for RequestMetrics {
     fn drop(&mut self) {
         if !self.succeeded {
             self.metrics.record(Event::RequestError, 1);
+            self.metrics.record(request_error_reason(self.failure), 1);
+            log_request_failure(self.failure);
         }
     }
 }
+
+/// The reason counter for a failed client request.
+fn request_error_reason(failure: Option<crate::error::Error>) -> Event {
+    use crate::error::Error;
+    match failure {
+        Some(Error::Overloaded) => Event::RequestErrorOverloaded,
+        Some(Error::Unavailable) => Event::RequestErrorUnavailable,
+        Some(Error::DeadlineExceeded) => Event::RequestErrorDeadline,
+        Some(Error::Cancelled) => Event::RequestErrorCancelled,
+        _ => Event::RequestErrorOther,
+    }
+}
+
+/// Log failed client requests at most once per [`FAILURE_LOG_INTERVAL`] per
+/// thread, with how many were suppressed in between, so a client whose
+/// stream ends early can find out why without flooding the log.
+fn log_request_failure(failure: Option<crate::error::Error>) {
+    use std::cell::Cell;
+    thread_local! {
+        static NEXT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        static SUPPRESSED: Cell<u64> = const { Cell::new(0) };
+    }
+    let now = std::time::Instant::now();
+    if NEXT.get().is_some_and(|next| now < next) {
+        SUPPRESSED.set(SUPPRESSED.get().saturating_add(1));
+        return;
+    }
+    NEXT.set(Some(now + FAILURE_LOG_INTERVAL));
+    let suppressed = SUPPRESSED.replace(0);
+    match failure {
+        Some(error) => eprintln!(
+            "racer: stage=client-request state=failed error={error:?} suppressed={suppressed}; see /debug/terminal"
+        ),
+        None => eprintln!(
+            "racer: stage=client-request state=failed error=unreported suppressed={suppressed}; see /debug/terminal"
+        ),
+    }
+}
+
+/// Least time between client-request failure log lines on one thread.
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 impl Metrics {
     pub(crate) fn observe_held(&self, snapshot: crate::store::catalog::HeldSnapshot) {
         self.held.replace(self.shard, snapshot);
@@ -3745,6 +3796,7 @@ impl Metrics {
             metrics: self.clone(),
             succeeded: false,
             overloaded: false,
+            failure: None,
         })
     }
     /// Saturate instead of wrapping a long-lived Prometheus counter.
@@ -5926,6 +5978,29 @@ pub(crate) mod tests {
             assert_eq!(metrics.count(Event::Request), 0);
             assert_eq!(metrics.count(Event::RequestError), 0);
             assert_eq!(metrics.gauge(Gauge::ActiveRequests), u64::MAX);
+        }
+
+        #[test]
+        fn failed_requests_count_their_first_reason() {
+            use crate::error::Error;
+            let metrics = Metrics::default();
+            let mut overloaded = metrics.request().unwrap();
+            overloaded.fail(Error::Overloaded);
+            overloaded.fail(Error::Unavailable);
+            drop(overloaded);
+            let mut unavailable = metrics.request().unwrap();
+            unavailable.fail(Error::Unavailable);
+            drop(unavailable);
+            drop(metrics.request().unwrap());
+            let mut succeeded = metrics.request().unwrap();
+            succeeded.fail(Error::DeadlineExceeded);
+            succeeded.success();
+            drop(succeeded);
+            assert_eq!(metrics.count(Event::RequestError), 3);
+            assert_eq!(metrics.count(Event::RequestErrorOverloaded), 1);
+            assert_eq!(metrics.count(Event::RequestErrorUnavailable), 1);
+            assert_eq!(metrics.count(Event::RequestErrorOther), 1);
+            assert_eq!(metrics.count(Event::RequestErrorDeadline), 0);
         }
 
         #[test]

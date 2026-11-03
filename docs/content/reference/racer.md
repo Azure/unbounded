@@ -974,6 +974,13 @@ and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-s
 are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
 network access, especially with host networking.
 
+A failed client request also counts in one of
+`racer_request_errors_overloaded_total`, `racer_request_errors_unavailable_total`,
+`racer_request_errors_deadline_total`, `racer_request_errors_cancelled_total`, or
+`racer_request_errors_other_total`, by the first error it reported, and each I/O
+thread logs at most one `stage=client-request state=failed` line every 10 s
+(with the number suppressed since). `/debug/terminal` keeps the details.
+
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 
