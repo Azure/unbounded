@@ -596,3 +596,87 @@ fn connect_failure_on_every_address_is_reported() {
     );
     assert!(f.bootstrap("big").is_err());
 }
+
+#[test]
+fn attempt_scope_narrows_only_non_final_attempts() {
+    let parent = scope();
+    // Final attempt: the full request scope.
+    assert_eq!(attempt_scope(&parent, 1).deadline.0, parent.deadline.0);
+    // 10s over two attempts is capped at ATTEMPT_CAP.
+    let now = Instant::now();
+    let first = attempt_scope(&parent, 2).deadline.0;
+    assert!(first <= Instant::now() + ATTEMPT_CAP);
+    assert!(first >= now + ATTEMPT_CAP - Duration::from_millis(100));
+    // 10s over 100 attempts is 100ms, raised to the floor.
+    let many = attempt_scope(&parent, 100).deadline.0;
+    assert!(many >= now + ATTEMPT_FLOOR - Duration::from_millis(10));
+    assert!(many <= Instant::now() + ATTEMPT_FLOOR);
+    // The floor never extends past the request deadline.
+    let mut tight = scope();
+    tight.deadline.0 = Instant::now() + Duration::from_millis(100);
+    assert_eq!(attempt_scope(&tight, 2).deadline.0, tight.deadline.0);
+    // Narrowed scopes share the request's cancellation.
+    let narrowed = attempt_scope(&parent, 2);
+    parent.cancel().unwrap();
+    assert_eq!(narrowed.check(), Err(Error::Cancelled));
+}
+
+#[test]
+fn stalled_handshake_fails_over_before_the_request_deadline() {
+    let Some(reactor) = reactor() else { return };
+    let identity = test_identity(&["account.blob.example"]);
+    let blobs = Arc::new(Mutex::new(Blobs {
+        etag: "\"v1\"".into(),
+    }));
+    let state = blobs.clone();
+    let (address, accepted, server) = serve(Some(identity.server.clone()), 1, move |head, _| {
+        azure(head, &state)
+    });
+    // The kernel completes TCP into this listener's backlog, but nothing ever
+    // answers the TLS ClientHello.
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "https://account.blob.example:{}/account/models",
+        address.port()
+    );
+    let f = fixture(
+        reactor.clone(),
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![stalled.local_addr().unwrap(), address]),
+        TrustRoots::fixed(http1::tls::client_config(identity.roots.clone())),
+        AnonymousOnly,
+    );
+    let container = AzureContainerUrl::parse(&url).unwrap();
+    let head = MessageHead {
+        start: StartLine::Request {
+            method: "HEAD".into(),
+            target: "/account/models/small".into(),
+        },
+        headers: vec![
+            http1::Header::new("Host", container.host_header().as_bytes()),
+            http1::Header::new("x-ms-version", b"2026-12-06"),
+        ],
+    };
+    // Two attempts over 2s: the stalled one is cut off after about 1s.
+    let mut scope = scope();
+    let started = Instant::now();
+    scope.deadline.0 = started + Duration::from_secs(2);
+    let exchange = drive(
+        &reactor,
+        f.origin.transport.exchange(&container, head, &scope),
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        exchange.head().unique("Content-Length").unwrap(),
+        Some(&b"5"[..])
+    );
+    exchange.finish().unwrap();
+    assert!(elapsed < Duration::from_millis(1800), "took {elapsed:?}");
+    assert!(scope.check().is_ok());
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    drop(f);
+    drop(stalled);
+    server.join().unwrap();
+}

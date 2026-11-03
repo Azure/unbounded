@@ -35,6 +35,34 @@ pub const MAX_RESPONSE_HEAD: usize = 32 * 1024;
 /// Largest error body read to keep a connection reusable.
 pub const MAX_DISCARD: u64 = 64 * 1024;
 
+/// Longest a non-final connect attempt may take before failing over.
+const ATTEMPT_CAP: Duration = Duration::from_secs(5);
+
+/// Shortest non-final connect attempt, so a tight request budget still gives
+/// a slow but healthy address a fair chance to answer.
+const ATTEMPT_FLOOR: Duration = Duration::from_millis(250);
+
+/// Scope for one checkout attempt with `remaining` attempts left, including
+/// this one. The final attempt keeps the full request scope. Earlier attempts
+/// get `min(budget / remaining, ATTEMPT_CAP)`, at least `ATTEMPT_FLOOR` (never
+/// past the request deadline), so an address that blackholes the TCP connect
+/// or stalls the TLS handshake cannot consume the whole request before the
+/// next resolved address is tried. The narrowed clone shares the request's
+/// cancellation, so cancelling the request still releases every attempt.
+fn attempt_scope(scope: &RequestScope, remaining: usize) -> RequestScope {
+    if remaining <= 1 {
+        return scope.clone();
+    }
+    let now = uring_runtime::environment::now();
+    let budget = scope.deadline.0.saturating_duration_since(now);
+    let share = (budget / remaining as u32)
+        .min(ATTEMPT_CAP)
+        .max(ATTEMPT_FLOOR);
+    let mut attempt = scope.clone();
+    attempt.deadline.0 = scope.deadline.0.min(now + share);
+    attempt
+}
+
 /// How long a failed trust bundle load is reported before loading again.
 const TRUST_RETRY: Duration = Duration::from_secs(30);
 
@@ -182,19 +210,28 @@ impl AzureTransport for PoolTransport {
             // The first fresh connect takes the endpoint's next rotated address
             // and each retry the following resolved address, so a connect or TLS failure retries on the remaining resolved
             // addresses (nothing has been sent yet) within the request scope.
+            // Each non-final attempt runs under a narrowed scope (see
+            // [`attempt_scope`]), so a stalled connect or handshake counts as a
+            // connect failure. Only checkout is narrowed: a reused idle
+            // connection returns at once, and the send and response read below
+            // use the full request scope.
             let attempts = remote.address_count().max(1);
             let mut attempt = 0;
             let lease = loop {
                 attempt += 1;
+                let attempt_scope = attempt_scope(scope, attempts - attempt + 1);
                 let checkout = if is_head {
-                    self.pool.checkout_metadata(&endpoint, scope).await
+                    self.pool.checkout_metadata(&endpoint, &attempt_scope).await
                 } else {
-                    self.pool.checkout_wait(&endpoint, scope).await
+                    self.pool.checkout_wait(&endpoint, &attempt_scope).await
                 };
                 match checkout {
                     Ok(lease) => break lease,
-                    Err(Error::Io | Error::Os(_) | Error::Unavailable)
-                        if attempt < attempts && scope.check().is_ok() => {}
+                    // A narrowed attempt's deadline is a stalled connect;
+                    // the request scope check rules out the request's own.
+                    Err(
+                        Error::Io | Error::Os(_) | Error::Unavailable | Error::DeadlineExceeded,
+                    ) if attempt < attempts && scope.check().is_ok() => {}
                     Err(error) => {
                         if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
                             remote.expire_addresses();
