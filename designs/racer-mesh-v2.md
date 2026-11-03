@@ -220,7 +220,12 @@ rule changes to use the mesh:
 - `topology::Membership` holds pools. Its graph is the union of the pool meshes.
 - Placement is per pool: one `topology::Placement` per pool per worker. The memory budget is
   split evenly. The page key is unchanged (cache ID, object key, page).
-- Routing uses the mesh routes above. BFS is gone.
+  A selector pool ranks over a placement-only membership of its members. A cache that no pool
+  lists uses every member.
+- Routing uses the mesh routes above. BFS is gone. A route takes no pool hint: it uses the highest
+  ranked pool that has both ends, which is 2 hops like the page's own pool.
+- A shed reader does not know which owner shed it. It asks the helper for the first of the 3
+  ranked owners that gives one that is not an owner.
 - `MAX_DEGREE` is gone. Capacities come from the local node's peer count.
 
 ## Simulator
