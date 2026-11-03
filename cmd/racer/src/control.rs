@@ -141,8 +141,8 @@ pub struct Snapshot {
     /// Cache namespaces admitted by this publication.
     pub caches: Vec<CacheDefinition>,
 
-    /// Node pools of `caches`, as validated from the publication. Not yet
-    /// used for placement.
+    /// Node pools of `caches`, as validated from the publication. Placement
+    /// reads them through `membership`.
     pub pools: Vec<racer_control_wire::Pool>,
 
     content_hash: [u8; 32],
