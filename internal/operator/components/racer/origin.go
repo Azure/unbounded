@@ -253,8 +253,9 @@ func (m originMirror) clone() originMirror {
 // restrictTo adds the cache's spec.nodeSelector to the required node
 // affinity, so the origin runs only on nodes that hold the cache. Required
 // terms are ORed, so every existing term gets the requirements; with no
-// required affinity, one term is created. The dataplane nodeSelector map is
-// left unchanged. A nil or empty selector leaves m unchanged.
+// required affinity, one term is created. An empty term, or a required
+// selector with no terms, matches no nodes and is left unchanged so it stays
+// unschedulable. The dataplane nodeSelector map is left unchanged. A nil or empty selector leaves m unchanged.
 func (m originMirror) restrictTo(selector *metav1.LabelSelector) (originMirror, error) {
 	reqs, err := nodeSelectorRequirements(selector)
 	if err != nil || len(reqs) == 0 {
@@ -270,12 +271,20 @@ func (m originMirror) restrictTo(selector *metav1.LabelSelector) (originMirror, 
 	}
 
 	na := m.affinity.NodeAffinity
-	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil || len(na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
-		na.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{}}}
+	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		na.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: reqs}}}
+
+		return m, nil
 	}
 
 	terms := na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 	for i := range terms {
+		// An empty term matches no nodes; adding requirements would make
+		// it match nodes.
+		if len(terms[i].MatchExpressions) == 0 && len(terms[i].MatchFields) == 0 {
+			continue
+		}
+
 		terms[i].MatchExpressions = append(terms[i].MatchExpressions, slices.Clone(reqs)...)
 	}
 

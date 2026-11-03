@@ -810,6 +810,7 @@ func TestOriginRestrictToCacheNodeSelector(t *testing.T) {
 		return corev1.NodeSelectorTerm{MatchExpressions: reqs}
 	}
 	pool := corev1.NodeSelectorRequirement{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu"}}
+	host := corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"n1"}}
 
 	tests := []struct {
 		name     string
@@ -841,6 +842,30 @@ func TestOriginRestrictToCacheNodeSelector(t *testing.T) {
 			affinity: required(term(zone), term(arch)),
 			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
 			want:     required(term(zone, pool), term(arch, pool)),
+		},
+		{
+			name:     "empty term preserved",
+			affinity: required(term(zone), corev1.NodeSelectorTerm{}),
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+			want:     required(term(zone, pool), corev1.NodeSelectorTerm{}),
+		},
+		{
+			name:     "required with zero terms unchanged",
+			affinity: required(),
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+			want:     required(),
+		},
+		{
+			name:     "nil required creates one term",
+			affinity: &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{}},
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+			want:     required(term(pool)),
+		},
+		{
+			name:     "match fields term",
+			affinity: required(corev1.NodeSelectorTerm{MatchFields: []corev1.NodeSelectorRequirement{host}}),
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+			want:     required(corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{pool}, MatchFields: []corev1.NodeSelectorRequirement{host}}),
 		},
 	}
 
