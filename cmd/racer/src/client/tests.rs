@@ -1004,12 +1004,8 @@ impl Fixture {
         let root = Root::new();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = Rc::new(crate::http::new_io(
-            reactor.clone(),
-            Codec::new(32768),
-            admission.clone(),
-            i64::MAX as u64,
-        ));
+        // Production client-socket framing, so route body caps are exercised.
+        let io = Rc::new(crate::http::client_io(reactor.clone(), admission.clone()));
         let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(2)));
         let mut metadata = body_metadata(17);
         metadata.expires_at =
@@ -2216,6 +2212,20 @@ fn actual_uds_prefetch_route_answers_json_and_closes() {
         ),
         (
             "PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n\
+             Content-Length: 67108865\r\n\r\n"
+                .into(),
+            "413",
+            "\"code\":\"too_large\"",
+        ),
+        (
+            "PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n\
+             Content-Length: 18446744073709551615\r\n\r\n"
+                .into(),
+            "413",
+            "\"code\":\"too_large\"",
+        ),
+        (
+            "PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n\
              Content-Length: 2\r\n\r\n{}"
                 .into(),
             "400",
@@ -2246,6 +2256,12 @@ fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
     oversized.truncate(32768);
     for (raw, status) in [
         (request("HEAD", "Authorization:secret\r\n"), 400),
+        (request("HEAD", "Content-Length: 67108865\r\n"), 400),
+        (request("HEAD", "Content-Length: 18446744073709551616\r\n"), 400),
+        (
+            b"PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Length: 18446744073709551616\r\n\r\n".to_vec(),
+            400,
+        ),
         (request("HEAD", "Authorization:  secret\r\n"), 400),
         (
             request("HEAD", "Content-Length: 0\r\nContent-Length: 0\r\n"),

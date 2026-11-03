@@ -316,9 +316,12 @@ pub fn client_io(
                 .min(MAX_HEAD_BYTES),
         ),
         Rc::new(HttpContext(admission)),
-        // The largest prefetch PUT body (RACER_PREFETCH_MAX_BODY_BYTES caps it
-        // lower); object requests carry no body.
-        (crate::model::PAGE_BYTES + 16).max(64 * 1024 * 1024),
+        // No framing cap: a framing rejection loses the decoded head, so the
+        // route parsers enforce body size before any read or allocation.
+        // Prefetch PUTs answer 413 above RACER_PREFETCH_MAX_BODY_BYTES; object
+        // requests reject any nonzero Content-Length. Both close the
+        // connection without reading the body.
+        u64::MAX,
         i64::MAX as u64,
     )
 }
@@ -3171,20 +3174,37 @@ pub(crate) mod tests {
             page_limit,
         );
         let client_io = client_io(reactor.clone(), admission.clone()).capped(4096);
-        // The client socket admits prefetch PUT bodies up to 64 MiB.
-        let client_limit = page_limit.max(64 * 1024 * 1024);
-        for (io, limit) in [(&page_io, page_limit), (&client_io, client_limit)] {
-            assert_eq!(io.framing(&response(limit as usize), false), Ok(limit));
-            for start in ["HTTP/1.1 200 OK", "GET /test HTTP/1.1"] {
-                let (socket, mut peer) = UnixStream::pair().unwrap();
-                let connection = from_accepted(socket.into(), &admission).unwrap();
-                write!(peer, "{start}\r\nContent-Length: {}\r\n\r\n", limit + 1).unwrap();
-                assert!(matches!(
-                    drive(&reactor, io.receive_head(connection, &scope)),
-                    Err(Error::InvalidRequest)
-                ));
-            }
+        assert_eq!(
+            page_io.framing(&response(page_limit as usize), false),
+            Ok(page_limit)
+        );
+        for start in ["HTTP/1.1 200 OK", "GET /test HTTP/1.1"] {
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            let connection = from_accepted(socket.into(), &admission).unwrap();
+            write!(
+                peer,
+                "{start}\r\nContent-Length: {}\r\n\r\n",
+                page_limit + 1
+            )
+            .unwrap();
+            assert!(matches!(
+                drive(&reactor, page_io.receive_head(connection, &scope)),
+                Err(Error::InvalidRequest)
+            ));
         }
+        // Client-socket route parsers cap request bodies (prefetch PUT answers
+        // 413); framing passes any representable length through to them.
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let connection = from_accepted(socket.into(), &admission).unwrap();
+        write!(
+            peer,
+            "PUT /v1/prefetches/a HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            u64::MAX
+        )
+        .unwrap();
+        let received = drive(&reactor, client_io.receive_head(connection, &scope)).unwrap();
+        assert_eq!(received.connection.receive_remaining(), Some(u64::MAX));
+        drop(received);
         for (io, length) in [
             (&page_io, page_limit + 1),
             (&client_io, i64::MAX as u64 + 1),
