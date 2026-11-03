@@ -1294,6 +1294,16 @@ change placement; in-flight snapshots mean label changes are not immediate revoc
 | `false` | Disable native RDMA |
 
 Release images include native verbs support; discovery/provider failures retain HTTP.
+Native activation registers the page-buffer pool within 5 s plus 1 s per GiB of
+`RACER_REGISTERED_BYTES`. When it fails, the dataplane logs
+`stage=rdma-activation state=failed`, counts `racer_rdma_activation_failures_total`,
+reports no RDMA rails (so peers stop planning RDMA to it), and retries; it
+advertises its rails again once activation succeeds. `racer_rdma_active` is 1
+while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
+`racer_rdma_http_fallback_total` counts pages that planned RDMA but went over
+HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
+split out the two common reasons: no ready link to the peer yet, and a grant that
+failed (usually because every page buffer was in use).
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json

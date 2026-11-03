@@ -161,11 +161,27 @@ impl WorkerApplication {
         {
             self.native_task = None;
             self.native_retry = uring_runtime::environment::now() + Duration::from_secs(1);
-            if result.is_err() {
-                links.close();
+            match &result {
+                Err(error) => {
+                    links.close();
+                    self.native_activation_failed(*error);
+                }
+                Ok(rails) if !rails.is_empty() => self.native_activation_succeeded(),
+                Ok(_) => {}
             }
         }
         self.actual_rails = links.active();
+        if self.native_owner() {
+            let metrics = &self.telemetry.metrics;
+            metrics.set_gauge(
+                crate::telemetry::Gauge::RdmaActive,
+                u64::from(!self.actual_rails.is_empty()),
+            );
+            metrics.set_gauge(
+                crate::telemetry::Gauge::RdmaFreeBuffers,
+                links.free_buffers() as u64,
+            );
+        }
         // The GPU helper started lazily after these rails activated: attach
         // its landing buffers to them now. Only the owner registers memory.
         if self.native_owner()
@@ -200,7 +216,7 @@ impl WorkerApplication {
         }
         let admission = self.runtime.admission.clone();
         let registered = admission.limit(crate::admission::ResourceClass::Registered);
-        let turn = scope(Duration::from_secs(5))?;
+        let turn = scope(activation_turn(registered))?;
         self.native_task = Some(Box::pin(async move {
             links
                 .activate(publication, &admission, registered, &turn)
@@ -246,11 +262,50 @@ impl WorkerApplication {
             Err(Error::Cancelled | Error::DeadlineExceeded) => {
                 startup.check()?;
             }
-            Err(_) => {
+            Err(error) => {
                 links.close();
+                self.native_activation_failed(error);
             }
         }
         Ok(())
+    }
+}
+
+/// Time one native activation may take: 5 s plus 1 s per GiB of registered
+/// page buffers, because registering memory that is not huge-page backed costs
+/// up to about 0.75 s per GiB. A fixed 5 s turn silently failed every retry on
+/// large pools.
+pub(crate) fn activation_turn(registered_bytes: usize) -> Duration {
+    const GIB: usize = 1 << 30;
+    Duration::from_secs(5 + registered_bytes.div_ceil(GIB) as u64)
+}
+
+impl WorkerApplication {
+    /// Count and log a failed activation, and stop advertising this node's
+    /// rails so peers stop planning RDMA to it. Activation keeps retrying.
+    fn native_activation_failed(&mut self, error: Error) {
+        self.telemetry
+            .metrics
+            .record(crate::telemetry::Event::RdmaActivationFailure, 1);
+        if !self.rdma_withdrawn {
+            eprintln!(
+                "racer: stage=rdma-activation state=failed error={error:?}; withdrawing RDMA rails and retrying"
+            );
+            if let Some((report, shares)) = &self.rdma_report {
+                report(*shares, Vec::new());
+            }
+            self.rdma_withdrawn = true;
+        }
+    }
+
+    /// Advertise the discovered rails again after a withdrawal.
+    fn native_activation_succeeded(&mut self) {
+        if std::mem::take(&mut self.rdma_withdrawn) {
+            eprintln!("racer: stage=rdma-activation state=active; advertising RDMA rails again");
+            if let Some((report, shares)) = &self.rdma_report {
+                report(*shares, self.discovered_nics.clone());
+            }
+        }
     }
 }
 
@@ -846,6 +901,14 @@ mod tests {
             assert!(native.client(pair.worker).unwrap().is_some());
             assert!(native.client(pair.worker).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn activation_turn_scales_with_registered_bytes() {
+        assert_eq!(activation_turn(0), Duration::from_secs(5));
+        assert_eq!(activation_turn(1), Duration::from_secs(6));
+        assert_eq!(activation_turn(1 << 30), Duration::from_secs(6));
+        assert_eq!(activation_turn(32 << 30), Duration::from_secs(37));
     }
 
     #[test]
