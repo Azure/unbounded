@@ -72,6 +72,55 @@ impl Plan {
     }
 }
 
+/// Kernel block devices, for nodes without udev's `disk/by-id` links.
+const SYS_BLOCK: &str = "/sys/block";
+
+/// Device ids a selector matches against, sorted, each with the path to open.
+///
+/// Normally the `disk/by-id` links under `root`. Nodes that run without udev
+/// (for example some container-based node images) have no such directory;
+/// then the ids come from `sys_block` instead: every kernel device name (such
+/// as `nvme1n1`), and for NVMe devices the name udev would give it,
+/// `nvme-<model>_<serial>` with whitespace replaced by `_`, so selectors
+/// written for udev hosts keep working. Paths point at `root/<kernel name>`.
+fn device_ids(root: &Path, sys_block: &Path) -> io::Result<Vec<(String, std::path::PathBuf)>> {
+    let mut ids = Vec::new();
+    match fs::read_dir(root.join("disk/by-id")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if let Some(id) = entry.file_name().to_str() {
+                    ids.push((id.to_owned(), entry.path()));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            for entry in fs::read_dir(sys_block)? {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let path = root.join(&name);
+                if name.starts_with("nvme") {
+                    let attribute = |file: &str| {
+                        fs::read_to_string(entry.path().join("device").join(file))
+                            .ok()
+                            .map(|v| v.split_whitespace().collect::<Vec<_>>().join("_"))
+                            .filter(|v| !v.is_empty())
+                    };
+                    if let (Some(model), Some(serial)) = (attribute("model"), attribute("serial")) {
+                        ids.push((format!("nvme-{model}_{serial}"), path.clone()));
+                    }
+                }
+                ids.push((name, path));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    ids.sort();
+    Ok(ids)
+}
+
 pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Option<Plan> {
     let selector = selector.filter(|s| !s.is_empty())?;
     let result = (|| {
@@ -80,14 +129,9 @@ pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Opti
         }
         let regex = Regex::new(selector).map_err(io::Error::other)?;
         let root = fs::canonicalize(&config.device_directory)?;
-        let mut paths = fs::read_dir(root.join("disk/by-id"))?.collect::<io::Result<Vec<_>>>()?;
-        paths.sort_by_key(|entry| entry.file_name());
-        let candidates = paths
+        let candidates = device_ids(&root, Path::new(SYS_BLOCK))?
             .into_iter()
-            .filter_map(|entry| {
-                let id = entry.file_name().to_str()?.to_owned();
-                regex.is_match(&id).then(|| (id, entry.path()))
-            })
+            .filter(|(id, _)| regex.is_match(id))
             .collect();
         let mut seen = HashSet::new();
         let mut devices = Vec::new();
@@ -1141,6 +1185,53 @@ mod tests {
         assert!(discover(&c, Some("missing"), 1).is_none());
         assert!(discover(&c, Some("cache"), 1).is_none());
         assert_eq!(fs::read(f.0.join("payload")).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn device_ids_use_by_id_links_when_present() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.0.join("disk/by-id")).unwrap();
+        std::os::unix::fs::symlink("../../nvme1n1", f.0.join("disk/by-id/nvme-B")).unwrap();
+        std::os::unix::fs::symlink("../../nvme2n1", f.0.join("disk/by-id/nvme-A")).unwrap();
+        let ids = device_ids(&f.0, &f.0.join("no-such-sys")).unwrap();
+        let names: Vec<_> = ids.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(names, ["nvme-A", "nvme-B"]);
+        assert_eq!(ids[0].1, f.0.join("disk/by-id/nvme-A"));
+    }
+
+    #[test]
+    fn device_ids_fall_back_to_sysfs_without_by_id_links() {
+        let f = Fixture::new();
+        let sys = f.0.join("sys-block");
+        for (name, model, serial) in [
+            ("nvme1n1", "Microsoft NVMe Direct Disk v2 \n", "4c90cd15 \n"),
+            ("sda", "Virtual Disk\n", "x\n"),
+        ] {
+            let device = sys.join(name).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("model"), model).unwrap();
+            fs::write(device.join("serial"), serial).unwrap();
+        }
+        let ids = device_ids(&f.0, &sys).unwrap();
+        let names: Vec<_> = ids.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "nvme-Microsoft_NVMe_Direct_Disk_v2_4c90cd15",
+                "nvme1n1",
+                "sda"
+            ]
+        );
+        assert!(
+            ids.iter()
+                .all(|(id, path)| path == &f.0.join(if id == "sda" { "sda" } else { "nvme1n1" }))
+        );
+    }
+
+    #[test]
+    fn device_ids_fail_when_neither_source_exists() {
+        let f = Fixture::new();
+        assert!(device_ids(&f.0, &f.0.join("no-such-sys")).is_err());
     }
 
     #[test]
