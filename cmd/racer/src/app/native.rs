@@ -534,7 +534,7 @@ mod tests {
             .collect();
         assert_eq!(
             values.len(),
-            14 + usize::from(values.contains_key("RACER_MAX_THREADS"))
+            10 + usize::from(values.contains_key("RACER_MAX_THREADS"))
         );
         assert_eq!(values.get("RACER_CONTROL_SEATS"), Some(&"auto"));
         let mut config = Config::from_lookup(|name| {
