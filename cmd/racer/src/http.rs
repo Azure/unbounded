@@ -360,6 +360,11 @@ impl http1::connection::Endpoint<Error> for Endpoint {
         }
     }
 }
+/// Bound on distinct endpoints per worker pool. Peer endpoints are keyed by
+/// next hop, so the bound must cover the local mesh degree plus origins and
+/// sockets. Entries exist only while traffic uses them and idle entries are
+/// evicted first, so this is a cap, not a preallocation.
+pub const MAX_ENDPOINTS: usize = crate::topology::LINK_HEALTH_CAPACITY + 64;
 pub fn new_pool(
     reactor: Rc<Reactor>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -369,7 +374,7 @@ pub fn new_pool(
         reactor,
         admission,
         per_endpoint,
-        256,
+        MAX_ENDPOINTS,
         Duration::from_secs(30),
     )
 }
@@ -722,6 +727,17 @@ fn validate_slice(page: &VerifiedPage, slice: PageSlice) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn peer_limits_cover_mesh_degree() {
+        // Mesh v2 degree is about 2.83 * sqrt(pool size); a 100,000 member
+        // pool gives about 900 peers. Four such overlapping pools still fit.
+        let degree = (2.83 * 100_000f64.sqrt()).ceil() as usize;
+        assert!(4 * degree <= crate::topology::LINK_HEALTH_CAPACITY);
+        const {
+            assert!(crate::peer::CAPACITY >= crate::topology::LINK_HEALTH_CAPACITY);
+            assert!(MAX_ENDPOINTS > crate::topology::LINK_HEALTH_CAPACITY);
+        }
+    }
     use crate::model::RequestId;
     use http1::Header;
     use http1::StartLine;

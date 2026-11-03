@@ -166,9 +166,18 @@ Every edge is a TCP edge. Some edges are also RDMA edges.
 Selector pools with up to about 2,000 nodes mostly fit within 128 RDMA peers, so both hops can use
 RDMA. Bigger pools, and the default pool on a large cluster, use TCP for the overflow edges.
 
-TCP limits scale with peers: the HTTP pool endpoint limit, outbound connection slots, link
-health capacity, and the peer admission key limit all allow at least as many peers as the
-local node has.
+TCP limits cover the local peer count. Link health capacity, the peer admission key limit,
+and the HTTP pool endpoint limit (plus 64 for origins and sockets) are fixed at 4,096. That
+covers the degree of a 100,000 node pool (about 900) four times over. All three create
+entries only when traffic needs them and drop idle ones, so a large limit costs nothing
+until it is used. A fixed limit avoids resizing on every membership change.
+
+Outbound connection slots stay at a quarter of `client_connections` per worker. They bound
+open sockets, not peers: a worker connects only to peers it is talking to right now, which
+in-flight limits keep well below the degree. When slots run out, the pool closes idle
+connections and retries, so a node with more peers than slots reconnects more often but does
+not fail. Holding one socket per peer per worker would need degree times workers file
+descriptors.
 
 ## Hot keys
 

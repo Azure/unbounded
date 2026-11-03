@@ -3438,7 +3438,7 @@ mod adaptive {
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
-                total: 512,
+                total: 2 * CAPACITY,
                 per_peer: 1,
                 ..Default::default()
             },
@@ -3544,7 +3544,7 @@ mod adaptive {
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
-                total: 512,
+                total: 2 * CAPACITY,
                 per_peer: 1,
                 ..Default::default()
             },

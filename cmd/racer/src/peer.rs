@@ -134,7 +134,11 @@ impl Config {
         Ok(())
     }
 }
-const CAPACITY: usize = 256;
+/// Bound on tracked peer admission keys. Keys are next hops, so this must
+/// cover the local mesh degree (about 900 peers in a 100,000 member pool).
+/// Entries are created lazily and retire after a minute idle, so the bound is
+/// a cap rather than a preallocation. It matches link health capacity.
+pub(crate) const CAPACITY: usize = crate::topology::LINK_HEALTH_CAPACITY;
 const BACKOFF: Duration = Duration::from_millis(250);
 const RECOVERY: Duration = Duration::from_secs(1);
 pub(crate) struct AdaptivePeers {
