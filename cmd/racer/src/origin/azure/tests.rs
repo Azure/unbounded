@@ -113,6 +113,7 @@ struct Harness {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     limits: Arc<AzureLimits>,
     definition: OriginDefinition,
+    snapshots: Arc<Published<Snapshot>>,
 }
 
 fn harness() -> Harness {
@@ -144,10 +145,11 @@ fn harness() -> Harness {
     let fake = Rc::new(Fake::default());
     let tokens = Rc::new(Tokens::default());
     let shared = Arc::new(AzureLimits::default());
+    let snapshots = Arc::new(Published::new(Snapshot::retention(2)));
     let origin = AzureOrigin::new(
         fake.clone(),
         tokens.clone(),
-        Arc::new(Published::new(Snapshot::retention(2))),
+        snapshots.clone(),
         admission.clone(),
         BufferPool::new(admission.clone()),
         shared.clone(),
@@ -164,6 +166,7 @@ fn harness() -> Harness {
         admission,
         limits: shared,
         definition,
+        snapshots,
     }
 }
 
@@ -784,4 +787,189 @@ fn lookup_requires_a_published_origin() {
         h.origin.definition(&context("k", "").object).map(|_| ()),
         Err(Error::Unavailable)
     );
+}
+
+mod router {
+    use super::*;
+    use crate::control::publication::PublicationTarget;
+    use crate::origin::router::OriginRouter;
+    use crate::read::candidates::CandidatePolicy;
+    use crate::topology::{Member, Membership, Placement};
+    use racer_control_wire::{CacheMode, ClusterId, MembershipVersion, NodeId};
+
+    /// Counts adapter calls; never performs I/O.
+    #[derive(Default)]
+    struct Adapter(Cell<usize>);
+
+    impl Origin for Rc<Adapter> {
+        fn bootstrap_reserved<'a>(
+            &'a self,
+            _: &'a OriginAuthority,
+            _: &'a OriginContext,
+            _: flow_control::Charge<AdmissionPolicy>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, MetadataReply> {
+            self.0.set(self.0.get() + 1);
+            Box::pin(async { Err(Error::NotImplemented) })
+        }
+        fn page_reserved<'a>(
+            &'a self,
+            _: &'a OriginAuthority,
+            _: &'a OriginContext,
+            _: &'a PageId,
+            _: flow_control::Charge<AdmissionPolicy>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, OriginPage> {
+            self.0.set(self.0.get() + 1);
+            Box::pin(async { Err(Error::NotImplemented) })
+        }
+        fn metadata<'a>(
+            &'a self,
+            _: &'a OriginAuthority,
+            _: &'a OriginContext,
+            _: MetadataSelector,
+            _: &'a RequestScope,
+        ) -> Operation<'a, MetadataReply> {
+            self.0.set(self.0.get() + 1);
+            Box::pin(async { Err(Error::NotImplemented) })
+        }
+    }
+
+    /// Publish the shared fixture, with an Azure origin when `native`.
+    fn publish(h: &Harness, native: bool) -> CacheId {
+        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/control-wire/testdata/publication.json"
+        )))
+        .unwrap();
+        if native {
+            publication.caches[0].origin = Some(h.definition.clone());
+        }
+        let target = PublicationTarget::new(publication.cluster.clone(), h.snapshots.clone());
+        target.apply(publication).unwrap();
+        h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
+    }
+
+    fn authority(h: &Harness, object: &ObjectId, page: u64) -> OriginAuthority {
+        let node = NodeId("node".into());
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                vec![Member {
+                    node: node.clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:1234".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+            )
+            .unwrap(),
+        );
+        let credentials = Rc::new(crate::security::CredentialCrypto::new(
+            Rc::new(racer_crypto::identity::Keyring::new(
+                ClusterId("cluster".into()),
+                node.clone(),
+                Arc::new(racer_crypto::identity::KeyEpochs::default()),
+            )),
+            h.admission.clone(),
+        ));
+        CandidatePolicy::new(
+            node,
+            Rc::new(Placement::new(2)),
+            crate::test_support::NoPeers::requester(),
+            credentials,
+            h.snapshots.clone(),
+        )
+        .local_authority(
+            membership,
+            object,
+            PageNumber(page),
+            CacheMode::PassthroughLocal,
+        )
+        .unwrap()
+    }
+
+    fn in_cache(cache: &CacheId) -> OriginContext {
+        let mut context = context("k", "");
+        context.object.cache = cache.clone();
+        context
+    }
+
+    type Router = OriginRouter<Rc<Adapter>, Rc<Fake>, Rc<Tokens>>;
+
+    fn router(h: Harness, native: bool) -> (Router, Rc<Adapter>, Rc<Fake>) {
+        let adapter = Rc::new(Adapter::default());
+        let fake = h.fake.clone();
+        let router = OriginRouter::new(
+            h.snapshots.clone(),
+            adapter.clone(),
+            native.then_some(h.origin),
+        );
+        (router, adapter, fake)
+    }
+
+    #[test]
+    fn native_caches_use_azure_and_others_use_the_adapter() {
+        let h = harness();
+        let cache = publish(&h, true);
+        let context = in_cache(&cache);
+        let authority = authority(&h, &context.object, 0);
+        let reserve = || {
+            h.admission
+                .reserve(Some(&cache), ResourceClass::Plaintext, PAGE_BYTES as usize)
+                .unwrap()
+        };
+        h.blob(206, 5, Some("bytes 0-4/5".into()), &[]);
+        h.blob(200, 5, None, &[]);
+        h.blob(206, 5, Some("bytes 0-4/5".into()), &[]);
+        let (bootstrap, page_reservation) = (reserve(), reserve());
+        let page = page(&context, 0);
+        let (router, adapter, fake) = router(h, true);
+        let reply =
+            block_on(router.bootstrap_reserved(&authority, &context, bootstrap, &scope())).unwrap();
+        assert_eq!(reply.metadata.length, 5);
+        block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope())).unwrap();
+        block_on(router.page_reserved(&authority, &context, &page, page_reservation, &scope()))
+            .unwrap();
+        assert_eq!(fake.sent.borrow().len(), 3);
+        assert_eq!(adapter.0.get(), 0);
+
+        // Authority is checked before Azure I/O.
+        let mut other = context.clone_for_test();
+        other.object.key.0[0] ^= 1;
+        assert_eq!(
+            block_on(router.metadata(&authority, &other, MetadataSelector::Fresh, &scope()))
+                .map(|_| ()),
+            Err(Error::Unauthorized)
+        );
+        // A cache UID the snapshot does not know goes to the adapter.
+        let stranger = in_cache(&CacheId("55555555-5555-4555-8555-555555555555".into()));
+        let _ = block_on(router.metadata(&authority, &stranger, MetadataSelector::Fresh, &scope()));
+        assert_eq!(adapter.0.get(), 1);
+        assert_eq!(fake.sent.borrow().len(), 3);
+    }
+
+    #[test]
+    fn caches_without_an_origin_use_the_adapter() {
+        let h = harness();
+        let cache = publish(&h, false);
+        let context = in_cache(&cache);
+        let authority = authority(&h, &context.object, 0);
+        let (router, adapter, fake) = router(h, true);
+        let _ = block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope()));
+        assert_eq!(adapter.0.get(), 1);
+        assert!(fake.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn without_azure_every_cache_uses_the_adapter() {
+        let h = harness();
+        let cache = publish(&h, true);
+        let context = in_cache(&cache);
+        let authority = authority(&h, &context.object, 0);
+        let (router, adapter, fake) = router(h, false);
+        let _ = block_on(router.metadata(&authority, &context, MetadataSelector::Fresh, &scope()));
+        assert_eq!(adapter.0.get(), 1);
+        assert!(fake.sent.borrow().is_empty());
+    }
 }
