@@ -98,6 +98,9 @@ _Static_assert(IBV_WC_SEND == 0 && IBV_WC_RDMA_WRITE == 1 && IBV_WC_BIND_MW == 5
  * whole length: Racer tags use only the low 24 bits. */
 #define RDMA_VERBS_CHUNK (8u << 20)
 #define RDMA_VERBS_TAG_MASK 0x00ffffffu
+/* Send queue entries per counted send in registration mode: enough chunks for
+ * a 32 MiB write, more than any Racer page needs. */
+#define RDMA_VERBS_WRITE_WRS 4u
 #define RDMA_VERBS_CM_MAGIC 0x52435231u /* "RCR1" */
 struct rdma_verbs_cm_req { uint32_t magic, initiator, responder; };
 /* Receives posted before a registration-mode QP exists. */
@@ -521,7 +524,10 @@ void *rdma_verbs_qp(struct rdma_verbs_device *d, uint8_t port, uint32_t send_dep
 #ifndef RDMA_VERBS_NO_REGISTRATION
     if (d->registration) {
         pthread_mutex_init(&q->lock, NULL);
-        q->dev = d; q->send_depth = send_depth; q->recv_depth = recv_depth;
+        /* A write posts up to RDMA_VERBS_WRITE_WRS chunks, so the send
+         * queue holds that many WRs per send the caller counts. */
+        if (send_depth > (uint32_t)INT_MAX / RDMA_VERBS_WRITE_WRS) goto token_fail;
+        q->dev = d; q->send_depth = send_depth * RDMA_VERBS_WRITE_WRS; q->recv_depth = recv_depth;
         q->recvs = calloc(recv_depth, sizeof(*q->recvs));
         if (!q->recvs) goto token_fail;
         pthread_mutex_lock(&d->cm->lock);
@@ -950,7 +956,7 @@ static int dyn_write_imm(struct rdma_verbs_qp *q, uint64_t addr, uint32_t length
     if (imm & ~RDMA_VERBS_TAG_MASK) goto fail_inval;
     uint64_t max = RDMA_VERBS_CHUNK;
     uint32_t before = length ? (uint32_t)((length - 1) / max) : 0;
-    if (before > 0xff) goto fail_inval;
+    if (before >= RDMA_VERBS_WRITE_WRS) goto fail_inval;
     imm |= before << 24;
     pthread_mutex_lock(&q->lock);
     if (!q->qp) { pthread_mutex_unlock(&q->lock); goto fail; }
