@@ -838,101 +838,39 @@ jobs:
           validate_layout controller
           validate_layout node
 
-  # ---------- Build Release Images ----------
-  # Build every component image release.yaml publishes, natively on each
-  # platform it publishes, so a Containerfile that breaks on one architecture
-  # fails on the PR instead of in the tag-triggered release. The v0.19.0 racer
-  # image failed only on arm64, where no PR job had ever built it.
-  #
-  # images/net and images/racer-object are built by build-images above.
-  # TestCIBuildsEveryReleaseImage in hack/release fails when release.yaml
-  # builds a Containerfile, target, or platform that this workflow does not.
-  #
-  # Nothing is pushed, scanned, signed, or attested: that stays on the release
-  # path.
-  release-images:
-    name: Build Release Image (${{ matrix.component.name }}, ${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    timeout-minutes: 90
+  # ---------- Cross-Platform Images ----------
+  # release.yaml publishes some images for platforms that no other PR job
+  # builds. Images whose Containerfile picks packages or downloads per
+  # architecture can break on one platform only, as the v0.19.0 racer image
+  # did on arm64 when its CUDA apt repo had no nvcc 12.9 package for sbsa.
+  # Build those images here for the platforms PR CI does not otherwise cover.
+  # Nothing is pushed.
+  cross-platform-images:
+    name: Build Cross-Platform Image (${{ matrix.name }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
-      # Report every broken image in one pass, as the release does.
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-        component:
-          - name: machina
-            file: images/machina/Containerfile
-          - name: token-refresher
-            file: images/token-refresher/Containerfile
-          - name: machine-ops-controller
-            file: images/machine-ops-controller/Containerfile
-          - name: unbounded-operator
-            file: images/unbounded-operator/Containerfile
-          - name: orca
-            file: images/orca/Containerfile
-          - name: gantry
-            file: images/gantry/Containerfile
+        include:
           - name: racer
             file: images/racer/Containerfile
-          - name: host-ubuntu2404
-            file: images/host-ubuntu2404/Containerfile
-          - name: host-azurelinux3
-            file: images/host-azurelinux3/Containerfile
-          - name: host-azurelinux3-nvidia
-            file: images/host-azurelinux3-nvidia/Containerfile
-          - name: inventory-aggregator
-            file: images/inventory/aggregator/Containerfile
-          - name: inventory-inspector
-            file: images/inventory/inspector/Containerfile
-          - name: inventory-viewer
-            file: images/inventory/viewer/Containerfile
-          - name: netboot
-            file: images/netboot/Containerfile
-            kernel: ubuntu
-          - name: netboot-azurelinux
-            file: images/netboot/Containerfile
-            kernel: azurelinux
-          - name: metalman
-            file: images/metalman/Containerfile
-        include:
-          # release.yaml publishes racer-vllm for linux/amd64 only.
-          - arch: amd64
-            component:
-              name: racer-vllm
-              file: images/racer-vllm/Containerfile
-              large: true
+            arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - name: Normalize container registry
-        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
-
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Free disk space for large images
-        # The vLLM base image alone is larger than a hosted runner's free disk.
-        if: matrix.component.large
-        run: |
-          set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Build ${{ matrix.component.name }} image
+      - name: Build ${{ matrix.name }} image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          file: ${{ matrix.component.file }}
+          file: ${{ matrix.file }}
           platforms: linux/${{ matrix.arch }}
           push: false
           provenance: false
-          # Same build args as release.yaml. VERSION is a placeholder semver
-          # because builds that embed it expect a release-shaped version.
-          build-args: |
-            VERSION=v0.0.0-ci
-            GIT_COMMIT=${{ github.sha }}
-            CONTAINER_REGISTRY=${{ env.REGISTRY }}
-            ${{ matrix.component.kernel && format('INSTALLER_KERNEL={0}', matrix.component.kernel) || '' }}
-          cache-from: type=gha,scope=release-image-${{ matrix.component.name }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=release-image-${{ matrix.component.name }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=cross-platform-${{ matrix.name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=cross-platform-${{ matrix.name }}-${{ matrix.arch }}
