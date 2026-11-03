@@ -399,7 +399,7 @@ table only.
 |-------|---------|---------|
 | `claimed` | Approved and in use as cache | |
 | `available` | Not approved; can be approved | |
-| `unavailable` | Not approved; could not be used | `mounted`, `held`, `read-only`, `too-small` |
+| `unavailable` | Not approved; could not be used | `mounted`, `held`, `read-only`, `too-small`, `io-error` (the host mount table could not be read) |
 | `rejected` | Approved, but not usable | `mounted`, `held`, `read-only`, `too-small`, `busy`, `not-whole-disk`, `io-error`, `wipe-failed`, `duplicate` |
 | `missing` | Approved, but no disk with that ID exists | |
 

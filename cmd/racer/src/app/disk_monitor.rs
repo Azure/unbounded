@@ -232,27 +232,37 @@ fn scan(
 /// Per-disk status from one bounded scan. When the scan exceeds its working
 /// budget, for example on a host with many loop devices, the optional
 /// inventory is dropped but approved disks still report the outcome recorded
-/// at startup, so a writer waiting on a claim or rejection still sees it.
+/// at startup, so a writer waiting on a claim or rejection still sees it. The
+/// same fallback applies when the mount table cannot be read, so no disk is
+/// reported available while its mount state is unknown.
 fn statuses(
     walk: &Walk,
     sys_root: &Path,
     device_directory: &Path,
     context: &Context,
 ) -> Vec<racer_cluster_control::disks::DiskStatus> {
-    match crate::hardware::discover(walk, sys_root, device_directory) {
-        Ok(found) => {
-            let mounts = std::fs::read_to_string(
-                context
-                    .mountinfo
-                    .as_deref()
-                    .unwrap_or(Path::new("/proc/self/mountinfo")),
-            )
-            .unwrap_or_default();
-            crate::hardware::classify_disks(&found.block_devices, &mounts, context)
+    let path = context
+        .mountinfo
+        .as_deref()
+        .unwrap_or(Path::new("/proc/self/mountinfo"));
+    let scanned = crate::hardware::discover(walk, sys_root, device_directory).and_then(|found| {
+        let mounts = crate::hardware::mounted_devices(walk, path, &found.block_devices)?;
+        Ok((found, mounts))
+    });
+    match scanned {
+        Ok((found, Ok(mounts))) => {
+            crate::hardware::classify_disks(&found.block_devices, Some(&mounts), context)
+        }
+        Ok((_, Err(error))) => {
+            eprintln!(
+                "racer: disk status scan: {}: {error}; reporting approved disks only",
+                path.display()
+            );
+            crate::hardware::classify_disks(&[], Some(&[]), context)
         }
         Err(abort) => {
             eprintln!("racer: disk status scan stopped: {abort:?}; reporting approved disks only");
-            crate::hardware::classify_disks(&[], "", context)
+            crate::hardware::classify_disks(&[], Some(&[]), context)
         }
     }
 }

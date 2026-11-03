@@ -347,14 +347,18 @@ pub fn report_with_snapshot(
             walk.charge_string(dev)?;
         }
     }
-    let mounts = fs::read_to_string(
-        context
-            .mountinfo
-            .as_deref()
-            .unwrap_or(Path::new("/proc/self/mountinfo")),
-    )
-    .unwrap_or_default();
-    let disks = classify_disks(&report.block_devices, &mounts, context);
+    let path = context
+        .mountinfo
+        .as_deref()
+        .unwrap_or(Path::new("/proc/self/mountinfo"));
+    let mounts = match mounted_devices(walk, path, &report.block_devices)? {
+        Ok(mounts) => Some(mounts),
+        Err(error) => {
+            section_error(walk, &mut report.errors, "racer.disks", path, &error)?;
+            None
+        }
+    };
+    let disks = classify_disks(&report.block_devices, mounts.as_deref(), context);
     walk.charge_slots::<DiskStatus>(disks.len())?;
     for disk in &disks {
         walk.charge(disk.id.len() + ENTRY_OVERHEAD)?;
@@ -380,9 +384,17 @@ fn disk_alias(name: &str) -> bool {
 /// Status of every whole disk with a by-id name, sorted by ID.
 ///
 /// Approved disks take their startup outcome. Other disks are classified from
-/// sysfs and the mount table only; they are never opened. Approved IDs that
-/// did not resolve to a whole disk in `devices` are listed under their own ID.
-pub fn classify_disks(devices: &[BlockDevice], mounts: &str, context: &Context) -> Vec<DiskStatus> {
+/// sysfs and the mount table only; they are never opened. `mounts` lists the
+/// `MAJ:MIN` sources of mounts from [`mounted_devices`]; when it is `None` the
+/// mount table could not be read and every unapproved disk is unavailable
+/// with [`DiskReason::IoError`], because an unknown mount state must not
+/// report a disk as available. Approved IDs that did not resolve to a whole
+/// disk in `devices` are listed under their own ID.
+pub fn classify_disks(
+    devices: &[BlockDevice],
+    mounts: Option<&[String]>,
+    context: &Context,
+) -> Vec<DiskStatus> {
     let mut disks = Vec::new();
     let mut matched = vec![false; context.approvals.len()];
     for device in devices {
@@ -443,10 +455,17 @@ pub fn classify_disks(devices: &[BlockDevice], mounts: &str, context: &Context) 
 }
 
 /// Why an unapproved disk could not be used, from sysfs and the mount table.
-fn unavailable(device: &BlockDevice, mounts: &str, segment_bytes: u64) -> Option<DiskReason> {
+fn unavailable(
+    device: &BlockDevice,
+    mounts: Option<&[String]>,
+    segment_bytes: u64,
+) -> Option<DiskReason> {
+    let Some(mounts) = mounts else {
+        return Some(DiskReason::IoError);
+    };
     let mounted = |dev: &Option<String>| {
         dev.as_deref()
-            .is_some_and(|dev| crate::app::is_mounted(mounts, dev))
+            .is_some_and(|dev| mounts.iter().any(|m| m == dev))
     };
     if mounted(&device.dev) || device.partitions.iter().any(|p| mounted(&p.dev)) {
         return Some(DiskReason::Mounted);
@@ -462,6 +481,96 @@ fn unavailable(device: &BlockDevice, mounts: &str, segment_bytes: u64) -> Option
         return Some(DiskReason::TooSmall);
     }
     None
+}
+
+/// Longest mountinfo field kept while scanning; `MAJ:MIN` is far shorter.
+const MAX_MOUNT_FIELD_BYTES: usize = 32;
+
+/// `MAJ:MIN` mount sources in the mountinfo file at `path` that name one of
+/// `devices` or their partitions.
+///
+/// The file is streamed in fixed-size chunks; only matching sources are
+/// retained and each is charged to `walk` before it is kept, so a host with
+/// many mounts costs no more working memory than its device inventory.
+/// Cancellation is checked before every chunk. Returns the inner `Err` when
+/// the file cannot be opened or read; callers must then treat mount state as
+/// unknown rather than unmounted.
+pub fn mounted_devices(
+    walk: &Walk,
+    path: &Path,
+    devices: &[BlockDevice],
+) -> Result<io::Result<Vec<String>>, Abort> {
+    walk.read()?;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
+    };
+    let wanted = |number: &[u8]| {
+        devices.iter().any(|d| {
+            d.dev.as_deref().map(str::as_bytes) == Some(number)
+                || d.partitions
+                    .iter()
+                    .any(|p| p.dev.as_deref().map(str::as_bytes) == Some(number))
+        })
+    };
+    let mut found: Vec<String> = Vec::new();
+    let mut keep = |walk: &Walk, number: &[u8]| -> Result<(), Abort> {
+        if !wanted(number) || found.iter().any(|f| f.as_bytes() == number) {
+            return Ok(());
+        }
+        let Ok(number) = std::str::from_utf8(number) else {
+            return Ok(());
+        };
+        walk.charge_string(number)?;
+        walk.push(&mut found, number.to_owned())
+    };
+    let mut chunk = [0u8; 4096];
+    // Field index within the current line, the third field's bytes, and
+    // whether the previous byte was a separator.
+    let mut field = 0usize;
+    let mut source = [0u8; MAX_MOUNT_FIELD_BYTES];
+    let mut len = 0usize;
+    let mut overflow = false;
+    let mut separator = true;
+    loop {
+        walk.read()?;
+        let n = match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Ok(Err(error)),
+        };
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                if field == 2 && !overflow {
+                    keep(walk, &source[..len])?;
+                }
+                (field, len, overflow, separator) = (0, 0, false, true);
+            } else if byte.is_ascii_whitespace() {
+                if !separator && field == 2 && !overflow {
+                    keep(walk, &source[..len])?;
+                }
+                if !separator {
+                    field += 1;
+                }
+                separator = true;
+            } else {
+                separator = false;
+                if field == 2 {
+                    if len < source.len() {
+                        source[len] = byte;
+                        len += 1;
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+        }
+    }
+    if field == 2 && !separator && !overflow {
+        keep(walk, &source[..len])?;
+    }
+    Ok(Ok(found))
 }
 
 /// Discover block and RDMA devices from sysfs (`sys_root`) and by-id links (`dev_root`).
@@ -1302,8 +1411,8 @@ mod tests {
             segment_bytes: 64 << 20,
             ..Default::default()
         };
-        let mounts = "36 1 8:1 / /boot rw - ext4 /dev/sda1 rw\n";
-        let disks = classify_disks(&devices, mounts, &context);
+        let mounts = ["8:1".to_owned()];
+        let disks = classify_disks(&devices, Some(&mounts), &context);
         let summary: Vec<_> = disks
             .iter()
             .map(|d| (d.id.as_str(), d.dev.as_deref(), d.state, d.reason))
@@ -1357,6 +1466,66 @@ mod tests {
     }
 
     #[test]
+    fn mounted_devices_streams_and_keeps_only_inventory_sources() {
+        let f = Fixture::new();
+        let path = f.0.join("mountinfo");
+        let mut sda = disk("sda", "8:0", &["wwn-a"]);
+        sda.partitions.push(Partition {
+            name: "sda1".into(),
+            dev: Some("8:1".into()),
+            ..Default::default()
+        });
+        let devices = vec![sda, disk("sdb", "8:16", &["wwn-b"])];
+        // Many unrelated mounts, a duplicate, an oversized field, and a last
+        // line without a trailing newline.
+        let mut text = String::new();
+        for i in 0..20_000 {
+            text.push_str(&format!("{i} 1 0:{i} / /run/k8s/{i} rw - tmpfs tmpfs rw\n"));
+        }
+        text.push_str("1 1 8:1 / /boot rw - ext4 /dev/sda1 rw\n");
+        text.push_str("2 1 8:1 / /boot2 rw - ext4 /dev/sda1 rw\n");
+        text.push_str(&format!("3 1 8:16{} / /x rw\n", "9".repeat(64)));
+        text.push_str("4 1  8:0");
+        fs::write(&path, &text).unwrap();
+        let walk = walk();
+        let found = mounted_devices(&walk, &path, &devices).unwrap().unwrap();
+        assert_eq!(found, ["8:1", "8:0"]);
+        // Only the kept sources are charged, far below the file size.
+        assert!(WORKING_BYTES - walk.remaining() < 1024);
+        assert!(text.len() > WORKING_BYTES);
+
+        // A missing file is an error, not an empty mount table.
+        let missing = f.sys().join("no-mountinfo");
+        assert!(mounted_devices(&walk, &missing, &devices).unwrap().is_err());
+
+        // Budget exhaustion and cancellation abort the scan.
+        let tight = Walk::new(Arc::default(), ENTRY_OVERHEAD);
+        assert!(matches!(
+            mounted_devices(&tight, &path, &devices),
+            Err(Abort::TooLarge)
+        ));
+        let cancelled = Walk::new(Arc::new(AtomicBool::new(true)), WORKING_BYTES);
+        assert!(matches!(
+            mounted_devices(&cancelled, &path, &devices),
+            Err(Abort::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn unknown_mount_state_never_reports_available() {
+        let devices = vec![disk("sde", "8:64", &["wwn-0xidle"])];
+        let idle = Context {
+            segment_bytes: 64 << 20,
+            ..Default::default()
+        };
+        let disks = classify_disks(&devices, None, &idle);
+        assert_eq!(disks[0].state, DiskState::Unavailable);
+        assert_eq!(disks[0].reason, Some(DiskReason::IoError));
+        let disks = classify_disks(&devices, Some(&[]), &idle);
+        assert_eq!(disks[0].state, DiskState::Available);
+    }
+
+    #[test]
     fn approval_does_not_follow_reused_dev_to_a_different_disk() {
         // The rejected disk was detached and a replacement took its MAJ:MIN.
         let devices = vec![
@@ -1389,7 +1558,7 @@ mod tests {
             segment_bytes: 64 << 20,
             ..Default::default()
         };
-        let disks = classify_disks(&devices, "", &context);
+        let disks = classify_disks(&devices, Some(&[]), &context);
         let summary: Vec<_> = disks
             .iter()
             .map(|d| (d.id.as_str(), d.dev.as_deref(), d.state, d.reason))

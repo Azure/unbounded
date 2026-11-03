@@ -762,7 +762,7 @@ fn check_unused(sys: &Path, dev: u64) -> std::result::Result<bool, Refusal> {
 }
 
 /// Whether `MAJ:MIN` is the source of any mount in `mountinfo` text.
-pub(crate) fn is_mounted(mounts: &str, number: &str) -> bool {
+fn is_mounted(mounts: &str, number: &str) -> bool {
     mounts
         .lines()
         .any(|line| line.split_whitespace().nth(2) == Some(number))

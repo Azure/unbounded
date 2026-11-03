@@ -110,7 +110,7 @@ use uring_runtime::drivers::poll_task;
 
 mod devices;
 mod disk_monitor;
-pub(crate) use devices::{GUARD_BYTES, is_mounted};
+pub(crate) use devices::GUARD_BYTES;
 mod native;
 mod recovery;
 
