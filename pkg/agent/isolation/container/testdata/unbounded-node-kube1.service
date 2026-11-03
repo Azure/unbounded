@@ -1,0 +1,25 @@
+[Unit]
+Description=Unbounded node container (kube1)
+Wants=network-online.target
+After=network-online.target local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Delegate=yes
+KillMode=mixed
+KillSignal=SIGRTMIN+3
+TimeoutStartSec=300
+TimeoutStopSec=120
+Restart=always
+RestartSec=1
+RestartMaxDelaySec=60
+RestartSteps=10
+ExecStartPre=-/opt/unbounded/runtime/runc delete --force unbounded-kube1
+ExecStartPre=/usr/local/bin/unbounded-agent node-lifecycle pre-start kube1
+ExecStart=/opt/unbounded/runtime/runc run --bundle /var/lib/unbounded/containers/bundles/kube1 unbounded-kube1
+ExecStartPost=/usr/local/bin/unbounded-agent node-lifecycle post-start kube1
+ExecStopPost=-/opt/unbounded/runtime/runc delete --force unbounded-kube1
+
+[Install]
+WantedBy=multi-user.target
