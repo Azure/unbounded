@@ -25,7 +25,6 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/machineops/providers/azurevm"
-	"github.com/Azure/unbounded/internal/machineops/providers/ociinstance"
 	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/machineops"
@@ -145,7 +144,6 @@ func configuredProviders(providerName string) ([]*machineops.Provider, error) {
 		unboundedv1alpha3.ExternalProviderAzureVM: func() (*machineops.Provider, error) {
 			return (&azurevm.Provider{}).Registration()
 		},
-		unboundedv1alpha3.ExternalProviderOCIInstance: func() (*machineops.Provider, error) { return (&ociinstance.Provider{}).Registration() },
 	}
 
 	if providerName != "" {
@@ -167,12 +165,7 @@ func configuredProviders(providerName string) ([]*machineops.Provider, error) {
 		return nil, fmt.Errorf("register Azure VM machine-ops provider: %w", err)
 	}
 
-	ociProvider, err := factories[unboundedv1alpha3.ExternalProviderOCIInstance]()
-	if err != nil {
-		return nil, fmt.Errorf("register OCI instance machine-ops provider: %w", err)
-	}
-
-	return []*machineops.Provider{azureProvider, ociProvider}, nil
+	return []*machineops.Provider{azureProvider}, nil
 }
 
 func leaderElectionID(cfg config) string {
