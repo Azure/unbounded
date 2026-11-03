@@ -156,7 +156,9 @@ func matrixCombinations(matrix map[string]any) ([]map[string]any, error) {
 		}
 	}
 
-	if len(combos) == 0 {
+	// A job without a matrix runs once. A matrix whose excludes remove every
+	// combination runs zero times, so it must not fall back to one.
+	if len(matrix) == 0 {
 		combos = []map[string]any{{}}
 	}
 
@@ -482,6 +484,49 @@ jobs:
 				if _, ok := builds[imageBuild{File: "images/net/Containerfile", Platform: platform}]; !ok {
 					t.Errorf("missing images/net/Containerfile for %s in %v", platform, builds)
 				}
+			}
+		})
+	}
+}
+
+func TestImageBuildsMatrixFallback(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		strategy string
+		want     int
+	}{
+		"no matrix": {want: 1},
+		"fully excluded matrix": {
+			strategy: `
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        exclude:
+          - arch: amd64
+          - arch: arm64`,
+			want: 0,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			builds, err := imageBuilds([]byte(`
+jobs:
+  net:
+    runs-on: ubuntu-latest` + tc.strategy + `
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/net/Containerfile
+          platforms: linux/amd64
+`))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(builds) != tc.want {
+				t.Errorf("got %d builds, want %d: %v", len(builds), tc.want, builds)
 			}
 		})
 	}
