@@ -240,7 +240,9 @@ Object read errors keep their empty bodies.
   admitted; `failed` belongs to failed refs.
 - `coverage` is present only with `?coverage=1`; otherwise omitted. It sends a
   `probe` to owners and reports resident bytes of the current desired set.
-  Probe failures count as not resident.
+  Probe failures count as not resident. Probing gets at most 3/4 of the time
+  left on the request, so a slow owner yields a lower bound, not a missing
+  response.
 - `refs` is present only with `?refs=failed` or `?refs=all`. Pages of
   `RACER_PREFETCH_REFS_PAGE` (256) entries; `next_cursor` is an opaque string
   or `null`; pass it back as `?cursor=`. A cursor from another

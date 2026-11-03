@@ -644,7 +644,8 @@ Query parameters:
   `400`. Closing the connection ends the wait.
 - `coverage=1` asks the owners which pages of the wanted set they hold now and
   adds `coverage`. It is a snapshot taken at `observed_at_ms`, not a promise.
-  Owners that do not answer count as not holding the page.
+  Owners that do not answer before the request deadline count as not holding
+  the page, so `resident_bytes` is a lower bound.
 - `refs=failed` or `refs=all` adds per-ref results, 256 per response. Pass
   `next_cursor` back as `cursor` for the next page. A cursor from another
   position is `400`. `index` is the ref position in the `PUT`. `outcome` is
