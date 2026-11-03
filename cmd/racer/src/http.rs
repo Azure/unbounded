@@ -328,10 +328,14 @@ pub enum Endpoint {
         path: PathBuf,
     },
     Peer(String),
+    /// Origin reached by DNS name or IP over HTTP or HTTPS. Resolve it with
+    /// [`crate::remote::RemoteEndpoint::resolve`] before checkout.
+    Remote(crate::remote::RemoteEndpoint),
 }
 impl http1::connection::Endpoint<Error> for Endpoint {
     fn address(&self) -> Result<SocketAddress> {
         Ok(match self {
+            Self::Remote(remote) => SocketAddress::Inet(remote.address()?),
             Self::Unix(path) | Self::Origin { path, .. } => SocketAddress::Unix(path.clone()),
             Self::Peer(value) => {
                 SocketAddress::Inet(value.parse().map_err(|_| Error::InvalidConfiguration)?)
@@ -340,18 +344,25 @@ impl http1::connection::Endpoint<Error> for Endpoint {
     }
     fn capacity(&self, config: &http1::connection::PoolConfig) -> usize {
         match self {
-            Self::Peer(_) => config.per_endpoint,
+            Self::Peer(_) | Self::Remote(_) => config.per_endpoint,
             _ => config.secondary_cap,
         }
     }
     fn priority_headroom(&self) -> usize {
-        usize::from(matches!(self, Self::Origin { .. }))
+        usize::from(matches!(self, Self::Origin { .. } | Self::Remote(_)))
+    }
+    fn tls(&self) -> Option<&http1::tls::TlsClient> {
+        match self {
+            Self::Remote(remote) => remote.tls(),
+            _ => None,
+        }
     }
     fn allocation(&self) -> usize {
         match self {
             Self::Unix(path) => path.as_os_str().len(),
             Self::Origin { cache, path } => cache.0.len() + path.as_os_str().len(),
             Self::Peer(value) => value.len(),
+            Self::Remote(remote) => remote.host().len(),
         }
     }
 }

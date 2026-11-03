@@ -125,6 +125,11 @@ impl TlsClient {
         self.mode
     }
 
+    /// The client configuration.
+    pub fn config(&self) -> &Arc<ClientConfig> {
+        &self.config
+    }
+
     /// The verified server name.
     pub fn server_name(&self) -> &ServerName<'static> {
         &self.name
