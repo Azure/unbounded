@@ -13,6 +13,10 @@
 //! - Named ClusterCache missing, or its node selector invalid: denied with 403.
 //! - ClusterCache lookup failed: denied with 503 so the client retries. The
 //!   pod is never admitted without its cache's node affinity.
+//! - Pod with `spec.nodeName` set and a cache with a node selector: the named
+//!   Node is looked up, because node affinity does not constrain a pod that
+//!   bypasses the scheduler. A missing or non-matching Node is denied with
+//!   403, and a failed Node lookup with 503.
 //! - Opted-in pod: allowed with a JSON Patch. When the cache has a node
 //!   selector, the patch adds it to the pod's required node affinity.
 //!
@@ -26,6 +30,7 @@ mod strict;
 
 use mutate::mutate;
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use base64::Engine as _;
@@ -120,6 +125,26 @@ pub enum CacheLookup {
     Unavailable,
 }
 
+/// Result of looking up the Node named by a pod's `spec.nodeName`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeLookup {
+    /// The Node exists. Holds its labels.
+    Found(BTreeMap<String, String>),
+    /// No Node has this name.
+    NotFound,
+    /// The lookup failed. The pod is denied with a retryable status.
+    Unavailable,
+}
+
+/// Looks up ClusterCaches and Nodes while answering a review.
+pub struct Lookups<'a> {
+    /// Resolves a ClusterCache by name.
+    pub cache: &'a dyn Fn(&str) -> CacheLookup,
+    /// Resolves a Node by name. Called only for a pod with `spec.nodeName`
+    /// set whose cache has a nonempty node selector.
+    pub node: &'a dyn Fn(&str) -> NodeLookup,
+}
+
 /// A parsed `AdmissionReview` request. [`Review::caches`] lists the
 /// ClusterCaches the pod may need, so the caller can look them up before
 /// [`Review::respond`].
@@ -132,12 +157,8 @@ pub struct Review {
 ///
 /// `image` is the racer-object sidecar image. A blank image denies every
 /// v1 Pod `CREATE`, as the Go handler does. `lookup` resolves the
-/// ClusterCache named by the pod.
-pub fn admit(
-    review: &[u8],
-    image: &str,
-    lookup: &dyn Fn(&str) -> CacheLookup,
-) -> Result<Vec<u8>, Error> {
+/// ClusterCache named by the pod, and the Node it is bound to when needed.
+pub fn admit(review: &[u8], image: &str, lookup: &Lookups) -> Result<Vec<u8>, Error> {
     Ok(Review::parse(review)?.respond(image, lookup))
 }
 
@@ -198,8 +219,20 @@ impl Review {
         out
     }
 
+    /// The pod's nonempty `spec.nodeName`, if any. The caller looks this
+    /// Node up only when a cache from [`Review::caches`] has a node selector.
+    pub fn node_name(&self) -> Option<String> {
+        self.req
+            .get("object")
+            .and_then(|o| o.get("spec"))
+            .and_then(|s| s.get("nodeName"))
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+    }
+
     /// Returns the response review as JSON.
-    pub fn respond(&self, image: &str, lookup: &dyn Fn(&str) -> CacheLookup) -> Vec<u8> {
+    pub fn respond(&self, image: &str, lookup: &Lookups) -> Vec<u8> {
         let uid = &self.uid;
         let req = &self.req;
         let response = match handle(req, image, lookup) {
@@ -256,11 +289,7 @@ fn deny(msg: impl Into<String>) -> Reject {
 }
 
 /// Returns JSON Patch operations, empty when the pod is left unchanged.
-fn handle(
-    req: &Map<String, Value>,
-    image: &str,
-    lookup: &dyn Fn(&str) -> CacheLookup,
-) -> Result<Vec<Value>, Reject> {
+fn handle(req: &Map<String, Value>, image: &str, lookup: &Lookups) -> Result<Vec<Value>, Reject> {
     let kind = req.get("kind").and_then(Value::as_object);
     let field = |name: &str| {
         kind.and_then(|k| k.get(name))
@@ -291,6 +320,7 @@ struct Pod<'a> {
     volumes: Option<&'a Vec<Value>>,
     host_network: bool,
     os_name: Option<&'a str>,
+    node_name: Option<&'a str>,
     node_selector: Option<&'a Map<String, Value>>,
     affinity: Option<&'a Map<String, Value>>,
 }
@@ -407,6 +437,7 @@ impl<'a> Pod<'a> {
             volumes: array(spec, "volumes", "spec.volumes")?,
             host_network,
             os_name,
+            node_name: string(spec, "nodeName", "spec.nodeName")?.filter(|n| !n.is_empty()),
             node_selector: string_map(spec, "nodeSelector", "spec.nodeSelector")?,
             affinity: object(spec, "affinity", "spec.affinity")?,
         };

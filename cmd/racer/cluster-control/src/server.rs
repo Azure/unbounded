@@ -1083,6 +1083,35 @@ pub(crate) async fn cache_lookups(
     out
 }
 
+/// Reads the Node a pod is bound to with a direct GET, under the same
+/// fail-closed rules as [`cache_lookups`]: a 404 is `NotFound`, any other
+/// failure, including a timeout, is `Unavailable`.
+pub(crate) async fn node_lookup(
+    api: &crate::kube::Kube,
+    name: &str,
+    timeout: Duration,
+) -> racer_admission::NodeLookup {
+    use racer_admission::NodeLookup;
+    let path = crate::kube::paths::node(&crate::kube::escape(name));
+    match exec::timeout(timeout, api.get(&path)).await {
+        Ok(Ok(node)) => {
+            let labels = node
+                .get("metadata")
+                .and_then(|m| m.get("labels"))
+                .and_then(serde_json::Value::as_object)
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            NodeLookup::Found(labels)
+        }
+        Ok(Err(crate::kube::KubeError::NotFound)) => NodeLookup::NotFound,
+        _ => NodeLookup::Unavailable,
+    }
+}
+
 /// Admission response bytes for one review body.
 pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
     let Some(image) = shared.config.object_image.as_deref() else {
@@ -1096,12 +1125,34 @@ pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
         Err(_) => return http::response_head(400, &[], 0, false),
     };
     let caches = cache_lookups(&shared.api, review.caches(), CACHE_LOOKUP_TIMEOUT).await;
-    let out = review.respond(image, &|name| {
-        caches
-            .get(name)
-            .cloned()
-            .unwrap_or(racer_admission::CacheLookup::Unavailable)
-    });
+    // A pod bound with spec.nodeName skips the scheduler, so its Node is
+    // checked against the cache's selector. GET it only when some cache has
+    // a selector; admission ignores it otherwise.
+    let has_selector = caches
+        .values()
+        .any(|c| matches!(c, racer_admission::CacheLookup::Found(Some(_))));
+    let node = match review.node_name() {
+        Some(name) if has_selector => Some((
+            node_lookup(&shared.api, &name, CACHE_LOOKUP_TIMEOUT).await,
+            name,
+        )),
+        _ => None,
+    };
+    let out = review.respond(
+        image,
+        &racer_admission::Lookups {
+            cache: &|name| {
+                caches
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(racer_admission::CacheLookup::Unavailable)
+            },
+            node: &|name| match &node {
+                Some((found, n)) if n == name => found.clone(),
+                _ => racer_admission::NodeLookup::Unavailable,
+            },
+        },
+    );
     let mut r = http::response_head(
         200,
         &[("Content-Type", "application/json")],
@@ -1402,6 +1453,32 @@ mod tests {
             api.delay_gets(delay.clone());
             let got = cache_lookups(&kube, names(&["plain"]), Duration::from_millis(100)).await;
             assert_eq!(got["plain"], CacheLookup::Unavailable);
+            delay.store(0, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    #[test]
+    fn node_lookup_maps_api_results() {
+        use racer_admission::NodeLookup;
+        fake::run(|api, kube| async move {
+            api.put_object(
+                &crate::kube::paths::node("n1"),
+                serde_json::json!({"metadata": {"name": "n1", "labels": {"pool": "gpu"}}}),
+            );
+            let t = Duration::from_secs(2);
+            assert_eq!(
+                node_lookup(&kube, "n1", t).await,
+                NodeLookup::Found([("pool".to_owned(), "gpu".to_owned())].into())
+            );
+            assert_eq!(node_lookup(&kube, "absent", t).await, NodeLookup::NotFound);
+            api.fail_next(&[403]);
+            assert_eq!(node_lookup(&kube, "n1", t).await, NodeLookup::Unavailable);
+            let delay = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+            api.delay_gets(delay.clone());
+            assert_eq!(
+                node_lookup(&kube, "n1", Duration::from_millis(100)).await,
+                NodeLookup::Unavailable
+            );
             delay.store(0, std::sync::atomic::Ordering::SeqCst);
         });
     }

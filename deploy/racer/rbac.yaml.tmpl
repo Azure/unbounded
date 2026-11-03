@@ -13,7 +13,8 @@ kind: ClusterRole
 metadata:
   name: racer
 rules:
-  # Membership is computed from Nodes. No Node writes.
+  # Membership is computed from Nodes. Seats also GET the Node a pod is bound
+  # to by spec.nodeName during admission. No Node writes.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]

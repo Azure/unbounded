@@ -229,7 +229,8 @@ rule changes to use the mesh:
   When a node leaves a pool, it unbinds the sockets.
 - The admission webhook looks up the `ClusterCache` named by `racer.unbounded-cloud.io/client-cache`.
   It rejects unknown caches. It adds required node affinity from the selector, so client pods
-  schedule only on pool nodes.
+  schedule only on pool nodes. A pod with `spec.nodeName` bypasses the scheduler, so the webhook
+  GETs that Node and rejects the pod unless it matches the selector (503 if the GET fails).
 - The operator adds the selector to the origin DaemonSet's node affinity.
 
 ## Control wire v2

@@ -6,11 +6,7 @@ use super::*;
 
 /// Ports Go `Mutate`. A failure denies the pod with no change. Returns JSON
 /// Patch operations that turn `pod` into the mutated pod.
-pub(crate) fn mutate(
-    pod: &Value,
-    image: &str,
-    lookup: &dyn Fn(&str) -> CacheLookup,
-) -> Result<Vec<Value>, Reject> {
+pub(crate) fn mutate(pod: &Value, image: &str, lookup: &Lookups) -> Result<Vec<Value>, Reject> {
     if image.trim().is_empty() {
         return Err(deny("racer-object sidecar image must not be empty"));
     }
@@ -82,11 +78,7 @@ fn check_linux(p: &Pod, what: &str) -> Result<(), Reject> {
 /// Injects the racer-object sidecar. The named ClusterCache must exist, and
 /// its node selector is added to the pod's required node affinity. Ports Go
 /// `mutateSidecar`.
-fn mutate_sidecar(
-    pod: &mut Value,
-    image: &str,
-    lookup: &dyn Fn(&str) -> CacheLookup,
-) -> Result<(), Reject> {
+fn mutate_sidecar(pod: &mut Value, image: &str, lookup: &Lookups) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
     if !p.wants_sidecar() {
@@ -109,7 +101,8 @@ fn mutate_sidecar(
         )));
     }
     check_linux(&p, "racer-object sidecar")?;
-    let pool = selector::cache_requirements(&spec.cache, CACHE_ANNOTATION, lookup)?;
+    let pool = selector::cache_requirements(&spec.cache, CACHE_ANNOTATION, lookup.cache)?;
+    selector::check_bound_node(p.node_name, &pool, &spec.cache, lookup.node)?;
 
     let client_dir = format!("/run/racer/{}/client", spec.cache);
     let container = json!({
@@ -147,10 +140,7 @@ fn mutate_sidecar(
 /// checked, not the mount's read-only flag. Pods without the label, or already
 /// marked with [`CLIENT_SOCKET_INJECTED_ANNOTATION`], are left unchanged.
 /// Ports Go `mutateClientSocket`.
-fn mutate_client_socket(
-    pod: &mut Value,
-    lookup: &dyn Fn(&str) -> CacheLookup,
-) -> Result<(), Reject> {
+fn mutate_client_socket(pod: &mut Value, lookup: &Lookups) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
     if !p.wants_client_socket() {
@@ -173,7 +163,8 @@ fn mutate_client_socket(
     let containers = p.containers.map(Vec::as_slice).unwrap_or_default();
     let targets = client_targets(p.annotations, init_containers, containers)?;
     check_linux(&p, "Racer client socket")?;
-    let pool = selector::cache_requirements(&cache, CLIENT_CACHE_ANNOTATION, lookup)?;
+    let pool = selector::cache_requirements(&cache, CLIENT_CACHE_ANNOTATION, lookup.cache)?;
+    selector::check_bound_node(p.node_name, &pool, &cache, lookup.node)?;
 
     let client_dir = format!("/run/racer/{cache}/client");
     let socket = format!("{client_dir}/socket");

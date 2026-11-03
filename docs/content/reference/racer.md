@@ -132,7 +132,9 @@ spec:
 ```
 
 - Client pods that use the cache can be scheduled only on matching nodes. The
-  Racer admission webhook adds this restriction.
+  Racer admission webhook adds this restriction. A pod that sets
+  `spec.nodeName` skips the scheduler, so the webhook rejects it unless that
+  Node matches the selector.
 - A managed `spec.origin` runs only on matching nodes.
 - Changing the selector moves the cache to a new set of nodes. Cached data is
   not moved; pages are read from the origin again.

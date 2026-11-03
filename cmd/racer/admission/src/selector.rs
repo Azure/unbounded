@@ -34,6 +34,54 @@ pub(crate) fn cache_requirements(
     }
 }
 
+/// Checks a pod bound with `spec.nodeName` against its cache's selector,
+/// given as `pool` requirements. Such a pod bypasses the scheduler, so the
+/// node affinity the webhook adds does not constrain it. Does nothing, and
+/// looks nothing up, when the pod is unbound or `pool` is empty.
+pub(crate) fn check_bound_node(
+    node: Option<&str>,
+    pool: &[Value],
+    cache: &str,
+    lookup: &dyn Fn(&str) -> NodeLookup,
+) -> Result<(), Reject> {
+    let Some(node) = node else { return Ok(()) };
+    if pool.is_empty() {
+        return Ok(());
+    }
+    match lookup(node) {
+        NodeLookup::Found(labels) if pool.iter().all(|r| matches(r, &labels)) => Ok(()),
+        NodeLookup::Found(_) => Err(deny(format!(
+            "pod spec.nodeName {node:?} does not match the spec.nodeSelector of ClusterCache {cache:?}, so the cache is not served there"
+        ))),
+        NodeLookup::NotFound => Err(deny(format!(
+            "pod spec.nodeName {node:?} names a Node that does not exist, so it cannot be checked against the spec.nodeSelector of ClusterCache {cache:?}"
+        ))),
+        NodeLookup::Unavailable => Err(Reject::Unavailable(format!(
+            "Node {node:?} named by pod spec.nodeName could not be looked up to check it against ClusterCache {cache:?}; retry"
+        ))),
+    }
+}
+
+/// Evaluates one requirement from [`requirements`] against node labels with
+/// Kubernetes semantics. `NotIn` matches when the key is absent.
+fn matches(req: &Value, labels: &BTreeMap<String, String>) -> bool {
+    let key = req.get("key").and_then(Value::as_str).unwrap_or("");
+    let value = labels.get(key);
+    let listed = || {
+        let v = value.map(String::as_str);
+        req.get("values")
+            .and_then(Value::as_array)
+            .is_some_and(|vs| vs.iter().any(|x| x.as_str() == v))
+    };
+    match req.get("operator").and_then(Value::as_str) {
+        Some("In") => value.is_some() && listed(),
+        Some("NotIn") => value.is_none() || !listed(),
+        Some("Exists") => value.is_some(),
+        Some("DoesNotExist") => value.is_none(),
+        _ => false,
+    }
+}
+
 /// Converts a LabelSelector to node selector requirements, validating it the
 /// way the Kubernetes API server does.
 pub(crate) fn requirements(sel: &Value) -> Result<Vec<Value>, String> {
@@ -160,6 +208,62 @@ fn label_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn requirements_match_with_kubernetes_semantics() {
+        let sel = json!({
+            "matchLabels": {"pool": "gpu"},
+            "matchExpressions": [
+                {"key": "zone", "operator": "In", "values": ["a", "b"]},
+                {"key": "tier", "operator": "NotIn", "values": ["spot"]},
+                {"key": "racer", "operator": "Exists"},
+                {"key": "drain", "operator": "DoesNotExist"},
+            ],
+        });
+        let reqs = requirements(&sel).unwrap();
+        let all = |l: &BTreeMap<String, String>| reqs.iter().all(|r| matches(r, l));
+        assert!(all(&labels(&[
+            ("pool", "gpu"),
+            ("zone", "a"),
+            ("racer", "")
+        ])));
+        assert!(all(&labels(&[
+            ("pool", "gpu"),
+            ("zone", "b"),
+            ("tier", "std"),
+            ("racer", "1")
+        ])));
+        assert!(!all(&labels(&[
+            ("pool", "cpu"),
+            ("zone", "a"),
+            ("racer", "")
+        ])));
+        assert!(!all(&labels(&[
+            ("pool", "gpu"),
+            ("zone", "c"),
+            ("racer", "")
+        ])));
+        assert!(!all(&labels(&[("pool", "gpu"), ("racer", "")])));
+        assert!(!all(&labels(&[
+            ("pool", "gpu"),
+            ("zone", "a"),
+            ("tier", "spot"),
+            ("racer", "")
+        ])));
+        assert!(!all(&labels(&[("pool", "gpu"), ("zone", "a")])));
+        assert!(!all(&labels(&[
+            ("pool", "gpu"),
+            ("zone", "a"),
+            ("racer", ""),
+            ("drain", "")
+        ])));
+    }
 
     #[test]
     fn key_prefix_matches_kubernetes_dns_subdomain() {

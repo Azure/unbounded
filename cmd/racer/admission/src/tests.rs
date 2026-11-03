@@ -5,7 +5,11 @@ const CACHE: &str = "test-cache";
 
 /// Every cache exists with no node selector.
 fn admit(review: &[u8], image: &str) -> Result<Vec<u8>, Error> {
-    super::admit(review, image, &|_| CacheLookup::Found(None))
+    let lookups = Lookups {
+        cache: &|_| CacheLookup::Found(None),
+        node: &|n| panic!("unexpected Node lookup {n}"),
+    };
+    super::admit(review, image, &lookups)
 }
 
 /// Opted-in pod naming CACHE. A `null` annotation value removes the key.
@@ -1082,8 +1086,19 @@ fn client_socket_bad_container_fields_are_400() {
 const REQUIRED: &str = "requiredDuringSchedulingIgnoredDuringExecution";
 
 /// Runs the review with `lookup` and returns the response.
+/// Any Node lookup fails the test.
 fn run_with(pod: &Value, lookup: &dyn Fn(&str) -> CacheLookup) -> Value {
-    response(&super::admit(&review("CREATE", pod), IMAGE, lookup).unwrap())
+    run_nodes(pod, lookup, &|n| panic!("unexpected Node lookup {n}"))
+}
+
+/// Runs the review with cache and Node lookups and returns the response.
+fn run_nodes(
+    pod: &Value,
+    cache: &dyn Fn(&str) -> CacheLookup,
+    node: &dyn Fn(&str) -> NodeLookup,
+) -> Value {
+    let lookups = Lookups { cache, node };
+    response(&super::admit(&review("CREATE", pod), IMAGE, &lookups).unwrap())
 }
 
 /// Runs the review where CACHE has `sel` and returns the patched pod.
@@ -1397,4 +1412,109 @@ fn review_caches_empty_when_nothing_mutates() {
             .caches()
             .is_empty()
     );
+}
+
+fn bound(mut p: Value, node: &str) -> Value {
+    p["spec"]["nodeName"] = json!(node);
+    p
+}
+
+fn gpu_cache(_: &str) -> CacheLookup {
+    CacheLookup::Found(Some(json!({"matchLabels": {"pool": "gpu"}})))
+}
+
+#[test]
+fn bound_pod_on_matching_node_is_admitted() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|n| {
+            assert_eq!(n, "n1");
+            NodeLookup::Found(BTreeMap::from([("pool".into(), "gpu".into())]))
+        });
+        assert_eq!(resp["allowed"], true, "{resp}");
+        assert!(resp.get("patch").is_some());
+    }
+}
+
+#[test]
+fn bound_pod_on_other_node_is_denied() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|_| {
+            NodeLookup::Found(BTreeMap::from([("pool".into(), "cpu".into())]))
+        });
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 403);
+        let msg = resp["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("does not match") && msg.contains("n1"),
+            "{msg}"
+        );
+        assert!(resp.get("patch").is_none());
+    }
+}
+
+#[test]
+fn bound_pod_on_missing_node_is_denied() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|_| NodeLookup::NotFound);
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 403);
+        let msg = resp["status"]["message"].as_str().unwrap();
+        assert!(msg.contains("does not exist"), "{msg}");
+    }
+}
+
+#[test]
+fn node_lookup_failure_is_retryable_denial() {
+    for p in [
+        bound(pod(json!({})), "n1"),
+        bound(client_pod(json!({})), "n1"),
+    ] {
+        let resp = run_nodes(&p, &gpu_cache, &|_| NodeLookup::Unavailable);
+        assert_eq!(resp["allowed"], false);
+        assert_eq!(resp["status"]["code"], 503);
+        assert_eq!(resp["status"]["reason"], "ServiceUnavailable");
+    }
+}
+
+#[test]
+fn node_lookup_is_skipped_when_not_needed() {
+    // No selector, or an empty one: a bound pod needs no Node check.
+    for sel in [None, Some(json!({}))] {
+        for p in [
+            bound(pod(json!({})), "n1"),
+            bound(client_pod(json!({})), "n1"),
+        ] {
+            let resp = run_with(&p, &|_| CacheLookup::Found(sel.clone()));
+            assert_eq!(resp["allowed"], true, "{resp}");
+        }
+    }
+    // Unbound pods rely on node affinity; an empty nodeName is unbound.
+    for p in [
+        pod(json!({})),
+        client_pod(json!({})),
+        bound(client_pod(json!({})), ""),
+    ] {
+        let resp = run_with(&p, &gpu_cache);
+        assert_eq!(resp["allowed"], true, "{resp}");
+    }
+}
+
+#[test]
+fn review_reports_node_name() {
+    let r = |p: &Value| Review::parse(&review("CREATE", p)).unwrap().node_name();
+    assert_eq!(
+        r(&bound(client_pod(json!({})), "n1")).as_deref(),
+        Some("n1")
+    );
+    assert_eq!(r(&bound(client_pod(json!({})), "")), None);
+    assert_eq!(r(&client_pod(json!({}))), None);
 }
