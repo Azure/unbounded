@@ -707,6 +707,7 @@ func (e *env) revoke(ctx context.Context, node string, ids []string, all, yes bo
 	} else {
 		printf(e.out, "Disks to revoke on node %s:\n  %s\n\n", node, strings.Join(remove, "\n  "))
 	}
+
 	printf(e.out, "Racer stops using these disks. Nothing is erased; existing data is left on disk.\nThe Racer pod on %s will restart and drop its cache.\n\n", node)
 
 	if err := e.confirm(yes); err != nil {
