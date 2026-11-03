@@ -869,7 +869,7 @@ pub(crate) mod tests {
                 },
             ]
         }
-        fn page(number: u64) -> PageId {
+        pub(crate) fn page(number: u64) -> PageId {
             PageId {
                 version: ObjectVersion {
                     object: object(),

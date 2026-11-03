@@ -58,8 +58,10 @@ nonempty Site and at least one rail. Each node ranks its eligible mesh edges
 (see [racer-mesh-v2.md](racer-mesh-v2.md)) and takes the best `RDMA_PEERS`
 (128). An edge is an RDMA edge only when both ends took it. Each membership
 caches these peer sets, computed on first use per node. A hop that qualifies
-by Site and rail but is not an RDMA edge sends its page over HTTP and counts
-`racer_rdma_fallback_overflow_total`.
+by Site and rail but is not an RDMA edge sends its page over HTTP. The node
+that receives the page body on that hop, the requester or a relay, counts
+`racer_rdma_fallback_overflow_total` once the body arrives in full. Misses,
+signed overloads, and failed exchanges deliver no body and do not count.
 
 When a page needs an idle link, `Transfers::ensure_link` starts setup in the
 background. That page uses HTTP instead of waiting for setup.

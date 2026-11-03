@@ -592,6 +592,7 @@ impl PeerServer {
                                 authentication,
                                 connection,
                                 length,
+                                overflow,
                             },
                             pipe,
                         )) => {
@@ -623,6 +624,12 @@ impl PeerServer {
                             {
                                 observation.complete();
                             }
+                            // Only a relayed body is a page; signed outcomes
+                            // without one, such as overloads, carry none.
+                            super::transport::record_overflow(
+                                overflow.as_deref(),
+                                result.is_ok() && length != 0,
+                            );
                             return result;
                         }
                         Ok((super::transport::RelayResponse::Complete(response), _)) => response,

@@ -181,7 +181,7 @@ Every edge is a TCP edge. Some edges are also RDMA edges.
   3. a symmetric hash of the two IDs: `H("/mesh/v2/edge\0", min(id), max(id))`.
 - Each node takes its 128 best ranked RDMA capable edges (`RDMA_PEERS`).
 - An edge uses RDMA only if both ends took it. The responder refuses other link setups. The
-  initiator never asks. The page then goes over TCP. This is counted in metrics as overflow.
+  initiator never asks. The page then goes over TCP. Each page body delivered this way counts in metrics as overflow.
 
 Selector pools with up to about 2,000 nodes mostly fit within 128 RDMA peers, so both hops can use
 RDMA. Bigger pools, and the default pool on a large cluster, use TCP for the overflow edges.

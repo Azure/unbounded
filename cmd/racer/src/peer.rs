@@ -479,6 +479,7 @@ impl Relay {
                     authentication,
                     connection,
                     length,
+                    overflow,
                 } => {
                     let authentication = self
                         .forwarding
@@ -488,6 +489,7 @@ impl Relay {
                         authentication,
                         connection,
                         length,
+                        overflow,
                     })
                 }
             }
@@ -1166,6 +1168,7 @@ impl Requester {
                 authentication,
                 mut connection,
                 length,
+                overflow,
             } => {
                 let authentication = forwarding
                     .verify_opaque_async(authentication, length, binding, scope)
@@ -1180,6 +1183,7 @@ impl Requester {
                     authentication,
                     connection,
                     length,
+                    overflow,
                 })
             }
         }

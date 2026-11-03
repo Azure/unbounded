@@ -702,12 +702,12 @@ mod send_failures {
 
 /// Sender side: the page is written in place through implicit on-demand
 /// paging, no pool buffer is used, and the metrics count it.
-mod send_in_place {
+pub(crate) mod send_in_place {
     use super::*;
     use crate::telemetry::{Event, Metrics};
 
     /// `w` with `metrics` attached to both nodes' links.
-    fn metered(w: World) -> (World, Metrics, Metrics) {
+    pub(crate) fn metered(w: World) -> (World, Metrics, Metrics) {
         let (ma, mb) = (Metrics::default(), Metrics::default());
         let World {
             _sim,

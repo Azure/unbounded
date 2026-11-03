@@ -1097,7 +1097,54 @@ pub enum RelayResponse {
         connection: Box<crate::http::ConnectionLease>,
 
         length: usize,
+
+        /// Links to charge one overflow page once the opaque body is
+        /// relayed in full, set only when this hop is an overflow edge.
+        overflow: Option<Rc<crate::rdma::Links>>,
     },
+}
+
+/// Whether the hop from `local` to `peer` carries `operation` over HTTP only
+/// because the edge is an overflow edge (see [`crate::rdma::is_overflow`]).
+pub(crate) fn overflow_hop(
+    plan: TransportPlan,
+    membership: Option<&crate::topology::Membership>,
+    operation: &super::protocol::Operation,
+    local: &racer_control_wire::NodeId,
+    peer: &racer_control_wire::NodeId,
+) -> bool {
+    plan == TransportPlan::Http
+        && membership
+            .zip(super::rail_hint(operation))
+            .is_some_and(|(membership, page)| {
+                crate::rdma::is_overflow(membership, &page, local, peer)
+            })
+}
+
+/// Whether a validated HTTP response of `length` body bytes delivered a page.
+/// Misses, signed overloads, and other bodiless outcomes deliver none.
+pub(crate) fn delivers_page_body<P, G>(
+    response: &racer_core::read::PeerResponse<P, G>,
+    length: usize,
+) -> bool {
+    use racer_core::read::PeerResponse;
+    length != 0
+        && matches!(
+            response,
+            PeerResponse::Page { .. }
+                | PeerResponse::Selected { .. }
+                | PeerResponse::Bootstrap {
+                    page_zero: Some(_),
+                    ..
+                }
+        )
+}
+
+/// Count one page body delivered over HTTP on an overflow edge.
+pub(crate) fn record_overflow(overflow: Option<&crate::rdma::Links>, delivered: bool) {
+    if delivered && let Some(links) = overflow {
+        links.record_fallback_overflow();
+    }
 }
 
 pub struct Transfers {
@@ -1296,13 +1343,16 @@ impl Transfers {
             if native.is_some() {
                 self.record_rdma_stage(Event::RdmaGrantCount, Event::RdmaGrantNs, granting);
             }
-            if plan == TransportPlan::Http
-                && let (Some(links), Some(membership)) = (&self.links, &membership)
-                && let Some(page) = super::rail_hint(&request.request.operation)
-                && crate::rdma::is_overflow(membership, &page, self.signatures.node(), &peer)
-            {
-                links.record_fallback_overflow();
-            }
+            // Overflow counts only page bodies this hop actually receives.
+            let overflow = self.links.clone().filter(|_| {
+                overflow_hop(
+                    plan,
+                    membership.as_deref(),
+                    &request.request.operation,
+                    self.signatures.node(),
+                    &peer,
+                )
+            });
             if let TransportPlan::Rdma { rail } = plan
                 && membership.is_some()
                 && self
@@ -1379,6 +1429,7 @@ impl Transfers {
                     authentication,
                     connection: Box::new(received.connection),
                     length,
+                    overflow,
                 });
             }
             if let Some(timing) = timing.as_deref_mut() {
@@ -1406,6 +1457,10 @@ impl Transfers {
             )?;
             validate_body_length(&response.response, length)?;
             connection.finish_exchange()?;
+            record_overflow(
+                overflow.as_deref(),
+                delivers_page_body(&response.response, length),
+            );
             Ok(RelayResponse::Complete(response))
         })
     }
@@ -1603,6 +1658,128 @@ pub(crate) async fn relay_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overflow counts a page only when its body arrives over an overflow
+    /// edge, once per hop, and never for bodiless outcomes or other edges.
+    #[test]
+    fn overflow_counts_only_delivered_page_bodies() {
+        use crate::rdma::tests::rails_tests::{mesh_with_budget, page};
+        use crate::telemetry::Event;
+        use racer_core::read::PeerResponse;
+        type Response = PeerResponse<(), ()>;
+
+        let membership = mesh_with_budget(40, 16);
+        let nodes: Vec<_> = membership
+            .members()
+            .iter()
+            .map(|m| m.node.clone())
+            .collect();
+        let operation = super::super::protocol::Operation::Page {
+            page: page(0),
+            mode: super::super::protocol::FetchMode::CopyOnly,
+        };
+        let hop = |a, b| {
+            overflow_hop(
+                TransportPlan::Http,
+                Some(&membership),
+                &operation,
+                &nodes[a],
+                &nodes[b],
+            )
+        };
+        let edge = |a, b| crate::rdma::is_rdma_edge(&membership, &nodes[a], &nodes[b]);
+        let pick = |want_rdma: bool| {
+            (1..nodes.len())
+                .find(|&b| membership.is_neighbor(&nodes[0], &nodes[b]) && edge(0, b) == want_rdma)
+                .expect("edge kind present")
+        };
+        let (overflow, rdma) = (pick(false), pick(true));
+        assert!(hop(0, overflow));
+        assert!(!hop(0, rdma));
+        // A planned RDMA hop, no membership, or a bodiless operation is never overflow.
+        assert!(!overflow_hop(
+            TransportPlan::Rdma { rail: RailId(7) },
+            Some(&membership),
+            &operation,
+            &nodes[0],
+            &nodes[overflow],
+        ));
+        assert!(!overflow_hop(
+            TransportPlan::Http,
+            None,
+            &operation,
+            &nodes[0],
+            &nodes[overflow],
+        ));
+        let offer = super::super::protocol::Operation::Page {
+            page: page(0),
+            mode: super::super::protocol::FetchMode::Offer,
+        };
+        assert!(!overflow_hop(
+            TransportPlan::Http,
+            Some(&membership),
+            &offer,
+            &nodes[0],
+            &nodes[overflow],
+        ));
+
+        let metadata = || crate::model::ObjectMetadata {
+            content_type: None,
+            version: page(0).version,
+            length: 8,
+            expires_at: crate::model::ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        };
+        let body = Response::Page {
+            metadata: metadata(),
+            ciphertext: (),
+        };
+        assert!(delivers_page_body(&body, 8));
+        assert!(delivers_page_body(
+            &Response::Selected {
+                metadata: metadata(),
+                ciphertext: (),
+                grant: (),
+            },
+            8
+        ));
+        for bodiless in [Response::Miss, Response::Overloaded, Response::NotFound] {
+            assert!(!delivers_page_body(&bodiless, 0));
+        }
+
+        let w = crate::rdma::links::tests::world();
+        let (w, metrics, _) = crate::rdma::links::tests::send_in_place::metered(w);
+        let links = Some(&*w.a.links);
+        let count = || metrics.count(Event::RdmaFallbackOverflow);
+        // Overflow edge, delivered page: once.
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            delivers_page_body(&body, 8),
+        );
+        assert_eq!(count(), 1);
+        // Overflow edge, copy miss or signed overload: none.
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            delivers_page_body(&Response::Miss, 0),
+        );
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            delivers_page_body(&Response::Overloaded, 0),
+        );
+        // Overflow edge, failed exchange or failed relay body: none.
+        record_overflow(links.filter(|_| hop(0, overflow)), false);
+        assert_eq!(count(), 1);
+        // A relay hop on an overflow edge counts its relayed body once.
+        let relayed: Result<()> = Ok(());
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            relayed.is_ok() && 8 != 0,
+        );
+        assert_eq!(count(), 2);
+        // A non-overflow edge never counts, body or not.
+        record_overflow(links.filter(|_| hop(0, rdma)), true);
+        assert_eq!(count(), 2);
+        assert_eq!(metrics.count(Event::RdmaHttpFallback), 0);
+    }
     #[test]
     fn link_refusal_admits_only_rdma_edges() {
         let rail = RailId(7);

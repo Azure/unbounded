@@ -449,7 +449,7 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaFallbackGrant, 1);
     }
 
-    /// Count a page over HTTP because its hop qualified for RDMA by Site and
+    /// Count a page body delivered over HTTP because its hop qualified for RDMA by Site and
     /// rail but the edge is not an RDMA edge: at least one end did not take
     /// it among its `RDMA_PEERS` best ranked edges. Not an HTTP fallback,
     /// since the page never planned RDMA.
