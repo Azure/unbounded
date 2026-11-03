@@ -182,6 +182,27 @@ func NewRESTConfigProvider(
 	return provider, nil
 }
 
+// StoredRESTConfig returns a REST config that authenticates with the
+// daemon-controller certificate already stored in opts.CredentialDir. found is
+// false when no certificate is stored or the stored one has expired. It never
+// starts the certificate manager, so it never requests a certificate.
+func StoredRESTConfig(base *rest.Config, nodeName string, opts ControllerCertificateOptions) (*rest.Config, bool, error) {
+	if err := opts.validate(); err != nil {
+		return nil, false, err
+	}
+
+	provider, err := newRESTConfigProvider(base, nodeName, opts)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if provider.manager.Current() == nil {
+		return nil, false, nil
+	}
+
+	return provider.config, true, nil
+}
+
 func (p *RESTConfigProvider) RESTConfig() *rest.Config {
 	return p.config
 }
