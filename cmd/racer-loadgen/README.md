@@ -233,6 +233,10 @@ memory. `--verify=true` uses a 32 KiB read buffer to hash each object, so bytes
 are copied into Go memory. Protocol, socket, origin, and runtime allocations
 still contribute to RSS; there is no fixed page-storage budget per read.
 
+Failure log lines carry a `cause` attribute that names the error class
+(`unexpected_eof`, `unavailable`, `deadline_exceeded`, and so on) without the error
+text, which can contain URLs or credentials.
+
 Metrics:
 
 - `racer_loadgen_pulls_total`, pull duration, and in-flight metrics describe
@@ -243,8 +247,9 @@ Metrics:
   verified operations. Failed batches and the default `--verify=false` receive
   no credit; enable `--verify` when measuring verified goodput.
 - `racer_loadgen_received_bytes_total` counts bytes delivered to the consumer,
-  including failed operations. Drain bytes are counted when `io.Copy` returns,
-  including on failure. This is **not wire traffic**; SDK framing is excluded.
+  including failed operations. Direct UDS drains credit bytes every second
+  while they run (from the SDK object's `Progress`), and the rest when `io.Copy`
+  returns, including on failure. This is **not wire traffic**; SDK framing is excluded.
 - UDS origin metrics count callback operations and bytes generated for the SDK,
   not HTTP socket writes. They are not network throughput counters.
 
