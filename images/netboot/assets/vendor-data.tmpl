@@ -29,6 +29,7 @@ write_files:
 - path: /etc/cloud/cloud-init.disabled
   defer: true
   content: ''
+{{- if not .OmitMachinedGuards }}
 # Block unattended-upgrades from restarting systemd-machined and tearing down
 # the running systemd-nspawn container. The agent re-asserts this file during
 # start; cloud-init writes it first so the protection exists from first boot.
@@ -49,6 +50,7 @@ write_files:
   permissions: '0644'
   content: |
     $nrconf{restart} = 'l';
+{{- end }}
 runcmd:
 - - /bin/bash
   - -c

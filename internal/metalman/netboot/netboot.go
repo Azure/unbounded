@@ -319,9 +319,15 @@ type templateData struct {
 	InstallScript    string
 	InstallEnv       []string
 	InstallRequested bool
-	VirtualMedia     bool
-	ArtifactRoot     string
-	MediaCallbackURL string
+	// OmitMachinedGuards drops the apt and needrestart drop-ins that keep a
+	// package upgrade from restarting systemd-machined. They protect the nspawn
+	// machine, so a Machine in any other isolation mode does not get them. The
+	// zero value keeps them, which is the output for every Machine without an
+	// isolation setting.
+	OmitMachinedGuards bool
+	VirtualMedia       bool
+	ArtifactRoot       string
+	MediaCallbackURL   string
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
@@ -344,7 +350,15 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		InstallScript:    provision.UnboundedAgentInstallScript(),
 		InstallEnv:       provision.AgentInstallEnv(agent),
 		InstallRequested: installRequested,
+
+		OmitMachinedGuards: node != nil && omitsMachinedGuards(node.Spec.Isolation),
 	}
+}
+
+// omitsMachinedGuards reports whether an isolation mode runs the node stack
+// without a systemd-nspawn machine. An unset mode is nspawn.
+func omitsMachinedGuards(mode v1alpha3.IsolationMode) bool {
+	return mode != "" && mode != v1alpha3.IsolationNSpawn
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
