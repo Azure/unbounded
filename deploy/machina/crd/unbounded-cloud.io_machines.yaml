@@ -266,6 +266,23 @@ spec:
                       tracks the latest published release.
                     type: string
                 type: object
+              allocationRef:
+                description: |-
+                  AllocationRef identifies the MachineAllocation this Machine was
+                  created for. It can be set only when the Machine is created.
+                properties:
+                  name:
+                    description: Name is the object name.
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: UID is the object UID.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
               configurationRef:
                 description: |-
                   ConfigurationRef references a MachineConfiguration (and
@@ -289,6 +306,11 @@ spec:
                 required:
                 - name
                 type: object
+              fenced:
+                description: |-
+                  Fenced forbids the agent from starting this Machine's node again. It
+                  can only change from false to true, and requires AllocationRef.
+                type: boolean
               host:
                 description: |-
                   Host contains desired host settings and exactly one optional host owner.
@@ -923,6 +945,8 @@ spec:
               rule: '!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure)
                 && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider)
                 && !has(self.providerID))'
+            - message: fenced requires allocationRef
+              rule: '!has(self.fenced) || !self.fenced || has(self.allocationRef)'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:
@@ -1083,6 +1107,16 @@ spec:
                 type: object
             type: object
         type: object
+        x-kubernetes-validations:
+        - fieldPath: .spec.allocationRef
+          message: allocationRef is immutable
+          rule: (has(self.spec) && has(self.spec.allocationRef)) == (has(oldSelf.spec)
+            && has(oldSelf.spec.allocationRef)) && (!has(self.spec) || !has(self.spec.allocationRef)
+            || self.spec.allocationRef == oldSelf.spec.allocationRef)
+        - fieldPath: .spec.fenced
+          message: fenced cannot be unset
+          rule: '!has(oldSelf.spec) || !has(oldSelf.spec.fenced) || !oldSelf.spec.fenced
+            || (has(self.spec) && has(self.spec.fenced) && self.spec.fenced)'
     served: true
     storage: true
     subresources:
