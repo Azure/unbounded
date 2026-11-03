@@ -186,6 +186,9 @@ pub struct NodeState {
 
     /// Process-wide memory-pressure level, written only by the control worker.
     pressure: crate::pressure::SharedPressure,
+
+    /// Native Azure origin limits, token caches, and TLS trust roots.
+    azure: crate::origin::azure::AzureNode,
 }
 
 impl Default for NodeState {
@@ -238,6 +241,7 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
             native: native::NativeNode::default(),
+            azure: crate::origin::azure::AzureNode::from_env(),
             pressure: Default::default(),
         })
     }
@@ -1354,22 +1358,46 @@ impl WorkerApplication {
             .with_rank0_hang_after(config.request_timeout / 2)
             .with_observer(admission.policy().observer().clone()),
         );
-        let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
+        let origin_io = Rc::new(
+            io.capped(
+                config
+                    .limits
+                    .header_bytes
+                    .get()
+                    .min(crate::http::MAX_HEAD_BYTES),
+            ),
+        );
+        let adapter = OriginClient::new(
             node.publications.clone(),
             http.clone(),
-            Rc::new(
-                io.capped(
-                    config
-                        .limits
-                        .header_bytes
-                        .get()
-                        .min(crate::http::MAX_HEAD_BYTES),
-                ),
-            ),
+            origin_io.clone(),
             admission.clone(),
             buffers.clone(),
             "/run/racer",
-        )?);
+        )?;
+        // Caches published with a native origin read Azure Blob in process;
+        // every other cache keeps its origin socket.
+        let azure = crate::origin::azure::AzureOrigin::new(
+            crate::origin::azure::transport::PoolTransport::new(
+                http.clone(),
+                origin_io,
+                Rc::new(crate::remote::DnsResolver::new(reactor.clone())),
+                node.azure.trust.clone(),
+            ),
+            crate::origin::azure::tokens::AzureTokens::new(
+                node.azure.tokens.clone(),
+                reactor.clone(),
+            ),
+            node.publications.clone(),
+            admission.clone(),
+            buffers.clone(),
+            node.azure.limits.clone(),
+        );
+        let origin: Rc<dyn Origin> = Rc::new(crate::origin::router::OriginRouter::new(
+            node.publications.clone(),
+            adapter,
+            Some(azure),
+        ));
         let flights = Rc::new(Flights::new(admission.clone(), availability.clone()));
         let (coordinator, metadata) = Self::assemble_reads(
             config,
