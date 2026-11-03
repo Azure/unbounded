@@ -2231,10 +2231,23 @@ impl Fill {
     fn complete(&mut self, outcome: Outcome, budget: &mut AcquisitionBudget) -> Result<Action> {
         self.pending();
         self.out.outcome = Some(Ok(outcome));
-        // Only rank 0's own answer (or its silence) says anything about rank 0.
-        if self.out.rank0_probe && (self.signed || outcome == Outcome::TimedOut) {
+        // Only rank 0's own answer (or its silence) says anything about rank 0. An overload on
+        // the route to rank 0 (or by rank 0) withholds origin like a timeout does
+        // ([`CandidateWalk::complete`]), so it feeds the watch like a timeout too: otherwise
+        // repeated overloads would never advance the page to `Overdue` and origin would never be
+        // asked.
+        let overloaded = matches!(
+            outcome,
+            Outcome::Probe(ProbeOutcome::Overloaded) | Outcome::Transport(ProbeOutcome::Overloaded)
+        );
+        if self.out.rank0_probe
+            && !self.out.helper
+            && (self.signed || outcome == Outcome::TimedOut || overloaded)
+        {
             self.out.rank0 = match outcome {
                 Outcome::TimedOut => Some(Rank0Note::TimedOut),
+                Outcome::Probe(ProbeOutcome::Overloaded)
+                | Outcome::Transport(ProbeOutcome::Overloaded) => Some(Rank0Note::TimedOut),
                 Outcome::Failed => Some(Rank0Note::Failed),
                 Outcome::Copy
                 | Outcome::Probe(

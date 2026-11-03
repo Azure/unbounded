@@ -1542,3 +1542,69 @@ fn fill_rank0_asks_previous_owners_on_grants() {
     assert!(!trace.contains("Batch"), "{trace}");
     assert!(trace.contains("Rank { ranking: Authority"), "{trace}");
 }
+
+/// Repeated relay overloads on rank 1's route to rank 0 feed the rank 0 watch like timeouts:
+/// origin is withheld while rank 0 may be fetching, then used once the watch says `Overdue`.
+#[test]
+fn rank0_route_overloads_advance_the_watch_to_origin() {
+    use crate::liveness::{Rank0Watch, WATCH_TTL};
+    const HANG: Duration = Duration::from_secs(10);
+    let mut watch = Rank0Watch::new(8, WATCH_TTL, HANG);
+    let (page, rank0) = (7u32, 10u32);
+    let start = Instant::now();
+    let mut origin_at = None;
+    for step in 0..6u32 {
+        let now = start + Duration::from_secs(4) * step;
+        let state = watch.state(&page, &rank0, now);
+        let mut f = fill(false, Features::PRODUCTION);
+        let mut b = budget(8, 32);
+        let mut note = None;
+        let mut origin = false;
+        for event in [
+            START,
+            Event::Ranked(Ok(owners(5, Some(1)))),
+            Event::Ranked(Err(Error::Unavailable)),
+            Event::Hints {
+                hints: &[],
+                rank0: state,
+            },
+            Event::Reply(Reply::Answer {
+                kind: ResponseKind::Overloaded,
+                signed: false,
+            }),
+            // Fed only when the walk asks for authority.
+            Event::Ranked(Ok(owners(5, Some(1)))),
+        ] {
+            let (action, e) = f.on(event, &mut b, now);
+            note = note.or(e.rank0);
+            origin |= matches!(action, Action::Origin { .. });
+            if matches!(action, Action::Done(_) | Action::Origin { .. }) {
+                break;
+            }
+        }
+        if origin {
+            assert_eq!(
+                state,
+                Rank0State::Overdue,
+                "origin before overdue at step {step}"
+            );
+            origin_at = Some(step);
+            break;
+        }
+        assert_ne!(
+            state,
+            Rank0State::Overdue,
+            "overdue without origin at step {step}"
+        );
+        assert_eq!(
+            note,
+            Some(Rank0Note::TimedOut),
+            "overload fed no note at step {step}"
+        );
+        watch.timed_out(page, rank0, now, now);
+    }
+    assert!(
+        origin_at.is_some_and(|s| s > 0),
+        "origin never used: {origin_at:?}"
+    );
+}
