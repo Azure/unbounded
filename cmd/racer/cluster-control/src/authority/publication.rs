@@ -5,6 +5,7 @@
 //! The same counters never name different content, so a new primary whose
 //! rebuilt content differs from the committed hash always takes new counters.
 
+use super::pools::{self, PoolPlan};
 use racer_control_wire::{
     self as wire, CacheDefinition, ClusterId, Member, MembershipVersion, Publication,
     PublicationSequence,
@@ -41,12 +42,14 @@ pub fn hashes(p: &Publication) -> Result<(String, String), wire::Error> {
     ))
 }
 
-/// Build the next publication from `prev` counters.
+/// Build the next publication from `prev` counters. `pools` name member
+/// Nodes by UID; non-members are left out of each pool.
 pub fn prepare(
     prev: &Record,
     cluster: &str,
     members: impl IntoIterator<Item = Member>,
     caches: Vec<CacheDefinition>,
+    pools: &[PoolPlan],
 ) -> Result<Prepared, wire::Error> {
     let mut p = Publication {
         schema_version: wire::SCHEMA_VERSION,
@@ -55,8 +58,11 @@ pub fn prepare(
         membership_version: MembershipVersion(1),
         members: members.into_iter().collect(),
         caches,
+        pools: Vec::new(),
     };
     p.members.sort_by(|a, b| a.node.cmp(&b.node));
+    let nodes: Vec<&str> = p.members.iter().map(|m| m.node.0.as_str()).collect();
+    p.pools = pools::resolve(pools, &nodes);
     let (content, membership) = hashes(&p)?;
     let mut record = prev.clone();
     if content != prev.content_hash {
@@ -83,7 +89,10 @@ pub fn prepare(
     })
 }
 
-fn members_json(p: &Publication) -> Result<(Value, BTreeMap<String, Value>), wire::Error> {
+/// Members by Node UID, and the cache and pool lists, as encoded.
+type Parts = (Value, Value, BTreeMap<String, Value>);
+
+fn members_json(p: &Publication) -> Result<Parts, wire::Error> {
     let mut v: Value = serde_json::from_slice(&wire::encode_publication(p)?)
         .map_err(|_| wire::Error::InvalidRequest)?;
     let members = match v["members"].take() {
@@ -94,13 +103,13 @@ fn members_json(p: &Publication) -> Result<(Value, BTreeMap<String, Value>), wir
         .into_iter()
         .map(|m| (m["node"].as_str().unwrap_or_default().to_owned(), m))
         .collect();
-    Ok((v["caches"].take(), map))
+    Ok((v["caches"].take(), v["pools"].take(), map))
 }
 
 /// Delta from `base` to `next`, in the old controller's format.
 pub fn encode_delta(base: &Publication, next: &Publication) -> Result<Vec<u8>, wire::Error> {
-    let (_, old) = members_json(base)?;
-    let (caches, new) = members_json(next)?;
+    let (_, _, old) = members_json(base)?;
+    let (caches, pools, new) = members_json(next)?;
     let upsert: Vec<&Value> = new
         .iter()
         .filter(|(k, v)| old.get(*k) != Some(v))
@@ -108,7 +117,7 @@ pub fn encode_delta(base: &Publication, next: &Publication) -> Result<Vec<u8>, w
         .collect();
     let remove: Vec<&String> = old.keys().filter(|k| !new.contains_key(*k)).collect();
     let d = json!({
-        "delta_version": 1,
+        "delta_version": wire::DELTA_VERSION,
         "cluster": next.cluster.0,
         "base_sequence": base.sequence.0.to_string(),
         "base_hash": wire::content_hash(base)?,
@@ -118,6 +127,7 @@ pub fn encode_delta(base: &Publication, next: &Publication) -> Result<Vec<u8>, w
         "upsert_members": upsert,
         "remove_members": remove,
         "caches": caches,
+        "pools": pools,
     });
     let b = serde_json::to_vec(&d).map_err(|_| wire::Error::InvalidRequest)?;
     if b.len() > MAX_DELTA_BYTES {
@@ -219,6 +229,17 @@ mod tests {
         }
     }
 
+    /// Prepare with every cache in the default pool.
+    fn prep(
+        prev: &Record,
+        cluster: &str,
+        members: impl IntoIterator<Item = Member>,
+        caches: Vec<CacheDefinition>,
+    ) -> Result<Prepared, wire::Error> {
+        let plans = pools::plan(&caches, &Default::default(), []);
+        prepare(prev, cluster, members, caches, &plans)
+    }
+
     fn cache() -> CacheDefinition {
         let (c, o) = wire::canonical_socket_paths("a").unwrap();
         CacheDefinition {
@@ -233,41 +254,46 @@ mod tests {
 
     #[test]
     fn counters() {
-        let p1 = prepare(&Record::default(), C, [member(1, 4)], vec![]).unwrap();
+        let p1 = prep(&Record::default(), C, [member(1, 4)], vec![]).unwrap();
         assert_eq!((p1.record.sequence, p1.record.membership_version), (1, 1));
         // Unchanged content keeps counters and bytes.
-        let same = prepare(&p1.record, C, [member(1, 4)], vec![]).unwrap();
+        let same = prep(&p1.record, C, [member(1, 4)], vec![]).unwrap();
         assert_eq!(same.record, p1.record);
         assert_eq!(same.encoded, p1.encoded);
-        // Cache change bumps only the sequence.
-        let p2 = prepare(&p1.record, C, [member(1, 4)], vec![cache()]).unwrap();
-        assert_eq!((p2.record.sequence, p2.record.membership_version), (2, 1));
-        let p3 = prepare(&p2.record, C, [member(1, 4), member(2, 4)], vec![cache()]).unwrap();
-        assert_eq!((p3.record.sequence, p3.record.membership_version), (3, 2));
+        // A new cache joins a pool, so membership changes too.
+        let p2 = prep(&p1.record, C, [member(1, 4)], vec![cache()]).unwrap();
+        assert_eq!((p2.record.sequence, p2.record.membership_version), (2, 2));
+        let p3 = prep(&p2.record, C, [member(1, 4), member(2, 4)], vec![cache()]).unwrap();
+        assert_eq!((p3.record.sequence, p3.record.membership_version), (3, 3));
         let mut max = p3.record.clone();
         max.sequence = u64::MAX;
         assert_eq!(
-            prepare(&max, C, [member(1, 4)], vec![]).err(),
+            prep(&max, C, [member(1, 4)], vec![]).err(),
             Some(wire::Error::Overloaded)
         );
     }
 
     #[test]
-    fn priority_change_republishes_without_membership_change() {
-        let p1 = prepare(&Record::default(), C, [member(1, 4)], vec![cache()]).unwrap();
+    fn priority_change_republishes_with_new_pool_rank() {
+        let p1 = prep(&Record::default(), C, [member(1, 4)], vec![cache()]).unwrap();
         let mut edited = cache();
         edited.priority = 900;
-        let p2 = prepare(&p1.record, C, [member(1, 4)], vec![edited]).unwrap();
+        let p2 = prep(&p1.record, C, [member(1, 4)], vec![edited]).unwrap();
         assert_eq!(p2.record.sequence, p1.record.sequence + 1);
         assert_ne!(p2.record.content_hash, p1.record.content_hash);
-        assert_eq!(p2.record.membership_version, p1.record.membership_version);
-        assert_eq!(p2.record.membership_hash, p1.record.membership_hash);
+        // The default pool's rank is its highest cache priority.
+        assert_eq!(
+            p2.record.membership_version,
+            p1.record.membership_version + 1
+        );
+        assert_ne!(p2.record.membership_hash, p1.record.membership_hash);
         assert_eq!(p2.publication.caches[0].priority, 900);
+        assert_eq!(p2.publication.pools[0].rank, 900);
     }
 
     #[test]
     fn mode_change_republishes_without_membership_change() {
-        let mut record = prepare(&Record::default(), C, [member(1, 4)], vec![cache()])
+        let mut record = prep(&Record::default(), C, [member(1, 4)], vec![cache()])
             .unwrap()
             .record;
         let mut hashes = vec![record.content_hash.clone()];
@@ -279,7 +305,7 @@ mod tests {
         ] {
             let mut edited = cache();
             edited.mode = mode;
-            let next = prepare(&record, C, [member(1, 4)], vec![edited]).unwrap();
+            let next = prep(&record, C, [member(1, 4)], vec![edited]).unwrap();
             assert_eq!(next.record.sequence, record.sequence + 1);
             assert_ne!(next.record.content_hash, record.content_hash);
             assert_eq!(next.record.membership_version, record.membership_version);
@@ -294,18 +320,18 @@ mod tests {
 
     #[test]
     fn failover_never_reuses_counters() {
-        let committed = prepare(&Record::default(), C, [member(1, 4)], vec![])
+        let committed = prep(&Record::default(), C, [member(1, 4)], vec![])
             .unwrap()
             .record;
         // A new primary builds different content from the committed counters.
-        let rebuilt = prepare(&committed, C, [member(1, 5)], vec![]).unwrap();
+        let rebuilt = prep(&committed, C, [member(1, 5)], vec![]).unwrap();
         assert_eq!(rebuilt.record.sequence, 2);
         assert_eq!(rebuilt.record.membership_version, 2);
     }
 
     #[test]
     fn delta_roundtrip_and_selection() {
-        let p1 = prepare(
+        let p1 = prep(
             &Record::default(),
             C,
             (1..50).map(|n| member(n, 4)),
@@ -318,7 +344,7 @@ mod tests {
             p1.encoded.clone(),
             None,
         );
-        let p2 = prepare(
+        let p2 = prep(
             &p1.record,
             C,
             (2..51).map(|n| member(n, if n == 7 { 9 } else { 4 })),
@@ -343,7 +369,7 @@ mod tests {
 
     #[test]
     fn follower_verification() {
-        let p = prepare(&Record::default(), C, [member(1, 4)], vec![]).unwrap();
+        let p = prep(&Record::default(), C, [member(1, 4)], vec![]).unwrap();
         assert!(verify_image(&p.encoded, C, &p.record).is_ok());
         let mut other = p.record.clone();
         other.content_hash = "0".repeat(64);
@@ -364,5 +390,82 @@ mod tests {
         );
         assert!(verify_image(b"{}", C, &p.record).is_err());
         assert_eq!(history(&p.publication).len(), 1);
+    }
+
+    fn gpu_pool() -> Vec<PoolPlan> {
+        let selector = pools::Selector::parse(Some(&json!({"matchLabels":{"gpu":"yes"}})))
+            .unwrap()
+            .unwrap();
+        let selectors = BTreeMap::from([(cache().id, selector)]);
+        let gpu = BTreeMap::from([("gpu".to_owned(), "yes".to_owned())]);
+        let none = BTreeMap::new();
+        let n = |i: u8| member(i, 4).node.0;
+        let (n1, n2, n3) = (n(1), n(2), n(3));
+        pools::plan(
+            &[cache()],
+            &selectors,
+            [
+                (n1.as_str(), &none),
+                (n2.as_str(), &gpu),
+                (n3.as_str(), &gpu),
+            ],
+        )
+    }
+
+    #[test]
+    fn pools_resolve_to_member_indexes_and_bump_membership() {
+        let plans = gpu_pool();
+        let members = || [member(3, 4), member(1, 4), member(2, 4)];
+        let p1 = prepare(&Record::default(), C, members(), vec![cache()], &plans).unwrap();
+        assert_eq!(p1.publication.pools.len(), 1);
+        assert_eq!(p1.publication.pools[0].members, Some(vec![1, 2]));
+        assert_eq!(p1.publication.pools[0].rank, (1 << 32) | 500);
+        // Same inputs in another order, as on another primary: same bytes.
+        let again = prepare(
+            &Record::default(),
+            C,
+            [member(2, 4), member(3, 4), member(1, 4)],
+            vec![cache()],
+            &plans,
+        )
+        .unwrap();
+        assert_eq!(again.encoded, p1.encoded);
+        assert_eq!(again.record, p1.record);
+        // A node leaving the pool changes only membership-relevant pools.
+        let mut moved = plans.clone();
+        moved[0]
+            .nodes
+            .as_mut()
+            .unwrap()
+            .remove(&member(3, 4).node.0);
+        let p2 = prepare(&p1.record, C, members(), vec![cache()], &moved).unwrap();
+        assert_eq!(p2.publication.pools[0].members, Some(vec![1]));
+        assert_eq!(p2.record.sequence, p1.record.sequence + 1);
+        assert_eq!(
+            p2.record.membership_version,
+            p1.record.membership_version + 1
+        );
+        // Moving the cache to the default pool also bumps membership.
+        let p3 = prep(&p2.record, C, members(), vec![cache()]).unwrap();
+        assert_eq!(p3.publication.pools[0].members, None);
+        assert_eq!(
+            p3.record.membership_version,
+            p2.record.membership_version + 1
+        );
+        // Pools naming non-members leave them out.
+        let p4 = prepare(&p3.record, C, [member(1, 4)], vec![cache()], &plans).unwrap();
+        assert_eq!(p4.publication.pools[0].members, Some(vec![]));
+        // Deltas carry pools.
+        let i3 = Image::new(
+            p3.record.clone(),
+            p3.publication.clone(),
+            p3.encoded.clone(),
+            None,
+        );
+        let d = encode_delta(&i3.publication, &p4.publication).unwrap();
+        let applied = wire::apply_delta(&p3.publication, &d).unwrap();
+        assert_eq!(wire::encode_publication(&applied).unwrap(), p4.encoded);
+        // Uncovered caches are rejected.
+        assert!(prepare(&Record::default(), C, members(), vec![cache()], &[]).is_err());
     }
 }
