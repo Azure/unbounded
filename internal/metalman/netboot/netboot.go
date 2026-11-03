@@ -182,7 +182,7 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 const userDataPath = "cloud-init/user-data"
 
 const (
-	gb200TestImageRepository       = "ghcr.io/azure/host-ubuntu2404-gb200-access"
+	gb200TestImageRepository       = "ghcr.io/azure/host-ubuntu2404-gb200-test"
 	gb200ProductionImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167"
 )
 

@@ -5,8 +5,8 @@ FROM scratch
 ARG VERSION
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
       org.opencontainers.image.revision="${VERSION}" \
-      org.opencontainers.image.description="MetalMan Ubuntu 24.04 ARM64 GB200 access host disk" \
+      org.opencontainers.image.description="MetalMan Ubuntu 24.04 ARM64 GB200 test host disk" \
       io.unbounded.host.architecture="arm64" \
       io.unbounded.host.base.digest="sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb"
-COPY images/host-ubuntu2404-gb200-access/output/disk /disk
+COPY images/host-ubuntu2404-gb200-test/output/disk /disk
 COPY LICENSE NOTICE /unbounded/licenses/

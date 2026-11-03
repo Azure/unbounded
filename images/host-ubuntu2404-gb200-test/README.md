@@ -1,4 +1,4 @@
-# Ubuntu 24.04 GB200 access host image
+# Ubuntu 24.04 GB200 test host image
 
 This ARM64-only image derives from the pinned immutable disk:
 
@@ -6,7 +6,7 @@ This ARM64-only image derives from the pinned immutable disk:
 ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
 ```
 
-The derivative makes only the access and recovery changes required for this
+The derivative makes only the test and recovery changes required for this
 image:
 
 - installs pinned `ssh-import-id` and the reviewed locked cloud-init users;
@@ -34,12 +34,12 @@ Build on a native ARM64 Linux host:
 
 ```bash
 sudo apt-get install -y pigz
-sudo images/host-ubuntu2404-gb200-access/build.sh
+sudo images/host-ubuntu2404-gb200-test/build.sh
 docker build \
   --platform linux/arm64 \
   --build-arg VERSION="$(git rev-parse HEAD)" \
-  -t host-ubuntu2404-gb200-access:test \
-  -f images/host-ubuntu2404-gb200-access/Containerfile .
+  -t host-ubuntu2404-gb200-test:test \
+  -f images/host-ubuntu2404-gb200-test/Containerfile .
 ```
 
 Building or publishing the artifact does not update or reboot a live machine.

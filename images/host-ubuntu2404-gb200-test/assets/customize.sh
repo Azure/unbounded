@@ -33,7 +33,7 @@ test "$(dpkg-query -W -f='${Version}' wget)" = 1.21.4-1ubuntu4.5 ||
 test "$(dpkg-query -W -f='${Version}' ssh-import-id)" = 5.11-0ubuntu2.24.04.1 ||
     fail "unexpected ssh-import-id version"
 
-cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
+cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-test-users.cfg
 grep -qx 'options nvidia NVreg_NvLinkDisable=1' "${nvlink_config}" ||
     fail "rootfs GPU NVLink policy changed"
 

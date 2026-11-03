@@ -48,8 +48,8 @@ customize_disk() {
         "${root}/tmp/wget.deb"
     install -D -m 0644 "${work}/packages/${agent_asset}" \
         "${root}/opt/unbounded/bootstrap/${agent_asset}"
-    install -D -m 0644 "${script_dir}/assets/90-gb200-access-users.cfg" \
-        "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
+    install -D -m 0644 "${script_dir}/assets/90-gb200-test-users.cfg" \
+        "${root}/etc/cloud/cloud.cfg.d/90-gb200-test-users.cfg"
     install -D -m 0644 "${script_dir}/assets/99-nvidia-disable-nvlink.conf" \
         "${root}/etc/modprobe.d/99-nvidia-disable-nvlink.conf"
     install -D -m 0755 "${script_dir}/assets/customize.sh" \
@@ -64,8 +64,8 @@ customize_disk() {
         /bin/sh /tmp/customize.sh
     rm -f "${root}/tmp/customize.sh" "${root}/usr/sbin/policy-rc.d"
 
-    cmp "${script_dir}/assets/90-gb200-access-users.cfg" \
-        "${root}/etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg"
+    cmp "${script_dir}/assets/90-gb200-test-users.cfg" \
+        "${root}/etc/cloud/cloud.cfg.d/90-gb200-test-users.cfg"
     cmp "${script_dir}/assets/99-nvidia-disable-nvlink.conf" \
         "${root}/etc/modprobe.d/99-nvidia-disable-nvlink.conf"
     test ! -s "${root}/etc/machine-id"
@@ -90,7 +90,7 @@ fi
 
 test "$#" -eq 0
 output="${script_dir}/output"
-work=$(mktemp -d /var/tmp/gb200-access.XXXXXX)
+work=$(mktemp -d /var/tmp/gb200-test.XXXXXX)
 source_container=
 
 cleanup() {
