@@ -506,8 +506,14 @@ class Client:
     def _prefetch_error(h: wire.ResponseHead, payload: bytes) -> PrefetchError:
         retry = None
         value = (h.get("retry-after") or "").strip()
-        if value.isdigit():
-            retry = float(int(value))
+        # Accept only ASCII digits: str.isdigit() also accepts characters such
+        # as superscripts that int() rejects. Malformed or oversized values
+        # leave retry as None so the status and error code still surface.
+        if value.isascii() and value.isdigit():
+            try:
+                retry = float(int(value))
+            except (ValueError, OverflowError):
+                retry = None
         code, message = "", ""
         try:
             data = json.loads(payload)

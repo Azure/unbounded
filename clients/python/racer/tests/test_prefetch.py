@@ -180,6 +180,8 @@ def test_invalid_ids(tmp_path, pid):
         (409, [], b'{"code":"stale_sequence","message":"old"}', "stale_sequence", None),
         (429, [("Retry-After", "7")], b'{"code":"ticket_limit","message":"x"}', "ticket_limit", 7.0),
         (429, [("Retry-After", "soon")], b'{"code":"pending_limit","message":"x"}', "pending_limit", None),
+        (429, [("Retry-After", "\u00b2")], b'{"code":"ticket_limit","message":"x"}', "ticket_limit", None),
+        (429, [("Retry-After", "9" * 400)], b'{"code":"ticket_limit","message":"x"}', "ticket_limit", None),
         (503, [], b"", "", None),
         (500, [("Content-Type", "text/html")], b"<html>", "", None),
     ],
