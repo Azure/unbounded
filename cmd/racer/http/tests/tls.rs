@@ -187,6 +187,7 @@ struct Fixture {
     reactor: std::rc::Rc<Reactor>,
     pool: Pool,
     io: Io,
+    admission: std::rc::Rc<Quotas<Limits>>,
 }
 fn fixture() -> Fixture {
     let admission = std::rc::Rc::new(Quotas::new(Limits));
@@ -207,11 +208,16 @@ fn fixture() -> Fixture {
     let io = Io::new(
         std::rc::Rc::new(reactor.clone()),
         Codec::new(16 * 1024),
-        std::rc::Rc::new(Caller(admission)),
+        std::rc::Rc::new(Caller(admission.clone())),
         (PAGE * 2) as u64,
         1 << 20,
     );
-    Fixture { reactor, pool, io }
+    Fixture {
+        reactor,
+        pool,
+        io,
+        admission,
+    }
 }
 fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
@@ -583,6 +589,157 @@ fn kernel_mode_fails_when_key_install_fails() {
     http1::tls::fail_next_key_installs(0);
     drop(fixture);
     server.join().unwrap();
+}
+
+/// Hold an accepted socket without answering until the peer closes it.
+/// Returns true when the client closed the socket (EOF or reset) and false if
+/// it stayed open past the watchdog.
+fn stall_until_closed(mut tcp: std::net::TcpStream) -> bool {
+    tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match tcp.read(&mut buffer) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Poll `future` until `ready` holds, so it is parked mid-handshake.
+fn drive_until(
+    reactor: &Reactor,
+    future: &mut std::pin::Pin<&mut impl Future>,
+    ready: impl Fn() -> bool,
+) {
+    let until = Instant::now() + Duration::from_secs(30);
+    let mut cx = Context::from_waker(Waker::noop());
+    while !ready() {
+        assert!(
+            future.as_mut().poll(&mut cx).is_pending(),
+            "checkout must stay pending against a stalled server"
+        );
+        assert!(Instant::now() < until, "fixture watchdog");
+        reactor.poll_budgeted(64).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    // Let the client flush what it can (ClientHello) before abandonment.
+    for _ in 0..10 {
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        reactor.poll_budgeted(64).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+}
+
+/// After abandonment the slot, admission, and pool entry are released and
+/// nothing unfinished was parked in the idle pool.
+fn assert_released(fixture: &Fixture, endpoint: &Endpoint) {
+    for (key, (active, idle)) in fixture.pool.snapshot().entries {
+        if key == *endpoint {
+            assert_eq!((active, idle), (0, 0), "no active or idle connection");
+        }
+    }
+    assert_eq!(
+        fixture.admission.used(Resource::Connection),
+        0,
+        "slot released"
+    );
+    assert_eq!(fixture.reactor.in_flight(), 0);
+}
+
+/// Dropping a checkout whose TLS handshake is stalled releases its slot and
+/// closes the socket without pooling the unfinished connection.
+#[test]
+fn abandoned_tls_handshake_releases_connection() {
+    let identity = identity(&["localhost"]);
+    for mode in [TlsMode::Userspace, TlsMode::Auto] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            stall_until_closed(tcp)
+        });
+        let fixture = fixture();
+        let endpoint = tls_endpoint(&identity, address, mode);
+        let scope = scope();
+        {
+            let checkout = fixture.pool.checkout(&endpoint, &scope);
+            let mut checkout = std::pin::pin!(checkout);
+            drive_until(&fixture.reactor, &mut checkout, || {
+                accepted.load(Ordering::SeqCst) == 1
+            });
+        }
+        drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
+        assert_released(&fixture, &endpoint);
+        assert!(server.join().unwrap(), "client socket closed ({mode:?})");
+        assert_eq!(fixture.admission.used(Resource::Context), 0);
+    }
+}
+
+/// Cancelling a checkout while the userspace reconnect after a failed kernel
+/// key install is stalled releases both sockets and the slot.
+#[cfg(feature = "test-util")]
+#[test]
+fn cancelled_fallback_reconnect_releases_connection() {
+    if !kernel_tls_available() {
+        return;
+    }
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(identity.chain.clone(), identity.key.clone_key())
+            .unwrap(),
+    );
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = std::thread::spawn(move || {
+        // First connection: complete the handshake so the client reaches key
+        // installation, then wait for it to drop the socket.
+        let (mut tcp, _) = listener.accept().unwrap();
+        counter.fetch_add(1, Ordering::SeqCst);
+        let mut session = rustls::ServerConnection::new(config).unwrap();
+        while session.is_handshaking() {
+            session.complete_io(&mut tcp).unwrap();
+        }
+        while session.wants_write() {
+            session.write_tls(&mut tcp).unwrap();
+        }
+        let first = stall_until_closed(tcp);
+        // Second connection: the userspace reconnect, stalled.
+        let (tcp, _) = listener.accept().unwrap();
+        counter.fetch_add(1, Ordering::SeqCst);
+        (first, stall_until_closed(tcp))
+    });
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Auto);
+    let scope = scope();
+    http1::tls::fail_next_key_installs(1);
+    let result = {
+        let checkout = fixture.pool.checkout(&endpoint, &scope);
+        let mut checkout = std::pin::pin!(checkout);
+        drive_until(&fixture.reactor, &mut checkout, || {
+            accepted.load(Ordering::SeqCst) == 2
+        });
+        scope.cancellation.cancel().unwrap();
+        drive(&fixture.reactor, checkout)
+    };
+    http1::tls::fail_next_key_installs(0);
+    assert!(matches!(
+        result.err(),
+        Some(Error::Runtime(uring_runtime::Error::Cancelled))
+    ));
+    drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
+    assert_released(&fixture, &endpoint);
+    assert_eq!(server.join().unwrap(), (true, true), "both sockets closed");
+    assert_eq!(fixture.admission.used(Resource::Context), 0);
 }
 
 /// Report client CPU per GiB for each record-layer placement:
