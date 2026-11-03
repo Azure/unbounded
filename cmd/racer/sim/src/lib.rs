@@ -13,6 +13,8 @@
 //! - [`report`]: histograms, counters, invariants, memory accounting.
 //! - [`phantom`]: shared-memo placement rankings and route searches that
 //!   keep every node's caches small.
+//! - [`mesh`]: mesh v2 measurements (peers per node, route links by
+//!   transport, edges changed by churn) and topology-only mesh scenarios.
 //! - [`node`]: real node logic (placement, routes, walk, flights, fill,
 //!   serve, caches, admission) driven by events; every scenario runs it.
 
@@ -21,6 +23,7 @@ pub mod config;
 pub mod control;
 pub mod engine;
 pub mod faults;
+pub mod mesh;
 pub mod node {
     //! Real Racer node logic, payload-free, for many simulated nodes.
     //!
@@ -64,6 +67,7 @@ pub const USAGE: &str = "usage: racer-sim [--scenario NAME] [--nodes N] [--seed 
 [--duration D] [--config FILE.json] [--out PATH]\n\
 scenarios: smoke, caches-only, zipf, storm, churn, faults, empty,\n\
            enrollment-storm, failover, ctl-churn, lagging,\n\
+           mesh, mesh-selector,\n\
            full-cold-start, full-failover, full-churn, full-lagging\n\
 durations: integer with ns, us, ms or s suffix (plain numbers are seconds)";
 
@@ -75,6 +79,8 @@ pub const SCENARIOS: &[&str] = &[
     "churn",
     "faults",
     "empty",
+    "mesh",
+    "mesh-selector",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,7 +287,9 @@ pub fn run(options: &Options) -> Result<Value, String> {
     }
     #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
     let started = std::time::Instant::now();
-    let mut report = if combined::SCENARIOS.contains(&scenario) {
+    let mut report = if scenario == "mesh" || scenario == "mesh-selector" {
+        mesh_scenario(scenario, &config, options.seed).run()
+    } else if combined::SCENARIOS.contains(&scenario) {
         combined::run(
             scenario,
             config,
@@ -297,6 +305,17 @@ pub fn run(options: &Options) -> Result<Value, String> {
     };
     report["wall_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
     Ok(report)
+}
+
+/// A topology-only mesh scenario from the config: `nodes` and `sites`; `mesh-selector` adds a
+/// selector pool of 256 members (or `nodes / 2` in smaller clusters).
+pub fn mesh_scenario(scenario: &str, config: &Config, seed: u64) -> mesh::MeshScenario {
+    let mut s = mesh::MeshScenario::new(config.nodes, seed);
+    s.sites = config.sites.max(1);
+    if scenario == "mesh-selector" {
+        s.selector = 256.min((config.nodes / 2).max(1));
+    }
+    s
 }
 
 #[cfg(test)]
