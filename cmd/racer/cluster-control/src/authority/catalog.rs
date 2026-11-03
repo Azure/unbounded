@@ -168,13 +168,17 @@ fn go_duration(s: &str) -> Option<std::time::Duration> {
             whole.parse().ok()?
         };
         let mut value = whole.checked_mul(scale)?;
-        // Go truncates fractional digits beyond nanosecond precision.
+        // Go keeps the fraction digits that fit and ignores the rest. The
+        // first 25 digits already resolve far below one nanosecond for every
+        // unit (scale < 4e12), and 10^25 * scale stays well inside u128.
         let (mut numerator, mut denominator) = (0u128, 1u128);
-        for b in fraction.bytes().take(30) {
-            numerator = numerator * 10 + u128::from(b - b'0');
-            denominator *= 10;
+        for b in fraction.bytes().take(25) {
+            numerator = numerator
+                .checked_mul(10)?
+                .checked_add(u128::from(b - b'0'))?;
+            denominator = denominator.checked_mul(10)?;
         }
-        value += numerator * scale / denominator;
+        value = value.checked_add(numerator.checked_mul(scale)? / denominator)?;
         total = total.checked_add(value)?;
         if value > limit || total > limit {
             return None;
@@ -185,11 +189,12 @@ fn go_duration(s: &str) -> Option<std::time::Duration> {
         return None;
     }
     let total = u64::try_from(total).ok()?;
-    let duration = std::time::Duration::from_nanos(total);
-    duration
-        .subsec_nanos()
-        .is_multiple_of(1_000_000)
-        .then_some(duration)
+    millisecond_precision(std::time::Duration::from_nanos(total))
+}
+
+/// Accept only durations the wire can carry exactly in milliseconds.
+fn millisecond_precision(d: std::time::Duration) -> Option<std::time::Duration> {
+    d.subsec_nanos().is_multiple_of(1_000_000).then_some(d)
 }
 
 /// Build the catalog sorted by UID. Any invalid cache fails the whole catalog.
@@ -375,6 +380,13 @@ mod tests {
             ("1000\u{b5}s", ms(1)),
             ("1000\u{3bc}s", ms(1)),
             ("1h2m3s4ms", ms(3_723_004)),
+            // Long fractions keep the precision that fits and ignore the rest.
+            ("0.100000000000000000000000000000h", ms(360_000)),
+            ("0.500000000000000000000000000000000000000000m", ms(30_000)),
+            ("1.250000000000000000000000000000000000000000s", ms(1_250)),
+            ("1.000000000000000000000000000000000000000009ms", ms(1)),
+            ("1000.000000000000000000000000000000000000009us", ms(1)),
+            ("1000000.00000000000000000000000000000000009ns", ms(1)),
         ] {
             assert_eq!(go_duration(s), Some(d), "{s}");
         }
@@ -397,6 +409,14 @@ mod tests {
             "9223372036854775808ns",
             "3000000h",
             "1S",
+            // Truncated to 999999ns, below millisecond precision.
+            "0.999999999999999999999999999999999999999999ms",
+            // Overflow is rejected without a panic.
+            "2562048h",
+            "2562047.9999999999999999999999999999999h",
+            "99999999999999999999999999999999999999999h",
+            "9223372036854775807ns1ns",
+            "2562047h2562047h",
         ] {
             assert_eq!(go_duration(s), None, "{s}");
         }
