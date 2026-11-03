@@ -38,6 +38,9 @@ type nodeDisks struct {
 	Disks    []disks.Disk `json:"disks"`
 	// Problem explains why Disks is empty, if it is.
 	Problem string `json:"problem,omitempty"`
+	// AnnotationError is set when the approval annotation is invalid. The
+	// dataplane ignores an invalid value entirely, so Approved is empty.
+	AnnotationError string `json:"annotationError,omitempty"`
 
 	report *disks.Report
 	legacy bool
@@ -125,11 +128,27 @@ func fromNode(n *corev1.Node) *nodeDisks {
 	_, legacy := n.Annotations[disks.LegacyBlockDevicesAnnotation]
 	v, annotated := n.Annotations[disks.Annotation]
 
-	return &nodeDisks{
+	nd := &nodeDisks{
 		Node:      n.Name,
-		Approved:  disks.ParseAnnotation(v),
 		legacy:    legacy,
 		annotated: annotated,
+	}
+
+	// The dataplane approves nothing from an invalid value, so expose no
+	// effective approvals rather than the entries that happen to parse.
+	if err := disks.ValidateAnnotation(v); err != nil {
+		nd.AnnotationError = err.Error()
+	} else {
+		nd.Approved = disks.ParseAnnotation(v)
+	}
+
+	return nd
+}
+
+func warnInvalid(w io.Writer, nd *nodeDisks) {
+	if nd.AnnotationError != "" {
+		printf(w, "Warning: node %s: %s annotation is invalid and approves no disks (%s); clear it with 'kubectl unbounded racer disks revoke %s --all'\n",
+			nd.Node, disks.Annotation, nd.AnnotationError, nd.Node)
 	}
 }
 
@@ -232,6 +251,7 @@ func (e *env) list(ctx context.Context, nodes []string, output string) error {
 
 	for _, nd := range result {
 		warnLegacy(e.errOut, nd)
+		warnInvalid(e.errOut, nd)
 
 		if nd.Problem != "" {
 			printf(e.errOut, "Warning: node %s: %s\n", nd.Node, nd.Problem)
@@ -469,6 +489,10 @@ func (e *env) allow(ctx context.Context, node string, ids []string, o allowOpts)
 
 	warnLegacy(e.errOut, nd)
 
+	if nd.AnnotationError != "" {
+		return fmt.Errorf("existing annotation on Node %s is invalid and approves no disks; clear it with 'revoke --all' first: %s", node, nd.AnnotationError)
+	}
+
 	if nd.report == nil || nd.report.Disks == nil {
 		printf(e.errOut, "Warning: node %s: %s\n", node, nd.Problem)
 	}
@@ -661,6 +685,7 @@ func (e *env) revoke(ctx context.Context, node string, ids []string, all, yes bo
 	}
 
 	warnLegacy(e.errOut, nd)
+	warnInvalid(e.errOut, nd)
 
 	var remove []string
 

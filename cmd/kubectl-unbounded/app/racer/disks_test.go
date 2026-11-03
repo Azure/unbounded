@@ -566,8 +566,23 @@ func TestMutationsRefuseInvalidExisting(t *testing.T) {
 				t.Fatalf("allow: want invalid existing error, got %v", err)
 			}
 
+			// An entry that parses from the invalid value is not an
+			// effective approval, so allow must not report it as done.
+			if err := h.e.allow(ctx, "n", []string{"wwn-old"}, allowOpts{yes: true, force: true}); err == nil || !strings.Contains(err.Error(), "revoke --all") {
+				t.Fatalf("allow existing entry: want invalid existing error, got %v", err)
+			}
+
+			if strings.Contains(h.out.String(), "already approved") {
+				t.Fatalf("allow reported invalid entry as approved: %s", h.out.String())
+			}
+
 			if v, _ := h.annotation(t, "n"); v != old {
 				t.Fatal("allow modified annotation")
+			}
+
+			// Revoking a single entry finds nothing effective to revoke.
+			if err := h.e.revoke(ctx, "n", []string{"wwn-old"}, false, true); err == nil {
+				t.Fatal("revoke of entry in invalid annotation succeeded")
 			}
 
 			// Clearing is always permitted.
@@ -579,6 +594,49 @@ func TestMutationsRefuseInvalidExisting(t *testing.T) {
 				t.Fatal("annotation still present")
 			}
 		})
+	}
+}
+
+func TestListInvalidAnnotation(t *testing.T) {
+	h := newHarness("", false,
+		node("n", map[string]string{disks.Annotation: "wwn-old,bad/id"}),
+		pod("racer-n", "n", fixture(t)))
+	if err := h.e.list(context.Background(), []string{"n"}, "json"); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(h.err.String(), "invalid and approves no disks") || !strings.Contains(h.err.String(), "revoke n --all") {
+		t.Fatalf("missing invalid warning: %s", h.err.String())
+	}
+
+	var got []nodeDisks
+	if err := json.Unmarshal(h.out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 1 || len(got[0].Approved) != 0 || got[0].AnnotationError == "" {
+		t.Fatalf("got %+v", got)
+	}
+
+	// A valid annotation reports approvals and no error.
+	h = newHarness("", false,
+		node("n", map[string]string{disks.Annotation: "wwn-old"}),
+		pod("racer-n", "n", fixture(t)))
+	if err := h.e.list(context.Background(), []string{"n"}, "json"); err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(h.err.String(), "invalid") {
+		t.Fatalf("unexpected warning: %s", h.err.String())
+	}
+
+	got = nil
+	if err := json.Unmarshal(h.out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 1 || len(got[0].Approved) != 1 || got[0].AnnotationError != "" {
+		t.Fatalf("got %+v", got)
 	}
 }
 
