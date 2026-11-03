@@ -59,7 +59,8 @@ another fetch.
   completes a read with bad data.
 - **One cache for images, models, and datasets.** Several caches share each
   node's capacity by priority. Gantry can store container images in Racer, and
-  apps can warm and hold specific model or dataset versions ahead of a job.
+  apps can prefetch model or dataset ranges ahead of a job. Prefetch is best
+  effort and does not pin pages.
 - **Consistent versions.** Every page of a read comes from the same version.
   Readers never get a mix of old and new bytes while the source changes.
 - **Fast paths for GPU nodes.** Racer can move pages over RDMA within a Site
