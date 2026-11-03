@@ -223,7 +223,7 @@ does not depend on the check being exhaustive:
 | `metadata.resourceVersion` | The operator applies rather than updates, so a `resourceVersion` here is always wrong. Watch for this when pasting from `kubectl get -o yaml`. |
 | `status` | Owned by the workload controller, not by the operator. Also easy to paste in by accident. |
 | `spec.template.spec.serviceAccountName` | Retargeting borrows another identity's API permissions. |
-| `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. |
+| `hostNetwork`, `hostPID`, `hostIPC` | Deliberate per-component decisions. One exception: a `racer` `DaemonSet` entry may set `hostNetwork` to a boolean, because RDMA devices that connect through the RDMA connection manager (such as Azure MANA) need the dataplane in the host network namespace. Set `dnsPolicy: ClusterFirstWithHostNet` with it. |
 | Labels and annotations under `unbounded-cloud.io/` | They carry config hashes, Site scoping and override visibility. |
 | `spec.replicas` on `metalman` | The Site owns it: set `spec.components.metalman.replicas`. See below. |
 | Repointing an operator-declared mount | Mount identity is `(container, mountPath)`, because `volumeMounts` merge on `mountPath` rather than on name, so protecting them by name would be bypassable. Mounting a *different* volume at a path the operator already mounts is refused; adjusting the same mount, for example `readOnly`, is not. |

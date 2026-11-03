@@ -255,7 +255,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
-| `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
+| `RACER_REGISTERED_BYTES` | Unset: `402653184` (384 MiB) per final I/O worker | Native RDMA page-buffer budget when enabled; an explicit value is node-wide. Each grant holds one 18 MiB buffer until its page is consumed, so many concurrent reads from many peers need several hundred buffers per node; `racer_rdma_free_buffers` shows what is left |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `33554432` (32 MiB) per final I/O worker | Request-context budget; an explicit value is node-wide |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
@@ -310,7 +310,11 @@ allocator, TLS, and filesystem cache are additional. Invalid combinations fail v
 ### Raw-device storage
 
 Set the Node annotation `racer.unbounded-cloud.io/block-devices` to a regex over
-basenames in `/host/dev/disk/by-id`, not full paths. The selector is limited to
+basenames in `/host/dev/disk/by-id`, not full paths. On nodes without udev, where
+`/host/dev/disk/by-id` does not exist, the selector instead matches the kernel
+names in `/sys/block` (such as `nvme1n1`) and, for NVMe devices, the name udev
+would give them (`nvme-<model>_<serial>`, whitespace replaced by `_`), so the
+same selector works on both. The selector is limited to
 1 KiB (1,024 bytes) and compiled with Rust's `regex` crate. Invalid or oversized
 values fall back to file-backed slabs. Matching is **unanchored**:
 use `^` and `$` to avoid unintended substring and partition matches.
@@ -972,6 +976,16 @@ and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-s
 are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
 network access, especially with host networking.
 
+`racer_delivery_bytes_total` counts every body byte delivered to clients;
+`racer_delivery_direct_bytes_total` counts only those sent outside the splice path.
+
+A failed client request also counts in one of
+`racer_request_errors_overloaded_total`, `racer_request_errors_unavailable_total`,
+`racer_request_errors_deadline_total`, `racer_request_errors_cancelled_total`, or
+`racer_request_errors_other_total`, by the first error it reported, and each I/O
+thread logs at most one `stage=client-request state=failed` line every 10 s
+(with the number suppressed since). `/debug/terminal` keeps the details.
+
 The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 
@@ -1294,6 +1308,16 @@ change placement; in-flight snapshots mean label changes are not immediate revoc
 | `false` | Disable native RDMA |
 
 Release images include native verbs support; discovery/provider failures retain HTTP.
+Native activation registers the page-buffer pool within 5 s plus 1 s per GiB of
+`RACER_REGISTERED_BYTES`. When it fails, the dataplane logs
+`stage=rdma-activation state=failed`, counts `racer_rdma_activation_failures_total`,
+reports no RDMA rails (so peers stop planning RDMA to it), and retries; it
+advertises its rails again once activation succeeds. `racer_rdma_active` is 1
+while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
+`racer_rdma_http_fallback_total` counts pages that planned RDMA but went over
+HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
+split out the two common reasons: no ready link to the peer yet, and a grant that
+failed (usually because every page buffer was in use).
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 type failureReason uint8
@@ -159,7 +161,7 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 		}
 	}
 
-	attrs := []any{"reason", reason.String(), "kind", kind, "http_status", status, "suppressed", suppressed}
+	attrs := []any{"reason", reason.String(), "kind", kind, "http_status", status, "suppressed", suppressed, "cause", failureCause(err)}
 	if reason == failureDigest && failure != nil && failure.integrity != nil {
 		evidence := failure.integrity
 		expected := safeSHA256(evidence.expectedDigest)
@@ -177,4 +179,39 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 	}
 
 	logger.Warn("blob batch failed", attrs...)
+}
+
+// failureCause names the class of err without its text, which can carry URLs,
+// credentials, or other caller data: an SDK sentinel, a context or socket
+// condition, or "other".
+func failureCause(err error) string {
+	var timeout net.Error
+
+	for _, c := range []struct {
+		target error
+		name   string
+	}{
+		{context.Canceled, "canceled"},
+		{context.DeadlineExceeded, "deadline_exceeded"},
+		{io.ErrUnexpectedEOF, "unexpected_eof"},
+		{net.ErrClosed, "closed"},
+		{racersdk.ErrUnavailable, "unavailable"},
+		{racersdk.ErrNotFound, "not_found"},
+		{racersdk.ErrVersionMismatch, "version_mismatch"},
+		{racersdk.ErrRangeNotSatisfiable, "range_not_satisfiable"},
+		{racersdk.ErrInvalidRequest, "invalid_request"},
+		{racersdk.ErrUnauthorized, "unauthorized"},
+		{racersdk.ErrForbidden, "forbidden"},
+		{racersdk.ErrDestination, "destination"},
+	} {
+		if errors.Is(err, c.target) {
+			return c.name
+		}
+	}
+
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return "timeout"
+	}
+
+	return "other"
 }

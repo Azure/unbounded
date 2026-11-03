@@ -140,7 +140,7 @@ func validateEntry(sourced SourcedEntry) []string {
 	problems = append(problems, validateAddNames("addContainers", entry.AddContainers)...)
 	problems = append(problems, validateAddNames("addInitContainers", entry.AddInitContainers)...)
 	problems = append(problems, reportAddedContainers(entry)...)
-	problems = append(problems, validatePatch(entry.Patch)...)
+	problems = append(problems, validatePatch(entry.Component, entry.Patch)...)
 	problems = append(problems, reportTypedFieldConflicts(entry)...)
 
 	return problems
@@ -305,7 +305,7 @@ func validateAddNames(field string, names []string) []string {
 }
 
 // validatePatch walks a patch against the allowlist.
-func validatePatch(patch map[string]any) []string {
+func validatePatch(component string, patch map[string]any) []string {
 	if len(patch) == 0 {
 		return nil
 	}
@@ -316,7 +316,7 @@ func validatePatch(patch map[string]any) []string {
 		problems = append(problems, problem)
 	}
 
-	walkPatch(patch, "", compiledAllowlist.root, report)
+	walkPatch(component, patch, "", compiledAllowlist.root, report)
 	reportAffinityTerms(patch, report)
 	reportAffinityExtras(patch, report)
 
@@ -455,7 +455,7 @@ func reportTermExpressions(term map[string]any, at string, report func(string)) 
 //     open and directives can delete operator-managed content
 //   - an explicit null, which strategic merge treats as deletion and which a
 //     path allowlist alone would not catch
-func walkPatch(value any, path string, node *pathNode, report func(string)) {
+func walkPatch(component string, value any, path string, node *pathNode, report func(string)) {
 	if value == nil {
 		report(fmt.Sprintf("%s is explicitly null; strategic merge treats null as deletion, which cannot be used to remove operator-managed content",
 			describePath(path)))
@@ -465,16 +465,16 @@ func walkPatch(value any, path string, node *pathNode, report func(string)) {
 
 	switch typed := value.(type) {
 	case map[string]any:
-		walkPatchMap(typed, path, node, report)
+		walkPatchMap(component, typed, path, node, report)
 	case []any:
-		walkPatchList(typed, path, node, report)
+		walkPatchList(component, typed, path, node, report)
 	default:
 		// A scalar at a permitted leaf is the normal case; anything not
 		// permitted was already reported by the parent.
 	}
 }
 
-func walkPatchMap(value map[string]any, path string, node *pathNode, report func(string)) {
+func walkPatchMap(component string, value map[string]any, path string, node *pathNode, report func(string)) {
 	keys := make([]string, 0, len(value))
 
 	for key := range value {
@@ -493,8 +493,16 @@ func walkPatchMap(value map[string]any, path string, node *pathNode, report func
 			continue
 		}
 
-		if reason, protected := protectedReason(childPath); protected {
+		if reason, protected := protectedReasonFor(component, childPath); protected {
 			report(fmt.Sprintf("%s is protected: %s", childPath, reason))
+
+			continue
+		}
+
+		if componentProtectedExceptions[component][childPath] {
+			if _, ok := value[key].(bool); !ok {
+				report(fmt.Sprintf("%s must be a boolean, but holds %T", childPath, value[key]))
+			}
 
 			continue
 		}
@@ -541,11 +549,11 @@ func walkPatchMap(value map[string]any, path string, node *pathNode, report func
 			continue
 		}
 
-		walkPatch(value[key], childPath, child, report)
+		walkPatch(component, value[key], childPath, child, report)
 	}
 }
 
-func walkPatchList(value []any, path string, node *pathNode, report func(string)) {
+func walkPatchList(component string, value []any, path string, node *pathNode, report func(string)) {
 	child := childNode(node, wildcard)
 	if child == nil {
 		report(fmt.Sprintf("%s is not an overridable field", describePath(path)))
@@ -560,7 +568,7 @@ func walkPatchList(value []any, path string, node *pathNode, report func(string)
 	elementPath := joinPath(path, wildcard)
 
 	for _, element := range value {
-		walkPatch(element, elementPath, child, report)
+		walkPatch(component, element, elementPath, child, report)
 	}
 }
 
