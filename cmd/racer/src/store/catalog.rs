@@ -1583,7 +1583,7 @@ mod tests {
         assert_eq!(index.hold_holders(&at(0)), 2);
         let other = descriptor("other", 17).version;
         assert_eq!(index.reserve_hold(&other, 2, until), Err(Error::Overloaded));
-        // The read's release leaves the shared pages held by the warm.
+        // The second reader's release leaves the shared pages held by the first.
         index.release_hold_pages(&version, &page_set(&[0, 2]), epoch);
         assert!(index.is_held(&at(0)));
         assert!(index.is_held(&at(2)));

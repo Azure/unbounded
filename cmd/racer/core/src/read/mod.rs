@@ -332,7 +332,7 @@ pub enum ServeAction {
     Acquire,
 }
 
-/// Dispatch rule. Subscriptions never arrive here; warm actions always acquire.
+/// Dispatch rule. Subscriptions never arrive here; prefetch fills always acquire.
 pub fn serve_action(facts: ServeFacts) -> ServeAction {
     if facts.operation == OperationKind::Subscribe {
         return ServeAction::Reject(Error::InvalidRequest);
