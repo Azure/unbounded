@@ -547,3 +547,24 @@ fn hundred_thousand_member_build_time() {
     eprintln!("degree {degree} in {:?}", start.elapsed());
     assert!(degree <= members.max_degree());
 }
+
+/// `is_neighbor` agrees with the neighbor lists both ways and rejects bad
+/// positions.
+#[test]
+fn is_neighbor_matches_neighbor_lists() {
+    for k in [0, 1, 2, 3, 64, 100, 257] {
+        let members = Membership::new(nodes(k, Sites::Mixed)).unwrap();
+        for a in 0..k {
+            let list = members.neighbors(a);
+            for b in 0..k {
+                assert_eq!(members.is_neighbor(a, b), list.contains(&b));
+            }
+            assert!(!members.is_neighbor(a, a));
+            assert!(!members.is_neighbor(a, k));
+            assert!(!members.is_neighbor(k, a));
+        }
+        assert!(!members.is_neighbor(usize::MAX, 0));
+        assert!(members.neighbors(k).is_empty());
+        assert!(members.neighbors(usize::MAX).is_empty());
+    }
+}
