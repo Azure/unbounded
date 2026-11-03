@@ -27,8 +27,9 @@ nvlink_disable_value() {
         '
 }
 
-apt-get update
-apt-get install -y --no-install-recommends /tmp/ssh-import-id.deb
+dpkg --install /tmp/wget.deb /tmp/ssh-import-id.deb
+test "$(dpkg-query -W -f='${Version}' wget)" = 1.21.4-1ubuntu4.5 ||
+    fail "unexpected wget version"
 test "$(dpkg-query -W -f='${Version}' ssh-import-id)" = 5.11-0ubuntu2.24.04.1 ||
     fail "unexpected ssh-import-id version"
 
@@ -73,7 +74,7 @@ rm -rf "${agent_dir}"
 trap - EXIT
 
 test -x /usr/bin/curl || fail "curl is required by the bootstrap script"
-rm -rf /tmp/ssh-import-id.deb /var/lib/apt/lists/* /var/lib/cloud/*
+rm -rf /tmp/ssh-import-id.deb /tmp/wget.deb /var/lib/cloud/*
 rm -f /etc/ssh/ssh_host_*
 : > /etc/machine-id
 ln -sf /etc/machine-id /var/lib/dbus/machine-id

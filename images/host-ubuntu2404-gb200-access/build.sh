@@ -44,6 +44,8 @@ customize_disk() {
 
     install -D -m 0644 "${work}/packages/ssh-import-id.deb" \
         "${root}/tmp/ssh-import-id.deb"
+    install -D -m 0644 "${work}/packages/wget.deb" \
+        "${root}/tmp/wget.deb"
     install -D -m 0644 "${work}/packages/${agent_asset}" \
         "${root}/opt/unbounded/bootstrap/${agent_asset}"
     install -D -m 0644 "${script_dir}/assets/90-gb200-access-users.cfg" \
@@ -106,8 +108,11 @@ mkdir -p "${work}/packages"
         apt-get update
         apt-get install -y --no-install-recommends ca-certificates curl
         cd /packages
-        apt-get download ssh-import-id=5.11-0ubuntu2.24.04.1
+        apt-get download \
+            ssh-import-id=5.11-0ubuntu2.24.04.1 \
+            wget=1.21.4-1ubuntu4.5
         mv ssh-import-id_*.deb ssh-import-id.deb
+        mv wget_*.deb wget.deb
         curl -fL --retry 5 --retry-all-errors --retry-delay 2 -O \
             "'"${agent_url}"'"
     '
@@ -115,6 +120,7 @@ mkdir -p "${work}/packages"
     cd "${work}/packages"
     sha256sum -c <<'EOF'
 97bb2840a271ee0573da934ce1811f961e4b844fe876e34602b4661db25135b5  ssh-import-id.deb
+ed71643b8873240cce1ac905b7993f3372436d39410894f413968f43839f84e6  wget.deb
 faf21645f33cd5ef80cce04ccb2d8c9fc289cfb1dedbaeb47cf85e58186a8ff0  unbounded-agent-linux-arm64.tar.gz
 EOF
 )
