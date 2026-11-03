@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +28,7 @@ func discardLogger() *slog.Logger {
 func fakeScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(v1alpha3.AddToScheme(s))
+	utilruntime.Must(corev1.AddToScheme(s))
 
 	return s
 }
@@ -35,6 +37,7 @@ func fakeClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(fakeScheme()).
 		WithObjects(objs...).
+		WithStatusSubresource(&v1alpha3.Machine{}).
 		Build()
 }
 
@@ -52,6 +55,20 @@ func Test_buildMachineCR(t *testing.T) {
 	assert.Equal(t, "bootstrap-token-abc123", machine.Spec.Kubernetes.BootstrapTokenRef.Name)
 	assert.Equal(t, map[string]string{"env": "test"}, machine.Spec.Kubernetes.NodeLabels)
 	assert.Equal(t, []string{"dedicated=test:NoSchedule"}, machine.Spec.Kubernetes.RegisterWithTaints)
+}
+
+// The agent registers the Machine on a host nobody created one for. Its spec
+// must say the mode the agent runs, or the IsolationDrift condition is True
+// from the first reconcile, because status.isolation says otherwise.
+func Test_buildMachineCR_CarriesTheConfiguredIsolation(t *testing.T) {
+	for _, mode := range []v1alpha3.IsolationMode{v1alpha3.IsolationNSpawn, v1alpha3.IsolationNone, v1alpha3.IsolationContainer} {
+		cfg := baseConfig()
+		cfg.Isolation = string(mode)
+
+		assert.Equal(t, mode, buildMachineCR(cfg).Spec.Isolation, string(mode))
+	}
+
+	assert.Empty(t, buildMachineCR(baseConfig()).Spec.Isolation, "no isolation in the config leaves the default for the spec")
 }
 
 func Test_buildMachineCR_TokenNoDot(t *testing.T) {

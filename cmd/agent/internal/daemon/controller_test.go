@@ -26,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
 )
 
 const testAgentUpgradeSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -64,6 +65,12 @@ type fakeNodeOperator struct {
 	stageUpgradeSHA256 string
 	stageUpgradeErr    error
 
+	migrateCalls    int
+	migrateActive   *ActiveMachine
+	migrateDesired  *provision.UnboundedAgentConfig
+	migrateStrategy migrate.Strategy
+	migrateErr      error
+
 	// restartRequests counts the target's restart requests; the test
 	// reconciler wires them here.
 	restartRequests int
@@ -101,6 +108,15 @@ func (op *fakeNodeOperator) RestartNode(_ context.Context, _ *slog.Logger, activ
 	op.restartActive = active
 
 	return op.restartErr
+}
+
+func (op *fakeNodeOperator) MigrateIsolation(_ context.Context, _ *slog.Logger, active *ActiveMachine, desired *provision.UnboundedAgentConfig, strategy migrate.Strategy) error {
+	op.migrateCalls++
+	op.migrateActive = active
+	op.migrateDesired = desired
+	op.migrateStrategy = strategy
+
+	return op.migrateErr
 }
 
 func (op *fakeNodeOperator) ResetAgentResources(context.Context, *slog.Logger) error {

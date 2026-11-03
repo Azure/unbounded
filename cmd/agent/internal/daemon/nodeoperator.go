@@ -14,10 +14,15 @@ import (
 	"strings"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
+	"github.com/Azure/unbounded/cmd/agent/internal/nspawnops"
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/appliedconfig"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/migrate"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestop"
@@ -30,30 +35,61 @@ import (
 type ActiveMachine struct {
 	Name   string
 	Config *provision.AgentConfig
+	// Mode is the isolation mode the machine was applied with. Configs written
+	// before the setting existed are nspawn.
+	Mode isolation.Mode
 }
 
-// nodeOperator performs host-local nspawn node operations for the daemon.
-// Reconcile code depends on this interface so tests can substitute the
-// host-mutating implementation with a fake.
+// registeredBackend reports whether this agent has a backend for a mode. It is
+// a variable so a test can simulate a known mode with no backend whichever
+// modes this binary ships.
+var registeredBackend = isolation.Registered
+
+// activeMode resolves the isolation mode recorded in an applied config and
+// confirms this agent has a backend for it, so an agent that does not know a
+// mode fails with a clear error instead of operating on the machine as nspawn.
+func activeMode(cfg *provision.AgentConfig) (isolation.Mode, error) {
+	mode, err := cfg.IsolationMode()
+	if err != nil {
+		return "", err
+	}
+
+	if err := registeredBackend(mode); err != nil {
+		return "", err
+	}
+
+	return mode, nil
+}
+
+// hostRebooter is the part of a nodeOperator about the host operating system
+// rather than a node stack, so it does not depend on the isolation mode.
+type hostRebooter interface {
+	// BootID returns the kernel boot ID of the current host boot.
+	BootID() (string, error)
+	// RebootHost asks systemd to reboot the host operating system. It returns
+	// once the reboot is queued; systemd then stops this daemon.
+	RebootHost(context.Context, *slog.Logger) error
+}
+
+// nodeOperator performs host-local node operations for the daemon, for the
+// isolation mode the host runs in (nspawn, none or container). Reconcile code
+// depends on this interface so tests can substitute the host-mutating
+// implementation with a fake.
 type nodeOperator interface {
-	// FindActiveMachine returns the currently active nspawn machine and its
+	// FindActiveMachine returns the currently active node slot and its
 	// applied agent configuration.
 	FindActiveMachine(*slog.Logger) (*ActiveMachine, error)
 	// EnsureLifecycleMigration installs lifecycle hooks for the active machine
 	// without restarting its currently running services.
 	EnsureLifecycleMigration(context.Context, *slog.Logger, *ActiveMachine) error
-	// RestartNode restarts the provided active nspawn-backed node in place.
+	// RestartNode restarts the provided active node in place.
 	RestartNode(context.Context, *slog.Logger, *ActiveMachine) error
 	// ResetAgentResources removes the unbounded-agent and associated resources
 	// without stopping the currently running daemon process.
 	ResetAgentResources(context.Context, *slog.Logger) error
 	// StopDaemon stops, disables, and removes the unbounded-agent-daemon unit.
 	StopDaemon(context.Context, *slog.Logger) error
-	// BootID returns the kernel boot ID of the current host boot.
-	BootID() (string, error)
-	// RebootHost asks systemd to reboot the host operating system. It returns
-	// once the reboot is queued; systemd then stops this daemon.
-	RebootHost(context.Context, *slog.Logger) error
+	hostRebooter
 	// RepaveNode performs the nspawn machine update:
 	//  1. Provision a new rootfs on the alternate machine
 	//  2. Stop the old machine (graceful service shutdown + nspawn teardown)
@@ -65,6 +101,16 @@ type nodeOperator interface {
 	// been cordoned, drained, and deleted. Repave reacts to Node deletion; it does
 	// not perform Kubernetes eviction or CNI-specific dataplane cleanup itself.
 	RepaveNode(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig) error
+	// MigrateIsolation moves the active node to the isolation mode of the
+	// desired configuration, using the already planned strategy. The caller
+	// has planned it with migrate.Plan, settled any earlier change and holds
+	// installation ownership. The target is built from the desired
+	// configuration, so a new Kubernetes version in the same repave is applied.
+	//
+	// It returns ErrMigrationHandedOff when the change continues without the
+	// daemon (reprovision). The change then stays InProgress in the Machine
+	// status.
+	MigrateIsolation(context.Context, *slog.Logger, *ActiveMachine, *provision.UnboundedAgentConfig, migrate.Strategy) error
 	// StageAgentUpgrade stages a new host-side agent binary.
 	StageAgentUpgrade(context.Context, *slog.Logger, agentUpgradeRequest) error
 	// ReconcileHostRoot moves the agent's files to the host root on a host an
@@ -78,66 +124,106 @@ type nodeOperator interface {
 type nspawnNodeOperator struct{}
 
 func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, error) {
-	// Verify the SHA-256 sidecar before trusting the applied config. A missing
-	// sidecar is logged as a warning and not treated as an error.
-	for _, name := range []string{goalstates.NSpawnMachineKube1, goalstates.NSpawnMachineKube2} {
-		path := goalstates.AppliedConfigPath(name)
-
-		data, err := os.ReadFile(path)
+	for _, name := range activeSlotOrder() {
+		active, err := readActiveSlot(log, name)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 
 		if err != nil {
-			return nil, fmt.Errorf("read applied config %s: %w", path, err)
+			return nil, err
 		}
 
-		// Verify the sidecar checksum before trusting the config data.
-		checksumPath := goalstates.AppliedConfigChecksumPath(name)
-		if err := goalstates.VerifyChecksum(data, checksumPath); err != nil {
-			return nil, fmt.Errorf("verify applied config checksum for %s: %w", name, err)
-		}
-
-		// If the sidecar file is missing, log a warning so operators
-		// know the integrity check was skipped.
-		if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-			log.Warn("no checksum sidecar found, skipping integrity check",
-				"config_path", path,
-				"checksum_path", checksumPath,
-			)
-		}
-
-		var cfg provision.AgentConfig
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, fmt.Errorf("decode applied config %s: %w", path, err)
-		}
-
-		// MachineName must be resolved before the node name because
-		// BackfillNodeName falls back to MachineName. The applied config is
-		// normally persisted with a name already set, so this is usually a
-		// no-op; it covers configs written by older agents or hand-edited.
-		source, err := provision.ResolveMachineName(&cfg)
-		if err != nil {
-			return nil, fmt.Errorf("resolve applied config machine name %s: %w", path, err)
-		}
-
-		if source != "config" {
-			log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
-		}
-
-		if err := cfg.BackfillNodeName(); err != nil {
-			return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
-		}
-
-		return &ActiveMachine{Name: name, Config: &cfg}, nil
+		return active, nil
 	}
 
 	return nil, fmt.Errorf("no applied config found in %s", goalstates.AgentConfigDir)
 }
 
+// activeSlotOrder is the order in which slots are searched for the applied
+// config of the running node; see appliedconfig.SlotOrder.
+func activeSlotOrder() []string {
+	return appliedconfig.SlotOrder(inPlaceJournalPath())
+}
+
+// readActiveSlot reads and verifies the applied config of one slot. A missing
+// file is an error that matches os.ErrNotExist.
+func readActiveSlot(log *slog.Logger, name string) (*ActiveMachine, error) {
+	// A present SHA-256 sidecar is verified before the config is trusted. A
+	// missing one is logged as a warning and not treated as an error.
+	path := goalstates.AppliedConfigPath(name)
+
+	data, checksumMissing, err := appliedconfig.ReadVerified(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if checksumMissing {
+		log.Warn("no checksum sidecar found, skipping integrity check",
+			"config_path", path,
+			"checksum_path", goalstates.AppliedConfigChecksumPath(name),
+		)
+	}
+
+	var cfg provision.AgentConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("decode applied config %s: %w", path, err)
+	}
+
+	// MachineName must be resolved before the node name because
+	// BackfillNodeName falls back to MachineName. The applied config is
+	// normally persisted with a name already set, so this is usually a
+	// no-op; it covers configs written by older agents or hand-edited.
+	source, err := provision.ResolveMachineName(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("resolve applied config machine name %s: %w", path, err)
+	}
+
+	if source != "config" {
+		log.Info("resolved unbounded MachineName", "name", cfg.MachineName, "source", source)
+	}
+
+	if err := cfg.BackfillNodeName(); err != nil {
+		return nil, fmt.Errorf("backfill applied config node name %s: %w", path, err)
+	}
+
+	mode, err := activeMode(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("applied config %s: %w", path, err)
+	}
+
+	return &ActiveMachine{Name: name, Config: &cfg, Mode: mode}, nil
+}
+
+// activeModeOf is the mode the active machine runs in. An unset mode is the
+// default, as the dispatcher treats it.
+func activeModeOf(active *ActiveMachine) isolation.Mode {
+	if active.Mode == "" {
+		return isolation.ModeNSpawn
+	}
+
+	return active.Mode
+}
+
+// effectiveIsolation is the mode cfg selects, with an empty value meaning the
+// default. A value that is not a mode is returned as it is, so it never equals
+// a real mode.
+func effectiveIsolation(cfg *provision.AgentConfig) isolation.Mode {
+	mode, err := cfg.IsolationMode()
+	if err != nil {
+		return isolation.Mode(cfg.Isolation)
+	}
+
+	return mode
+}
+
 // hasDrift reports whether the desired AgentConfig differs from the applied
 // config in any field that would require a machine update.
 func hasDrift(applied, desired *provision.AgentConfig) bool {
+	if effectiveIsolation(applied) != effectiveIsolation(desired) {
+		return true
+	}
+
 	appliedVersion := strings.TrimPrefix(applied.Cluster.Version, "v")
 
 	desiredVersion := strings.TrimPrefix(desired.Cluster.Version, "v")
@@ -220,20 +306,14 @@ func (nspawnNodeOperator) EnsureLifecycleMigration(ctx context.Context, log *slo
 }
 
 func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
-	gs, err := goalstates.ResolveMachine(log, active.Config, active.Name, nil)
+	backend, err := nspawnops.New(nspawnops.Params{Log: log, Config: active.Config})
 	if err != nil {
-		return fmt.Errorf("resolve machine goal state: %w", err)
+		return fmt.Errorf("create nspawn backend: %w", err)
 	}
 
 	log.Info("restarting active node", "machine", active.Name)
 
-	err = phases.Serial(
-		log,
-		nodestart.ReconcileNSpawnLifecycle(log, active.Name),
-		nodestart.WaitForLocalDNS(log, gs.NodeStart),
-		nodestart.WaitForKubelet(log, active.Name),
-	).Do(ctx)
-	if err != nil {
+	if err := backend.Restart(ctx, nspawn.Root(active.Name)); err != nil {
 		return err
 	}
 
@@ -244,7 +324,9 @@ func (nspawnNodeOperator) RestartNode(ctx context.Context, log *slog.Logger, act
 
 func (nspawnNodeOperator) ResetAgentResources(ctx context.Context, log *slog.Logger) error {
 	// The MachineOperation holds installation ownership through daemon stop.
-	return resetUnderLock(ctx, log, installstate.DefaultStore(), resetResources(log))
+	mode := detectResetMode(log)
+
+	return resetUnderLock(ctx, log, installstate.DefaultStore(), mode, resetResourcesFor(log, mode))
 }
 
 func (nspawnNodeOperator) StopDaemon(ctx context.Context, log *slog.Logger) error {
@@ -307,6 +389,16 @@ func (nspawnNodeOperator) RepaveNode(
 	)
 
 	return nil
+}
+
+func (nspawnNodeOperator) MigrateIsolation(
+	ctx context.Context,
+	log *slog.Logger,
+	active *ActiveMachine,
+	desired *provision.UnboundedAgentConfig,
+	strategy migrate.Strategy,
+) error {
+	return migrateIsolation(ctx, log, active, desired, strategy)
 }
 
 func (nspawnNodeOperator) StageAgentUpgrade(ctx context.Context, log *slog.Logger, request agentUpgradeRequest) error {

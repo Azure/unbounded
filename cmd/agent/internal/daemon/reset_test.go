@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/hostnode"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 )
 
@@ -45,7 +46,7 @@ func TestResetRetainsOwnershipUntilTeardownAndSyncSucceed(t *testing.T) {
 
 			injected := errors.New("injected reset failure")
 			cleaned := false
-			task := lifecycleTask{name: "cleanup", run: func(context.Context) error {
+			task := hostnode.Func("cleanup", func(context.Context) error {
 				if failure == "cleanup" {
 					return injected
 				}
@@ -53,7 +54,7 @@ func TestResetRetainsOwnershipUntilTeardownAndSyncSucceed(t *testing.T) {
 				cleaned = true
 
 				return nil
-			}}
+			})
 			synced := false
 
 			err = durableReset(t.Context(), store, task, []string{store.Root()}, func(int) error {

@@ -23,6 +23,17 @@ import (
 	"github.com/Azure/unbounded/internal/provision"
 )
 
+// ReconcileRepave brings the node to the desired configuration when its Node
+// is deleted. That includes the isolation mode the Machine declares in
+// spec.isolation: setting the field declares intent and takes effect here, at
+// the next repave, never immediately.
+//
+// A repave is a replacement: the Node was drained and deleted, and the node
+// stack is rebuilt. Extension point: an upgrade that swaps containerd and
+// kubelet on the host without deleting the Node would be a separate trigger and
+// operation beside this one (the none backend's versioned install directory and
+// its atomic current link are the mechanism for it). It is not built; this
+// reconciler stays tied to Node deletion.
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
 	lock, err := r.installation.AcquireMutationLock()
 	if errors.Is(err, installstate.ErrLockHeld) {
@@ -38,6 +49,13 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)
+	}
+
+	// A mode change an earlier daemon or reconcile left unfinished is settled
+	// and reported first. Nothing new starts in the same reconcile: the node was
+	// only just put in a known state.
+	if settleIsolationChanges(ctx, r.log, r.Client, r.machineName, r.nodeOperator) {
+		return reconcile.Result{}, nil
 	}
 
 	desiredConfig, appliedRef, err := resolveDesiredRepaveConfig(ctx, r.Client, r.machineName, active.Config)
@@ -59,6 +77,11 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		}
 
 		return reconcile.Result{}, nil
+	}
+
+	// A different declared mode is a mode change, not a same-mode repave.
+	if desiredMode, err := desiredConfig.IsolationMode(); err != nil || desiredMode != activeModeOf(active) {
+		return r.changeIsolation(ctx, active, desiredConfig, appliedRef)
 	}
 
 	if err := r.nodeOperator.RepaveNode(ctx, r.log, active, desiredConfig); err != nil {
@@ -84,6 +107,12 @@ func resolveDesiredRepaveConfig(
 	}
 
 	desired := configFromApplied(applied)
+
+	// spec.isolation declares the mode the node moves to. Empty is no
+	// declaration: the node keeps the mode it runs in.
+	if machine.Spec.Isolation != "" {
+		desired.Isolation = string(machine.Spec.Isolation)
+	}
 
 	var appliedRef *v1alpha3.MachineConfigurationRefStatus
 
