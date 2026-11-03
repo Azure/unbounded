@@ -68,6 +68,7 @@ pub fn build(caches: &[CacheInfo]) -> Result<Vec<CacheDefinition>, wire::Error> 
             origin_socket: origin,
             priority: priority as u16,
             mode: mode(c.passthrough.as_ref())?,
+            origin: None,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));

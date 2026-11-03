@@ -44,6 +44,7 @@
 
 pub use codec::*;
 pub use definitions::*;
+pub use origin::*;
 use std::time::Duration;
 
 /// Current control record schema version.
@@ -396,6 +397,8 @@ pub struct ErrorResponse {
 }
 
 /// Pure identities, records, and syntax validation without runtime policy.
+mod origin;
+
 mod definitions {
     use std::{collections::HashSet, num::NonZeroU32, path::PathBuf};
 
@@ -491,6 +494,10 @@ mod definitions {
 
         /// Whether nodes retain this cache's pages and metadata.
         pub mode: CacheMode,
+
+        /// Object origin the dataplane reads directly. None keeps the cache's
+        /// origin Unix socket as the only origin.
+        pub origin: Option<crate::OriginDefinition>,
     }
 
     /// How a cache treats object data. Only `Cached` retains pages or metadata.
@@ -595,6 +602,9 @@ mod definitions {
                 || d.priority > crate::MAX_PRIORITY
             {
                 return Err(Error::InvalidRequest);
+            }
+            if let Some(origin) = &d.origin {
+                origin.validate()?;
             }
             let (client, origin) = canonical_socket_paths(&d.name)?;
             // Path equality normalizes separators; the wire requires exact strings.
@@ -1188,6 +1198,111 @@ mod codec {
         // Optional and omitted for cached caches, so their canonical bytes are unchanged.
         #[serde(default, skip_serializing_if = "ModeDto::is_cached")]
         mode: ModeDto,
+
+        // Optional and omitted when absent, so caches without an origin keep
+        // their canonical bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<OriginDto>,
+    }
+
+    /// Wire spelling of `OriginDefinition`.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OriginDto {
+        azure: AzureDto,
+
+        #[serde(rename = "metadataTTLMillis")]
+        metadata_ttl_millis: u64,
+
+        #[serde(rename = "requestTimeoutMillis")]
+        request_timeout_millis: u64,
+
+        #[serde(rename = "maxConcurrentRequests")]
+        max_concurrent_requests: u32,
+    }
+
+    /// Wire spelling of `AzureOriginDefinition`.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AzureDto {
+        #[serde(rename = "containerURL")]
+        container_url: String,
+
+        credential: CredentialDto,
+    }
+
+    /// Wire spelling of `AzureCredential`: an object with exactly one key.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    enum CredentialDto {
+        Anonymous {},
+
+        ManagedIdentity {
+            #[serde(rename = "clientID", default, skip_serializing_if = "Option::is_none")]
+            client_id: Option<String>,
+        },
+
+        WorkloadIdentity {
+            #[serde(rename = "clientID")]
+            client_id: String,
+
+            #[serde(rename = "tenantID", default, skip_serializing_if = "Option::is_none")]
+            tenant_id: Option<String>,
+        },
+    }
+
+    impl OriginDto {
+        fn from_definition(o: &crate::OriginDefinition) -> Result<Self> {
+            let millis =
+                |d: Duration| u64::try_from(d.as_millis()).map_err(|_| Error::InvalidRequest);
+            Ok(Self {
+                azure: AzureDto {
+                    container_url: o.azure.container_url.as_str().into(),
+                    credential: match &o.azure.credential {
+                        crate::AzureCredential::Anonymous => CredentialDto::Anonymous {},
+                        crate::AzureCredential::ManagedIdentity { client_id } => {
+                            CredentialDto::ManagedIdentity {
+                                client_id: client_id.clone(),
+                            }
+                        }
+                        crate::AzureCredential::WorkloadIdentity {
+                            client_id,
+                            tenant_id,
+                        } => CredentialDto::WorkloadIdentity {
+                            client_id: client_id.clone(),
+                            tenant_id: tenant_id.clone(),
+                        },
+                    },
+                },
+                metadata_ttl_millis: millis(o.metadata_ttl)?,
+                request_timeout_millis: millis(o.request_timeout)?,
+                max_concurrent_requests: o.max_concurrent_requests,
+            })
+        }
+
+        fn into_definition(self) -> Result<crate::OriginDefinition> {
+            Ok(crate::OriginDefinition {
+                azure: crate::AzureOriginDefinition {
+                    container_url: crate::AzureContainerUrl::parse(&self.azure.container_url)?,
+                    credential: match self.azure.credential {
+                        CredentialDto::Anonymous {} => crate::AzureCredential::Anonymous,
+                        CredentialDto::ManagedIdentity { client_id } => {
+                            crate::AzureCredential::ManagedIdentity { client_id }
+                        }
+                        CredentialDto::WorkloadIdentity {
+                            client_id,
+                            tenant_id,
+                        } => crate::AzureCredential::WorkloadIdentity {
+                            client_id,
+                            tenant_id,
+                        },
+                    },
+                },
+                metadata_ttl: Duration::from_millis(self.metadata_ttl_millis),
+                request_timeout: Duration::from_millis(self.request_timeout_millis),
+                max_concurrent_requests: self.max_concurrent_requests,
+            })
+        }
     }
 
     /// Wire spelling of `CacheMode`. `Cached` is never written or accepted: a
@@ -1287,18 +1402,21 @@ mod codec {
             });
         }
         members.sort_by(|a, b| a.node.cmp(&b.node));
-        let mut caches: Vec<_> = p
+        let mut caches = p
             .caches
             .into_iter()
-            .map(|c| CacheDefinition {
-                id: CacheId(c.id),
-                name: c.name,
-                client_socket: c.client_socket.into(),
-                origin_socket: c.origin_socket.into(),
-                priority: c.priority,
-                mode: c.mode.into(),
+            .map(|c| {
+                Ok(CacheDefinition {
+                    id: CacheId(c.id),
+                    name: c.name,
+                    client_socket: c.client_socket.into(),
+                    origin_socket: c.origin_socket.into(),
+                    priority: c.priority,
+                    mode: c.mode.into(),
+                    origin: c.origin.map(OriginDto::into_definition).transpose()?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         validate_definitions(&caches)?;
         caches.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(Publication {
@@ -1342,6 +1460,11 @@ mod codec {
                     .into(),
                 priority: c.priority,
                 mode: c.mode.into(),
+                origin: c
+                    .origin
+                    .as_ref()
+                    .map(OriginDto::from_definition)
+                    .transpose()?,
             });
         }
         caches.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1801,6 +1924,115 @@ mod codec {
             assert_eq!(mh, hashes["membership"]);
             let b = encode_publication(&p).unwrap();
             assert_eq!(b, round_trip("publication.json", &b).unwrap());
+        }
+
+        /// Origins round trip, are omitted when absent, and are validated on decode.
+        #[test]
+        fn cache_origin_round_trip_omission_and_validation() {
+            let raw = fixture("publication.json");
+            let p = decode_publication(&raw).unwrap();
+            assert!(p.caches.iter().all(|c| c.origin.is_none()));
+            let (base_content, base_membership) = content_hashes(&p).unwrap();
+            let base_bytes = encode_publication(&p).unwrap();
+            assert!(
+                !String::from_utf8(base_bytes.clone())
+                    .unwrap()
+                    .contains("origin\":{")
+            );
+
+            let url = crate::AzureContainerUrl::parse("https://acct.blob.core.windows.net/models")
+                .unwrap();
+            let guid = "0123abcd-0123-4abc-89ab-0123456789ab".to_string();
+            for credential in [
+                crate::AzureCredential::Anonymous,
+                crate::AzureCredential::ManagedIdentity { client_id: None },
+                crate::AzureCredential::ManagedIdentity {
+                    client_id: Some(guid.clone()),
+                },
+                crate::AzureCredential::WorkloadIdentity {
+                    client_id: guid.clone(),
+                    tenant_id: Some(guid.clone()),
+                },
+            ] {
+                let mut next = p.clone();
+                let mut origin = crate::OriginDefinition::azure(url.clone(), credential);
+                origin.metadata_ttl = Duration::from_millis(1500);
+                next.caches[0].origin = Some(origin);
+                let b = encode_publication(&next).unwrap();
+                assert_eq!(decode_publication(&b).unwrap().caches, next.caches);
+                assert_eq!(validate_publication(&next).unwrap().caches, next.caches);
+                let (content, membership) = content_hashes(&next).unwrap();
+                assert_ne!(content, base_content);
+                assert_eq!(membership, base_membership);
+                // Removing the origin restores the original bytes and hash.
+                next.caches[0].origin = None;
+                assert_eq!(encode_publication(&next).unwrap(), base_bytes);
+                assert_eq!(content_hashes(&next).unwrap().0, base_content);
+            }
+
+            let mut next = p.clone();
+            next.caches[0].origin = Some(crate::OriginDefinition::azure(
+                url.clone(),
+                crate::AzureCredential::WorkloadIdentity {
+                    client_id: guid.clone(),
+                    tenant_id: None,
+                },
+            ));
+            let text = String::from_utf8(encode_publication(&next).unwrap()).unwrap();
+            let exact = format!(
+                "\"origin\":{{\"azure\":{{\"containerURL\":\"https://acct.blob.core.windows.net/models\",\"credential\":{{\"workloadIdentity\":{{\"clientID\":\"{guid}\"}}}}}},\"metadataTTLMillis\":30000,\"requestTimeoutMillis\":60000,\"maxConcurrentRequests\":512}}"
+            );
+            assert!(text.contains(&exact), "{text}");
+
+            // Invalid in-process definitions are rejected by encode and validate.
+            let mut bad = next.clone();
+            bad.caches[0].origin = Some(crate::OriginDefinition::azure(
+                crate::AzureContainerUrl::parse("http://acct/models").unwrap(),
+                crate::AzureCredential::ManagedIdentity { client_id: None },
+            ));
+            assert!(encode_publication(&bad).is_err());
+            assert!(validate_publication(&bad).is_err());
+
+            // Invalid wire origins are rejected by decode.
+            let good = text.clone();
+            for (from, to) in [
+                (
+                    "https://acct.blob.core.windows.net/models",
+                    "https://acct.blob.core.windows.net/Models",
+                ),
+                (
+                    "https://acct.blob.core.windows.net/models",
+                    "http://acct.blob.core.windows.net/models",
+                ),
+                (
+                    "\"requestTimeoutMillis\":60000",
+                    "\"requestTimeoutMillis\":0",
+                ),
+                (
+                    "\"maxConcurrentRequests\":512",
+                    "\"maxConcurrentRequests\":0",
+                ),
+                (
+                    "\"maxConcurrentRequests\":512",
+                    "\"maxConcurrentRequests\":65537",
+                ),
+                (
+                    "\"maxConcurrentRequests\":512",
+                    "\"maxConcurrentRequests\":512,\"extra\":1",
+                ),
+                (
+                    "{\"workloadIdentity\"",
+                    "{\"anonymous\":{},\"workloadIdentity\"",
+                ),
+                ("\"workloadIdentity\"", "\"secretRef\""),
+                (&format!("\"clientID\":\"{guid}\""), "\"clientID\":\"x\""),
+                (",\"metadataTTLMillis\":30000", ""),
+            ] {
+                let bad = good.replace(from, to);
+                assert_ne!(bad, good, "{from}");
+                assert!(decode_publication(bad.as_bytes()).is_err(), "{to}");
+            }
+            assert!(decode_publication(good.as_bytes()).is_ok());
         }
 
         /// Cache priority is required, bounded, and part of canonical content.

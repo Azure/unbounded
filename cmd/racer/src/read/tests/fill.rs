@@ -714,6 +714,7 @@ fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
         origin_socket: "/o".into(),
         priority,
         mode: racer_control_wire::CacheMode::Cached,
+        origin: None,
     };
     let weigh = |under_priority, over_priority| {
         policy.weights().update(&[
@@ -2793,6 +2794,7 @@ mod pressure {
                 origin_socket: "/o".into(),
                 priority,
                 mode: racer_control_wire::CacheMode::Cached,
+                origin: None,
             };
             let weigh = |under_priority, over_priority| {
                 admission.policy().weights().update(&[
@@ -3229,6 +3231,7 @@ impl Fixture {
                     origin_socket,
                     priority: racer_control_wire::DEFAULT_PRIORITY,
                     mode: racer_control_wire::CacheMode::Cached,
+                    origin: None,
                 }],
             })
             .unwrap();
@@ -3542,6 +3545,7 @@ pub(super) fn adapter_client(
                 origin_socket,
                 priority: racer_control_wire::DEFAULT_PRIORITY,
                 mode: racer_control_wire::CacheMode::Cached,
+                origin: None,
             }],
         })
         .unwrap();
