@@ -2531,7 +2531,8 @@ mod codec {
             let mut reordered = two.clone();
             reordered.pools.reverse();
             assert_eq!(encode_publication(&reordered).unwrap(), encoded);
-            let mutations: Vec<Box<dyn Fn(&mut Publication)>> = vec![
+            type Mutation = Box<dyn Fn(&mut Publication)>;
+            let mutations: Vec<Mutation> = vec![
                 Box::new(|p| p.pools[0].id = PoolId("sel-".into())),
                 Box::new(|p| p.pools[0].id = PoolId(format!("sel-{}", "A".repeat(32)))),
                 Box::new(|p| p.pools[0].id = PoolId(format!("sel-{}", "a".repeat(31)))),
