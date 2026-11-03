@@ -31,14 +31,103 @@ type imageBuild struct {
 	File     string
 	Target   string
 	Platform string
+	// Args holds the build-defining build-args as sorted, comma-separated
+	// KEY=VALUE pairs, so builds that select different stages stay distinct.
+	Args string
 }
 
 func (b imageBuild) String() string {
-	if b.Target == "" {
-		return fmt.Sprintf("%s (%s)", b.File, b.Platform)
+	s := b.File
+	if b.Target != "" {
+		s += " target " + b.Target
 	}
 
-	return fmt.Sprintf("%s target %s (%s)", b.File, b.Target, b.Platform)
+	if b.Args != "" {
+		s += " args " + b.Args
+	}
+
+	return fmt.Sprintf("%s (%s)", s, b.Platform)
+}
+
+// buildDefiningArgs lists the build-args that change what an image is, as
+// opposed to release metadata such as VERSION, GIT_COMMIT, CONTAINER_REGISTRY,
+// or GO_VERSION, which differ between ci.yaml and release.yaml by design. This
+// is an allowlist rather than a denylist: metadata values reference steps,
+// env, and github contexts the test cannot resolve, and a new metadata arg
+// must not make every release build look uncovered. A new arg that selects a
+// stage or variant belongs here.
+var buildDefiningArgs = map[string]bool{
+	"INSTALLER_KERNEL": true,
+}
+
+// conditionalArg matches a `${{ matrix.x && format('KEY={0}', matrix.x) || ... }}`
+// line whose fallback is the empty string, the idiom ci.yaml uses to emit a
+// build-arg only for matrix entries that set it.
+var conditionalArg = regexp.MustCompile(
+	`^\$\{\{\s*matrix\.([A-Za-z0-9_.-]+)\s*&&\s*format\('([A-Za-z0-9_]+)=\{0\}',\s*matrix\.([A-Za-z0-9_.-]+)\)\s*\|\|\s*''\s*\}\}$`)
+
+// lookupMatrix resolves a dotted matrix path, returning nil when it is unset.
+func lookupMatrix(combo map[string]any, path string) any {
+	var cur any = combo
+	for _, part := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+
+		cur = m[part]
+	}
+
+	return cur
+}
+
+// buildArgs returns the build-defining args of a build-args input, normalized
+// as sorted KEY=VALUE pairs joined by commas. Empty values are dropped since
+// they leave the Containerfile default in effect.
+func buildArgs(value string, combo map[string]any) (string, error) {
+	var args []string
+
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		if m := conditionalArg.FindStringSubmatch(line); m != nil {
+			if m[1] != m[3] {
+				return "", fmt.Errorf("unsupported conditional build-arg %q", line)
+			}
+
+			v := lookupMatrix(combo, m[1])
+			if v != nil && v != false && fmt.Sprint(v) != "" && buildDefiningArgs[m[2]] {
+				args = append(args, m[2]+"="+fmt.Sprint(v))
+			}
+
+			continue
+		}
+
+		key, raw, ok := strings.Cut(line, "=")
+		if !ok {
+			return "", fmt.Errorf("build-arg %q is not KEY=VALUE", line)
+		}
+
+		if !buildDefiningArgs[key] {
+			continue
+		}
+
+		v, err := expand(raw, combo)
+		if err != nil {
+			return "", fmt.Errorf("build-arg %s: %w", key, err)
+		}
+
+		if v != "" {
+			args = append(args, key+"="+v)
+		}
+	}
+
+	sort.Strings(args)
+
+	return strings.Join(args, ","), nil
 }
 
 type imageWorkflow struct {
@@ -314,8 +403,13 @@ func imageBuilds(data []byte) (map[imageBuild][]string, error) {
 					platforms = runnerPlatform(runsOn)
 				}
 
+				args, err := buildArgs(step.With["build-args"], combo)
+				if err != nil {
+					return nil, fmt.Errorf("job %s build-args: %w", name, err)
+				}
+
 				for _, platform := range strings.Split(platforms, ",") {
-					build := imageBuild{File: file, Target: target, Platform: strings.TrimSpace(platform)}
+					build := imageBuild{File: file, Target: target, Platform: strings.TrimSpace(platform), Args: args}
 					if !slices.Contains(builds[build], name) {
 						builds[build] = append(builds[build], name)
 					}
@@ -370,6 +464,8 @@ func TestCIBuildsEveryReleaseImage(t *testing.T) {
 		{File: "images/racer/Containerfile", Platform: "linux/arm64"},
 		{File: "images/net/Containerfile", Target: "node", Platform: "linux/arm64"},
 		{File: "images/racer-vllm/Containerfile", Platform: "linux/amd64"},
+		{File: "images/netboot/Containerfile", Platform: "linux/arm64", Args: "INSTALLER_KERNEL=ubuntu"},
+		{File: "images/netboot/Containerfile", Platform: "linux/arm64", Args: "INSTALLER_KERNEL=azurelinux"},
 	} {
 		if _, ok := release[want]; !ok {
 			t.Errorf("release.yaml no longer builds %s; update this test", want)
@@ -610,5 +706,67 @@ func TestMissingBuildsReportsPlatformGaps(t *testing.T) {
 
 	if got := missingBuilds(ci, ci); len(got) != 0 {
 		t.Fatalf("missingBuilds of a workflow against itself = %q, want none", got)
+	}
+}
+
+func TestMissingBuildsReportsBuildArgGaps(t *testing.T) {
+	t.Parallel()
+
+	release, err := imageBuilds([]byte(`
+jobs:
+  netboot:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component:
+          - {name: netboot, kernel: ubuntu}
+          - {name: netboot-azurelinux, kernel: azurelinux}
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/netboot/Containerfile
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            INSTALLER_KERNEL=${{ matrix.component.kernel }}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ci, err := imageBuilds([]byte(`
+jobs:
+  release-images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component:
+          - {name: netboot, kernel: ubuntu}
+          - {name: metalman}
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/netboot/Containerfile
+          platforms: linux/amd64
+          build-args: |
+            VERSION=v0.0.0-ci
+            ${{ matrix.component.kernel && format('INSTALLER_KERNEL={0}', matrix.component.kernel) || '' }}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := ci[imageBuild{File: "images/netboot/Containerfile", Platform: "linux/amd64"}]; !ok {
+		t.Errorf("conditional build-arg without a kernel should produce no args: %v", ci)
+	}
+
+	got := missingBuilds(release, ci)
+	want := []string{
+		"images/netboot/Containerfile args INSTALLER_KERNEL=azurelinux (linux/amd64), built by release job netboot",
+	}
+
+	if !slices.Equal(got, want) {
+		t.Fatalf("missingBuilds = %q, want %q", got, want)
 	}
 }
