@@ -10,13 +10,18 @@
 //! - Not a v1 Pod `CREATE`, not opted in, or already injected: allowed, no patch.
 //! - Bad pod settings: denied with code 403 and a message naming the field.
 //! - Pod object that cannot be read: denied with code 400.
-//! - Opted-in pod: allowed with a JSON Patch.
+//! - Named ClusterCache missing, or its node selector invalid: denied with 403.
+//! - ClusterCache lookup failed: denied with 503 so the client retries. The
+//!   pod is never admitted without its cache's node affinity.
+//! - Opted-in pod: allowed with a JSON Patch. When the cache has a node
+//!   selector, the patch adds it to the pod's required node affinity.
 //!
 //! [`admit`] returns [`Error`] only when the review itself cannot be answered,
 //! for example when it is not JSON or has no request UID.
 
 mod mutate;
 mod quantity;
+mod selector;
 mod strict;
 
 use mutate::mutate;
@@ -103,72 +108,150 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Result of looking up a ClusterCache by name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CacheLookup {
+    /// The cache exists. Holds its `spec.nodeSelector`, or `None` when unset.
+    Found(Option<Value>),
+    /// No ClusterCache has this name.
+    NotFound,
+    /// The lookup failed, for example with an API error. The pod is denied
+    /// with a retryable status rather than admitted without its pool affinity.
+    Unavailable,
+}
+
+/// A parsed `AdmissionReview` request. [`Review::caches`] lists the
+/// ClusterCaches the pod may need, so the caller can look them up before
+/// [`Review::respond`].
+pub struct Review {
+    uid: String,
+    req: Map<String, Value>,
+}
+
 /// Answers one `AdmissionReview` and returns the response review as JSON.
 ///
 /// `image` is the racer-object sidecar image. A blank image denies every
-/// v1 Pod `CREATE`, as the Go handler does.
-pub fn admit(review: &[u8], image: &str) -> Result<Vec<u8>, Error> {
-    if review.len() > MAX_REQUEST_BYTES {
-        return Err(Error::TooLarge(review.len()));
-    }
-    let review = strict::parse(review).map_err(|e| Error::Json(e.to_string()))?;
-    let review = review
-        .as_object()
-        .ok_or_else(|| Error::Review("not an object".into()))?;
+/// v1 Pod `CREATE`, as the Go handler does. `lookup` resolves the
+/// ClusterCache named by the pod.
+pub fn admit(
+    review: &[u8],
+    image: &str,
+    lookup: &dyn Fn(&str) -> CacheLookup,
+) -> Result<Vec<u8>, Error> {
+    Ok(Review::parse(review)?.respond(image, lookup))
+}
 
-    if review.get("apiVersion").and_then(Value::as_str) != Some(API_VERSION) {
-        return Err(Error::Review(format!("apiVersion must be {API_VERSION}")));
-    }
-    if review.get("kind").and_then(Value::as_str) != Some(REVIEW_KIND) {
-        return Err(Error::Review(format!("kind must be {REVIEW_KIND}")));
-    }
-    let req = review
-        .get("request")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::Review("request is missing".into()))?;
-    let uid = match req.get("uid") {
-        Some(Value::String(u)) if !u.is_empty() && u.len() <= UID_MAX => u.clone(),
-        _ => {
-            return Err(Error::Review(
-                "request.uid must be a non-empty string".into(),
-            ));
+impl Review {
+    /// Parses and checks the review envelope.
+    pub fn parse(review: &[u8]) -> Result<Self, Error> {
+        if review.len() > MAX_REQUEST_BYTES {
+            return Err(Error::TooLarge(review.len()));
         }
-    };
+        let review = strict::parse(review).map_err(|e| Error::Json(e.to_string()))?;
+        let Value::Object(mut review) = review else {
+            return Err(Error::Review("not an object".into()));
+        };
 
-    let response = match handle(req, image) {
-        Ok(patch) if patch.is_empty() => {
-            json!({"uid": uid, "allowed": true, "status": {"code": 200}})
+        if review.get("apiVersion").and_then(Value::as_str) != Some(API_VERSION) {
+            return Err(Error::Review(format!("apiVersion must be {API_VERSION}")));
         }
-        Ok(patch) => {
-            let patch = serde_json::to_vec(&patch).expect("serializing a JSON value cannot fail");
-            json!({
+        if review.get("kind").and_then(Value::as_str) != Some(REVIEW_KIND) {
+            return Err(Error::Review(format!("kind must be {REVIEW_KIND}")));
+        }
+        let Some(Value::Object(req)) = review.remove("request") else {
+            return Err(Error::Review("request is missing".into()));
+        };
+        let uid = match req.get("uid") {
+            Some(Value::String(u)) if !u.is_empty() && u.len() <= UID_MAX => u.clone(),
+            _ => {
+                return Err(Error::Review(
+                    "request.uid must be a non-empty string".into(),
+                ));
+            }
+        };
+        Ok(Review { uid, req })
+    }
+
+    /// Names of the ClusterCaches the opted-in pod names, valid names only,
+    /// without duplicates. Empty when no lookup is needed.
+    pub fn caches(&self) -> Vec<String> {
+        let annotations = self
+            .req
+            .get("object")
+            .and_then(|o| o.get("metadata"))
+            .and_then(|m| m.get("annotations"))
+            .and_then(Value::as_object);
+        let labels = self
+            .req
+            .get("object")
+            .and_then(|o| o.get("metadata"))
+            .and_then(|m| m.get("labels"))
+            .and_then(Value::as_object);
+        let mut out: Vec<String> = Vec::new();
+        for (label, annotation) in [
+            (ENABLED_LABEL, CACHE_ANNOTATION),
+            (CLIENT_SOCKET_LABEL, CLIENT_CACHE_ANNOTATION),
+        ] {
+            if get_str(labels, label) != Some(ENABLED_VALUE) {
+                continue;
+            }
+            if let Some(c) = get_str(annotations, annotation)
+                && valid_cache(c)
+                && !out.iter().any(|o| o == c)
+            {
+                out.push(c.to_owned());
+            }
+        }
+        out
+    }
+
+    /// Returns the response review as JSON.
+    pub fn respond(&self, image: &str, lookup: &dyn Fn(&str) -> CacheLookup) -> Vec<u8> {
+        let uid = &self.uid;
+        let req = &self.req;
+        let response = match handle(req, image, lookup) {
+            Ok(patch) if patch.is_empty() => {
+                json!({"uid": uid, "allowed": true, "status": {"code": 200}})
+            }
+            Ok(patch) => {
+                let patch =
+                    serde_json::to_vec(&patch).expect("serializing a JSON value cannot fail");
+                json!({
+                    "uid": uid,
+                    "allowed": true,
+                    "status": {"code": 200},
+                    "patchType": "JSONPatch",
+                    "patch": base64::engine::general_purpose::STANDARD.encode(patch),
+                })
+            }
+            Err(Reject::Denied(msg)) => json!({
                 "uid": uid,
-                "allowed": true,
-                "status": {"code": 200},
-                "patchType": "JSONPatch",
-                "patch": base64::engine::general_purpose::STANDARD.encode(patch),
-            })
-        }
-        Err(Reject::Denied(msg)) => json!({
-            "uid": uid,
-            "allowed": false,
-            "status": {"code": 403, "reason": "Forbidden", "message": msg},
-        }),
-        Err(Reject::BadRequest(msg)) => json!({
-            "uid": uid,
-            "allowed": false,
-            "status": {"code": 400, "message": msg},
-        }),
-    };
+                "allowed": false,
+                "status": {"code": 403, "reason": "Forbidden", "message": msg},
+            }),
+            Err(Reject::BadRequest(msg)) => json!({
+                "uid": uid,
+                "allowed": false,
+                "status": {"code": 400, "message": msg},
+            }),
+            Err(Reject::Unavailable(msg)) => json!({
+                "uid": uid,
+                "allowed": false,
+                "status": {"code": 503, "reason": "ServiceUnavailable", "message": msg},
+            }),
+        };
 
-    let out = json!({"apiVersion": API_VERSION, "kind": REVIEW_KIND, "response": response});
-    Ok(serde_json::to_vec(&out).expect("serializing a JSON value cannot fail"))
+        let out = json!({"apiVersion": API_VERSION, "kind": REVIEW_KIND, "response": response});
+        serde_json::to_vec(&out).expect("serializing a JSON value cannot fail")
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Reject {
     Denied(String),
     BadRequest(String),
+    /// Retryable: the pod may be admitted once the dependency recovers.
+    Unavailable(String),
 }
 
 fn bad(msg: impl Into<String>) -> Reject {
@@ -180,7 +263,11 @@ fn deny(msg: impl Into<String>) -> Reject {
 }
 
 /// Returns JSON Patch operations, empty when the pod is left unchanged.
-fn handle(req: &Map<String, Value>, image: &str) -> Result<Vec<Value>, Reject> {
+fn handle(
+    req: &Map<String, Value>,
+    image: &str,
+    lookup: &dyn Fn(&str) -> CacheLookup,
+) -> Result<Vec<Value>, Reject> {
     let kind = req.get("kind").and_then(Value::as_object);
     let field = |name: &str| {
         kind.and_then(|k| k.get(name))
@@ -197,7 +284,7 @@ fn handle(req: &Map<String, Value>, image: &str) -> Result<Vec<Value>, Reject> {
     }
     // dryRun needs no special handling: this webhook has no side effects.
     match req.get("object") {
-        Some(pod @ Value::Object(_)) => mutate(pod, image),
+        Some(pod @ Value::Object(_)) => mutate(pod, image, lookup),
         _ => Err(bad("request.object must be a Pod object")),
     }
 }
@@ -503,10 +590,12 @@ fn exclusion() -> Value {
     json!({"key": EXCLUSION_LABEL, "operator": "DoesNotExist"})
 }
 
-/// Returns the pod affinity with the exclusion requirement added. Ports Go
+/// Returns the pod affinity with the exclusion requirement and `extra` node
+/// requirements ANDed into every required node selector term. Ports Go
 /// `addExclusionAffinity`.
-fn with_exclusion(affinity: Option<&Map<String, Value>>) -> Result<Value, Reject> {
-    let required_only = || json!({"nodeSelectorTerms": [{"matchExpressions": [exclusion()]}]});
+fn with_exclusion(affinity: Option<&Map<String, Value>>, extra: &[Value]) -> Result<Value, Reject> {
+    let mut reqs = vec![exclusion()];
+    reqs.extend_from_slice(extra);
     let mut aff = affinity.cloned().unwrap_or_default();
     let mut na = object(&aff, "nodeAffinity", "spec.affinity.nodeAffinity")?
         .cloned()
@@ -514,14 +603,14 @@ fn with_exclusion(affinity: Option<&Map<String, Value>>) -> Result<Value, Reject
     let key = "requiredDuringSchedulingIgnoredDuringExecution";
     let path = "spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution";
     let sel = match object(&na, key, path)? {
-        None => required_only(),
+        None => json!({"nodeSelectorTerms": [{"matchExpressions": reqs}]}),
         Some(sel) => {
             let mut sel = sel.clone();
             let tpath = format!("{path}.nodeSelectorTerms");
             if let Some(terms) = array(&sel, "nodeSelectorTerms", &tpath)? {
                 let mut terms = terms.clone();
                 for term in &mut terms {
-                    add_to_term(term, &tpath)?;
+                    add_to_term(term, &tpath, &reqs)?;
                 }
                 sel.insert("nodeSelectorTerms".into(), Value::Array(terms));
             }
@@ -533,31 +622,51 @@ fn with_exclusion(affinity: Option<&Map<String, Value>>) -> Result<Value, Reject
     Ok(Value::Object(aff))
 }
 
-fn add_to_term(term: &mut Value, path: &str) -> Result<(), Reject> {
+/// Whether two node selector requirements are the same, treating absent
+/// and empty values alike.
+fn same_requirement(a: &Map<String, Value>, b: &Value) -> bool {
+    let values = |v: Option<&Value>| match v {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) => a.clone(),
+        Some(other) => vec![other.clone()],
+    };
+    a.get("key") == b.get("key")
+        && a.get("operator") == b.get("operator")
+        && values(a.get("values")) == values(b.get("values"))
+}
+
+fn add_to_term(term: &mut Value, path: &str, reqs: &[Value]) -> Result<(), Reject> {
     let t = term
         .as_object_mut()
         .ok_or_else(|| bad(format!("{path} items must be objects")))?;
     let exprs = array(t, "matchExpressions", &format!("{path}.matchExpressions"))?;
     let fields = array(t, "matchFields", &format!("{path}.matchFields"))?;
-    // An empty term matches no nodes. Adding the exclusion would make it
-    // match every node without the exclusion label, so leave it unchanged.
+    // An empty term matches no nodes. Adding requirements would make it
+    // match nodes, so leave it unchanged.
     if exprs.is_none_or(Vec::is_empty) && fields.is_none_or(Vec::is_empty) {
         return Ok(());
     }
     let mut exprs = exprs.cloned().unwrap_or_default();
+    let mut existing = Vec::with_capacity(exprs.len());
     for e in &exprs {
         let e = e
             .as_object()
             .ok_or_else(|| bad(format!("{path}.matchExpressions items must be objects")))?;
-        let key = string(e, "key", "matchExpressions.key")?.unwrap_or("");
-        let op = string(e, "operator", "matchExpressions.operator")?.unwrap_or("");
-        let values = array(e, "values", "matchExpressions.values")?;
-        if key == EXCLUSION_LABEL && op == "DoesNotExist" && values.is_none_or(Vec::is_empty) {
-            return Ok(());
+        string(e, "key", "matchExpressions.key")?;
+        string(e, "operator", "matchExpressions.operator")?;
+        array(e, "values", "matchExpressions.values")?;
+        existing.push(e.clone());
+    }
+    let mut changed = false;
+    for r in reqs {
+        if !existing.iter().any(|e| same_requirement(e, r)) {
+            exprs.push(r.clone());
+            changed = true;
         }
     }
-    exprs.push(exclusion());
-    t.insert("matchExpressions".into(), Value::Array(exprs));
+    if changed {
+        t.insert("matchExpressions".into(), Value::Array(exprs));
+    }
     Ok(())
 }
 

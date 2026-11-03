@@ -6,13 +6,17 @@ use super::*;
 
 /// Ports Go `Mutate`. A failure denies the pod with no change. Returns JSON
 /// Patch operations that turn `pod` into the mutated pod.
-pub(crate) fn mutate(pod: &Value, image: &str) -> Result<Vec<Value>, Reject> {
+pub(crate) fn mutate(
+    pod: &Value,
+    image: &str,
+    lookup: &dyn Fn(&str) -> CacheLookup,
+) -> Result<Vec<Value>, Reject> {
     if image.trim().is_empty() {
         return Err(deny("racer-object sidecar image must not be empty"));
     }
     let mut out = pod.clone();
-    mutate_sidecar(&mut out, image)?;
-    mutate_client_socket(&mut out)?;
+    mutate_sidecar(&mut out, image, lookup)?;
+    mutate_client_socket(&mut out, lookup)?;
     let mut ops = Vec::new();
     diff(pod, &out, &mut String::new(), &mut ops);
     Ok(ops)
@@ -46,10 +50,11 @@ fn set_annotation(pod: &mut Value, key: &str, value: &str) {
     child_in(child(pod, "metadata"), "annotations").insert(key.into(), json!(value));
 }
 
-/// Places the pod on Linux nodes that run the dataplane. Ports Go
+/// Places the pod on Linux nodes that run the dataplane and match the
+/// cache's node selector, given as `pool` requirements. Ports Go
 /// `requireRacerNode`.
-fn require_racer_node(pod: &mut Value) -> Result<(), Reject> {
-    let affinity = with_exclusion(Pod::read(pod)?.affinity)?;
+fn require_racer_node(pod: &mut Value, pool: &[Value]) -> Result<(), Reject> {
+    let affinity = with_exclusion(Pod::read(pod)?.affinity, pool)?;
     let spec = child(pod, "spec");
     child_in(spec, "nodeSelector").insert(OS_LABEL.into(), json!("linux"));
     spec.insert("affinity".into(), affinity);
@@ -74,8 +79,14 @@ fn check_linux(p: &Pod, what: &str) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Injects the racer-object sidecar. Ports Go `mutateSidecar`.
-fn mutate_sidecar(pod: &mut Value, image: &str) -> Result<(), Reject> {
+/// Injects the racer-object sidecar. The named ClusterCache must exist, and
+/// its node selector is added to the pod's required node affinity. Ports Go
+/// `mutateSidecar`.
+fn mutate_sidecar(
+    pod: &mut Value,
+    image: &str,
+    lookup: &dyn Fn(&str) -> CacheLookup,
+) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
     if get_str(p.labels, ENABLED_LABEL) != Some(ENABLED_VALUE) {
@@ -101,6 +112,7 @@ fn mutate_sidecar(pod: &mut Value, image: &str) -> Result<(), Reject> {
         )));
     }
     check_linux(&p, "racer-object sidecar")?;
+    let pool = selector::cache_requirements(&spec.cache, CACHE_ANNOTATION, lookup)?;
 
     let client_dir = format!("/run/racer/{}/client", spec.cache);
     let container = json!({
@@ -126,18 +138,22 @@ fn mutate_sidecar(pod: &mut Value, image: &str) -> Result<(), Reject> {
     let s = child(pod, "spec");
     child_array(s, "initContainers").insert(0, container);
     child_array(s, "volumes").push(volume);
-    require_racer_node(pod)?;
+    require_racer_node(pod, &pool)?;
     set_annotation(pod, INJECTED_ANNOTATION, image);
     Ok(())
 }
 
-/// Mounts `/run/racer/<cache>/client` read-only at the same path in the
+/// Requires the named ClusterCache to exist and adds its node selector to
+/// the pod's required node affinity. Mounts `/run/racer/<cache>/client` read-only at the same path in the
 /// selected init and app containers and sets [`SOCKET_ENV`]. A read-only mount still
 /// permits connect(2) on the socket: write permission on the socket inode is
 /// checked, not the mount's read-only flag. Pods without the label, or already
 /// marked with [`CLIENT_SOCKET_INJECTED_ANNOTATION`], are left unchanged.
 /// Ports Go `mutateClientSocket`.
-fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
+fn mutate_client_socket(
+    pod: &mut Value,
+    lookup: &dyn Fn(&str) -> CacheLookup,
+) -> Result<(), Reject> {
     let p = Pod::read(pod)?;
 
     if get_str(p.labels, CLIENT_SOCKET_LABEL) != Some(ENABLED_VALUE) {
@@ -165,6 +181,7 @@ fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
     let containers = p.containers.map(Vec::as_slice).unwrap_or_default();
     let targets = client_targets(p.annotations, init_containers, containers)?;
     check_linux(&p, "Racer client socket")?;
+    let pool = selector::cache_requirements(&cache, CLIENT_CACHE_ANNOTATION, lookup)?;
 
     let client_dir = format!("/run/racer/{cache}/client");
     let socket = format!("{client_dir}/socket");
@@ -233,7 +250,7 @@ fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
             .push(json!({"name": volume, "mountPath": client_dir, "readOnly": true}));
         child_array(c, "env").push(json!({"name": SOCKET_ENV, "value": socket}));
     }
-    require_racer_node(pod)?;
+    require_racer_node(pod, &pool)?;
     set_annotation(pod, CLIENT_SOCKET_INJECTED_ANNOTATION, &cache);
     Ok(())
 }
