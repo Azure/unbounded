@@ -4158,3 +4158,81 @@ fn handoff_acceptor_drains_backlog_and_wakes_only_while_one_remains() {
     assert_eq!(worker.listeners.active_connections_for(&definition().id), 3);
 }
 mod direct;
+
+/// Cross-language prefetch conformance: the production Go SDK (built from
+/// `RACER_SDK_ROOT` with the shared fixture overlay) talks to the real client
+/// listener and prefetch service.
+#[test]
+#[ignore = "set RACER_SDK_ROOT to the Go repository and run --ignored sdk_prefetch"]
+fn sdk_prefetch_conformance_against_actual_uds() {
+    use std::process::Command;
+    let root = PathBuf::from(std::env::var_os("RACER_SDK_ROOT").expect("RACER_SDK_ROOT required"));
+    assert!(root.join("pkg/racersdk/prefetch.go").is_file());
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = manifest.join("tests/conformance/sdk_fixture_test.go.txt");
+    let output = Root::new();
+    let overlay = output.0.join("overlay.json");
+    fs::write(
+        &overlay,
+        serde_json::to_vec(&serde_json::json!({"Replace": {
+            root.join("pkg/racersdk/rust_conformance_fixture_test.go").to_str().unwrap(): fixture
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let binary = output.0.join("sdk.test");
+    let build = Command::new("timeout")
+        .current_dir(&root)
+        .args([
+            "--signal=TERM",
+            "--kill-after=10s",
+            "300s",
+            "go",
+            "test",
+            "-overlay",
+        ])
+        .arg(&overlay)
+        .args(["-c", "-o"])
+        .arg(&binary)
+        .arg("./pkg/racersdk")
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "SDK build: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let fixture = Fixture::new();
+    fixture.reconcile(&[definition()]).unwrap();
+    let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
+    let mut child = Command::new(&binary)
+        .args([
+            "-test.run=^TestRustWirePrefetchFixture$",
+            "-test.timeout=60s",
+            "-test.v",
+        ])
+        .env(
+            "RACER_CONFORMANCE_SOCKET",
+            format!(
+                "/proc/{}/fd/{}/socket",
+                std::process::id(),
+                directory.as_raw_fd()
+            ),
+        )
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        fixture.pump(16);
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("SDK prefetch fixture stalled");
+        }
+        fixture.reactor.wait(Duration::from_millis(1)).unwrap();
+    };
+    assert!(status.success(), "SDK prefetch fixture failed");
+}

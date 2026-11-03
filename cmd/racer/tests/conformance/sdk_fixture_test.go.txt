@@ -183,3 +183,96 @@ func TestRustWireOriginFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestRustWirePrefetchFixture drives the production prefetch API against the
+// real Rust client listener and prefetch service. The Rust side serves one
+// cache whose origin has a single 17-byte object for every key.
+func TestRustWirePrefetchFixture(t *testing.T) {
+	client, err := newClient(ClientConfig{Cache: "conformance", MaxConnections: 1}, os.Getenv("RACER_CONFORMANCE_SOCKET"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	key := "00000000000000000000000000000000000000000000000000000000000000aa"
+	spec := PrefetchSpec{Priority: "high", TTL: 90 * time.Second, Refs: []PrefetchRef{{Key: key}, {Key: key, Offset: 4, Length: 100}, {Key: key, Offset: 17}}}
+
+	created, err := client.Prefetch(ctx, "conformance-1", spec)
+	if err != nil || !created.Created || created.ID != "conformance-1" || created.Priority != "high" || created.TTL != 90*time.Second || created.RefsTotal != 3 || created.CacheUID == "" {
+		t.Fatalf("create: %+v %v", created, err)
+	}
+
+	// An identical PUT is an idempotent replay, even over a new connection.
+	again, err := client.Prefetch(ctx, "conformance-1", spec)
+	if err != nil || again.Created || again.Generation != 0 || again.Sequence != 0 {
+		t.Fatalf("replay: %+v %v", again, err)
+	}
+
+	var pe *PrefetchError
+
+	other := spec
+	other.Refs = []PrefetchRef{{Key: key}}
+
+	if _, err := client.Prefetch(ctx, "conformance-1", other); !errors.As(err, &pe) || pe.Status != 409 || pe.Code != "payload_mismatch" || pe.Message == "" {
+		t.Fatalf("payload mismatch: %v", err)
+	}
+
+	status, err := client.PrefetchStatus(ctx, "conformance-1", StatusOptions{Wait: 10 * time.Second, Coverage: true, Refs: "all"})
+	if err != nil || !status.Settled || status.Coverage == nil || len(status.Refs) != 3 || status.NextCursor != "" {
+		t.Fatalf("status: %+v %v", status, err)
+	}
+
+	// The single-worker rig resolves versions but may not complete owner
+	// fills, so refs 0 and 1 can fail; ref 2 starts at the object end.
+	if (status.State != PrefetchPartial && status.State != PrefetchFailed) || status.RefsFailed < 1 || status.Refs[2].Outcome != "failed" || status.Refs[2].Error != "invalid_range" || status.Refs[1].Length != 13 || status.Refs[0].ETag == "" {
+		t.Fatalf("outcomes: %+v", status)
+	}
+
+	failed, err := client.PrefetchStatus(ctx, "conformance-1", StatusOptions{Refs: "failed"})
+	if err != nil || len(failed.Refs) != int(status.RefsFailed) || failed.Refs[len(failed.Refs)-1].Index != 2 || failed.Coverage != nil {
+		t.Fatalf("failed refs: %+v %v", failed, err)
+	}
+
+	next := spec
+	next.Sequence = 1
+	window := client.NewPrefetchWindow("conformance-1", next)
+	if updated, err := window.Update(ctx, spec.Refs[:1]); err != nil || updated.Sequence != 1 {
+		t.Fatalf("update: %+v %v", updated, err)
+	}
+
+	if _, err := client.Prefetch(ctx, "conformance-1", spec); !errors.As(err, &pe) || pe.Status != 409 || pe.Code != "stale_sequence" {
+		t.Fatalf("stale sequence: %v", err)
+	}
+
+	if _, err := client.PrefetchStatus(ctx, "conformance-1", StatusOptions{Refs: "all", Cursor: "0.0.256"}); !errors.As(err, &pe) || pe.Status != 400 || pe.Code != "invalid_request" || !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("stale cursor: %v", err)
+	}
+
+	if _, err := client.PrefetchStatus(ctx, "missing", StatusOptions{}); !errors.As(err, &pe) || pe.Status != 404 || pe.Code != "not_found" || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("not found: %v", err)
+	}
+
+	if _, err := client.Prefetch(ctx, "conformance-2", PrefetchSpec{CacheUID: "not-this-cache", Refs: spec.Refs}); !errors.As(err, &pe) || pe.Status != 409 || pe.Code != "cache_uid_mismatch" {
+		t.Fatalf("cache uid: %v", err)
+	}
+
+	list, err := client.ListPrefetches(ctx)
+	if err != nil || len(list) != 1 || list[0].ID != "conformance-1" || list[0].Sequence != 1 {
+		t.Fatalf("list: %+v %v", list, err)
+	}
+
+	canceled, err := client.CancelPrefetch(ctx, "conformance-1")
+	if err != nil || canceled.State != PrefetchCanceled || canceled.Reason != "client" || !canceled.Settled {
+		t.Fatalf("cancel: %+v %v", canceled, err)
+	}
+
+	// A higher sequence restarts the canceled ticket.
+	if restarted, err := window.Update(ctx, spec.Refs[:1]); err != nil || restarted.Sequence != 2 || restarted.State == PrefetchCanceled || restarted.Created {
+		t.Fatalf("restart: %+v %v", restarted, err)
+	}
+
+	fmt.Fprintln(os.Stderr, "prefetch fixture ok")
+}
