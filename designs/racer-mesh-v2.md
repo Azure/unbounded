@@ -136,6 +136,26 @@ For reader `r` and owner `o` in the same pool:
 So every pool has diameter at most 2, and routes need no search. Routing works on the union
 graph: any node that is linked to the destination can relay to it.
 
+### Which path a request takes
+
+A route picks the primary path every time, and a retry with a new seed does too. So a hung
+relay would eat every exchange and every retry over it. To avoid that, each worker keeps a
+detour level per destination (`liveness::Detours`):
+
+- 0: the primary path.
+- 1: after an exchange with the destination goes unanswered. Routes skip the primary relay as
+  a first hop (`Membership::detour`), so they take the alternate path.
+- 2: after an exchange sent on the detour also goes unanswered. Routes skip both relays and
+  take a 3-hop path.
+
+An answer does not end a detour, since an answer over the alternate says nothing about the
+primary relay. A detour ends a while after the last timeout that set or renewed it. A direct
+link is never detoured.
+
+A silence ping always uses at least level 1. The ping follows up on exchanges that may have
+been eaten by the primary relay, so it must not cross that relay. Otherwise a healthy owner
+behind a hung relay would be marked silent.
+
 ### Churn
 
 - A join or leave changes the member's own edges, plus the delegate edges whose ring arc it
