@@ -45,11 +45,24 @@ func runController(
 	nodeName string,
 	nodeOperator nodeOperator,
 	installation *installstate.Store,
+	machineRefSelectable bool,
 ) error {
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
+		},
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				// Read these from the API server. Caching either would watch
+				// every one in the cluster. The daemon watches only its own
+				// MachineOperations, in the caches added below, and reads a
+				// MachineConfigurationVersion only to repave.
+				DisableFor: []client.Object{
+					&v1alpha3.MachineOperation{},
+					&v1alpha3.MachineConfigurationVersion{},
+				},
+			},
 		},
 		Cache: ctrlcache.Options{
 			// Keep the daemon cache intentionally small. The daemon only needs
@@ -63,7 +76,6 @@ func runController(
 				&v1alpha3.Machine{}: {
 					Field: fields.OneTermEqualSelector("metadata.name", machineName),
 				},
-				&v1alpha3.MachineConfigurationVersion{}: {},
 			},
 		},
 	})
@@ -96,6 +108,17 @@ func runController(
 	)
 	if err != nil {
 		return fmt.Errorf("create MachineOperation reconciler: %w", err)
+	}
+
+	// Without selection, the reconciler watches every MachineOperation in the
+	// manager's cache, as daemons did before the CRD declared the field.
+	if machineRefSelectable {
+		caches, err := daemon.AddMachineOperationCaches(mgr, machineName)
+		if err != nil {
+			return fmt.Errorf("add MachineOperation caches: %w", err)
+		}
+
+		machineOperationReconciler.WatchMachineOperationsIn(caches...)
 	}
 
 	repaveReconciler := &repaveReconciler{

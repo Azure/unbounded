@@ -184,7 +184,7 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. |
+| `spec.machineRef` | string | No | Target `Machine` name. Either `machineRef` or `machineSelector` must be set. Selectable as a field on Kubernetes 1.31 and later, for example `kubectl get mop --field-selector spec.machineRef=worker-01`. |
 | `spec.machineSelector` | LabelSelector | No | Selects Machines by label. Supported for agent-handled operations (`NodeReboot`, `AgentUpgrade`, `AgentReset`). Each matching agent independently picks up the operation. Not supported for host operations. |
 | `spec.operationKind` | string | Yes | One of `NodeReboot`, `AgentUpgrade`, `AgentReset`, `HostHardReboot`, `HostSoftReboot`, `HostPowerOff`, `HostPowerOn`, `HostReplace`. |
 | `spec.parameters` | map[string]string | No | Operation-specific parameters. |
@@ -195,6 +195,8 @@ spec:
 | `status.completedAt` | time | No | Terminal phase timestamp. |
 | `status.targets` | []TargetStatus | No | Per-Machine target status snapshot used by host operation controllers. |
 | `status.conditions` | []Condition | No | Operation conditions. `Completed` tracks terminal state. `BootLoaderDownloaded=True` is latched by metalman when a target first downloads the initial PXE boot loader, usually over TFTP. `BootImageWritten` starts as `Unknown` for metalman `HostReplace`, transitions to `False` when the PXE installer requests `disk.img.gz`, and transitions to `True` when the existing `/pxe/disable` completion signal is received. `CloudInitDone` starts as `Unknown`, transitions to `False` when first-boot cloud-init starts, and transitions to `True` on final cloud-init success or `False` with reason `Failed` and a summarized error when cloud-init reports a failure. |
+
+The in-host agent asks the API server only for the operations it can act on: those whose `spec.machineRef` is its Machine, and those with no `machineRef`, which select Machines by label. Where the API server cannot select by `spec.machineRef`, such as before Kubernetes 1.31, the agent logs a warning and watches every MachineOperation instead.
 
 `AgentUpgrade` is handled by the in-host agent and requires `spec.parameters.downloadURL`. The URL may use HTTP or HTTPS and must point to an `unbounded-agent` release tarball. The optional `spec.parameters.sha256` is the expected digest of the compressed archive. The agent verifies the digest when provided, stages the archive's exact `unbounded-agent` member as the inactive blue/green daemon binary, records the previous binary as last known good, and restarts `unbounded-agent-daemon.service`. If systemd cannot keep the upgraded daemon running, `unbounded-agent-daemon-recovery.service` switches the daemon back to the last known good binary.
 

@@ -25,6 +25,7 @@ func init() {
 // +kubebuilder:printcolumn:name="Operation",type="string",JSONPath=".spec.operationKind"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:selectablefield:JSONPath=".spec.machineRef"
 
 // MachineOperation represents a discrete operation to be performed on a
 // Machine. MachineOperations are created by CLI commands or controllers and
@@ -47,6 +48,11 @@ type MachineOperationList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []MachineOperation `json:"items"`
 }
+
+// MachineOperationMachineRefField is the field selector key for
+// spec.machineRef. The CRD declares it selectable, which the API server honors
+// from Kubernetes 1.31. An operation with no machineRef has the empty value.
+const MachineOperationMachineRefField = "spec.machineRef"
 
 // OperationKind identifies the kind of operation to perform. Predefined
 // operations cover common lifecycle actions; custom operations may be

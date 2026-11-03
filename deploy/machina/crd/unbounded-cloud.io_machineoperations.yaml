@@ -719,6 +719,8 @@ spec:
                 x-kubernetes-list-type: map
             type: object
         type: object
+    selectableFields:
+    - jsonPath: .spec.machineRef
     served: true
     storage: true
     subresources:

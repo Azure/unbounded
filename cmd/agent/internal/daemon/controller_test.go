@@ -159,13 +159,20 @@ func (op *fakeNodeOperator) ReconcileHostRoot(_ context.Context, _ *slog.Logger,
 	return op.hostRootRestarted, op.hostRootErr
 }
 
+// fakeStatusClient returns a fake client that, like an API server serving the
+// current MachineOperation CRD, selects MachineOperations by spec.machineRef.
 func fakeStatusClient(objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().
 		WithScheme(fakeScheme()).
 		WithStatusSubresource(&v1alpha3.Machine{}).
 		WithStatusSubresource(&v1alpha3.MachineOperation{}).
+		WithIndex(&v1alpha3.MachineOperation{}, v1alpha3.MachineOperationMachineRefField, machineOperationMachineRef).
 		WithObjects(objs...).
 		Build()
+}
+
+func machineOperationMachineRef(obj client.Object) []string {
+	return []string{obj.(*v1alpha3.MachineOperation).Spec.MachineRef}
 }
 
 func newTestMachinaMachineOperationReconciler(t *testing.T, c client.Client, op nodeOperator) *daemon.MachinaMachineOperationReconciler {

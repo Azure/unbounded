@@ -64,3 +64,31 @@ func TestMachineOperationKindSchemaEnum(t *testing.T) {
 		t.Fatalf("operationKind enum = %v, want %v", got, want)
 	}
 }
+
+func TestMachineOperationMachineRefSelectable(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile("../../../deploy/machina/crd/unbounded-cloud.io_machineoperations.yaml")
+	if err != nil {
+		t.Fatalf("read MachineOperation CRD: %v", err)
+	}
+
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatalf("parse MachineOperation CRD: %v", err)
+	}
+
+	// Agents select their MachineOperations by this field on the API server.
+	want := "." + MachineOperationMachineRefField
+
+	for _, version := range crd.Spec.Versions {
+		var got []string
+		for _, field := range version.SelectableFields {
+			got = append(got, field.JSONPath)
+		}
+
+		if !slices.Contains(got, want) {
+			t.Fatalf("version %s selectableFields = %v, want %s", version.Name, got, want)
+		}
+	}
+}

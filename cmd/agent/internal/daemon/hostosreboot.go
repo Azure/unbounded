@@ -202,11 +202,19 @@ func hostSoftRebootTarget(status *v1alpha3.MachineOperationStatus, machineName s
 
 // publishHostSoftReboots reports HostSoftReboot operations that an earlier daemon
 // on this machine issued. Each completes if the host has booted since its
-// reboot was issued and fails otherwise, so none stays InProgress.
-func publishHostSoftReboots(ctx context.Context, log *slog.Logger, c client.Client, machineName string, currentBootID func() (string, error)) error {
-	var ops v1alpha3.MachineOperationList
-	if err := c.List(ctx, &ops); err != nil {
-		return fmt.Errorf("list MachineOperations: %w", err)
+// reboot was issued and fails otherwise, so none stays InProgress. It lists
+// only the operations this machine can act on; see daemon.ListMachineOperations.
+func publishHostSoftReboots(
+	ctx context.Context,
+	log *slog.Logger,
+	c client.Client,
+	machineName string,
+	machineRefSelectable bool,
+	currentBootID func() (string, error),
+) error {
+	ops, err := daemon.ListMachineOperations(ctx, c, machineName, machineRefSelectable)
+	if err != nil {
+		return err
 	}
 
 	var (
@@ -214,8 +222,8 @@ func publishHostSoftReboots(ctx context.Context, log *slog.Logger, c client.Clie
 		errs   []error
 	)
 
-	for i := range ops.Items {
-		op := &ops.Items[i]
+	for i := range ops {
+		op := &ops[i]
 		if op.Spec.OperationKind != v1alpha3.OperationHostSoftReboot {
 			continue
 		}
