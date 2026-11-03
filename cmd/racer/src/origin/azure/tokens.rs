@@ -20,8 +20,9 @@ use crate::origin::azure_auth::{self, AuthEndpoints, AuthError, AzureTokenCache}
 use crate::remote::Resolver;
 use crate::runtime::{Reactor, RequestScope};
 use racer_control_wire::AzureCredential;
+use racer_control_wire::OriginDefinition;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,7 +59,9 @@ fn provider(credential: &AzureCredential) -> Option<(Key, azure_auth::AzureCrede
 /// Node-wide token caches, shared by every worker.
 pub struct AzureTokenCaches {
     endpoints: AuthEndpoints,
-    caches: Mutex<HashMap<Key, Arc<AzureTokenCache>>>,
+    /// Weak, so a credential no worker uses any more drops its cache (and its
+    /// tokens). Workers own the caches through their sources.
+    caches: Mutex<HashMap<Key, std::sync::Weak<AzureTokenCache>>>,
 }
 
 impl AzureTokenCaches {
@@ -80,12 +83,21 @@ impl AzureTokenCaches {
         credential: azure_auth::AzureCredential,
     ) -> Result<Arc<AzureTokenCache>> {
         let mut caches = self.caches.lock().map_err(|_| Error::Internal)?;
-        if let Some(cache) = caches.get(key) {
-            return Ok(cache.clone());
+        if let Some(cache) = caches.get(key).and_then(std::sync::Weak::upgrade) {
+            return Ok(cache);
         }
+        // New credentials are rare, so sweeping here keeps the map at the
+        // credentials some worker still holds.
+        caches.retain(|_, cache| cache.strong_count() > 0);
         let cache = Arc::new(AzureTokenCache::new(credential, self.endpoints.clone())?);
-        caches.insert(key.clone(), cache.clone());
+        caches.insert(key.clone(), Arc::downgrade(&cache));
         Ok(cache)
+    }
+
+    /// Credentials with a cache entry, live or not yet swept (tests).
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.caches.lock().map_or(0, |caches| caches.len())
     }
 }
 
@@ -109,6 +121,12 @@ pub struct AzureTokens {
 }
 
 impl AzureTokens {
+    /// Worker-local sources (tests).
+    #[cfg(test)]
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.borrow().len()
+    }
+
     /// Fetch on `reactor` with DNS resolution.
     pub fn new(caches: Arc<AzureTokenCaches>, reactor: Rc<Reactor>) -> Self {
         Self {
@@ -180,6 +198,19 @@ impl AzureTokenSource for AzureTokens {
         sent: Option<&[u8]>,
     ) -> bool {
         self.rejected_at(credential, challenge, sent, Instant::now())
+    }
+
+    /// Drop sources for credentials no published origin uses. A request in
+    /// flight keeps its own `Rc` to the source.
+    fn retain(&self, live: &[&OriginDefinition]) {
+        let live: HashSet<Key> = live
+            .iter()
+            .filter_map(|origin| provider(&origin.azure.credential).map(|(key, _)| key))
+            .collect();
+        let mut sources = self.sources.borrow_mut();
+        let stale: Vec<_> = sources.extract_if(|key, _| !live.contains(key)).collect();
+        drop(sources);
+        drop(stale);
     }
 }
 
@@ -421,5 +452,48 @@ mod tests {
                 tenant_id: Some("t".into())
             }
         );
+    }
+
+    #[test]
+    fn sources_and_caches_for_unpublished_credentials_are_dropped() {
+        let Some(reactor) = reactor() else { return };
+        let caches = Arc::new(AzureTokenCaches::new(AuthEndpoints {
+            imds: RemoteEndpoint::http("127.0.0.1", 9).unwrap(),
+            authority: "https://login.microsoftonline.com/".into(),
+            federated_token_file: None,
+            tls: None,
+        }));
+        let tokens = AzureTokens::new(caches.clone(), reactor);
+        let origin = |credential: AzureCredential| {
+            OriginDefinition::azure(
+                racer_control_wire::AzureContainerUrl::parse(
+                    "https://acct.blob.core.windows.net/models",
+                )
+                .unwrap(),
+                credential,
+            )
+        };
+        let (a, b) = (origin(managed("a")), origin(managed("b")));
+        let source = |definition: &OriginDefinition| {
+            let (key, provider) = provider(&definition.azure.credential).unwrap();
+            tokens.source(&key, provider).unwrap()
+        };
+        source(&a);
+        // A request in flight holds its source, and with it the cache.
+        let held = source(&b);
+        assert_eq!((tokens.source_count(), caches.tracked()), (2, 2));
+
+        // b's credential is edited away: only a's source stays on this worker.
+        tokens.retain(&[&a, &origin(AzureCredential::Anonymous)]);
+        assert_eq!(tokens.source_count(), 1);
+        assert_eq!(Arc::strong_count(held.cache()), 1);
+        drop(held);
+        // The node-wide entry for b is swept when the next credential arrives.
+        source(&origin(managed("c")));
+        assert_eq!((tokens.source_count(), caches.tracked()), (2, 2));
+        tokens.retain(&[]);
+        assert_eq!(tokens.source_count(), 0);
+        source(&a);
+        assert_eq!(caches.tracked(), 1);
     }
 }

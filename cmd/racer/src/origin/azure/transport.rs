@@ -21,9 +21,9 @@ use crate::remote::{RemoteEndpoint, Resolver};
 use crate::runtime::RequestScope;
 use http1::tls::rustls::ClientConfig;
 use http1::{MessageHead, StartLine};
-use racer_control_wire::AzureContainerUrl;
+use racer_control_wire::{AzureContainerUrl, OriginDefinition};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -168,8 +168,18 @@ impl PoolTransport {
         }
     }
 
+    fn key(url: &AzureContainerUrl) -> (bool, String, u16) {
+        (url.scheme_is_https(), url.host().to_owned(), url.port())
+    }
+
+    /// Cached endpoints (tests).
+    #[cfg(test)]
+    pub(crate) fn endpoint_count(&self) -> usize {
+        self.endpoints.borrow().len()
+    }
+
     fn endpoint(&self, url: &AzureContainerUrl) -> Result<Endpoint> {
-        let key = (url.scheme_is_https(), url.host().to_owned(), url.port());
+        let key = Self::key(url);
         if let Some(endpoint) = self.endpoints.borrow().get(&key) {
             return Ok(endpoint.clone());
         }
@@ -186,6 +196,21 @@ impl PoolTransport {
 
 impl AzureTransport for PoolTransport {
     type Exchange = PoolExchange;
+
+    /// Forget resolved addresses, rotation, and TLS state for endpoints no
+    /// published origin uses. Exchanges in flight hold their own clone, and
+    /// the pool's idle connections are bounded by its endpoint limit.
+    fn retain(&self, live: &[&OriginDefinition]) {
+        let live: HashSet<_> = live
+            .iter()
+            .map(|origin| Self::key(&origin.azure.container_url))
+            .collect();
+        // Dropped after the borrow is released.
+        let mut endpoints = self.endpoints.borrow_mut();
+        let stale: Vec<_> = endpoints.extract_if(|key, _| !live.contains(key)).collect();
+        drop(endpoints);
+        drop(stale);
+    }
 
     fn exchange<'a>(
         &'a self,

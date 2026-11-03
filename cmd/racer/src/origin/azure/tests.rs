@@ -26,6 +26,8 @@ struct Fake {
     finished: Rc<Cell<usize>>,
     read: Rc<Cell<usize>>,
     discarded: Rc<Cell<usize>>,
+    /// Live origin count of each `retain` call.
+    retained: RefCell<Vec<usize>>,
 }
 
 struct FakeExchange {
@@ -57,6 +59,10 @@ impl AzureTransport for Rc<Fake> {
                 discarded: self.discarded.clone(),
             })
         })
+    }
+
+    fn retain(&self, live: &[&OriginDefinition]) {
+        self.retained.borrow_mut().push(live.len());
     }
 }
 
@@ -933,6 +939,39 @@ mod router {
     }
 
     #[test]
+    fn new_snapshots_prune_worker_state_once() {
+        let h = harness();
+        let apply = |native: bool, sequence: u64| {
+            let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/control-wire/testdata/publication.json"
+            )))
+            .unwrap();
+            publication.sequence = racer_control_wire::PublicationSequence(sequence);
+            if native {
+                publication.caches[0].origin = Some(h.definition.clone());
+            }
+            PublicationTarget::new(publication.cluster.clone(), h.snapshots.clone())
+                .apply(publication)
+                .unwrap();
+            h.snapshots.current().unwrap().unwrap().caches[0].id.clone()
+        };
+        let object = in_cache(&apply(true, 1)).object;
+        h.origin.definition(&object).unwrap();
+        h.origin.definition(&object).unwrap();
+        // One prune per generation, against its one native origin.
+        assert_eq!(*h.fake.retained.borrow(), [1]);
+
+        // The cache loses its origin in a new generation: nothing is live.
+        apply(false, 2);
+        assert_eq!(
+            h.origin.definition(&object).map(|_| ()),
+            Err(Error::Unavailable)
+        );
+        assert_eq!(*h.fake.retained.borrow(), [1, 0]);
+    }
+
+    #[test]
     fn native_caches_use_azure_and_others_use_the_adapter() {
         let h = harness();
         let cache = publish(&h, true);
@@ -1038,4 +1077,28 @@ fn unauthorized_retries_once_when_the_token_source_allows() {
     );
     assert_eq!(h.tokens.1.borrow().len(), 2);
     assert_eq!(h.fake.sent.borrow().len(), 4);
+}
+
+#[test]
+fn limits_drop_counters_for_caches_with_nothing_in_flight() {
+    let limits = AzureLimits::default();
+    let held = limits.acquire(&cache(), 1).unwrap();
+    // Many short-lived caches, for example created and deleted over time.
+    for index in 0..100 {
+        drop(
+            limits
+                .acquire(&CacheId(format!("gone-{index}")), 1)
+                .unwrap(),
+        );
+    }
+    assert!(limits.tracked() <= 32, "{}", limits.tracked());
+    // The cache with an operation in flight keeps its count and its limit.
+    assert_eq!(limits.in_flight(&cache()), 1);
+    assert_eq!(
+        limits.acquire(&cache(), 1).map(|_| ()),
+        Err(Error::Overloaded)
+    );
+    drop(held);
+    assert_eq!(limits.in_flight(&cache()), 0);
+    drop(limits.acquire(&cache(), 1).unwrap());
 }

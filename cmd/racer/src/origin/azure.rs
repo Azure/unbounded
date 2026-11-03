@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uring_runtime::environment::Deadline;
 use zeroize::Zeroizing;
@@ -102,6 +102,10 @@ pub trait AzureTokenSource {
         challenge: Option<&[u8]>,
         sent: Option<&[u8]>,
     ) -> bool;
+
+    /// Drop state for credentials not used by any of `live`. Called when the
+    /// worker observes a new snapshot; in-flight requests keep what they hold.
+    fn retain(&self, _live: &[&OriginDefinition]) {}
 }
 
 /// Token source for deployments without credential providers: anonymous
@@ -143,6 +147,11 @@ pub trait AzureTransport {
         head: MessageHead,
         scope: &'a RequestScope,
     ) -> Operation<'a, Self::Exchange>;
+
+    /// Drop per-endpoint state for endpoints not used by any of `live`.
+    /// Called when the worker observes a new snapshot; in-flight exchanges
+    /// keep what they hold.
+    fn retain(&self, _live: &[&OriginDefinition]) {}
 }
 
 /// One in-flight response. Dropping it without [`AzureExchange::finish`] or
@@ -174,10 +183,21 @@ pub trait AzureExchange {
 }
 
 /// Node-wide in-flight request counts per cache, shared by every worker.
-/// Entries for deleted caches remain (one small counter per cache UID).
+///
+/// Only permits own a counter; the map holds weak references, so a cache with
+/// nothing in flight (including a deleted cache) holds no live counter. Dead
+/// entries are swept when the map doubles past its last swept size, keeping
+/// the map within twice the number of caches with operations in flight.
 #[derive(Debug, Default)]
 pub struct AzureLimits {
-    caches: Mutex<HashMap<CacheId, Arc<AtomicU32>>>,
+    caches: Mutex<LimitMap>,
+}
+
+#[derive(Debug, Default)]
+struct LimitMap {
+    counters: HashMap<CacheId, Weak<AtomicU32>>,
+    /// Size after the last sweep; the next sweep runs at twice this.
+    swept: usize,
 }
 
 /// One admitted upstream operation; releases its slot on drop.
@@ -195,9 +215,21 @@ impl AzureLimits {
     pub fn acquire(&self, cache: &CacheId, max: u32) -> Result<AzurePermit> {
         let counter = {
             let mut caches = self.caches.lock().map_err(|_| Error::Internal)?;
-            match caches.get(cache) {
-                Some(counter) => counter.clone(),
-                None => caches.entry(cache.clone()).or_default().clone(),
+            match caches.counters.get(cache).and_then(Weak::upgrade) {
+                Some(counter) => counter,
+                None => {
+                    if caches.counters.len() >= (caches.swept * 2).max(16) {
+                        caches
+                            .counters
+                            .retain(|_, counter| counter.strong_count() > 0);
+                        caches.swept = caches.counters.len();
+                    }
+                    let counter = Arc::new(AtomicU32::new(0));
+                    caches
+                        .counters
+                        .insert(cache.clone(), Arc::downgrade(&counter));
+                    counter
+                }
             }
         };
         counter
@@ -213,8 +245,14 @@ impl AzureLimits {
         self.caches
             .lock()
             .ok()
-            .and_then(|caches| caches.get(cache).map(|c| c.load(Ordering::Acquire)))
-            .unwrap_or(0)
+            .and_then(|caches| caches.counters.get(cache).and_then(Weak::upgrade))
+            .map_or(0, |counter| counter.load(Ordering::Acquire))
+    }
+
+    /// Map entries, live or not yet swept (tests).
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.caches.lock().map_or(0, |caches| caches.counters.len())
     }
 }
 
@@ -247,6 +285,9 @@ pub struct AzureOrigin<T, K> {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
     limits: Arc<AzureLimits>,
+    /// The last snapshot pruned against. Weak, so the generation is not kept
+    /// alive, and its allocation cannot be reused by a later snapshot.
+    observed: std::cell::RefCell<std::sync::Weak<Snapshot>>,
 }
 
 impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
@@ -265,13 +306,42 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             admission,
             buffers,
             limits,
+            observed: std::cell::RefCell::default(),
         }
+    }
+
+    /// Prune worker-local endpoint and token state against `snapshot` the
+    /// first time it is seen. One pointer comparison on the request path;
+    /// the scan over the snapshot's caches runs once per generation.
+    pub fn observe(&self, snapshot: &Arc<Snapshot>) {
+        if std::ptr::eq(self.observed.borrow().as_ptr(), Arc::as_ptr(snapshot)) {
+            return;
+        }
+        *self.observed.borrow_mut() = Arc::downgrade(snapshot);
+        let live: Vec<&OriginDefinition> = snapshot
+            .caches
+            .iter()
+            .filter_map(|cache| cache.origin.as_ref())
+            .collect();
+        self.transport.retain(&live);
+        self.tokens.retain(&live);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tokens(&self) -> &K {
+        &self.tokens
     }
 
     /// The published definition for the context's cache. The cache UID is the
     /// lookup key, so a recreated ClusterCache never reaches a stale origin.
     fn definition(&self, object: &ObjectId) -> Result<(Arc<Snapshot>, usize)> {
         let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
+        self.observe(&snapshot);
         let index = snapshot
             .caches
             .iter()

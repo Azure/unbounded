@@ -42,6 +42,7 @@ impl<U: Origin, T: AzureTransport, K: AzureTokenSource> OriginRouter<U, T, K> {
     fn native(&self, object: &ObjectId) -> Option<(&AzureOrigin<T, K>, Arc<Snapshot>, usize)> {
         let azure = self.azure.as_ref()?;
         let snapshot = self.snapshots.current().ok()??;
+        azure.observe(&snapshot);
         let index = snapshot
             .caches
             .iter()

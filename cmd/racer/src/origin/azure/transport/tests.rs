@@ -680,3 +680,39 @@ fn stalled_handshake_fails_over_before_the_request_deadline() {
     drop(stalled);
     server.join().unwrap();
 }
+
+#[test]
+fn endpoints_for_unpublished_origins_are_dropped() {
+    let Some(reactor) = reactor() else { return };
+    let admission = reactor.admission().clone();
+    let transport = PoolTransport::new(
+        Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 4)),
+        Rc::new(crate::http::client_io(reactor, admission)),
+        Rc::new(MapResolver::new(Vec::new())),
+        Arc::new(TrustRoots::from_env()),
+    );
+    let origin = |url: &str| {
+        OriginDefinition::azure(
+            AzureContainerUrl::parse(url).unwrap(),
+            AzureCredential::Anonymous,
+        )
+    };
+    let kept = origin("http://kept.example:10000/account/models");
+    let gone = origin("http://gone.example:10000/account/models");
+    transport.endpoint(&kept.azure.container_url).unwrap();
+    // An exchange in flight holds its own clone of the endpoint.
+    let held = transport.endpoint(&gone.azure.container_url).unwrap();
+    assert_eq!(transport.endpoint_count(), 2);
+
+    transport.retain(&[&kept]);
+    assert_eq!(transport.endpoint_count(), 1);
+    let Endpoint::Remote(remote) = &held else {
+        panic!("remote endpoint");
+    };
+    assert_eq!(remote.address_count(), 0);
+    // The live endpoint and its state survive; a re-published origin starts fresh.
+    transport.endpoint(&kept.azure.container_url).unwrap();
+    assert_eq!(transport.endpoint_count(), 1);
+    transport.retain(&[]);
+    assert_eq!(transport.endpoint_count(), 0);
+}
