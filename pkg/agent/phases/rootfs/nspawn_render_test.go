@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -413,6 +414,27 @@ func TestConfigRegenerationUnit(t *testing.T) {
 	require.NotContains(t, out, "if [ ! -x")
 	require.Contains(t, out, "Restart=on-failure")
 	require.Contains(t, out, "RestartMode=direct")
+	require.Contains(t, out, "RestartSec=10s")
+
+	// A final allocation launch refusal must end the start, never let it
+	// through: the code is not restarted, and it is not a success.
+	require.Contains(t, out, "\nRestartPreventExitStatus="+strconv.Itoa(goalstates.NSpawnPreStartRefusedExitCode)+"\n")
+	require.NotContains(t, out, "SuccessExitStatus")
+	require.NotContains(t, out, "RemainAfterExit")
+}
+
+func TestConfigRegenerationUnit_WithoutRefusedExitCode(t *testing.T) {
+	t.Parallel()
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.PreStartRefusedExitCode = 0
+
+	var buf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "config-regeneration.service", data))
+
+	out := buf.String()
+	require.NotContains(t, out, "RestartPreventExitStatus")
+	require.True(t, strings.HasSuffix(out, "\nRestartSec=10s\n"), "unit must end as before: %q", out)
 }
 
 func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
@@ -478,6 +500,27 @@ func TestWriteNSpawnConfigs_ConfiguredLifecycleCommands(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(unit), "\nExecStart=/usr/bin/systemctl start app-pre-start@%i.service\n")
 	require.NotContains(t, string(unit), "unbounded-agent-nspawn-lifecycle")
+	// The agent does not control a configured command's exit codes.
+	require.NotContains(t, string(unit), "RestartPreventExitStatus")
+}
+
+func TestWriteNSpawnConfigs_LifecycleHelperRefusedExitCode(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	goalState := &goalstates.RootFS{
+		MachineDir:             filepath.Join(dir, "machines", "kube1"),
+		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+		ConfigRegenerationFile: filepath.Join(dir, "unbounded-agent-regenerate-config@kube1.service"),
+	}
+	require.NoError(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState))
+
+	unit, err := os.ReadFile(goalState.ConfigRegenerationFile)
+	require.NoError(t, err)
+	require.Contains(t, string(unit), "nspawn-lifecycle pre-start kube1")
+	require.Contains(t, string(unit), "\nRestartPreventExitStatus="+strconv.Itoa(goalstates.NSpawnPreStartRefusedExitCode)+"\n")
+	require.NotContains(t, string(unit), "SuccessExitStatus")
 }
 
 func TestWriteNSpawnConfigs_RejectsInvalidLifecycleCommands(t *testing.T) {
@@ -596,6 +639,7 @@ func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
 		PreStartCommand:              "/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle pre-start " + machineName,
 		PostStartCommand:             "/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start " + machineName,
+		PreStartRefusedExitCode:      goalstates.NSpawnPreStartRefusedExitCode,
 	}
 }
 

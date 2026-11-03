@@ -148,6 +148,10 @@ type nspawnTemplateData struct {
 	// PreStartCommand and PostStartCommand are the lifecycle hooks' commands.
 	PreStartCommand  string
 	PostStartCommand string
+	// PreStartRefusedExitCode is the pre-start exit code that must not be
+	// restarted. It is set only for the lifecycle helper, whose exit codes the
+	// agent controls; zero renders no directive.
+	PreStartRefusedExitCode int
 }
 
 // TODO: migrate AdditionalHostMounts, HostDevicePaths/HostDeviceGroupSpecifiers,
@@ -209,7 +213,11 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
 	}
+
 	templateData.PreStartCommand, templateData.PostStartCommand = nspawnLifecycleCommands(goalState, machineName)
+	if goalState.UsesLifecycleHelper() {
+		templateData.PreStartRefusedExitCode = goalstates.NSpawnPreStartRefusedExitCode
+	}
 
 	if len(hostDevicePaths) > 0 {
 		log.Info("host devices detected, configuring nspawn bind-mounts",
