@@ -344,7 +344,9 @@ impl http1::connection::Endpoint<Error> for Endpoint {
     }
     fn capacity(&self, config: &http1::connection::PoolConfig) -> usize {
         match self {
-            Self::Peer(_) | Self::Remote(_) => config.per_endpoint,
+            Self::Peer(_) => config.per_endpoint,
+            // Remote origins share the origin connection cap
+            // (`origin_connections_per_cache`), not the neighbor cap.
             _ => config.secondary_cap,
         }
     }
@@ -743,6 +745,23 @@ pub(crate) mod tests {
     use uring_runtime::reactor::IoBuffer;
 
     /// Optional gates and response outcomes must not change completion ownership.
+    #[test]
+    fn remote_endpoints_use_the_origin_connection_cap() {
+        use http1::connection::Endpoint as _;
+        let config = http1::connection::PoolConfig {
+            per_endpoint: 2,
+            secondary_cap: 12,
+            max_endpoints: 1,
+            idle_timeout: Duration::from_secs(1),
+            waiter_cap: 1,
+            tcp_nodelay: true,
+        };
+        let remote =
+            Endpoint::Remote(crate::remote::RemoteEndpoint::http("127.0.0.1", 80).unwrap());
+        assert_eq!(remote.capacity(&config), 12);
+        assert_eq!(Endpoint::Peer("127.0.0.1:1".into()).capacity(&config), 2);
+    }
+
     #[test]
     fn exchange_owners_report_only_finished_verification_and_release_on_idle() {
         use crate::telemetry::{Event, Gauge, Metrics};
