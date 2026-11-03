@@ -57,7 +57,7 @@ pub const DEFAULT_TRUST_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// Largest trust bundle accepted.
 pub const MAX_TRUST_BUNDLE: u64 = 8 << 20;
 
-/// Largest buffered post-handshake handshake message accepted under kernel TLS.
+/// Largest post-handshake handshake message accepted under kernel TLS.
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
 const SOL_TCP: libc::c_int = 6;
@@ -622,40 +622,71 @@ impl Read for BoundedRead<'_, '_> {
 }
 
 /// Post-handshake records received on a kernel TLS socket.
+///
+/// Ticket bodies are skipped rather than buffered, so a pooled connection
+/// holds only a fixed few bytes of parser state and needs no admission charge.
 #[derive(Default)]
 pub(crate) struct ControlRecords {
-    pending: Vec<u8>,
+    /// Partial four-byte handshake message header.
+    header: [u8; 4],
+
+    /// Header bytes collected so far.
+    have: usize,
+
+    /// Body bytes of the current ticket still to skip.
+    skip: usize,
 }
 
 impl ControlRecords {
     /// Accept a non-application record fragment. Complete NewSessionTicket
     /// messages are discarded; anything else ends the connection.
-    pub(crate) fn absorb(&mut self, kind: u8, bytes: &[u8]) -> std::result::Result<(), ()> {
+    pub(crate) fn absorb(&mut self, kind: u8, mut bytes: &[u8]) -> std::result::Result<(), ()> {
         const HANDSHAKE: u8 = 22;
         const NEW_SESSION_TICKET: u8 = 4;
-        if kind != HANDSHAKE || self.pending.len() + bytes.len() > MAX_CONTROL_BYTES {
+        if kind != HANDSHAKE {
             // Alerts (including close_notify), KeyUpdate handling, and unknown
             // record types are not supported on a pooled connection.
             return Err(());
         }
-        self.pending.extend_from_slice(bytes);
-        let mut offset = 0;
-        while self.pending.len() - offset >= 4 {
-            let message = &self.pending[offset..];
-            if message[0] != NEW_SESSION_TICKET {
-                return Err(());
+        while !bytes.is_empty() {
+            if self.skip > 0 {
+                let n = self.skip.min(bytes.len());
+                self.skip -= n;
+                bytes = &bytes[n..];
+                if self.skip == 0 {
+                    TICKETS.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
             }
-            let length = (usize::from(message[1]) << 16)
-                | (usize::from(message[2]) << 8)
-                | usize::from(message[3]);
-            if message.len() < 4 + length {
+            let n = (4 - self.have).min(bytes.len());
+            self.header[self.have..self.have + n].copy_from_slice(&bytes[..n]);
+            self.have += n;
+            bytes = &bytes[n..];
+            if self.have < 4 {
                 break;
             }
-            offset += 4 + length;
-            TICKETS.fetch_add(1, Ordering::Relaxed);
+            self.have = 0;
+            if self.header[0] != NEW_SESSION_TICKET {
+                return Err(());
+            }
+            let length = (usize::from(self.header[1]) << 16)
+                | (usize::from(self.header[2]) << 8)
+                | usize::from(self.header[3]);
+            if 4 + length > MAX_CONTROL_BYTES {
+                return Err(());
+            }
+            if length == 0 {
+                TICKETS.fetch_add(1, Ordering::Relaxed);
+            }
+            self.skip = length;
         }
-        self.pending.drain(..offset);
         Ok(())
+    }
+
+    /// Whether no partial message is outstanding.
+    #[cfg(test)]
+    fn idle(&self) -> bool {
+        self.have == 0 && self.skip == 0
     }
 }
 
@@ -882,18 +913,39 @@ mod tests {
         let mut control = ControlRecords::default();
         // A ticket split across two fragments, followed by a second ticket.
         assert!(control.absorb(22, &[4, 0, 0, 3, 1]).is_ok());
+        assert!(!control.idle());
         assert!(control.absorb(22, &[2, 3, 4, 0, 0, 0]).is_ok());
-        assert!(control.pending.is_empty());
+        assert!(control.idle());
         // KeyUpdate.
         assert!(control.absorb(22, &[24, 0, 0, 1, 0]).is_err());
         // Alert.
         assert!(ControlRecords::default().absorb(21, &[1, 0]).is_err());
-        // Oversized.
-        assert!(
-            ControlRecords::default()
-                .absorb(22, &vec![4; MAX_CONTROL_BYTES + 1])
-                .is_err()
-        );
+        // Oversized, rejected from the header alone.
+        let length = MAX_CONTROL_BYTES - 3;
+        let header = [4, (length >> 16) as u8, (length >> 8) as u8, length as u8];
+        assert!(ControlRecords::default().absorb(22, &header).is_err());
+    }
+
+    #[test]
+    fn control_records_hold_no_ticket_bytes() {
+        // The largest accepted ticket, delivered one byte at a time, with the
+        // header split across fragments; state stays fixed size throughout.
+        let length = MAX_CONTROL_BYTES - 4;
+        let mut control = ControlRecords::default();
+        let header = [4, (length >> 16) as u8, (length >> 8) as u8, length as u8];
+        assert!(control.absorb(22, &header[..1]).is_ok());
+        assert!(control.absorb(22, &header[1..]).is_ok());
+        for _ in 0..length {
+            assert!(!control.idle());
+            assert!(control.absorb(22, &[0xaa]).is_ok());
+        }
+        assert!(control.idle());
+        // Empty ticket bodies and empty fragments are accepted.
+        assert!(control.absorb(22, &[4, 0, 0, 0]).is_ok());
+        assert!(control.absorb(22, &[]).is_ok());
+        assert!(control.idle());
+        // A non-ticket header after a ticket in the same fragment fails.
+        assert!(control.absorb(22, &[4, 0, 0, 1, 9, 2, 0, 0, 0]).is_err());
     }
 
     #[test]
