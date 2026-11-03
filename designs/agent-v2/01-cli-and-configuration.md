@@ -5,30 +5,39 @@ repository baseline, citation conventions and terms.
 
 ## 1. CLI
 
+These are the commands of the v2 build, at the top level. The v1 build has only
+v1's commands, and nothing in it reaches v2
+([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). In this design, a command name on its own, such as
+`start`, means the v2 build's command, and v1's commands are always written as
+v1's `start`.
+
 | Command | Purpose |
 |---|---|
-| `v2 start` | Bootstrap: install check, host preparation, provision, start the node, install the daemon |
-| `v2 preflight [--output json] [--ignore-errors]` | Read-only checks: built-in, runtime, extension and plugin checks |
-| `v2 daemon` | Long-running reconciler, run by `unbounded-agent-daemon.service` |
-| `v2 reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
-| `v2 status [--output json]` | New. Runtime, slots, applied goal version, node readiness and any cleanup leftovers |
-| `v2 migrate [--rollback] [--adopt-machine]` | Move a v1 host, or a machine another `pkg/agent` consumer built, to v2 without replacing its node, or roll that back on the host ([migrating from v1](10-migration-from-v1.md)) |
-| `v2 agent-upgrade [--preflight] [--plugin-manifest <url> --plugin-manifest-sha256 <hex>]` | Activate a staged agent binary, and optionally a new plugin set, without a MachineOperation, for host delivery automation ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
-| `v2 boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
-| `v2 record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
-| `v2 plugin-exec` (hidden) | Runs inside a plugin's sandboxed unit: verifies the stored plugin and replaces itself with it ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
-| `v2 convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by operators preparing a configuration by hand for a host without a Machine. |
-| `v2 version` | Prints the version; also used to verify an upgrade candidate supports v2 |
+| `start` | Bootstrap: install check, host preparation, provision, start the node, install the daemon |
+| `preflight [--output json] [--ignore-errors]` | Read-only checks: built-in, runtime, extension and plugin checks |
+| `daemon` | Long-running reconciler, run by `unbounded-agent-daemon.service` |
+| `reset [--force-standard-paths]` | Remove the node, everything the runtime owns, extensions, host preparation and agent state |
+| `status [--output json]` | New. Runtime, slots, applied goal version, node readiness, any migration and any cleanup leftovers |
+| `migrate --rollback` | Put v1 back on a host that migrated, while the rollback window is open ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)). A v1 host migrates by installing this build, not with this command. |
+| `migrate --adopt-machine --config <file>` | Take over a machine another `pkg/agent` consumer built, without replacing its node ([migrating from v1, section 9](10-migration-from-v1.md#9-hosts-built-by-other-pkgagent-consumers)) |
+| `agent-upgrade [--preflight] [--plugin-manifest <url> --plugin-manifest-sha256 <hex>]` (hidden) | Activate a staged agent binary, and optionally a new plugin set, without a MachineOperation, for host delivery automation. Running it with the v2 build on a v1 host migrates the host. ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
+| `boot-hook <pre-start\|post-start> <slot>` (hidden) | Called by systemd around the node boot unit; runs the runtime's boot hook |
+| `record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
+| `plugin-exec` (hidden) | Runs inside a plugin's sandboxed unit: verifies the stored plugin and replaces itself with it ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
+| `convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by operators preparing a configuration by hand for a host without a Machine. |
+| `version [--output json] [--daemon v2]` | Prints the version, and which agent the binary's `daemon` command runs. With `--daemon v2`, it exits non-zero unless that is v2's daemon. A v1 binary of any release fails this check: older ones do not know the flag. The upgrade candidate check and the daemon unit both use it ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
 
-The `v2` group is listed in `unbounded-agent --help` as "Experimental v2 agent
-(unstable)". At the first official v2 release, these commands move to the top
-level, replacing v1's, and `v2` stays as a hidden alias
-([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). Every `v2` command logs this warning as its first line of output:
+During the experimental releases, every command of the v2 build logs this
+warning as its first line of output, and `--help` says the same:
 
-> unbounded-agent v2 is experimental: configuration, plugin protocol and
-> on-host layout may change without notice; not supported for production use.
+> This is the experimental v2 build of unbounded-agent: configuration, plugin
+> protocol and on-host layout may change without notice; not supported for
+> production use.
 
-`v2 status --output json` is a documented, versioned interface, so tests and
+The first official v2 release drops the warning
+([implementation, section 4](09-implementation.md#4-production-readiness)).
+
+`status --output json` is a documented, versioned interface, so tests and
 tools never read v2's state files. It reports:
 
 - the install phase and install ID, the runtime, and any migration in
@@ -184,7 +193,7 @@ Validation rules:
   (`pkg/agent/config/config.go:604-623`).
 - Extensions follow the rules in [extensions, section 2](02-extensions.md#2-declarative-extensions).
 - Every plugin has a `sha256`, the lowercase hex SHA-256 of its executable.
-  `command[0]` is where `v2 start` reads the executable from at first install,
+  `command[0]` is where `start` reads the executable from at first install,
   and the rest of `command` are its arguments. `env` holds literal values only
   and never secrets, which travel on stdin
   ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
@@ -206,7 +215,7 @@ The configuration has two kinds of settings:
 
 | Kind | Fields | Where they come from | How they change |
 |---|---|---|---|
-| Install-time settings | `machine`, `runtime` (except `runtime.nspawnContainer.image`), `credentials`, `control`, `plugins`, `hooks`, `extensions` | The configuration file only | Reset, then `v2 start` with the new file. Running `v2 start` with different install-time settings on an installed host fails the install check. |
+| Install-time settings | `machine`, `runtime` (except `runtime.nspawnContainer.image`), `credentials`, `control`, `plugins`, `hooks`, `extensions` | The configuration file only | Reset, then `start` with the new file. Running `start` with different install-time settings on an installed host fails the install check. |
 | Goal settings (`config.GoalSettings`) | `cluster`, `kubelet`, `components`, `artifacts`, `runtime.nspawnContainer.image` | The configuration file at bootstrap, then the goal source | A goal with different goal settings; drift decides whether a repave is needed ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 
 The install check compares the machine name and a fingerprint of the
@@ -216,8 +225,8 @@ Kubernetes version, the OCI image and the API server
 (`cmd/agent/internal/installstate/store.go:216-224`):
 
 - If the machine name or fingerprint differs from the install record's,
-  `v2 start` fails and asks for a reset.
-- On a complete install, `v2 start` verifies the node and the daemon, repairs
+  `start` fails and asks for a reset.
+- On a complete install, `start` verifies the node and the daemon, repairs
   the daemon if needed, and ignores any other differences in the file.
 - On a resumed install, a node that has not started yet is provisioned from
   the file. A node that is already running is kept as it is. Bootstrap
@@ -237,9 +246,9 @@ permissions, environment, timeouts or hooks
 ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). The `command[0]` and `sha256` values in the file are
 therefore used only at first install. After it, the plugin set stored beside
 the agent binary is what runs ([extensions, section 3](02-extensions.md#3-plugin-protocol)). The file's
-plugins are part of the install check's fingerprint, so `v2 start` with
+plugins are part of the install check's fingerprint, so `start` with
 changed plugins on an installed host is refused like any other changed
-install-time setting, while `v2 start` again with the original file is not
+install-time setting, while `start` again with the original file is not
 affected by later plugin upgrades.
 
 ### Choosing the runtime
@@ -265,7 +274,11 @@ The runtime is therefore a field on the Machine:
   `kubectl unbounded machine manual-bootstrap`
   (`cmd/kubectl-unbounded/app/machine_manual_bootstrap.go:491`). It gains a
   `Runtime` field, which converts to `runtime.type`
-  ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), and runs v2's `start` for a `host` Machine.
+  ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)).
+- **Provisioning installs the build that can run it.** A `host` Machine gets
+  the v2 build, because only v2 can run `host`. Until the first official v2
+  release, an `nspawn-container` Machine gets the v1 build, and moves to v2 by
+  being upgraded to the v2 build ([migrating from v1, section 4](10-migration-from-v1.md#4-migrating-early)).
   `manual-bootstrap` builds its Machine from flags
   (`machine_manual_bootstrap.go:474-486`), so it gains a `--runtime` flag.
 - **A Machine the daemon creates records the runtime.** When the daemon
@@ -276,11 +289,11 @@ The runtime is therefore a field on the Machine:
   `json.Unmarshal` (`cmd/agent/internal/cmd/config.go:94`), so a binary that
   does not know the field would ignore it and install `nspawn-container`.
   Provisioning refuses, with a clear reason, a `host` Machine whose
-  `spec.agent.version` pins a release that cannot run `host`, and v1 builds
-  from this design on refuse a configuration that asks for `host`.
+  `spec.agent.version` pins a release that has no v2 build, and the v1 build
+  refuses a configuration that asks for `host`.
 - **A change takes effect at the next reinstall.** The runtime is an
   install-time setting, so editing the field never changes a running host.
-  Until a HostReplace, or a reset followed by `v2 start`, reinstalls the host,
+  Until a HostReplace, or a reset followed by `start`, reinstalls the host,
   the Machine shows `RuntimeChangePending=True`, and `status.agent.runtime`
   shows the runtime actually installed ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). Moving a
   fleet between runtimes is: set the field, then replace each Machine.

@@ -32,9 +32,11 @@ This document specifies how v2 is tested. It has two priorities:
   `kubectl unbounded machine manual-bootstrap` renders for cloud-init and
   Ignition, compared with golden v2 configurations.
 - Migration with a fake host: each check that refuses, each phase resumed after
-  a crash, automatic rollback after a failure in each phase, `--rollback`
-  before and after the first repave, and the conversion of v1's applied config,
-  credentials, Machine status and host preparation.
+  a crash, the return to v1 after a failure in each step before the commit,
+  `--rollback` before and after the first repave and after a crash at each of
+  its steps, and the conversion of v1's applied config, credentials, Machine
+  status and host preparation. `version --daemon v2` for the v1 build, the v2
+  build and an older v1 release.
 - Plugin protocol tests with a reference plugin: timeouts, errors, oversized
   output and ownership checks. `plugin-exec` refuses a file whose SHA-256 does
   not match, a `#!` script and any other file that is not ELF, and runs the
@@ -44,7 +46,7 @@ This document specifies how v2 is tested. It has two priorities:
   response.
 - Plugin sets in AgentUpgrade: staging from a manifest, copying the running
   set without one, and refusing a manifest with a wrong digest or with a
-  plugin added or dropped. `v2 start` with changed plugins on an installed host
+  plugin added or dropped. `start` with changed plugins on an installed host
   is refused, and with the original file after a plugin upgrade is not.
 - Host cleanup with a fake `SystemOps`: order of operations, `ErrNodeBusy` on a
   hung process, refusal to cross a bind mount inside `/var/lib/kubelet/pods`,
@@ -78,23 +80,23 @@ The harness gets two settings:
 
 | Setting | Values | Default |
 |---|---|---|
-| `AGENT_PROFILE` | `v1`, `v2` | `v1` |
+| `AGENT_PROFILE` | `v1`, `v2`: which build of the change under test the harness installs | `v1` |
 | `NODE_RUNTIME` | `nspawn-container`, `host` (only with `v2`) | `nspawn-container` |
 
 A profile object holds everything that differs between them, so the suites
 themselves do not change:
 
-- **Commands.** The generated bootstrap script and the Ignition unit run
-  `start` and `preflight` (`cmd/kubectl-unbounded/app/ignition.go:188-189`).
-  For `v2`, the harness rewrites them to `v2 start` and `v2 preflight`, as it
-  already rewrites the script to add preflight (`e2e.py:3709-3719`). It also
-  owns the `version` and `agent-upgrade` commands it runs on the host.
+- **Build.** For `v2`, the harness installs the v2 build. The generated
+  bootstrap script and the Ignition unit run `start` and `preflight`
+  (`cmd/kubectl-unbounded/app/ignition.go:188-189`), which are the v2 build's
+  own commands, so the harness does not rewrite them. It still owns the
+  `version` and `agent-upgrade` commands it runs on the host.
 - **Configuration.** The harness generates the configuration with
   `kubectl unbounded machine manual-bootstrap`, passing `--runtime` for the
   runtime under test ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)). v2 converts the v1 JSON
   the script carries.
 - **State.** For `v2`, the harness reads install and node state from
-  `v2 status --output json`, not from v2's files
+  `status --output json`, not from v2's files
   ([CLI and configuration, section 1](01-cli-and-configuration.md#1-cli)).
 - **Running a command inside the node.** `machinectl shell` (`e2e.py:637-644`)
   for `nspawn-container`; SSH to the host for `host`.
@@ -105,17 +107,17 @@ themselves do not change:
 
 | Check | v1 | v2, `nspawn-container` | v2, `host` |
 |---|---|---|---|
-| Daemon unit and binary layout (`e2e.py:1407-1444,5615-5649`) | `unbounded-agent-daemon.service` runs `<current> daemon` | The same unit, running `<current> v2 daemon`; the binary layout is the same | Same as `nspawn-container` |
-| Install record (`e2e.py:3737-3797,6480`) | `install-state.json`: phase and install ID | `v2 status`: install phase and install ID | Same |
-| Applied config unchanged by a resumed bootstrap (`e2e.py:3762-3803`) | Hash of `kube1-applied-config.json` | `v2 status`: digest of the applied settings | Same |
+| Daemon unit and binary layout (`e2e.py:1407-1444,5615-5649`) | `unbounded-agent-daemon.service` runs `<current> daemon` | Unchanged: the same unit runs `<current> daemon`, which in the v2 build is v2's daemon, and the binary layout is the same | Same as `nspawn-container` |
+| Install record (`e2e.py:3737-3797,6480`) | `install-state.json`: phase and install ID | `status`: install phase and install ID | Same |
+| Applied config unchanged by a resumed bootstrap (`e2e.py:3762-3803`) | Hash of `kube1-applied-config.json` | `status`: digest of the applied settings | Same |
 | Failure injected during bootstrap (`e2e.py:3735-3741`) | Blocks v1's daemon recovery script | Blocks v2's daemon recovery script | Same |
 | The node's distribution matches the host's (`e2e.py:715-731`) | `/var/lib/machines/<m>/etc/os-release` | Unchanged | Not applicable: the node is the host |
 | Extra host mounts and devices (`e2e.py:4150-4234`) | `.nspawn` binds and `DeviceAllow` | Unchanged | Not applicable: these settings are rejected for `host` ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)), so the scenario runs only on `nspawn-container` |
 | A device that appears at boot is usable in the node (`e2e.py:4312-4394`) | `.nspawn` and override rewritten | Unchanged | The device is read from the host directly |
-| Boot wiring (`e2e.py:5599-5607`) | The override runs `nspawn-lifecycle post-start` | The override runs `v2 boot-hook post-start` | Not applicable |
-| A repave switches machines (`e2e.py:734-747,6077-6091`) | `kube1` to `kube2`, with a bpffs sentinel | Unchanged: slots `a` and `b` are `kube1` and `kube2` | `v2 status`: the enabled slot switches |
+| Boot wiring (`e2e.py:5599-5607`) | The override runs `nspawn-lifecycle post-start` | The override runs `boot-hook post-start` | Not applicable |
+| A repave switches machines (`e2e.py:734-747,6077-6091`) | `kube1` to `kube2`, with a bpffs sentinel | Unchanged: slots `a` and `b` are `kube1` and `kube2` | `status`: the enabled slot switches |
 | NodeReboot (`e2e.py:5415-5452`) | New Node boot ID and a `Rebooted` event | Unchanged | Unchanged ([node runtime, section 5.2](03-node-runtime.md#52-host)) |
-| AgentUpgrade rollback (`e2e.py:1515`) | The fake failing agent answers `version` | It also answers `v2 version`, so the test still reaches the failing-daemon path | Same |
+| AgentUpgrade rollback (`e2e.py:1515`) | The fake failing agent answers `version` | It also passes `version --daemon v2`, so the test still reaches the failing-daemon path | Same |
 | Reset leaves nothing (`e2e.py:5021-5083`) | v1's leftover list | The list in [host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host), plus the host snapshot (section 3) | Same, with the `host` runtime's items |
 
 ### 2.4 Keeping v1 runs unchanged
@@ -158,29 +160,32 @@ preparation changes that the reset reports as left in place
 ## 4. Migration suite
 
 A new `migration-v2` suite follows the existing host-root `migration` suite
-(`e2e.py:6504-6509`):
+(`e2e.py:6504-6509`). Migrating early and the cutover are the same step, an
+upgrade to the v2 build ([migrating from v1, section 2.1](10-migration-from-v1.md#21-how-a-host-migrates)), so one suite covers
+both:
 
 1. Stage host files, as the existing suite does, and take the host snapshot.
-2. Install v1: the release in `LEGACY_AGENT_VERSION`, or this build's v1
-   commands. Record a checksum of every v1 file and unit.
+2. Install v1: the release in `LEGACY_AGENT_VERSION`, or the v1 build of the
+   change under test. Record a checksum of every v1 file and unit, and of the
+   v1 binary.
 3. Wait for the node, run the workload, and record the Node UID, the machine's
    PID, and the workload pods' UIDs and restart counts.
-4. Migrate with an AgentUpgrade with `agentMode: v2`. A variant runs
-   `v2 migrate` on the host instead.
+4. Migrate with an AgentUpgrade to the v2 build of the change under test. A
+   variant runs `agent-upgrade` with the v2 build on the host instead.
 5. Check that:
    - the operation is `Complete`, and was published only after the v2 daemon
      reported ready;
    - the Node UID, machine PID, pod UIDs and restart counts are unchanged;
    - v1's detection files are gone ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)), so v1
      `start` refuses the host;
-   - `last-good` names the v2 binary;
-   - `v2 status` shows a complete install on `nspawn-container`, with the
+   - `last-good` names the v2 binary, and the backup holds the v1 binary;
+   - `status` shows a complete install on `nspawn-container`, with the
      running machine as the enabled slot;
    - the staged files are untouched.
 6. Reboot the host. The node comes back through v2's boot wiring.
 7. Run the v1 lifecycle steps under the `v2` profile: NodeReboot,
    AgentUpgrade in place, AgentUpgrade rollback, the workload and a repave.
-   After the repave, the v1 backup is gone and `v2 migrate --rollback` is
+   After the repave, the v1 backup is gone and `migrate --rollback` is
    refused.
 8. Reset, and compare with the snapshot (section 3).
 
@@ -188,29 +193,21 @@ Variants:
 
 | Variant | What it checks |
 |---|---|
-| Rollback | Migrate, then `v2 migrate --rollback`. v1's daemon runs, v1's files and the binary match the checksums from step 2, `current` and `last-good` name that binary, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. |
-| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), and each step of the commit and of the restore, a helper on the host watches the migration record and kills the migrating process, or reboots the host, when the step is reached. The node must keep running, or boot with one complete machine override, and the migration or restore must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
-| Failed | In each step before the commit, a v2 path is made unwritable, or the startup checks are made to fail. The host must return to a working v1 whose files match the checksums from step 2, and the operation must be `Failed` with the reason. A second variant makes the v2 daemon fail to report ready after an early migration commits: the host must end `RolledBack`, with the operation `Failed`. |
-| Refused | `v2 migrate` changes nothing on a v1 host with an unfinished install, with two applied configs, or on a release older than the oldest supported one. `v2 start` on a v1 host that was not migrated is refused. |
-| To `host` | After migrating, set the Machine's `spec.agent.runtime` to `host` and check that `RuntimeChangePending` is `True`. Then `v2 reset`, bootstrap again with `manual-bootstrap --runtime host`, check that `RuntimeChangePending` is `False` and `status.agent.runtime` is `host`, and run the lifecycle suite under `NODE_RUNTIME=host`. |
+| Release matrix | Step 2 runs once for each v1 release from the oldest supported one to the latest. The oldest release in this matrix is the oldest supported v1 release ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
+| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), and each step of the commit and of the rollback, a helper on the host watches the migration record and kills the migrating process, or reboots the host, when the step is reached. The node must keep running, or boot with one complete machine override, and the migration or rollback must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
+| Failed | In each step before the commit, a v2 path is made unwritable, or the startup checks are made to fail. The daemon returns `current` to the v1 binary, v1's daemon runs, v1's files match their checksums, the node is unchanged, and the operation is `Failed` with reason `MigrationFailed`. A second variant blocks the API server while it fails: v1's daemon then publishes the failure from its signal. |
+| Refused | An upgrade to the v2 build changes nothing of v1's on a v1 host with an unfinished install, with two applied configs, or on a release older than the oldest supported one, and the operation is `Failed`. The v2 build's `start` on a v1 host is refused. |
+| Rollback | Migrate, then `migrate --rollback`. v1's daemon runs, v1's files and the v1 binary match the checksums from step 2, `current` and `last-good` name that binary, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. A second variant makes the restored v1 daemon fail repeatedly: the recovery unit restarts v1, never v2. |
+| v1 build refused | After migrating, an AgentUpgrade to a v1 build, and one to the v1 release the host ran before, are rejected before the switch, both inside the rollback window and after a repave |
+| Crash loop after the commit | After migrating, make the v2 daemon fail repeatedly, then do the same after a repave. Each time, the recovery unit restores a v2 binary, never the v1 one, and the daemon runs again once the fault is removed ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). `migrate --rollback` still works while the daemon cannot start. |
+| Readiness timeout | After migrating, make an AgentUpgrade's new daemon hang before its startup gate opens. The start times out three times, the recovery unit restores the previous binary, and the operation is `Failed` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
+| To `host` | After migrating, set the Machine's `spec.agent.runtime` to `host` and check that `RuntimeChangePending` is `True`. Then `reset`, bootstrap again with `manual-bootstrap --runtime host`, check that `RuntimeChangePending` is `False` and `status.agent.runtime` is `host`, and run the lifecycle suite under `NODE_RUNTIME=host`. |
 | Immutable host | The cluster-started migration on an Ignition host (`HOST_BASE_OS=acl`), which needs no access to the host |
-| Adopted machine | `v2 migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |
+| Adopted machine | `migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |
 
-The cutover at the first official v2 release gets its own variants
-([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). They run against two kinds of build. Before that
-release exists, a build tag that only test builds set makes a development build
-behave as it will, with v2's commands at the top level, so the cutover is
-tested on every change. Once release builds exist, the same variants also run
-against them, because the tag cannot prove that the released binary behaves
-the same.
-
-| Variant | What it checks |
-|---|---|
-| Cutover matrix | For each v1 release from the oldest supported one to the last experimental release, install it, run the workload, then upgrade to the first official v2 release with an ordinary AgentUpgrade. The host migrates with the checks in step 5. The oldest release in this matrix is the oldest supported v1 release. |
-| Cutover failure | Make the migration fail at each step before the commit. The daemon returns `current` to the v1 binary, v1's daemon runs, v1's files match their checksums, the node is unchanged, and the AgentUpgrade is `Failed` with reason `MigrationFailed`. A variant blocks the API server while it fails: v1's daemon then publishes the failure from its signal. |
-| Rollback after the cutover | After the cutover, `v2 migrate --rollback` restores v1 and the v1 binary the host ran before. An AgentUpgrade to that v1 release is rejected before the switch, both inside the window and after a repave. A variant makes the restored v1 daemon fail repeatedly: the recovery unit restarts v1, never v2. |
-| Crash loop after the commit | After the cutover, make the v2 daemon fail repeatedly, then do the same after a repave. Each time, the recovery unit restores a v2 binary, never the v1 one, and the daemon runs again once the fault is removed ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
-| Readiness timeout | After the cutover, make an AgentUpgrade's new daemon hang before its startup gate opens. The start times out three times, the recovery unit restores the previous binary, and the operation is `Failed` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
+The suite runs against the v2 build of each change, and nightly also against
+the published v2 build of each release, because a build from source cannot
+prove that the released binary behaves the same.
 
 ## 5. Further end-to-end tests
 
@@ -246,8 +243,8 @@ These cover what v1 never had, so the v1 suites cannot:
 
 | When | Runs |
 |---|---|
-| Pull requests that touch `internal/agentv2`, `cmd/agent`, `pkg/agent` or `hack/agent/e2e-kind` | The existing v1 jobs, unchanged. On ubuntu2404: the v1 suites under `AGENT_PROFILE=v2` for both runtimes, and the `migration-v2` suite, including the cutover variants on a test build (section 4). All of these are required to merge, from the first pull request that adds v2 code. |
-| Nightly | The v1 suites under `AGENT_PROFILE=v2` across the full host matrix (`.github/workflows/agent-e2e-kind.yaml:98-116`) for both runtimes, the configuration suite for both runtimes, every `migration-v2` variant, and section 5. Once release builds of the first official v2 release exist, the cutover variants also run against them. |
+| Pull requests that touch `internal/agentv2`, `cmd/agent`, `pkg/agent` or `hack/agent/e2e-kind` | Both builds are built. The existing v1 jobs, unchanged, against the v1 build. On ubuntu2404: the v1 suites against the v2 build (`AGENT_PROFILE=v2`) for both runtimes, and the `migration-v2` suite (section 4). All of these are required to merge, from the first pull request that adds v2 code. |
+| Nightly | The v1 suites under `AGENT_PROFILE=v2` across the full host matrix (`.github/workflows/agent-e2e-kind.yaml:98-116`) for both runtimes, the configuration suite for both runtimes, every `migration-v2` variant, against both the change's v2 build and the published v2 build of each release, and section 5. |
 
 The v2 jobs are required from the start, not only once v2 is official. The
 experimental releases are what operators migrate early, and v2 code that
@@ -259,14 +256,14 @@ Each job stays within the matrix's existing time limits
 Every host in the matrix, including the immutable-host (`acl`) entry, runs both
 runtimes' capability probes ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)) and checks each result
 against what is expected for that host. A runtime's lifecycle suites run on a
-host only where its probes pass; where they fail, the job checks that `v2 start`
+host only where its probes pass; where they fail, the job checks that `start`
 refuses with the failing probe in its error.
 
-From the first official v2 release, the build has no v1 commands, so the
-`AGENT_PROFILE=v1` jobs can no longer run against it and are removed. The v2
-jobs stay required and replace them, and `AGENT_PROFILE` defaults to `v2`. The
-`migration-v2` suite then installs v1 only from `LEGACY_AGENT_VERSION`, and
-the test build tag for the cutover is no longer needed (section 4).
+From the first official v2 release, the v1 build is no longer built or
+published, so the `AGENT_PROFILE=v1` jobs are removed. The v2 jobs stay
+required and replace them, and `AGENT_PROFILE` defaults to `v2`. The
+`migration-v2` suite then installs v1 only from `LEGACY_AGENT_VERSION`
+(section 4).
 
 ## 7. Validation tasks
 

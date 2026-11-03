@@ -6,7 +6,7 @@ repository baseline, citation conventions and terms.
 ## 1. What v2 creates on the host
 
 This is the complete list of what v2 creates or changes on a host, and what
-`v2 reset` removes or reverses. It replaces scripts such as Flex's
+`reset` removes or reverses. It replaces scripts such as Flex's
 `uninstall.sh` that hardcode agent paths.
 
 **The agent:**
@@ -22,12 +22,12 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Artifact cache | `/var/lib/unbounded/agent-v2/artifacts/<sha256>` |
 | Slots: saved bundle manifests, and on `host` the staged binaries and files | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Configuration copy (`config.json`), daemon credentials, upgrade signal | `/etc/unbounded/agent-v2/` |
-| Daemon units | `unbounded-agent-daemon.service`, `unbounded-agent-daemon-recovery.service`. The names are the same as v1's. The daemon unit is `Type=notify`, with the start timeout and start limit in [lifecycles, section 5](05-lifecycles.md#5-agentupgrade), and its `ExecStartPre=` runs `<current> v2 version`, so it never starts a binary without v2. |
+| Daemon units | `unbounded-agent-daemon.service`, `unbounded-agent-daemon-recovery.service`. The names are the same as v1's. The daemon unit is `Type=notify`, with the start timeout and start limit in [lifecycles, section 5](05-lifecycles.md#5-agentupgrade), and its `ExecStartPre=` runs `<current> version --daemon v2`, so it never starts a binary whose daemon is not v2's. It runs `<current> daemon`, as v1's does. |
 | Boot hook binary, which a binary rollback does not revert | `/opt/unbounded/agent/bin/unbounded-agent-boot-hook` ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
 | First-boot unit, if a provisioning tool installed one | For example v1's Ignition unit, `unbounded-agent-bootstrap.service` (`internal/provision/script.go:13`) |
 | Extension host units and files | As declared in each extension ([extensions, section 2](02-extensions.md#2-declarative-extensions)) |
 | On a host migrated from v1: the migration record, v2's staged files until the commit, and v1's files and binary from the commit until v2's first repave | `/var/lib/unbounded/agent-v2/migration.json`, `/var/lib/unbounded/agent-v2/migration/staged/`, `/var/lib/unbounded/agent-v2/migration/v1-backup/` ([migrating from v1, sections 6 and 8](10-migration-from-v1.md#6-steps)) |
-| While an early migration, or a rollback started on the host, is in progress | `unbounded-agent-migrate.service` |
+| While a rollback, or the adoption of another consumer's machine, is in progress | `unbounded-agent-migrate.service` |
 
 **Host preparation (section 3), for both runtimes:**
 

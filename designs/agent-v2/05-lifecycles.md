@@ -3,13 +3,13 @@
 Part of the [Unbounded Agent v2 design](README.md). The README has the status,
 repository baseline, citation conventions and terms.
 
-## 1. Bootstrap (`v2 start`)
+## 1. Bootstrap (`start`)
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant Op as cloud-init, Ignition or operator
-  participant CLI as v2 start
+  participant CLI as start
   participant St as state
   participant Px as providers and hooks
   participant HP as hostprep
@@ -187,7 +187,7 @@ sequenceDiagram
   D->>D: hook agent.upgrade.before
   D->>AB: download, verify sha256, install into the inactive blue or green binary
   D->>AB: stage the plugin set beside it, from the plugin manifest or a copy of the running set
-  AB->>AB: candidate must answer version and v2 version
+  AB->>AB: candidate must pass version --daemon v2
   AB->>AB: switch current link, keep last-good
   D->>D: write upgrade signal
   D->>SD: restart the daemon unit
@@ -220,11 +220,14 @@ This is v1's mechanism
   which three 60-second timeouts would never reach. Five minutes is the
   longest interval v1's recovery script accepts
   (`unbounded-agent-daemon-recovery.sh:61-64`), and v2's keeps that limit.
-- A candidate binary is checked with `v2 version` as well as `version`
-  (`pkg/agent/agentbinary/agentbinary.go:125`), so a binary without the `v2`
-  command is rejected before the switch. The daemon unit's `ExecStartPre=`
+- **Only v2 binaries are accepted.** A candidate is checked with
+  `version --daemon v2` where v1 checks `version`
+  (`pkg/agent/agentbinary/agentbinary.go:125`), so a v1 build, or any older v1
+  release, is rejected before the switch. The daemon unit's `ExecStartPre=`
   repeats the check at every start, so the recovery unit cannot start such a
-  binary either ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)).
+  binary either ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). On a host migrated from v1, the way
+  back to v1 is `migrate --rollback` on the host, while the rollback window is
+  open ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)).
 - **Plugins move with the binary.** The optional parameters
   `pluginManifestURL` and `pluginManifestSHA256` name a plugin manifest:
 
@@ -248,15 +251,11 @@ This is v1's mechanism
   restoring `last-good` rolls both back. The new daemon checks every plugin
   with `describe` before its startup gate opens, so a plugin that does not fit
   the new binary is rolled back with it.
-- A candidate whose daemon would be v1's is always rejected before the switch.
-  On a host migrated from v1, the way back to v1 is `v2 migrate --rollback` on
-  the host, while the rollback window is open
-  ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)).
-- The daemon unit runs `<current> v2 daemon` in the experimental releases, and
-  `<current> daemon` from the first official v2 release, which rewrites the
-  unit when its daemon first starts.
+- **On a v1 host, upgrading to the v2 build migrates the host.** v1's daemon
+  installs it as any candidate, and v2's daemon migrates the host when it
+  first starts ([migrating from v1, section 2.1](10-migration-from-v1.md#21-how-a-host-migrates)).
 
-The `v2 agent-upgrade` command is the other way in. Host delivery automation
+The hidden `agent-upgrade` command is the other way in. Host delivery automation
 runs it on the host, from a separately staged candidate binary, without a
 MachineOperation, as v1's hidden `agent-upgrade` command is run
 (`cmd/agent/internal/cmd/agentupgrade.go:63-70`). It uses the same activation:
@@ -266,11 +265,11 @@ not (`pkg/agent/agentbinary/activation.go:83-246`). The `agent.upgrade.before`
 and `agent.upgrade.after` events fire on this path too, and
 `--plugin-manifest` with `--plugin-manifest-sha256` stage a new plugin set as
 the parameters do. Like an AgentUpgrade, it never installs a binary whose
-daemon would be v1's.
+daemon is not v2's.
 
 ## 6. Reset
 
-Reset is triggered by `v2 reset`, an `AgentReset` MachineOperation, or a goal
+Reset is triggered by `reset`, an `AgentReset` MachineOperation, or a goal
 with `delete: true`.
 
 ```mermaid
@@ -296,7 +295,7 @@ sequenceDiagram
   T->>T: operation or goal only, stop and remove the daemon unit last
 ```
 
-The order of stopping the daemon matches v1. `v2 reset` stops the daemon first,
+The order of stopping the daemon matches v1. `reset` stops the daemon first,
 so it cannot act during the reset (`cmd/agent/internal/daemon/reset.go:29-31`).
 When the daemon itself runs the reset, for an `AgentReset` operation or a goal
 with `delete: true`, it stops its own unit last, after it has reported the

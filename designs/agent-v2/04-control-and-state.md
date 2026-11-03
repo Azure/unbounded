@@ -211,7 +211,7 @@ saved bundle manifests, and the migration record on a host migrated from v1.
   binary ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)), which must still be able to read what the newer binary
   wrote.
 - If a file has an unknown `schemaVersion` or fails its checksum, the daemon
-  makes no changes and reports `StateCorrupt`. `v2 reset` still runs, using the
+  makes no changes and reports `StateCorrupt`. `reset` still runs, using the
   conservative paths described in [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown).
 - The state files listed above, the configuration copy and daemon credentials
   under `/etc/unbounded/agent-v2/`, and every file the bundle marks as secret
@@ -259,7 +259,7 @@ failure code instead of reporting ready, as v1's daemon exits when it cannot
 make sense of the host's machines (`daemon.go:137-140`). After an AgentUpgrade,
 this rolls the binary back. When the state itself is at fault, the `last-good`
 binary that the recovery unit starts fails the same way, and the host needs
-`v2 reset` on the host or a HostReplace.
+`reset` on the host or a HostReplace.
 
 `Decide` repaves only when the daemon itself sees this node's Node object
 being deleted, as v1 does: v1 watches only Node delete events
@@ -292,7 +292,7 @@ A node that never registers is reported but not repaved, because there is no
 Node to delete. This matches v1, where such a node also stays as it is. The
 `NodeNotRegistered` status, counted from `Applied.StartedAt`, makes the problem
 visible, including on the Machine as `AgentHealthy=False` (section 1). Recovery
-is manual, as in v1: an `AgentReset` operation or `v2 reset`, then `v2 start`.
+is manual, as in v1: an `AgentReset` operation or `reset`, then `start`.
 
 ## 6. MachineOperation handling
 

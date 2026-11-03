@@ -323,9 +323,9 @@ sequenceDiagram
   participant D as v2 daemon
   SD->>U: start the enabled slot
   U->>P: Requires, nftables flush, LocalDNS network helper, extension host units
-  U->>H: Requires, v2 boot-hook pre-start, from the saved manifest and the host's devices
+  U->>H: Requires, boot-hook pre-start, from the saved manifest and the host's devices
   U->>N: node starts
-  N->>N: nspawn-container only, ExecStartPost runs v2 boot-hook post-start
+  N->>N: nspawn-container only, ExecStartPost runs boot-hook post-start
   SD->>D: start daemon, Recover, then reconcile
 ```
 

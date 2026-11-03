@@ -336,7 +336,7 @@ Without an ownership record, Teardown is conservative:
   `unbounded-node-prestart.service` and v2 state. Host preparation units, such
   as `nftables-flush.service`, are reversed by the undo log after Teardown.
 - Every non-empty standard path in section 4 is reported as a leftover.
-- `v2 reset --force-standard-paths` clears their contents, using the safe
+- `reset --force-standard-paths` clears their contents, using the safe
   remover. It never removes the directories.
 - The node manager still reverses host preparation, including the original
   sysctl values, from its own undo log ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). If that log is missing too, the
@@ -352,8 +352,8 @@ Without an ownership record, Teardown is conservative:
 | Host network reset | No owned links, rules or tables; no `unbounded_localdns` table; on Teardown, no owned chains | Repave: error, retried by `Recover`. Teardown: leftover. |
 | Teardown | None of the runtime's owned resources remain; no ownership record | Leftovers reported; non-zero exit |
 
-Leftovers are reported as `{kind, id, reason}` in `v2 reset` output, in
-`v2 status`, and through the status reporter.
+Leftovers are reported as `{kind, id, reason}` in `reset` output, in
+`status`, and through the status reporter.
 
 ## 11. Crash behavior
 

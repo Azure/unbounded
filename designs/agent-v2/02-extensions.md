@@ -66,7 +66,7 @@ fields specific to each event.
 | `node.restart.after` | After `Restart(slot)` and the readiness wait | slot, operation name, node name | `Fail` |
 | `node.repave.before` | Before a repave begins | old slot, new slot, applied and goal versions | `Fail` |
 | `node.repave.after` | After the repave commits and the old slot is destroyed, or after an attempt fails | old slot, new slot, goal version | `Ignore` |
-| `agent.upgrade.before` | Before the new binary is staged, in the daemon or the `v2 agent-upgrade` command | current version, operation name if any | `Fail` |
+| `agent.upgrade.before` | Before the new binary is staged, in the daemon or the `agent-upgrade` command | current version, operation name if any | `Fail` |
 | `agent.upgrade.after` | In the daemon that publishes the upgrade result | old and new version, operation name if any | `Ignore` |
 | `agent.reset.before` | Before reset begins | trigger (`CLI`, `Operation` or `Goal`) | `Ignore` |
 | `agent.reset.after` | After reset, before the daemon unit is removed | trigger, leftovers | `Ignore` |
@@ -75,7 +75,7 @@ The order of events in each lifecycle:
 
 | Lifecycle | Events, in order |
 |---|---|
-| Bootstrap ([lifecycles, section 1](05-lifecycles.md#1-bootstrap-v2-start)) | `agent.install.before`, `host.prepare.before`, `host.prepare.after`, `node.provision.before`, `node.provision.after`, `node.start.before`, `node.start.after`, `agent.install.after` |
+| Bootstrap ([lifecycles, section 1](05-lifecycles.md#1-bootstrap-start)) | `agent.install.before`, `host.prepare.before`, `host.prepare.after`, `node.provision.before`, `node.provision.after`, `node.start.before`, `node.start.after`, `agent.install.after` |
 | Repave ([lifecycles, section 2](05-lifecycles.md#2-repave)) | `node.repave.before`, `node.provision.before` (new), `node.provision.after` (new), `node.stop.before` (old), `node.stop.after` (old), `node.start.before` (new), `node.start.after` (new), `node.repave.after` |
 | NodeReboot ([lifecycles, section 3](05-lifecycles.md#3-nodereboot)) | `node.restart.before`, `node.restart.after` |
 | HostOSReboot ([lifecycles, section 4](05-lifecycles.md#4-hostosreboot)) | None: the host reboots, and systemd starts the node at boot |
@@ -216,9 +216,9 @@ these phases onto the Machine's conditions rather than its phase
 
 Operational rules:
 
-- **`describe`** is called when `v2 start`, `v2 daemon`, `v2 preflight` or
-  `v2 reset` starts. If a plugin configured as a provider does not list a
-  method the configuration uses, startup fails, except for `v2 reset` (below).
+- **`describe`** is called when `start`, `daemon`, `preflight` or
+  `reset` starts. If a plugin configured as a provider does not list a
+  method the configuration uses, startup fails, except for `reset` (below).
   For the daemon this happens before its startup gate opens
   ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)), so a plugin set that does not fit a newly
   upgraded binary keeps the daemon from reporting ready, and the recovery unit
@@ -237,7 +237,7 @@ Operational rules:
 - **What is checked is what runs.** The agent starts each call as a transient
   systemd service (`systemd-run --pipe --wait --collect`), named
   `unbounded-agent-plugin-<name>-<id>.service`, whose command is the agent's
-  own hidden `v2 plugin-exec`. Inside the sandbox, `plugin-exec` opens the
+  own hidden `plugin-exec`. Inside the sandbox, `plugin-exec` opens the
   stored plugin, hashes it through the open file descriptor, and replaces
   itself with that same descriptor through `execveat(2)` with `AT_EMPTY_PATH`.
   A file swapped after the check is never the one that runs.
@@ -247,7 +247,7 @@ Operational rules:
   and everything it loads are not pinned (`execveat(2)` manual page). Only the
   executable itself is pinned, so a dynamically linked plugin still loads the
   host's shared libraries. Plugins should be linked statically, and
-  `v2 preflight` warns about one that is not.
+  `preflight` warns about one that is not.
 - **Sandboxed and unprivileged by default.** Each call's unit applies these
   settings. A plugin asks for more only through `plugins[].permissions`, which
   is an install-time setting ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)):
@@ -269,14 +269,14 @@ Operational rules:
   capabilities and writable paths, the duration, the exit status and the
   response size. It never includes the request or the response, which can hold
   secrets.
-- **Reset never fails because of a plugin.** During `v2 reset` and other
+- **Reset never fails because of a plugin.** During `reset` and other
   resets, `describe` failures, provider failures and hook failures are logged
   and reset continues. This is why the reset events default to `Ignore`.
 - **Plugins change only with the agent.** The agent keeps one plugin set
   beside each of its blue and green binaries, under
   `/opt/unbounded/agent/plugins/{blue,green}/`, with a manifest of each
   plugin's name and SHA-256, and runs the set beside the binary that `current`
-  resolves to. `v2 start` fills it at first install from each plugin's
+  resolves to. `start` fills it at first install from each plugin's
   `command[0]`, after checking its `sha256`. After that, only an AgentUpgrade
   changes it: one with a plugin manifest stages the new executables beside the
   new binary, and one without copies the running set. Switching `current`, or
@@ -329,4 +329,4 @@ type Client interface {
 | `machineOperationMode: disable` | `control.operations.enabled: false` |
 | Startup gate around its reconcilers | Built in ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 | Own blue/green upgrade, signal file, recovery unit and unit names | Built in ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
-| Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `v2 reset` plus the documented list of what v2 creates ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)) |
+| Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `reset` plus the documented list of what v2 creates ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)) |

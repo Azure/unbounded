@@ -15,7 +15,7 @@ The design is split into the documents below. Read this README first.
 | Document | Covers | Who should read it |
 |---|---|---|
 | This README | Purpose, how v1 and AKS Flex Node work today, goals, open questions, architecture overview, terms | Everyone |
-| [01. CLI and configuration](01-cli-and-configuration.md) | The `v2` commands, the configuration file, install-time and goal settings, credentials | Consumers such as AKS Flex Node |
+| [01. CLI and configuration](01-cli-and-configuration.md) | The v2 build's commands, the configuration file, install-time and goal settings, credentials | Consumers such as AKS Flex Node |
 | [02. Extensions](02-extensions.md) | Lifecycle hooks, declarative extensions, the plugin protocol, and how each AKS Flex Node customization maps onto them | Consumers |
 | [03. Node runtime](03-node-runtime.md) | The `NodeRuntime` interface and its rules, the node bundle, slot states, boot units, the two runtimes | Reviewers of the runtime interface |
 | [04. Control and state](04-control-and-state.md) | Goal sources, status, credentials, the node manager, state files, the daemon's reconcile, MachineOperations | Reviewers of agent lifecycle changes |
@@ -37,6 +37,10 @@ against. Everything in them is versioned and experimental until the
 code is built to production standard from the start, and
 [implementation, section 4](09-implementation.md#4-production-readiness) lists what must hold before v2 replaces v1.
 
+Commands are written as the v2 build's top-level commands, such as `start` or
+`migrate --rollback`. v1's commands are always written as v1's, such as v1's
+`start`.
+
 Code citations are `file:line` against the baseline above. Statements that rely
 on upstream behavior (Kubernetes, containerd, CNI, systemd, the kernel) rather
 than code in this repository are marked *(inference)*. The Go in these
@@ -56,8 +60,8 @@ Node currently imports `pkg/agent` and builds its own agent from the pieces.
 The goal is for consumers to use the agent *binary*, customizing it through
 well-defined hook points.
 
-This design proposes v2: a new implementation, shipped inside the existing
-binary under a `v2` subcommand, marked experimental.
+This design proposes v2: a new implementation, shipped as a second build of
+each release and marked experimental until it replaces v1.
 
 ### 1.1 The v1 agent
 
@@ -147,7 +151,7 @@ library.
 | Old and new slot | During a repave, the slot the running node is in and the slot its replacement is built in ([lifecycles, section 2](05-lifecycles.md#2-repave)). |
 | Bundle manifest | The record of a provisioned bundle, saved in its slot by `Provision`, from which boot hooks and `Recover` work without rendering again ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). |
 | Boot unit | The unit that must start before a runtime's node does, and that host-side prerequisites attach to ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
-| Boot hook | Runtime-owned work that systemd runs around the boot unit, through `v2 boot-hook`. Not a lifecycle hook ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
+| Boot hook | Runtime-owned work that systemd runs around the boot unit, through `boot-hook`. Not a lifecycle hook ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
 | Lifecycle hook | A plugin call at a fixed point in a lifecycle, such as `node.start.after` ([extensions, section 1](02-extensions.md#lifecycle-hook-events)). |
 | Install-time and goal settings | The two parts of the configuration. Install-time settings, such as the runtime and plugins, change only through a reset, except that an AgentUpgrade can replace plugin executables; goal settings can come from a goal source ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). |
 | Applied state | `state.Applied`: the goal version, settings and bundle digest of the running node, and any approved repave ([control and state, section 4](04-control-and-state.md#4-state)). |
@@ -157,9 +161,10 @@ library.
 | Host network reset | The node manager's cleanup of links, routes, rules and firewall state after a node stops ([host changes, section 2](06-host-changes.md#2-host-network-reset)). |
 | Ownership record and active-slot record | The `host` runtime's records of the host paths it owns and of the slot installed into them ([host runtime cleanup, sections 3 and 8](07-host-runtime-cleanup.md#3-ownership-and-adoption)). |
 | Leftover | Something a cleanup could not remove, reported rather than ignored ([host runtime cleanup, section 10](07-host-runtime-cleanup.md#10-post-conditions)). |
+| v1 build and v2 build | The two builds of each experimental release, from the same source and version. The v1 build has only v1's commands; the v2 build has only v2's, at the top level. Installing the v2 build on a v1 host migrates it. From the first official v2 release only the v2 build is published ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
 | First official v2 release | The release that replaces v1 with v2. Its daemon migrates every v1 host it starts on ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
 | Oldest supported v1 release | The oldest v1 release a host can migrate from, set by the releases the migration test matrix covers ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
-| Rollback window | From a migration's commit until v2's first repave on that host. Inside it, `v2 migrate --rollback` on the host can put v1 back ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)). |
+| Rollback window | From a migration's commit until v2's first repave on that host. Inside it, `migrate --rollback` on the host can put v1 back ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)). |
 
 ## 2. Goals and non-goals
 
@@ -172,8 +177,8 @@ library.
 - **G3.** Consumers customize the agent binary through hook points. They do
   not link against agent Go packages.
 - **G4.** v1 behavior is unchanged, apart from the small changes listed in
-  [v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries). v2 is opt-in through `unbounded-agent v2 ...` until
-  the first official v2 release, which replaces v1.
+  [v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries). v2 is opt-in, by installing the v2 build,
+  until the first official v2 release, which replaces v1.
 - **G5.** Code is internal by default. Exporting any of it is an explicit,
   recorded decision ([implementation, section 2](09-implementation.md#2-export-policy)).
 - **G6.** Existing v1 hosts move to v2 without replacing their node, with a
@@ -206,7 +211,7 @@ flowchart TB
     PLG["Plugin executables"]
     EXT["Declarative extensions"]
   end
-  subgraph Agent["unbounded-agent v2 (internal/agentv2)"]
+  subgraph Agent["unbounded-agent, v2 build (internal/agentv2)"]
     CLI["cli: start, preflight, daemon, reset, status, migrate, agent-upgrade, version, boot-hook, convert-config"]
     BOOT["bootstrap coordinator"]
     DAE["daemon: serialized controller"]

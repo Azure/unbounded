@@ -6,7 +6,9 @@ repository baseline, citation conventions and terms.
 ## 1. Packages
 
 ```
-cmd/agent/internal/cmd/v2.go     registers the "v2" group, delegates to internal/agentv2/cli
+cmd/agent/internal/cmd/
+  commands_v1.go  //go:build !agentv2: registers v1's commands, as cmd.go:30-39 does today
+  commands_v2.go  //go:build agentv2: registers internal/agentv2/cli's commands instead
 internal/agentv2/
   cli/            cobra commands and the experimental warning
   config/         AgentConfiguration v1alpha1, defaults, validation, v1 JSON conversion
@@ -26,7 +28,7 @@ internal/agentv2/
   credentials/    bootstrap (static, tpm, plugin), kubelet, daemon (csr, kubeconfig, plugin)
   daemon/         controller wiring, startup gate, operation handlers, unit assets
   agentupgrade/   MachineOperation and CLI upgrade over pkg/agent/agentbinary
-  migrate/        v2 migrate: checks, conversion of v1 state, rollback
+  migrate/        migration run by the daemon, migrate --rollback and --adopt-machine
   plugin/         exec client, protocol types, describe negotiation
   hooks/          event runner
   extensions/     validation, resolution, merge into bundle and hostprep
@@ -63,14 +65,19 @@ internal/agentv2/
   `root: true` or capabilities is trusted with them
   ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
 - **A plugin's shared libraries are not pinned.** Only the executable is.
-  Statically linked plugins avoid this, and `v2 preflight` warns about the
+  Statically linked plugins avoid this, and `preflight` warns about the
   others.
 - **Agent and plugin versions could skew.** Plugins change only with an
   AgentUpgrade, which stages and rolls them back with the binary, and the
   daemon checks each plugin with `describe` before it reports ready
   ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
-- **Experimental code ships in the production binary.** It is reachable only
-  through `v2` commands.
+- **Each release has two builds.** An operator could install the wrong one.
+  The v2 build on a v1 host migrates it, which is what the v2 build is for. A
+  v1 build on a v2 host is rejected before the switch, and the daemon unit
+  refuses to start it. A build tag rather than a linker flag selects the
+  commands, so a mistake fails to compile instead of being ignored, and v1's
+  build contains none of v2's code. CI builds and tests both
+  ([testing, section 6](11-testing.md#6-ci)).
 - **Copied code drifts from v1.** The list in [v1 compatibility, section 3](08-v1-compatibility.md#3-code-copied-from-v1) is the mitigation.
 - **Migration takes over running production nodes.** A bug could disrupt a
   node that was working. Before the commit, v2 changes nothing of v1's, so a
@@ -101,4 +108,4 @@ release's tracking issue lists each one with links to the evidence.
 | CI | The v2 jobs have been required on every pull request that touches the agent since the first v2 code merged, and pass nightly on the full host matrix for both runtimes ([testing, section 6](11-testing.md#6-ci)) |
 | Migration matrix | The cutover matrix passes against the release builds, from every v1 release back to the oldest supported one, together with every interrupted and failed variant. The release notes name the oldest supported v1 release ([testing, section 4](11-testing.md#4-migration-suite)). |
 | Capability probes | Every host in the matrix gives the expected probe results for both runtimes, and a host that fails a probe is refused with the probe in the error ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)) |
-| Documentation | The public site under `docs/` covers the configuration format, writing plugins (the protocol, permissions and plugin manifests), the AgentUpgrade parameters, the two runtimes and their capability probes, what v2 creates on a host, and migrating and rolling back. The experimental warning and the `v2` command group's "unstable" label are removed in the same release. |
+| Documentation | The public site under `docs/` covers the configuration format, writing plugins (the protocol, permissions and plugin manifests), the AgentUpgrade parameters, the two runtimes and their capability probes, what v2 creates on a host, and migrating and rolling back. The same release drops the v2 build's experimental warning, publishes the v2 build under the plain artifact name, and stops publishing the v1 build. |
