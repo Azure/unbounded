@@ -708,6 +708,39 @@ impl<M: Member> Membership<M> {
                 .any(|pool| pool.edge(position, other).is_some())
     }
 
+    /// First hops to add to [`PathQuery::blocked`] so a route from `from`
+    /// to `to` skips relays that may have failed it, by detour `level`:
+    ///
+    /// - 0: none. The route takes the primary path.
+    /// - 1: the primary relay ([`Pool::primary`]) of each pool that has both
+    ///   ends. The route takes the alternate path ([`Pool::alternate`]),
+    ///   whose relay is never the primary one, or else a 3-link fallback.
+    /// - 2 or more: the alternate relays too, leaving the 3-link fallbacks.
+    ///
+    /// Never contains `to`, so a direct link is never detoured. Sorted, no
+    /// repeats.
+    #[must_use]
+    pub fn detour(&self, from: usize, to: usize, level: u8) -> Vec<usize> {
+        let mut hops = Vec::new();
+        if level == 0 || from == to {
+            return hops;
+        }
+        for pool in self
+            .pools
+            .iter()
+            .filter(|p| p.contains(from) && p.contains(to))
+        {
+            hops.extend(pool.primary(from, to));
+            if level >= 2 {
+                hops.extend(pool.alternate(from, to));
+            }
+        }
+        hops.retain(|&h| h != from && h != to);
+        hops.sort_unstable();
+        hops.dedup();
+        hops
+    }
+
     /// Best `(pool rank, edge kind)` over pools that have the edge.
     fn edge_rank(&self, a: usize, b: usize) -> Option<(u64, EdgeKind)> {
         self.pools

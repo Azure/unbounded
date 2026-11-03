@@ -16,6 +16,12 @@
 //! one. A route never passes a `visited` member, and never starts with a
 //! `blocked` first hop. Members that share no pool and are not linked are
 //! unreachable.
+//!
+//! Retries: the seed only picks within a group, and the primary group usually
+//! has one route, so a retry with a new seed takes the same relay. To route
+//! around a relay that may have failed, block the hops from
+//! [`crate::Membership::detour`]: level 1 skips the primary relay (the route
+//! takes the disjoint alternate), level 2 also skips the alternate relay.
 
 use crate::{Error, Member, Membership, Pool, hash};
 
@@ -1254,6 +1260,53 @@ mod tests {
         key.links = 3;
         key.blocked = neighbors;
         assert_eq!(search(&members, &key), Err(Error::Unreachable));
+    }
+
+    /// Detour levels: 0 takes the primary relay, 1 the disjoint alternate,
+    /// 2 neither. Direct links are never detoured. Same inputs, same route.
+    #[test]
+    fn detour_levels_skip_primary_then_alternate_relays() {
+        let members = membership(4096);
+        let pool = &members.pools()[0];
+        let paths = Paths::new(64);
+        let mut checked = 0;
+        for (from, to) in [(0, 4095), (19, 2048), (777, 3001), (5, 6), (100, 101)] {
+            let route = |level: u8| {
+                let blocked = members.detour(from, to, level);
+                assert!(!blocked.contains(&to) && !blocked.contains(&from));
+                let query = PathQuery {
+                    blocked: &blocked,
+                    seed: b"retry",
+                    ..query(from, to, 4)
+                };
+                let first = futures::executor::block_on(paths.route(&members, query)).unwrap();
+                let again = futures::executor::block_on(paths.route(&members, query)).unwrap();
+                assert_eq!(first, again);
+                first
+            };
+            if members.is_neighbor(from, to) {
+                for level in 0..=2 {
+                    assert_eq!(route(level), vec![from, to]);
+                }
+                continue;
+            }
+            checked += 1;
+            let primary = pool.primary(from, to).unwrap();
+            let alternate = pool.alternate(from, to).unwrap();
+            assert_ne!(primary, alternate);
+            assert_eq!(members.detour(from, to, 0), Vec::<usize>::new());
+            assert_eq!(members.detour(from, to, 1), vec![primary]);
+            assert_eq!(route(0), vec![from, primary, to]);
+            assert_eq!(route(1), vec![from, alternate, to]);
+            let fallback = route(2);
+            assert!(fallback.len() <= 4, "{fallback:?}");
+            assert!(
+                !fallback.contains(&primary) && !fallback.contains(&alternate),
+                "{fallback:?}"
+            );
+        }
+        assert!(checked >= 2);
+        assert!(members.detour(3, 3, 2).is_empty());
     }
 
     /// Weighted picking is fair, including at its edges.
