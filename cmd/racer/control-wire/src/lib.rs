@@ -47,7 +47,10 @@ pub use definitions::*;
 use std::time::Duration;
 
 /// Current control record schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Current incremental publication format version.
+pub const DELTA_VERSION: u32 = 2;
 
 /// Enrollment endpoint for a new node identity.
 pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
@@ -135,6 +138,9 @@ pub struct Publication {
     pub members: Vec<Member>,
 
     pub caches: Vec<CacheDefinition>,
+
+    /// Node pools of the catalog's caches. Each cache is in exactly one pool.
+    pub pools: Vec<Pool>,
 }
 
 /// The transport supplies the projected bearer token, never a DTO or diagnostic.
@@ -491,6 +497,88 @@ mod definitions {
 
         /// Whether nodes retain this cache's pages and metadata.
         pub mode: CacheMode,
+    }
+
+    /// Pool identity: `default`, or `sel-` and 32 lowercase hexadecimal digits.
+    #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    pub struct PoolId(pub String);
+
+    impl PoolId {
+        /// Spelling of the pool that holds every member.
+        pub const DEFAULT: &'static str = "default";
+
+        /// The default pool, which holds every member.
+        pub fn default_pool() -> Self {
+            Self(Self::DEFAULT.into())
+        }
+
+        /// Whether this is the default pool.
+        pub fn is_default(&self) -> bool {
+            self.0 == Self::DEFAULT
+        }
+
+        /// Whether the ID is `default` or `sel-` and 32 lowercase hex digits.
+        pub fn valid(&self) -> bool {
+            self.is_default()
+                || self.0.strip_prefix("sel-").is_some_and(|hex| {
+                    hex.len() == 32
+                        && hex
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        }
+    }
+
+    /// Members that own the pages of a set of caches.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Pool {
+        pub id: PoolId,
+
+        /// RDMA ordering, higher first: `(selector ? 1 : 0) << 32 | max cache priority`.
+        pub rank: u64,
+
+        /// Strictly increasing indexes into the publication's members sorted by
+        /// node ID. `None` means every member and is required for the default pool
+        /// and forbidden otherwise.
+        pub members: Option<Vec<u32>>,
+
+        /// Caches that use this pool. Never empty.
+        pub caches: Vec<CacheId>,
+    }
+
+    /// Check pool syntax and that each catalog cache is in exactly one pool.
+    pub fn validate_pools(
+        pools: &[Pool],
+        member_count: usize,
+        definitions: &[CacheDefinition],
+    ) -> Result<()> {
+        let catalog: HashSet<&CacheId> = definitions.iter().map(|d| &d.id).collect();
+        let mut ids = HashSet::new();
+        let mut seen = HashSet::new();
+        for pool in pools {
+            if !pool.id.valid()
+                || !ids.insert(&pool.id)
+                || pool.id.is_default() != pool.members.is_none()
+                || pool.caches.is_empty()
+            {
+                return Err(Error::InvalidRequest);
+            }
+            if let Some(members) = &pool.members
+                && (members.windows(2).any(|w| w[0] >= w[1])
+                    || members.last().is_some_and(|m| *m as usize >= member_count))
+            {
+                return Err(Error::InvalidRequest);
+            }
+            for cache in &pool.caches {
+                if !catalog.contains(cache) || !seen.insert(cache) {
+                    return Err(Error::InvalidRequest);
+                }
+            }
+        }
+        if seen.len() != catalog.len() {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(())
     }
 
     /// How a cache treats object data. Only `Cached` retains pages or metadata.
@@ -1245,6 +1333,67 @@ mod codec {
         members: Vec<MemberDto>,
 
         caches: Vec<Cache>,
+
+        pools: Vec<PoolDto>,
+    }
+
+    /// Pool JSON record. `members` is absent, never null, for the default pool.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PoolDto {
+        id: String,
+
+        rank: u64,
+
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nonnull_indexes"
+        )]
+        members: Option<Vec<u32>>,
+
+        caches: Vec<String>,
+    }
+
+    /// Accept present pool members only as an array, never explicit null.
+    fn nonnull_indexes<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<Vec<u32>>, D::Error> {
+        Vec::<u32>::deserialize(d).map(Some)
+    }
+
+    /// Convert decoded pools; validation happens against the decoded catalog.
+    fn pools_from_dto(pools: Vec<PoolDto>) -> Vec<Pool> {
+        let mut pools: Vec<_> = pools
+            .into_iter()
+            .map(|p| Pool {
+                id: PoolId(p.id),
+                rank: p.rank,
+                members: p.members,
+                caches: p.caches.into_iter().map(CacheId).collect(),
+            })
+            .collect();
+        pools.sort_by(|a, b| a.id.cmp(&b.id));
+        pools
+    }
+
+    /// Encode pools in canonical order: by ID, with sorted cache IDs.
+    fn pools_to_dto(pools: &[Pool]) -> Vec<PoolDto> {
+        let mut out: Vec<_> = pools
+            .iter()
+            .map(|p| {
+                let mut caches: Vec<String> = p.caches.iter().map(|c| c.0.clone()).collect();
+                caches.sort();
+                PoolDto {
+                    id: p.id.0.clone(),
+                    rank: p.rank,
+                    members: p.members.clone(),
+                    caches,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// Decode and normalize a bounded full publication.
@@ -1301,6 +1450,11 @@ mod codec {
             .collect();
         validate_definitions(&caches)?;
         caches.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut pools = pools_from_dto(p.pools);
+        validate_pools(&pools, members.len(), &caches)?;
+        for pool in &mut pools {
+            pool.caches.sort();
+        }
         Ok(Publication {
             schema_version: p.schema_version,
             cluster: ClusterId(p.cluster),
@@ -1308,6 +1462,7 @@ mod codec {
             membership_version,
             members,
             caches,
+            pools,
         })
     }
 
@@ -1352,6 +1507,7 @@ mod codec {
             membership_version: p.membership_version.0.to_string(),
             members,
             caches,
+            pools: pools_to_dto(&p.pools),
         })
     }
 
@@ -1394,9 +1550,12 @@ mod codec {
             members: &'a [MemberDto],
 
             caches: &'a [Cache],
+
+            pools: &'a [PoolDto],
         }
 
-        /// Canonical membership bytes exclude both cursors and cache definitions.
+        /// Canonical membership bytes exclude cursors and cache definitions, but
+        /// include pools, so pool or cache-to-pool changes take a new version.
         #[derive(Serialize)]
         struct Membership<'a> {
             schema_version: u32,
@@ -1404,6 +1563,8 @@ mod codec {
             cluster: &'a str,
 
             members: &'a [MemberDto],
+
+            pools: &'a [PoolDto],
         }
         Ok((
             encode(
@@ -1412,6 +1573,7 @@ mod codec {
                     cluster: &d.cluster,
                     members: &d.members,
                     caches: &d.caches,
+                    pools: &d.pools,
                 },
                 MAX_PUBLICATION_BYTES,
             )?,
@@ -1420,6 +1582,7 @@ mod codec {
                     schema_version: d.schema_version,
                     cluster: &d.cluster,
                     members: &d.members,
+                    pools: &d.pools,
                 },
                 MAX_PUBLICATION_BYTES,
             )?,
@@ -1449,6 +1612,9 @@ mod codec {
         remove_members: Vec<String>,
 
         caches: Vec<Cache>,
+
+        /// Complete pool list of the target; member indexes refer to its members.
+        pools: Vec<PoolDto>,
     }
 
     /// Hash the canonical publication content using lowercase SHA-256 hexadecimal.
@@ -1462,7 +1628,7 @@ mod codec {
     /// on any delta failure; no partially applied state is ever published.
     pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
         let d: DeltaDto = decode(bytes, 4 * 1024 * 1024)?;
-        if d.delta_version != 1
+        if d.delta_version != DELTA_VERSION
             || d.cluster != base.cluster.0
             || counter(&d.base_sequence)? != base.sequence.0
             || d.base_hash != content_hash(base)?
@@ -1494,6 +1660,7 @@ mod codec {
         }
         original.members = members.into_values().collect();
         original.caches = d.caches;
+        original.pools = d.pools;
         original.sequence = d.sequence;
         original.membership_version = d.membership_version;
         encode(&original, MAX_PUBLICATION_BYTES)?;
@@ -1762,10 +1929,11 @@ mod codec {
             next.members.push(added);
             let dto = dto(&next).unwrap();
             let mut delta = serde_json::json!({
-                "delta_version":1,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
+                "delta_version":2,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
                 "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
                 "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
-                "upsert_members":dto.members,"remove_members":[removed],"caches":dto.caches
+                "upsert_members":dto.members,"remove_members":[removed],"caches":dto.caches,
+                "pools":dto.pools
             });
             let bytes = serde_json::to_vec(&delta).unwrap();
             assert_eq!(
@@ -2147,7 +2315,9 @@ mod codec {
             p.members[0].rails.reverse();
             assert_eq!(content_hashes(&p).unwrap(), hashes);
             assert_eq!(p.members[0].rails[0].rail.0, 65535, "caller input mutated");
-            p.caches[0].id = CacheId("66666666-6666-4666-8666-666666666666".into());
+            p.caches[0].name = "cache-b".into();
+            (p.caches[0].client_socket, p.caches[0].origin_socket) =
+                canonical_socket_paths("cache-b").unwrap();
             let changed = content_hashes(&p).unwrap();
             assert_ne!(changed.0, hashes.0);
             assert_eq!(changed.1, hashes.1);
@@ -2317,6 +2487,183 @@ mod codec {
             assert_eq!(
                 decode_publication(b.as_slice()).err(),
                 Some(Error::Overloaded)
+            );
+        }
+
+        /// Pools round-trip canonically and enforce exact cache coverage.
+        #[test]
+        fn pool_validation_and_canonical_order() {
+            let base = decode_publication(&fixture("publication.json")).unwrap();
+            assert_eq!(
+                base.pools,
+                vec![Pool {
+                    id: PoolId::default_pool(),
+                    rank: 250,
+                    members: None,
+                    caches: vec![base.caches[0].id.clone()],
+                }]
+            );
+            let sel = |n: char| PoolId(format!("sel-{}", n.to_string().repeat(32)));
+            let mut two = base.clone();
+            two.caches.push(two.caches[0].clone());
+            two.caches[1].id = CacheId("55555555-5555-4555-8555-555555555555".into());
+            two.caches[1].name = "cache-b".into();
+            (two.caches[1].client_socket, two.caches[1].origin_socket) =
+                canonical_socket_paths("cache-b").unwrap();
+            two.pools.insert(
+                0,
+                Pool {
+                    id: sel('f'),
+                    rank: (1 << 32) | 9,
+                    members: Some(vec![0, 1]),
+                    caches: vec![two.caches[1].id.clone()],
+                },
+            );
+            let encoded = encode_publication(&two).unwrap();
+            let decoded = decode_publication(&encoded).unwrap();
+            assert_eq!(decoded.pools[0].id, PoolId::default_pool());
+            assert_eq!(decoded.pools[1], two.pools[0]);
+            assert!(
+                String::from_utf8(encoded.clone())
+                    .unwrap()
+                    .contains("{\"id\":\"default\",\"rank\":250,\"caches\"")
+            );
+            let mut reordered = two.clone();
+            reordered.pools.reverse();
+            assert_eq!(encode_publication(&reordered).unwrap(), encoded);
+            let mutations: Vec<Box<dyn Fn(&mut Publication)>> = vec![
+                Box::new(|p| p.pools[0].id = PoolId("sel-".into())),
+                Box::new(|p| p.pools[0].id = PoolId(format!("sel-{}", "A".repeat(32)))),
+                Box::new(|p| p.pools[0].id = PoolId(format!("sel-{}", "a".repeat(31)))),
+                Box::new(|p| p.pools[0].id = PoolId("other".into())),
+                Box::new(|p| p.pools[0].id = PoolId::default_pool()),
+                Box::new(|p| p.pools[0].members = None),
+                Box::new(|p| p.pools[1].members = Some(vec![])),
+                Box::new(|p| p.pools[0].members = Some(vec![1, 0])),
+                Box::new(|p| p.pools[0].members = Some(vec![0, 0])),
+                Box::new(|p| p.pools[0].members = Some(vec![2])),
+                Box::new(|p| p.pools[0].caches.clear()),
+                Box::new(|p| {
+                    let c = p.pools[0].caches[0].clone();
+                    p.pools[1].caches.push(c);
+                }),
+                Box::new(|p| {
+                    p.pools[0].caches[0] = CacheId("66666666-6666-4666-8666-666666666666".into())
+                }),
+                Box::new(|p| {
+                    p.pools.remove(0);
+                }),
+                Box::new(|p| p.pools.clear()),
+            ];
+            for (i, mutate) in mutations.iter().enumerate() {
+                let mut candidate = two.clone();
+                mutate(&mut candidate);
+                assert_eq!(
+                    validate_publication(&candidate).err(),
+                    Some(Error::InvalidRequest),
+                    "mutation {i}"
+                );
+                let bytes = encode(&dto(&candidate).unwrap(), MAX_PUBLICATION_BYTES).unwrap();
+                assert_eq!(
+                    decode_publication(&bytes).err(),
+                    Some(Error::InvalidRequest),
+                    "mutation {i}"
+                );
+            }
+            let raw = String::from_utf8(encoded).unwrap();
+            for (old, new) in [
+                (",\"rank\":250", ""),
+                (",\"rank\":250", ",\"rank\":-1"),
+                (",\"rank\":250", ",\"rank\":2.5"),
+                ("\"rank\":250,", "\"rank\":250,\"members\":null,"),
+                ("\"rank\":250,", "\"rank\":250,\"future\":0,"),
+                ("\"members\":[0,1]", "\"members\":[0,-1]"),
+                (",\"pools\":[", ",\"pools\":null,\"x\":["),
+            ] {
+                let changed = raw.replacen(old, new, 1);
+                assert_ne!(changed, raw, "{new}");
+                assert!(decode_publication(changed.as_bytes()).is_err(), "{new}");
+            }
+            let mut no_pools: Value = serde_json::from_str(&raw).unwrap();
+            no_pools.as_object_mut().unwrap().remove("pools");
+            assert!(decode_publication(&serde_json::to_vec(&no_pools).unwrap()).is_err());
+        }
+
+        /// Membership bytes cover pools, so pool changes take a new version.
+        #[test]
+        fn membership_hash_covers_pools() {
+            let mut p = decode_publication(&fixture("publication.json")).unwrap();
+            let id = PoolId(format!("sel-{}", "0".repeat(32)));
+            let base = content_hashes(&p).unwrap();
+            // Moving the cache to a selector pool.
+            p.pools[0] = Pool {
+                id: id.clone(),
+                rank: (1 << 32) | 250,
+                members: Some(vec![0, 1]),
+                caches: p.pools[0].caches.clone(),
+            };
+            let moved = content_hashes(&p).unwrap();
+            assert_ne!(moved.0, base.0);
+            assert_ne!(moved.1, base.1);
+            // Changing the pool's members.
+            p.pools[0].members = Some(vec![1]);
+            let shrunk = content_hashes(&p).unwrap();
+            assert_ne!(shrunk.0, moved.0);
+            assert_ne!(shrunk.1, moved.1);
+            // Changing the pool's rank.
+            p.pools[0].rank += 1;
+            let ranked = content_hashes(&p).unwrap();
+            assert_ne!(ranked.1, shrunk.1);
+            // Renaming the pool.
+            p.pools[0].id = PoolId(format!("sel-{}", "1".repeat(32)));
+            assert_ne!(content_hashes(&p).unwrap().1, ranked.1);
+        }
+
+        /// Deltas carry the target's full pool list and bind it to the hash.
+        #[test]
+        fn delta_replaces_pools() {
+            let base = decode_publication(&fixture("publication.json")).unwrap();
+            let mut next = base.clone();
+            next.sequence.0 = base.sequence.0;
+            let mut base = base;
+            base.sequence.0 -= 1;
+            next.membership_version.0 += 1;
+            next.pools[0] = Pool {
+                id: PoolId(format!("sel-{}", "a".repeat(32))),
+                rank: (1 << 32) | 250,
+                members: Some(vec![1]),
+                caches: next.pools[0].caches.clone(),
+            };
+            let d = dto(&next).unwrap();
+            let mut delta = serde_json::json!({
+                "delta_version":2,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
+                "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
+                "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
+                "upsert_members":[],"remove_members":[],"caches":d.caches,"pools":d.pools
+            });
+            let applied = apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).unwrap();
+            assert_eq!(applied.pools, next.pools);
+            delta["pools"][0]["members"] = serde_json::json!([0]);
+            assert_eq!(
+                apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).err(),
+                Some(Error::Replay)
+            );
+            delta["pools"][0]["members"] = serde_json::json!([5]);
+            assert_eq!(
+                apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).err(),
+                Some(Error::InvalidRequest)
+            );
+            delta["pools"][0]["members"] = serde_json::json!([1]);
+            delta["delta_version"] = 1.into();
+            assert_eq!(
+                apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).err(),
+                Some(Error::Replay)
+            );
+            delta["delta_version"] = 2.into();
+            delta.as_object_mut().unwrap().remove("pools");
+            assert_eq!(
+                apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).err(),
+                Some(Error::InvalidRequest)
             );
         }
 
@@ -2510,7 +2857,7 @@ mod codec {
         /// The Go delta fixture applies exactly once and binds changed member content.
         #[test]
         fn go_delta_vector_applies_exactly_and_rejects_tampering() {
-            let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[]}"#).unwrap();
+            let base = decode_publication(br#"{"schema_version":2,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[],"pools":[]}"#).unwrap();
             let delta = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/delta.json"));
             let next = apply_delta(&base, delta.as_bytes()).unwrap();
             assert_eq!(next.sequence.0, 2);
@@ -2519,7 +2866,7 @@ mod codec {
             assert_eq!(next.members[1].shares.get(), 7);
             assert_eq!(
                 format!("{:x}", Sha256::digest(canonical_content(&next).unwrap().0)),
-                "0929db4d1b89c4fdb5c6c20d938a77b286318a830df0b1ac823ee62916af4e20"
+                "6c712b7c02dffe1e6f64d0794a8ccb23699b7d375bc212f748620b2fc464d7c9"
             );
             assert!(apply_delta(&next, delta.as_bytes()).is_err());
             assert!(
@@ -2536,14 +2883,15 @@ mod codec {
         fn strict_numbers_duplicates_unknowns_and_bounds() {
             for (old, new) in [
                 (
-                    "\"schema_version\":1",
-                    "\"schema_version\":1,\"schema_versi\\u006fn\":1",
+                    "\"schema_version\":2",
+                    "\"schema_version\":2,\"schema_versi\\u006fn\":1",
                 ),
                 (
-                    "\"schema_version\":1",
-                    "\"schema_version\":1,\"future\":{\"x\":1,\"x\":2}",
+                    "\"schema_version\":2",
+                    "\"schema_version\":2,\"future\":{\"x\":1,\"x\":2}",
                 ),
-                ("\"schema_version\":1", "\"schema_version\":2"),
+                ("\"schema_version\":2", "\"schema_version\":1"),
+                ("\"schema_version\":2", "\"schema_version\":3"),
                 ("\"rail\":0", "\"rail\":-0"),
                 ("\"shares\":4,", "\"shares\":4.0,"),
                 ("\"numa_node\":4294967295", "\"numa_node\":null"),
@@ -2565,8 +2913,8 @@ mod codec {
                 decode_publication(
                     PUBLICATION
                         .replacen(
-                            "\"schema_version\":1",
-                            "\"schema_version\":1,\"SCHEMA_VERSION\":42",
+                            "\"schema_version\":2",
+                            "\"schema_version\":2,\"SCHEMA_VERSION\":42",
                             1
                         )
                         .as_bytes()
