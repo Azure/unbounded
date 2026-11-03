@@ -395,9 +395,10 @@ impl PeerServer {
 
     /// Whether to answer a page request with `Overloaded` because this node owns the page and is
     /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
-    /// all the bodies it is writing. The page's other owners and this node's column mates in the
-    /// page's pool are never shed: the column mates are the helpers shed readers ask, so owner
-    /// fan-in for one page stays bounded by the column size. The ranking is only computed for a
+    /// all the bodies it is writing. The page's other owners are never shed. This node's column
+    /// mates in the page's pool (the helpers shed readers ask) are shed only past
+    /// `hot_page_exempt_bodies`, so owner fan-in for one page stays near the threshold whatever
+    /// the column size. The ranking is only computed for a
     /// page that is already hot, and stays in this server's placement cache.
     fn shed_hot_page(
         &self,
@@ -405,7 +406,7 @@ impl PeerServer {
         requester: &racer_control_wire::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        use racer_core::read::budget::shed_hot_page;
+        use racer_core::read::budget::{HotPageLimits, shed_hot_page};
         let threshold = hot_page_threshold();
         let (streaming, all) = self.streaming(page);
         if streaming < threshold {
@@ -422,7 +423,7 @@ impl PeerServer {
             column_mate,
             streaming,
             all,
-            threshold,
+            HotPageLimits::mesh(threshold),
         )
     }
     /// Bound incoming heads and the complete connection handshake, including writes.

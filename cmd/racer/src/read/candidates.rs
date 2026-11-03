@@ -1807,7 +1807,8 @@ impl CandidatePolicy {
 
     /// The member this non-owner asks to acquire `page` for it when an owner
     /// sheds the request (`racer_core::read::budget::mesh_helper`): the middle
-    /// node of this node's primary mesh path to an owner, in owner rank order,
+    /// node of this node's primary mesh path to an owner, starting at a hashed
+    /// owner rank (`helper_start`) so readers spread over the owners' columns,
     /// never an owner and never this node.
     pub(crate) fn fanout_helper(
         &self,
@@ -1818,6 +1819,7 @@ impl CandidatePolicy {
         let membership = &candidates.membership;
         racer_core::read::budget::mesh_helper(
             &candidates.ordered,
+            racer_core::read::budget::helper_start(self.node.0.as_bytes()),
             |owner| membership.helper(&object.cache, &self.node, owner),
             |node| node == &self.node || candidates.ordered.contains(node),
         )

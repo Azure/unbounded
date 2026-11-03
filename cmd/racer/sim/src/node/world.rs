@@ -22,8 +22,10 @@ use racer_core::liveness::{
 use racer_core::read::Error;
 use racer_core::read::Source;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
+use racer_core::read::budget::{
+    HotPageLimits, helper_start, hot_page_bodies, mesh_helper, shed_hot_page,
+};
 use racer_core::read::budget::{fanout_helper, is_helper};
-use racer_core::read::budget::{hot_page_bodies, mesh_helper, shed_hot_page};
 use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
     Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, should_notice,
@@ -3619,6 +3621,7 @@ impl NodeWorld {
             let me = me?;
             return mesh_helper(
                 &owners,
+                helper_start(&node.to_be_bytes()),
                 |owner| {
                     let owner = members.position(&owner.to_be_bytes())?;
                     pool.helper(me, owner).map(at)
@@ -3715,7 +3718,8 @@ impl NodeWorld {
     /// Production hot-page shed (`racer_core::read::budget::shed_hot_page`): an owner already
     /// streaming [`Self::hot_page_threshold`] bodies of `page`, at least half of all bodies it
     /// streams, answers `Overloaded` to a requester that is neither an owner nor in the owner's
-    /// column.
+    /// column. With mesh helpers, column mates are shed too once it streams
+    /// `hot_page_exempt_bodies` bodies; v1 helpers are never shed.
     fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
         let now = self.now();
         let streaming = live_ends(&mut self.streaming, (dest, page), now);
@@ -3751,7 +3755,11 @@ impl NodeWorld {
             column_mate,
             streaming,
             all,
-            threshold,
+            if mesh {
+                HotPageLimits::mesh(threshold)
+            } else {
+                HotPageLimits::v1(threshold)
+            },
         )
     }
 

@@ -1904,10 +1904,10 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     hot_page_shedding(false);
 }
 
-/// A hot owner never sheds a requester in its own mesh column of the page's
-/// pool: with more than 64 members the pool has several columns, and the
-/// same hot page that sheds a requester in another column is served to one
-/// in the owner's column.
+/// A hot owner sheds a requester in its own mesh column of the page's pool
+/// only past the exempt cap: with more than 64 members the pool has several
+/// columns, and the same hot page that sheds a requester in another column is
+/// served to one in the owner's column until the cap.
 #[test]
 fn hot_page_owner_serves_its_column_mates() {
     hot_page_shedding(true);
@@ -2091,7 +2091,18 @@ fn hot_page_shedding(mate: bool) {
     assert_eq!(calls.get(), served + 1);
     drop((held, other));
     // A node that does not own the page (for example a helper) never sheds.
-    let _held = server.hold_streaming(&page_id(foreign_page), hot);
+    let held = server.hold_streaming(&page_id(foreign_page), hot);
     assert!(!ask(foreign_page));
     assert_eq!(calls.get(), served + 2);
+    drop(held);
+    // Past the exempt cap a column mate is shed too, so the column cannot pile onto C.
+    let cap = racer_core::read::budget::hot_page_exempt_bodies(hot);
+    let held = server.hold_streaming(&page_id(shed_page), cap - 1);
+    assert_eq!(ask(shed_page), !mate);
+    let served = served + usize::from(mate) + 2;
+    assert_eq!(calls.get(), served);
+    drop(held);
+    let _held = server.hold_streaming(&page_id(shed_page), cap);
+    assert!(ask(shed_page));
+    assert_eq!(calls.get(), served);
 }
