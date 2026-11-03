@@ -249,7 +249,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
-| `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
+| `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (18 MiB, one page rounded up to whole 2 MiB pages) it is off; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PEER` | `auto` | `auto` lets one GPU copy an encrypted page another GPU already holds over NVLink or PCIe peer-to-peer where the driver allows it; `off` turns peer access off, so requests on different GPUs do not share encrypted copies and any page that must move between GPUs goes through host memory. Other values fail startup. Each GPU still checks the page itself |
 | `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
@@ -1208,7 +1208,7 @@ pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
-encrypted pages. It is split into slots of one page (16 MiB plus 4 KiB). Two
+encrypted pages. It is split into slots of one page rounded up to whole 2 MiB pages (18 MiB). Two
 slots are needed for decryption, so a smaller cap means the CPU decrypts. The
 other slots hold pages read with cuFile. When all of them are in use, the
 dataplane reads the next page through host memory instead. If the image has no
