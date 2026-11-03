@@ -396,16 +396,15 @@ pub fn classify_disks(devices: &[BlockDevice], mounts: &str, context: &Context) 
         let Some(id) = racer_cluster_control::disks::preferred_id(&aliases).cloned() else {
             continue;
         };
-        let approval = device.dev.as_ref().and_then(|dev| {
-            context
-                .approvals
-                .iter()
-                .position(|a| a.dev.as_ref() == Some(dev))
-        });
+        // An approval applies only while its by-id name still names this
+        // disk; a replacement may reuse the old disk's MAJ:MIN.
+        let applies =
+            |a: &Approved| device.dev.is_some() && a.dev == device.dev && aliases.contains(&a.id);
+        let approval = context.approvals.iter().position(applies);
         let (state, reason) = match approval {
             Some(index) => {
                 for (i, other) in context.approvals.iter().enumerate() {
-                    if other.dev == context.approvals[index].dev {
+                    if applies(other) {
                         matched[i] = true;
                     }
                 }
@@ -1355,6 +1354,65 @@ mod tests {
         );
         assert_eq!(disks[3].aliases, ["ata-X_1", "wwn-0x1111"]);
         assert!(disks[5].aliases.is_empty() && disks[5].size_bytes.is_none());
+    }
+
+    #[test]
+    fn approval_does_not_follow_reused_dev_to_a_different_disk() {
+        // The rejected disk was detached and a replacement took its MAJ:MIN.
+        let devices = vec![
+            disk("sde", "8:64", &["wwn-0xnew"]),
+            disk("sdf", "8:80", &["wwn-0xkept", "ata-kept"]),
+        ];
+        let context = Context {
+            approvals: vec![
+                Approved {
+                    id: "wwn-0xold".into(),
+                    dev: Some("8:64".into()),
+                    state: DiskState::Rejected,
+                    reason: Some(DiskReason::Busy),
+                },
+                // Same disk, still present under the approved name.
+                Approved {
+                    id: "ata-kept".into(),
+                    dev: Some("8:80".into()),
+                    state: DiskState::Claimed,
+                    reason: None,
+                },
+                // Approved name is gone but the dev matches another disk.
+                Approved {
+                    id: "ata-gone".into(),
+                    dev: Some("8:80".into()),
+                    state: DiskState::Rejected,
+                    reason: Some(DiskReason::Busy),
+                },
+            ],
+            segment_bytes: 64 << 20,
+            ..Default::default()
+        };
+        let disks = classify_disks(&devices, "", &context);
+        let summary: Vec<_> = disks
+            .iter()
+            .map(|d| (d.id.as_str(), d.dev.as_deref(), d.state, d.reason))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "ata-gone",
+                    None,
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy)
+                ),
+                ("wwn-0xkept", Some("sdf"), DiskState::Claimed, None),
+                ("wwn-0xnew", Some("sde"), DiskState::Available, None),
+                (
+                    "wwn-0xold",
+                    None,
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy)
+                ),
+            ]
+        );
     }
 
     #[test]
