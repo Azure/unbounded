@@ -5,9 +5,12 @@ package utilio
 
 import (
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsDirEmpty(t *testing.T) {
@@ -210,4 +213,27 @@ func TestNearestExistingDir(t *testing.T) {
 			t.Fatalf("NearestExistingDir = %q, want /", got)
 		}
 	})
+}
+
+func TestRemoveIfExists(t *testing.T) {
+	t.Parallel()
+
+	log := slog.New(slog.DiscardHandler)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "f")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+
+	require.NoError(t, RemoveFileIfExists(log, file))
+	require.NoError(t, RemoveFileIfExists(log, file), "absence is not an error")
+	require.NoError(t, RemoveAllIfExists(log, filepath.Join(dir, "missing")))
+
+	tree := filepath.Join(dir, "tree", "sub")
+	require.NoError(t, os.MkdirAll(tree, 0o755))
+	require.NoError(t, RemoveAllIfExists(log, filepath.Join(dir, "tree")))
+	require.NoDirExists(t, tree)
+
+	// A non-empty directory is not a file: Remove fails and the failure is returned.
+	nonEmpty := filepath.Join(dir, "d")
+	require.NoError(t, os.MkdirAll(filepath.Join(nonEmpty, "x"), 0o755))
+	require.Error(t, RemoveFileIfExists(log, nonEmpty))
 }

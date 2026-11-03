@@ -115,3 +115,26 @@ func FileSHA256(path string) ([sha256.Size]byte, error) {
 
 	return digest, nil
 }
+
+// WriteFileAtomic writes data to path through a temporary file in the same
+// directory and a rename, creating missing parent directories with mode 0755.
+// Unlike WriteFileDurable it does not sync, so it suits files that are rebuilt
+// from other state.
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp) //nolint:errcheck // best effort cleanup
+
+		return err
+	}
+
+	return nil
+}

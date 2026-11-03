@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -124,4 +125,26 @@ func ProbeWritableDir(dir string) error {
 	}
 
 	return os.Remove(name)
+}
+
+// RemoveFileIfExists removes a file, ignoring absence and logging and returning
+// any other failure.
+func RemoveFileIfExists(log *slog.Logger, path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Warn("failed to remove file", "path", path, "error", err)
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// RemoveAllIfExists removes a path and everything below it. Removal failures
+// are logged and returned so callers keep ownership of what is left.
+func RemoveAllIfExists(log *slog.Logger, path string) error {
+	if err := os.RemoveAll(path); err != nil {
+		log.Warn("failed to remove directory", "path", path, "error", err)
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+
+	return nil
 }
