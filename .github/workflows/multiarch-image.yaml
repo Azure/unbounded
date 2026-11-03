@@ -70,7 +70,7 @@ on:
         type: string
         default: ""
       free-disk-space:
-        description: Remove preinstalled toolchains first, for images larger than a hosted runner's free disk.
+        description: Remove preinstalled toolchains before building and before SBOM generation, for images larger than a hosted runner's free disk.
         required: false
         type: boolean
         default: false
@@ -271,6 +271,15 @@ jobs:
     outputs:
       digest: ${{ steps.create.outputs.digest }}
     steps:
+      # The SBOM step pulls the image again on this fresh runner, so it needs
+      # the same headroom as the build job.
+      - name: Free disk space for large images
+        if: inputs.free-disk-space && inputs.sign
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       # The key's hash suffix keeps this pattern from matching other images
       # whose names share a prefix (racer vs racer-object). Each artifact
       # still keeps its own directory and only the planned arches are read.
