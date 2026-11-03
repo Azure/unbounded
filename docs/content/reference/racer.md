@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; no `status` |
+| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -117,6 +117,25 @@ spec:
   pages that a node read from its own origin.
 - `spec.passthrough` can be added, changed, or removed at any time. When a cache
   switches to passthrough, data previously cached for it is dropped.
+
+### Node selector
+
+Set `spec.nodeSelector` to a label selector to choose which Racer nodes store,
+serve, and read the cache, by Node labels. Unset or empty means every Racer
+node.
+
+```yaml
+spec:
+  nodeSelector:
+    matchLabels:
+      pool: gpu
+```
+
+- Client pods that use the cache can be scheduled only on matching nodes. The
+  Racer admission webhook adds this restriction.
+- A managed `spec.origin` runs only on matching nodes.
+- Changing the selector moves the cache to a new set of nodes. Cached data is
+  not moved; pages are read from the origin again.
 
 The controller and dataplane must run the same version. A mismatched pair
 rejects the cache catalog.
