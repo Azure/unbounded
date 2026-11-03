@@ -89,7 +89,6 @@ reboot-worker-01    HostHardReboot    worker-01    Complete     45s
 | Provider | Action |
 |----------|--------|
 | Azure VM | `VirtualMachinesClient.BeginRestart` |
-| OCI Instance | `RESET` |
 | Bare metal (BMC) | Redfish power reset |
 
 ## HostSoftReboot
@@ -155,7 +154,6 @@ kubectl apply -f poweroff-worker-01.yaml
 | Provider | Action |
 |----------|--------|
 | Azure VM | `VirtualMachinesClient.BeginPowerOff` |
-| OCI Instance | `STOP` |
 | Bare metal (BMC) | Redfish power off |
 
 ## HostPowerOn
@@ -182,7 +180,6 @@ kubectl apply -f poweron-worker-01.yaml
 | Provider | Action |
 |----------|--------|
 | Azure VM | `VirtualMachinesClient.BeginStart` |
-| OCI Instance | `START` |
 | Bare metal (BMC) | Redfish power on |
 
 ## HostReplace
@@ -233,9 +230,6 @@ custom data that installs `unbounded-agent`. The old OS disk is not reused.
 Configure `machine-ops-controller --api-server-endpoint` with an API server
 address reachable from replaced hosts; the generated agent bootstrap config uses
 that value.
-
-**OCI Instance** - not currently supported. An identity-preserving OCI
-replacement flow with fresh `user_data` injection has not been verified.
 
 **Bare metal (PXE)** - metalman sets the PXE or HTTP boot override, force-restarts
 the machine through Redfish, writes the selected host OS image, installs or
