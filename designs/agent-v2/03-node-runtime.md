@@ -447,6 +447,7 @@ the ones each runtime needs:
 | Writable locations | `/var/lib/machines` and the agent's own directories | The slot directories, `/etc/systemd/system`, the agent's own directories and every path the runtime owns ([host runtime cleanup, section 4](07-host-runtime-cleanup.md#4-owned-resources)), such as `/var/lib/kubelet`, `/etc/kubernetes`, `/opt/cni/bin` and `/etc/cni/net.d` |
 | Programs run from the slot directories | Not needed | The filesystem is not mounted `noexec`, and a test binary staged in a slot directory actually runs, which also covers an enforcing SELinux policy |
 | The host's own containerd and kubelet | Masked, as v1 does | None that cannot be disabled, such as a containerd shipped in a read-only operating system image and enabled there; if present, the probe fails |
+| No OS package owns files in the node's paths | Not needed: node state lives inside the machine | Required. A file in an owned path that `dpkg -S` or `rpm -qf` attributes to a package fails the probe, naming the package ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)). |
 | NVIDIA driver, when GPUs are present | Required, as in v1 | Required, plus the toolkit artifact (section 5.2) |
 
 The probes are the support decision; the end-to-end host matrix only tests

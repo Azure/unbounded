@@ -155,7 +155,7 @@ Enumerated fields:
 | `plugins[].permissions.paths[].access` | `read`, `write` ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
 | `plugins[].permissions.capabilities` | Linux capability names, such as `CAP_NET_ADMIN`. Default none. |
 | `plugins[].permissions.root` | `false` (default): the plugin runs as an unprivileged dynamic user. `true`: it runs as root, still sandboxed and still limited to its declared capabilities. |
-| `runtime.host.adoptExistingPaths[].policy` | `Preserve`, `Discard` ([host runtime cleanup, section 3](07-host-runtime-cleanup.md#3-ownership-and-adoption)). Required. |
+| `runtime.host.adoptExistingPaths[].policy` | `Preserve`, `Discard` ([host runtime cleanup, section 3](07-host-runtime-cleanup.md#3-ownership-and-adoption)). Required. Neither applies to files an OS package owns: a host with such files in a node path is refused ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)). |
 | `runtime.host.adoptPreserveMaxBytes` | The largest `Preserve` backup allowed for any one path. Default 1 GiB. |
 
 Credentials:

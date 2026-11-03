@@ -64,6 +64,11 @@ internal/agentv2/
   clean environment and an audit line per call. A plugin that declares
   `root: true` or capabilities is trusted with them
   ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
+- **OS packages can own the node's paths.** v2 does not control the OS images
+  it runs on, and a package can ship files where the `host` runtime keeps node
+  state. The runtime refuses such hosts rather than touch package files, which
+  limits where `host` runs until validation task V7 shows how common this is
+  ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)).
 - **Only statically linked plugins run.** The pin covers only the executable,
   so a dynamically linked plugin would load unpinned libraries from the host.
   Consumers whose plugins are dynamically linked today must rebuild them.
@@ -104,7 +109,7 @@ release's tracking issue lists each one with links to the evidence.
 
 | Criterion | Met when |
 |---|---|
-| Validation tasks | V1 to V6 have prototypes, their results are written back into this design, and the design has changed wherever a result required it ([testing, section 7](11-testing.md#7-validation-tasks)) |
+| Validation tasks | V1 to V7 have prototypes, their results are written back into this design, and the design has changed wherever a result required it ([testing, section 7](11-testing.md#7-validation-tasks)) |
 | CI | The v2 jobs have been required on every pull request that touches the agent since the first v2 code merged, and pass nightly on the full host matrix for both runtimes ([testing, section 6](11-testing.md#6-ci)) |
 | Migration matrix | The cutover matrix passes against the release builds, from every v1 release back to the oldest supported one, together with every interrupted and failed variant. The release notes name the oldest supported v1 release ([testing, section 4](11-testing.md#4-migration-suite)). |
 | Capability probes | Every host in the matrix gives the expected probe results for both runtimes, and a host that fails a probe is refused with the probe in the error ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)) |

@@ -69,7 +69,9 @@ This document specifies how v2 is tested. It has two priorities:
   `--force-standard-paths`.
 - Adoption: the `Preserve` round-trip including mode, extended attributes and
   SELinux labels; the size cap; rejection of a mount inside an adopted tree;
-  `Discard` deleting contents at the first wipe only.
+  `Discard` deleting contents at the first wipe only. A package-owned file in
+  an owned path fails the capability probe whatever the policy, and one that
+  appears after bootstrap stops the next wipe before anything is deleted.
 
 ## 2. Running the v1 end-to-end suites on v2
 
@@ -296,3 +298,4 @@ Each needs a prototype before the feature it covers is built:
 | V4 | The SELinux labels the `host` runtime gives binaries in the slot directories on hosts with an enforcing policy, such as Azure Linux 3, so the exec capability probe passes ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). |
 | V5 | The oneshot prerequisites and pre-start boot hook run once per node start, and only then: after a host reboot, on `systemctl restart systemd-nspawn@<m>`, and on a `host` `Start` or `Restart`. On `host`, killing kubelet or containerd so that systemd restarts it must not run the nftables flush or the pre-start boot hook ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
 | V6 | On `host`, kubelet reports the boot ID mounted over `/proc/sys/kernel/random/boot_id` for `kubelet.service`, a NodeReboot produces a new Node boot ID and a `Rebooted` event, a kubelet that systemd restarts on its own keeps the same boot ID, and nothing else on the node depends on kubelet's boot ID matching the kernel's. |
+| V7 | For every image in the host matrix, which of the `host` runtime's owned paths ([host runtime cleanup, section 4](07-host-runtime-cleanup.md#4-owned-resources)) exist on a fresh host, and what is in them: files an OS package owns, other files, or nothing. The result decides whether `Preserve` adoption stays ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)). |

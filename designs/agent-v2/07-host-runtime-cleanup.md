@@ -76,8 +76,9 @@ kept here; the host preparation undo log keeps them for both runtimes
 | Absent | Create it; record `created: true` |
 | Exists and empty | Record `created: false` |
 | Exists and is a mount point, such as a dedicated disk for `/var/lib/containerd` | Record `preexistingMount: true`. The mount is never unmounted; only its contents are wiped. |
+| Contains a file that an OS package owns | Refused, whatever its adoption policy: a capability probe fails with `package-owned-node-path`, naming the path, the file and the package (section 3.1) |
 | Exists, non-empty, no `adoptExistingPaths` entry | Preflight error `existing-node-state`, listing the path |
-| Exists, non-empty, adoption policy `Preserve` | Copy the contents into a backup, then take ownership with `adopted: "Preserve"`. Teardown restores the backup. |
+| Exists, non-empty, adoption policy `Preserve` | Copy the contents into a backup, then take ownership with `adopted: "Preserve"`. Teardown restores the backup. Kept for content no package owns until validation task V7 shows whether it is needed (section 3.1). |
 | Exists, non-empty, adoption policy `Discard` | Take ownership with `adopted: "Discard"`. The contents are deleted at the first wipe. Teardown leaves the path empty. |
 
 `Preserve` backups:
@@ -89,10 +90,38 @@ kept here; the host preparation undo log keeps them for both runtimes
 - must stay within one filesystem; a mount inside the tree fails the adoption.
 
 Preflight reports the adoption plan before anything changes: each path, its
-mode, its size and file count, and the owning OS package if there is one
-(`dpkg -S` or `rpm -qf`). An owned package gets a warning that a package
-upgrade could write into a path the node now owns; removing the package is the
-recommended alternative.
+mode, and its size and file count.
+
+### 3.1 Paths that an OS package owns
+
+v2 does not control the OS images it runs on, and a package can ship files in
+a path the node needs, such as CNI plugins in `/opt/cni/bin` or a default
+`/etc/containerd/config.toml`. Neither adoption policy works for those files:
+
+- `Discard` deletes them, so the package's own checks (`dpkg --verify`,
+  `rpm -V`) fail, and a later upgrade or removal of the package misbehaves.
+- `Preserve` puts them back at teardown, but meanwhile a package upgrade writes
+  into a path the node owns, and the next wipe deletes what it wrote.
+
+So the `host` runtime never takes ownership of a file a package owns:
+
+1. **It refuses such a host.** Before ownership is taken, every file in each
+   owned path is looked up with `dpkg -S` or `rpm -qf`. Any match fails the
+   `package-owned-node-path` capability probe
+   ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)), naming the path, the file and the package. The fix
+   is to remove the package, or to use `nspawn-container`, which keeps node
+   state inside the machine. This is a documented limitation of the `host`
+   runtime.
+2. **It checks again before every wipe.** A package installed after bootstrap
+   can put files into an owned path. The slot change then stops before
+   anything is deleted, the old slot keeps running if it was, and the Machine
+   shows `AgentHealthy=False` with reason `PackageOwnedNodePath`.
+3. **How common this is decides `Preserve`.** Validation task V7 lists, for
+   every image in the host matrix, which owned paths exist and what is in
+   them, separating package-owned files from everything else
+   ([testing, section 7](11-testing.md#7-validation-tasks)). If content that no package owns turns up in practice,
+   `Preserve` stays for that content. If not, it is removed, leaving refusal
+   and `Discard`.
 
 Without an ownership record, Teardown is conservative (section 9).
 
@@ -270,21 +299,29 @@ stateDiagram-v2
 
 Wipe:
 
-1. Write `phase: Wiping` and sync it to disk.
-2. Terminate and Unmount, both verified.
-3. Clear every persistent path in the ownership record and every declared
+1. Check the owned paths for package-owned files again (section 3.1). If any
+   are found, stop here: nothing has changed yet.
+2. Write `phase: Wiping` and sync it to disk.
+3. Terminate and Unmount, both verified.
+4. Clear every persistent path in the ownership record and every declared
    `cleanup.statePaths` entry. Directories keep their mode and SELinux label;
    only their contents are removed. The WireGuard entries are single files.
-4. The safe remover opens with `O_NOFOLLOW`, compares `st_dev` with the root's
+5. The safe remover opens with `O_NOFOLLOW`, compares `st_dev` with the root's
    device at every directory and aborts with `ErrMountInTree` on a mismatch,
    unlinks symlinks without following them, and refuses if an owned path has
    become a symlink.
-5. Delete declared eBPF pins (section 13).
-6. Verify (section 10). Write `phase: Installing`, install the slot's units,
+6. Delete declared eBPF pins (section 13).
+7. Verify (section 10). Write `phase: Installing`, install the slot's units,
    configuration, binaries and CNI plugins, then write `phase: Active` with the
    slot and digest.
 
-With `runtime.host.repave.retainContainerImages: true`, step 3 does not clear
+A Kubernetes upgrade repaves every host at once, so without
+`runtime.host.repave.retainContainerImages` every host pulls every image again
+at the same time. That strains registries with rate limits and slow links to
+edge sites, makes repaves of large GPU and machine learning images slow, and
+throws away gantry's peer-to-peer cache, which lives in `/var/lib/containerd`.
+
+With `runtime.host.repave.retainContainerImages: true`, step 4 does not clear
 `/var/lib/containerd`. Instead it performs an image-preserving reset:
 
 1. Start a temporary maintenance containerd: the binary from the slot being

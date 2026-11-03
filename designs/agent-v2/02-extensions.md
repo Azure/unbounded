@@ -255,7 +255,7 @@ stdin, never in arguments or the environment.
 | `Ready` | The node is running and the daemon has seen its Node object | None |
 | `Pending` | A repave is waiting for the Node to be deleted | None |
 | `Reconciling` | A repave or reboot is in progress | None |
-| `Failed` | The agent cannot make progress without a retry or an operator | `StateMismatch` ([control and state, section 4](04-control-and-state.md#4-state)), `StateCorrupt` ([control and state, section 4](04-control-and-state.md#4-state)), `RepaveFailed` ([lifecycles, section 2](05-lifecycles.md#2-repave)) |
+| `Failed` | The agent cannot make progress without a retry or an operator | `StateMismatch` ([control and state, section 4](04-control-and-state.md#4-state)), `StateCorrupt` ([control and state, section 4](04-control-and-state.md#4-state)), `RepaveFailed` ([lifecycles, section 2](05-lifecycles.md#2-repave)), `PackageOwnedNodePath` ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)) |
 | `Resetting` | A reset is in progress | None |
 
 `attempts` is set while a repave is being retried, and `leftovers` lists
