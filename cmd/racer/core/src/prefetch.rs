@@ -179,6 +179,9 @@ pub fn backoff(attempt: u32, unit: f64, retry_after: Option<Duration>) -> Durati
     }
 }
 
+/// Longest throttle deferral the owner reports.
+const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(3600);
+
 /// Owner-side prefetch admission. Each admitted fill holds one slot until it
 /// finishes or a demand read promotes it.
 #[derive(Debug)]
@@ -199,7 +202,10 @@ pub enum Deferral {
 
 impl<K: Eq + Hash + Clone> OwnerBudget<K> {
     /// `rate` is origin bytes per second; zero disables the token bucket. The
-    /// bucket holds at most one second of tokens.
+    /// bucket holds at most one second of tokens. A fill is admitted once the
+    /// bucket holds `min(bytes, rate)` tokens and is charged its full size, so
+    /// a page larger than one second's allowance leaves the bucket in debt and
+    /// delays later fills until the debt is repaid.
     pub fn new(concurrent: usize, rate: u64) -> Self {
         Self {
             concurrent: concurrent.max(1),
@@ -243,10 +249,15 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
                 let wait = (need - self.tokens) / self.rate as f64;
                 return Err((
                     Deferral::Throttle,
-                    Duration::from_secs_f64(wait).max(Duration::from_millis(1)),
+                    // Debt from a huge page can imply an unrepresentable
+                    // wait; cap it so callers can add it to an `Instant`.
+                    Duration::try_from_secs_f64(wait)
+                        .unwrap_or(MAX_THROTTLE_WAIT)
+                        .clamp(Duration::from_millis(1), MAX_THROTTLE_WAIT),
                 ));
             }
-            self.tokens -= need;
+            // Charge the whole page; the balance may go negative (debt).
+            self.tokens -= bytes as f64;
         }
         self.active.insert(key, bytes);
         Ok(())
@@ -264,7 +275,8 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
         match self.active.remove(key) {
             Some(bytes) => {
                 if self.rate != 0 {
-                    self.tokens = (self.tokens + bytes.min(self.rate) as f64).min(self.rate as f64);
+                    // Refund exactly what admit charged, capped at a full bucket.
+                    self.tokens = (self.tokens + bytes as f64).min(self.rate as f64);
                 }
                 true
             }
@@ -417,5 +429,73 @@ mod tests {
         // Pages larger than one second of tokens wait for a full bucket only.
         let mut small = OwnerBudget::new(8, 10);
         assert!(small.admit(1, 1000, start).is_ok());
+    }
+
+    #[test]
+    fn owner_budget_charges_whole_pages_larger_than_the_rate() {
+        const MIB: u64 = 1 << 20;
+        let start = Instant::now();
+        let mut budget = OwnerBudget::new(64, MIB);
+        let page = 16 * MIB;
+        let mut now = start;
+        for key in 0..4u64 {
+            loop {
+                match budget.admit(key, page, now) {
+                    Ok(()) => break,
+                    Err((why, wait)) => {
+                        assert_eq!(why, Deferral::Throttle);
+                        now += wait;
+                    }
+                }
+            }
+            assert!(budget.finish(&key));
+        }
+        // The first page starts at once; each later one waits 16 s of debt.
+        let elapsed = now - start;
+        assert!(
+            elapsed >= Duration::from_secs(48) && elapsed < Duration::from_millis(48_010),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn owner_budget_refunds_whole_pages_without_overflowing() {
+        let start = Instant::now();
+        let mut budget = OwnerBudget::new(8, 10);
+        assert!(budget.admit(1, 1000, start).is_ok());
+        let (_, wait) = budget.admit(2, 1, start).unwrap_err();
+        assert!(wait >= Duration::from_secs(99), "{wait:?}");
+        // Promotion repays the full charge but caps at one second of tokens.
+        assert!(budget.promote(&1));
+        assert!(budget.admit(2, 10, start).is_ok());
+        let (_, wait) = budget.admit(3, 1, start).unwrap_err();
+        assert!(wait <= Duration::from_millis(100), "{wait:?}");
+        assert!(!budget.promote(&1), "double promotion refunds nothing");
+    }
+
+    #[test]
+    fn owner_budget_edge_cases() {
+        let start = Instant::now();
+        // Rate 0 turns throttling off, even for huge pages.
+        let mut off = OwnerBudget::new(8, 0);
+        for key in 0..8u64 {
+            assert!(off.admit(key, u64::MAX, start).is_ok());
+        }
+        // A huge page and a huge rate stay finite and refund cleanly.
+        let mut huge = OwnerBudget::new(8, 1 << 40);
+        assert!(huge.admit(1, u64::MAX, start).is_ok());
+        let (_, wait) = huge.admit(2, 1, start).unwrap_err();
+        assert_eq!(wait, MAX_THROTTLE_WAIT);
+        let mut tiny = OwnerBudget::new(8, 1);
+        assert!(tiny.admit(1, u64::MAX, start).is_ok());
+        assert_eq!(tiny.admit(2, 1, start).unwrap_err().1, MAX_THROTTLE_WAIT);
+        assert!(huge.promote(&1));
+        assert!(huge.admit(2, 1 << 40, start).is_ok());
+        // Long idle refills only to one second of tokens.
+        let mut idle = OwnerBudget::new(8, 10);
+        assert!(idle.admit(1, 10, start).is_ok());
+        let later = start + Duration::from_secs(1_000_000);
+        assert!(idle.admit(2, 10, later).is_ok());
+        assert!(idle.admit(3, 1, later).is_err());
     }
 }
