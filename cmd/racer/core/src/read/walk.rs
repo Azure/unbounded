@@ -1789,7 +1789,7 @@ impl Fill {
             TargetKind::Successor
         } else if i < self.granted && self.demoted.contains(&self.handoff[i]) {
             TargetKind::Demoted
-        } else if i < self.granted {
+        } else if i < self.granted && self.lineage_targets.contains(&self.handoff[i]) {
             TargetKind::Lineage
         } else {
             TargetKind::Handoff
@@ -2041,13 +2041,20 @@ impl Fill {
     fn start_walk(&mut self, budget: &mut AcquisitionBudget) -> Result<Action> {
         let page = self.page();
         // Successor targets come first, then lineage targets, each on its own
-        // grant; version - 1 targets after them spend the walk's credits.
-        self.granted = self.successors
-            + if self.has(Features::LINEAGE_GRANTS) && self.rank.is_some() {
-                granted_prefix(&self.handoff[self.successors..], &self.lineage_targets)
-            } else {
-                0
-            };
+        // grant; version - 1 targets after them spend the walk's credits, except at rank 0.
+        self.granted = if self.has(Features::LINEAGE_GRANTS) && self.rank == Some(0) && page {
+            // Rank 0 fetches for every owner that delegated to it, and a delegation carries
+            // only rank 0's origin credit: every previous owner is asked on its own grant, so a
+            // page that moved to newly joined owners is copied before origin is asked again.
+            self.handoff.len()
+        } else {
+            self.successors
+                + if self.has(Features::LINEAGE_GRANTS) && self.rank.is_some() {
+                    granted_prefix(&self.handoff[self.successors..], &self.lineage_targets)
+                } else {
+                    0
+                }
+        };
         let continuation = std::mem::take(&mut self.continuation);
         self.bounded = continuation.bounded_routes;
         self.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {

@@ -1494,3 +1494,51 @@ fn fills() {
 fn fill_origin_without_a_request_panics() {
     fill(false, Features::PRODUCTION).on(Event::Origin(Ok(())), &mut budget(8, 16), Instant::now());
 }
+
+/// A delegated rank 0 holds only its origin credit, yet asks every previous owner on its own grant
+/// before origin, so a page that moved to newly joined owners is not fetched again.
+#[test]
+fn fill_rank0_asks_previous_owners_on_grants() {
+    let run = |features: Features, previous: &[u32], copy: bool| {
+        let mut f = fill(false, features);
+        let mut events = vec![
+            START,
+            Event::Ranked(Ok(owners(5, Some(0)))),
+            Event::Ranked(Ok(Ranked::new(4, previous, None))),
+            NO_HINTS,
+        ];
+        let trace = script(&mut f, &mut budget(1, 8), &events);
+        let kinds: Vec<TargetKind> = (0..f.handoff.len()).map(|i| f.target_kind(i)).collect();
+        events.clear();
+        events.push(Event::BatchDone { copy });
+        let after = if trace.contains("Batch") {
+            script(&mut f, &mut budget(1, 8), &events)
+        } else {
+            String::new()
+        };
+        (trace, kinds, after)
+    };
+    let production = Features::PRODUCTION;
+    // Moved owners: one granted batch of every previous owner, still counted as handoff probes.
+    let (trace, kinds, after) = run(production, &[20, 21, 22], false);
+    assert!(trace.contains("Batch { first: 0, count: 3"), "{trace}");
+    assert_eq!(kinds, vec![TargetKind::Handoff; 3]);
+    // A miss everywhere: origin authority, never a hang.
+    assert!(after.contains("Rank { ranking: Authority"), "{after}");
+    // A copy wins.
+    let (_, _, after) = run(production, &[20, 21, 22], true);
+    assert!(after.starts_with("Publish(Peer)"), "{after}");
+    // Unchanged owners: no handoff, straight to authority.
+    let (trace, kinds, _) = run(production, &[10, 11, 12], false);
+    assert!(!trace.contains("Batch"), "{trace}");
+    assert!(trace.contains("Rank { ranking: Authority"), "{trace}");
+    assert!(kinds.is_empty());
+    // Without grants, rank 0's one credit cannot fund a handoff probe: origin.
+    let (trace, _, _) = run(
+        production.with(Features::LINEAGE_GRANTS, false),
+        &[20, 21, 22],
+        false,
+    );
+    assert!(!trace.contains("Batch"), "{trace}");
+    assert!(trace.contains("Rank { ranking: Authority"), "{trace}");
+}

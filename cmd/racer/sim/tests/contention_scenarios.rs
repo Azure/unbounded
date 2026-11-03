@@ -1117,7 +1117,6 @@ fn joined_owners_copy_from_previous_owners() {
 
 /// Strict form of [`joined_owners_copy_from_previous_owners`]: no page is fetched again.
 #[test]
-#[ignore = "core: a delegated rank 0 has no credit for handoff probes (walk.rs)"]
 fn joined_owners_never_refetch() {
     let (per_page, report) = join_after_read(7);
     assert_eq!(
