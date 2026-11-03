@@ -2178,6 +2178,66 @@ fn actual_uds_errors_and_idle_drain() {
 }
 
 #[test]
+fn actual_uds_prefetch_route_answers_json_and_closes() {
+    let fixture = Fixture::new();
+    fixture.reconcile(&[definition()]).unwrap();
+    for (raw, status, expected) in [
+        (
+            "GET /v1/prefetches HTTP/1.1\r\nHost: racer\r\n\r\n".to_string(),
+            "200",
+            "{\"prefetches\":[]}",
+        ),
+        (
+            "POST /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\n\r\n".into(),
+            "405",
+            "allow: get, put, delete\r\n",
+        ),
+        (
+            "DELETE /v1/prefetches HTTP/1.1\r\nHost: racer\r\n\r\n".into(),
+            "405",
+            "allow: get\r\n",
+        ),
+        (
+            "GET /v1/prefetches/.. HTTP/1.1\r\nHost: racer\r\n\r\n".into(),
+            "400",
+            "\"code\":\"invalid_request\"",
+        ),
+        (
+            "GET /v1/prefetches/missing HTTP/1.1\r\nHost: racer\r\n\r\n".into(),
+            "404",
+            "\"code\":\"not_found\"",
+        ),
+        (
+            "PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n\
+             Content-Length: 4194305\r\n\r\n"
+                .into(),
+            "413",
+            "\"code\":\"too_large\"",
+        ),
+        (
+            "PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n\
+             Content-Length: 2\r\n\r\n{}"
+                .into(),
+            "400",
+            "\"code\":\"invalid_request\"",
+        ),
+    ] {
+        let mut socket = fixture.connect();
+        socket.write_all(raw.as_bytes()).unwrap();
+        let output = fixture.receive(&mut socket, true);
+        let text = std::str::from_utf8(&output).unwrap();
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.starts_with(&format!("http/1.1 {status}")), "{text}");
+        assert!(
+            lower.contains("content-type: application/json\r\n"),
+            "{text}"
+        );
+        assert!(lower.contains(&expected.to_ascii_lowercase()), "{text}");
+    }
+    assert_eq!(fixture.completed_heads(), 0);
+}
+
+#[test]
 fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
     let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();

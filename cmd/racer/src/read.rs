@@ -748,23 +748,27 @@ impl LocalPageService for Coordinator {
                         PeerOperation::Page {
                             page,
                             mode: FetchMode::Acquire,
-                        } => self
-                            .fill
-                            .acquire_ciphertext(
-                                page.clone(),
-                                membership,
-                                &context,
-                                &effective,
-                                &mut budget,
-                            )
-                            .await
-                            .and_then(|page_result| {
-                                page_result.validate_metadata()?;
-                                Ok(PeerResponse::Page {
-                                    metadata: page_result.metadata,
-                                    ciphertext: page_result.ciphertext,
+                        } => {
+                            // A remote demand read joining a prefetch flight
+                            // promotes it.
+                            self.streams.directory().prefetch.promote(&page);
+                            self.fill
+                                .acquire_ciphertext(
+                                    page.clone(),
+                                    membership,
+                                    &context,
+                                    &effective,
+                                    &mut budget,
+                                )
+                                .await
+                                .and_then(|page_result| {
+                                    page_result.validate_metadata()?;
+                                    Ok(PeerResponse::Page {
+                                        metadata: page_result.metadata,
+                                        ciphertext: page_result.ciphertext,
+                                    })
                                 })
-                            }),
+                        }
                         PeerOperation::Metadata {
                             object,
                             selector,

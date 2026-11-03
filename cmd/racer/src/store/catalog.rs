@@ -1567,7 +1567,7 @@ mod tests {
             number: crate::model::PageNumber(number),
         };
         let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
-        // A warm holds 0..3 and a read independently holds 0 and 2.
+        // One reader holds 0..3 and another independently holds 0 and 2.
         let epoch = index
             .reserve_hold_pages(&version, &page_set(&[0, 1, 2]), until)
             .unwrap();
@@ -1629,7 +1629,7 @@ mod tests {
             .unwrap();
         clock.advance(ttl + std::time::Duration::from_secs(1));
         assert_eq!(index.hold_holders(&page), 0);
-        // Another reader or warm job re-reserves the page; the expired entry is
+        // Another reader re-reserves the page; the expired entry is
         // pruned and the replacement is a new epoch.
         let until = uring_runtime::environment::wall_now() + ttl;
         let replacement = index

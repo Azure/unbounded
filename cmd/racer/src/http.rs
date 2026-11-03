@@ -316,7 +316,9 @@ pub fn client_io(
                 .min(MAX_HEAD_BYTES),
         ),
         Rc::new(HttpContext(admission)),
-        crate::model::PAGE_BYTES + 16,
+        // The largest prefetch PUT body (RACER_PREFETCH_MAX_BODY_BYTES caps it
+        // lower); object requests carry no body.
+        (crate::model::PAGE_BYTES + 16).max(64 * 1024 * 1024),
         i64::MAX as u64,
     )
 }
@@ -3169,20 +3171,14 @@ pub(crate) mod tests {
             page_limit,
         );
         let client_io = client_io(reactor.clone(), admission.clone()).capped(4096);
-        for io in [&page_io, &client_io] {
-            assert_eq!(
-                io.framing(&response(page_limit as usize), false),
-                Ok(page_limit)
-            );
+        // The client socket admits prefetch PUT bodies up to 64 MiB.
+        let client_limit = page_limit.max(64 * 1024 * 1024);
+        for (io, limit) in [(&page_io, page_limit), (&client_io, client_limit)] {
+            assert_eq!(io.framing(&response(limit as usize), false), Ok(limit));
             for start in ["HTTP/1.1 200 OK", "GET /test HTTP/1.1"] {
                 let (socket, mut peer) = UnixStream::pair().unwrap();
                 let connection = from_accepted(socket.into(), &admission).unwrap();
-                write!(
-                    peer,
-                    "{start}\r\nContent-Length: {}\r\n\r\n",
-                    page_limit + 1
-                )
-                .unwrap();
+                write!(peer, "{start}\r\nContent-Length: {}\r\n\r\n", limit + 1).unwrap();
                 assert!(matches!(
                     drive(&reactor, io.receive_head(connection, &scope)),
                     Err(Error::InvalidRequest)
