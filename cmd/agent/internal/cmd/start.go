@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/base64"
+	"errors"
 	"os"
 	"os/signal"
 	"strings"
@@ -30,7 +31,8 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 
 			cmdCtx.Setup()
 
-			cmdCtx.Logger.Info("starting unbounded-agent",
+			cmdCtx.Logger.Info(
+				"starting unbounded-agent",
 				"version", version.Version,
 				"commit", version.GitCommit,
 			)
@@ -95,9 +97,14 @@ func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates
 // a failure there is the most common real one: a rejected or expired token, an
 // unreachable API server, a CA mismatch. Reporting it as a generic failure
 // would tell an operator nothing.
+//
+// A refused allocation launch is matched first, by error rather than by text,
+// so a message that happens to name a task cannot hide it.
 func classifyNodeStartFailure(err error) string {
 	message := err.Error()
 	switch {
+	case errors.Is(err, daemon.ErrAllocationLaunchRefused):
+		return daemon.AllocationLaunchRefusedReason
 	case strings.Contains(message, "start-kubelet"),
 		strings.Contains(message, "wait-for-kubelet-bootstrap"):
 		return "KubeletBootstrapFailed"

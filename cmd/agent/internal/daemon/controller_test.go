@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -271,7 +273,7 @@ func TestReconcileNodeReboot_Failed(t *testing.T) {
 		},
 	}
 
-	op := &fakeNodeOperator{restartErr: errors.New("restart failed")}
+	op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: baseConfig()}, restartErr: errors.New("restart failed")}
 	c := fakeStatusClient(machine, machineOp)
 	reconciler := newTestMachinaMachineOperationReconciler(t, c, op)
 
@@ -815,5 +817,215 @@ func machineConfigurationVersion(
 			Version:  version,
 			Template: template,
 		},
+	}
+}
+
+func newAllocationMachineOperationReconciler(
+	t *testing.T,
+	c client.Client,
+	reader client.Reader,
+	op nodeOperator,
+) *daemon.MachinaMachineOperationReconciler {
+	t.Helper()
+
+	target := &machineOperationTarget{
+		installation:         installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+		Client:               c,
+		apiReader:            reader,
+		allocationLaunch:     testAllocationLaunchOptions(t),
+		log:                  discardLogger(),
+		machineName:          "test-machine",
+		nodeOperator:         op,
+		agentUpgradeLockPath: filepath.Join(t.TempDir(), "agent-upgrade.lock"),
+		requestRestart:       func() {},
+	}
+
+	reconciler, err := daemon.NewMachinaMachineOperationReconciler(c, "test-machine", "test-node", target.handlers())
+	require.NoError(t, err)
+
+	return reconciler
+}
+
+func nodeRebootOperation() *v1alpha3.MachineOperation {
+	return &v1alpha3.MachineOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "op-1"},
+		Spec: v1alpha3.MachineOperationSpec{
+			MachineRef:    "test-machine",
+			OperationKind: v1alpha3.OperationNodeReboot,
+		},
+	}
+}
+
+func fencedAllocationMachine() *v1alpha3.Machine {
+	machine := allocationMachine(testAllocationUID)
+	machine.Spec.Fenced = true
+
+	return machine
+}
+
+func TestReconcileNodeReboot_AllocationLaunch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// cached is the Machine the manager's cache serves.
+		cached *v1alpha3.Machine
+		// reader is the live API reader; nil serves the cached Machine.
+		reader      func(t *testing.T) client.Reader
+		cfg         func(t *testing.T) *provision.AgentConfig
+		wantRestart bool
+		wantPhase   v1alpha3.OperationPhase
+		wantReason  string
+	}{
+		{
+			name:       "fenced allocation Machine",
+			cached:     fencedAllocationMachine(),
+			cfg:        func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+			wantPhase:  v1alpha3.OperationPhaseFailed,
+			wantReason: AllocationLaunchRefusedReason,
+		},
+		{
+			name:   "stale cache shows the Machine unfenced",
+			cached: allocationMachine(testAllocationUID),
+			reader: func(*testing.T) client.Reader {
+				return fakeStatusClient(fencedAllocationMachine())
+			},
+			cfg:        func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+			wantPhase:  v1alpha3.OperationPhaseFailed,
+			wantReason: AllocationLaunchRefusedReason,
+		},
+		{
+			name:        "allowed allocation host",
+			cached:      allocationMachine(testAllocationUID),
+			cfg:         func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+			wantRestart: true,
+			wantPhase:   v1alpha3.OperationPhaseComplete,
+			wantReason:  "Succeeded",
+		},
+		{
+			name:        "non-allocation host never reads live",
+			cached:      &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine", Generation: 3}},
+			reader:      func(t *testing.T) client.Reader { return failingReader{t: t} },
+			cfg:         func(*testing.T) *provision.AgentConfig { return baseConfig() },
+			wantRestart: true,
+			wantPhase:   v1alpha3.OperationPhaseComplete,
+			wantReason:  "Succeeded",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fakeStatusClient(tc.cached, nodeRebootOperation())
+
+			var reader client.Reader = c
+			if tc.reader != nil {
+				reader = tc.reader(t)
+			}
+
+			op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: tc.cfg(t)}}
+			reconciler := newAllocationMachineOperationReconciler(t, c, reader, op)
+
+			_, err := reconciler.ReconcileMachineOperation(context.Background(), "op-1")
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantRestart, op.restartCalled)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+			assert.Equal(t, tc.wantPhase, updated.Status.Phase)
+			completed := apimeta.FindStatusCondition(updated.Status.Conditions, "Completed")
+			require.NotNil(t, completed)
+			assert.Equal(t, tc.wantReason, completed.Reason)
+
+			if tc.wantReason == AllocationLaunchRefusedReason {
+				assert.Contains(t, updated.Status.Message, ErrAllocationLaunchRefused.Error())
+				assert.Contains(t, updated.Status.Message, errAllocationMachineFenced.Error())
+			}
+		})
+	}
+}
+
+func TestReconcileRepave_AllocationLaunch(t *testing.T) {
+	version := int32(2)
+	desiredMachine := func(machine *v1alpha3.Machine) *v1alpha3.Machine {
+		machine.Spec.ConfigurationRef = &v1alpha3.MachineConfigurationRef{Name: "config-a", Version: ptr.To(version)}
+
+		return machine
+	}
+	// The desired version differs from the applied config, so there is drift.
+	newMCV := func() *v1alpha3.MachineConfigurationVersion {
+		return machineConfigurationVersion("config-a", version, v1alpha3.MachineConfigurationTemplate{
+			Kubernetes: &v1alpha3.MachineConfigurationKubernetes{Version: "v1.34.1"},
+		})
+	}
+
+	for _, tc := range []struct {
+		name        string
+		machine     *v1alpha3.Machine
+		reader      func(t *testing.T) client.Reader
+		cfg         func(t *testing.T) *provision.AgentConfig
+		wantRepave  bool
+		wantRequeue bool
+	}{
+		{
+			name:    "fenced Machine",
+			machine: desiredMachine(fencedAllocationMachine()),
+			cfg:     func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+		},
+		{
+			name:    "API unavailable for the whole budget",
+			machine: desiredMachine(allocationMachine(testAllocationUID)),
+			reader: func(*testing.T) client.Reader {
+				var reads atomic.Int32
+
+				return countingReader(nil, &reads, repeat(apierrors.NewServiceUnavailable("down"), 100000))
+			},
+			cfg:         func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+			wantRequeue: true,
+		},
+		{
+			name:       "allowed allocation host",
+			machine:    desiredMachine(allocationMachine(testAllocationUID)),
+			cfg:        func(t *testing.T) *provision.AgentConfig { return allocationConfig(t, testAllocationUID) },
+			wantRepave: true,
+		},
+		{
+			name:       "non-allocation host never reads live",
+			machine:    desiredMachine(&v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "test-machine"}}),
+			reader:     func(t *testing.T) client.Reader { return failingReader{t: t} },
+			cfg:        func(*testing.T) *provision.AgentConfig { return baseConfig() },
+			wantRepave: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fakeStatusClient(tc.machine, newMCV())
+
+			var reader client.Reader = c
+			if tc.reader != nil {
+				reader = tc.reader(t)
+			}
+
+			op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: tc.cfg(t)}}
+			reconciler := &repaveReconciler{
+				installation:     installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
+				Client:           c,
+				apiReader:        reader,
+				allocationLaunch: testAllocationLaunchOptions(t),
+				log:              discardLogger(),
+				machineName:      "test-machine",
+				nodeOperator:     op,
+			}
+
+			result, err := reconciler.ReconcileRepave(context.Background(), "node-delete")
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantRepave, op.repaveActive != nil, "RepaveNode called")
+
+			if tc.wantRequeue {
+				assert.Positive(t, result.RequeueAfter)
+			} else {
+				assert.Zero(t, result.RequeueAfter)
+			}
+
+			if !tc.wantRepave {
+				var updated v1alpha3.Machine
+				require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "test-machine"}, &updated))
+				assert.Nil(t, updated.Status.Configuration, "a refused repave must not mark the configuration applied")
+			}
+		})
 	}
 }

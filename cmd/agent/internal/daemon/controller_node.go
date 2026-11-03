@@ -61,6 +61,16 @@ func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (recon
 		return reconcile.Result{}, nil
 	}
 
+	// Checked live before anything changes, so a refusal leaves the running
+	// node alone. The new slot's pre-start checks again before it starts.
+	if err := verifyAllocationMachine(ctx, r.log, r.apiReader, active.Config, r.allocationLaunch); err != nil {
+		if errors.Is(err, errAllocationLaunchUnconfirmed) {
+			return reconcile.Result{RequeueAfter: allocationLaunchCheckTimeout}, nil
+		}
+
+		return reconcile.Result{}, nil
+	}
+
 	if err := r.nodeOperator.RepaveNode(ctx, r.log, active, desiredConfig); err != nil {
 		return reconcile.Result{}, fmt.Errorf("update node for repave: %w", err)
 	}

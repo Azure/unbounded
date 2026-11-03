@@ -67,6 +67,18 @@ func newNSpawnLifecycle(log *slog.Logger) (*nspawnlifecycle.Lifecycle, error) {
 }
 
 func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineName string) error {
+	loadApplied := func(machineName string) (*config.AgentConfig, bool, error) {
+		return loadAppliedConfig(
+			log,
+			goalstates.AppliedConfigPath(machineName),
+			goalstates.AppliedConfigChecksumPath(machineName),
+		)
+	}
+
+	if err := authorizeNSpawnStart(ctx, log, machineName, loadApplied, daemon.LoadAllocationLaunchConfig, daemon.VerifyAllocationLaunch); err != nil {
+		return err
+	}
+
 	return preStartAfterMigrate(log, daemon.MigrateHostRoot, func() error {
 		lifecycle, err := newNSpawnLifecycle(log)
 		if err != nil {
@@ -75,6 +87,49 @@ func runNSpawnLifecyclePreStart(ctx context.Context, log *slog.Logger, machineNa
 
 		return lifecycle.PreStart(ctx, machineName)
 	})
+}
+
+// authorizeNSpawnStart runs the allocation launch guard before every start of
+// the nspawn machine: at boot, from machinectl start, from systemctl restart
+// and from Restart=on-failure. A refusal fails the pre-start, so the machine
+// does not start, and systemd runs the pre-start again.
+//
+// It checks the slot's applied config when that loads. Otherwise it checks the
+// allocation launch record, which bootstrap writes before the node first
+// starts: the slot has no applied config between the start and the end of
+// bootstrap, and during a repave. A host with neither is not allocation-backed.
+// An applied config that fails to load is still reported by the pre-start
+// itself.
+func authorizeNSpawnStart(
+	ctx context.Context,
+	log *slog.Logger,
+	machineName string,
+	loadApplied func(machineName string) (*config.AgentConfig, bool, error),
+	loadRecord func() (*config.AgentConfig, bool, error),
+	verify func(context.Context, *slog.Logger, *config.AgentConfig) error,
+) error {
+	cfg, found, err := loadApplied(machineName)
+	if err != nil {
+		log.Warn("cannot load the applied config for the allocation launch check; using the allocation launch record",
+			"machine", machineName, "error", err)
+	}
+
+	if err != nil || !found {
+		record, recordFound, recordErr := loadRecord()
+		if recordErr != nil {
+			log.Error("allocation launch refused", "machine", machineName, "cause", recordErr)
+
+			return fmt.Errorf("%w: %w", daemon.ErrAllocationLaunchRefused, recordErr)
+		}
+
+		if !recordFound {
+			return nil
+		}
+
+		cfg = record
+	}
+
+	return verify(ctx, log, cfg)
 }
 
 // preStartAfterMigrate regenerates the machine's nspawn config once the host

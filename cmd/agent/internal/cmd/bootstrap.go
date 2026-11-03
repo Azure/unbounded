@@ -6,6 +6,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -222,13 +223,49 @@ func (s *agentStages) EnsureNodeStarted(ctx context.Context) error {
 		return err
 	}
 
-	if err := s.nodeStartTask(registered).Do(ctx); err != nil {
+	// The record has to reach disk before the node can start: after a crash,
+	// the nspawn pre-start relies on it whenever the slot has no applied config.
+	persist := func(cfg *provision.AgentConfig) error {
+		if err := daemon.PersistAllocationLaunchConfig(cfg); err != nil {
+			return err
+		}
+
+		return fsutil.SyncFilesystems(goalstates.AgentConfigDir)
+	}
+
+	if err := guardNodeStart(ctx, s.log, &s.cfg.AgentConfig, persist, daemon.VerifyAllocationLaunch, s.nodeStartTask(registered).Do); err != nil {
 		return err
 	}
 
 	// AgentConfigDir holds the applied config written above, so it must reach
 	// disk before this stage reports success.
 	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+}
+
+// guardNodeStart starts the node of an allocation-backed host only once its
+// allocation is confirmed. It writes the allocation launch record first, so
+// every later start of the node checks the allocation too, even before the
+// applied config exists. The check runs even when the node is already
+// registered. Any other host starts as before.
+func guardNodeStart(
+	ctx context.Context,
+	log *slog.Logger,
+	cfg *provision.AgentConfig,
+	persist func(*provision.AgentConfig) error,
+	verify func(context.Context, *slog.Logger, *provision.AgentConfig) error,
+	start func(context.Context) error,
+) error {
+	if _, backed := daemon.AllocationUID(cfg); backed {
+		if err := persist(cfg); err != nil {
+			return fmt.Errorf("persist allocation launch config: %w", err)
+		}
+
+		if err := verify(ctx, log, cfg); err != nil {
+			return err
+		}
+	}
+
+	return start(ctx)
 }
 
 func (s *agentStages) daemonInstallTask() phases.Task {

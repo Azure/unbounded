@@ -335,6 +335,20 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 		return fmt.Errorf("get Machine CR %q: %w", machineName, err)
 	}
 
+	// An allocation host's Machine is created for its allocation by the
+	// cluster. A Machine the agent created would carry no allocationRef and
+	// could never authorize this host, so the agent leaves it absent and every
+	// node start refuses.
+	if uid, backed := AllocationUID(cfg); backed {
+		log.Warn(
+			"Machine CR not found; an allocation host does not register its Machine",
+			slog.String("machine", machineName),
+			slog.String("allocation_uid", uid),
+		)
+
+		return nil
+	}
+
 	// Machine CR does not exist; create a minimal one.
 	log.Info("Machine CR not found, creating", slog.String("machine", machineName))
 
