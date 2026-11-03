@@ -291,8 +291,6 @@ fi
 
 rm -rf "${output}"
 mkdir -p "${output}/disk"
-cp "${script_dir}/assets/image-inputs.json" \
-    "${output}/disk/gb200-access-inputs.json"
 pigz -1 "${work}/disk.img"
 mv "${work}/disk.img.gz" "${output}/disk/disk.img.gz"
 pigz --test "${output}/disk/disk.img.gz"
