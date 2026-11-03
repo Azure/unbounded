@@ -20,6 +20,9 @@ type Containerd struct {
 type ContainerdOptions struct {
 	SandboxImage   string
 	NvidiaRequired bool
+	// NvidiaToolkit locates the toolkit for the nvidia runtime handler. The
+	// zero value is the default install paths.
+	NvidiaToolkit NvidiaToolkit
 }
 
 // ResolveContainerd returns the containerd configuration goal state.
@@ -35,6 +38,6 @@ func ResolveContainerd(opts ContainerdOptions) Containerd {
 		CNIBinDir:         CNIBinDir,
 		CNIConfDir:        CNIConfigDir,
 		MetricsAddress:    ContainerdMetricsAddress,
-		NvidiaRuntime:     resolveNvidiaRuntime(opts.NvidiaRequired),
+		NvidiaRuntime:     resolveNvidiaRuntime(opts.NvidiaRequired, opts.NvidiaToolkit),
 	}
 }
