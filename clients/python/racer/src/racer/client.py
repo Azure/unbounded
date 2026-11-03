@@ -504,7 +504,9 @@ class Client:
                 code = data["code"]
                 message = data.get("message") if isinstance(data.get("message"), str) else ""
         except ValueError:
-            pass
+            # Non-JSON or malformed bodies are expected (e.g. from proxies or
+            # older servers); keep the empty code/message defaults.
+            code, message = "", ""
         return PrefetchError(h.status, code, message, retry)
 
     # Shared response checks ------------------------------------------------
