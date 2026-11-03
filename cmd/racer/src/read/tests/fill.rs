@@ -3126,6 +3126,9 @@ pub(super) struct Fixture {
     pub(super) page: PageId,
     pub(super) scope: RequestScope,
     pub(super) directory: std::path::PathBuf,
+    /// Node pools that [`Fixture::read_graph`] publishes; the default pool
+    /// holding this fixture's cache when `None`.
+    pub(super) pools: Option<Vec<racer_control_wire::Pool>>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -3212,32 +3215,35 @@ impl Fixture {
         ));
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths(settings.name).unwrap();
-        snapshots
-            .apply(
-                Publication {
-                    pools: Vec::new(),
-                    schema_version: SCHEMA_VERSION,
-                    cluster: self.keys.cluster().clone(),
-                    sequence: PublicationSequence(1),
-                    membership_version: membership.version,
-                    members: membership
-                        .members()
-                        .iter()
-                        .cloned()
-                        .map(Into::into)
-                        .collect(),
-                    caches: vec![CacheDefinition {
-                        id: self.context.object.cache.clone(),
-                        name: settings.name.into(),
-                        client_socket,
-                        origin_socket,
-                        priority: racer_control_wire::DEFAULT_PRIORITY,
-                        mode: racer_control_wire::CacheMode::Cached,
-                    }],
-                }
-                .with_default_pool(),
-            )
-            .unwrap();
+        let publication = Publication {
+            pools: Vec::new(),
+            schema_version: SCHEMA_VERSION,
+            cluster: self.keys.cluster().clone(),
+            sequence: PublicationSequence(1),
+            membership_version: membership.version,
+            members: membership
+                .members()
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            caches: vec![CacheDefinition {
+                id: self.context.object.cache.clone(),
+                name: settings.name.into(),
+                client_socket,
+                origin_socket,
+                priority: racer_control_wire::DEFAULT_PRIORITY,
+                mode: racer_control_wire::CacheMode::Cached,
+            }],
+        };
+        let publication = match &self.pools {
+            Some(pools) => Publication {
+                pools: pools.clone(),
+                ..publication
+            },
+            None => publication.with_default_pool(),
+        };
+        snapshots.apply(publication).unwrap();
         let owners = fill.dependencies.metadata_owner.clone();
         let metadata = Rc::new(MetadataService::new(
             fill.dependencies.candidates.clone(),
@@ -3482,6 +3488,7 @@ fn fixture_with_caches(
         context,
         membership,
         page,
+        pools: None,
         scope: RequestScope::new(
             RequestId([1; 16]),
             Instant::now() + Duration::from_secs(600),

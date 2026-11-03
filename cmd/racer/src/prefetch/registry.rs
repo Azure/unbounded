@@ -810,12 +810,16 @@ impl Registry {
     }
 
     /// Re-plan after a membership change: admitted pages of live tickets
-    /// whose owner left are queued again.
-    pub fn requeue_departed(&mut self, is_member: impl Fn(&NodeId) -> bool) {
+    /// whose owner no longer serves the page's cache are queued again. An
+    /// owner can leave a cache's pool and still be a cluster member.
+    pub fn requeue_departed(&mut self, serves: impl Fn(&CacheId, &NodeId) -> bool) {
         let mut requeued = Vec::new();
         for (key, unit) in &mut self.units {
             if unit.state == UnitState::Admitted
-                && unit.owner.as_ref().is_some_and(|owner| !is_member(owner))
+                && unit
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| !serves(&key.version.object.cache, owner))
                 && !unit.interest.is_empty()
             {
                 unit.state = UnitState::Queued;

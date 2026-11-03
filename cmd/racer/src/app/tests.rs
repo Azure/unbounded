@@ -4583,6 +4583,37 @@ mod cache_publication {
             Some(&[][..])
         );
     }
+
+    /// Prefetch tickets of a cache are kept only while the cache is published
+    /// and this node is in its pool, so leaving the pool cancels them.
+    #[test]
+    fn prefetch_tickets_are_kept_only_on_pool_members() {
+        use crate::topology::tests::pool_tests::{NARROW, pooled};
+        let mut narrow = crate::app::tests::definition();
+        narrow.id = racer_control_wire::CacheId(NARROW.into());
+        let local = crate::topology::tests::fixtures::member(0, 4).node;
+        let snapshot = |membership: &Arc<crate::topology::Membership>| {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership.clone());
+            snapshot.caches = vec![narrow.clone()];
+            snapshot
+        };
+        let inside = Arc::new(pooled(1, 4, vec![0, 1, 2], None));
+        assert!(crate::app::prefetch_keeps(
+            &snapshot(&inside),
+            &local,
+            &narrow.id
+        ));
+        let left = Arc::new(pooled(2, 4, vec![1, 2], Some(&inside)));
+        assert!(!crate::app::prefetch_keeps(
+            &snapshot(&left),
+            &local,
+            &narrow.id
+        ));
+        // A removed cache is not kept even on a pool member.
+        let mut removed = snapshot(&inside);
+        removed.caches.clear();
+        assert!(!crate::app::prefetch_keeps(&removed, &local, &narrow.id));
+    }
 }
 
 mod lifecycle {

@@ -1877,13 +1877,13 @@ impl WorkerApplication {
         self.memory.remove_caches(&passthrough)?;
         self.store.writer.remove_caches(&passthrough)?;
         // Prefetch tickets end with their cache: a passthrough switch cancels
-        // them with `passthrough`, and removal or a UID change (a new cache
-        // id) with `cache_removed`.
+        // them with `passthrough`, and removal, a UID change (a new cache
+        // id), or this node leaving the cache's pool with `cache_removed`.
         self.node.workers.prefetch.passthrough_caches(&passthrough);
         self.node
             .workers
             .prefetch
-            .retain_caches(|cache| snapshot.caches.iter().any(|new| &new.id == cache));
+            .retain_caches(|cache| prefetch_keeps(&snapshot, &self.local, cache));
         current_scope.check()?;
         // Priority changes apply live: memory shares are recomputed now, disk
         // shares on the next ranking pass.
@@ -2700,6 +2700,16 @@ impl CachePublication {
             listeners: Some(listeners),
         }))
     }
+}
+
+/// Whether this node keeps prefetch tickets of `cache`: the cache is
+/// published and this node is in its pool.
+fn prefetch_keeps(
+    snapshot: &crate::control::Snapshot,
+    local: &NodeId,
+    cache: &racer_control_wire::CacheId,
+) -> bool {
+    snapshot.caches.iter().any(|new| &new.id == cache) && snapshot.membership.serves(cache, local)
 }
 
 impl WorkerApplication {

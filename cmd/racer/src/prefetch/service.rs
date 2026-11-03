@@ -463,6 +463,11 @@ pub(crate) async fn serve(
     if local.prefetch_directory().prefetch.draining() {
         return Ok(PeerResponse::Unavailable);
     }
+    // A node outside the cache's pool never owns its pages. The sender ranked
+    // on a membership where it did, so it re-plans on a newer one.
+    if !membership.serves(&version.object.cache, &local.local_node()) {
+        return Ok(PeerResponse::StaleMembership);
+    }
     Ok(PeerResponse::Prefetch(match action {
         PrefetchAction::Probe { pages } => serve_probe(local, &version, &pages, scope).await,
         PrefetchAction::Fill {
@@ -520,10 +525,13 @@ async fn dispatch(
             .rank_owner(membership.clone(), &version.object, page, &scope)
             .await
         {
-            Ok(owner) => groups
-                .entry(owner.unwrap_or_else(|| me.clone()))
-                .or_default()
-                .push(page),
+            Ok(Some(owner)) => groups.entry(owner).or_default().push(page),
+            // An empty pool has no owner; retry once the pool has members.
+            Ok(None) => results.push((
+                unit(page),
+                UnitOutcome::Retry(RetryKind::Unavailable, None),
+                None,
+            )),
             Err(error) => results.push((unit(page), classify(error), None)),
         }
     }
@@ -614,7 +622,7 @@ async fn run_pump(prefetch: Arc<Prefetch>, local: Rc<Coordinator>) {
         if let Some(membership) = local.current_membership() {
             if membership_version.is_some_and(|v| v != membership.version) {
                 prefetch.with_registry(|registry| {
-                    registry.requeue_departed(|node| membership.member(node).is_ok())
+                    registry.requeue_departed(|cache, node| membership.serves(cache, node))
                 });
             }
             membership_version = Some(membership.version);
@@ -773,12 +781,14 @@ async fn coverage(
     let me = local.local_node();
     let mut groups: BTreeMap<(NodeId, ObjectVersion), Vec<u64>> = BTreeMap::new();
     for unit in units {
-        let owner = local
+        let Some(owner) = local
             .rank_owner(membership.clone(), &unit.version.object, unit.page, &scope)
             .await
             .ok()
             .flatten()
-            .unwrap_or_else(|| me.clone());
+        else {
+            continue;
+        };
         groups
             .entry((owner, unit.version))
             .or_default()
