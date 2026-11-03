@@ -235,7 +235,7 @@ func TestMachineOperationReconciler_SkipsOperationForDifferentProviderScope(t *t
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
-	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
+	machine := newExternalMachine("machine-1", "ExampleCloud")
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostHardReboot)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostHardReboot: true}}
 
@@ -701,12 +701,12 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 	s := newOperationTestScheme(t)
 	require.NoError(t, corev1.AddToScheme(s))
 
-	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
+	machine := newExternalMachine("machine-1", "ExampleCloud")
 	machine.Spec.Provider = ""
 	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
-		Provider:   unboundedv1alpha3.ExternalProviderOCIInstance,
-		ProviderID: "oci://old-instance",
+		Provider:   "ExampleCloud",
+		ProviderID: "example://old-instance",
 	}}
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{BootstrapTokenRef: &unboundedv1alpha3.LocalObjectReference{Name: "bootstrap-token-test"}}
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
@@ -717,11 +717,11 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 			"token-secret": []byte("secret456"),
 		},
 	}
-	credential := newWorkloadIdentityCredential("cred-a", "site-a", unboundedv1alpha3.ExternalProviderOCIInstance)
+	credential := newWorkloadIdentityCredential("cred-a", "site-a", "ExampleCloud")
 	provider := &recordingProvider{
-		provider:  unboundedv1alpha3.ExternalProviderOCIInstance,
+		provider:  "ExampleCloud",
 		supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostReplace: true},
-		result:    OperationResult{ProviderID: "oci://new-instance", CleanupProviderID: "oci://old-instance"},
+		result:    OperationResult{ProviderID: "example://new-instance", CleanupProviderID: "example://old-instance"},
 	}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, secret, credential).WithStatusSubresource(op).WithInterceptorFuncs(interceptor.Funcs{
@@ -746,9 +746,9 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 
 	var updatedMachine unboundedv1alpha3.Machine
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "machine-1"}, &updatedMachine))
-	require.Equal(t, "oci://new-instance", updatedMachine.Spec.Host.External.ProviderID)
-	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.calls)
-	require.Equal(t, []string{"HostReplace:machine-1:oci://old-instance"}, provider.cleanupCalls)
+	require.Equal(t, "example://new-instance", updatedMachine.Spec.Host.External.ProviderID)
+	require.Equal(t, []string{"HostReplace:machine-1:example://old-instance"}, provider.calls)
+	require.Equal(t, []string{"HostReplace:machine-1:example://old-instance"}, provider.cleanupCalls)
 
 	var updatedOp unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updatedOp))
@@ -791,10 +791,10 @@ func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing
 	t.Parallel()
 
 	s := newOperationTestScheme(t)
-	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.ProviderID = "oci://ocid1.instance.oc1.test"
+	machine := newExternalMachine("machine-1", "ExampleCloud")
+	machine.Spec.ProviderID = "example://instance-1"
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
-	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderOCIInstance, supported: map[unboundedv1alpha3.OperationKind]bool{}}
+	provider := &recordingProvider{provider: "ExampleCloud", supported: map[unboundedv1alpha3.OperationKind]bool{}}
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
 	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
@@ -806,7 +806,29 @@ func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing
 	var updated unboundedv1alpha3.MachineOperation
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
 	require.Equal(t, unboundedv1alpha3.OperationPhaseFailed, updated.Status.Phase)
-	require.Contains(t, updated.Status.Message, "HostReplace is not supported for OCIInstance")
+	require.Contains(t, updated.Status.Message, "HostReplace is not supported for ExampleCloud")
+}
+
+func TestMachineOperationReconciler_IgnoresOperationForUnregisteredProvider(t *testing.T) {
+	t.Parallel()
+
+	s := newOperationTestScheme(t)
+	machine := newExternalMachine("machine-1", "OCIInstance")
+	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostPowerOff)
+	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM, supported: map[unboundedv1alpha3.OperationKind]bool{unboundedv1alpha3.OperationHostPowerOff: true}}
+
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op).WithStatusSubresource(op).Build()
+	reconciler := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}, Now: fixedOperationNow}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "op-1"}})
+	require.NoError(t, err)
+	require.Equal(t, ctrl.Result{}, result)
+	require.Empty(t, provider.calls)
+
+	var updated unboundedv1alpha3.MachineOperation
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Name: "op-1"}, &updated))
+	require.Empty(t, updated.Status.Phase)
+	require.Empty(t, updated.Status.Conditions)
 }
 
 func TestMachineOperationReconciler_SelectorOperationIsIgnored(t *testing.T) {
