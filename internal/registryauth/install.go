@@ -383,10 +383,8 @@ func (i *Installer) dropIn() ([]byte, error) {
 }
 
 func (i *Installer) remove(ctx context.Context) error {
-	for _, path := range []string{ownerPath, dropInPath, providerPath, providerConfigPath, azureConfigPath, ownedCAPath, proxyCAPath, restartPath} {
-		if err := i.checkPath(path); err != nil {
-			return err
-		}
+	if err := i.checkPath(ownerPath); err != nil {
+		return err
 	}
 
 	owner, err := os.ReadFile(i.path(ownerPath))
@@ -400,6 +398,12 @@ func (i *Installer) remove(ctx context.Context) error {
 
 	if string(owner) != managedMarker {
 		return errors.New("refusing to remove registry-auth files with an unknown owner")
+	}
+
+	for _, path := range []string{dropInPath, providerPath, providerConfigPath, azureConfigPath, ownedCAPath, proxyCAPath, restartPath} {
+		if err := i.checkPath(path); err != nil {
+			return err
+		}
 	}
 
 	data, err := os.ReadFile(i.path(dropInPath))

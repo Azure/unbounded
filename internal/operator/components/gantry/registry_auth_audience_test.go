@@ -248,6 +248,20 @@ func TestRegistryAuthIdentityUseRestoresAndRevokesWithoutHelpers(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, env.Client.Get(t.Context(), key, &binding), "managed policy must restore a deleted identity-use grant")
 
+	acknowledged := binding.Annotations[registryAuthHash]
+	require.NotEmpty(t, acknowledged)
+
+	binding.Annotations[registryAuthHash] = "previous-policy"
+	require.NoError(t, env.Client.Update(t.Context(), &binding))
+
+	cfg, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
+	require.NoError(t, err)
+	operations, err := planRegistryAuthIdentityUse(t.Context(), env, cfg)
+	require.NoError(t, err)
+	require.Len(t, operations, 1)
+	require.Equal(t, acknowledged, operations[0].Object.GetAnnotations()[registryAuthHash])
+	storeAudienceOperations(t, env, operations)
+
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(source), source))
 	source.Data[registryauth.ConfigKey] = "mode: external"
 	require.NoError(t, env.Client.Update(t.Context(), source))

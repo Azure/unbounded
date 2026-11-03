@@ -237,12 +237,6 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 		if err := h.waitForACRInstallation(ctx, cfg); err != nil {
 			return fmt.Errorf("policy saved, but stock provider installation is not ready: %w", err)
 		}
-
-		// The operator must observe managed policy before a grant can survive
-		// an external-policy reconciliation queued during initial attachment.
-		if err := h.grantACRIdentityUse(ctx, cfg.ClientID); err != nil {
-			return fmt.Errorf("provider installed, but identity-use authorization is not ready: %w", err)
-		}
 	}
 
 	if h.out != nil {
@@ -498,7 +492,16 @@ func (h *attachACRHandler) waitForACRInstallation(ctx context.Context, cfg regis
 		}
 
 		if err == nil && ds.Spec.Template.Annotations["unbounded-cloud.io/registry-auth-config-hash"] == expected && acrInstallerReady(ds) {
-			return nil
+			binding, err := h.client.RbacV1().ClusterRoleBindings().Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+
+			if err == nil && binding.Annotations["unbounded-cloud.io/registry-auth-config-hash"] == expected &&
+				binding.Labels["app.kubernetes.io/managed-by"] == acrAttachManager &&
+				binding.Labels["unbounded-cloud.io/namespace"] == h.namespace {
+				return nil
+			}
 		}
 
 		select {

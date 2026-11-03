@@ -5,6 +5,9 @@ package gantry
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -163,6 +166,7 @@ func registryAuthRBACEvents() predicate.Predicate {
 				older, ok := ev.ObjectOld.(*rbacv1.ClusterRoleBinding)
 
 				return !ok || older.RoleRef != newer.RoleRef || !slices.Equal(older.Subjects, newer.Subjects) ||
+					older.Annotations[registryAuthHash] != newer.Annotations[registryAuthHash] ||
 					older.Labels["app.kubernetes.io/managed-by"] != newer.Labels["app.kubernetes.io/managed-by"] ||
 					older.Labels["unbounded-cloud.io/namespace"] != newer.Labels["unbounded-cloud.io/namespace"]
 			}
@@ -395,6 +399,12 @@ func planRegistryAuthAudience(ctx context.Context, env *component.Env, cfg regis
 }
 
 func planRegistryAuthIdentityUse(ctx context.Context, env *component.Env, cfg registryauth.Config) ([]component.Operation, error) {
+	payload, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	hash := sha256.Sum256(payload)
 	metadata := metav1.ObjectMeta{Name: registryauth.IdentityRoleName, Labels: map[string]string{
 		"app.kubernetes.io/managed-by": "unbounded-acr-attach", "unbounded-cloud.io/namespace": env.Namespace,
 	}}
@@ -407,6 +417,7 @@ func planRegistryAuthIdentityUse(ctx context.Context, env *component.Env, cfg re
 		RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name},
 		Subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}},
 	}
+	binding.Annotations = map[string]string{registryAuthHash: hex.EncodeToString(hash[:])}
 
 	var operations []component.Operation
 
@@ -468,7 +479,8 @@ func registryAuthAudienceOperation(ctx context.Context, env *component.Env, desi
 				return nil, fmt.Errorf("unexpected registry-auth binding %T", current)
 			}
 
-			equal = wanted.RoleRef == existing.RoleRef && slices.Equal(wanted.Subjects, existing.Subjects)
+			equal = wanted.RoleRef == existing.RoleRef && slices.Equal(wanted.Subjects, existing.Subjects) &&
+				(wanted.Name != registryauth.IdentityRoleName || wanted.Annotations[registryAuthHash] == existing.Annotations[registryAuthHash])
 			replace = wanted.RoleRef != existing.RoleRef
 		case *rbacv1.ClusterRole:
 			existing, roleOK := current.(*rbacv1.ClusterRole)

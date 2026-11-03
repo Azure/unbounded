@@ -77,6 +77,22 @@ func TestRegistryOnboardingRefusesAmbiguousOrConflictingConfiguration(t *testing
 	require.Equal(t, original, merged)
 }
 
+func TestRegistryAttachmentDoesNotOverrideInheritedUpstreams(t *testing.T) {
+	runtime := "<<: &defaults\n  upstream_registries:\n  - name: other.example\n    endpoint: https://other.example\n"
+	_, _, err := EnsureUpstream(runtime, testIdentityPolicy+"registry: "+testRegistry)
+	require.ErrorContains(t, err, "make inherited upstream_registries explicit")
+}
+
+func TestRegistryAttachmentResolvesMergedAndAliasedNames(t *testing.T) {
+	for _, alias := range []string{"", "  name: *registry\n"} {
+		runtime := "upstream_registries:\n- <<: &entry\n    name: &registry " + testRegistry + "\n    endpoint: https://" + testRegistry + "\n" + alias
+		merged, changed, err := EnsureUpstream(runtime, testIdentityPolicy+"registry: "+testRegistry)
+		require.NoError(t, err)
+		require.False(t, changed, "an effective existing name must not be duplicated")
+		require.Equal(t, runtime, merged)
+	}
+}
+
 func TestManagedRegistryOnboardingRejectsInvalidExistingEndpoints(t *testing.T) {
 	for _, endpoint := range []string{"http://" + testRegistry, "https://other.azurecr.io", "https://" + testRegistry + "/path", "https://user@" + testRegistry} {
 		t.Run(endpoint, func(t *testing.T) {

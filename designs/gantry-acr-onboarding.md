@@ -49,10 +49,9 @@ assign identities to Azure VMs and VMSS models.
 6. The operator installs a node-configuration DaemonSet targeting Linux Flex
    nodes. It copies the pinned upstream binary and configures its built-in
    identity-bindings mode in the actual kubelet runtime.
-7. The command waits for managed installation before authorizing
-   `system:serviceaccounts` collectively to use the identity. This prevents an
-   external-policy reconciliation queued during opt-in from revoking a staged
-   grant.
+7. The policy controller serializes publication and revocation of the owned
+   collective identity-use grant. The command waits for helper readiness and
+   the controller's configuration-hash acknowledgement before reporting success.
 8. Kubelet supplies Pod-bound ServiceAccount tokens directly to the stock
    executable. The upstream implementation performs token exchange with the
    AKS-managed endpoint.

@@ -164,6 +164,26 @@ func managedAttachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]
 	require.NoError(t, err)
 
 	hash := sha256.Sum256(data)
+
+	client.PrependReactor("get", "daemonsets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		// Model the policy controller acknowledging its grant after installation.
+		_, err := client.Tracker().Get(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), "", registryauth.IdentityRoleName)
+		if apierrors.IsNotFound(err) {
+			err = client.Tracker().Create(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), &rbacv1.ClusterRoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        registryauth.IdentityRoleName,
+					Labels:      map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace},
+					Annotations: map[string]string{"unbounded-cloud.io/registry-auth-config-hash": hex.EncodeToString(hash[:])},
+				},
+				RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: registryauth.IdentityRoleName},
+				Subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}},
+			}, "")
+		}
+
+		require.NoError(t, err)
+
+		return false, nil, nil
+	})
 	_, err = client.AppsV1().DaemonSets(h.namespace).Create(t.Context(), &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "gantry-acr-auth", Namespace: h.namespace, Generation: 1},
 		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
@@ -356,23 +376,50 @@ func TestGantryAttachACRPublishesIdentityGrantAfterManagedInstallation(t *testin
 		return false, nil, nil
 	})
 	require.NoError(t, h.execute(t.Context()))
+
+	actions := client.Actions()
 	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
 	require.NoError(t, err, "the identity-use grant must survive the transition from external policy")
 
-	installerRead, grantWrite := -1, -1
+	installerRead, grantRead := -1, -1
 
-	for index, action := range client.Actions() {
+	for index, action := range actions {
 		if action.Matches("get", "daemonsets") {
 			installerRead = index
 		}
 
-		if action.Matches("create", "clusterrolebindings") {
-			grantWrite = index
+		if action.Matches("get", "clusterrolebindings") {
+			grantRead = index
 		}
 	}
 
 	require.NotEqual(t, -1, installerRead)
-	require.Greater(t, grantWrite, installerRead, "wait for the operator to observe managed policy before publishing the grant")
+	require.Greater(t, grantRead, installerRead, "wait for the policy controller acknowledgement after installation")
+}
+
+func TestGantryAttachACRWaitsForCurrentPolicyAcknowledgement(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	reads := 0
+
+	client.PrependReactor("get", "clusterrolebindings", func(k8stesting.Action) (bool, runtime.Object, error) {
+		reads++
+		if reads != 1 {
+			return false, nil, nil
+		}
+
+		object, err := client.Tracker().Get(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), "", registryauth.IdentityRoleName)
+		require.NoError(t, err)
+
+		binding, ok := object.(*rbacv1.ClusterRoleBinding)
+		require.True(t, ok)
+
+		binding = binding.DeepCopy()
+		binding.Annotations["unbounded-cloud.io/registry-auth-config-hash"] = "previous-policy"
+
+		return true, binding, nil
+	})
+	require.NoError(t, h.execute(t.Context()))
+	require.GreaterOrEqual(t, reads, 2, "helper readiness alone must not acknowledge the policy controller")
 }
 
 func TestGantryAttachACRDoesNotStageIdentityGrantWhenPolicySaveFails(t *testing.T) {

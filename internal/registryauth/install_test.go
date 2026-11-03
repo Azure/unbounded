@@ -125,6 +125,20 @@ func TestInstallerDoesNotOverwriteDropInAfterOwnershipChanges(t *testing.T) {
 	require.Equal(t, "foreign", string(data))
 }
 
+func TestExternalCleanupWithoutOwnershipPreservesCustomerCASymlink(t *testing.T) {
+	i, _, restarts := installerFixture(t)
+	target := i.path("/customer-ca.crt")
+	require.NoError(t, os.WriteFile(target, []byte("customer CA"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Dir(i.path(proxyCAPath)), 0o755))
+	require.NoError(t, os.Symlink(target, i.path(proxyCAPath)))
+	require.NoError(t, i.Reconcile(t.Context(), Config{Mode: ExternalMode}))
+	require.Zero(t, *restarts)
+
+	got, err := os.Readlink(i.path(proxyCAPath))
+	require.NoError(t, err)
+	require.Equal(t, target, got)
+}
+
 func TestInstallerRemovalAndReenableWithoutRejoin(t *testing.T) {
 	i, args, restarts := installerFixture(t)
 	cfg := testManagedConfig(t)

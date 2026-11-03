@@ -58,6 +58,10 @@ func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 	}
 
 	if upstreams == nil {
+		if _, inherited := validated["upstream_registries"]; inherited {
+			return "", false, errors.New("make inherited upstream_registries explicit before registry attachment")
+		}
+
 		upstreams = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "upstream_registries"}, upstreams)
 	}
@@ -67,13 +71,13 @@ func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 	}
 
 	for _, entry := range upstreams.Content {
-		if entry.Kind != yaml.MappingNode {
+		if entry.Kind != yaml.MappingNode && entry.Kind != yaml.AliasNode {
 			return "", false, errors.New("gantry upstream registry must be a mapping")
 		}
 
-		fields := map[string]string{}
-		for index := 0; index < len(entry.Content); index += 2 {
-			fields[entry.Content[index].Value] = entry.Content[index+1].Value
+		var fields map[string]string
+		if err := entry.Decode(&fields); err != nil {
+			return "", false, fmt.Errorf("decode Gantry upstream registry: %w", err)
 		}
 
 		if fields["name"] != cfg.Registry {

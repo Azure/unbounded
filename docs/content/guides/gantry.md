@@ -332,9 +332,10 @@ does not add or repair registry entries. Removing the selected upstream while
 retaining managed policy reports a configuration error. Rerun attachment to
 restore the upstream.
 
-Identity-use authorization is published after the managed helper rollout is
-ready, so cleanup queued under the previous external policy cannot revoke a
-grant staged before opt-in.
+The attachment command waits for both helper readiness and the policy
+controller's configuration-hash acknowledgement of the identity-use grant.
+That controller serializes grant publication and revocation; the CLI does not
+publish a competing grant.
 
 ```text
 unchanged application Pod/ServiceAccount
