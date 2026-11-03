@@ -249,7 +249,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
-| `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
+| `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (18 MiB, one page rounded up to whole 2 MiB pages) it is off; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PCI_P2PDMA` | `false` | `true` asks cuFile to read local NVMe into GPU memory over PCI P2PDMA instead of `nvidia-fs` (cuFile `use_pci_p2pdma`). Needs cuFile 1.13 (CUDA 12.8) or later; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_PEER` | `auto` | `auto` lets one GPU copy an encrypted page another GPU already holds over NVLink or PCIe peer-to-peer where the driver allows it; `off` turns peer access off, so requests on different GPUs do not share encrypted copies and any page that must move between GPUs goes through host memory. Other values fail startup. Each GPU still checks the page itself |
 | `RACER_SHARES` | `4` | Reported shares, 1..4,294,967,295; explicit Node `shares` wins |
@@ -277,8 +277,10 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
+| `RACER_CLIENT_CONNECTIONS` | Unset: `64` per final I/O worker | Connection admission; an explicit value is node-wide and divided among I/O workers, 1..65,536. A quarter of each worker's share (less one slot, at least one) bounds its outbound peer and origin connections, so raise it when many concurrent page reads to different peers are refused as `Overloaded` |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
 | `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps; each 1..65,536, and the per-neighbor cap at most the in-flight cap |
+| `RACER_PEER_ADMISSION_RECOVERY_MS` | `1000` | Least time between one-slot recoveries of the node-wide peer-exchange limit after local pressure halved it; 1..60,000 ms. Lower values let bulk transfers regain concurrency faster |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
@@ -1208,7 +1210,7 @@ pods. The dataplane logs `stage=gpu-landing` lines when it registers them, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
-encrypted pages. It is split into slots of one page (16 MiB plus 4 KiB). Two
+encrypted pages. It is split into slots of one page rounded up to whole 2 MiB pages (18 MiB). Two
 slots are needed for decryption, so a smaller cap means the CPU decrypts. The
 other slots hold pages read with cuFile. When all of them are in use, the
 dataplane reads the next page through host memory instead. If the image has no
@@ -1301,8 +1303,32 @@ The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entr
 `port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
 optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
 
-Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order,
-published from the dataplane's own Pod report. Explicit
+Absent administrator policy uses eligible active ports in PCI BDF/port order,
+published from the dataplane's own Pod report. A port is eligible on a device with
+type 2B memory windows (window mode), or on a device without memory windows that
+supports RC queue pairs and has an IPv4-mapped RoCE GID (registration mode, for
+example Azure MANA guest RDMA).
+
+### Registration mode
+
+Registration mode keeps transfers zero copy without memory windows or on-demand
+paging. A grant registers the granted page buffer itself for remote write and
+sends that registration's key; the arrival deregisters it, so the key works for
+exactly one transfer into exactly one buffer. A write registers the sender's
+page memory for local access, writes straight from it, and deregisters it on
+completion. Page memory is 2 MiB aligned and huge-page backed, so these
+registrations are cheap. Queue pairs connect through the RDMA connection manager
+on the node's IPv4 address:
+
+- The dataplane must run in the host network namespace: patch the `racer`
+  DaemonSet with `hostNetwork: true` and `dnsPolicy: ClusterFirstWithHostNet`.
+- Each dataplane listens on TCP port `RACER_RDMA_CM_PORT` (default 18515) of its
+  RDMA device's address for connection requests. Requests must name a link both
+  peers set up through the authenticated exchange.
+- The image ships rdma-core 65, which has the MANA RC provider (rdma-core 54 or
+  later is required).
+- Window keys rotate per grant in both modes; registration mode reports the
+  whole written length through the immediate's top byte, so link tags use 24 bits. Explicit
 `[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
 or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
 
