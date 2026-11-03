@@ -165,7 +165,8 @@ type Layout struct {
 	BinDir             string // nspawn-container: /usr/local/bin; host: /var/lib/unbounded/agent-v2/slots/<slot>/bin
 	CNIBinDir          string
 	ImageArchiveDir    string
-	OwnsSystemResolver bool // nspawn-container: true; host: false
+	KubeletKubeconfig  string // kubelet's kubeconfig as a path inside the node
+	OwnsSystemResolver bool   // nspawn-container: true; host: false
 }
 
 type NodeBundle struct {
@@ -187,7 +188,9 @@ type File struct {
 	Secret   bool // never logged or included in diagnostics
 }
 
-// Render is pure. The same inputs produce the same bundle and digest.
+// Render is pure. The same inputs produce the same bundle and digest. It also
+// fills templated extension content from the spec and the layout
+// (extensions doc, section 2).
 func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (*NodeBundle, error)
 ```
 

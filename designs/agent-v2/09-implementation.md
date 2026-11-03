@@ -24,7 +24,7 @@ internal/agentv2/
   state/          install record, node state, locks
   bootstrap/      install check and stages
   nodemanager/    Ensure, Apply, Reboot, Reset, Recover, Decide
-  control/        goal sources, status reporters, operation source (machina, static, plugin)
+  control/        goal sources and status reporters (machina, static, plugin), the MachineOperation source
   credentials/    bootstrap (static, tpm, plugin), kubelet, daemon (csr, kubeconfig, plugin)
   daemon/         controller wiring, startup gate, operation handlers, unit assets
   agentupgrade/   MachineOperation and CLI upgrade over pkg/agent/agentbinary

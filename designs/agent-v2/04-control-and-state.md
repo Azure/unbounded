@@ -34,6 +34,20 @@ type GoalSource interface {
 type StatusReporter interface {
 	Report(ctx context.Context, s Status) error
 }
+
+// OperationSource is where MachineOperations come from. The MachineOperation
+// CRD is the only implementation (section 6); it is an interface so that
+// another source, such as operations from AKS's ARM API, can be added later
+// without changing the handlers.
+type OperationSource interface {
+	Pending(ctx context.Context) ([]Operation, error) // this machine's operations still to run
+	Start(ctx context.Context, op Operation, message string) error
+	Finish(ctx context.Context, op Operation, r OperationResult) error
+	// Restored returns results recorded before a restart, such as an
+	// AgentUpgrade's, for the daemon to finish once it is ready.
+	Restored(ctx context.Context) ([]PendingResult, error)
+	Trigger() Trigger
+}
 ```
 
 Built-in providers:
@@ -63,9 +77,11 @@ Built-in providers:
   source.
 
 Bootstrap does not ask the goal source for a goal. It builds the first node
-from the configuration file and records an empty goal version. The goal
-version is recorded only when the daemon handles a Node deletion (section 5),
-as in v1, which never records a version at bootstrap
+from the configuration file and records an empty goal version. The daemon
+records the goal's version as applied on its first check whose goal settings
+match the applied ones (section 5), usually seconds after it starts, so a goal
+source learns straight away which version the node runs. v1 records a version
+only when it handles a Node deletion
 (`cmd/agent/internal/daemon/controller_node.go:43-68`).
 
 The `machina` status reporter writes what v1 writes, at the same moments, and
@@ -77,7 +93,7 @@ machina owns that field and branches on it, and a Machine in `Pending`,
 | Machine field | Written | As in v1 |
 |---|---|---|
 | `AgentBootstrapped` condition | During bootstrap: `Running`, then `Succeeded`, or a failure reason. v2 adds two reasons: `NodeStartFailed` when the `host` runtime cannot start the node, where v1's `NSpawnFailed` would be misleading, and `RuntimeUnsupported` when the host fails a capability probe for the requested runtime ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). | Yes, plus the two reasons (`cmd/agent/internal/cmd/bootstrap.go:260-272`, `cmd/agent/internal/daemon/bootstrap_status.go:85-112`) |
-| `RepavePending` condition and `status.configuration` | Only when the daemon handles a Node deletion | Yes (`controller_node.go:54-68,116-133`) |
+| `RepavePending` condition and `status.configuration` | Whenever the daemon records a goal version: after a repave, and on any check whose goal settings match the applied ones (section 5) | The same fields and values (`controller_node.go:54-68,116-133`). v1 writes them only when it handles a Node deletion, so v2 can write them earlier, but only when nothing needs to change. |
 | `status.observedProvisioningFormat` | When the daemon starts and registers the Machine | Yes (`cmd/agent/internal/daemon/daemon.go:327,340,350`) |
 | `AgentHealthy` condition | `True` with reason `Healthy` while the daemon works normally; `False` with reason `NodeNotRegistered`, `RepaveFailed`, `StateMismatch` or `StateCorrupt`, with the attempt count and last error in the message where they apply | New |
 | `RuntimeChangePending` condition | `True` when `spec.agent.runtime` differs from the runtime installed on the host, until a reinstall applies it ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)) | New |
@@ -87,11 +103,14 @@ A requested runtime change is not a health problem, which is why it has its own
 condition rather than a reason on `AgentHealthy`. The daemon can already update
 Machine status (`deploy/machina/07-bootstrapper-rbac.yaml.tmpl:17-19`), so none
 of this needs new permissions. The phases the status reporter receives
-([extensions, section 3](02-extensions.md#3-plugin-protocol)), such as `Pending`, are not written to the Machine: the
-Machine's `RepavePending` condition keeps v1's meaning and timing. Provisioning
-does not apply `configurationRef` yet (issue #1039), so a Machine whose
-referenced version differs from what its node was built from would otherwise
-show a pending repave right after bootstrap.
+([extensions, section 3](02-extensions.md#3-plugin-protocol)), such as `Pending`, are not written to the Machine, so
+`RepavePending` is never set to `True` by a goal that is only waiting for a Node
+deletion. Provisioning does not apply `configurationRef` yet (issue #1039), so a
+Machine whose referenced version differs from what its node was built from
+would otherwise show a pending repave right after bootstrap. Nothing in this
+repository reads `status.configuration` or `RepavePending` apart from the
+agent and an e2e check after a repave (`hack/agent/e2e-kind/e2e.py:6097-6107`),
+so writing them earlier when nothing differs affects no consumer.
 
 ## 2. Credentials
 
@@ -136,7 +155,9 @@ type Manager interface {
 
 // Trigger is why the daemon is reconciling: NodeDeleted when it saw this
 // node's Node object being deleted, NodeChanged when the Node's status
-// changed, otherwise GoalChanged, Poll or Startup.
+// changed, otherwise GoalChanged, Poll or Startup. Whether the Node counts as
+// deleted also depends on the observation (section 5), not only on the
+// trigger.
 type Trigger string
 
 type Action string // Steady, Wait, Repave, Reset
@@ -154,10 +175,11 @@ for one runtime, such as the nspawn OCI image, are contributed by that runtime.
 package state
 
 type Applied struct {
-	GoalVersion  string               // empty until the daemon first handles a Node deletion
+	GoalVersion  string               // empty until the daemon first sees a goal with matching settings
 	Settings     *config.GoalSettings // the goal settings the running node was built from
 	BundleDigest string               // digest of that node's saved bundle manifest
 	StartedAt    time.Time            // when that node started, for the registration timeout
+	NodeUID      string               // UID of that node's Node object, once the daemon has seen it
 	Repave       *Repave              // non-nil from the moment a repave is approved
 }
 
@@ -285,24 +307,41 @@ When `Recover` finds the state inconsistent or corrupt (`StateMismatch`,
   sense of the host's machines (`daemon.go:137-140`), which leaves only access
   to the host, or a HostReplace, to fix it.
 
-`Decide` repaves only when the daemon itself sees this node's Node object
-being deleted, as v1 does: v1 watches only Node delete events
-(`cmd/agent/internal/daemon/controller.go:151-156`).
+`Decide` repaves only after this node's Node object has been deleted, which is
+how an operator or a control plane approves a repave. v1 only reacts to a
+deletion event it receives while running, and ignores creates and updates
+(`cmd/agent/internal/daemon/controller.go:147-156`), so a Node deleted while
+its daemon restarts is never acted on: the node keeps running with no Node
+object, and whoever deleted it waits forever. v2 also notices a deletion it
+did not see happen. The daemon saves the UID of the node's Node object in
+`Applied.NodeUID` the first time it sees it, and on every check compares:
 
-| Trigger | Goal `delete` | Drift | Action |
+| What the daemon finds | Node deleted? |
+|---|---|
+| A deletion event for the Node | Yes |
+| No Node, and a UID is saved | Yes: it was deleted while the daemon was not watching, for example while it restarted |
+| A Node with a different UID | Yes: it was deleted and registered again while the daemon was not watching, for example around a host reboot, when kubelet registers again before the daemon starts *(inference: kubelet registers once at startup)* |
+| A Node with the saved UID, or a Node and no saved UID | No. The daemon saves the UID if none is saved. |
+| No Node, and no UID saved | No: the node has not registered yet |
+
+| Node deleted? | Goal `delete` | Drift | Action |
 |---|---|---|---|
 | Any | `true` | Any | Reset |
-| `NodeDeleted` | `false` | Yes | Repave: save `Repave`, then `Apply` |
-| `NodeDeleted` | `false` | No | Steady; record the goal version as applied, as v1 does (`cmd/agent/internal/daemon/controller_node.go:54-62`) |
-| Any other | `false` | Yes | Wait: a repave is pending until the Node is deleted |
-| Any other | `false` | No | Steady |
+| Yes | `false` | Yes | Repave: save `Repave`, then `Apply` |
+| Yes | `false` | No | Steady |
+| No | `false` | Yes | Wait: a repave is pending until the Node is deleted |
+| No | `false` | No | Steady |
 
-A Node deleted while the daemon is not running is never acted on, as in v1.
-Stopping the daemon is therefore a safe way to keep a node as it is, for
-example while debugging. To repave after such a deletion, start the daemon and
-delete the Node again. kubelet registers the Node again when it restarts
-*(inference: kubelet registers once at startup)*, for example after a
-NodeReboot operation or a host reboot.
+When the action is Steady, the daemon records the goal's version as applied if
+it is not already, and the UID of the Node it sees, if any. v1 records a goal
+version only when it handles a Node deletion
+(`cmd/agent/internal/daemon/controller_node.go:54-62`), so v2 records it
+sooner, but only when nothing needs to change (section 1). A repave starts a
+new `Applied` record, whose `NodeUID` is empty until the new Node registers.
+
+A Node deleted while the daemon is not running is acted on when the daemon
+starts again. Stopping the daemon still keeps a node as it is, for example
+while debugging, but only for as long as the daemon is stopped.
 
 The reported phase is `Pending` while a repave waits for the Node to be
 deleted. Otherwise it follows the Node: `Ready` while the Node exists, and
@@ -312,13 +351,37 @@ deleted. Otherwise it follows the Node: `Ready` while the Node exists, and
 settings that the drift function ignores, such as artifact download sources,
 are saved with the version and take effect at the next provision.
 
-A node that never registers is reported but not repaved, because there is no
-Node to delete. This matches v1, where such a node also stays as it is. The
+A node that never registers is reported but not repaved: with no Node seen,
+no UID is saved, so a missing Node is never taken for a deletion. This matches
+v1, where such a node also stays as it is. The
 `NodeNotRegistered` status, counted from `Applied.StartedAt`, makes the problem
 visible, including on the Machine as `AgentHealthy=False` (section 1). Recovery
 is manual, as in v1: an `AgentReset` operation or `reset`, then `start`.
 
 ## 6. MachineOperation handling
+
+Operations are read from the MachineOperation CRD, which is not installed on
+every cluster: AKS clusters running AKS Flex Node often lack it. Flex detects
+that at startup and then ignores operations
+(`pkg/daemon/machineoperation_reconciler.go:58-77,114-126` at Flex
+`2c149e991`). A watch on a type the API server does not know would instead
+keep the manager from starting *(inference: controller-runtime fails to start
+a source whose kind has no REST mapping)*. With `control.operations.enabled`
+set, the default, the daemon therefore:
+
+- checks discovery for the MachineOperation type when it starts. Every
+  authenticated client may read discovery, so this needs no new permission
+  *(inference: Kubernetes' default `system:discovery` binding)*;
+- if the type is missing, runs without the watch, logs it once, reports it in
+  `status`, and checks again every 10 minutes, with up to 10% random jitter;
+- starts the watch as soon as the type appears, without a restart.
+
+Every machina cluster has the CRD, so machina hosts behave as in v1.
+
+The CRD is the only operation source (section 1). AKS Flex Node plans to take
+operations from AKS's ARM API instead (`docs/design/agent-and-aks.md:16` at
+Flex `2c149e991`), but AKS has not defined that contract, so v2 does not design
+a plugin protocol for it yet ([overview, section 3](README.md#3-open-questions)).
 
 `OperationKind` is a closed enum (`api/machina/v1alpha3/machineoperation_types.go:54`).
 There are no custom kinds: consumers customize the agent through plugins,

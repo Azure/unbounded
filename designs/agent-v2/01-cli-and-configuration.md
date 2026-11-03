@@ -42,6 +42,7 @@ tools never read v2's state files. It reports:
 
 - the install phase and install ID, the runtime, and any migration in
   progress with its phase;
+- whether MachineOperations are handled, waiting for the CRD, or turned off;
 - each slot's phase, whether it is enabled, and its bundle digest;
 - the applied goal version and a digest of the applied goal settings;
 - any approved repave in progress, with its attempt count and last error;
@@ -120,8 +121,7 @@ provisioning works unchanged.
     }
   ],
   "hooks": [
-    { "event": "node.start.after", "plugin": "aks", "timeout": "2m", "failurePolicy": "Fail" },
-    { "event": "agent.upgrade.*", "plugin": "aks", "timeout": "30s" }
+    { "event": "node.repave.after", "plugin": "aks", "timeout": "30s", "failurePolicy": "Ignore" }
   ],
   "extensions": []
 }
@@ -150,7 +150,7 @@ Enumerated fields:
 | `control.goal.type` | `machina`, `static` (the goal settings in the configuration file are the goal), `plugin` |
 | `control.goal.pollInterval` | A duration. Default `10m`. Only for the `plugin` source ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). |
 | `control.status.type` | `machina`, `none`, `plugin` |
-| `control.operations.enabled` | `true` (default): handle MachineOperations through machina. `false`: ignore them. |
+| `control.operations.enabled` | `true` (default): handle MachineOperations through machina once the MachineOperation CRD exists, waiting without error while it does not ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)). `false`: ignore them. |
 | `hooks[].failurePolicy` | `Fail`, `Ignore`. If omitted, each event's default ([extensions, section 1](02-extensions.md#1-extension-mechanisms)). |
 | `plugins[].permissions.paths[].access` | `read`, `write` ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
 | `plugins[].permissions.capabilities` | Linux capability names, such as `CAP_NET_ADMIN`. Default none. |
@@ -210,6 +210,11 @@ The LocalDNS Corefile template variables become a documented contract:
 (`pkg/agent/goalstates/localdns.go:101-108`). The default template uses all but
 `NodeUpstreamIPs` (`pkg/agent/goalstates/assets/default-localdns.Corefile.tmpl:2-33`).
 Flex's LocalDNS rendering depends on these names.
+
+The extension template variables are a documented contract in the same way:
+`NodeName`, `MachineName`, `APIServer`, `ClusterDNS` and
+`KubeletKubeconfigPath` ([extensions, section 2](02-extensions.md#2-declarative-extensions)). New variables can be added; renaming
+or removing one needs a new configuration `apiVersion`.
 
 ### Install-time settings and goal settings
 

@@ -15,6 +15,16 @@ repository baseline, citation conventions and terms.
 Use the first mechanism that fits, in this order. There are no in-process Go
 plugins: consumers never link agent code.
 
+Lifecycle hooks are the escape hatch. No current consumer needs one: every AKS
+Flex Node customization maps to configuration, an extension or a provider
+(section 5). Hooks exist for side effects at fixed points that nothing else
+covers, such as sending lifecycle telemetry, collecting diagnostics before a
+reset, registering the node with an external system after it joins, or
+migrating a consumer's own files after an upgrade. Without them, a consumer
+with such a need would go back to linking `pkg/agent`, which goal G3 rules
+out. Most hooks should use the `Ignore` failure policy, so a broken hook
+cannot block the node.
+
 ### Lifecycle hook events
 
 Events are named `<subject>.<action>.<phase>`:
@@ -126,7 +136,14 @@ agent itself renders.
   ],
   "node": {
     "files": [ { "path": "/etc/npd/kernel-monitor.json", "mode": "0644", "content": "..." } ],
-    "units": [ { "name": "node-problem-detector.service", "content": "...", "start": "AfterKubelet" } ]
+    "units": [
+      {
+        "name": "node-problem-detector.service",
+        "start": "AfterKubelet",
+        "template": true,
+        "content": "[Service]\nExecStart=/usr/local/bin/node-problem-detector --hostname-override={{.NodeName}} --apiserver-override=\"{{.APIServer}}?inClusterConfig=false&auth={{.KubeletKubeconfigPath}}\" --config.system-log-monitor=/etc/npd/kernel-monitor.json\n"
+      }
+    ]
   },
   "host": {
     "units": [ { "name": "static-routes.service", "content": "...", "orderBeforeNode": true } ],
@@ -134,6 +151,7 @@ agent itself renders.
   },
   "sharedHostPaths": [ { "hostPath": "/opt/aks-flex-node/bin", "nodePath": "/opt/aks-flex-node/bin", "readOnly": true } ],
   "nodeDependencies": { "requires": ["systemd-udev-settle.service", "himdsd.service"] },
+  "agentDependencies": { "after": ["himdsd.service"] },
   "cleanup": {}
 }
 ```
@@ -149,6 +167,39 @@ Rules:
 - `sharedHostPaths` are host paths made visible inside the node: a bind mount
   for `nspawn-container`, the path itself for `host`. On `host`, `hostPath` must
   equal `nodePath`; validation rejects anything else.
+- A node file or unit with `"template": true` is rendered as a Go
+  `text/template` when the slot's bundle is rendered, with only these
+  variables, a contract like the LocalDNS template variables
+  ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)):
+
+  | Variable | Value |
+  |---|---|
+  | `NodeName` | The Kubernetes Node name, `machine.nodeName` |
+  | `MachineName` | The Machine's name, `machine.name` |
+  | `APIServer` | The API server URL this provision uses: `cluster.apiServer`, unless the `credentials.bootstrap` provider replaced it |
+  | `ClusterDNS` | The cluster DNS service IP, `cluster.clusterDNS` |
+  | `KubeletKubeconfigPath` | kubelet's kubeconfig, as a path inside the node, which differs between runtimes |
+
+  - None of the variables is a secret, so a rendered file never holds one.
+  - Only `text/template`'s built-in functions are available. Without the
+    flag, content is used exactly as written, and inside a template a literal
+    `{{` is written `{{"{{"}}`.
+  - The rendered content is saved in the slot's manifest and counted in its
+    digest. Restarts and reboots do not render it again; a changed value
+    reaches the node at its next provision.
+  - Templates apply to node content only. Host files and units are installed
+    once, at bootstrap, so a value that later changed through a goal would
+    leave them stale.
+  - When the configuration loads, in `start`, `preflight` and the daemon, each
+    template is rendered with placeholder values, so a misspelled variable
+    fails with the extension, the file or unit, and the name, before anything
+    is installed.
+- `agentDependencies.after` lists host units the agent's own daemon should
+  start after, such as an identity service its credentials depend on. v2
+  writes a drop-in for `unbounded-agent-daemon.service` with `After=` and
+  `Wants=` on each. It never uses `Requires=`: a broken or stopped dependency
+  must not stop the agent, which may be needed to reset the host. `preflight`
+  warns about a listed unit that does not exist.
 - An extension's node files and units may not use a path or unit name that the
   agent renders itself or that a runtime owns, such as
   `/etc/containerd/config.toml` or `kubelet.service`. Validation rejects them.
@@ -316,19 +367,23 @@ type Client interface {
 | Flex today | v2 mechanism |
 |---|---|
 | Own configuration schema, translated with `ToAgentConfig` | Flex's bootstrap script renders an `AgentConfiguration`; dynamic values come from providers |
-| ARM Machine backend: create, get, ETag, status | `goal` and `status` plugin providers |
+| ARM Machine backend: create, get, ETag, status | `goal` and `status` plugin providers. `goal.register` pushes the local goal as Flex's `EnsureMachine` does, and the daemon records the Machine's ETag as applied on its first check whose settings match ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)). |
 | Reset on a deleting taint plus a missing ARM Machine | `goal.get` sees the Node's taints and returns `delete: true` |
+| Repave when the Node is missing and the goal is not applied, even after a daemon restart | Built in: a missing Node, or one with a new UID, counts as deleted ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 | Fresh bootstrap data before a repave | `credentials.bootstrap` provider, called before every provision |
 | Kubelet exec credential, binary copied into the rootfs | `credentials.kubelet.type: exec`; the runtime makes the command visible inside the node |
 | Daemon exec credential, host path rewritten | `credentials.daemon.type: plugin`; Flex's plugin implements `credentials.cluster` |
 | CSR group `aks-flex-node-daemons` | `credentials.daemon.csr.group` |
 | Static routes with `RequiredBy=systemd-nspawn@.service` | Host extension unit with `orderBeforeNode` |
+| Daemon unit ordered after `himdsd.service` when Arc is enabled | `agentDependencies.after` |
+| Host preparation steps copied from unbounded (`pkg/daemon/start.go:16-28`), which have since missed unbounded's Docker, containerd and kubelet steps (Azure/AKSFlexNode#423) | Built-in host preparation, the same for every consumer. An adopted host gains the missing steps, and adoption warns which host services will be masked ([migrating from v1, section 9](10-migration-from-v1.md#9-hosts-built-by-other-pkgagent-consumers)). |
 | `additionalRequiredServices` and the udev-settle drop-in | `nodeDependencies.requires` |
-| NPD written into the rootfs and started with `systemd-run` | Node extension: an artifact plus a unit with `start: AfterKubelet` |
+| NPD written into the rootfs and started with `systemd-run`, its unit rendered with the node name, API server and kubeconfig | Node extension: an artifact plus a templated unit with `start: AfterKubelet`, using `NodeName`, `APIServer` and `KubeletKubeconfigPath` |
 | Arc and NPD preflight checks | `preflight.check`, plus automatic reachability checks for extension artifacts |
 | `maxPods`, reserved resources, forced labels | `kubelet.configuration` and `kubelet.labels` |
 | AKS LocalDNS template | `components.localDNS.corefileTemplate` plus the variable contract |
-| `machineOperationMode: disable` | `control.operations.enabled: false` |
+| `machineOperationMode`: `auto`, the default, which checks for the MachineOperation CRD at start, and `disable` | `control.operations.enabled`: `true`, which handles operations once the CRD exists, and `false` ([control and state, section 6](04-control-and-state.md#6-machineoperation-handling)) |
+| ARM-backed MachineOperations, planned (`docs/design/agent-and-aks.md:16`) | Not yet: operations come only from the MachineOperation CRD ([overview, section 3](README.md#3-open-questions)) |
 | Startup gate around its reconcilers | Built in ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 | Own blue/green upgrade, signal file, recovery unit and unit names | Built in ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
 | Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `reset` plus the documented list of what v2 creates ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)) |

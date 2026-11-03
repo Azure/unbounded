@@ -120,7 +120,9 @@ their v2 equivalents in [extensions, section 5](02-extensions.md#5-mapping-aks-f
 Several patterns in Flex point to missing extension points:
 
 - It copies unbounded's list of host tasks so it can add its own
-  (`pkg/daemon/start.go`), so new unbounded host tasks are silently missed.
+  (`pkg/daemon/start.go`), so new unbounded host tasks are silently missed. It
+  has already missed the Docker, containerd and kubelet steps unbounded added
+  in #563 (Azure/AKSFlexNode#423).
 - It re-composes the node start sequence in three places (`pkg/daemon/start.go`,
   `pkg/daemon/nodeoperator.go`).
 - It writes content directly into the machine directory after provisioning
@@ -200,7 +202,19 @@ library.
 
 ## 3. Open questions
 
-No questions are open at the moment.
+**MachineOperations from AKS's ARM API.** AKS Flex Node plans to receive
+operations from ARM rather than from the MachineOperation CRD
+(`docs/design/agent-and-aks.md:16` at Flex `2c149e991`). AKS has not defined
+that contract yet. v2 reads operations through an internal `OperationSource`
+whose only implementation is the CRD ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)), so either path
+stays open:
+
+- add a second source once the contract exists: built in, or as new plugin
+  methods that `describe` negotiates, which is an additive change; or
+- have Flex's cluster-side controller, which already exists
+  (`pkg/flexcontroller/server.go`), turn ARM operations into MachineOperation
+  objects, so the agent needs no change. This depends on AKS accepting the CRD
+  in its clusters.
 
 ## 4. Architecture overview
 

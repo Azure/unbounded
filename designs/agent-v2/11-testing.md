@@ -14,8 +14,10 @@ This document specifies how v2 is tested. It has two priorities:
 
 - The runtime conformance suite, plus a fake runtime for `nodemanager` and
   `daemon` tests.
-- One test per row of the `Decide` table, with each trigger, including a Node
-  deleted while the daemon is stopped, which must be ignored.
+- One test per row of both `Decide` tables, with each trigger: a deletion
+  event, a missing Node with a saved UID, a Node with a new UID, a Node that
+  has never registered, which must not count as deleted, and the goal version
+  recorded on a check whose settings match.
 - `Recover` after a simulated crash between every two steps of a repave,
   including after `Repave` is saved but before the bundle is rendered.
 - Golden tests showing the `nspawn-container` runtime renders kubelet,
@@ -49,6 +51,16 @@ This document specifies how v2 is tested. It has two priorities:
   set without one, and refusing a manifest with a wrong digest or with a
   plugin added or dropped. `start` with changed plugins on an installed host
   is refused, and with the original file after a plugin upgrade is not.
+- Extension templates: rendering on both runtimes, where
+  `KubeletKubeconfigPath` differs; a misspelled variable rejected when the
+  configuration loads; an `APIServer` replaced by the bootstrap credentials
+  provider showing up at the next provision; content without `template` left
+  untouched.
+- `agentDependencies`: the daemon drop-in's content, a warning for a unit that
+  does not exist, and the drop-in removed by reset.
+- MachineOperation handling without the CRD: the daemon starts, reports that it
+  is waiting, keeps reconciling the node, and starts the watch once a fake API
+  server begins serving the type.
 - Host cleanup with a fake `SystemOps`: order of operations, `ErrNodeBusy` on a
   hung process, refusal to cross a bind mount inside `/var/lib/kubelet/pods`,
   refusal when an owned path is replaced by a symlink, keeping
@@ -206,7 +218,7 @@ Variants:
 | Limited mode | After migrating, make the node state disagree with the host and restart the daemon: it reports ready, shows `AgentHealthy=False` with `StateMismatch`, changes nothing on a Node deletion, and runs an AgentReset. Repeat right after an AgentUpgrade: the new binary is rolled back. |
 | To `host` | After migrating, set the Machine's `spec.agent.runtime` to `host` and check that `RuntimeChangePending` is `True`. Then `reset`, bootstrap again with `manual-bootstrap --runtime host`, check that `RuntimeChangePending` is `False` and `status.agent.runtime` is `host`, and run the lifecycle suite under `NODE_RUNTIME=host`. |
 | Immutable host | The cluster-started migration on an Ignition host (`HOST_BASE_OS=acl`), which needs no access to the host |
-| Adopted machine | `migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |
+| Adopted machine | `migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, its copy of the host steps without the Docker, containerd and kubelet ones, a running host containerd, and a supplied v2 configuration with a plugin. The checks warn that containerd will be masked, adoption masks it and sets Docker's `iptables: false`, and `reset` reverses both. |
 
 The suite runs against the v2 build of each change, and nightly also against
 the published v2 build of each release, because a build from source cannot
@@ -223,10 +235,14 @@ These cover what v1 never had, so the v1 suites cannot:
   returns after reset.
 - Repave with `retainContainerImages: true`: images present, no containers or
   sandboxes, kubelet starts cleanly.
-- A Node deleted while the daemon is stopped: the daemon must not repave when
-  it starts. A NodeReboot then restarts kubelet, which registers the Node
-  again *(inference: kubelet registers only when it starts)*, and deleting the
-  Node again must repave.
+- A Node deleted, with drift, while the daemon is stopped: the daemon must
+  repave when it starts. In a second run, the host also reboots before the
+  daemon starts, so kubelet has registered a new Node: the daemon must repave
+  because the UID changed. In a third, nothing drifted: the daemon must not
+  repave, and must record the new Node's UID.
+- On a Machine whose `configurationRef` names the version the node was built
+  from, `status.configuration` and `RepavePending=False` are set shortly after
+  the daemon starts, without a repave.
 - A daemon restart after it saw a Node deleted, but before the new slot is
   rendered: the repave must finish without another deletion.
 - GPU coverage on `hack/agent/azure-gpu-vm`.

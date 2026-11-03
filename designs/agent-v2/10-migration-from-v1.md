@@ -494,7 +494,15 @@ binary needs it, so it is part of the first implementation:
   manifest, node state, boot wiring and daemon. The backup holds only the
   machine's override, which the commit replaces, and a rollback restores only
   that. v2's undo log records only what v2 changes from then on.
-- The goal version starts empty, as after a bootstrap
+- Host preparation is brought up to v2's, which is the same for every
+  consumer. AKS Flex Node's copy of unbounded's host steps has missed some of
+  them (Azure/AKSFlexNode#423), so an adopted Flex host gains Docker's
+  `iptables: false` and has its own containerd and kubelet masked. The checks
+  before the commit list each host service that will be masked, as warnings
+  that name any that are running. The commit applies the steps and records
+  them in the undo log, so `reset` reverses them.
+- The goal version starts empty, as after a bootstrap, and is recorded on the
+  daemon's first check whose settings match
   ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)).
 
 ## 10. Moving to the `host` runtime
