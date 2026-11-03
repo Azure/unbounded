@@ -1201,6 +1201,7 @@ unsafe extern "C" fn connect(
     raw: *mut c_void,
     local: *const Endpoint,
     remote: *const Endpoint,
+    _initiator: c_int,
 ) -> c_int {
     let Some(h) = (unsafe { handle(raw) }) else {
         return -1;
@@ -1667,11 +1668,16 @@ unsafe extern "C" fn bind(
     qp: *mut c_void,
     window: *mut c_void,
     region: *mut c_void,
-    key: u32,
+    key: *mut u32,
     id: u64,
     offset: u64,
     length: u32,
 ) -> c_int {
+    // The simulated fabric models window mode: the key is the caller's.
+    if key.is_null() {
+        return -1;
+    }
+    let key = unsafe { *key };
     let (Some(q), Some(w), Some(r)) = (unsafe { (handle(qp), handle(window), handle(region)) })
     else {
         return -1;
@@ -1697,7 +1703,7 @@ unsafe extern "C" fn bind(
 }
 
 /// Queue an invalidate. Checked when it completes.
-unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
+unsafe extern "C" fn invalidate(qp: *mut c_void, _window: *mut c_void, key: u32, id: u64) -> c_int {
     let Some(q) = (unsafe { handle(qp) }) else {
         return -1;
     };
@@ -1953,10 +1959,10 @@ mod tests {
             assert!(register(raw, 32, 5).is_null());
             assert!(window(raw, &mut output).is_null());
             assert!(bytes(raw).is_null());
-            assert_eq!(connect(raw, &endpoint, &endpoint), -1);
+            assert_eq!(connect(raw, &endpoint, &endpoint, 1), -1);
             assert_eq!(stop(raw), -1);
-            assert_eq!(bind(raw, raw, raw, 1, 2, 0, 3), -1);
-            assert_eq!(invalidate(raw, 1, 2), -1);
+            assert_eq!(bind(raw, raw, raw, &mut 1, 2, 0, 3), -1);
+            assert_eq!(invalidate(raw, raw, 1, 2), -1);
             assert_eq!(write_imm(raw, raw, 0, 1, 2, 3, 4, 5), -1);
             assert_eq!(send(raw, raw, 0, 1, 2), -1);
             assert_eq!(post_recv(raw, raw, 0, 1, 2), -1);
@@ -2033,7 +2039,7 @@ mod tests {
             sim.fault(Operation::WriteImm, Fault::Reject);
             unsafe {
                 for (q, w, r) in [(null, w, r), (q, null, r), (q, w, null)] {
-                    assert_eq!(bind(q, w, r, inc_rkey(key), 100, 4096, 17), -1);
+                    assert_eq!(bind(q, w, r, &mut inc_rkey(key), 100, 4096, 17), -1);
                 }
                 for (q, r) in [(null, r), (q, null)] {
                     assert_eq!(write_imm(q, r, 0, 17, address, key, 0, 101), -1);
@@ -2169,21 +2175,21 @@ mod tests {
                 Endpoint { port: 0, ..remote },
                 Endpoint { qpn: r, ..remote },
             ] {
-                assert_eq!(connect(q, &local, &bad), -1);
+                assert_eq!(connect(q, &local, &bad, 1), -1);
                 events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
                 assert!(!sim.world.borrow().ready(local.qpn));
                 assert_eq!(sim.live_resources(), 5);
             }
             sim.fault(Operation::Connect, Fault::Reject);
-            assert_eq!(connect(q, &local, &remote), -1);
+            assert_eq!(connect(q, &local, &remote, 1), -1);
             events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
             assert!(!sim.world.borrow().ready(local.qpn));
-            assert_eq!(connect(q, &local, &remote), 0);
+            assert_eq!(connect(q, &local, &remote, 1), 0);
             events(&sim, &[(Operation::Connect, local.qpn, None, 0, false)]);
             assert!(sim.world.borrow().ready(local.qpn));
-            assert_eq!(connect(q, &local, &remote), -1);
+            assert_eq!(connect(q, &local, &remote, 1), -1);
             events(&sim, &[(Operation::Connect, local.qpn, None, -1, false)]);
-            assert_eq!(bind(q, w, region, key, 7, 0, 17), 0);
+            assert_eq!(bind(q, w, region, &mut key, 7, 0, 17), 0);
             events(&sim, &[(Operation::Bind, local.qpn, Some(7), 0, false)]);
             for completed in [false, true] {
                 if completed {
@@ -2262,7 +2268,7 @@ mod tests {
                     (other.pages.raw.as_ptr(), inc_rkey(key)),
                     (link.pages.raw.as_ptr(), key + 0x100),
                 ] {
-                    assert_eq!(bind(q, w.raw.as_ptr(), region, key, 41, 0, 17), -1);
+                    assert_eq!(bind(q, w.raw.as_ptr(), region, &mut { key }, 41, 0, 17), -1);
                     events(&sim, &[(Operation::Bind, qpn, Some(41), -1, false)]);
                 }
                 assert_eq!(
@@ -2286,7 +2292,7 @@ mod tests {
                     let result = if operation == Operation::WriteImm {
                         write_imm(q, link.pages.raw.as_ptr(), 0, 17, target, key + 100, 0, id)
                     } else {
-                        invalidate(q, key + 100, id)
+                        invalidate(q, q, key + 100, id)
                     };
                     assert_eq!(result, 0);
                     events(&sim, &[(operation, qpn, Some(id), 0, false)]);
@@ -2435,8 +2441,8 @@ mod tests {
             .unwrap(),
         };
         before_connect(&link);
-        link.a.connect(link.b.endpoint).unwrap();
-        link.b.connect(link.a.endpoint).unwrap();
+        link.a.connect(link.b.endpoint, true).unwrap();
+        link.b.connect(link.a.endpoint, false).unwrap();
         link
     }
 
@@ -2590,7 +2596,7 @@ mod tests {
                 let link = link(&sim, |_| {});
                 // Connected to `b`, but `b` is not connected back to it.
                 let stranger = link.qp();
-                stranger.connect(link.b.endpoint).unwrap();
+                stranger.connect(link.b.endpoint, true).unwrap();
                 let writer = if case == 5 { &stranger } else { &link.a };
                 let (window, first) = grant(&link, wr(1), 4096, 100);
                 link.b.invalidate_window(wr(2), &window, first).unwrap();
@@ -2946,15 +2952,15 @@ mod tests {
             assert_eq!(post_recv(a, control, 1, 64, 2), -1);
             assert_eq!(post_recv(a, control, 0, 0, 2), -1);
             assert_eq!(send(a, control, 0, 8, 3), -1);
-            assert_eq!(connect(a, &local, &remote), 0);
-            assert_eq!(connect(b, &remote, &local), 0);
+            assert_eq!(connect(a, &local, &remote, 1), 0);
+            assert_eq!(connect(b, &remote, &local, 1), 0);
             // A bind on a control region fails on completion.
             let mut key = 0;
             let w = window(device, &mut key);
             assert_eq!(key & 0xff, 1);
             // Wrong window index, then the right one.
-            assert_eq!(bind(a, w, control, key + 0x100, 4, 0, 8), -1);
-            assert_eq!(bind(a, w, control, key, 4, 0, 8), 0);
+            assert_eq!(bind(a, w, control, &mut (key + 0x100), 4, 0, 8), -1);
+            assert_eq!(bind(a, w, control, &mut key, 4, 0, 8), 0);
             let mut c = Completion::default();
             assert_eq!(poll(a, &mut c, 1), 1);
             assert_eq!((c.id, c.status, c.opcode), (4, 6, u32::MAX));
@@ -2974,10 +2980,10 @@ mod tests {
             assert_eq!(deregister(control), -1);
             assert_eq!(qp_free(b), -1);
             // A bind must use a new key generation.
-            assert_eq!(bind(a, w, pages, key, 8, 0, 8), -1);
+            assert_eq!(bind(a, w, pages, &mut key, 8, 0, 8), -1);
             assert_eq!(stop(b), 0);
             assert_eq!(stop(a), 0);
-            assert_eq!(bind(b, w, pages, key, 7, 0, 8), -1);
+            assert_eq!(bind(b, w, pages, &mut key, 7, 0, 8), -1);
             assert_eq!(window_free(w), 0);
             for (raw, operation) in [
                 (control, Operation::Deregister),
@@ -3040,8 +3046,8 @@ mod tests {
                 let (window, key) = grant(&link, wr(1), 4096, 17);
                 let address = link.pages.address() + 4096;
                 let (sender, receiver) = (link.qp(), link.qp());
-                sender.connect(receiver.endpoint).unwrap();
-                receiver.connect(sender.endpoint).unwrap();
+                sender.connect(receiver.endpoint, true).unwrap();
+                receiver.connect(sender.endpoint, false).unwrap();
                 link.b.post_recv(wr(2), &link.control, 0, 64).unwrap();
                 poke(&link.pages, 0, &[0xa5; 17]);
                 sim.fault(Operation::WriteImm, Fault::Delay(1));
