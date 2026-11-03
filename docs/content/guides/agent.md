@@ -163,6 +163,18 @@ kubectl unbounded machine manual-bootstrap my-node --site mysite > bootstrap.sh
 ```
 {{< /callout >}}
 
+{{< callout type="note" >}}
+`manual-bootstrap` adds `unbounded-cloud.io/site=<--site>` to the node labels
+unless you set a site label yourself with `--node-label`. The agent copies it
+onto the Machine it creates, which site-scoped Machine operations require.
+Machines bootstrapped by an earlier version of the CLI have no site label. Add
+it with:
+
+```bash
+kubectl label machine <name> unbounded-cloud.io/site=<site>
+```
+{{< /callout >}}
+
 ### Reusable bootstrap payloads (VMSS / Auto Scaling)
 
 The `NAME` argument is optional. When you omit it, the generated payload leaves
