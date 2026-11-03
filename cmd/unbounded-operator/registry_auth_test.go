@@ -17,5 +17,9 @@ func TestOperatorDoesNotImplementCredentialProvider(t *testing.T) {
 	node, _, err := cmd.Find([]string{"registry-auth-node"})
 	require.NoError(t, err)
 	require.NotNil(t, node.Flags().Lookup("provider-binary"))
+	require.NotNil(t, node.Flags().Lookup("config-json"))
+	require.Nil(t, node.Flags().Lookup("namespace"))
+	require.Nil(t, node.Flags().Lookup("identity"))
+	require.Nil(t, node.Flags().Lookup("config"))
 	require.Nil(t, node.Flags().Lookup("token-file"), "the installer must not acquire ACR credentials")
 }

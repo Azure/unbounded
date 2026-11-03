@@ -320,6 +320,12 @@ kubectl unbounded gantry attach-acr \
 unified stock `acr-credential-provider` in **AKS identity-bindings mode** on
 Linux Flex nodes, whether those nodes run in Azure or outside Azure.
 
+**Warning:** applying managed authentication may restart all targeted Flex
+kubelets concurrently. Nodes are not drained automatically; the administrator
+is responsible for the impact on existing workloads. The CLI prints this warning
+before making managed-authentication changes. New workers automatically receive
+the policy; no additional attachment command is needed.
+
 The attachment command updates Gantry's upstream configuration and managed-auth
 policy together. The operator validates that policy and configures nodes; it
 does not add or repair registry entries. Removing the selected upstream while
@@ -345,6 +351,14 @@ the `system:nodes` group. Membership follows eligible node additions, relabeling
 and removal. Switching to external policy revokes these operator-owned grants.
 Kubernetes still checks that each token request is bound to a Pod on the
 requesting node.
+
+The separate `gantry-acr-auth` DaemonSet receives non-secret policy inline in
+its Pod template and does not mount an API token or reference a ConfigMap or
+Secret. There is no shared restart Lease or per-worker configuration watch.
+Local checks repair owned-file drift without restarting unchanged kubelets.
+Node membership is maintained by a central, server-filtered metadata informer and
+event-driven RBAC reconciliation, with at most 1,000 named users per binding.
+The 10,000-worker behavior is tested offline, not live benchmarked.
 
 There is no custom broker, exec adapter, or token-exchange service. Pull
 authentication needs no VM/VMSS identity assignments or IMDS fallback. Initial

@@ -27,10 +27,8 @@ func registryAuthCommands() []*cobra.Command {
 		},
 	}
 	node.Flags().StringVar(&opts.Root, "host-root", "/host", "Mounted node root filesystem")
-	node.Flags().StringVar(&opts.ConfigPath, "config", "/etc/registry-auth/config.json", "Projected node-auth desired state")
+	node.Flags().StringVar(&opts.ConfigJSON, "config-json", os.Getenv("REGISTRY_AUTH_CONFIG"), "Inline non-secret node-auth desired state")
 	node.Flags().StringVar(&opts.Listen, "listen", ":9096", "Node-auth health listener")
-	node.Flags().StringVar(&opts.Namespace, "namespace", os.Getenv("POD_NAMESPACE"), "Restart Lease namespace")
-	node.Flags().StringVar(&opts.Identity, "identity", os.Getenv("POD_UID"), "Unique identity for restart coordination")
 	node.Flags().StringVar(&opts.ProviderPath, "provider-binary", registryauth.ProviderBinary, "Stock upstream ACR provider executable")
 
 	return []*cobra.Command{node}

@@ -75,15 +75,15 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	require.NotNil(t, result)
 	require.False(t, result.Ready)
 	require.Equal(t, "RegistryAuthInstalling", result.Reason)
-	require.Positive(t, result.RequeueAfter)
-	require.Len(t, operations, 8)
+	require.Zero(t, result.RequeueAfter)
+	require.Len(t, operations, 2)
 
 	var ds appsv1.DaemonSet
 
 	for _, op := range operations {
 		if op.Object.GetKind() == "DaemonSet" {
 			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds))
-			require.Len(t, op.DependsOn, 7)
+			require.Len(t, op.DependsOn, 1)
 		}
 	}
 
@@ -92,8 +92,19 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	require.Equal(t, installationManagerOperator, ds.Labels["app.kubernetes.io/managed-by"])
 	require.Equal(t, "registry.example.com/unbounded/unbounded-operator:v1.2.3", ds.Spec.Template.Spec.Containers[0].Image)
 	require.Equal(t, registryAuthName, ds.Spec.Template.Spec.ServiceAccountName)
+	require.False(t, *ds.Spec.Template.Spec.AutomountServiceAccountToken)
+	require.Empty(t, ds.Spec.Template.Spec.Containers[0].EnvFrom)
+	require.Len(t, ds.Spec.Template.Spec.Containers[0].Env, 1)
+	require.Nil(t, ds.Spec.Template.Spec.Containers[0].Env[0].ValueFrom)
+
+	var cfg registryauth.Config
+	require.NoError(t, json.Unmarshal([]byte(ds.Spec.Template.Spec.Containers[0].Env[0].Value), &cfg))
+	require.Equal(t, registryauth.IdentityBindingMode, cfg.Mode)
 
 	for _, volume := range ds.Spec.Template.Spec.Volumes {
+		require.Nil(t, volume.ConfigMap)
+		require.Nil(t, volume.Secret)
+
 		if volume.Projected == nil {
 			continue
 		}
@@ -106,7 +117,7 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	}
 
 	require.Equal(t, []string{"registry-auth-node"}, ds.Spec.Template.Spec.Containers[0].Args)
-	require.Equal(t, int32(1), ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal)
+	require.Equal(t, "100%", ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.StrVal)
 	require.Equal(t, []corev1.Capability{"SYS_CHROOT"}, ds.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities.Add)
 
 	var got corev1.ConfigMap
@@ -116,6 +127,29 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 
 func componentKey(name string) struct{ Namespace, Name string } {
 	return struct{ Namespace, Name string }{Namespace: component.DefaultNamespace, Name: name}
+}
+
+func TestNodeAuthInlinePolicyDoesNotExpandServiceEnvironmentReferences(t *testing.T) {
+	source := authSource("")
+	cfg, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
+	require.NoError(t, err)
+
+	cfg.Audience = "api://$(KUBERNETES_SERVICE_HOST)"
+	policy, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+
+	source.Data[registryauth.ConfigKey] = string(policy)
+	operations, _, err := planRegistryAuth(t.Context(), testEnv(t, source))
+	require.NoError(t, err)
+
+	var ds appsv1.DaemonSet
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &ds))
+	value := ds.Spec.Template.Spec.Containers[0].Env[0].Value
+	require.Contains(t, value, "api://$$(KUBERNETES_SERVICE_HOST)", "a service environment variable must not replace the configured audience")
+
+	var received registryauth.Config
+	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(value, "$$", "$")), &received))
+	require.Equal(t, cfg, received)
 }
 
 func TestNodeAuthInstallationModes(t *testing.T) {
@@ -140,7 +174,7 @@ func TestNodeAuthInstallationModes(t *testing.T) {
 			require.NoError(t, err)
 
 			if tc.install {
-				require.Len(t, operations, 8, "kubelet authentication must survive a Gantry storage-backend change")
+				require.Len(t, operations, 2, "kubelet authentication must survive a Gantry storage-backend change")
 				require.NotNil(t, result)
 			} else {
 				require.Empty(t, operations)
@@ -173,8 +207,15 @@ func TestNodeAuthReadinessDistinguishesUnverifiedPermissions(t *testing.T) {
 			_, result, err := planRegistryAuth(t.Context(), env)
 			require.NoError(t, err)
 			require.True(t, result.Ready)
+			require.Zero(t, result.RequeueAfter)
 
 			require.Contains(t, result.Message, "unverified")
+
+			existing.Spec.Template.Spec.Containers[0].Env[0].Value = `{"mode":"external"}`
+			require.NoError(t, env.Client.Update(t.Context(), &existing))
+			_, result, err = planRegistryAuth(t.Context(), env)
+			require.NoError(t, err)
+			require.False(t, result.Ready, "a matching hash must not conceal actual template drift")
 
 			existing.Spec.Template.Annotations[registryAuthHash] = "old-config"
 			require.NoError(t, env.Client.Update(t.Context(), &existing))
@@ -193,46 +234,35 @@ func TestNodeAuthExternalModeKeepsReconcilerForOwnedFileCleanup(t *testing.T) {
 	operations, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
 	require.False(t, result.Ready)
-	require.Len(t, operations, 6)
+	require.Len(t, operations, 2)
 
 	for _, op := range operations {
-		if op.Object.GetKind() == "ConfigMap" {
-			var config corev1.ConfigMap
-			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &config))
+		if op.Object.GetKind() == "DaemonSet" {
+			var ds appsv1.DaemonSet
+			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds))
 
 			var cfg registryauth.Config
-			require.NoError(t, json.Unmarshal([]byte(config.Data["config.json"]), &cfg))
+			require.NoError(t, json.Unmarshal([]byte(ds.Spec.Template.Spec.Containers[0].Env[0].Value), &cfg))
 			require.Equal(t, "external", cfg.Mode)
 		}
 	}
 }
 
-func TestNodeAuthLeasePrivilegesAreNarrowAndOperatorCreatesLease(t *testing.T) {
+func TestNodeAuthRequiresNoLeaseOrKubernetesPrivileges(t *testing.T) {
 	env := testEnv(t, authSource(""))
 	operations, _, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
 
-	var role rbacv1.Role
-
 	for _, op := range operations {
-		switch op.Object.GetKind() {
-		case "Role":
-			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &role))
-		case "Lease":
-			require.Equal(t, registryauth.RestartLeaseName, op.Object.GetName())
-			require.Equal(t, component.OpCreateIfAbsent, op.Kind)
-		}
+		require.Contains(t, []string{"ServiceAccount", "DaemonSet"}, op.Object.GetKind())
 	}
 
-	require.Len(t, role.Rules, 1)
-	require.Equal(t, []string{"get", "update"}, role.Rules[0].Verbs)
-	require.Equal(t, []string{registryauth.RestartLeaseName}, role.Rules[0].ResourceNames)
-	require.Equal(t, []string{"leases"}, role.Rules[0].Resources)
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("flex", nil)})
 	require.NoError(t, err)
 	order, err := plan.ExecutionOrder()
 	require.NoError(t, err)
-	require.Less(t, strings.Index(order, "CreateIfAbsent Lease/"+component.DefaultNamespace+"/"+registryauth.RestartLeaseName), strings.Index(order, "CreateIfAbsent DaemonSet/"+component.DefaultNamespace+"/"+registryAuthName))
+	require.NotContains(t, order, "gantry-acr-auth-restart")
+	require.Less(t, strings.Index(order, "CreateIfAbsent ServiceAccount/"+component.DefaultNamespace+"/"+registryAuthName), strings.Index(order, "CreateIfAbsent DaemonSet/"+component.DefaultNamespace+"/"+registryAuthName))
 }
 
 func TestAuthCleanupRecreatesDeletedHelper(t *testing.T) {
@@ -242,7 +272,7 @@ func TestAuthCleanupRecreatesDeletedHelper(t *testing.T) {
 	require.NoError(t, rbacv1.AddToScheme(env.Client.Scheme()))
 	operations, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
-	require.Len(t, operations, 6)
+	require.Len(t, operations, 2)
 	require.NotNil(t, result)
 	require.False(t, result.Ready)
 }
@@ -259,7 +289,7 @@ func TestExternalCleanupRevokesOnlyOwnedIdentityUseBinding(t *testing.T) {
 			require.NoError(t, rbacv1.AddToScheme(env.Client.Scheme()))
 			require.NoError(t, env.Client.Create(t.Context(), binding))
 
-			operations, _, err := planRegistryAuth(t.Context(), env)
+			operations, err := planRegistryAuthAudience(t.Context(), env, registryauth.Config{Mode: registryauth.ExternalMode})
 			if !owned {
 				require.ErrorContains(t, err, "unowned")
 				return
@@ -383,11 +413,15 @@ func TestRegistryAuthAudienceOwnershipAndRevocation(t *testing.T) {
 				require.NoError(t, env.Client.Create(t.Context(), object))
 			}
 
-			operations, err = planRegistryAuthAudience(t.Context(), env, cfg)
+			changed := cfg
+			changed.Audience += "-changed"
+
+			operations, err = planRegistryAuthAudience(t.Context(), env, changed)
 			if foreign {
 				require.ErrorContains(t, err, "unowned registry-auth")
 			} else {
 				require.NoError(t, err)
+				require.Len(t, operations, 1)
 
 				for _, op := range operations {
 					require.Equal(t, component.OpApply, op.Kind)
@@ -425,9 +459,8 @@ func TestRegistryAuthAudienceRevokedAfterHelperDeletion(t *testing.T) {
 		require.NoError(t, env.Client.Create(t.Context(), op.Object))
 	}
 
-	operations, result, err := planRegistryAuth(t.Context(), env)
+	operations, err = planRegistryAuthAudience(t.Context(), env, registryauth.Config{Mode: registryauth.ExternalMode})
 	require.NoError(t, err)
-	require.Nil(t, result)
 	require.Len(t, operations, 2)
 
 	for _, op := range operations {

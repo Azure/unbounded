@@ -9,11 +9,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -51,7 +51,7 @@ func TestExternalAuthUpgradeIgnoresUnownedHelperNames(t *testing.T) {
 					order, err := plan.ExecutionOrder()
 					require.NoError(t, err)
 					require.NotContains(t, order, registryAuthName)
-					require.NotContains(t, order, registryauth.RestartLeaseName)
+					require.NotContains(t, order, "gantry-acr-auth-restart")
 					require.NotContains(t, order, registryauth.IdentityRoleName)
 
 					var got corev1.ConfigMap
@@ -97,18 +97,14 @@ func TestRegistryAuthRefusesUnownedSupportResources(t *testing.T) {
 	}
 }
 
-func TestRegistryAuthPinsOwnedUpdatesAndPreservesRestartLease(t *testing.T) {
+func TestRegistryAuthPinsOwnedUpdatesWithoutRestartCoordination(t *testing.T) {
 	objects, _ := registryAuthObjects(&component.Env{Namespace: component.DefaultNamespace}, nil, "old-config")
-
-	var originalLease *coordinationv1.Lease
 
 	for _, object := range objects {
 		object.SetUID(types.UID("owned-" + object.GetObjectKind().GroupVersionKind().Kind))
 
-		if lease, ok := object.(*coordinationv1.Lease); ok {
-			holder := "running-installer"
-			lease.Spec.HolderIdentity = &holder
-			originalLease = lease
+		if account, ok := object.(*corev1.ServiceAccount); ok {
+			account.AutomountServiceAccountToken = ptr.To(true)
 		}
 	}
 
@@ -116,28 +112,19 @@ func TestRegistryAuthPinsOwnedUpdatesAndPreservesRestartLease(t *testing.T) {
 	env := testEnv(t, fixtures...)
 	operations, _, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
-	require.Len(t, operations, 7)
+	require.Len(t, operations, 2)
 
 	for _, op := range operations {
 		require.NotEqual(t, "Lease", op.Object.GetKind())
-
-		if op.Object.GetKind() == "ClusterRole" || op.Object.GetKind() == "ClusterRoleBinding" {
-			require.Equal(t, component.OpCreateIfAbsent, op.Kind)
-			continue
-		}
 
 		require.Equal(t, component.OpApply, op.Kind)
 		require.Equal(t, "owned-"+op.Object.GetKind(), string(op.Object.GetUID()))
 		require.NotEmpty(t, op.Object.GetResourceVersion())
 
 		if op.Object.GetKind() == "DaemonSet" {
-			require.Len(t, op.DependsOn, 6)
+			require.Len(t, op.DependsOn, 1)
 		}
 	}
-
-	var lease coordinationv1.Lease
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(originalLease), &lease))
-	require.Equal(t, originalLease.Spec, lease.Spec)
 }
 
 func TestRegistryAuthCreateRacePreservesCustomerObject(t *testing.T) {
@@ -149,9 +136,9 @@ func TestRegistryAuthCreateRacePreservesCustomerObject(t *testing.T) {
 		require.Equal(t, component.OpCreateIfAbsent, op.Kind)
 	}
 
-	foreign := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: registryAuthName, Namespace: env.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "customer"}},
-		Data:       map[string]string{"config.json": "preserve"},
+	foreign := &corev1.ServiceAccount{
+		ObjectMeta:                   metav1.ObjectMeta{Name: registryAuthName, Namespace: env.Namespace, Labels: map[string]string{"app.kubernetes.io/managed-by": "customer"}},
+		AutomountServiceAccountToken: ptr.To(true),
 	}
 	require.NoError(t, env.Client.Create(t.Context(), foreign))
 
@@ -162,9 +149,9 @@ func TestRegistryAuthCreateRacePreservesCustomerObject(t *testing.T) {
 	require.NotEmpty(t, result.Stale)
 	require.NotEmpty(t, result.Deferred)
 
-	var got corev1.ConfigMap
+	var got corev1.ServiceAccount
 	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(foreign), &got))
-	require.Equal(t, foreign.Data, got.Data)
+	require.Equal(t, foreign.AutomountServiceAccountToken, got.AutomountServiceAccountToken)
 	require.Equal(t, foreign.Labels, got.Labels)
 
 	var ds appsv1.DaemonSet

@@ -36,7 +36,7 @@ const (
 
 // Installer owns only its dedicated directory and kubelet drop-in. It never
 // edits the agent-generated unit, its drop-ins, or containerd's mirror route.
-// Call Reconcile under the restart coordination Lease.
+// Each node reconciles independently; only changed configuration restarts kubelet.
 type Installer struct {
 	Root        string
 	Executable  string

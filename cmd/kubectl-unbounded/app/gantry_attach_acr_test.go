@@ -215,6 +215,7 @@ func TestGantryAttachACRExternalPreservesCustomerAuthentication(t *testing.T) {
 			require.Contains(t, got.Data["config.yaml"], "credentials_path: /shared/auth")
 			require.Contains(t, got.Data["config.yaml"], "central.azurecr.io")
 			require.Contains(t, h.out.(*bytes.Buffer).String(), "existing authentication unchanged")
+			require.NotContains(t, h.out.(*bytes.Buffer).String(), "WARNING:")
 
 			for _, action := range client.Actions() {
 				require.Equal(t, "configmaps", action.GetResource().Resource)
@@ -223,6 +224,24 @@ func TestGantryAttachACRExternalPreservesCustomerAuthentication(t *testing.T) {
 			require.NoError(t, h.execute(t.Context()))
 		})
 	}
+}
+
+func TestGantryManagedACRWarningPrecedesEverySideEffect(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	run := h.runAzure
+	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+		require.Contains(t, h.out.(*bytes.Buffer).String(), "kubelets on all targeted Linux Flex nodes concurrently")
+		require.Contains(t, h.out.(*bytes.Buffer).String(), "Nodes are not drained automatically")
+		require.Contains(t, h.out.(*bytes.Buffer).String(), "responsible for the impact on existing workloads")
+
+		return run(ctx, args...)
+	}
+
+	client.PrependReactor("*", "*", func(k8stesting.Action) (bool, runtime.Object, error) {
+		require.Contains(t, h.out.(*bytes.Buffer).String(), "WARNING:")
+		return false, nil, nil
+	})
+	require.NoError(t, h.execute(t.Context()))
 }
 
 func TestGantryAttachACRDefaultDoesNotCreateAuthenticationPolicy(t *testing.T) {

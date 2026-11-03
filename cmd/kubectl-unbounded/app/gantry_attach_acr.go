@@ -115,6 +115,10 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 		if !strings.EqualFold(clusterID.SubscriptionID, acrID.SubscriptionID) {
 			return errors.New("ACR and AKS cluster must be in the same subscription")
 		}
+
+		if _, err := fmt.Fprintln(h.out, "WARNING: managed ACR authentication may restart kubelets on all targeted Linux Flex nodes concurrently. Nodes are not drained automatically; you are responsible for the impact on existing workloads."); err != nil {
+			return err
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, h.timeout)

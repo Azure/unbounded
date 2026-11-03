@@ -1,7 +1,8 @@
 # Gantry ACR onboarding
 
-Status: agreed design, implementation in progress. Live private-image pulls and
-end-to-end acceleration have not been validated.
+Status: private-image pulls and peer delivery have been live-validated on three
+Azure-hosted Flex VMSS workers with AKS 1.36.5. The scalability redesign is
+offline-tested, not live-deployed.
 
 ## Contract
 
@@ -81,8 +82,21 @@ cluster access, not per-tenant isolation.
   operator-owned helper state; all helper resources must have matching ownership
   labels before updates. Existing updates and deletes carry observed API
   preconditions, and absent objects are created without forcing adoption.
-- Restart coordination serializes kubelet configuration changes. Owned-file
-  drift and Flex-runtime recreation are reconciled automatically.
+- Helpers receive non-secret policy inline in their Pod templates, not through
+  ConfigMap or Secret references. Policy changes replace helpers with a
+  `100%` max-unavailable rollout. They have no Kubernetes client, API token,
+  Lease permissions, or shared restart coordination.
+- Kubelets may restart concurrently, without draining nodes. The CLI warns
+  before managed-authentication side effects; the administrator owns the impact
+  on existing workloads. Local drift checks restart only when required.
+- A separate singleton controller maintains named-node audience grants using
+  one server-filtered, metadata-only Linux Flex Node informer. ConfigMap, Node membership, and
+  audience RBAC events trigger coalesced work; healthy controllers do not poll.
+- Bindings contain at most 1,000 users. Existing eligible users retain their
+  binding across joins and departures; overflow gets a new binding. Migration
+  populates new bindings before truncating the old single binding. Changed
+  resources receive authoritative ownership checks and API preconditions;
+  unchanged roles and bindings receive no writes or live reads.
 - Explicit external policy removes only owned node configuration and revokes
   the owned collective identity-use binding. The shared ACR is never adopted,
   retagged, recreated, or deleted.
@@ -111,6 +125,9 @@ Offline tests cover deployment and upgrades without authentication changes,
 default external behavior, explicit managed-auth opt-in, ownership collisions,
 configuration preservation, stock-provider request configuration, Linux Flex
 selection, ownership conflicts, retry/restart recovery, and failure paths.
+Simulated 10,000-worker tests cover bounded grants, stable assignments, no-op
+RBAC, cache-only Node lists, burst coalescing, and legacy migration. They are
+not a live performance benchmark.
 Installation readiness does not establish ACR authorization, a successful
 private-image pull, or Gantry acceleration. Those require separate live checks
 on Azure and non-Azure nodes, including future nodes and runtime recreation.
