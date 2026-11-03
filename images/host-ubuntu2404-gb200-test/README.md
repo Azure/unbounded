@@ -27,15 +27,12 @@ The image:
 NVLink and NVLS are deliberately disabled. Local CUDA and fallback collectives
 remain available.
 
-Before HostReplace, annotate the Machine so MetalMan does not replace these
-image-baked users with its vendor-data user list:
+MetalMan recognizes the exact GB200 test image repository, including tagged and
+digest-pinned references, and does not replace its image-baked users with the
+vendor-data user list. Other images retain the existing vendor user behavior.
 
-```text
-unbounded-cloud.io/preserve-image-users: "true"
-```
-
-The temporary Machine user-data ConfigMap reference must also be removed or
-replaced with configuration that retains the complete user list.
+Before HostReplace, the temporary Machine user-data ConfigMap reference must be
+removed or replaced with configuration that retains the complete user list.
 
 The embedded agent is available at:
 

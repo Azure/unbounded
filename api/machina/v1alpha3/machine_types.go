@@ -107,10 +107,6 @@ const (
 	// object to record which MachineConfigurationVersion was used to
 	// bootstrap the machine.
 	AnnotationConfigurationVersion = "unbounded-cloud.io/machine-configuration-version"
-
-	// AnnotationPreserveImageUsers prevents MetalMan vendor-data from
-	// replacing users configured in the host image.
-	AnnotationPreserveImageUsers = "unbounded-cloud.io/preserve-image-users"
 )
 
 // MachineSpec defines the desired state of a Machine.

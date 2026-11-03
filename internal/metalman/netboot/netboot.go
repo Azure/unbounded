@@ -21,12 +21,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"oras.land/oras-go/v2/registry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
+
+const gb200TestImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-test"
 
 // ErrNotYetDownloaded is returned when an OCI image has not yet been
 // pulled and unpacked to the local cache.
@@ -336,7 +339,9 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		agent = node.Spec.Agent
 
 		bootLease = selectBootLease(node, requestIP)
-		preserveImageUsers = node.Annotations[v1alpha3.AnnotationPreserveImageUsers] == "true"
+		if netboot := node.Spec.Netboot(); netboot != nil {
+			preserveImageUsers = isGB200TestImage(netboot.Image)
+		}
 	}
 
 	return templateData{
@@ -350,6 +355,15 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		InstallRequested:   installRequested,
 		PreserveImageUsers: preserveImageUsers,
 	}
+}
+
+func isGB200TestImage(image string) bool {
+	imageRef, err := registry.ParseReference(image)
+	if err != nil {
+		return false
+	}
+
+	return imageRef.Registry+"/"+imageRef.Repository == gb200TestImageRepository
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
