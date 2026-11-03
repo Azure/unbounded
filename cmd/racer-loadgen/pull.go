@@ -495,6 +495,7 @@ func (p *puller) readBody(body io.Reader) (int64, string, error) {
 		stop := p.reportProgress(body)
 		n, err := io.Copy(devNull, body)
 		reported := stop()
+
 		p.drains.put(devNull)
 		p.metrics.receivedBytes.Add(float64(n - reported))
 

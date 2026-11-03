@@ -314,7 +314,7 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 		if o.finalReady {
 			n, err := dst.write(o.final[:])
 			written += n
-		o.progress.Add(n)
+			o.progress.Add(n)
 
 			if err != nil {
 				return written, err
@@ -329,7 +329,7 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 		if o.conn.r.Buffered() == 0 && unix && dst.rf != nil {
 			n, err := o.splice(dst, raw)
 			written += n
-		o.progress.Add(n)
+			o.progress.Add(n)
 
 			if err != nil {
 				return written, err
