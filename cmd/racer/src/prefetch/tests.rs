@@ -415,14 +415,14 @@ fn ttl_expiry_cancels_unsettled_tickets_and_retention_removes_them() {
     assert!(r.registry.next_deadline().is_some());
     r.registry.expire(r.now + Duration::from_secs(6));
     let status = r.status("t");
-    assert_eq!(status.state, State::Cancelled);
+    assert_eq!(status.state, State::Canceled);
     assert_eq!(status.reason, Some(Reason::Expired));
     // A settled ticket keeps its outcome at expiry.
     assert_eq!(r.status("done").state, State::Succeeded);
     // Equal (g, s) and hash on a terminal ticket returns the retained status;
     // a higher (g, s) restarts it.
     let replay = spec("\"ttl_seconds\":5,", &[&pages(KEY_A, 0, 1)]);
-    assert_eq!(r.put("t", replay).unwrap().1.state, State::Cancelled);
+    assert_eq!(r.put("t", replay).unwrap().1.state, State::Canceled);
     r.registry.expire(r.now + Duration::from_secs(17));
     assert_eq!(r.registry.ticket_count(), 0);
     let restart = spec("\"sequence\":1,", &[&pages(KEY_A, 0, 1)]);
@@ -435,7 +435,7 @@ fn delete_cancels_and_restart_needs_higher_sequence() {
     r.put("t", spec("", &[&pages(KEY_A, 0, 2)])).unwrap();
     let batch = r.registry.next_batch(r.now, 1).unwrap();
     let status = r.registry.delete(&cache(), "t", r.now).unwrap();
-    assert_eq!(status.state, State::Cancelled);
+    assert_eq!(status.state, State::Canceled);
     assert_eq!(status.reason, Some(Reason::Client));
     assert!(status.settled);
     // The queued page is dropped; the in-flight fill completes normally.
@@ -460,7 +460,7 @@ fn delete_cancels_and_restart_needs_higher_sequence() {
         .unwrap();
     assert_eq!((code, status.state), (200, State::Queued));
     let (_, finished) = r.registry.take_events();
-    assert!(finished.contains(&(Priority::Normal, Outcome::Cancelled)));
+    assert!(finished.contains(&(Priority::Normal, Outcome::Canceled)));
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn cache_removal_and_passthrough_cancel_tickets() {
     let status = r.status("t");
     assert_eq!(
         (status.state, status.reason),
-        (State::Cancelled, Some(Reason::CacheRemoved))
+        (State::Canceled, Some(Reason::CacheRemoved))
     );
 }
 

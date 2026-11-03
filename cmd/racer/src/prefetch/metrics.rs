@@ -59,23 +59,18 @@ pub enum Outcome {
     Succeeded,
     Partial,
     Failed,
-    Cancelled,
+    Canceled,
 }
 
 impl Outcome {
-    const ALL: [Self; 4] = [
-        Self::Succeeded,
-        Self::Partial,
-        Self::Failed,
-        Self::Cancelled,
-    ];
+    const ALL: [Self; 4] = [Self::Succeeded, Self::Partial, Self::Failed, Self::Canceled];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Partial => "partial",
             Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
+            Self::Canceled => "cancelled",
         }
     }
 }

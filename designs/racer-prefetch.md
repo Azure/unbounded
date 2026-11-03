@@ -509,7 +509,7 @@ specified above. Where the server had to choose, it did the following.
   pages.
 - Membership change re-plans queued units (owners are ranked at dispatch) and
   re-queues admitted pages of live tickets whose owner left. Units in flight
-  to a departed owner are not cancelled; their failure is retried and
+  to a departed owner are not canceled; their failure is retried and
   re-ranked.
 - A unit that already failed for one ticket is reported failed to another
   ticket that adds interest while the unit is still tracked.

@@ -174,10 +174,10 @@ pub enum State {
     #[serde(rename = "FAILED")]
     Failed,
     #[serde(rename = "CANCELLED")]
-    Cancelled,
+    Canceled,
 }
 
-/// Why a ticket was cancelled.
+/// Why a ticket was canceled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {

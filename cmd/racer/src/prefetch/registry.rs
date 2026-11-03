@@ -129,8 +129,8 @@ struct Ticket {
     expires_at_ms: u64,
     created_at_ms: u64,
     updated_at_ms: u64,
-    cancelled: Option<Reason>,
-    /// Interest released (cancelled or expired). The ticket is retained for
+    canceled: Option<Reason>,
+    /// Interest released (canceled or expired). The ticket is retained for
     /// status until `remove_at`.
     released: bool,
     remove_at: Option<Instant>,
@@ -466,7 +466,7 @@ impl Registry {
             expires_at_ms: wall + spec.ttl_seconds * 1000,
             created_at_ms: previous.as_ref().map_or(wall, |old| old.created_at_ms),
             updated_at_ms: wall,
-            cancelled: None,
+            canceled: None,
             released: false,
             remove_at: None,
             refs,
@@ -871,16 +871,16 @@ impl Registry {
         let Some(ticket) = self.tickets.get_mut(key) else {
             return;
         };
-        if ticket.cancelled.is_some() {
+        if ticket.canceled.is_some() {
             return;
         }
         let record = !ticket.finished_recorded;
-        ticket.cancelled = Some(reason);
+        ticket.canceled = Some(reason);
         ticket.finished_recorded = true;
         ticket.updated_at_ms = wall_ms();
         let priority = ticket.priority;
         if record {
-            self.finished.push((priority, Outcome::Cancelled));
+            self.finished.push((priority, Outcome::Canceled));
         }
         self.release(key, now);
     }
@@ -992,8 +992,8 @@ impl Registry {
     }
 
     fn state_of(&self, ticket: &Ticket) -> State {
-        if ticket.cancelled.is_some() {
-            return State::Cancelled;
+        if ticket.canceled.is_some() {
+            return State::Canceled;
         }
         if !ticket.released && ticket.open != 0 {
             let started = ticket.units.iter().any(|key| {
@@ -1144,7 +1144,7 @@ impl Registry {
             id: ticket.id.clone(),
             cache_uid: ticket.cache.0.clone(),
             state: self.state_of(ticket),
-            reason: ticket.cancelled,
+            reason: ticket.canceled,
             priority: ticket.priority.as_str(),
             generation: ticket.generation,
             sequence: ticket.sequence,
@@ -1173,7 +1173,7 @@ impl Registry {
             .map(|(_, ticket)| Summary {
                 id: ticket.id.clone(),
                 state: self.state_of(ticket),
-                reason: ticket.cancelled,
+                reason: ticket.canceled,
                 priority: ticket.priority.as_str(),
                 generation: ticket.generation,
                 sequence: ticket.sequence,
