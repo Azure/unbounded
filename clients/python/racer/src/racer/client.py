@@ -459,9 +459,20 @@ class Client:
         raw = self._head_bytes(head + "\r\n") + (body or b"")
         conn = _Conn(self.socket_path, None if self.timeout is None else self.timeout + wait)
         try:
-            conn.send_head(raw)
-            h = wire.parse_response_head(conn.read_head())
-            payload = self._read_body(conn, h)
+            try:
+                conn.send_head(raw)
+            except (BrokenPipeError, ConnectionResetError) as send_err:
+                # Racer may reject an oversized body before reading it. Recover
+                # a complete rejection response if one is readable; otherwise
+                # surface the original send error.
+                try:
+                    h = wire.parse_response_head(conn.read_head())
+                    payload = self._read_body(conn, h)
+                except Exception:
+                    raise send_err from None
+            else:
+                h = wire.parse_response_head(conn.read_head())
+                payload = self._read_body(conn, h)
         finally:
             conn.close()
         if h.status not in (200, 201):

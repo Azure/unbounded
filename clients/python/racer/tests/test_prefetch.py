@@ -482,3 +482,52 @@ def test_oversized_put_rejected_before_body(server):
     head, _, body = out.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.1 413")
     assert json.loads(body)["code"] == "too_large"
+
+
+def _early_close_server(path, response):
+    """Reads only the request head, optionally replies, then closes without reading the body."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    sock.listen(1)
+
+    def serve():
+        conn, _ = sock.accept()
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        if response:
+            conn.sendall(response)
+        conn.close()
+        sock.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    return t
+
+
+def test_oversized_put_rejected_before_body(tmp_path):
+    path = str(tmp_path / "s")
+    body = json.dumps({"code": "too_large", "message": "body too large"}).encode()
+    resp = (
+        b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n"
+        b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    t = _early_close_server(path, resp)
+    c = racer.Client(socket_path=path, timeout=5)
+    with pytest.raises(racer.PrefetchError) as exc:
+        c._json_call("PUT", "/v1/prefetch/x", "Content-Type: application/json\r\n", b"x" * (16 << 20))
+    assert exc.value.status == 413
+    assert exc.value.code == "too_large"
+    t.join(5)
+
+
+def test_oversized_put_send_error_without_response(tmp_path):
+    path = str(tmp_path / "s")
+    t = _early_close_server(path, b"")
+    c = racer.Client(socket_path=path, timeout=5)
+    with pytest.raises((BrokenPipeError, ConnectionResetError)):
+        c._json_call("PUT", "/v1/prefetch/x", "Content-Type: application/json\r\n", b"x" * (16 << 20))
+    t.join(5)
