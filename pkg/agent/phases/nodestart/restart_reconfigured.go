@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
@@ -70,9 +69,7 @@ func (r *restartReconfigured) Do(ctx context.Context) error {
 			"machine", r.goalState.MachineName,
 		)
 
-		if _, err := executil.MachineRun(ctx, r.log, r.goalState.MachineName,
-			"systemctl", "restart", unit.name,
-		); err != nil {
+		if _, err := r.goalState.Exec(ctx, r.log, "systemctl", "restart", unit.name); err != nil {
 			return fmt.Errorf("systemctl restart %s in %s: %w", unit.name, r.goalState.MachineName, err)
 		}
 	}

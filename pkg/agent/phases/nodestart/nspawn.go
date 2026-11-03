@@ -7,67 +7,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
-	"time"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
-
-// machinectlRunner abstracts the small set of machinectl/systemctl operations
-// we need so tests can exercise the recovery path without invoking real
-// binaries. The default implementation, defaultMachinectlRunner, shells out
-// via executil.
-type machinectlRunner interface {
-	Start(ctx context.Context, name string) error
-	Enable(ctx context.Context, name string) error
-	Terminate(ctx context.Context, name string) error
-	Exists(ctx context.Context, name string) bool
-	ResetFailed(ctx context.Context, name string) error
-	Running(ctx context.Context, name string) (bool, error)
-}
-
-type defaultMachinectlRunner struct {
-	log *slog.Logger
-}
-
-func (r defaultMachinectlRunner) Running(ctx context.Context, name string) (bool, error) {
-	out, err := executil.OutputCmd(ctx, r.log, "systemctl", "show", "systemd-nspawn@"+name+".service", "--property=ActiveState", "--value")
-	if err != nil {
-		return false, err
-	}
-
-	return strings.TrimSpace(out) == "active" || strings.TrimSpace(out) == "activating", nil
-}
-
-func (r defaultMachinectlRunner) Enable(ctx context.Context, name string) error {
-	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "enable", name)
-}
-
-func (r defaultMachinectlRunner) Start(ctx context.Context, name string) error {
-	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "start", name)
-}
-
-func (r defaultMachinectlRunner) Terminate(ctx context.Context, name string) error {
-	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "terminate", name)
-}
-
-func (r defaultMachinectlRunner) Exists(ctx context.Context, name string) bool {
-	return executil.RunCmd(ctx, r.log, executil.Machinectl(), "show", name) == nil
-}
-
-func (r defaultMachinectlRunner) ResetFailed(ctx context.Context, name string) error {
-	service := fmt.Sprintf("systemd-nspawn@%s.service", name)
-	return executil.RunCmd(ctx, r.log, executil.Systemctl(), "reset-failed", service)
-}
 
 type startNSpawnMachine struct {
 	log       *slog.Logger
 	goalState *goalstates.NodeStart
 
-	// runner is the machinectl/systemctl driver. Tests inject a fake.
-	runner machinectlRunner
+	// runner is the machine control driver. Tests inject a fake.
+	runner nspawn.Runner
 
 	// wasRunning records whether the machine was already up before this task
 	// touched it. A reapply against a live node has to restart any service
@@ -76,9 +27,9 @@ type startNSpawnMachine struct {
 	wasRunning bool
 }
 
-// StartNSpawnMachine returns a task that starts the systemd-nspawn machine using machinectl and
+// StartNSpawnMachine returns a task that starts the systemd-nspawn machine and
 // waits until D-Bus is responsive inside the machine so that subsequent phases
-// can safely use executil.MachineRun().
+// can safely use nspawn.Exec().
 //
 // The agent reaches this work through StartNode, which builds the task directly
 // so it can tell whether the configuration it wrote differed. This entry point
@@ -87,7 +38,7 @@ func StartNSpawnMachine(log *slog.Logger, goalState *goalstates.NodeStart) phase
 	return &startNSpawnMachine{
 		log:       log,
 		goalState: goalState,
-		runner:    defaultMachinectlRunner{log: log},
+		runner:    nspawn.NewRunner(log),
 	}
 }
 
@@ -96,8 +47,8 @@ func (s *startNSpawnMachine) Name() string { return "start-nspawn-machine" }
 func (s *startNSpawnMachine) Do(ctx context.Context) error {
 	name := s.goalState.MachineName
 
-	if err := s.runner.Enable(ctx, name); err != nil {
-		return fmt.Errorf("machinectl enable %s: %w", name, err)
+	if err := nspawn.Enable(ctx, s.runner, name); err != nil {
+		return err
 	}
 
 	if err := s.startWithRecovery(ctx, name); err != nil {
@@ -111,120 +62,21 @@ func (s *startNSpawnMachine) Do(ctx context.Context) error {
 	return nil
 }
 
-// startWithRecovery runs `machinectl start` and, if it fails because the
-// machine is already registered (e.g. systemd-machined was restarted out from
-// under us, leaving an orphaned registration with errno 17 / "File exists"),
-// terminates the stale registration and retries once.
+// startWithRecovery starts the machine, recovering from a stale registration
+// (see nspawn.StartWithRecovery), and records whether it was already running.
 func (s *startNSpawnMachine) startWithRecovery(ctx context.Context, name string) error {
-	running, err := s.runner.Running(ctx, name)
+	running, err := nspawn.StartWithRecovery(ctx, s.log, s.runner, name)
 	if err != nil {
-		return fmt.Errorf("inspect nspawn service before replay: %w", err)
+		return err
 	}
 
 	s.wasRunning = running
 
-	if running {
-		return nil
-	}
-
-	startErr := s.runner.Start(ctx, name)
-	if startErr == nil {
-		return nil
-	}
-
-	// Decide whether this looks like a stale-registration failure that we
-	// can recover from. Two strong signals:
-	//   - the machine is currently registered (machinectl show <name> ok),
-	//   - or the error message contains "already exists" / "File exists".
-	stale := s.runner.Exists(ctx, name) || isAlreadyExistsErr(startErr)
-	if !stale {
-		return fmt.Errorf("machinectl start %s: %w", name, startErr)
-	}
-
-	s.log.Warn("machinectl start failed with stale registration, attempting recovery",
-		"machine", name, "error", startErr)
-
-	// Clear any prior `failed` state on the unit; otherwise systemctl will
-	// refuse the next start attempt. Best-effort: ignore errors.
-	if err := s.runner.ResetFailed(ctx, name); err != nil {
-		s.log.Debug("systemctl reset-failed returned an error (continuing)",
-			"machine", name, "error", err)
-	}
-
-	if err := s.runner.Terminate(ctx, name); err != nil {
-		s.log.Warn("machinectl terminate during recovery failed (continuing)",
-			"machine", name, "error", err)
-	}
-
-	if !s.waitForGone(ctx, name, 15*time.Second) {
-		return fmt.Errorf("machinectl start %s: stale registration did not clear after terminate (initial error: %w)",
-			name, startErr)
-	}
-
-	if err := s.runner.Start(ctx, name); err != nil {
-		return fmt.Errorf("machinectl start %s after recovery: %w", name, err)
-	}
-
-	s.log.Info("recovered stale nspawn registration and started machine", "machine", name)
-
 	return nil
 }
 
-// waitForGone polls until the machine is no longer registered or the timeout
-// elapses. Returns true when the machine is gone.
-func (s *startNSpawnMachine) waitForGone(ctx context.Context, name string, timeout time.Duration) bool {
-	const pollInterval = 500 * time.Millisecond
-
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !s.runner.Exists(ctx, name) {
-			return true
-		}
-
-		select {
-		case <-ctx.Done():
-			return !s.runner.Exists(ctx, name)
-		case <-time.After(pollInterval):
-		}
-	}
-
-	return !s.runner.Exists(ctx, name)
-}
-
-// isAlreadyExistsErr reports whether err looks like a machinectl "machine
-// already exists" failure (errno 17 / EEXIST surfaced as text).
-func isAlreadyExistsErr(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	msg := strings.ToLower(err.Error())
-
-	return strings.Contains(msg, "already exists") || strings.Contains(msg, "file exists")
-}
-
 // WaitForMachine polls the machine until it is responsive to systemd-run
-// commands. machinectl start returns before D-Bus is ready, so phases that use
-// executil.MachineRun() would fail without this gate.
+// commands. See nspawn.WaitForMachine.
 func WaitForMachine(ctx context.Context, log *slog.Logger, machine string) error {
-	const (
-		pollInterval = 500 * time.Millisecond
-		timeout      = 30 * time.Second
-	)
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	for {
-		if _, err := executil.MachineRun(ctx, log, machine, "/bin/true"); err == nil {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			// TODO: dump machine state (e.g. machinectl status, journalctl) to aid debugging when the machine fails to start.
-			return fmt.Errorf("machine %s not responsive after %s: %w", machine, timeout, ctx.Err())
-		case <-time.After(pollInterval):
-		}
-	}
+	return nspawn.WaitForMachine(ctx, log, machine)
 }

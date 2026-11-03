@@ -255,17 +255,6 @@ func outputCmdOnce(ctx context.Context, logger *slog.Logger, stderrLevel slog.Le
 	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
-// MachineRun executes a command inside the named nspawn machine using
-// systemd-run --machine=<machine> --pipe --wait. It streams stdout at Debug
-// and stderr at Error, and returns the captured stdout.
-func MachineRun(ctx context.Context, log *slog.Logger, machine string, args ...string) (string, error) {
-	runArgs := make([]string, 0, 3+len(args))
-	runArgs = append(runArgs, "--machine="+machine, "--pipe", "--wait")
-	runArgs = append(runArgs, args...)
-
-	return OutputCmd(ctx, log, "systemd-run", runArgs...)
-}
-
 // streamLogs reads lines from reader and logs each one at the given level.
 // closeAll releases pipes belonging to a command that never started.
 func closeAll(closers ...io.Closer) {
@@ -323,13 +312,6 @@ func Dnf() func(context.Context) *exec.Cmd {
 func Ip() func(context.Context) *exec.Cmd {
 	return func(ctx context.Context) *exec.Cmd {
 		return exec.CommandContext(ctx, "ip")
-	}
-}
-
-// Machinectl returns a command factory for machinectl.
-func Machinectl() func(context.Context) *exec.Cmd {
-	return func(ctx context.Context) *exec.Cmd {
-		return exec.CommandContext(ctx, "machinectl")
 	}
 }
 

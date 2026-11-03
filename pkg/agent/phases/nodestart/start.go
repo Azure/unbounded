@@ -7,6 +7,7 @@ import (
 	"log/slog"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -29,7 +30,7 @@ func StartNode(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
 	startMachine := &startNSpawnMachine{
 		log:       log,
 		goalState: gs,
-		runner:    defaultMachinectlRunner{log: log},
+		runner:    nspawn.NewRunner(log),
 	}
 
 	return phases.Serial(log,

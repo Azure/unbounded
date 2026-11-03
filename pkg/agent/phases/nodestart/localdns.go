@@ -36,7 +36,7 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return nil
 	}
 
-	root := filepath.Join(c.goalState.MachineDir, "etc/unbounded/localdns")
+	root := c.goalState.Root().Path("etc/unbounded/localdns")
 	if err := utilio.WriteFile(filepath.Join(root, "Corefile"), c.goalState.LocalDNS.Corefile, 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS Corefile: %w", err)
 	}
@@ -63,7 +63,7 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 		return fmt.Errorf("render LocalDNS slice: %w", err)
 	}
 
-	if err := utilio.WriteFile(filepath.Join(c.goalState.MachineDir, "etc/systemd/system", goalstates.LocalDNSSliceUnit), slice.Bytes(), 0o644); err != nil {
+	if err := utilio.WriteFile(c.goalState.Root().Path(filepath.Join("etc/systemd/system", goalstates.LocalDNSSliceUnit)), slice.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS slice: %w", err)
 	}
 
@@ -83,10 +83,18 @@ func (c *configureLocalDNS) Do(_ context.Context) error {
 	resolverLines = append(resolverLines, "nameserver "+c.goalState.LocalDNS.NodeListenerIP.String())
 
 	resolverContent := []byte(strings.Join(resolverLines, "\n") + "\n")
-	for _, resolvPath := range []string{
-		filepath.Join(c.goalState.MachineDir, "etc/resolv.conf"),
-		filepath.Join(c.goalState.MachineDir, strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
-	} {
+
+	resolvPaths := []string{
+		c.goalState.Root().Path("etc/resolv.conf"),
+		c.goalState.Root().Path(strings.TrimPrefix(goalstates.LocalDNSResolvConfPath, "/")),
+	}
+	if c.goalState.HostNative() {
+		// The host keeps its own resolver configuration; only kubelet's
+		// dedicated resolver file carries the LocalDNS listener.
+		resolvPaths = resolvPaths[1:]
+	}
+
+	for _, resolvPath := range resolvPaths {
 		if err := utilio.WriteFile(resolvPath, resolverContent, 0o644); err != nil {
 			return fmt.Errorf("write machine resolver %s: %w", resolvPath, err)
 		}
@@ -163,6 +171,12 @@ func WriteLocalDNSNetworkFiles(goalState *goalstates.NodeStart) error {
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, goalstates.LocalDNSNetworkUnit)
 	if err := utilio.WriteFile(unitPath, unit.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS network unit: %w", err)
+	}
+
+	if !goalState.NSpawnMachine() {
+		// No nspawn machine to order against; the host-native units and the
+		// container supervising unit order themselves after the network unit.
+		return nil
 	}
 
 	dropIn := []byte("[Unit]\nRequires=" + goalstates.LocalDNSNetworkUnit + "\nAfter=" + goalstates.LocalDNSNetworkUnit + "\n")

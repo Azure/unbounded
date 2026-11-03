@@ -10,19 +10,57 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation/nspawn"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
+
+// execFunc runs a command in the node stack and returns its stdout.
+type execFunc func(ctx context.Context, log *slog.Logger, args ...string) (string, error)
 
 type waitForKubelet struct {
 	log     *slog.Logger
 	machine string
+	// exec runs commands in the node stack. Nil means the nspawn machine.
+	exec execFunc
+	// unit is the kubelet unit to poll. Empty means the nspawn machine's.
+	unit string
 }
 
 type waitForKubeletBootstrap struct {
 	log     *slog.Logger
 	machine string
+	exec    execFunc
+}
+
+// execInNode runs a command in the node stack: through exec when set, in the
+// nspawn machine otherwise.
+func execInNode(ctx context.Context, log *slog.Logger, exec execFunc, machine string, args ...string) (string, error) {
+	if exec != nil {
+		return exec(ctx, log, args...)
+	}
+
+	return nspawn.Exec(ctx, log, machine, args...)
+}
+
+func (w *waitForKubelet) run(ctx context.Context, args ...string) (string, error) {
+	return execInNode(ctx, w.log, w.exec, w.machine, args...)
+}
+
+func (w *waitForKubeletBootstrap) run(ctx context.Context, args ...string) (string, error) {
+	return execInNode(ctx, w.log, w.exec, w.machine, args...)
+}
+
+// WaitForKubeletOnHost is WaitForKubelet for a host-native node stack: it
+// polls unit through the goal state's executor.
+func WaitForKubeletOnHost(log *slog.Logger, gs *goalstates.NodeStart, unit string) phases.Task {
+	return &waitForKubelet{log: log, machine: gs.MachineName, exec: gs.Exec, unit: unit}
+}
+
+// WaitForKubeletBootstrapOnHost is WaitForKubeletBootstrap for a host-native
+// node stack.
+func WaitForKubeletBootstrapOnHost(log *slog.Logger, gs *goalstates.NodeStart) phases.Task {
+	return &waitForKubeletBootstrap{log: log, machine: gs.MachineName, exec: gs.Exec}
 }
 
 // WaitForKubelet returns a task that polls the kubelet systemd service inside
@@ -52,9 +90,12 @@ func (w *waitForKubelet) Do(ctx context.Context) error {
 	defer cancel()
 
 	for {
-		out, err := executil.MachineRun(ctx, w.log, w.machine,
-			"systemctl", "is-active", goalstates.SystemdUnitKubelet,
-		)
+		unit := w.unit
+		if unit == "" {
+			unit = goalstates.SystemdUnitKubelet
+		}
+
+		out, err := w.run(ctx, "systemctl", "is-active", unit)
 		if err == nil && strings.TrimSpace(out) == "active" {
 			w.log.Info("kubelet is active", "machine", w.machine)
 			return nil
@@ -78,7 +119,7 @@ func (w *waitForKubeletBootstrap) Do(ctx context.Context) error {
 	defer cancel()
 
 	for {
-		if _, err := executil.MachineRun(ctx, w.log, w.machine, "test", "-s", goalstates.KubeletKubeconfigPath); err == nil {
+		if _, err := w.run(ctx, "test", "-s", goalstates.KubeletKubeconfigPath); err == nil {
 			w.log.Info("kubelet bootstrap completed", "machine", w.machine, "kubeconfig", goalstates.KubeletKubeconfigPath)
 			return nil
 		}

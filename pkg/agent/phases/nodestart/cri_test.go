@@ -275,3 +275,31 @@ func TestConfigureContainerdLeavesPerRegistryHostsConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, original, data)
 }
+
+func TestConfigureContainerdNvidiaRuntimeBinaryName(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		toolkit goalstates.NvidiaToolkit
+		want    string
+	}{
+		"default":    {want: goalstates.NvidiaContainerRuntimePath},
+		"configured": {toolkit: goalstates.NvidiaToolkit{ContainerRuntimePath: "/opt/tk/nvidia-container-runtime"}, want: "/opt/tk/nvidia-container-runtime"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			machineDir := t.TempDir()
+			goalState := &goalstates.NodeStart{
+				MachineDir: machineDir,
+				Containerd: goalstates.ResolveContainerd(goalstates.ContainerdOptions{NvidiaRequired: true, NvidiaToolkit: tc.toolkit}),
+			}
+
+			require.NoError(t, ConfigureContainerd(goalState).Do(context.Background()))
+
+			data, err := os.ReadFile(filepath.Join(machineDir, goalstates.NvidiaRuntimeDropInPath))
+			require.NoError(t, err)
+			require.Contains(t, string(data), `BinaryName = "`+tc.want+`"`)
+		})
+	}
+}
