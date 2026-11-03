@@ -155,9 +155,9 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"http workload": {map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["azure"] = map[string]any{"containerURL": "http://account/models", "credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID}}}
 		})}, "containerURL must use https"},
-		"bad default client":    {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
-		"workload no client":    {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
-		"workload bad tenant":   {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
+		"bad default client":  {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
+		"workload no client":  {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
+		"workload bad tenant": {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
 	}
 	for name, tc := range invalid {
 		t.Run("rejects "+name, func(t *testing.T) {
