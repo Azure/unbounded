@@ -26,8 +26,8 @@ use crate::hardware::{Context, WORKING_BYTES, Walk};
 use racer_cluster_control::disks::DiskState;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 /// Settling time for approval changes before restarting.
@@ -35,6 +35,10 @@ pub(super) const DEBOUNCE: Duration = Duration::from_secs(10);
 
 /// Interval between sysfs rescans for the Pod report.
 const RESCAN: Duration = Duration::from_secs(60);
+
+/// Longest teardown waits for the monitor thread. A thread still blocked in
+/// sysfs I/O after this is detached; it holds only a weak control reference.
+const JOIN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Interval between approval checks.
 const TICK: Duration = Duration::from_secs(1);
@@ -113,10 +117,12 @@ fn appeared(context: &Context, device_directory: &Path) -> Option<String> {
         .map(|a| a.id.clone())
 }
 
-/// Running monitor; dropping it stops and joins the thread.
+/// Running monitor; dropping it stops the thread and waits up to
+/// [`JOIN_DEADLINE`] for it to exit.
 pub(super) struct Monitor {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    exited: mpsc::Receiver<()>,
 }
 
 impl Monitor {
@@ -128,13 +134,22 @@ impl Monitor {
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        // The thread holds only a weak reference, so a detached thread
+        // never keeps embedded control alive after teardown.
+        let control = Arc::downgrade(&control);
+        let (done, exited) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("racer-disks".into())
-            .spawn(move || run(&*control, &context, &device_directory, startup, &flag))
+            .spawn(move || {
+                // Dropped on exit, including unwinding, to signal teardown.
+                let _done = done;
+                run(&control, &context, &device_directory, startup, &flag);
+            })
             .map_err(|_| Error::Unavailable)?;
         Ok(Self {
             stop,
             thread: Some(thread),
+            exited,
         })
     }
 }
@@ -144,17 +159,24 @@ impl Drop for Monitor {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
-            let _ = thread.join();
+            match self.exited.recv_timeout(JOIN_DEADLINE) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!("racer: disk monitor did not stop in time; detaching it");
+                }
+                _ => {
+                    let _ = thread.join();
+                }
+            }
         }
     }
 }
 
 fn run(
-    control: &dyn ClusterControl,
+    control: &Weak<dyn ClusterControl>,
     context: &Context,
     device_directory: &Path,
     startup: Vec<String>,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) {
     let mut debounce = Debounce::new(startup);
     let mut next_scan = Instant::now();
@@ -162,13 +184,23 @@ fn run(
         let now = Instant::now();
         if now >= next_scan {
             next_scan = now + RESCAN;
-            report(control, context, device_directory);
+            let disks = scan(context, device_directory, stop);
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let Some(control) = control.upgrade() else {
+                return;
+            };
+            control.report_disks(disks);
             if let Some(id) = appeared(context, device_directory) {
                 eprintln!("racer: approved disk {id:?} appeared; restarting to claim it");
                 RESTART_REQUESTED.store(true, Ordering::Relaxed);
                 return;
             }
         }
+        let Some(control) = control.upgrade() else {
+            return;
+        };
         let latest = control.approval();
         let disks = latest.as_ref().map(|a| a.disks.as_slice());
         if debounce.observe(now, disks) {
@@ -182,19 +214,19 @@ fn run(
         if let Some(revision) = applied_revision(&debounce, latest) {
             control.report_disks_revision(revision);
         }
+        drop(control);
         std::thread::park_timeout(TICK);
     }
 }
 
-/// Classify every disk and publish the result in the Pod report.
-fn report(control: &dyn ClusterControl, context: &Context, device_directory: &Path) {
-    let walk = Walk::new(Arc::new(AtomicBool::new(false)), WORKING_BYTES);
-    control.report_disks(statuses(
-        &walk,
-        Path::new("/sys"),
-        device_directory,
-        context,
-    ));
+/// Classify every disk; the scan aborts between reads once `stop` is set.
+fn scan(
+    context: &Context,
+    device_directory: &Path,
+    stop: &Arc<AtomicBool>,
+) -> Vec<racer_cluster_control::disks::DiskStatus> {
+    let walk = Walk::new(stop.clone(), WORKING_BYTES);
+    statuses(&walk, Path::new("/sys"), device_directory, context)
 }
 
 /// Per-disk status from one bounded scan. When the scan exceeds its working
@@ -344,5 +376,93 @@ mod tests {
         // Without approvals the fallback is empty rather than an error.
         let walk = Walk::new(Arc::default(), 0);
         assert!(statuses(&walk, &f.0.join("sys"), &f.0, &Context::default()).is_empty());
+    }
+
+    /// Control whose disk report blocks until released, standing in for a
+    /// scan stalled in sysfs I/O.
+    struct Stalled {
+        entered: std::sync::Mutex<mpsc::Sender<()>>,
+        release: std::sync::Mutex<mpsc::Receiver<()>>,
+        block: bool,
+    }
+
+    impl ClusterControl for Stalled {
+        fn bootstrap(
+            &self,
+            _: Duration,
+        ) -> std::result::Result<
+            crate::control::managed::Bootstrapped,
+            crate::control::managed::BootstrapError,
+        > {
+            Err(crate::control::managed::BootstrapError::Fatal)
+        }
+
+        fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+            Default::default()
+        }
+
+        fn report(&self, _: u32, _: Vec<racer_control_wire::RailMapping>) {}
+
+        fn report_disks(&self, _: Vec<racer_cluster_control::disks::DiskStatus>) {
+            let _ = self.entered.lock().unwrap().send(());
+            if self.block {
+                let _ = self.release.lock().unwrap().recv();
+            }
+        }
+    }
+
+    fn stalled(block: bool) -> (Arc<Stalled>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, on_enter) = mpsc::channel();
+        let (release, on_release) = mpsc::channel();
+        let control = Arc::new(Stalled {
+            entered: std::sync::Mutex::new(entered),
+            release: std::sync::Mutex::new(on_release),
+            block,
+        });
+        (control, on_enter, release)
+    }
+
+    #[test]
+    fn teardown_joins_and_releases_control() {
+        let f = super::super::devices::tests::Fixture::new();
+        let (control, entered, _release) = stalled(false);
+        let monitor = Monitor::start(
+            control.clone(),
+            Arc::new(Context::default()),
+            f.0.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(60)).unwrap();
+        drop(monitor);
+        assert_eq!(Arc::strong_count(&control), 1);
+    }
+
+    #[test]
+    fn teardown_detaches_a_stalled_thread_after_the_deadline() {
+        let f = super::super::devices::tests::Fixture::new();
+        let (control, entered, release) = stalled(true);
+        let monitor = Monitor::start(
+            control.clone(),
+            Arc::new(Context::default()),
+            f.0.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        entered.recv_timeout(Duration::from_secs(60)).unwrap();
+        let start = Instant::now();
+        drop(monitor);
+        let waited = start.elapsed();
+        assert!(waited >= JOIN_DEADLINE, "returned early: {waited:?}");
+        assert!(waited < JOIN_DEADLINE * 10, "blocked: {waited:?}");
+        // Once the stall clears, the detached thread exits without
+        // touching control again and drops its temporary reference.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Arc::strong_count(&control) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&control), 1);
+        assert!(!restart_requested());
     }
 }
