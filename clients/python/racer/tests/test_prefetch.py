@@ -466,7 +466,7 @@ def test_stat_sends_no_retention(client, server):
     assert os.path.exists(server.path)
 
 
-def test_oversized_put_rejected_before_body(server):
+def test_server_rejects_oversized_put_before_body(server):
     # Racer rejects the head without reading the body, so a client that
     # sends only headers must still get 413 instead of hanging.
     size = server.prefetches.max_body + 1
@@ -510,7 +510,7 @@ def _early_close_server(path, response):
     return t
 
 
-def test_oversized_put_rejected_before_body(tmp_path):
+def test_client_surfaces_413_when_server_closes_before_body(tmp_path):
     path = str(tmp_path / "s")
     body = json.dumps({"code": "too_large", "message": "body too large"}).encode()
     resp = (
