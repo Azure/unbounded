@@ -34,9 +34,7 @@ const (
 	managedMarker      = "# Managed by unbounded-operator registry authentication.\n"
 )
 
-// Installer owns only its dedicated directory and kubelet drop-in. It never
-// edits the agent-generated unit, its drop-ins, or containerd's mirror route.
-// Each node reconciles independently; only changed configuration restarts kubelet.
+// Installer manages its own files and drop-in without editing the agent's unit.
 type Installer struct {
 	Root        string
 	Executable  string
@@ -44,7 +42,6 @@ type Installer struct {
 	KubeletArgs func() ([]string, error)
 }
 
-// Reconcile converges the owned files and verifies that kubelet is using them.
 func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -329,8 +326,7 @@ func (i *Installer) claim() error {
 	return err
 }
 
-// dropIn preserves the agent's complete ExecStart expression, including all
-// environment expansions. Its original unit remains authoritative on every pass.
+// Preserve the agent's ExecStart, including environment expansions.
 func (i *Installer) dropIn() ([]byte, error) {
 	unit, err := os.ReadFile(i.path(unitPath))
 	if err != nil {
@@ -453,7 +449,7 @@ func (i *Installer) remove(ctx context.Context) error {
 			return errors.New("kubelet still uses the managed credential provider; leaving provider files in place")
 		}
 	}
-	// Never recursively remove a directory that another actor might have added to.
+
 	if owned, err := os.ReadFile(i.path(ownedCAPath)); err == nil {
 		existing, err := os.ReadFile(i.path(proxyCAPath))
 		if err == nil {
@@ -476,8 +472,7 @@ func (i *Installer) remove(ctx context.Context) error {
 			return err
 		}
 	}
-	// Empty directories are removed non-recursively so a later opted-in
-	// installation can reclaim the same paths without touching foreign files.
+	// Remove only empty directories, preserving foreign files.
 	for _, path := range []string{installDir + "/bin", installDir} {
 		if err := os.Remove(i.path(path)); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {
 			return err
@@ -487,7 +482,6 @@ func (i *Installer) remove(ctx context.Context) error {
 	return nil
 }
 
-// safeParent rejects symlinks in operator-owned paths before atomic replacement.
 func (i *Installer) safeParent(path string) error {
 	if err := i.checkPath(path); err != nil {
 		return err
@@ -585,9 +579,7 @@ func (i *Installer) copyExecutable() (bool, error) {
 }
 
 func (i *Installer) replace(path string, mode fs.FileMode, write func(io.Writer) error) error {
-	// Persist restart intent before changing any active provider file. If a
-	// restart or lease renewal fails, the next pass must retry even when the
-	// files already match and the old provider flags are still present.
+	// Persist restart intent so a failed restart is retried even if files match.
 	if path != ownerPath && path != restartPath {
 		if _, err := i.write(restartPath, []byte(managedMarker), 0o600); err != nil {
 			return err

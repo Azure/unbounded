@@ -23,7 +23,6 @@ import (
 	"github.com/spf13/cobra"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
@@ -411,69 +410,6 @@ func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryau
 	}
 
 	return nil
-}
-
-func (h *attachACRHandler) grantACRIdentityUse(ctx context.Context, clientID string) error {
-	return retry.OnError(retry.DefaultBackoff, func(err error) bool {
-		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
-	}, func() error {
-		return h.grantACRIdentityUseOnce(ctx, clientID)
-	})
-}
-
-func (h *attachACRHandler) grantACRIdentityUseOnce(ctx context.Context, clientID string) error {
-	labels := map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace}
-	roles := h.client.RbacV1().ClusterRoles()
-
-	role, err := roles.Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	createRole := apierrors.IsNotFound(err)
-	if createRole {
-		role = &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: registryauth.IdentityRoleName, Labels: labels}}
-	} else if role.Labels["app.kubernetes.io/managed-by"] != acrAttachManager || role.Labels["unbounded-cloud.io/namespace"] != h.namespace {
-		return errors.New("refusing to replace an unowned ACR identity-use ClusterRole")
-	}
-
-	role.AggregationRule = nil
-
-	role.Rules = []rbacv1.PolicyRule{{APIGroups: []string{"cid.wi.aks.azure.com"}, Resources: []string{clientID}, Verbs: []string{"use-managed-identity"}}}
-	if createRole {
-		_, err = roles.Create(ctx, role, metav1.CreateOptions{})
-	} else {
-		_, err = roles.Update(ctx, role, metav1.UpdateOptions{})
-	}
-
-	if err != nil {
-		return err
-	}
-
-	bindings := h.client.RbacV1().ClusterRoleBindings()
-
-	binding, err := bindings.Get(ctx, registryauth.IdentityRoleName, metav1.GetOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	createBinding := apierrors.IsNotFound(err)
-	if createBinding {
-		binding = &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: registryauth.IdentityRoleName, Labels: labels}}
-	} else if binding.Labels["app.kubernetes.io/managed-by"] != acrAttachManager || binding.Labels["unbounded-cloud.io/namespace"] != h.namespace {
-		return errors.New("refusing to replace an unowned ACR identity-use ClusterRoleBinding")
-	}
-
-	binding.RoleRef = rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name}
-
-	binding.Subjects = []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}}
-	if createBinding {
-		_, err = bindings.Create(ctx, binding, metav1.CreateOptions{})
-	} else {
-		_, err = bindings.Update(ctx, binding, metav1.UpdateOptions{})
-	}
-
-	return err
 }
 
 func (h *attachACRHandler) waitForACRInstallation(ctx context.Context, cfg registryauth.Config) error {

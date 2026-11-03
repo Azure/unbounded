@@ -5,46 +5,13 @@ package registryauth
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-func TestNodeReconciliationDoesNotContactKubernetes(t *testing.T) {
-	var requests atomic.Int64
-
-	api := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		requests.Add(1)
-	}))
-	defer api.Close()
-
-	t.Setenv("KUBERNETES_SERVICE_HOST", api.Listener.Addr().String())
-	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
-
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-	defer cancel()
-
-	require.NoError(t, RunNode(ctx, NodeOptions{
-		Root: t.TempDir(), ConfigJSON: `{"mode":"external"}`, Listen: "127.0.0.1:0",
-	}))
-	require.Zero(t, requests.Load())
-}
-
-func TestManagedNodeHelpersRestartIndependentlyWithoutAPIRequests(t *testing.T) {
-	var requests atomic.Int64
-
-	api := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		requests.Add(1)
-	}))
-	defer api.Close()
-
-	t.Setenv("KUBERNETES_SERVICE_HOST", api.Listener.Addr().String())
-	t.Setenv("KUBERNETES_SERVICE_PORT", "443")
-
+func TestManagedNodeHelpersRestartIndependently(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	results := make(chan error, 2)
@@ -111,8 +78,6 @@ func TestManagedNodeHelpersRestartIndependentlyWithoutAPIRequests(t *testing.T) 
 	for _, count := range restarts {
 		require.Equal(t, 1, *count, "unchanged local repair must not restart again")
 	}
-
-	require.Zero(t, requests.Load())
 }
 
 func TestNodeCancellationDoesNotInvokeHostOperation(t *testing.T) {

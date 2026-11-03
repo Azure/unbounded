@@ -125,8 +125,8 @@ For the full walkthrough including pod networking verification, see the
 
 ### AKS Flex: create the entire cluster with one script
 
-For one AKS system node plus a three-instance Flex worker VMSS with
-Unbounded-Net, use the self-contained, idempotent provisioning script:
+Create one AKS system node and three automatically bootstrapped VMSS workers,
+with Unbounded networking and Gantry:
 
 ```bash
 bash hack/scripts/aks-flex-cluster.sh \
@@ -136,23 +136,19 @@ bash hack/scripts/aks-flex-cluster.sh \
     --yes
 ```
 
-Workers share one managed identity and one public IP for outbound access and
-per-instance SSH ports. VMSS custom data bootstraps new instances automatically,
-including after `az vmss scale`; the topology reserves capacity for 1,000 workers.
-Rerun the same initial command to reuse the deployment without shrinking an
-externally scaled VMSS. SSH ingress remains restricted to your public IPv4
-`/32`. SSH commands and a private kubeconfig are saved under
-`tmp/aks-flex/my-flex-cluster/`. Add `--plan` to inspect the topology without
-creating resources. See the [deployment runbook](designs/aks-flex-cluster.md) for
-prerequisites, validation, and recovery boundaries. Run `make aks-flex-test` for
-the offline deployment tests; no Azure credentials are needed.
+Requires an authenticated Azure CLI >= 2.90.0 and a subscription supporting the
+AKS Flex preview. Run `bash hack/scripts/aks-flex-cluster.sh --help` for tools
+and options; add `--plan` to preview without creating resources.
 
-Cluster creation installs Gantry without ACR configuration or authentication
-setup. The [ACR attachment guide](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
-covers registry attachment, default preservation of existing authentication,
-and explicit managed-auth opt-in. Attachment requires a compatible plugin/operator
-release; it is not included in the script's `v0.8.0` baseline. Attach managed
-ACR authentication once; future joined Linux Flex nodes inherit the policy.
+Keep the state directory (`tmp/aks-flex/my-flex-cluster/` by default), which
+contains the kubeconfig and SSH key. Rerun with the same arguments to resume
+provisioning. Scale workers separately with `az vmss scale`; reruns preserve
+capacity. The script is not an upgrade or teardown tool.
+
+Gantry starts without ACR authentication. See the
+[ACR attachment guide](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+to enable it with a compatible plugin/operator; the script's pinned `v0.8.0`
+baseline does not include managed authentication.
 
 ## Documentation
 

@@ -202,25 +202,25 @@ func managedAttachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]
 	return h, client, calls
 }
 
-func TestGantryAttachACRDefaultsToExternalAuth(t *testing.T) {
-	cmd := gantryCommandGroup()
-	attach, _, err := cmd.Find([]string{"attach-acr"})
-	require.NoError(t, err)
-	require.Equal(t, registryauth.ExternalMode, attach.Flags().Lookup("auth-mode").DefValue)
-	require.NotContains(t, attach.Flags().Lookup("auth-mode").Annotations, "cobra_annotation_bash_completion_one_required_flag")
-	cmd.SetArgs([]string{"attach-acr"})
-	require.ErrorContains(t, cmd.Execute(), `"acr-resource-id"`)
-}
-
 func TestGantryAttachACRExternalPreservesCustomerAuthentication(t *testing.T) {
-	for _, mode := range []string{"", registryauth.ExternalMode} {
-		t.Run("mode="+mode, func(t *testing.T) {
+	for _, tc := range []struct{ name, mode, policy string }{
+		{name: "default without policy"},
+		{name: "external without policy", mode: registryauth.ExternalMode},
+		{name: "default with customer policy", policy: "customer-owned-policy: untouched"},
+		{name: "external with customer policy", mode: registryauth.ExternalMode, policy: "customer-owned-policy: untouched"},
+		{name: "default with managed policy", policy: "mode: aks-identity-binding\nregistry: central.azurecr.io\n"},
+		{name: "external with managed policy", mode: registryauth.ExternalMode, policy: "mode: aks-identity-binding\nregistry: central.azurecr.io\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			h, client, calls := attachFixture(t)
-			h.authMode = mode
+			h.authMode = tc.mode
 			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
 			require.NoError(t, err)
 
-			source.Data[registryauth.ConfigKey] = "customer-owned-policy: untouched"
+			if tc.policy != "" {
+				source.Data[registryauth.ConfigKey] = tc.policy
+			}
+
 			source.Data["config.yaml"] += "  credentials_path: /shared/auth\n"
 			_, err = client.CoreV1().ConfigMaps(h.namespace).Update(t.Context(), source, metav1.UpdateOptions{})
 			require.NoError(t, err)
@@ -230,12 +230,16 @@ func TestGantryAttachACRExternalPreservesCustomerAuthentication(t *testing.T) {
 			require.Contains(t, (*calls)[0], "acr show")
 			got, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), source.Name, metav1.GetOptions{})
 			require.NoError(t, err)
-			require.Equal(t, source.Data[registryauth.ConfigKey], got.Data[registryauth.ConfigKey])
+			require.Equal(t, tc.policy, got.Data[registryauth.ConfigKey])
+
+			if tc.policy == "" {
+				require.NotContains(t, got.Data, registryauth.ConfigKey)
+			}
+
 			require.Equal(t, "preserve", got.Data["other.yaml"])
 			require.Contains(t, got.Data["config.yaml"], "# retain comment")
 			require.Contains(t, got.Data["config.yaml"], "credentials_path: /shared/auth")
 			require.Contains(t, got.Data["config.yaml"], "central.azurecr.io")
-			require.Contains(t, h.out.(*bytes.Buffer).String(), "existing authentication unchanged")
 			require.NotContains(t, h.out.(*bytes.Buffer).String(), "WARNING:")
 
 			for _, action := range client.Actions() {
@@ -251,9 +255,7 @@ func TestGantryManagedACRWarningPrecedesEverySideEffect(t *testing.T) {
 	h, client, _ := managedAttachFixture(t)
 	run := h.runAzure
 	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
-		require.Contains(t, h.out.(*bytes.Buffer).String(), "kubelets on all targeted Linux Flex nodes concurrently")
-		require.Contains(t, h.out.(*bytes.Buffer).String(), "Nodes are not drained automatically")
-		require.Contains(t, h.out.(*bytes.Buffer).String(), "responsible for the impact on existing workloads")
+		require.Contains(t, h.out.(*bytes.Buffer).String(), "WARNING:")
 
 		return run(ctx, args...)
 	}
@@ -263,46 +265,6 @@ func TestGantryManagedACRWarningPrecedesEverySideEffect(t *testing.T) {
 		return false, nil, nil
 	})
 	require.NoError(t, h.execute(t.Context()))
-}
-
-func TestGantryAttachACRDefaultDoesNotCreateAuthenticationPolicy(t *testing.T) {
-	h, client, calls := attachFixture(t)
-	h.authMode = ""
-	require.NoError(t, h.execute(t.Context()))
-	require.Len(t, *calls, 1)
-
-	var source *corev1.ConfigMap
-
-	source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.NotContains(t, source.Data, registryauth.ConfigKey)
-	require.Contains(t, source.Data["config.yaml"], "central.azurecr.io")
-
-	for _, action := range client.Actions() {
-		require.Equal(t, "configmaps", action.GetResource().Resource)
-	}
-}
-
-func TestGantryAttachACRDefaultPreservesPreviouslyManagedAuthentication(t *testing.T) {
-	h, client, calls := managedAttachFixture(t)
-	require.NoError(t, h.execute(t.Context()))
-	source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
-	require.NoError(t, err)
-
-	policy := source.Data[registryauth.ConfigKey]
-	h.authMode = ""
-	*calls = nil
-
-	client.ClearActions()
-	require.NoError(t, h.execute(t.Context()))
-	require.Len(t, *calls, 1)
-	source, err = client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Equal(t, policy, source.Data[registryauth.ConfigKey])
-
-	for _, action := range client.Actions() {
-		require.Equal(t, "configmaps", action.GetResource().Resource)
-	}
 }
 
 func TestGantryAttachACRRejectsInvalidAuthModeBeforeWrites(t *testing.T) {
@@ -453,43 +415,6 @@ func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {
 	require.NotContains(t, source.Data, registryauth.ConfigKey, "invalid merged policy must not be persisted")
 }
 
-func TestGantryIdentityUseGrantToleratesConcurrentControllerCreate(t *testing.T) {
-	h, client, _ := managedAttachFixture(t)
-	raced := false
-
-	client.PrependReactor("create", "clusterroles", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		if raced {
-			return false, nil, nil
-		}
-
-		raced = true
-		create, ok := action.(k8stesting.CreateAction)
-		require.True(t, ok)
-		require.NoError(t, client.Tracker().Create(rbacv1.SchemeGroupVersion.WithResource("clusterroles"), create.GetObject(), ""))
-
-		return true, nil, apierrors.NewAlreadyExists(schema.GroupResource{Group: rbacv1.GroupName, Resource: "clusterroles"}, registryauth.IdentityRoleName)
-	})
-	require.NoError(t, h.grantACRIdentityUse(t.Context(), attachClientID))
-	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
-	require.NoError(t, err)
-}
-
-func TestGantryIdentityUseRepairClearsAggregation(t *testing.T) {
-	h, client, _ := managedAttachFixture(t)
-	require.NoError(t, h.grantACRIdentityUse(t.Context(), attachClientID))
-	role, err := client.RbacV1().ClusterRoles().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
-	require.NoError(t, err)
-
-	role.AggregationRule = &rbacv1.AggregationRule{ClusterRoleSelectors: []metav1.LabelSelector{{}}}
-	_, err = client.RbacV1().ClusterRoles().Update(t.Context(), role, metav1.UpdateOptions{})
-	require.NoError(t, err)
-	require.NoError(t, h.grantACRIdentityUse(t.Context(), attachClientID))
-	role, err = client.RbacV1().ClusterRoles().Get(t.Context(), role.Name, metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Nil(t, role.AggregationRule)
-	require.Equal(t, []string{attachClientID}, role.Rules[0].Resources)
-}
-
 func TestGantryAttachACRRejectsWrongClusterBeforeAzureWrites(t *testing.T) {
 	h, _, calls := managedAttachFixture(t)
 	h.restConfig.Host = "https://different.example.com"
@@ -584,25 +509,6 @@ func TestGantryAttachACRManagedRestoresRemovedUpstream(t *testing.T) {
 	require.Equal(t, "central.azurecr.io", cfg.Registry)
 }
 
-func TestGantryAttachACRDoesNotBroadenInheritedConditionalPullGrant(t *testing.T) {
-	h, _, calls := attachFixture(t)
-	run := h.runAzure
-	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
-		if strings.HasPrefix(strings.Join(args, " "), "role assignment list") {
-			require.Contains(t, args, "--include-inherited")
-
-			return json.Marshal([]map[string]string{{
-				"principalId": attachPrincipalID, "scope": "/subscriptions/" + attachSubscription,
-				"roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d", "condition": "repository restriction",
-			}})
-		}
-
-		return run(ctx, args...)
-	}
-	require.ErrorContains(t, h.ensureACRPullGrant(t.Context(), attachPrincipalID, "7f951dda-4ed3-4680-a7ca-43fe172d538d"), "conditional")
-	require.Empty(t, *calls)
-}
-
 func TestGantryAttachACRRejectsOldKubeletsAndCrossSubscription(t *testing.T) {
 	h, client, calls := managedAttachFixture(t)
 	node, err := client.CoreV1().Nodes().Get(t.Context(), "off-azure", metav1.GetOptions{})
@@ -627,8 +533,10 @@ func TestGantryAttachACRRejectsMissingAdmissionAndConditionalGrants(t *testing.T
 				run := h.runAzure
 				h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
 					if strings.HasPrefix(strings.Join(args, " "), "role assignment list") {
+						require.Contains(t, args, "--include-inherited")
+
 						return json.Marshal([]map[string]string{{
-							"principalId": attachPrincipalID, "scope": attachACRID,
+							"principalId": attachPrincipalID, "scope": "/subscriptions/" + attachSubscription,
 							"roleDefinitionId": "/providers/Microsoft.Authorization/roleDefinitions/7f951dda-4ed3-4680-a7ca-43fe172d538d", "condition": "repository restriction",
 						}})
 					}

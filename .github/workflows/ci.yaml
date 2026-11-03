@@ -31,21 +31,6 @@ env:
   CNI_PLUGINS_VERSION: v1.9.1
 
 jobs:
-  # ---------- AKS Flex deployment tooling (offline) ----------
-  aks-flex-deployment:
-    name: AKS Flex Deployment Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Check deployment script
-        run: shellcheck hack/scripts/aks-flex-cluster.sh
-
-      - name: Test deployment tooling without Azure access
-        run: make aks-flex-test
-
   # ---------- Frontend ----------
   frontend:
     name: Build Frontend

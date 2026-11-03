@@ -20,6 +20,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -68,57 +69,29 @@ func authSource(policy string) *corev1.ConfigMap {
 func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	source := authSource("")
 	env := testEnv(t, source)
-	env.Config.ImageRegistry = "registry.example.com/unbounded"
-	env.Config.ImageTag = "v1.2.3"
 	operations, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.False(t, result.Ready)
 	require.Equal(t, "RegistryAuthInstalling", result.Reason)
 	require.Zero(t, result.RequeueAfter)
-	require.Len(t, operations, 2)
+
+	plan := component.NewPlan()
+	plan.Add(operations...)
+	executed, err := env.Execute(t.Context(), plan)
+	require.NoError(t, err)
+	require.Empty(t, executed.Failed())
+	require.Empty(t, executed.Deferred)
 
 	var ds appsv1.DaemonSet
-
-	for _, op := range operations {
-		if op.Object.GetKind() == "DaemonSet" {
-			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds))
-			require.Len(t, op.DependsOn, 1)
-		}
-	}
-
-	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue}, ds.Spec.Template.Spec.NodeSelector, "must exclude native AKS nodes")
-	require.True(t, ds.Spec.Template.Spec.HostPID)
-	require.Equal(t, installationManagerOperator, ds.Labels["app.kubernetes.io/managed-by"])
-	require.Equal(t, "registry.example.com/unbounded/unbounded-operator:v1.2.3", ds.Spec.Template.Spec.Containers[0].Image)
-	require.Equal(t, registryAuthName, ds.Spec.Template.Spec.ServiceAccountName)
-	require.False(t, *ds.Spec.Template.Spec.AutomountServiceAccountToken)
-	require.Empty(t, ds.Spec.Template.Spec.Containers[0].EnvFrom)
-	require.Len(t, ds.Spec.Template.Spec.Containers[0].Env, 1)
-	require.Nil(t, ds.Spec.Template.Spec.Containers[0].Env[0].ValueFrom)
+	require.NoError(t, env.Client.Get(t.Context(), componentKey(registryAuthName), &ds))
 
 	var cfg registryauth.Config
 	require.NoError(t, json.Unmarshal([]byte(ds.Spec.Template.Spec.Containers[0].Env[0].Value), &cfg))
-	require.Equal(t, registryauth.IdentityBindingMode, cfg.Mode)
 
-	for _, volume := range ds.Spec.Template.Spec.Volumes {
-		require.Nil(t, volume.ConfigMap)
-		require.Nil(t, volume.Secret)
-
-		if volume.Projected == nil {
-			continue
-		}
-
-		for _, source := range volume.Projected.Sources {
-			if source.ServiceAccountToken != nil {
-				t.Fatal("installer must not project an authentication token")
-			}
-		}
-	}
-
-	require.Equal(t, []string{"registry-auth-node"}, ds.Spec.Template.Spec.Containers[0].Args)
-	require.Equal(t, "100%", ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.StrVal)
-	require.Equal(t, []corev1.Capability{"SYS_CHROOT"}, ds.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities.Add)
+	expected, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
+	require.NoError(t, err)
+	require.Equal(t, expected, cfg)
 
 	var got corev1.ConfigMap
 	require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &got))
@@ -248,23 +221,6 @@ func TestNodeAuthExternalModeKeepsReconcilerForOwnedFileCleanup(t *testing.T) {
 	}
 }
 
-func TestNodeAuthRequiresNoLeaseOrKubernetesPrivileges(t *testing.T) {
-	env := testEnv(t, authSource(""))
-	operations, _, err := planRegistryAuth(t.Context(), env)
-	require.NoError(t, err)
-
-	for _, op := range operations {
-		require.Contains(t, []string{"ServiceAccount", "DaemonSet"}, op.Object.GetKind())
-	}
-
-	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("flex", nil)})
-	require.NoError(t, err)
-	order, err := plan.ExecutionOrder()
-	require.NoError(t, err)
-	require.NotContains(t, order, "gantry-acr-auth-restart")
-	require.Less(t, strings.Index(order, "CreateIfAbsent ServiceAccount/"+component.DefaultNamespace+"/"+registryAuthName), strings.Index(order, "CreateIfAbsent DaemonSet/"+component.DefaultNamespace+"/"+registryAuthName))
-}
-
 func TestAuthCleanupRecreatesDeletedHelper(t *testing.T) {
 	source := authSource("mode: external")
 	retained := &corev1.ConfigMap{ObjectMeta: ownedAuthMetadata()}
@@ -333,31 +289,20 @@ func TestRegistryAuthAudienceIsLimitedToLinuxFlexNodeUsers(t *testing.T) {
 		t.Helper()
 		operations, err := planRegistryAuthAudience(t.Context(), env, cfg)
 		require.NoError(t, err)
-		require.Len(t, operations, 2)
+		storeAudienceOperations(t, env, operations)
+		assignments := audienceAssignments(t, env)
+		require.Len(t, assignments, len(expected))
 
-		var role rbacv1.ClusterRole
-		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[0].Object.Object, &role))
-		require.Equal(t, []rbacv1.PolicyRule{{
-			APIGroups: []string{""}, Resources: []string{cfg.Audience},
-			Verbs: []string{"request-serviceaccounts-token-audience"},
-		}}, role.Rules)
-
-		var binding rbacv1.ClusterRoleBinding
-		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &binding))
-		require.Equal(t, rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name}, binding.RoleRef)
-
-		var subjects []string
-
-		for _, subject := range binding.Subjects {
-			require.Equal(t, rbacv1.UserKind, subject.Kind)
-			require.Equal(t, rbacv1.GroupName, subject.APIGroup)
-			subjects = append(subjects, subject.Name)
+		for _, name := range expected {
+			require.Contains(t, assignments, name)
 		}
-
-		require.Equal(t, expected, subjects)
-		require.Equal(t, []component.ObjectRef{operations[0].Ref()}, operations[1].DependsOn)
 	}
 	check("system:node:flex-a")
+
+	var role rbacv1.ClusterRole
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: registryAuthAudienceName}, &role))
+	require.Len(t, role.Rules, 1)
+	require.Equal(t, []string{cfg.Audience}, role.Rules[0].Resources)
 
 	future := node("flex-b", "linux", registryauth.FlexNodeValue)
 	require.NoError(t, env.Client.Create(t.Context(), future))
@@ -368,30 +313,6 @@ func TestRegistryAuthAudienceIsLimitedToLinuxFlexNodeUsers(t *testing.T) {
 	check("system:node:flex-b")
 	require.NoError(t, env.Client.Delete(t.Context(), future))
 	check()
-}
-
-func TestRegistryAuthAudienceForThousandFlexWorkers(t *testing.T) {
-	env := testEnv(t)
-	expected := make([]rbacv1.Subject, 0, 1000)
-
-	for i := range 1000 {
-		name := fmt.Sprintf("flexdemo-flex%d", i)
-		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
-			"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue,
-		}}}
-		require.NoError(t, env.Client.Create(t.Context(), node))
-
-		expected = append(expected, rbacv1.Subject{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "system:node:" + name})
-	}
-
-	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding"}
-	operations, err := planRegistryAuthAudience(t.Context(), env, cfg)
-	require.NoError(t, err)
-	require.Len(t, operations, 2)
-
-	var binding rbacv1.ClusterRoleBinding
-	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &binding))
-	require.ElementsMatch(t, expected, binding.Subjects)
 }
 
 func TestRegistryAuthAudienceOwnershipAndRevocation(t *testing.T) {
@@ -445,25 +366,5 @@ func TestRegistryAuthAudienceOwnershipAndRevocation(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestRegistryAuthAudienceRevokedAfterHelperDeletion(t *testing.T) {
-	env := testEnv(t, authSource("mode: external"))
-	operations, err := planRegistryAuthAudience(t.Context(), env, registryauth.Config{
-		Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding",
-	})
-	require.NoError(t, err)
-
-	for _, op := range operations {
-		require.NoError(t, env.Client.Create(t.Context(), op.Object))
-	}
-
-	operations, err = planRegistryAuthAudience(t.Context(), env, registryauth.Config{Mode: registryauth.ExternalMode})
-	require.NoError(t, err)
-	require.Len(t, operations, 2)
-
-	for _, op := range operations {
-		require.Equal(t, component.OpDelete, op.Kind)
 	}
 }

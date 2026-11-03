@@ -36,14 +36,12 @@ import (
 
 const registryAuthBindingSize = 1000
 
-// RegistryAuthNodeSelector restricts the central informer on the server, not
-// merely the events delivered to the controller.
+// RegistryAuthNodeSelector filters the central informer on the server.
 func RegistryAuthNodeSelector() map[string]string {
 	return map[string]string{"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue}
 }
 
-// RegistryAuthAudienceReconciler maintains named-node grants independently of
-// Site and Gantry workload reconciliation.
+// RegistryAuthAudienceReconciler maintains grants independently of Site planning.
 type RegistryAuthAudienceReconciler struct {
 	Client    client.Client
 	APIReader client.Reader
@@ -82,8 +80,7 @@ func (r *RegistryAuthAudienceReconciler) Reconcile(ctx context.Context, _ ctrl.R
 	}
 
 	for _, op := range operations {
-		// Typed creates/deletes reuse the typed RBAC informers, including on
-		// create races; no unstructured informer is started as a side effect.
+		// Typed writes avoid starting unstructured RBAC informers.
 		var object client.Object
 
 		switch op.Object.GetKind() {
@@ -178,7 +175,6 @@ func registryAuthRBACEvents() predicate.Predicate {
 
 func registryAuthAudienceEvents() handler.EventHandler {
 	enqueue := func(q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
-		// AddAfter coalesces a burst into one singleton without polling when idle.
 		q.AddAfter(ctrl.Request{}, 250*time.Millisecond)
 	}
 
@@ -503,7 +499,7 @@ func registryAuthAudienceOperation(ctx context.Context, env *component.Env, desi
 	} else if !active {
 		return nil, nil
 	}
-	// Only changed resources need an authoritative ownership/concurrency read.
+
 	live, ok := desired.DeepCopyObject().(client.Object)
 	if !ok {
 		return nil, fmt.Errorf("unsupported registry-auth object %T", desired)

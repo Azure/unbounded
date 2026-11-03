@@ -90,7 +90,7 @@ capacity. ACR attachment is performed once with a compatible plugin/operator;
 future joined Linux Flex nodes inherit that policy without reattaching ACR.
 This is not an upgrade, reset, or teardown tool. It never deletes Azure
 resources or resets an existing node. A partially bootstrapped host that needs a
-reset is reported, not automatically destroyed. See designs/aks-flex-cluster.md.'
+reset is reported, not automatically destroyed. See README.md for the quickstart.'
 }
 
 parse_args() {

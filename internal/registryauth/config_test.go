@@ -14,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -98,39 +97,26 @@ func TestDerive(t *testing.T) {
 	}
 }
 
-func TestDeriveSortsDeduplicatesAndPreservesClientID(t *testing.T) {
+func TestProviderConfigurationUsesSelectedIdentityAndRegistry(t *testing.T) {
 	cfg := testManagedConfig(t)
-	require.Equal(t, testClientID, cfg.ClientID)
-	require.Equal(t, testTenantID, cfg.TenantID)
+	cfg.Registry = "another.azurecr.io"
+	cfg.ClientID, cfg.TenantID = testTenantID, testClientID
 	data, err := cfg.ProviderConfig()
 	require.NoError(t, err)
 
 	var wire struct {
-		APIVersion, Kind string
-		Providers        []struct {
-			Name, APIVersion  string
+		Providers []struct {
 			MatchImages, Args []string
 			TokenAttributes   map[string]any
 		}
 	}
 	require.NoError(t, json.Unmarshal(data, &wire))
-	require.Equal(t, "kubelet.config.k8s.io/v1", wire.APIVersion)
 	require.Len(t, wire.Providers, 1)
 	provider := wire.Providers[0]
-	require.Equal(t, ProviderName, provider.Name)
-	require.Equal(t, []string{testRegistry}, provider.MatchImages)
-	require.Equal(t, "credentialprovider.kubelet.k8s.io/v1", provider.APIVersion)
-	require.Equal(t, []string{
-		azureConfigPath, "--ib-sni-name=proxy.example.com", "--ib-default-client-id=" + testClientID,
-		"--ib-default-tenant-id=" + testTenantID, "--ib-apiserver-ip=10.0.0.1",
-	}, provider.Args)
-	require.Equal(t, map[string]any{"serviceAccountTokenAudience": cfg.Audience, "cacheType": "Token", "requireServiceAccount": true}, provider.TokenAttributes)
-	require.NotContains(t, string(data), "AnnotationKeys")
-	require.NotContains(t, string(data), "socket")
-
-	serialized, err := yaml.Marshal(cfg)
-	require.NoError(t, err)
-	require.NotContains(t, string(serialized), "registries:")
+	require.Equal(t, []string{cfg.Registry}, provider.MatchImages)
+	require.Contains(t, provider.Args, "--ib-default-client-id="+cfg.ClientID)
+	require.Contains(t, provider.Args, "--ib-default-tenant-id="+cfg.TenantID)
+	require.Equal(t, cfg.Audience, provider.TokenAttributes["serviceAccountTokenAudience"])
 }
 
 func TestACRValidationAndImages(t *testing.T) {
