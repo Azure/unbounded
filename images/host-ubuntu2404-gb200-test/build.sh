@@ -8,7 +8,7 @@ test "$(uname -m)" = aarch64
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 container_engine=${CONTAINER_ENGINE:-docker}
-source_image=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
+production_image=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
 ubuntu_image=docker.io/library/ubuntu@sha256:18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d
 agent_version=v0.17.0-rc.1
 agent_asset=unbounded-agent-linux-arm64.tar.gz
@@ -125,8 +125,8 @@ faf21645f33cd5ef80cce04ccb2d8c9fc289cfb1dedbaeb47cf85e58186a8ff0  unbounded-agen
 EOF
 )
 
-"${container_engine}" pull --platform linux/arm64 "${source_image}"
-source_container=$("${container_engine}" create --platform linux/arm64 "${source_image}" /unused)
+"${container_engine}" pull --platform linux/arm64 "${production_image}"
+source_container=$("${container_engine}" create --platform linux/arm64 "${production_image}" /unused)
 "${container_engine}" cp "${source_container}:/disk/disk.img.gz" "${work}/disk.img.gz"
 "${container_engine}" rm "${source_container}" >/dev/null
 source_container=

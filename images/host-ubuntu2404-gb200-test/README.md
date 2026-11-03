@@ -1,10 +1,15 @@
 # Ubuntu 24.04 GB200 test host image
 
-This ARM64-only image derives from the pinned immutable disk:
+This ARM64-only test image derives from the pinned immutable production image:
 
 ```text
 ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
 ```
+
+The production image is already published in GHCR as an OCI image containing
+`/disk/disk.img.gz`. The test-image producer pulls the exact digest, copies that
+disk from a stopped container, applies the changes below, and packages the
+result under `host-ubuntu2404-gb200-test`.
 
 The derivative makes only the test and recovery changes required for this
 image:
