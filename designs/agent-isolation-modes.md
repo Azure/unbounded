@@ -34,7 +34,7 @@ Goals:
 - No behavior change for existing `nspawn` hosts. Hosts with no recorded mode
   are `nspawn`.
 - A supported way to switch modes on a live host.
-- Documentation that describes each mode and how to choose and migrate.
+- Documentation that describes each mode and how to choose and change it.
 
 Non-goals:
 
@@ -45,23 +45,47 @@ Non-goals:
 ## 3. Verification notes
 
 Code is authoritative (`AGENTS.md`). Facts below come from an exploration pass
-whose line numbers were approximate. WP0 step 1 must re-verify every file and
-symbol cited here before editing. Verified during planning: the files named in
-section 4 exist, and `nodeOperator` is defined at
+whose line numbers were approximate; WP0 step 1 re-verified them (see
+"Citation verification" at the end of this section). Verified at the pre-change
+commit: the files named in section 4 exist, and `nodeOperator` is defined at
 `cmd/agent/internal/daemon/nodeoperator.go:37` with a single nspawn
 implementation. There are 35 `MachineRun(` references in Go sources (the
 exploration estimated about 40).
 
 Known doc and code drift to fix while touching these files:
 
-- `hack/smoke-metalman.py:68` cites `cmd/agent/internal/goalstates/constants.go`.
-  The file is `pkg/agent/goalstates/constants.go`.
-- `pkg/agent/phases/rootfs/os.go` hard-codes Ubuntu Noble apt sources, even for
-  Azure Linux rootfs images.
+- `hack/smoke-metalman.py:68` cited `cmd/agent/internal/goalstates/constants.go`.
+  The file is `pkg/agent/goalstates/constants.go`. The comment is fixed on this
+  branch.
+- `pkg/agent/phases/rootfs/os.go` hard-codes Ubuntu Noble apt sources
+  (`archSources`, `sources-amd64.list`, `sources-arm64.list`), and
+  `rootfs/provision.go:36` applies `ConfigureOS` to every rootfs, including the
+  Azure Linux 3 default images (`goalstates/constants.go:182-183`). Not changed
+  by this work.
 - Deprecated constants `DaemonBinaryPath` and `NSpawnLifecycleBinaryPath` in
-  `pkg/agent/goalstates/constants.go` are superseded by `hostroot`.
+  `pkg/agent/goalstates/constants.go` (lines 34 and 44 at the pre-change
+  commit) are superseded by `hostroot`.
+
+### Citation verification
+
+WP0 step 1 checked every file, line and symbol citation in this document
+against the pre-change commit (`design/agent-isolation-modes`, which is `main`
+plus the design documents). All file paths exist, except the deliberately wrong
+`cmd/agent/internal/goalstates/constants.go` quoted above. All symbols exist:
+`nodeOperator` (line 37), `machinectlRunner`, `NSpawnMachineKube1/Kube2`,
+`ResolveNSpawnConfig`, `resetResources`, `NSpawnLifecycleConfig`,
+`ProvisioningFormat`, and the hidden `nspawn-lifecycle` command. The `MachineRun(`
+count of 35 is exact. The reset order in section 9 matches `resetResources`.
+Corrections made: `FindActiveMachine` is a method of `nodeOperator`, not a
+function; `host/assets/99-*` also matches `99-kubernetes-sysctl.conf`, which is
+not a machined guard, so WP3 names the two guard files instead; section 4 is
+the pre-change layout, and WP0 moved the nspawn items it lists into
+`pkg/agent/isolation/nspawn`.
 
 ## 4. Current coupling (as explored)
+
+This section describes the layout at the pre-change commit. After WP0 the
+nspawn-specific items below live in `pkg/agent/isolation/nspawn`.
 
 Agent code lives in `cmd/agent/internal/{cmd,daemon,bootstrap,attest,installstate}`
 and `pkg/agent/{goalstates,phases/{host,rootfs,nodestart,nodestop,reset},nspawnlifecycle,config,hostroot,agentbinary}`.
@@ -86,8 +110,9 @@ Coupling points to abstract:
   `nspawn-lifecycle` command in `cmd/agent/internal/cmd/nspawn_lifecycle.go`.
 - Daemon seam: `nodeOperator` (`cmd/agent/internal/daemon/nodeoperator.go`),
   used by reboot, repave, reset, upgrade.
-- Active machine discovery: `FindActiveMachine`, keyed on
-  `/etc/unbounded/agent/<m>-applied-config.json`.
+- Active machine discovery: the `nodeOperator` method `FindActiveMachine`,
+  keyed on `/etc/unbounded/agent/<m>-applied-config.json`
+  (`goalstates.AppliedConfigPath`).
 - Uninstall: `internal/provision/assets/unbounded-agent-uninstall.sh`
   hard-codes `machinectl`, `/etc/systemd/nspawn`, `/var/lib/machines`.
 - Generated config and vendor data: `internal/provision/agent_config.go`,
@@ -123,14 +148,23 @@ Add to `MachineSpec` in `api/machina/v1alpha3/machine_types.go` an optional
 field:
 
 ```go
-// Isolation selects where the node stack runs. Defaults to nspawn.
+// Isolation declares where the node stack should run. Empty declares nothing:
+// a new node uses nspawn and a running node keeps its mode.
 // +kubebuilder:validation:Enum=nspawn;none;container
 // +optional
 Isolation IsolationMode `json:"isolation,omitempty"`
 ```
 
+`Machine.status` gains `isolation` (the mode the agent reports as
+applied) and `isolationChange` (the agent's last attempt to change the mode:
+`targetMode`, `phase` of `InProgress`, `Succeeded` or `Failed`, `strategy` of
+`InPlace` or `Reprovision`, `message` and `lastTransitionTime`).
+
 It is additive within `v1alpha3`. No API version bump. Regenerate with
 `make generate`; never edit CRD YAML by hand.
+
+`spec.isolation` is the operator's declaration. The agent never writes `spec`,
+so no RBAC beyond the existing `machines/status` permissions is needed.
 
 ### 6.2 Agent config
 
@@ -147,15 +181,40 @@ and new files.
 
 ### 6.4 Version skew
 
-- The agent rejects any unrecognized `isolation` value with a clear error.
-- Machina emits a non-default `isolation` into generated agent config only for
-  agent versions known to support it, otherwise it sets a condition on the
-  Machine explaining why.
+- The agent rejects any unrecognized `isolation` value with a clear error. An
+  agent that predates the key does not reject it: the config is decoded with
+  `encoding/json` (`cmd/agent/internal/cmd/config.go`), which ignores unknown
+  keys, so that agent runs the node as `nspawn`.
+- Machina passes `spec.isolation` through to generated agent config without
+  checking the agent version. No release number is compiled into the code; the
+  operator pins an agent version that supports the requested mode.
 
 ### 6.5 Drift
 
-If `spec.isolation` differs from the applied mode, Machine status reports
-drift. Nothing moves until an `IsolationMigrate` MachineOperation (section 9).
+`spec.isolation` declares intent; it does not move the node. The controller
+compares it with `status.isolation` and `status.isolationChange` and
+sets the `IsolationDrift` condition:
+
+| Reason | Status | When |
+|---|---|---|
+| `NoModeDeclared` | `False` | `spec.isolation` is empty |
+| `AppliedModeMatches` | `False` | the declared mode runs |
+| `AppliedModeDiffers` | `True` | a different mode is declared; it applies at the next repave |
+| `ChangeInProgress` | `True` | `status.isolationChange` is `InProgress` for the declared mode |
+| `ChangeFailed` | `True` | `status.isolationChange` is `Failed` for the declared mode |
+
+The condition is absent until the agent has reported a mode. The mode changes
+when the node is next repaved (section 10).
+
+### 6.6 Implementation status
+
+- 6.4: implemented without a version gate. `provision.BuildAgentConfig` passes
+  `spec.isolation` through and no release number is compiled into the code.
+  Because an older agent ignores the key (above), pin a supporting agent
+  version before setting a non-default mode.
+- 6.5: the controller sets `IsolationDrift` as above from `spec.isolation`,
+  `status.isolation` (which the agent daemon writes at startup and after
+  a change) and `status.isolationChange`. The agent never writes `spec`.
 
 ## 7. Backend interface
 
@@ -248,15 +307,39 @@ Everything runs directly on the host.
 - Units: agent-owned systemd units for containerd, kubelet and CoreDNS.
 - Safety: preflight refuses to start if it finds a kubelet or containerd it does
   not own (unit, binary or running process).
-- Requirements: writable `/etc`, `/opt`, `/var`. `/usr` need not be writable.
-  Not supported on a read-only `/usr`; use `container`.
+- Requirements: writable `/etc`, `/opt`, `/var`. `/usr` is never modified, so
+  a read-only `/usr` is fine.
 - Network and paths: host native. Pods share the host netns trivially.
 - bpffs: no per-machine bpffs. The host `/sys/fs/bpf` is used directly. This is
   a documented difference for eBPF CNIs such as Cilium.
 - Exec: runs on the host as the unit's environment. Logs: `journalctl` for the
   agent-owned units.
-- Upgrade: drain, stop units, flip `current`, start units, wait for kubelet
+- Upgrade: stop units, flip `current`, start units, wait for kubelet
   Ready, flip back automatically on failure. The node is briefly down.
+
+**Status (WP1).** Implemented end to end: bootstrap, start, soft reboot,
+upgrade with rollback, reset, `exec`, `logs`, preflight and uninstall.
+Decisions: the applied config is recorded under the fixed slot `kube1` (the
+version directory, named `<kubernetes version>-<digest of other artifact
+versions>`, is the unit of upgrade); same-path files are written by the existing
+nodestart phases through a goal-state `RootOverride`, and binaries land in
+`<base>/<version>/bin` through the same rootfs installers.
+
+GPU: every grant is honored or refused by `Prepare`, never ignored. Device
+nodes and identity mounts are checked for existence, NVIDIA library and helper
+directories are satisfied by the host view, and a mount at another path or a
+library-path grant is an error. On a host with NVIDIA devices `Prepare`
+requires the NVIDIA Container Toolkit on the host, at `/usr/bin` or at the
+paths in the agent config `NvidiaToolkit` (valid only for `none`). Before the
+units start on `Start`, `Restart` and `Upgrade` (and its rollback) the agent
+selects CDI mode and regenerates `/etc/cdi/nvidia.yaml` as nspawn does. Reset
+removes the spec and leaves the toolkit's `config.toml` in CDI mode, which is
+accepted.
+
+Unverified: everything against a real systemd and containerd, kubelet Ready
+beyond "unit active and credentials present", pods surviving a plain unit stop,
+the GPU path on a real GPU host (including `nvidia-ctk cdi generate
+--driver-root /` on the distros in use), and a read-only `/usr`.
 
 ### 8.3 `container` (Azure Container Linux)
 
@@ -269,7 +352,7 @@ Provisional until the node facts in section 13 are collected.
 - Image: reuse the `images/agent-*` rootfs images with systemd as PID 1 (an
   entrypoint is added to the image family if needed).
 - Launch: the agent reuses the OCI unpack step, generates an OCI runtime bundle
-  (`config.json`) over the unpacked rootfs, and runs it with `runc` or `crun`
+  (`config.json`) over the unpacked rootfs, and runs it with `runc`
   supplied as an agent-downloaded artifact under `/opt/unbounded`. An
   agent-owned systemd unit supervises the container. The host's docker and
   containerd are not used.
@@ -279,7 +362,7 @@ Provisional until the node facts in section 13 are collected.
   `/var/lib/kubelet`, device and cgroup rules from grants.
 - SELinux: when enforcing, set `process.selinuxLabel` to `spc_t`. A preflight
   check verifies label support. Provisional.
-- Requirements: writable `/etc`, `/opt`, `/var`, a loadable `runc`/`crun`, cgroup
+- Requirements: writable `/etc`, `/opt`, `/var`, a loadable `runc`, cgroup
   v2, required kernel modules available to the container.
 - Provisioning: existing `ignition` `ProvisioningFormat`. No new format.
 - Lifecycle hooks: a new hidden generic `node-lifecycle` subcommand with the
@@ -287,6 +370,35 @@ Provisional until the node facts in section 13 are collected.
   `pkg/agent`. `nspawn-lifecycle` is untouched.
 - Exec: via `runc exec` (or equivalent) behind `Backend.Exec`. Logs: container
   journal via `journalctl -M` equivalent or `runc exec journalctl`.
+
+**Status (WP2, provisional).** Implemented end to end: the OCI bundle and
+supervising unit, bootstrap, start, soft reboot, blue/green upgrade with
+rollback, reset, `exec`, `logs`, preflight, GPU wiring through the
+`node-lifecycle` hooks, and uninstall. The runtime is `runc`, downloaded to
+`/opt/unbounded/runtime/runc` in this mode only.
+Decisions: paths under the bind-mounted same-path directories are written on the
+host side, since a bind mount hides anything written below it in the rootfs;
+both slots share those directories, so a repave resets the shared kubelet state
+and a rollback restarts the old slot against the new shared files (saved and
+restored byte for byte, see section 10.4); the applied config moves to the new
+slot only after it is healthy; the node-lifecycle post-start hook asks the
+runtime, not `systemctl is-active`, because the unit is still activating while
+`ExecStartPost` runs (an inference from systemd semantics, not observed).
+
+Unverified assumptions, all still open until the node facts in section 13 are
+collected:
+- `spc_t` is accepted by the node policy.
+- `rshared` on `/var/lib/kubelet` propagates through the host root mount, and
+  pod mounts propagate to the host.
+- `SIGRTMIN+3` through `runc` stops systemd as PID 1.
+- The capability, device and mount set in `config.json` is enough for kubelet,
+  containerd and the CNI.
+- `/proc/<pid>/root` of a containerized process resolves to the bundle rootfs
+  (used by the bind-address ownership preflight).
+- The runtime path and the `/lib/modules` read-only bind are right for the
+  image.
+- The privileged container, the `/run/host-nvidia*` binds and the CDI hooks
+  work on Azure Container Linux.
 
 ## 9. Operation matrix
 
@@ -303,6 +415,7 @@ Provisional until the node facts in section 13 are collected.
 | Exec / logs | `Backend.Exec` via `systemd-run --machine`; journal of machine | host exec; `journalctl` | `runc exec`; container journal |
 | GPU / devices | binds and `DeviceAllow` | native | OCI mounts and devices |
 | LocalDNS | CoreDNS in machine, host network unit | CoreDNS host unit, same network unit | CoreDNS in container, same network unit |
+| Mode change | declare `spec.isolation`, delete the Node; repave switches in place to `container` | repave resets and bootstraps again (reprovision) | declare `spec.isolation`, delete the Node; repave switches in place to `nspawn` |
 | Agent binary upgrade | unchanged (nspawn independent) | unchanged | unchanged |
 | Uninstall script | reads mode from applied-config, mode-specific cleanup | same | same |
 
@@ -310,49 +423,112 @@ The order of reset steps in `daemon/reset.go` (`resetResources`) is preserved:
 daemon unit, stop, WireGuard keys, config, root, bpffs, network and routes,
 bootstrap unit, artifacts, systemd reload.
 
-## 10. Migration
+## 10. Changing the mode
 
 ### 10.1 Trigger
 
-New `MachineOperation` type `IsolationMigrate` (alongside `NodeReboot`) in
-`api/machina/v1alpha3/machineoperation_types.go`, carrying `targetMode` and
-`strategy` (`inPlace` or `reprovision`). Handled by the daemon controller
-(`cmd/agent/internal/daemon/controller_machineoperation.go`). Editing
-`spec.isolation` alone only reports drift.
+There is no operation for it. The operator declares the mode in
+`spec.isolation` and the change is applied by the node's next repave, the
+existing OnDelete repave: the daemon repaves when the Node object is deleted
+(`cmd/agent/internal/daemon/controller_node.go`, `ReconcileRepave`). The repave
+builds the desired configuration from the Machine, which now carries the
+declared mode, and `hasDrift` compares the mode like any other field. When the
+mode differs, the repave changes it, together with anything else the repave
+applies (a new Kubernetes version, labels). Editing `spec.isolation` alone only
+reports drift. The agent never drains: the operator cordons and drains the node
+before deleting it, as for any repave.
+
+An empty `spec.isolation` declares nothing, so a repave never changes the mode
+of a node whose Machine does not declare one.
 
 ### 10.2 Supported strategies
 
+The strategy follows from the pair; the operator does not choose it.
+
 | From / To | `nspawn` | `container` | `none` |
 |---|---|---|---|
-| `nspawn` | n/a | in-place or reprovision | reprovision |
-| `container` | in-place or reprovision | n/a | reprovision |
+| `nspawn` | n/a | in-place | reprovision |
+| `container` | in-place | n/a | reprovision |
 | `none` | reprovision | reprovision | n/a |
 
-Reprovision is always available: drain, reset, bootstrap in the new mode.
+Reprovision is reset, then bootstrap in the new mode. Declaring the mode that
+already runs changes nothing.
 
 ### 10.3 In-place steps (`nspawn` <-> `container`)
 
 1. Preflight the target backend. Fail before mutating anything.
 2. Download artifacts for the target.
-3. Prepare the target backend in the alternate slot.
-4. Drain the node.
+3. Save the shared host configuration (`confsnap`).
+4. Prepare the target backend in the alternate slot.
 5. Stop the source node stack.
 6. Clean up host networking as repave does today.
 7. Start the target. Issue fresh kubelet credentials through the normal
    bootstrap and attestation flow. No credentials are copied. The Node name,
    labels and taints are kept.
 8. Persist new applied-config (mode, slot, owning backend).
-9. Wait for kubelet Ready within a bounded timeout.
-10. On success, destroy the source slot and remove its applied-config.
-11. On failure, stop the target, restart the source slot and report the failure
-    in the operation status. The source slot is retained until step 9 passes.
+9. Wait for the target to come up on the host within a bounded timeout.
+10. On success, destroy the source slot, remove its applied-config and the saved
+    configuration, and record `Succeeded` in `status.isolationChange`.
+11. On failure, stop the target, restore the saved configuration, restart the
+    source slot and record `Failed` in `status.isolationChange` with the cause
+    and `rolled back to <mode>`. The source slot is retained until step 9 passes.
 
-Existing repave is not changed to adopt rollback in this plan.
+A failed change is not retried on its own, so a bad declaration cannot cause
+repeated outages: the node keeps the mode it had and `IsolationDrift` reports
+`ChangeFailed`. The next trigger (deleting the Node again, or a configuration
+change) starts a new attempt.
 
 ### 10.4 State
 
 Pod data and the image store are re-pulled. Host-global state (invariant 2)
 is untouched.
+
+**Status.** Implemented for both strategies, driven from the repave.
+
+- *In place (nspawn <-> container).* `migrate.RunInPlace` with real hooks:
+  the target mode's host preflight, the repave's download resolution and archive
+  staging, prepare in the alternate slot, the repave's network cleanup, persist
+  the target's applied config, and the repave's local kubelet check within five
+  minutes. Rollback removes the target's record and restores the source's.
+  Success removes the source and updates `status.isolation`. Kubelet
+  credentials are fresh because the target boots a new kubelet from the
+  configuration's bootstrap token, as a repave does; nothing is copied.
+- *Crash safety.* `migrate.Journal` is a write-ahead step file at
+  `/etc/unbounded/agent/isolation-migration.json`. The daemon resolves a leftover
+  journal at start (before the source stopped: drop the target; once it may have
+  stopped: roll back; `awaiting-ready`: wait again; `ready`: finish cleanup) and
+  records the outcome in `status.isolationChange`. While both slots have an
+  applied config, the journal decides which one is active.
+- *Reprovision (any pair, required for `none`).* The reset removes the daemon,
+  so the daemon stages `/var/lib/unbounded-agent-reprovision` (binary copy,
+  target config, journal) and starts `unbounded-agent-reprovision.service`,
+  whose hidden `isolation-reprovision` command runs the existing reset, then the
+  target mode's bootstrap, retried by systemd up to
+  `daemon.ReprovisionMaxAttempts` runs. The daemon that bootstrap installs
+  records the outcome once the applied config is in the target mode.
+- *Shared configuration.* `confsnap` saves, byte for byte, the host files both
+  stacks write at the same paths before an in-place change, a `none` upgrade
+  and a container upgrade, and restores them before the source starts again on
+  any failure, also after a restart mid-change.
+- *Preflight and tokens.* The `none` target's static preflight runs before the
+  reset and the ownership half after. An attested host records its attestation
+  URL at bootstrap and attests again on reprovision; any other host is checked
+  for a still-valid bootstrap token before the reset. An invalid token cannot
+  be renewed from the agent: the operator must renew it or bootstrap with
+  attestation. A change to nspawn is refused up front when the host lacks the
+  nspawn runtime, because a change installs nothing.
+- *Gaps.* After a reprovision that never bootstraps, `status.isolationChange` is
+  recorded `Failed` only once an agent next runs on the host.
+
+### 10.5 Future: in-place upgrades without deleting the Node
+
+A mode change, like any repave, replaces the node stack and needs the Node
+deleted. Upgrades that swap only containerd and kubelet on the host, without
+deleting the Node, are not built. The `none` backend is the extension point: it
+installs each version in `/opt/unbounded/node/<version>` and switches an atomic
+`current` link, with automatic rollback. A future trigger other than Node
+deletion could flip that link directly. The mode change does not depend on it
+and the repave stays the only trigger today.
 
 ## 11. Work packages
 
@@ -387,7 +563,8 @@ moved from the nspawn-specific files), and edits to
 Steps:
 
 1. Re-verify section 4 against the code. Record any discrepancy in a short
-   note appended to this document before proceeding.
+   note appended to this document before proceeding. Done; see "Citation
+   verification" in section 3.
 2. Define `Backend`, `NodeRoot`, `Grant`, `Requirements`, `ExecSpec`, `Status`
    in `pkg/agent/isolation`, plus a registry and a fake backend for tests.
 3. Move all nspawn-specific code behind an `nspawn` backend: rendering
@@ -406,7 +583,23 @@ Acceptance:
   (`rootfs/testdata/**`, nodestart, reset, daemon tests).
 - `rg 'MachineDir|MachineRun|machinectl'` outside `pkg/agent/isolation/nspawn/`
   and `pkg/agent/phases/host/preflight*` returns no hits, or each remaining hit
-  is documented as intentional.
+  is documented as intentional. Remaining hits in Go sources (tests excluded),
+  all intentional:
+  - `goalstates/{rootfs,nodestart,resolve}.go`: the `MachineDir` field is the
+    nspawn backend's root directory in the goal state, kept so the nspawn
+    output is unchanged; `noderoot.go` is the adapter that turns it into a
+    `NodeRoot`.
+  - `phases/rootfs/preflight_local.go`: `nspawnMachineProvisioningChecker` is
+    nspawn-only preflight by nature (it inspects the machine directory), the
+    rootfs counterpart of the host machine checks, so it is acceptable here and
+    only runs for the nspawn mode.
+  - `phases/nodestart/preflight_api_server.go`: derives the blue/green slot name
+    from the root directory for the bootstrap preflight.
+  - `phases/host/os.go` and `isolation/isolation.go`: comments only.
+  - `nspawnlifecycle/lifecycle.go`: the `nspawn-lifecycle` hook is untouched
+    (invariant 6).
+  - `cmd/kubectl-unbounded/app/machine_soft_reboot.go`: help text that names
+    `machinectl shell kube1` for nspawn hosts.
 - `make lint` and `make test` pass.
 - The Python QEMU e2e for the default mode passes, if runnable. Otherwise
   report that it was not run.
@@ -443,7 +636,7 @@ Owns: `pkg/agent/isolation/container/` (new), OCI bundle generation,
 `node-lifecycle` hidden command in `cmd/agent/internal/cmd/`, shared lifecycle
 code in `pkg/agent/` (new package, for example `pkg/agent/nodelifecycle`),
 changes to `images/agent-*` needed for systemd as PID 1, and the runtime
-artifact (`runc` or `crun`) download wiring.
+artifact (`runc`) download wiring.
 
 Steps: implement `Backend` per section 8.3. Reuse the OCI unpack code from
 `pkg/agent/phases/rootfs/oci`. Apply grants as OCI mounts and devices. Set the
@@ -458,40 +651,43 @@ Acceptance:
 - The design section 8.3 is updated with the verified node facts, and anything
   still unverified stays labeled provisional.
 
-### WP3: API, config, applied-config, migration
+### WP3: API, config, applied-config, mode change
 
 Depends on: WP0. Parallel with WP1, WP2 (stubs for backends are fine).
 
-Owns: `api/machina/v1alpha3/{machine_types,machineoperation_types}.go`,
+Owns: `api/machina/v1alpha3/machine_types.go`,
 generated CRDs and deepcopy via `make generate`,
 `pkg/agent/config/config.go`, applied-config read/write,
-`cmd/agent/internal/daemon/controller_machineoperation.go`, a new
-`IsolationMigrate` handler, machina agent-config generation
-(`internal/provision/agent_config.go` and machina controller), metalman
-passthrough, `kubectl unbounded` manual bootstrap flag.
+`cmd/agent/internal/daemon/controller_node.go` (the repave), machina
+agent-config generation (`internal/provision/agent_config.go` and machina
+controller), metalman passthrough, `kubectl unbounded` manual bootstrap flag.
 
 Steps:
 
-1. Add `spec.isolation` and the `IsolationMigrate` operation type. Run
-   `make generate`.
+1. Add `spec.isolation`, `status.isolation` and
+   `status.isolationChange`. Run `make generate`.
 2. Add `Isolation` to `AgentConfig` with validation. Unknown values rejected.
 3. Applied-config records mode, slot, owning backend. Tolerate old files.
-4. Machina gating by agent version and a Machine condition (section 6.4).
-5. Drift reporting in Machine status.
-6. Implement the migration orchestrator (section 10.3) on top of the
-   `Backend` interface, including automatic rollback.
+4. Pass `spec.isolation` into generated agent config (section 6.4).
+5. Drift reporting in Machine status (section 6.5).
+6. Implement the change orchestrator (section 10.3) on top of the `Backend`
+   interface, including automatic rollback, and call it from the repave when the
+   declared mode differs from the applied one.
 7. Make nspawn-only host guards conditional: the `systemd-container` install
-   in `host/os.go`, the machined restart guards in `host/assets/99-*`, and the
+   in `host/os.go`, the machined restart guards
+   (`host/assets/99-unbounded-needrestart.conf` and
+   `99-unbounded-no-restart-systemd.conf`, applied by `host/apt.go`), and the
    `images/netboot/assets/vendor-data.tmpl` machined rules.
 
 Acceptance:
 
 - Existing Machines without the field produce unchanged generated output
   (golden comparison).
-- Migration tests with fake backends: success, preflight failure (no mutation),
-  target failure (rollback to source), and unsupported pair (rejected).
-- Version-skew tests: old agent version leads to a condition and no emitted
-  mode.
+- Mode change tests with fake backends: success, preflight failure (no
+  mutation), target failure (rollback to source), no retry of a failed change,
+  and an empty declaration (the mode is kept).
+- Config tests: `spec.isolation` reaches the generated agent config, and an
+  unset field leaves the output unchanged.
 
 ### WP4: `exec`, `logs`, lifecycle and uninstall
 
@@ -519,11 +715,11 @@ Docs (`docs/` is public site documentation only, not design material):
 
 - Split `docs/content/reference/agent/nspawn.md` into an isolation overview
   (comparison table, "choosing a mode"), one page per mode (`nspawn`, `none`,
-  `container`), and a migration page.
+  `container`), and a page on changing the mode.
 - Add per-mode sections to `reference/gpu/{nvidia,amd}.md`,
   `reference/agent/{_index,configuration}.md`, `guides/agent.md`,
   `guides/operations/_index.md`, `concepts/overview.md`, `reference/cli.md`.
-- Document `spec.isolation`, `IsolationMigrate`, `exec` and `logs`.
+- Document `spec.isolation`, `status.isolationChange`, `exec` and `logs`.
 - Replace `machinectl shell` recipes with `exec`/`logs`; keep the nspawn-specific
   recipes on the nspawn page only.
 - Update the diagrams under `docs/static/img/` or note them as nspawn-only.
@@ -532,8 +728,9 @@ E2E:
 
 - Parameterize `e2e.py` by mode. Default-mode tests unchanged.
 - Add `none` and `container` bootstrap, soft reboot, upgrade and reset tests.
-- Add migration tests: `nspawn` to `container` and back, plus a reprovision
-  case, including the rollback case.
+- Add mode change tests: declare `spec.isolation`, delete the Node, and check
+  `nspawn` to `container` and back (in place), `none` (reprovision), the
+  rollback case, and that a failed change is not retried.
 
 Acceptance: docs build; every mode page covers requirements, bootstrap, each
 operation in section 9, GPU, LocalDNS, limits and troubleshooting; links valid;
@@ -545,11 +742,15 @@ operation in section 9, GPU, LocalDNS, limits and troubleshooting; links valid;
   units and configs (existing pattern in `rootfs/nspawn_render_test.go`).
 - Conformance: one shared Go suite run against every backend (prepare, start,
   stop, restart, exec, destroy, idempotence, failure recovery).
-- Migration: fake-backend tests for every row of section 10.2 and the rollback
-  path.
+- Mode change: fake-backend tests for every row of section 10.2 and the
+  rollback path.
 - E2E: the Python QEMU suite parameterized by mode (WP5).
 
 ## 13. Open items and prerequisites
+
+Status: WP2 was implemented without these facts; see the status note in
+section 8.3. Every item below is still open. Remaining gap beyond these facts:
+nothing has run on a real host or in the QEMU e2e.
 
 1. **Azure Container Linux node facts (blocks WP2).** Run on a live node and
    record the output: `uname -r`, `containerd --version`, `runc --version`,
@@ -565,6 +766,6 @@ operation in section 9, GPU, LocalDNS, limits and troubleshooting; links valid;
    Flatcar. Only the lineage, read-only `/usr` with dm-verity, weekly
    image-based updates, signed UKI with Secure Boot, and enforcing SELinux are
    confirmed from Microsoft documentation.
-5. WP0 step 1 re-verifies all code citations in this document.
+5. WP0 step 1 re-verified all code citations in this document (section 3).
 6. Approving this document is the approval required by `AGENTS.md` for the
    cross-package refactor in WP0.
