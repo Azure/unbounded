@@ -290,6 +290,27 @@ impl AzureTokenCache {
         *self.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// Drop the cached token only if it is `sent`, so a stale rejection does
+    /// not evict a newer token another request or worker already fetched.
+    /// Returns whether it was dropped.
+    pub fn invalidate_sent(&self, sent: &[u8]) -> bool {
+        let mut token = self.token.lock().unwrap_or_else(|e| e.into_inner());
+        let held = token.as_ref().is_some_and(|t| t.token.as_bytes() == sent);
+        if held {
+            *token = None;
+        }
+        held
+    }
+
+    /// Whether the cached token is `sent`.
+    pub fn holds(&self, sent: &[u8]) -> bool {
+        self.token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|t| t.token.as_bytes() == sent)
+    }
+
     /// The cached token if it is not yet due for refresh.
     fn fresh(&self, now: SystemTime) -> Option<Arc<str>> {
         let token = self.token.lock().unwrap_or_else(|e| e.into_inner());

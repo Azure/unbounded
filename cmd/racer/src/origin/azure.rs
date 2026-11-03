@@ -92,10 +92,16 @@ pub trait AzureTokenSource {
     ) -> Operation<'a, Option<BearerToken>>;
 
     /// Storage answered 401 to a request for `credential`. `challenge` is its
-    /// `WWW-Authenticate` value and `sent` whether the request carried a bearer
-    /// token. Drop a rejected token or learn a tenant from the challenge, and
-    /// return whether one retry may succeed. The origin retries at most once.
-    fn rejected(&self, credential: &AzureCredential, challenge: Option<&[u8]>, sent: bool) -> bool;
+    /// `WWW-Authenticate` value and `sent` the bearer token the request
+    /// carried, if any. Drop the rejected token (but not a newer one cached
+    /// since) or learn a tenant from the challenge, and return whether one
+    /// retry may succeed. The origin retries at most once.
+    fn rejected(
+        &self,
+        credential: &AzureCredential,
+        challenge: Option<&[u8]>,
+        sent: Option<&[u8]>,
+    ) -> bool;
 }
 
 /// Token source for deployments without credential providers: anonymous
@@ -117,7 +123,7 @@ impl AzureTokenSource for AnonymousOnly {
         })
     }
 
-    fn rejected(&self, _: &AzureCredential, _: Option<&[u8]>, _: bool) -> bool {
+    fn rejected(&self, _: &AzureCredential, _: Option<&[u8]>, _: Option<&[u8]>) -> bool {
         false
     }
 }
@@ -338,8 +344,6 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                 if_match,
                 token.as_ref().map(BearerToken::as_bytes),
             )?;
-            let sent = token.is_some();
-            drop(token);
             let exchange = self
                 .transport
                 .exchange(url, head, &begun.scope)
@@ -354,9 +358,11 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             let challenge = response::field(exchange.head(), "WWW-Authenticate")
                 .ok()
                 .flatten();
+            let sent = token.as_ref().map(BearerToken::as_bytes);
             if !self.tokens.rejected(credential, challenge, sent) {
                 return Ok(exchange);
             }
+            drop(token);
             let _ = exchange.discard(&begun.scope).await;
             retried = true;
         }

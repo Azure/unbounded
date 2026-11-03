@@ -8,8 +8,11 @@
 //!
 //! Storage 401s feed back through [`AzureTokenSource::rejected`]: a
 //! challenge teaches workload identity its tenant, and a rejected token is
-//! dropped so the retry fetches a fresh one. Token drops are rate limited per
-//! worker and credential so a persistent 401 cannot hammer the token service.
+//! dropped so the retry fetches a fresh one. Only the token that was sent is
+//! dropped: when another request or worker already replaced it, the retry
+//! uses the newer token and nothing is evicted. Token drops are rate limited
+//! per worker and credential so a persistent 401 cannot hammer the token
+//! service.
 
 use super::{AzureTokenSource, BearerToken};
 use crate::error::{Error, Operation, Result};
@@ -170,7 +173,12 @@ impl AzureTokenSource for AzureTokens {
         })
     }
 
-    fn rejected(&self, credential: &AzureCredential, challenge: Option<&[u8]>, sent: bool) -> bool {
+    fn rejected(
+        &self,
+        credential: &AzureCredential,
+        challenge: Option<&[u8]>,
+        sent: Option<&[u8]>,
+    ) -> bool {
         self.rejected_at(credential, challenge, sent, Instant::now())
     }
 }
@@ -182,7 +190,7 @@ impl AzureTokens {
         &self,
         credential: &AzureCredential,
         challenge: Option<&[u8]>,
-        sent: bool,
+        sent: Option<&[u8]>,
         now: Instant,
     ) -> bool {
         let Some((key, provider)) = provider(credential) else {
@@ -192,12 +200,18 @@ impl AzureTokens {
             return false;
         };
         let cache = source.cache();
-        if !sent {
+        let Some(sent) = sent else {
             // Only workload identity without a tenant sends anonymously.
             return challenge.is_some_and(|challenge| cache.learn_tenant(challenge));
-        }
+        };
         if let Some(challenge) = challenge {
             cache.learn_tenant(challenge);
+        }
+        if !cache.holds(sent) {
+            // Already dropped or replaced (by a tenant change, another
+            // request, or another worker): retry with the current token
+            // without spending this worker's invalidation window.
+            return true;
         }
         let mut sources = self.sources.borrow_mut();
         let Some(entry) = sources.get_mut(&key) else {
@@ -210,7 +224,9 @@ impl AzureTokens {
             return false;
         }
         entry.invalidated = Some(now);
-        cache.invalidate();
+        // Compare and drop under the cache lock: a newer token stored since
+        // the check above survives.
+        cache.invalidate_sent(sent);
         true
     }
 }
@@ -277,34 +293,99 @@ mod tests {
             AzureTokens::new(caches, reactor).with_resolver(Rc::new(MapResolver::new(Vec::new())));
         let (a, b) = (managed("a"), managed("b"));
 
-        assert!(!tokens.rejected(&AzureCredential::Anonymous, None, true));
+        assert!(!tokens.rejected(&AzureCredential::Anonymous, None, Some(b"x")));
         assert_eq!(bearer(&tokens, &a), "a-1");
         assert_eq!(bearer(&tokens, &b), "b-2");
 
         // A rejected token is dropped and the next bearer fetches a new one.
         let start = Instant::now();
-        assert!(tokens.rejected_at(&a, None, true, start));
+        assert!(tokens.rejected_at(&a, None, Some(b"a-1"), start));
         assert_eq!(bearer(&tokens, &a), "a-3");
         // Other credentials keep their tokens.
         assert_eq!(bearer(&tokens, &b), "b-2");
 
         // Within the window a second rejection keeps the token.
         let within = start + INVALIDATE_INTERVAL - Duration::from_millis(1);
-        assert!(!tokens.rejected_at(&a, None, true, within));
+        assert!(!tokens.rejected_at(&a, None, Some(b"a-3"), within));
         assert_eq!(bearer(&tokens, &a), "a-3");
         // The window is per credential.
-        assert!(tokens.rejected_at(&b, None, true, within));
+        assert!(tokens.rejected_at(&b, None, Some(b"b-2"), within));
         assert_eq!(bearer(&tokens, &b), "b-4");
         assert_eq!(bearer(&tokens, &a), "a-3");
 
         // Once the window passes the rejected token is dropped again.
-        assert!(tokens.rejected_at(&a, None, true, start + INVALIDATE_INTERVAL));
+        assert!(tokens.rejected_at(&a, None, Some(b"a-3"), start + INVALIDATE_INTERVAL));
         assert_eq!(bearer(&tokens, &a), "a-5");
         assert_eq!(bearer(&tokens, &b), "b-4");
         assert_eq!(accepted.load(Ordering::SeqCst), 5);
 
         drop(tokens);
         // Unblock the server's remaining accept.
+        let _ = std::net::TcpStream::connect(address);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stale_rejections_keep_newer_tokens_across_workers() {
+        let count = Arc::new(Mutex::new(0usize));
+        let seen = count.clone();
+        let (address, accepted, server) = serve(None, 4, move |_, _| {
+            let mut count = seen.lock().unwrap();
+            *count += 1;
+            let body = format!(
+                "{{\"access_token\":\"t-{count}\",\"expires_in\":\"3600\",\"token_type\":\"Bearer\"}}"
+            );
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        });
+        let Some(reactor) = reactor() else {
+            let _ = std::net::TcpStream::connect(address);
+            return;
+        };
+        let caches = Arc::new(AzureTokenCaches::new(AuthEndpoints {
+            imds: RemoteEndpoint::http("127.0.0.1", address.port()).unwrap(),
+            authority: "https://login.microsoftonline.com/".into(),
+            federated_token_file: None,
+            tls: None,
+        }));
+        // Two workers sharing the node-wide cache.
+        let one = AzureTokens::new(caches.clone(), reactor.clone())
+            .with_resolver(Rc::new(MapResolver::new(Vec::new())));
+        let two =
+            AzureTokens::new(caches, reactor).with_resolver(Rc::new(MapResolver::new(Vec::new())));
+        let a = managed("a");
+        assert_eq!(bearer(&one, &a), "t-1");
+        assert_eq!(bearer(&two, &a), "t-1");
+
+        // Worker one drops t-1 and refreshes.
+        let start = Instant::now();
+        assert!(one.rejected_at(&a, None, Some(b"t-1"), start));
+        assert_eq!(bearer(&one, &a), "t-2");
+
+        // A late 401 for t-1 on worker two retries with t-2 and keeps it.
+        assert!(two.rejected_at(&a, None, Some(b"t-1"), start));
+        assert_eq!(bearer(&two, &a), "t-2");
+        assert_eq!(bearer(&one, &a), "t-2");
+
+        // That stale rejection did not spend worker two's window: a
+        // rejection of the current token still drops it.
+        assert!(two.rejected_at(&a, None, Some(b"t-2"), start));
+        assert_eq!(bearer(&one, &a), "t-3");
+        // Worker two's window is now spent for the current token.
+        assert!(!two.rejected_at(&a, None, Some(b"t-3"), start));
+        // A stale rejection on the same worker within its own window still
+        // retries, since the current token differs.
+        assert!(one.rejected_at(&a, None, Some(b"t-1"), start));
+        assert_eq!(bearer(&two, &a), "t-3");
+        // An unknown token is never evicted.
+        assert!(one.rejected_at(&a, None, Some(b"other"), start));
+        assert_eq!(bearer(&one, &a), "t-3");
+        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+
+        drop((one, two));
         let _ = std::net::TcpStream::connect(address);
         server.join().unwrap();
     }

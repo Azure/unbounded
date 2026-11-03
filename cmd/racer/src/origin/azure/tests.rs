@@ -119,10 +119,13 @@ impl AzureTokenSource for Rc<Tokens> {
             })
         })
     }
-    fn rejected(&self, _: &AzureCredential, challenge: Option<&[u8]>, sent: bool) -> bool {
+    fn rejected(&self, _: &AzureCredential, challenge: Option<&[u8]>, sent: Option<&[u8]>) -> bool {
+        if let Some(sent) = sent {
+            assert_eq!(sent, b"secret-token");
+        }
         self.1
             .borrow_mut()
-            .push((challenge.map(<[u8]>::to_vec), sent));
+            .push((challenge.map(<[u8]>::to_vec), sent.is_some()));
         self.2.get()
     }
 }
