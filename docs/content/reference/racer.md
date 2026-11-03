@@ -1538,6 +1538,8 @@ while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
 HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that
 failed (usually because every page buffer was in use).
+`racer_rdma_fallback_overflow_total` counts pages sent over HTTP because the hop
+qualified by Site and rail but was not among the 128 RDMA peers both nodes chose.
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json

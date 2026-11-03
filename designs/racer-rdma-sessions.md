@@ -53,6 +53,14 @@ Links are keyed by `LinkKey { peer: SHA-256(NodeId), rail }`. A local `Epoch`
 identifies one incarnation; the signed handshake establishes a separate
 64-bit link id shared by the two nodes.
 
+Only RDMA edges get links. An edge is eligible when both ends share a
+nonempty Site and at least one rail. Each node ranks its eligible mesh edges
+(see [racer-mesh-v2.md](racer-mesh-v2.md)) and takes the best `RDMA_PEERS`
+(128). An edge is an RDMA edge only when both ends took it. Each membership
+caches these peer sets, computed on first use per node. A hop that qualifies
+by Site and rail but is not an RDMA edge sends its page over HTTP and counts
+`racer_rdma_fallback_overflow_total`.
+
 When a page needs an idle link, `Transfers::ensure_link` starts setup in the
 background. That page uses HTTP instead of waiting for setup.
 
@@ -80,7 +88,9 @@ posts link traffic. The response must bind our exact setup and must not echo
 it back as the responder's setup.
 
 The server checks the signature and session peer, a shared nonempty Site, and
-the rail in both nodes' published NIC lists and the rail domain. Simultaneous
+the rail in both nodes' published NIC lists and the rail domain. An offer
+on an edge that is not an RDMA edge in the responder's membership gets `403`,
+and the initiator backs off. Simultaneous
 setup uses byte ordering of NodeIds: the lower NodeId's offer wins. The other
 offer gets `409`. Setup is limited to one accepted attempt per peer and rail
 per second; excess attempts get `429`. Unavailable native service gets `503`.
