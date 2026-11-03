@@ -332,6 +332,10 @@ does not add or repair registry entries. Removing the selected upstream while
 retaining managed policy reports a configuration error. Rerun attachment to
 restore the upstream.
 
+Identity-use authorization is published after the managed helper rollout is
+ready, so cleanup queued under the previous external policy cannot revoke a
+grant staged before opt-in.
+
 ```text
 unchanged application Pod/ServiceAccount
   -> kubelet Pod-bound ServiceAccount token
@@ -358,7 +362,9 @@ Secret. There is no shared restart Lease or per-worker configuration watch.
 Local checks repair owned-file drift without restarting unchanged kubelets.
 Node membership is maintained by a central, server-filtered metadata informer and
 event-driven RBAC reconciliation, with at most 1,000 named users per binding.
-The 10,000-worker behavior is tested offline, not live benchmarked.
+These helper and authorization properties have been live-validated on a fresh
+three-worker AKS 1.36.5 cluster, including private pulls without application
+changes. The 10,000-worker behavior is tested offline, not live benchmarked.
 
 There is no custom broker, exec adapter, or token-exchange service. Pull
 authentication needs no VM/VMSS identity assignments or IMDS fallback. Initial

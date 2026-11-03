@@ -1,8 +1,8 @@
 # Gantry ACR onboarding
 
-Status: private-image pulls and peer delivery have been live-validated on three
-Azure-hosted Flex VMSS workers with AKS 1.36.5. The scalability redesign is
-offline-tested, not live-deployed.
+Status: the scalability redesign, private-image pulls, and peer delivery have
+been live-validated on a fresh AKS 1.36.5 cluster with three Azure-hosted Flex
+VMSS workers. The 10,000-worker behavior remains offline-tested, not benchmarked.
 
 ## Contract
 
@@ -44,12 +44,16 @@ assign identities to Azure VMs and VMSS models.
    No application Pod or ServiceAccount is changed.
 4. It grants the identity the registry-appropriate pull-only role. Existing
    conditional grants are not silently broadened.
-5. It authorizes `system:serviceaccounts` collectively to use that identity and
-   persists validated, nonsecret installation policy.
+5. It persists validated, nonsecret installation policy together with the
+   registry's Gantry upstream configuration.
 6. The operator installs a node-configuration DaemonSet targeting Linux Flex
    nodes. It copies the pinned upstream binary and configures its built-in
    identity-bindings mode in the actual kubelet runtime.
-7. Kubelet supplies Pod-bound ServiceAccount tokens directly to the stock
+7. The command waits for managed installation before authorizing
+   `system:serviceaccounts` collectively to use the identity. This prevents an
+   external-policy reconciliation queued during opt-in from revoking a staged
+   grant.
+8. Kubelet supplies Pod-bound ServiceAccount tokens directly to the stock
    executable. The upstream implementation performs token exchange with the
    AKS-managed endpoint.
 

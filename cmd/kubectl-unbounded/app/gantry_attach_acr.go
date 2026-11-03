@@ -231,6 +231,12 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 		if err := h.waitForACRInstallation(ctx, cfg); err != nil {
 			return fmt.Errorf("policy saved, but stock provider installation is not ready: %w", err)
 		}
+
+		// The operator must observe managed policy before a grant can survive
+		// an external-policy reconciliation queued during initial attachment.
+		if err := h.grantACRIdentityUse(ctx, cfg.ClientID); err != nil {
+			return fmt.Errorf("provider installed, but identity-use authorization is not ready: %w", err)
+		}
 	}
 
 	if h.out != nil {

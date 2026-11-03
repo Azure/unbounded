@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -343,6 +344,45 @@ func TestGantryAttachACRManagedUsesStockProviderWithoutComputeAssignment(t *test
 			require.Equal(t, "gantry-acr-discovery", action.(k8stesting.CreateAction).GetObject().(*corev1.ServiceAccount).Name)
 		}
 	}
+}
+
+func TestGantryAttachACRPublishesIdentityGrantAfterManagedInstallation(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	client.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		// A queued external-policy reconciliation can revoke a staged grant.
+		err := client.Tracker().Delete(rbacv1.SchemeGroupVersion.WithResource("clusterrolebindings"), "", registryauth.IdentityRoleName)
+		require.True(t, err == nil || apierrors.IsNotFound(err))
+
+		return false, nil, nil
+	})
+	require.NoError(t, h.execute(t.Context()))
+	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
+	require.NoError(t, err, "the identity-use grant must survive the transition from external policy")
+
+	installerRead, grantWrite := -1, -1
+
+	for index, action := range client.Actions() {
+		if action.Matches("get", "daemonsets") {
+			installerRead = index
+		}
+
+		if action.Matches("create", "clusterrolebindings") {
+			grantWrite = index
+		}
+	}
+
+	require.NotEqual(t, -1, installerRead)
+	require.Greater(t, grantWrite, installerRead, "wait for the operator to observe managed policy before publishing the grant")
+}
+
+func TestGantryAttachACRDoesNotStageIdentityGrantWhenPolicySaveFails(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	client.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("policy write failed")
+	})
+	require.ErrorContains(t, h.execute(t.Context()), "policy write failed")
+	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err), "a failed opt-in must not publish collective identity-use permission")
 }
 
 func TestGantryAttachACRRejectsWrongClusterBeforeAzureWrites(t *testing.T) {

@@ -217,7 +217,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 				return err
 			}
 
-			return h.grantACRIdentityUse(ctx, selected.ClientID)
+			return nil
 		case "Creating", "Updating":
 		default:
 			return fmt.Errorf("AKS identity binding provisioning state: %s", binding.Properties.ProvisioningState)
