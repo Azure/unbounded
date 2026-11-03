@@ -110,8 +110,10 @@ func testAllocationLaunchOptions(t *testing.T) allocationLaunchOptions {
 
 			return nil, errors.New("unexpected client construction")
 		},
-		interval: time.Millisecond,
-		timeout:  50 * time.Millisecond,
+		// The budget leaves room for a slow first read under the race
+		// detector; every read selects its credential and builds a client.
+		interval: 10 * time.Millisecond,
+		timeout:  time.Second,
 	}
 }
 
