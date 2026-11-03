@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -361,4 +362,69 @@ func planHasObject(plan *component.Plan, kind, name string) bool {
 	}
 
 	return false
+}
+
+// dataplanePod creates a Pod owned by the live dataplane DaemonSet.
+func dataplanePod(t *testing.T, env *component.Env, name string, native, ready bool) {
+	t.Helper()
+
+	ds := liveDataplane(t, env)
+	if ds.UID == "" {
+		ds.UID = types.UID("dataplane-uid")
+		require.NoError(t, env.Client.Update(t.Context(), ds))
+		ds = liveDataplane(t, env)
+	}
+
+	annotations := map[string]string{}
+	if native {
+		annotations[nativeOriginAnnotation] = "true"
+	}
+
+	status := corev1.ConditionFalse
+	if ready {
+		status = corev1.ConditionTrue
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       ds.Namespace,
+			Labels:          ds.Spec.Selector.MatchLabels,
+			Annotations:     annotations,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ds, appsv1.SchemeGroupVersion.WithKind("DaemonSet"))},
+		},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}},
+	}
+	require.NoError(t, env.Client.Create(t.Context(), pod))
+}
+
+func TestLeftoverOriginsWaitForSurgeRollout(t *testing.T) {
+	env := testEnv(t, originCache("a", nil))
+	initialize(t, env)
+	leftoverOrigin(t, env, "a", component.FieldOwner)
+
+	// A surge rollout: the old Pod is still ready and serving while its
+	// replacement is not, yet the counters all equal the desired count.
+	dataplanePod(t, env, "old", false, true)
+	dataplanePod(t, env, "new", true, false)
+
+	ds := liveDataplane(t, env)
+	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{ObservedGeneration: ds.Generation, DesiredNumberScheduled: 1, UpdatedNumberScheduled: 1, NumberAvailable: 1})
+
+	plan, result := planResult(t, env)
+	require.Empty(t, deletedOrigins(plan))
+	require.Equal(t, pendingRequeue, result.RequeueAfter)
+
+	// The old Pod goes but the replacement is still unready: keep waiting.
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "old", Namespace: ds.Namespace}}))
+
+	plan, _ = planResult(t, env)
+	require.Empty(t, deletedOrigins(plan))
+
+	// Only ready native-origin Pods remain: the origins go.
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "new", Namespace: ds.Namespace}}))
+	dataplanePod(t, env, "new2", true, true)
+
+	plan, _ = planResult(t, env)
+	require.Len(t, deletedOrigins(plan), 2)
 }

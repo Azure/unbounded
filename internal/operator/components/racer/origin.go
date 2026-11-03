@@ -131,11 +131,79 @@ func nativeOriginRolledOut(ctx context.Context, env *component.Env) (bool, error
 	}
 
 	st := ds.Status
+	if st.ObservedGeneration < ds.Generation ||
+		st.UpdatedNumberScheduled != st.DesiredNumberScheduled ||
+		st.NumberAvailable != st.DesiredNumberScheduled ||
+		st.NumberUnavailable != 0 {
+		return false, nil
+	}
 
-	return st.ObservedGeneration >= ds.Generation &&
-		st.UpdatedNumberScheduled == st.DesiredNumberScheduled &&
-		st.NumberAvailable == st.DesiredNumberScheduled &&
-		st.NumberUnavailable == 0, nil
+	// The counters alone are not enough: during a surge rollout a ready old
+	// Pod and an unready replacement on the same node can satisfy all of
+	// them. Require every live Pod the DaemonSet owns to run the
+	// native-origin template and be Ready.
+	return dataplanePodsNative(ctx, env, ds)
+}
+
+// dataplanePodsNative reports whether every non-terminating Pod owned by ds
+// carries the native-origin annotation and is Ready.
+func dataplanePodsNative(ctx context.Context, env *component.Env, ds *appsv1.DaemonSet) (bool, error) {
+	if ds.Spec.Selector == nil {
+		return false, nil
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+	if err != nil {
+		return false, err
+	}
+
+	pods := &corev1.PodList{}
+	if err := env.LiveReader().List(ctx, pods, client.InNamespace(ds.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return false, err
+	}
+
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !ownedBy(pod, ds) {
+			continue
+		}
+
+		if pod.Annotations[nativeOriginAnnotation] != "true" {
+			// An old-revision Pod may still serve origin reads, even while
+			// terminating.
+			return false, nil
+		}
+
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		if !podReady(pod) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func ownedBy(pod *corev1.Pod, ds *appsv1.DaemonSet) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.UID == ds.UID && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+
+	return false
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+
+	return false
 }
 
 // pruneOrigins deletes the origin DaemonSets and ServiceAccounts that this
