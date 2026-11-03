@@ -317,7 +317,13 @@ kubectl unbounded gantry attach-acr \
 
 `AKS_ID` is the full resource ID of the target AKS cluster. This mode uses one
 unified stock `acr-credential-provider` in **AKS identity-bindings mode** on
-Linux Flex nodes, whether those nodes run in Azure or outside Azure:
+Linux Flex nodes, whether those nodes run in Azure or outside Azure.
+
+The attachment command updates Gantry's upstream configuration and managed-auth
+policy together. The operator validates that policy and configures nodes; it
+does not add or repair registry entries. Removing the selected upstream while
+retaining managed policy reports a configuration error. Rerun attachment to
+restore the upstream.
 
 ```text
 unchanged application Pod/ServiceAccount

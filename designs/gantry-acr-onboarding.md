@@ -9,14 +9,8 @@ Fresh cluster deployment installs Gantry without a central ACR, pull identity,
 or authentication policy. The user subsequently attaches an existing ACR in
 the same subscription, possibly in another resource group:
 
-```sh
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID"
-
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID" --auth-mode aks-identity-binding \
-  --cluster-resource-id "$AKS_ID"
-```
+Commands and user-facing requirements are documented in the
+[ACR attachment guide](../docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes).
 
 Authentication defaults to `external`; no authentication flag is needed to
 preserve the customer's current setup. Managed authentication requires explicit
@@ -57,6 +51,11 @@ assign identities to Azure VMs and VMSS models.
 7. Kubelet supplies Pod-bound ServiceAccount tokens directly to the stock
    executable. The upstream implementation performs token exchange with the
    AKS-managed endpoint.
+
+The command updates Gantry's upstream configuration and authentication policy
+together. The operator validates managed policy against the configured upstream;
+it never adds or repairs registry entries. Removing the selected upstream while
+retaining managed policy produces a configuration error, not an automatic merge.
 
 There is no custom exec adapter, broker, token-exchange implementation,
 VM/VMSS identity assignment, ARM node discovery, or ongoing Azure write

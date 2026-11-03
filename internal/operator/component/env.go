@@ -84,10 +84,6 @@ type Config struct {
 	ImageRegistry string
 	ImageTag      string
 
-	// RegistryAuthImage optionally selects an exact operator image for the
-	// node-auth helper without retagging unrelated component images.
-	RegistryAuthImage string
-
 	// APIServerEndpoint is injected into the machina controller config and
 	// advertised to metalman.
 	APIServerEndpoint string
@@ -98,15 +94,6 @@ type Config struct {
 // org/namespace segment.
 func (c Config) Image(repository string) string {
 	return strings.TrimRight(c.ImageRegistry, "/") + "/" + repository + ":" + c.ImageTag
-}
-
-// RegistryAuthNodeImage returns the explicit helper image or the version-matched operator image.
-func (c Config) RegistryAuthNodeImage() string {
-	if c.RegistryAuthImage != "" {
-		return c.RegistryAuthImage
-	}
-
-	return c.Image("unbounded-operator")
 }
 
 // SetPodSpecImages replaces every init and main container image in a workload.

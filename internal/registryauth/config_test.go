@@ -59,7 +59,10 @@ func TestDerive(t *testing.T) {
 	cases := []struct{ name, upstream, policy, wantMode, wantErr string }{
 		{name: "no inferred identity", upstream: testUpstream, wantMode: ExternalMode},
 		{name: "explicit shared identity", upstream: testUpstream, policy: policy, wantMode: IdentityBindingMode},
-		{name: "placeholder", upstream: "upstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com", policy: policy, wantMode: IdentityBindingMode},
+		{name: "placeholder", upstream: "upstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com", policy: policy, wantErr: "requires its registry"},
+		{name: "registry absent from upstreams", upstream: "upstream_registries: []\n", policy: policy, wantErr: "requires its registry"},
+		{name: "duplicate upstream keys", upstream: testUpstream + "upstream_registries: []\n", policy: policy, wantErr: "parse Gantry"},
+		{name: "non-sequence upstreams", upstream: "upstream_registries: {}\n", policy: policy, wantErr: "parse Gantry"},
 		{name: "shared credentials conflict", upstream: testUpstream + "    credentials_path: /shared\n", policy: policy, wantErr: "credentials_path"},
 		{name: "external", upstream: "unrelated customer configuration", policy: "mode: external", wantMode: ExternalMode},
 		{name: "unknown mode", policy: "mode: auto", wantErr: "mode must"},
@@ -89,7 +92,7 @@ func TestDerive(t *testing.T) {
 			require.Equal(t, tc.wantMode, cfg.Mode)
 
 			if cfg.Mode == IdentityBindingMode {
-				require.Equal(t, []string{testRegistry}, cfg.Registries)
+				require.Equal(t, testRegistry, cfg.Registry)
 			}
 		})
 	}

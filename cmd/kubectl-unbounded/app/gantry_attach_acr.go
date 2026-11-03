@@ -166,14 +166,15 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 		return err
 	}
 
-	if _, _, err := registryauth.EnsureUpstream(source.Data["config.yaml"], string(policy)); err != nil {
+	attached, _, err := registryauth.EnsureUpstream(source.Data["config.yaml"], string(policy))
+	if err != nil {
 		return err
 	}
 
 	originalPolicy := source.Data[registryauth.ConfigKey]
 	if h.authMode == registryauth.IdentityBindingMode {
 		if originalPolicy != "" {
-			current, err := registryauth.Derive(source.Data["config.yaml"], originalPolicy)
+			current, err := registryauth.Derive(attached, originalPolicy)
 			if err != nil {
 				return fmt.Errorf("existing authentication policy must be resolved explicitly: %w", err)
 			}

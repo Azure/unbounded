@@ -34,15 +34,14 @@ var acrHost = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?
 // Config contains installation policy, never access tokens or client secrets.
 // An absent policy leaves customer authentication entirely alone.
 type Config struct {
-	Mode         string   `json:"mode,omitempty"`
-	Registry     string   `json:"registry,omitempty"`
-	ClientID     string   `json:"clientID,omitempty"`
-	TenantID     string   `json:"tenantID,omitempty"`
-	SNIName      string   `json:"sniName,omitempty"`
-	ProxyAddress string   `json:"proxyAddress,omitempty"`
-	Audience     string   `json:"audience,omitempty"`
-	CACert       string   `json:"caCert,omitempty"`
-	Registries   []string `json:"-"`
+	Mode         string `json:"mode,omitempty"`
+	Registry     string `json:"registry,omitempty"`
+	ClientID     string `json:"clientID,omitempty"`
+	TenantID     string `json:"tenantID,omitempty"`
+	SNIName      string `json:"sniName,omitempty"`
+	ProxyAddress string `json:"proxyAddress,omitempty"`
+	Audience     string `json:"audience,omitempty"`
+	CACert       string `json:"caCert,omitempty"`
 }
 
 func IsACR(host string) bool { return len(host) <= 253 && acrHost.MatchString(host) }
@@ -64,13 +63,6 @@ func Derive(gantry, policy string) (Config, error) {
 		return cfg, nil
 	}
 
-	merged, _, err := EnsureUpstream(gantry, policy)
-	if err != nil {
-		return Config{}, err
-	}
-
-	gantry = merged
-
 	var upstreams struct {
 		Registries []struct {
 			Name            string `json:"name"`
@@ -78,7 +70,13 @@ func Derive(gantry, policy string) (Config, error) {
 			CredentialsPath string `json:"credentials_path"`
 		} `json:"upstream_registries"`
 	}
-	if err := yaml.Unmarshal([]byte(gantry), &upstreams); err != nil {
+
+	data, err := yaml.YAMLToJSONStrict([]byte(gantry))
+	if err != nil {
+		return Config{}, fmt.Errorf("parse Gantry upstreams: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &upstreams); err != nil {
 		return Config{}, fmt.Errorf("parse Gantry upstreams: %w", err)
 	}
 
@@ -96,8 +94,6 @@ func Derive(gantry, policy string) (Config, error) {
 			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 			return Config{}, errors.New("managed ACR authentication requires the registry's matching HTTPS endpoint")
 		}
-
-		cfg.Registries = []string{cfg.Registry}
 
 		return cfg, nil
 	}

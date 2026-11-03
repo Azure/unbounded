@@ -68,6 +68,8 @@ func authSource(policy string) *corev1.ConfigMap {
 func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	source := authSource("")
 	env := testEnv(t, source)
+	env.Config.ImageRegistry = "registry.example.com/unbounded"
+	env.Config.ImageTag = "v1.2.3"
 	operations, result, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -88,7 +90,7 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue}, ds.Spec.Template.Spec.NodeSelector, "must exclude native AKS nodes")
 	require.True(t, ds.Spec.Template.Spec.HostPID)
 	require.Equal(t, installationManagerOperator, ds.Labels["app.kubernetes.io/managed-by"])
-	require.Equal(t, env.Config.RegistryAuthNodeImage(), ds.Spec.Template.Spec.Containers[0].Image)
+	require.Equal(t, "registry.example.com/unbounded/unbounded-operator:v1.2.3", ds.Spec.Template.Spec.Containers[0].Image)
 	require.Equal(t, registryAuthName, ds.Spec.Template.Spec.ServiceAccountName)
 
 	for _, volume := range ds.Spec.Template.Spec.Volumes {

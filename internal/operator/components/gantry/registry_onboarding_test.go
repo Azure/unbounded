@@ -12,53 +12,40 @@ import (
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-func TestRegistryOnboardingPatchesOnlyRequestedRuntimeUpstream(t *testing.T) {
-	source := authSource("registry: example.azurecr.io")
-	source.Data["config.yaml"] = "# preserve this comment\nmirror_listen: 0.0.0.0:5000\nupstream_registries:\n- name: ghcr.io\n  endpoint: https://ghcr.io\n"
-	source.Data["other.yaml"] = "preserve"
-	source.BinaryData = map[string][]byte{"keep": []byte("preserve")}
-	env := testEnv(t, source)
-	_, op, err := planConfig(t.Context(), env)
-	require.NoError(t, err)
-	require.NotNil(t, op)
-	require.Equal(t, component.OpMergePatch, op.Kind)
-	require.NotNil(t, op.Base)
-	hash, err := ensureConfig(t, env)
-	require.NoError(t, err)
+func TestRegistryAuthPolicyDoesNotModifyGantryConfiguration(t *testing.T) {
+	for _, mode := range []string{"managed", "external", "registry-only"} {
+		t.Run(mode, func(t *testing.T) {
+			source := authSource("")
+			switch mode {
+			case "external":
+				source.Data["node-auth.yaml"] = "mode: external\nregistry: example.azurecr.io\n"
+			case "registry-only":
+				source.Data["node-auth.yaml"] = "registry: example.azurecr.io\n"
+			}
 
-	var got corev1.ConfigMap
-	require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &got))
-	require.Contains(t, got.Data["config.yaml"], "# preserve this comment")
-	require.Contains(t, got.Data["config.yaml"], "ghcr.io")
-	require.Contains(t, got.Data["config.yaml"], "example.azurecr.io")
-	require.Equal(t, "preserve", got.Data["other.yaml"])
-	require.Equal(t, source.BinaryData, got.BinaryData)
-	require.Equal(t, source.Data["node-auth.yaml"], got.Data["node-auth.yaml"])
-	require.Equal(t, component.ConfigMapPayloadHash(&got), hash)
-	_, op, err = planConfig(t.Context(), env)
-	require.NoError(t, err)
-	require.Nil(t, op)
-}
+			source.Data["config.yaml"] = "# administrator edit\nupstream_registries:\n- name: ghcr.io\n  endpoint: https://ghcr.io\n"
+			source.Data["other.yaml"] = "preserve"
+			source.BinaryData = map[string][]byte{"keep": []byte("preserve")}
+			env := testEnv(t, source)
+			hash, op, err := planConfig(t.Context(), env)
+			require.NoError(t, err)
+			require.Nil(t, op)
+			require.Equal(t, component.ConfigMapPayloadHash(source), hash)
 
-func TestRegistryOnboardingDoesNotOverwriteConcurrentAdministratorEdit(t *testing.T) {
-	source := authSource("registry: example.azurecr.io")
-	source.Data["config.yaml"] = "upstream_registries: []\n"
-	env := testEnv(t, source)
-	_, op, err := planConfig(t.Context(), env)
-	require.NoError(t, err)
+			operations, result, err := planRegistryAuth(t.Context(), env)
+			if mode == "managed" {
+				require.ErrorContains(t, err, "requires its registry in Gantry upstream_registries")
+			} else {
+				require.NoError(t, err)
+			}
 
-	var current corev1.ConfigMap
-	require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &current))
-	current.Data["config.yaml"] = "# concurrent administrator edit\nupstream_registries: []\n"
-	require.NoError(t, env.Client.Update(t.Context(), &current))
+			require.Empty(t, operations)
+			require.Nil(t, result)
 
-	plan := component.NewPlan()
-	plan.Add(*op)
-	result, err := env.Execute(t.Context(), plan)
-	require.NoError(t, err)
-	require.NotEmpty(t, result.Deferred)
-
-	var got corev1.ConfigMap
-	require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &got))
-	require.Equal(t, current.Data, got.Data)
+			var got corev1.ConfigMap
+			require.NoError(t, env.Client.Get(t.Context(), componentKey(configName), &got))
+			require.Equal(t, source.Data, got.Data)
+			require.Equal(t, source.BinaryData, got.BinaryData)
+		})
+	}
 }

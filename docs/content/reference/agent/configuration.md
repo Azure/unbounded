@@ -49,43 +49,10 @@ for command usage, exit behavior, and the current check list.
 }
 ```
 
-For Gantry on AKS Flex nodes, deployment and registry authentication are separate.
-The cluster creation script installs Gantry without ACR configuration. The
-intended attachment workflow requires a compatible plugin/operator release
-containing `gantry attach-acr`; the `v0.8.0` deployment baseline does not include
-it, and the managed path has not been live-validated:
-
-```bash
-# Registry-only attachment; retain customer-owned authentication.
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID"
-
-# Explicit opt-in to shared managed authentication.
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID" --auth-mode aks-identity-binding \
-  --cluster-resource-id "$AKS_ID"
-```
-
-Both IDs are full Azure resource IDs; `--kubeconfig /path/to/kubeconfig` is
-optional. `--auth-mode` defaults to `external`, preserving the existing provider,
-authentication policy, and shared credentials without any additional flags.
-Use `--auth-mode aks-identity-binding` only to explicitly enable managed authentication.
-Neither mode silently replaces customer-owned authentication.
-
-Managed mode uses the stock `acr-credential-provider` in AKS identity-bindings
-mode for both Azure and non-Azure Linux Flex nodes. Collective RBAC and kubelet
-Pod-bound ServiceAccount tokens authorize a shared pull identity, without changes
-to application Pods or ServiceAccounts. There is no custom broker, adapter, or
-token-exchange service, no VM/VMSS pull-identity assignments, and no
-Azure-privileged ongoing operator. Native AKS nodes are unaffected. Future joined
-nodes are configured only when an explicit managed-auth opt-in policy exists.
-
-This requires supported AKS identity bindings, kubelets >= 1.34 with
-`KubeletServiceAccountTokenForCredentialProviders` enabled, and a reachable AKS
-identity-binding proxy. API-server VNet integration is unsupported under the
-[current AKS documentation](https://learn.microsoft.com/en-us/azure/aks/identity-bindings#limitations).
-See [ACR attachment and explicit authentication](../../guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
-for the intended workflow and limitations.
+Opt-in registry authentication on AKS Flex nodes is configured through the
+operator, not these agent settings. See the
+[ACR attachment guide](../../guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+for the workflow and requirements.
 
 ## Fields
 

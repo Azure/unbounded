@@ -127,8 +127,6 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 			}
 
 			if cfg.Mode == IdentityBindingMode {
-				cfg.Registries = []string{cfg.Registry}
-
 				output, err := exec.CommandContext(reconcileCtx, "chroot", opts.Root, "/usr/local/bin/kubelet", "--version").Output()
 				if err != nil {
 					return fmt.Errorf("check kubelet version: %w", err)

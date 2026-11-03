@@ -12,10 +12,8 @@ import (
 	sigyaml "sigs.k8s.io/yaml"
 )
 
-// EnsureUpstream merges only the explicitly selected registry. It preserves
-// unrelated runtime fields, registry entries, and YAML comments. This lets
-// provisioning tools hand off structured identity configuration without parsing
-// or replacing the administrator's Gantry YAML themselves.
+// EnsureUpstream merges only the explicitly selected registry during attachment.
+// It preserves unrelated runtime fields, registry entries, and YAML comments.
 func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 	if policy == "" {
 		return runtimeConfig, false, nil

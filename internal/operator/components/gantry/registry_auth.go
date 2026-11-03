@@ -51,7 +51,7 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 		return nil, nil, err
 	}
 
-	active := cfg.Mode != "external" && len(cfg.Registries) > 0
+	active := cfg.Mode == registryauth.IdentityBindingMode
 
 	var existing appsv1.DaemonSet
 
@@ -136,7 +136,7 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 
 	if existing.Spec.Template.Annotations[registryAuthHash] == digest && existing.Status.ObservedGeneration >= existing.Generation &&
 		existing.Status.UpdatedNumberScheduled == existing.Status.DesiredNumberScheduled && existing.Status.NumberAvailable == existing.Status.DesiredNumberScheduled &&
-		len(existing.Spec.Template.Spec.Containers) > 0 && existing.Spec.Template.Spec.Containers[0].Image == env.Config.RegistryAuthNodeImage() {
+		len(existing.Spec.Template.Spec.Containers) > 0 && existing.Spec.Template.Spec.Containers[0].Image == env.Config.Image("unbounded-operator") {
 		message := "stock ACR credential provider configured; private pulls and Gantry acceleration remain unverified"
 		if !active {
 			message = "operator-owned node authentication removed; registry authentication is externally managed"
@@ -176,7 +176,7 @@ func registryAuthObjects(env *component.Env, payload []byte, hash string) ([]cli
 			Tolerations:        []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 			ServiceAccountName: registryAuthName, HostPID: true, HostNetwork: true, DNSPolicy: corev1.DNSClusterFirstWithHostNet,
 			Containers: []corev1.Container{{
-				Name: "configure", Image: env.Config.RegistryAuthNodeImage(), ImagePullPolicy: corev1.PullIfNotPresent,
+				Name: "configure", Image: env.Config.Image("unbounded-operator"), ImagePullPolicy: corev1.PullIfNotPresent,
 				Args:            []string{"registry-auth-node"},
 				Env:             []corev1.EnvVar{{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}}, {Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}},
 				SecurityContext: &corev1.SecurityContext{RunAsUser: ptr.To(int64(0)), RunAsNonRoot: ptr.To(false), AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"SYS_CHROOT"}}, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},

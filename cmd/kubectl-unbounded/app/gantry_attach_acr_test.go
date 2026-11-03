@@ -297,7 +297,7 @@ func TestGantryAttachACRManagedUsesStockProviderWithoutComputeAssignment(t *test
 	cfg, err := registryauth.Derive(source.Data["config.yaml"], source.Data[registryauth.ConfigKey])
 	require.NoError(t, err)
 	require.Equal(t, attachClientID, cfg.ClientID)
-	require.Equal(t, []string{"central.azurecr.io"}, cfg.Registries)
+	require.Equal(t, "central.azurecr.io", cfg.Registry)
 	binding, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Len(t, binding.Subjects, 1)
@@ -364,6 +364,27 @@ func TestGantryAttachACRManagedRerunsReuseOwnedResources(t *testing.T) {
 
 		require.Equal(t, 1, count, operation)
 	}
+}
+
+func TestGantryAttachACRManagedRestoresRemovedUpstream(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	require.NoError(t, h.execute(t.Context()))
+	source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	policy := source.Data[registryauth.ConfigKey]
+	source.Data["config.yaml"] = "# administrator edit\nupstream_registries: []\n"
+	_, err = client.CoreV1().ConfigMaps(h.namespace).Update(t.Context(), source, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, h.execute(t.Context()))
+
+	source, err = client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), source.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, policy, source.Data[registryauth.ConfigKey])
+	require.Contains(t, source.Data["config.yaml"], "# administrator edit")
+	cfg, err := registryauth.Derive(source.Data["config.yaml"], policy)
+	require.NoError(t, err)
+	require.Equal(t, "central.azurecr.io", cfg.Registry)
 }
 
 func TestGantryAttachACRDoesNotBroadenInheritedConditionalPullGrant(t *testing.T) {

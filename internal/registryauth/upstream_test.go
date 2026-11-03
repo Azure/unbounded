@@ -33,9 +33,9 @@ func TestExplicitRegistryOnboardingPreservesOtherRuntimeConfiguration(t *testing
 	require.False(t, changed)
 	require.Equal(t, merged, again)
 
-	cfg, err := Derive(original, policy)
+	cfg, err := Derive(merged, policy)
 	require.NoError(t, err)
-	require.Equal(t, []string{testRegistry}, cfg.Registries, "the auth plan must use the same desired registry as the runtime merge")
+	require.Equal(t, testRegistry, cfg.Registry, "the auth plan must use the registry actually attached to Gantry")
 }
 
 func TestExplicitRegistryReplacesOnlyUntouchedDefaultPlaceholder(t *testing.T) {
@@ -52,7 +52,10 @@ func TestExplicitRegistryDoesNotEnrollUnrelatedACRUpstreams(t *testing.T) {
 	policy := testIdentityPolicy + "registry: " + testRegistry
 	cfg, err := Derive(runtime, policy)
 	require.NoError(t, err)
-	require.Equal(t, []string{testRegistry}, cfg.Registries)
+	require.Equal(t, testRegistry, cfg.Registry)
+	provider, err := cfg.ProviderConfig()
+	require.NoError(t, err)
+	require.NotContains(t, string(provider), "other.azurecr.io")
 
 	unchanged, changed, err := EnsureUpstream(runtime, policy)
 	require.NoError(t, err)

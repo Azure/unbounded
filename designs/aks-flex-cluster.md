@@ -116,7 +116,7 @@ but Flex VMs must support the script's x86_64 image and agent archive. The
 `--timeout` value is used for individual polling/rollout and host-bootstrap
 waits, not an overall deadline for every Azure CLI operation.
 
-## Attach ACR separately with an explicit authentication choice
+## Attach ACR separately
 
 Cluster deployment is independent of registry authentication. A fresh cluster
 installs Gantry without ACR configuration. The script does not read or write
@@ -125,68 +125,17 @@ ACR roles. The removed `--acr`, `--acr-pull-identity`, and `--acr-probe-image`
 options are rejected, including with `--plan`. Old registry state files are
 ignored rather than restored or deleted on a provisioning rerun.
 
-The following is the intended workflow for a compatible plugin/operator release
-containing `gantry attach-acr`. The pinned `v0.8.0` baseline does not provide this
-feature. Select a compatible published release when available, or upgrade the
-plugin/operator separately before attachment; provisioning reruns preserve an
-already-upgraded operator. This authentication path has not been live-validated.
+Follow the [ACR attachment guide](../docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+using this deployment's kubeconfig at `tmp/aks-flex/<name>/kubeconfig`.
+Authentication is unchanged by default; managed authentication requires explicit
+opt-in. Attachment needs a compatible plugin/operator release, not the pinned
+`v0.8.0` baseline. Upgrade separately if necessary; provisioning reruns preserve
+an already-upgraded operator.
 
-Use the full resource ID of an existing registry. Registry-only attachment
-defaults to externally managed authentication:
-
-```bash
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID" \
-  --kubeconfig tmp/aks-flex/my-flex-cluster/kubeconfig
-```
-
-Or explicitly opt in to shared managed authentication:
-
-```bash
-kubectl unbounded gantry attach-acr \
-  --acr-resource-id "$ACR_ID" \
-  --auth-mode aks-identity-binding \
-  --cluster-resource-id "$AKS_ID" \
-  --kubeconfig tmp/aks-flex/my-flex-cluster/kubeconfig
-```
-
-`AKS_ID` is the full cluster resource ID. `--kubeconfig` may be omitted when the
-current context selects that cluster. `--auth-mode` defaults to `external`,
-retaining existing providers, authentication policy, pull secrets, and shared
-credentials. Only managed authentication requires explicit opt-in.
-Managed mode must not silently replace customer-owned
-authentication either.
-
-Managed authentication uses the stock `acr-credential-provider` in AKS
-identity-bindings mode on Linux Flex nodes, both Azure and non-Azure. Collective
-Kubernetes RBAC authorizes the eligible ServiceAccounts to use a shared pull
-identity. Kubelet supplies short-lived Pod-bound ServiceAccount tokens to the
-provider; applications need no Pod or ServiceAccount edits. The provider uses
-the AKS identity-binding proxy, not a custom broker, adapter, or token-exchange
-service. Native AKS nodes are unaffected. There are no VM/VMSS identity
-assignments for pulls or Azure-privileged ongoing operator. The VM identities
-and Flex Node Agent Role used by this script remain only for node bootstrap.
-
-Attachment is the administrative opt-in step; future joined Linux Flex nodes
-are automatically configured only while that explicit policy exists. Registry
-selection and authentication are separate concerns. Sharing one pull identity
-is shared workload access, not per-application registry isolation.
-
-Requirements and limitations:
-
-- The target AKS cluster must support and enable identity bindings.
-- Kubelets must be >= 1.34 with
-  `KubeletServiceAccountTokenForCredentialProviders` enabled.
-- Every participating Flex node must reach the AKS identity-binding proxy.
-- [Current AKS documentation](https://learn.microsoft.com/en-us/azure/aks/identity-bindings#limitations)
-  excludes API-server VNet integration.
-- Offline tests and network smoke success do not establish that managed ACR
-  authentication or private-image distribution works live.
-
-See the [Gantry guide](../docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
-for the authentication boundary. Retiring a cluster and its registry access
-remains separate from this provisioning-only script; do not remove a shared
-customer identity or grant as part of one cluster's cleanup.
+The VM identities and Flex Node Agent Role used by this script are only for
+node bootstrap. Retiring a cluster and its registry access remains separate
+from this provisioning-only script; do not remove a shared customer identity
+or grant as part of one cluster's cleanup.
 
 ## Outputs and security
 
