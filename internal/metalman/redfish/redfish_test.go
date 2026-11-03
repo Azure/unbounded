@@ -789,7 +789,7 @@ func testMachine(name, url string) *v1alpha3.Machine {
 					URL:         url,
 					Username:    "admin",
 					DeviceID:    "System.Embedded.1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
+					PasswordRef: v1alpha3.RedfishPasswordSelector{Name: "bmc-pass", Namespace: "default", Key: "password"},
 				},
 			},
 		},

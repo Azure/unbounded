@@ -68,12 +68,21 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.redfish.url` | string | Yes | - | Redfish endpoint URL. |
 | `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
 | `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
-| `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
+| `host.netboot.redfish.passwordRef` | RedfishPasswordSelector | Yes | - | Secret containing the Redfish password. |
+| `host.netboot.redfish.passwordRef.name` | string | Yes | - | Secret name. |
+| `host.netboot.redfish.passwordRef.namespace` | string | Yes | - | Secret namespace. |
+| `host.netboot.redfish.passwordRef.key` | string | No | `"password"` | Key within the Secret's `data` map. |
 | `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
 | `host.netboot.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
 | `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
 | `host.netboot.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
 | `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
+
+> **Migration note:** `redfish.passwordRef.key` used to default to
+> `"ssh-privatekey"`. It now defaults to `"password"`. Existing Machines keep
+> the key that was stored when they were created. New or replaced Machines
+> that omit `key` read the `password` key. If your Redfish password Secret
+> stores the password under `ssh-privatekey`, set `key: ssh-privatekey`.
 
 ### spec.kubernetes
 
@@ -140,8 +149,14 @@ them again until their operation handle has been persisted. `OperationRequest`
 contains the exact external machine resource UID and generation, resolved host
 image, and observed Machine generation frozen in target status. Providers
 receive the canonical `host.external.providerID` or Azure resource ID; legacy
-Machines continue to supply `Machine.spec.providerID`. Host operations targeting
-the same Machine are serialized.
+Machines continue to supply `Machine.spec.providerID`. Out-of-band host
+operations targeting the same Machine are serialized in creation order, except
+that metalman runs an operation still holding boot media, or whose boot from
+disk after media release is unconfirmed, ahead of others, even if it is
+terminal. A
+`HostSoftReboot` does not start while an out-of-band host operation on its
+Machine is unfinished. Out-of-band host operations do not wait for a
+`HostSoftReboot`.
 
 ```yaml
 apiVersion: unbounded-cloud.io/v1alpha3

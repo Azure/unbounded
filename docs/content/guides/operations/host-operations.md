@@ -11,10 +11,22 @@ machine. They are handled by `machine-ops-controller` for cloud VMs and by
 
 For metalman-managed bare-metal machines, host operations may target a single
 machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
-Selector-based bare-metal host operations must include
-`unbounded-cloud.io/site=<site>` so exactly one metalman instance owns the
-operation. The default unlabeled metalman instance supports `machineRef` host
-operations only.
+Exactly one metalman instance owns each operation, and the other instances
+ignore it without changing its status:
+
+- A `machineRef` operation is owned by the metalman instance for the target
+  Machine's `unbounded-cloud.io/site`. The default unlabeled metalman instance
+  owns operations for Machines that have no site label.
+- A `machineSelector` operation is owned by the metalman instance for the site
+  the selector names, either in `matchLabels` or as a single-value `In`
+  expression on `unbounded-cloud.io/site`. The default unlabeled metalman
+  instance does not support selector-based operations.
+- An operation that mounts boot media is owned by the metalman instance for
+  the boot media's site.
+
+An operation that no metalman instance can own is marked `Failed`. This covers
+a selector that names no site or more than one site, and a `machineRef` that
+names a Machine that does not exist.
 
 For cloud VMs, run `machine-ops-controller` scoped to the Machine's site and
 provider, for example `--site=remote --provider=AzureVM`. A scoped controller
@@ -107,6 +119,16 @@ ID in `status.targets[].bootID` before it issues the reboot. When the agent
 starts again, it marks the operation `Complete` if the boot ID changed, or
 `Failed` if the host did not reboot. The operation is reported only after the host comes back and the agent
 reconnects to the cluster.
+
+The agent does not start a `HostSoftReboot` while a `HostHardReboot`,
+`HostPowerOff`, `HostPowerOn`, or `HostReplace` targeting the same Machine is
+unfinished. A `HostReplace` that still holds boot media, or has not confirmed
+the host booted from disk, counts as unfinished even after it fails or
+completes. The operation stays `Pending` and `status.message` names the
+operation it is waiting for. Out-of-band operations do not wait for a
+`HostSoftReboot`, so you can always use them to recover a host. If an
+out-of-band operation will never finish, for example because no controller
+handles it, delete it to let the `HostSoftReboot` run.
 
 ## HostPowerOff
 

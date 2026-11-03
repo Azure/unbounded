@@ -4,6 +4,7 @@
 package v1alpha3
 
 import (
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -76,7 +77,9 @@ const (
 
 	// OperationHostSoftReboot reboots the host operating system from inside
 	// the host (systemctl reboot). Handled by the in-VM agent, which reports
-	// completion after it starts again on a new boot.
+	// completion after it starts again on a new boot. The agent does not start
+	// it while an out-of-band host operation targeting the same Machine is
+	// unfinished; out-of-band host operations do not wait for it.
 	OperationHostSoftReboot OperationKind = "HostSoftReboot"
 
 	// OperationHostPowerOff powers off the host through an out-of-band provider.
@@ -394,4 +397,35 @@ type MachineOperationBootMediaStatus struct {
 // IsTerminal returns true if the operation phase is Complete or Failed.
 func (s *MachineOperationStatus) IsTerminal() bool {
 	return s.Phase == OperationPhaseComplete || s.Phase == OperationPhaseFailed
+}
+
+// HasOutstandingBootMedia reports whether virtual boot media for this target
+// is still owned, or released before the host confirmed a boot from disk.
+// The host must not be rebooted by anyone else while this holds.
+func (t MachineOperationTargetStatus) HasOutstandingBootMedia() bool {
+	return t.BootMedia != nil && (!t.BootMedia.Released || t.BootMediaBootUnconfirmed())
+}
+
+// BootMediaBootUnconfirmed reports whether the host may still be running the
+// media installer because it has not reported booting the installed OS.
+func (t MachineOperationTargetStatus) BootMediaBootUnconfirmed() bool {
+	b := t.BootMedia
+	if b == nil || b.Abandoned || t.CloudInitReported() {
+		return false
+	}
+
+	// After cleanup the media config serves halt, so only a loader that
+	// already started can still be running an installer.
+	return b.ImageWritten || b.LoaderStartedAt != nil ||
+		(!b.Cleaned && (b.Phase == "PoweringOn" || b.Phase == "Installing" || b.Phase == "Installed"))
+}
+
+// CloudInitReported reports whether the installed OS has reported a final
+// cloud-init result. A failure also proves the host left the installer and
+// booted from disk.
+func (t MachineOperationTargetStatus) CloudInitReported() bool {
+	cond := apimeta.FindStatusCondition(t.Conditions, MachineOperationConditionCloudInitDone)
+
+	return cond != nil && (cond.Status == metav1.ConditionTrue ||
+		(cond.Status == metav1.ConditionFalse && cond.Reason == "Failed"))
 }

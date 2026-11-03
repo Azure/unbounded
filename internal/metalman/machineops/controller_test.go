@@ -474,6 +474,88 @@ func TestRedfishPowerClientFactoryRejectsMissingSecretKey(t *testing.T) {
 
 	_, err := factory.ForMachine(context.Background(), machine)
 	require.ErrorContains(t, err, `redfish password secret unbounded-system/redfish missing key "password"`)
+	require.ErrorContains(t, err, "set passwordRef.key")
+}
+
+func TestRedfishPassword(t *testing.T) {
+	t.Parallel()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "redfish", Namespace: "unbounded-system"},
+		Data: map[string][]byte{
+			"password":       []byte("from-password"),
+			"bmc-01":         []byte("from-bmc-01"),
+			"ssh-privatekey": []byte("from-ssh-privatekey"),
+		},
+	}
+
+	tests := []struct {
+		name    string
+		ref     v1alpha3.RedfishPasswordSelector
+		want    string
+		wantErr string
+	}{
+		{
+			name: "empty key reads the password key",
+			ref:  v1alpha3.RedfishPasswordSelector{Name: "redfish", Namespace: "unbounded-system"},
+			want: "from-password",
+		},
+		{
+			name: "explicit key",
+			ref:  v1alpha3.RedfishPasswordSelector{Name: "redfish", Namespace: "unbounded-system", Key: "bmc-01"},
+			want: "from-bmc-01",
+		},
+		{
+			name: "explicit ssh-privatekey key still works",
+			ref:  v1alpha3.RedfishPasswordSelector{Name: "redfish", Namespace: "unbounded-system", Key: "ssh-privatekey"},
+			want: "from-ssh-privatekey",
+		},
+		{
+			name:    "missing key",
+			ref:     v1alpha3.RedfishPasswordSelector{Name: "redfish", Namespace: "unbounded-system", Key: "absent"},
+			wantErr: `redfish password secret unbounded-system/redfish missing key "absent"`,
+		},
+		{
+			name:    "missing secret",
+			ref:     v1alpha3.RedfishPasswordSelector{Name: "absent", Namespace: "unbounded-system"},
+			wantErr: "get Redfish password secret",
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(secret).Build()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := redfishPassword(context.Background(), c, tt.ref)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.Empty(t, got)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestRedfishPowerClientFactoryDefaultsEmptySecretKey(t *testing.T) {
+	t.Parallel()
+
+	s := testScheme(t)
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.Redfish.PasswordRef.Key = ""
+	secret := testRedfishSecret()
+	secret.Data = map[string][]byte{"ssh-privatekey": []byte("secret")}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, secret).Build()
+	factory := &RedfishPowerClientFactory{Reader: c, Pool: redfish.NewPool()}
+
+	// An empty key means "password", not the SSH default "ssh-privatekey".
+	_, err := factory.ForMachine(context.Background(), machine)
+	require.ErrorContains(t, err, `redfish password secret unbounded-system/redfish missing key "password"`)
 }
 
 func TestReconcilerSnapshotsSiteScopedSelectorTargets(t *testing.T) {
@@ -1803,7 +1885,7 @@ func testBareMetalMachine(name, site string) *v1alpha3.Machine {
 					URL:         "https://bmc.example.com",
 					Username:    "admin",
 					DeviceID:    "1",
-					PasswordRef: v1alpha3.SecretKeySelector{Name: "redfish", Namespace: "unbounded-system", Key: "password"},
+					PasswordRef: v1alpha3.RedfishPasswordSelector{Name: "redfish", Namespace: "unbounded-system", Key: "password"},
 				},
 			},
 		},

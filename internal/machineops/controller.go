@@ -381,7 +381,8 @@ func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation, operation *p
 
 // isHostOperation reports whether an out-of-band provider is expected to
 // execute operation. HostSoftReboot is executed by the in-host agent, so a
-// provider that does not register it must ignore rather than fail it.
+// provider that does not register it must ignore rather than fail it. Host
+// operations do not wait for a HostSoftReboot; the agent waits for them.
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
 	if operation == unboundedv1alpha3.OperationHostSoftReboot {
 		return false

@@ -278,7 +278,8 @@ spec:
         key: password
 ```
 
-The BMC password is read from a Secret in the same namespace (key: `password`).
+The BMC password is read from the Secret named by `passwordRef`. The key
+defaults to `password` when `passwordRef.key` is omitted.
 On first connection, the controller captures the BMC's TLS certificate
 fingerprint and pins it in `status.redfish.certFingerprint` for subsequent
 requests.

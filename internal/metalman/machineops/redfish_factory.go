@@ -37,17 +37,10 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 		return nil, fmt.Errorf("machine %s has no Redfish certificate fingerprint", machine.Name)
 	}
 
-	var secret corev1.Secret
-	if err := f.Reader.Get(ctx, types.NamespacedName{Name: rf.PasswordRef.Name, Namespace: rf.PasswordRef.Namespace}, &secret); err != nil {
-		return nil, fmt.Errorf("get Redfish password secret: %w", err)
+	password, err := redfishPassword(ctx, f.Reader, rf.PasswordRef)
+	if err != nil {
+		return nil, err
 	}
-
-	passwordBytes, ok := secret.Data[rf.PasswordRef.Key]
-	if !ok {
-		return nil, fmt.Errorf("redfish password secret %s/%s missing key %q", rf.PasswordRef.Namespace, rf.PasswordRef.Name, rf.PasswordRef.Key)
-	}
-
-	password := string(passwordBytes)
 
 	c, err := f.Pool.Get(ctx, rf.URL, fingerprint, rf.Username, password, rf.DeviceID)
 	if err != nil {
@@ -55,4 +48,23 @@ func (f *RedfishPowerClientFactory) ForMachine(ctx context.Context, machine *v1a
 	}
 
 	return c, nil
+}
+
+// redfishPassword reads the Redfish password from the Secret that ref selects.
+// An empty key falls back to v1alpha3.DefaultRedfishPasswordKey, matching the
+// CRD default.
+func redfishPassword(ctx context.Context, reader client.Reader, ref v1alpha3.RedfishPasswordSelector) (string, error) {
+	var secret corev1.Secret
+	if err := reader.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, &secret); err != nil {
+		return "", fmt.Errorf("get Redfish password secret: %w", err)
+	}
+
+	key := ref.KeyOrDefault()
+
+	password, ok := secret.Data[key]
+	if !ok {
+		return "", fmt.Errorf("redfish password secret %s/%s missing key %q; set passwordRef.key to the key that holds the password", ref.Namespace, ref.Name, key)
+	}
+
+	return string(password), nil
 }
