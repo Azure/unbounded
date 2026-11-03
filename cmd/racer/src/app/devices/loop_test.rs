@@ -221,7 +221,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
             .raw_os_error(),
         Some(libc::EROFS)
     );
-    let plan = discover(&config, &approved(&["cache-a", "cache-b"]), 2)
+    let plan = discover(&config, &approved(&["cache-a", "cache-b"]), 2, &|_| true)
         .plan
         .expect("both disposable loops must be usable through read-only bind");
     assert_eq!(
@@ -244,7 +244,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
         2
     );
     assert!(
-        discover(&config, &approved(&["cache-a", "cache-b"]), 2)
+        discover(&config, &approved(&["cache-a", "cache-b"]), 2, &|_| true)
             .plan
             .is_none(),
         "second exclusive claim must fail"
@@ -379,7 +379,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
     let digests: Vec<_> = plan.workers.iter().map(|w| w.digest).collect();
     drop(slab);
     drop(plan);
-    let restarted = discover(&config, &approved(&["cache-a", "cache-b"]), 2)
+    let restarted = discover(&config, &approved(&["cache-a", "cache-b"]), 2, &|_| true)
         .plan
         .unwrap();
     for (file, bytes) in [(&first, 5 * segment), (&second, 6 * segment)] {
@@ -416,7 +416,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
     )
     .unwrap();
     config.device_directory = root.join("dev");
-    let changed = discover(&config, &approved(&["cache-a", "cache-c"]), 2)
+    let changed = discover(&config, &approved(&["cache-a", "cache-c"]), 2, &|_| true)
         .plan
         .unwrap();
     assert_ne!(changed.workers[0].digest, digests[0]);

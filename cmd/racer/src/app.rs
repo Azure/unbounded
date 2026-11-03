@@ -517,7 +517,14 @@ impl Application {
             Some(managed) => current_approval(managed),
             None => enrolled_disks,
         };
-        let discovery = devices::discover(&self.config, &approved, plan.pairs.len());
+        let discovery = devices::discover(&self.config, &approved, plan.pairs.len(), &|id| {
+            // Approval can change while discovery waits for busy disks; managed
+            // mode rechecks the latest approval before any destructive write.
+            self.config
+                .managed_control
+                .as_ref()
+                .is_none_or(|managed| current_approval(managed).iter().any(|a| a == id))
+        });
         let approvals = discovery
             .approvals
             .iter()

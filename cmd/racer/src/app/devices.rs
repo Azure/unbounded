@@ -150,7 +150,18 @@ impl Refusal {
 /// [`prepare_guards`]). Disks that are mounted, held, read-only, too small,
 /// busy, or partitions are refused. When no disk is usable, the plan is
 /// `None` and storage falls back to slab files.
-pub fn discover(config: &Config, approved: &[String], workers: usize) -> Discovery {
+///
+/// `consent` reports whether an ID is still approved. Approval can change
+/// while discovery waits for busy disks, so it is checked before every open
+/// and again under the exclusive claim immediately before any guard write.
+/// IDs no longer approved are not opened, not waited on, and are omitted from
+/// the returned approvals.
+pub fn discover(
+    config: &Config,
+    approved: &[String],
+    workers: usize,
+    consent: &dyn Fn(&str) -> bool,
+) -> Discovery {
     let mut ids: Vec<&String> = Vec::new();
     for id in approved {
         if !ids.contains(&id) {
@@ -246,29 +257,20 @@ pub fn discover(config: &Config, approved: &[String], workers: usize) -> Discove
     }
     let mut devices = Vec::new();
     let mut refused: Vec<(String, DiskReason)> = Vec::new();
+    let mut revoked: Vec<String> = Vec::new();
     let still_busy = open_with_busy_wait(
         candidates,
         config.device_busy_wait,
         &mut SystemClock(std::time::Instant::now()),
-        |(id, path): &(String, std::path::PathBuf)| match open_device(
-            &root,
-            sys,
-            path,
-            id,
-            config.segment_bytes,
-        ) {
-            Ok(device) => {
-                devices.push(device);
-                Ok(())
-            }
-            Err(refusal) if refusal.reason == DiskReason::Busy && is_busy(&refusal.error) => {
-                Err(refusal.error)
-            }
-            Err(refusal) => {
-                refused.retain(|(other, _)| other != id);
-                refused.push((id.clone(), refusal.reason));
-                Err(refusal.error)
-            }
+        |(id, path): &(String, std::path::PathBuf)| {
+            open_approved(
+                id,
+                consent,
+                |consent| open_device(&root, sys, path, id, config.segment_bytes, consent),
+                &mut devices,
+                &mut refused,
+                &mut revoked,
+            )
         },
     );
     for (id, _) in still_busy {
@@ -316,6 +318,7 @@ pub fn discover(config: &Config, approved: &[String], workers: usize) -> Discove
             approvals[index].outcome = approvals[*first].outcome;
         }
     }
+    approvals.retain(|approval| !revoked.contains(&approval.id));
     for approval in &approvals {
         match approval.outcome {
             Outcome::Claimed => {}
@@ -358,6 +361,46 @@ fn sys_text(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Opens one candidate only while `consent` still approves it, passing the
+/// recheck to `open` for use under the exclusive claim. A revoked ID is never
+/// retried and is recorded in `revoked` instead of `refused`. Busy refusals
+/// are returned as the raw error so [`open_with_busy_wait`] retries them.
+fn open_approved<D>(
+    id: &str,
+    consent: &dyn Fn(&str) -> bool,
+    open: impl FnOnce(&dyn Fn() -> bool) -> std::result::Result<D, Refusal>,
+    devices: &mut Vec<D>,
+    refused: &mut Vec<(String, DiskReason)>,
+    revoked: &mut Vec<String>,
+) -> io::Result<()> {
+    let result = if consent(id) {
+        open(&|| consent(id))
+    } else {
+        Err(Refusal::new(DiskReason::IoError, "approval revoked"))
+    };
+    match result {
+        Ok(device) => {
+            devices.push(device);
+            Ok(())
+        }
+        Err(_) if !consent(id) => {
+            refused.retain(|(other, _)| other != id);
+            if !revoked.iter().any(|other| other == id) {
+                revoked.push(id.into());
+            }
+            Err(io::Error::other("approval revoked"))
+        }
+        Err(refusal) if refusal.reason == DiskReason::Busy && is_busy(&refusal.error) => {
+            Err(refusal.error)
+        }
+        Err(refusal) => {
+            refused.retain(|(other, _)| other != id);
+            refused.push((id.into(), refusal.reason));
+            Err(refusal.error)
+        }
+    }
 }
 
 /// Interval between exclusive-open retries for busy devices.
@@ -478,6 +521,7 @@ fn open_device(
     path: &Path,
     id: &str,
     segment_bytes: u64,
+    consent: impl Fn() -> bool,
 ) -> std::result::Result<Device, Refusal> {
     let io_error = Refusal::io(DiskReason::IoError);
     let path = fs::canonicalize(path).map_err(Refusal::io(DiskReason::IoError))?;
@@ -543,6 +587,10 @@ fn open_device(
     let alignment = device_alignment(&file).map_err(Refusal::io(DiskReason::IoError))?;
     guarded_capacity(bytes, segment_bytes, alignment)
         .map_err(|e| Refusal::new(DiskReason::TooSmall, e))?;
+    // Approval is consent to wipe; recheck it under the claim, just before writing.
+    if !consent() {
+        return Err(Refusal::new(DiskReason::IoError, "approval revoked"));
+    }
     prepare_guards(&BlockGuards(&file), id, bytes, alignment, partitions)?;
     Ok(Device {
         file: Arc::new(file),
@@ -1007,6 +1055,127 @@ pub(super) mod tests {
         io::Error::from_raw_os_error(libc::EBUSY)
     }
 
+    fn busy_refusal() -> Refusal {
+        Refusal {
+            reason: DiskReason::Busy,
+            error: busy(),
+        }
+    }
+
+    #[test]
+    fn revoked_while_busy_stops_waiting_and_never_opens() {
+        let approved = std::cell::RefCell::new(vec!["a".to_owned(), "b".to_owned()]);
+        let consent = |id: &str| approved.borrow().iter().any(|a| a == id);
+        let (mut devices, mut refused, mut revoked) = (Vec::new(), Vec::new(), Vec::new());
+        let mut clock = FakeClock(Duration::ZERO);
+        let mut attempts = 0;
+        let left = open_with_busy_wait(
+            candidates(&["a", "b"]),
+            Duration::from_secs(120),
+            &mut clock,
+            |(id, _)| {
+                open_approved(
+                    id,
+                    &consent,
+                    |_| {
+                        if id == "a" {
+                            attempts += 1;
+                            // Revoked during the wait; the disk then frees up.
+                            if attempts == 2 {
+                                approved.borrow_mut().retain(|a| a != "a");
+                            }
+                            return Err(busy_refusal());
+                        }
+                        Ok(id.clone())
+                    },
+                    &mut devices,
+                    &mut refused,
+                    &mut revoked,
+                )
+            },
+        );
+        assert!(left.is_empty());
+        assert_eq!(devices, ["b"]);
+        assert!(refused.is_empty());
+        assert_eq!(revoked, ["a"]);
+        assert_eq!(attempts, 2, "no open after revocation");
+        assert_eq!(clock.0, BUSY_POLL, "stops waiting once revoked");
+    }
+
+    #[test]
+    fn consent_is_rechecked_before_destructive_write() {
+        let approved = std::cell::Cell::new(true);
+        let consent = |_: &str| approved.get();
+        let (mut devices, mut refused, mut revoked) = (Vec::new(), Vec::new(), Vec::new());
+        let mut wiped = false;
+        let result = open_approved(
+            "a",
+            &consent,
+            |consent: &dyn Fn() -> bool| {
+                // Revoked after the open, while holding the claim.
+                approved.set(false);
+                if !consent() {
+                    return Err(Refusal::new(DiskReason::IoError, "approval revoked"));
+                }
+                wiped = true;
+                Ok(())
+            },
+            &mut devices,
+            &mut refused,
+            &mut revoked,
+        );
+        assert!(result.is_err());
+        assert!(!wiped);
+        assert!(devices.is_empty());
+        assert!(refused.is_empty());
+        assert_eq!(revoked, ["a"]);
+    }
+
+    #[test]
+    fn approved_open_outcomes_are_kept() {
+        let consent = |_: &str| true;
+        let (mut devices, mut refused, mut revoked) =
+            (Vec::new(), Vec::new(), Vec::<String>::new());
+        assert!(
+            open_approved(
+                "a",
+                &consent,
+                |c| {
+                    assert!(c());
+                    Ok(1)
+                },
+                &mut devices,
+                &mut refused,
+                &mut revoked
+            )
+            .is_ok()
+        );
+        let error = open_approved(
+            "b",
+            &consent,
+            |_| Err(busy_refusal()),
+            &mut devices,
+            &mut refused,
+            &mut revoked,
+        )
+        .unwrap_err();
+        assert!(is_busy(&error), "busy stays retryable");
+        assert!(
+            open_approved(
+                "c",
+                &consent,
+                |_| Err(Refusal::new(DiskReason::TooSmall, "small")),
+                &mut devices,
+                &mut refused,
+                &mut revoked,
+            )
+            .is_err()
+        );
+        assert_eq!(devices, [1]);
+        assert_eq!(refused, [("c".to_owned(), DiskReason::TooSmall)]);
+        assert!(revoked.is_empty());
+    }
+
     #[test]
     fn busy_device_released_within_deadline_is_used() {
         let mut clock = FakeClock(Duration::from_secs(5));
@@ -1459,10 +1628,10 @@ pub(super) mod tests {
         assert!(plan(Vec::new(), &c, 1).is_err());
         assert!(plan(vec![device("a", 2, s)], &c, 1).is_err());
         assert!(plan(vec![device("a", 5, s)], &c, 2).is_err());
-        assert!(discover(&c, &[], 1).plan.is_none());
-        assert!(discover(&c, &[], 1).approvals.is_empty());
+        assert!(discover(&c, &[], 1, &|_| true).plan.is_none());
+        assert!(discover(&c, &[], 1, &|_| true).approvals.is_empty());
         c.device_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("nonexistent-device-root");
-        let d = discover(&c, &["nvme-a".into()], 1);
+        let d = discover(&c, &["nvme-a".into()], 1, &|_| true);
         assert!(d.plan.is_none());
         assert_eq!(d.approvals[0].outcome, Outcome::Missing);
     }
@@ -1497,11 +1666,12 @@ pub(super) mod tests {
     fn non_block_device_and_escaped_path_are_rejected_before_open() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let sys = Path::new(SYS_DEV_BLOCK);
-        let Err(refusal) = open_device(root, sys, &root.join("Cargo.toml"), "file", 4096) else {
+        let Err(refusal) = open_device(root, sys, &root.join("Cargo.toml"), "file", 4096, || true)
+        else {
             panic!("a regular file must be refused");
         };
         assert_eq!(refusal.reason, DiskReason::NotWholeDisk);
-        assert!(open_device(root, sys, Path::new("/dev/null"), "escape", 4096).is_err());
+        assert!(open_device(root, sys, Path::new("/dev/null"), "escape", 4096, || true).is_err());
     }
 
     pub(crate) struct Fixture(pub(crate) std::path::PathBuf);
@@ -1739,11 +1909,11 @@ pub(super) mod tests {
         std::os::unix::fs::symlink("../../payload", f.0.join("disk/by-id/cache-alias")).unwrap();
         let mut c = config();
         c.device_directory = f.0.clone();
-        let d = discover(&c, &["missing".into()], 1);
+        let d = discover(&c, &["missing".into()], 1, &|_| true);
         assert!(d.plan.is_none());
         assert_eq!(d.approvals[0].outcome, Outcome::Missing);
         // Exact names only: a prefix of an entry does not match it.
-        let d = discover(&c, &["cach".into()], 1);
+        let d = discover(&c, &["cach".into()], 1, &|_| true);
         assert_eq!(d.approvals[0].outcome, Outcome::Missing);
         let d = discover(
             &c,
@@ -1754,6 +1924,7 @@ pub(super) mod tests {
                 "../payload".into(),
             ],
             1,
+            &|_| true,
         );
         assert!(d.plan.is_none());
         assert_eq!(
