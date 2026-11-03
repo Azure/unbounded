@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn default_worker_sizing_funds_node_wide_native_buffers() {
         let mut config = default_config(true);
-        assert_eq!(config.limits.registered_bytes.get(), 96 * 1024 * 1024);
+        assert_eq!(config.limits.registered_bytes.get(), 384 * 1024 * 1024);
         let mut plan = four_pair_plan(&config);
         config.scale_limits(plan.pairs.len()).unwrap();
         let limits = size_workers(&config.limits, &mut plan, true).unwrap();
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(limits.registered_bytes, config.limits.registered_bytes);
         assert_eq!(
             buffer_count(&limits),
-            5 * 96 * 1024 * 1024 / crate::rdma::BUFFER_LEN
+            5 * 384 * 1024 * 1024 / crate::rdma::BUFFER_LEN
         );
         let native = NativeNode::default();
         native

@@ -126,7 +126,7 @@ impl Default for Limits {
             plaintext_bytes: nz(64 * MIB),
             ciphertext_bytes: nz(128 * MIB),
             dirty_bytes: nz(160 * MIB),
-            registered_bytes: nz(96 * MIB),
+            registered_bytes: nz(384 * MIB),
             request_context_bytes: nz(32 * MIB),
             flights: nz(64),
             waiters_per_flight: nz(64),
