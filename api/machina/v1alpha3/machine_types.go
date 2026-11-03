@@ -90,6 +90,14 @@ const (
 	// configuration is assigned.
 	MachineConditionConfigurationPending = "ConfigurationPending"
 
+	// MachineConditionIsolationDrift is True when spec.isolation differs
+	// from the mode the agent reports as applied
+	// (status.isolation). Nothing moves on drift: the node changes
+	// mode at its next repave. False when they match or when spec.isolation
+	// is empty (no declaration), absent when the applied mode has not been
+	// reported.
+	MachineConditionIsolationDrift = "IsolationDrift"
+
 	// MachineConditionRepavePending indicates that the Machine's desired
 	// configuration version has not yet been applied to the running Node.
 	// For OnDelete updates this remains True until the operator deletes
@@ -130,6 +138,16 @@ type MachineSpec struct {
 	// Agent contains settings for the unbounded node agent.
 	// +optional
 	Agent *AgentSpec `json:"agent,omitempty"`
+
+	// Isolation declares where the node stack (containerd, kubelet, CNI and
+	// CoreDNS) runs on the host. Empty means no declaration: a new host is
+	// provisioned in nspawn, and a repave leaves a running node in the mode it
+	// already uses. Setting it does not move a running node. The node changes
+	// to this mode at its next repave, which the agent performs when the Node
+	// is deleted.
+	// +kubebuilder:validation:Enum=nspawn;none;container
+	// +optional
+	Isolation IsolationMode `json:"isolation,omitempty"`
 
 	// Provider identifies the legacy external control provider for this machine.
 	// New callers should use Host.External.Provider or Host.Azure.
@@ -554,6 +572,70 @@ type KubernetesSpec struct {
 	BootstrapTokenRef *LocalObjectReference `json:"bootstrapTokenRef,omitempty"`
 }
 
+// IsolationMode names where the node stack runs on a host.
+type IsolationMode string
+
+const (
+	// IsolationNSpawn runs the node stack in a systemd-nspawn machine. It is
+	// the default.
+	IsolationNSpawn IsolationMode = "nspawn"
+	// IsolationNone runs the node stack directly on the host.
+	IsolationNone IsolationMode = "none"
+	// IsolationContainer runs the node stack in a privileged OCI container.
+	IsolationContainer IsolationMode = "container"
+)
+
+// IsolationChangePhase is how far a mode change got.
+// +kubebuilder:validation:Enum=InProgress;Succeeded;Failed
+type IsolationChangePhase string
+
+const (
+	// IsolationChangeInProgress means the agent started the change.
+	IsolationChangeInProgress IsolationChangePhase = "InProgress"
+	// IsolationChangeSucceeded means the node now runs in the target mode.
+	IsolationChangeSucceeded IsolationChangePhase = "Succeeded"
+	// IsolationChangeFailed means the change did not complete. The message
+	// says whether the node was rolled back. The agent does not retry on its
+	// own; the next repave tries again.
+	IsolationChangeFailed IsolationChangePhase = "Failed"
+)
+
+// IsolationChangeStrategy is how a mode change is carried out.
+// +kubebuilder:validation:Enum=InPlace;Reprovision
+type IsolationChangeStrategy string
+
+const (
+	// IsolationChangeInPlace builds the target beside the running node and
+	// switches over, rolling back on failure. nspawn and container only.
+	IsolationChangeInPlace IsolationChangeStrategy = "InPlace"
+	// IsolationChangeReprovision resets the host and bootstraps it again in
+	// the target mode. Required for any change to or from none.
+	IsolationChangeReprovision IsolationChangeStrategy = "Reprovision"
+)
+
+// IsolationChangeStatus reports a mode change made at a repave.
+type IsolationChangeStatus struct {
+	// TargetMode is the mode the change was moving the node to.
+	// +kubebuilder:validation:Enum=nspawn;none;container
+	TargetMode IsolationMode `json:"targetMode"`
+
+	// Phase is how far the change got.
+	Phase IsolationChangePhase `json:"phase"`
+
+	// Strategy is how the change was carried out.
+	// +optional
+	Strategy IsolationChangeStrategy `json:"strategy,omitempty"`
+
+	// Message explains the phase, including why a failed change failed and
+	// whether the node was rolled back.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// LastTransitionTime is when Phase last changed.
+	// +optional
+	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
 // AgentSpec defines settings for the unbounded node agent.
 type AgentSpec struct {
 	// Image is the OCI image reference used for provisioning the
@@ -711,6 +793,19 @@ type MachineStatus struct {
 	// It does not override desired replacement image settings.
 	// +optional
 	ObservedProvisioningFormat ProvisioningFormat `json:"observedProvisioningFormat,omitempty"`
+
+	// Isolation is the isolation mode the agent reports as applied
+	// on the host. Empty means the agent has not reported one. It is
+	// compared with spec.isolation to report drift.
+	// +kubebuilder:validation:Enum=nspawn;none;container
+	// +optional
+	Isolation IsolationMode `json:"isolation,omitempty"`
+
+	// IsolationChange reports the agent's latest attempt to move the node to
+	// the mode in spec.isolation during a repave.
+	// +optional
+	IsolationChange *IsolationChangeStatus `json:"isolationChange,omitempty"`
+
 	// Phase is the current phase of the machine. Intended for human
 	// consumption; follows the state machine rather than driving it.
 	Phase MachinePhase `json:"phase,omitempty"`

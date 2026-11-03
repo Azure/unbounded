@@ -579,6 +579,19 @@ spec:
                   rule: '!has(oldSelf.azure) || has(self.azure)'
                 - message: external host ownership is immutable once set
                   rule: '!has(oldSelf.external) || has(self.external)'
+              isolation:
+                description: |-
+                  Isolation declares where the node stack (containerd, kubelet, CNI and
+                  CoreDNS) runs on the host. Empty means no declaration: a new host is
+                  provisioned in nspawn, and a repave leaves a running node in the mode it
+                  already uses. Setting it does not move a running node. The node changes
+                  to this mode at its next repave, which the agent performs when the Node
+                  is deleted.
+                enum:
+                - nspawn
+                - none
+                - container
+                type: string
               kubernetes:
                 description: Kubernetes contains Kubernetes-specific configuration.
                 properties:
@@ -1035,6 +1048,55 @@ spec:
                       VersionName is the full MachineConfigurationVersion object name
                       (e.g. "myconfig-v3").
                     type: string
+                type: object
+              isolation:
+                description: |-
+                  Isolation is the isolation mode the agent reports as applied
+                  on the host. Empty means the agent has not reported one. It is
+                  compared with spec.isolation to report drift.
+                enum:
+                - nspawn
+                - none
+                - container
+                type: string
+              isolationChange:
+                description: |-
+                  IsolationChange reports the agent's latest attempt to move the node to
+                  the mode in spec.isolation during a repave.
+                properties:
+                  lastTransitionTime:
+                    description: LastTransitionTime is when Phase last changed.
+                    format: date-time
+                    type: string
+                  message:
+                    description: |-
+                      Message explains the phase, including why a failed change failed and
+                      whether the node was rolled back.
+                    type: string
+                  phase:
+                    description: Phase is how far the change got.
+                    enum:
+                    - InProgress
+                    - Succeeded
+                    - Failed
+                    type: string
+                  strategy:
+                    description: Strategy is how the change was carried out.
+                    enum:
+                    - InPlace
+                    - Reprovision
+                    type: string
+                  targetMode:
+                    description: TargetMode is the mode the change was moving the
+                      node to.
+                    enum:
+                    - nspawn
+                    - none
+                    - container
+                    type: string
+                required:
+                - phase
+                - targetMode
                 type: object
               message:
                 description: Message provides additional status information.
