@@ -28,11 +28,16 @@
 #
 # Knobs (environment, defaults in brackets):
 #   BEFORE_BIN, AFTER_BIN  binary directories per variant (from `build`)
+#   CONTROL_BIN   directory holding the mode-aware racer-performance-control used
+#                 by every variant [$AFTER_BIN, else $BEFORE_BIN]
 #   TOOLS_BIN     fake-azure-blob + racer-origin-bench [$BEFORE_BIN or $AFTER_BIN]
 #   OUT           output directory [<repo>/tmp/racer-origin-bench/results-default]
 #   VARIANTS      ["before after"], alternated and reversed on odd repetitions
 #   MODES         ["cached"]; passed to the control as RACER_BENCH_MODE
-#                 (cached|passthrough); the base control ignores it
+#                 (cached|passthrough). The control must print mode=<mode>
+#                 after its endpoint; the driver fails the run if the line is
+#                 missing or differs, so a base control that ignores the mode
+#                 is rejected rather than silently benchmarking cached mode
 #   SIZES         object bytes ["4194304 67108864"]
 #   CONCURRENCY   ["8 32"]
 #   TOTAL_BYTES   bytes per run [4294967296]
@@ -44,8 +49,11 @@
 #   Any RACER_BENCH_RACER_<NAME>=v overrides racer's RACER_<NAME> setting.
 #
 # The after variant's control (cmd/racer-loadgen/performance/control.rs) is
+# shared by both variants via CONTROL_BIN. Only the after variant is
 # given RACER_BENCH_AZURE_CONTAINER_URL=http://127.0.0.1:PORT/devstoreaccount1/bench
-# (anonymous credential) and must publish it as the gantry cache's Azure origin.
+# (anonymous credential) and must publish it as the gantry cache's Azure origin;
+# without it the publication omits `origin` and stays wire-compatible with the
+# base racer. racer (and racer-object for before) come from the variant's BIN.
 # The before variant starts racer-object as UID 65532 (the owner racer gives
 # /run/racer/gantry/origin) with the invoking user's primary group so it can
 # traverse the binary path.
@@ -90,6 +98,7 @@ case "${1:-}" in
     fi
     tools=${TOOLS_BIN:-${BEFORE_BIN:-${AFTER_BIN:-}}}
     [ -n "$tools" ] || { echo 'set BEFORE_BIN/AFTER_BIN (and optionally TOOLS_BIN)' >&2; exit 2; }
+    control=${CONTROL_BIN:-${AFTER_BIN:-${BEFORE_BIN:-}}}
     mkdir -p "$OUT/results" "$OUT/work"
     reps=${REPS:-5}
     for rep in $(seq 0 $((reps - 1))); do
@@ -120,7 +129,7 @@ case "${1:-}" in
               # sudo resets the environment; forward the knobs explicitly.
               mapfile -t knobs < <(env | grep -E '^(TOTAL_BYTES|SLAB_BYTES|CPUS_[A-Z]+|LOADGEN_GOMAXPROCS|BENCH_ARGS|RACER_BENCH_[A-Z0-9_]+)=' || true)
               if ! timeout -s TERM --kill-after=30s 1800 sudo -n env "${knobs[@]}" unshare --mount --fork bash "$script" namespace \
-                "$work" "$result" "$variant" "$mode" "$size" "$c" "$rep" "$bin" "$tools" "$(id -g)" "$(id -u):$(id -g)"; then
+                "$work" "$result" "$variant" "$mode" "$size" "$c" "$rep" "$bin" "$tools" "$control" "$(id -g)" "$(id -u):$(id -g)"; then
                 echo "FAILED $name; logs in $work" >&2
                 exit 1
               fi
@@ -134,7 +143,7 @@ case "${1:-}" in
     "$script" summarize | tee "$OUT/summary.md"
     ;;
   namespace)
-    work=$2 result=$3 variant=$4 mode=$5 size=$6 c=$7 rep=$8 bin=$9 tools=${10} group=${11} owner=${12}
+    work=$2 result=$3 variant=$4 mode=$5 size=$6 c=$7 rep=$8 bin=$9 tools=${10} control=${11} group=${12} owner=${13}
     trap 'chown -R "$owner" "$work" "$result" 2>/dev/null || true' EXIT
     chown -R root:root "$work/runtime"
     chmod -R go-w "$work/runtime"
@@ -144,7 +153,7 @@ case "${1:-}" in
     taskset -c "${CPUS_FAKE:-8-15}" env GOMAXPROCS="${LOADGEN_GOMAXPROCS:-8}" "$tools/racer-origin-bench" run \
       -variant "$variant" -mode "$mode" -object-size "$size" -concurrency "$c" -rep "$rep" \
       -total-bytes "${TOTAL_BYTES:-4294967296}" -slab-bytes "${SLAB_BYTES:-1073741824}" \
-      -racer "$bin/racer" -control "$bin/racer-performance-control" -racer-object "$bin/racer-object" \
+      -racer "$bin/racer" -control "$control/racer-performance-control" -racer-object "$bin/racer-object" \
       -fake "$tools/fake-azure-blob" -work "$work" -out "$result" -origin-groups "$group" \
       -cpus-racer "${CPUS_RACER:-0-3}" -cpus-origin "${CPUS_ORIGIN:-4-7}" -cpus-fake "${CPUS_FAKE:-8-15}" \
       ${BENCH_ARGS:-} 2>&1 | tee "$work/driver.log"
@@ -159,7 +168,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    sed -n '4,47p' "$0" >&2
+    sed -n '4,59p' "$0" >&2
     exit 2
     ;;
 esac

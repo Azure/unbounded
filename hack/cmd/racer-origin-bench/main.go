@@ -100,22 +100,25 @@ type CPU struct {
 }
 
 type Result struct {
-	Variant      string             `json:"variant"`
-	Mode         string             `json:"mode"`
-	Rep          int                `json:"rep"`
-	ObjectSize   int64              `json:"object_size"`
-	Concurrency  int                `json:"concurrency"`
-	Objects      int                `json:"objects"`
-	Bytes        int64              `json:"bytes"`
-	Seconds      float64            `json:"seconds"`
-	MiBPerSecond float64            `json:"mib_per_second"`
-	CPU          map[string]CPU     `json:"cpu"`
-	CPUPerGiB    map[string]float64 `json:"cpu_seconds_per_gib"`
-	Fake         fakeblob.Snapshot  `json:"fake"`
-	CPUSets      map[string]string  `json:"cpu_sets"`
-	Binaries     map[string]string  `json:"binaries"`
-	Started      time.Time          `json:"started"`
-	ClockTicks   int                `json:"clock_ticks"`
+	Variant string `json:"variant"`
+	Mode    string `json:"mode"`
+	// PublishedMode is the cache mode the control reported publishing; the
+	// run fails unless it equals Mode.
+	PublishedMode string             `json:"published_mode"`
+	Rep           int                `json:"rep"`
+	ObjectSize    int64              `json:"object_size"`
+	Concurrency   int                `json:"concurrency"`
+	Objects       int                `json:"objects"`
+	Bytes         int64              `json:"bytes"`
+	Seconds       float64            `json:"seconds"`
+	MiBPerSecond  float64            `json:"mib_per_second"`
+	CPU           map[string]CPU     `json:"cpu"`
+	CPUPerGiB     map[string]float64 `json:"cpu_seconds_per_gib"`
+	Fake          fakeblob.Snapshot  `json:"fake"`
+	CPUSets       map[string]string  `json:"cpu_sets"`
+	Binaries      map[string]string  `json:"binaries"`
+	Started       time.Time          `json:"started"`
+	ClockTicks    int                `json:"clock_ticks"`
 	// Retries counts whole-object retries after transient errors; RetriedBytes
 	// were delivered and then discarded. Both are included in CPU.
 	Retries        int64  `json:"retries"`
@@ -352,12 +355,10 @@ func (h *harness) run(ctx context.Context) (*Result, error) {
 		return nil, err
 	}
 
-	controlScanner := bufio.NewScanner(controlOut)
-	if !controlScanner.Scan() {
-		return nil, errors.New("control did not print its endpoint")
+	endpoint, publishedMode, err := readControlHandshake(bufio.NewScanner(controlOut), o.Mode)
+	if err != nil {
+		return nil, err
 	}
-
-	endpoint := controlScanner.Text()
 
 	// Racer dataplane, settings from TestRacerMixedPerformance.
 	diagnostics, err := freePort()
@@ -565,7 +566,7 @@ func (h *harness) run(ctx context.Context) (*Result, error) {
 	warn("drain", drainErr)
 
 	result := &Result{
-		Variant: o.Variant, Mode: o.Mode, Rep: o.Rep, ObjectSize: o.ObjectSize, Concurrency: o.Concurrency,
+		Variant: o.Variant, Mode: o.Mode, PublishedMode: publishedMode, Rep: o.Rep, ObjectSize: o.ObjectSize, Concurrency: o.Concurrency,
 		Objects: objects, Bytes: total.Load(), Seconds: readSeconds, CPU: map[string]CPU{}, CPUPerGiB: map[string]float64{},
 		CPUSets:  map[string]string{"racer": o.CPUsRacer, "origin": o.CPUsOrigin, "fake": o.CPUsFake},
 		Binaries: map[string]string{"racer": o.Racer, "control": o.Control, "racer-object": o.RacerObject, "fake": o.Fake},
@@ -606,6 +607,33 @@ func (h *harness) run(ctx context.Context) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+// readControlHandshake reads the control's endpoint line and its
+// "mode=<mode>" line, and fails unless the published mode equals want. A
+// control that ignores RACER_BENCH_MODE does not print the mode line, so it
+// is rejected rather than silently benchmarking a different cache mode.
+func readControlHandshake(scanner *bufio.Scanner, want string) (endpoint, mode string, err error) {
+	if !scanner.Scan() {
+		return "", "", errors.New("control did not print its endpoint")
+	}
+
+	endpoint = scanner.Text()
+
+	if !scanner.Scan() {
+		return "", "", errors.New("control did not report its published mode; use a mode-aware racer-performance-control")
+	}
+
+	mode, ok := strings.CutPrefix(scanner.Text(), "mode=")
+	if !ok {
+		return "", "", fmt.Errorf("control printed %q, want mode=<mode>; use a mode-aware racer-performance-control", scanner.Text())
+	}
+
+	if mode != want {
+		return "", "", fmt.Errorf("control published mode %q, requested %q", mode, want)
+	}
+
+	return endpoint, mode, nil
 }
 
 func fakeStats(get func(string) ([]byte, bool), addr string) (fakeblob.Snapshot, bool) {

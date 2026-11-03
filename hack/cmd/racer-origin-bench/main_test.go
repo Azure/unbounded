@@ -4,9 +4,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -42,4 +44,26 @@ func TestRunRejectsInvalidFlags(t *testing.T) {
 	require.Error(t, runCommand([]string{"-variant", "before"}))
 	require.Error(t, runCommand([]string{"-variant", "sideways", "-racer", "r", "-control", "c", "-fake", "f", "-work", "w", "-out", "o"}))
 	require.Error(t, runCommand([]string{"-variant", "after", "-racer", "r", "-control", "c", "-fake", "f", "-work", "w", "-out", "o", "-total-bytes", "1"}))
+}
+
+func TestReadControlHandshake(t *testing.T) {
+	scan := func(s string) *bufio.Scanner { return bufio.NewScanner(strings.NewReader(s)) }
+
+	endpoint, mode, err := readControlHandshake(scan("https://127.0.0.1:1\nmode=passthrough\n"), "passthrough")
+	require.NoError(t, err)
+	require.Equal(t, "https://127.0.0.1:1", endpoint)
+	require.Equal(t, "passthrough", mode)
+
+	// A control that ignores RACER_BENCH_MODE prints only its endpoint.
+	_, _, err = readControlHandshake(scan("https://127.0.0.1:1\n"), "cached")
+	require.ErrorContains(t, err, "did not report its published mode")
+
+	_, _, err = readControlHandshake(scan("https://127.0.0.1:1\nmode=cached\n"), "passthrough")
+	require.ErrorContains(t, err, `published mode "cached", requested "passthrough"`)
+
+	_, _, err = readControlHandshake(scan("https://127.0.0.1:1\nready\n"), "cached")
+	require.ErrorContains(t, err, "want mode=<mode>")
+
+	_, _, err = readControlHandshake(scan(""), "cached")
+	require.ErrorContains(t, err, "did not print its endpoint")
 }

@@ -62,6 +62,14 @@ fn bench_cache(url: Option<String>, mode: Option<String>) -> Result<control::Cac
     Ok(spec)
 }
 
+/// The `RACER_BENCH_MODE` name of a published cache mode.
+fn mode_name(mode: racer_control_wire::CacheMode) -> &'static str {
+    match mode {
+        racer_control_wire::CacheMode::PassthroughPeers => "passthrough",
+        _ => "cached",
+    }
+}
+
 fn main() {
     let root = std::env::args().nth(1).expect("scratch directory required");
     let spec = bench_cache(
@@ -69,8 +77,12 @@ fn main() {
         std::env::var("RACER_BENCH_MODE").ok(),
     )
     .unwrap_or_else(|error| panic!("{error}"));
+    let mode = mode_name(spec.mode);
     let control = control::Control::start_with_specs(Path::new(&root), vec![spec]);
     println!("{}", control.endpoint);
+    // The bench driver rejects runs whose published mode differs from the
+    // requested one.
+    println!("mode={mode}");
     io::stdout().flush().unwrap();
     let _ = io::stdin().read(&mut [0]);
     eprintln!(
@@ -107,6 +119,10 @@ mod tests {
                 .is_none()
         );
         assert!(bench_cache(None, Some("local".into())).is_err());
+        for name in ["cached", "passthrough"] {
+            let spec = bench_cache(None, Some(name.into())).unwrap();
+            assert_eq!(mode_name(spec.mode), name);
+        }
         assert!(bench_cache(Some("https://host/Models".into()), None).is_err());
     }
 }
