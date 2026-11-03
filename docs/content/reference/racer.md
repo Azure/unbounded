@@ -974,6 +974,9 @@ and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-s
 are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
 network access, especially with host networking.
 
+`racer_delivery_bytes_total` counts every body byte delivered to clients;
+`racer_delivery_direct_bytes_total` counts only those sent outside the splice path.
+
 A failed client request also counts in one of
 `racer_request_errors_overloaded_total`, `racer_request_errors_unavailable_total`,
 `racer_request_errors_deadline_total`, `racer_request_errors_cancelled_total`, or
