@@ -11,7 +11,6 @@ import pytest
 from fakeprefetch import Fail, Outcome
 
 import racer
-from racer import PrefetchError, PrefetchRef, PrefetchSpec, PrefetchWindow, split_prefetch
 from racer.prefetch import encode_body, format_wait, status_query
 
 KEY_A = "a" * 64
@@ -98,8 +97,8 @@ def test_request_encoding(scripted):
         "future_field": True,
     }
     s, c = scripted(201, [("Content-Type", "application/json")], json.dumps(status).encode())
-    spec = PrefetchSpec(
-        refs=[PrefetchRef(KEY_A, etag='"v"', offset=1, length=2, metadata="m"), PrefetchRef(KEY_B)],
+    spec = racer.PrefetchSpec(
+        refs=[racer.PrefetchRef(KEY_A, etag='"v"', offset=1, length=2, metadata="m"), racer.PrefetchRef(KEY_B)],
         cache_uid="u",
         priority="high",
         generation=2,
@@ -119,7 +118,7 @@ def test_request_encoding(scripted):
     assert got.created and got.state == "PARTIAL" and got.bytes.failed == 8 and got.coverage.resident_bytes == 9
     assert got.refs[0].error == "version_changed" and got.refs[0].etag is None and got.next_cursor == "c1"
 
-    c.prefetch("min", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
+    c.prefetch("min", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)]))
     head, body = s.requests[1]
     assert "Authorization" not in head
     assert body == b'{"generation":0,"sequence":0,"refs":[{"key":"' + KEY_A.encode() + b'"}]}'
@@ -148,18 +147,18 @@ def test_format_wait_and_query():
 @pytest.mark.parametrize(
     "spec",
     [
-        PrefetchSpec(),
-        PrefetchSpec(refs=[PrefetchRef("ABC")]),
-        PrefetchSpec(refs=[PrefetchRef("A" * 64)]),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A, etag='W/"x"')]),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A, offset=-1)]),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A, length=-1)]),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A, metadata="a\nb")]),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A)], priority="urgent"),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=1 << 53),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A)], sequence=-1),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A)], ttl_seconds=-1),
-        PrefetchSpec(refs=[PrefetchRef(KEY_A)], authorization="x\r\n"),
+        racer.PrefetchSpec(),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef("ABC")]),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef("A" * 64)]),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A, etag='W/"x"')]),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A, offset=-1)]),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A, length=-1)]),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A, metadata="a\nb")]),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], priority="urgent"),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=1 << 53),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], sequence=-1),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], ttl_seconds=-1),
+        racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], authorization="x\r\n"),
     ],
 )
 def test_invalid_specs(spec):
@@ -170,7 +169,7 @@ def test_invalid_specs(spec):
 @pytest.mark.parametrize("pid", ["", ".", "..", "a/b", "a b", "x" * 129])
 def test_invalid_ids(tmp_path, pid):
     c = racer.Client(socket_path=str(tmp_path / "none"))
-    for call in (lambda: c.prefetch(pid, PrefetchSpec(refs=[PrefetchRef(KEY_A)])), lambda: c.prefetch_status(pid), lambda: c.cancel_prefetch(pid)):
+    for call in (lambda: c.prefetch(pid, racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)])), lambda: c.prefetch_status(pid), lambda: c.cancel_prefetch(pid)):
         with pytest.raises(racer.RacerError):
             call()
 
@@ -187,8 +186,8 @@ def test_invalid_ids(tmp_path, pid):
 )
 def test_error_mapping(scripted, status, headers, body, code, retry):
     _, c = scripted(status, headers, body)
-    with pytest.raises(PrefetchError) as exc:
-        c.prefetch("a", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
+    with pytest.raises(racer.PrefetchError) as exc:
+        c.prefetch("a", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)]))
     assert exc.value.status == status and exc.value.code == code and exc.value.retry_after == retry
     assert isinstance(exc.value, racer.StatusError)
 
@@ -210,72 +209,72 @@ def test_protocol_errors(scripted):
 
 
 def test_idempotency_table(client, server):
-    spec = PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=1, sequence=5)
+    spec = racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=1, sequence=5)
     s = client.prefetch("w", spec)
     assert s.created and s.state == "SUCCEEDED" and s.settled
     assert not client.prefetch("w", spec).created
     cases = [
-        (PrefetchSpec(refs=[PrefetchRef(KEY_B)], generation=1, sequence=5), "payload_mismatch"),
-        (PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=1, sequence=5, authorization="a"), "payload_mismatch"),
-        (PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=1, sequence=4), "stale_sequence"),
-        (PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=0, sequence=9), "stale_generation"),
+        (racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_B)], generation=1, sequence=5), "payload_mismatch"),
+        (racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=1, sequence=5, authorization="a"), "payload_mismatch"),
+        (racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=1, sequence=4), "stale_sequence"),
+        (racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=0, sequence=9), "stale_generation"),
     ]
     for bad, code in cases:
-        with pytest.raises(PrefetchError) as exc:
+        with pytest.raises(racer.PrefetchError) as exc:
             client.prefetch("w", bad)
         assert exc.value.status == 409 and exc.value.code == code
-    assert client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_B)], generation=1, sequence=6)).sequence == 6
-    assert client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=2)).generation == 2
+    assert client.prefetch("w", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_B)], generation=1, sequence=6)).sequence == 6
+    assert client.prefetch("w", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=2)).generation == 2
     # Like Racer, the hash covers the body as sent: an explicit default
     # differs from an omitted field.
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=2, priority="normal", ttl_seconds=600))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("w", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=2, priority="normal", ttl_seconds=600))
     assert exc.value.code == "payload_mismatch"
 
     s = client.cancel_prefetch("w")
     assert s.state == "CANCELLED" and s.reason == "client"
-    assert client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], generation=2, sequence=1)).state == "SUCCEEDED"
-    with pytest.raises(PrefetchError) as exc:
+    assert client.prefetch("w", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], generation=2, sequence=1)).state == "SUCCEEDED"
+    with pytest.raises(racer.PrefetchError) as exc:
         client.cancel_prefetch("missing")
     assert exc.value.status == 404 and exc.value.code == "not_found"
 
 
 def test_limits(client, server):
     server.prefetches.passthrough = True
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("p", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)]))
     assert exc.value.code == "passthrough"
     server.prefetches.passthrough = False
 
     server.prefetches.cache_uid = "uid"
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A)], cache_uid="other"))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("p", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], cache_uid="other"))
     assert exc.value.code == "cache_uid_mismatch"
 
     server.prefetches.max_refs = 1
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A), PrefetchRef(KEY_B)]))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("p", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A), racer.PrefetchRef(KEY_B)]))
     assert exc.value.status == 413 and exc.value.code == "too_large"
 
     server.prefetches.max_body = 4096
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A, metadata="m" * 5000)]))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("p", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A, metadata="m" * 5000)]))
     assert exc.value.status == 413
 
     server.prefetches.max_tickets = 1
-    client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("q", PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
+    client.prefetch("p", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)]))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("q", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)]))
     assert exc.value.status == 429 and exc.value.code == "ticket_limit" and exc.value.retry_after == 5.0
     # A retained finished ticket makes room before 429.
     client.cancel_prefetch("p")
-    assert client.prefetch("q", PrefetchSpec(refs=[PrefetchRef(KEY_A)])).created
-    with pytest.raises(PrefetchError):
+    assert client.prefetch("q", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)])).created
+    with pytest.raises(racer.PrefetchError):
         client.prefetch_status("p")
 
     server.prefetches.admit = lambda pid, body: Fail(429, "pending_limit", "busy", 9)
-    with pytest.raises(PrefetchError) as exc:
-        client.prefetch("p", PrefetchSpec(refs=[PrefetchRef(KEY_A)], sequence=1))
+    with pytest.raises(racer.PrefetchError) as exc:
+        client.prefetch("p", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], sequence=1))
     assert exc.value.code == "pending_limit" and exc.value.retry_after == 9.0
 
 
@@ -283,7 +282,7 @@ def test_ttl_expiry(client, server):
     clock = [1000.0]
     server.prefetches.now = lambda: clock[0]
     server.prefetches.max_ttl = 10
-    s = client.prefetch("t", PrefetchSpec(refs=[PrefetchRef(KEY_A)], ttl_seconds=3600))
+    s = client.prefetch("t", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], ttl_seconds=3600))
     assert s.ttl_seconds == 10 and s.expires_at_ms == 1_010_000
     clock[0] += 11
     # A settled ticket keeps its outcome at expiry.
@@ -293,7 +292,7 @@ def test_ttl_expiry(client, server):
     clock[0] = 1309.0
     assert client.prefetch_status("t").state == "SUCCEEDED"
     clock[0] = 1310.0
-    with pytest.raises(PrefetchError) as exc:
+    with pytest.raises(racer.PrefetchError) as exc:
         client.prefetch_status("t")
     assert exc.value.status == 404
 
@@ -302,7 +301,7 @@ def test_ttl_expiry_cancels_unsettled(client, server):
     clock = [1000.0]
     server.prefetches.now = lambda: clock[0]
     server.prefetches.outcome = lambda pid, ref: Outcome(pending=True)
-    client.prefetch("u", PrefetchSpec(refs=[PrefetchRef(KEY_A)], ttl_seconds=5))
+    client.prefetch("u", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], ttl_seconds=5))
     clock[0] += 5
     s = client.prefetch_status("u")
     assert s.state == "CANCELLED" and s.reason == "expired" and s.settled and s.bytes.in_flight == 0
@@ -311,8 +310,8 @@ def test_ttl_expiry_cancels_unsettled(client, server):
 
 def test_empty_object_and_wire_shapes(client, server):
     server.prefetches.outcome = lambda pid, ref: Outcome(empty=True, etag='"e"')
-    refs = [PrefetchRef(KEY_A), PrefetchRef(KEY_A, offset=1), PrefetchRef(KEY_A, length=1)]
-    s = client.prefetch("e", PrefetchSpec(refs=refs))
+    refs = [racer.PrefetchRef(KEY_A), racer.PrefetchRef(KEY_A, offset=1), racer.PrefetchRef(KEY_A, length=1)]
+    s = client.prefetch("e", racer.PrefetchSpec(refs=refs))
     assert s.state == "PARTIAL" and s.refs_succeeded == 1 and s.refs_failed == 2 and s.bytes.aligned_requested == 0
     status, headers, body = server.prefetches.handle("GET", "/v1/prefetches/e", {"host": "racer"}, b"")
     data = json.loads(body)
@@ -342,8 +341,8 @@ def test_wait_coverage_and_paging(client, server):
 
     server.prefetches.outcome = outcome
     server.prefetches.refs_page = 2
-    refs = [PrefetchRef(KEY_B if i % 2 else KEY_A, offset=i, length=1) for i in range(5)]
-    s = client.prefetch("w", PrefetchSpec(refs=refs))
+    refs = [racer.PrefetchRef(KEY_B if i % 2 else KEY_A, offset=i, length=1) for i in range(5)]
+    s = client.prefetch("w", racer.PrefetchSpec(refs=refs))
     assert s.state == "RUNNING" and not s.settled and s.refs_pending == 3
 
     start = time.monotonic()
@@ -364,8 +363,8 @@ def test_wait_coverage_and_paging(client, server):
 
     server.prefetches.refs_page = 1
     cursor = client.prefetch_status("w", refs="all").next_cursor
-    client.prefetch("w", PrefetchSpec(refs=[PrefetchRef(KEY_A)], sequence=1))
-    with pytest.raises(PrefetchError) as exc:
+    client.prefetch("w", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)], sequence=1))
+    with pytest.raises(racer.PrefetchError) as exc:
         client.prefetch_status("w", refs="all", cursor=cursor)
     assert exc.value.status == 400
 
@@ -373,7 +372,7 @@ def test_wait_coverage_and_paging(client, server):
 def test_list(client, server):
     assert client.list_prefetches() == []
     for pid in ("c", "a", "b"):
-        client.prefetch(pid, PrefetchSpec(refs=[PrefetchRef(KEY_A)]))
+        client.prefetch(pid, racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_A)]))
     got = client.list_prefetches()
     assert [s.id for s in got] == ["a", "b", "c"]
     assert all(s.refs is None and s.coverage is None and s.state == "SUCCEEDED" for s in got)
@@ -388,8 +387,8 @@ def test_window(client, server):
         return Fail(503, "unavailable", "down") if fail.is_set() else None
 
     server.prefetches.admit = admit
-    refs = [PrefetchRef(KEY_A)]
-    w = PrefetchWindow(client, "win", PrefetchSpec(refs=[PrefetchRef(KEY_B)], generation=3, sequence=7, priority="low"))
+    refs = [racer.PrefetchRef(KEY_A)]
+    w = racer.PrefetchWindow(client, "win", racer.PrefetchSpec(refs=[racer.PrefetchRef(KEY_B)], generation=3, sequence=7, priority="low"))
     assert w.position == (3, 7)
     s = w.update(refs)
     assert (s.generation, s.sequence, s.priority, s.created) == (3, 7, "low", True)
@@ -397,10 +396,10 @@ def test_window(client, server):
     with pytest.raises(racer.RacerError):
         w.update([])
     fail.set()
-    with pytest.raises(PrefetchError):
+    with pytest.raises(racer.PrefetchError):
         w.update(refs)
     fail.clear()
-    assert w.update([PrefetchRef(KEY_B)]).sequence == 10
+    assert w.update([racer.PrefetchRef(KEY_B)]).sequence == 10
     s = w.reset(refs)
     assert (s.generation, s.sequence) == (4, 0)
     assert w.update(refs).sequence == 1
@@ -408,8 +407,8 @@ def test_window(client, server):
 
 
 def test_window_concurrent(client, server):
-    w = PrefetchWindow(client, "c")
-    threads = [threading.Thread(target=w.update, args=([PrefetchRef(KEY_A)],)) for _ in range(8)]
+    w = racer.PrefetchWindow(client, "c")
+    threads = [threading.Thread(target=w.update, args=([racer.PrefetchRef(KEY_A)],)) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
@@ -418,41 +417,41 @@ def test_window_concurrent(client, server):
 
 
 def test_window_exhaustion(tmp_path):
-    w = PrefetchWindow(racer.Client(socket_path=str(tmp_path / "x")), "x", PrefetchSpec(generation=(1 << 53) - 1, sequence=(1 << 53) - 1))
+    w = racer.PrefetchWindow(racer.Client(socket_path=str(tmp_path / "x")), "x", racer.PrefetchSpec(generation=(1 << 53) - 1, sequence=(1 << 53) - 1))
     w._submitted = True
     with pytest.raises(racer.RacerError):
-        w.update([PrefetchRef(KEY_A)])
+        w.update([racer.PrefetchRef(KEY_A)])
     with pytest.raises(racer.RacerError):
-        w.reset([PrefetchRef(KEY_A)])
+        w.reset([racer.PrefetchRef(KEY_A)])
 
 
 def test_split():
-    refs = [PrefetchRef(KEY_A, offset=i + 1) for i in range(10)]
-    spec = PrefetchSpec(refs=refs, priority="high", generation=1, sequence=2, authorization="a")
-    parts = split_prefetch("job", spec, max_refs=4)
+    refs = [racer.PrefetchRef(KEY_A, offset=i + 1) for i in range(10)]
+    spec = racer.PrefetchSpec(refs=refs, priority="high", generation=1, sequence=2, authorization="a")
+    parts = racer.split_prefetch("job", spec, max_refs=4)
     assert [p[0] for p in parts] == ["job.0", "job.1", "job.2"]
     assert [len(p[1].refs) for p in parts] == [4, 4, 2]
     assert all(p[1].priority == "high" and p[1].authorization == "a" and p[1].sequence == 2 for p in parts)
-    assert len(split_prefetch("job", spec)) == 1
+    assert len(racer.split_prefetch("job", spec)) == 1
 
-    limit = len(encode_body(PrefetchSpec(refs=refs[:3], priority="high", generation=1, sequence=2)))
-    parts = split_prefetch("job", spec, max_refs=100, max_body_bytes=limit)
+    limit = len(encode_body(racer.PrefetchSpec(refs=refs[:3], priority="high", generation=1, sequence=2)))
+    parts = racer.split_prefetch("job", spec, max_refs=100, max_body_bytes=limit)
     assert [len(p[1].refs) for p in parts] == [3, 3, 3, 1]
     assert all(len(encode_body(p[1])) <= limit for p in parts)
     assert [r.offset for p in parts for r in p[1].refs] == list(range(1, 11))
 
     with pytest.raises(racer.RacerError):
-        split_prefetch("job", spec, max_body_bytes=50)
+        racer.split_prefetch("job", spec, max_body_bytes=50)
     with pytest.raises(racer.RacerError):
-        split_prefetch("x" * 127, spec)
+        racer.split_prefetch("x" * 127, spec)
     with pytest.raises(racer.RacerError):
-        split_prefetch("job", PrefetchSpec())
+        racer.split_prefetch("job", racer.PrefetchSpec())
 
 
 def test_split_parts_accepted(client, server):
     server.prefetches.max_refs = 3
-    refs = [PrefetchRef(KEY_A, offset=i) for i in range(7)]
-    for pid, spec in split_prefetch("big", PrefetchSpec(refs=refs), max_refs=3):
+    refs = [racer.PrefetchRef(KEY_A, offset=i) for i in range(7)]
+    for pid, spec in racer.split_prefetch("big", racer.PrefetchSpec(refs=refs), max_refs=3):
         client.prefetch(pid, spec)
     assert [s.id for s in client.list_prefetches()] == ["big.0", "big.1", "big.2"]
 
