@@ -7,11 +7,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"sort"
@@ -33,8 +33,12 @@ type PrefetchOutcome struct {
 	// ETag is the resolved version reported for refs submitted without one.
 	ETag string
 	// Size is the object length, used to resolve a zero Length. Zero leaves
-	// the logical length at the requested Length.
+	// the logical length at the requested Length unless Empty is set.
 	Size uint64
+	// Empty reports a zero-length object. Like Racer, a ref with offset 0
+	// and no length then succeeds with no pages; any other ref fails
+	// invalid_range.
+	Empty bool
 }
 
 // PrefetchReject is a scripted whole-request failure.
@@ -63,8 +67,13 @@ type PrefetchConfig struct {
 	Outcome func(ctx context.Context, ticket string, ref wire.PrefetchRef) PrefetchOutcome
 }
 
-// Prefetches is an in-memory prefetch ticket registry for one cache. It is
-// not a compatibility oracle: there are no pages, owners, or scheduling.
+// Prefetches is an in-memory prefetch ticket registry for one cache. It
+// follows the Racer server's client-socket contract (validation, error codes,
+// idempotency, expiry, retention, and JSON shapes) but has no pages, owners,
+// or scheduling: refs move from pending to an outcome as the Outcome hook
+// decides, an unsettled ticket reports RUNNING (never QUEUED), and the only
+// byte counters it fills are the requested, admitted, fetched, in-flight, and
+// failed bytes.
 type Prefetches struct {
 	config  PrefetchConfig
 	mu      sync.Mutex
@@ -88,7 +97,11 @@ type ticket struct {
 	created, updated     time.Time
 	expires              time.Time
 	canceled             string
-	refs                 []refState
+	// released is set once the ticket is canceled or expires: its outcomes
+	// are frozen and it is removed at removeAt.
+	released bool
+	removeAt time.Time
+	refs     []refState
 }
 
 // NewPrefetches returns an empty registry.
@@ -160,9 +173,6 @@ func (p *Prefetches) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		status, body = failure.status, wire.PrefetchErrorBody{Code: failure.code, Message: failure.msg}
-		if failure.code == "" {
-			body = wire.PrefetchErrorBody{Code: wire.PrefetchInvalidRequest, Message: "method not allowed"}
-		}
 	}
 
 	raw, err := json.Marshal(body)
@@ -171,8 +181,10 @@ func (p *Prefetches) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Racer closes the connection after every prefetch response.
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+	w.Header().Set("Connection", "close")
 	w.WriteHeader(status)
 
 	if _, err := w.Write(raw); err != nil {
@@ -183,7 +195,7 @@ func (p *Prefetches) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Prefetches) serve(r *http.Request) (int, any, *prefetchFailure) {
 	if r.URL.Path == wire.PrefetchPath {
 		if r.Method != http.MethodGet {
-			return 0, nil, fail(http.StatusMethodNotAllowed, "", "")
+			return 0, nil, fail(http.StatusMethodNotAllowed, wire.PrefetchMethodNotAllowed, "method not allowed")
 		}
 
 		if f := noBody(r); f != nil {
@@ -202,7 +214,7 @@ func (p *Prefetches) serve(r *http.Request) (int, any, *prefetchFailure) {
 	switch r.Method {
 	case http.MethodGet, http.MethodPut, http.MethodDelete:
 	default:
-		return 0, nil, fail(http.StatusMethodNotAllowed, "", "")
+		return 0, nil, fail(http.StatusMethodNotAllowed, wire.PrefetchMethodNotAllowed, "method not allowed")
 	}
 
 	if wire.ValidatePrefetchID(id) != nil {
@@ -270,32 +282,23 @@ func (p *Prefetches) put(r *http.Request, id string) (int, any, *prefetchFailure
 		return 0, nil, invalidRequest("short body")
 	}
 
-	request, f := p.decode(raw)
-	if f != nil {
-		return 0, nil, f
-	}
-
+	// Racer rejects a passthrough cache before it parses the body.
 	if p.config.Passthrough {
 		return 0, nil, fail(http.StatusConflict, wire.PrefetchPassthrough, "cache is passthrough")
+	}
+
+	request, canonical, f := p.decode(raw)
+	if f != nil {
+		return 0, nil, f
 	}
 
 	if p.config.CacheUID != "" && request.CacheUID != "" && request.CacheUID != p.config.CacheUID {
 		return 0, nil, fail(http.StatusConflict, wire.PrefetchCacheUIDMismatch, "cache uid mismatch")
 	}
 
-	if p.config.Admit != nil {
-		if reject := p.config.Admit(id, request); reject != nil {
-			return 0, nil, &prefetchFailure{status: reject.Status, code: reject.Code, msg: "rejected", retryAfter: reject.RetryAfter}
-		}
-	}
-
-	// The hash covers the canonical body with defaults applied and the
+	// Like Racer, the hash covers the body as sent (re-encoded without
+	// whitespace, absent fields omitted, defaults not applied) and the
 	// presence, not the value, of Authorization.
-	canonical, err := json.Marshal(request)
-	if err != nil {
-		return 0, nil, invalidRequest("encode")
-	}
-
 	hash := sha256.Sum256(append(canonical, boolByte(auth != "")))
 
 	ctx := r.Context()
@@ -304,39 +307,51 @@ func (p *Prefetches) put(r *http.Request, id string) (int, any, *prefetchFailure
 	defer p.mu.Unlock()
 
 	now := p.config.Now()
-	p.gc(now)
+	p.gc(ctx, now)
 
 	t, ok := p.tickets[id]
+	if ok {
+		switch {
+		case request.Generation < t.generation:
+			return 0, nil, fail(http.StatusConflict, wire.PrefetchStaleGeneration, "generation %d is older than current %d", request.Generation, t.generation)
+		case request.Generation == t.generation && request.Sequence < t.sequence:
+			return 0, nil, fail(http.StatusConflict, wire.PrefetchStaleSequence, "sequence %d is older than current %d", request.Sequence, t.sequence)
+		case request.Generation == t.generation && request.Sequence == t.sequence:
+			if hash != t.hash {
+				return 0, nil, fail(http.StatusConflict, wire.PrefetchPayloadMismatch, "generation %d sequence %d was submitted with another payload", t.generation, t.sequence)
+			}
+
+			// A replay renews the TTL of a live ticket only.
+			if !t.released {
+				t.expires = now.Add(t.ttl)
+			}
+
+			return http.StatusOK, p.render(ctx, t, wire.PrefetchQuery{}), nil
+		}
+	}
+
+	if p.config.Admit != nil {
+		if reject := p.config.Admit(id, request); reject != nil {
+			return 0, nil, &prefetchFailure{status: reject.Status, code: reject.Code, msg: "rejected", retryAfter: reject.RetryAfter}
+		}
+	}
+
 	code := http.StatusOK
 
-	switch {
-	case !ok:
-		if len(p.tickets) >= p.config.MaxTickets {
-			return 0, nil, &prefetchFailure{status: http.StatusTooManyRequests, code: wire.PrefetchTicketLimit, msg: "ticket limit", retryAfter: 1}
+	if !ok {
+		if len(p.tickets) >= p.config.MaxTickets && !p.evictOldestReleased() {
+			return 0, nil, &prefetchFailure{status: http.StatusTooManyRequests, code: wire.PrefetchTicketLimit, msg: "node prefetch ticket limit reached", retryAfter: 5}
 		}
 
 		t = &ticket{id: id, created: now}
 		p.tickets[id] = t
 		code = http.StatusCreated
-	case request.Generation == t.generation && request.Sequence == t.sequence:
-		if hash != t.hash {
-			return 0, nil, fail(http.StatusConflict, wire.PrefetchPayloadMismatch, "payload differs at generation %d sequence %d", t.generation, t.sequence)
-		}
-
-		if t.canceled == "" {
-			t.expires, t.updated = now.Add(t.ttl), now
-		}
-
-		return code, p.render(ctx, t, wire.PrefetchQuery{}), nil
-	case request.Generation < t.generation:
-		return 0, nil, fail(http.StatusConflict, wire.PrefetchStaleGeneration, "generation %d is older than current %d", request.Generation, t.generation)
-	case request.Generation == t.generation && request.Sequence < t.sequence:
-		return 0, nil, fail(http.StatusConflict, wire.PrefetchStaleSequence, "sequence %d is older than current %d", request.Sequence, t.sequence)
 	}
 
 	t.priority, t.generation, t.sequence, t.hash = request.Priority, request.Generation, request.Sequence, hash
 	t.ttl = time.Duration(request.TTLSeconds) * time.Second
 	t.updated, t.expires, t.canceled = now, now.Add(t.ttl), ""
+	t.released, t.removeAt = false, time.Time{}
 	t.refs = make([]refState, len(request.Refs))
 
 	for i, ref := range request.Refs {
@@ -350,6 +365,26 @@ func (p *Prefetches) put(r *http.Request, id string) (int, any, *prefetchFailure
 	return code, p.render(ctx, t, wire.PrefetchQuery{}), nil
 }
 
+// evictOldestReleased drops the released ticket that is due for removal
+// first, as Racer does before answering 429 ticket_limit. Callers hold p.mu.
+func (p *Prefetches) evictOldestReleased() bool {
+	var oldest *ticket
+
+	for _, t := range p.tickets {
+		if t.released && (oldest == nil || t.removeAt.Before(oldest.removeAt)) {
+			oldest = t
+		}
+	}
+
+	if oldest == nil {
+		return false
+	}
+
+	delete(p.tickets, oldest.id)
+
+	return true
+}
+
 func boolByte(b bool) byte {
 	if b {
 		return 1
@@ -358,93 +393,155 @@ func boolByte(b bool) byte {
 	return 0
 }
 
-// decode parses strictly and applies defaults.
-func (p *Prefetches) decode(raw []byte) (wire.PrefetchRequest, *prefetchFailure) {
-	var request wire.PrefetchRequest
+// rawRequest mirrors Racer's raw PUT body: absent fields stay absent so the
+// canonical encoding distinguishes an explicit default from an omitted field.
+type rawRequest struct {
+	CacheUID        *string  `json:"cache_uid,omitempty"`
+	Priority        *string  `json:"priority,omitempty"`
+	Generation      *uint64  `json:"generation,omitempty"`
+	Sequence        *uint64  `json:"sequence,omitempty"`
+	TTLSeconds      *uint64  `json:"ttl_seconds,omitempty"`
+	MaxPendingBytes *uint64  `json:"max_pending_bytes,omitempty"`
+	Refs            []rawRef `json:"refs"`
+}
 
-	var present struct {
-		TTLSeconds *uint64 `json:"ttl_seconds"`
-		Length     []struct {
-			Length *uint64 `json:"length"`
-		} `json:"refs"`
+type rawRef struct {
+	Key      string  `json:"key"`
+	ETag     *string `json:"etag,omitempty"`
+	Offset   *uint64 `json:"offset,omitempty"`
+	Length   *uint64 `json:"length,omitempty"`
+	Metadata *string `json:"metadata,omitempty"`
+}
+
+func value[T any](v *T) T {
+	var zero T
+	if v == nil {
+		return zero
 	}
+
+	return *v
+}
+
+// decode parses strictly, applies defaults and caps, and returns the
+// canonical encoding of the body as sent.
+func (p *Prefetches) decode(raw []byte) (wire.PrefetchRequest, []byte, *prefetchFailure) {
+	var (
+		body    rawRequest
+		request wire.PrefetchRequest
+	)
 
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 
-	if err := decoder.Decode(&request); err != nil || decoder.More() {
-		return request, invalidRequest("invalid JSON: %v", err)
+	if err := decoder.Decode(&body); err != nil {
+		return request, nil, invalidRequest("invalid JSON body: %v", err)
 	}
 
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return request, invalidRequest("trailing data")
+		return request, nil, invalidRequest("invalid JSON body: trailing data")
 	}
 
-	if err := json.Unmarshal(raw, &present); err != nil {
-		return request, invalidRequest("invalid JSON")
+	if body.Refs == nil {
+		return request, nil, invalidRequest("invalid JSON body: missing refs")
 	}
 
-	if request.Priority == "" {
+	request = wire.PrefetchRequest{
+		CacheUID:        value(body.CacheUID),
+		Priority:        value(body.Priority),
+		Generation:      value(body.Generation),
+		Sequence:        value(body.Sequence),
+		TTLSeconds:      wire.PrefetchDefaultTTLSecs,
+		MaxPendingBytes: value(body.MaxPendingBytes),
+	}
+
+	if body.Priority == nil {
 		request.Priority = "normal"
 	}
 
 	switch {
+	case len(body.Refs) == 0:
+		return request, nil, invalidRequest("refs must not be empty")
+	case len(body.Refs) > p.config.MaxRefs:
+		return request, nil, fail(http.StatusRequestEntityTooLarge, wire.PrefetchTooLarge, "%d refs exceed %d", len(body.Refs), p.config.MaxRefs)
 	case !wire.ValidPriority(request.Priority):
-		return request, invalidRequest("invalid priority")
+		return request, nil, invalidRequest("priority must be high, normal, or low")
 	case request.Generation > wire.PrefetchMaxCounter || request.Sequence > wire.PrefetchMaxCounter:
-		return request, invalidRequest("counter out of range")
-	case present.TTLSeconds != nil && *present.TTLSeconds == 0:
-		return request, invalidRequest("ttl_seconds must be positive")
-	case len(request.Refs) == 0:
-		return request, invalidRequest("refs must not be empty")
-	case len(request.Refs) > p.config.MaxRefs:
-		return request, fail(http.StatusRequestEntityTooLarge, wire.PrefetchTooLarge, "more than %d refs", p.config.MaxRefs)
+		return request, nil, invalidRequest("counter exceeds 2^53-1")
+	case body.TTLSeconds != nil && *body.TTLSeconds == 0:
+		return request, nil, invalidRequest("ttl_seconds must be at least 1")
+	case body.CacheUID != nil && (*body.CacheUID == "" || len(*body.CacheUID) > 64):
+		return request, nil, invalidRequest("invalid cache_uid")
 	}
 
-	if request.TTLSeconds == 0 {
-		request.TTLSeconds = wire.PrefetchDefaultTTLSecs
+	if body.TTLSeconds != nil {
+		request.TTLSeconds = *body.TTLSeconds
 	}
 
 	request.TTLSeconds = min(request.TTLSeconds, uint64(p.config.MaxTTL/time.Second))
 
-	for i, ref := range request.Refs {
+	request.Refs = make([]wire.PrefetchRef, len(body.Refs))
+
+	for i, ref := range body.Refs {
 		if _, err := wire.ParseKey(ref.Key); err != nil {
-			return request, invalidRequest("ref %d: invalid key", i)
+			return request, nil, invalidRequest("refs[%d].key is not 64 hex", i)
 		}
 
-		if ref.ETag != "" && wire.ValidateETag(ref.ETag) != nil {
-			return request, invalidRequest("ref %d: invalid etag", i)
+		if ref.ETag != nil && wire.ValidateETag(*ref.ETag) != nil {
+			return request, nil, invalidRequest("refs[%d].etag is not strong", i)
 		}
 
-		if ref.Metadata != "" && wire.ValidateOpaque(ref.Metadata) != nil {
-			return request, invalidRequest("ref %d: invalid metadata", i)
+		if ref.Length != nil && *ref.Length == 0 {
+			return request, nil, invalidRequest("refs[%d].length must be at least 1", i)
 		}
 
-		if present.Length[i].Length != nil && ref.Length == 0 {
-			return request, invalidRequest("ref %d: length must be positive", i)
+		if ref.Metadata != nil && wire.ValidateOpaque(*ref.Metadata) != nil {
+			return request, nil, invalidRequest("refs[%d].metadata is invalid", i)
 		}
+
+		request.Refs[i] = wire.PrefetchRef{Key: ref.Key, ETag: value(ref.ETag), Offset: value(ref.Offset), Length: value(ref.Length), Metadata: value(ref.Metadata)}
 	}
 
-	return request, nil
+	canonical, err := json.Marshal(body)
+	if err != nil {
+		return request, nil, invalidRequest("body cannot be canonicalized")
+	}
+
+	return request, canonical, nil
 }
 
-// gc expires live tickets and drops terminal tickets after retention. Callers
-// hold p.mu.
-func (p *Prefetches) gc(now time.Time) {
+// gc applies TTL expiry and retention like Racer: an unsettled ticket
+// becomes CANCELLED (expired), a settled one keeps its outcome, and either is
+// removed once retention passes. Callers hold p.mu.
+func (p *Prefetches) gc(ctx context.Context, now time.Time) {
 	for id, t := range p.tickets {
-		if t.canceled == "" && !now.Before(t.expires) {
-			t.canceled, t.updated = "expired", t.expires
+		if !t.released && !now.Before(t.expires) {
+			p.evaluate(ctx, t)
+
+			if !t.settled() {
+				t.canceled, t.updated = "expired", t.expires
+			}
+
+			p.release(t, t.expires)
 		}
 
-		if t.canceled != "" && !now.Before(t.updated.Add(p.config.Retention)) {
+		if t.released && !now.Before(t.removeAt) {
 			delete(p.tickets, id)
 		}
 	}
 }
 
+// release freezes a ticket's outcomes and starts its retention.
+func (p *Prefetches) release(t *ticket, at time.Time) {
+	if t.released {
+		return
+	}
+
+	t.released, t.removeAt = true, at.Add(p.config.Retention)
+}
+
 // evaluate asks the hook about pending refs. Callers hold p.mu.
 func (p *Prefetches) evaluate(ctx context.Context, t *ticket) {
-	if t.canceled != "" {
+	if t.released {
 		return
 	}
 
@@ -461,6 +558,13 @@ func (p *Prefetches) evaluate(ctx context.Context, t *ticket) {
 
 		if outcome.Pending {
 			continue
+		}
+
+		if outcome.Empty {
+			ref.length = 0
+			if ref.ref.Offset != 0 || ref.ref.Length != 0 {
+				outcome.Error = "invalid_range"
+			}
 		}
 
 		if ref.etag == nil && outcome.ETag != "" {
@@ -488,7 +592,7 @@ func (p *Prefetches) evaluate(ctx context.Context, t *ticket) {
 }
 
 func (t *ticket) settled() bool {
-	if t.canceled != "" {
+	if t.released {
 		return true
 	}
 
@@ -501,17 +605,55 @@ func (t *ticket) settled() bool {
 	return true
 }
 
-type cursor struct {
-	Generation uint64 `json:"g"`
-	Sequence   uint64 `json:"s"`
-	Next       int    `json:"n"`
+// statusJSON is the status body exactly as Racer sends it: every field is
+// present, reason is null unless canceled, and refs and next_cursor (null on
+// the last page) appear only when refs were requested.
+type statusJSON struct {
+	ID            string                    `json:"id"`
+	CacheUID      string                    `json:"cache_uid"`
+	State         string                    `json:"state"`
+	Reason        *string                   `json:"reason"`
+	Priority      string                    `json:"priority"`
+	Generation    uint64                    `json:"generation"`
+	Sequence      uint64                    `json:"sequence"`
+	Settled       bool                      `json:"settled"`
+	TTLSeconds    uint64                    `json:"ttl_seconds"`
+	ExpiresAtMs   int64                     `json:"expires_at_ms"`
+	CreatedAtMs   int64                     `json:"created_at_ms"`
+	UpdatedAtMs   int64                     `json:"updated_at_ms"`
+	RefsTotal     uint64                    `json:"refs_total"`
+	RefsSucceeded uint64                    `json:"refs_succeeded"`
+	RefsFailed    uint64                    `json:"refs_failed"`
+	RefsPending   uint64                    `json:"refs_pending"`
+	Bytes         wire.PrefetchBytes        `json:"bytes"`
+	Coverage      *wire.PrefetchCoverage    `json:"coverage,omitempty"`
+	Refs          *[]wire.PrefetchRefStatus `json:"refs,omitempty"`
+	NextCursor    **string                  `json:"next_cursor,omitempty"`
 }
 
-// render builds a status. Callers hold p.mu and have run gc and evaluate.
-func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery) wire.PrefetchStatus {
+// summaryJSON is one entry of the list body.
+type summaryJSON struct {
+	ID          string             `json:"id"`
+	State       string             `json:"state"`
+	Reason      *string            `json:"reason"`
+	Priority    string             `json:"priority"`
+	Generation  uint64             `json:"generation"`
+	Sequence    uint64             `json:"sequence"`
+	Settled     bool               `json:"settled"`
+	ExpiresAtMs int64              `json:"expires_at_ms"`
+	Bytes       wire.PrefetchBytes `json:"bytes"`
+}
+
+type listJSON struct {
+	Prefetches []summaryJSON `json:"prefetches"`
+}
+
+// render builds a status. Callers hold p.mu and have run gc. The cursor, if
+// any, has been validated by decodeCursor.
+func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery) statusJSON {
 	p.evaluate(ctx, t)
 
-	s := wire.PrefetchStatus{
+	s := statusJSON{
 		ID:          t.id,
 		CacheUID:    p.config.CacheUID,
 		Priority:    t.priority,
@@ -555,7 +697,7 @@ func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery
 		default:
 			s.RefsPending++
 
-			if t.canceled == "" {
+			if !t.released {
 				s.Bytes.InFlight += aligned
 			}
 		}
@@ -570,7 +712,7 @@ func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery
 		s.State = "RUNNING"
 	case s.RefsFailed == 0:
 		s.State = "SUCCEEDED"
-	case s.RefsSucceeded == 0:
+	case s.RefsFailed == s.RefsTotal:
 		s.State = "FAILED"
 	default:
 		s.State = "PARTIAL"
@@ -581,28 +723,28 @@ func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery
 	}
 
 	if q.Refs != "" {
-		start := 0
+		// Like Racer, the cursor is an offset into the filtered refs.
+		start, _ := decodeCursor(q.Cursor, t) //nolint:errcheck // Validated by status.
 
-		if q.Cursor != "" {
-			raw, _ := base64.RawURLEncoding.DecodeString(q.Cursor) //nolint:errcheck // Validated by status.
+		refs := []wire.PrefetchRefStatus{}
 
-			var c cursor
+		var next *string
 
-			_ = json.Unmarshal(raw, &c) //nolint:errcheck // Validated by status.
-			start = c.Next
-		}
+		matched := 0
 
-		s.Refs = []wire.PrefetchRefStatus{}
-
-		for i := start; i < len(t.refs); i++ {
-			ref := t.refs[i]
+		for i, ref := range t.refs {
 			if q.Refs == "failed" && ref.outcome != "failed" {
 				continue
 			}
 
-			if len(s.Refs) == p.config.RefsPage {
-				next := encodeCursor(cursor{Generation: t.generation, Sequence: t.sequence, Next: i})
-				s.NextCursor = &next
+			matched++
+			if matched <= start {
+				continue
+			}
+
+			if len(refs) == p.config.RefsPage {
+				cursor := encodeCursor(t, start+len(refs))
+				next = &cursor
 
 				break
 			}
@@ -613,20 +755,52 @@ func (p *Prefetches) render(ctx context.Context, t *ticket, q wire.PrefetchQuery
 				status.Error = &e
 			}
 
-			s.Refs = append(s.Refs, status)
+			refs = append(refs, status)
 		}
+
+		s.Refs, s.NextCursor = &refs, &next
 	}
 
 	return s
 }
 
-func encodeCursor(c cursor) string {
-	raw, err := json.Marshal(c)
-	if err != nil {
-		return ""
+// encodeCursor uses Racer's "<generation>.<sequence>.<offset>" format.
+func encodeCursor(t *ticket, offset int) string {
+	return fmt.Sprintf("%d.%d.%d", t.generation, t.sequence, offset)
+}
+
+// decodeCursor returns the offset of a cursor for t's current window. An
+// empty cursor is offset 0.
+func decodeCursor(cursor string, t *ticket) (int, *prefetchFailure) {
+	if cursor == "" {
+		return 0, nil
 	}
 
-	return base64.RawURLEncoding.EncodeToString(raw)
+	parts := strings.Split(cursor, ".")
+	if len(parts) < 3 {
+		return 0, invalidRequest("invalid cursor")
+	}
+
+	var numbers [3]uint64
+
+	for i := range numbers {
+		n, err := strconv.ParseUint(parts[i], 10, 64)
+		if err != nil {
+			return 0, invalidRequest("invalid cursor")
+		}
+
+		numbers[i] = n
+	}
+
+	if numbers[0] != t.generation || numbers[1] != t.sequence {
+		return 0, invalidRequest("cursor belongs to another generation or sequence")
+	}
+
+	if numbers[2] > math.MaxInt32 {
+		return 0, invalidRequest("invalid cursor")
+	}
+
+	return int(numbers[2]), nil
 }
 
 func (p *Prefetches) status(r *http.Request, id string) (int, any, *prefetchFailure) {
@@ -635,36 +809,29 @@ func (p *Prefetches) status(r *http.Request, id string) (int, any, *prefetchFail
 		return 0, nil, invalidRequest("invalid query")
 	}
 
-	var c cursor
-
-	if q.Cursor != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(q.Cursor)
-		if q.Refs == "" || err != nil || json.Unmarshal(raw, &c) != nil || c.Next < 0 {
-			return 0, nil, invalidRequest("invalid cursor")
-		}
-	}
-
+	ctx := r.Context()
 	deadline := time.Now().Add(q.Wait)
 
-	for {
+	for first := true; ; first = false {
 		p.mu.Lock()
-		p.gc(p.config.Now())
+		p.gc(ctx, p.config.Now())
 
 		t, ok := p.tickets[id]
 		if !ok {
 			p.mu.Unlock()
-			return 0, nil, fail(http.StatusNotFound, wire.PrefetchNotFound, "no prefetch %q", id)
+			return 0, nil, fail(http.StatusNotFound, wire.PrefetchNotFound, "prefetch %s not found", id)
 		}
 
-		if q.Cursor != "" && (c.Generation != t.generation || c.Sequence != t.sequence) {
+		// Like Racer, validate the cursor before waiting and again after.
+		if _, f := decodeCursor(q.Cursor, t); f != nil {
 			p.mu.Unlock()
-			return 0, nil, invalidRequest("cursor from another window")
+			return 0, nil, f
 		}
 
-		p.evaluate(r.Context(), t)
+		p.evaluate(ctx, t)
 
-		if t.settled() || !time.Now().Before(deadline) {
-			s := p.render(r.Context(), t, q)
+		if t.settled() || (!first && !time.Now().Before(deadline)) || q.Wait == 0 {
+			s := p.render(ctx, t, q)
 			p.mu.Unlock()
 
 			return http.StatusOK, s, nil
@@ -673,9 +840,9 @@ func (p *Prefetches) status(r *http.Request, id string) (int, any, *prefetchFail
 		p.mu.Unlock()
 
 		select {
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return 0, nil, fail(http.StatusServiceUnavailable, wire.PrefetchUnavailable, "client went away")
-		case <-time.After(min(5*time.Millisecond, time.Until(deadline))):
+		case <-time.After(max(0, min(5*time.Millisecond, time.Until(deadline)))):
 		}
 	}
 }
@@ -685,26 +852,30 @@ func (p *Prefetches) cancel(ctx context.Context, id string) (int, any, *prefetch
 	defer p.mu.Unlock()
 
 	now := p.config.Now()
-	p.gc(now)
+	p.gc(ctx, now)
 
 	t, ok := p.tickets[id]
 	if !ok {
-		return 0, nil, fail(http.StatusNotFound, wire.PrefetchNotFound, "no prefetch %q", id)
+		return 0, nil, fail(http.StatusNotFound, wire.PrefetchNotFound, "prefetch %s not found", id)
 	}
 
+	// An already canceled ticket keeps its reason; a settled ticket that
+	// expired becomes CANCELLED (client) but keeps its retention.
 	if t.canceled == "" {
 		p.evaluate(ctx, t)
 		t.canceled, t.updated = "client", now
+		p.release(t, now)
 	}
 
 	return http.StatusOK, p.render(ctx, t, wire.PrefetchQuery{}), nil
 }
 
-func (p *Prefetches) list() wire.PrefetchList {
+func (p *Prefetches) list() listJSON {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.gc(p.config.Now())
+	ctx := context.Background()
+	p.gc(ctx, p.config.Now())
 
 	ids := make([]string, 0, len(p.tickets))
 	for id := range p.tickets {
@@ -713,11 +884,15 @@ func (p *Prefetches) list() wire.PrefetchList {
 
 	sort.Strings(ids)
 
-	list := wire.PrefetchList{Prefetches: []wire.PrefetchStatus{}}
+	if len(ids) > 1024 {
+		ids = ids[:1024]
+	}
+
+	list := listJSON{Prefetches: []summaryJSON{}}
 
 	for _, id := range ids {
-		s := p.render(context.Background(), p.tickets[id], wire.PrefetchQuery{})
-		list.Prefetches = append(list.Prefetches, wire.PrefetchStatus{
+		s := p.render(ctx, p.tickets[id], wire.PrefetchQuery{})
+		list.Prefetches = append(list.Prefetches, summaryJSON{
 			ID: s.ID, State: s.State, Reason: s.Reason, Priority: s.Priority, Generation: s.Generation,
 			Sequence: s.Sequence, Settled: s.Settled, ExpiresAtMs: s.ExpiresAtMs, Bytes: s.Bytes,
 		})

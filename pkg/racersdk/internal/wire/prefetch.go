@@ -30,6 +30,7 @@ const (
 const (
 	PrefetchInvalidRequest   = "invalid_request"
 	PrefetchNotFound         = "not_found"
+	PrefetchMethodNotAllowed = "method_not_allowed"
 	PrefetchCacheUIDMismatch = "cache_uid_mismatch"
 	PrefetchPayloadMismatch  = "payload_mismatch"
 	PrefetchStaleSequence    = "stale_sequence"
@@ -214,17 +215,18 @@ func ParsePrefetchQuery(raw string, maxWait time.Duration) (PrefetchQuery, error
 
 		switch name {
 		case "wait":
+			// Racer rejects signs that Go accepts.
 			d, err := time.ParseDuration(value)
-			if err != nil || d < 0 || d > maxWait {
+			if err != nil || strings.HasPrefix(value, "+") || strings.HasPrefix(value, "-") || d > maxWait {
 				return q, bad
 			}
 
 			q.Wait = d
 		case "coverage":
 			switch value {
-			case "1":
+			case "1", "true":
 				q.Coverage = true
-			case "0":
+			case "0", "false":
 			default:
 				return q, bad
 			}
@@ -235,7 +237,7 @@ func ParsePrefetchQuery(raw string, maxWait time.Duration) (PrefetchQuery, error
 
 			q.Refs = value
 		case "cursor":
-			if value == "" {
+			if !validCursor(value) {
 				return q, bad
 			}
 
@@ -245,7 +247,27 @@ func ParsePrefetchQuery(raw string, maxWait time.Duration) (PrefetchQuery, error
 		}
 	}
 
+	if q.Cursor != "" && q.Refs == "" {
+		return q, bad
+	}
+
 	return q, nil
+}
+
+// validCursor matches Racer's cursor syntax: [A-Za-z0-9._-]{1,256}.
+func validCursor(s string) bool {
+	if s == "" || len(s) > 256 {
+		return false
+	}
+
+	for i := range len(s) {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '.' && c != '_' && c != '-' {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ParseRetryAfter parses an integer Retry-After in seconds. Invalid values are zero.

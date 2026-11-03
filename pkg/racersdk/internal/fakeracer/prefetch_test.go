@@ -153,8 +153,14 @@ func TestPrefetchIdempotencyTable(t *testing.T) {
 		})
 	}
 
-	// Defaults are part of the canonical body, so an explicit default matches.
-	if r := call(t, h, "PUT", path, `{"priority":"normal","generation":2,"sequence":0,"ttl_seconds":600,"refs":[{"key":"`+keyA+`","offset":0}]}`); r.code != 200 {
+	// Like Racer, the hash covers the body as sent: whitespace and field
+	// order do not matter, but an explicit default differs from an omitted
+	// field.
+	if r := call(t, h, "PUT", path, ` { "refs" : [ {"key":"`+keyA+`"} ], "sequence":0, "generation":2 } `); r.code != 200 {
+		t.Fatalf("reordered: %+v", r)
+	}
+
+	if r := call(t, h, "PUT", path, `{"priority":"normal","generation":2,"sequence":0,"ttl_seconds":600,"refs":[{"key":"`+keyA+`","offset":0}]}`); r.code != 409 || r.err.Code != wire.PrefetchPayloadMismatch {
 		t.Fatalf("explicit defaults: %+v", r)
 	}
 }
@@ -201,15 +207,127 @@ func TestPrefetchTTLExpiryAndRetention(t *testing.T) {
 
 	clock.Add(10 * time.Second)
 
+	// A settled ticket keeps its outcome at expiry.
 	r = call(t, h, "GET", path, "")
-	if r.status.State != "CANCELLED" || *r.status.Reason != "expired" {
-		t.Fatalf("expired: %+v", r.status)
+	if r.status.State != "SUCCEEDED" || r.status.Reason != nil || !r.status.Settled {
+		t.Fatalf("expired settled: %+v", r.status)
 	}
 
-	clock.Add(time.Minute)
+	// The replay no longer renews a released ticket.
+	if r2 := call(t, h, "PUT", path, `{"ttl_seconds":3600,"refs":[{"key":"`+keyA+`"}]}`); r2.code != 200 || r2.status.ExpiresAtMs != r.status.ExpiresAtMs {
+		t.Fatalf("replay after expiry: %+v", r2)
+	}
+
+	// Retention counts from expiry.
+	clock.Add(time.Minute - time.Second)
+
+	if r := call(t, h, "GET", path, ""); r.code != 200 {
+		t.Fatalf("retained: %+v", r)
+	}
+
+	clock.Add(time.Second)
 
 	if r := call(t, h, "GET", path, ""); r.code != 404 {
 		t.Fatalf("retention: %+v", r)
+	}
+}
+
+func TestPrefetchTTLExpiryCancelsUnsettled(t *testing.T) {
+	_, h, clock := newFake(PrefetchConfig{Retention: time.Minute, Outcome: func(context.Context, string, wire.PrefetchRef) PrefetchOutcome {
+		return PrefetchOutcome{Pending: true}
+	}})
+	path := wire.PrefetchPath + "/u"
+
+	call(t, h, "PUT", path, `{"ttl_seconds":5,"refs":[{"key":"`+keyA+`"}]}`)
+	clock.Add(5 * time.Second)
+
+	r := call(t, h, "GET", path, "")
+	if r.status.State != "CANCELLED" || r.status.Reason == nil || *r.status.Reason != "expired" || !r.status.Settled || r.status.Bytes.InFlight != 0 {
+		t.Fatalf("expired: %+v", r.status)
+	}
+
+	// DELETE keeps the original reason.
+	if r := call(t, h, "DELETE", path, ""); r.code != 200 || *r.status.Reason != "expired" {
+		t.Fatalf("delete: %+v", r)
+	}
+}
+
+func TestPrefetchTicketLimitEvictsRetained(t *testing.T) {
+	_, h, clock := newFake(PrefetchConfig{MaxTickets: 2})
+
+	call(t, h, "PUT", wire.PrefetchPath+"/a", spec(0, 0, keyA))
+	call(t, h, "PUT", wire.PrefetchPath+"/b", spec(0, 0, keyA))
+	call(t, h, "DELETE", wire.PrefetchPath+"/b", "")
+	clock.Add(time.Second)
+	call(t, h, "DELETE", wire.PrefetchPath+"/a", "")
+
+	// The oldest retained ticket (b) makes room.
+	if r := call(t, h, "PUT", wire.PrefetchPath+"/c", spec(0, 0, keyA)); r.code != 201 {
+		t.Fatalf("evict: %+v", r)
+	}
+
+	if r := call(t, h, "GET", wire.PrefetchPath+"/b", ""); r.code != 404 {
+		t.Fatalf("b: %+v", r)
+	}
+
+	if r := call(t, h, "PUT", wire.PrefetchPath+"/d", spec(0, 0, keyA)); r.code != 201 {
+		t.Fatalf("evict a: %+v", r)
+	}
+
+	if r := call(t, h, "PUT", wire.PrefetchPath+"/e", spec(0, 0, keyA)); r.code != 429 || r.header.Get("Retry-After") != "5" {
+		t.Fatalf("limit: %+v", r)
+	}
+}
+
+func TestPrefetchEmptyObjectAndWireShapes(t *testing.T) {
+	_, h, _ := newFake(PrefetchConfig{Outcome: func(context.Context, string, wire.PrefetchRef) PrefetchOutcome {
+		return PrefetchOutcome{Empty: true, ETag: `"e"`}
+	}})
+	path := wire.PrefetchPath + "/e"
+
+	r := call(t, h, "PUT", path, `{"refs":[{"key":"`+keyA+`"},{"key":"`+keyA+`","offset":1},{"key":"`+keyA+`","length":1}]}`)
+	if r.status.State != "PARTIAL" || r.status.RefsSucceeded != 1 || r.status.RefsFailed != 2 || r.status.Bytes.AlignedRequested != 0 {
+		t.Fatalf("empty: %+v", r.status)
+	}
+
+	raw := func(target string) map[string]json.RawMessage {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "http://racer"+target, nil))
+
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
+			t.Fatal(err)
+		}
+
+		return m
+	}
+
+	m := raw(path)
+	for _, field := range []string{"cache_uid", "reason", "ttl_seconds", "created_at_ms", "updated_at_ms", "refs_total", "refs_succeeded", "refs_failed", "refs_pending", "bytes"} {
+		if _, ok := m[field]; !ok {
+			t.Errorf("missing %s", field)
+		}
+	}
+
+	for _, field := range []string{"refs", "next_cursor", "coverage"} {
+		if _, ok := m[field]; ok {
+			t.Errorf("unrequested %s", field)
+		}
+	}
+
+	m = raw(path + "?refs=all")
+	if string(m["next_cursor"]) != "null" || len(m["refs"]) == 0 {
+		t.Fatalf("refs: %s %s", m["refs"], m["next_cursor"])
+	}
+
+	if r := call(t, h, "POST", path, ""); r.err.Code != wire.PrefetchMethodNotAllowed {
+		t.Fatalf("405: %+v", r)
+	}
+
+	for _, body := range []string{`{"cache_uid":"","refs":[{"key":"` + keyA + `"}]}`, `{"cache_uid":"` + strings.Repeat("u", 65) + `","refs":[{"key":"` + keyA + `"}]}`} {
+		if r := call(t, h, "PUT", path, body); r.code != 400 {
+			t.Fatalf("cache uid: %+v", r)
+		}
 	}
 }
 
@@ -219,7 +337,7 @@ func TestPrefetchLimitsAndRejections(t *testing.T) {
 	call(t, h, "PUT", wire.PrefetchPath+"/a", spec(0, 0, keyA))
 
 	r := call(t, h, "PUT", wire.PrefetchPath+"/b", spec(0, 0, keyA))
-	if r.code != 429 || r.err.Code != wire.PrefetchTicketLimit || r.header.Get("Retry-After") != "1" {
+	if r.code != 429 || r.err.Code != wire.PrefetchTicketLimit || r.header.Get("Retry-After") != "5" {
 		t.Fatalf("ticket limit: %+v", r)
 	}
 

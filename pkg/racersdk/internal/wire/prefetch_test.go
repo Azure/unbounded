@@ -56,8 +56,11 @@ func TestPrefetchQueryEncodeOrder(t *testing.T) {
 		t.Fatal(got)
 	}
 
-	q, err := ParsePrefetchQuery(got, time.Minute)
-	if err != nil || q != (PrefetchQuery{Wait: time.Second, Coverage: true, Refs: "failed", Cursor: "a+b/="}) {
+	// Racer cursors are [A-Za-z0-9._-]; other bytes are escaped but rejected.
+	want := PrefetchQuery{Wait: 1500 * time.Millisecond, Coverage: true, Refs: "failed", Cursor: "2.5.256"}
+
+	q, err := ParsePrefetchQuery(want.Encode(), time.Minute)
+	if err != nil || q != want {
 		t.Fatal(q, err)
 	}
 }
@@ -65,11 +68,20 @@ func TestPrefetchQueryEncodeOrder(t *testing.T) {
 func TestParsePrefetchQueryRejects(t *testing.T) {
 	for _, raw := range []string{
 		"bogus=1", "wait=1s&wait=2s", "wait=-1s", "wait=61s", "wait=abc", "coverage=yes",
-		"refs=some", "cursor=", "%zz",
+		"refs=some", "cursor=", "%zz", "wait=+1s", "wait=1", "cursor=0.0.1", "refs=all&cursor=a%2Fb",
+		"refs=all&cursor=" + strings.Repeat("a", 257),
 	} {
 		if _, err := ParsePrefetchQuery(raw, time.Minute); err == nil {
 			t.Errorf("%q accepted", raw)
 		}
+	}
+
+	if q, err := ParsePrefetchQuery("coverage=true", time.Minute); err != nil || !q.Coverage {
+		t.Fatal(q, err)
+	}
+
+	if q, err := ParsePrefetchQuery("wait=0&coverage=false", time.Minute); err != nil || q.Wait != 0 || q.Coverage {
+		t.Fatal(q, err)
 	}
 
 	if q, err := ParsePrefetchQuery("wait=60s&coverage=0&refs=all", time.Minute); err != nil || q.Wait != time.Minute || q.Coverage || q.Refs != "all" {
