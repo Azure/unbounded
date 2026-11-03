@@ -1302,8 +1302,32 @@ The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entr
 `port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
 optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
 
-Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order,
-published from the dataplane's own Pod report. Explicit
+Absent administrator policy uses eligible active ports in PCI BDF/port order,
+published from the dataplane's own Pod report. A port is eligible on a device with
+type 2B memory windows (window mode), or on a device without memory windows that
+supports RC queue pairs and has an IPv4-mapped RoCE GID (registration mode, for
+example Azure MANA guest RDMA).
+
+### Registration mode
+
+Registration mode keeps transfers zero copy without memory windows or on-demand
+paging. A grant registers the granted page buffer itself for remote write and
+sends that registration's key; the arrival deregisters it, so the key works for
+exactly one transfer into exactly one buffer. A write registers the sender's
+page memory for local access, writes straight from it, and deregisters it on
+completion. Page memory is 2 MiB aligned and huge-page backed, so these
+registrations are cheap. Queue pairs connect through the RDMA connection manager
+on the node's IPv4 address:
+
+- The dataplane must run in the host network namespace: patch the `racer`
+  DaemonSet with `hostNetwork: true` and `dnsPolicy: ClusterFirstWithHostNet`.
+- Each dataplane listens on TCP port `RACER_RDMA_CM_PORT` (default 18515) of its
+  RDMA device's address for connection requests. Requests must name a link both
+  peers set up through the authenticated exchange.
+- The image ships rdma-core 65, which has the MANA RC provider (rdma-core 54 or
+  later is required).
+- Window keys rotate per grant in both modes; registration mode reports the
+  whole written length through the immediate's top byte, so link tags use 24 bits. Explicit
 `[]` disables eligibility; a list overrides automatic rails. Discovery cannot infer cabling
 or correct asymmetric initial inventories: use explicit mappings when ordinals do not match.
 
