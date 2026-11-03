@@ -32,6 +32,7 @@ func TestReportProgressCreditsDuringTheDrain(t *testing.T) {
 	body.n.Store(100)
 
 	stop := p.reportProgress(body)
+
 	time.Sleep(progressInterval + progressInterval/2)
 
 	if got := testutil.ToFloat64(p.metrics.receivedBytes); got != 100 {
