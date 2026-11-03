@@ -254,7 +254,10 @@ jobs:
           name: digests-${{ needs.plan.outputs.key }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
-          retention-days: 1
+          # 7, not 1: match release.yaml's retry window so a
+          # "re-run failed jobs" can still merge digests from arch
+          # builds that succeeded and are not rerun.
+          retention-days: 7
           # A full re-run of the calling workflow uploads the same name again.
           overwrite: true
 
