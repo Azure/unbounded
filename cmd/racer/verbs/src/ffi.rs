@@ -110,7 +110,7 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(any(test, all(feature = "native", target_os = "linux")))]
-const ABI_VERSION: u32 = 5;
+const ABI_VERSION: u32 = 6;
 
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
 pub(crate) mod opcode {
@@ -251,7 +251,7 @@ native_api! {
 
     qp: unsafe extern "C" fn(*mut c_void, u8, u32, u32, *mut u32) -> *mut c_void,
 
-    connect: unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint) -> c_int,
+    connect: unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint, c_int) -> c_int,
 
     stop: unsafe extern "C" fn(*mut c_void) -> c_int,
 
@@ -271,9 +271,9 @@ native_api! {
 
     window_free: unsafe extern "C" fn(*mut c_void) -> c_int,
 
-    bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, u64, u32) -> c_int,
+    bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut u32, u64, u64, u32) -> c_int,
 
-    invalidate: unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int,
+    invalidate: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u64) -> c_int,
 
     write_imm: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32, u32, u64) -> c_int,
 
@@ -863,7 +863,12 @@ impl NativeQueuePair {
     }
 
     /// Connect to `remote`. Once only. On failure, stops the QP.
-    pub(crate) fn connect(&self, remote: Endpoint) -> Result<()> {
+    ///
+    /// `initiator` is the side that opened the link. Devices in the adapter's
+    /// registration mode connect through the RDMA connection manager: the
+    /// initiator connects and returns once connected, the responder records
+    /// the initiator and returns at once. Window-mode devices ignore it.
+    pub(crate) fn connect(&self, remote: Endpoint, initiator: bool) -> Result<()> {
         remote.validate()?;
         if self.stopped.get()
             || self.terminating.get()
@@ -872,7 +877,15 @@ impl NativeQueuePair {
         {
             return Err(Error::InvalidRequest);
         }
-        if unsafe { (self.device.api.connect)(self.raw.as_ptr(), &self.endpoint, &remote) } != 0 {
+        if unsafe {
+            (self.device.api.connect)(
+                self.raw.as_ptr(),
+                &self.endpoint,
+                &remote,
+                c_int::from(initiator),
+            )
+        } != 0
+        {
             self.stop()?;
             return Err(Error::Unavailable);
         }
@@ -1168,7 +1181,7 @@ impl NativeQueuePair {
         {
             return Err(Error::InvalidRequest);
         }
-        let key = window.next_key.get();
+        let mut key = window.next_key.get();
         self.post_ranged(
             id,
             false,
@@ -1182,7 +1195,7 @@ impl NativeQueuePair {
                     self.raw.as_ptr(),
                     window.raw.as_ptr(),
                     region.raw.as_ptr(),
-                    key,
+                    &mut key,
                     id,
                     offset,
                     length,
@@ -1217,7 +1230,9 @@ impl NativeQueuePair {
             0,
             1,
             Some(window.clone()),
-            || unsafe { (self.device.api.invalidate)(self.raw.as_ptr(), key, id) },
+            || unsafe {
+                (self.device.api.invalidate)(self.raw.as_ptr(), window.raw.as_ptr(), key, id)
+            },
         )
     }
 
@@ -1391,7 +1406,12 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Accept connection setup without a physical peer.
-    unsafe extern "C" fn connect(_: *mut c_void, _: *const Endpoint, _: *const Endpoint) -> c_int {
+    unsafe extern "C" fn connect(
+        _: *mut c_void,
+        _: *const Endpoint,
+        _: *const Endpoint,
+        _: c_int,
+    ) -> c_int {
         0
     }
 
@@ -1455,7 +1475,7 @@ pub(crate) mod lifetime_tests {
         _: *mut c_void,
         _: *mut c_void,
         _: *mut c_void,
-        _: u32,
+        _: *mut u32,
         _: u64,
         _: u64,
         _: u32,
@@ -1502,7 +1522,7 @@ pub(crate) mod lifetime_tests {
     }
 
     /// Accept or reject an invalidation according to the fault script.
-    unsafe extern "C" fn invalidate(_: *mut c_void, _: u32, _: u64) -> c_int {
+    unsafe extern "C" fn invalidate(_: *mut c_void, _: *mut c_void, _: u32, _: u64) -> c_int {
         post_result()
     }
 
@@ -1579,7 +1599,7 @@ pub(crate) mod lifetime_tests {
             4,
         )
         .unwrap();
-        qp.connect(qp.endpoint).unwrap();
+        qp.connect(qp.endpoint, true).unwrap();
         let (quota, charged) = quota();
         let region = NativeRegion::with_access(device, 32, Access::PAGES, quota).unwrap();
         (qp, region, charged)
@@ -1772,7 +1792,7 @@ pub(crate) mod lifetime_tests {
             recv,
         )
         .unwrap();
-        qp.connect(qp.endpoint).unwrap();
+        qp.connect(qp.endpoint, true).unwrap();
         let region = NativeRegion::with_access(device, 256, Access::PAGES, quota().0).unwrap();
         (qp, region)
     }
@@ -2110,8 +2130,8 @@ pub(crate) mod lifetime_tests {
         };
         let receiver = qp();
         let sender = qp();
-        receiver.connect(sender.endpoint).unwrap();
-        sender.connect(receiver.endpoint).unwrap();
+        receiver.connect(sender.endpoint, false).unwrap();
+        sender.connect(receiver.endpoint, true).unwrap();
         let region = |access| NativeRegion::with_access(device.clone(), 4096, access, quota().0);
         let destination = region(Access::PAGES_REMOTE_WRITE).unwrap();
         let source = region(Access::PAGES).unwrap();

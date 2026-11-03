@@ -9,11 +9,11 @@ if [ "$#" -ne 2 ]; then
 fi
 
 # Fail before compiling if the real verbs development package is unavailable.
-pkg-config --exists libibverbs
+pkg-config --exists libibverbs librdmacm
 mkdir -p "$(dirname "$2")"
 # pkg-config emits compiler/linker argument lists, intentionally word-split.
 # shellcheck disable=SC2046
-"${CC:-cc}" $(pkg-config --cflags libibverbs) \
+"${CC:-cc}" $(pkg-config --cflags libibverbs librdmacm) \
     -O2 -g -fno-omit-frame-pointer -std=gnu11 -Wall -Wextra -Werror -fPIC -shared \
     -Wl,-soname,librdma_verbs.so.1 -Wl,-z,defs \
-    -o "$2" "$1" $(pkg-config --libs libibverbs)
+    -o "$2" "$1" $(pkg-config --libs libibverbs librdmacm) -lpthread

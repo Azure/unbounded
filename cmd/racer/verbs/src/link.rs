@@ -594,7 +594,7 @@ impl Link {
             return Err(Error::InvalidRequest);
         }
 
-        self.qp.connect(remote)?;
+        self.qp.connect(remote, self.role == Role::Initiator)?;
         self.credits = credits;
         self.grant_cap = self.limits.grants.min(peer_grants);
         self.link_id = link_id;
