@@ -16,7 +16,7 @@ import (
 )
 
 func TestDebugOptions(t *testing.T) {
-	for _, mode := range []string{"origin", "sidecar"} {
+	for _, mode := range []string{"sidecar"} {
 		for _, address := range []string{"", "127.0.0.1:6060", ":6060"} {
 			args := modeArgs(mode)
 			if address != "" {
@@ -85,7 +85,7 @@ func TestDebugDisabledAndBindFailure(t *testing.T) {
 		}
 	}
 
-	for _, mode := range []string{"origin", "sidecar"} {
+	for _, mode := range []string{"sidecar"} {
 		err := run(context.Background(), modeArgs(mode, "--debug-listen="+l.Addr().String()), io.Discard)
 		if err == nil || err.Error() != "could not bind debug listener" {
 			t.Fatalf("%s did not bind diagnostics before main startup: %v", mode, err)

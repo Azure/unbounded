@@ -13,69 +13,29 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go/logging"
-	"golang.org/x/sys/unix"
 
 	"github.com/Azure/unbounded/internal/racerobject"
 	"github.com/Azure/unbounded/internal/version"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-// bucketFlag accepts exactly one value so a repeated --bucket fails instead
-// of silently replacing the first.
-type bucketFlag string
-
-func (b *bucketFlag) String() string { return string(*b) }
-func (b *bucketFlag) Set(value string) error {
-	if *b != "" {
-		return errors.New("--bucket may be set only once")
-	}
-
-	*b = bucketFlag(value)
-
-	return nil
-}
-
-// cacheUIDPattern matches the canonical lowercase UUID form of a Kubernetes UID.
-var cacheUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-
 type options struct {
-	mode            string
-	cache           string
-	cacheUID        string
-	bucket          bucketFlag
-	provider        string
-	api             string
-	containerURL    string
-	azureCredential string
-	region          string
-	endpoint        string
-	pathStyle       bool
-	metadataTTL     time.Duration
-	requestTimeout  time.Duration
-	listen          string
-	debugListen     string
-	maxRequests     int
-	maxConnections  int
+	mode           string
+	cache          string
+	api            string
+	requestTimeout time.Duration
+	listen         string
+	debugListen    string
+	maxConnections int
 }
 
 const (
-	// defaultOriginRequests is sized for remote object stores: at roughly
-	// 30 MB/s per connection, filling a 40 Gb/s NIC takes a few hundred
-	// concurrent 16 MiB page fetches.
-	defaultOriginRequests = 512
 	// defaultSidecarConnections bounds both accepted client connections and
 	// concurrent Racer reads.
 	defaultSidecarConnections = 128
@@ -95,15 +55,15 @@ func main() {
 func parseOptions(args []string, output io.Writer) (options, error) {
 	var o options
 	if len(args) == 0 {
-		return o, errors.New("expected origin or sidecar (use --help)")
+		return o, errors.New("expected sidecar (use --help)")
 	}
 
 	switch args[0] {
 	case "--help", "-h":
-		return o, writeHelp(output, "Usage: racer-object <origin|sidecar> [flags]\nUse racer-object <command> --help for flags.\n")
+		return o, writeHelp(output, "Usage: racer-object sidecar [flags]\nUse racer-object sidecar --help for flags.\n")
 	case "--version":
 		return o, writeHelp(output, version.String()+"\n")
-	case "origin", "sidecar":
+	case "sidecar":
 		o.mode = args[0]
 	default:
 		return o, errors.New("unknown command (use --help)")
@@ -127,24 +87,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
-	if o.mode == "origin" {
-		fs.StringVar(&o.cacheUID, "cache-uid", "", "Optional ClusterCache UID (lowercase UUID) this origin serves; when set, requests for any other or no cache UID are refused so a leftover origin cannot fill a recreated cache with the same name")
-		fs.Var(&o.bucket, "bucket", "S3 bucket served by this origin; required for s3 and rejected for azure. Requests for any other bucket are forbidden")
-		fs.StringVar(&o.provider, "provider", "s3", "Upstream provider: s3 or azure")
-		fs.StringVar(&o.containerURL, "container-url", "", "Azure Blob container URL (https://ACCOUNT.blob.core.windows.net/CONTAINER); required for azure, without credentials or query. Requests for any other container are forbidden")
-		fs.StringVar(&o.azureCredential, "azure-credential", "default", "Azure credential: default or anonymous; default requires HTTPS and uses the Azure credential chain (AZURE_CLIENT_ID and related environment variables)")
-		fs.StringVar(&o.region, "region", "", "AWS region (defaults to AWS configuration and environment)")
-		fs.StringVar(&o.endpoint, "endpoint", "", "Optional HTTP(S) upstream origin, without a path or credentials")
-		fs.BoolVar(&o.pathStyle, "path-style", true, "Use path-style upstream addressing")
-		fs.DurationVar(&o.metadataTTL, "metadata-ttl", 30*time.Second, "Metadata lifetime; zero expires immediately")
-		fs.DurationVar(&o.requestTimeout, "request-timeout", time.Minute, "Positive origin request timeout")
-		fs.IntVar(&o.maxRequests, "max-concurrent-requests", defaultOriginRequests, "Concurrent page requests served to Racer and pooled upstream connections; 1..65536")
-	} else {
-		fs.StringVar(&o.api, "api", "s3", "Sidecar API: s3 or azure")
-		fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "Loopback IP literal and port")
-		fs.DurationVar(&o.requestTimeout, "request-timeout", 5*time.Minute, "Positive sidecar request timeout")
-		fs.IntVar(&o.maxConnections, "max-connections", defaultSidecarConnections, "Concurrent client connections and Racer reads; 1..65536")
-	}
+	fs.StringVar(&o.api, "api", "s3", "Sidecar API: s3 or azure")
+	fs.StringVar(&o.listen, "listen", "127.0.0.1:8080", "Loopback IP literal and port")
+	fs.DurationVar(&o.requestTimeout, "request-timeout", 5*time.Minute, "Positive sidecar request timeout")
+	fs.IntVar(&o.maxConnections, "max-connections", defaultSidecarConnections, "Concurrent client connections and Racer reads; 1..65536")
 
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -174,42 +120,20 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	closeResource(validationClient)
 
-	if o.mode == "origin" && o.cacheUID != "" && !cacheUIDPattern.MatchString(o.cacheUID) {
-		return o, errors.New("invalid --cache-uid")
-	}
-
 	if o.requestTimeout <= 0 {
 		return o, errors.New("--request-timeout must be positive")
 	}
 
-	if o.mode == "origin" {
-		if o.maxRequests < 1 || o.maxRequests > maxConcurrencyFlag {
-			return o, errors.New("--max-concurrent-requests must be between 1 and 65536")
-		}
+	if o.maxConnections < 1 || o.maxConnections > maxConcurrencyFlag {
+		return o, errors.New("--max-connections must be between 1 and 65536")
+	}
 
-		if err := validateProviderOptions(&o, fs); err != nil {
-			return o, err
-		}
+	if o.api != "s3" && o.api != "azure" {
+		return o, errors.New("--api must be s3 or azure")
+	}
 
-		if o.metadataTTL < 0 {
-			return o, errors.New("--metadata-ttl must not be negative")
-		}
-
-		if err := validateEndpoint(o.endpoint); err != nil {
-			return o, err
-		}
-	} else {
-		if o.maxConnections < 1 || o.maxConnections > maxConcurrencyFlag {
-			return o, errors.New("--max-connections must be between 1 and 65536")
-		}
-
-		if o.api != "s3" && o.api != "azure" {
-			return o, errors.New("--api must be s3 or azure")
-		}
-
-		if err := validateListen(o.listen); err != nil {
-			return o, err
-		}
+	if err := validateListen(o.listen); err != nil {
+		return o, err
 	}
 
 	return o, nil
@@ -227,32 +151,6 @@ func closeResource(c io.Closer) {
 	if err := c.Close(); err != nil {
 		return
 	}
-}
-
-func validateEndpoint(value string) error {
-	if value == "" {
-		return nil
-	}
-
-	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
-		u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(value, "#") ||
-		(u.EscapedPath() != "" && u.EscapedPath() != "/") {
-		return errors.New("--endpoint must be an HTTP(S) origin without credentials, query, fragment, or path prefix")
-	}
-
-	if strings.HasSuffix(u.Host, ":") {
-		return errors.New("invalid --endpoint port")
-	}
-
-	if port := u.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 {
-			return errors.New("invalid --endpoint port")
-		}
-	}
-
-	return nil
 }
 
 func validateListen(value string) error {
@@ -290,177 +188,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 
 	return runWithDebug(ctx, o.debugListen, func(ctx context.Context) error {
-		if o.mode == "origin" {
-			return runOrigin(ctx, o)
-		}
-
 		return runSidecar(ctx, o)
 	})
-}
-
-func originAWSConfig(ctx context.Context, o options) (aws.Config, error) {
-	load := []func(*config.LoadOptions) error{
-		config.WithHTTPClient(originHTTPClient(o)),
-		config.WithLogger(logging.NewStandardLogger(io.Discard)),
-	}
-	if o.region != "" {
-		load = append(load, config.WithRegion(o.region))
-	}
-
-	cfg, err := config.LoadDefaultConfig(ctx, load...)
-	if err != nil {
-		return aws.Config{}, errors.New("could not load AWS configuration")
-	}
-
-	if strings.TrimSpace(cfg.Region) == "" {
-		return aws.Config{}, errors.New("AWS region is required; set --region or AWS_REGION")
-	}
-
-	return cfg, nil
-}
-
-// originHTTPClient returns the upstream HTTP client. Its idle pool matches
-// the origin's request limit so steady page fetches reuse warm TLS
-// connections instead of reconnecting once more than two are in flight.
-func originHTTPClient(o options) *http.Client {
-	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
-	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		transport = base.Clone()
-	}
-
-	transport.MaxIdleConns = o.maxRequests
-	transport.MaxIdleConnsPerHost = o.maxRequests
-
-	return &http.Client{Timeout: o.requestTimeout, Transport: transport}
-}
-
-func createOrigin(ctx context.Context, o options) (racersdk.Origin, error) {
-	originConfig := racerobject.OriginConfig{
-		Bucket: string(o.bucket), MetadataTTL: o.metadataTTL,
-	}
-	if o.provider == "azure" {
-		client, err := originAzureClient(o)
-		if err != nil {
-			return nil, err
-		}
-
-		origin, err := racerobject.NewAzureOrigin(client, originConfig)
-		if err != nil {
-			return nil, errors.New("could not configure origin")
-		}
-
-		return origin, nil
-	}
-
-	if o.provider != "" && o.provider != "s3" {
-		return nil, errors.New("--provider must be s3 or azure")
-	}
-
-	cfg, err := originAWSConfig(ctx, o)
-	if err != nil {
-		return nil, err
-	}
-
-	client := s3.NewFromConfig(cfg, func(s *s3.Options) {
-		s.UsePathStyle = o.pathStyle
-		if o.endpoint != "" {
-			s.BaseEndpoint = aws.String(o.endpoint)
-		}
-	})
-
-	origin, err := racerobject.NewOrigin(client, originConfig)
-	if err != nil {
-		return nil, errors.New("could not configure origin")
-	}
-
-	return origin, nil
-}
-
-func runOrigin(ctx context.Context, o options) error {
-	origin, err := createOrigin(ctx, o)
-	if err != nil {
-		return err
-	}
-
-	root, err := os.Open("/")
-	if err != nil {
-		return errors.New("could not open origin directory root")
-	}
-	defer closeResource(root)
-
-	if err := checkOriginDirectory(root, []string{"run", "racer", o.cache, "origin"}); err != nil {
-		return fmt.Errorf("unsafe or missing origin directory /run/racer/%s/origin (racer creates it "+
-			"owned by UID/GID %d with mode 0700; run the origin as UID %d and mount that directory): %w",
-			o.cache, originUID, originUID, err)
-	}
-
-	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
-		Cache: o.cache, CacheUID: o.cacheUID, RecoverStaleSocket: true, MaxConcurrentRequests: o.maxRequests,
-	}, origin)
-	if ctx.Err() != nil {
-		return nil
-	}
-
-	if err != nil {
-		return errors.New("origin server failed")
-	}
-
-	return nil
-}
-
-// originUID is the UID/GID origins run as. The racer creates
-// /run/racer/<cache>/origin owned by this user with mode 0700
-// (ORIGIN_UID in cmd/racer/src/client/origin_directory.rs).
-const originUID = 65532
-
-// errOriginDirectoryMissing reports that the dataplane has not created the
-// origin directory yet, or that it is not mounted into the pod.
-var errOriginDirectoryMissing = errors.New("origin directory does not exist")
-
-// checkOriginDirectory walks from a trusted descriptor without following
-// symlinks, creating nothing and changing no permissions. Every ancestor must
-// be a directory owned by root or the effective user without group or other
-// write permission. The final component is the dataplane-managed origin
-// directory and must be owned by the effective user.
-func checkOriginDirectory(parent *os.File, parts []string) error {
-	info, err := parent.Stat()
-	if err != nil {
-		return err
-	}
-
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.IsDir() || info.Mode().Perm()&0o022 != 0 ||
-		(stat.Uid != 0 && stat.Uid != uint32(os.Geteuid())) {
-		return fmt.Errorf("%s: unsafe owner or permissions: %w", parent.Name(), os.ErrPermission)
-	}
-
-	if len(parts) == 0 {
-		if stat.Uid != uint32(os.Geteuid()) {
-			return fmt.Errorf("%s: owned by UID %d, not effective UID %d: %w",
-				parent.Name(), stat.Uid, os.Geteuid(), os.ErrPermission)
-		}
-
-		return nil
-	}
-
-	part := parts[0]
-	if part == "" || part == "." || part == ".." || strings.Contains(part, "/") {
-		return os.ErrInvalid
-	}
-
-	fd, err := unix.Openat(int(parent.Fd()), part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("%s: %w", part, errOriginDirectoryMissing)
-	}
-
-	if err != nil {
-		return fmt.Errorf("%s: %w", part, err)
-	}
-
-	child := os.NewFile(uintptr(fd), part)
-	defer closeResource(child)
-
-	return checkOriginDirectory(child, parts[1:])
 }
 
 func runSidecar(ctx context.Context, o options) error {
