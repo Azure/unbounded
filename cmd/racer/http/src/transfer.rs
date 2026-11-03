@@ -85,6 +85,10 @@ pub mod delivery {
         /// Observe bytes accepted by a direct or runtime-owned send.
         fn direct_bytes(&self, _count: usize) {}
 
+        /// Observe every accepted byte, through any path: splice, direct, or
+        /// owned send. Called once per cursor advance.
+        fn delivered_bytes(&self, _count: usize) {}
+
         /// Observe a complete pipe drain before submitting an owned send.
         fn pipe_drained(&self) {}
 
@@ -159,6 +163,7 @@ pub mod delivery {
             }
             observer.direct_bytes(sent);
             owner.advance(sent);
+            observer.delivered_bytes(sent);
             stalled_at = uring_runtime::environment::now();
             budget += sent;
             calls += 1;
@@ -268,6 +273,7 @@ pub mod delivery {
                 return Err(uring_runtime::Error::Io.into());
             }
             owner.advance(sent);
+            observer.delivered_bytes(sent);
             stalled_at = uring_runtime::environment::now();
             budget += sent;
             calls += 1;
@@ -626,6 +632,8 @@ pub mod delivery {
         struct Observe {
             events: RefCell<Vec<(&'static str, usize)>>,
 
+            delivered: Cell<usize>,
+
             reject: Cell<bool>,
 
             scope_error: Cell<bool>,
@@ -646,6 +654,11 @@ pub mod delivery {
             /// Record bytes accepted outside the splice path.
             fn direct_bytes(&self, count: usize) {
                 self.events.borrow_mut().push(("direct", count));
+            }
+
+            /// Total every accepted byte.
+            fn delivered_bytes(&self, count: usize) {
+                self.delivered.set(self.delivered.get() + count);
             }
 
             /// Record a completed pipe drain.
@@ -717,6 +730,8 @@ pub mod delivery {
             assert_eq!(owner.sent, 10);
             assert_eq!(owner.pipe.bytes, b"23456789");
             assert_eq!(*observer.events.borrow(), [("direct", 8)]);
+            // Splice and direct sends both count as delivered.
+            assert_eq!(observer.delivered.get(), 10);
             assert_eq!(
                 connection.send_remaining(),
                 None,
@@ -929,6 +944,7 @@ pub mod delivery {
             assert_eq!(prefix, [7; 64]);
             let (owner, connection) = drive(&reactor, work).unwrap();
             assert_eq!(owner.sent, 100);
+            assert_eq!(observer.delivered.get(), 100);
             drop(connection);
             let mut suffix = Vec::new();
             peer.read_to_end(&mut suffix).unwrap();

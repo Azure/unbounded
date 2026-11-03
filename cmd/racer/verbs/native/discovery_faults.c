@@ -111,6 +111,9 @@ static void *test_calloc(size_t count, size_t size) {
 #define ibv_alloc_pd test_alloc_pd
 #define ibv_dealloc_pd test_dealloc_pd
 #define calloc test_calloc
+/* These scenarios cover window-mode discovery and open; registration mode
+ * needs the connection manager and real QPs. */
+#define RDMA_VERBS_NO_REGISTRATION
 #include "verbs.c"
 
 /* Post one bind (`which` 0) or invalidate (`which` 1) through a fake QP and
@@ -129,12 +132,14 @@ unsigned rdma_test_post_flags(unsigned which) {
     static struct ibv_qp qp;
     struct ibv_mr mr = {0};
     struct ibv_mw mw = {0};
+    struct rdma_verbs_window w = { .mw = &mw };
+    uint32_t key = 1;
     context.ops.post_send = test_post_send;
     qp.context = &context;
     struct rdma_verbs_qp q = { .qp = &qp };
     struct rdma_verbs_mr m = { .mr = &mr, .bytes = (void *)4096, .length = 8192 };
     posted_opcode = UINT_MAX;
-    int rc = which ? rdma_verbs_invalidate(&q, 1, 2) : rdma_verbs_bind(&q, &mw, &m, 1, 2, 0, 4096);
+    int rc = which ? rdma_verbs_invalidate(&q, &w, 1, 2) : rdma_verbs_bind(&q, &w, &m, &key, 2, 0, 4096);
     if (rc || posted_opcode != (which ? IBV_WR_LOCAL_INV : IBV_WR_BIND_MW))
         return UINT_MAX;
     return posted_flags;

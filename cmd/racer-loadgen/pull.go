@@ -43,6 +43,12 @@ type pullOptions struct {
 	Interval          time.Duration
 	Verify            bool
 	DiagnoseIntegrity bool
+	PageCredits       int
+	RangeBytes        int64
+	RangeParallel     int
+	RangeRetries      int
+	RangeRotate       bool
+	RangeCohorts      int
 }
 
 type puller struct {
@@ -232,6 +238,16 @@ func waitPullDelay(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+// untilStart returns how long to wait from now until the Unix time startAt.
+// Zero or a past time means no wait.
+func untilStart(startAt int64, now time.Time) time.Duration {
+	if startAt <= 0 {
+		return 0
+	}
+
+	return max(time.Unix(startAt, 0).Sub(now), 0)
+}
+
 func (p *puller) pull(ctx context.Context) error {
 	return p.pullImage(ctx, p.img)
 }
@@ -417,6 +433,55 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 	return nil
 }
 
+// progressReader is a body that reports bytes handed to the caller so far,
+// such as a racersdk.Object.
+type progressReader interface {
+	Progress() int64
+}
+
+// progressInterval is how often a long splice drain credits received bytes.
+const progressInterval = time.Second
+
+// reportProgress credits a drained body's received bytes while the drain runs,
+// so long reads show progress instead of one jump at the end. The returned
+// stop function ends reporting and returns the bytes already credited.
+func (p *puller) reportProgress(body io.Reader) func() int64 {
+	progress, ok := body.(progressReader)
+	if !ok {
+		return func() int64 { return 0 }
+	}
+
+	done := make(chan struct{})
+	finished := make(chan int64, 1)
+
+	go func() {
+		var credited int64
+
+		ticker := time.NewTicker(progressInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				finished <- credited
+
+				return
+			case <-ticker.C:
+				if now := progress.Progress(); now > credited {
+					p.metrics.receivedBytes.Add(float64(now - credited))
+					credited = now
+				}
+			}
+		}
+	}()
+
+	return func() int64 {
+		close(done)
+
+		return <-finished
+	}
+}
+
 // readBody counts bytes even when Read returns data together with an error.
 func (p *puller) readBody(body io.Reader) (int64, string, error) {
 	if !p.opts.Verify && !p.opts.DiagnoseIntegrity {
@@ -427,9 +492,12 @@ func (p *puller) readBody(body io.Reader) (int64, string, error) {
 			return 0, "", err
 		}
 
+		stop := p.reportProgress(body)
 		n, err := io.Copy(devNull, body)
+		reported := stop()
+
 		p.drains.put(devNull)
-		p.metrics.receivedBytes.Add(float64(n))
+		p.metrics.receivedBytes.Add(float64(n - reported))
 
 		return n, "", err
 	}

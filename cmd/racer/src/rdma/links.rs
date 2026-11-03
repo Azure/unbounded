@@ -26,8 +26,16 @@ use std::time::Instant;
 /// Signed `Accept` extension naming the receiver's in-band grant.
 pub const GRANT_HEADER: &str = "racer-rdma-grant";
 
-/// Page buffer length: `MAX_CIPHERTEXT` rounded up to 4 KiB.
-pub const BUFFER_LEN: usize = (MAX_CIPHERTEXT + 4095) & !4095;
+/// Page buffer length: `MAX_CIPHERTEXT` rounded up to 2 MiB.
+///
+/// Whole 2 MiB pages keep every buffer huge-page aligned, which devices without
+/// memory windows need: their grants register the granted buffer itself, and
+/// a registration covering whole huge pages is cheap and still ends inside the
+/// buffer (see `bind` in `verbs/native/verbs.c`).
+pub const BUFFER_LEN: usize = (MAX_CIPHERTEXT + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+
+/// Huge page size buffers are aligned to.
+const HUGE_PAGE: usize = 2 << 20;
 
 /// A ready link with no grant, write, or release this long closes.
 pub const LINK_IDLE: Duration = Duration::from_secs(120);
@@ -426,6 +434,27 @@ impl Links {
     /// Count a peer transfer that planned RDMA but carried its page over HTTP.
     pub fn record_http_fallback(&self) {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
+    }
+
+    /// As [`Self::record_http_fallback`], because no ready link to the peer existed.
+    pub fn record_fallback_no_link(&self) {
+        self.record_http_fallback();
+        self.record(crate::telemetry::Event::RdmaFallbackNoLink, 1);
+    }
+
+    /// As [`Self::record_http_fallback`], because the grant failed, typically
+    /// with every page buffer in use.
+    pub fn record_fallback_grant(&self) {
+        self.record_http_fallback();
+        self.record(crate::telemetry::Event::RdmaFallbackGrant, 1);
+    }
+
+    /// Free page buffers across the active rails.
+    pub fn free_buffers(&self) -> usize {
+        self.active()
+            .iter()
+            .filter_map(|m| self.client.buffers(m.rail.0, rdma_verbs::BufferState::Free))
+            .sum()
     }
 
     /// The local node.

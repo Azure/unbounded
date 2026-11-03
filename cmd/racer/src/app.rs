@@ -964,6 +964,14 @@ pub struct WorkerApplication {
 
     native_retry: std::time::Instant,
 
+    /// Managed-mode report sink and shares, so a failed native activation can
+    /// withdraw this node's RDMA rails instead of advertising rails it cannot
+    /// serve. `None` outside managed mode.
+    rdma_report: Option<(crate::control::Report, u32)>,
+
+    /// The rails were withdrawn after a failed activation.
+    rdma_withdrawn: bool,
+
     telemetry: Rc<Telemetry>,
 
     directory: Arc<WorkerDirectory>,
@@ -1471,6 +1479,11 @@ impl WorkerApplication {
             inventory_generation: 0,
             native_task: None,
             native_retry: uring_runtime::environment::now(),
+            rdma_report: config
+                .managed_control
+                .as_ref()
+                .map(|managed| (managed.report.clone(), config.shares.get())),
+            rdma_withdrawn: false,
             telemetry: Rc::new(telemetry),
             directory: node.workers.clone(),
             node,

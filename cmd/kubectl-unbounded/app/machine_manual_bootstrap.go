@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
@@ -361,6 +362,10 @@ func (h *manualBootstrapHandler) validate() error {
 		return errors.New("site name is required")
 	}
 
+	if errs := validation.IsValidLabelValue(h.siteName); len(errs) > 0 {
+		return fmt.Errorf("invalid --site %q: %s", h.siteName, strings.Join(errs, "; "))
+	}
+
 	// The machine name is optional. When omitted, the unbounded-agent resolves
 	// it at startup from the AGENT_MACHINE_NAME environment variable or the host
 	// hostname, which lets a single bootstrap payload be reused across many
@@ -372,8 +377,13 @@ func (h *manualBootstrapHandler) validate() error {
 		}
 	}
 
-	if _, err := parseNodeLabels(h.nodeLabels); err != nil {
+	labels, err := parseNodeLabels(h.nodeLabels)
+	if err != nil {
 		return fmt.Errorf("invalid --node-label: %w", err)
+	}
+
+	if err := validateSiteNodeLabels(labels); err != nil {
+		return err
 	}
 
 	if h.variant == "" {
@@ -402,6 +412,50 @@ func (h *manualBootstrapHandler) validate() error {
 	}
 
 	return nil
+}
+
+// validateSiteNodeLabels rejects a --node-label that sets a site label key to
+// an empty or invalid label value. The agent ignores an empty site label, so
+// letting one through would leave the Machine without a site.
+func validateSiteNodeLabels(labels map[string]string) error {
+	for _, key := range []string{unboundedv1alpha3.MachineSiteLabelKey, netv1alpha1.SiteLabelKey} {
+		value, ok := labels[key]
+		if !ok {
+			continue
+		}
+
+		if value == "" {
+			return fmt.Errorf("invalid --node-label %s: value must not be empty", key)
+		}
+
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			return fmt.Errorf("invalid --node-label %s=%q: %s", key, value, strings.Join(errs, "; "))
+		}
+	}
+
+	return nil
+}
+
+// withSiteNodeLabel returns the node labels kubelet registers with. It adds
+// unbounded-cloud.io/site=siteName unless the labels already carry a site
+// label under the canonical or the deprecated key, in which case the user's
+// value wins. The agent copies the site label onto the Machine it creates.
+func withSiteNodeLabel(labels map[string]string, siteName string) map[string]string {
+	if _, ok := labels[unboundedv1alpha3.MachineSiteLabelKey]; ok {
+		return labels
+	}
+
+	if _, ok := labels[netv1alpha1.SiteLabelKey]; ok {
+		return labels
+	}
+
+	if labels == nil {
+		labels = make(map[string]string, 1)
+	}
+
+	labels[unboundedv1alpha3.MachineSiteLabelKey] = siteName
+
+	return labels
 }
 
 // buildAgentConfig resolves cluster information and assembles the provision.AgentConfig
@@ -475,7 +529,7 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = h.machineName
 	machine.Spec.Kubernetes = &unboundedv1alpha3.KubernetesSpec{
-		NodeLabels:         labels,
+		NodeLabels:         withSiteNodeLabel(labels, h.siteName),
 		RegisterWithTaints: h.taints,
 	}
 
@@ -681,6 +735,11 @@ instances, for example an Azure VMSS or AWS Auto Scaling group, where each
 instance derives its own name. The resolved name is logged by the agent and can
 be inspected with 'journalctl -u unbounded-agent'.
 
+--site selects the site's bootstrap token and is added to the kubelet node
+labels as unbounded-cloud.io/site, unless --node-label already sets
+unbounded-cloud.io/site or net.unbounded-cloud.io/site. The agent copies the
+site label onto the Machine it creates.
+
 Use --variant to choose the output format:
 
   script      (default) A bash script that can be piped directly to a host.
@@ -721,7 +780,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&handler.siteName, "site", "", "Name of the site")
+	cmd.Flags().StringVar(&handler.siteName, "site", "", "Name of the site. Selects the site's bootstrap token and is added as the unbounded-cloud.io/site node label unless --node-label already sets unbounded-cloud.io/site or net.unbounded-cloud.io/site")
 	cmd.Flags().StringVar(&handler.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
 	cmd.Flags().StringArrayVar(&handler.nodeLabels, "node-label", nil, "Label in key=value format to pass to kubelet (can be repeated)")
 	cmd.Flags().StringArrayVar(&handler.taints, "register-with-taint", nil, "Taint to register on the node (can be repeated)")

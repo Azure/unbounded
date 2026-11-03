@@ -1053,3 +1053,33 @@ patch:
 		t.Fatalf("a well-formed preference must be accepted: %v", err)
 	}
 }
+
+// TestRacerMayJoinHostNetwork covers the one protected path a component may
+// set: the racer dataplane's hostNetwork, which RDMA devices that connect
+// through the RDMA connection manager need and which the racer migration
+// check tells administrators to set through an override.
+func TestRacerMayJoinHostNetwork(t *testing.T) {
+	racer := "component: racer\nkind: DaemonSet\npatch:\n  spec:\n    template:\n      spec:\n        hostNetwork: true\n        dnsPolicy: ClusterFirstWithHostNet\n"
+	if err := validateFragment(t, racer); err != nil {
+		t.Fatalf("racer hostNetwork override rejected: %v", err)
+	}
+
+	for _, protected := range []string{"hostPID: true", "hostIPC: true"} {
+		fragment := "component: racer\nkind: DaemonSet\npatch:\n  spec:\n    template:\n      spec:\n        " + protected + "\n"
+		if err := validateFragment(t, fragment); err == nil || !strings.Contains(err.Error(), "is protected") {
+			t.Fatalf("racer %s must stay protected, got %v", protected, err)
+		}
+	}
+
+	net := "component: net\nkind: DaemonSet\npatch:\n  spec:\n    template:\n      spec:\n        hostNetwork: true\n"
+	if err := validateFragment(t, net); err == nil || !strings.Contains(err.Error(), "is protected") {
+		t.Fatalf("net hostNetwork must stay protected, got %v", err)
+	}
+}
+
+func TestRacerHostNetworkMustBeBoolean(t *testing.T) {
+	fragment := "component: racer\nkind: DaemonSet\npatch:\n  spec:\n    template:\n      spec:\n        hostNetwork: \"yes\"\n"
+	if err := validateFragment(t, fragment); err == nil || !strings.Contains(err.Error(), "must be a boolean") {
+		t.Fatalf("non-boolean hostNetwork must be rejected, got %v", err)
+	}
+}

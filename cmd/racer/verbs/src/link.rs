@@ -155,6 +155,9 @@ impl std::fmt::Debug for Source {
     }
 }
 
+/// Tags use the low 24 bits of the write's immediate.
+pub(crate) const TAG_MASK: u32 = 0x00ff_ffff;
+
 /// `(send_depth, recv_depth)` for `grants` grants per link.
 pub(crate) fn depths(grants: u32) -> Option<(u32, u32)> {
     let recv = grants.checked_mul(2)?.checked_add(4)?;
@@ -594,7 +597,7 @@ impl Link {
             return Err(Error::InvalidRequest);
         }
 
-        self.qp.connect(remote)?;
+        self.qp.connect(remote, self.role == Role::Initiator)?;
         self.credits = credits;
         self.grant_cap = self.limits.grants.min(peer_grants);
         self.link_id = link_id;
@@ -712,10 +715,11 @@ impl Link {
         }
     }
 
-    /// Next nonzero tag not in use.
+    /// Next nonzero tag not in use. Tags stay below 2^24: the adapter's
+    /// registration mode carries a chunk count in the immediate's top byte.
     fn allocate_tag(&mut self) -> u32 {
         loop {
-            self.next_tag = self.next_tag.wrapping_add(1);
+            self.next_tag = self.next_tag.wrapping_add(1) & TAG_MASK;
 
             if self.next_tag != 0 && !self.grants.contains_key(&self.next_tag) {
                 return self.next_tag;
