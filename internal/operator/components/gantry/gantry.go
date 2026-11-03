@@ -208,7 +208,15 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		}
 
 		kind := component.OpApply
+
 		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") {
+			var existing coordinationv1.Lease
+			if err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), &existing); err == nil {
+				continue
+			} else if !apierrors.IsNotFound(err) {
+				return nil, component.Result{}, fmt.Errorf("read chair Lease/%s: %w", obj.GetName(), err)
+			}
+
 			kind = component.OpCreateIfAbsent
 		}
 

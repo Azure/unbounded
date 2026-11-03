@@ -76,3 +76,17 @@ func TestRegistryOnboardingRefusesAmbiguousOrConflictingConfiguration(t *testing
 	require.False(t, changed)
 	require.Equal(t, original, merged)
 }
+
+func TestManagedRegistryOnboardingRejectsInvalidExistingEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"http://" + testRegistry, "https://other.azurecr.io", "https://" + testRegistry + "/path", "https://user@" + testRegistry} {
+		t.Run(endpoint, func(t *testing.T) {
+			runtime := "upstream_registries:\n- name: " + testRegistry + "\n  endpoint: " + endpoint + "\n"
+			_, _, err := EnsureUpstream(runtime, testIdentityPolicy+"registry: "+testRegistry)
+			require.ErrorContains(t, err, "matching HTTPS endpoint")
+			unchanged, changed, err := EnsureUpstream(runtime, "mode: external\nregistry: "+testRegistry)
+			require.NoError(t, err)
+			require.False(t, changed)
+			require.Equal(t, runtime, unchanged, "external authentication must preserve customer endpoints")
+		})
+	}
+}

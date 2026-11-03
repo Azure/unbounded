@@ -62,6 +62,10 @@ together. The operator validates managed policy against the configured upstream;
 it never adds or repairs registry entries. Removing the selected upstream while
 retaining managed policy produces a configuration error, not an automatic merge.
 
+The operator maintains the owned identity-use role and binding from persisted
+managed policy. This repairs a lost grant without repeating Azure setup.
+External policy revokes the owned binding independently of helper existence.
+
 There is no custom exec adapter, broker, token-exchange implementation,
 VM/VMSS identity assignment, ARM node discovery, or ongoing Azure write
 permission for the operator or node installer.

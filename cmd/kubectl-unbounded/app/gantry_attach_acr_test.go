@@ -385,6 +385,64 @@ func TestGantryAttachACRDoesNotStageIdentityGrantWhenPolicySaveFails(t *testing.
 	require.True(t, apierrors.IsNotFound(err), "a failed opt-in must not publish collective identity-use permission")
 }
 
+func TestGantryAttachACRRejectsConcurrentInvalidEndpoint(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	run := h.runAzure
+	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+		if args[0] == "identity" && args[1] == "create" {
+			source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			source.Data["config.yaml"] += "- name: central.azurecr.io\n  endpoint: http://central.azurecr.io\n"
+			_, err = client.CoreV1().ConfigMaps(h.namespace).Update(t.Context(), source, metav1.UpdateOptions{})
+			require.NoError(t, err)
+		}
+
+		return run(ctx, args...)
+	}
+	require.ErrorContains(t, h.execute(t.Context()), "matching HTTPS endpoint")
+	source, err := client.CoreV1().ConfigMaps(h.namespace).Get(t.Context(), "gantry-config", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotContains(t, source.Data, registryauth.ConfigKey, "invalid merged policy must not be persisted")
+}
+
+func TestGantryIdentityUseGrantToleratesConcurrentControllerCreate(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	raced := false
+
+	client.PrependReactor("create", "clusterroles", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if raced {
+			return false, nil, nil
+		}
+
+		raced = true
+		create, ok := action.(k8stesting.CreateAction)
+		require.True(t, ok)
+		require.NoError(t, client.Tracker().Create(rbacv1.SchemeGroupVersion.WithResource("clusterroles"), create.GetObject(), ""))
+
+		return true, nil, apierrors.NewAlreadyExists(schema.GroupResource{Group: rbacv1.GroupName, Resource: "clusterroles"}, registryauth.IdentityRoleName)
+	})
+	require.NoError(t, h.grantACRIdentityUse(t.Context(), attachClientID))
+	_, err := client.RbacV1().ClusterRoleBindings().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
+	require.NoError(t, err)
+}
+
+func TestGantryIdentityUseRepairClearsAggregation(t *testing.T) {
+	h, client, _ := managedAttachFixture(t)
+	require.NoError(t, h.grantACRIdentityUse(t.Context(), attachClientID))
+	role, err := client.RbacV1().ClusterRoles().Get(t.Context(), registryauth.IdentityRoleName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	role.AggregationRule = &rbacv1.AggregationRule{ClusterRoleSelectors: []metav1.LabelSelector{{}}}
+	_, err = client.RbacV1().ClusterRoles().Update(t.Context(), role, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, h.grantACRIdentityUse(t.Context(), attachClientID))
+	role, err = client.RbacV1().ClusterRoles().Get(t.Context(), role.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Nil(t, role.AggregationRule)
+	require.Equal(t, []string{attachClientID}, role.Rules[0].Resources)
+}
+
 func TestGantryAttachACRRejectsWrongClusterBeforeAzureWrites(t *testing.T) {
 	h, _, calls := managedAttachFixture(t)
 	h.restConfig.Host = "https://different.example.com"

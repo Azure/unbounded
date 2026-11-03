@@ -74,6 +74,10 @@ func audienceAssignments(t *testing.T, env *component.Env) map[string]string {
 	assignments := map[string]string{}
 
 	for _, binding := range bindings.Items {
+		if !registryAuthBindingName(binding.Name) {
+			continue
+		}
+
 		require.LessOrEqual(t, len(binding.Subjects), registryAuthBindingSize)
 
 		for _, subject := range binding.Subjects {
@@ -223,7 +227,56 @@ func TestRegistryAuthAudienceControllerCreatesConvergesAndRevokes(t *testing.T) 
 
 	var roles rbacv1.ClusterRoleList
 	require.NoError(t, env.Client.List(t.Context(), &roles))
-	require.Empty(t, roles.Items)
+	require.Len(t, roles.Items, 1)
+	require.Equal(t, registryauth.IdentityRoleName, roles.Items[0].Name)
+}
+
+func TestRegistryAuthIdentityUseRestoresAndRevokesWithoutHelpers(t *testing.T) {
+	source := authSource("")
+	env := testEnv(t, source)
+	r := &RegistryAuthAudienceReconciler{Client: env.Client, APIReader: env.Client, Namespace: env.Namespace}
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+
+	var binding rbacv1.ClusterRoleBinding
+
+	key := client.ObjectKey{Name: registryauth.IdentityRoleName}
+	require.NoError(t, env.Client.Get(t.Context(), key, &binding))
+	require.Equal(t, "system:serviceaccounts", binding.Subjects[0].Name)
+	require.NoError(t, env.Client.Delete(t.Context(), &binding))
+	_, err = r.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+	require.NoError(t, env.Client.Get(t.Context(), key, &binding), "managed policy must restore a deleted identity-use grant")
+
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(source), source))
+	source.Data[registryauth.ConfigKey] = "mode: external"
+	require.NoError(t, env.Client.Update(t.Context(), source))
+	_, err = r.Reconcile(t.Context(), ctrl.Request{})
+	require.NoError(t, err)
+	require.Error(t, env.Client.Get(t.Context(), key, &binding), "revocation must not depend on helper objects")
+
+	var helpers appsv1.DaemonSetList
+	require.NoError(t, env.Client.List(t.Context(), &helpers))
+	require.Empty(t, helpers.Items)
+}
+
+func TestRegistryAuthFindsShardsDespiteOwnershipLabelDrift(t *testing.T) {
+	env := testEnv(t, audienceNode("flex"))
+	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding"}
+	operations, err := planRegistryAuthAudience(t.Context(), env, cfg)
+	require.NoError(t, err)
+	storeAudienceOperations(t, env, operations)
+
+	var binding rbacv1.ClusterRoleBinding
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: registryAuthAudienceName}, &binding))
+	binding.Name += "-0001"
+	binding.ResourceVersion = ""
+	binding.UID = ""
+	delete(binding.Labels, "app.kubernetes.io/name")
+	require.NoError(t, env.Client.Create(t.Context(), &binding))
+	operations, err = planRegistryAuthAudience(t.Context(), env, cfg)
+	require.ErrorContains(t, err, "unowned")
+	require.Nil(t, operations)
 }
 
 func TestRegistryAuthAudienceRejectsRecreatedResourcesFromStaleCache(t *testing.T) {

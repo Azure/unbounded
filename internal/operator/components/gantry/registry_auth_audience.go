@@ -69,6 +69,15 @@ func (r *RegistryAuthAudienceReconciler) Reconcile(ctx context.Context, _ ctrl.R
 		return ctrl.Result{}, err
 	}
 
+	if cfg.Mode == registryauth.IdentityBindingMode {
+		identityOperations, err := planRegistryAuthIdentityUse(ctx, env, cfg)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		operations = append(operations, identityOperations...)
+	}
+
 	for _, op := range operations {
 		// Typed creates/deletes reuse the typed RBAC informers, including on
 		// create races; no unstructured informer is started as a side effect.
@@ -122,7 +131,7 @@ func registryAuthRBACEvents() predicate.Predicate {
 	match := func(object client.Object) bool {
 		switch object.(type) {
 		case *rbacv1.ClusterRole:
-			return object.GetName() == registryAuthAudienceName
+			return object.GetName() == registryAuthAudienceName || object.GetName() == registryauth.IdentityRoleName
 		case *rbacv1.ClusterRoleBinding:
 			return registryAuthBindingName(object.GetName()) || object.GetName() == registryauth.IdentityRoleName
 		default:
@@ -138,7 +147,9 @@ func registryAuthRBACEvents() predicate.Predicate {
 				return false
 			}
 
-			if registryAuthOwned(ev.ObjectOld) != registryAuthOwned(ev.ObjectNew) {
+			if registryAuthOwned(ev.ObjectOld) != registryAuthOwned(ev.ObjectNew) ||
+				ev.ObjectOld.GetLabels()["app.kubernetes.io/managed-by"] != ev.ObjectNew.GetLabels()["app.kubernetes.io/managed-by"] ||
+				ev.ObjectOld.GetLabels()["unbounded-cloud.io/namespace"] != ev.ObjectNew.GetLabels()["unbounded-cloud.io/namespace"] {
 				return true
 			}
 
@@ -209,7 +220,7 @@ func planRegistryAuthAudience(ctx context.Context, env *component.Env, cfg regis
 	}
 
 	var observed rbacv1.ClusterRoleBindingList
-	if err := env.Client.List(ctx, &observed, client.MatchingLabels{"app.kubernetes.io/name": registryAuthName}); err != nil {
+	if err := env.Client.List(ctx, &observed); err != nil {
 		return nil, err
 	}
 
@@ -365,20 +376,64 @@ func planRegistryAuthAudience(ctx context.Context, env *component.Env, cfg regis
 			operations = append(operations, *roleOp)
 		}
 
-		var binding rbacv1.ClusterRoleBinding
-		if err := env.Client.Get(ctx, client.ObjectKey{Name: registryauth.IdentityRoleName}, &binding); err == nil {
-			if binding.Labels["app.kubernetes.io/managed-by"] != "unbounded-acr-attach" || binding.Labels["unbounded-cloud.io/namespace"] != env.Namespace {
-				return nil, fmt.Errorf("refusing to remove an unowned identity-binding ClusterRoleBinding/%s", binding.Name)
-			}
+		binding := &rbacv1.ClusterRoleBinding{
+			TypeMeta:   metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"},
+			ObjectMeta: metav1.ObjectMeta{Name: registryauth.IdentityRoleName},
+		}
 
-			binding.TypeMeta = metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"}
-			operations = append(operations, component.DeleteOperation(&binding, "gantry", ""))
-		} else if !apierrors.IsNotFound(err) {
+		op, err := registryAuthAudienceOperation(ctx, env, binding, false)
+		if err != nil {
 			return nil, err
+		}
+
+		if op != nil {
+			operations = append(operations, *op)
 		}
 	}
 
 	return operations, nil
+}
+
+func planRegistryAuthIdentityUse(ctx context.Context, env *component.Env, cfg registryauth.Config) ([]component.Operation, error) {
+	metadata := metav1.ObjectMeta{Name: registryauth.IdentityRoleName, Labels: map[string]string{
+		"app.kubernetes.io/managed-by": "unbounded-acr-attach", "unbounded-cloud.io/namespace": env.Namespace,
+	}}
+	role := &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRole"}, ObjectMeta: metadata,
+		Rules: []rbacv1.PolicyRule{{APIGroups: []string{"cid.wi.aks.azure.com"}, Resources: []string{cfg.ClientID}, Verbs: []string{"use-managed-identity"}}},
+	}
+	binding := &rbacv1.ClusterRoleBinding{
+		TypeMeta: metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"}, ObjectMeta: metadata,
+		RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name},
+		Subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:serviceaccounts"}},
+	}
+
+	var operations []component.Operation
+
+	for _, object := range []client.Object{role, binding} {
+		op, err := registryAuthAudienceOperation(ctx, env, object, true)
+		if err != nil {
+			return nil, err
+		}
+
+		if op != nil {
+			operations = append(operations, *op)
+			if op.Kind == component.OpDelete {
+				break
+			}
+		}
+	}
+
+	return operations, nil
+}
+
+func registryAuthRBACOwned(object client.Object, namespace string) bool {
+	if object.GetName() == registryauth.IdentityRoleName {
+		return object.GetLabels()["app.kubernetes.io/managed-by"] == "unbounded-acr-attach" &&
+			object.GetLabels()["unbounded-cloud.io/namespace"] == namespace
+	}
+
+	return registryAuthOwned(object)
 }
 
 func registryAuthAudienceOperation(ctx context.Context, env *component.Env, desired client.Object, active bool) (*component.Operation, error) {
@@ -395,8 +450,8 @@ func registryAuthAudienceOperation(ctx context.Context, env *component.Env, desi
 	kind := component.OpCreateIfAbsent
 
 	if err == nil {
-		if !registryAuthOwned(current) {
-			if !active {
+		if !registryAuthRBACOwned(current, env.Namespace) {
+			if !active && desired.GetName() != registryauth.IdentityRoleName {
 				return nil, nil
 			}
 
@@ -447,7 +502,7 @@ func registryAuthAudienceOperation(ctx context.Context, env *component.Env, desi
 		return nil, liveErr
 	}
 
-	if liveErr == nil && !registryAuthOwned(live) {
+	if liveErr == nil && !registryAuthRBACOwned(live, env.Namespace) {
 		return nil, fmt.Errorf("refusing to overwrite an unowned registry-auth %s/%s", desired.GetObjectKind().GroupVersionKind().Kind, desired.GetName())
 	}
 

@@ -88,6 +88,10 @@ func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 			return "", false, errors.New("managed authentication conflicts with shared Gantry credentials_path; use external authentication")
 		}
 
+		if cfg.Mode == IdentityBindingMode && !matchingRegistryEndpoint(fields["endpoint"], cfg.Registry) {
+			return "", false, errors.New("managed ACR authentication requires the registry's matching HTTPS endpoint")
+		}
+
 		return runtimeConfig, false, nil
 	}
 

@@ -677,3 +677,166 @@ func TestChairLeasePredicateReconcilesDeletionOnly(t *testing.T) {
 		t.Fatal("out-of-range chair name triggered reconciliation")
 	}
 }
+
+func TestChairLeasePlanningConvergesAndRepairsDeletion(t *testing.T) {
+	env, _ := reconcilerEnv(t)
+	sites := []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)}
+
+	run := func() *component.ExecutionResult {
+		t.Helper()
+
+		plan, _, err := (Component{}).Plan(t.Context(), env, sites)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+
+		result, err := env.Execute(t.Context(), plan)
+		if err != nil || result.Err() != nil {
+			t.Fatalf("Execute: %v, %v", err, result.Err())
+		}
+
+		return &result
+	}
+	if result := run(); len(result.Stale) != 0 {
+		t.Fatalf("initial creation reported stale objects: %v", result.Stale)
+	}
+
+	var held coordinationv1.Lease
+
+	key := client.ObjectKey{Namespace: env.Namespace, Name: "gantry-chair-07"}
+	if err := env.Client.Get(t.Context(), key, &held); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := "existing-peer"
+
+	held.Spec.HolderIdentity = &holder
+	if err := env.Client.Update(t.Context(), &held); err != nil {
+		t.Fatal(err)
+	}
+
+	var before coordinationv1.LeaseList
+	if err := env.Client.List(t.Context(), &before, client.InNamespace(env.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, sites)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() == "Lease" {
+			t.Fatalf("existing chair Lease should have no operation: %s", op.Ref())
+		}
+	}
+
+	if result := run(); len(result.Stale) != 0 || len(result.Deferred) != 0 {
+		t.Fatalf("steady-state reconciliation did not converge: %+v", result)
+	}
+
+	if err := env.Client.Get(t.Context(), key, &held); err != nil {
+		t.Fatal(err)
+	}
+
+	if held.Spec.HolderIdentity == nil || *held.Spec.HolderIdentity != holder {
+		t.Fatal("steady-state reconciliation overwrote the existing chair holder")
+	}
+
+	if err := env.Client.Delete(t.Context(), &held); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, _, err = (Component{}).Plan(t.Context(), env, sites)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	creates := 0
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() == "Lease" {
+			if op.Kind != component.OpCreateIfAbsent || op.Object.GetName() != held.Name {
+				t.Fatalf("unexpected Lease repair: %s %s", op.Kind, op.Ref())
+			}
+
+			creates++
+		}
+	}
+
+	if creates != 1 {
+		t.Fatalf("planned %d Lease repairs, want only the deleted chair", creates)
+	}
+
+	if result := run(); len(result.Stale) != 0 {
+		t.Fatalf("deletion repair reported stale objects: %v", result.Stale)
+	}
+
+	for _, lease := range before.Items {
+		var after coordinationv1.Lease
+		if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(&lease), &after); err != nil {
+			t.Fatal(err)
+		}
+
+		if lease.Name != held.Name && lease.ResourceVersion != after.ResourceVersion {
+			t.Fatalf("unchanged Lease/%s was written", lease.Name)
+		}
+	}
+}
+
+func TestChairLeasePlanningFailsOnReadError(t *testing.T) {
+	wantErr := errors.New("chair read failed")
+	env := testEnv(t)
+	env.Client = fake.NewClientBuilder().WithScheme(testScheme(t)).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*coordinationv1.Lease); ok {
+				return wantErr
+			}
+
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if !errors.Is(err, wantErr) || plan != nil {
+		t.Fatalf("Plan = %v, %v; want read failure without a plan", plan, err)
+	}
+}
+
+func TestChairLeaseCreationRaceRemainsStale(t *testing.T) {
+	env, _ := reconcilerEnv(t)
+	sites := []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)}
+
+	plan, _, err := (Component{}).Plan(t.Context(), env, sites)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	holder := "race-winner"
+
+	winner := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: "gantry-chair-07", Namespace: env.Namespace},
+		Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+	}
+	if err := env.Client.Create(t.Context(), winner); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := env.Execute(t.Context(), plan)
+	if err != nil || result.Err() != nil {
+		t.Fatalf("Execute: %v, %v", err, result.Err())
+	}
+
+	if len(result.Stale) != 1 || result.Stale[0].Name != winner.Name {
+		t.Fatalf("stale = %v, want the chair created after planning", result.Stale)
+	}
+
+	var after coordinationv1.Lease
+	if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(winner), &after); err != nil {
+		t.Fatal(err)
+	}
+
+	if after.Spec.HolderIdentity == nil || *after.Spec.HolderIdentity != holder {
+		t.Fatal("creation race overwrote the existing chair holder")
+	}
+}

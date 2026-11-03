@@ -349,6 +349,10 @@ them to the credential provider for image pulls. No application Pod or
 ServiceAccount annotations, token volumes, or other edits are needed. This is
 shared pull access, not per-application registry or cached-content isolation.
 
+The operator maintains the owned identity-use role and binding from persisted
+managed policy, repairing deletion or permission drift. External policy revokes
+the owned binding even if the node helpers have already been removed.
+
 The operator grants `request-serviceaccounts-token-audience` only for the
 configured audience, binding individually named Linux Flex kubelets rather than
 the `system:nodes` group. Membership follows eligible node additions, relabeling,

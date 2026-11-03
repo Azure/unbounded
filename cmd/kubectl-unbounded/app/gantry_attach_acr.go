@@ -215,6 +215,12 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 			return err
 		}
 
+		if h.authMode == registryauth.IdentityBindingMode {
+			if _, err := registryauth.Derive(data, string(policy)); err != nil {
+				return fmt.Errorf("validate Gantry attachment policy: %w", err)
+			}
+		}
+
 		current.Data["config.yaml"] = data
 		if h.authMode == registryauth.IdentityBindingMode {
 			current.Data[registryauth.ConfigKey] = string(policy)
@@ -414,6 +420,14 @@ func (h *attachACRHandler) discoverACRProxy(ctx context.Context, cfg *registryau
 }
 
 func (h *attachACRHandler) grantACRIdentityUse(ctx context.Context, clientID string) error {
+	return retry.OnError(retry.DefaultBackoff, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
+	}, func() error {
+		return h.grantACRIdentityUseOnce(ctx, clientID)
+	})
+}
+
+func (h *attachACRHandler) grantACRIdentityUseOnce(ctx context.Context, clientID string) error {
 	labels := map[string]string{"app.kubernetes.io/managed-by": acrAttachManager, "unbounded-cloud.io/namespace": h.namespace}
 	roles := h.client.RbacV1().ClusterRoles()
 
@@ -428,6 +442,8 @@ func (h *attachACRHandler) grantACRIdentityUse(ctx context.Context, clientID str
 	} else if role.Labels["app.kubernetes.io/managed-by"] != acrAttachManager || role.Labels["unbounded-cloud.io/namespace"] != h.namespace {
 		return errors.New("refusing to replace an unowned ACR identity-use ClusterRole")
 	}
+
+	role.AggregationRule = nil
 
 	role.Rules = []rbacv1.PolicyRule{{APIGroups: []string{"cid.wi.aks.azure.com"}, Resources: []string{clientID}, Verbs: []string{"use-managed-identity"}}}
 	if createRole {

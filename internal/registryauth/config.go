@@ -89,9 +89,7 @@ func Derive(gantry, policy string) (Config, error) {
 			return Config{}, errors.New("managed ACR authentication conflicts with Gantry credentials_path; use external authentication")
 		}
 
-		u, err := url.Parse(upstream.Endpoint)
-		if err != nil || u.Scheme != "https" || u.Host != cfg.Registry || u.User != nil ||
-			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		if !matchingRegistryEndpoint(upstream.Endpoint, cfg.Registry) {
 			return Config{}, errors.New("managed ACR authentication requires the registry's matching HTTPS endpoint")
 		}
 
@@ -99,6 +97,13 @@ func Derive(gantry, policy string) (Config, error) {
 	}
 
 	return Config{}, errors.New("managed ACR authentication requires its registry in Gantry upstream_registries")
+}
+
+func matchingRegistryEndpoint(endpoint, registry string) bool {
+	u, err := url.Parse(endpoint)
+
+	return err == nil && u.Scheme == "https" && u.Host == registry && u.User == nil &&
+		(u.Path == "" || u.Path == "/") && u.RawQuery == "" && u.Fragment == ""
 }
 
 func (c Config) Validate() error {
