@@ -146,7 +146,7 @@ kubectl unbounded machine manual-bootstrap my-node --site remote \
 {{< callout type="tip" >}}
 The generated bootstrap script runs `unbounded-agent preflight` automatically
 before starting the agent. Preflight checks the loaded config, host
-prerequisites, API server reachability, artifact sources, nspawn paths, and GPU
+prerequisites, API server reachability, artifact sources, the paths for the configured isolation mode, and GPU
 driver readiness. See [Agent Preflight]({{< relref "reference/agent/preflight" >}}).
 {{< /callout >}}
 

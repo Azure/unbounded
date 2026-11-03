@@ -14,9 +14,11 @@ Unbounded has two lifecycle boundaries:
 
 - **Host** - the VM, PXE host, or bare-metal machine. Host operations change
   the power state or replace the host entirely.
-- **Node** - the `systemd-nspawn` container running kubelet, containerd, CNI
-  plugins, and pod workloads. Node operations restart the container while
-  leaving the host running.
+- **Node** - the node stack running kubelet, containerd, CNI plugins, and pod
+  workloads. Where it runs depends on the [isolation mode]({{< relref "reference/agent/isolation" >}}):
+  a `systemd-nspawn` machine (the default), agent-owned units on the host, or a
+  privileged OCI container. Node operations restart the node stack while leaving
+  the host running.
 
 The agent itself is a third operational target. Agent operations upgrade or
 remove the host-resident agent binary and its managed resources.
@@ -30,7 +32,7 @@ remove the host-resident agent binary and its managed resources.
 | `HostHardReboot` | Host | `machine-ops-controller` / `metalman` | Reboot or power-cycle the host out of band. |
 | `HostSoftReboot` | Host | `unbounded-agent` | Reboot the host OS from inside the host (`systemctl reboot`). |
 | `HostReplace` | Host | `machine-ops-controller` / `metalman` | Delete and recreate the VM or reimage the physical host. |
-| `NodeReboot` | Node | `unbounded-agent` | Restart the nspawn container without replacing the rootfs. |
+| `NodeReboot` | Node | `unbounded-agent` | Restart the node stack (the nspawn machine, the host units, or the container, by isolation mode) without replacing the rootfs or rebooting the host. |
 | `AgentUpgrade` | Agent | `unbounded-agent` | Replace the host agent binary using blue-green staging. |
 | `AgentReset` | Agent | `unbounded-agent` | Remove the agent and all managed resources from the host. |
 
@@ -45,7 +47,9 @@ top-level provider fields remain readable for existing Machines.
 Redfish/BMC control for power state and boot-order changes.
 
 `unbounded-agent` owns node and agent operations because it runs on the host
-alongside `machinectl`, systemd, and the nspawn rootfs.
+alongside systemd and the node stack, whatever the isolation mode. To inspect the
+node stack, use `unbounded-agent exec` and `unbounded-agent logs`, which work in
+every mode.
 
 ## Creating an Operation
 
@@ -135,7 +139,7 @@ spec:
 - [Host Operations]({{< relref "guides/operations/host-operations" >}}) -
   power management and host replacement
 - [Node Operations]({{< relref "guides/operations/node-operations" >}}) -
-  restarting the nspawn container and node recreation
+  restarting the node stack and node recreation
 - [Agent Operations]({{< relref "guides/operations/agent-operations" >}}) -
   upgrading and resetting the agent
 - [Automation Patterns]({{< relref "guides/operations/automation" >}}) -

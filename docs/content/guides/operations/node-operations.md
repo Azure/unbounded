@@ -1,18 +1,24 @@
 ---
 title: "Node Operations"
 weight: 2
-description: "Restarting the nspawn container and recreating nodes."
+description: "Restarting the node stack, moving it between isolation modes, and recreating nodes."
 ---
 
-Node operations act on the `systemd-nspawn` container that runs kubelet,
-containerd, CNI plugins, and pod workloads. They leave the host running and are
-handled by `unbounded-agent`.
+Node operations act on the node stack that runs kubelet, containerd, CNI
+plugins, and pod workloads. Where it runs depends on the
+[isolation mode]({{< relref "reference/agent/isolation" >}}); the default is a
+`systemd-nspawn` container. They leave the host running and are handled by
+`unbounded-agent`. This page describes the default `nspawn` mode unless it says
+otherwise.
 
 ## NodeReboot
 
 Stops kubelet and containerd inside the nspawn machine, stops the nspawn
 container, then restarts it and brings kubelet and containerd back up. The rootfs
 is not replaced.
+
+In every isolation mode only the node stack restarts and the host is not
+rebooted; each mode page describes its own mechanics.
 
 Use this when you need to restart Kubernetes components without touching the
 host, for example after applying node-level configuration changes or to clear
@@ -42,6 +48,17 @@ node-reboot-worker-01    NodeReboot    worker-01    Complete     30s
 
 After the operation completes, the Node object remains and kubelet re-registers
 with the API server.
+
+## Changing the isolation mode
+
+There is no operation for it: declare the mode in the Machine's
+`spec.isolation` and delete the Node object. See
+[Changing the Isolation Mode]({{< relref "reference/agent/isolation-migration" >}}).
+
+## Inspecting the node stack
+
+`unbounded-agent exec` and `unbounded-agent logs` work in every isolation mode.
+See [Running commands and reading logs]({{< relref "reference/agent/isolation" >}}#running-commands-and-reading-logs).
 
 ## Node Recreation
 

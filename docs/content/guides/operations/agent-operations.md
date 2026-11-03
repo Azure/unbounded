@@ -147,17 +147,25 @@ the MachineOperation path.
 
 ### What Reset Does
 
+Reset reads the isolation mode recorded in the host's applied config and removes
+the node stack of that mode. A host with no recorded mode is an `nspawn` host and
+gets the nspawn cleanup. Host-global state is cleaned the same way in every mode.
+The steps below describe the `nspawn` cleanup, which is the default; steps 1, 4,
+and 5 remove the node stack of the recorded mode instead, as the Operations table
+on its page lists: [none]({{< relref "reference/agent/isolation-none" >}}),
+[container]({{< relref "reference/agent/isolation-container" >}}).
+
 The reset process performs these steps in order:
 
-1. **Stops the nspawn machines** - gracefully stops `kube1` and `kube2`, then
-   force-terminates if needed.
+1. **Stops the node stack** - gracefully stops the `kube1` and `kube2` machines,
+   then force-terminates if needed.
 2. **Removes network interfaces** - WireGuard (`wg*`), tunnel (`geneve0`,
    `vxlan0`, `ipip0`), and overlay (`unbounded0`, `cbr0`) interfaces.
 3. **Removes WireGuard keys** - cleans up `/etc/wireguard/server.priv` and
    `server.pub`.
-4. **Removes nspawn configuration** - deletes `.nspawn` configs and systemd
-   overrides for both machines.
-5. **Removes the machine rootfs** - deletes `/var/lib/machines/kube1` and
+4. **Removes the node stack configuration** - deletes `.nspawn` configs and
+   systemd overrides for both machines.
+5. **Removes the node stack files** - deletes `/var/lib/machines/kube1` and
    `/var/lib/machines/kube2`.
 6. **Cleans up routing** - removes policy routing rules and flushes routing
    tables.
@@ -170,9 +178,9 @@ The reset process performs these steps in order:
    left alone.
 9. **Reloads systemd** - picks up all configuration changes.
 
-The reset is **idempotent** and safe to run multiple times. It unconditionally
-cleans up both possible nspawn machine names (`kube1` and `kube2`) so it works
-regardless of which upgrade cycle the node is in.
+The reset is **idempotent** and safe to run multiple times. It cleans up
+both possible slot names (`kube1` and `kube2`) so it works regardless of which
+upgrade cycle the node is in.
 
 ### When to Reset
 

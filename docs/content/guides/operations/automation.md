@@ -230,7 +230,7 @@ operations:
 
 | Step | Operation | When to Use |
 |------|-----------|-------------|
-| 1 | `NodeReboot` | Kubelet or containerd is stuck. Restarts the nspawn container. |
+| 1 | `NodeReboot` | Kubelet or containerd is stuck. Restarts the node stack without rebooting the host. |
 | 2 | `HostHardReboot` | Node reboot did not help. Reboots the entire host. |
 | 3 | Delete the Node | Host is running but the node needs a fresh rootfs. |
 | 4 | `HostReplace` | Host OS is corrupted or needs reimaging. |

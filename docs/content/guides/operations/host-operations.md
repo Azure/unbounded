@@ -217,7 +217,7 @@ replacement flow with fresh `user_data` injection has not been verified.
 
 **Bare metal (PXE)** - metalman sets the PXE or HTTP boot override, force-restarts
 the machine through Redfish, writes the selected host OS image, installs or
-configures the agent, and lets the agent create the nspawn node. The
+configures the agent, and lets the agent create the node. The
 `MachineOperation` records per-machine progress in `status.targets[]`; each
 target completes after `BootImageWritten=True`, `CloudInitDone=True`, and the
 corresponding Kubernetes Node object exists. Metalman also latches
@@ -234,7 +234,7 @@ failure without updating for every cloud-init log entry.
 ### HostReplace vs Node Recreation
 
 `HostReplace` deletes and recreates the entire host. If you only need to replace
-the nspawn rootfs (for example, to upgrade the Kubernetes version), delete the
+the node stack (for example, to upgrade the Kubernetes version), delete the
 Kubernetes Node object instead and let the agent reconcile. See
 [Node Operations]({{< relref "guides/operations/node-operations" >}}) for
 details.

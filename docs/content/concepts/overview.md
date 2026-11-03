@@ -35,9 +35,12 @@ tunnels. It supports four provisioning paths and a unified networking layer.
 **unbounded-agent** is a single binary that is delivered to each provisioned
 host -- via SSH, cloud-init, PXE image, or other mechanisms -- to turn it into
 a Kubernetes worker node. It detects host settings such as CPU architecture and
-GPU devices, prepares the host, and creates a `systemd-nspawn` machine to run
-the worker node components (kubelet, containerd, etc.) inside of it. Its
-behavior is configured through a JSON config file.
+GPU devices, prepares the host, and runs the worker node components (kubelet,
+containerd, etc.) in the configured isolation mode: by default inside a
+`systemd-nspawn` machine, or directly on the host (`none`), or in a privileged
+OCI container (`container`, experimental). The agent itself always runs on the
+host. Its behavior is configured through a JSON config file. See
+[Isolation Modes]({{< relref "reference/agent/isolation" >}}).
 
 See the [Agent guide]({{< relref "guides/agent" >}}) for a hands-on walkthrough
 and implementation details.
