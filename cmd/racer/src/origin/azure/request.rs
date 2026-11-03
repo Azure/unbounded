@@ -12,6 +12,7 @@ use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
 use racer_control_wire::AzureContainerUrl;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The service version azblob v1.8.2 (the Go SDK in go.mod) sends.
 pub const AZURE_SERVICE_VERSION: &[u8] = b"2026-12-06";
@@ -86,6 +87,35 @@ pub fn target(url: &AzureContainerUrl, object: &AzureObject) -> String {
     target
 }
 
+/// Format seconds since the Unix epoch as an RFC 1123 IMF-fixdate, for
+/// example `Tue, 03 Nov 2026 20:47:23 GMT`. Uses the civil-from-days
+/// algorithm so no date crate is needed.
+pub fn http_date(secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let weekday = DAYS[(days % 7) as usize];
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!(
+        "{weekday}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        MONTHS[(month - 1) as usize],
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
 /// Build one request head. `bearer` is the raw access token, never logged.
 pub fn head(
     url: &AzureContainerUrl,
@@ -95,9 +125,15 @@ pub fn head(
     if_match: Option<&StrongEtag>,
     bearer: Option<&[u8]>,
 ) -> Result<MessageHead> {
-    let mut headers = Vec::with_capacity(6);
+    let mut headers = Vec::with_capacity(7);
     headers.push(Header::new("Host", url.host_header().as_bytes()));
     headers.push(Header::new("x-ms-version", AZURE_SERVICE_VERSION));
+    // Azure Storage rejects authorized requests without a request date. The
+    // head is rebuilt per attempt, so retries carry a fresh date.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    headers.push(Header::new("x-ms-date", http_date(now).as_bytes()));
     headers.push(Header::new("User-Agent", b"racer"));
     if let Some(range) = range {
         headers.push(Header::new(
@@ -166,6 +202,16 @@ mod tests {
     }
 
     #[test]
+    fn http_date_known_values() {
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(http_date(1_709_164_800), "Thu, 29 Feb 2024 00:00:00 GMT");
+        assert_eq!(http_date(1_793_738_843), "Tue, 03 Nov 2026 20:47:23 GMT");
+        assert_eq!(http_date(4_107_542_399), "Sun, 28 Feb 2100 23:59:59 GMT");
+        assert_eq!(http_date(4_107_542_400), "Mon, 01 Mar 2100 00:00:00 GMT");
+        assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
+    }
+
+    #[test]
     fn targets_and_headers() {
         let url = AzureContainerUrl::parse("https://acct.blob.core.windows.net/models").unwrap();
         assert_eq!(
@@ -202,10 +248,14 @@ mod tests {
         assert_eq!(get("x-ms-range"), b"bytes=0-16777215");
         assert_eq!(get("If-Match"), b"\"0x8D\"");
         assert_eq!(get("Authorization"), b"Bearer token");
+        let date = std::str::from_utf8(get("x-ms-date")).unwrap();
+        assert_eq!(date.len(), 29);
+        assert!(date.ends_with(" GMT"));
         let anonymous =
             super::head(&url, &object("k", ""), AzureMethod::Head, None, None, None).unwrap();
         for name in ["Authorization", "If-Match", "x-ms-range"] {
             assert_eq!(anonymous.unique(name).unwrap(), None);
         }
+        assert!(anonymous.unique("x-ms-date").unwrap().is_some());
     }
 }
