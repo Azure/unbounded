@@ -133,7 +133,7 @@ pub fn issue_at(
     csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let cert = csr.signed_by(ca, key).unwrap();
     racer_control_wire::EnrollmentResponse {
-        block_devices: None,
+        disks: Vec::new(),
         schema_version: 1,
         cluster: request.cluster.clone(),
         node: racer_control_wire::NodeId(node.into()),

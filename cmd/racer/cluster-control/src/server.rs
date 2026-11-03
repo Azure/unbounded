@@ -583,7 +583,7 @@ impl Server {
             )
             .map_err(pki_failure)?;
         let response = wire::EnrollmentResponse {
-            block_devices: block_devices(&caller.node.annotations),
+            disks: crate::disks::approved(&caller.node.annotations),
             schema_version: wire::SCHEMA_VERSION,
             cluster: request.cluster,
             node: wire::NodeId(caller.node.uid.clone()),
@@ -848,12 +848,6 @@ fn require_primary(is_primary: bool) -> Result<(), ProtocolFailure> {
     } else {
         Err(ProtocolFailure::Unavailable)
     }
-}
-
-/// Valid block device pattern from Node annotations, as the old controller.
-pub fn block_devices(annotations: &std::collections::BTreeMap<String, String>) -> Option<String> {
-    let v = annotations.get(crate::annotations::BLOCK_DEVICES)?;
-    (!v.is_empty() && v.len() <= 1024 && regex::Regex::new(v).is_ok()).then(|| v.clone())
 }
 
 /// Concurrent admission bodies held in memory, each up to
@@ -1941,24 +1935,6 @@ mod tests {
             wire::decode_error(body.as_bytes()).unwrap().code,
             ProtocolFailure::Forbidden
         );
-    }
-
-    #[test]
-    fn block_device_validation() {
-        let mut a = std::collections::BTreeMap::new();
-        assert_eq!(block_devices(&a), None);
-        a.insert(
-            crate::annotations::BLOCK_DEVICES.to_owned(),
-            "nvme-.*".to_owned(),
-        );
-        assert_eq!(block_devices(&a).as_deref(), Some("nvme-.*"));
-        a.insert(crate::annotations::BLOCK_DEVICES.to_owned(), "(".to_owned());
-        assert_eq!(block_devices(&a), None);
-        a.insert(
-            crate::annotations::BLOCK_DEVICES.to_owned(),
-            "a".repeat(1025),
-        );
-        assert_eq!(block_devices(&a), None);
     }
 
     #[test]

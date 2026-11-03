@@ -109,6 +109,8 @@ use std::time::UNIX_EPOCH;
 use uring_runtime::drivers::poll_task;
 
 mod devices;
+mod disk_monitor;
+pub(crate) use devices::GUARD_BYTES;
 mod native;
 mod recovery;
 
@@ -487,7 +489,7 @@ impl Application {
             // Managed mode has no static endpoint; startup must attach control first.
             return Err(Error::InvalidConfiguration);
         }
-        let (identity, enrolled_selector) = if self.config.managed() {
+        let (identity, enrolled_disks) = if self.config.managed() {
             // Election and enrollment outlive any data request deadline; keep the
             // embedded control alive and retry bounded attempts until stopped.
             let enrolled = retry_enrollment(
@@ -508,13 +510,30 @@ impl Application {
             let scope = scope(self.config.request_timeout)?;
             bootstrap(&self.config, &self.node, &self.limits, &scope)?
         };
-        let selector = self
-            .config
-            .managed_control
-            .as_ref()
-            .and_then(|managed| managed.block_devices.clone())
-            .or(enrolled_selector);
-        let devices = devices::discover(&self.config, selector.as_deref(), plan.pairs.len());
+        // Managed bootstrap read the Node itself; enrollment carries the same
+        // annotation for standalone control. Enrollment can wait indefinitely, so
+        // read the latest approval now; the monitor baselines on this same set.
+        let approved = match &self.config.managed_control {
+            Some(managed) => current_approval(managed),
+            None => enrolled_disks,
+        };
+        let discovery = devices::discover(&self.config, &approved, plan.pairs.len(), &|id| {
+            // Approval can change while discovery waits for busy disks; managed
+            // mode rechecks the latest approval before any destructive write.
+            self.config
+                .managed_control
+                .as_ref()
+                .is_none_or(|managed| current_approval(managed).iter().any(|a| a == id))
+        });
+        // Discovery drops IDs revoked while it waited; baseline on what it
+        // applied so a later reapproval still differs and restarts.
+        let approved = applied_approval(&approved, &discovery.approvals);
+        let approvals = discovery
+            .approvals
+            .iter()
+            .map(devices::Approval::hardware)
+            .collect::<Vec<_>>();
+        let devices = discovery.plan;
         if let Some(devices) = &devices {
             Arc::get_mut(&mut self.config)
                 .ok_or(Error::Internal)?
@@ -523,17 +542,36 @@ impl Application {
         }
         let node = Arc::get_mut(&mut self.node).ok_or(Error::Internal)?;
         node.hardware = Arc::new(crate::hardware::Context {
-            block_device_selector: selector.clone(),
+            approved_disks: approved.clone(),
             claimed_disks: devices
                 .as_ref()
                 .map(devices::Plan::claimed_disks)
                 .unwrap_or_default(),
+            approvals,
+            segment_bytes: self.config.segment_bytes,
+            mountinfo: Some(self.config.mountinfo.clone()),
         });
         if devices.is_none() {
             let workers: Vec<_> = plan.pairs.iter().map(|p| p.worker).collect();
             prune_stale_slab_files(&self.config.slab_directory, &workers);
         }
         node.devices = devices;
+        // Reports disk status and restarts on approval changes. Dropped before
+        // returning, so embedded control is never kept alive past `run`.
+        let _disk_monitor = self
+            .config
+            .managed_control
+            .as_ref()
+            .and_then(|managed| managed.control.clone())
+            .map(|control| {
+                disk_monitor::Monitor::start(
+                    control,
+                    node.hardware.clone(),
+                    self.config.device_directory.clone(),
+                    approved,
+                )
+            })
+            .transpose()?;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
@@ -549,6 +587,35 @@ impl Application {
             result => result,
         }
     }
+}
+
+/// Latest approved disks from embedded control, falling back to the bootstrap
+/// snapshot when control is absent or has no approval yet.
+fn current_approval(managed: &crate::control::Managed) -> Vec<String> {
+    managed
+        .control
+        .as_ref()
+        .and_then(|control| control.approved_disks())
+        .unwrap_or_else(|| managed.disks.clone())
+}
+
+/// IDs of `approved` that discovery kept, in approval order.
+fn applied_approval(approved: &[String], kept: &[devices::Approval]) -> Vec<String> {
+    approved
+        .iter()
+        .filter(|id| kept.iter().any(|a| &a.id == *id))
+        .cloned()
+        .collect()
+}
+
+/// Require the serving enrollment approval to equal the set storage applied,
+/// so renewals compare against the layout actually in use.
+fn serving_approval(applied: &[String], enrolled: &[String]) -> Result<()> {
+    if crate::control::same_disks(applied, enrolled) {
+        return Ok(());
+    }
+    eprintln!("racer: approved disks changed during startup; restarting to apply");
+    Err(Error::DiskApprovalChanged)
 }
 
 /// Whether `error` is the cancellation a requested SIGTERM/SIGINT produces, so the
@@ -712,7 +779,7 @@ fn bootstrap(
     node: &NodeState,
     limits: &Limits,
     startup: &RequestScope,
-) -> Result<(NodeId, Option<String>)> {
+) -> Result<(NodeId, Vec<String>)> {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         limits.clone(),
     )));
@@ -740,7 +807,7 @@ fn bootstrap(
             node.keys.clone(),
         ));
         control.bind_keyring(keys)?;
-        Ok((identity.node().clone(), control.block_devices()))
+        Ok((identity.node().clone(), control.disks()))
     });
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -787,24 +854,29 @@ fn bootstrap(
     result.and_then(|identity| shutdown_result.map(|()| identity))
 }
 
-/// End `operation` with `Cancelled` as soon as a process stop is requested.
+/// End `operation` with `Cancelled` as soon as a process stop is requested,
+/// or with `DiskApprovalChanged` once the disk monitor requests a restart.
 ///
-/// The lifecycle driver re-polls startup periodically, so a stop request is
+/// The lifecycle driver re-polls startup periodically, so either request is
 /// observed promptly even while the operation waits on a long control turn.
 /// Dropping the operation leaves reactor and CQE fencing to normal teardown.
 async fn stoppable<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    stoppable_by(&STOP_REQUESTED, operation).await
+    stoppable_by(&STOP_REQUESTED, disk_monitor::restart_requested, operation).await
 }
 
-/// [`stoppable`] with an explicit stop flag.
+/// [`stoppable`] with an explicit stop flag and disk restart check.
 async fn stoppable_by<T>(
     stop: &AtomicBool,
+    disk_restart: impl Fn() -> bool,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     let mut operation = std::pin::pin!(operation);
     std::future::poll_fn(|cx| {
         if stop.load(Ordering::Relaxed) {
             return Poll::Ready(Err(Error::Cancelled));
+        }
+        if disk_restart() {
+            return Poll::Ready(Err(Error::DiskApprovalChanged));
         }
         operation.as_mut().poll(cx)
     })
@@ -934,6 +1006,10 @@ pub struct WorkerApplication {
     runtime: WorkerRuntime,
 
     control: Option<Rc<Session>>,
+
+    /// Standalone only: the approval storage was built from, which the
+    /// serving enrollment must match. Managed mode uses the disk monitor.
+    standalone_disks: Option<Vec<String>>,
 
     snapshots: Rc<PublicationTarget>,
 
@@ -1457,6 +1533,7 @@ impl WorkerApplication {
             worker,
             runtime,
             control,
+            standalone_disks: (!config.managed()).then(|| node.hardware.approved_disks.clone()),
             snapshots,
             keys,
             store,
@@ -2423,6 +2500,9 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
         if STOP_REQUESTED.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        if disk_monitor::restart_requested() {
+            return Err(Error::DiskApprovalChanged);
+        }
         self.poll_services(cx, work_budget)
     }
 
@@ -2979,6 +3059,13 @@ impl WorkerApplication {
             if identity.node() != self.keys.node() {
                 return Err(Error::NodeIdentityChanged);
             }
+            // Standalone storage was built from the bootstrap enrollment, and
+            // renewals compare against this serving enrollment. Without a disk
+            // monitor, a revocation between the two would go unnoticed, so the
+            // serving approval must match what storage applied.
+            if let Some(applied) = &self.standalone_disks {
+                serving_approval(applied, &control.disks())?;
+            }
             control.activate_identity()?;
             // Accept a complete compatible first snapshot before any listener.
             while self.snapshots.current().is_err() {
@@ -3321,7 +3408,11 @@ mod lifecycle_policy_tests {
         let stop = AtomicBool::new(false);
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut pending = Box::pin(stoppable_by(&stop, std::future::pending::<Result<()>>()));
+        let mut pending = Box::pin(stoppable_by(
+            &stop,
+            || false,
+            std::future::pending::<Result<()>>(),
+        ));
         assert!(pending.as_mut().poll(&mut cx).is_pending());
         stop.store(true, Ordering::Relaxed);
         assert_eq!(
@@ -3329,12 +3420,43 @@ mod lifecycle_policy_tests {
             Poll::Ready(Err(Error::Cancelled))
         );
         let clear = AtomicBool::new(false);
-        let mut done = Box::pin(stoppable_by(&clear, async {
+        let mut done = Box::pin(stoppable_by(&clear, || false, async {
             Err::<(), _>(Error::Unauthorized)
         }));
         assert_eq!(
             done.as_mut().poll(&mut cx),
             Poll::Ready(Err(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn stoppable_startup_ends_on_disk_approval_restart() {
+        let stop = AtomicBool::new(false);
+        let restart = AtomicBool::new(false);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = Box::pin(stoppable_by(
+            &stop,
+            || restart.load(Ordering::Relaxed),
+            std::future::pending::<Result<()>>(),
+        ));
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        restart.store(true, Ordering::Relaxed);
+        assert_eq!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::DiskApprovalChanged))
+        );
+        drop(pending);
+        // A process stop takes precedence over a disk restart request.
+        stop.store(true, Ordering::Relaxed);
+        let mut both = Box::pin(stoppable_by(
+            &stop,
+            || restart.load(Ordering::Relaxed),
+            std::future::pending::<Result<()>>(),
+        ));
+        assert_eq!(
+            both.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
         );
     }
 

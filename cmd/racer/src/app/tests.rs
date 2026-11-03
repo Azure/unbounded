@@ -224,7 +224,7 @@ impl EnrollmentHandler {
             &node.0,
             not_before,
         );
-        response.block_devices = Some("nvme-cache".into());
+        response.disks = vec!["nvme-cache".into()];
         (200, wire::encode_enrollment_response(&response).unwrap())
     }
 }
@@ -358,6 +358,16 @@ impl ControlHandlers {
     }
 }
 
+/// Record the bootstrap approval as applied storage, as `run` does, and
+/// return the enrolled identity.
+fn applied((identity, disks): (NodeId, Vec<String>), node: &mut Arc<NodeState>) -> NodeId {
+    Arc::get_mut(node).unwrap().hardware = Arc::new(crate::hardware::Context {
+        approved_disks: disks,
+        ..Default::default()
+    });
+    identity
+}
+
 impl ControlFixture {
     /// Enroll a normal node; failure and retained-identity scenarios call bootstrap
     /// directly so their result and on-disk identity assertions stay independent.
@@ -367,11 +377,16 @@ impl ControlFixture {
         timeout: Duration,
     ) -> (Config, Arc<NodeState>) {
         let mut config = self.config.take().unwrap();
-        let node = Arc::new(NodeState::new((0..workers).map(WorkerId).collect(), 64).unwrap());
-        config.node = bootstrap(&config, &node, &config.limits, &scope(timeout).unwrap())
-            .unwrap()
-            .0;
-        (config, node)
+        let mut node = NodeState::new((0..workers).map(WorkerId).collect(), 64).unwrap();
+        let (identity, disks) =
+            bootstrap(&config, &node, &config.limits, &scope(timeout).unwrap()).unwrap();
+        config.node = identity;
+        // As in `run`, storage applies the bootstrap approval.
+        node.hardware = Arc::new(crate::hardware::Context {
+            approved_disks: disks,
+            ..Default::default()
+        });
+        (config, Arc::new(node))
     }
 
     pub(super) fn new() -> Self {
@@ -2542,15 +2557,17 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap()
-    .0;
+    let mut node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    config.node = applied(
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_secs(15)).unwrap(),
+        )
+        .unwrap(),
+        &mut node,
+    );
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
     Rc::get_mut(&mut worker.clients)
         .unwrap()
@@ -2782,8 +2799,8 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
             &scope(Duration::from_secs(5)).unwrap(),
         )
     };
-    let (old, selector) = start().unwrap();
-    assert_eq!(selector.as_deref(), Some("nvme-cache"));
+    let (old, disks) = start().unwrap();
+    assert_eq!(disks, ["nvme-cache"]);
     let committed = std::fs::read(config.identity_directory.join("identity.json")).unwrap();
     let new = NodeId("99999999-9999-4999-8999-999999999999".into());
     *fixture.binding.lock().unwrap() = new.clone();
@@ -2871,18 +2888,20 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         assert_eq!(images[0].1.shards.len(), 2);
         fixture.poll_status.store(200, Ordering::Release);
         fixture.certificate_age.store(1, Ordering::Release);
-        let fresh = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+        let mut fresh = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
         drop(group);
         let app = Arc::try_unwrap(app).ok().unwrap();
         let mut config = Arc::try_unwrap(app.config).ok().unwrap();
-        config.node = bootstrap(
-            &config,
-            &fresh,
-            &config.limits,
-            &scope(Duration::from_secs(15)).unwrap(),
-        )
-        .unwrap()
-        .0;
+        config.node = applied(
+            bootstrap(
+                &config,
+                &fresh,
+                &config.limits,
+                &scope(Duration::from_secs(15)).unwrap(),
+            )
+            .unwrap(),
+            &mut fresh,
+        );
         assert_eq!(config.node, new);
         let (mut worker, runtime, mut engine) = local_worker(&config, &fresh, 0);
         drive(
@@ -3196,21 +3215,23 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
 fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let mut node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
             crate::test_support::security::rotation_bundle(1, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap()
-    .0;
+    config.node = applied(
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_secs(15)).unwrap(),
+        )
+        .unwrap(),
+        &mut node,
+    );
     assert_eq!(
         *fixture.keyring_tokens.lock().unwrap(),
         vec!["fixture.token"]
@@ -3394,11 +3415,12 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let mut node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     let startup = scope(Duration::from_secs(15)).unwrap();
-    config.node = bootstrap(&config, &node, &config.limits, &startup)
-        .unwrap()
-        .0;
+    config.node = applied(
+        bootstrap(&config, &node, &config.limits, &startup).unwrap(),
+        &mut node,
+    );
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
     let startup = scope(Duration::from_secs(15)).unwrap();
@@ -5070,4 +5092,128 @@ fn prune_stale_slab_files_ignores_symlinked_directories() {
     super::prune_stale_slab_files(&real.join("slabs"), &[WorkerId(0)]);
     assert!(!stale.exists());
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Embedded control stub whose latest approval is fixed.
+struct FixedApproval(Option<Vec<String>>);
+
+impl crate::control::managed::ClusterControl for FixedApproval {
+    fn bootstrap(
+        &self,
+        _: Duration,
+    ) -> std::result::Result<
+        crate::control::managed::Bootstrapped,
+        crate::control::managed::BootstrapError,
+    > {
+        Err(crate::control::managed::BootstrapError::Fatal)
+    }
+
+    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+        Default::default()
+    }
+
+    fn report(&self, _: u32, _: Vec<racer_control_wire::RailMapping>) {}
+
+    fn approved_disks(&self) -> Option<Vec<String>> {
+        self.0.clone()
+    }
+}
+
+fn managed_with(control: Option<FixedApproval>) -> crate::control::Managed {
+    crate::control::Managed {
+        endpoints: Default::default(),
+        report: std::sync::Arc::new(|_, _| {}),
+        disks: vec!["bootstrap".into()],
+        control: control.map(|c| std::sync::Arc::new(c) as _),
+    }
+}
+
+#[test]
+fn discovery_uses_latest_approval_over_bootstrap_snapshot() {
+    // Revoked during enrollment: the bootstrap disk must not be used.
+    let revoked = managed_with(Some(FixedApproval(Some(vec![]))));
+    assert!(super::current_approval(&revoked).is_empty());
+    let changed = managed_with(Some(FixedApproval(Some(vec!["later".into()]))));
+    assert_eq!(super::current_approval(&changed), vec!["later".to_owned()]);
+}
+
+#[test]
+fn discovery_falls_back_to_bootstrap_without_latest_approval() {
+    let unknown = managed_with(Some(FixedApproval(None)));
+    assert_eq!(
+        super::current_approval(&unknown),
+        vec!["bootstrap".to_owned()]
+    );
+    let absent = managed_with(None);
+    assert_eq!(
+        super::current_approval(&absent),
+        vec!["bootstrap".to_owned()]
+    );
+}
+
+#[test]
+fn applied_approval_drops_ids_revoked_during_discovery() {
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let kept = |v: &[&str]| {
+        v.iter()
+            .map(|id| devices::Approval {
+                id: (*id).to_owned(),
+                rdev: None,
+                outcome: devices::Outcome::Missing,
+            })
+            .collect::<Vec<_>>()
+    };
+    let approved = ids(&["nvme-a", "nvme-b", "nvme-c"]);
+    // Nothing revoked: the full set applies.
+    assert_eq!(
+        applied_approval(&approved, &kept(&["nvme-a", "nvme-b", "nvme-c"])),
+        approved
+    );
+    // A revoked ID leaves the baseline, so reapproving it is a change.
+    let applied = applied_approval(&approved, &kept(&["nvme-c", "nvme-a"]));
+    assert_eq!(applied, ids(&["nvme-a", "nvme-c"]));
+    assert!(!crate::control::same_disks(&applied, &approved));
+    // Everything revoked.
+    assert!(applied_approval(&approved, &[]).is_empty());
+}
+
+#[test]
+fn serving_approval_requires_storage_applied_disks() {
+    let disks = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let applied = disks(&["nvme-a", "nvme-b"]);
+    // Order is not significant.
+    assert_eq!(
+        serving_approval(&applied, &disks(&["nvme-b", "nvme-a"])),
+        Ok(())
+    );
+    assert_eq!(serving_approval(&[], &[]), Ok(()));
+    // Revoked, added, or entirely cleared approvals restart before serving.
+    for enrolled in [
+        disks(&["nvme-a"]),
+        disks(&["nvme-a", "nvme-b", "nvme-c"]),
+        Vec::new(),
+    ] {
+        assert_eq!(
+            serving_approval(&applied, &enrolled),
+            Err(Error::DiskApprovalChanged)
+        );
+    }
+}
+
+#[test]
+fn standalone_start_rejects_approval_changed_since_storage_discovery() {
+    let mut fixture = ControlFixture::new();
+    let mut config = fixture.config.take().unwrap();
+    let mut node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    let startup = scope(Duration::from_secs(15)).unwrap();
+    let (identity, _) = bootstrap(&config, &node, &config.limits, &startup).unwrap();
+    // Storage applied a disk the serving enrollment no longer approves.
+    config.node = applied((identity, vec!["nvme-revoked".into()]), &mut node);
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    let startup = scope(Duration::from_secs(15)).unwrap();
+    assert_eq!(
+        drive(&runtime, &mut engine, worker.start(&startup)),
+        Err(Error::DiskApprovalChanged)
+    );
+    assert!(!node.observations.health.ready());
 }

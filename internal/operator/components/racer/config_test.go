@@ -148,7 +148,7 @@ func TestValidateDataplaneConfigRejects(t *testing.T) {
 		{"RACER_WARM_MAX_TTL_SECS", "0"},
 		{"RACER_WARM_WINDOW_PAGES", "65"},
 		{"RACER_RETAINED_SEGMENT_PERCENT", "101"},
-		{"RACER_MAX_THREADS", "2"},
+		{"RACER_MAX_THREADS", "3"},
 		{"RACER_CONTROL_SEATS", "17"},
 		{"RACER_CONTROL_SEATS", "01"},
 		{"RACER_SLAB_BYTES", strings.Repeat("1", 4097)},

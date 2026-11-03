@@ -172,7 +172,7 @@ func validateDataplaneConfig(data map[string]string) error {
 
 	if value, ok := data["RACER_MAX_THREADS"]; ok {
 		if threads, valid := dataplaneDecimal(value); !valid || threads < minThreads {
-			add("RACER_MAX_THREADS", fmt.Sprintf("must be an integer of at least %d, including the control plane thread", minThreads))
+			add("RACER_MAX_THREADS", fmt.Sprintf("must be an integer of at least %d, including the control plane and disk monitor threads", minThreads))
 		}
 	}
 

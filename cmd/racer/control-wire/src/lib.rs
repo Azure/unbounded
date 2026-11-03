@@ -156,7 +156,8 @@ pub struct EnrollmentRequest {
 /// Assigned node identity and certificate chain correlated to an enrollment.
 #[derive(Clone)]
 pub struct EnrollmentResponse {
-    pub block_devices: Option<String>,
+    /// Approved raw cache disks for this node, as `/dev/disk/by-id` basenames.
+    pub disks: Vec<String>,
 
     pub schema_version: u32,
 
@@ -547,6 +548,20 @@ mod definitions {
                     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
                 }
             })
+    }
+
+    /// Most approved disks one enrollment response carries.
+    pub const MAX_DISKS: usize = 256;
+
+    /// A `/dev/disk/by-id` basename: 1 to 255 printable ASCII bytes without
+    /// `/`, `,`, or whitespace, and not `.` or `..`.
+    pub fn valid_disk_id(value: &str) -> bool {
+        (1..=255).contains(&value.len())
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b'/' && b != b',')
     }
 
     /// Accept an absent site or a bounded ASCII site label.
@@ -1023,12 +1038,21 @@ mod codec {
 
         certificate_chain: Vec<String>,
 
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            deserialize_with = "nonnull_gid"
-        )]
-        block_devices: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        disks: Vec<String>,
+
+        /// Retired regex selector from older control peers; accepted and ignored.
+        #[serde(default, skip_serializing)]
+        #[allow(dead_code)]
+        block_devices: Option<serde::de::IgnoredAny>,
+    }
+
+    /// Validate approved disk IDs.
+    fn disks(disks: &[String]) -> Result<()> {
+        if disks.len() > MAX_DISKS || !disks.iter().all(|d| valid_disk_id(d)) {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(())
     }
 
     /// Decode enrollment correlation and certificate syntax without establishing trust.
@@ -1038,8 +1062,9 @@ mod codec {
         uuid(&r.node)?;
         uuid(&r.enrollment)?;
         let chain = certificates(&r.certificate_chain)?;
+        disks(&r.disks)?;
         Ok(EnrollmentResponse {
-            block_devices: r.block_devices.filter(|s| !s.is_empty()),
+            disks: r.disks,
             schema_version: r.schema_version,
             cluster: ClusterId(r.cluster),
             node: NodeId(r.node),
@@ -1052,7 +1077,8 @@ mod codec {
     pub fn encode_enrollment_response(r: &EnrollmentResponse) -> Result<Vec<u8>> {
         let b = encode(
             &Response {
-                block_devices: r.block_devices.clone().filter(|s| !s.is_empty()),
+                disks: r.disks.clone(),
+                block_devices: None,
                 schema_version: r.schema_version,
                 cluster: r.cluster.0.clone(),
                 node: r.node.0.clone(),
@@ -1989,57 +2015,61 @@ mod codec {
         }
 
         #[test]
-        fn optional_block_device_selector_is_omitted_when_absent_and_rejects_non_strings() {
-            let without_selector = fixture("bootstrap-response.json");
-            let mut response = decode_enrollment_response(&without_selector).unwrap();
-            assert!(response.block_devices.is_none());
-            for selector in ["nvme.*cache", "[", ""] {
-                response.block_devices = Some(selector.into());
+        fn optional_disks_are_omitted_when_empty_and_reject_non_string_arrays() {
+            let without_disks = fixture("bootstrap-response.json");
+            let mut response = decode_enrollment_response(&without_disks).unwrap();
+            assert!(response.disks.is_empty());
+            for disks in [
+                vec!["wwn-0x5000c500a1b2c3d4".to_owned()],
+                vec!["nvme-eui.0025385b71b2c3d4".into(), "ata-X_Y".into()],
+                vec![],
+            ] {
+                response.disks = disks.clone();
                 let encoded = encode_enrollment_response(&response).unwrap();
                 let decoded = decode_enrollment_response(&encoded).unwrap();
-                assert_eq!(
-                    decoded.block_devices.as_deref(),
-                    (!selector.is_empty()).then_some(selector)
-                );
-                if selector.is_empty() {
-                    assert_eq!(encoded, without_selector);
+                assert_eq!(decoded.disks, disks);
+                if disks.is_empty() {
+                    assert_eq!(encoded, without_disks);
                 }
             }
+            for bad in ["", ".", "..", "a/b", "a,b", "a b", "a\tb", "\u{e9}"] {
+                response.disks = vec![bad.into()];
+                assert!(encode_enrollment_response(&response).is_err(), "{bad}");
+            }
+            response.disks = vec!["a".into(); MAX_DISKS + 1];
+            assert!(encode_enrollment_response(&response).is_err());
             for value in [
                 Value::Null,
                 serde_json::json!(1),
-                serde_json::json!(true),
-                serde_json::json!([]),
+                serde_json::json!("wwn-1"),
+                serde_json::json!([1]),
+                serde_json::json!([null]),
             ] {
-                let mut json: Value = serde_json::from_slice(&without_selector).unwrap();
-                json["block_devices"] = value;
+                let mut json: Value = serde_json::from_slice(&without_disks).unwrap();
+                json["disks"] = value;
                 assert!(decode_enrollment_response(&serde_json::to_vec(&json).unwrap()).is_err());
             }
         }
 
         #[test]
-        fn shared_block_device_selector_vectors() {
-            let without_selector = String::from_utf8(fixture("bootstrap-response.json")).unwrap();
+        fn shared_disk_vectors() {
+            let without_disks = String::from_utf8(fixture("bootstrap-response.json")).unwrap();
             let vectors: Vec<Value> =
-                serde_json::from_slice(&fixture("bootstrap-block-devices.json")).unwrap();
+                serde_json::from_slice(&fixture("bootstrap-disks.json")).unwrap();
             for vector in vectors {
                 let bytes = format!(
                     "{}{} }}",
-                    without_selector.trim_end().strip_suffix('}').unwrap(),
+                    without_disks.trim_end().strip_suffix('}').unwrap(),
                     vector["fields"].as_str().unwrap()
                 );
                 let decoded = decode_enrollment_response(bytes.as_bytes());
                 if vector["code"] == "" {
                     let decoded = decoded.unwrap();
-                    assert_eq!(
-                        decoded.block_devices.as_deref().unwrap_or(""),
-                        vector["pattern"].as_str().unwrap()
-                    );
+                    let want: Vec<String> =
+                        serde_json::from_value(vector["disks"].clone()).unwrap();
+                    assert_eq!(decoded.disks, want, "{}", vector["name"]);
                     let encoded = encode_enrollment_response(&decoded).unwrap();
-                    assert_eq!(
-                        decode_enrollment_response(&encoded).unwrap().block_devices,
-                        decoded.block_devices
-                    );
+                    assert_eq!(decode_enrollment_response(&encoded).unwrap().disks, want);
                 } else {
                     assert!(
                         matches!(decoded, Err(Error::InvalidRequest)),
@@ -2050,7 +2080,6 @@ mod codec {
             }
         }
 
-        /// NIC limits count physical ports, permit shared rails, and normalize order.
         #[test]
         fn physical_nic_bounds_repeated_rails_and_bootstrap_canonical_order() {
             let mut p = decode_publication(&fixture("publication.json")).unwrap();

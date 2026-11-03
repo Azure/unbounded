@@ -32,7 +32,7 @@ impl ClusterControl for Embedded {
         match self.0.bootstrap(timeout) {
             Ok(bootstrap) => Ok(Bootstrapped {
                 cluster: bootstrap.cluster,
-                block_devices: bootstrap.block_devices,
+                disks: bootstrap.disks,
             }),
             Err(racer_cluster_control::Error::Unavailable) => Err(BootstrapError::Retry),
             Err(racer_cluster_control::Error::Timeout) => Err(BootstrapError::Pending),
@@ -51,6 +51,26 @@ impl ClusterControl for Embedded {
         // Reports are retried by control; a refused enqueue is logged, never fatal.
         if let Err(error) = self.0.report(shares, rails) {
             eprintln!("racer: stage=cluster-report error={error}");
+        }
+    }
+
+    fn report_disks(&self, disks: Vec<racer_cluster_control::disks::DiskStatus>) {
+        if let Err(error) = self.0.report_disks(disks) {
+            eprintln!("racer: stage=cluster-report-disks error={error}");
+        }
+    }
+
+    fn approved_disks(&self) -> Option<Vec<String>> {
+        self.0.approved_disks()
+    }
+
+    fn approval(&self) -> Option<racer_cluster_control::disks::Approval> {
+        self.0.approval()
+    }
+
+    fn report_disks_revision(&self, revision: Option<String>) {
+        if let Err(error) = self.0.report_disks_revision(revision) {
+            eprintln!("racer: stage=cluster-report-disks-revision error={error}");
         }
     }
 }

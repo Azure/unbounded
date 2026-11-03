@@ -198,6 +198,10 @@ func DaemonSet(c Config) (*appsv1.DaemonSet, error) {
 	}, nil
 }
 
+// HostMountinfoPath is where the host's mount table, /proc/1/mountinfo, is
+// mounted in the dataplane container.
+const HostMountinfoPath = "/host/proc/1/mountinfo"
+
 func dataplanePod(c Config) corev1.PodSpec {
 	pod := corev1.PodSpec{
 		ServiceAccountName: DataplaneDaemonSetName,
@@ -269,6 +273,13 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 				HostPath: &corev1.HostPathVolumeSource{Path: "/dev", Type: ptr.To(corev1.HostPathDirectory)},
 			},
 		},
+		{
+			// Classifies disks mounted only on the host as in use.
+			Name: "host-mountinfo",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{Path: "/proc/1/mountinfo", Type: ptr.To(corev1.HostPathFile)},
+			},
+		},
 		apiVolume(),
 		{
 			Name: "token",
@@ -315,6 +326,7 @@ func dataplaneContainer(c Config) corev1.Container {
 		// from this privileged container.
 		{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
 		{Name: "devices", MountPath: "/host/dev", ReadOnly: true},
+		{Name: "host-mountinfo", MountPath: HostMountinfoPath, ReadOnly: true},
 	}
 	if c.nvidiaMode() != NVIDIAOff {
 		mounts = append(mounts, corev1.VolumeMount{Name: "udev", MountPath: "/run/udev", ReadOnly: true}, corev1.VolumeMount{Name: "cufile-log", MountPath: CUFileLogDirectory})
@@ -380,6 +392,7 @@ func dataplaneEnvironment(c Config) []corev1.EnvVar {
 		{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity/private"},
 		{Name: "RACER_SLAB_DIRECTORY", Value: "/var/lib/racer/slabs"},
 		{Name: "RACER_DEVICE_DIRECTORY", Value: "/host/dev"},
+		{Name: "RACER_MOUNTINFO", Value: HostMountinfoPath},
 	}
 
 	// Ask the NVIDIA runtime for driver libraries only. The privileged

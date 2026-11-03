@@ -116,6 +116,12 @@ func (h *harness) checkDataplaneHardware() {
 		h.t.Fatalf("racer is not a JSON object: %v: %s", err, report["racer"])
 	}
 
+	for _, key := range []string{"approved_disks", "claimed_disks", "disks", "rdma_rails"} {
+		if _, ok := racer[key]; !ok {
+			h.t.Fatalf("/debug/hardware racer is missing key %q: %s", key, report["racer"])
+		}
+	}
+
 	h.t.Logf("/debug/hardware on %s reported %d block devices", pod, len(blockDevices))
 }
 

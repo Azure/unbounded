@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use racer_cluster_control::disks::{DiskReason, DiskState, DiskStatus};
 use serde::Serialize;
 
 /// Working-memory budget for one discovery.
@@ -192,6 +193,7 @@ pub struct Partition {
     pub dev: Option<String>,
     pub size_bytes: Option<u64>,
     pub by_id: Vec<String>,
+    pub holders: Vec<String>,
 }
 
 /// One entry under `<sys>/class/infiniband`.
@@ -220,8 +222,11 @@ pub struct RdmaPort {
 /// Racer's own view of the hardware it uses.
 #[derive(Debug, Default, Serialize)]
 pub struct Racer {
-    pub block_device_selector: Option<String>,
+    /// Approved disk IDs from this node's `disks` annotation at startup.
+    pub approved_disks: Vec<String>,
     pub claimed_disks: Vec<ClaimedDisk>,
+    /// Status of every whole disk with a by-id name, as in the Pod report.
+    pub disks: Vec<DiskStatus>,
     pub rdma_rails: Option<Rails>,
 }
 
@@ -249,11 +254,27 @@ pub struct Rail {
     pub numa_node: Option<usize>,
 }
 
+/// Startup outcome of one approved disk ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Approved {
+    pub id: String,
+    /// `MAJ:MIN` the ID resolved to at startup, if it resolved.
+    pub dev: Option<String>,
+    /// `Claimed`, `Rejected`, or `Missing`.
+    pub state: DiskState,
+    pub reason: Option<DiskReason>,
+}
+
 /// Startup-fixed inputs for the Racer section of the report.
 #[derive(Clone, Debug, Default)]
 pub struct Context {
-    pub block_device_selector: Option<String>,
+    pub approved_disks: Vec<String>,
     pub claimed_disks: Vec<ClaimedDisk>,
+    pub approvals: Vec<Approved>,
+    /// Segment size; a disk smaller than its guards and one segment is too small.
+    pub segment_bytes: u64,
+    /// Mount table to classify disks; `None` reads `/proc/self/mountinfo`.
+    pub mountinfo: Option<std::path::PathBuf>,
 }
 
 /// Build the full report, including Racer's selector, claimed disks, and rails.
@@ -314,7 +335,8 @@ pub fn report_with_snapshot(
             None
         }
     };
-    for value in context.block_device_selector.iter() {
+    walk.charge_slots::<String>(context.approved_disks.len())?;
+    for value in &context.approved_disks {
         walk.charge_string(value)?;
     }
     // `Vec::clone` allocates exactly `len` slots.
@@ -325,12 +347,230 @@ pub fn report_with_snapshot(
             walk.charge_string(dev)?;
         }
     }
+    let path = context
+        .mountinfo
+        .as_deref()
+        .unwrap_or(Path::new("/proc/self/mountinfo"));
+    let mounts = match mounted_devices(walk, path, &report.block_devices)? {
+        Ok(mounts) => Some(mounts),
+        Err(error) => {
+            section_error(walk, &mut report.errors, "racer.disks", path, &error)?;
+            None
+        }
+    };
+    let disks = classify_disks(&report.block_devices, mounts.as_deref(), context);
+    walk.charge_slots::<DiskStatus>(disks.len())?;
+    for disk in &disks {
+        walk.charge(disk.id.len() + ENTRY_OVERHEAD)?;
+        for alias in &disk.aliases {
+            walk.charge_string(alias)?;
+        }
+    }
     report.racer = Some(Racer {
-        block_device_selector: context.block_device_selector.clone(),
+        approved_disks: context.approved_disks.clone(),
         claimed_disks: context.claimed_disks.clone(),
+        disks,
         rdma_rails,
     });
     Ok(report)
+}
+
+/// By-id names that identify a disk itself, not a device-mapper, MD, or LVM
+/// mapping stacked on it.
+fn disk_alias(name: &str) -> bool {
+    !["dm-", "md-", "lvm-"].iter().any(|p| name.starts_with(p))
+}
+
+/// Status of every whole disk with a by-id name, sorted by ID.
+///
+/// Approved disks take their startup outcome. Other disks are classified from
+/// sysfs and the mount table only; they are never opened. `mounts` lists the
+/// `MAJ:MIN` sources of mounts from [`mounted_devices`]; when it is `None` the
+/// mount table could not be read and every unapproved disk is unavailable
+/// with [`DiskReason::IoError`], because an unknown mount state must not
+/// report a disk as available. Approved IDs that did not resolve to a whole
+/// disk in `devices` are listed under their own ID.
+pub fn classify_disks(
+    devices: &[BlockDevice],
+    mounts: Option<&[String]>,
+    context: &Context,
+) -> Vec<DiskStatus> {
+    let mut disks = Vec::new();
+    let mut matched = vec![false; context.approvals.len()];
+    for device in devices {
+        let mut aliases: Vec<String> = device
+            .by_id
+            .iter()
+            .filter(|name| disk_alias(name))
+            .cloned()
+            .collect();
+        aliases.sort();
+        let Some(id) = racer_cluster_control::disks::preferred_id(&aliases).cloned() else {
+            continue;
+        };
+        // An approval applies only while its by-id name still names this
+        // disk; a replacement may reuse the old disk's MAJ:MIN.
+        let applies =
+            |a: &Approved| device.dev.is_some() && a.dev == device.dev && aliases.contains(&a.id);
+        let approval = context.approvals.iter().position(applies);
+        let (state, reason) = match approval {
+            Some(index) => {
+                for (i, other) in context.approvals.iter().enumerate() {
+                    if applies(other) {
+                        matched[i] = true;
+                    }
+                }
+                let a = &context.approvals[index];
+                (a.state, a.reason)
+            }
+            None => match unavailable(device, mounts, context.segment_bytes) {
+                Some(reason) => (DiskState::Unavailable, Some(reason)),
+                None => (DiskState::Available, None),
+            },
+        };
+        disks.push(DiskStatus {
+            id,
+            aliases,
+            dev: Some(device.name.clone()),
+            size_bytes: device.size_bytes,
+            model: device.model.clone(),
+            serial: device.serial.clone(),
+            state,
+            reason,
+        });
+    }
+    for (approval, matched) in context.approvals.iter().zip(matched) {
+        if matched || disks.iter().any(|d| d.aliases.contains(&approval.id)) {
+            continue;
+        }
+        disks.push(DiskStatus {
+            state: approval.state,
+            reason: approval.reason,
+            ..DiskStatus::missing(approval.id.clone())
+        });
+    }
+    disks.sort_by(|a, b| a.id.cmp(&b.id));
+    disks.dedup_by(|a, b| a.id == b.id);
+    disks
+}
+
+/// Why an unapproved disk could not be used, from sysfs and the mount table.
+fn unavailable(
+    device: &BlockDevice,
+    mounts: Option<&[String]>,
+    segment_bytes: u64,
+) -> Option<DiskReason> {
+    let Some(mounts) = mounts else {
+        return Some(DiskReason::IoError);
+    };
+    let mounted = |dev: &Option<String>| {
+        dev.as_deref()
+            .is_some_and(|dev| mounts.iter().any(|m| m == dev))
+    };
+    if mounted(&device.dev) || device.partitions.iter().any(|p| mounted(&p.dev)) {
+        return Some(DiskReason::Mounted);
+    }
+    if !device.holders.is_empty() || device.partitions.iter().any(|p| !p.holders.is_empty()) {
+        return Some(DiskReason::Held);
+    }
+    if device.read_only == Some(true) {
+        return Some(DiskReason::ReadOnly);
+    }
+    let minimum = segment_bytes.saturating_add(2 * crate::app::GUARD_BYTES);
+    if device.size_bytes.is_none_or(|size| size < minimum) {
+        return Some(DiskReason::TooSmall);
+    }
+    None
+}
+
+/// Longest mountinfo field kept while scanning; `MAJ:MIN` is far shorter.
+const MAX_MOUNT_FIELD_BYTES: usize = 32;
+
+/// `MAJ:MIN` mount sources in the mountinfo file at `path` that name one of
+/// `devices` or their partitions.
+///
+/// The file is streamed in fixed-size chunks; only matching sources are
+/// retained and each is charged to `walk` before it is kept, so a host with
+/// many mounts costs no more working memory than its device inventory.
+/// Cancellation is checked before every chunk. Returns the inner `Err` when
+/// the file cannot be opened or read; callers must then treat mount state as
+/// unknown rather than unmounted.
+pub fn mounted_devices(
+    walk: &Walk,
+    path: &Path,
+    devices: &[BlockDevice],
+) -> Result<io::Result<Vec<String>>, Abort> {
+    walk.read()?;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
+    };
+    let wanted = |number: &[u8]| {
+        devices.iter().any(|d| {
+            d.dev.as_deref().map(str::as_bytes) == Some(number)
+                || d.partitions
+                    .iter()
+                    .any(|p| p.dev.as_deref().map(str::as_bytes) == Some(number))
+        })
+    };
+    let mut found: Vec<String> = Vec::new();
+    let mut keep = |walk: &Walk, number: &[u8]| -> Result<(), Abort> {
+        if !wanted(number) || found.iter().any(|f| f.as_bytes() == number) {
+            return Ok(());
+        }
+        let Ok(number) = std::str::from_utf8(number) else {
+            return Ok(());
+        };
+        walk.charge_string(number)?;
+        walk.push(&mut found, number.to_owned())
+    };
+    let mut chunk = [0u8; 4096];
+    // Field index within the current line, the third field's bytes, and
+    // whether the previous byte was a separator.
+    let mut field = 0usize;
+    let mut source = [0u8; MAX_MOUNT_FIELD_BYTES];
+    let mut len = 0usize;
+    let mut overflow = false;
+    let mut separator = true;
+    loop {
+        walk.read()?;
+        let n = match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Ok(Err(error)),
+        };
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                if field == 2 && !overflow {
+                    keep(walk, &source[..len])?;
+                }
+                (field, len, overflow, separator) = (0, 0, false, true);
+            } else if byte.is_ascii_whitespace() {
+                if !separator && field == 2 && !overflow {
+                    keep(walk, &source[..len])?;
+                }
+                if !separator {
+                    field += 1;
+                }
+                separator = true;
+            } else {
+                separator = false;
+                if field == 2 {
+                    if len < source.len() {
+                        source[len] = byte;
+                        len += 1;
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+        }
+    }
+    if field == 2 && !separator && !overflow {
+        keep(walk, &source[..len])?;
+    }
+    Ok(Ok(found))
 }
 
 /// Discover block and RDMA devices from sysfs (`sys_root`) and by-id links (`dev_root`).
@@ -567,6 +807,7 @@ fn block_devices(
                 dev: text(walk, &part.join("dev"))?,
                 size_bytes: sectors(walk, &part.join("size"))?,
                 by_id: by_id_for(walk, by_id, &child)?,
+                holders: list_or_empty(walk, &part.join("holders"))?,
                 name: child,
             });
         }
@@ -1059,13 +1300,15 @@ mod tests {
     fn shared_context_is_not_copied_and_report_copy_is_charged() {
         let f = Fixture::new();
         let context = Arc::new(Context {
-            block_device_selector: Some("^nvme-".into()),
+            approved_disks: vec!["nvme-eui.0001".into()],
+            mountinfo: Some(f.sys().join("no-mountinfo")),
             claimed_disks: (0..4)
                 .map(|i| ClaimedDisk {
                     id: format!("nvme-disk-{i}"),
                     dev: Some(format!("259:{i}")),
                 })
                 .collect(),
+            ..Default::default()
         });
         // Each request clones the pointer, so repeated requests share one context.
         let request = Arc::clone(&context);
@@ -1077,7 +1320,6 @@ mod tests {
 
         // A context larger than the walk budget still aborts as too large.
         let big = Arc::new(Context {
-            block_device_selector: None,
             claimed_disks: vec![
                 ClaimedDisk {
                     id: "x".repeat(WORKING_BYTES),
@@ -1085,12 +1327,261 @@ mod tests {
                 };
                 1
             ],
+            ..Default::default()
         });
         let shared = Arc::clone(&big);
         assert!(matches!(
             report_with_snapshot(&walk(), &f.sys(), &f.dev(), &shared, snapshot()),
             Err(Abort::TooLarge)
         ));
+    }
+
+    fn disk(name: &str, dev: &str, by_id: &[&str]) -> BlockDevice {
+        BlockDevice {
+            name: name.into(),
+            dev: Some(dev.into()),
+            size_bytes: Some(1 << 40),
+            read_only: Some(false),
+            by_id: by_id.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classifies_unapproved_disks_from_sysfs_and_mounts_only() {
+        let mut mounted = disk("sda", "8:0", &["wwn-0x1111", "ata-X_1"]);
+        mounted.partitions.push(Partition {
+            name: "sda1".into(),
+            dev: Some("8:1".into()),
+            ..Default::default()
+        });
+        let mut held = disk("sdb", "8:16", &["wwn-0x2222"]);
+        held.partitions.push(Partition {
+            name: "sdb1".into(),
+            dev: Some("8:17".into()),
+            holders: vec!["md0".into()],
+            ..Default::default()
+        });
+        let mut ro = disk("sdc", "8:32", &["scsi-3"]);
+        ro.read_only = Some(true);
+        let mut small = disk("sdd", "8:48", &["ata-small"]);
+        small.size_bytes = Some(1);
+        let mut idle = disk("nvme1n1", "259:4", &["nvme-Model_SN", "nvme-eui.0025"]);
+        idle.partitions.push(Partition {
+            name: "nvme1n1p1".into(),
+            dev: Some("259:5".into()),
+            ..Default::default()
+        });
+        let devices = vec![
+            mounted,
+            held,
+            ro,
+            small,
+            idle,
+            // Stacked mappings and disks without by-id names are omitted.
+            disk("dm-0", "253:0", &["dm-name-vg-lv", "dm-uuid-LVM-x"]),
+            disk("loop0", "7:0", &[]),
+            disk("nvme0n1", "259:0", &["nvme-eui.claimed", "wwn-0x5000"]),
+            disk("sde", "8:64", &["wwn-0x9999"]),
+        ];
+        let approved = |id: &str, dev: Option<&str>, state, reason| Approved {
+            id: id.into(),
+            dev: dev.map(str::to_owned),
+            state,
+            reason,
+        };
+        let context = Context {
+            approvals: vec![
+                // Approved under a non-preferred alias.
+                approved("nvme-eui.claimed", Some("259:0"), DiskState::Claimed, None),
+                approved(
+                    "wwn-0x9999",
+                    Some("8:64"),
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy),
+                ),
+                approved("wwn-0x3333", None, DiskState::Missing, None),
+                approved(
+                    "wwn-0x9999-part1",
+                    Some("8:65"),
+                    DiskState::Rejected,
+                    Some(DiskReason::NotWholeDisk),
+                ),
+            ],
+            segment_bytes: 64 << 20,
+            ..Default::default()
+        };
+        let mounts = ["8:1".to_owned()];
+        let disks = classify_disks(&devices, Some(&mounts), &context);
+        let summary: Vec<_> = disks
+            .iter()
+            .map(|d| (d.id.as_str(), d.dev.as_deref(), d.state, d.reason))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "ata-small",
+                    Some("sdd"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::TooSmall)
+                ),
+                ("nvme-eui.0025", Some("nvme1n1"), DiskState::Available, None),
+                (
+                    "scsi-3",
+                    Some("sdc"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::ReadOnly)
+                ),
+                (
+                    "wwn-0x1111",
+                    Some("sda"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::Mounted)
+                ),
+                (
+                    "wwn-0x2222",
+                    Some("sdb"),
+                    DiskState::Unavailable,
+                    Some(DiskReason::Held)
+                ),
+                ("wwn-0x3333", None, DiskState::Missing, None),
+                ("wwn-0x5000", Some("nvme0n1"), DiskState::Claimed, None),
+                (
+                    "wwn-0x9999",
+                    Some("sde"),
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy)
+                ),
+                (
+                    "wwn-0x9999-part1",
+                    None,
+                    DiskState::Rejected,
+                    Some(DiskReason::NotWholeDisk)
+                ),
+            ]
+        );
+        assert_eq!(disks[3].aliases, ["ata-X_1", "wwn-0x1111"]);
+        assert!(disks[5].aliases.is_empty() && disks[5].size_bytes.is_none());
+    }
+
+    #[test]
+    fn mounted_devices_streams_and_keeps_only_inventory_sources() {
+        let f = Fixture::new();
+        let path = f.0.join("mountinfo");
+        let mut sda = disk("sda", "8:0", &["wwn-a"]);
+        sda.partitions.push(Partition {
+            name: "sda1".into(),
+            dev: Some("8:1".into()),
+            ..Default::default()
+        });
+        let devices = vec![sda, disk("sdb", "8:16", &["wwn-b"])];
+        // Many unrelated mounts, a duplicate, an oversized field, and a last
+        // line without a trailing newline.
+        let mut text = String::new();
+        for i in 0..20_000 {
+            text.push_str(&format!("{i} 1 0:{i} / /run/k8s/{i} rw - tmpfs tmpfs rw\n"));
+        }
+        text.push_str("1 1 8:1 / /boot rw - ext4 /dev/sda1 rw\n");
+        text.push_str("2 1 8:1 / /boot2 rw - ext4 /dev/sda1 rw\n");
+        text.push_str(&format!("3 1 8:16{} / /x rw\n", "9".repeat(64)));
+        text.push_str("4 1  8:0");
+        fs::write(&path, &text).unwrap();
+        let walk = walk();
+        let found = mounted_devices(&walk, &path, &devices).unwrap().unwrap();
+        assert_eq!(found, ["8:1", "8:0"]);
+        // Only the kept sources are charged, far below the file size.
+        assert!(WORKING_BYTES - walk.remaining() < 1024);
+        assert!(text.len() > WORKING_BYTES);
+
+        // A missing file is an error, not an empty mount table.
+        let missing = f.sys().join("no-mountinfo");
+        assert!(mounted_devices(&walk, &missing, &devices).unwrap().is_err());
+
+        // Budget exhaustion and cancellation abort the scan.
+        let tight = Walk::new(Arc::default(), ENTRY_OVERHEAD);
+        assert!(matches!(
+            mounted_devices(&tight, &path, &devices),
+            Err(Abort::TooLarge)
+        ));
+        let cancelled = Walk::new(Arc::new(AtomicBool::new(true)), WORKING_BYTES);
+        assert!(matches!(
+            mounted_devices(&cancelled, &path, &devices),
+            Err(Abort::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn unknown_mount_state_never_reports_available() {
+        let devices = vec![disk("sde", "8:64", &["wwn-0xidle"])];
+        let idle = Context {
+            segment_bytes: 64 << 20,
+            ..Default::default()
+        };
+        let disks = classify_disks(&devices, None, &idle);
+        assert_eq!(disks[0].state, DiskState::Unavailable);
+        assert_eq!(disks[0].reason, Some(DiskReason::IoError));
+        let disks = classify_disks(&devices, Some(&[]), &idle);
+        assert_eq!(disks[0].state, DiskState::Available);
+    }
+
+    #[test]
+    fn approval_does_not_follow_reused_dev_to_a_different_disk() {
+        // The rejected disk was detached and a replacement took its MAJ:MIN.
+        let devices = vec![
+            disk("sde", "8:64", &["wwn-0xnew"]),
+            disk("sdf", "8:80", &["wwn-0xkept", "ata-kept"]),
+        ];
+        let context = Context {
+            approvals: vec![
+                Approved {
+                    id: "wwn-0xold".into(),
+                    dev: Some("8:64".into()),
+                    state: DiskState::Rejected,
+                    reason: Some(DiskReason::Busy),
+                },
+                // Same disk, still present under the approved name.
+                Approved {
+                    id: "ata-kept".into(),
+                    dev: Some("8:80".into()),
+                    state: DiskState::Claimed,
+                    reason: None,
+                },
+                // Approved name is gone but the dev matches another disk.
+                Approved {
+                    id: "ata-gone".into(),
+                    dev: Some("8:80".into()),
+                    state: DiskState::Rejected,
+                    reason: Some(DiskReason::Busy),
+                },
+            ],
+            segment_bytes: 64 << 20,
+            ..Default::default()
+        };
+        let disks = classify_disks(&devices, Some(&[]), &context);
+        let summary: Vec<_> = disks
+            .iter()
+            .map(|d| (d.id.as_str(), d.dev.as_deref(), d.state, d.reason))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "ata-gone",
+                    None,
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy)
+                ),
+                ("wwn-0xkept", Some("sdf"), DiskState::Claimed, None),
+                ("wwn-0xnew", Some("sde"), DiskState::Available, None),
+                (
+                    "wwn-0xold",
+                    None,
+                    DiskState::Rejected,
+                    Some(DiskReason::Busy)
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1100,11 +1591,19 @@ mod tests {
         rdma_tree(&f);
         let inventory = crate::rdma::Inventory::default();
         let context = Context {
-            block_device_selector: Some("^nvme-".into()),
+            approved_disks: vec!["nvme-eui.0001".into()],
             claimed_disks: vec![ClaimedDisk {
-                id: "nvme-Microsoft_NVMe_SN123".into(),
+                id: "nvme-eui.0001".into(),
                 dev: Some("259:0".into()),
             }],
+            approvals: vec![Approved {
+                id: "nvme-eui.0001".into(),
+                dev: Some("259:0".into()),
+                state: DiskState::Claimed,
+                reason: None,
+            }],
+            segment_bytes: 64 << 20,
+            mountinfo: Some(f.sys().join("no-mountinfo")),
         };
         let report = report(&walk(), &f.sys(), &f.dev(), &context, &inventory).unwrap();
         let value: serde_json::Value =
@@ -1139,7 +1638,7 @@ mod tests {
         );
         assert_eq!(
             keys(&value["block_devices"][1]["partitions"][0]),
-            ["by_id", "dev", "name", "size_bytes"]
+            ["by_id", "dev", "holders", "name", "size_bytes"]
         );
         assert_eq!(
             keys(&value["rdma_devices"][0]["ports"][0]),
@@ -1156,7 +1655,20 @@ mod tests {
         );
         assert_eq!(
             keys(&value["racer"]),
-            ["block_device_selector", "claimed_disks", "rdma_rails"]
+            ["approved_disks", "claimed_disks", "disks", "rdma_rails"]
+        );
+        assert_eq!(value["racer"]["approved_disks"][0], "nvme-eui.0001");
+        assert_eq!(
+            value["racer"]["disks"],
+            serde_json::json!([{
+                "id": "nvme-eui.0001",
+                "aliases": ["nvme-Microsoft_NVMe_SN123", "nvme-eui.0001"],
+                "dev": "nvme0n1",
+                "size_bytes": 7501476528u64 * 512,
+                "model": "Microsoft NVMe Direct Disk",
+                "serial": "SN123",
+                "state": "claimed"
+            }])
         );
         assert_eq!(value["racer"]["claimed_disks"][0]["dev"], "259:0");
         assert_eq!(value["racer"]["rdma_rails"]["generation"], 0);

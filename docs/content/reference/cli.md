@@ -471,6 +471,46 @@ kubectl unbounded overrides status
 
 ---
 
+### `kubectl unbounded racer disks`
+
+Choose which raw disks Racer may use on a Node. Racer only uses a disk listed in
+the Node annotation `racer.unbounded-cloud.io/disks`. These commands read the
+disks each Racer pod reports and edit that annotation for you. See
+**[Racer]({{< relref "reference/racer" >}})**.
+
+Approving a disk lets Racer erase its first and last 1 MiB. This destroys the
+partition table and any filesystem, LVM, or RAID signatures. Any change to the
+list restarts the Racer pod on that Node, which drops its cache.
+
+| Command | Description |
+|----------|-------------|
+| `racer disks list [NODE...]` | Show each disk a Racer pod reports: ID, device, size, state, and reason. With no Node, lists every Node that runs a Racer pod. Warns about Nodes with no Racer pod or no report. |
+| `racer disks allow NODE ID...` | Approve disks. An ID may be any `/dev/disk/by-id` name the report lists; the command stores the reported ID. Refuses disks that are `unavailable` or not reported unless you pass `--force`. Asks you to type `yes` unless you pass `--yes`. |
+| `racer disks revoke NODE (ID...\|--all)` | Remove approval. Nothing is erased; data stays on the disk. Removes the annotation when the list is empty. |
+
+Disk states: `claimed` (in use), `available` (can be approved), `unavailable`
+(cannot be used, see reason), `rejected` (approved but failed, see reason), and
+`missing` (approved but not found).
+
+#### Optional Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `-o`, `--output` | string | `list` only. `wide` adds model, serial, and aliases. `json` prints Nodes with their approved list and disks. |
+| `--yes` | bool | `allow` and `revoke`. Skip the prompt. Required when stdin is not a terminal. |
+| `--force` | bool | `allow` only. Approve disks that are unavailable or not reported. |
+| `--wait` | bool | `allow` only. Wait until each new disk is `claimed` or `rejected`. Fails if any is rejected. |
+| `--timeout` | duration | `allow` only. How long `--wait` waits. Defaults to `5m`. |
+| `-n`, `--namespace` | string | Namespace of the Racer pods. Defaults to `unbounded-system`. |
+
+```bash
+kubectl unbounded racer disks list node-1
+kubectl unbounded racer disks allow node-1 nvme-eui.0025385b71b2c3d4 --wait
+kubectl unbounded racer disks revoke node-1 --all --yes
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Description |

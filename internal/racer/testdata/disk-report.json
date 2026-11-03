@@ -1,0 +1,46 @@
+{
+  "shares": 4,
+  "rdma_nics": [],
+  "disks_revision": "rev-1",
+  "disks": [
+    {
+      "id": "wwn-0x5000c500a1b2c3d4",
+      "aliases": [
+        "wwn-0x5000c500a1b2c3d4",
+        "nvme-Samsung_SSD_980_S64ANS0T123456"
+      ],
+      "dev": "nvme0n1",
+      "size_bytes": 1000204886016,
+      "model": "Samsung SSD 980",
+      "serial": "S64ANS0T123456",
+      "state": "claimed"
+    },
+    {
+      "id": "nvme-eui.0025385b71b2c3d4",
+      "aliases": [
+        "nvme-eui.0025385b71b2c3d4"
+      ],
+      "dev": "nvme1n1",
+      "size_bytes": 1000204886016,
+      "state": "available"
+    },
+    {
+      "id": "wwn-0x1111",
+      "dev": "sda",
+      "size_bytes": 480103981056,
+      "state": "unavailable",
+      "reason": "mounted"
+    },
+    {
+      "id": "wwn-0x2222",
+      "dev": "sdb",
+      "size_bytes": 1,
+      "state": "rejected",
+      "reason": "too-small"
+    },
+    {
+      "id": "wwn-0x3333",
+      "state": "missing"
+    }
+  ]
+}

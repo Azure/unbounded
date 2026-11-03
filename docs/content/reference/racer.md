@@ -188,6 +188,7 @@ runs a privileged UID 0 container with these host paths:
 | `/var/lib/racer/slabs` | Slab files and checkpoints; must stay writable in device mode too |
 | `/run/racer` | Client and origin sockets |
 | `/dev`, mounted read-only at `/host/dev` | Optional [raw cache devices](#raw-device-storage) |
+| `/proc/1/mountinfo`, mounted read-only at `/host/proc/1/mountinfo` | Host mount table, so disks mounted on the host are reported as in use |
 
 Do not turn off cluster-wide admission protections. Authorize these workloads
 narrowly. RDMA is optional; see [RDMA](#rdma).
@@ -216,7 +217,7 @@ Keys below use the `racer.unbounded-cloud.io/` prefix unless shown in full.
 | Label `unbounded-cloud.io/site` | Canonical Site boundary for RDMA; absent or empty means HTTP-only |
 | Annotation `shares` | Positive decimal `uint32` placement weight; overrides reported shares; default 4 |
 | Annotation `rdma-nics` | Administrator NIC/rail policy; see [RDMA](#rdma); explicit `[]` disables eligibility |
-| Annotation `block-devices` | Startup-only regex selecting raw cache devices by `disk/by-id` basename; see [raw-device storage](#raw-device-storage) |
+| Annotation `disks` | Comma-separated `disk/by-id` names of whole disks Racer may wipe and use as cache; see [raw-device storage](#raw-device-storage) |
 
 Each dataplane writes its shares and NIC report to its own Pod's
 `racer.unbounded-cloud.io/report` annotation. Control seats do not write Node
@@ -224,7 +225,8 @@ annotations. Old `enrolled-shares`, `enrolled-rdma-nics`, and
 `last-admitted-member` annotations are no longer runtime state.
 
 Malformed membership annotations retain admitted attributes; invalid new nodes are omitted.
-Site uses current labels. Invalid `block-devices` selectors instead fall back to slab files.
+Site uses current labels. An invalid `disks` annotation approves no disks, so
+storage falls back to slab files.
 
 ## Dataplane configuration
 
@@ -242,7 +244,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
-| `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, and managed control threads; managed deployments need at least 3 |
+| `RACER_MAX_THREADS` | Unset (automatic) | Total I/O, crypto, managed control, and disk monitor threads; managed deployments need at least 4 |
 | `RACER_IO_WORKERS` | Unset (automatic) | Exact I/O count, 1..65,536; requires `RACER_CRYPTO_HELPERS` |
 | `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
@@ -275,6 +277,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_FREE_SEGMENT_RESERVE` | `2` | Positive reserved segment count per I/O worker, less than that worker's total segments (at most 1,048,575) |
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
+| `RACER_MOUNTINFO` | `/proc/self/mountinfo` | Mount table used to report disks as in use; managed workloads set `/host/proc/1/mountinfo` so host mounts count |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
@@ -285,21 +288,22 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
 
 Exact sizing requires both count settings. Their sum, plus the managed control
-thread, must fit `RACER_MAX_THREADS`;
+and disk monitor threads, must fit `RACER_MAX_THREADS`;
 the cap is never raised implicitly. The first NUMA node in the normal placement
 preference order must be known and have enough eligible CPUs for the whole split.
 Other host NUMA nodes are allowed, but exact placement does not span nodes or skip
 an undersized preferred node. Insufficient CPU quota or per-I/O resource budgets
 fails startup rather than reducing counts. For a managed 20-I/O comparison, use
-10 helpers with cap 31 or 20 helpers with cap 41. Keep all resource budgets fixed.
+10 helpers with cap 32 or 20 helpers with cap 42. Keep all resource budgets fixed.
 Omit both count settings to retain automatic sizing.
 Extra helpers change available crypto execution capacity, not I/O ownership or
 per-I/O budgets. They do not guarantee higher throughput; compare matched workloads
 before drawing a performance conclusion.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
-Without an explicit thread cap, one unpinned control thread runs alongside the
-automatically sized I/O and crypto workers. With a cap, it consumes one slot.
+Without an explicit thread cap, one unpinned control thread and one unpinned disk
+monitor thread run alongside the automatically sized I/O and crypto workers. With
+a cap, they consume two slots.
 Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
 can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
 divided among them. Admission budgets are not RSS limits:
@@ -307,45 +311,108 @@ allocator, TLS, and filesystem cache are additional. Invalid combinations fail v
 
 ### Raw-device storage
 
-Set the Node annotation `racer.unbounded-cloud.io/block-devices` to a regex over
-basenames in `/host/dev/disk/by-id`, not full paths. The selector is limited to
-1 KiB (1,024 bytes) and compiled with Rust's `regex` crate. Invalid or oversized
-values fall back to file-backed slabs. Matching is **unanchored**:
-use `^` and `$` to avoid unintended substring and partition matches.
+Racer uses a raw disk only after an administrator approves it for one node.
+**Approving a disk is consent to wipe it.**
 
-Discovery runs once after startup enrollment. Changing or removing the annotation
-does not change a running layout or trigger a rollout; restart the affected
-dataplane to apply it. An absent/empty selector, Rust compile failure, discovery
-failure, no usable matches, or too few segments for all workers' reserves falls
-back to file-backed slabs. Rejected candidates are skipped with diagnostics;
-remaining usable devices can still be selected. Aliases for one device are
-deduplicated.
+Approve disks with the `kubectl unbounded racer disks` plugin:
 
-**Selected devices are overwritten except for reserved guards. There is no
-general filesystem or data-signature check, formatting step, or preservation of
-cache-area contents.** Racer skips
-devices with child partitions, active holders, read-only state, or visible mounts.
-It opens devices with `O_RDWR | O_DIRECT | O_EXCL`. A device whose open fails
-with `EBUSY`, for example while a replaced dataplane is still releasing its
-claim, is retried every 250 ms until `RACER_DEVICE_BUSY_WAIT_SECS` elapses;
-all busy devices share that one deadline. Devices still busy at the deadline
-are skipped. Other rejections, including active holders, are not retried.
-These checks are not proof that a device is safe to erase. A partition itself is
-allowed: a broad selector can overwrite an unmounted OS or data partition.
-Select only dedicated disposable cache devices after checking each match.
+```sh
+# Show every disk Racer sees, with its state. Add -o wide or -o json for more.
+kubectl unbounded racer disks list [NODE...] [-o wide|json]
 
-The first and last **1 MiB (1,048,576 bytes)** of each device are reserved and must
-already be entirely zero. Startup reads each full guard through the same held
-exclusive `O_DIRECT` descriptor, using one aligned 1 MiB buffer. Nonzero bytes,
-short reads, I/O errors, or unsupported alignment reject that device. Racer never
-zeros the guards or bypasses partition, holder, or mount checks. Clearing old
-contents is a separate operator-approved operation, not an automatic repair.
-Keeping cache records out of these ends prevents cache data from looking like a
-partition table or filesystem signature; it is not proof against every partition parser.
+# Approve disks by ID. Asks for confirmation unless --yes is set.
+# --force approves disks that are unavailable or not reported.
+# --wait waits (up to --timeout, default 5m) until each disk is claimed or rejected.
+kubectl unbounded racer disks allow NODE ID... [--yes] [--force] [--wait] [--timeout DURATION]
+
+# Remove approvals.
+kubectl unbounded racer disks revoke NODE (ID...|--all) [--yes]
+```
+
+All commands accept `-n NAMESPACE` for the Racer pods' namespace, which defaults
+to `unbounded-system`. See the
+**[CLI reference]({{< relref "reference/cli" >}})** for every flag.
+
+The plugin edits the Node annotation `racer.unbounded-cloud.io/disks`. You can
+also set it directly. It is a comma-separated list of basenames in
+`/dev/disk/by-id`, such as `wwn-0x5000c500a1b2c3d4,nvme-eui.0025385b71b2c3d4`.
+Spaces around entries and empty entries are ignored. An entry is 1 to 255
+printable ASCII characters, must not contain `/`, `,`, or whitespace, and must
+not be `.` or `..`. The value is limited to 4 KiB and 256 disks. If any entry is invalid, Racer ignores the whole annotation and uses slab
+files. Each ID must name a whole disk; a partition is rejected. Several IDs for
+the same disk are used once.
+
+Each change made by the plugin also sets the Node annotation
+`racer.unbounded-cloud.io/disks-revision` to a new random token. While a
+dataplane's applied disk set matches the Node, it echoes that token as
+`disks_revision` in its report, and stops echoing once it starts restarting.
+`allow --wait` only accepts states from a report carrying the token it wrote,
+so it never reads the result of an earlier approval.
+
+**Upgrade note:** the old `racer.unbounded-cloud.io/block-devices` regex is no
+longer honored, because it never granted consent to wipe. Racer logs a warning
+when it is still set. Approve the same disks with
+`kubectl unbounded racer disks allow`, then remove the old annotation.
+
+Changes apply automatically. When the approved set changes, the dataplane waits
+about 10 seconds for edits to settle, then drains and restarts so storage is
+planned again. A restart drops that node's cache. A disk approved while missing
+also triggers a restart when it appears. Revoking a disk does not erase it.
+
+#### What approval permits
+
+The first and last **1 MiB (1,048,576 bytes)** of each disk are reserved guards
+and must be zero. If either guard is not zero, Racer zeros it, flushes the disk,
+and checks it again. This destroys partition tables (MBR and both GPT copies)
+and filesystem, LVM, and RAID signatures kept there. If the kernel lists
+partitions on the disk, Racer asks it to reread the partition table so they
+disappear. Guards that are already zero are never written, so restarts do not
+rewrite the disk. Racer logs each wipe with the disk ID. The rest of the disk
+is cache space and is overwritten without any check of its contents.
+
+Even when approved, Racer refuses a disk that is:
+
+- mounted, or has a mounted partition;
+- held by another device such as dm, md, or LVM, or has a held partition;
+- read-only;
+- too small for both guards and one segment;
+- busy: another process holds it open exclusively, or the partition table
+  reread fails with `EBUSY` because a partition is open. Racer rereads the
+  table before writing either guard, so a busy disk is refused unwiped.
+
+Idle partitions do not block approval; they are wiped. Racer opens disks with
+`O_RDWR | O_DIRECT | O_EXCL`. An open that fails with `EBUSY`, for example while a
+replaced dataplane still holds the disk, is retried every 250 ms until
+`RACER_DEVICE_BUSY_WAIT_SECS` passes. All busy disks share one deadline. If no
+approved disk is usable, or the usable disks are too small for all workers'
+reserves, storage falls back to slab files.
+
+#### Disk states
+
+Each dataplane reports every disk that has a `disk/by-id` name in its Pod
+annotation `racer.unbounded-cloud.io/report`, under `disks`. The list is
+rescanned every 60 seconds, so new disks show up without a restart. Disks that
+are not approved are never opened; they are classified from sysfs and the mount
+table only.
+
+| State | Meaning | Reasons |
+|-------|---------|---------|
+| `claimed` | Approved and in use as cache | |
+| `available` | Not approved; can be approved | |
+| `unavailable` | Not approved; could not be used | `mounted`, `held`, `read-only`, `too-small`, `io-error` (the host mount table could not be read) |
+| `rejected` | Approved, but not usable | `mounted`, `held`, `read-only`, `too-small`, `busy`, `not-whole-disk`, `io-error`, `wipe-failed`, `duplicate` |
+| `missing` | Approved, but no disk with that ID exists | |
+
+Each entry has an `id`, the preferred stable name: a `wwn-*` name first, then
+`nvme-eui.*`, then other `nvme-*`, `scsi-*`, or `ata-*` names. `aliases` lists
+all of the disk's by-id names. `dev`, `size_bytes`, `model`, and `serial` are
+included when known. `duplicate` means the ID is another path to a disk that is
+already approved. Entries are sorted by `id`. If the list does not fit in the
+32 KiB report, `available` and `unavailable` entries are dropped first.
 
 The managed privileged container mounts host `/dev` read-only at `/host/dev`.
-This protects directory entries, **not device contents**: raw writes are
-intentional. `RACER_SLAB_DIRECTORY` still holds `checkpoint.0` and `checkpoint.1`
+This protects directory entries, **not device contents**: raw writes to
+approved disks are intentional. `RACER_SLAB_DIRECTORY` still holds `checkpoint.0` and `checkpoint.1`
 and must remain writable and available.
 
 Device mode uses `floor((device_bytes - 2 MiB) / segment_bytes)` segments per
@@ -899,10 +966,13 @@ clocks synchronized.
 | `/debug/aead`, `/debug/decrypt-failures`, `/debug/send-crc` | Bounded crypto and checksum failure details |
 | `/debug/terminal`, `/debug/admission-final`, `/debug/candidate-final` | Bounded final-outcome records |
 | `/debug/gate-events`, `/debug/flight-expiry` | Bounded gate and in-flight expiry events |
-| `/debug/hardware` | Live JSON report of block devices, RDMA devices, and Racer's claimed disks and RDMA rails |
+| `/debug/hardware` | Live JSON report of block devices, RDMA devices, and Racer's approved, claimed, and per-disk status and RDMA rails |
 | `/debug/pprof/profile?seconds=30` | Opt-in native CPU profile |
 
 `/debug/hardware` reads sysfs on every request. It never opens block devices.
+Its `racer` section lists `approved_disks` from startup, `claimed_disks`, and
+`disks`, with the same entries, states, and reasons as the Pod report (see
+[disk states](#disk-states)).
 The read runs on a helper thread, so a slow read does not delay health checks.
 Values it cannot read are `null`, and section failures are listed in `errors`.
 It returns 503 `response_too_large` if the JSON does not fit in one response

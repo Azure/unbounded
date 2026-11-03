@@ -41,6 +41,7 @@ mod auth;
 pub mod authority;
 mod config;
 mod control;
+pub mod disks;
 pub mod entropy;
 mod exec;
 mod http;

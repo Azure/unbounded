@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	netcmd "github.com/Azure/unbounded/cmd/kubectl-unbounded/app/net"
+	racercmd "github.com/Azure/unbounded/cmd/kubectl-unbounded/app/racer"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -26,6 +27,7 @@ func Run() {
 	root.AddCommand(siteCommandGroup())
 	root.AddCommand(machineCommandGroup())
 	root.AddCommand(netcmd.Command())
+	root.AddCommand(racercmd.Command())
 	root.AddCommand(overridesCommandGroup())
 	root.AddCommand(installCommand())
 	root.AddCommand(version.Command())

@@ -22,7 +22,7 @@ const CLUSTER_SENTINEL: &str = "cluster";
 
 /// Embedded cluster-control service as seen by dataplane startup.
 pub trait ClusterControl: Send + Sync + 'static {
-    /// Wait up to `timeout` for durable cluster state; return cluster and device selector.
+    /// Wait up to `timeout` for durable cluster state; return cluster and approved disks.
     fn bootstrap(&self, timeout: Duration) -> std::result::Result<Bootstrapped, BootstrapError>;
 
     /// Shared, discovery-refreshed elected endpoint set.
@@ -30,6 +30,26 @@ pub trait ClusterControl: Send + Sync + 'static {
 
     /// Enqueue a Pod report of shares and rails; must not block the caller.
     fn report(&self, shares: u32, rails: Vec<racer_control_wire::RailMapping>);
+
+    /// Enqueue per-disk status for the Pod report; must not block the caller.
+    fn report_disks(&self, _disks: Vec<racer_cluster_control::disks::DiskStatus>) {}
+
+    /// Latest approved disks for this node, or `None` when not yet known.
+    fn approved_disks(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Latest approved disks and approval revision, read together.
+    fn approval(&self) -> Option<racer_cluster_control::disks::Approval> {
+        self.approved_disks()
+            .map(|disks| racer_cluster_control::disks::Approval {
+                disks,
+                revision: None,
+            })
+    }
+
+    /// Enqueue the approval revision the reported disk states reflect.
+    fn report_disks_revision(&self, _revision: Option<String>) {}
 }
 
 /// Cluster state returned once cluster control has initialized or joined it.
@@ -37,8 +57,8 @@ pub struct Bootstrapped {
     /// Cluster UID derived from the cluster state Secret.
     pub cluster: ClusterId,
 
-    /// Optional device selector for this node.
-    pub block_devices: Option<String>,
+    /// Approved disks for this node.
+    pub disks: Vec<String>,
 }
 
 /// Whether bootstrap may still succeed on a later attempt.
@@ -128,7 +148,8 @@ fn start_with(
     let managed = Managed {
         endpoints: control.endpoints(),
         report: std::sync::Arc::new(move |shares, rails| reporter.report(shares, rails)),
-        block_devices: bootstrapped.block_devices,
+        disks: bootstrapped.disks,
+        control: Some(control),
     };
     adopt(config, bootstrapped.cluster, managed)
 }
@@ -285,7 +306,8 @@ mod tests {
         Managed {
             endpoints: Default::default(),
             report: std::sync::Arc::new(|_, _| {}),
-            block_devices: Some("nvme*".into()),
+            disks: vec!["nvme-a".into()],
+            control: None,
         }
     }
 
@@ -452,7 +474,7 @@ mod tests {
     fn bootstrapped(cluster: &str) -> std::result::Result<Bootstrapped, BootstrapError> {
         Ok(Bootstrapped {
             cluster: ClusterId(cluster.into()),
-            block_devices: Some("nvme*".into()),
+            disks: vec!["nvme-a".into()],
         })
     }
 
@@ -460,7 +482,7 @@ mod tests {
     fn start_retries_until_bootstrap_then_binds_endpoints_and_report() {
         let d = Directory::new("start");
         let mut config = managed_config(&d.0);
-        config.max_threads = 3;
+        config.max_threads = 4;
         let control = std::sync::Arc::new(Scripted::new(vec![
             Err(BootstrapError::Retry),
             Err(BootstrapError::Retry),
@@ -474,7 +496,7 @@ mod tests {
             &managed.endpoints,
             &control.endpoints
         ));
-        assert_eq!(managed.block_devices.as_deref(), Some("nvme*"));
+        assert_eq!(managed.disks, ["nvme-a"]);
         (managed.report)(7, Vec::new());
         assert_eq!(*control.reports.lock().unwrap(), vec![(7, 0)]);
     }
@@ -495,7 +517,7 @@ mod tests {
             Err(Error::Cancelled)
         );
         let mut config = managed_config(&d.0);
-        config.max_threads = 2;
+        config.max_threads = 3;
         assert_eq!(
             start(&mut config, never, &|| false),
             Err(Error::InvalidConfiguration)

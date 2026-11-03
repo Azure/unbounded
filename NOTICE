@@ -920,15 +920,6 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/facebook/react/blob/HEAD/LICENSE
-  - dependency: regex
-    ecosystem: cargo
-    copyright:
-      - Copyright (c) 2014 The Rust Project Developers
-    license:
-      - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-APACHE
-      - name: MIT License
-        link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-MIT
   - dependency: ring
     ecosystem: cargo
     copyright:
