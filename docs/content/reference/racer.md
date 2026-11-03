@@ -110,9 +110,8 @@ spec:
 - Object metadata (ETag, size, expiry) is not reused across reads, so each read
   revalidates with the origin. One read still pins one object version for all
   of its pages.
-- Retention is refused. A HEAD that asks for retention still returns metadata,
-  but without `Racer-Retain-Until`, and counts in `racer_warm_refused_total`.
-  Owners refuse hold and warm fill requests for the cache.
+- Prefetch is refused. A [prefetch](#prefetch) `PUT` returns
+  `409 passthrough`, and owners refuse prefetch fills for the cache.
 - `spec.priority` still weights in-flight memory use.
 - With the `Local` route, `racer_passthrough_local_origin_fills_total` counts
   pages that a node read from its own origin.
@@ -261,13 +260,10 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
 | `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |
 | `RACER_ADMISSION_PERIOD_SECS` | `60` | History rotation period; 1..86,400 seconds |
-| `RACER_WARM_MAX_TTL_SECS` | `3600` | Maximum admitted warm TTL; 1..86,400 seconds |
-| `RACER_WARM_FILL_TIMEOUT_SECS` | `600` | Independent background fill deadline; 1..86,400 seconds |
-| `RACER_WARM_MAX_JOBS` | `16` | Node-wide tracked warm versions, including completed jobs until expiry; 1..1024 |
-| `RACER_WARM_WINDOW_PAGES` | `2` | Maximum in-flight pages per warm job; 1..64 |
 | `RACER_RANGE_WINDOW_PAGES` | `2` | Pages each read fetches ahead of delivery, in any order; 1..64. Per-worker plaintext budget must fit one page more than the window |
+| `RACER_PREFETCH_*` | See [prefetch settings](#prefetch-settings) | Prefetch limits |
 | `RACER_RANGE_SPILL_PAGES` | `0` | Pages past the read window that a read may fetch to local disk under a short hold; 0..1024; `0` disables spill |
-| `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
+| `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker [spill-hold](#spill-holds) cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
@@ -463,163 +459,328 @@ Racer-Destination-Length: <length>
 - When the read ends for any reason, the dataplane waits for its GPU work,
   then releases the memory. See [GPU reads](#gpu-reads).
 
-### Warm and hard retention
+### Prefetch
 
-Send `HEAD` on the client socket with `Cache-Control: max-age=<seconds>` to request
-warming of the whole selected version. The value is a positive integer TTL in
-seconds, clamped to `RACER_WARM_MAX_TTL_SECS`. No `max-age`, or `max-age=0`, is an
-ordinary metadata request. Duplicate, malformed, negative, or overflowing
-`max-age` values are rejected. `If-Match` selects one strong ETag; without it,
-Racer resolves the current version. The retention hint applies only to HEAD,
-not to reads or origin requests.
+Prefetch asks Racer to load object ranges into the cache before a job reads
+them. It is best effort. Racer does not pin or retain prefetched pages: they are
+stored like any other cached page and can be evicted later.
 
-| HEAD result | Meaning |
-|-------------|---------|
-| `200` with `Racer-Retain-Until` | Retention admitted; the header is an absolute Unix timestamp in milliseconds, not a TTL or completion signal |
-| `200` without `Racer-Retain-Until` | Metadata succeeded but retention was refused; do not assume warming started |
-| Non-success status | Metadata, version selection, or request processing failed |
+Prefetch uses a JSON API on the client socket
+(`/run/racer/<cache>/client/socket`) with HTTP/1.1 and `Host: racer`, like
+object reads. A client submits a ticket that lists object ranges. The node finds
+the missing 16 MiB pages and asks each page's owner to fill it through the
+normal fill path. Tickets live in memory on the node that received them. A
+restart loses them; submit the same ticket again and only missing pages are
+loaded.
 
-Admission reserves capacity before returning the header. Filling continues
-asynchronously with a separate cancellation scope. The TTL starts at HEAD
-admission and runs during the fill, so a short TTL can expire before all pages
-load. Repeated requests for the same cache, key, and ETag share the job and can
-extend, but never shorten, its hold. Admission can be refused because of job,
-storage, index, or request-context limits, or shutdown. A successful metadata
-response does not make these limits optional.
+| Method | Path | Purpose |
+|--------|------|---------|
+| `PUT` | `/v1/prefetches/{id}` | Create or update a ticket |
+| `GET` | `/v1/prefetches/{id}` | Ticket status; query `wait`, `coverage`, `refs`, `cursor` |
+| `DELETE` | `/v1/prefetches/{id}` | Cancel a ticket |
+| `GET` | `/v1/prefetches` | List this cache's tickets on this node |
 
-Warm stores pages in the normal cache topology. Each page is held and stored by
-its **primary owner**, the first-ranked node for that page under the membership
-the requesting node used at admission. The requesting node holds only pages it
-is the primary owner of. Admission works like this:
+Other methods return `405` with `Allow: GET, PUT, DELETE` for a ticket path, or
+`Allow: GET` for the list path. `{id}` is chosen by the client, matches
+`[A-Za-z0-9._-]{1,128}`, and is scoped to the socket's cache. `.` and `..` are
+invalid. Query parameters are form-encoded; unknown or repeated parameters are
+`400`.
 
-1. The requesting node finds the primary owner of every page.
-2. It reserves holds for its own pages, and sends one hold request to every
-   other primary owner. Each owner checks that it is the primary owner of at
-   least one page, then reserves holds for the pages it owns.
-3. Admission is all or nothing. If any owner refuses or cannot be reached, the
-   requesting node releases every hold it asked for and the HEAD response has
-   no `Racer-Retain-Until`.
-4. `Racer-Retain-Until` is the earliest expiry that any owner accepted. An owner
-   caps a hold at its own `RACER_WARM_MAX_TTL_SECS`.
+`PUT` needs `Content-Type: application/json` and a body of at most
+`RACER_PREFETCH_MAX_BODY_BYTES`. `Transfer-Encoding`, `Expect`, and
+`Content-Encoding` are rejected. `GET` and `DELETE` take no body. `Authorization`
+is accepted on `PUT` only. Racer sends it to the origin for every ref, keeps it in
+memory only, and replaces it on each accepted `PUT`; a `PUT` without it clears it.
+Prefetch responses close the connection.
 
-The warm job then asks each owner to fill its pages. It starts fills in
-ascending page order, at most `RACER_WARM_WINDOW_PAGES` at a time, and pages can
-finish in any order. A remote owner fills the page through its own normal
-path, writes it to its own disk under the hold, and replies with an
-acknowledgement only. No page bytes go back to the requesting node. Each fill
-request carries the admitted version's length and content type, and an owner
-that fetches a copy with different metadata refuses to store or acknowledge it,
-which fails the job. A busy or
-unreachable owner is retried up to 3 times. If a page still fails, the job
-stops and sends a best-effort release to every owner. Owners that do not get the
-release keep their holds until expiry.
+#### Request body
 
-Owners track holds per requesting node and warm job (a lease), so several nodes
-can warm the same version on one owner. An owner frees unused hold capacity only
-after the last lease for that version is released or expires. A release never
-drops pages already written under a hold; they stay held until the hold expires.
+```json
+{
+  "cache_uid": "5b0c7a5e-2f7d-4b8e-9d0e-6f6f2f3b1a10",
+  "priority": "normal",
+  "generation": 0,
+  "sequence": 0,
+  "ttl_seconds": 600,
+  "max_pending_bytes": 0,
+  "refs": [
+    {"key": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+     "etag": "\"0x8DC1A2B3C4D5E6F\"", "offset": 0, "length": 1073741824,
+     "metadata": "opaque"},
+    {"key": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"}
+  ]
+}
+```
 
-Lease entries are bounded. A repeated HEAD for the same requesting node and warm
-job extends its existing lease (never shortening it) instead of adding one. A
-new lease is refused as overloaded once the version has 64 live leases or the
-node has 64 times `RACER_WARM_MAX_JOBS` live leases; expired leases are pruned
-first, and existing leases are never affected by a refusal.
+| Field | Default | Rules |
+|-------|---------|-------|
+| `cache_uid` | Absent | If set, must equal the live ClusterCache UID, else `409 cache_uid_mismatch` |
+| `priority` | `normal` | `high`, `normal`, or `low` |
+| `generation` | `0` | 0 to 2^53-1 |
+| `sequence` | `0` | 0 to 2^53-1 |
+| `ttl_seconds` | `600` | At least 1; capped at `RACER_PREFETCH_MAX_TTL_SECS`. Status shows the applied value |
+| `max_pending_bytes` | `0` | Bound on the ticket's in-flight bytes. `0` means `RACER_PREFETCH_DEFAULT_PENDING_BYTES`; capped at `RACER_PREFETCH_MAX_PENDING_BYTES` |
+| `refs` | Required | 1 to `RACER_PREFETCH_MAX_REFS` entries |
+| `refs[].key` | Required | 64 lowercase hex characters, as in `/v1/objects/{key}` |
+| `refs[].etag` | Absent | Strong quoted ETag, as in `If-Match`. If absent, Racer resolves the current version once at submit |
+| `refs[].offset` | `0` | Must be less than the object length, else the ref fails with `invalid_range` |
+| `refs[].length` | To end | At least 1 when set; clamped to the object end |
+| `refs[].metadata` | Absent | Sent to the origin like `Racer-Metadata` |
 
-Reads of that exact version on the requesting node follow the warm job. Each
-page a read needs waits only for that page's warm fill, not for earlier pages.
-While it waits, the read starts no competing peer requests or fills. After a page is warm, a read of a page held on this node reads it
-from local disk. A read of a page held by another owner uses the normal fill
-path, which reaches that owner's held copy. Their own deadlines and credits
-still apply. If the warm
-job fails or expires, waiting reads use the normal fill path. A different ETag
-never joins the old job. Reads on other nodes do not wait for warm progress.
+Unknown fields are `400`. Duplicate refs are allowed; each page is loaded once.
+If version lookup fails for a ref, that ref fails and the `PUT` still succeeds.
+A ref to an empty object with offset 0 and no length succeeds with no pages.
+`max_pending_bytes` limits dispatched bytes, but a ticket with nothing in flight
+can always send one page.
 
-Limits of primary-owner holds:
+#### Generation and sequence
 
-- **Membership changes.** Holds are not moved when membership changes. If a
-  page gets a new primary owner, the old owner still holds its copy until
-  expiry, and reads may fill the page again from the new owner's path.
-- **Clock skew.** Hold expiry travels between nodes as a wall-clock time. Each
-  owner compares it with its own clock, so skew between nodes shifts the
-  actual expiry by the same amount.
-- **Mixed versions.** Older dataplanes do not support remote holds. A warm that
-  needs an older owner is refused.
+Each ticket stores the `(generation, sequence)` of its last accepted `PUT`, here
+`(G, S)`. Racer also stores a hash of the body and of whether `Authorization` was
+present.
 
-Retention is separate from freshness. An unpinned request still refreshes expired
-current-version metadata. Pin `Get` to the returned ETag to read the warmed version;
-retention does not force later unpinned reads to select it.
+| Incoming `(g, s)` | Result |
+|-------------------|--------|
+| No ticket | Created, `201` |
+| `g == G`, `s == S`, same body | `200` with current status; renews the TTL |
+| `g == G`, `s == S`, different body | `409 payload_mismatch` |
+| `g == G`, `s > S` | Replaces the wanted set, `200` |
+| `g == G`, `s < S` | `409 stale_sequence` |
+| `g > G` | Replaces the wanted set and starts a new generation, `200` |
+| `g < G` | `409 stale_generation` |
 
-Hard holds bypass second-sight and veto both page-index eviction and reclamation
-of a segment containing a held record. Each owner charges **one whole segment per
-held page**, including short pages and existing local copies. This is conservative
-capacity accounting, not a dedicated warm tail or one-page physical layout.
-Existing local copies stay where they are and are not rewritten. The charge
-leaves room for the eviction veto even when records are fragmented across segments.
-It can reject a request well before the disk's payload-byte capacity is full.
-Each worker must fit its pages within the retained percentage of both segments
-and index entries, while preserving the free-segment reserve and unused index
-reservations. Worker imbalance can also cause refusal.
+A one-shot batch is one `PUT` with `(0, 0)`. A rolling window is the same ticket
+updated with a higher `sequence`. When the wanted set is replaced, pages no
+longer wanted lose this ticket's interest. Queued pages that no ticket wants are
+dropped. Fills already in flight finish. A `PUT` with a higher position also
+restarts a finished ticket.
 
-Progress means verified ciphertext has been published on disk, not merely queued
-for writing. If a later page fails, completed disk pages keep their admitted
-deadlines; unused reservation capacity is released after outstanding persistence
-finishes. Retention is not a guarantee against corruption, key loss, cache removal,
-or storage failure.
+Every accepted `PUT` renews the TTL. When the TTL ends, a ticket that is still
+working becomes `CANCELLED` with reason `expired`. A settled ticket keeps its
+state. Either way it releases its interest. Nothing is evicted. Finished tickets
+stay visible for `RACER_PREFETCH_TICKET_RETENTION_SECS` after expiry or cancel.
 
-The background job owns a charged, zeroizing copy of `Authorization` and `Metadata`
-in memory only. It uses the fill timeout (600 seconds by default), separate from
-the HEAD deadline and retention TTL. Credentials are never checkpointed. On
-restart, jobs, waiters, and unused reservations are gone. Checkpoints restore
-only unexpired holds for completed disk records. Live hold expiry waits for both
-wall and monotonic deadlines; restart has only the saved wall-clock deadline.
-Neither payload nor checkpoint publication adds `fsync`, so process or host
-failure can lose pages or holds.
+#### Status
 
-Warm gauges refresh on worker health ticks (normally every 100 ms). They report
-the shared node registry once, without worker, object, or version labels. A
-stalled worker can leave an older sample visible; samples are not atomic with
-storage or request state.
+`GET /v1/prefetches/{id}` and successful `PUT` and `DELETE` calls return:
+
+```json
+{
+  "id": "epoch-17",
+  "cache_uid": "5b0c7a5e-2f7d-4b8e-9d0e-6f6f2f3b1a10",
+  "state": "PARTIAL",
+  "reason": null,
+  "priority": "normal",
+  "generation": 2,
+  "sequence": 5,
+  "settled": true,
+  "ttl_seconds": 600,
+  "expires_at_ms": 1793750400000,
+  "created_at_ms": 1793749800000,
+  "updated_at_ms": 1793749810000,
+  "refs_total": 2,
+  "refs_succeeded": 1,
+  "refs_failed": 1,
+  "refs_pending": 0,
+  "bytes": {
+    "logical_requested": 1073741824,
+    "aligned_requested": 1090519040,
+    "already_resident": 268435456,
+    "queued": 0,
+    "in_flight": 0,
+    "joined": 16777216,
+    "fetched_from_origin": 805306368,
+    "admitted": 1090519040,
+    "failed": 16777216
+  },
+  "coverage": {"resident_bytes": 1073741824, "observed_at_ms": 1793749811000},
+  "refs": [
+    {"index": 1, "key": "60303ae2...c752", "etag": null,
+     "offset": 0, "length": 16777216, "outcome": "failed",
+     "error": "version_changed"}
+  ],
+  "next_cursor": null
+}
+```
+
+| `state` | Meaning |
+|---------|---------|
+| `QUEUED` | Accepted; nothing sent yet |
+| `RUNNING` | Pages are queued or in flight |
+| `SUCCEEDED` | Settled; every ref succeeded |
+| `PARTIAL` | Settled; some refs failed |
+| `FAILED` | Settled; every ref failed |
+| `CANCELLED` | Stopped. `reason` is `client`, `expired`, `superseded` (cache UID changed), `cache_removed`, or `passthrough` |
+
+`reason` is `null` unless the state is `CANCELLED`. `settled` is true when
+nothing for the current position is queued or in flight. A settled window goes
+back to `RUNNING` on its next update.
+
+A ref succeeds when every one of its pages was stored or already present at an
+owner when the ticket settled. Success does not mean the pages stay in the
+cache; normal eviction can remove them later.
+
+`bytes` values are 16 MiB aligned except `logical_requested`:
+
+| Field | Meaning |
+|-------|---------|
+| `logical_requested` | Sum of ref lengths |
+| `aligned_requested` | Bytes of distinct pages |
+| `already_resident` | Present when planned |
+| `queued`, `in_flight` | Current |
+| `joined` | Joined a fill already in progress |
+| `fetched_from_origin` | Started a new origin fill |
+| `admitted` | Stored or already present |
+| `failed` | Belong to failed refs |
+
+Query parameters:
+
+- `wait=<duration>` waits until the ticket settles or the time ends, then
+  returns status with `200` either way. Use Go-style units `ms`, `s`, or `m`
+  (`500ms`, `30s`, `2m`). The limit is `RACER_PREFETCH_MAX_WAIT_SECS`; larger is
+  `400`. Closing the connection ends the wait.
+- `coverage=1` asks the owners which pages of the wanted set they hold now and
+  adds `coverage`. It is a snapshot taken at `observed_at_ms`, not a promise.
+  Owners that do not answer count as not holding the page.
+- `refs=failed` or `refs=all` adds per-ref results, 256 per response. Pass
+  `next_cursor` back as `cursor` for the next page. A cursor from another
+  position is `400`. `index` is the ref position in the `PUT`. `outcome` is
+  `succeeded`, `failed`, or `pending`. `etag` is the resolved ETag, or `null`.
+
+Ref `error` values:
+
+| Error | Meaning |
+|-------|---------|
+| `version_changed` | The version is no longer available |
+| `not_found` | The object does not exist |
+| `forbidden` | The origin rejected the request |
+| `origin_error` | The origin or owner failed after retries |
+| `peer_unsupported` | The owner runs a dataplane without prefetch |
+| `budget_timeout` | The owner stayed busy after `RACER_PREFETCH_MAX_ATTEMPTS` tries |
+| `invalid_range` | The offset is past the object end |
+
+`GET /v1/prefetches` returns `{"prefetches": [...]}`: summaries sorted by id,
+without `refs` or `coverage`.
+
+`DELETE` returns `200` with the `CANCELLED` status and reason `client`. It
+releases interest. Fills in flight finish and nothing is evicted.
+
+#### Errors
+
+Every non-2xx prefetch response has `Content-Type: application/json` and a body
+like:
+
+```json
+{"code": "stale_sequence", "message": "sequence 3 is older than current 5"}
+```
+
+`message` is for people and can change. Object read errors still have empty
+bodies.
+
+| Status | `code` | When |
+|--------|--------|------|
+| `400` | `invalid_request` | Bad JSON, field, id, query, or header |
+| `404` | `not_found` | Unknown id on `GET` or `DELETE` |
+| `405` | | Method not allowed |
+| `409` | `cache_uid_mismatch`, `payload_mismatch`, `stale_sequence`, `stale_generation`, `passthrough` | See above. A `PUT` to a [passthrough](#passthrough) cache is `409 passthrough` |
+| `413` | `too_large` | Body over `RACER_PREFETCH_MAX_BODY_BYTES` or refs over `RACER_PREFETCH_MAX_REFS` |
+| `429` | `ticket_limit`, `pending_limit` | Node ticket or pending-byte limit. `Retry-After` gives 1 to 60 seconds |
+| `503` | `unavailable` | Node is draining or the cache is not ready |
+
+Before answering `429 ticket_limit`, Racer drops the oldest finished ticket to
+make room.
+
+#### How prefetch runs
+
+- **Priority.** `high` goes before `normal`, and `normal` before `low`. Within a
+  priority, tickets take turns. Within a ticket, refs go in order.
+- **Owners.** Each page goes to its first-ranked owner, which fills it through the
+  shared fill table and stores it with normal eviction. If membership changes,
+  queued pages go to the new owner, and stored pages of live tickets whose owner
+  left are queued again.
+- **Shared work.** Tickets that want the same page share one fill.
+- **Demand reads come first.** A read that needs a page being prefetched joins
+  that fill and takes it out of the prefetch limits. Queued prefetch work never
+  delays reads.
+- **Owner limits.** An owner runs at most `RACER_PREFETCH_CONCURRENT_FILLS`
+  prefetch fills and, if set, at most `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` of
+  origin reads for prefetch. Over a limit it tells the sender to retry later.
+- **Retries.** Busy, unavailable, and I/O failures are retried with backoff
+  (100 ms base, doubling, 10 s cap, random jitter) up to
+  `RACER_PREFETCH_MAX_ATTEMPTS` times per page. Then the ref fails with
+  `budget_timeout` or `origin_error`.
+- **Cache changes.** Switching a cache to passthrough cancels its tickets
+  (`passthrough`). Removing the ClusterCache or changing its UID cancels them
+  (`cache_removed`).
+
+Read the prefetched data with the ETag from the ref status, or pin the ETag in
+the ref, so later reads select the same version.
+
+#### Prefetch settings
+
+Set these in `racer-settings` like the [dataplane settings](#dataplane-configuration).
+Out-of-range values fail startup.
+
+| Setting | Default | Range | Meaning |
+|---------|---------|-------|---------|
+| `RACER_PREFETCH_MAX_BODY_BYTES` | `4194304` (4 MiB) | 4,096..67,108,864 | `PUT` body limit |
+| `RACER_PREFETCH_MAX_REFS` | `16384` | 1..1,048,576 | Refs per `PUT` |
+| `RACER_PREFETCH_MAX_TICKETS` | `1024` | 1..65,536 | Live and finished tickets per node, all caches |
+| `RACER_PREFETCH_MAX_TTL_SECS` | `3600` | 1..86,400 | TTL limit |
+| `RACER_PREFETCH_TICKET_RETENTION_SECS` | `300` | 0..86,400 | How long finished tickets stay visible |
+| `RACER_PREFETCH_MAX_WAIT_SECS` | `60` | 1..600 | `wait` limit |
+| `RACER_PREFETCH_DEFAULT_PENDING_BYTES` | `1073741824` (1 GiB) | 16 MiB..`RACER_PREFETCH_MAX_PENDING_BYTES` | Per-ticket in-flight bound when `max_pending_bytes` is 0 |
+| `RACER_PREFETCH_MAX_PENDING_BYTES` | `17179869184` (16 GiB) | 16 MiB..2^50 | Limit on `max_pending_bytes` |
+| `RACER_PREFETCH_NODE_PENDING_BYTES` | `68719476736` (64 GiB) | 16 MiB..2^52 | Node-wide queued and in-flight bytes; checked on each `PUT` that creates or changes a ticket; over it is `429` |
+| `RACER_PREFETCH_CONCURRENT_FILLS` | `16` | 1..1,024 | Concurrent prefetch fills per owner |
+| `RACER_PREFETCH_ORIGIN_BYTES_PER_SEC` | `0` | 0..2^40 | Prefetch origin read rate per owner; `0` turns the limit off |
+| `RACER_PREFETCH_MAX_ATTEMPTS` | `5` | 1..32 | Tries per page |
+
+The old `RACER_WARM_*` settings are no longer used.
+
+#### Prefetch metrics
+
+All prefetch metrics have a `priority` label.
+`racer_prefetch_tickets_finished_total` also has `outcome`: `succeeded`,
+`partial`, `failed`, or `cancelled`.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `racer_prefetch_requested_bytes_total` | counter | Logical bytes requested |
+| `racer_prefetch_aligned_bytes_total` | counter | Page-aligned bytes requested |
+| `racer_prefetch_already_resident_bytes_total` | counter | Bytes already present when planned |
+| `racer_prefetch_queued_bytes` | gauge | Bytes waiting to be sent |
+| `racer_prefetch_fetched_bytes_total` | counter | Bytes that started a new origin fill |
+| `racer_prefetch_joined_bytes_total` | counter | Bytes that joined a fill in progress |
+| `racer_prefetch_admitted_bytes_total` | counter | Bytes stored or already present |
+| `racer_prefetch_failed_bytes_total` | counter | Bytes that failed |
+| `racer_prefetch_demand_joins_total` | counter | Reads that joined a prefetch fill |
+| `racer_prefetch_demand_wait_seconds` | histogram | Time from a read joining a prefetch fill to fill completion |
+| `racer_prefetch_retries_total` | counter | Page retries |
+| `racer_prefetch_deferrals_total` | counter | Owner "retry later" answers |
+| `racer_prefetch_throttle_seconds_total` | counter | Time spent waiting on owner limits |
+| `racer_prefetch_window_updates_total` | counter | Accepted ticket updates |
+| `racer_prefetch_window_dropped_bytes_total` | counter | Bytes dropped from the wanted set by updates |
+| `racer_prefetch_tickets` | gauge | Tickets on the node |
+| `racer_prefetch_tickets_finished_total` | counter | Tickets that finished, by outcome |
+
+### Spill holds
+
+Spill (`RACER_RANGE_SPILL_PAGES`) keeps pages on local disk under a short hard
+hold. Holds bypass second-sight and block eviction of the page and reclamation
+of its segment. Each held page is charged one whole segment. Each worker must
+fit its held pages within `RACER_RETAINED_SEGMENT_PERCENT` of both segments and
+index entries, while keeping the free-segment reserve. That setting now governs
+only spill holds.
+
+These gauges refresh on worker health ticks (normally every 100 ms) and are
+summed across storage workers. They were named `racer_warm_held_*` before.
 
 | Metric | Meaning |
 | --- | --- |
-| `racer_warm_tracked_jobs` | Tracked versions, including completed jobs until expiry or removal; not just running fills |
-| `racer_warm_waiters` | Registered GET page waits for warm progress; excludes HEAD admissions and unregistered reads |
-| `racer_warm_held_pages` | Published indexed pages under live hard holds; excludes unused reservations and pending writes |
-| `racer_warm_held_payload_bytes` | Logical payload bytes of those pages, excluding tags, headers, and padding |
-| `racer_warm_held_segments` | Distinct segments containing those pages, summed across storage workers |
-
-Held gauges use each storage worker's latest health snapshot. Expired holds are
-excluded after both wall and monotonic deadlines pass. Recovered holds count even
-without a live warm job. Repeated samples replace worker values rather than add
-them; the node sum is not an atomic storage snapshot.
-
-Counters record retention decisions after metadata succeeds, admitted job outcomes,
-and genuine registered GET waits. Immediate warm hits, registry misses, and failed
-waiter registration do not count as waits. Caller disconnection does not change a
-detached admission's decision or count it twice.
-
-| Counter | Meaning |
-| --- | --- |
-| `racer_warm_accepted_total` | Accepted HEAD retention admissions, including coalesced requests |
-| `racer_warm_refused_total` | Refused HEAD retention admissions |
-| `racer_warm_completed_total` | Jobs that finished publishing their pages |
-| `racer_warm_failed_total` | Admitted jobs that stopped before completion, including abandoned drivers |
-| `racer_warm_wait_started_total` | Registered GET waits, counted once rather than on each poll |
-| `racer_warm_wait_completed_total` | Registered waits satisfied by warm publication |
-| `racer_warm_wait_fallback_total` | Registered waits released to normal Fill after warm stopped |
-| `racer_warm_wait_failed_total` | Registered waits ended by error, cancellation, deadline, or abandonment |
-| `racer_warm_remote_hold_accepted_total` | Hold requests this node sent that a remote owner accepted |
-| `racer_warm_remote_hold_refused_total` | Hold requests this node sent that a remote owner refused or that failed |
-| `racer_warm_remote_fill_completed_total` | Pages a remote owner acknowledged as written under its hold |
-| `racer_warm_remote_fill_retried_total` | Remote page fills retried after a busy or unreachable owner |
-| `racer_warm_remote_fill_failed_total` | Remote page fills that failed and stopped the job |
-| `racer_warm_remote_release_sent_total` | Releases a remote owner acknowledged |
-| `racer_warm_remote_release_failed_total` | Releases that failed; that owner keeps its hold until expiry |
-| `racer_warm_owner_hold_accepted_total` | Hold requests this node accepted as primary owner |
-| `racer_warm_owner_hold_refused_total` | Hold requests this node refused, including when it owns none of the pages |
-| `racer_warm_owner_fill_completed_total` | Pages this node wrote to disk for a remote warm job |
-| `racer_warm_owner_fill_failed_total` | Remote warm fills this node refused or failed |
-| `racer_warm_owner_released_total` | Leases released by remote warm jobs |
+| `racer_held_pages` | Published indexed pages under live holds |
+| `racer_held_payload_bytes` | Logical payload bytes of those pages |
+| `racer_held_segments` | Distinct segments containing those pages |
 
 ### Second-sight disk retention
 
@@ -659,7 +820,7 @@ queue. Segment reclamation favors
 segments that hold mostly over-share data; under-share pages in a recycled
 segment are still lost. A non-owned page is not admitted when its cache is over
 share and the worker has no free segments beyond the reserve. Owned pages are
-always admitted. Warm and spill holds are never evicted.
+always admitted. Spill holds are never evicted.
 
 Ownership hints use completed rankings for the current accepted placement.
 Missing or obsolete hints provide no bonus until refreshed. Each worker also
@@ -1068,39 +1229,75 @@ is the complete SDK reference, including configuration, the copy and no-copy rea
 paths, the origin contract, and error handling. The SDK does not provision caches
 or origins.
 
-### Warm an exact version
+### Prefetch
 
-The method signature is:
+The Go SDK wraps the [prefetch API](#prefetch):
 
 ```go
-func (c *Client) Warm(ctx context.Context, request Request, ttl time.Duration, opts WarmOptions) (WarmResult, error)
+func (c *Client) Prefetch(ctx context.Context, id string, spec PrefetchSpec) (PrefetchStatus, error)
+func (c *Client) PrefetchStatus(ctx context.Context, id string, opts StatusOptions) (PrefetchStatus, error)
+func (c *Client) CancelPrefetch(ctx context.Context, id string) (PrefetchStatus, error)
+func (c *Client) ListPrefetches(ctx context.Context) ([]PrefetchStatus, error)
+func SplitPrefetch(id string, spec PrefetchSpec, maxRefs, maxBodyBytes int) []PrefetchPart
+func (c *Client) NewPrefetchWindow(id string, spec PrefetchSpec) *PrefetchWindow
+func (w *PrefetchWindow) Update(ctx context.Context, refs []PrefetchRef) (PrefetchStatus, error)
+func (w *PrefetchWindow) Reset(ctx context.Context, refs []PrefetchRef) (PrefetchStatus, error)
 ```
 
-`WarmOptions{}` selects the current version; `WarmOptions{ETag: tag}` pins a strong
-ETag. `ttl` must be positive; the SDK rounds it up to whole seconds and rejects
-rounding overflow. `WarmResult` contains `Metadata` and `RetainUntil`. A zero
-`RetainUntil` means refusal, not a metadata error. A nonzero value is admission,
-not fill completion. `Warm` shares the SDK's bounded Stat lane; `Stat` itself does
-not request warming.
+`PrefetchSpec.TTL` is rounded up to whole seconds; `0` uses the server default.
+`PrefetchRef.Length` `0` means to the end of the object. `PrefetchStatus.Created`
+is true when the `PUT` created the ticket. A rejected request returns
+`*PrefetchError` with `Status`, `Code`, `Message`, and `RetryAfter`. It matches
+`ErrInvalidRequest` for `400` and `413`, `ErrNotFound` for `404`, and
+`ErrUnavailable` for `429` and `503`.
 
-With an existing `client`, `ctx`, and `request`:
+With an existing `client`, `ctx`, and object `key`:
 
 ```go
-warmed, err := client.Warm(ctx, request, 10*time.Minute, racersdk.WarmOptions{})
+status, err := client.Prefetch(ctx, "epoch-17", racersdk.PrefetchSpec{
+    Refs: []racersdk.PrefetchRef{{Key: key}},
+})
 if err != nil {
     return err
 }
-// A zero RetainUntil means this Get may need a normal cache fill.
-object, err := client.Get(ctx, request, racersdk.ReadOptions{ETag: warmed.Metadata.ETag})
+status, err = client.PrefetchStatus(ctx, "epoch-17", racersdk.StatusOptions{
+    Wait: 30 * time.Second,
+    Refs: "failed",
+})
 if err != nil {
     return err
 }
-defer object.Close()
+// PARTIAL or FAILED: inspect status.Refs. Reads still work through normal fills.
 ```
 
-Read and close `object` as usual. Pinning the ETag, rather than calling an unpinned
-`Get`, selects the version admitted by `Warm`. See [warm and hard retention](#warm-and-hard-retention)
-for server limits, partial failures, and restart behavior.
+`SplitPrefetch` splits a large spec into parts that fit the server's ref and
+body limits. Zero limits use the defaults (16,384 refs, 4 MiB). Part ids are
+`<id>.<n>`, counting from 0.
+
+`PrefetchWindow` keeps one rolling ticket. `Update` increments the sequence and
+`Reset` increments the generation and sets the sequence to 0. A failed call does
+not roll the position back.
+
+```go
+window := client.NewPrefetchWindow("reader-0", racersdk.PrefetchSpec{Priority: "high"})
+if _, err := window.Update(ctx, nextRefs); err != nil {
+    return err
+}
+```
+
+The Python client in `clients/python/racer` has the same calls:
+`prefetch(id, spec)`, `prefetch_status(id, wait=None, coverage=False,
+refs=None, cursor=None)`, `cancel_prefetch(id)`, `list_prefetches()`,
+`split_prefetch`, `PrefetchWindow` (`update` and `reset`), and `PrefetchError`
+(`status`, `code`, `message`, `retry_after`).
+
+```python
+import racer
+
+client = racer.Client(cache="artifacts")
+client.prefetch("epoch-17", racer.PrefetchSpec(refs=[racer.PrefetchRef(key=key)]))
+status = client.prefetch_status("epoch-17", wait=30, refs="failed")
+```
 
 | Socket | Path |
 |--------|------|
