@@ -154,9 +154,10 @@ impl PrefetchMetrics {
 
     pub fn demand_wait(&self, priority: Priority, wait: Duration) {
         let histogram = &self.demand_wait[priority.index()];
-        let millis = wait.as_millis().min(u128::from(u64::MAX)) as u64;
+        // Compare the exact duration so fractional milliseconds are not
+        // truncated into a lower bucket than the recorded sum implies.
         for (bucket, bound) in histogram.buckets.iter().zip(WAIT_BUCKETS_MS) {
-            if millis <= bound {
+            if wait <= Duration::from_millis(bound) {
                 saturating_add(bucket, 1);
             }
         }
@@ -260,6 +261,45 @@ fn saturating_add(counter: &AtomicU64, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bucket_counts(metrics: &PrefetchMetrics, priority: Priority) -> Vec<u64> {
+        metrics.demand_wait[priority.index()]
+            .buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    #[test]
+    fn demand_wait_buckets_do_not_truncate_fractional_millis() {
+        let cases: [(Duration, usize); 7] = [
+            (Duration::ZERO, 0),
+            (Duration::from_millis(1), 0),
+            (Duration::from_micros(1001), 1),
+            (Duration::from_micros(1900), 1),
+            (Duration::from_millis(5), 1),
+            (Duration::from_micros(5900), 2),
+            (Duration::from_nanos(60_000_000_001), WAIT_BUCKETS_MS.len()),
+        ];
+        for (wait, first) in cases {
+            let metrics = PrefetchMetrics::default();
+            metrics.demand_wait(Priority::Low, wait);
+            let expected: Vec<u64> = (0..WAIT_BUCKETS_MS.len())
+                .map(|i| u64::from(i >= first))
+                .collect();
+            assert_eq!(bucket_counts(&metrics, Priority::Low), expected, "{wait:?}");
+        }
+        let metrics = PrefetchMetrics::default();
+        metrics.demand_wait(Priority::Low, Duration::MAX);
+        assert!(
+            bucket_counts(&metrics, Priority::Low)
+                .iter()
+                .all(|&c| c == 0)
+        );
+        let histogram = &metrics.demand_wait[Priority::Low.index()];
+        assert_eq!(histogram.count.load(Ordering::Relaxed), 1);
+        assert_eq!(histogram.sum_micros.load(Ordering::Relaxed), u64::MAX);
+    }
 
     #[test]
     fn exposition_has_fixed_labels_and_saturates() {
