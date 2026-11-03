@@ -64,6 +64,15 @@ type ClusterCacheSpec struct {
 	// passthrough, data previously cached for it is dropped.
 	// +optional
 	Passthrough *Passthrough `json:"passthrough,omitempty"`
+
+	// NodeSelector selects, by Node labels, the Racer nodes that store, serve,
+	// and read this cache. When unset or empty, every Racer node does.
+	// Changing it moves the cache to a new pool of nodes with no migration:
+	// pages are refilled from the origin. The Racer admission webhook
+	// restricts client pods that use this cache to matching nodes, and the
+	// managed origin DaemonSet (spec.origin) runs only on matching nodes.
+	// +optional
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
 }
 
 // PassthroughRoute selects which node's origin serves a passthrough read.
