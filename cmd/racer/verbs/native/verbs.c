@@ -92,6 +92,12 @@ _Static_assert(IBV_WC_SEND == 0 && IBV_WC_RDMA_WRITE == 1 && IBV_WC_BIND_MW == 5
  * No bounce buffer or extra copy is involved: the NIC reads the sender's page
  * memory and writes the receiver's page buffer, as in window mode. */
 #define RDMA_VERBS_HUGE (2u << 20)
+/* Registration-mode writes go out in chunks of this size (at most a port's
+ * message size on supported devices). The last chunk carries the immediate,
+ * whose top byte counts the chunks before it, so the receiver reports the
+ * whole length: Racer tags use only the low 24 bits. */
+#define RDMA_VERBS_CHUNK (8u << 20)
+#define RDMA_VERBS_TAG_MASK 0x00ffffffu
 #define RDMA_VERBS_CM_MAGIC 0x52435231u /* "RCR1" */
 struct rdma_verbs_cm_req { uint32_t magic, initiator, responder; };
 /* Receives posted before a registration-mode QP exists. */
@@ -266,6 +272,7 @@ static int cm_start(struct rdma_verbs_device *d, uint8_t port) {
     union ibv_gid gid;
     if (index < 0 || ibv_query_gid(d->ctx, port, index, &gid)) return -1;
     d->max_msg = pa.max_msg_sz ? pa.max_msg_sz : (1u << 30);
+    if (d->max_msg < RDMA_VERBS_CHUNK) return -1;
     struct rdma_verbs_cm *cm = calloc(1, sizeof(*cm));
     if (!cm) return -1;
     pthread_mutex_init(&cm->lock, NULL);
@@ -940,7 +947,11 @@ static int dyn_write_imm(struct rdma_verbs_qp *q, uint64_t addr, uint32_t length
     if (head && !(e->mr[0] = ibv_reg_mr(q->dev->pd, (void *)(uintptr_t)addr, head, access))) goto fail;
     if (tail && !(e->mr[1] = ibv_reg_mr(q->dev->pd, (void *)(uintptr_t)(addr + head), tail, access)))
         goto fail;
-    uint64_t max = q->dev->max_msg ? q->dev->max_msg : length;
+    if (imm & ~RDMA_VERBS_TAG_MASK) goto fail_inval;
+    uint64_t max = RDMA_VERBS_CHUNK;
+    uint32_t before = length ? (uint32_t)((length - 1) / max) : 0;
+    if (before > 0xff) goto fail_inval;
+    imm |= before << 24;
     pthread_mutex_lock(&q->lock);
     if (!q->qp) { pthread_mutex_unlock(&q->lock); goto fail; }
     for (uint64_t off = 0; off < length;) {
@@ -978,6 +989,10 @@ fail:
     for (int i = 0; i < 2; ++i) if (e->mr[i]) (void)ibv_dereg_mr(e->mr[i]);
     free(e);
     return errno ? errno : EIO;
+fail_inval:
+    for (int i = 0; i < 2; ++i) if (e->mr[i]) (void)ibv_dereg_mr(e->mr[i]);
+    free(e);
+    return EINVAL;
 }
 
 /* Release a completed write's source registrations. Caller holds q->lock. */
@@ -1114,6 +1129,13 @@ int rdma_verbs_poll(struct rdma_verbs_qp *q, struct rdma_verbs_wc *out, uint32_t
         if (wc[i].wc_flags & IBV_WC_WITH_IMM) {
             o->imm = ntohl(wc[i].imm_data);
             o->flags = RDMA_VERBS_WC_IMM;
+#ifndef RDMA_VERBS_NO_REGISTRATION
+            if (q->dev && wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
+                uint64_t whole = (uint64_t)(o->imm >> 24) * RDMA_VERBS_CHUNK + o->byte_len;
+                o->imm &= RDMA_VERBS_TAG_MASK;
+                o->byte_len = whole > UINT32_MAX ? UINT32_MAX : (uint32_t)whole;
+            }
+#endif
         }
     }
     return n;

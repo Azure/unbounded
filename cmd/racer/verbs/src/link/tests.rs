@@ -1141,3 +1141,14 @@ fn implicit_region_is_required_and_send_only() {
     drop(implicit);
     finish(p);
 }
+
+#[test]
+fn tags_stay_below_24_bits_and_skip_zero() {
+    let sim = Simulation::new();
+    let now = Instant::now();
+    let mut side = side(&sim, 1, Role::Initiator, 1, now);
+    side.link.next_tag = TAG_MASK - 1;
+    assert_eq!(side.link.allocate_tag(), TAG_MASK);
+    // Wraps within 24 bits, past zero.
+    assert_eq!(side.link.allocate_tag(), 1);
+}
