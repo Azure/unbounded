@@ -171,6 +171,20 @@ impl AzureTokenSource for AzureTokens {
     }
 
     fn rejected(&self, credential: &AzureCredential, challenge: Option<&[u8]>, sent: bool) -> bool {
+        self.rejected_at(credential, challenge, sent, Instant::now())
+    }
+}
+
+impl AzureTokens {
+    /// [`AzureTokenSource::rejected`] at `now`, so tests can step the
+    /// invalidation window without sleeping.
+    fn rejected_at(
+        &self,
+        credential: &AzureCredential,
+        challenge: Option<&[u8]>,
+        sent: bool,
+        now: Instant,
+    ) -> bool {
         let Some((key, provider)) = provider(credential) else {
             return false;
         };
@@ -185,7 +199,6 @@ impl AzureTokenSource for AzureTokens {
         if let Some(challenge) = challenge {
             cache.learn_tenant(challenge);
         }
-        let now = Instant::now();
         let mut sources = self.sources.borrow_mut();
         let Some(entry) = sources.get_mut(&key) else {
             return false;
@@ -205,6 +218,96 @@ impl AzureTokenSource for AzureTokens {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::RemoteEndpoint;
+    use crate::remote::tests::{MapResolver, serve};
+    use crate::test_support::enrollment::{drive, reactor, scope};
+    use std::sync::atomic::Ordering;
+
+    fn managed(client_id: &str) -> AzureCredential {
+        AzureCredential::ManagedIdentity {
+            client_id: Some(client_id.into()),
+        }
+    }
+
+    fn bearer(tokens: &AzureTokens, credential: &AzureCredential) -> String {
+        let scope = scope();
+        let token = drive(
+            &tokens.reactor,
+            Box::pin(async { Ok(tokens.bearer(credential, &scope).await) }),
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        String::from_utf8(token.as_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn rejected_tokens_refresh_at_most_once_per_window_per_credential() {
+        // IMDS names each token after the requesting client and request count.
+        let count = Arc::new(Mutex::new(0usize));
+        let seen = count.clone();
+        let (address, accepted, server) = serve(None, 6, move |head, _| {
+            let mut count = seen.lock().unwrap();
+            *count += 1;
+            let client = if head.contains("client_id=a ") {
+                "a"
+            } else {
+                "b"
+            };
+            let body = format!(
+                "{{\"access_token\":\"{client}-{count}\",\"expires_in\":\"3600\",\"token_type\":\"Bearer\"}}"
+            );
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+        });
+        let Some(reactor) = reactor() else {
+            let _ = std::net::TcpStream::connect(address);
+            return;
+        };
+        let caches = Arc::new(AzureTokenCaches::new(AuthEndpoints {
+            imds: RemoteEndpoint::http("127.0.0.1", address.port()).unwrap(),
+            authority: "https://login.microsoftonline.com/".into(),
+            federated_token_file: None,
+            tls: None,
+        }));
+        let tokens =
+            AzureTokens::new(caches, reactor).with_resolver(Rc::new(MapResolver::new(Vec::new())));
+        let (a, b) = (managed("a"), managed("b"));
+
+        assert!(!tokens.rejected(&AzureCredential::Anonymous, None, true));
+        assert_eq!(bearer(&tokens, &a), "a-1");
+        assert_eq!(bearer(&tokens, &b), "b-2");
+
+        // A rejected token is dropped and the next bearer fetches a new one.
+        let start = Instant::now();
+        assert!(tokens.rejected_at(&a, None, true, start));
+        assert_eq!(bearer(&tokens, &a), "a-3");
+        // Other credentials keep their tokens.
+        assert_eq!(bearer(&tokens, &b), "b-2");
+
+        // Within the window a second rejection keeps the token.
+        let within = start + INVALIDATE_INTERVAL - Duration::from_millis(1);
+        assert!(!tokens.rejected_at(&a, None, true, within));
+        assert_eq!(bearer(&tokens, &a), "a-3");
+        // The window is per credential.
+        assert!(tokens.rejected_at(&b, None, true, within));
+        assert_eq!(bearer(&tokens, &b), "b-4");
+        assert_eq!(bearer(&tokens, &a), "a-3");
+
+        // Once the window passes the rejected token is dropped again.
+        assert!(tokens.rejected_at(&a, None, true, start + INVALIDATE_INTERVAL));
+        assert_eq!(bearer(&tokens, &a), "a-5");
+        assert_eq!(bearer(&tokens, &b), "b-4");
+        assert_eq!(accepted.load(Ordering::SeqCst), 5);
+
+        drop(tokens);
+        // Unblock the server's remaining accept.
+        let _ = std::net::TcpStream::connect(address);
+        server.join().unwrap();
+    }
 
     #[test]
     fn credentials_map_to_distinct_caches() {
