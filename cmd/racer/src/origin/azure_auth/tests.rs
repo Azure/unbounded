@@ -184,9 +184,8 @@ fn managed_identity_caches_refreshes_and_invalidates() {
         let mut seen = seen.lock().unwrap();
         seen.push(head.to_owned());
         let index = seen.len();
-        // Short lifetimes: refresh at half-life (one second).
         ok(
-            &token_json(&format!("token-{index}"), "\"expires_in\":\"2\""),
+            &token_json(&format!("token-{index}"), "\"expires_in\":\"3600\""),
             index.is_multiple_of(2),
         )
     });
@@ -203,7 +202,10 @@ fn managed_identity_caches_refreshes_and_invalidates() {
     assert_eq!(&*bearer(&source).unwrap(), "token-1");
     assert_eq!(&*bearer(&source).unwrap(), "token-1");
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
-    std::thread::sleep(Duration::from_millis(1100));
+    // Reaching the refresh time fetches again; no sleeping on wall time.
+    if let Some(token) = source.cache.token.lock().unwrap().as_mut() {
+        token.refresh = SystemTime::now() - Duration::from_secs(1);
+    }
     assert_eq!(&*bearer(&source).unwrap(), "token-2");
     source.invalidate();
     assert_eq!(&*bearer(&source).unwrap(), "token-3");
