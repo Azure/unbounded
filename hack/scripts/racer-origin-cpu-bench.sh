@@ -30,7 +30,8 @@
 #   BEFORE_BIN, AFTER_BIN  binary directories per variant (from `build`)
 #   CONTROL_BIN   directory holding the mode-aware racer-performance-control used
 #                 by every variant [$AFTER_BIN, else $BEFORE_BIN]
-#   TOOLS_BIN     fake-azure-blob + racer-origin-bench [$BEFORE_BIN or $AFTER_BIN]
+#   TOOLS_BIN     fake-azure-blob + racer-origin-bench [$AFTER_BIN, else
+#                 $BEFORE_BIN if it has both tools]
 #   OUT           output directory [<repo>/tmp/racer-origin-bench/results-default]
 #   VARIANTS      ["before after"], alternated and reversed on odd repetitions
 #   MODES         ["cached"]; passed to the control as RACER_BENCH_MODE
@@ -68,6 +69,23 @@ busy() {
   pgrep -l -x 'compile|rustc|cargo|link|docker-buildx|go' | awk '{print $2}' | sort | uniq -c | xargs echo -n || true
 }
 
+# tools_dir prints TOOLS_BIN if set, else the first of AFTER_BIN and BEFORE_BIN
+# holding both shared tools, else AFTER_BIN (or BEFORE_BIN) so errors name it.
+tools_dir() {
+  if [ -n "${TOOLS_BIN:-}" ]; then
+    echo "$TOOLS_BIN"
+    return
+  fi
+  local d
+  for d in "${AFTER_BIN:-}" "${BEFORE_BIN:-}"; do
+    if [ -n "$d" ] && [ -x "$d/fake-azure-blob" ] && [ -x "$d/racer-origin-bench" ]; then
+      echo "$d"
+      return
+    fi
+  done
+  echo "${AFTER_BIN:-${BEFORE_BIN:-}}"
+}
+
 case "${1:-}" in
   build)
     dir=${2:?build DIR}
@@ -96,7 +114,7 @@ case "${1:-}" in
       printf 'Build processes are active; rerun after they finish (or ALLOW_BUILDS=1):\n%s\n' "$(busy)" >&2
       exit 1
     fi
-    tools=${TOOLS_BIN:-${BEFORE_BIN:-${AFTER_BIN:-}}}
+    tools=$(tools_dir)
     [ -n "$tools" ] || { echo 'set BEFORE_BIN/AFTER_BIN (and optionally TOOLS_BIN)' >&2; exit 2; }
     control=${CONTROL_BIN:-${AFTER_BIN:-${BEFORE_BIN:-}}}
     mkdir -p "$OUT/results" "$OUT/work"
@@ -160,7 +178,7 @@ case "${1:-}" in
     exit "${PIPESTATUS[0]}"
     ;;
   summarize)
-    tools=${TOOLS_BIN:-${BEFORE_BIN:-${AFTER_BIN:-}}}
+    tools=$(tools_dir)
     if [ -n "$tools" ] && [ -x "$tools/racer-origin-bench" ]; then
       "$tools/racer-origin-bench" summarize -dir "$OUT/results"
     else
@@ -168,7 +186,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    sed -n '4,59p' "$0" >&2
+    sed -n '4,60p' "$0" >&2
     exit 2
     ;;
 esac
