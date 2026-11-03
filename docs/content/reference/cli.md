@@ -295,6 +295,20 @@ kubectl unbounded machine register \
 
 ---
 
+### `kubectl unbounded machine manual-bootstrap`
+
+Generate the bootstrap script or cloud-init payload for a host. Run
+`kubectl unbounded machine manual-bootstrap --help` for all flags; the one that
+selects where the node stack runs is:
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--isolation` | string | empty (`nspawn`) | `nspawn`, `none`, or `container`. Other values are rejected. |
+
+See [Selecting a mode]({{< relref "reference/agent/isolation#selecting-a-mode" >}}).
+
+---
+
 ### `kubectl unbounded machine operation`
 
 Create and watch `MachineOperation` resources.
@@ -406,7 +420,7 @@ name, default `--ttl 300`, and `--wait=true`.
 
 | Command | Operation kind | Notes |
 |---------|----------------|-------|
-| `kubectl unbounded machine node-reboot NAME` | `NodeReboot` | Restarts the nspawn-backed Kubernetes node. |
+| `kubectl unbounded machine node-reboot NAME` | `NodeReboot` | Restarts the node stack (nspawn machine, host units, or container, by isolation mode). The host does not reboot. |
 | `kubectl unbounded machine host-hard-reboot NAME` | `HostHardReboot` | Reboots or power-cycles the host through the owning backend. |
 | `kubectl unbounded machine host-soft-reboot NAME` | `HostSoftReboot` | Reboots the host OS through the in-host agent (`systemctl reboot`). |
 | `kubectl unbounded machine power-off NAME` | `HostPowerOff` | Powers off the host. |
@@ -477,8 +491,22 @@ kubectl unbounded overrides status
 |----------|-------------|
 | `KUBECONFIG` | Fallback kubeconfig path when `--kubeconfig` is not provided |
 
+## Agent subcommands for node access
+
+Two `unbounded-agent` subcommands, run on the host, reach the node stack in every
+isolation mode:
+
+| Command | Description |
+|---------|-------------|
+| `unbounded-agent exec -- <cmd...>` | Run a command in the node stack. |
+| `unbounded-agent logs [--unit NAME] [--follow] [--lines N]` | Stream the journal of a unit in the node stack. |
+
+See [Running commands and reading logs]({{< relref "reference/agent/isolation#running-commands-and-reading-logs" >}}).
+
 ## See Also
 
+- **[Isolation Modes]({{< relref "reference/agent/isolation" >}})** -- Where the
+  node stack runs, and how to choose and change between modes.
 - **[Getting Started]({{< relref "guides/getting-started" >}})** -- Walks
   through `site init` and `machine register` step by step.
 - **[SSH Guide]({{< relref "guides/ssh" >}})** -- Detailed SSH provisioning

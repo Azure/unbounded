@@ -1,10 +1,14 @@
 ---
-title: "systemd-nspawn Isolation"
-weight: 3
-description: "How the unbounded-agent uses systemd-nspawn to isolate Kubernetes worker node components."
+title: "nspawn Mode"
+weight: 4
+description: "The default isolation mode: the node stack runs in a systemd-nspawn machine."
+aliases:
+  - /reference/agent/nspawn/
 ---
 
-The unbounded-agent runs all Kubernetes worker node components inside a
+`nspawn` is the default [isolation mode]({{< relref "reference/agent/isolation" >}}).
+A host with no recorded mode is an `nspawn` host. In this mode the
+unbounded-agent runs all Kubernetes worker node components inside a
 [systemd-nspawn](https://www.freedesktop.org/software/systemd/man/latest/systemd-nspawn.html)
 container. This provides lightweight OS-level isolation (separate filesystem,
 PID, and cgroup namespaces) while sharing the host kernel. The container runs
@@ -12,7 +16,25 @@ a full systemd init tree so that kubelet, containerd, and their dependencies
 are managed as regular systemd services, decoupled from anything running on the
 host.
 
-![Host and nspawn container boundary: unbounded-agent, machinectl, and systemd-nspawn on the host; systemd, containerd, kubelet, CNI plugins, and pod containers inside the nspawn container; shared network namespace across both](../../../img/nspawn-host-container-boundary.svg)
+The agent and its daemon always run on the host. Only the node stack (containerd,
+kubelet, CNI plugins, and CoreDNS) lives in the machine.
+
+## Requirements
+
+- The `systemd-container` package, which provides `systemd-nspawn` and
+  `machinectl`. Bootstrap installs it when it is missing.
+- Writable `/etc` and `/var`. The machine rootfs is `/var/lib/machines/<name>`
+  and its configuration lives under `/etc/systemd`.
+
+An immutable host with a read-only `/usr` and no package manager cannot install
+`systemd-container`. Use the [`container`]({{< relref "reference/agent/isolation-container" >}})
+mode there, or an image that already carries the nspawn tools.
+
+`nspawn` is used when nothing else is configured; see
+[Selecting a mode]({{< relref "reference/agent/isolation#selecting-a-mode" >}}) to
+select it explicitly.
+
+![Host and nspawn container boundary (nspawn mode only): unbounded-agent, machinectl, and systemd-nspawn on the host; systemd, containerd, kubelet, CNI plugins, and pod containers inside the nspawn container; shared network namespace across both](../../../img/nspawn-host-container-boundary.svg)
 
 ## Why nspawn
 
@@ -429,8 +451,59 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback, unless `NSpawnLifecycle` is set. On a host installed by a release before `/opt/unbounded/agent`, that directory is a link to `/usr/local` until the agent moves the files; see [Where the agent installs]({{< relref "guides/agent#where-the-agent-installs" >}}). |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
+## Operations
+
+How each machine operation behaves in `nspawn` mode. The other modes have the
+same operations with different mechanics; see their pages and the
+[comparison]({{< relref "reference/agent/isolation#comparison" >}}).
+
+| Operation | Behavior |
+|---|---|
+| Bootstrap | Host preparation, unpack the rootfs into the slot (`kube1` or `kube2`), render the nspawn config and service override, start the machine, then start the stack inside it. See [Startup](#startup). |
+| Start | `systemd-nspawn@<slot>.service` starts the machine and its in-machine units. The pre-start and post-start hooks reconcile devices, mounts, and GPU state. |
+| Stop | The agent stops kubelet and containerd inside the machine first, then stops the machine, so the machine stop does not force-kill them. |
+| Soft reboot (`NodeReboot`) | Restarts the machine unit, which reruns config regeneration and the post-start hook. The host does not reboot. See [Pre-start and post-start hooks](#machine-configuration). |
+| Repave and upgrade | Blue/green. A new rootfs is prepared in the alternate slot, the node moves to it, and the old slot is removed. Each slot has its own private bpffs mount. |
+| Reset | Stops the slot, removes its configuration and rootfs, cleans up bpffs, then removes host-global state. See [Removal](#removal). |
+| Health | The machine is registered with `machinectl`, kubelet is healthy, and LocalDNS answers when enabled. |
+| Exec and logs | `unbounded-agent exec` and `unbounded-agent logs` reach the machine through `systemd-run --machine`. Usage is in [Running commands and reading logs]({{< relref "reference/agent/isolation#running-commands-and-reading-logs" >}}). |
+| GPU and devices | Device and library bind-mounts plus `DeviceAllow=` rules in the nspawn config. See [Machine Configuration](#machine-configuration). |
+| LocalDNS | CoreDNS runs inside the machine. Its link-local listeners are on the host network namespace. |
+| Uninstall | The uninstall script reads the mode from the applied config and removes the machines, `.nspawn` files, and overrides. A host with no recorded mode gets this cleanup. |
+
+## Limits
+
+- Requires `systemd-container` and a writable `/etc` and `/var`.
+- Hosts with an enforcing SELinux policy can deny `systemd-machined` actions.
+  The agent works around the `machinectl remove` denial described under
+  [Removal](#removal).
+- Each machine has a private bpffs mount. eBPF CNIs that pin objects under
+  `/sys/fs/bpf` see only their own machine's mount.
+- The lifecycle hooks and the `nspawn-lifecycle` helper are specific to this
+  mode. Their names are kept stable across agent rollbacks.
+- The diagrams on this page are specific to `nspawn`.
+
+## Troubleshooting
+
+These recipes use `machinectl` directly and apply to `nspawn` hosts only. Prefer
+`unbounded-agent exec` and `unbounded-agent logs`.
+
+| Symptom | Check |
+|---|---|
+| Node never starts | `sudo machinectl list` and `sudo systemctl status systemd-nspawn@kube1.service`. A post-start failure fails the unit and systemd retries it. |
+| No shell in the machine | `sudo machinectl shell kube1 /bin/sh`. The machine must be running. |
+| Kubelet is unhealthy | `sudo machinectl shell kube1 /bin/journalctl -u kubelet --no-pager -n 100`. |
+| Which slot is active | The slot with `/etc/unbounded/agent/<slot>-applied-config.json`. |
+| `machinectl remove` reports `Access denied` | Expected on SELinux-enforcing Fedora. The agent falls back to deleting the inactive rootfs. |
+| GPU libraries missing in the machine | Check the bind-mounts in `/etc/systemd/nspawn/<slot>.nspawn`. See [NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}}). |
+| Node did not complete first bootstrap | Reset the partial deployment and bootstrap again; `NodeReboot` is not a recovery path for a partially provisioned first boot. |
+
 ## See Also
 
+- **[Isolation Modes]({{< relref "reference/agent/isolation" >}})**:
+  Compare modes and choose one.
+- **[Changing the Isolation Mode]({{< relref "reference/agent/isolation-migration" >}})**:
+  Declare another mode and apply it with the node's next repave.
 - **[Agent Configuration]({{< relref "reference/agent/configuration" >}})**:
   JSON config file specification including `MachineName` and `OCIImage`.
 - **[NVIDIA GPU Support]({{< relref "reference/gpu/nvidia" >}})**:

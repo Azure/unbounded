@@ -5,9 +5,12 @@ description: "How the unbounded-agent exposes AMD GPUs so the AMD Kubernetes dev
 ---
 
 The unbounded-agent detects AMD GPUs on the host and exposes the device nodes
-and sysfs paths required by the AMD Kubernetes device plugin inside the
-`systemd-nspawn` machine. Kubernetes resource advertisement is still handled by
-a user-deployed AMD device plugin.
+and sysfs paths required by the AMD Kubernetes device plugin inside the node
+stack. Kubernetes resource advertisement is still handled by a user-deployed AMD
+device plugin. Most of this page describes the default `nspawn`
+[isolation mode]({{< relref "reference/agent/isolation" >}}); see
+[GPU support by isolation mode](#gpu-support-by-isolation-mode) for `none` and
+`container`.
 
 ## Prerequisites
 
@@ -22,7 +25,17 @@ The AMD Kubernetes device plugin must also be deployed in the cluster. The agent
 does not install the plugin, configure ROCm userspace libraries, or create a
 custom containerd runtime for AMD GPUs.
 
+## GPU support by isolation mode
+
+| Mode | How AMD devices and sysfs paths reach the node stack |
+|---|---|
+| [`nspawn`]({{< relref "reference/agent/isolation-nspawn" >}}) | `Bind=` entries, read-only sysfs bind-mounts, and `DeviceAllow=` rules in the nspawn config. The rest of this page describes this mode. |
+| [`none`]({{< relref "reference/agent/isolation-none" >}}) | Native. The node stack runs on the host and sees `/dev/kfd`, `/dev/dri/*`, and the AMD sysfs paths directly. Nothing is bind-mounted. |
+| [`container`]({{< relref "reference/agent/isolation-container" >}}) | The same device and sysfs requests become OCI mounts, devices, and cgroup device rules. Provisional and unverified on Azure Container Linux. |
+
 ## How It Works
+
+This section describes `nspawn` mode.
 
 AMD GPU support is intentionally limited to making host hardware visible inside
 the nspawn machine so the AMD device plugin can do the Kubernetes-level
@@ -80,9 +93,9 @@ ls -ld /sys/module/amdgpu /sys/class/kfd /sys/class/drm
 ls -l /dev/kfd /dev/dri/card* /dev/dri/renderD*
 ```
 
-Inside the nspawn machine, check:
+Inside the node stack, in any isolation mode, check:
 
 ```bash
-machinectl shell <machine-name> /bin/ls -ld /sys/module/amdgpu /sys/class/kfd /sys/class/drm
-machinectl shell <machine-name> /bin/ls -l /dev/kfd /dev/dri/card* /dev/dri/renderD*
+sudo unbounded-agent exec -- ls -ld /sys/module/amdgpu /sys/class/kfd /sys/class/drm
+sudo unbounded-agent exec -- sh -c 'ls -l /dev/kfd /dev/dri/card* /dev/dri/renderD*'
 ```
