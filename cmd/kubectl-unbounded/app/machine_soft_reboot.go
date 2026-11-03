@@ -37,7 +37,11 @@ The agent issues the reboot and, once it starts again on the new boot,
 updates the MachineOperation status to "Complete" or "Failed".
 
 To restart only the nspawn-backed node without rebooting the host, use
-"node-reboot".`,
+"node-reboot".
+
+To inspect the node afterwards, on the host run 'unbounded-agent logs
+--unit kubelet' or 'unbounded-agent exec -- crictl ps'. These work in every
+isolation mode. For nspawn hosts, 'machinectl shell kube1' is also available.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ctrl.SetupSignalHandler()

@@ -30,6 +30,7 @@ import (
 	"github.com/Azure/unbounded/internal/kube"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 )
 
 //go:embed assets/node-bootstrap/script.sh
@@ -93,6 +94,10 @@ type manualBootstrapHandler struct {
 	// it is included in the AgentConfig JSON so the agent uses a container
 	// image to bootstrap the machine rootfs.
 	ociImage string
+
+	// isolation selects where the node stack runs (nspawn, none or container).
+	// Empty means nspawn.
+	isolation string
 
 	// sandboxImage overrides the containerd CRI sandbox image.
 	sandboxImage string
@@ -376,6 +381,10 @@ func (h *manualBootstrapHandler) validate() error {
 		return fmt.Errorf("invalid --node-label: %w", err)
 	}
 
+	if _, err := isolation.ParseMode(h.isolation); err != nil {
+		return fmt.Errorf("invalid --isolation: %w", err)
+	}
+
 	if h.variant == "" {
 		h.variant = string(variantScript)
 	}
@@ -478,6 +487,8 @@ func (h *manualBootstrapHandler) buildAgentConfig(ctx context.Context) (*provisi
 		NodeLabels:         labels,
 		RegisterWithTaints: h.taints,
 	}
+
+	machine.Spec.Isolation = unboundedv1alpha3.IsolationMode(h.isolation)
 
 	machine.Spec.Agent = &unboundedv1alpha3.AgentSpec{Image: h.ociImage}
 	if h.localDNS {
@@ -728,6 +739,7 @@ Examples:
 	cmd.Flags().StringVar(&handler.nodeIP, "node-ip", "", "IP address to pass to kubelet")
 	cmd.Flags().BoolVar(&handler.localDNS, "local-dns", false, "Enable the nspawn-local CoreDNS cache")
 	cmd.Flags().StringVar(&handler.ociImage, "oci-image", "", "OCI image source for the agent rootfs (registry reference, HTTPS OCI layout archive, or oci-layout:// URL)")
+	cmd.Flags().StringVar(&handler.isolation, "isolation", "", "Where the node stack runs: nspawn (default), none or container")
 	cmd.Flags().StringVar(&handler.sandboxImage, "sandbox-image", "", "Containerd CRI sandbox image reference")
 	cmd.Flags().StringVar(&handler.offlineArtifactsSource, "offline-artifacts-source", "", "Offline rootfs binary artifact source to embed in agent config (absolute path, file:// URL, HTTPS archive, or oci:// artifact reference)")
 	cmd.Flags().StringArrayVar(&handler.additionalHostMounts, "additional-host-mount", nil, `Extra host bind-mount for the nspawn machine in "source[:target][:ro]" format (can be repeated). target defaults to source; append :ro for a read-only mount`)

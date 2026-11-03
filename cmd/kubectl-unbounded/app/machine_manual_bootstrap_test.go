@@ -1323,3 +1323,37 @@ func TestValidateRejectsIgnitionInputBeforeContactingTheCluster(t *testing.T) {
 		})
 	}
 }
+
+func TestManualBootstrapHandler_Isolation(t *testing.T) {
+	t.Parallel()
+
+	kubeconfigPath := writeTempKubeconfig(t)
+
+	for _, mode := range []string{"", "nspawn", "none", "container"} {
+		h := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: mode}
+		require.NoError(t, h.validate(), "mode %q", mode)
+	}
+
+	h := manualBootstrapHandler{siteName: "dc1", machineName: "my-node", kubeconfigPath: kubeconfigPath, isolation: "microvm"}
+	require.ErrorContains(t, h.validate(), "invalid --isolation")
+
+	// The flag flows into the generated agent config.
+	h = manualBootstrapHandler{
+		siteName:    "dc1",
+		machineName: "my-node",
+		isolation:   "none",
+		kubeCli:     newFakeCluster(t, "dc1"),
+		kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
+		logger:      discardLogger(),
+	}
+
+	cfg, err := h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "none", cfg.Isolation)
+
+	// Unset leaves the default, so generated output is unchanged.
+	h.isolation = ""
+	cfg, err = h.buildAgentConfig(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, cfg.Isolation)
+}
