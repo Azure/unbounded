@@ -20,15 +20,15 @@ UNBOUNDED_VERSION="v0.8.0"
 AGENT_VERSION="v0.2.0"
 VNET_CIDR="10.91.0.0/16"
 CLUSTER_POD_CIDR="10.93.0.0/16"
-FLEX_POD_CIDR="10.95.0.0/16"
+FLEX_POD_CIDR="10.96.0.0/14"
 SERVICE_CIDR="10.94.0.0/16"
 SSH_KEY=""
 SSH_SOURCE_IP=""
 STATE_DIR=""
 TIMEOUT=3600
+BOOTSTRAP_TIMEOUT=""
 ASSUME_YES=false
 PLAN_ONLY=false
-BOOTSTRAP_TRANSPORT="run-command"
 LOCK_HELD=false
 ADMIN_USER="azureuser"
 FLEX_POOL="flexpool"
@@ -37,6 +37,11 @@ CONFIG_TAG="unbounded-flex-config"
 FLEX_ROLE="8f139b0f-7eaf-460b-a9da-5b1246d9ed0d"
 NETWORK_ROLE="4d97b98b-1d4f-4787-a291-c67834d212e7"
 POOL_API_VERSION="2026-05-02-preview"
+VMSS_API_VERSION="2026-04-01"
+NETWORK_API_VERSION="2023-06-01"
+MAX_FLEX_COUNT=1000
+SSH_PORT_START=50000
+SSH_PORT_END=50999
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -44,8 +49,10 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
   printf '%s\n' 'Usage: bash hack/scripts/aks-flex-cluster.sh --name NAME --location REGION [options]'
   printf '%s\n' '
-Creates one AKS system node and three standalone Ubuntu 24.04 Flex VMs by
-default. Reuses matching resources and already-joined hosts on subsequent runs.
+Creates one AKS system node and one Uniform VMSS with three Ubuntu 24.04 Flex
+instances by default. All worker instances share one managed identity and one
+load-balancer public IP for outbound access and per-instance SSH NAT ports.
+New VMSS instances bootstrap automatically, including after a scale-out.
 Requires az >= 2.90.0, kubectl, jq, python3, curl, tar, openssl, and OpenSSH.
 Flex VM sizes must support x86_64; the host image and agent archive use amd64.
 Uses the active Azure account unless --subscription is supplied. The selected
@@ -57,19 +64,18 @@ Options:
   --location REGION           Required Azure region
   --subscription UUID         Azure subscription (default: active account)
   --resource-group NAME       Dedicated resource group (default: NAME)
-  --flex-count N              Flex VM count (default: 3, range: 1-20)
+  --flex-count N              Initial VMSS capacity (default: 3, range: 1-1000)
   --vm-size SKU               Flex VM size (default: Standard_D4s_v6)
   --system-vm-size SKU        AKS system VM size (default: Standard_D4s_v6)
   --kubernetes-version V      Initial AKS version (default: AKS default)
   --unbounded-version TAG     Pinned plugin/operator release (default: v0.8.0)
   --agent-version TAG         Pinned Flex agent release (default: v0.2.0)
-  --vnet-cidr CIDR            IPv4 VNet, /16 through /23 (default: 10.91.0.0/16)
+  --vnet-cidr CIDR            IPv4 VNet, /16 through /20 (default: 10.91.0.0/16)
   --cluster-pod-cidr CIDR     System-site pods (default: 10.93.0.0/16)
-  --flex-pod-cidr CIDR        Flex-site pods (default: 10.95.0.0/16)
+  --flex-pod-cidr CIDR        Flex-site pods, /14 or larger (default: 10.96.0.0/14)
   --service-cidr CIDR         Services (default: 10.94.0.0/16)
   --ssh-key PATH              Existing private key (default: generate in state dir)
   --ssh-source-ip IPv4        SSH source (default: detected public IPv4); always /32
-  --bootstrap-transport MODE  run-command (default, Azure VM agent) or ssh
   --state-dir PATH            State/keys/cache (default: repo tmp/aks-flex/NAME)
   --timeout SECONDS           Per-phase wait timeout (default: 3600)
   --plan                      Print the plan without network calls or file writes
@@ -79,7 +85,10 @@ Options:
 Keep the state directory and use the same provisioning arguments on reruns.
 Changing SSH source IP is supported; topology, keys, sizes, and release changes
 are rejected rather than silently replacing or downgrading existing resources.
-This is not a scaling, upgrade, reset, or teardown tool. It never deletes Azure
+Scale the worker VMSS separately with az vmss scale; reruns retain its current
+capacity. ACR attachment is performed once with a compatible plugin/operator;
+future joined Linux Flex nodes inherit that policy without reattaching ACR.
+This is not an upgrade, reset, or teardown tool. It never deletes Azure
 resources or resets an existing node. A partially bootstrapped host that needs a
 reset is reported, not automatically destroyed. See designs/aks-flex-cluster.md.'
 }
@@ -90,7 +99,7 @@ parse_args() {
       --plan) PLAN_ONLY=true; shift ;;
       --yes) ASSUME_YES=true; shift ;;
       -h|--help) usage; exit 0 ;;
-      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--bootstrap-transport|--state-dir|--timeout)
+      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--state-dir|--timeout)
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
         case "$1" in
           --name) NAME="$2" ;;
@@ -109,7 +118,6 @@ parse_args() {
           --service-cidr) SERVICE_CIDR="$2" ;;
           --ssh-key) SSH_KEY="$2" ;;
           --ssh-source-ip) SSH_SOURCE_IP="$2" ;;
-          --bootstrap-transport) BOOTSTRAP_TRANSPORT="$2" ;;
           --state-dir) STATE_DIR="$2" ;;
           --timeout) TIMEOUT="$2" ;;
         esac
@@ -124,10 +132,9 @@ validate_args() {
   [[ "$LOCATION" =~ ^[a-z][a-z0-9]+$ ]] || die "--location must be an Azure region name"
   RESOURCE_GROUP="${RESOURCE_GROUP:-$NAME}"
   [[ "$RESOURCE_GROUP" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$ && "$RESOURCE_GROUP" != *. ]] || die "invalid resource group name"
-  [[ "$FLEX_COUNT" =~ ^[1-9][0-9]?$ ]] || die "--flex-count must be 1-20"
-  ((FLEX_COUNT <= 20)) || die "--flex-count must be 1-20"
+  [[ "$FLEX_COUNT" =~ ^[1-9][0-9]{0,3}$ ]] || die "--flex-count must be 1-1000"
+  ((FLEX_COUNT <= MAX_FLEX_COUNT)) || die "--flex-count must be 1-1000"
   [[ "$TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || die "--timeout must be a positive integer of at most six digits"
-  [[ "$BOOTSTRAP_TRANSPORT" == ssh || "$BOOTSTRAP_TRANSPORT" == run-command ]] || die "--bootstrap-transport must be ssh or run-command"
   [[ "$VM_SIZE" =~ ^Standard_[a-zA-Z0-9_]+$ && "$SYSTEM_VM_SIZE" =~ ^Standard_[a-zA-Z0-9_]+$ ]] || die "invalid VM size"
   [[ -z "$KUBERNETES_VERSION" || "$KUBERNETES_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--kubernetes-version must be a full x.y.z version"
   local tag
@@ -144,17 +151,18 @@ import sys
 try:
     networks = [ipaddress.IPv4Network(value, strict=True) for value in sys.argv[1:]]
     vnet, cluster, flex, services = networks
-    if not 16 <= vnet.prefixlen <= 23:
-        raise ValueError("VNet must have a /16 through /23 prefix")
-    if cluster.prefixlen > 24 or flex.prefixlen > 24:
-        raise ValueError("pod networks must have /24 or larger address spaces")
+    if not 16 <= vnet.prefixlen <= 20:
+        raise ValueError("VNet must have a /16 through /20 prefix")
+    if cluster.prefixlen > 24 or flex.prefixlen > 14:
+        raise ValueError("system pods need /24 or larger; Flex pods need /14 or larger for 1000 /24 node blocks")
     if services.num_addresses <= 16:
         raise ValueError("service network must have more than 16 addresses")
     for index, network in enumerate(networks):
         if any(network.overlaps(other) for other in networks[index + 1:]):
             raise ValueError("VNet, pod, and service CIDRs must not overlap")
-    subnets = vnet.subnets(new_prefix=24)
-    print(json.dumps({"system": str(next(subnets)), "flex": str(next(subnets)),
+    worker_subnets = vnet.subnets(new_prefix=21)
+    next(worker_subnets)
+    print(json.dumps({"system": str(next(vnet.subnets(new_prefix=24))), "flex": str(next(worker_subnets)),
                       "dns": str(services.network_address + 10)}))
 except ValueError as error:
     print(f"invalid network configuration: {error}", file=sys.stderr)
@@ -164,6 +172,7 @@ PY
   SYSTEM_NODE_CIDR=$(jq -r .system <<<"$network")
   FLEX_NODE_CIDR=$(jq -r .flex <<<"$network")
   DNS_SERVICE_IP=$(jq -r .dns <<<"$network")
+  VMSS_NAME="$NAME-workers"
 }
 
 validate_subscription() {
@@ -199,7 +208,8 @@ print_plan() {
   else
     printf '  SSH ingress:              public IPv4 detected before provisioning\n'
   fi
-  printf '  Bootstrap transport:      %s\n' "$BOOTSTRAP_TRANSPORT"
+  printf '  Worker topology:          Uniform VMSS, automatic instance bootstrap\n'
+  printf '  Worker scale ceiling:     %s; one identity and shared outbound/SSH IP\n' "$MAX_FLEX_COUNT"
   printf '  State:                    %s\n\n' "${STATE_DIR:-$SCRIPT_ROOT/tmp/aks-flex/$NAME}"
 }
 
@@ -277,20 +287,25 @@ prepare_state() {
   [[ -r "$SSH_KEY" ]] || die "SSH private key not readable: $SSH_KEY"
   SSH_KEY="$(cd "$(dirname "$SSH_KEY")" && pwd)/$(basename "$SSH_KEY")"
   ssh-keygen -y -f "$SSH_KEY" > "$STATE_DIR/ssh.pub" || die "cannot derive the SSH public key (unlock encrypted keys before use)"
+  BOOTSTRAP_TIMEOUT="$TIMEOUT"
+  if [[ -f "$STATE_DIR/intent.json" ]]; then
+    BOOTSTRAP_TIMEOUT=$(jq -r '.bootstrapTimeout // empty' "$STATE_DIR/intent.json")
+    [[ "$BOOTSTRAP_TIMEOUT" =~ ^[1-9][0-9]{0,5}$ ]] || die "saved intent is not a VMSS deployment; this script does not migrate standalone VMs"
+  fi
   jq -n --arg subscription "$SUBSCRIPTION" --arg name "$NAME" --arg rg "$RESOURCE_GROUP" \
     --arg location "$LOCATION" --argjson count "$FLEX_COUNT" --arg vm "$VM_SIZE" \
     --arg systemVM "$SYSTEM_VM_SIZE" --arg k8s "$KUBERNETES_VERSION" \
     --arg unbounded "$UNBOUNDED_VERSION" --arg agent "$AGENT_VERSION" \
     --arg vnet "$VNET_CIDR" --arg clusterPods "$CLUSTER_POD_CIDR" \
     --arg flexPods "$FLEX_POD_CIDR" --arg services "$SERVICE_CIDR" \
-    --rawfile sshKey "$STATE_DIR/ssh.pub" \
+    --rawfile sshKey "$STATE_DIR/ssh.pub" --argjson bootstrapTimeout "$BOOTSTRAP_TIMEOUT" \
     '{subscription:$subscription,name:$name,resourceGroup:$rg,location:$location,
-      flexCount:$count,vmSize:$vm,systemVMSize:$systemVM,kubernetesVersion:$k8s,
+      workerTopology:"vmss",bootstrapTimeout:$bootstrapTimeout,flexCount:$count,vmSize:$vm,systemVMSize:$systemVM,kubernetesVersion:$k8s,
       unboundedVersion:$unbounded,agentVersion:$agent,vnetCIDR:$vnet,
       clusterPodCIDR:$clusterPods,flexPodCIDR:$flexPods,serviceCIDR:$services,sshKey:$sshKey}' \
     > "$STATE_DIR/intent.next.json"
   if [[ -f "$STATE_DIR/intent.json" ]]; then
-    cmp -s "$STATE_DIR/intent.json" "$STATE_DIR/intent.next.json" || die "provisioning arguments differ from $STATE_DIR/intent.json; this script does not scale, resize, rotate keys, or upgrade existing clusters"
+    cmp -s "$STATE_DIR/intent.json" "$STATE_DIR/intent.next.json" || die "provisioning arguments differ from $STATE_DIR/intent.json; this script does not migrate standalone VMs, resize, rotate keys, or upgrade existing clusters"
   else
     mv "$STATE_DIR/intent.next.json" "$STATE_DIR/intent.json"
   fi
@@ -576,64 +591,163 @@ ensure_flex_pool() {
   [[ "$(jq -r .properties.orchestratorVersion <<<"$pool")" == "$CURRENT_KUBERNETES_VERSION" ]] || die "Flex pool version differs from the control plane; resolve version skew before onboarding"
 }
 
-ensure_vm() {
-  local name="$1" existing pip nic vm power
-  existing=$(lookup_resource Microsoft.Network/publicIPAddresses "$name-pip")
+ensure_worker_network() {
+  local existing pip lb rule
+  existing=$(lookup_resource Microsoft.Network/publicIPAddresses "$NAME-flex-pip")
   if [[ "$existing" == null ]]; then
-    az_cmd network public-ip create -g "$RESOURCE_GROUP" --name "$name-pip" --location "$LOCATION" \
+    az_cmd network public-ip create -g "$RESOURCE_GROUP" --name "$NAME-flex-pip" --location "$LOCATION" \
       --sku Standard --allocation-method Static --version IPv4 --tags "${TAGS[@]}" -o none
   fi
-  pip=$(az_cmd network public-ip show -g "$RESOURCE_GROUP" --name "$name-pip" -o json)
-  jq -e '.sku.name == "Standard" and .publicIPAllocationMethod == "Static"' <<<"$pip" >/dev/null || die "$name public IP has conflicting settings"
-  existing=$(lookup_resource Microsoft.Network/networkInterfaces "$name-nic")
+  pip=$(az_cmd network public-ip show -g "$RESOURCE_GROUP" --name "$NAME-flex-pip" -o json)
+  jq -e '.sku.name == "Standard" and .publicIPAllocationMethod == "Static"' <<<"$pip" >/dev/null || die "worker public IP has conflicting settings"
+  WORKER_PUBLIC_IP=$(jq -r .ipAddress <<<"$pip")
+  existing=$(lookup_resource Microsoft.Network/loadBalancers "$NAME-flex-lb")
   if [[ "$existing" == null ]]; then
-    az_cmd network nic create -g "$RESOURCE_GROUP" --name "$name-nic" --location "$LOCATION" \
-      --subnet "$FLEX_SUBNET_ID" --public-ip-address "$(jq -r .id <<<"$pip")" --ip-forwarding true --tags "${TAGS[@]}" -o none
+    az_cmd network lb create -g "$RESOURCE_GROUP" --name "$NAME-flex-lb" --location "$LOCATION" \
+      --sku Standard --public-ip-address "$(jq -r .id <<<"$pip")" --frontend-ip-name workers \
+      --backend-pool-name workers --tags "${TAGS[@]}" -o none
   fi
-  nic=$(az_cmd network nic show -g "$RESOURCE_GROUP" --name "$name-nic" -o json)
-  jq -e --arg subnet "$FLEX_SUBNET_ID" --arg pip "$(jq -r .id <<<"$pip")" \
-    '.enableIPForwarding == true and .ipConfigurations[0].subnet.id == $subnet and .ipConfigurations[0].publicIPAddress.id == $pip' <<<"$nic" >/dev/null \
-    || die "$name NIC does not match the Flex network"
-  existing=$(lookup_resource Microsoft.Compute/virtualMachines "$name")
-  if [[ "$existing" == null ]]; then
-    log "Creating Ubuntu 24.04 Flex VM $name"
-    az_cmd vm create -g "$RESOURCE_GROUP" --name "$name" --location "$LOCATION" \
-      --image Canonical:ubuntu-24_04-lts:server:latest --size "$VM_SIZE" --nics "$(jq -r .id <<<"$nic")" \
-      --admin-username "$ADMIN_USER" --ssh-key-values "$STATE_DIR/ssh.pub" --assign-identity '[system]' \
-      --os-disk-size-gb 128 --storage-sku StandardSSD_LRS --security-type Standard --tags "${TAGS[@]}" -o none
+  lb=$(az_cmd network lb show -g "$RESOURCE_GROUP" --name "$NAME-flex-lb" -o json)
+  jq -e --arg pip "$(jq -r .id <<<"$pip")" \
+    '.sku.name == "Standard" and (.frontendIPConfigurations | length) == 1
+     and .frontendIPConfigurations[0].name == "workers" and .frontendIPConfigurations[0].publicIPAddress.id == $pip
+     and (.backendAddressPools | length) == 1 and .backendAddressPools[0].name == "workers"
+     and all(.inboundNatRules[]?; .name == "ssh") and all(.outboundRules[]?; .name == "egress")
+     and ((.inboundNatPools // []) | length) == 0 and ((.loadBalancingRules // []) | length) == 0' <<<"$lb" >/dev/null \
+    || die "worker load balancer has conflicting frontends, pools, or rules"
+  WORKER_LB_ID=$(jq -r .id <<<"$lb")
+  WORKER_BACKEND_ID="$WORKER_LB_ID/backendAddressPools/workers"
+  rule=$(jq -c '[.inboundNatRules[]? | select(.name == "ssh")][0] // null' <<<"$lb")
+  if [[ "$rule" == null ]]; then
+    az_cmd network lb inbound-nat-rule create -g "$RESOURCE_GROUP" --lb-name "$NAME-flex-lb" --name ssh \
+      --protocol Tcp --frontend-ip-name workers --backend-pool-name "$WORKER_BACKEND_ID" \
+      --frontend-port-range-start "$SSH_PORT_START" --frontend-port-range-end "$SSH_PORT_END" --backend-port 22 -o none
+  else
+    jq -e --arg backend "$WORKER_BACKEND_ID" --argjson start "$SSH_PORT_START" --argjson end "$SSH_PORT_END" \
+      '.protocol == "Tcp" and .backendPort == 22 and .frontendPortRangeStart == $start
+       and .frontendPortRangeEnd == $end and .backendAddressPool.id == $backend
+       and (.frontendIPConfiguration.id | endswith("/frontendIPConfigurations/workers"))' <<<"$rule" >/dev/null \
+      || die "worker SSH NAT rule conflicts with the reserved 1000-instance range"
   fi
-  vm=$(az_cmd vm show -g "$RESOURCE_GROUP" --name "$name" -o json)
-  jq -e --arg size "$VM_SIZE" --arg name "$name" --arg nic "$(jq -r .id <<<"$nic")" \
-    '.hardwareProfile.vmSize == $size and .osProfile.computerName == $name
-     and .storageProfile.imageReference.publisher == "Canonical" and .storageProfile.imageReference.offer == "ubuntu-24_04-lts"
-     and .networkProfile.networkInterfaces[0].id == $nic and (.identity.type | contains("SystemAssigned"))
-     and (.identity.principalId | type == "string" and length > 0)' <<<"$vm" >/dev/null \
-    || die "$name VM has conflicting hardware, image, network, or identity settings"
-  ensure_role "$(jq -r .identity.principalId <<<"$vm")" "$FLEX_ROLE" "$POOL_ID"
-  power=$(az_cmd vm get-instance-view -g "$RESOURCE_GROUP" --name "$name" --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" -o tsv)
-  case "$power" in
-    PowerState/running) ;;
-    PowerState/deallocated|PowerState/stopped) az_cmd vm start -g "$RESOURCE_GROUP" --name "$name" -o none ;;
-    *) die "$name has unexpected power state: $power" ;;
-  esac
-  VM_PUBLIC_IP=$(jq -r .ipAddress <<<"$pip")
-  VM_PRIVATE_IP=$(jq -r .ipConfigurations[0].privateIPAddress <<<"$nic")
-  [[ "$VM_PUBLIC_IP" != null && "$VM_PRIVATE_IP" != null ]] || die "$name has no assigned IP addresses"
+  rule=$(jq -c '[.outboundRules[]? | select(.name == "egress")][0] // null' <<<"$lb")
+  if [[ "$rule" == null ]]; then
+    # Reserve a bounded SNAT budget so 1000 backends and the SSH NAT range fit on one IP.
+    az_cmd network lb outbound-rule create -g "$RESOURCE_GROUP" --lb-name "$NAME-flex-lb" --name egress \
+      --address-pool "$WORKER_BACKEND_ID" --frontend-ip-configs workers --outbound-ports 32 --protocol All -o none
+  else
+    jq -e --arg backend "$WORKER_BACKEND_ID" \
+      '.protocol == "All" and .allocatedOutboundPorts == 32 and .backendAddressPool.id == $backend
+       and (.frontendIPConfigurations | length) == 1
+       and (.frontendIPConfigurations[0].id | endswith("/frontendIPConfigurations/workers"))' <<<"$rule" >/dev/null \
+      || die "worker outbound rule has conflicting port budget or frontend"
+  fi
 }
 
-ssh_vm() {
-  ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
-    -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$STATE_DIR/known_hosts" \
-    "$ADMIN_USER@$VM_PUBLIC_IP" "$@"
+ensure_vmss() {
+  local existing model state principal deadline bootstrap_hash
+  VMSS_ID="/subscriptions/$SUBSCRIPTION/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Compute/virtualMachineScaleSets/$VMSS_NAME"
+  write_vmss_custom_data "$STATE_DIR/vmss-custom-data.sh"
+  bootstrap_hash=$(sha256 "$STATE_DIR/vmss-custom-data.sh")
+  existing=$(lookup_resource Microsoft.Compute/virtualMachineScaleSets "$VMSS_NAME")
+  if [[ "$existing" == null ]]; then
+    log "Creating Uniform Flex VMSS $VMSS_NAME with $FLEX_COUNT instances and one shared identity"
+    jq -n --arg location "$LOCATION" --arg size "$VM_SIZE" --argjson count "$FLEX_COUNT" \
+      --arg owner "$NAME" --arg hash "$CONFIG_HASH" --arg bootstrap "$bootstrap_hash" \
+      --arg prefix "${NAME:0:9}" --arg user "$ADMIN_USER" --rawfile key "$STATE_DIR/ssh.pub" \
+      --arg data "$(base64 < "$STATE_DIR/vmss-custom-data.sh" | tr -d '\n')" \
+      --arg subnet "$FLEX_SUBNET_ID" --arg nsg "$NSG_ID" --arg backend "$WORKER_BACKEND_ID" \
+      '{location:$location,tags:{"unbounded-flex-cluster":$owner,"unbounded-flex-config":$hash,"unbounded-flex-bootstrap":$bootstrap},
+        sku:{name:$size,tier:"Standard",capacity:$count},identity:{type:"SystemAssigned"},
+        properties:{orchestrationMode:"Uniform",singlePlacementGroup:false,overprovision:false,
+          upgradePolicy:{mode:"Manual"},virtualMachineProfile:{
+            securityProfile:{securityType:"Standard"},
+            osProfile:{computerNamePrefix:$prefix,adminUsername:$user,customData:$data,
+              linuxConfiguration:{disablePasswordAuthentication:true,
+                ssh:{publicKeys:[{path:("/home/"+$user+"/.ssh/authorized_keys"),keyData:($key | rtrimstr("\n"))}]}}},
+            storageProfile:{imageReference:{publisher:"Canonical",offer:"ubuntu-24_04-lts",sku:"server",version:"latest"},
+              osDisk:{createOption:"FromImage",diskSizeGB:128,managedDisk:{storageAccountType:"StandardSSD_LRS"}}},
+            networkProfile:{networkInterfaceConfigurations:[{name:"worker-nic",properties:{
+              primary:true,enableIPForwarding:true,networkSecurityGroup:{id:$nsg},
+              ipConfigurations:[{name:"worker-ip",properties:{primary:true,subnet:{id:$subnet},
+                loadBalancerBackendAddressPools:[{id:$backend}]}}]}}]}}}}' > "$STATE_DIR/vmss.json"
+    az_cmd rest --method put --url "https://management.azure.com$VMSS_ID?api-version=$VMSS_API_VERSION" \
+      --headers 'If-None-Match=*' --body "@$STATE_DIR/vmss.json" -o none
+  fi
+  deadline=$((SECONDS + TIMEOUT))
+  while true; do
+    model=$(az_cmd rest --method get --url "https://management.azure.com$VMSS_ID?api-version=$VMSS_API_VERSION" -o json)
+    assert_owned "$model" "worker VMSS"
+    jq -e --arg size "$VM_SIZE" --arg subnet "$FLEX_SUBNET_ID" --arg backend "$WORKER_BACKEND_ID" \
+      --arg nsg "$NSG_ID" --arg bootstrap "$bootstrap_hash" --arg user "$ADMIN_USER" --arg prefix "${NAME:0:9}" --rawfile key "$STATE_DIR/ssh.pub" \
+      '.sku.name == $size and .sku.capacity >= 1 and .sku.capacity <= 1000
+       and .identity.type == "SystemAssigned" and ((.identity.userAssignedIdentities // {}) | length) == 0
+       and .tags["unbounded-flex-bootstrap"] == $bootstrap and .properties.orchestrationMode == "Uniform"
+       and .properties.singlePlacementGroup == false and .properties.overprovision == false
+       and .properties.upgradePolicy.mode == "Manual"
+       and .properties.virtualMachineProfile.osProfile.adminUsername == $user
+       and .properties.virtualMachineProfile.osProfile.computerNamePrefix == $prefix
+       and .properties.virtualMachineProfile.osProfile.linuxConfiguration.disablePasswordAuthentication == true
+       and (.properties.virtualMachineProfile.osProfile.linuxConfiguration.ssh.publicKeys[0].keyData | rtrimstr("\n")) == ($key | rtrimstr("\n"))
+       and .properties.virtualMachineProfile.storageProfile.imageReference.publisher == "Canonical"
+       and .properties.virtualMachineProfile.storageProfile.imageReference.offer == "ubuntu-24_04-lts"
+       and .properties.virtualMachineProfile.storageProfile.imageReference.sku == "server"
+       and .properties.virtualMachineProfile.storageProfile.osDisk.diskSizeGB == 128
+       and .properties.virtualMachineProfile.storageProfile.osDisk.managedDisk.storageAccountType == "StandardSSD_LRS"
+       and (.properties.virtualMachineProfile.securityProfile.securityType // "Standard") == "Standard"
+       and (.properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations | length) == 1
+       and .properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.enableIPForwarding == true
+       and .properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.networkSecurityGroup.id == $nsg
+       and (.properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.ipConfigurations | length) == 1
+       and .properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.ipConfigurations[0].properties.subnet.id == $subnet
+       and .properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.ipConfigurations[0].properties.loadBalancerBackendAddressPools == [{id:$backend}]
+       and .properties.virtualMachineProfile.networkProfile.networkInterfaceConfigurations[0].properties.ipConfigurations[0].properties.publicIPAddressConfiguration == null' <<<"$model" >/dev/null \
+      || die "worker VMSS has conflicting bootstrap, identity, hardware, or network configuration"
+    principal=$(jq -r '.identity.principalId // empty' <<<"$model")
+    if [[ -n "$principal" ]]; then ensure_role "$principal" "$FLEX_ROLE" "$POOL_ID"; fi
+    state=$(jq -r .properties.provisioningState <<<"$model")
+    case "$state" in
+      Succeeded) [[ -n "$principal" ]] || die "worker VMSS identity has no principal"; break ;;
+      Creating|Updating|InProgress) ((SECONDS < deadline)) || die "timed out waiting for worker VMSS"; sleep 15 ;;
+      *) die "worker VMSS provisioning state: $state" ;;
+    esac
+  done
+  FLEX_COUNT=$(jq -r .sku.capacity <<<"$model")
 }
 
 write_remote_script() {
-  local name="$1" file="$2"
+  local file="$1"
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\numask 077\n'
-    printf 'AKS_ID=%q\nPOOL=%q\nNODE=%q\nNODE_IP=%q\nVERSION=%q\nDIGEST=%q\nWAIT_TIMEOUT=%q\n' \
-      "$AKS_ID" "$FLEX_POOL" "$name" "$VM_PRIVATE_IP" "$AGENT_VERSION" "$AGENT_DIGEST" "$TIMEOUT"
+    printf 'AKS_ID=%q\nPOOL=%q\nVMSS_ID=%q\nVMSS_NAME=%q\nPREFIX=%q\nSUBNET=%q\nVERSION=%q\nDIGEST=%q\nWAIT_TIMEOUT=%q\n' \
+      "$AKS_ID" "$FLEX_POOL" "$VMSS_ID" "$VMSS_NAME" "$NAME" "$FLEX_NODE_CIDR" "$AGENT_VERSION" "$AGENT_DIGEST" "${BOOTSTRAP_TIMEOUT:-$TIMEOUT}"
     cat <<'REMOTE'
+coordinates=$(python3 - "$VMSS_ID" "$VMSS_NAME" "$PREFIX" "$SUBNET" <<'PY'
+import ipaddress
+import json
+import re
+import sys
+import urllib.request
+try:
+    request = urllib.request.Request('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata': 'true'})
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=30) as response:
+        data = json.load(response)
+    compute = data['compute']
+    resource = compute['resourceId']
+    instance = resource.rsplit('/', 1)[1]
+    if compute['vmScaleSetName'].lower() != sys.argv[2].lower() or resource.lower() != (sys.argv[1] + '/virtualMachines/' + instance).lower() or re.fullmatch(r'[0-9]+', instance) is None:
+        raise ValueError('metadata does not identify an instance of the expected VMSS')
+    address = data['network']['interface'][0]['ipv4']['ipAddress'][0]['privateIpAddress']
+    if ipaddress.IPv4Address(address) not in ipaddress.IPv4Network(sys.argv[4]):
+        raise ValueError('instance address is outside the expected Flex subnet')
+    print(sys.argv[3] + '-flex' + instance)
+    print(address)
+except (KeyError, IndexError, TypeError, ValueError, OSError) as error:
+    print(f'cannot identify Flex VMSS instance: {error}', file=sys.stderr)
+    sys.exit(1)
+PY
+) || exit 1
+NODE=${coordinates%%$'\n'*}
+NODE_IP=${coordinates#*$'\n'}
 config=/etc/aks-flex-node/config.json
 unit=/etc/systemd/system/aks-flex-node-agent.service
 if [[ -f "$unit" ]]; then
@@ -672,7 +786,7 @@ install -d -m 0700 /run/aks-flex-node-bootstrap
 # runtime. A 404 is expected for a machine that has never joined this pool.
 deadline=$((SECONDS + WAIT_TIMEOUT))
 while true; do
-  token_response=$(curl -fsS --connect-timeout 10 --max-time 30 -H Metadata:true \
+  token_response=$(curl -fsS --noproxy '*' --connect-timeout 10 --max-time 30 -H Metadata:true \
     'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null || true)
   token=$(jq -r '.access_token // empty' <<<"$token_response" 2>/dev/null || true)
   unset token_response
@@ -712,70 +826,111 @@ REMOTE
   bash -n "$file"
 }
 
-run_vm_command() {
-  local name="$1" file="$2" marker wrapper response status
-  marker="__AKS_FLEX_REMOTE_EXIT_$(openssl rand -hex 12)__"
-  wrapper="$STATE_DIR/run-command-$name.sh"
-  response="$STATE_DIR/run-command-$name.json"
+write_vmss_custom_data() {
+  local file="$1" bootstrap="$STATE_DIR/vmss-bootstrap.sh"
+  write_remote_script "$bootstrap"
   {
-    # The Azure Linux handler may invoke this file with /bin/sh, regardless
-    # of its shebang. Enter Bash explicitly before using Bash-only syntax.
-    printf '#!/bin/sh\nexec /bin/bash <<\047AKS_FLEX_COMMAND_BASH\047\nset -euo pipefail\numask 077\nmarker=%q\n' "$marker"
-    cat <<'RUN_COMMAND'
-# Run Command reports extension success independently of the shell exit code.
-# Emit a unique final stdout marker even on failure, and verify it locally.
-trap 'status=$?; printf "%s=%s\n" "$marker" "$status"' EXIT
-base64 -d > /run/aks-flex-node-deployment.sh <<'DEPLOYMENT_BASE64'
-RUN_COMMAND
-    base64 < "$file"
-    cat <<'RUN_COMMAND'
-DEPLOYMENT_BASE64
-chmod 0700 /run/aks-flex-node-deployment.sh
-RUN_COMMAND
-    printf 'timeout --signal=TERM --kill-after=30s %q bash /run/aks-flex-node-deployment.sh\n' "$TIMEOUT"
-    printf 'rm -f /run/aks-flex-node-deployment.sh\nAKS_FLEX_COMMAND_BASH\n'
-  } > "$wrapper"
-  bash -n "$wrapper"
-  log "Bootstrapping/checking $name through the Azure VM agent; SSH ingress remains $SSH_SOURCE_IP/32"
-  az_cmd vm run-command invoke -g "$RESOURCE_GROUP" --name "$name" \
-    --command-id RunShellScript --scripts "@$wrapper" -o json > "$response" \
-    || die "Azure Run Command failed on $name; inspect $response before retrying"
-  status=$(jq -er --arg marker "$marker=" \
-    '[.value[]? | .message | split("\n")[] | select(startswith($marker)) | ltrimstr($marker) | sub("\\r$"; "")] | if length == 1 then .[0] else error("missing or ambiguous remote exit marker") end' "$response") \
-    || die "Run Command on $name did not report a shell exit code; inspect $response (no automatic reset)"
-  jq -r '.value[]? | .message' "$response"
-  [[ "$status" == 0 ]] || die "bootstrap/check failed on $name with exit $status; inspect $response (no automatic reset)"
+    cat <<'CUSTOM_DATA'
+#!/bin/bash
+set -euo pipefail
+umask 077
+install -d -m 0700 /etc/aks-flex-vmss-bootstrap
+base64 -d > /etc/aks-flex-vmss-bootstrap/bootstrap.sh <<'VMSS_BOOTSTRAP_BASE64'
+CUSTOM_DATA
+    base64 < "$bootstrap"
+    cat <<'CUSTOM_DATA'
+VMSS_BOOTSTRAP_BASE64
+chmod 0700 /etc/aks-flex-vmss-bootstrap/bootstrap.sh
+cat > /etc/systemd/system/aks-flex-vmss-bootstrap.service <<'BOOTSTRAP_UNIT'
+[Unit]
+Description=Automatically join this VMSS instance to its AKS Flex pool
+After=cloud-final.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
+CUSTOM_DATA
+    printf 'ExecStart=/usr/bin/timeout --signal=TERM --kill-after=30s %s /bin/bash /etc/aks-flex-vmss-bootstrap/bootstrap.sh\n' "${BOOTSTRAP_TIMEOUT:-$TIMEOUT}"
+    cat <<'CUSTOM_DATA'
+
+[Install]
+WantedBy=multi-user.target
+BOOTSTRAP_UNIT
+systemctl daemon-reload
+# Do not wait inside cloud-final for a service ordered after cloud-final.
+systemctl enable --now --no-block aks-flex-vmss-bootstrap.service
+CUSTOM_DATA
+  } > "$file"
+  bash -n "$file"
+  (($(wc -c < "$file") <= 65535)) || die "VMSS custom data exceeds the Azure 64 KiB limit"
 }
 
-join_vm() {
-  local name="$1" deadline=$((SECONDS + TIMEOUT)) file="$STATE_DIR/remote-$1.sh"
-  write_remote_script "$name" "$file"
-  if [[ "$BOOTSTRAP_TRANSPORT" == run-command ]]; then
-    run_vm_command "$name" "$file"
-    return
-  fi
-  log "Waiting for SSH on $name ($VM_PUBLIC_IP); ingress is restricted to $SSH_SOURCE_IP/32"
-  until ssh_vm true >/dev/null 2>&1; do
-    ((SECONDS < deadline)) || die "SSH unavailable on $name; check your public IP, NSG, and SSH key"
-    sleep 10
-  done
-  # Do not retry the entire bootstrap after it has modified a host. Bound
-  # library throttling retries and leave any interrupted deployment intact.
-  ssh_vm sudo timeout --signal=TERM --kill-after=30s "$TIMEOUT" bash -s < "$file" || die "bootstrap/check failed on $name; inspect its logs before retrying (no automatic reset)"
+write_ssh_access() {
+  local address mapping port
+  az_cmd vmss nic list -g "$RESOURCE_GROUP" --vmss-name "$VMSS_NAME" -o json > "$STATE_DIR/vmss-nics.json"
+  jq -er --argjson count "$FLEX_COUNT" \
+    'if type == "array" and length == $count and all(.[]; .ipConfigurations[0].privateIPAddress | type == "string")
+     then .[0:20][].ipConfigurations[0].privateIPAddress else error("VMSS NIC list does not match its capacity") end' \
+    "$STATE_DIR/vmss-nics.json" > "$STATE_DIR/ssh-private-ips.txt"
+  : > "$STATE_DIR/ssh-access.txt"
+  while IFS= read -r address; do
+    mapping=$(az_cmd rest --method post \
+      --url "https://management.azure.com$WORKER_BACKEND_ID/queryInboundNatRulePortMapping?api-version=$NETWORK_API_VERSION" \
+      --body "$(jq -cn --arg address "$address" '{ipAddress:$address}')" -o json)
+    port=$(jq -er --argjson start "$SSH_PORT_START" --argjson end "$SSH_PORT_END" \
+      '[.inboundNatRulePortMappings[] | select(.inboundNatRuleName == "ssh" and .protocol == "Tcp" and .backendPort == 22
+        and .frontendPort >= $start and .frontendPort <= $end)] | if length == 1 then .[0].frontendPort else error("missing or ambiguous SSH NAT mapping") end' <<<"$mapping") \
+      || die "SSH mapping for $address is not ready; inspect the worker load balancer"
+    printf 'ssh -p %q -i %q -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%q %q\n' \
+      "$port" "$SSH_KEY" "$STATE_DIR/known_hosts" "$ADMIN_USER@$WORKER_PUBLIC_IP" >> "$STATE_DIR/ssh-access.txt"
+  done < "$STATE_DIR/ssh-private-ips.txt"
+  printf '# At large capacities, commands above sample up to 20 instances. Query other private-IP mappings at:\n# %s\n' \
+    "https://management.azure.com$WORKER_BACKEND_ID/queryInboundNatRulePortMapping?api-version=$NETWORK_API_VERSION" >> "$STATE_DIR/ssh-access.txt"
 }
 
 validate_deployment() {
-  local machines nodes index name
-  log "Checking every Flex Node and its ARM Machine"
-  machines=$(az_cmd rest --method get --url "https://management.azure.com$POOL_ID/machines?api-version=$POOL_API_VERSION" -o json)
-  for ((index=1; index<=FLEX_COUNT; index++)); do
-    name="$NAME-flex$index"
-    jq -e --arg name "$name" 'any(.value[]; (.name | ascii_downcase) == $name and .properties.provisioningState == "Succeeded")' <<<"$machines" >/dev/null \
-      || die "ARM Machine $name is missing or not successfully provisioned"
-    kube wait --for=condition=Ready "node/$name" --timeout="${TIMEOUT}s"
-    nodes=$(kube get "node/$name" -o json)
-    jq -e --arg pool "$FLEX_POOL" '.metadata.labels["kubernetes.azure.com/agentpool"] == $pool and .metadata.labels["unbounded-cloud.io/site"] == "flex-site"' <<<"$nodes" >/dev/null \
-      || die "$name is not assigned to the expected pool and network site"
+  local page url deadline=$((SECONDS + TIMEOUT))
+  log "Waiting for automatic VMSS bootstrap, ARM registration, and Flex node readiness"
+  while true; do
+    az_cmd vmss list-instances -g "$RESOURCE_GROUP" --name "$VMSS_NAME" -o json > "$STATE_DIR/vmss-instances.json"
+    jq -e 'type == "array" and all(.[]; .instanceId | test("^[0-9]+$"))' "$STATE_DIR/vmss-instances.json" >/dev/null \
+      || die "VMSS returned invalid instance identifiers"
+    [[ "$(jq length "$STATE_DIR/vmss-instances.json")" == "$FLEX_COUNT" ]] && break
+    ((SECONDS < deadline)) || die "VMSS instance list does not match its capacity before the timeout"
+    sleep 5
+  done
+  jq -ce --arg prefix "$NAME-flex" --argjson count "$FLEX_COUNT" \
+    'if length == $count and all(.[]; (.instanceId | test("^[0-9]+$"))) then
+       [.[] | $prefix + .instanceId] | unique | if length == $count then . else error("duplicate instance IDs") end
+     else error("VMSS instance list does not match its capacity") end' "$STATE_DIR/vmss-instances.json" > "$STATE_DIR/expected-worker-nodes.json"
+  while true; do
+    : > "$STATE_DIR/worker-machines.jsonl"
+    url="https://management.azure.com$POOL_ID/machines?api-version=$POOL_API_VERSION"
+    while [[ -n "$url" ]]; do
+      [[ "$url" == "https://management.azure.com$POOL_ID/machines?"* ]] || die "ARM Machine pagination left the expected pool"
+      page=$(az_cmd rest --method get --url "$url" -o json)
+      jq -c '.value[] | {name: (.name | ascii_downcase), state: .properties.provisioningState}' <<<"$page" >> "$STATE_DIR/worker-machines.jsonl"
+      url=$(jq -r '.nextLink // empty' <<<"$page")
+    done
+    kube get nodes -l "kubernetes.azure.com/agentpool=$FLEX_POOL" -o json > "$STATE_DIR/worker-nodes.json"
+    if jq -en --slurpfile expected "$STATE_DIR/expected-worker-nodes.json" \
+      --slurpfile machines "$STATE_DIR/worker-machines.jsonl" --slurpfile nodes "$STATE_DIR/worker-nodes.json" --arg pool "$FLEX_POOL" \
+      '($machines | map({key: .name, value: .state}) | from_entries) as $states |
+       ($nodes[0].items | map({key: .metadata.name, value:
+         (.metadata.labels["kubernetes.azure.com/agentpool"] == $pool
+          and .metadata.labels["unbounded-cloud.io/site"] == "flex-site"
+          and any(.status.conditions[]?; .type == "Ready" and .status == "True"))}) | from_entries) as $ready |
+       all($expected[0][]; $states[.] == "Succeeded" and $ready[.] == true)' >/dev/null; then
+      break
+    fi
+    ((SECONDS < deadline)) || die "VMSS workers are not Ready, ARM-registered, or assigned to the expected pool and network site; inspect cloud-init and aks-flex-vmss-bootstrap.service logs"
+    sleep 15
   done
   wait_component_rollout daemonset/unbounded-net-node
   wait_component_rollout daemonset/unbounded-net-kube-proxy-flex-site
@@ -803,6 +958,8 @@ smoke_test() {
   kube -n "$namespace" rollout status daemonset/echo --timeout="${TIMEOUT}s"
   pods=$(kube -n "$namespace" get pods -l app=flex-smoke -o json)
   [[ "$(jq '.items | length' <<<"$pods")" == "$FLEX_COUNT" ]] || die "smoke DaemonSet does not have exactly $FLEX_COUNT pods"
+  # Bound cross-node sampling rather than issuing a quadratic all-pairs test at 1000 nodes.
+  pods=$(jq '{items: (.items | sort_by(.metadata.name) | [.[0], .[length / 2 | floor], .[-1]] | unique_by(.metadata.name))}' <<<"$pods")
   while IFS= read -r pod; do targets+=("$pod"); done < <(jq -r '.items[].status.podIP' <<<"$pods")
   targets+=("echo.$namespace.svc.cluster.local")
   while IFS= read -r pod; do
@@ -837,22 +994,19 @@ main() {
   AGENT_DIGEST=$(release_digest Azure/AKSFlexNode "$AGENT_VERSION" aks-flex-node-linux-amd64.tar.gz)
   fetch_file "https://raw.githubusercontent.com/Azure/AKSFlexNode/$AGENT_VERSION/scripts/bootstrap.sh" "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
   bash -n "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
-  local index name
-  : > "$STATE_DIR/ssh-access.txt"
-  for ((index=1; index<=FLEX_COUNT; index++)); do
-    name="$NAME-flex$index"
-    ensure_vm "$name"
-    printf 'ssh -i %q -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%q %q\n' \
-      "$SSH_KEY" "$STATE_DIR/known_hosts" "$ADMIN_USER@$VM_PUBLIC_IP" >> "$STATE_DIR/ssh-access.txt"
-    join_vm "$name"
-  done
+  ensure_worker_network
+  ensure_vmss
   validate_deployment
   smoke_test
+  write_ssh_access
   log "Deployment ready: one system node and $FLEX_COUNT Flex nodes"
   kube get nodes -L kubernetes.azure.com/agentpool,unbounded-cloud.io/site -o wide
   printf '\nKubeconfig: %s\nSSH ingress: %s/32\nSSH access:\n' "$STATE_DIR/kubeconfig" "$SSH_SOURCE_IP"
   while IFS= read -r line; do printf '  %s\n' "$line"; done < "$STATE_DIR/ssh-access.txt"
-  printf '\nRerun with the same arguments and state directory. No node reset or agent downgrade is performed.\n'
+  printf '\nScale workers: az vmss scale --resource-group %q --name %q --new-capacity N --subscription %q\n' \
+    "$RESOURCE_GROUP" "$VMSS_NAME" "$SUBSCRIPTION"
+  printf 'New instances join automatically; an existing managed ACR policy applies without reattachment.\n'
+  printf 'Rerun with the same initial arguments and state directory. Existing VMSS capacity is retained.\n'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

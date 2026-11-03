@@ -340,6 +340,30 @@ func TestRegistryAuthAudienceIsLimitedToLinuxFlexNodeUsers(t *testing.T) {
 	check()
 }
 
+func TestRegistryAuthAudienceForThousandFlexWorkers(t *testing.T) {
+	env := testEnv(t)
+	expected := make([]rbacv1.Subject, 0, 1000)
+
+	for i := range 1000 {
+		name := fmt.Sprintf("flexdemo-flex%d", i)
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+			"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue,
+		}}}
+		require.NoError(t, env.Client.Create(t.Context(), node))
+
+		expected = append(expected, rbacv1.Subject{Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "system:node:" + name})
+	}
+
+	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding"}
+	operations, err := planRegistryAuthAudience(t.Context(), env, cfg)
+	require.NoError(t, err)
+	require.Len(t, operations, 2)
+
+	var binding rbacv1.ClusterRoleBinding
+	require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &binding))
+	require.ElementsMatch(t, expected, binding.Subjects)
+}
+
 func TestRegistryAuthAudienceOwnershipAndRevocation(t *testing.T) {
 	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding"}
 

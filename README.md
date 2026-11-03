@@ -125,7 +125,7 @@ For the full walkthrough including pod networking verification, see the
 
 ### AKS Flex: create the entire cluster with one script
 
-For one AKS system node plus three Azure VMs joined to a FlexNodes pool with
+For one AKS system node plus a three-instance Flex worker VMSS with
 Unbounded-Net, use the self-contained, idempotent provisioning script:
 
 ```bash
@@ -136,10 +136,12 @@ bash hack/scripts/aks-flex-cluster.sh \
     --yes
 ```
 
-Rerun the same command to reuse the deployment. Bootstrap uses Azure VM Run
-Command by default; `--bootstrap-transport ssh` selects SSH instead. SSH ingress
-to the Flex VMs remains restricted to your public IPv4 `/32` with either
-transport. SSH commands and a private kubeconfig are saved under
+Workers share one managed identity and one public IP for outbound access and
+per-instance SSH ports. VMSS custom data bootstraps new instances automatically,
+including after `az vmss scale`; the topology reserves capacity for 1,000 workers.
+Rerun the same initial command to reuse the deployment without shrinking an
+externally scaled VMSS. SSH ingress remains restricted to your public IPv4
+`/32`. SSH commands and a private kubeconfig are saved under
 `tmp/aks-flex/my-flex-cluster/`. Add `--plan` to inspect the topology without
 creating resources. See the [deployment runbook](designs/aks-flex-cluster.md) for
 prerequisites, validation, and recovery boundaries. Run `make aks-flex-test` for
@@ -149,7 +151,8 @@ Cluster creation installs Gantry without ACR configuration or authentication
 setup. The [ACR attachment guide](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
 covers registry attachment, default preservation of existing authentication,
 and explicit managed-auth opt-in. Attachment requires a compatible plugin/operator
-release; it is not included in the script's `v0.8.0` baseline.
+release; it is not included in the script's `v0.8.0` baseline. Attach managed
+ACR authentication once; future joined Linux Flex nodes inherit the policy.
 
 ## Documentation
 

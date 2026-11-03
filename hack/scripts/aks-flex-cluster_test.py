@@ -26,11 +26,13 @@ SUBSCRIPTION = "11111111-1111-1111-1111-111111111111"
 MOCK = r'''#!/usr/bin/env python3
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from urllib.parse import parse_qs, urlparse
 
 root = Path(os.environ["MOCK_ROOT"])
 state_path = root / "cloud.json"
@@ -61,6 +63,17 @@ def add(t, name, **properties):
     save()
     return r
 def get(t, name): return s["resources"][t + "/" + name]
+def join_instances():
+    vmss = get("Microsoft.Compute/virtualMachineScaleSets", "flexdemo-workers")
+    if s.get("registration_blocked"): return
+    for i in range(vmss["sku"]["capacity"]):
+        node = f"flexdemo-flex{i}"
+        if node in s["joined"]: continue
+        if s.get("fail_join_once") == node:
+            s.pop("fail_join_once"); save(); return
+        s["joined"].append(node)
+        s["bootstraps"][node] = s["bootstraps"].get(node,0) + 1
+    save()
 
 group = arg("-g", "--resource-group")
 name = arg("--name")
@@ -119,65 +132,86 @@ if command == "az":
         out([] if not s.get("pool") else [{"name":"flexpool"}])
     elif a[:1] == ["rest"]:
         method, url = arg("--method"), arg("--url")
-        if method == "put":
+        if "/virtualMachineScaleSets/" in url:
+            key = "Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"
+            if method == "put":
+                assert arg("--headers") == "If-None-Match=*"
+                if key in s["resources"]:
+                    print("PreconditionFailed",file=sys.stderr); sys.exit(1)
+                body = json.loads(Path(arg("--body")[1:]).read_text())
+                body.update(id=resource_id("Microsoft.Compute/virtualMachineScaleSets","flexdemo-workers"),
+                            name="flexdemo-workers",type="Microsoft.Compute/virtualMachineScaleSets")
+                body["identity"]["principalId"] = "vmss-principal"
+                body["properties"]["provisioningState"] = "Succeeded"
+                s["resources"][key] = body
+                data = base64.b64decode(body["properties"]["virtualMachineProfile"]["osProfile"]["customData"]).decode()
+                (root / "custom-data.sh").write_text(data)
+                encoded = data.split("<<'VMSS_BOOTSTRAP_BASE64'\n",1)[1].split("\nVMSS_BOOTSTRAP_BASE64",1)[0]
+                (root / "remote.sh").write_bytes(base64.b64decode(encoded))
+                save()
+            else: out(s["resources"][key])
+        elif method == "post" and "queryInboundNatRulePortMapping" in url:
+            body = json.loads(arg("--body"))
+            index = int(ipaddress.IPv4Address(body["ipAddress"])) - int(ipaddress.IPv4Address("10.91.8.4"))
+            out({"inboundNatRulePortMappings":[] if s.get("missing_ssh_mapping") else [
+                {"inboundNatRuleName":"ssh","protocol":"Tcp","backendPort":22,"frontendPort":50000+index}]})
+        elif method == "put":
             body = json.loads(Path(arg("--body")[1:]).read_text())
             assert body["properties"]["type"] == "FlexNodes"
             assert "count" not in body["properties"]
             s["pool"] = {"properties":{**body["properties"],"provisioningState":"Succeeded"}}; save()
         elif "/machines?" in url:
-            out({"value":[{"name":n,"properties":{"provisioningState":"Succeeded"}} for n in s["joined"]]})
+            join_instances()
+            offset = int(parse_qs(urlparse(url).query).get("$skiptoken",["0"])[0])
+            size = s.get("machine_page_size",len(s["joined"]) or 1)
+            result = {"value":[{"name":n,"properties":{"provisioningState":"Succeeded"}} for n in s["joined"][offset:offset+size]]}
+            if offset+size < len(s["joined"]):
+                result["nextLink"] = url.split("&$skiptoken=")[0]+"&$skiptoken="+str(offset+size)
+            if s.get("pagination_escape"): result["nextLink"] = "https://untrusted.invalid/machines?page=2"
+            out(result)
         else: out(s["pool"])
     elif a[:3] == ["network", "public-ip", "create"]:
-        number = name.split("-flex")[1].split("-")[0]
-        add("Microsoft.Network/publicIPAddresses", name, sku={"name":"Standard"},publicIPAllocationMethod="Static",ipAddress="20.30.40."+number)
+        add("Microsoft.Network/publicIPAddresses", name, sku={"name":"Standard"},publicIPAllocationMethod="Static",ipAddress="20.30.40.1")
     elif a[:3] == ["network", "public-ip", "show"]: out(get("Microsoft.Network/publicIPAddresses", name))
-    elif a[:3] == ["network", "nic", "create"]:
-        number = name.split("-flex")[1].split("-")[0]
-        add("Microsoft.Network/networkInterfaces", name,enableIPForwarding=True,
-            ipConfigurations=[{"subnet":{"id":arg("--subnet")},"publicIPAddress":{"id":arg("--public-ip-address")},"privateIPAddress":"10.91.1."+str(3+int(number))}])
-    elif a[:3] == ["network", "nic", "show"]: out(get("Microsoft.Network/networkInterfaces", name))
-    elif a[:2] == ["vm", "create"]:
-        add("Microsoft.Compute/virtualMachines", name,hardwareProfile={"vmSize":arg("--size")},
-            osProfile={"computerName":name},storageProfile={"imageReference":{"publisher":"Canonical","offer":"ubuntu-24_04-lts"}},
-            networkProfile={"networkInterfaces":[{"id":arg("--nics")}]},identity={"type":"SystemAssigned","principalId":name+"-principal"})
-    elif a[:2] == ["vm", "show"]: out(get("Microsoft.Compute/virtualMachines", name))
-    elif a[:3] == ["vm", "run-command", "invoke"]:
-        if s.get("run_command_api_failure"):
-            print("VM Run Command extension unavailable", file=sys.stderr); sys.exit(1)
-        wrapper = Path(arg("--scripts")[1:]).read_text()
-        marker = next(line.split("=",1)[1] for line in wrapper.splitlines() if line.startswith("marker="))
-        encoded = wrapper.split("<<'DEPLOYMENT_BASE64'\n",1)[1].split("\nDEPLOYMENT_BASE64",1)[0]
-        (root / "remote.sh").write_bytes(base64.b64decode(encoded))
-        if s.get("execute_run_command"):
-            # Execute only a sandboxed wrapper supplied by the unit test, never
-            # a real host bootstrap. All /run writes stay in this fixture.
-            sandboxed = root / "sandboxed-run-command.sh"
-            sandboxed.write_text(wrapper.replace("/run/aks-flex-node-deployment.sh",str(root / "payload.sh")))
-            result = subprocess.run(["/bin/sh",str(sandboxed)],env=os.environ,text=True,capture_output=True,timeout=10)
-            message = "Enable succeeded:\n[stdout]\n"+result.stdout+"\n[stderr]\n"+result.stderr
-            s["executed_run_command_shell"] = "/bin/sh"; save()
-        else:
-            code = s.get("run_command_exit",0)
-            if s.get("fail_join_once") == name:
-                s.pop("fail_join_once"); code = 78; save()
-            status = "already-joined" if name in s["joined"] else "joined"
-            if code == 0 and name not in s["joined"]:
-                s["joined"].append(name); s["bootstraps"][name] = s["bootstraps"].get(name,0)+1; save()
-            message = f"FLEX_STATUS={status} node={name}\n{marker}={code}\n"
-            if s.get("missing_run_command_marker"): message = "remote script did not finish"
-            if s.get("run_command_marker_mode") == "duplicate": message += f"{marker}={code}\n"
-            if s.get("run_command_marker_mode") == "stale": message = message.replace(marker,"__AKS_FLEX_REMOTE_EXIT_old__")
-            if s.get("run_command_crlf"): message = message.replace("\n","\r\n")
-            message = "Enable succeeded:\n[stdout]\n"+message+"\n[stderr]\n"
-        out({"value":[{"code":"ProvisioningState/succeeded","message":message}]})
-    elif a[:2] == ["vm", "get-instance-view"]: out(s.get("power",{}).get(name,"PowerState/running"))
-    elif a[:2] == ["vm", "start"]:
-        s.setdefault("power",{})[name] = "PowerState/running"; save()
+    elif a[:3] == ["network", "lb", "create"]:
+        lb_id = resource_id("Microsoft.Network/loadBalancers",name)
+        add("Microsoft.Network/loadBalancers",name,sku={"name":"Standard"},
+            frontendIPConfigurations=[{"name":"workers","id":lb_id+"/frontendIPConfigurations/workers",
+                                       "publicIPAddress":{"id":arg("--public-ip-address")}}],
+            backendAddressPools=[{"name":"workers","id":lb_id+"/backendAddressPools/workers"}],
+            inboundNatRules=[],outboundRules=[])
+    elif a[:3] == ["network", "lb", "show"]: out(get("Microsoft.Network/loadBalancers",name))
+    elif a[:4] == ["network","lb","inbound-nat-rule","create"]:
+        lb = get("Microsoft.Network/loadBalancers",arg("--lb-name"))
+        lb["inboundNatRules"] = [{"name":name,"protocol":"Tcp","backendPort":22,
+            "frontendPortRangeStart":int(arg("--frontend-port-range-start")),
+            "frontendPortRangeEnd":int(arg("--frontend-port-range-end")),
+            "backendAddressPool":{"id":arg("--backend-pool-name")},
+            "frontendIPConfiguration":{"id":lb["id"]+"/frontendIPConfigurations/workers"}}]; save()
+    elif a[:4] == ["network","lb","outbound-rule","create"]:
+        lb = get("Microsoft.Network/loadBalancers",arg("--lb-name"))
+        lb["outboundRules"] = [{"name":name,"protocol":"All","allocatedOutboundPorts":int(arg("--outbound-ports")),
+            "backendAddressPool":{"id":arg("--address-pool")},
+            "frontendIPConfigurations":[{"id":lb["id"]+"/frontendIPConfigurations/workers"}]}]; save()
+    elif a[:2] == ["vmss","list-instances"]:
+        if s.get("missing_instance_polls",0):
+            s["missing_instance_polls"] -= 1; save(); out([])
+        else: out([{"instanceId":str(i)} for i in range(get("Microsoft.Compute/virtualMachineScaleSets","flexdemo-workers")["sku"]["capacity"])])
+    elif a[:3] == ["vmss","nic","list"]:
+        count = get("Microsoft.Compute/virtualMachineScaleSets","flexdemo-workers")["sku"]["capacity"]
+        out([{"ipConfigurations":[{"privateIPAddress":str(ipaddress.IPv4Address("10.91.8.4")+i)}]} for i in range(count)])
+    elif a[:2] == ["vmss","scale"]:
+        get("Microsoft.Compute/virtualMachineScaleSets",name)["sku"]["capacity"] = int(arg("--new-capacity"))
+        join_instances()
     else: raise RuntimeError((command,a))
 elif command == "curl":
     file = arg("-o")
-    url = next(x for x in a if x.startswith("https://"))
-    if url == "https://api.ipify.org": out("8.8.4.4")
+    url = next(x for x in a if x.startswith(("https://","http://")))
+    if url.startswith("http://169.254.169.254"):
+        assert arg("--noproxy") == "*"
+        out({"access_token":"unit-test-token"})
+    elif url.startswith("https://management.azure.com"): print("404")
+    elif url == "https://api.ipify.org": out("8.8.4.4")
     elif url.endswith("checksums.txt"):
         if "AKSFlexNode" in url:
             Path(file).write_text("a"*64+"  aks-flex-node-linux-amd64.tar.gz\n")
@@ -209,10 +243,12 @@ elif command in ["kubectl", "kubectl-unbounded"]:
         if kind == "namespaces": out({"items":s.get("namespaces",[])})
         elif kind == "deployments": out({"items":[] if not s.get("operator") else [{"metadata":{"name":"unbounded-operator","namespace":"unbounded-system"}}]})
         elif kind == "pods":
-            out({"items":[{"metadata":{"name":n+"-echo"},"status":{"podIP":"10.95."+str(i)+".2"}} for i,n in enumerate(s["joined"]) ]})
+            out({"items":[{"metadata":{"name":n+"-echo"},"status":{"podIP":str(ipaddress.IPv4Address("10.96.0.2")+i*256)}} for i,n in enumerate(s["joined"]) ]})
         elif kind.startswith("node/"):
             out({"metadata":{"labels":s.get("node_labels",{"kubernetes.azure.com/agentpool":"flexpool","unbounded-cloud.io/site":"flex-site"})}})
-        elif kind == "nodes": pass
+        elif kind == "nodes":
+            out({"items":[{"metadata":{"name":n,"labels":s.get("node_labels",{"kubernetes.azure.com/agentpool":"flexpool","unbounded-cloud.io/site":"flex-site"})},
+                           "status":{"conditions":[{"type":"Ready","status":"True"}]}} for n in s["joined"]]})
         elif kind.startswith(("deployment/", "daemonset/")):
             remaining = s.get("get_missing",{}).get(kind,0)
             if remaining:
@@ -220,18 +256,6 @@ elif command in ["kubectl", "kubectl-unbounded"]:
             else: out(kind)
         else: raise RuntimeError((command,a))
     else: raise RuntimeError((command,a))
-elif command == "ssh":
-    if a[-1] == "true": sys.exit(1 if s.get("fail_ssh_connection") else 0)
-    body = sys.stdin.read()
-    (root / "remote.sh").write_text(body)
-    number = next(x for x in a if x.startswith("azureuser@")).rsplit(".",1)[1]
-    node = "flexdemo-flex"+number
-    if s.get("fail_join_once") == node:
-        s.pop("fail_join_once"); save(); sys.exit(78)
-    if node not in s["joined"]:
-        s["joined"].append(node); s["bootstraps"][node] = s["bootstraps"].get(node,0)+1; save()
-        out("FLEX_STATUS=joined node="+node)
-    else: out("FLEX_STATUS=already-joined node="+node)
 elif command == "sleep": pass
 elif command == "timeout":
     assert a[:2] == ["--signal=TERM","--kill-after=30s"]
@@ -240,9 +264,10 @@ elif command == "timeout":
 elif command == "systemctl":
     if a[0] == "start": s["host_active"] = True; save()
     elif a[0] == "is-active": sys.exit(0 if s.get("host_active",True) else 1)
+    elif a[0] in ("daemon-reload","enable"): pass
     else: raise RuntimeError((command,a))
 elif command == "cloud-init": sys.exit(s.get("cloud_init_exit",0))
-elif command == "apt-get": sys.exit(77)
+elif command == "apt-get": sys.exit(s.get("apt_get_exit",77))
 else: raise RuntimeError(command)
 '''
 
@@ -322,14 +347,14 @@ class DeploymentTests(unittest.TestCase):
         calls = len(self.calls())
         result = self.run_script()
         second = self.state()
-        self.assertEqual(len(first["resources"]), 13)  # VNet, NSG, identity, AKS, 3x(PIP, NIC, VM)
+        self.assertEqual(len(first["resources"]), 7)
         self.assertEqual(first["resources"], second["resources"])
-        self.assertEqual(len(second["roles"]), 4)
+        self.assertEqual(len(second["roles"]), 2)
         cluster = second["resources"]["Microsoft.ContainerService/managedClusters/flexdemo"]
         flex_roles = [role for role in second["roles"] if role["roleDefinitionId"].endswith("/8f139b0f-7eaf-460b-a9da-5b1246d9ed0d")]
-        self.assertEqual(len(flex_roles), 3)
+        self.assertEqual(len(flex_roles), 1)
         self.assertEqual({role["scope"] for role in flex_roles}, {cluster["id"] + "/agentPools/flexpool"})
-        self.assertEqual({role["principalId"] for role in flex_roles}, {f"flexdemo-flex{i}-principal" for i in range(1, 4)})
+        self.assertEqual({role["principalId"] for role in flex_roles}, {"vmss-principal"})
         network_role = next(role for role in second["roles"] if role["principalId"] == "controlplane-principal")
         self.assertTrue(network_role["roleDefinitionId"].endswith("/4d97b98b-1d4f-4787-a291-c67834d212e7"))
         self.assertEqual(network_role["scope"], second["resources"]["Microsoft.Network/virtualNetworks/flexdemo-vnet"]["id"])
@@ -337,9 +362,8 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["sourceAddressPrefix"], "8.8.4.4/32")
         self.assertEqual(rules[0]["destinationPortRange"], "22")
-        self.assertEqual(second["bootstraps"], {f"flexdemo-flex{i}": 1 for i in range(1, 4)})
-        self.assertEqual(result.stdout.count("already-joined"), 3)
-        self.assertIn("Bootstrap transport:      run-command", result.stdout)
+        self.assertEqual(second["bootstraps"], {f"flexdemo-flex{i}": 1 for i in range(3)})
+        self.assertIn("flexdemo-workers", result.stdout)
         self.assertFalse(any(call[0] == "ssh" for call in self.calls()))
         rerun = self.calls()[calls:]
         self.assertFalse(any(call[0] == "az" and "create" in call for call in rerun))
@@ -351,7 +375,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual((state_dir / "id_ed25519").stat().st_mode & 0o777, 0o600)
         self.assertFalse((state_dir / ".lock").exists())
         access = (state_dir / "ssh-access.txt").read_text()
-        self.assertEqual(access.count("ssh -i"), 3)
+        self.assertEqual(access.count("ssh -p"), 3)
         sites = json.loads((state_dir / "sites.json").read_text())["items"]
         self.assertEqual(sites[2]["spec"], {"sites": ["cluster", "flex-site"], "meshNodes": True, "tunnelProtocol": "Auto"})
         self.assertFalse(any(item["kind"] in ("GatewayPool", "SiteGatewayPoolAssignment") for item in sites))
@@ -359,7 +383,8 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("--agent-sha256", remote)
         self.assertIn("existing agent belongs to another cluster", remote)
         self.assertIn("partial node deployment exists", remote)
-        self.assertIn("NODE=flexdemo-flex3", remote)
+        self.assertIn("metadata/instance", remote)
+        self.assertNotIn("NODE=flexdemo-flex", remote)
         self.assertNotIn("aks-flex-node reset", remote)
         subprocess.run(["bash", "-n", str(self.root / "remote.sh")], check=True)
         self.assertEqual(sum(call[0] == "kubectl" and "exec" in call for call in self.calls()), 6)
@@ -377,97 +402,103 @@ class DeploymentTests(unittest.TestCase):
         gets = [call for call in self.calls() if call[0] == "kubectl" and "deployment/unbounded-net-controller" in call and "get" in call]
         self.assertEqual(len(gets), 3)
 
-    def test_run_command_transport_reuses_hosts_without_ssh(self):
-        self.run_script(["--bootstrap-transport", "run-command"])
-        self.run_script(["--bootstrap-transport", "run-command"])
-        self.assertEqual(self.state()["bootstraps"], {f"flexdemo-flex{i}": 1 for i in range(1,4)})
-        self.assertFalse(any(call[0] == "ssh" for call in self.calls()))
-        self.assertEqual(sum(call[:4] == ["az","vm","run-command","invoke"] for call in self.calls()), 6)
-        for file in (self.root / "state").glob("run-command-*.sh"):
-            subprocess.run(["bash", "-n", str(file)], check=True)
-
-    def test_run_command_shell_failure_is_not_extension_success(self):
-        self.modify(run_command_exit=78)
-        result = self.run_script(["--bootstrap-transport", "run-command"], success=False)
-        self.assertIn("with exit 78", result.stderr)
-        self.assertEqual(self.state()["joined"], [])
-
-    def test_run_command_requires_remote_completion_marker(self):
-        self.modify(missing_run_command_marker=True)
-        result = self.run_script(["--bootstrap-transport", "run-command"], success=False)
-        self.assertIn("did not report a shell exit code", result.stderr)
-
-    def test_run_command_accepts_crlf_completion_marker(self):
-        self.modify(run_command_crlf=True)
-        self.run_script(["--flex-count", "1"])
-        self.assertEqual(self.state()["joined"], ["flexdemo-flex1"])
-
-    def test_run_command_rejects_duplicate_or_stale_completion_marker(self):
-        for mode in ("duplicate", "stale"):
-            with self.subTest(mode=mode):
-                self.modify(run_command_marker_mode=mode)
-                result = self.run_script(["--flex-count", "1"], success=False)
-                self.assertIn("did not report a shell exit code", result.stderr)
-                self.assertNotIn("Deployment ready:", result.stderr)
-
-    def test_run_command_api_failure_is_not_bootstrap_success(self):
-        self.modify(run_command_api_failure=True)
-        result = self.run_script(["--flex-count", "1"], success=False)
-        self.assertIn("Azure Run Command failed", result.stderr)
-        self.assertEqual(self.state()["joined"], [])
-
-    def execute_run_command_wrapper(self, payload, success):
-        state = self.root / "state"
-        state.mkdir()
-        file = self.root / "unit-payload.sh"
-        file.write_text(payload)
-        self.modify(execute_run_command=True)
-        result = subprocess.run(
-            ["bash", "-c", 'source "$1"; STATE_DIR="$2"; SUBSCRIPTION="$3"; RESOURCE_GROUP=flexdemo; SSH_SOURCE_IP=8.8.4.4; run_vm_command flexdemo-flex1 "$4"',
-             "test", str(SCRIPT), str(state), SUBSCRIPTION, str(file)],
-            env=self.env, text=True, capture_output=True, timeout=15,
-        )
-        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
-        self.assertEqual(self.state()["executed_run_command_shell"], "/bin/sh")
-        wrapper = state / "run-command-flexdemo-flex1.sh"
-        subprocess.run(["/bin/sh", "-n", str(wrapper)], check=True)
-        subprocess.run(["bash", "-n", str(wrapper)], check=True)
-        return result
-
-    def test_run_command_launcher_runs_bash_payload_under_posix_handler(self):
-        result = self.execute_run_command_wrapper(
-            '#!/bin/bash\nset -euo pipefail\nvalues=(alpha beta)\n[[ "${values[1]}" == beta ]]\nprintf "sandbox payload ran\\n"\n',
-            success=True,
-        )
-        self.assertIn("sandbox payload ran", result.stdout)
-        self.assertFalse((self.root / "payload.sh").exists())
-
-    def test_run_command_launcher_preserves_actual_payload_failure(self):
-        result = self.execute_run_command_wrapper("#!/bin/bash\nexit 78\n", success=False)
-        self.assertIn("with exit 78", result.stderr)
-
-    def test_ssh_transport_remains_available_and_idempotent(self):
-        options = ["--bootstrap-transport", "ssh", "--flex-count", "1"]
-        self.run_script(options)
-        result = self.run_script(options)
-        self.assertEqual(self.state()["bootstraps"], {"flexdemo-flex1": 1})
-        self.assertIn("already-joined", result.stdout)
-        self.assertTrue(any(call[0] == "ssh" for call in self.calls()))
-        self.assertFalse(any(call[:4] == ["az", "vm", "run-command", "invoke"] for call in self.calls()))
-
-    def test_ssh_failure_does_not_automatically_change_transport(self):
-        self.modify(fail_ssh_connection=True)
-        result = self.run_script(["--bootstrap-transport", "ssh", "--flex-count", "1", "--timeout", "1"], success=False)
-        self.assertIn("SSH unavailable", result.stderr)
-        self.assertEqual(self.state()["joined"], [])
-        self.assertFalse(any(call[:4] == ["az", "vm", "run-command", "invoke"] for call in self.calls()))
-
-    def test_partial_run_resumes_without_rebootstrapping_first_node(self):
-        self.modify(fail_join_once="flexdemo-flex2")
-        self.run_script(success=False)
-        self.assertEqual(self.state()["joined"], ["flexdemo-flex1"])
+    def test_shared_vmss_network_and_bootstrap_profile(self):
         self.run_script()
-        self.assertEqual(self.state()["bootstraps"], {f"flexdemo-flex{i}": 1 for i in range(1, 4)})
+        resources = self.state()["resources"]
+        vmss = resources["Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"]
+        self.assertFalse(vmss["properties"]["singlePlacementGroup"])
+        self.assertFalse(vmss["properties"]["overprovision"])
+        self.assertEqual(vmss["identity"]["type"], "SystemAssigned")
+        profile = vmss["properties"]["virtualMachineProfile"]
+        ip = profile["networkProfile"]["networkInterfaceConfigurations"][0]["properties"]["ipConfigurations"][0]["properties"]
+        self.assertNotIn("publicIPAddressConfiguration", ip)
+        self.assertTrue(ip["subnet"]["id"].endswith("/subnets/flex"))
+        lb = resources["Microsoft.Network/loadBalancers/flexdemo-flex-lb"]
+        self.assertEqual(lb["inboundNatRules"][0]["frontendPortRangeEnd"], 50999)
+        self.assertEqual(lb["outboundRules"][0]["allocatedOutboundPorts"], 32)
+        access = (self.root / "state/ssh-access.txt").read_text()
+        for port in range(50000, 50003):
+            self.assertIn(f"ssh -p {port} ", access)
+        self.assertEqual(access.count("azureuser@20.30.40.1"), 3)
+        data = self.root / "custom-data.sh"
+        subprocess.run(["bash", "-n", str(data)], check=True)
+        host = self.root / "host"
+        (host / "etc/systemd/system").mkdir(parents=True)
+        data.write_text(data.read_text().replace("/etc/aks-flex-vmss-bootstrap", str(host / "bootstrap"))
+                        .replace("/etc/systemd", str(host / "etc/systemd")))
+        subprocess.run(["bash", str(data)], env=self.env, check=True, timeout=5)
+        unit = (host / "etc/systemd/system/aks-flex-vmss-bootstrap.service").read_text()
+        self.assertIn("After=cloud-final.service network-online.target", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartPreventExitStatus=78", unit)
+        self.assertIn(["systemctl", "enable", "--now", "--no-block", "aks-flex-vmss-bootstrap.service"], self.calls())
+
+    def test_registration_retries_without_rebootstrapping_existing_instance(self):
+        self.modify(fail_join_once="flexdemo-flex1")
+        self.run_script()
+        self.assertEqual(self.state()["bootstraps"], {f"flexdemo-flex{i}": 1 for i in range(3)})
+
+    def test_registration_timeout_is_not_deployment_success(self):
+        self.modify(registration_blocked=True)
+        result = self.run_script(["--timeout", "1"], success=False)
+        self.assertIn("not Ready", result.stderr)
+        self.assertNotIn("Deployment ready:", result.stderr)
+
+    def test_external_scale_preserves_identity_and_does_not_repeat_acr_onboarding(self):
+        self.run_script()
+        before = self.state()
+        subprocess.run(["az", "vmss", "scale", "--name", "flexdemo-workers", "--new-capacity", "1000"],
+                       env=self.env, check=True)
+        after = self.state()
+        self.assertEqual(len(after["joined"]), 1000)
+        self.assertEqual(before["roles"], after["roles"])
+        self.assertEqual(before["resources"]["Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"]["identity"],
+                         after["resources"]["Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"]["identity"])
+        self.assertEqual(after["bootstraps"]["flexdemo-flex999"], 1)
+        self.assert_no_acr_wiring()
+
+    def test_rerun_retains_external_scale_capacity(self):
+        self.run_script()
+        subprocess.run(["az", "vmss", "scale", "--name", "flexdemo-workers", "--new-capacity", "5"],
+                       env=self.env, check=True)
+        self.run_script(["--timeout", "60"])
+        self.assertEqual(len(self.state()["joined"]), 5)
+        self.assertEqual(self.state()["resources"]["Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"]["sku"]["capacity"], 5)
+        self.assertEqual(len(self.state()["roles"]), 2)
+
+    def test_machine_registration_follows_pagination(self):
+        self.modify(machine_page_size=1)
+        self.run_script()
+        self.assertTrue(any("$skiptoken=2" in str(call) for call in self.calls()))
+
+    def test_waits_for_asynchronous_instance_inventory(self):
+        self.modify(missing_instance_polls=2)
+        self.run_script()
+        self.assertEqual(self.state()["missing_instance_polls"], 0)
+        self.assertEqual(sum(call[:3] == ["az", "vmss", "list-instances"] for call in self.calls()), 3)
+
+    def test_standalone_intent_is_rejected_before_azure_calls(self):
+        self.run_script()
+        intent = self.root / "state/intent.json"
+        saved = json.loads(intent.read_text())
+        saved.pop("bootstrapTimeout")
+        saved.pop("workerTopology")
+        intent.write_text(json.dumps(saved))
+        before = len(self.calls())
+        result = self.run_script(success=False)
+        self.assertIn("does not migrate standalone VMs", result.stderr)
+        self.assertFalse(any(call[0] == "az" and call[1] not in ("version","account") for call in self.calls()[before:]))
+
+    def test_machine_pagination_cannot_escape_pool_scope(self):
+        self.modify(pagination_escape=True)
+        result = self.run_script(success=False)
+        self.assertIn("pagination left the expected pool", result.stderr)
+        self.assertFalse(any("untrusted.invalid" in str(call) for call in self.calls()))
+
+    def test_missing_ssh_mapping_is_reported(self):
+        self.modify(missing_ssh_mapping=True)
+        result = self.run_script(success=False)
+        self.assertIn("SSH", result.stderr)
 
     def test_public_ip_change_updates_only_ssh_rule(self):
         self.run_script()
@@ -524,33 +555,41 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.state()["groups"], {})
         self.assertEqual(self.state()["roles"], [])
 
-    def test_stopped_vm_is_started_without_recreating_it(self):
+    def test_conflicting_vmss_profile_is_not_overwritten(self):
         self.run_script()
-        self.modify(power={"flexdemo-flex2": "PowerState/deallocated"})
+        state = self.state()
+        state["resources"]["Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"]["properties"]["singlePlacementGroup"] = True
+        self.model.write_text(json.dumps(state))
         before = len(self.calls())
-        self.run_script()
-        starts = [call for call in self.calls()[before:] if call[:3] == ["az", "vm", "start"]]
-        self.assertEqual(len(starts), 1)
-        self.assertEqual(self.state()["power"]["flexdemo-flex2"], "PowerState/running")
-        self.assertEqual(self.state()["bootstraps"]["flexdemo-flex2"], 1)
+        result = self.run_script(success=False)
+        self.assertIn("conflicting bootstrap", result.stderr)
+        self.assertFalse(any("put" in call for call in self.calls()[before:]))
 
     def test_single_flex_node_option(self):
         self.run_script(["--flex-count", "1"])
-        self.assertEqual(self.state()["joined"], ["flexdemo-flex1"])
+        self.assertEqual(self.state()["joined"], ["flexdemo-flex0"])
         self.assertEqual(len(self.state()["resources"]), 7)
 
-    def remote_script(self, config=None, partial=False):
+    def remote_script(self, config=None, partial=False, instance="1", private_ip="10.91.8.5", vmss_name="flexdemo-workers"):
         state = self.root / "state"
         cache = state / "cache"
-        cache.mkdir(parents=True)
-        (cache / "bootstrap-v0.2.0.sh").write_text("#!/bin/bash\nexit 0\n")
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "bootstrap-v0.2.0.sh").write_text(
+            '#!/bin/bash\npython3 - "$@" <<\'PY\'\nimport json, os, pathlib, sys\n'
+            'pathlib.Path(os.environ["MOCK_ROOT"], "agent-args.json").write_text(json.dumps(sys.argv[1:]))\nPY\n')
         remote = self.root / "remote-guard.sh"
         cluster_id = f"/subscriptions/{SUBSCRIPTION}/resourceGroups/flexdemo/providers/Microsoft.ContainerService/managedClusters/flexdemo"
-        subprocess.run(["bash", "-c", 'source "$1"; STATE_DIR="$2"; AKS_ID="$3"; VM_PRIVATE_IP=10.91.1.4; AGENT_DIGEST=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; write_remote_script flexdemo-flex1 "$4"',
+        subprocess.run(["bash", "-c", 'source "$1"; STATE_DIR="$2"; AKS_ID="$3"; NAME=flexdemo; VMSS_NAME=flexdemo-workers; VMSS_ID="/subscriptions/$MOCK_SUBSCRIPTION/resourceGroups/flexdemo/providers/Microsoft.Compute/virtualMachineScaleSets/flexdemo-workers"; FLEX_NODE_CIDR=10.91.8.0/21; AGENT_DIGEST=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; write_remote_script "$4"',
                         "test", str(SCRIPT), str(state), cluster_id, str(remote)], check=True, env=self.env)
+        metadata = self.root / "metadata.json"
+        metadata.write_text(json.dumps({"compute":{"vmScaleSetName":vmss_name,
+            "resourceId":f"/subscriptions/{SUBSCRIPTION}/resourceGroups/flexdemo/providers/Microsoft.Compute/virtualMachineScaleSets/{vmss_name}/virtualMachines/{instance}"},
+            "network":{"interface":[{"ipv4":{"ipAddress":[{"privateIpAddress":private_ip}]}}]}}))
         host = self.root / "host"
         body = remote.read_text().replace("/etc/aks-flex-node", str(host / "etc/aks-flex-node"))
         body = body.replace("/etc/systemd", str(host / "etc/systemd"))
+        body = body.replace("/run/aks-flex-node-bootstrap", str(host / "run/bootstrap"))
+        body = body.replace("http://169.254.169.254/metadata/instance?api-version=2021-02-01", metadata.as_uri())
         remote.write_text(body)
         if config is not None:
             unit = host / "etc/systemd/system/aks-flex-node-agent.service"
@@ -559,7 +598,7 @@ class DeploymentTests(unittest.TestCase):
             file = host / "etc/aks-flex-node/config.json"
             file.parent.mkdir(parents=True)
             file.write_text(json.dumps({"azure":{"targetCluster":{"resourceId":config},"targetAgentPoolName":"flexpool"},
-                                        "agent":{"nodeName":"flexdemo-flex1"},"node":{"kubelet":{"nodeIP":"10.91.1.4"}}}))
+                                        "agent":{"nodeName":"flexdemo-flex1"},"node":{"kubelet":{"nodeIP":"10.91.8.5"}}}))
         if partial:
             unit = host / "etc/systemd/nspawn/kube1.nspawn"
             unit.parent.mkdir(parents=True)
@@ -613,6 +652,25 @@ class DeploymentTests(unittest.TestCase):
                 if code == 2:
                     self.assertIn("recoverable warnings", result.stderr)
 
+    def test_future_instance_derives_its_own_registration_settings(self):
+        remote, _ = self.remote_script(instance="999", private_ip="10.91.11.235")
+        self.modify(apt_get_exit=0)
+        result = subprocess.run(["bash", str(remote)], env=self.env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = json.loads((self.root / "agent-args.json").read_text())
+        self.assertEqual(arguments[arguments.index("--auth")+1], "msi")
+        overrides = json.loads(arguments[arguments.index("--config-overrides")+1])
+        self.assertEqual(overrides["agent"]["nodeName"], "flexdemo-flex999")
+        self.assertEqual(overrides["node"]["kubelet"]["nodeIP"], "10.91.11.235")
+
+    def test_metadata_mismatch_stops_before_host_changes(self):
+        for overrides in ({"instance":"invalid"}, {"private_ip":"10.91.0.4"}, {"vmss_name":"other-workers"}):
+            with self.subTest(overrides=overrides):
+                remote, _ = self.remote_script(**overrides)
+                result = subprocess.run(["bash", str(remote)], env=self.env, text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls(), [])
+
     def test_component_query_failure_is_not_treated_as_missing_workload(self):
         self.modify(fail_get="deployment/unbounded-net-controller")
         result = self.run_script(success=False)
@@ -621,8 +679,8 @@ class DeploymentTests(unittest.TestCase):
 
     def test_legacy_short_pool_label_does_not_pass_flex_validation(self):
         self.modify(node_labels={"agentpool": "flexpool", "unbounded-cloud.io/site": "flex-site"})
-        result = self.run_script(["--flex-count", "1"], success=False)
-        self.assertIn("not assigned to the expected pool and network site", result.stderr)
+        result = self.run_script(["--flex-count", "1", "--timeout", "1"], success=False)
+        self.assertIn("not Ready", result.stderr)
         self.assertNotIn("Deployment ready:", result.stderr)
 
     def test_smoke_failure_is_not_reported_as_deployment_success(self):
@@ -649,7 +707,7 @@ class DeploymentTests(unittest.TestCase):
     def test_help_and_documented_deployment_examples_are_offline(self):
         help_result = subprocess.run(["bash", str(SCRIPT), "--help"], env=self.env, text=True, capture_output=True, timeout=5)
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("run-command (default, Azure VM agent) or ssh", help_result.stdout)
+        self.assertIn("New VMSS instances bootstrap automatically", help_result.stdout)
         examples = []
         for document in (ROOT / "README.md", ROOT / "designs/aks-flex-cluster.md"):
             for block in re.findall(r"```bash\n(.*?)```", document.read_text(), re.DOTALL):
@@ -660,7 +718,7 @@ class DeploymentTests(unittest.TestCase):
                     result = subprocess.run([*arguments, "--plan"], cwd=ROOT, env=self.env, text=True, capture_output=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn("1 system + 3 Flex = 4 total", result.stdout)
-                    self.assertIn("Bootstrap transport:      run-command", result.stdout)
+                    self.assertIn("Uniform VMSS", result.stdout)
                     examples.append(document.name)
         self.assertGreaterEqual(examples.count("README.md"), 1)
         self.assertGreaterEqual(examples.count("aks-flex-cluster.md"), 2)
@@ -679,10 +737,10 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_invalid_parameters_fail_without_cloud_calls(self):
-        for extra in (["--flex-count", "0"], ["--flex-count", "21"], ["--service-cidr", "10.91.0.0/24"],
+        for extra in (["--flex-count", "0"], ["--flex-count", "1001"], ["--service-cidr", "10.91.0.0/24"],
                       ["--ssh-source-ip", "0.0.0.0/0"], ["--ssh-source-ip", "10.0.0.1"], ["--vnet-cidr", "10.91.1.1/16"],
                       ["--agent-version", "latest"], ["--timeout", "00"], ["--subscription", "not-a-uuid"],
-                      ["--bootstrap-transport", "unsafe"]):
+                      ["--bootstrap-transport", "ssh"], ["--vnet-cidr", "10.91.0.0/24"], ["--flex-pod-cidr", "10.95.0.0/16"]):
             with self.subTest(extra=extra):
                 self.run_script(extra, success=False)
                 self.assertEqual(self.calls(), [])
@@ -692,6 +750,12 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn("1 system + 3 Flex = 4 total", result.stdout)
         self.assertEqual(self.calls(), [])
         self.assertFalse((self.root / "state").exists())
+
+    def test_thousand_worker_configuration_and_bounded_smoke(self):
+        self.run_script(["--flex-count", "1000"])
+        self.assertEqual(len(self.state()["joined"]), 1000)
+        self.assertEqual(sum(call[0] == "kubectl" and "exec" in call for call in self.calls()), 3)
+        self.assertEqual((self.root / "state/ssh-access.txt").read_text().count("ssh -p"), 20)
 
     def test_removed_acr_flags_fail_without_cloud_calls_or_state(self):
         for flag, value in (("--acr", "sharedtestacr"),
