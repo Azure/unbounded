@@ -127,6 +127,28 @@ fn put_fills_every_page_through_the_owner_and_reports_success() {
         json(&response)["coverage"]["resident_bytes"],
         3 * PAGE_BYTES
     );
+    // With no request budget left for probing, for example after a long-poll
+    // wait or a slow owner, the status is still answered without probing.
+    let request = f.scope.clone();
+    f.scope = crate::runtime::RequestScope::new(f.scope.request, uring_runtime::environment::now())
+        .unwrap();
+    let response = run(
+        &mut f,
+        &mut endpoint,
+        &local,
+        PrefetchRequest::Get {
+            id: "two".into(),
+            query: StatusQuery {
+                coverage: true,
+                ..StatusQuery::default()
+            },
+        },
+        b"",
+    );
+    f.scope = request;
+    assert_eq!(status_code(&response), 200);
+    assert_eq!(json(&response)["state"], "SUCCEEDED");
+    assert_eq!(json(&response)["coverage"]["resident_bytes"], 0);
     // List and delete.
     let list = json(&run(
         &mut f,

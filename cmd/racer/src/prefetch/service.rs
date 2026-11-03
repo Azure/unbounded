@@ -742,9 +742,32 @@ async fn resolve(
         .collect()
 }
 
+/// Share of the remaining client request budget that coverage probes may use.
+/// The rest is reserved so the status response is still written before the
+/// client request deadline, even when an owner is slow or unresponsive.
+const COVERAGE_BUDGET_NUMERATOR: u32 = 3;
+const COVERAGE_BUDGET_DENOMINATOR: u32 = 4;
+
+/// Deadline for coverage probes made on behalf of a request expiring at
+/// `request_deadline`: a share of the remaining budget, capped at
+/// [`DISPATCH_TIMEOUT`]. `None` when no budget remains.
+pub(super) fn coverage_deadline(at: Instant, request_deadline: Instant) -> Option<Instant> {
+    let remaining = request_deadline.checked_duration_since(at)?;
+    let share =
+        (remaining * COVERAGE_BUDGET_NUMERATOR / COVERAGE_BUDGET_DENOMINATOR).min(DISPATCH_TIMEOUT);
+    (!share.is_zero()).then(|| at + share)
+}
+
 /// Probe the owners of a ticket's desired pages and count resident bytes.
-async fn coverage(local: &Coordinator, membership: &Arc<Membership>, units: Vec<UnitKey>) -> u64 {
-    let Ok(scope) = RequestScope::new(request_id(), now() + DISPATCH_TIMEOUT) else {
+/// Probing stops at `deadline`; the count is then a lower bound covering only
+/// the owners that answered in time.
+async fn coverage(
+    local: &Coordinator,
+    membership: &Arc<Membership>,
+    units: Vec<UnitKey>,
+    deadline: Instant,
+) -> u64 {
+    let Ok(scope) = RequestScope::new(request_id(), deadline) else {
         return 0;
     };
     let me = local.local_node();
@@ -764,6 +787,9 @@ async fn coverage(local: &Coordinator, membership: &Arc<Membership>, units: Vec<
     let mut resident = 0u64;
     for ((owner, version), pages) in groups {
         for chunk in pages.chunks(racer_core::prefetch::MAX_OPERATION_PAGES) {
+            if scope.check().is_err() {
+                return resident;
+            }
             let results = if owner == me {
                 serve_probe(local, &version, chunk, &scope).await
             } else {
@@ -934,9 +960,12 @@ async fn get(
         prefetch.with_registry(|r| r.status(cache, id, query.refs, query.cursor.as_deref()))?;
     if query.coverage {
         let units = prefetch.with_registry(|r| r.desired(cache, id))?;
-        let resident = match local.cache_membership(cache) {
-            Ok(membership) => coverage(local, &membership, units).await,
-            Err(_) => 0,
+        // Bound probing by the client request deadline so a slow or
+        // unresponsive owner cannot consume the budget needed to answer.
+        let deadline = coverage_deadline(now(), scope.deadline.0);
+        let resident = match (local.cache_membership(cache), deadline) {
+            (Ok(membership), Some(deadline)) => coverage(local, &membership, units, deadline).await,
+            _ => 0,
         };
         status.coverage = Some(Coverage {
             resident_bytes: resident,

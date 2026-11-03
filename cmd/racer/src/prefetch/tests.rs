@@ -760,3 +760,18 @@ fn owner_and_peer_records_map_to_unit_outcomes() {
         UnitOutcome::Failed(RefError::Forbidden)
     );
 }
+
+#[test]
+fn coverage_deadline_reserves_part_of_the_request_budget() {
+    use super::service::coverage_deadline;
+    let at = Instant::now();
+    // A short request budget leaves time to send the status response.
+    let deadline = coverage_deadline(at, at + Duration::from_secs(4)).unwrap();
+    assert_eq!(deadline, at + Duration::from_secs(3));
+    // A long-poll budget is still capped by the dispatch timeout.
+    let deadline = coverage_deadline(at, at + Duration::from_secs(3600)).unwrap();
+    assert_eq!(deadline, at + Duration::from_secs(120));
+    // No remaining budget means no probing.
+    assert!(coverage_deadline(at, at).is_none());
+    assert!(coverage_deadline(at + Duration::from_secs(1), at).is_none());
+}
