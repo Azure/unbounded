@@ -146,6 +146,10 @@ class FakeRacer:
     def _dispatch(self, conn, method, target, headers, fds, seen, rest):
         path = target.partition("?")[0]
         if headers.get("host") == "racer" and (path == PREFETCH_PATH or path.startswith(PREFETCH_PATH + "/")):
+            early = self.prefetches.check_head(method, target, headers)
+            if early is not None:
+                self._send(conn, *early)
+                return
             body = rest or b""
             try:
                 want = int(headers.get("content-length", "0"))

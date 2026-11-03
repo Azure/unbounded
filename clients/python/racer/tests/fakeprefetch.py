@@ -125,6 +125,23 @@ class FakePrefetches:
         headers = [("Content-Type", "application/json"), ("Content-Length", str(len(raw))), ("Connection", "close")]
         return status, extra + headers, raw
 
+    def check_head(self, method, target, headers):
+        """Return an error response if the head alone is rejected, else None.
+
+        Racer parses and validates the request head (route, method, id,
+        framing, and Content-Length bounds) before it reads a PUT body.
+        """
+        path, _, query = target.partition("?")
+        if path == PATH or method != "PUT":
+            return None
+        try:
+            if not _ID.fullmatch(path[len(PATH) + 1 :] or "") or path[len(PATH) + 1 :] in (".", ".."):
+                return None
+            self._put_head(query, headers)
+        except Fail:
+            return self.handle(method, target, headers, b"")
+        return None
+
     def _route(self, method, path, query, headers, body):
         if path == PATH:
             if method != "GET":
@@ -156,7 +173,7 @@ class FakePrefetches:
 
     # PUT ---------------------------------------------------------------
 
-    def _put(self, pid, query, headers, body):
+    def _put_head(self, query, headers):
         for h in ("transfer-encoding", "expect", "content-encoding"):
             if h in headers:
                 raise _bad("unsupported body framing")
@@ -165,10 +182,15 @@ class FakePrefetches:
         if headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
             raise _bad("content type must be application/json")
         declared = headers.get("content-length", "")
-        if not declared.isdigit() or int(declared) == 0 or not body:
+        if not declared.isdigit() or int(declared) == 0:
             raise _bad("missing body")
         if int(declared) > self.max_body:
             raise Fail(413, "too_large", "body too large")
+
+    def _put(self, pid, query, headers, body):
+        self._put_head(query, headers)
+        if not body:
+            raise _bad("missing body")
         # Racer rejects a passthrough cache before it parses the body.
         if self.passthrough:
             raise Fail(409, "passthrough", "cache is passthrough")

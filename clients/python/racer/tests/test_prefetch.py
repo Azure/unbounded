@@ -462,3 +462,23 @@ def test_stat_sends_no_retention(client, server):
     assert m.size == 3 and not hasattr(m, "retain_until_ms")
     assert "cache-control" not in last(server).headers
     assert os.path.exists(server.path)
+
+
+def test_oversized_put_rejected_before_body(server):
+    # Racer rejects the head without reading the body, so a client that
+    # sends only headers must still get 413 instead of hanging.
+    size = server.prefetches.max_body + 1
+    raw = (
+        "PUT /v1/prefetches/a HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {size}\r\n\r\n"
+    ).encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5)
+        s.connect(server.path)
+        s.sendall(raw)
+        out = b""
+        while chunk := s.recv(65536):
+            out += chunk
+    head, _, body = out.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 413")
+    assert json.loads(body)["code"] == "too_large"
