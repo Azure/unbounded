@@ -35,15 +35,16 @@ This document specifies how v2 is tested. It has two priorities:
   a crash, the return to v1 after a failure in each step before the commit,
   `--rollback` before and after the first repave and after a crash at each of
   its steps, and the conversion of v1's applied config, credentials, Machine
-  status and host preparation. `version --daemon v2` for the v1 build, the v2
+  status and host preparation. The `agent:` line of `version` for the v1 build, the v2
   build and an older v1 release.
 - Plugin protocol tests with a reference plugin: timeouts, errors, oversized
   output and ownership checks. `plugin-exec` refuses a file whose SHA-256 does
-  not match, a `#!` script and any other file that is not ELF, and runs the
+  not match, a `#!` script, any other file that is not ELF, and a dynamically
+  linked executable, and runs the
   descriptor it checked even when the file is replaced between the check and
   the exec. The unit properties for each combination of `permissions`, the
-  clean environment, and an audit line that never contains the request or
-  response.
+  clean environment, `plugins[].env` refusing `PATH` and `LD_` names, and an
+  audit line that never contains the request or response.
 - Plugin sets in AgentUpgrade: staging from a manifest, copying the running
   set without one, and refusing a manifest with a wrong digest or with a
   plugin added or dropped. `start` with changed plugins on an installed host
@@ -117,7 +118,7 @@ themselves do not change:
 | Boot wiring (`e2e.py:5599-5607`) | The override runs `nspawn-lifecycle post-start` | The override runs `boot-hook post-start` | Not applicable |
 | A repave switches machines (`e2e.py:734-747,6077-6091`) | `kube1` to `kube2`, with a bpffs sentinel | Unchanged: slots `a` and `b` are `kube1` and `kube2` | `status`: the enabled slot switches |
 | NodeReboot (`e2e.py:5415-5452`) | New Node boot ID and a `Rebooted` event | Unchanged | Unchanged ([node runtime, section 5.2](03-node-runtime.md#52-host)) |
-| AgentUpgrade rollback (`e2e.py:1515`) | The fake failing agent answers `version` | It also passes `version --daemon v2`, so the test still reaches the failing-daemon path | Same |
+| AgentUpgrade rollback (`e2e.py:1515`) | The fake failing agent answers `version` | It also prints `agent: v2`, so the test still reaches the failing-daemon path | Same |
 | Reset leaves nothing (`e2e.py:5021-5083`) | v1's leftover list | The list in [host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host), plus the host snapshot (section 3) | Same, with the `host` runtime's items |
 
 ### 2.4 Keeping v1 runs unchanged
@@ -193,14 +194,16 @@ Variants:
 
 | Variant | What it checks |
 |---|---|
-| Release matrix | Step 2 runs once for each v1 release from the oldest supported one to the latest. The oldest release in this matrix is the oldest supported v1 release ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
-| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), and each step of the commit and of the rollback, a helper on the host watches the migration record and kills the migrating process, or reboots the host, when the step is reached. The node must keep running, or boot with one complete machine override, and the migration or rollback must then finish on its own. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
-| Failed | In each step before the commit, a v2 path is made unwritable, or the startup checks are made to fail. The daemon returns `current` to the v1 binary, v1's daemon runs, v1's files match their checksums, the node is unchanged, and the operation is `Failed` with reason `MigrationFailed`. A second variant blocks the API server while it fails: v1's daemon then publishes the failure from its signal. |
+| Release matrix | Step 2 runs once for each v1 release from the oldest supported one, at least v0.13.0, to the latest. The oldest release in this matrix is the oldest supported v1 release. A host on v0.12.x is refused before anything changes ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
+| Interrupted | For each phase in [migrating from v1, section 6](10-migration-from-v1.md#6-steps), and each step of the commit and of the rollback, a helper on the host watches the migration record and kills the migrating process, or reboots the host, when the step is reached. The node must keep running, or boot with one complete machine override, and the migration or rollback must then finish on its own. During a rollback, a reboot before v1's daemon unit is back must start v2, never v1, and a finished rollback must leave `last-good` naming the v1 binary. This is done from outside, without failure points in the product, as the existing bootstrap-recovery test does (`e2e.py:3732-3741`). |
+| Failed | In each step before the commit, a v2 path is made unwritable, or the checks before the commit are made to fail, including with the API server unreachable. The daemon returns `current` to the v1 binary, v1's daemon runs, v1's files match their checksums, the node is unchanged, and the operation is `Failed` with reason `DaemonFailed` and v2's error as its message. |
 | Refused | An upgrade to the v2 build changes nothing of v1's on a v1 host with an unfinished install, with two applied configs, or on a release older than the oldest supported one, and the operation is `Failed`. The v2 build's `start` on a v1 host is refused. |
 | Rollback | Migrate, then `migrate --rollback`. v1's daemon runs, v1's files and the v1 binary match the checksums from step 2, `current` and `last-good` name that binary, and the node is unchanged. The v1 NodeReboot and AgentUpgrade steps pass. Migrating again succeeds. A second variant makes the restored v1 daemon fail repeatedly: the recovery unit restarts v1, never v2. |
 | v1 build refused | After migrating, an AgentUpgrade to a v1 build, and one to the v1 release the host ran before, are rejected before the switch, both inside the rollback window and after a repave |
 | Crash loop after the commit | After migrating, make the v2 daemon fail repeatedly, then do the same after a repave. Each time, the recovery unit restores a v2 binary, never the v1 one, and the daemon runs again once the fault is removed ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). `migrate --rollback` still works while the daemon cannot start. |
-| Readiness timeout | After migrating, make an AgentUpgrade's new daemon hang before its startup gate opens. The start times out three times, the recovery unit restores the previous binary, and the operation is `Failed` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
+| Readiness timeout | After migrating, make an AgentUpgrade's new daemon hang before it reports ready. The start times out three times, the recovery unit restores the previous binary, and the operation is `Failed` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
+| API server unreachable | After migrating, block the API server and restart the daemon: it reports ready and catches up once the API server is back, with no binary rollback. Repeat right after an AgentUpgrade: the new binary is rolled back and the operation is `Failed` once the API server is back. |
+| Limited mode | After migrating, make the node state disagree with the host and restart the daemon: it reports ready, shows `AgentHealthy=False` with `StateMismatch`, changes nothing on a Node deletion, and runs an AgentReset. Repeat right after an AgentUpgrade: the new binary is rolled back. |
 | To `host` | After migrating, set the Machine's `spec.agent.runtime` to `host` and check that `RuntimeChangePending` is `True`. Then `reset`, bootstrap again with `manual-bootstrap --runtime host`, check that `RuntimeChangePending` is `False` and `status.agent.runtime` is `host`, and run the lifecycle suite under `NODE_RUNTIME=host`. |
 | Immutable host | The cluster-started migration on an Ignition host (`HOST_BASE_OS=acl`), which needs no access to the host |
 | Adopted machine | `migrate --adopt-machine` on a host built by a fixture that mimics AKS Flex Node: its own daemon unit and paths, and a supplied v2 configuration with a plugin |

@@ -193,7 +193,7 @@ mistaken for no repave:
 | Not `Repave.Slot`, digest matches `Applied.BundleDigest` | No repave in progress, or one that never got as far as starting the new slot, including one approved but not yet rendered (`Repave.Slot` empty) | Continues or retries the approved repave, if any, from the beginning of its first unfinished step |
 | `Repave.Slot`, digest matches `Repave.BundleDigest` | The new slot started, but the commit did not happen | Waits for readiness, then commits |
 | None, and `Repave` is set | The old slot was stopped, but the new one was not started | Continues the approved repave from starting the new slot |
-| Any other case | The record and the host disagree | Reports `StateMismatch`, changes nothing, and keeps the daemon from reporting ready (section 5) |
+| Any other case | The record and the host disagree | Reports `StateMismatch` and changes nothing; the daemon runs in limited mode (section 5) |
 
 The runtime kind is an install-time setting, so it lives in the install
 record, not here.
@@ -211,8 +211,9 @@ saved bundle manifests, and the migration record on a host migrated from v1.
   binary ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)), which must still be able to read what the newer binary
   wrote.
 - If a file has an unknown `schemaVersion` or fails its checksum, the daemon
-  makes no changes and reports `StateCorrupt`. `reset` still runs, using the
-  conservative paths described in [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown).
+  makes no changes, reports `StateCorrupt` and runs in limited mode (section 5).
+  `reset` still runs, using the conservative paths described in
+  [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown).
 - The state files listed above, the configuration copy and daemon credentials
   under `/etc/unbounded/agent-v2/`, and every file the bundle marks as secret
   have mode 0600. The configuration copy can hold a bootstrap token. Slot
@@ -242,24 +243,47 @@ flowchart TD
   D -- Steady --> S["status.report Ready, or Provisioning while the Node does not exist"]
 ```
 
-The startup gate opens when the Machine is registered, `Recover` has found the
-host consistent with the state (section 4), every configured plugin has
-answered `describe` with the methods the configuration uses
-([extensions, section 3](02-extensions.md#3-plugin-protocol)), and the caches have synced. The
-daemon then tells systemd it is ready: the daemon unit is `Type=notify`, and the
-daemon sends `READY=1` ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). It then publishes pending AgentUpgrade and
-HostOSReboot results, as v1 publishes them when its daemon starts
+The daemon reports ready to systemd, with `READY=1` (the daemon unit is
+`Type=notify`), once its local checks pass: its state files are readable,
+`Recover` has compared the host with the state (section 4), and every
+configured plugin has answered `describe` with the methods the configuration
+uses, the calls made in parallel ([extensions, section 3](02-extensions.md#3-plugin-protocol)). Right after an AgentUpgrade,
+while the upgrade signal is pending, it must also register or read its own
+Machine with one authenticated API call, which proves the new binary can reach
+the API ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). Readiness never waits for anything else:
+
+- **Not for the API server on an ordinary start.** The daemon connects in the
+  background and keeps retrying, so a control-plane outage never keeps it from
+  starting. v1's daemon exits when it cannot register its Machine
+  (`cmd/agent/internal/daemon/daemon.go:166-168`). During a long outage it
+  fails at every start, its start limit trips, and the recovery unit swaps it
+  for `last-good` (`unbounded-agent-daemon-recovery.sh:11,26`): a binary
+  rollback for a fault the binary does not have.
+- **Not for the caches.** On a large cluster they can take a long time to sync:
+  the daemon, like v1's, caches every MachineOperation in the cluster (issue
+  #1058). A slow sync must not fail an upgrade.
+
+The startup gate opens once the daemon is ready, has reached the API server and
+its caches have synced. It then publishes pending AgentUpgrade and HostOSReboot
+results, as v1 publishes them when its daemon starts
 (`cmd/agent/internal/daemon/daemon.go:170-176`), and starts taking requests from
 the queue. An approved repave that `Recover` found is finished from the queue,
-after the gate opens, so a long repave never delays readiness.
+so a long repave never delays readiness either.
 
-A daemon whose `Recover` finds the state inconsistent or corrupt
-(`StateMismatch`, `StateCorrupt`) reports it on the Machine and exits with a
-failure code instead of reporting ready, as v1's daemon exits when it cannot
-make sense of the host's machines (`daemon.go:137-140`). After an AgentUpgrade,
-this rolls the binary back. When the state itself is at fault, the `last-good`
-binary that the recovery unit starts fails the same way, and the host needs
-`reset` on the host or a HostReplace.
+When `Recover` finds the state inconsistent or corrupt (`StateMismatch`,
+`StateCorrupt`):
+
+- **Right after an AgentUpgrade,** the daemon reports the reason on the
+  Machine if it can and exits with a failure code instead of reporting ready.
+  The new binary disagrees with a state the old one accepted, so it is the
+  likely fault, and the recovery unit rolls it back.
+- **On any other start,** the daemon reports ready in a limited mode. It shows
+  `AgentHealthy=False` with the reason, makes no change to the node, and runs
+  only AgentReset, which handles corrupt state with conservative paths
+  ([host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown)), and AgentUpgrade, so a fixed binary can be shipped.
+  Every other request waits. v1's daemon instead exits when it cannot make
+  sense of the host's machines (`daemon.go:137-140`), which leaves only access
+  to the host, or a HostReplace, to fix it.
 
 `Decide` repaves only when the daemon itself sees this node's Node object
 being deleted, as v1 does: v1 watches only Node delete events

@@ -22,7 +22,7 @@ This is the complete list of what v2 creates or changes on a host, and what
 | Artifact cache | `/var/lib/unbounded/agent-v2/artifacts/<sha256>` |
 | Slots: saved bundle manifests, and on `host` the staged binaries and files | `/var/lib/unbounded/agent-v2/slots/{a,b}` |
 | Configuration copy (`config.json`), daemon credentials, upgrade signal | `/etc/unbounded/agent-v2/` |
-| Daemon units | `unbounded-agent-daemon.service`, `unbounded-agent-daemon-recovery.service`. The names are the same as v1's. The daemon unit is `Type=notify`, with the start timeout and start limit in [lifecycles, section 5](05-lifecycles.md#5-agentupgrade), and its `ExecStartPre=` runs `<current> version --daemon v2`, so it never starts a binary whose daemon is not v2's. It runs `<current> daemon`, as v1's does. |
+| Daemon units | `unbounded-agent-daemon.service`, `unbounded-agent-daemon-recovery.service`. The names are the same as v1's. The daemon unit runs `<current> daemon`, as v1's does. It is `Type=notify`, with the start timeout and start limit in [lifecycles, section 5](05-lifecycles.md#5-agentupgrade), and, as v1's does, treats the deferred exit code as success (`cmd/agent/internal/daemon/assets/unbounded-agent-daemon.service:17-22`). |
 | Boot hook binary, which a binary rollback does not revert | `/opt/unbounded/agent/bin/unbounded-agent-boot-hook` ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
 | First-boot unit, if a provisioning tool installed one | For example v1's Ignition unit, `unbounded-agent-bootstrap.service` (`internal/provision/script.go:13`) |
 | Extension host units and files | As declared in each extension ([extensions, section 2](02-extensions.md#2-declarative-extensions)) |

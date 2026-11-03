@@ -64,17 +64,17 @@ internal/agentv2/
   clean environment and an audit line per call. A plugin that declares
   `root: true` or capabilities is trusted with them
   ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
-- **A plugin's shared libraries are not pinned.** Only the executable is.
-  Statically linked plugins avoid this, and `preflight` warns about the
-  others.
+- **Only statically linked plugins run.** The pin covers only the executable,
+  so a dynamically linked plugin would load unpinned libraries from the host.
+  Consumers whose plugins are dynamically linked today must rebuild them.
 - **Agent and plugin versions could skew.** Plugins change only with an
   AgentUpgrade, which stages and rolls them back with the binary, and the
   daemon checks each plugin with `describe` before it reports ready
   ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
 - **Each release has two builds.** An operator could install the wrong one.
   The v2 build on a v1 host migrates it, which is what the v2 build is for. A
-  v1 build on a v2 host is rejected before the switch, and the daemon unit
-  refuses to start it. A build tag rather than a linker flag selects the
+  v1 build on a v2 host is rejected before the switch, and the v1 build's
+  own commands refuse to act on a v2 host. A build tag rather than a linker flag selects the
   commands, so a mistake fails to compile instead of being ignored, and v1's
   build contains none of v2's code. CI builds and tests both
   ([testing, section 6](11-testing.md#6-ci)).

@@ -25,7 +25,7 @@ v1's `start`.
 | `record-agent-upgrade-failure-signal` (hidden) | Used by the daemon recovery script |
 | `plugin-exec` (hidden) | Runs inside a plugin's sandboxed unit: verifies the stored plugin and replaces itself with it ([extensions, section 3](02-extensions.md#3-plugin-protocol)) |
 | `convert-config [--runtime <kind>]` (hidden) | Reads a v1 configuration on stdin and writes the v2 configuration it converts to ([v1 compatibility, section 5](08-v1-compatibility.md#5-converting-a-v1-configuration)), optionally for another runtime. Used by operators preparing a configuration by hand for a host without a Machine. |
-| `version [--output json] [--daemon v2]` | Prints the version, and which agent the binary's `daemon` command runs. With `--daemon v2`, it exits non-zero unless that is v2's daemon. A v1 binary of any release fails this check: older ones do not know the flag. The upgrade candidate check and the daemon unit both use it ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
+| `version [--output json]` | Prints the version, and which agent the binary is, as `agent: v2`. The v1 build prints `agent: v1`, and older v1 releases print no such line, which also means v1. The upgrade candidate check reads it ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). |
 
 During the experimental releases, every command of the v2 build logs this
 warning as its first line of output, and `--help` says the same:
@@ -196,7 +196,9 @@ Validation rules:
   `command[0]` is where `start` reads the executable from at first install,
   and the rest of `command` are its arguments. `env` holds literal values only
   and never secrets, which travel on stdin
-  ([extensions, section 3](02-extensions.md#3-plugin-protocol)).
+  ([extensions, section 3](02-extensions.md#3-plugin-protocol)). It cannot set `PATH` or any name
+  starting with `LD_`, which could make a pinned plugin load code that is not
+  pinned.
 - `plugins[].permissions.paths` cannot name anything under `/etc/unbounded`
   or `/var/lib/unbounded`, which hold the agent's credentials and state, and
   cannot grant `write` under `/opt/unbounded`, which holds the agent and plugin

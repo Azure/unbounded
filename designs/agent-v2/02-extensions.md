@@ -219,7 +219,7 @@ Operational rules:
 - **`describe`** is called when `start`, `daemon`, `preflight` or
   `reset` starts. If a plugin configured as a provider does not list a
   method the configuration uses, startup fails, except for `reset` (below).
-  For the daemon this happens before its startup gate opens
+  For the daemon this happens, for all plugins in parallel, before it reports ready
   ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)), so a plugin set that does not fit a newly
   upgraded binary keeps the daemon from reporting ready, and the recovery unit
   rolls both back ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
@@ -241,13 +241,15 @@ Operational rules:
   stored plugin, hashes it through the open file descriptor, and replaces
   itself with that same descriptor through `execveat(2)` with `AT_EMPTY_PATH`.
   A file swapped after the check is never the one that runs.
-- **Compiled executables only.** `plugin-exec` refuses a file that is not ELF.
-  A `#!` script cannot be run safely from a descriptor: its interpreter either
-  reopens the script by path or cannot reach it at all, and the interpreter
-  and everything it loads are not pinned (`execveat(2)` manual page). Only the
-  executable itself is pinned, so a dynamically linked plugin still loads the
-  host's shared libraries. Plugins should be linked statically, and
-  `preflight` warns about one that is not.
+- **Statically linked executables only.** `plugin-exec` refuses a file that is
+  not ELF. A `#!` script cannot be run safely from a descriptor: its
+  interpreter either reopens the script by path or cannot reach it at all, and
+  the interpreter and everything it loads are not pinned (`execveat(2)` manual
+  page). It also refuses a dynamically linked executable, because only the
+  executable is pinned and the shared libraries it would load come from the
+  host. `preflight` and `start` report the same before anything runs. A Go
+  plugin built with `CGO_ENABLED=0` is static, as this repository's own
+  release builds are (`.goreleaser.yml:34-35`).
 - **Sandboxed and unprivileged by default.** Each call's unit applies these
   settings. A plugin asks for more only through `plugins[].permissions`, which
   is an install-time setting ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)):
@@ -262,8 +264,8 @@ Operational rules:
 
 - **A clean environment.** The plugin's environment holds only `PATH`, set to
   `/usr/sbin:/usr/bin:/sbin:/bin`, `LANG=C.UTF-8`, and the literal values in
-  `plugins[].env`, such as proxy settings. Nothing from the agent's own
-  environment passes through.
+  `plugins[].env`, such as proxy settings, which cannot set `PATH` or any
+  `LD_` name. Nothing from the agent's own environment passes through.
 - **An audit log.** Every call writes one line to the agent's log: the plugin,
   the method, the SHA-256 that was run, the unit name, the user, the granted
   capabilities and writable paths, the duration, the exit status and the

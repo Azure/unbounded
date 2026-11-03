@@ -187,12 +187,12 @@ sequenceDiagram
   D->>D: hook agent.upgrade.before
   D->>AB: download, verify sha256, install into the inactive blue or green binary
   D->>AB: stage the plugin set beside it, from the plugin manifest or a copy of the running set
-  AB->>AB: candidate must pass version --daemon v2
+  AB->>AB: candidate's version must say agent: v2
   AB->>AB: switch current link, keep last-good
   D->>D: write upgrade signal
   D->>SD: restart the daemon unit
   SD->>N: start, Type=notify
-  N->>SD: READY=1 once the startup gate opens
+  N->>SD: READY=1 once its local checks pass and it can read its Machine
   N->>N: publish Complete from the signal, hook agent.upgrade.after
   SD-->>SD: if starts keep failing or timing out, the recovery unit restores last-good, whose daemon publishes Failed and fires agent.upgrade.after
 ```
@@ -202,8 +202,11 @@ This is v1's mechanism
 `pkg/agent/agentbinary/upgrade.go:193-273`) with these additions:
 
 - **The operation completes only when the new daemon is ready.** The daemon
-  unit is `Type=notify`, and the daemon sends `READY=1` only when its startup
-  gate opens ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). The old daemon therefore restarts the
+  unit is `Type=notify`. After an AgentUpgrade, the new daemon sends `READY=1`
+  only when its local checks pass and it has registered or read its own Machine
+  with one authenticated API call, which proves it can reach the API
+  ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). It does not wait for its caches, so the size of the
+  cluster does not decide whether an upgrade succeeds. The old daemon therefore restarts the
   unit through systemd, so that the new daemon's start is held to the start
   timeout, rather than running the new binary in the same process as v1 does
   (`cmd/agent/internal/cmd/daemon.go:50-59`). v1 has no such check on this
@@ -212,20 +215,18 @@ This is v1's mechanism
   v1's host-driven activation waits, for a process that stays up for 3 seconds
   (`cmd/agent/internal/daemon/hostupgrade.go:23-26,110-146`).
 - **A daemon that never becomes ready is rolled back like one that crashes.**
-  The unit sets `TimeoutStartSec=60s`, `RestartSec=10s`, `StartLimitBurst=3` and
-  `StartLimitIntervalSec=5min`. Three starts that time out take at most 200
+  The unit sets `TimeoutStartSec=90s`, `RestartSec=10s`, `StartLimitBurst=3` and
+  `StartLimitIntervalSec=5min`. Three starts that time out take at most 290
   seconds, inside the interval, so the start limit trips and the recovery unit
   runs. v1's unit allows three starts in 60 seconds
   (`cmd/agent/internal/daemon/assets/unbounded-agent-daemon.service:9-10,16`),
-  which three 60-second timeouts would never reach. Five minutes is the
+  which three 90-second timeouts would never reach. Five minutes is the
   longest interval v1's recovery script accepts
   (`unbounded-agent-daemon-recovery.sh:61-64`), and v2's keeps that limit.
-- **Only v2 binaries are accepted.** A candidate is checked with
-  `version --daemon v2` where v1 checks `version`
-  (`pkg/agent/agentbinary/agentbinary.go:125`), so a v1 build, or any older v1
-  release, is rejected before the switch. The daemon unit's `ExecStartPre=`
-  repeats the check at every start, so the recovery unit cannot start such a
-  binary either ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). On a host migrated from v1, the way
+- **Only v2 binaries are accepted.** Where v1 only checks that `version` runs
+  (`pkg/agent/agentbinary/agentbinary.go:119-125`), v2 also requires its output
+  to say `agent: v2` ([CLI and configuration, section 1](01-cli-and-configuration.md#1-cli)). A v1 build, or any older v1
+  release, is rejected before the switch. On a host migrated from v1, the way
   back to v1 is `migrate --rollback` on the host, while the rollback window is
   open ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)).
 - **Plugins move with the binary.** The optional parameters
@@ -249,7 +250,7 @@ This is v1's mechanism
   plugins exist, and what they may do, are install-time settings. Switching
   `current` then activates binary and plugins together, and the recovery unit
   restoring `last-good` rolls both back. The new daemon checks every plugin
-  with `describe` before its startup gate opens, so a plugin that does not fit
+  with `describe` before it reports ready, so a plugin that does not fit
   the new binary is rolled back with it.
 - **On a v1 host, upgrading to the v2 build migrates the host.** v1's daemon
   installs it as any candidate, and v2's daemon migrates the host when it
