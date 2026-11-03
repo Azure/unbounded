@@ -3257,6 +3257,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::DiagnosticFailures => "racer_diagnostic_failures_total",
             Self::DeliveryPipeDrain => "racer_delivery_pipe_drains_total",
             Self::DeliveryDirectBytes => "racer_delivery_direct_bytes_total",
+            Self::DeliveryBytes => "racer_delivery_bytes_total",
             Self::CryptoEncryptStarted => "racer_crypto_encrypt_started_total",
             Self::CryptoEncryptSuccess => "racer_crypto_encrypt_success_total",
             Self::CryptoEncryptFailure => "racer_crypto_encrypt_failure_total",
