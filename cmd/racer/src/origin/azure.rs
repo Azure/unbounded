@@ -327,16 +327,6 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         self.tokens.retain(&live);
     }
 
-    #[cfg(test)]
-    pub(crate) fn transport(&self) -> &T {
-        &self.transport
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tokens(&self) -> &K {
-        &self.tokens
-    }
-
     /// The published definition for the context's cache. The cache UID is the
     /// lookup key, so a recreated ClusterCache never reaches a stale origin.
     fn definition(&self, object: &ObjectId) -> Result<(Arc<Snapshot>, usize)> {
