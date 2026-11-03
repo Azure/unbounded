@@ -79,6 +79,14 @@ on:
         required: false
         type: boolean
         default: false
+      large-sbom:
+        description: >-
+          With sign, sign the SBOM with cosign sign-blob instead of attesting it,
+          and attach the bundle to the release too. Rekor cannot take very large
+          attestations (racer-vllm's SBOM is ~30 MB); sign-blob logs only the digest.
+        required: false
+        type: boolean
+        default: false
       release-tag:
         description: When set with sign, also attach the SBOM to this GitHub release (replacing any existing asset).
         required: false
@@ -342,15 +350,21 @@ jobs:
           upload-release-assets: false
 
       - name: Attest SBOM to image
-        if: inputs.sign
+        if: inputs.sign && !inputs.large-sbom
         env:
           REF: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}@${{ steps.create.outputs.digest }}
           SBOM: sbom-${{ inputs.name }}.spdx.json
         run: cosign attest --yes --predicate "$SBOM" --type spdxjson "$REF"
 
-      # After the attestation, not before: the attestation is the
-      # authoritative, digest-bound copy, and it should never be blocked by the
-      # releases API having a bad minute.
+      - name: Sign the SBOM
+        if: inputs.sign && inputs.large-sbom
+        env:
+          SBOM: sbom-${{ inputs.name }}.spdx.json
+        run: cosign sign-blob --yes --bundle "${SBOM}.bundle.json" "$SBOM"
+
+      # After the attestation or signature, not before: that is the
+      # authoritative copy, and it should never be blocked by the releases API
+      # having a bad minute.
       - name: Attach SBOM to the release
         if: inputs.sign && inputs.release-tag != ''
         env:
@@ -358,4 +372,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.release-tag }}
           SBOM: sbom-${{ inputs.name }}.spdx.json
-        run: gh release upload "$TAG" "$SBOM" --clobber
+          LARGE_SBOM: ${{ inputs.large-sbom }}
+        run: |
+          set -euo pipefail
+
+          assets=("$SBOM")
+          if [[ "$LARGE_SBOM" == "true" ]]; then
+            assets+=("${SBOM}.bundle.json")
+          fi
+
+          gh release upload "$TAG" "${assets[@]}" --clobber
