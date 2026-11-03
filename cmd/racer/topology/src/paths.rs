@@ -1,8 +1,23 @@
-//! Shortest-path routing over the membership graph.
+//! Mesh routing between members.
 //!
-//! Searches run in small steps so one route never blocks a worker for long.
+//! Every pool has diameter 2, so routes need no graph search. A route is the
+//! best usable candidate, in this order:
+//!
+//! 1. The direct link.
+//! 2. `from -> d -> to` with `d` the primary delegate
+//!    ([`crate::Pool::primary`]) of each pool that has both ends, highest
+//!    pool rank first.
+//! 3. The alternates ([`crate::Pool::alternate`]), highest pool rank first.
+//! 4. Any other common neighbor of `from` and `to` in the union graph.
+//! 5. With 3 links: `from -> m -> delegate(m, col(to)) -> to` for each
+//!    column mate `m` of `from`, in each pool that has both ends.
+//!
+//! Candidates in one group are equivalent; the seed and first-hop weights pick
+//! one. A route never passes a `visited` member, and never starts with a
+//! `blocked` first hop. Members that share no pool and are not linked are
+//! unreachable.
 
-use crate::{Error, MAX_DEGREE, Member, Membership, hash};
+use crate::{Error, Member, Membership, Pool, hash};
 
 use sha2::Digest;
 
@@ -39,7 +54,8 @@ pub struct PathQuery<'a> {
     /// Members the route must not pass through.
     pub visited: &'a [usize],
 
-    /// Neighbors of `from` to skip as the first hop. At most 64 entries.
+    /// Neighbors of `from` to skip as the first hop. At most
+    /// [`MAX_BLOCKED`] entries.
     /// Members that are not neighbors of `from` are ignored.
     pub blocked: &'a [usize],
 
@@ -52,8 +68,8 @@ pub struct PathQuery<'a> {
 ///
 /// Use one per worker thread. It does no I/O and has no timers.
 ///
-/// `S` decides how searches run. The default, [`Exhaustive`], searches the
-/// graph. The simulator replays searches from a memo shared by many `Paths`:
+/// `S` decides how searches run. The default, [`Exhaustive`], computes mesh
+/// routes. The simulator replays searches from a memo shared by many `Paths`:
 /// each `Paths` keeps only its own LRU of keys and in-flight counters, while
 /// hits, misses, evictions, admission limits, and the number of polls per
 /// search stay identical.
@@ -108,35 +124,31 @@ pub trait Searches {
     fn finish(&self, search: &Self::Search) -> Result<Alternatives>;
 }
 
-/// Default [`Searches`]: run the real bidirectional search.
+/// Default [`Searches`]: compute the real mesh routes ([`MeshSearch`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Exhaustive;
 
 impl Searches for Exhaustive {
-    type Search = EqualCostSearch;
+    type Search = MeshSearch;
 
     #[inline]
-    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> EqualCostSearch {
-        EqualCostSearch::new(membership.graph(), key)
+    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> MeshSearch {
+        MeshSearch::new(membership.shared_pools(), key)
     }
 
     #[inline]
-    fn step(&self, search: &mut EqualCostSearch) -> bool {
-        let step = search.step(SEARCH_QUANTUM);
-        debug_assert!(
-            step.expansions <= SEARCH_QUANTUM && step.edges <= step.expansions * MAX_DEGREE
-        );
-        step.done
+    fn step(&self, search: &mut MeshSearch) -> bool {
+        search.step()
     }
 
     #[inline]
-    fn finish(&self, search: &EqualCostSearch) -> Result<Alternatives> {
-        search.finish().map(Rc::new)
+    fn finish(&self, search: &MeshSearch) -> Result<Alternatives> {
+        search.finish()
     }
 }
 
-/// Most nodes one poll may expand before yielding.
-const SEARCH_QUANTUM: usize = 32;
+/// Most `blocked` entries a query may have.
+pub const MAX_BLOCKED: usize = 65_536;
 
 /// Longest seed we accept.
 const MAX_SEED_BYTES: usize = 65_536;
@@ -162,8 +174,8 @@ pub struct PathKey {
 }
 
 impl PathKey {
-    /// Topology identity ([`Membership::topology_identity`]) of the graph
-    /// searched.
+    /// Topology identity ([`Membership::topology_identity`]) of the mesh
+    /// routed over.
     #[must_use]
     pub fn topology(&self) -> [u8; 32] {
         self.membership
@@ -175,7 +187,7 @@ impl PathKey {
         if query.from >= count
             || query.to >= count
             || query.visited.len() > usize::from(u8::MAX - query.links)
-            || query.blocked.len() > MAX_DEGREE
+            || query.blocked.len() > MAX_BLOCKED
             || query.seed.len() > MAX_SEED_BYTES
             || query
                 .visited
@@ -193,12 +205,10 @@ impl PathKey {
         let mut blocked = query.blocked.to_vec();
         blocked.sort_unstable();
         blocked.dedup();
-        blocked.retain(|v| {
-            membership
-                .neighbor_slice(query.from)
-                .binary_search(v)
-                .is_ok()
-        });
+        if !blocked.is_empty() {
+            let neighbors = membership.neighbors(query.from);
+            blocked.retain(|v| neighbors.binary_search(v).is_ok());
+        }
         Ok(Self {
             membership: membership.topology_identity(),
             from: query.from,
@@ -395,7 +405,7 @@ impl<S: Searches> Drop for SearchAdmission<'_, S> {
 }
 
 /// One caller's place in the search queue. Dropping it (admitted, finished,
-/// or cancelled) leaves the queue and wakes the next caller.
+/// or canceled) leaves the queue and wakes the next caller.
 struct QueueTicket<'a, S: Searches> {
     paths: &'a Paths<S>,
 
@@ -533,13 +543,14 @@ impl<S: Searches> Paths<S> {
         self.inflight.borrow().len()
     }
 
-    /// Find a shortest route from `query.from` to `query.to`.
+    /// Find a mesh route from `query.from` to `query.to` (see the module
+    /// docs for the order candidates are tried in).
     ///
     /// Returns the positions along the route, including both ends. When
-    /// several routes are equally short, the seed and the first hop's weight
+    /// several candidates are equivalent, the seed and the first hop's weight
     /// decide which one is returned.
     ///
-    /// The search yields often, so it does not block the worker. Dropping
+    /// A search takes three steps and yields between them. Dropping
     /// the future cancels the search unless another caller is still waiting
     /// on it.
     ///
@@ -699,197 +710,157 @@ fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
     unreachable!("ticket is below the sum of positive weights")
 }
 
-/// What the search knows about one reached node.
-struct Visit {
-    depth: u8,
+/// Picks the middle node of a 2-link path in one pool.
+type MiddleHop = fn(&Pool, usize, usize) -> Option<usize>;
 
-    parent: usize,
-
-    first: u64,
-}
-
-/// One side of the search: from the source, or from the destination.
-struct EqualCostWave {
-    visits: BTreeMap<usize, Visit>,
-
-    queue: VecDeque<usize>,
-}
-
-impl EqualCostWave {
-    /// Start a side at its endpoint.
-    fn new(root: usize) -> Self {
-        Self {
-            visits: BTreeMap::from([(
-                root,
-                Visit {
-                    depth: 0,
-                    parent: root,
-                    first: 0,
-                },
-            )]),
-            queue: VecDeque::from([root]),
-        }
-    }
-}
-
-/// Search from both ends at once, one layer at a time, until the sides meet.
-///
-/// It tracks which first hops lead to each node. It finishes the whole layer
-/// where the sides meet, so every shortest first hop is found, not just the
-/// first one by ID. It keeps one route per first hop, not every route.
-pub struct EqualCostSearch {
-    graph: Arc<Vec<Vec<usize>>>,
+/// A mesh route computation in three steps: the direct link and delegate
+/// paths, then other common neighbors, then 3-link fallbacks. Each step only
+/// runs if the earlier ones found nothing. It always yields after the first
+/// two steps, so concurrent callers can join it and no poll does much work.
+pub struct MeshSearch {
+    pools: Arc<[Pool]>,
 
     key: PathKey,
 
-    waves: [EqualCostWave; 2],
+    steps: u8,
 
-    side: usize,
-
-    remaining: usize,
-
-    layers: u8,
-
-    meetings: Vec<Option<usize>>,
-
-    done: bool,
+    result: Option<Result<Vec<Vec<usize>>>>,
 }
 
-/// What one search step did.
-#[derive(Default)]
-struct SearchStep {
-    done: bool,
-
-    expansions: usize,
-
-    edges: usize,
-}
-
-impl EqualCostSearch {
-    /// Start a search on the given graph.
-    fn new(graph: Arc<Vec<Vec<usize>>>, key: &PathKey) -> Self {
-        let neighbors = &graph[key.from];
-        assert!(neighbors.len() <= MAX_DEGREE);
+impl MeshSearch {
+    /// Start a search over these pools.
+    fn new(pools: Arc<[Pool]>, key: &PathKey) -> Self {
         Self {
+            pools,
             key: key.clone(),
-            meetings: vec![None; neighbors.len()],
-            graph,
-            waves: [EqualCostWave::new(key.from), EqualCostWave::new(key.to)],
-            side: 0,
-            remaining: 1,
-            layers: 0,
-            done: key.from == key.to || key.links == 0,
+            steps: 0,
+            result: None,
         }
     }
 
-    /// Expand up to `quantum` nodes. Sides switch after each full layer.
-    fn step(&mut self, quantum: usize) -> SearchStep {
-        let mut step = SearchStep::default();
-        for _ in 0..quantum {
-            if self.done {
-                break;
-            }
-            let Some(node) = self.waves[self.side].queue.pop_front() else {
-                self.done = true;
-                break;
+    /// Run one step. Returns true when done.
+    fn step(&mut self) -> bool {
+        let step = self.steps;
+        self.steps = self.steps.saturating_add(1);
+        if self.result.is_none() {
+            self.result = match step {
+                0 => self.delegates().map(Ok),
+                1 => self.common().map(Ok),
+                2 => Some(self.fallback()),
+                _ => None,
             };
-            step.expansions += 1;
-            step.edges += self.graph[node].len();
-            let depth = self.waves[self.side].visits[&node].depth + 1;
-            let first = self.waves[self.side].visits[&node].first;
-            for &next in &self.graph[node] {
-                if self.key.visited.binary_search(&next).is_ok()
-                    || (node == self.key.from && self.key.blocked.binary_search(&next).is_ok())
-                    || (next == self.key.from && self.key.blocked.binary_search(&node).is_ok())
-                {
-                    continue;
-                }
-                let bits = if self.side == 0 && node == self.key.from {
-                    1u64 << self.graph[self.key.from].binary_search(&next).unwrap()
-                } else {
-                    first
-                };
-                let wave = &mut self.waves[self.side];
-                let visit = wave.visits.entry(next).or_insert_with(|| {
-                    wave.queue.push_back(next);
-                    Visit {
-                        depth,
-                        parent: node,
-                        first: 0,
-                    }
-                });
-                if visit.depth != depth {
-                    continue;
-                }
-                visit.first |= bits;
-                if let Some(opposite) = self.waves[1 - self.side].visits.get(&next) {
-                    // Widen sums so the full public u8 link range is safe.
-                    if u16::from(depth) + u16::from(opposite.depth) != u16::from(self.layers) + 1 {
-                        continue;
-                    }
-                    let mut mask = self.waves[0].visits[&next].first;
-                    while mask != 0 {
-                        let bit = mask.trailing_zeros() as usize;
-                        self.meetings[bit].get_or_insert(next);
-                        mask &= mask - 1;
-                    }
-                }
-            }
-            self.remaining -= 1;
-            if self.remaining == 0 {
-                self.layers += 1;
-                self.done = self.meetings.iter().any(Option::is_some)
-                    || self.layers == self.key.links
-                    || self.waves[self.side].queue.is_empty();
-                self.side = 1 - self.side;
-                self.remaining = self.waves[self.side].queue.len();
-            }
         }
-        step.done = self.done;
-        step
+        step >= 2
     }
 
-    /// Build the routes found by a finished search.
-    fn finish(&self) -> Result<Vec<Vec<usize>>> {
-        if self.key.from == self.key.to {
-            return Ok(vec![vec![self.key.from]]);
+    /// Routes of a finished search.
+    fn finish(&self) -> Result<Alternatives> {
+        match &self.result {
+            Some(Ok(routes)) => Ok(Rc::new(routes.clone())),
+            Some(Err(error)) => Err(*error),
+            None => Err(Error::Unreachable),
         }
-        let mut routes = Vec::new();
-        for (bit, meeting) in self.meetings.iter().enumerate() {
-            let Some(meeting) = *meeting else {
-                continue;
-            };
-            let mut nodes = vec![meeting];
-            let mut current = meeting;
-            while current != self.key.from {
-                let depth = self.waves[0].visits[&current].depth;
-                current = if depth == 1 {
-                    self.key.from
-                } else {
-                    self.graph[current]
-                        .iter()
-                        .copied()
-                        .find(|candidate| {
-                            self.waves[0].visits.get(candidate).is_some_and(|v| {
-                                v.depth + 1 == depth && v.first & (1u64 << bit) != 0
-                            })
-                        })
-                        .ok_or(Error::Unreachable)?
-                };
-                nodes.push(current);
-            }
-            nodes.reverse();
-            current = meeting;
-            while current != self.key.to {
-                current = self.waves[1].visits[&current].parent;
-                nodes.push(current);
-            }
-            routes.push(nodes);
+    }
+
+    /// Whether `node` may be the first hop.
+    fn first_hop(&self, node: usize) -> bool {
+        node != self.key.from
+            && node != self.key.to
+            && self.key.blocked.binary_search(&node).is_err()
+            && self.key.visited.binary_search(&node).is_err()
+    }
+
+    /// Pools that have both ends, highest rank first.
+    fn shared(&self) -> Vec<&Pool> {
+        let mut shared: Vec<_> = self
+            .pools
+            .iter()
+            .filter(|p| p.contains(self.key.from) && p.contains(self.key.to))
+            .collect();
+        shared.sort_by_key(|p| std::cmp::Reverse(p.rank()));
+        shared
+    }
+
+    /// The direct link, or the best group of delegate paths, if any.
+    fn delegates(&self) -> Option<Vec<Vec<usize>>> {
+        let (from, to) = (self.key.from, self.key.to);
+        let linked = self.pools.iter().any(|p| p.edge(from, to).is_some());
+        if self.key.links == 0 {
+            return None;
         }
-        if routes.is_empty() {
+        if linked && self.key.blocked.binary_search(&to).is_err() {
+            return Some(vec![vec![from, to]]);
+        }
+        if self.key.links < 2 {
+            return None;
+        }
+        let shared = self.shared();
+        let middles: [MiddleHop; 2] = [Pool::primary, Pool::alternate];
+        for middle in middles {
+            for group in shared.chunk_by(|a, b| a.rank() == b.rank()) {
+                let mut hops: Vec<_> = group
+                    .iter()
+                    .filter_map(|pool| middle(pool, from, to))
+                    .filter(|&d| self.first_hop(d))
+                    .collect();
+                hops.sort_unstable();
+                hops.dedup();
+                if !hops.is_empty() {
+                    return Some(hops.into_iter().map(|d| vec![from, d, to]).collect());
+                }
+            }
+        }
+        None
+    }
+
+    /// 2-link routes through any other common neighbor, if any.
+    fn common(&self) -> Option<Vec<Vec<usize>>> {
+        let (from, to) = (self.key.from, self.key.to);
+        if self.key.links < 2 || self.shared().is_empty() {
+            return None;
+        }
+        let ends = crate::union_neighbors(&self.pools, to);
+        let common: Vec<_> = crate::union_neighbors(&self.pools, from)
+            .into_iter()
+            .filter(|&d| self.first_hop(d) && ends.binary_search(&d).is_ok())
+            .map(|d| vec![from, d, to])
+            .collect();
+        (!common.is_empty()).then_some(common)
+    }
+
+    /// 3-link fallbacks through column mates of `from`.
+    fn fallback(&self) -> Result<Vec<Vec<usize>>> {
+        let (from, to) = (self.key.from, self.key.to);
+        if self.key.links < 3 {
             return Err(Error::Unreachable);
         }
-        Ok(routes)
+        let mut routes = Vec::new();
+        for pool in self.shared() {
+            let (Some(own), Some(target)) = (pool.column(from), pool.column(to)) else {
+                continue;
+            };
+            if own == target {
+                continue;
+            }
+            for mate in pool.column_members(own) {
+                if !self.first_hop(mate) {
+                    continue;
+                }
+                let Some(d) = pool.delegate(mate, target) else {
+                    continue;
+                };
+                if d != to && self.key.visited.binary_search(&d).is_err() {
+                    routes.push(vec![from, mate, d, to]);
+                }
+            }
+        }
+        routes.sort_unstable();
+        routes.dedup();
+        if routes.is_empty() {
+            Err(Error::Unreachable)
+        } else {
+            Ok(routes)
+        }
     }
 }
 
@@ -1034,36 +1005,11 @@ mod tests {
         }
     }
 
-    /// Rebuild the ring graph from scratch, as a check on the real code.
-    fn graph(n: usize) -> Vec<Vec<usize>> {
-        let mut edges = vec![vec![]; n];
-        if n < 2 {
-            return edges;
-        }
-        for ring in 0u32..32 {
-            let mut order: Vec<_> = (0..n)
-                .map(|position| {
-                    let id = format!("node-{position:06}");
-                    let mut bytes = b"racer/overlay/sha256-rings-32/v1\0".to_vec();
-                    bytes.extend_from_slice(&ring.to_be_bytes());
-                    bytes.extend_from_slice(&(id.len() as u64).to_be_bytes());
-                    bytes.extend_from_slice(id.as_bytes());
-                    (<[u8; 32]>::from(sha2::Sha256::digest(bytes)), position)
-                })
-                .collect();
-            order.sort_unstable();
-            for index in 0..n {
-                let a = order[index].1;
-                let b = order[(index + 1) % n].1;
-                edges[a].push(b);
-                edges[b].push(a);
-            }
-        }
-        for neighbors in &mut edges {
-            neighbors.sort_unstable();
-            neighbors.dedup();
-        }
-        edges
+    /// Every member's neighbor list, from the public API.
+    fn graph(members: &Membership<TestMember>) -> Vec<Vec<usize>> {
+        (0..members.members().len())
+            .map(|p| members.neighbors(p))
+            .collect()
     }
 
     /// Hop count from every node to `to`, by plain BFS.
@@ -1087,19 +1033,36 @@ mod tests {
         distances
     }
 
-    /// Run a search one node at a time and return all routes it finds.
+    /// Run a search to completion and return all routes it finds.
     fn search(members: &Membership<TestMember>, key: &PathKey) -> Result<Vec<Vec<usize>>> {
-        let mut search = EqualCostSearch::new(members.graph(), key);
-        while !search.step(1).done {}
-        search.finish()
+        let mut search = MeshSearch::new(members.shared_pools(), key);
+        assert!(!search.step(), "the first step always yields");
+        assert!(!search.step(), "the second step always yields");
+        assert!(search.step());
+        assert!(search.step());
+        search.finish().map(|routes| routes.to_vec())
     }
 
-    /// Search finds every shortest first hop, matching plain BFS.
+    /// Every common neighbor of `from` and `to`, so blocking them all forces
+    /// the 3-link fallback group.
+    fn common(members: &Membership<TestMember>, from: usize, to: usize) -> Vec<usize> {
+        let ends = members.neighbors(to);
+        members
+            .neighbors(from)
+            .into_iter()
+            .filter(|v| ends.contains(v))
+            .collect()
+    }
+
+    /// Mesh routes are valid, never longer than needed up to 2 links, and
+    /// follow the documented candidate order. Replaces the BFS equal-cost
+    /// oracle: routes no longer need a search, so the oracle checks the order.
     #[test]
-    fn all_equal_next_hops_match_independent_oracle() {
+    fn mesh_routes_follow_candidate_order_and_match_bfs_up_to_two_links() {
         for n in [37, 401, 1500] {
-            let edges = graph(n);
             let members = membership(n);
+            let edges = graph(&members);
+            let pool = &members.pools()[0];
             for source in [0, 19, n - 1] {
                 for to in (0..n).step_by(17).filter(|&to| to != source) {
                     for filtered in [false, true] {
@@ -1111,32 +1074,38 @@ mod tests {
                                 .collect();
                             key.blocked = edges[source].iter().copied().step_by(2).collect();
                         }
-                        let distance = distances(&edges, &key);
-                        for links in [1, 2, 4, 255] {
+                        let distance = distances(&edges, &key)[source];
+                        for links in [1, 2, 3, 4, 255] {
                             key.links = links;
                             let result = search(&members, &key);
-                            if distance[source] > links as usize {
+                            if distance > usize::from(links) {
                                 assert_eq!(result, Err(Error::Unreachable));
                                 continue;
                             }
+                            if distance > 2 && result.is_err() {
+                                continue;
+                            }
                             let alternatives = result.unwrap();
-                            let expected: Vec<_> = edges[source]
-                                .iter()
-                                .copied()
-                                .filter(|v| {
-                                    !key.blocked.contains(v)
-                                        && !key.visited.contains(v)
-                                        && distance[*v].checked_add(1) == Some(distance[source])
-                                })
-                                .collect();
-                            assert_eq!(
-                                alternatives.iter().map(|p| p[1]).collect::<Vec<_>>(),
-                                expected
-                            );
+                            let length = alternatives[0].len();
+                            assert!(alternatives.iter().all(|p| p.len() == length));
+                            assert!(length <= 4);
+                            if distance <= 2 {
+                                assert_eq!(length, distance + 1);
+                            }
+                            let free =
+                                |v: usize| !key.blocked.contains(&v) && !key.visited.contains(&v);
+                            if length == 3 {
+                                // Primary first, then alternate, then others.
+                                let primary = pool.primary(source, to).filter(|&d| free(d));
+                                let alternate = pool.alternate(source, to).filter(|&d| free(d));
+                                if let Some(expected) = primary.or(alternate) {
+                                    assert_eq!(alternatives, vec![vec![source, expected, to]]);
+                                }
+                            }
                             for path in alternatives {
                                 assert_eq!(path.first(), Some(&source));
                                 assert_eq!(path.last(), Some(&to));
-                                assert_eq!(path.len(), distance[source] + 1);
+                                assert!(free(path[1]));
                                 for pair in path.windows(2) {
                                     assert!(edges[pair[0]].contains(&pair[1]));
                                     assert!(!key.visited.contains(&pair[1]));
@@ -1159,9 +1128,17 @@ mod tests {
         let members = Membership::new(input).unwrap();
         let cached = Paths::new(1);
         let cold = Paths::new(0);
+        let blocked = common(&members, 0, 1499);
         let alternatives = search(
             &members,
-            &PathKey::new(&members, &query(0, 1499, 4)).unwrap(),
+            &PathKey::new(
+                &members,
+                &PathQuery {
+                    blocked: &blocked,
+                    ..query(0, 1499, 4)
+                },
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(alternatives.len() > 1);
@@ -1171,6 +1148,7 @@ mod tests {
             seed.extend_from_slice(&attempt.to_be_bytes());
             let query = PathQuery {
                 seed: &seed,
+                blocked: &blocked,
                 ..query(0, 1499, 4)
             };
             let mut bytes = b"racer/next-hop/v1\0".to_vec();
@@ -1212,6 +1190,7 @@ mod tests {
         seed.extend_from_slice(&[2; 16]);
         let query = PathQuery {
             seed: &seed,
+            blocked: &blocked,
             ..query(0, 1499, 4)
         };
         let previous = Rc::clone(
@@ -1240,29 +1219,39 @@ mod tests {
         assert_eq!(cold.cache.borrow().entries.len(), 0);
     }
 
-    /// The 64th first hop works end to end.
+    /// With every first hop blocked but one column mate, the route is the
+    /// 3-link fallback through it. Replaces the BFS 64-bit first-hop mask
+    /// test: there is no mask any more, and degree can exceed 64.
     #[test]
-    fn last_first_hop_bit_survives_search_and_reconstruction() {
-        let n = 100_000;
+    fn three_link_fallback_through_the_only_free_column_mate() {
+        let members = membership(4096);
+        let pool = &members.pools()[0];
         let source = 19;
-        let members = membership(n);
         let neighbors = members.neighbors(source);
-        assert_eq!(neighbors.len(), 64);
-        let last = neighbors[63];
-        let mut key = PathKey::new(&members, &query(source, last, 4)).unwrap();
-        key.blocked = neighbors[..63].to_vec();
-        let next = members
-            .neighbors(last)
+        assert!(neighbors.len() > 64);
+        let own = pool.column(source).unwrap();
+        let mate = pool
+            .column_members(own)
             .into_iter()
-            .find(|v| *v != source && !neighbors.contains(v))
+            .find(|&m| m != source)
             .unwrap();
-        for to in [last, next] {
-            key.to = to;
-            let alternatives = search(&members, &key).unwrap();
-            assert_eq!(alternatives.len(), 1);
-            assert_eq!(alternatives[0][1], last);
-            assert_eq!(alternatives[0].last(), Some(&to));
-        }
+        let to = (0..4096)
+            .find(|&t| {
+                pool.column(t) != Some(own)
+                    && !members.is_neighbor(source, t)
+                    && !members.is_neighbor(mate, t)
+            })
+            .unwrap();
+        let mut key = PathKey::new(&members, &query(source, to, 3)).unwrap();
+        key.blocked = neighbors.iter().copied().filter(|&v| v != mate).collect();
+        let delegate = pool.delegate(mate, pool.column(to).unwrap()).unwrap();
+        assert_eq!(
+            search(&members, &key).unwrap(),
+            vec![vec![source, mate, delegate, to]]
+        );
+        key.links = 2;
+        assert_eq!(search(&members, &key), Err(Error::Unreachable));
+        key.links = 3;
         key.blocked = neighbors;
         assert_eq!(search(&members, &key), Err(Error::Unreachable));
     }
@@ -1280,76 +1269,71 @@ mod tests {
         assert_eq!(weighted_draw(u64::MAX, 64 * max, &[max; 64]), Some(1));
     }
 
-    /// Each search step stays within its work limits.
+    /// A search takes three steps and its routes never exceed 3 links.
+    /// Replaces the BFS per-step work bound: mesh routes do no graph search.
     #[test]
-    fn search_work_is_bounded_per_turn() {
-        let members = membership(100_000);
-        let key = PathKey::new(&members, &query(0, 80_003, 4)).unwrap();
-        let mut search = EqualCostSearch::new(members.graph(), &key);
-        assert!(Arc::ptr_eq(&search.graph, &members.graph()));
-        loop {
-            let step = search.step(7);
-            assert!(step.expansions <= 7);
-            assert!(step.edges <= step.expansions * MAX_DEGREE);
-            assert!(
-                search
-                    .waves
-                    .iter()
-                    .map(|wave| wave.visits.len())
-                    .sum::<usize>()
-                    <= 2 * 100_000
-            );
-            if step.done {
-                break;
+    fn search_takes_three_steps_and_at_most_three_links() {
+        let members = membership(10_000);
+        for (from, to) in [(0, 8003), (5, 9999), (17, 18)] {
+            for blocked in [vec![], common(&members, from, to)] {
+                let key = PathKey::new(
+                    &members,
+                    &PathQuery {
+                        blocked: &blocked,
+                        ..query(from, to, 255)
+                    },
+                )
+                .unwrap();
+                let mut search = MeshSearch::new(members.shared_pools(), &key);
+                assert!(!search.step());
+                assert!(!search.step());
+                assert!(search.step());
+                let routes = search.finish().unwrap();
+                assert!(routes.iter().all(|p| p.len() <= 4));
+                if blocked.is_empty() {
+                    assert!(routes.iter().all(|p| p.len() <= 3));
+                }
             }
         }
-        let alternatives = search.finish().unwrap();
-        assert!(alternatives.len() <= MAX_DEGREE);
-        assert!(alternatives.iter().all(|p| p.len() <= 5));
     }
 
-    /// Small graphs match the from-scratch ID-ring graph.
+    /// Pools up to 64 members are full meshes. Replaces the 32-ring graph
+    /// definition check: the ring overlay is gone.
     #[test]
-    fn small_graphs_match_ring_definition() {
-        for n in 1..=160 {
+    fn small_pools_are_full_meshes() {
+        for n in 1..=64 {
             let members = membership(n);
-            let expected = graph(n);
-            for (i, row) in expected.iter().enumerate() {
-                assert_eq!(members.neighbor_slice(i), row, "N={n}, i={i}");
+            for i in 0..n {
+                let expected: Vec<_> = (0..n).filter(|&j| j != i).collect();
+                assert_eq!(members.neighbors(i), expected, "N={n}, i={i}");
             }
         }
         assert!(membership(0).neighbors(0).is_empty());
         assert!(membership(1).neighbors(usize::MAX).is_empty());
     }
 
-    /// Large graphs keep degree limits, symmetry, and short routes.
+    /// Large pools are symmetric, within the degree bound, and every route
+    /// with nothing blocked has at most 2 links. Replaces the 100,000-node
+    /// 4-link BFS check (now 2 links; size reduced for debug test time, the
+    /// 100,000-node build is covered by the ignored timing test).
     #[test]
-    fn hundred_thousand_nodes_bounded_symmetric_and_four_link_reachable() {
-        let n = 100_000;
+    fn large_pools_symmetric_bounded_and_two_link_routes() {
+        let n = 4096;
         let members = membership(n);
+        let edges = graph(&members);
+        let bound = members.max_degree();
         for i in 0..n {
-            let neighbors = members.neighbor_slice(i);
-            assert!(neighbors.len() <= MAX_DEGREE);
-            for &other in neighbors {
-                assert!(members.neighbor_slice(other).binary_search(&i).is_ok());
+            assert!(edges[i].len() <= bound);
+            for &other in &edges[i] {
+                assert!(edges[other].binary_search(&i).is_ok());
             }
         }
-        for source in [0, 1, 17, 49_999, 99_999] {
-            let mut distance = vec![u8::MAX; n];
-            distance[source] = 0;
-            let mut queue = VecDeque::from([source]);
-            while let Some(i) = queue.pop_front() {
-                if distance[i] == 4 {
-                    continue;
-                }
-                for &j in members.neighbor_slice(i) {
-                    if distance[j] == u8::MAX {
-                        distance[j] = distance[i] + 1;
-                        queue.push_back(j);
-                    }
-                }
+        let paths = Paths::new(0);
+        for source in [0, 1, 17, 2047, 4095] {
+            for to in (0..n).step_by(7) {
+                let route = block_on(paths.route(&members, query(source, to, 2))).unwrap();
+                assert!(route.len() <= 3);
             }
-            assert!(distance.iter().all(|d| *d <= 4));
         }
     }
 
@@ -1375,11 +1359,12 @@ mod tests {
         let members =
             Membership::new((0u16..1500).map(|i| Binary(i.to_be_bytes())).collect()).unwrap();
         let paths = Paths::new(2);
+        assert!(!members.is_neighbor(0, 1499));
         let basic = query(0, 1499, 255);
         let route = block_on(paths.route(&members, basic)).unwrap();
         assert_eq!(route.first(), Some(&0));
         assert_eq!(route.last(), Some(&1499));
-        assert!(route.len() > 2);
+        assert_eq!(route.len(), 3);
         // Blocking the destination's first-hop edge does not ban reaching it later.
         assert_eq!(
             block_on(paths.route(
@@ -1504,19 +1489,19 @@ mod tests {
     /// Dropping a search frees its slot, with or without a cache.
     #[test]
     fn cooperative_admission_cancellation_and_cache_hits() {
-        let members = membership(100_000);
-        let base = query(0, 80_003, 4);
+        let members = membership(10_000);
+        let base = query(0, 8003, 4);
         let mut cx = Context::from_waker(noop_waker_ref());
         for capacity in [0, 1, 32] {
             let paths = Paths::with_limits(capacity, usize::MAX, 2);
             let mut pending = Vec::new();
-            for to in [80_003, 80_004] {
+            for to in [8003, 8004] {
                 let mut future = Box::pin(paths.route(&members, PathQuery { to, ..base }));
                 assert!(future.as_mut().poll(&mut cx).is_pending());
                 pending.push(future);
             }
             assert_eq!(
-                block_on(paths.route(&members, PathQuery { to: 80_005, ..base })),
+                block_on(paths.route(&members, PathQuery { to: 8005, ..base })),
                 Err(Error::Overloaded)
             );
             drop(pending);
@@ -1753,7 +1738,7 @@ mod tests {
     }
 
     /// A new caller does not take a free slot ahead of waiting callers, a
-    /// cancelled waiter leaves the queue and wakes the next one, and a waiter
+    /// canceled waiter leaves the queue and wakes the next one, and a waiter
     /// whose search is already running joins it without a slot.
     #[test]
     fn queue_is_fair_cancellable_and_joins_running_searches() {
@@ -1866,7 +1851,7 @@ mod tests {
                 Err(Error::InvalidQuery)
             );
         }
-        let blocked = vec![1; 65];
+        let blocked = vec![1; MAX_BLOCKED + 1];
         let seed = vec![0; MAX_SEED_BYTES + 1];
         for invalid in [
             PathQuery {
@@ -1887,7 +1872,7 @@ mod tests {
             PathKey::new(
                 &members,
                 &PathQuery {
-                    blocked: &blocked[..64],
+                    blocked: &blocked[..MAX_BLOCKED],
                     seed: &seed[..MAX_SEED_BYTES],
                     ..query(0, 400, 4)
                 }
@@ -1895,7 +1880,7 @@ mod tests {
             .is_ok()
         );
         let non_neighbor = (1..401)
-            .find(|v| !members.neighbor_slice(0).contains(v))
+            .find(|v| !members.neighbors(0).contains(v))
             .unwrap();
         let canonical = PathKey::new(
             &members,
@@ -1909,9 +1894,10 @@ mod tests {
         check_deterministic_fuzz_cases(&members, &paths);
     }
 
-    /// Many queries match plain BFS hop counts.
+    /// Many queries match plain BFS hop counts up to 2 links, and longer
+    /// routes are the 3-link fallback or unreachable.
     fn check_deterministic_fuzz_cases(members: &Membership<TestMember>, paths: &Paths) {
-        let edges = members.graph();
+        let edges = graph(members);
         let mut state = 0xa127_3921u64;
         for iteration in 0..128 {
             state ^= state << 13;
@@ -1923,12 +1909,7 @@ mod tests {
                 .map(|i| (i * 37 + iteration) % 401)
                 .filter(|v| *v != from && *v != to)
                 .collect();
-            let blocked: Vec<_> = members
-                .neighbor_slice(from)
-                .iter()
-                .copied()
-                .step_by(3)
-                .collect();
+            let blocked: Vec<_> = members.neighbors(from).iter().copied().step_by(3).collect();
             let q = PathQuery {
                 visited: &visited,
                 blocked: &blocked,
@@ -1937,11 +1918,14 @@ mod tests {
             let key = PathKey::new(members, &q).unwrap();
             let distance = distances(&edges, &key)[from];
             let actual = block_on(paths.route(members, q));
-            if distance > usize::from(q.links) {
+            if distance > usize::from(q.links) || (distance > 2 && actual.is_err()) {
                 assert_eq!(actual, Err(Error::Unreachable));
             } else {
                 let route = actual.unwrap();
-                assert_eq!(route.len(), distance + 1);
+                if distance <= 2 {
+                    assert_eq!(route.len(), distance + 1);
+                }
+                assert!(route.len() <= usize::from(q.links) + 1);
                 assert_eq!(route.first(), Some(&from));
                 assert_eq!(route.last(), Some(&to));
                 for pair in route.windows(2) {
@@ -2047,7 +2031,11 @@ mod tests {
     #[test]
     fn concurrent_weight_snapshots_share_search_but_not_selection() {
         let members = membership(10_000);
-        let q = query(0, 9999, 4);
+        let blocked = common(&members, 0, 9999);
+        let q = PathQuery {
+            blocked: &blocked,
+            ..query(0, 9999, 4)
+        };
         let alternatives = search(&members, &PathKey::new(&members, &q).unwrap()).unwrap();
         assert!(alternatives.len() > 1);
         let mut values = members.members().to_vec();
@@ -2101,27 +2089,25 @@ mod tests {
         assert_eq!(paths.cached_entries(), 1);
     }
 
-    /// Routes work at the maximum of 255 links.
+    /// The full u8 link range is accepted and behaves like 3 links. Replaces
+    /// the 255-link BFS chain test: mesh routes never need more than 3.
     #[test]
-    fn full_u8_link_limit_reconstructs_without_overflow() {
-        let members = membership(257);
-        let mut graph = vec![vec![]; 257];
-        for position in 1..257 {
-            graph[position - 1].push(position);
-            graph[position].push(position - 1);
-        }
-        let graph = Arc::new(graph);
-        for (destination, reachable) in [(254, true), (255, true), (256, false)] {
-            let key = PathKey::new(&members, &query(0, destination, 255)).unwrap();
-            let mut search = EqualCostSearch::new(Arc::clone(&graph), &key);
-            while !search.step(7).done {}
-            if reachable {
-                assert_eq!(
-                    search.finish().unwrap(),
-                    vec![(0..=destination).collect::<Vec<_>>()]
-                );
-            } else {
-                assert_eq!(search.finish(), Err(Error::Unreachable));
+    fn full_u8_link_limit_behaves_like_three_links() {
+        let members = membership(1500);
+        for to in [1, 700, 1499] {
+            let blocked = common(&members, 0, to);
+            for blocked in [vec![], blocked] {
+                let key = |links| {
+                    PathKey::new(
+                        &members,
+                        &PathQuery {
+                            blocked: &blocked,
+                            ..query(0, to, links)
+                        },
+                    )
+                    .unwrap()
+                };
+                assert_eq!(search(&members, &key(255)), search(&members, &key(3)));
             }
         }
     }

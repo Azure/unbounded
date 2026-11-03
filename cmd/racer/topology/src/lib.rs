@@ -84,22 +84,36 @@
 //!
 //! The example uses a simple test executor. Real callers use their own.
 //!
-//! # Membership
+//! # Membership and pools
 //!
-//! Each member has a binary ID and a positive weight. IDs must be unique.
-//! An empty membership is allowed, but has nothing to route between.
+//! Each member has a binary ID, a positive weight, and a Site name
+//! ([`Member::site`], empty by default). IDs must be unique. An empty
+//! membership is allowed, but has nothing to route between.
 //!
-//! Members are linked into a graph built from 32 hash rings. Each member has
-//! at most [`MAX_DEGREE`] neighbors and the graph is always connected. Adding
-//! or removing one member only changes that member's ring neighbors. Weights
-//! do not affect the graph.
+//! Members are grouped into pools ([`PoolSpec`], [`Pool`]). Pools may overlap.
+//! [`Membership::new`] makes one default pool of every member. Each pool has
+//! its own mesh, and the membership's graph is the union of the pool meshes.
 //!
-//! Building a membership takes O(N log N) time. At 100,000 members the graph
-//! uses about 49 MiB.
+//! A pool of up to [`FULL_MESH_MAX`] members is a full mesh. A larger pool is
+//! split into columns, mostly by Site. Members of a column are all linked,
+//! and each member links to one delegate in every other column. So any two
+//! members of a pool are at most 2 links apart, with two disjoint 2-link
+//! paths. A member of a pool of `k` members has about `2.83 * sqrt(k)`
+//! neighbors in it. One join or leave changes O(sqrt(k)) edges. Weights and
+//! pool IDs do not affect the mesh. See `designs/racer-mesh-v2.md`.
+//!
+//! Neighbor lists are not stored. Each pool keeps the column of each member,
+//! the members of each column, one hash ring per column (16 points per
+//! member), and its members sorted by delegate key: about 230 bytes per
+//! member. Building takes O(k log k) time per pool. [`Membership::neighbors`]
+//! computes a list on demand; [`Membership::is_neighbor`] is a few binary
+//! searches per shared pool.
 //!
 //! When membership changes, build the new one with
-//! [`Membership::new_with_predecessor`]. It reuses the old graph when the IDs
-//! are the same, and helps [`Placement`] update its cache cheaply.
+//! [`Membership::new_with_predecessor`] or
+//! [`Membership::with_pools_and_predecessor`]. They reuse old pool meshes
+//! when IDs, Sites, and the pool's members are the same, and help
+//! [`Placement`] update its cache cheaply.
 //!
 //! # Threads and caches
 //!
@@ -110,20 +124,27 @@
 //! whole cache before scoring starts.
 //!
 //! Every cache has a size limit. Byte counts are estimates, not hard memory
-//! limits. [`Membership::retained_bytes`] counts a shared graph in full for
+//! limits. [`Membership::retained_bytes`] counts a shared mesh in full for
 //! every membership that uses it, so adding them up overcounts.
 //!
 //! # Compatibility
 //!
-//! Every node in a cluster must agree on placement and routing. Both depend
-//! on [`Member::DOMAIN`], member IDs, weights, and this crate's hash formats.
+//! Every node in a cluster must agree on placement and routing. Placement
+//! depends on [`Member::DOMAIN`], member IDs, weights, and this crate's hash
+//! formats. The mesh also depends on Sites and pool members, and routes on
+//! pool ranks.
 //!
 //! - Changing a domain changes the hashes; placement and routes may move.
 //! - Hash formats are versioned (`/slot/v1`, `/hrw/v1`,
-//!   `/placement-identity/v1`, `/next-hop/v1`, and ring `v1`). Changing one
-//!   needs a planned cluster-wide rollout. Nothing here detects a mismatch.
+//!   `/placement-identity/v1`, `/next-hop/v1`, `/mesh/v2/column`,
+//!   `/mesh/v2/delegate`, `/mesh/v2/point`, `/mesh/v2/edge`, and
+//!   `/topology-identity/mesh/v2`). Changing one needs a planned
+//!   cluster-wide rollout. Nothing here detects a mismatch.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+/// The per-pool mesh.
+mod mesh;
 
 /// Routing between members.
 mod paths;
@@ -131,9 +152,11 @@ mod paths;
 /// Choosing which members store a key.
 mod placement;
 
+pub use mesh::{EdgeKind, FULL_MESH_MAX, POINTS, Pool, PoolSpec, RDMA_PEERS, jump, target_columns};
+
 pub use paths::{
-    Alternatives, DEFAULT_SEARCH_QUEUE, EqualCostSearch, Exhaustive, PathKey, PathQuery, Paths,
-    Searches,
+    Alternatives, DEFAULT_SEARCH_QUEUE, Exhaustive, MAX_BLOCKED, MeshSearch, PathKey, PathQuery,
+    Paths, Searches,
 };
 
 pub use placement::{
@@ -145,12 +168,9 @@ use sha2::Digest;
 
 use std::{mem::size_of, num::NonZeroU32, sync::Arc};
 
-/// Most neighbors any member can have in the graph.
-pub const MAX_DEGREE: usize = 2 * overlay::RINGS as usize;
-
 /// A cluster member, as seen by this crate.
 ///
-/// [`Membership`] reads the ID and weight once, when it is built.
+/// [`Membership`] reads the ID, weight, and Site once, when it is built.
 pub trait Member {
     /// A name that keeps this application's hashes apart from others.
     ///
@@ -162,8 +182,15 @@ pub trait Member {
     fn id(&self) -> &[u8];
 
     /// How much this member is favored, compared to others. Higher is more.
-    /// Used for both placement and routing.
+    /// Used for both placement and route tie-breaks.
     fn weight(&self) -> NonZeroU32;
+
+    /// Site name. Members of a large Site get columns of their own in each
+    /// pool mesh. Affects only the mesh, not placement. Empty by default; the
+    /// empty name is a Site like any other. At most `u32::MAX` bytes.
+    fn site(&self) -> &[u8] {
+        &[]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,8 +203,12 @@ pub enum Error {
     /// [`Member::DOMAIN`] contains a NUL byte.
     InvalidDomain,
 
-    /// A member ID is longer than `u32::MAX` bytes.
+    /// A member ID or Site is longer than `u32::MAX` bytes.
     InvalidMember,
+
+    /// A pool names an unknown member or names one twice, or two pools share
+    /// an ID.
+    InvalidPool,
 
     /// A query has a bad position or breaks a limit.
     InvalidQuery,
@@ -199,6 +230,7 @@ impl std::fmt::Display for Error {
             Self::DuplicateMember => "duplicate member identity",
             Self::InvalidDomain => "member domain must not contain NUL",
             Self::InvalidMember => "member identity exceeds the hash length limit",
+            Self::InvalidPool => "invalid pool",
             Self::InvalidQuery => "invalid topology query",
             Self::Overloaded => "topology placement or route search overloaded",
             Self::Unreachable => "destination unreachable",
@@ -213,10 +245,13 @@ impl std::error::Error for Error {}
 /// changes are handled by recomputing from scratch.
 pub const MAX_INCREMENTAL_CHANGES: usize = 64;
 
-/// A fixed set of members, sorted by ID.
+/// Hash prefix for [`Membership::topology_identity`].
+const TOPOLOGY_IDENTITY_DOMAIN: &[u8] = b"/topology-identity/mesh/v2\0";
+
+/// A fixed set of members, sorted by ID, and their pools.
 ///
-/// IDs and weights are copied when it is built, so later changes to the
-/// records do not affect it. It can be shared across threads if `M` can.
+/// IDs, weights, and Sites are copied when it is built, so later changes to
+/// the records do not affect it. It can be shared across threads if `M` can.
 #[derive(Debug)]
 pub struct Membership<M: Member> {
     /// The original records, in ID order.
@@ -228,14 +263,18 @@ pub struct Membership<M: Member> {
     /// Copied weights, matching `ids`.
     weights: Vec<NonZeroU32>,
 
+    /// Copied Sites, matching `ids`.
+    sites: Vec<Box<[u8]>>,
+
     /// Hash of the domain, IDs, and weights.
     identity: [u8; 32],
 
-    /// Hash of the domain and IDs only. Used as the route cache key.
+    /// Hash of the domain, IDs, Sites, and pools. Used as the route cache key.
     topology_identity: [u8; 32],
 
-    /// Neighbor lists. Shared with later memberships that have the same IDs.
-    graph: Arc<Vec<Vec<usize>>>,
+    /// Pools sorted by ID. Meshes are shared with equal pools and
+    /// predecessors.
+    pools: Arc<[Pool]>,
 
     /// Estimated bytes, measured once at build time. Excludes `delta`.
     owned_bytes: usize,
@@ -307,7 +346,9 @@ struct MembershipDelta {
 }
 
 impl<M: Member> Membership<M> {
-    /// Build a membership: copy IDs and weights, sort by ID, and build the graph.
+    /// Build a membership with one default pool of every member
+    /// ([`PoolSpec::default_pool`]): copy IDs, weights, and Sites, sort by
+    /// ID, and build the mesh.
     ///
     /// This runs synchronously and takes O(N log N) time, so choose where to
     /// run it with care for large memberships.
@@ -315,18 +356,33 @@ impl<M: Member> Membership<M> {
     /// # Errors
     /// - [`Error::InvalidDomain`] if [`Member::DOMAIN`] contains NUL.
     /// - [`Error::DuplicateMember`] if two members share an ID.
-    /// - [`Error::InvalidMember`] if an ID is longer than `u32::MAX` bytes.
+    /// - [`Error::InvalidMember`] if an ID or Site is longer than `u32::MAX`
+    ///   bytes.
     ///
     /// # Panics
     /// Panics if a [`Member`] method panics.
     pub fn new(members: Vec<M>) -> Result<Self, Error> {
-        Self::build(members, None)
+        Self::build(members, vec![PoolSpec::default_pool()], None)
     }
 
-    /// Build a membership that replaces `old`.
+    /// Build a membership with these pools. With no pools there are no
+    /// edges, and building does no mesh work (placement only).
+    ///
+    /// # Errors
+    /// Same as [`Self::new`], plus [`Error::InvalidPool`] if a pool names an
+    /// unknown member, names a member twice, or two pools share an ID.
+    ///
+    /// # Panics
+    /// Panics if a [`Member`] method panics.
+    pub fn with_pools(members: Vec<M>, pools: Vec<PoolSpec>) -> Result<Self, Error> {
+        Self::build(members, pools, None)
+    }
+
+    /// Build a membership that replaces `old`, with one default pool.
     ///
     /// Same as [`Self::new`] followed by [`Self::with_predecessor`], but also
-    /// reuses `old`'s graph when the IDs are the same. Does not keep `old` alive.
+    /// reuses `old`'s meshes where possible (see
+    /// [`Self::with_pools_and_predecessor`]). Does not keep `old` alive.
     ///
     /// # Errors
     /// Same as [`Self::new`].
@@ -334,11 +390,31 @@ impl<M: Member> Membership<M> {
     /// # Panics
     /// Panics if a [`Member`] method panics.
     pub fn new_with_predecessor(members: Vec<M>, old: &Self) -> Result<Self, Error> {
-        Ok(Self::build(members, Some(old))?.with_predecessor(old))
+        Self::with_pools_and_predecessor(members, vec![PoolSpec::default_pool()], old)
     }
 
-    /// Shared code for the constructors. Reuses `old`'s graph if IDs match.
-    fn build(members: Vec<M>, old: Option<&Self>) -> Result<Self, Error> {
+    /// Build a membership with these pools that replaces `old`.
+    ///
+    /// Same as [`Self::with_pools`] followed by [`Self::with_predecessor`].
+    /// When the member IDs and Sites equal `old`'s, a pool whose members
+    /// equal an old pool's reuses that pool's mesh. Does not keep `old` alive.
+    ///
+    /// # Errors
+    /// Same as [`Self::with_pools`].
+    ///
+    /// # Panics
+    /// Panics if a [`Member`] method panics.
+    pub fn with_pools_and_predecessor(
+        members: Vec<M>,
+        pools: Vec<PoolSpec>,
+        old: &Self,
+    ) -> Result<Self, Error> {
+        Ok(Self::build(members, pools, Some(old))?.with_predecessor(old))
+    }
+
+    /// Shared code for the constructors. Reuses `old`'s meshes if IDs and
+    /// Sites match.
+    fn build(members: Vec<M>, pools: Vec<PoolSpec>, old: Option<&Self>) -> Result<Self, Error> {
         if M::DOMAIN.as_bytes().contains(&0) {
             return Err(Error::InvalidDomain);
         }
@@ -349,8 +425,11 @@ impl<M: Member> Membership<M> {
                 let id = member.id();
                 validate_id_length(id.len())?;
                 let id: Box<[u8]> = id.into();
+                let site = member.site();
+                validate_id_length(site.len())?;
+                let site: Box<[u8]> = site.into();
                 let weight = member.weight();
-                Ok((member, id, weight))
+                Ok((member, id, weight, site))
             })
             .collect::<Result<_, Error>>()?;
         frozen.sort_unstable_by(|a, b| a.1.cmp(&b.1));
@@ -360,26 +439,26 @@ impl<M: Member> Membership<M> {
         let mut members = Vec::with_capacity(frozen.len());
         let mut ids = Vec::with_capacity(frozen.len());
         let mut weights = Vec::with_capacity(frozen.len());
+        let mut sites = Vec::with_capacity(frozen.len());
         let mut digest = hash::domain::<M>(b"/placement-identity/v1\0");
-        for (member, id, weight) in frozen {
+        for (member, id, weight, site) in frozen {
             hash::bytes(&mut digest, &id);
             digest.update(weight.get().to_be_bytes());
             members.push(member);
             ids.push(id);
             weights.push(weight);
+            sites.push(site);
         }
-        let topology_identity = overlay::identity::<M>(&ids);
-        let graph = match old.filter(|old| old.ids == ids) {
-            Some(old) => Arc::clone(&old.graph),
-            None => Arc::new(overlay::build::<M>(&ids)),
-        };
+        let pools = Self::build_pools(&ids, &sites, pools, old)?;
+        let topology_identity = topology_identity::<M>(&ids, &sites, &pools);
         let mut membership = Self {
             members,
             ids,
             weights,
+            sites,
             identity: hash::finish(digest),
             topology_identity,
-            graph,
+            pools: pools.into(),
             owned_bytes: 0,
             delta: None,
             generation: 0,
@@ -390,11 +469,59 @@ impl<M: Member> Membership<M> {
         Ok(membership)
     }
 
+    /// Resolve pool specs to positions and build (or reuse) their meshes.
+    fn build_pools(
+        ids: &[Box<[u8]>],
+        sites: &[Box<[u8]>],
+        specs: Vec<PoolSpec>,
+        old: Option<&Self>,
+    ) -> Result<Vec<Pool>, Error> {
+        let mut resolved = Vec::with_capacity(specs.len());
+        for spec in specs {
+            validate_id_length(spec.id.len()).map_err(|_| Error::InvalidPool)?;
+            let positions = match spec.members {
+                None => (0..ids.len()).collect(),
+                Some(list) => {
+                    let mut positions = list
+                        .iter()
+                        .map(|id| {
+                            ids.binary_search_by(|m| m.as_ref().cmp(id))
+                                .map_err(|_| Error::InvalidPool)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    positions.sort_unstable();
+                    if positions.windows(2).any(|pair| pair[0] == pair[1]) {
+                        return Err(Error::InvalidPool);
+                    }
+                    positions
+                }
+            };
+            resolved.push((spec.id, spec.rank, positions));
+        }
+        resolved.sort_by(|a, b| a.0.cmp(&b.0));
+        if resolved.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(Error::InvalidPool);
+        }
+        let reusable = old.filter(|old| old.ids == ids && old.sites == sites);
+        let mut pools: Vec<Pool> = Vec::with_capacity(resolved.len());
+        for (id, rank, positions) in resolved {
+            let shared = pools
+                .iter()
+                .chain(reusable.iter().flat_map(|old| old.pools.iter()))
+                .find(|pool| pool.members() == positions.as_slice())
+                .map(|pool| Arc::clone(pool.mesh()));
+            let mesh =
+                shared.unwrap_or_else(|| Arc::new(mesh::Mesh::build::<M>(positions, ids, sites)));
+            pools.push(Pool::new(id, rank, mesh));
+        }
+        Ok(pools)
+    }
+
     /// Record what changed since `old`, so [`Placement`] can update cheaply.
     ///
     /// Only up to [`MAX_INCREMENTAL_CHANGES`] changes are recorded. With more,
     /// nothing is recorded and placement recomputes from scratch. Replaces any
-    /// earlier record. Does not keep `old` alive or change the graph.
+    /// earlier record. Does not keep `old` alive or change the mesh.
     ///
     /// Also continues `old`'s lineage ([`Self::since`]): members that `old`
     /// listed keep their arrival generation, the others arrive now.
@@ -513,7 +640,8 @@ impl<M: Member> Membership<M> {
         self.weights[position]
     }
 
-    /// Hash of the domain and IDs. Weights are left out.
+    /// Hash of the domain, IDs, Sites, and pools (ID, rank, members).
+    /// Weights are left out.
     ///
     /// This is the graph identity that route cache keys use
     /// ([`PathKey::topology`]).
@@ -522,34 +650,122 @@ impl<M: Member> Membership<M> {
         self.topology_identity
     }
 
-    /// Neighbors of a member, sorted. Empty if the position is out of range.
+    /// The pools, sorted by ID.
+    #[must_use]
+    pub fn pools(&self) -> &[Pool] {
+        &self.pools
+    }
+
+    /// The pool with this ID.
+    #[must_use]
+    pub fn pool(&self, id: &[u8]) -> Option<&Pool> {
+        self.pools
+            .binary_search_by(|pool| pool.id().cmp(id))
+            .ok()
+            .map(|index| &self.pools[index])
+    }
+
+    /// A shared handle to the pools.
+    pub(crate) fn shared_pools(&self) -> Arc<[Pool]> {
+        Arc::clone(&self.pools)
+    }
+
+    /// Neighbors of a member: the sorted union over its pools. Empty if the
+    /// position is out of range.
     #[must_use]
     pub fn neighbors(&self, position: usize) -> Vec<usize> {
-        self.neighbor_slice(position).to_vec()
+        union_neighbors(&self.pools, position)
     }
 
-    /// Whether two members share an overlay edge. Allocation-free: neighbor
-    /// lists are sorted, so this is one binary search. False when either
-    /// position is out of range or both positions are the same member.
+    /// Number of neighbors of a member.
+    #[must_use]
+    pub fn degree(&self, position: usize) -> usize {
+        self.neighbors(position).len()
+    }
+
+    /// Upper bound on any member's degree: the sum of per-pool bounds
+    /// ([`Pool::max_degree`]), capped at `members - 1`. Use it to size
+    /// per-peer capacity. It can be well above the real maximum when pools
+    /// overlap; [`Self::degree`] is exact.
+    #[must_use]
+    pub fn max_degree(&self) -> usize {
+        self.pools
+            .iter()
+            .map(Pool::max_degree)
+            .fold(0usize, usize::saturating_add)
+            .min(self.ids.len().saturating_sub(1))
+    }
+
+    /// Whether two members share a mesh edge in any pool. Does not allocate:
+    /// a few binary searches per pool. False when either position is out of
+    /// range or both positions are the same member.
     #[must_use]
     pub fn is_neighbor(&self, position: usize, other: usize) -> bool {
-        self.neighbor_slice(position).binary_search(&other).is_ok()
+        position != other
+            && self
+                .pools
+                .iter()
+                .any(|pool| pool.edge(position, other).is_some())
     }
 
-    /// Like [`Self::neighbors`], but borrows instead of copying.
-    fn neighbor_slice(&self, position: usize) -> &[usize] {
-        self.graph.get(position).map_or(&[], Vec::as_slice)
+    /// Best `(pool rank, edge kind)` over pools that have the edge.
+    fn edge_rank(&self, a: usize, b: usize) -> Option<(u64, EdgeKind)> {
+        self.pools
+            .iter()
+            .filter_map(|pool| pool.edge(a, b).map(|kind| (pool.rank(), kind)))
+            .max()
     }
 
-    /// A shared handle to the graph.
-    fn graph(&self) -> Arc<Vec<Vec<usize>>> {
-        Arc::clone(&self.graph)
+    /// The member's RDMA peers: its top `budget` neighbors `q` with
+    /// `eligible(position, q)`, best first.
+    ///
+    /// Edges rank by the highest rank of a pool that has the edge, then
+    /// column edge before delegate edge, then the symmetric hash
+    /// `H("/mesh/v2/edge\0", min id, max id)` (lower first). Both ends compute
+    /// the same rank. `eligible` must be symmetric, for example "same
+    /// nonempty Site and a shared rail". Production uses [`RDMA_PEERS`].
+    #[must_use]
+    pub fn rdma_peers(
+        &self,
+        position: usize,
+        budget: usize,
+        eligible: impl Fn(usize, usize) -> bool,
+    ) -> Vec<usize> {
+        let mut ranked: Vec<_> = self
+            .neighbors(position)
+            .into_iter()
+            .filter(|&other| eligible(position, other))
+            .filter_map(|other| {
+                let (rank, kind) = self.edge_rank(position, other)?;
+                let tie = mesh::edge_hash::<M>(self.id(position), self.id(other));
+                Some((std::cmp::Reverse(rank), std::cmp::Reverse(kind), tie, other))
+            })
+            .collect();
+        ranked.sort_unstable();
+        ranked.truncate(budget);
+        ranked.into_iter().map(|entry| entry.3).collect()
+    }
+
+    /// Whether the edge uses RDMA: both ends took it in
+    /// [`Self::rdma_peers`] with the same `budget` and `eligible`.
+    #[must_use]
+    pub fn is_rdma_edge(
+        &self,
+        a: usize,
+        b: usize,
+        budget: usize,
+        eligible: impl Fn(usize, usize) -> bool,
+    ) -> bool {
+        self.is_neighbor(a, b)
+            && eligible(a, b)
+            && self.rdma_peers(a, budget, &eligible).contains(&b)
+            && self.rdma_peers(b, budget, &eligible).contains(&a)
     }
 
     /// Estimated heap bytes used by this membership. Fast to call.
     ///
-    /// Counts the full graph even when it is shared with another membership.
-    /// Does not count heap memory owned by your records.
+    /// Counts every mesh in full, even when it is shared with another pool
+    /// or membership. Does not count heap memory owned by your records.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.owned_bytes
@@ -570,22 +786,55 @@ impl<M: Member> Membership<M> {
                 .capacity()
                 .saturating_mul(size_of::<NonZeroU32>()),
         );
-        for id in &self.ids {
-            bytes = bytes.saturating_add(id.len());
+        bytes = bytes.saturating_add(self.sites.capacity().saturating_mul(size_of::<Box<[u8]>>()));
+        for (id, site) in self.ids.iter().zip(&self.sites) {
+            bytes = bytes.saturating_add(id.len()).saturating_add(site.len());
         }
         bytes = bytes.saturating_add(self.since.capacity().saturating_mul(size_of::<u32>()));
-        // Arc contains the Vec header and two atomic reference counters.
-        bytes = bytes.saturating_add(size_of::<Vec<Vec<usize>>>() + 2 * size_of::<usize>());
-        bytes = bytes.saturating_add(
-            self.graph
-                .capacity()
-                .saturating_mul(size_of::<Vec<usize>>()),
-        );
-        for neighbors in self.graph.iter() {
-            bytes = bytes.saturating_add(neighbors.capacity().saturating_mul(size_of::<usize>()));
+        // Arc of a pool slice: two counters plus the pools.
+        bytes = bytes.saturating_add(2 * size_of::<usize>() + self.pools.len() * size_of::<Pool>());
+        for pool in self.pools.iter() {
+            bytes = bytes
+                .saturating_add(pool.id().len())
+                .saturating_add(pool.mesh().bytes());
         }
         bytes
     }
+}
+
+/// Sorted union of a member's neighbors over `pools`.
+pub(crate) fn union_neighbors(pools: &[Pool], position: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for pool in pools {
+        pool.extend_neighbors(position, &mut out);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Hash the domain, IDs, Sites, and pools (ID, rank, member positions).
+fn topology_identity<M: Member>(
+    ids: &[Box<[u8]>],
+    sites: &[Box<[u8]>],
+    pools: &[Pool],
+) -> [u8; 32] {
+    let mut digest = hash::domain::<M>(TOPOLOGY_IDENTITY_DOMAIN);
+    digest.update((ids.len() as u64).to_be_bytes());
+    for (id, site) in ids.iter().zip(sites) {
+        hash::bytes(&mut digest, id);
+        hash::bytes(&mut digest, site);
+    }
+    digest.update((pools.len() as u64).to_be_bytes());
+    for pool in pools {
+        hash::bytes(&mut digest, pool.id());
+        digest.update(pool.rank().to_be_bytes());
+        digest.update((pool.members().len() as u64).to_be_bytes());
+        for &position in pool.members() {
+            digest.update((position as u64).to_be_bytes());
+        }
+    }
+    hash::finish(digest)
 }
 
 /// Reject IDs longer than `u32::MAX` bytes.
@@ -700,231 +949,6 @@ pub mod hash {
     }
 }
 
-/// The member graph.
-///
-/// Each of 32 rings orders members by a different hash of their ID. Each
-/// member links to its two neighbors in every ring. Weights play no part.
-mod overlay {
-    use crate::{Member, hash};
-
-    use sha2::Digest;
-
-    /// Number of rings.
-    pub(super) const RINGS: u32 = 32;
-
-    /// Hash prefix for ring order. Changing it changes every graph.
-    const RING_DOMAIN: &[u8] = b"/overlay/sha256-rings-32/v1\0";
-
-    /// Hash prefix for `identity`.
-    const IDENTITY_DOMAIN: &[u8] = b"/topology-identity/sha256-rings-32/v1\0";
-
-    /// Hash the domain and sorted IDs. Weights are left out.
-    pub(super) fn identity<M: Member>(ids: &[Box<[u8]>]) -> [u8; 32] {
-        let mut digest = hash::domain::<M>(IDENTITY_DOMAIN);
-        for id in ids {
-            digest.update((id.len() as u64).to_be_bytes());
-            digest.update(id);
-        }
-        hash::finish(digest)
-    }
-
-    /// Build sorted, duplicate-free neighbor lists from all rings.
-    pub(super) fn build<M: Member>(ids: &[Box<[u8]>]) -> Vec<Vec<usize>> {
-        let mut graph: Vec<_> = (0..ids.len())
-            .map(|_| Vec::with_capacity(if ids.len() > 1 { 2 * RINGS as usize } else { 0 }))
-            .collect();
-        if ids.len() < 2 {
-            return graph;
-        }
-        let mut order = Vec::with_capacity(ids.len());
-        for ring in 0..RINGS {
-            order.clear();
-            let mut prefix = hash::domain::<M>(RING_DOMAIN);
-            prefix.update(ring.to_be_bytes());
-            for (position, id) in ids.iter().enumerate() {
-                let mut digest = prefix.clone();
-                digest.update((id.len() as u64).to_be_bytes());
-                digest.update(id);
-                order.push((hash::finish(digest), position));
-            }
-            // Frozen-ID positions break digest ties without size-dependent edges.
-            order.sort_unstable();
-            for index in 0..order.len() {
-                let a = order[index].1;
-                let b = order[(index + 1) % order.len()].1;
-                graph[a].push(b);
-                graph[b].push(a);
-            }
-        }
-        for neighbors in &mut graph {
-            neighbors.sort_unstable();
-            neighbors.dedup();
-        }
-        graph
-    }
-
-    /// Graph tests.
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        use crate::Membership;
-
-        use std::{collections::BTreeSet, num::NonZeroU32};
-
-        /// Test member with a 4-byte ID.
-        #[derive(Clone, Debug)]
-        struct Node([u8; 4], NonZeroU32);
-
-        impl Member for Node {
-            const DOMAIN: &'static str = "overlay-tests";
-
-            /// Return the ID.
-            fn id(&self) -> &[u8] {
-                &self.0
-            }
-
-            /// Return the weight.
-            fn weight(&self) -> NonZeroU32 {
-                self.1
-            }
-        }
-
-        /// Test member with weight 1.
-        fn node(id: u32) -> Node {
-            Node(id.to_be_bytes(), NonZeroU32::new(1).unwrap())
-        }
-
-        /// Members with even IDs, leaving gaps to insert odd ones.
-        fn membership(count: u32) -> Membership<Node> {
-            Membership::new((0..count).map(|id| node(2 * id)).collect()).unwrap()
-        }
-
-        /// All edges, as ID pairs, so they can be compared across memberships.
-        fn edges(members: &Membership<Node>) -> BTreeSet<(Vec<u8>, Vec<u8>)> {
-            let mut edges = BTreeSet::new();
-            for position in 0..members.members().len() {
-                for &other in members.neighbor_slice(position) {
-                    if position < other {
-                        edges.insert((members.id(position).to_vec(), members.id(other).to_vec()));
-                    }
-                }
-            }
-            edges
-        }
-
-        /// Graphs are symmetric, connected, size-limited, and order-independent.
-        #[test]
-        fn symmetric_connected_bounded_and_deterministic() {
-            for count in [0, 1, 2, 3, 32, 65, 257, 1024] {
-                let members = membership(count);
-                let mut permuted = members.members().to_vec();
-                permuted.reverse();
-                for member in &mut permuted {
-                    member.1 = NonZeroU32::new(u32::MAX).unwrap();
-                }
-                let reordered = Membership::new(permuted).unwrap();
-                assert_eq!(members.graph(), reordered.graph());
-                assert_eq!(members.topology_identity(), reordered.topology_identity());
-                for position in 0..count as usize {
-                    let neighbors = members.neighbor_slice(position);
-                    assert_eq!(members.neighbors(position), neighbors);
-                    assert!(neighbors.len() <= crate::MAX_DEGREE);
-                    assert!(neighbors.windows(2).all(|pair| pair[0] < pair[1]));
-                    assert!(!neighbors.contains(&position));
-                    for &other in neighbors {
-                        assert!(other < count as usize);
-                        assert!(
-                            members
-                                .neighbor_slice(other)
-                                .binary_search(&position)
-                                .is_ok()
-                        );
-                    }
-                }
-                let mut seen = BTreeSet::new();
-                let mut pending = if count == 0 { vec![] } else { vec![0] };
-                while let Some(position) = pending.pop() {
-                    if seen.insert(position) {
-                        pending.extend(members.neighbor_slice(position));
-                    }
-                }
-                assert_eq!(seen.len(), count as usize);
-                assert!(members.neighbors(count as usize).is_empty());
-                assert!(members.neighbor_slice(usize::MAX).is_empty());
-                assert!(members.neighbors(usize::MAX).is_empty());
-            }
-        }
-
-        /// `is_neighbor` agrees with the neighbor lists and rejects bad positions.
-        #[test]
-        fn is_neighbor_matches_neighbor_lists() {
-            for count in [0, 1, 2, 3, 32, 100, 257] {
-                let members = membership(count);
-                let count = count as usize;
-                for position in 0..count {
-                    let neighbors = members.neighbors(position);
-                    for other in 0..count {
-                        assert_eq!(
-                            members.is_neighbor(position, other),
-                            neighbors.contains(&other)
-                        );
-                    }
-                    assert!(!members.is_neighbor(position, position));
-                    assert!(!members.is_neighbor(position, count));
-                    assert!(!members.is_neighbor(count, position));
-                }
-                assert!(!members.is_neighbor(usize::MAX, 0));
-            }
-        }
-
-        /// A join or leave only changes edges next to that member.
-        #[test]
-        fn joins_and_leaves_change_only_local_id_edges() {
-            let old = membership(512);
-            let before = edges(&old);
-            for id in [1, 511, 1023] {
-                let mut values = old.members().to_vec();
-                values.push(node(id));
-                let joined = Membership::new(values).unwrap();
-                let after = edges(&joined);
-                assert!(before.symmetric_difference(&after).count() <= 3 * RINGS as usize);
-                let removed: Vec<_> = before.difference(&after).collect();
-                assert!(removed.len() <= RINGS as usize);
-                let added: Vec<_> = after.difference(&before).collect();
-                assert!(added.len() <= 2 * RINGS as usize);
-                assert!(
-                    added.iter().all(|(a, b)| a.as_slice() == id.to_be_bytes()
-                        || b.as_slice() == id.to_be_bytes())
-                );
-                let remaining = Membership::new(
-                    joined
-                        .members()
-                        .iter()
-                        .filter(|member| member.id() != id.to_be_bytes())
-                        .cloned()
-                        .collect(),
-                )
-                .unwrap();
-                assert_eq!(edges(&remaining), before);
-            }
-            for id in [0u32, 512, 1022] {
-                let remaining = Membership::new(
-                    old.members()
-                        .iter()
-                        .filter(|member| member.id() != id.to_be_bytes())
-                        .cloned()
-                        .collect(),
-                )
-                .unwrap();
-                assert!(
-                    before.symmetric_difference(&edges(&remaining)).count() <= 3 * RINGS as usize
-                );
-            }
-        }
-    }
-}
-
 /// Membership tests.
 #[cfg(test)]
 mod tests {
@@ -947,6 +971,20 @@ mod tests {
         /// Return the weight.
         fn weight(&self) -> NonZeroU32 {
             self.1
+        }
+    }
+
+    impl<M: Member> Membership<M> {
+        /// The default pool's shared mesh.
+        fn graph(&self) -> Arc<mesh::Mesh> {
+            Arc::clone(self.pools()[0].mesh())
+        }
+
+        /// Every member's neighbor list.
+        fn adjacency(&self) -> Vec<Vec<usize>> {
+            (0..self.members().len())
+                .map(|p| self.neighbors(p))
+                .collect()
         }
     }
 
@@ -1247,7 +1285,7 @@ mod tests {
         let changed = Membership::new(vec![member(b"b", u32::MAX), member(b"a", 2)]).unwrap();
         assert_ne!(old.identity(), changed.identity());
         assert_eq!(old.topology_identity(), changed.topology_identity());
-        assert_eq!(old.graph(), changed.graph());
+        assert_eq!(old.adjacency(), changed.adjacency());
         let removed = Membership::new(vec![member(b"a", 1)]).unwrap();
         assert_ne!(old.topology_identity(), removed.topology_identity());
         domain_member!(OtherDomain, "another-domain");
@@ -1359,25 +1397,19 @@ mod tests {
             + new.ids.capacity() * size_of::<Box<[u8]>>()
             + new.ids.iter().map(|id| id.len()).sum::<usize>()
             + new.weights.capacity() * size_of::<NonZeroU32>()
+            + new.sites.capacity() * size_of::<Box<[u8]>>()
             + new.since.capacity() * size_of::<u32>()
             + new.delta.as_ref().unwrap().changes.capacity() * size_of::<MemberChange>()
-            + size_of::<Vec<Vec<usize>>>()
             + 2 * size_of::<usize>()
-            + new.graph.capacity() * size_of::<Vec<usize>>()
-            + new
-                .graph
-                .iter()
-                .map(|row| row.capacity() * size_of::<usize>())
-                .sum::<usize>();
+            + size_of::<Pool>()
+            + b"default".len()
+            + new.graph().bytes();
         assert_eq!(new.retained_bytes(), expected);
         let shared = new.graph();
         assert_eq!(new.retained_bytes(), expected);
         assert!(Arc::ptr_eq(&shared, &new.graph()));
-        let empty = Membership::<BinaryMember>::new(vec![]).unwrap();
-        assert_eq!(
-            empty.retained_bytes(),
-            size_of::<Vec<Vec<usize>>>() + 2 * size_of::<usize>()
-        );
+        let empty = Membership::<BinaryMember>::with_pools(vec![], vec![]).unwrap();
+        assert_eq!(empty.retained_bytes(), 2 * size_of::<usize>());
     }
 
     /// A membership of plain records can move to another thread.
@@ -1422,12 +1454,80 @@ mod tests {
             Membership::new_with_predecessor(vec![member(b"a", 1), member(b"c", 2)], &old).unwrap();
         assert!(!Arc::ptr_eq(&old.graph(), &changed.graph()));
         assert_eq!(
-            changed.graph(),
-            Membership::new(changed.members().to_vec()).unwrap().graph()
+            changed.adjacency(),
+            Membership::new(changed.members().to_vec())
+                .unwrap()
+                .adjacency()
         );
         assert!(
             Membership::new_with_predecessor(vec![member(b"a", 1), member(b"a", 2)], &old).is_err()
         );
+    }
+
+    /// Pool meshes are shared within a membership and with a predecessor
+    /// only when IDs, Sites, and pool members match.
+    #[test]
+    fn pool_meshes_shared_only_for_equal_ids_sites_and_members() {
+        /// Member with a Site.
+        #[derive(Clone)]
+        struct Sited(Vec<u8>, Vec<u8>);
+
+        impl Member for Sited {
+            const DOMAIN: &'static str = "sited";
+
+            /// Return the ID.
+            fn id(&self) -> &[u8] {
+                &self.0
+            }
+
+            /// Weight 1.
+            fn weight(&self) -> NonZeroU32 {
+                NonZeroU32::new(1).unwrap()
+            }
+
+            /// Return the Site.
+            fn site(&self) -> &[u8] {
+                &self.1
+            }
+        }
+        let input = |site: &[u8]| -> Vec<Sited> {
+            (0..100u32)
+                .map(|i| Sited(i.to_be_bytes().to_vec(), site.to_vec()))
+                .collect()
+        };
+        let half: Vec<Box<[u8]>> = (0..50u32).map(|i| i.to_be_bytes().into()).collect();
+        let pools = || {
+            vec![
+                PoolSpec::default_pool(),
+                PoolSpec {
+                    id: (*b"a").into(),
+                    rank: 1,
+                    members: Some(half.clone()),
+                },
+                PoolSpec {
+                    id: (*b"b").into(),
+                    rank: 2,
+                    members: Some(half.clone()),
+                },
+            ]
+        };
+        let old = Membership::with_pools(input(b"x"), pools()).unwrap();
+        let (a, b, default) = (&old.pools()[0], &old.pools()[1], &old.pools()[2]);
+        assert_eq!(default.id(), b"default");
+        assert!(Arc::ptr_eq(a.mesh(), b.mesh()));
+        assert!(!Arc::ptr_eq(a.mesh(), default.mesh()));
+        let same = Membership::with_pools_and_predecessor(input(b"x"), pools(), &old).unwrap();
+        for (x, y) in old.pools().iter().zip(same.pools()) {
+            assert!(Arc::ptr_eq(x.mesh(), y.mesh()));
+        }
+        assert_eq!(same.generation(), 1);
+        let moved = Membership::with_pools_and_predecessor(input(b"y"), pools(), &old).unwrap();
+        for (x, y) in old.pools().iter().zip(moved.pools()) {
+            assert!(!Arc::ptr_eq(x.mesh(), y.mesh()));
+        }
+        assert_ne!(old.topology_identity(), moved.topology_identity());
+        assert_eq!(old.identity(), moved.identity());
+        assert_eq!(Error::InvalidPool.to_string(), "invalid pool");
     }
 
     /// `retained_bytes` uses the stored measure plus the change list.
