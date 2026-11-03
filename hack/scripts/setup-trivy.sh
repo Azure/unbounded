@@ -74,7 +74,8 @@ done
 #
 # Runs the command until it succeeds or SETUP_TRIVY_ATTEMPTS is exhausted,
 # sleeping SETUP_TRIVY_BACKOFF seconds after the first failure and doubling
-# the delay after each subsequent failure, capped at SETUP_TRIVY_MAX_BACKOFF.
+# the delay after each subsequent failure. Every delay, including the first,
+# is capped at SETUP_TRIVY_MAX_BACKOFF.
 retry() {
     local description="$1"
     shift
@@ -82,6 +83,10 @@ retry() {
     local attempt=1
     local delay="${SETUP_TRIVY_BACKOFF}"
     local rc
+
+    if [[ "${delay}" -gt "${SETUP_TRIVY_MAX_BACKOFF}" ]]; then
+        delay="${SETUP_TRIVY_MAX_BACKOFF}"
+    fi
 
     while true; do
         "$@" && return 0

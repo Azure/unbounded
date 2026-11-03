@@ -172,6 +172,17 @@ else
     fail "binary download fails after exhausting attempts" "rc=${rc} output: ${out}"
 fi
 
+# An initial backoff above SETUP_TRIVY_MAX_BACKOFF is clamped, so no delay,
+# including the first, exceeds the max.
+run_setup backoff-clamped SETUP_TRIVY_DOWNLOAD_URL="file://${TMP}/missing.tar.gz" \
+    SETUP_TRIVY_BACKOFF=10 SETUP_TRIVY_MAX_BACKOFF=1
+delays="$(grep -o 'retrying in [0-9]*s' <<<"${out}" | tr '\n' ' ')"
+if [[ "${rc}" -ne 0 && "${delays}" == "retrying in 1s retrying in 1s retrying in 1s " ]]; then
+    pass "initial backoff is clamped to the max backoff"
+else
+    fail "initial backoff is clamped to the max backoff" "rc=${rc} output: ${out}"
+fi
+
 # A tarball that does not match the pinned checksum is never installed.
 run_setup bad-checksum SETUP_TRIVY_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
 if [[ "${rc}" -ne 0 && ! -e "${case_dir}/bin/trivy" ]] && grep -q "checksum mismatch" <<<"${out}"; then
