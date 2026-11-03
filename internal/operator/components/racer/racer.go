@@ -36,7 +36,6 @@ const (
 	reasonGuards        = "AdmissionGuardUnavailable"
 	reasonInitializing  = "Initializing"
 	reasonOriginInvalid = "OriginInvalid"
-	reasonOriginPending = "OriginPending"
 )
 
 // Component owns the Racer dataplane workloads and their inputs.
@@ -210,17 +209,13 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 		return nil, component.Result{}, err
 	}
 
-	invalid, waiting, err := planOrigins(ctx, env, plan)
+	invalid, err := planOrigins(ctx, env, plan)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
 	if len(invalid) != 0 {
-		return plan, component.NotReadyAfter(reasonOriginInvalid, "Racer origins not reconciled for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
-	}
-
-	if waiting {
-		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer DaemonSet placement", 30*time.Second), nil
+		return plan, component.NotReadyAfter(reasonOriginInvalid, "Racer origins invalid for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
 	}
 
 	if cleaning {
@@ -244,47 +239,22 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(secretWatched(env))))
 }
 
-// runtimeWorkload matches the dataplane and every origin workload or account.
+// runtimeWorkload matches the dataplane and every origin workload or account
+// left by earlier operator versions, so leftovers are pruned promptly.
 func runtimeWorkload(env *component.Env) func(client.Object) bool {
 	dataplane, origin := env.InNamespaceNamed(dataplaneName), env.InNamespaceWithPrefix(originPrefix)
 
 	return func(obj client.Object) bool { return dataplane(obj) || origin(obj) }
 }
 
-// secretWatched matches racer-state and every Secret in the operator
-// namespace that a ClusterCache origin reads its credentials from, so a
-// rotated credential rolls the origin Pods.
+// secretWatched matches the racer-state Secret.
 func secretWatched(env *component.Env) func(client.Object) bool {
-	state := env.InNamespaceNamed(stateName)
-
-	return func(obj client.Object) bool {
-		if state(obj) {
-			return true
-		}
-
-		if obj.GetNamespace() != env.Namespace {
-			return false
-		}
-
-		caches := &racerv1.ClusterCacheList{}
-		if err := env.Client.List(context.Background(), caches); err != nil {
-			// Reconcile rather than risk missing a rotation.
-			return true
-		}
-
-		for i := range caches.Items {
-			if credentialSecretName(&caches.Items[i]) == obj.GetName() {
-				return true
-			}
-		}
-
-		return false
-	}
+	return env.InNamespaceNamed(stateName)
 }
 
 // clusterCachePredicate passes spec changes and the transition into
 // termination. A finalizer-held cache only gains a deletionTimestamp, which
-// does not bump the generation, but origin planning must prune it right away.
+// does not bump the generation, but origin validation must drop it right away.
 func clusterCachePredicate() predicate.Predicate {
 	return predicate.Or(
 		predicate.GenerationChangedPredicate{},
