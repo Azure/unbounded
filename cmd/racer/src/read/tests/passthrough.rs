@@ -393,10 +393,10 @@ fn passthrough_metadata_is_revalidated_on_every_read() {
     }
 }
 
-/// Holds and warm fills retain pages, so a passthrough cache refuses them on
-/// the owner worker while a cached cache accepts the same hold.
+/// Holds and prefetch fills retain pages, so a passthrough cache refuses them
+/// on the owner worker while a cached cache accepts the same hold.
 #[test]
-fn passthrough_refuses_warm_holds() {
+fn passthrough_refuses_holds_and_prefetch_fills() {
     use crate::test_support::security::network;
     for mode in [CacheMode::Cached, MODES[0], MODES[1]] {
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -409,19 +409,9 @@ fn passthrough_refuses_warm_holds() {
         let (_local, mut endpoint, _publication) =
             super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let directory = f.fill.dependencies.metadata_owner.clone();
-        let version = f.page.version.clone();
-        let worker = directory.page_owner(&f.page).unwrap();
-        let held = std::collections::BTreeMap::from([(
-            worker.0,
-            [PageNumber(0)]
-                .into_iter()
-                .collect::<crate::store::holds::HoldPages>(),
-        )]);
         let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-        let mut fresh = Vec::new();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut future =
-            Box::pin(directory.reserve_warm(&version, &held, until, &f.scope, &mut fresh));
+        let mut future = Box::pin(directory.hold_read_page(&f.page, until, &f.scope));
         let mut output = None;
         for _ in 0..4096 {
             if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
@@ -436,85 +426,36 @@ fn passthrough_refuses_warm_holds() {
         if mode.passthrough() {
             assert_eq!(result.err(), Some(Error::Unavailable), "{mode:?}");
             assert!(!index.is_held(&f.page), "{mode:?}");
+            // A prefetch fill on a passthrough owner fails the page as
+            // unavailable without contacting the origin.
+            let mut future = Box::pin(directory.prefetch_page(
+                f.page.clone(),
+                f.origin.metadata.immutable(),
+                membership.clone(),
+                &f.context,
+                &f.scope,
+            ));
+            let mut output = None;
+            for _ in 0..4096 {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                    output = Some(result);
+                    break;
+                }
+                pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+            }
+            drop(future);
+            assert_eq!(
+                output.expect("prefetch did not complete").unwrap(),
+                racer_core::prefetch::PageResult::Failed(
+                    racer_core::prefetch::FailCode::Unavailable
+                ),
+                "{mode:?}"
+            );
         } else {
             result.unwrap();
             assert!(index.is_held(&f.page));
         }
         endpoint.uninstall().unwrap();
-    }
-}
-
-/// A warm job that completed before the cache switched to passthrough no
-/// longer holds a copy, so reads skip it and fetch from origin, and the
-/// transition forgets the job and its leases.
-#[test]
-fn reads_after_switching_a_warmed_cache_to_passthrough_use_origin() {
-    use crate::test_support::security::network;
-    // The local route reaches origin without peers; the guard is mode-agnostic.
-    for mode in [CacheMode::PassthroughLocal] {
-        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
-        let _queue = queue.enter();
-        let signers = network(1);
-        let mut f = fixture();
-        f.reactor.init().unwrap();
-        // The local route only grants origin authority to a member node.
-        let membership = Arc::new(
-            Membership::validate(
-                racer_control_wire::MembershipVersion(1),
-                vec![Member {
-                    node: signers[0].node().clone(),
-                    shares: std::num::NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:8000".into(),
-                    rails: vec![],
-                    site: String::new(),
-                }],
-            )
-            .unwrap(),
-        );
-        let (_local, mut endpoint, _publication) =
-            super::hot_reads::coordinator(&f, &signers[0], &membership, NoPeer::requester());
-        let directory = f.fill.dependencies.metadata_owner.clone();
-        let version = f.page.version.clone();
-        // The warm job completed page 0 on this node, then the cache switched.
-        let (job, _) = directory.warm.begin(&version).unwrap();
-        crate::read::warm::WarmRegistry::publish_through(&job, 1);
-        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
-        crate::read::warm::WarmRegistry::finish(&job, until);
-        let key = (
-            racer_control_wire::NodeId("22222222-2222-4222-8222-000000000007".into()),
-            [1; 16],
-        );
-        directory.warm.grant_lease(&version, &key, until).unwrap();
-        f.set_mode(mode);
-
-        let budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
-        let mut work = directory
-            .start_page(
-                f.page.clone(),
-                membership.clone(),
-                &f.context,
-                &f.scope,
-                budget,
-            )
-            .unwrap();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut output = None;
-        for _ in 0..4096 {
-            if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
-                output = Some(result);
-                break;
-            }
-            pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
-        }
-        drop(work);
-        let result = output.expect("read did not complete").unwrap().0.unwrap();
-        assert_eq!(result.plaintext.bytes(), b"abc", "{mode:?}");
-        assert_eq!(f.origin.calls.get(), 1, "{mode:?}");
-
-        assert!(directory.warm.contains(&version));
-        directory.warm.forget_cache(&version.object.cache);
-        assert!(!directory.warm.contains(&version), "{mode:?}");
-        assert_eq!(directory.warm.lease_count(&version), 0, "{mode:?}");
     }
 }
 
@@ -635,7 +576,6 @@ fn passthrough_stream_keeps_its_whole_window_of_origin_reads_in_flight() {
         f.origin.blocked_pages.borrow_mut().extend(0..7);
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
-            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: None,

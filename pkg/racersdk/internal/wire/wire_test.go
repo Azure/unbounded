@@ -366,17 +366,17 @@ func TestOriginResponseSelection(t *testing.T) {
 	assertKind(t, err, ErrorInvalidArgument)
 }
 
-func TestClientHeadAddsRetentionOnlyForClient(t *testing.T) {
-	r := Request{Operation: OperationHead, RetainSeconds: 5}
+func TestClientHeadSendsNoRetention(t *testing.T) {
+	r := Request{Operation: OperationHead}
 
-	head, err := ClientHead(r)
-	if err != nil || !bytes.HasPrefix(head, []byte("HEAD /v1/objects/")) || !bytes.Contains(head, []byte("Cache-Control: max-age=5\r\n")) {
-		t.Fatal(string(head), err)
+	client, err := ClientHead(r)
+	if err != nil || !bytes.HasPrefix(client, []byte("HEAD /v1/objects/")) || bytes.Contains(client, []byte("Cache-Control")) {
+		t.Fatal(string(client), err)
 	}
 
-	head, err = RequestHead(r)
-	if err != nil || !bytes.HasPrefix(head, []byte("HEAD /v1/objects/")) || bytes.Contains(head, []byte("Cache-Control")) {
-		t.Fatal(string(head), err)
+	origin, err := RequestHead(r)
+	if err != nil || !bytes.Equal(client, origin) {
+		t.Fatal(string(origin), err)
 	}
 }
 

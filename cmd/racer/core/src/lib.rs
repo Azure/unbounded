@@ -7,6 +7,7 @@
 pub mod admission;
 pub mod cache;
 pub mod liveness;
+pub mod prefetch;
 pub mod read;
 pub mod route;
 pub mod subscriptions;

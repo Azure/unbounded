@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,7 +33,7 @@ type ClientConfig struct {
 	Cache string
 	// MaxConnections bounds concurrent [Client.Get] transfers without
 	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers have a
-	// separate four-slot lane. [Client.Stat] and [Client.Warm] share another
+	// separate four-slot lane. [Client.Stat] and the prefetch calls share another
 	// lane with MaxConnections slots, so every transfer can be preceded by a
 	// Stat. Each lane has a bounded queue; calls fail with [ErrUnavailable] if
 	// it is full or the wait times out.
@@ -54,7 +55,7 @@ const (
 	smallConnections      = 4
 	smallQueue            = 128
 	statQueue             = 128
-	// statIdleConnections bounds pooled Stat and Warm connections apart from
+	// statIdleConnections bounds pooled Stat connections apart from
 	// the Stat lane. Racer holds an ingress slot for each open connection,
 	// and Get always dials, so a burst of Stats must not leave the pool
 	// holding the slots a later Get needs.
@@ -97,9 +98,11 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	mu     sync.Mutex
-	idle   []*clientConn
-	active map[context.Context]context.CancelCauseFunc
+	mu   sync.Mutex
+	idle []*clientConn
+	// prefetch carries prefetch JSON requests; created on first use.
+	prefetch *http.Transport
+	active   map[context.Context]context.CancelCauseFunc
 }
 
 type lane struct {
@@ -198,7 +201,12 @@ func (c *Client) Close() error {
 	c.active = nil
 	idle := c.idle
 	c.idle = nil
+	prefetch := c.prefetch
 	c.mu.Unlock()
+
+	if prefetch != nil {
+		prefetch.CloseIdleConnections()
+	}
 
 	for _, conn := range idle {
 		closeQuietly(conn)
@@ -222,43 +230,6 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 	}
 
 	return fromWireMetadata(response.Metadata), nil
-}
-
-// Warm asks Racer to load and retain an object without returning its contents.
-// ttl must be positive and is rounded up to whole seconds. A duration whose
-// rounded value overflows time.Duration is invalid. A zero RetainUntil means
-// Racer refused retention; metadata is still returned. Warm shares Stat's lane.
-// Pages are held on each page's primary owner in the cache cluster, which is
-// not always the local node. Reads on this node wait for warm progress.
-func (c *Client) Warm(ctx context.Context, request Request, ttl time.Duration, opts WarmOptions) (WarmResult, error) {
-	const op = "warm"
-
-	if ttl <= 0 {
-		return WarmResult{}, invalid(op, errors.New("ttl must be positive"))
-	}
-
-	seconds := ttl / time.Second
-	if ttl%time.Second != 0 {
-		seconds++
-	}
-
-	if seconds > time.Duration(math.MaxInt64)/time.Second {
-		return WarmResult{}, invalid(op, errors.New("rounded ttl overflows duration"))
-	}
-
-	r, err := request.wire(wire.OperationHead)
-	if err != nil {
-		return WarmResult{}, err
-	}
-
-	r.Pin, r.RetainSeconds = opts.ETag, uint64(seconds)
-
-	response, err := c.head(ctx, r, op)
-	if err != nil {
-		return WarmResult{}, err
-	}
-
-	return WarmResult{Metadata: fromWireMetadata(response.Metadata), RetainUntil: response.RetainUntil}, nil
 }
 
 func (c *Client) head(ctx context.Context, r wire.Request, op string) (wire.Response, error) {

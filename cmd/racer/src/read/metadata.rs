@@ -527,9 +527,7 @@ impl MetadataService {
                 }
                 PeerResponse::Page { .. }
                 | PeerResponse::Selected { .. }
-                | PeerResponse::Held { .. }
-                | PeerResponse::Warmed
-                | PeerResponse::Released => {
+                | PeerResponse::Prefetch(_) => {
                     return Err(Error::CorruptRecord.into());
                 }
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),

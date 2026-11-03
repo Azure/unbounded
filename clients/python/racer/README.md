@@ -52,6 +52,31 @@ host's. A custom destination can provide it with a `gpu_uuid()` method.
 Set `RACER_LIBCUDA` to load a different library. torch is needed only for
 `racer.tensors`. A tensor from `as_tensor` keeps the allocation alive.
 
+## Prefetching
+
+```python
+spec = racer.PrefetchSpec(refs=[racer.PrefetchRef(request.hex, metadata=request.metadata)])
+status = client.prefetch("epoch-17", spec)
+status = client.prefetch_status("epoch-17", wait=30, refs="failed")
+```
+
+`prefetch` submits a ticket of object ranges for Racer to load in the
+background. Pages are filled on their owners in the cache cluster and evicted
+like any other page; nothing is pinned. Tickets are local to the node and kept
+in memory, so after a dataplane restart resubmit the same id and only missing
+pages are loaded. Resubmitting the same spec is idempotent.
+
+`prefetch_status` reports progress, optionally waiting for the ticket to
+settle (`wait`), probing resident bytes (`coverage=True`), and paging through
+per-ref outcomes (`refs="failed"` or `"all"`, then `cursor=status.next_cursor`).
+`cancel_prefetch` releases a ticket and `list_prefetches` lists this cache's
+tickets. `PrefetchWindow` replaces a ticket's desired set as a reader moves
+forward: `update(refs)` advances the sequence and `reset(refs)` the
+generation. `split_prefetch` divides a spec that exceeds Racer's per-ticket
+limits into tickets `<id>.0`, `<id>.1`, and so on. Rejections raise
+`PrefetchError` with `status`, `code` (for example `stale_sequence`),
+`message`, and `retry_after`.
+
 ## Object keys
 
 `object_key(bucket, key, version_id)` gives the same 64-hex key as

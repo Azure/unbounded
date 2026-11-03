@@ -9,7 +9,7 @@ use racer_object_wire::model::{
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::ops::Range;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 pub mod budget;
 pub mod flight;
@@ -156,14 +156,8 @@ pub enum PeerResponse<P, G> {
     OriginForbidden,
     /// Authenticated peer no longer retains the requested routing epoch.
     StaleMembership,
-    /// Warm holds accepted until this wall-clock time (millisecond precision).
-    Held {
-        until: SystemTime,
-    },
-    /// The requested warm page is published on the owner's disk under its hold.
-    Warmed,
-    /// The warm lease is gone. Unused capacity is freed after the last lease.
-    Released,
+    /// One owner result per page named by a `prefetch` operation, in order.
+    Prefetch(Vec<crate::prefetch::PageResult>),
 }
 
 impl<P, G> PeerResponse<P, G> {
@@ -182,9 +176,7 @@ impl<P, G> PeerResponse<P, G> {
             Self::OriginRejected => ResponseKind::OriginRejected,
             Self::OriginForbidden => ResponseKind::OriginForbidden,
             Self::StaleMembership => ResponseKind::StaleMembership,
-            Self::Held { .. } => ResponseKind::Held,
-            Self::Warmed => ResponseKind::Warmed,
-            Self::Released => ResponseKind::Released,
+            Self::Prefetch(_) => ResponseKind::Prefetch,
         }
     }
 }
@@ -197,10 +189,9 @@ mod response_tests {
     fn kind_matches_variant() {
         let miss: PeerResponse<(), ()> = PeerResponse::Miss;
         assert_eq!(miss.kind(), ResponseKind::Miss);
-        let held: PeerResponse<(), ()> = PeerResponse::Held {
-            until: SystemTime::UNIX_EPOCH,
-        };
-        assert_eq!(held.kind(), ResponseKind::Held);
+        let prefetch: PeerResponse<(), ()> =
+            PeerResponse::Prefetch(vec![crate::prefetch::PageResult::Resident]);
+        assert_eq!(prefetch.kind(), ResponseKind::Prefetch);
     }
 }
 
@@ -341,7 +332,7 @@ pub enum ServeAction {
     Acquire,
 }
 
-/// Dispatch rule. Subscriptions never arrive here; warm actions always acquire.
+/// Dispatch rule. Subscriptions never arrive here; prefetch fills always acquire.
 pub fn serve_action(facts: ServeFacts) -> ServeAction {
     if facts.operation == OperationKind::Subscribe {
         return ServeAction::Reject(Error::InvalidRequest);
@@ -352,7 +343,7 @@ pub fn serve_action(facts: ServeFacts) -> ServeAction {
     if !facts.cache_available {
         return ServeAction::Miss;
     }
-    if facts.copy_only && facts.operation != OperationKind::Warm {
+    if facts.copy_only && facts.operation != OperationKind::Prefetch {
         ServeAction::CopyOnly
     } else {
         ServeAction::Acquire
@@ -417,7 +408,7 @@ mod serve_tests {
             ServeAction::CopyOnly
         );
         assert_eq!(
-            serve_action(facts(OperationKind::Warm, true)),
+            serve_action(facts(OperationKind::Prefetch, true)),
             ServeAction::Acquire
         );
         assert_eq!(
@@ -1225,7 +1216,7 @@ pub enum OperationKind {
         fresh: bool,
     },
     Bootstrap,
-    Warm,
+    Prefetch,
 }
 
 /// Payload-free shape of a peer response.
@@ -1243,9 +1234,7 @@ pub enum ResponseKind {
     OriginRejected,
     OriginForbidden,
     StaleMembership,
-    Held,
-    Warmed,
-    Released,
+    Prefetch,
 }
 
 impl ResponseKind {
@@ -1302,7 +1291,7 @@ pub fn classify<E: From<Error>>(
         ResponseKind::OriginRejected => return Err(Error::OriginRejected.into()),
         ResponseKind::OriginForbidden => return Err(Error::OriginForbidden.into()),
         ResponseKind::StaleMembership => return Err(Error::IncompatibleMembership.into()),
-        // Warm acknowledgements never answer a candidate data probe.
+        // Prefetch results never answer a candidate data probe.
         _ => return Err(Error::CorruptRecord.into()),
     };
     Ok(Some(outcome))
@@ -1632,8 +1621,11 @@ mod candidates_tests {
             classify(R::StaleMembership, O::Page, true, ok),
             Err(Error::IncompatibleMembership)
         );
-        for warm in [R::Held, R::Warmed, R::Released] {
-            assert_eq!(classify(warm, O::Warm, true, ok), Err(Error::CorruptRecord));
+        {
+            assert_eq!(
+                classify(R::Prefetch, O::Prefetch, true, ok),
+                Err(Error::CorruptRecord)
+            );
         }
     }
 

@@ -66,6 +66,26 @@ class Unavailable(StatusError):
     pass
 
 
+class PrefetchError(StatusError):
+    """A prefetch request was rejected.
+
+    code is the machine-readable code from the JSON error body, such as
+    "stale_sequence", or "" if the body was missing or invalid. retry_after is
+    the Retry-After header in seconds, or None.
+    """
+
+    def __init__(self, status: int, code: str = "", message: str = "", retry_after: float | None = None) -> None:
+        text = f"racer: prefetch: status {status}"
+        if code:
+            text += " " + code
+        if message:
+            text += ": " + message
+        super().__init__(status, text)
+        self.code = code
+        self.message = message
+        self.retry_after = retry_after
+
+
 _BY_STATUS = {
     400: InvalidArgument,
     401: Unauthorized,

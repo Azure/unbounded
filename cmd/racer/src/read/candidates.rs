@@ -2631,7 +2631,7 @@ impl CandidatePolicy {
             PeerOperation::Bootstrap { .. } => CandidateOperation::Bootstrap,
             PeerOperation::Metadata { .. } => CandidateOperation::Metadata,
             PeerOperation::Subscribe { .. } => CandidateOperation::Subscribe,
-            PeerOperation::Warm { .. } => CandidateOperation::Page,
+            PeerOperation::Prefetch { .. } => CandidateOperation::Page,
         };
         self.observer.candidate_final(CandidateFinal {
             failure: Failure::new(Stage::CandidateExhausted, error)
@@ -2807,14 +2807,9 @@ fn operation_identity(operation: &PeerOperation) -> (&ObjectId, PageNumber) {
         PeerOperation::Page { page, .. } => (&page.version.object, page.number),
         PeerOperation::Metadata { object, .. } => (object, PageNumber(0)),
         PeerOperation::Bootstrap { object, .. } => (object, PageNumber(0)),
-        PeerOperation::Warm {
-            version, action, ..
-        } => (
+        PeerOperation::Prefetch { version, action } => (
             &version.object,
-            match action {
-                crate::peer::protocol::WarmAction::Fill { page, .. } => *page,
-                _ => PageNumber(0),
-            },
+            PageNumber(action.pages().first().copied().unwrap_or(0)),
         ),
     }
 }
@@ -2839,14 +2834,9 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
             selector: selector.clone(),
             mode,
         },
-        // Warm actions are always acquire-mode; the probe mode is not applied.
-        PeerOperation::Warm {
-            version,
-            lease,
-            action,
-        } => PeerOperation::Warm {
+        // Prefetch actions are always acquire-mode; the probe mode is not applied.
+        PeerOperation::Prefetch { version, action } => PeerOperation::Prefetch {
             version: version.clone(),
-            lease: *lease,
             action: action.clone(),
         },
     }
@@ -2861,7 +2851,7 @@ pub(crate) fn operation_kind(operation: &PeerOperation) -> racer_core::read::Ope
             fresh: matches!(selector, MetadataSelector::Fresh),
         },
         PeerOperation::Bootstrap { .. } => OperationKind::Bootstrap,
-        PeerOperation::Warm { .. } => OperationKind::Warm,
+        PeerOperation::Prefetch { .. } => OperationKind::Prefetch,
     }
 }
 
@@ -4041,7 +4031,7 @@ pub(super) mod tests {
                     | PeerOperation::Metadata { mode, .. } => {
                         matches!(mode, FetchMode::CopyOnly)
                     }
-                    PeerOperation::Warm { .. } => false,
+                    PeerOperation::Prefetch { .. } => false,
                 };
                 self.calls
                     .borrow_mut()

@@ -143,6 +143,13 @@ linters:
         linters:
           - misspell
         text: '`cancelled` is a misspelling'
+      # `CANCELLED` is the prefetch ticket state literal on Racer's client
+      # socket wire contract (designs/racer-prefetch.md). Go identifiers and
+      # prose still say canceled.
+      - path: pkg/racersdk/
+        linters:
+          - misspell
+        text: '`CANCELLED` is a misspelling'
     paths:
       - examples$
       - hack/scratch
