@@ -596,6 +596,16 @@ fn current_approval(managed: &crate::control::Managed) -> Vec<String> {
         .unwrap_or_else(|| managed.disks.clone())
 }
 
+/// Require the serving enrollment approval to equal the set storage applied,
+/// so renewals compare against the layout actually in use.
+fn serving_approval(applied: &[String], enrolled: &[String]) -> Result<()> {
+    if crate::control::same_disks(applied, enrolled) {
+        return Ok(());
+    }
+    eprintln!("racer: approved disks changed during startup; restarting to apply");
+    Err(Error::DiskApprovalChanged)
+}
+
 /// Whether `error` is the cancellation a requested SIGTERM/SIGINT produces, so the
 /// process stops cleanly instead of reporting a fatal failure.
 fn signal_stop(error: Error, requested: bool) -> bool {
@@ -984,6 +994,10 @@ pub struct WorkerApplication {
     runtime: WorkerRuntime,
 
     control: Option<Rc<Session>>,
+
+    /// Standalone only: the approval storage was built from, which the
+    /// serving enrollment must match. Managed mode uses the disk monitor.
+    standalone_disks: Option<Vec<String>>,
 
     snapshots: Rc<PublicationTarget>,
 
@@ -1507,6 +1521,7 @@ impl WorkerApplication {
             worker,
             runtime,
             control,
+            standalone_disks: (!config.managed()).then(|| node.hardware.approved_disks.clone()),
             snapshots,
             keys,
             store,
@@ -3031,6 +3046,13 @@ impl WorkerApplication {
             let identity = start_control(&control, self.runtime.reactor.clone(), startup).await?;
             if identity.node() != self.keys.node() {
                 return Err(Error::NodeIdentityChanged);
+            }
+            // Standalone storage was built from the bootstrap enrollment, and
+            // renewals compare against this serving enrollment. Without a disk
+            // monitor, a revocation between the two would go unnoticed, so the
+            // serving approval must match what storage applied.
+            if let Some(applied) = &self.standalone_disks {
+                serving_approval(applied, &control.disks())?;
             }
             control.activate_identity()?;
             // Accept a complete compatible first snapshot before any listener.
