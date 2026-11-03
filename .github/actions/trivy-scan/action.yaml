@@ -1,0 +1,49 @@
+name: Trivy image scan
+description: >-
+  Scan a container image with aquasecurity/trivy-action, installing Trivy and
+  its vulnerability DB through hack/scripts/setup-trivy.sh first. The script
+  retries transient network failures with exponential backoff, which
+  trivy-action's built-in installer does not. Requires the repository to be
+  checked out.
+inputs:
+  image-ref:
+    description: Image to scan.
+    required: true
+  severity:
+    description: Comma-separated severities to report.
+    required: false
+    default: CRITICAL,HIGH
+  exit-code:
+    description: Exit code when findings at the given severities are present.
+    required: false
+    default: "1"
+  trivyignores:
+    description: Comma-separated list of .trivyignore files.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    # Idempotent: reuses the binary when already installed in this job, and
+    # Trivy skips the DB download when the cached DB is fresh.
+    - name: Set up Trivy
+      shell: bash
+      env:
+        TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        TRIVY_INSTALL_DIR: ${{ runner.temp }}/trivy-bin
+      run: timeout --kill-after=10s 1800s ./hack/scripts/setup-trivy.sh
+
+    # skip-setup-trivy and cache: false keep trivy-action from downloading
+    # anything itself. setup-trivy.sh exported TRIVY_SKIP_DB_UPDATE=true, so
+    # the scan uses the DB downloaded above.
+    - name: Scan with Trivy
+      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      with:
+        image-ref: ${{ inputs['image-ref'] }}
+        format: table
+        severity: ${{ inputs.severity }}
+        exit-code: ${{ inputs['exit-code'] }}
+        trivyignores: ${{ inputs.trivyignores }}
+        skip-setup-trivy: "true"
+        cache: "false"
+        cache-dir: ${{ runner.temp }}/trivy-cache
