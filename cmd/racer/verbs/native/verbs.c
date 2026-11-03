@@ -365,8 +365,10 @@ static void cm_params(struct rdma_conn_param *p, struct rdma_verbs_cm_req *req) 
     p->private_data = req; p->private_data_len = sizeof(*req);
     /* No RDMA reads or atomics are posted; MANA requires a nonzero depth. */
     p->responder_resources = 1; p->initiator_depth = 1;
-    /* Like window mode: a missing receive fails rather than stalls. */
-    p->retry_count = 3; p->rnr_retry_count = 0;
+    /* A missing receive fails rather than stalls, like window mode. Transport
+     * retries are at the maximum: under fan-in a lost packet is congestion,
+     * and a link broken by retry exhaustion falls back to HTTP for a while. */
+    p->retry_count = 7; p->rnr_retry_count = 0;
 }
 
 /* Accept a connection request for a registered responder QP whose expected
