@@ -116,6 +116,62 @@ but Flex VMs must support the script's x86_64 image and agent archive. The
 `--timeout` value is used for individual polling/rollout and host-bootstrap
 waits, not an overall deadline for every Azure CLI operation.
 
+## Test a branch with a build-only snapshot
+
+The `Build-only snapshot` workflow publishes Linux amd64 component images tagged
+`snapshot-<full-sha>` and a matching workstation CLI artifact. It reuses the
+nightly build jobs with `build_only=true`, but has its own workflow run identity
+so it cannot be mistaken for a healthy nightly deployment. It does not access
+a cluster, request nightly environment secrets, run deployments or smoke tests,
+or cancel the scheduled nightly deployment. These are unsigned evaluation
+artifacts, not a signed release or evidence that private ACR pulls work.
+
+To publish a snapshot, push a new `snapshots/*` tag pointing to the exact branch
+commit. Do not move or overwrite a previously published snapshot tag. This
+trigger works before the workflow has been merged to the default branch:
+
+```bash
+git tag "snapshots/pr-1037-<full-commit-sha>" "<full-commit-sha>"
+git push origin "refs/tags/snapshots/pr-1037-<full-commit-sha>"
+```
+
+Wait for the build-only run to succeed. Its artifact is named
+`snapshot-<full-sha>` and is retained for 30 days. Download it:
+
+```bash
+gh run download "<run-id>" --repo Azure/unbounded \
+  --name "snapshot-<full-commit-sha>" --dir "<snapshot-dir>"
+```
+
+Create a **new** cluster using that downloaded artifact:
+
+```bash
+bash hack/scripts/aks-flex-cluster.sh \
+  --name my-flex-snapshot \
+  --location canadacentral \
+  --subscription "<subscription-uuid>" \
+  --snapshot-dir "<snapshot-dir>" \
+  --yes
+```
+
+`--snapshot-dir` is mutually exclusive with `--unbounded-version`. It validates
+`snapshot.json`, requires the core image digests, and checks the workstation
+plugin's SHA-256 before any Azure calls. The snapshot plugin contains the
+matching operator manifests and component image tag; using a release plugin
+with only an overridden operator image is not equivalent. The state intent
+records the full snapshot commit and registry, and rejects changing them on a
+rerun. `--plan` can validate a downloaded snapshot without provisioning anything.
+Checksums detect corruption, not provenance; download only from a trusted
+successful workflow run. The artifact includes all four Linux/macOS amd64/arm64
+workstation plugins, but the published container images are Linux amd64 only.
+
+The provisioning script copies the matching plugin into
+`tmp/aks-flex/<name>/bin/snapshot-<full-sha>/kubectl-unbounded`. Use that same
+plugin for the separate `gantry attach-acr` command with the new cluster's
+kubeconfig. The AKS Flex agent remains independently pinned at `v0.2.0` unless
+explicitly changed. Registry authentication is still opt-in and separate from
+cluster creation.
+
 ## Attach ACR separately
 
 Cluster deployment is independent of registry authentication. A fresh cluster

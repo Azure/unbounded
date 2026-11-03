@@ -1,0 +1,25 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build-only snapshot
+
+on:
+  # A tag trigger works before this workflow has been merged to the default
+  # branch. Tag the exact branch commit to publish, not a moving branch name.
+  push:
+    tags:
+      - "snapshots/*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    if: github.repository == 'Azure/unbounded'
+    uses: ./.github/workflows/nightly.yaml
+    with:
+      ref: ${{ github.sha }}
+      build_only: true
+    # Deliberately do not inherit secrets or declare a cluster environment.
