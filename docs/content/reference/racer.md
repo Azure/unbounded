@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; no `status` |
+| Fields | Optional `spec.origin` for an Azure Blob origin that the dataplane reads directly; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -35,7 +35,7 @@ component flag. This resource is not a Kubernetes PersistentVolume or
 PersistentVolumeClaim (PVC), does not set absolute capacity, and makes no
 durability promise. `spec.priority` sets only its relative share of each node's
 cache capacity (see [Priority](#priority)). It configures an origin only when `spec.origin` is set (see
-[Managed Azure origin](#managed-azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
+[Azure origin](#azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
 wire cache identity (`CacheID`).
 
 | Path on the node | Owner and purpose |
@@ -103,7 +103,7 @@ spec:
 | `route` | Behavior |
 |---------|----------|
 | `Peers` (default) | Each page goes to its owner nodes through the mesh, as for a cached cache. The owner reads from its local origin. Concurrent reads of the same page anywhere in the cluster share one origin read, and many pages are in flight at once. |
-| `Local` | The reading node reads from its own local origin and never asks peers. Concurrent reads of the same page on one node still share one origin read. Every node that reads needs an origin; a managed `spec.origin` runs one per dataplane node. |
+| `Local` | The reading node reads from its own local origin and never asks peers. Concurrent reads of the same page on one node still share one origin read. Every node that reads needs an origin; with `spec.origin`, every dataplane node has one. |
 
 - Pages are not written to disk and stay in memory only while concurrent
   readers share an in-flight origin read.
@@ -122,14 +122,15 @@ spec:
 The controller and dataplane must run the same version. A mismatched pair
 rejects the cache catalog.
 
-### Managed Azure origin
+### Azure origin
 
-Set `spec.origin` to have the operator run a `racer-object origin` DaemonSet for
-the cache. Leave it unset to deploy your own origin, as described in the
-[racer-object reference](racer-object.md#deploying-the-origin). Do not do both
-for one cache. Set or omit `spec.origin` when you create the cache: it cannot be
-added or removed later. To change the origin, create a new ClusterCache, which
-starts with an empty cache. Deleting the ClusterCache removes the managed origin.
+Set `spec.origin` to have the Racer dataplane read the cache's misses directly
+from an Azure Blob container. No separate origin process runs. Leave it unset
+to deploy your own origin with the [Go SDK](#go-sdk). Do not do both for one cache: when
+`spec.origin` is set, the dataplane ignores the cache's origin socket. Set or
+omit `spec.origin` when you create the cache: it cannot be added or removed
+later. To change the origin, create a new ClusterCache, which starts with an
+empty cache.
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
@@ -147,21 +148,32 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `metadataTTL` | Optional. How long object metadata is reused; not negative |
-| `requestTimeout` | Optional. Limit for each upstream request; positive |
-| `maxConcurrentRequests` | Optional. Upstream requests per origin pod, 1 to 65536 |
-| `azure.containerURL` | Required. The one blob container the origin may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
+| `metadataTTL` | Optional. How long object metadata is reused; not negative. Default `30s` |
+| `requestTimeout` | Optional. Limit for each upstream request; positive. Default `1m` |
+| `maxConcurrentRequests` | Optional. Upstream requests for this cache on each node, 1 to 65536. Default `512` |
+| `azure.containerURL` | Required. The one blob container the cache may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
 | `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
-| `azure.credential.default` | `DefaultAzureCredential`. Optional `clientID` for a user-assigned managed identity, or `secretRef` to a Secret in the operator namespace whose keys become environment variables |
-| `azure.credential.workloadIdentity` | Microsoft Entra Workload ID. Requires `clientID`, optional `tenantID`. The cluster must run the Azure Workload Identity webhook, and the identity must trust the origin ServiceAccount |
+| `azure.credential.default` | The node's managed identity, through the Azure Instance Metadata Service (IMDS). Optional `clientID` selects a user-assigned identity |
+| `azure.credential.workloadIdentity` | Microsoft Entra Workload ID for the `racer` ServiceAccount. Requires `clientID`; optional `tenantID`, otherwise discovered from the storage account |
 
-Unset optional fields use the `racer-object` defaults.
+All caches on a node share one dataplane pod, so every credential runs as that
+pod:
 
-The operator names the DaemonSet and its ServiceAccount `racer-origin-<cache>`
-in the Racer namespace. It copies node affinity, node selector, tolerations, and
-image pull secrets from the `racer` DaemonSet, and waits until that
-DaemonSet exists. The origin runs as UID and GID 65532 and serves
-`/run/racer/<cache>/origin/socket`, which the dataplane creates.
+- `default` asks IMDS at `169.254.169.254` for a storage token. Each Racer node
+  needs the identity attached.
+- `workloadIdentity` uses a ServiceAccount token that the operator always
+  projects into the dataplane, with audience `api://AzureADTokenExchange`, at
+  `/var/run/secrets/azure/tokens/azure-identity-token`
+  (`RACER_AZURE_FEDERATED_TOKEN_FILE`). The identity needs a federated credential
+  with subject `system:serviceaccount:<Racer namespace>:racer`, for example
+  `system:serviceaccount:unbounded-system:racer`. No webhook is needed.
+
+Any ClusterCache can name any identity that trusts the `racer` ServiceAccount
+or is attached to the nodes. Limit who can create ClusterCaches accordingly.
+Tokens are cached per node and never appear in the cache catalog.
+
+Every dataplane node needs network access to the storage account, and to IMDS
+when you use `default`. With `hostNetwork` off, the pod network must allow it.
 
 Each ClusterCache maps to one container. You cannot change
 `azure.containerURL` after creation. To read a different source, create a new
@@ -169,12 +181,12 @@ ClusterCache. It gets a new UID, so it starts with an empty cache. A pod that
 reads two containers needs two ClusterCaches and two sidecars.
 
 Sidecars attach with `racer.unbounded-cloud.io/object-cache: <ClusterCache name>`.
-They can read any blob in the cache's container. The origin rejects requests
-for any other container with `403`.
+They can read any blob in the cache's container. Racer rejects requests for any
+other container with `403`.
 
-If the spec is not valid, the operator skips that origin and reports
-`OriginInvalid`. It reports `OriginPending` while the dataplane DaemonSet is
-missing.
+If the spec is not valid, the operator reports `OriginInvalid`. Earlier
+versions ran a `racer-origin-<cache>` DaemonSet and ServiceAccount per cache;
+the operator deletes them on upgrade.
 
 ## Node requirements
 
@@ -192,7 +204,8 @@ runs a privileged UID 0 container with these host paths:
 Do not turn off cluster-wide admission protections. Authorize these workloads
 narrowly. RDMA is optional; see [RDMA](#rdma).
 
-Racer origins run as the non-root UID/GID 65532 and do not need privileged mode.
+Origins that you deploy for caches without `spec.origin` run as the non-root
+UID/GID 65532 and do not need privileged mode.
 For each cache, the dataplane creates `/run/racer/<name>/origin` owned by
 UID/GID 65532 with mode `0700`, and repairs its owner and mode on every cache
 setup. Origins do not create this directory: mount it with hostPath type
