@@ -524,6 +524,20 @@ specified above. Where the server had to choose, it did the following.
   one dispatch, including the owner's fills, at 120 s.
 - The former `racer_warm_held_*` gauges, which report spill holds, are
   renamed `racer_held_*`.
+- 405 responses carry the error code `method_not_allowed` (not in the
+  status-code table above) with the `Allow` header.
+- The payload hash covers the PUT body re-encoded as sent: whitespace and
+  field order do not matter, but absent fields are omitted rather than
+  defaulted, so an explicit default (`"ttl_seconds": 600`, `"generation": 0`)
+  is a different payload from an omitted field, and two TTLs that cap to the
+  same value differ. The SDKs always encode a spec the same way, so their
+  retries replay. A replay renews the TTL only of a ticket that has not
+  expired or been canceled.
+- Both 429 codes send `Retry-After: 5`.
+- The Go `fakeracer` and the Python fake server follow this contract,
+  including the cursor format, but have no pages or owners: an unsettled
+  ticket reports `RUNNING` (never `QUEUED`), and only the requested,
+  admitted, fetched, in-flight, and failed byte counters are filled.
 - Deferred: the owner does not check that it is the rank-0 owner of each
   requested page; a per-owner dispatch queue and eager re-plan of in-flight
   units are not implemented.
