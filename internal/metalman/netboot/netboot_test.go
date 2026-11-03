@@ -1336,19 +1336,58 @@ func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
 	require.True(t, installRequested)
 }
 
-func TestPreservesImageUsers(t *testing.T) {
+func TestNewTemplateData_PreserveImageUsersAnnotation(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
-		image string
-		want  bool
+		name        string
+		annotations map[string]string
+		want        bool
 	}{
-		{image: gb200TestImageRepository + ":candidate", want: true},
-		{image: gb200ProductionImageRepository + "@sha256:abc", want: true},
-		{image: gb200TestImageRepository + "-other:latest"},
-		{image: "ghcr.io/azure/host-ubuntu2404:latest"},
+		{name: "annotation enabled", annotations: map[string]string{v1alpha3.AnnotationPreserveImageUsers: "true"}, want: true},
+		{name: "annotation disabled", annotations: map[string]string{v1alpha3.AnnotationPreserveImageUsers: "false"}},
+		{name: "annotation absent"},
 	} {
-		require.Equal(t, tt.want, preservesImageUsers(tt.image), tt.image)
+		t.Run(tt.name, func(t *testing.T) {
+			data := newTemplateData(
+				&v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}},
+				ClusterInfo{},
+				"",
+				"",
+				"",
+				false,
+			)
+
+			require.Equal(t, tt.want, data.PreserveImageUsers)
+		})
+	}
+}
+
+func TestVendorDataTemplate_PreserveImageUsers(t *testing.T) {
+	t.Parallel()
+
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name               string
+		preserveImageUsers bool
+		wantUnboundedMetal bool
+	}{
+		{name: "generic image", wantUnboundedMetal: true},
+		{name: "GB200 image", preserveImageUsers: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := renderTemplate(string(vendorDataTmpl), templateData{
+				ServeURL:           "http://192.0.2.1",
+				AgentConfigJSON:    "{}",
+				InstallScript:      "true",
+				PreserveImageUsers: tt.preserveImageUsers,
+			})
+			require.NoError(t, err)
+
+			require.Equal(t, tt.wantUnboundedMetal, strings.Contains(string(result), "name: unbounded-metal"))
+		})
 	}
 }
 

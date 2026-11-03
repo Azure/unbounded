@@ -44,12 +44,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build test host disk
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pigz
-          sudo images/host-ubuntu2404-gb200-test/build.sh
-
       - name: Build and push image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -61,4 +55,4 @@ jobs:
           cache-from: type=gha,scope=host-ubuntu2404-gb200-test
           cache-to: type=gha,scope=host-ubuntu2404-gb200-test,mode=max
           build-args: |
-            VERSION=${{ env.IMAGE_TAG }}
+            SOURCE_COMMIT=${{ github.sha }}

@@ -181,11 +181,6 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 
 const userDataPath = "cloud-init/user-data"
 
-const (
-	gb200TestImageRepository       = "ghcr.io/azure/host-ubuntu2404-gb200-test"
-	gb200ProductionImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167"
-)
-
 // defaultUserData is the minimal cloud-config returned when no custom
 // user-data ConfigMap is configured on the Machine.
 const defaultUserData = "#cloud-config\n"
@@ -341,9 +336,7 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		agent = node.Spec.Agent
 
 		bootLease = selectBootLease(node, requestIP)
-		if netboot := node.Spec.Netboot(); netboot != nil {
-			preserveImageUsers = preservesImageUsers(netboot.Image)
-		}
+		preserveImageUsers = node.Annotations[v1alpha3.AnnotationPreserveImageUsers] == "true"
 	}
 
 	return templateData{
@@ -357,19 +350,6 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		InstallRequested:   installRequested,
 		PreserveImageUsers: preserveImageUsers,
 	}
-}
-
-func preservesImageUsers(imageRef string) bool {
-	repository := imageRef
-	if index := strings.IndexByte(repository, '@'); index >= 0 {
-		repository = repository[:index]
-	}
-
-	if colon := strings.LastIndexByte(repository, ':'); colon > strings.LastIndexByte(repository, '/') {
-		repository = repository[:colon]
-	}
-
-	return repository == gb200TestImageRepository || repository == gb200ProductionImageRepository
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
