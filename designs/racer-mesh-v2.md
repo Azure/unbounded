@@ -237,6 +237,21 @@ Scenarios: default pools of 512, 4k, and 20k nodes; a 256 node selector pool in 
 a hot page storm (v1 numbers are in the old reports); churn; and a primary failover that must
 give the same mesh.
 
+These are in `cmd/racer/sim/tests/mesh_scenarios.rs` and the `mesh` section of every sim report
+(see `designs/racer-core-simulation.md`). Findings (one Site):
+
+- Peers per node match the table: 61 at 512, 189 at 4,096, 408 at 20,000. Every sampled route
+  without failures takes at most 2 links. Selector pool routes never leave the pool, and nearly
+  all their links are RDMA.
+- A join or leave changes about `T + 3C` edges (82 at 512, 271 at 4,000, 630 at 20,000).
+  Leaving a pool of exactly a power of four rebuilds most of the mesh.
+- Hot page storm, 512 nodes on 32 MiB/s NICs: peak bodies of the page at one owner are 54
+  with the v2 rule, 37 with v1, and 14 of 513 reads time out (none with v1). The column
+  exemption admits up to `3T / 2` column mates at once.
+- Every route takes the same primary delegate. A hung delegate keeps failing the same reader,
+  and the reader's ping of the healthy owner crosses it too. Owners also send every probe of
+  rank 0 through one delegate, so relay limits are reached sooner. Both are open questions.
+
 ## Rollout
 
 Cold cutover. Stop every Racer pod, roll out the new image, then start. Mixed versions reject
