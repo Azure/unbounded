@@ -69,10 +69,12 @@ fn origin_definition(
             Some(_) => Err(invalid),
         }
     };
-    let duration = |key: &str, default| -> Result<std::time::Duration, wire::Error> {
+    let duration = |key: &str, default, round_up| -> Result<std::time::Duration, wire::Error> {
         match present(origin, key) {
             None => Ok(default),
-            Some(Value::String(s)) => go_duration(&s).ok_or(invalid),
+            Some(Value::String(s)) => go_duration(&s)
+                .and_then(|d| to_millis(d, round_up))
+                .ok_or(invalid),
             Some(_) => Err(invalid),
         }
     };
@@ -111,8 +113,8 @@ fn origin_definition(
             container_url: wire::AzureContainerUrl::parse(&url)?,
             credential,
         },
-        metadata_ttl: duration("metadataTTL", wire::DEFAULT_ORIGIN_METADATA_TTL)?,
-        request_timeout: duration("requestTimeout", wire::DEFAULT_ORIGIN_REQUEST_TIMEOUT)?,
+        metadata_ttl: duration("metadataTTL", wire::DEFAULT_ORIGIN_METADATA_TTL, false)?,
+        request_timeout: duration("requestTimeout", wire::DEFAULT_ORIGIN_REQUEST_TIMEOUT, true)?,
         max_concurrent_requests,
     };
     definition.validate()?;
@@ -120,8 +122,8 @@ fn origin_definition(
 }
 
 /// Parse a Go `time.Duration` string such as "30s", "1m30s", or "1.5h", as
-/// written by metav1.Duration. Negative durations and durations that do not
-/// fit the wire's millisecond precision are rejected; "-0" is zero.
+/// written by metav1.Duration, to nanosecond precision. Negative durations are
+/// rejected; "-0" is zero.
 fn go_duration(s: &str) -> Option<std::time::Duration> {
     let (negative, mut rest) = match s.as_bytes().first()? {
         b'-' => (true, &s[1..]),
@@ -189,12 +191,19 @@ fn go_duration(s: &str) -> Option<std::time::Duration> {
         return None;
     }
     let total = u64::try_from(total).ok()?;
-    millisecond_precision(std::time::Duration::from_nanos(total))
+    Some(std::time::Duration::from_nanos(total))
 }
 
-/// Accept only durations the wire can carry exactly in milliseconds.
-fn millisecond_precision(d: std::time::Duration) -> Option<std::time::Duration> {
-    d.subsec_nanos().is_multiple_of(1_000_000).then_some(d)
+/// Round to the wire's whole-millisecond precision. The API admits any
+/// nanosecond duration, so sub-millisecond parts are rounded rather than
+/// rejected: down (like the Go origin's TTL truncation) or, when `up`, up so
+/// a positive timeout stays positive. Returns None only on overflow.
+fn to_millis(d: std::time::Duration, up: bool) -> Option<std::time::Duration> {
+    let mut millis = u64::try_from(d.as_millis()).ok()?;
+    if up && !d.subsec_nanos().is_multiple_of(1_000_000) {
+        millis = millis.checked_add(1)?;
+    }
+    Some(std::time::Duration::from_millis(millis))
 }
 
 /// Build the catalog sorted by UID. Any invalid cache fails the whole catalog.
@@ -390,6 +399,31 @@ mod tests {
         ] {
             assert_eq!(go_duration(s), Some(d), "{s}");
         }
+        let ns = std::time::Duration::from_nanos;
+        for (s, d) in [
+            ("1ns", ns(1)),
+            ("1500us", ns(1_500_000)),
+            ("999999ns", ns(999_999)),
+            // Truncated to 999999ns.
+            (
+                "0.999999999999999999999999999999999999999999ms",
+                ns(999_999),
+            ),
+        ] {
+            assert_eq!(go_duration(s), Some(d), "{s}");
+        }
+        // TTLs floor and timeouts ceil to whole milliseconds.
+        for (d, floor, ceil) in [
+            (ns(0), 0, 0),
+            (ns(1), 0, 1),
+            (ns(999_999), 0, 1),
+            (ns(1_000_000), 1, 1),
+            (ns(1_500_000), 1, 2),
+            (ns(i64::MAX as u64), 9_223_372_036_854, 9_223_372_036_855),
+        ] {
+            assert_eq!(to_millis(d, false), Some(ms(floor)), "{d:?}");
+            assert_eq!(to_millis(d, true), Some(ms(ceil)), "{d:?}");
+        }
         for s in [
             "",
             "-",
@@ -404,13 +438,9 @@ mod tests {
             "1s ",
             " 1s",
             "1ms5",
-            "1500us",
-            "1ns",
             "9223372036854775808ns",
             "3000000h",
             "1S",
-            // Truncated to 999999ns, below millisecond precision.
-            "0.999999999999999999999999999999999999999999ms",
             // Overflow is rejected without a panic.
             "2562048h",
             "2562047.9999999999999999999999999999999h",
@@ -504,7 +534,9 @@ mod tests {
             serde_json::json!({"azure":{"containerURL":url},"metadataTTL":"-1s"}),
             serde_json::json!({"azure":{"containerURL":url},"metadataTTL":30}),
             serde_json::json!({"azure":{"containerURL":url},"requestTimeout":"0s"}),
-            serde_json::json!({"azure":{"containerURL":url},"requestTimeout":"1500us"}),
+            serde_json::json!({"azure":{"containerURL":url},"requestTimeout":"0ns"}),
+            serde_json::json!({"azure":{"containerURL":url},"requestTimeout":"-1ns"}),
+            serde_json::json!({"azure":{"containerURL":url},"metadataTTL":"1x"}),
             serde_json::json!({"azure":{"containerURL":url},"maxConcurrentRequests":0}),
             serde_json::json!({"azure":{"containerURL":url},"maxConcurrentRequests":65537}),
             serde_json::json!({"azure":{"containerURL":url},"maxConcurrentRequests":-1}),
@@ -518,6 +550,38 @@ mod tests {
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }
+
+        // Sub-millisecond durations the API admits are rounded, not rejected:
+        // TTLs floor, timeouts ceil so they stay positive.
+        let ms = std::time::Duration::from_millis;
+        for (value, ttl, timeout) in [
+            ("1ns", ms(0), ms(1)),
+            ("1500us", ms(1), ms(2)),
+            ("999999ns", ms(0), ms(1)),
+            (
+                "0.999999999999999999999999999999999999999999ms",
+                ms(0),
+                ms(1),
+            ),
+        ] {
+            let o = parse(serde_json::json!({
+                "azure":{"containerURL":url},"metadataTTL":value,"requestTimeout":value
+            }))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                (o.metadata_ttl, o.request_timeout),
+                (ttl, timeout),
+                "{value}"
+            );
+        }
+        // A cache with sub-millisecond durations publishes alongside others.
+        let mut sub = c("22222222-2222-4222-8222-222222222222", "b");
+        sub.origin = Some(serde_json::json!({
+            "azure":{"containerURL":url},"metadataTTL":"1ns","requestTimeout":"1500us"
+        }));
+        let out = build(&[c(u, "a"), sub]).unwrap();
+        assert_eq!(out.len(), 2);
 
         // An invalid origin fails the whole catalog, like any other invalid cache.
         let mut bad = c("22222222-2222-4222-8222-222222222222", "b");

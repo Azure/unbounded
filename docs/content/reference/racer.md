@@ -148,8 +148,8 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `metadataTTL` | Optional. How long object metadata is reused; not negative. Default `30s` |
-| `requestTimeout` | Optional. Limit for each origin operation, including token acquisition and one retry after an authentication challenge; positive. Default `1m` |
+| `metadataTTL` | Optional. How long object metadata is reused; not negative; rounded down to whole milliseconds. Default `30s` |
+| `requestTimeout` | Optional. Limit for each origin operation, including token acquisition and one retry after an authentication challenge; positive; rounded up to whole milliseconds. Default `1m` |
 | `maxConcurrentRequests` | Optional. Upstream operations in flight for this cache on each node, 1 to 65536. Operations over the limit fail as overloaded rather than wait. Default `512` |
 | `azure.containerURL` | Required. The one blob container the cache may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
 | `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
