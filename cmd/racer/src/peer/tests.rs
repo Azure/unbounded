@@ -1546,6 +1546,7 @@ mod requester_safety {
             crate::peer::Config {
                 total: 4,
                 per_peer: 1,
+                ..Default::default()
             },
             metrics.clone(),
         )
@@ -3384,6 +3385,7 @@ mod adaptive {
             Config {
                 total: 4,
                 per_peer: 2,
+                ..Default::default()
             },
             Metrics::default(),
         )
@@ -3399,6 +3401,7 @@ mod adaptive {
             Config {
                 total: 4,
                 per_peer: 2,
+                ..Default::default()
             },
             Metrics::default(),
         )
@@ -3415,6 +3418,7 @@ mod adaptive {
             Config {
                 total: 512,
                 per_peer: 1,
+                ..Default::default()
             },
             Metrics::default(),
         )
@@ -3450,6 +3454,7 @@ mod adaptive {
             Config {
                 total: 2,
                 per_peer: 1,
+                ..Default::default()
             },
             metrics.clone(),
         )
@@ -3483,6 +3488,7 @@ mod adaptive {
             Config {
                 total: 4,
                 per_peer: 4,
+                ..Default::default()
             },
             Metrics::default(),
         )
@@ -3518,6 +3524,7 @@ mod adaptive {
             Config {
                 total: 512,
                 per_peer: 1,
+                ..Default::default()
             },
             Metrics::default(),
         )
@@ -3558,6 +3565,7 @@ mod adaptive {
             Config {
                 total: 4,
                 per_peer: 4,
+                ..Default::default()
             },
             metrics.clone(),
         )

@@ -75,6 +75,7 @@ var (
 		"RACER_PAGE_HEDGE_BYTES":             {0, 32 * duplicateBytes},
 		"RACER_PEER_INFLIGHT_MAX":            {1, 65536},
 		"RACER_PEER_PER_NEIGHBOR_MAX":        {1, 65536},
+		"RACER_PEER_ADMISSION_RECOVERY_MS":   {1, 60000},
 		"RACER_PEER_RECEIVE_MAX":             {0, 65536},
 		"RACER_PEER_RECEIVE_QUEUE_MAX":       {1, 65536},
 		"RACER_PEER_RECEIVE_WAIT_MS":         {1, 30000},

@@ -3806,6 +3806,7 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
     config.peer_admission = crate::peer::Config {
         total: 2,
         per_peer: 1,
+        ..Default::default()
     };
     let node = Arc::new(
         NodeState::with_peer_admission(vec![WorkerId(0), WorkerId(1)], 16, config.peer_admission)

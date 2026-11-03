@@ -107,18 +107,27 @@ impl Drop for PageTiming<'_> {
 pub struct Config {
     pub total: usize,
     pub per_peer: usize,
+    /// Least time between one-slot recoveries of a reduced limit after
+    /// verified successes.
+    pub recovery: Duration,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             total: 256,
             per_peer: 32,
+            recovery: RECOVERY,
         }
     }
 }
 impl Config {
     pub fn validate(self) -> Result<()> {
-        if self.total == 0 || self.total > 65536 || self.per_peer == 0 || self.per_peer > self.total
+        if self.total == 0
+            || self.total > 65536
+            || self.per_peer == 0
+            || self.per_peer > self.total
+            || self.recovery.is_zero()
+            || self.recovery > Duration::from_secs(60)
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -186,7 +195,7 @@ impl AdaptivePeers {
                     per_key: config.per_peer,
                     capacity: CAPACITY,
                     backoff: BACKOFF,
-                    recovery: RECOVERY,
+                    recovery: config.recovery,
                     retire_after: Duration::from_secs(60),
                 },
                 AdmissionObserver(metrics),
