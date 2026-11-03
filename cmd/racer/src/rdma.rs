@@ -274,15 +274,126 @@ pub fn select_hop(
     }) {
         return Err(Error::IncompatibleMembership);
     }
-    select_members(
+    let plan = select_members(
         &route.membership,
         &[
             route.membership.member(local)?,
             route.membership.member(peer)?,
         ],
         page,
-    )
+    )?;
+    if plan != TransportPlan::Http && !is_rdma_edge(&route.membership, local, peer) {
+        return Ok(TransportPlan::Http);
+    }
+    Ok(plan)
 }
+/// Whether the hop from `local` to `peer` would use RDMA for `page` except
+/// that the edge is not an RDMA edge: both nodes qualify by Site and rail but
+/// at least one of them did not take the edge among its [`RDMA_PEERS`] best.
+/// Such a page goes over HTTP and counts as overflow.
+///
+/// [`RDMA_PEERS`]: crate::topology::RDMA_PEERS
+pub fn is_overflow(
+    membership: &crate::topology::Membership,
+    page: &PageId,
+    local: &racer_control_wire::NodeId,
+    peer: &racer_control_wire::NodeId,
+) -> bool {
+    let (Ok(a), Ok(b)) = (membership.member(local), membership.member(peer)) else {
+        return false;
+    };
+    membership.is_neighbor(local, peer)
+        && rail_plan(membership, &[a, b], page).is_some()
+        && !is_rdma_edge(membership, local, peer)
+}
+
+/// The symmetric RDMA eligibility of an edge: both ends are in the same
+/// nonempty Site and publish at least one common rail.
+fn rdma_eligible(ours: &crate::topology::Member, theirs: &crate::topology::Member) -> bool {
+    !ours.site.is_empty()
+        && ours.site == theirs.site
+        && ours
+            .rails
+            .iter()
+            .any(|r| theirs.rails.iter().any(|t| t.rail == r.rail))
+}
+
+/// Per-membership cache of RDMA peer sets, computed on first use per
+/// position. A membership change builds a new [`crate::topology::Membership`]
+/// and so a fresh cache.
+#[derive(Debug)]
+pub struct RdmaEdges {
+    budget: usize,
+    peers: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<[usize]>>>,
+}
+
+impl Default for RdmaEdges {
+    fn default() -> Self {
+        Self::with_budget(crate::topology::RDMA_PEERS)
+    }
+}
+
+impl RdmaEdges {
+    /// A cache where each node takes at most `budget` RDMA peers. Production
+    /// uses [`crate::topology::RDMA_PEERS`]; tests use small budgets.
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Self {
+            budget,
+            peers: Default::default(),
+        }
+    }
+
+    /// The sorted RDMA peer positions of `position`.
+    fn peers(
+        &self,
+        membership: &crate::topology::Membership,
+        position: usize,
+    ) -> std::sync::Arc<[usize]> {
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        peers
+            .entry(position)
+            .or_insert_with(|| {
+                let members = membership.members();
+                let mut chosen = membership.inner.rdma_peers(position, self.budget, |a, b| {
+                    rdma_eligible(&members[a], &members[b])
+                });
+                chosen.sort_unstable();
+                chosen.into()
+            })
+            .clone()
+    }
+}
+
+/// Whether the edge between `a` and `b` uses RDMA: they are neighbors, the
+/// edge is eligible, and both ends took it among their
+/// [`crate::topology::RDMA_PEERS`] best ranked eligible edges.
+pub fn is_rdma_edge(
+    membership: &crate::topology::Membership,
+    a: &racer_control_wire::NodeId,
+    b: &racer_control_wire::NodeId,
+) -> bool {
+    let (Ok(pa), Ok(pb)) = (membership.position(a), membership.position(b)) else {
+        return false;
+    };
+    let members = membership.members();
+    pa != pb
+        && membership.inner.is_neighbor(pa, pb)
+        && rdma_eligible(&members[pa], &members[pb])
+        && membership
+            .rdma_edges
+            .peers(membership, pa)
+            .binary_search(&pb)
+            .is_ok()
+        && membership
+            .rdma_edges
+            .peers(membership, pb)
+            .binary_search(&pa)
+            .is_ok()
+}
+
 fn validate_route(route: &Route) -> Result<()> {
     if route.nodes.is_empty()
         || route.nodes.len() > usize::from(FAILURE_LINKS) + 1
@@ -304,16 +415,27 @@ fn select_members(
     members: &[&crate::topology::Member],
     page: &PageId,
 ) -> Result<TransportPlan> {
+    Ok(rail_plan(membership, members, page)
+        .map_or(TransportPlan::Http, |rail| TransportPlan::Rdma { rail }))
+}
+
+/// The page's rail when every member is in the same nonempty Site and
+/// publishes it, ignoring the RDMA peer budget.
+fn rail_plan(
+    membership: &crate::topology::Membership,
+    members: &[&crate::topology::Member],
+    page: &PageId,
+) -> Option<RailId> {
     if members
         .iter()
         .any(|m| m.site.is_empty() || m.site != members[0].site || m.rails.is_empty())
     {
-        return Ok(TransportPlan::Http);
+        return None;
     }
     // Site is an admission boundary, not a new rail domain or hash scheme.
     let domain = membership.rail_domain();
     if domain.is_empty() {
-        return Ok(TransportPlan::Http);
+        return None;
     }
     let mut digest = crate::topology::hash_domain(b"racer/rail/v1\0");
     crate::topology::hash_object(&mut digest, &page.version.object, page.number);
@@ -324,9 +446,9 @@ fn select_members(
         .iter()
         .all(|m| m.rails.iter().any(|m| m.rail == rail))
     {
-        return Ok(TransportPlan::Http);
+        return None;
     }
-    Ok(TransportPlan::Rdma { rail })
+    Some(rail)
 }
 
 #[cfg(test)]
@@ -858,6 +980,148 @@ pub(crate) mod tests {
             let plan = select_hop(&mixed, &page(0), a, b).unwrap();
             assert!(local_compatible(&mixed, &plan, a, &mappings()).unwrap());
             assert!(!local_compatible(&mixed, &plan, a, &[]).unwrap());
+        }
+        /// `n` members in one Site with the same rails.
+        pub(crate) fn mesh(n: usize) -> Arc<Membership> {
+            mesh_with_budget(n, crate::topology::RDMA_PEERS)
+        }
+        /// As [`mesh`], with each node taking at most `budget` RDMA peers.
+        pub(crate) fn mesh_with_budget(n: usize, budget: usize) -> Arc<Membership> {
+            let members = (0..n)
+                .map(|i| {
+                    let mut member = member(i, 4);
+                    member.site = "site1".into();
+                    member.rails = mappings();
+                    member
+                })
+                .collect();
+            let mut membership = Membership::validate(MembershipVersion(1), members).unwrap();
+            membership.rdma_edges = RdmaEdges::with_budget(budget);
+            Arc::new(membership)
+        }
+        fn hop(membership: &Arc<Membership>, a: &NodeId, b: &NodeId) -> TransportPlan {
+            let route = Route {
+                membership: membership.clone(),
+                nodes: vec![a.clone(), b.clone()],
+            };
+            select_hop(&route, &page(0), a, b).unwrap()
+        }
+        #[test]
+        fn small_mesh_uses_rdma_on_every_edge() {
+            let membership = mesh(8);
+            let nodes: Vec<_> = membership
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .collect();
+            for a in &nodes {
+                for b in nodes.iter().filter(|b| *b != a) {
+                    assert!(is_rdma_edge(&membership, a, b));
+                    assert!(!is_overflow(&membership, &page(0), a, b));
+                    assert_eq!(
+                        hop(&membership, a, b),
+                        TransportPlan::Rdma { rail: RailId(7) }
+                    );
+                }
+                assert!(!is_rdma_edge(&membership, a, a));
+            }
+        }
+        #[test]
+        fn rdma_edges_need_both_ends_within_the_peer_budget() {
+            // A full mesh of 40 with a budget of 16: 39 neighbors each.
+            let budget = 16;
+            let membership = mesh_with_budget(40, budget);
+            let nodes: Vec<_> = membership
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .collect();
+            let (mut rdma, mut overflow) = (0, 0);
+            for (i, a) in nodes.iter().enumerate() {
+                let mut degree = 0;
+                for b in nodes.iter().filter(|b| *b != a) {
+                    let pa = membership.position(a).unwrap();
+                    let pb = membership.position(b).unwrap();
+                    let expected = membership.inner.is_rdma_edge(pa, pb, budget, |_, _| true);
+                    let edge = is_rdma_edge(&membership, a, b);
+                    assert_eq!(edge, expected);
+                    assert_eq!(edge, is_rdma_edge(&membership, b, a));
+                    if !membership.is_neighbor(a, b) {
+                        assert!(!edge);
+                        assert!(!is_overflow(&membership, &page(0), a, b));
+                        continue;
+                    }
+                    let plan = hop(&membership, a, b);
+                    if edge {
+                        degree += 1;
+                        assert_eq!(plan, TransportPlan::Rdma { rail: RailId(7) });
+                        assert!(!is_overflow(&membership, &page(0), a, b));
+                    } else {
+                        assert_eq!(plan, TransportPlan::Http);
+                        assert!(is_overflow(&membership, &page(0), a, b));
+                    }
+                    // The cached peer set agrees with the topology crate.
+                    let took = membership
+                        .inner
+                        .rdma_peers(pa, budget, |_, _| true)
+                        .contains(&pb);
+                    assert_eq!(
+                        took,
+                        membership.rdma_edges.peers(&membership, pa).contains(&pb)
+                    );
+                }
+                assert!(degree <= budget, "node {i}");
+                rdma += degree;
+                overflow += membership.neighbors(a).unwrap().len() - degree;
+            }
+            assert!(rdma > 0);
+            assert!(overflow > 0);
+        }
+        #[test]
+        fn ineligible_edges_are_neither_rdma_nor_overflow() {
+            let membership = {
+                let members = (0..8)
+                    .map(|i| {
+                        let mut member = member(i, 4);
+                        member.site = if i == 0 { "site2" } else { "site1" }.into();
+                        member.rails = if i == 1 { vec![] } else { mappings() };
+                        member
+                    })
+                    .collect();
+                Arc::new(Membership::validate(MembershipVersion(1), members).unwrap())
+            };
+            let nodes: Vec<_> = membership
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .collect();
+            let other = membership
+                .members()
+                .iter()
+                .find(|m| m.site == "site1" && !m.rails.is_empty())
+                .unwrap()
+                .node
+                .clone();
+            for odd in membership
+                .members()
+                .iter()
+                .filter(|m| m.site == "site2" || m.rails.is_empty())
+            {
+                assert!(!is_rdma_edge(&membership, &odd.node, &other));
+                assert!(!is_overflow(&membership, &page(0), &odd.node, &other));
+                assert_eq!(hop(&membership, &odd.node, &other), TransportPlan::Http);
+            }
+            assert!(!is_rdma_edge(
+                &membership,
+                &nodes[0],
+                &NodeId("unknown".into())
+            ));
+            assert!(!is_overflow(
+                &membership,
+                &page(0),
+                &nodes[0],
+                &NodeId("unknown".into())
+            ));
         }
         #[test]
         fn golden_page_to_rail_vectors() {

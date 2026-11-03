@@ -265,6 +265,8 @@ pub struct Membership {
     pub(crate) inner: ::topology::Membership<Member>,
     retained_bytes: usize,
     rail_domain: Vec<racer_control_wire::RailId>,
+    /// Lazily computed RDMA peer sets, one per queried position.
+    pub(crate) rdma_edges: crate::rdma::RdmaEdges,
 }
 
 impl From<racer_control_wire::Member> for Member {
@@ -340,6 +342,7 @@ impl Membership {
             .map_err(|_| Error::InvalidConfiguration)?,
             retained_bytes,
             rail_domain,
+            rdma_edges: Default::default(),
         })
     }
     /// Prepare bounded incremental ranking hints outside the publication lock.
