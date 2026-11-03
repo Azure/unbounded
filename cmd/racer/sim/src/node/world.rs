@@ -5402,7 +5402,12 @@ mod shed_tests {
         assert_eq!(owners.len(), 3);
         let owner = owners[0];
         assert!(world.owners_at(owner, w, page, false).is_empty());
-        let mate = |n: u32| column_mates(&members, owner, n);
+        let (object, number) = (world.ids.object(page), world.ids.number(page));
+        let mate = |n: u32| {
+            members
+                .position(&n.to_be_bytes())
+                .is_some_and(|p| is_helper(&object, number, p, members.members().len()))
+        };
         let reader = (0..nodes)
             .find(|n| !owners.contains(n) && !mate(*n) && *n != ranker)
             .unwrap();
@@ -5414,7 +5419,7 @@ mod shed_tests {
         assert!(world.shed_hot(owner, reader, page));
         assert!(!world.shed_hot(owner, owners[1], page), "owners are exempt");
         if let Some(h) = helper_node {
-            assert!(!world.shed_hot(owner, h, page), "column mates are exempt");
+            assert!(!world.shed_hot(owner, h, page), "v1 helpers are exempt");
         }
         // A non-owner never sheds, cached ranking or not.
         let busy = vec![SECONDS; threshold];
