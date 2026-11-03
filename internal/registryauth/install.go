@@ -13,14 +13,20 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"sigs.k8s.io/yaml"
 )
 
 const (
 	installDir         = "/opt/unbounded/registry-auth"
 	providerPath       = installDir + "/bin/" + ProviderName
 	providerConfigPath = installDir + "/credential-provider.json"
+	azureConfigPath    = installDir + "/azure.json"
+	proxyCAPath        = "/etc/kubernetes/certs/ca.crt"
+	ownedCAPath        = installDir + "/proxy-ca.crt"
 	ownerPath          = installDir + "/.owner"
 	restartPath        = installDir + "/.restart-required"
 	dropInPath         = "/etc/systemd/system/kubelet.service.d/90-unbounded-registry-auth.conf"
@@ -40,14 +46,12 @@ type Installer struct {
 
 // Reconcile converges the owned files and verifies that kubelet is using them.
 func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
-	if cfg.Mode == "external" || len(cfg.Registries) == 0 {
-		return i.remove(ctx)
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
 
-	for _, registry := range cfg.Registries {
-		if !IsACR(registry) {
-			return errors.New("invalid ACR registry in node-auth desired state")
-		}
+	if cfg.Mode == ExternalMode {
+		return i.remove(ctx)
 	}
 
 	args, err := i.KubeletArgs()
@@ -61,6 +65,10 @@ func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 	for _, arg := range args {
 		if arg == "--image-credential-provider-config" || arg == "--image-credential-provider-bin-dir" {
 			return errors.New("kubelet already uses an external credential provider; preserve it with node-auth mode external")
+		}
+
+		if err := i.checkPodTokenFeature(args); err != nil {
+			return err
 		}
 
 		if strings.HasPrefix(arg, "--image-credential-provider-config=") && arg != "--image-credential-provider-config="+providerConfigPath {
@@ -86,6 +94,53 @@ func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 	}
 
 	if err := i.claim(); err != nil {
+		return err
+	}
+
+	if cfg.CACert != "" {
+		if err := i.checkPath(proxyCAPath); err != nil {
+			return err
+		}
+
+		existing, err := os.ReadFile(i.path(proxyCAPath))
+
+		owned, ownedErr := os.ReadFile(i.path(ownedCAPath))
+		if ownedErr != nil && !errors.Is(ownedErr, os.ErrNotExist) {
+			return ownedErr
+		}
+
+		if err == nil && !bytes.Equal(existing, []byte(cfg.CACert)) && (ownedErr != nil || !bytes.Equal(existing, owned)) {
+			return errors.New("stock ACR provider CA path already contains a different certificate; refusing to overwrite it")
+		}
+
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		created := errors.Is(err, os.ErrNotExist)
+		if created {
+			if _, err := i.write(ownedCAPath, []byte(cfg.CACert), 0o644); err != nil {
+				return err
+			}
+		}
+
+		if _, err := i.write(proxyCAPath, []byte(cfg.CACert), 0o644); err != nil {
+			return err
+		}
+
+		if !created && ownedErr == nil {
+			if _, err := i.write(ownedCAPath, []byte(cfg.CACert), 0o644); err != nil {
+				return err
+			}
+		}
+	}
+
+	azureConfig, err := cfg.AzureConfig()
+	if err != nil {
+		return err
+	}
+
+	if _, err := i.write(azureConfigPath, azureConfig, 0o644); err != nil {
 		return err
 	}
 
@@ -137,8 +192,85 @@ func (i *Installer) Reconcile(ctx context.Context, cfg Config) error {
 		return errors.New("kubelet has not activated the managed ACR credential-provider flags")
 	}
 
+	if err := i.checkPodTokenFeature(args); err != nil {
+		return err
+	}
+
 	if err := os.Remove(i.path(restartPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+
+	return nil
+}
+
+func (i *Installer) checkPodTokenFeature(args []string) error {
+	const feature = "KubeletServiceAccountTokenForCredentialProviders"
+
+	var configPath, gateFlags string
+
+	for index, arg := range args {
+		for _, flag := range []string{"--config", "--feature-gates"} {
+			value, matched := strings.CutPrefix(arg, flag+"=")
+			if arg == flag {
+				if index+1 == len(args) {
+					return fmt.Errorf("kubelet flag %s has no value", flag)
+				}
+
+				value, matched = args[index+1], true
+			}
+
+			if matched {
+				if flag == "--config" {
+					configPath = value
+				} else {
+					gateFlags = value
+				}
+			}
+		}
+	}
+
+	enabled := true
+
+	if configPath != "" {
+		if !filepath.IsAbs(configPath) {
+			return errors.New("cannot verify kubelet feature gates from a relative configuration path")
+		}
+
+		if err := i.checkPath(configPath); err != nil {
+			return err
+		}
+
+		data, err := os.ReadFile(i.path(configPath))
+		if err != nil {
+			return fmt.Errorf("read kubelet feature gates: %w", err)
+		}
+
+		var config struct {
+			FeatureGates map[string]bool `json:"featureGates"`
+		}
+		if err := yaml.Unmarshal(data, &config); err != nil {
+			return fmt.Errorf("parse kubelet feature gates: %w", err)
+		}
+
+		if value, ok := config.FeatureGates[feature]; ok {
+			enabled = value
+		}
+	}
+
+	for _, entry := range strings.Split(gateFlags, ",") {
+		key, value, _ := strings.Cut(entry, "=")
+		if key == feature {
+			var err error
+
+			enabled, err = strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("parse kubelet Pod-token feature flag: %w", err)
+			}
+		}
+	}
+
+	if !enabled {
+		return errors.New("kubelet ServiceAccount tokens for credential providers are explicitly disabled")
 	}
 
 	return nil
@@ -251,7 +383,7 @@ func (i *Installer) dropIn() ([]byte, error) {
 }
 
 func (i *Installer) remove(ctx context.Context) error {
-	for _, path := range []string{ownerPath, dropInPath, providerPath, providerConfigPath, restartPath} {
+	for _, path := range []string{ownerPath, dropInPath, providerPath, providerConfigPath, azureConfigPath, ownedCAPath, proxyCAPath, restartPath} {
 		if err := i.checkPath(path); err != nil {
 			return err
 		}
@@ -318,12 +450,29 @@ func (i *Installer) remove(ctx context.Context) error {
 		}
 	}
 	// Never recursively remove a directory that another actor might have added to.
-	for _, path := range []string{providerPath, providerConfigPath, restartPath, ownerPath} {
+	if owned, err := os.ReadFile(i.path(ownedCAPath)); err == nil {
+		existing, err := os.ReadFile(i.path(proxyCAPath))
+		if err == nil {
+			if !bytes.Equal(existing, owned) {
+				return errors.New("managed proxy CA changed ownership; refusing to remove it")
+			}
+
+			if err := os.Remove(i.path(proxyCAPath)); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	for _, path := range []string{providerPath, providerConfigPath, azureConfigPath, ownedCAPath, restartPath, ownerPath} {
 		if err := os.Remove(i.path(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	// Empty directories are removed non-recursively so a later auto-mode
+	// Empty directories are removed non-recursively so a later opted-in
 	// installation can reclaim the same paths without touching foreign files.
 	for _, path := range []string{installDir + "/bin", installDir} {
 		if err := os.Remove(i.path(path)); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) {

@@ -19,37 +19,30 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
-// RestartLeaseName is created by the operator. Node helpers can only get/update it.
 const RestartLeaseName = "gantry-acr-auth-restart"
 
-// ErrKubeletNotRunning permits recovery only after an owned installation exists.
 var ErrKubeletNotRunning = errors.New("no running kubelet found; waiting before configuring node authentication")
 
-// NodeOptions selects the local mount, projected configuration, and assertion.
 type NodeOptions struct {
-	Root       string
-	ConfigPath string
-	Listen     string
-	Namespace  string
-	Identity   string
-	TokenFile  string
+	Root         string
+	ConfigPath   string
+	Listen       string
+	Namespace    string
+	Identity     string
+	ProviderPath string
 }
 
-// RunNode reconciles a node-wide broker and exec adapter. The broker's own
-// infrastructure ServiceAccount supplies the assertion. Applications are untouched.
+// RunNode installs configuration and upstream's executable. It never handles credentials.
 func RunNode(ctx context.Context, opts NodeOptions) error {
 	if opts.Identity == "" || opts.Namespace == "" {
 		return errors.New("node-auth requires a pod identity and namespace")
-	}
-
-	if opts.TokenFile == "" {
-		opts.TokenFile = FederatedTokenPath
 	}
 
 	restConfig, err := rest.InClusterConfig()
@@ -62,19 +55,13 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 		return err
 	}
 
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	installer := &Installer{Root: opts.Root, Executable: executable}
+	installer := &Installer{Root: opts.Root, Executable: opts.ProviderPath}
 	installer.HostCommand = func(ctx context.Context, args ...string) error {
 		commandCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
 		defer cancel()
 
-		command := exec.CommandContext(commandCtx, "chroot", append([]string{opts.Root, "/usr/bin/systemctl"}, args...)...)
-		if err := command.Run(); err != nil {
-			return fmt.Errorf("host systemctl %s failed: %w", args[0], err)
+		if err := exec.CommandContext(commandCtx, "chroot", append([]string{opts.Root, "/usr/bin/systemctl"}, args...)...).Run(); err != nil {
+			return fmt.Errorf("node systemctl %s: %w", args[0], err)
 		}
 
 		return nil
@@ -87,7 +74,7 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 		message string
 	}
 
-	health.message = "waiting for federated node authentication reconciliation"
+	health.message = "waiting for stock ACR provider installation"
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		health.RLock()
@@ -98,9 +85,9 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 			return
 		}
 
-		_, _ = fmt.Fprintln(w, health.message) //nolint:errcheck // Probe responses are best effort after headers are sent.
+		_, _ = fmt.Fprintln(w, health.message) //nolint:errcheck // Probe responses are best effort.
 	})
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }) //nolint:errcheck // Probe responses are best effort.
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }) //nolint:errcheck // Probe response.
 
 	listener, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
@@ -110,32 +97,16 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	defer closeQuietly(server)
 
-	brokerListener, err := ListenBroker(opts.Root)
-	if err != nil {
-		closeQuietly(listener)
-		return err
-	}
-
-	var broker Broker
-
-	brokerServer := &http.Server{Handler: &broker, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 35 * time.Second, MaxHeaderBytes: 8192}
-	defer closeQuietly(brokerServer)
-
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 1)
 	go func() { errCh <- server.Serve(listener) }()
-	go func() { errCh <- brokerServer.Serve(brokerListener) }()
-
-	var (
-		provider                                    *Provider
-		providerIdentity, lastVerified, lastMessage string
-		verifiedAt                                  time.Time
-	)
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	var lastMessage string
+
 	for {
-		message := "federated node broker and credential adapter active; repository pull permission is unverified (set node-auth probeImage)"
+		message := "stock ACR credential provider configured; private pulls and Gantry acceleration are not yet verified"
 
 		err := func() error {
 			reconcileCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -147,65 +118,39 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 			}
 
 			var cfg Config
-			if json.Unmarshal(data, &cfg) != nil {
-				return errors.New("invalid projected node-auth configuration")
+			if err := json.Unmarshal(data, &cfg); err != nil {
+				return fmt.Errorf("invalid projected node-auth configuration: %w", err)
 			}
 
-			if cfg.Mode != "external" && cfg.Mode != "workloadIdentity" {
-				return errors.New("node-auth requires explicit workloadIdentity or external mode")
-			}
-
-			if cfg.Mode == "external" || len(cfg.Registries) == 0 {
-				broker.Configure(Config{}, nil)
-
-				message = "operator-owned credential adapter removed; authentication is externally managed"
-
-				return withRestartLease(reconcileCtx, client, opts, func(ctx context.Context) error { return installer.Reconcile(ctx, cfg) })
-			}
-
-			identity := cfg.ClientID + "/" + cfg.TenantID
-			if provider == nil || providerIdentity != identity {
-				provider, err = NewProvider(cfg, opts.TokenFile)
-				if err != nil {
-					return err
-				}
-
-				providerIdentity = identity
-			}
-			// Validate federation before changing kubelet. There is deliberately
-			// no fallback to a VM identity when assertion exchange fails.
-			if string(data) != lastVerified || time.Since(verifiedAt) >= 5*time.Minute {
-				if cfg.ProbeImage != "" {
-					if err := provider.Probe(reconcileCtx, cfg.ProbeImage); err != nil {
-						return err
-					}
-				} else {
-					for _, registry := range cfg.Registries {
-						if _, err := provider.RefreshToken(reconcileCtx, registry); err != nil {
-							return err
-						}
-					}
-				}
-
-				lastVerified, verifiedAt = string(data), time.Now()
-			}
-
-			broker.Configure(cfg, provider)
-
-			if err := withRestartLease(reconcileCtx, client, opts, func(ctx context.Context) error { return installer.Reconcile(ctx, cfg) }); err != nil {
+			if err := cfg.Validate(); err != nil {
 				return err
 			}
 
-			if cfg.ProbeImage != "" {
-				message = "federated node broker and credential adapter active; private-image authorization verified by manifest HEAD"
+			if cfg.Mode == IdentityBindingMode {
+				cfg.Registries = []string{cfg.Registry}
+
+				output, err := exec.CommandContext(reconcileCtx, "chroot", opts.Root, "/usr/local/bin/kubelet", "--version").Output()
+				if err != nil {
+					return fmt.Errorf("check kubelet version: %w", err)
+				}
+
+				fields := strings.Fields(string(output))
+				if len(fields) == 0 {
+					return errors.New("kubelet returned no version")
+				}
+
+				v, err := version.ParseGeneric(fields[len(fields)-1])
+				if err != nil || !v.AtLeast(version.MustParseGeneric("1.34.0")) {
+					return errors.New("AKS identity bindings require kubelet 1.34 or later with ServiceAccount tokens for credential providers enabled")
+				}
+			} else {
+				message = "operator-owned provider removed; customer authentication is unchanged"
 			}
 
-			return nil
+			return withRestartLease(reconcileCtx, client, opts, func(ctx context.Context) error { return installer.Reconcile(ctx, cfg) })
 		}()
 		if err != nil {
 			message = err.Error()
-
-			broker.Configure(Config{}, nil)
 		}
 
 		health.Lock()
@@ -214,9 +159,9 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 
 		if message != lastMessage {
 			if err != nil {
-				slog.Error("registry authentication is not ready", "reason", message)
+				slog.Error("stock ACR provider installation is not ready", "reason", message)
 			} else {
-				slog.Info("registry authentication reconciled", "status", message)
+				slog.Info("stock ACR provider reconciled", "status", message)
 			}
 
 			lastMessage = message
@@ -236,7 +181,6 @@ func RunNode(ctx context.Context, opts NodeOptions) error {
 	}
 }
 
-// RunningKubeletArgs reads only arguments, never credentials or environment.
 func RunningKubeletArgs(root string) ([]string, error) {
 	proc := filepath.Join(root, "proc")
 
@@ -255,7 +199,7 @@ func RunningKubeletArgs(root string) ([]string, error) {
 
 		data, err := os.ReadFile(filepath.Join(proc, entry.Name(), "cmdline"))
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read running kubelet arguments: %w", err)
 		}
 
 		if result != nil {

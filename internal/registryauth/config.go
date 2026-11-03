@@ -1,103 +1,66 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package registryauth implements operator-managed kubelet authentication for ACR.
+// Package registryauth installs the stock ACR credential provider when explicitly requested.
 package registryauth
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/opencontainers/go-digest"
 	"sigs.k8s.io/yaml"
-
-	"github.com/Azure/unbounded/internal/gantry/oci"
 )
 
 const (
-	// ConfigKey is the optional installation policy in gantry-config.
-	ConfigKey = "node-auth.yaml"
-	// ProviderName is the executable name kubelet invokes.
-	ProviderName = "unbounded-acr-credential-provider"
-	// ServiceAccountName is the infrastructure identity, never an application's account.
-	ServiceAccountName = "registry-pull"
-	// FederatedAudience is the Azure token-exchange audience of the projected assertion.
-	FederatedAudience = "api://AzureADTokenExchange"
-	// FederatedTokenPath exists only in the broker Pod, not on the host.
-	FederatedTokenPath = "/var/run/secrets/unbounded-registry-auth/token"
-	// BrokerSocketPath is the protected node-local exec adapter endpoint.
-	BrokerSocketPath = "/run/unbounded-registry-auth/credential.sock"
-	// FlexNodeLabel and FlexNodeValue identify AKS Flex nodes, not native AKS nodes.
-	FlexNodeLabel = "kubernetes.azure.com/nodepool-type"
-	FlexNodeValue = "FlexNodes"
+	ConfigKey           = "node-auth.yaml"
+	ProviderName        = "acr-credential-provider"
+	ProviderBinary      = "/unbounded/bin/acr-credential-provider"
+	ExternalMode        = "external"
+	IdentityBindingMode = "aks-identity-binding"
+	FlexNodeLabel       = "kubernetes.azure.com/nodepool-type"
+	FlexNodeValue       = "FlexNodes"
+	IdentityRoleName    = "gantry-acr-pull"
 )
 
-var (
-	acrHost  = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
-	imageTag = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
-)
+var acrHost = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)?(?:\.[a-z0-9]+\.geo)?\.azurecr\.io$`)
 
-// Config is the public installation policy plus the operator-derived registries.
-// Registries are never read from node-auth.yaml; gantry-config is authoritative.
+// Config contains installation policy, never access tokens or client secrets.
+// An absent policy leaves customer authentication entirely alone.
 type Config struct {
-	Mode       string   `json:"mode,omitempty"`
-	Registry   string   `json:"registry,omitempty"`
-	ClientID   string   `json:"clientID,omitempty"`
-	TenantID   string   `json:"tenantID,omitempty"`
-	ProbeImage string   `json:"probeImage,omitempty"`
-	Registries []string `json:"registries,omitempty"`
+	Mode         string   `json:"mode,omitempty"`
+	Registry     string   `json:"registry,omitempty"`
+	ClientID     string   `json:"clientID,omitempty"`
+	TenantID     string   `json:"tenantID,omitempty"`
+	SNIName      string   `json:"sniName,omitempty"`
+	ProxyAddress string   `json:"proxyAddress,omitempty"`
+	Audience     string   `json:"audience,omitempty"`
+	CACert       string   `json:"caCert,omitempty"`
+	Registries   []string `json:"-"`
 }
 
-// IsACR reports whether host is a public-cloud ACR login server.
 func IsACR(host string) bool { return len(host) <= 253 && acrHost.MatchString(host) }
 
-// Derive reads node-auth policy and derives eligible upstreams without modifying
-// the administrator's Gantry payload. Explicit shared credentials bypass this path.
+// Derive validates the explicitly selected policy against Gantry's actual upstream.
 func Derive(gantry, policy string) (Config, error) {
-	var cfg Config
+	cfg := Config{Mode: ExternalMode}
 	if policy != "" {
 		if err := yaml.UnmarshalStrict([]byte(policy), &cfg); err != nil {
 			return Config{}, fmt.Errorf("parse %s: %w", ConfigKey, err)
 		}
-
-		if len(cfg.Registries) != 0 {
-			return Config{}, errors.New("node-auth registries must come from Gantry upstream_registries")
-		}
 	}
 
-	if cfg.Mode == "" {
-		cfg.Mode = "external"
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
 	}
 
-	if cfg.Mode != "workloadIdentity" && cfg.Mode != "external" {
-		return Config{}, errors.New("node-auth mode must be workloadIdentity or external")
-	}
-
-	if cfg.Mode == "workloadIdentity" {
-		if _, err := uuid.Parse(cfg.ClientID); err != nil {
-			return Config{}, errors.New("node-auth workloadIdentity requires an explicit clientID UUID")
-		}
-
-		if _, err := uuid.Parse(cfg.TenantID); err != nil {
-			return Config{}, errors.New("node-auth workloadIdentity requires an explicit tenantID UUID")
-		}
-	}
-
-	if cfg.Registry != "" && !IsACR(cfg.Registry) {
-		return Config{}, errors.New("node-auth registry must be a public-cloud ACR login server")
-	}
-
-	if cfg.Mode == "external" {
-		if cfg.ProbeImage != "" {
-			return Config{}, errors.New("node-auth probeImage requires workloadIdentity mode")
-		}
-
+	if cfg.Mode == ExternalMode {
 		return cfg, nil
 	}
 
@@ -120,86 +83,111 @@ func Derive(gantry, policy string) (Config, error) {
 	}
 
 	for _, upstream := range upstreams.Registries {
-		if cfg.Registry != "" && upstream.Name != cfg.Registry {
+		if upstream.Name != cfg.Registry {
 			continue
 		}
 
-		if !IsACR(upstream.Name) || upstream.CredentialsPath != "" {
-			continue
+		if upstream.CredentialsPath != "" {
+			return Config{}, errors.New("managed ACR authentication conflicts with Gantry credentials_path; use external authentication")
 		}
 
 		u, err := url.Parse(upstream.Endpoint)
-		if err != nil || u.Scheme != "https" || u.Host != upstream.Name || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-			return Config{}, fmt.Errorf("ACR upstream %s must use its matching HTTPS endpoint; use external node-auth mode for custom authentication", upstream.Name)
+		if err != nil || u.Scheme != "https" || u.Host != cfg.Registry || u.User != nil ||
+			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			return Config{}, errors.New("managed ACR authentication requires the registry's matching HTTPS endpoint")
 		}
 
-		cfg.Registries = append(cfg.Registries, upstream.Name)
+		cfg.Registries = []string{cfg.Registry}
+
+		return cfg, nil
 	}
 
-	slices.Sort(cfg.Registries)
-
-	cfg.Registries = slices.Compact(cfg.Registries)
-	if cfg.ProbeImage != "" {
-		host, _, _, err := ParseImage(cfg.ProbeImage)
-		if err != nil || !slices.Contains(cfg.Registries, host) {
-			return Config{}, errors.New("node-auth probeImage must be an image in a configured federated ACR upstream")
-		}
-	}
-
-	return cfg, nil
+	return Config{}, errors.New("managed ACR authentication requires its registry in Gantry upstream_registries")
 }
 
-// ParseImage separates an explicit ACR image into registry, repository, and reference.
-func ParseImage(image string) (string, string, string, error) {
-	host, rest, ok := strings.Cut(image, "/")
-	if !ok || !IsACR(host) || strings.ContainsAny(rest, " \t\r\n?#%\\") {
-		return "", "", "", errors.New("expected an explicit public-cloud ACR image reference")
+func (c Config) Validate() error {
+	if c.Mode != ExternalMode && c.Mode != IdentityBindingMode {
+		return errors.New("node-auth mode must be external or aks-identity-binding")
 	}
 
-	repo, ref, hasDigest := strings.Cut(rest, "@")
-	if hasDigest {
-		if _, err := digest.Parse(ref); err != nil {
-			return "", "", "", errors.New("invalid ACR image digest")
+	if c.Registry != "" && !IsACR(c.Registry) {
+		return errors.New("node-auth registry must be a public-cloud ACR login server")
+	}
+
+	if c.Mode == ExternalMode {
+		return nil
+	}
+
+	if c.Registry == "" {
+		return errors.New("aks-identity-binding requires an explicit registry")
+	}
+
+	if id, err := uuid.Parse(c.ClientID); err != nil || id == uuid.Nil {
+		return errors.New("aks-identity-binding requires a nonzero clientID UUID")
+	}
+
+	if id, err := uuid.Parse(c.TenantID); err != nil || id == uuid.Nil {
+		return errors.New("aks-identity-binding requires a nonzero tenantID UUID")
+	}
+
+	if !validHostname(c.SNIName) {
+		return errors.New("aks-identity-binding requires the AKS token proxy SNI hostname")
+	}
+
+	if net.ParseIP(c.ProxyAddress) == nil && !validHostname(c.ProxyAddress) {
+		return errors.New("aks-identity-binding requires the AKS token proxy IP address or hostname")
+	}
+
+	if c.Audience == "" || strings.ContainsAny(c.Audience, " \t\r\n") {
+		return errors.New("aks-identity-binding requires the discovered ServiceAccount token audience")
+	}
+
+	if !x509.NewCertPool().AppendCertsFromPEM([]byte(c.CACert)) {
+		return errors.New("aks-identity-binding requires the AKS token proxy CA certificate")
+	}
+
+	return nil
+}
+
+func validHostname(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
 		}
 
-		if pos := strings.LastIndex(repo, ":"); pos >= 0 {
-			if !imageTag.MatchString(repo[pos+1:]) {
-				return "", "", "", errors.New("invalid ACR image tag")
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
+				return false
 			}
-
-			repo = repo[:pos]
-		}
-	} else {
-		repo, ref = rest, "latest"
-		if pos := strings.LastIndex(rest, ":"); pos >= 0 {
-			repo, ref = rest[:pos], rest[pos+1:]
-		}
-
-		if !imageTag.MatchString(ref) {
-			return "", "", "", errors.New("invalid ACR image tag")
 		}
 	}
 
-	if oci.ValidateRepositoryName(repo) != nil {
-		return "", "", "", errors.New("invalid ACR image repository")
-	}
-
-	return host, repo, ref, nil
+	return true
 }
 
-// ProviderConfig renders kubelet's stable v1 exec provider configuration.
+// ProviderConfig configures upstream's identity-binding mode, not its IMDS mode.
 func (c Config) ProviderConfig() ([]byte, error) {
-	args := []string{"acr-credential-provider", "--socket=" + BrokerSocketPath}
-
-	for _, registry := range c.Registries {
-		args = append(args, "--registry="+registry)
-	}
-
 	return json.MarshalIndent(map[string]any{
 		"apiVersion": "kubelet.config.k8s.io/v1", "kind": "CredentialProviderConfig",
 		"providers": []any{map[string]any{
-			"name": ProviderName, "matchImages": c.Registries, "defaultCacheDuration": "5m",
-			"apiVersion": "credentialprovider.kubelet.k8s.io/v1", "args": args,
+			"name": ProviderName, "matchImages": []string{c.Registry}, "defaultCacheDuration": "5m",
+			"apiVersion": "credentialprovider.kubelet.k8s.io/v1",
+			"args": []string{
+				azureConfigPath, "--ib-sni-name=" + c.SNIName,
+				"--ib-default-client-id=" + c.ClientID, "--ib-default-tenant-id=" + c.TenantID,
+				"--ib-apiserver-ip=" + c.ProxyAddress,
+			},
+			"tokenAttributes": map[string]any{
+				"serviceAccountTokenAudience": c.Audience, "cacheType": "Token", "requireServiceAccount": true,
+			},
 		}},
 	}, "", "  ")
+}
+
+func (c Config) AzureConfig() ([]byte, error) {
+	return json.Marshal(map[string]any{"cloud": "AzurePublicCloud", "tenantId": c.TenantID, "useManagedIdentityExtension": true})
 }

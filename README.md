@@ -145,25 +145,41 @@ creating resources. See the [deployment runbook](designs/aks-flex-cluster.md) fo
 prerequisites, validation, and recovery boundaries. Run `make aks-flex-test` for
 the offline deployment tests; no Azure credentials are needed.
 
-For transparent private-image pulls from an existing shared ACR, the script can
-also provision one federated pull identity per cluster and configure the
-operator's node-wide broker:
+Cluster creation installs Gantry without ACR configuration or authentication
+setup. Attach an existing registry separately, using a compatible plugin/operator
+release containing `gantry attach-acr`; the `v0.8.0` deployment baseline does
+not include this feature. Attachment leaves existing authentication untouched
+by default; managed authentication requires explicit opt-in:
 
 ```bash
-bash hack/scripts/aks-flex-cluster.sh \
-    --name my-flex-cluster \
-    --location canadacentral \
-    --subscription "<subscription-uuid>" \
-    --acr sharedtestacr \
-    --yes
+# Registry-only attachment; customers retain responsibility for authentication.
+kubectl unbounded gantry attach-acr \
+    --acr-resource-id "$ACR_ID" \
+    --kubeconfig tmp/aks-flex/my-flex-cluster/kubeconfig
+
+# Explicit opt-in to shared managed authentication on Linux Flex nodes.
+kubectl unbounded gantry attach-acr \
+    --acr-resource-id "$ACR_ID" --auth-mode aks-identity-binding \
+    --cluster-resource-id "$AKS_ID" \
+    --kubeconfig tmp/aks-flex/my-flex-cluster/kubeconfig
 ```
 
-This requires an operator release containing the federated registry broker. The
-network-only `v0.8.0` baseline does not provide it; select a compatible published
-release with `--unbounded-version`, or preinstall a compatible operator before
-onboarding an existing cluster. The script checks capability before registry
-identity/role changes. Applications need no authentication-specific Pod or
-ServiceAccount edits. The shared ACR is never created, adopted, or deleted.
+`ACR_ID` and `AKS_ID` are full Azure resource IDs. `--kubeconfig` is optional
+when the current context selects the target cluster. Managed authentication uses
+the stock `acr-credential-provider` in AKS identity-bindings mode, collective RBAC,
+and kubelet Pod-bound tokens for a shared pull identity on Azure and non-Azure
+Linux Flex nodes. It needs no custom broker, adapter, or token-exchange service,
+VM/VMSS identity assignments, or Azure-privileged ongoing operator. Future joined
+nodes are configured only when an explicit opt-in policy exists. Application
+Pods and ServiceAccounts stay unchanged; native AKS nodes and customer-owned
+providers/shared credentials are not silently replaced.
+
+This path has not been live-validated. It requires supported AKS identity
+bindings, kubelets >= 1.34 with `KubeletServiceAccountTokenForCredentialProviders`
+enabled, and access to the AKS identity-binding proxy. API-server VNet integration
+is unsupported under the [current AKS documentation](https://learn.microsoft.com/en-us/azure/aks/identity-bindings#limitations).
+See the [ACR workflow](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+for details.
 
 ## Documentation
 

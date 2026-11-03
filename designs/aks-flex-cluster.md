@@ -14,9 +14,9 @@ The default topology is:
 - Three standalone Ubuntu 24.04 x86_64 VMs, each with its own system-assigned
   managed identity, NIC, static Standard public IPv4 address, and 128 GiB disk.
 - One VNet with separate `/24` system and Flex subnets.
-- The Unbounded operator, networking controller/node agent, Machina, and the
-  Flex site's managed kube-proxy. Optional components otherwise follow the
-  selected operator release's defaults.
+- The Unbounded operator, Gantry, networking controller/node agent, Machina, and
+  the Flex site's managed kube-proxy. Gantry starts without ACR configuration;
+  other component settings follow the selected operator release's defaults.
 - Two Sites and private-L3 mesh peering. There are no public gateway pools or
   public WireGuard ports in this topology.
 
@@ -116,80 +116,77 @@ but Flex VMs must support the script's x86_64 image and agent archive. The
 `--timeout` value is used for individual polling/rollout and host-bootstrap
 waits, not an overall deadline for every Azure CLI operation.
 
-## Shared ACR onboarding without application changes
+## Attach ACR separately with an explicit authentication choice
 
-A shared registry does not require sharing VM identities across clusters. With
-`--acr NAME`, this script creates one dedicated `NAME-acr-pull` user-assigned
-identity per test cluster, grants pull access on the existing ACR, and federates
-the cluster's infrastructure ServiceAccount. The VM system-assigned identities
-remain for ARM node bootstrap; no VM receives an ACR role from this integration.
+Cluster deployment is independent of registry authentication. A fresh cluster
+installs Gantry without ACR configuration. The script does not read or write
+registry policy, enable OIDC for registry access, configure federation, or grant
+ACR roles. The removed `--acr`, `--acr-pull-identity`, and `--acr-probe-image`
+options are rejected, including with `--plan`. Old registry state files are
+ignored rather than restored or deleted on a provisioning rerun.
+
+The following is the intended workflow for a compatible plugin/operator release
+containing `gantry attach-acr`. The pinned `v0.8.0` baseline does not provide this
+feature. Select a compatible published release when available, or upgrade the
+plugin/operator separately before attachment; provisioning reruns preserve an
+already-upgraded operator. This authentication path has not been live-validated.
+
+Use the full resource ID of an existing registry. Registry-only attachment
+defaults to externally managed authentication:
 
 ```bash
-bash hack/scripts/aks-flex-cluster.sh \
-  --name my-flex-cluster \
-  --location canadacentral \
-  --subscription "<subscription-uuid>" \
-  --acr sharedtestacr \
-  --yes
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id "$ACR_ID" \
+  --kubeconfig tmp/aks-flex/my-flex-cluster/kubeconfig
 ```
 
-This path requires an operator release containing the federated registry broker.
-The network-only `v0.8.0` baseline does not provide it. Select a compatible
-published version with `--unbounded-version`, or preinstall a compatible operator
-before onboarding an existing cluster. The script retains upgraded operators
-and checks broker capability before registry identity or role changes. It never
-pretends an old release supports the feature.
+Or explicitly opt in to shared managed authentication:
 
-The shared ACR must already exist in the selected subscription. It is not
-adopted, retagged, made public, or deleted. RBAC registries receive an `AcrPull`
-grant; ABAC-enabled registries use the built-in repository-reader role instead.
-These are read grants at the selected registry, not push or subscription-wide
-permissions. Existing conditional assignments are not replaced with broader
-ones. Permission failures stop the run; there is no administrator-role fallback.
+```bash
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id "$ACR_ID" \
+  --auth-mode aks-identity-binding \
+  --cluster-resource-id "$AKS_ID" \
+  --kubeconfig tmp/aks-flex/my-flex-cluster/kubeconfig
+```
 
-The script enables the AKS OIDC issuer if necessary. Trust is exact:
+`AKS_ID` is the full cluster resource ID. `--kubeconfig` may be omitted when the
+current context selects that cluster. `--auth-mode` defaults to `external`,
+retaining existing providers, authentication policy, pull secrets, and shared
+credentials. Only managed authentication requires explicit opt-in.
+Managed mode must not silently replace customer-owned
+authentication either.
 
-- Issuer: the cluster's returned OIDC issuer URL.
-- Subject: `system:serviceaccount:unbounded-system:registry-pull`.
-- Audience: `api://AzureADTokenExchange`.
+Managed authentication uses the stock `acr-credential-provider` in AKS
+identity-bindings mode on Linux Flex nodes, both Azure and non-Azure. Collective
+Kubernetes RBAC authorizes the eligible ServiceAccounts to use a shared pull
+identity. Kubelet supplies short-lived Pod-bound ServiceAccount tokens to the
+provider; applications need no Pod or ServiceAccount edits. The provider uses
+the AKS identity-binding proxy, not a custom broker, adapter, or token-exchange
+service. Native AKS nodes are unaffected. There are no VM/VMSS identity
+assignments for pulls or Azure-privileged ongoing operator. The VM identities
+and Flex Node Agent Role used by this script remain only for node bootstrap.
 
-It writes the registry login server, pull identity client ID, and tenant ID into
-`gantry-config`'s `node-auth.yaml` key. The operator adds the selected HTTPS
-upstream while preserving unrelated runtime settings and registries. A JSON
-patch with a resource-version test protects the script's policy handoff from
-concurrent changes. An existing foreign node-auth policy is not overwritten.
+Attachment is the administrative opt-in step; future joined Linux Flex nodes
+are automatically configured only while that explicit policy exists. Registry
+selection and authentication are separate concerns. Sharing one pull identity
+is shared workload access, not per-application registry isolation.
 
-The operator projects the infrastructure account's token into its node-local
-brokers and configures the kubelet exec adapter. Applications keep their normal
-ServiceAccounts and Pod specifications. The operator needs Kubernetes access,
-not Azure IAM-administrator permissions. This works independently of the Flex
-node's physical location and does not use IMDS for registry authentication.
+Requirements and limitations:
 
-Use `--acr-pull-identity RESOURCE_ID` to deliberately reuse an existing
-user-assigned identity in the selected subscription. The script resolves its
-client/tenant/principal IDs without adopting its tags or lifecycle. Federation
-binding names include a hash of the cluster identity and issuer, so different
-clusters do not overwrite each other's trust. Many test clusters should normally
-use the default per-cluster pull identity to keep access and retirement isolated.
+- The target AKS cluster must support and enable identity bindings.
+- Kubelets must be >= 1.34 with
+  `KubeletServiceAccountTokenForCredentialProviders` enabled.
+- Every participating Flex node must reach the AKS identity-binding proxy.
+- [Current AKS documentation](https://learn.microsoft.com/en-us/azure/aks/identity-bindings#limitations)
+  excludes API-server VNet integration.
+- Offline tests and network smoke success do not establish that managed ACR
+  authentication or private-image distribution works live.
 
-An optional `--acr-probe-image sharedtestacr.azurecr.io/private/application:v1`
-asks every broker to verify that existing image with an authenticated manifest
-HEAD. This checks authorization without running the application or downloading
-layers. Without it, repository permission is explicitly unverified; broker
-rollout is not proof of end-to-end Gantry/P2P distribution. The ordinary network
-smoke workload remains unchanged.
-
-ACR onboarding can be added on a rerun of an existing deployment. It has a
-separate saved intent and does not alter infrastructure ownership hashes or
-rebootstrap joined VMs. Later ordinary reruns restore the saved registry
-configuration. Changing its registry or identity target is rejected instead of
-silently broadening access; an owned probe-image setting can be updated.
-
-Retiring a cluster requires separate registry-role cleanup using the saved
-scope/principal/role metadata. The shared ACR is outside the cluster resource
-lifecycle. Do not remove an externally provided shared identity or a shared grant
-as part of one cluster's retirement. This script remains provisioning-only and
-does not delete these Azure resources automatically.
+See the [Gantry guide](../docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+for the authentication boundary. Retiring a cluster and its registry access
+remains separate from this provisioning-only script; do not remove a shared
+customer identity or grant as part of one cluster's cleanup.
 
 ## Outputs and security
 
@@ -203,10 +200,6 @@ By default, private local state lives under `tmp/aks-flex/<name>/`:
 - `ssh-access.txt`: one copyable SSH command for each Flex VM.
 - `cache/`: pinned release archives, checksums, and bootstrap script.
 - Generated Site, pool, smoke, and remote-bootstrap payloads.
-- `registry-intent.json` and `registry-access.json` when ACR onboarding is enabled:
-  the saved target, resolved identity identifiers, federation binding, scoped
-  role metadata, and ownership information. These contain no registry tokens.
-- `registry-config-patch.json` and diagnostic logs for the scoped policy handoff.
 - `run-command-<vm>.sh` and `run-command-<vm>.json`: generated launchers and
   returned VM-agent output when using Run Command.
 
@@ -286,8 +279,8 @@ and three standalone Flex VMs. All four nodes were Ready; the reuse run reported
 all three Flex hosts as already joined. Pod HTTP, Service/DNS, exec, and logs
 checks passed. This records one evaluated combination, not a guarantee that
 every version, VM size, region, or subscription supports the preview. That live
-evaluation predates federated ACR onboarding and does not validate the new broker
-path; it requires separate live validation with a compatible operator.
+evaluation does not validate the intended AKS identity-binding authentication
+path; that path still requires live validation with a compatible release.
 
 Direct SSH from that workstation failed before authentication. Run Command
 bootstrap and the cluster smoke checks succeeded without broadening the `/32`
@@ -313,10 +306,10 @@ Coverage includes the default Run Command transport, explicit SSH transport,
 resource and host reuse, partial-run recovery, scoped roles and ownership,
 public-IP changes, corrupt archives, configuration validation, asynchronous
 operator workload creation, the canonical Flex pool label, and smoke-test
-failure propagation. ACR tests cover late onboarding, owned and supplied pull
-identities, shared-registry preservation, exact federation, role scopes, ABAC
-reader selection, policy ownership, reruns, and authorization failures without
-admin fallback or application changes. Run Command tests check actual payload success/failure
+failure propagation. Assertions ensure deployment and reruns do no ACR wiring,
+ignore obsolete registry intent, preserve customer-owned authentication, and
+reject the removed ACR flags before cloud calls or state writes. Run Command
+tests check actual payload success/failure
 through a sandboxed `/bin/sh` handler, plus missing, duplicate, stale, and CRLF
 completion markers. Documentation examples are exercised with `--plan` to
 prevent accidental cloud calls.

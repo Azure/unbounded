@@ -73,8 +73,7 @@ if command == "az":
     elif a[:2] == ["feature", "register"]: s.setdefault("features",{})[name] = "Registered"; save()
     elif a[:2] == ["provider", "register"]: pass
     elif a[:3] == ["role", "definition", "list"]:
-        role_name = "dddddddd-1111-2222-3333-444444444444" if name == "Container Registry Repository Reader" else name
-        out([] if s.get("missing_role") else [{"name":role_name,"roleType":"BuiltInRole"}])
+        out([] if s.get("missing_role") else [{"name":name,"roleType":"BuiltInRole"}])
     elif a[:2] == ["group", "list"]: out(list(s["groups"].values()))
     elif a[:2] == ["group", "create"]:
         s["groups"][name] = {"name":name,"location":"eastus2","tags":tags()}; save()
@@ -102,36 +101,18 @@ if command == "az":
         nsg["securityRules"] = [{"name":name,"sourceAddressPrefix":arg("--source-address-prefixes"),
             "destinationPortRange":"22","sourcePortRange":"*","destinationAddressPrefix":"*",
             "priority":100,"direction":"Inbound","protocol":"Tcp","access":"Allow"}]; save()
-    elif a[:2] == ["acr", "show"]:
-        if s.get("registry_read_failure"): print("ACR forbidden",file=sys.stderr);sys.exit(1)
-        out(s.get("registry",{"id":resource_id("Microsoft.ContainerRegistry/registries",name).replace("/flexdemo/","/shared/"),"name":name,"loginServer":name+".azurecr.io","roleAssignmentMode":"LegacyRegistryPermissions","tags":{"external":"preserve"}}))
     elif a[:2] == ["identity", "create"]:
-        if name.endswith("-acr-pull"):
-            if s.get("identity_create_failure"): print("Identity creation forbidden",file=sys.stderr);sys.exit(1)
-            add("Microsoft.ManagedIdentity/userAssignedIdentities",name,principalId="aaaaaaaa-1111-2222-3333-444444444444",clientId="bbbbbbbb-1111-2222-3333-444444444444",tenantId="cccccccc-1111-2222-3333-444444444444")
-        else: add("Microsoft.ManagedIdentity/userAssignedIdentities", name, principalId="controlplane-principal")
-    elif a[:2] == ["identity", "show"]:
-        if "--ids" in a: out(s["external_identity"])
-        else: out(get("Microsoft.ManagedIdentity/userAssignedIdentities", name))
-    elif a[:3] == ["identity", "federated-credential", "list"]:
-        if s.get("federation_list_failure"): print("Federation query forbidden",file=sys.stderr);sys.exit(1)
-        out([v for v in s.get("federation",[]) if v["identityName"] == arg("--identity-name")])
-    elif a[:3] == ["identity", "federated-credential", "create"]:
-        s.setdefault("federation",[]).append({"name":name,"identityName":arg("--identity-name"),"issuer":arg("--issuer"),"subject":arg("--subject"),"audiences":[arg("--audiences")]});save()
+        add("Microsoft.ManagedIdentity/userAssignedIdentities", name, principalId="controlplane-principal")
+    elif a[:2] == ["identity", "show"]: out(get("Microsoft.ManagedIdentity/userAssignedIdentities", name))
     elif a[:3] == ["role", "assignment", "list"]:
         out([r for r in s["roles"] if r["scope"] == arg("--scope")])
     elif a[:3] == ["role", "assignment", "create"]:
-        if s.get("acr_role_failure") and arg("--role") != "4d97b98b-1d4f-4787-a291-c67834d212e7" and arg("--role") != "8f139b0f-7eaf-460b-a9da-5b1246d9ed0d":
-            print("Registry role assignment forbidden",file=sys.stderr);sys.exit(1)
         s["roles"].append({"principalId":arg("--assignee-object-id"),"roleDefinitionId":"/roles/"+arg("--role"),"scope":arg("--scope")}); save()
     elif a[:2] == ["aks", "create"]:
         add("Microsoft.ContainerService/managedClusters", name, provisioningState="Succeeded",kubernetesVersion="1.36.2",currentKubernetesVersion="1.36.2",
             networkProfile={"networkPlugin":"none","serviceCidr":arg("--service-cidr"),"dnsServiceIp":arg("--dns-service-ip"),"podCidr":arg("--pod-cidr")},
             agentPoolProfiles=[{"name":"system","mode":"System","count":1,"vmSize":arg("--node-vm-size"),"vnetSubnetId":arg("--vnet-subnet-id")}])
     elif a[:2] == ["aks", "show"]: out(get("Microsoft.ContainerService/managedClusters", name))
-    elif a[:2] == ["aks", "update"]:
-        cluster=get("Microsoft.ContainerService/managedClusters",name)
-        cluster["oidcIssuerProfile"]={"enabled":True,"issuerUrl":"https://issuer.example/flexdemo/"};save()
     elif a[:2] == ["aks", "get-credentials"]: Path(arg("--file")).write_text("fake kubeconfig\n")
     elif a[:3] == ["aks", "operation", "show-latest"]: out({"status":"Succeeded"})
     elif a[:3] == ["aks", "nodepool", "list"]:
@@ -217,18 +198,7 @@ elif command in ["kubectl", "kubectl-unbounded"]:
             if item["kind"] == "Namespace":
                 s["namespaces"] = [item]
         save()
-    elif "patch" in a:
-        if s.get("registry_patch_failure"): print("ConfigMap patch forbidden",file=sys.stderr);sys.exit(1)
-        patch=json.loads(Path(arg("--patch-file")).read_text())
-        source=s["gantry_config"]
-        assert patch[0]["value"] == source["metadata"]["resourceVersion"]
-        source["metadata"]["annotations"]=patch[1]["value"]
-        source["data"]["node-auth.yaml"]=patch[2]["value"]
-        source["metadata"]["resourceVersion"]=str(int(source["metadata"]["resourceVersion"])+1);save();out("configmap/gantry-config")
     elif "exec" in a:
-        if "registry-auth-node" in a:
-            if s.get("unsupported_registry_operator"): print("unknown command",file=sys.stderr);sys.exit(1)
-            out("--token-file projected infrastructure assertion");sys.exit(0)
         if s.get("fail_smoke_exec"):
             print("smoke workload connection failed",file=sys.stderr); sys.exit(1)
     elif "rollout" in a or "wait" in a or "logs" in a: pass
@@ -236,11 +206,7 @@ elif command in ["kubectl", "kubectl-unbounded"]:
         kind = a[a.index("get")+1]
         if s.get("fail_get") == kind:
             print("Kubernetes API forbidden",file=sys.stderr); sys.exit(1)
-        if kind == "configmap":
-            if "gantry_config" not in s:
-                s["gantry_config"]={"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"gantry-config","namespace":"unbounded-system","resourceVersion":"1","annotations":{"user.example/keep":"yes"}},"data":{"config.yaml":"# preserve administrator settings\nmirror_listen: 0.0.0.0:5000\nupstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com\n","unrelated":"preserve"}};save()
-            out(s["gantry_config"])
-        elif kind == "namespaces": out({"items":s.get("namespaces",[])})
+        if kind == "namespaces": out({"items":s.get("namespaces",[])})
         elif kind == "deployments": out({"items":[] if not s.get("operator") else [{"metadata":{"name":"unbounded-operator","namespace":"unbounded-system"}}]})
         elif kind == "pods":
             out({"items":[{"metadata":{"name":n+"-echo"},"status":{"podIP":"10.95."+str(i)+".2"}} for i,n in enumerate(s["joined"]) ]})
@@ -325,6 +291,29 @@ class DeploymentTests(unittest.TestCase):
         file = self.root / "calls.jsonl"
         return [json.loads(line) for line in file.read_text().splitlines()] if file.exists() else []
 
+    def assert_no_acr_wiring(self):
+        state = self.state()
+        for call in self.calls():
+            if call[0] == "az":
+                self.assertNotEqual(call[1], "acr")
+                self.assertNotEqual(call[1:3], ["aks", "update"])
+                self.assertNotEqual(call[1:3], ["identity", "federated-credential"])
+                if call[1] == "identity":
+                    self.assertEqual(call[call.index("--name") + 1], "flexdemo-controlplane")
+            for forbidden in ("gantry-config", "node-auth.yaml", "registry-auth-node",
+                              "gantry-acr-auth", "--attach-acr", "--enable-oidc-issuer",
+                              "--enable-workload-identity", "--enable-identity-binding"):
+                self.assertNotIn(forbidden, call)
+        allowed_roles = {"4d97b98b-1d4f-4787-a291-c67834d212e7", "8f139b0f-7eaf-460b-a9da-5b1246d9ed0d"}
+        self.assertTrue(all(role["roleDefinitionId"].split("/")[-1] in allowed_roles for role in state["roles"]))
+        for manifest in state["manifests"]:
+            payload = json.dumps(manifest)
+            for forbidden in ("azurecr.io", "node-auth.yaml", "imagePullSecrets", "serviceAccountName"):
+                self.assertNotIn(forbidden, payload)
+        remote = (self.root / "remote.sh").read_text()
+        for forbidden in ("azurecr.io", "acr-credential-provider", "registry-auth", "node-auth.yaml"):
+            self.assertNotIn(forbidden, remote)
+
     def test_complete_run_and_no_duplicate_resources_on_rerun(self):
         self.run_script()
         first = self.state()
@@ -375,6 +364,8 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(sum(call[0] == "kubectl-unbounded" for call in self.calls()), 1)
         smoke = json.loads((state_dir / "smoke.json").read_text())["items"][1]
         self.assertEqual(smoke["spec"]["template"]["spec"]["nodeSelector"], {"kubernetes.azure.com/agentpool": "flexpool"})
+        self.assert_no_acr_wiring()
+        self.assertEqual(list(state_dir.glob("registry-*")), [])
 
     def test_waits_for_asynchronous_operator_workload_creation(self):
         self.modify(get_missing={"deployment/unbounded-net-controller":2,"daemonset/unbounded-net-node":1,
@@ -674,9 +665,7 @@ class DeploymentTests(unittest.TestCase):
         for extra in (["--flex-count", "0"], ["--flex-count", "21"], ["--service-cidr", "10.91.0.0/24"],
                       ["--ssh-source-ip", "0.0.0.0/0"], ["--ssh-source-ip", "10.0.0.1"], ["--vnet-cidr", "10.91.1.1/16"],
                       ["--agent-version", "latest"], ["--timeout", "00"], ["--subscription", "not-a-uuid"],
-                      ["--bootstrap-transport", "unsafe"], ["--acr", "https://sharedtestacr.azurecr.io"],
-                      ["--acr-pull-identity", "not-a-resource-id"], ["--acr-probe-image", "sharedtestacr.azurecr.io/repo:v1"],
-                      ["--acr", "sharedtestacr", "--acr-probe-image", "https://unsafe.example/repo?secret=1"]):
+                      ["--bootstrap-transport", "unsafe"]):
             with self.subTest(extra=extra):
                 self.run_script(extra, success=False)
                 self.assertEqual(self.calls(), [])
@@ -687,143 +676,31 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
         self.assertFalse((self.root / "state").exists())
 
-    def test_shared_acr_uses_one_federated_cluster_identity(self):
-        options = ["--acr", "sharedtestacr", "--acr-probe-image", "sharedtestacr.azurecr.io/private/probe:v1"]
-        self.run_script(options)
-        state = self.state()
-        identity = state["resources"]["Microsoft.ManagedIdentity/userAssignedIdentities/flexdemo-acr-pull"]
-        pulls = [role for role in state["roles"] if role["roleDefinitionId"].endswith("/7f951dda-4ed3-4680-a7ca-43fe172d538d")]
-        self.assertEqual(len(pulls), 1)
-        self.assertEqual(pulls[0]["principalId"], identity["principalId"])
-        self.assertIn("/resourceGroups/shared/", pulls[0]["scope"])
-        self.assertFalse(any(role["principalId"].startswith("flexdemo-flex") for role in pulls))
-        self.assertFalse(any(resource["type"] == "Microsoft.ContainerRegistry/registries" for resource in state["resources"].values()))
-        self.assertEqual(len(state["federation"]), 1)
-        trust = state["federation"][0]
-        self.assertEqual(trust["subject"], "system:serviceaccount:unbounded-system:registry-pull")
-        self.assertEqual(trust["issuer"], "https://issuer.example/flexdemo/")
-        self.assertEqual(trust["audiences"], ["api://AzureADTokenExchange"])
-        config = state["gantry_config"]
-        policy = json.loads(config["data"]["node-auth.yaml"])
-        self.assertEqual(policy, {"mode": "workloadIdentity", "registry": "sharedtestacr.azurecr.io", "clientID": identity["clientId"], "tenantID": identity["tenantId"], "probeImage": options[-1]})
-        self.assertIn("preserve administrator settings", config["data"]["config.yaml"])
-        self.assertEqual(config["data"]["unrelated"], "preserve")
-        self.assertEqual(config["metadata"]["annotations"]["user.example/keep"], "yes")
-        smoke = json.loads((self.root / "state/smoke.json").read_text())["items"][1]["spec"]["template"]["spec"]
-        self.assertNotIn("serviceAccountName", smoke)
-        self.assertNotIn("imagePullSecrets", smoke)
-        before = len(self.calls())
-        self.run_script()  # Saved registry intent survives an ordinary rerun.
-        self.assertFalse(any(call[0] == "az" and "create" in call for call in self.calls()[before:]))
-        self.assertEqual(len(self.state()["roles"]), 5)
-        self.assertEqual(len(self.state()["federation"]), 1)
-        record = json.loads((self.root / "state/registry-access.json").read_text())
-        self.assertTrue(record["identityCreatedByDeployment"])
-        self.assertNotIn("accessToken", record)
+    def test_removed_acr_flags_fail_without_cloud_calls_or_state(self):
+        for flag, value in (("--acr", "sharedtestacr"),
+                            ("--acr-pull-identity", f"/subscriptions/{SUBSCRIPTION}/resourceGroups/shared/providers/Microsoft.ManagedIdentity/userAssignedIdentities/pull"),
+                            ("--acr-probe-image", "sharedtestacr.azurecr.io/private/probe:v1")):
+            for mode in ([], ["--plan"]):
+                with self.subTest(flag=flag, mode=mode):
+                    result = self.run_script([*mode, flag, value], success=False)
+                    self.assertIn(f"unknown option: {flag}", result.stderr)
+                    self.assertFalse((self.root / "state").exists())
+        self.assertEqual(self.calls(), [])
 
-    def test_acr_can_be_onboarded_after_cluster_creation(self):
-        self.run_script()
-        intent = (self.root / "state/intent.json").read_bytes()
-        before = self.state()
-        self.run_script(["--acr", "sharedtestacr"])
-        after = self.state()
-        self.assertEqual(intent, (self.root / "state/intent.json").read_bytes())
-        self.assertEqual(before["bootstraps"], after["bootstraps"])
-        for name, resource in before["resources"].items():
-            if resource["type"] != "Microsoft.ContainerService/managedClusters":
-                self.assertEqual(resource, after["resources"][name])
-        self.assertTrue(after["resources"]["Microsoft.ContainerService/managedClusters/flexdemo"]["oidcIssuerProfile"]["enabled"])
-        self.assertEqual(sum(call[:3] == ["az", "aks", "update"] for call in self.calls()), 1)
-
-    def test_existing_pull_identity_is_resolved_without_adoption(self):
-        identity = {"id": f"/subscriptions/{SUBSCRIPTION}/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/shared-pull", "principalId": "aaaaaaaa-1111-2222-3333-444444444444", "clientId": "bbbbbbbb-1111-2222-3333-444444444444", "tenantId": "cccccccc-1111-2222-3333-444444444444", "tags": {"foreign": "preserve"}}
-        self.modify(external_identity=identity)
-        self.run_script(["--acr", "sharedtestacr", "--acr-pull-identity", identity["id"]])
-        self.assertEqual(self.state()["external_identity"], identity)
-        self.assertNotIn("Microsoft.ManagedIdentity/userAssignedIdentities/flexdemo-acr-pull", self.state()["resources"])
-        record = json.loads((self.root / "state/registry-access.json").read_text())
-        self.assertFalse(record["identityCreatedByDeployment"])
-        self.assertEqual(record["identityResourceId"], identity["id"])
-        self.assertEqual(self.state()["federation"][0]["identityName"], "shared-pull")
-
-    def test_matching_preconfigured_federation_is_reused_by_content(self):
-        self.run_script(["--acr", "sharedtestacr", "--flex-count", "1"])
-        trust = self.state()["federation"]
-        trust[0]["name"] = "platform-managed-trust"
-        self.modify(federation=trust)
-        before = len(self.calls())
+    def test_stale_registry_intent_is_ignored_and_customer_auth_is_preserved(self):
         self.run_script(["--flex-count", "1"])
-        self.assertEqual(self.state()["federation"], trust)
-        self.assertFalse(any(call[:4] == ["az", "identity", "federated-credential", "create"] for call in self.calls()[before:]))
-        record = json.loads((self.root / "state/registry-access.json").read_text())
-        self.assertEqual(record["federatedCredentialName"], "platform-managed-trust")
-        self.assertFalse(record["federationManagedByDeployment"])
-
-    def test_artifact_streaming_runner_fails_before_cloud_calls_without_its_variant(self):
-        runner = ROOT / "hack/scripts/gantry-aks-integration.sh"
-        result = subprocess.run(["bash", "-c", 'source "$1"; COMMAND=deploy; REPO_ROOT="$2"; initialize', "test", str(runner), str(self.root)], env=self.env, text=True, capture_output=True, timeout=5)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("artifact-streaming Gantry image/chart support is absent", result.stderr)
-        self.assertEqual(self.calls(), [])
-
-    def test_registry_auth_requires_a_compatible_operator_before_iam_changes(self):
-        self.modify(unsupported_registry_operator=True)
-        result = self.run_script(["--acr", "sharedtestacr"], success=False)
-        self.assertIn("does not support federated registry onboarding", result.stderr)
-        self.assertNotIn("Microsoft.ManagedIdentity/userAssignedIdentities/flexdemo-acr-pull", self.state()["resources"])
-        self.assertFalse(any("7f951dda" in role["roleDefinitionId"] for role in self.state()["roles"]))
-
-    def test_foreign_registry_policy_is_not_overwritten(self):
-        source = {"metadata": {"resourceVersion": "1", "annotations": {}}, "data": {"config.yaml": "upstream_registries: []", "node-auth.yaml": "mode: external"}}
-        self.modify(gantry_config=source)
-        result = self.run_script(["--acr", "sharedtestacr"], success=False)
-        self.assertIn("not owned by this deployment", result.stderr)
-        self.assertEqual(self.state()["gantry_config"], source)
-        self.assertNotIn("Microsoft.ManagedIdentity/userAssignedIdentities/flexdemo-acr-pull", self.state()["resources"])
-
-    def test_conflicting_federation_is_not_overwritten(self):
-        self.run_script(["--acr", "sharedtestacr"])
-        federation = self.state()["federation"]
-        federation[0]["subject"] = "system:serviceaccount:another:account"
-        self.modify(federation=federation)
-        before = len(self.calls())
-        result = self.run_script(success=False)
-        self.assertIn("federation binding conflicts", result.stderr)
-        self.assertEqual(self.state()["federation"], federation)
-        self.assertFalse(any(call[:4] == ["az", "identity", "federated-credential", "create"] for call in self.calls()[before:]))
-
-    def test_registry_permission_failures_never_use_admin_fallback(self):
-        for failure in ("registry_read_failure", "identity_create_failure", "federation_list_failure", "acr_role_failure", "registry_patch_failure"):
-            with self.subTest(failure=failure):
-                self.modify(**{failure: True})
-                result = self.run_script(["--acr", "sharedtestacr", "--flex-count", "1"], success=False)
-                self.assertNotIn("Deployment ready:", result.stderr)
-                self.assertFalse(any(call[0] == "az" and "--role" in call and call[call.index("--role") + 1] in ("Owner", "Contributor", "User Access Administrator") for call in self.calls()))
-                self.modify(**{failure: False})
-        self.run_script(["--acr", "sharedtestacr", "--flex-count", "1"])
-        self.assertEqual(len(self.state()["federation"]), 1)
-
-    def test_abac_registry_uses_repository_reader_role(self):
-        registry = {"id": f"/subscriptions/{SUBSCRIPTION}/resourceGroups/shared/providers/Microsoft.ContainerRegistry/registries/sharedtestacr", "loginServer": "sharedtestacr.azurecr.io", "roleAssignmentMode": "AbacRepositoryPermissions"}
-        self.modify(registry=registry)
-        self.run_script(["--acr", "sharedtestacr", "--flex-count", "1"])
-        self.assertEqual(self.state()["registry"], registry)
-        self.assertTrue(any(role["roleDefinitionId"].endswith("/dddddddd-1111-2222-3333-444444444444") for role in self.state()["roles"]))
-        self.assertFalse(any(role["roleDefinitionId"].endswith("/7f951dda-4ed3-4680-a7ca-43fe172d538d") for role in self.state()["roles"]))
-
-    def test_registry_changes_require_explicit_reconfiguration(self):
-        self.run_script(["--acr", "sharedtestacr", "--flex-count", "1"])
-        before = len(self.calls())
-        result = self.run_script(["--acr", "anotherregistry", "--flex-count", "1"], success=False)
-        self.assertIn("differs from saved intent", result.stderr)
-        self.assertFalse(any(call[0] == "az" and "create" in call for call in self.calls()[before:]))
-
-    def test_registry_plan_remains_offline(self):
-        result = self.run_script(["--acr", "sharedtestacr", "--plan"])
-        self.assertIn("one identity per cluster", result.stdout)
-        self.assertIn("system:serviceaccount:unbounded-system:registry-pull", result.stdout)
-        self.assertEqual(self.calls(), [])
-        self.assertFalse((self.root / "state").exists())
+        state_dir = self.root / "state"
+        legacy = state_dir / "registry-intent.json"
+        legacy.write_text("obsolete state must not be parsed or changed\n")
+        customer_auth = {"provider": "customer-owned", "credentials_path": "/customer/credentials.json"}
+        self.modify(customer_auth=customer_auth)
+        intent = (state_dir / "intent.json").read_bytes()
+        self.run_script(["--flex-count", "1"])
+        self.assertEqual(legacy.read_text(), "obsolete state must not be parsed or changed\n")
+        self.assertEqual((state_dir / "intent.json").read_bytes(), intent)
+        self.assertEqual(self.state()["customer_auth"], customer_auth)
+        self.assertEqual([file.name for file in state_dir.glob("registry-*")], ["registry-intent.json"])
+        self.assert_no_acr_wiring()
 
     def test_corrupt_cached_archive_is_rejected(self):
         self.run_script()

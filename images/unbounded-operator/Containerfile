@@ -29,6 +29,15 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG GIT_COMMIT=
 ARG BUILD_TIME=
+RUN case "${TARGETARCH}" in \
+      amd64) sha=b8f9a8137640685ab06cf5ffc4d37f0525534654c057973630f73485442ea21b ;; \
+      arm64) sha=8097badaccae6cd9e3f90ea5520a2a2343e2484c0dc6aa7835f5d33f8a6b2d5d ;; \
+      *) echo "Unsupported ACR provider architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL --retry 3 "https://github.com/kubernetes-sigs/cloud-provider-azure/releases/download/v1.36.0/azure-acr-credential-provider-linux-${TARGETARCH}" -o /acr-credential-provider \
+    && echo "${sha}  /acr-credential-provider" | sha256sum --check \
+    && chmod 0755 /acr-credential-provider \
+    && curl -fsSL --retry 3 "https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-azure/v1.36.0/LICENSE" -o /acr-provider-LICENSE
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     make unbounded-operator-build VERSION=${VERSION} ${GIT_COMMIT:+GIT_COMMIT=${GIT_COMMIT}} ${BUILD_TIME:+BUILD_TIME=${BUILD_TIME}}
 
@@ -42,7 +51,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 RUN mkdir -p /unbounded/bin
 
 COPY --from=builder /src/bin/unbounded-operator /unbounded/bin/unbounded-operator
+COPY --from=builder /acr-credential-provider /unbounded/bin/acr-credential-provider
 COPY LICENSE NOTICE /unbounded/licenses/
+COPY --from=builder /acr-provider-LICENSE /unbounded/licenses/acr-credential-provider/LICENSE
 
 ENV PATH="/unbounded/bin:${PATH}"
 

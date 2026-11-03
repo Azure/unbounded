@@ -24,6 +24,7 @@ func installerFixture(t *testing.T) (*Installer, *[]string, *int) {
 		require.NoError(t, os.WriteFile(filepath.Join(root, path), []byte(content), 0o644))
 	}
 	write(unitPath, testUnit)
+	write("/var/lib/kubelet/config.yaml", "apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\n")
 	write("/source-operator", "static-binary-fixture")
 
 	args := []string{"/usr/local/bin/kubelet", "--config=/var/lib/kubelet/config.yaml"}
@@ -47,7 +48,7 @@ func installerFixture(t *testing.T) (*Installer, *[]string, *int) {
 
 func TestInstallerLateInstallationIdempotencyAndDrift(t *testing.T) {
 	i, args, restarts := installerFixture(t)
-	cfg := Config{Mode: "auto", Registries: []string{testRegistry}}
+	cfg := testManagedConfig(t)
 	require.NoError(t, i.Reconcile(t.Context(), cfg))
 	require.True(t, hasProviderArgs(*args))
 	require.Equal(t, 1, *restarts)
@@ -74,7 +75,7 @@ func TestInstallerLateInstallationIdempotencyAndDrift(t *testing.T) {
 	require.NoError(t, i.Reconcile(t.Context(), cfg))
 	require.Equal(t, 2, *restarts)
 
-	cfg.Registries = append(cfg.Registries, "other.azurecr.io")
+	cfg.Registry = "other.azurecr.io"
 	require.NoError(t, i.Reconcile(t.Context(), cfg))
 	require.Equal(t, 3, *restarts)
 
@@ -106,7 +107,7 @@ func TestInstallerRefusesConflictingOwnersAndProviders(t *testing.T) {
 				require.NoError(t, os.Symlink(t.TempDir(), i.path(installDir)))
 			}
 
-			require.Error(t, i.Reconcile(t.Context(), Config{Mode: "auto", Registries: []string{testRegistry}}))
+			require.Error(t, i.Reconcile(t.Context(), testManagedConfig(t)))
 			require.Zero(t, *restarts)
 		})
 	}
@@ -114,7 +115,7 @@ func TestInstallerRefusesConflictingOwnersAndProviders(t *testing.T) {
 
 func TestInstallerDoesNotOverwriteDropInAfterOwnershipChanges(t *testing.T) {
 	i, _, _ := installerFixture(t)
-	cfg := Config{Mode: "auto", Registries: []string{testRegistry}}
+	cfg := testManagedConfig(t)
 	require.NoError(t, i.Reconcile(t.Context(), cfg))
 	require.NoError(t, os.WriteFile(i.path(dropInPath), []byte("foreign"), 0o644))
 	require.ErrorContains(t, i.Reconcile(t.Context(), cfg), "unowned")
@@ -126,7 +127,7 @@ func TestInstallerDoesNotOverwriteDropInAfterOwnershipChanges(t *testing.T) {
 
 func TestInstallerRemovalAndReenableWithoutRejoin(t *testing.T) {
 	i, args, restarts := installerFixture(t)
-	cfg := Config{Mode: "auto", Registries: []string{testRegistry}}
+	cfg := testManagedConfig(t)
 	require.NoError(t, i.Reconcile(t.Context(), cfg))
 	require.NoError(t, i.Reconcile(t.Context(), Config{Mode: "external"}))
 	require.False(t, hasProviderArgs(*args))
@@ -143,7 +144,7 @@ func TestInstallerRecoversFromRestartFailure(t *testing.T) {
 	i, _, restarts := installerFixture(t)
 	run := i.HostCommand
 	i.HostCommand = func(_ context.Context, args ...string) error { return errors.New("systemd unavailable") }
-	cfg := Config{Mode: "auto", Registries: []string{testRegistry}}
+	cfg := testManagedConfig(t)
 	require.ErrorContains(t, i.Reconcile(t.Context(), cfg), "systemd unavailable")
 	require.FileExists(t, i.path(providerPath))
 	i.HostCommand = run
@@ -153,7 +154,7 @@ func TestInstallerRecoversFromRestartFailure(t *testing.T) {
 
 func TestInstallerTracksAgentUnitChangesAndRejectsUnsupportedUnits(t *testing.T) {
 	i, _, restarts := installerFixture(t)
-	cfg := Config{Mode: "auto", Registries: []string{testRegistry}}
+	cfg := testManagedConfig(t)
 	require.NoError(t, i.Reconcile(t.Context(), cfg))
 
 	updated := strings.Replace(testUnit, "/usr/local/bin/kubelet", "/usr/local/bin/new-kubelet", 1)

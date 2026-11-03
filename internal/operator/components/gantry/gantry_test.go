@@ -13,6 +13,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,7 +33,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, schedulingv1.AddToScheme, unboundedv1alpha3.AddToScheme, racerv1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, coordinationv1.AddToScheme, rbacv1.AddToScheme, schedulingv1.AddToScheme, unboundedv1alpha3.AddToScheme, racerv1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}

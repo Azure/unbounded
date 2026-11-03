@@ -29,12 +29,6 @@ TIMEOUT=3600
 ASSUME_YES=false
 PLAN_ONLY=false
 BOOTSTRAP_TRANSPORT="run-command"
-ACR=""
-ACR_PULL_IDENTITY=""
-ACR_PROBE_IMAGE=""
-ACR_PULL_ROLE="7f951dda-4ed3-4680-a7ca-43fe172d538d"
-REGISTRY_SUBJECT="system:serviceaccount:unbounded-system:registry-pull"
-REGISTRY_AUDIENCE="api://AzureADTokenExchange"
 LOCK_HELD=false
 ADMIN_USER="azureuser"
 FLEX_POOL="flexpool"
@@ -56,6 +50,7 @@ Requires az >= 2.90.0, kubectl, jq, python3, curl, tar, openssl, and OpenSSH.
 Flex VM sizes must support x86_64; the host image and agent archive use amd64.
 Uses the active Azure account unless --subscription is supplied. The selected
 subscription must support the Flex preview and publish the Flex Node Agent Role.
+Gantry is installed without registry-specific configuration or authentication setup.
 
 Options:
   --name NAME                 Required, lowercase resource prefix (3-30 characters)
@@ -75,10 +70,6 @@ Options:
   --ssh-key PATH              Existing private key (default: generate in state dir)
   --ssh-source-ip IPv4        SSH source (default: detected public IPv4); always /32
   --bootstrap-transport MODE  run-command (default, Azure VM agent) or ssh
-  --acr NAME                  Existing shared ACR to onboard (never created/deleted)
-  --acr-pull-identity ID       Optional existing user-assigned identity resource ID
-                              (default: one owned NAME-acr-pull identity per cluster)
-  --acr-probe-image IMAGE     Optional existing private image for an authorization probe
   --state-dir PATH            State/keys/cache (default: repo tmp/aks-flex/NAME)
   --timeout SECONDS           Per-phase wait timeout (default: 3600)
   --plan                      Print the plan without network calls or file writes
@@ -99,7 +90,7 @@ parse_args() {
       --plan) PLAN_ONLY=true; shift ;;
       --yes) ASSUME_YES=true; shift ;;
       -h|--help) usage; exit 0 ;;
-      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--bootstrap-transport|--state-dir|--timeout|--acr|--acr-pull-identity|--acr-probe-image)
+      --name|--location|--subscription|--resource-group|--flex-count|--vm-size|--system-vm-size|--kubernetes-version|--unbounded-version|--agent-version|--vnet-cidr|--cluster-pod-cidr|--flex-pod-cidr|--service-cidr|--ssh-key|--ssh-source-ip|--bootstrap-transport|--state-dir|--timeout)
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
         case "$1" in
           --name) NAME="$2" ;;
@@ -121,9 +112,6 @@ parse_args() {
           --bootstrap-transport) BOOTSTRAP_TRANSPORT="$2" ;;
           --state-dir) STATE_DIR="$2" ;;
           --timeout) TIMEOUT="$2" ;;
-          --acr) ACR="$2" ;;
-          --acr-pull-identity) ACR_PULL_IDENTITY="$2" ;;
-          --acr-probe-image) ACR_PROBE_IMAGE="$2" ;;
         esac
         shift 2 ;;
       *) die "unknown option: $1" ;;
@@ -146,7 +134,6 @@ validate_args() {
   for tag in "$UNBOUNDED_VERSION" "$AGENT_VERSION"; do
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] || die "release versions must be pinned vX.Y.Z tags (optionally prerelease)"
   done
-  validate_registry_args
   if [[ -n "$SUBSCRIPTION" ]]; then validate_subscription; fi
   if [[ -n "$SSH_SOURCE_IP" ]]; then validate_ssh_ip; fi
   local network
@@ -177,15 +164,6 @@ PY
   SYSTEM_NODE_CIDR=$(jq -r .system <<<"$network")
   FLEX_NODE_CIDR=$(jq -r .flex <<<"$network")
   DNS_SERVICE_IP=$(jq -r .dns <<<"$network")
-}
-
-validate_registry_args() {
-  [[ -z "$ACR" || "$ACR" =~ ^[a-z0-9]{5,50}$ ]] || die "--acr must be an Azure registry name, not a URL"
-  [[ -n "$ACR" || ( -z "$ACR_PULL_IDENTITY" && -z "$ACR_PROBE_IMAGE" ) ]] || die "--acr-pull-identity and --acr-probe-image require --acr"
-  if [[ -n "$ACR_PULL_IDENTITY" ]]; then
-    [[ "$ACR_PULL_IDENTITY" =~ ^/subscriptions/[0-9a-fA-F-]{36}/resource[Gg]roups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[a-zA-Z0-9_-]+$ ]] || die "--acr-pull-identity must be a full user-assigned identity resource ID"
-  fi
-  [[ -z "$ACR_PROBE_IMAGE" || "$ACR_PROBE_IMAGE" =~ ^[a-z0-9][a-zA-Z0-9./:_@-]+$ ]] || die "invalid --acr-probe-image"
 }
 
 validate_subscription() {
@@ -222,12 +200,6 @@ print_plan() {
     printf '  SSH ingress:              public IPv4 detected before provisioning\n'
   fi
   printf '  Bootstrap transport:      %s\n' "$BOOTSTRAP_TRANSPORT"
-  if [[ -n "$ACR" ]]; then
-    printf '  Shared ACR:               %s (existing; pull access only)\n' "$ACR"
-    printf '  Federated pull identity:  %s\n' "${ACR_PULL_IDENTITY:-$NAME-acr-pull (one identity per cluster)}"
-    printf '  Infrastructure subject:   %s\n' "$REGISTRY_SUBJECT"
-    printf '  Private-image probe:      %s\n' "${ACR_PROBE_IMAGE:-not configured; repository permission remains unverified}"
-  fi
   printf '  State:                    %s\n\n' "${STATE_DIR:-$SCRIPT_ROOT/tmp/aks-flex/$NAME}"
 }
 
@@ -340,140 +312,6 @@ lookup_resource() {
   result=$(jq -c --arg name "$name" '[.[] | select(.name == $name)] | if length > 1 then error("ambiguous resource") else .[0] // null end' <<<"$resources")
   if [[ "$result" != null ]]; then assert_owned "$result" "$type/$name"; fi
   printf '%s\n' "$result"
-}
-
-prepare_registry_intent() {
-  local saved="$STATE_DIR/registry-intent.json" next="$STATE_DIR/registry-intent.next.json"
-  if [[ -f "$saved" && -z "$ACR" ]]; then
-    ACR=$(jq -er .registryName "$saved")
-    ACR_PULL_IDENTITY=$(jq -r '.identityResourceId // ""' "$saved")
-    ACR_PROBE_IMAGE=$(jq -r '.probeImage // ""' "$saved")
-  fi
-  [[ -n "$ACR" ]] || return 0
-  validate_registry_args
-  jq -n --arg registry "$ACR" --arg identity "$ACR_PULL_IDENTITY" --arg probe "$ACR_PROBE_IMAGE" \
-    '{registryName:$registry,identityResourceId:$identity,probeImage:$probe}' > "$next"
-  if [[ -f "$saved" ]]; then
-    [[ "$(jq -cS 'del(.probeImage)' "$saved")" == "$(jq -cS 'del(.probeImage)' "$next")" ]] \
-      || die "registry onboarding identity or ACR differs from saved intent; refusing to change shared-registry access implicitly"
-    if [[ -z "$ACR_PROBE_IMAGE" ]]; then ACR_PROBE_IMAGE=$(jq -r '.probeImage // ""' "$saved"); fi
-  fi
-  jq --arg probe "$ACR_PROBE_IMAGE" '.probeImage=$probe' "$next" > "$saved"
-  rm "$next"
-}
-
-registry_configuration() {
-  local source owner
-  source=$(kube -n unbounded-system get configmap gantry-config -o json) || die "cannot read operator Gantry configuration"
-  jq -e '.data["config.yaml"] | type == "string" and length > 0' <<<"$source" >/dev/null || die "operator has not created a complete gantry-config yet; rerun after reconciliation"
-  owner=$(jq -r '.metadata.annotations["unbounded-cloud.io/registry-auth-owner"] // ""' <<<"$source")
-  if [[ -n "$(jq -r '.data["node-auth.yaml"] // ""' <<<"$source")" && "$owner" != "$NAME" ]]; then
-    die "existing node-auth policy is not owned by this deployment; refusing to overwrite it"
-  fi
-  printf '%s\n' "$source"
-}
-
-ensure_registry_auth() {
-  [[ -n "$ACR" ]] || return 0
-  local help registry cluster issuer identity identity_group identity_name principal client tenant
-  local credentials credential credential_name matching credential_owned=true role mode source policy patched=false attempt
-  help=$(kube -n unbounded-system exec deployment/unbounded-operator -- \
-    /unbounded/bin/unbounded-operator registry-auth-node --help 2>"$STATE_DIR/registry-operator-capability.log") \
-    || die "selected operator does not support federated registry onboarding; install a compatible release before --acr"
-  [[ "$help" == *--token-file* ]] || die "operator lacks the federated broker; no Azure registry grants were made"
-  source=$(registry_configuration)
-  registry=$(az_cmd acr show --name "$ACR" -o json) || die "cannot read shared ACR $ACR; this script never creates or adopts a registry"
-  ACR_RESOURCE_ID=$(jq -er .id <<<"$registry")
-  ACR_LOGIN_SERVER=$(jq -er .loginServer <<<"$registry")
-  [[ "$ACR_LOGIN_SERVER" =~ ^[a-z0-9.-]+\.azurecr\.io$ ]] || die "this integration requires a public-cloud ACR login server"
-  [[ -z "$ACR_PROBE_IMAGE" || "$ACR_PROBE_IMAGE" == "$ACR_LOGIN_SERVER/"* ]] || die "--acr-probe-image must belong to the selected shared ACR"
-  cluster=$(az_cmd aks show -g "$RESOURCE_GROUP" --name "$NAME" -o json)
-  if [[ "$(jq -r '.oidcIssuerProfile.enabled // false' <<<"$cluster")" != true ]]; then
-    wait_cluster_operation
-    az_cmd aks update -g "$RESOURCE_GROUP" --name "$NAME" --enable-oidc-issuer -o none
-    cluster=$(az_cmd aks show -g "$RESOURCE_GROUP" --name "$NAME" -o json)
-  fi
-  issuer=$(jq -er '.oidcIssuerProfile.issuerUrl | select(startswith("https://"))' <<<"$cluster") \
-    || die "cluster has no usable OIDC issuer; no registry identity can be federated"
-  if [[ -n "$ACR_PULL_IDENTITY" ]]; then
-    identity=$(az_cmd identity show --ids "$ACR_PULL_IDENTITY" -o json) || die "cannot resolve the supplied pull identity"
-    jq -e --arg id "$ACR_PULL_IDENTITY" '(.id | ascii_downcase) == ($id | ascii_downcase)' <<<"$identity" >/dev/null \
-      || die "resolved pull identity differs from the requested identity"
-  else
-    identity_name="$NAME-acr-pull"
-    identity=$(lookup_resource Microsoft.ManagedIdentity/userAssignedIdentities "$identity_name")
-    if [[ "$identity" == null ]]; then
-      az_cmd identity create -g "$RESOURCE_GROUP" --name "$identity_name" --location "$LOCATION" --tags "${TAGS[@]}" -o none
-    fi
-    identity=$(az_cmd identity show -g "$RESOURCE_GROUP" --name "$identity_name" -o json)
-  fi
-  jq -e --arg subscription "$SUBSCRIPTION" '(.id | split("/")[2] | ascii_downcase) == ($subscription | ascii_downcase)' <<<"$identity" >/dev/null \
-    || die "pull identity must be in the selected subscription"
-  PULL_IDENTITY_ID=$(jq -er .id <<<"$identity")
-  identity_group=$(jq -r '.id | split("/")[4]' <<<"$identity")
-  identity_name=$(jq -r '.id | split("/")[8]' <<<"$identity")
-  principal=$(jq -er .principalId <<<"$identity")
-  client=$(jq -er .clientId <<<"$identity")
-  tenant=$(jq -er .tenantId <<<"$identity")
-  python3 - "$principal" "$client" "$tenant" <<'PY' || die "pull identity is missing valid principal, client, or tenant IDs"
-import sys
-import uuid
-for value in sys.argv[1:]:
-    uuid.UUID(value)
-PY
-  role="$ACR_PULL_ROLE"
-  mode=$(jq -r '.roleAssignmentMode // "LegacyRegistryPermissions"' <<<"$registry")
-  case "$mode" in
-    LegacyRegistryPermissions) ;;
-    AbacRepositoryPermissions)
-      credentials=$(az_cmd role definition list --name 'Container Registry Repository Reader' -o json)
-      role=$(jq -er '[.[] | select(.roleType == "BuiltInRole")] | if length == 1 then .[0].name else error("missing or ambiguous repository-reader role") end' <<<"$credentials") ;;
-    *) die "unsupported shared ACR role-assignment mode: $mode" ;;
-  esac
-  credential_name="unbounded-$NAME-$(printf '%s' "$AKS_ID/$issuer/$REGISTRY_SUBJECT" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])')"
-  credentials=$(az_cmd identity federated-credential list -g "$identity_group" --identity-name "$identity_name" -o json)
-  credential=$(jq -c --arg name "$credential_name" '[.[] | select(.name == $name)][0] // null' <<<"$credentials")
-  if [[ "$credential" == null ]]; then
-    matching=$(jq -c --arg issuer "$issuer" --arg subject "$REGISTRY_SUBJECT" --arg audience "$REGISTRY_AUDIENCE" \
-      '[.[] | select(.issuer == $issuer and .subject == $subject and .audiences == [$audience])] | if length > 1 then error("ambiguous matching federation") else .[0] // null end' <<<"$credentials")
-    if [[ "$matching" != null ]]; then
-      credential="$matching"
-      credential_name=$(jq -er .name <<<"$matching")
-      credential_owned=false
-    fi
-  fi
-  if [[ "$credential" == null ]]; then
-    az_cmd identity federated-credential create -g "$identity_group" --identity-name "$identity_name" --name "$credential_name" \
-      --issuer "$issuer" --subject "$REGISTRY_SUBJECT" --audiences "$REGISTRY_AUDIENCE" -o none
-  else
-    jq -e --arg issuer "$issuer" --arg subject "$REGISTRY_SUBJECT" --arg audience "$REGISTRY_AUDIENCE" \
-      '.issuer == $issuer and .subject == $subject and .audiences == [$audience]' <<<"$credential" >/dev/null \
-      || die "existing federation binding conflicts with this cluster; refusing to overwrite it"
-  fi
-  # One registry-scoped grant to the selected pull identity, never to VM identities.
-  ensure_role "$principal" "$role" "$ACR_RESOURCE_ID"
-  jq -n --arg registry "$ACR_RESOURCE_ID" --arg identity "$PULL_IDENTITY_ID" --arg principal "$principal" \
-    --arg client "$client" --arg tenant "$tenant" --arg issuer "$issuer" --arg credential "$credential_name" \
-    --arg subject "$REGISTRY_SUBJECT" --arg role "$role" --arg supplied "$ACR_PULL_IDENTITY" --argjson managedFederation "$credential_owned" \
-    '{registryId:$registry,identityResourceId:$identity,principalId:$principal,clientId:$client,tenantId:$tenant,
-      issuer:$issuer,federatedCredentialName:$credential,subject:$subject,pullRoleId:$role,identityCreatedByDeployment:($supplied == ""),federationManagedByDeployment:$managedFederation}' \
-    > "$STATE_DIR/registry-access.json"
-  policy=$(jq -cn --arg registry "$ACR_LOGIN_SERVER" --arg client "$client" --arg tenant "$tenant" --arg probe "$ACR_PROBE_IMAGE" \
-    '{mode:"workloadIdentity",registry:$registry,clientID:$client,tenantID:$tenant} + (if $probe == "" then {} else {probeImage:$probe} end)')
-  for attempt in 1 2 3 4 5; do
-    source=$(registry_configuration)
-    jq -n --argjson source "$source" --arg policy "$policy" --arg name "$NAME" \
-      '[{op:"test",path:"/metadata/resourceVersion",value:$source.metadata.resourceVersion},
-        {op:"add",path:"/metadata/annotations",value:(($source.metadata.annotations // {}) + {"unbounded-cloud.io/registry-auth-owner":$name})},
-        {op:"add",path:"/data/node-auth.yaml",value:$policy}]' > "$STATE_DIR/registry-config-patch.json"
-    if kube -n unbounded-system patch configmap gantry-config --type=json --patch-file "$STATE_DIR/registry-config-patch.json" -o name \
-      2>"$STATE_DIR/registry-config-patch.log"; then patched=true; break; fi
-    log "Registry configuration patch attempt $attempt/5 failed; retrying against current state"
-    sleep 1
-  done
-  [[ "$patched" == true ]] || die "could not merge registry onboarding policy; inspect registry-config-patch.log and rerun"
-  log "Configured shared ACR $ACR_LOGIN_SERVER with cluster pull identity $PULL_IDENTITY_ID"
-  log "Application specifications and ServiceAccounts are unchanged; registry auth uses the dedicated federated pull identity"
 }
 
 ensure_features() {
@@ -983,14 +821,12 @@ main() {
     [[ "$confirmation" == y || "$confirmation" == Y ]] || die "deployment canceled"
   fi
   prepare_state
-  prepare_registry_intent
   ensure_features
   ensure_group
   ensure_network
   ensure_cluster
   install_plugin
   setup_cni
-  ensure_registry_auth
   ensure_flex_pool
   AGENT_DIGEST=$(release_digest Azure/AKSFlexNode "$AGENT_VERSION" aks-flex-node-linux-amd64.tar.gz)
   fetch_file "https://raw.githubusercontent.com/Azure/AKSFlexNode/$AGENT_VERSION/scripts/bootstrap.sh" "$STATE_DIR/cache/bootstrap-$AGENT_VERSION.sh"
@@ -1005,7 +841,6 @@ main() {
     join_vm "$name"
   done
   validate_deployment
-  if [[ -n "$ACR" ]]; then wait_component_rollout daemonset/gantry-acr-auth; fi
   smoke_test
   log "Deployment ready: one system node and $FLEX_COUNT Flex nodes"
   kube get nodes -L kubernetes.azure.com/agentpool,unbounded-cloud.io/site -o wide

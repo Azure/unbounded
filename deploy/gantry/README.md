@@ -165,12 +165,42 @@ entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
 the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
-Operator-managed Gantry can separately reconcile a node-wide federated ACR
-broker and kubelet adapter on Linux Flex nodes when an explicit pull identity is
-configured. Applications and their ServiceAccounts are unchanged; no VM identity
-or IMDS endpoint is required. This does not change the containerd mirror route. See the operator-managed ACR section in
-[`docs/content/guides/gantry.md`](../../docs/content/guides/gantry.md) for managed
-identity permissions, `node-auth.yaml`, private-image probes, and external mode.
+ACR attachment is separate from deployment. The AKS Flex cluster script installs
+Gantry without ACR configuration or authentication setup. With a compatible
+plugin/operator release containing `gantry attach-acr` (not the `v0.8.0`
+deployment baseline), the intended workflow is:
+
+```sh
+# Registry-only attachment with customer-owned authentication.
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id "$ACR_ID"
+
+# Explicit opt-in to shared managed authentication on Linux Flex nodes.
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id "$ACR_ID" --auth-mode aks-identity-binding \
+  --cluster-resource-id "$AKS_ID"
+```
+
+Both IDs are full Azure resource IDs. Either command accepts an optional
+`--kubeconfig /path/to/kubeconfig`. Omitting `--auth-mode` defaults to `external`,
+retaining existing providers, authentication policy, and shared credentials.
+Explicit `--auth-mode external` is also accepted. Managed mode requires
+`--auth-mode aks-identity-binding` and uses the stock `acr-credential-provider` in AKS
+identity-bindings mode, collective RBAC, and kubelet Pod-bound ServiceAccount
+tokens for a shared pull identity. The same path serves Azure and non-Azure
+Linux Flex nodes, with no custom broker/adapter/token-exchange service, VM/VMSS
+identity assignments, or Azure-privileged ongoing operator.
+
+Application Pods and ServiceAccounts remain unchanged; native AKS nodes are
+unaffected. Existing customer providers/shared credentials are never silently
+replaced. Future joined nodes are configured automatically only if the explicit
+managed-auth opt-in policy exists. This path has not been live-validated. It
+requires supported AKS identity bindings, kubelets >= 1.34 with
+`KubeletServiceAccountTokenForCredentialProviders` enabled, and a reachable AKS
+identity-binding proxy. API-server VNet integration is unsupported under the
+[current AKS documentation](https://learn.microsoft.com/en-us/azure/aks/identity-bindings#limitations).
+See the [ACR attachment guide](../../docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+for the intended authentication boundary and limitations.
 
 Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
 resident reconciler checks the default `hosts.toml` every five seconds and

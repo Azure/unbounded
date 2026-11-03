@@ -86,8 +86,8 @@ func EnsureUpstream(runtimeConfig, policy string) (string, bool, error) {
 			continue
 		}
 
-		if cfg.Mode == "workloadIdentity" && fields["credentials_path"] != "" {
-			return "", false, errors.New("explicit federated registry conflicts with shared Gantry credentials_path; resolve that configuration explicitly")
+		if cfg.Mode == IdentityBindingMode && fields["credentials_path"] != "" {
+			return "", false, errors.New("managed authentication conflicts with shared Gantry credentials_path; use external authentication")
 		}
 
 		return runtimeConfig, false, nil
