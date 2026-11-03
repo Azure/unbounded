@@ -57,7 +57,7 @@ impl flow_control::Class for Resource {
         self as usize
     }
 }
-struct Limits;
+struct Limits(usize);
 impl Policy for Limits {
     type Class = Resource;
 
@@ -65,7 +65,7 @@ impl Policy for Limits {
 
     fn limit(&self, class: Resource) -> usize {
         match class {
-            Resource::Context => 1 << 30,
+            Resource::Context => self.0,
             Resource::Connection => 64,
         }
     }
@@ -190,7 +190,10 @@ struct Fixture {
     admission: std::rc::Rc<Quotas<Limits>>,
 }
 fn fixture() -> Fixture {
-    let admission = std::rc::Rc::new(Quotas::new(Limits));
+    fixture_with(1 << 30)
+}
+fn fixture_with(context: usize) -> Fixture {
+    let admission = std::rc::Rc::new(Quotas::new(Limits(context)));
     let reactor = std::rc::Rc::new(Reactor::new(64, ()));
     reactor.init().unwrap();
     let pool = Pool::new(
@@ -740,6 +743,93 @@ fn cancelled_fallback_reconnect_releases_connection() {
     assert_released(&fixture, &endpoint);
     assert_eq!(server.join().unwrap(), (true, true), "both sockets closed");
     assert_eq!(fixture.admission.used(Resource::Context), 0);
+}
+
+/// A budget that admits the handshake but not the relay buffers rejects the
+/// userspace connect and leaks neither the charge nor the slot.
+#[test]
+fn userspace_relay_over_budget_is_rejected() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, accepted) = serve(listener, Some(&identity), false, 1);
+    let fixture = fixture_with(http1::tls::RELAY_ALLOCATION - 1);
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    let scope = scope();
+    let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
+    assert!(matches!(result.err(), Some(Error::Quota(_))));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "handshake was admitted");
+    drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
+    assert_released(&fixture, &endpoint);
+    assert_eq!(fixture.admission.used(Resource::Context), 0);
+    drop(fixture);
+    server.join().unwrap();
+}
+
+/// The relay charge stays held while the connection idles in the pool and is
+/// released once the pool closes it and the relay thread exits.
+#[test]
+fn userspace_relay_charge_spans_idle_connection() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, accepted) = serve(listener, Some(&identity), false, 1);
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    assert!(!fetch(&fixture, &endpoint, 2, false).unwrap());
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "keep-alive reuse");
+    assert!(
+        fixture
+            .pool
+            .snapshot()
+            .entries
+            .iter()
+            .any(|(key, counts)| *key == endpoint && *counts == (0, 1))
+    );
+    assert!(fixture.admission.used(Resource::Context) >= http1::tls::RELAY_ALLOCATION);
+    fixture.pool.close();
+    // Only the I/O helper's cached head buffer may remain charged.
+    assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
+    drop(fixture);
+    server.join().unwrap();
+}
+
+/// Cancelling an exchange on a userspace connection releases the relay charge
+/// once the connection is dropped.
+#[test]
+fn cancelled_userspace_exchange_releases_relay_charge() {
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, _) = serve(listener, Some(&identity), false, 1);
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Userspace);
+    let scope = scope();
+    let connection = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope)).unwrap();
+    assert!(fixture.admission.used(Resource::Context) >= http1::tls::RELAY_ALLOCATION);
+    // No request was sent, so the head receive stalls until cancelled.
+    let result = {
+        let receive = fixture.io.receive_head(connection, &scope);
+        let mut receive = std::pin::pin!(receive);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..10 {
+            assert!(receive.as_mut().poll(&mut cx).is_pending());
+            fixture.reactor.poll_budgeted(64).unwrap();
+            fixture.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        scope.cancellation.cancel().unwrap();
+        drive(&fixture.reactor, receive)
+    };
+    assert!(matches!(
+        result.err(),
+        Some(Error::Runtime(uring_runtime::Error::Cancelled))
+    ));
+    drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
+    assert_released(&fixture, &endpoint);
+    // Only the I/O helper's cached head buffer may remain charged.
+    assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
+    drop(fixture);
+    server.join().unwrap();
 }
 
 /// Report client CPU per GiB for each record-layer placement:

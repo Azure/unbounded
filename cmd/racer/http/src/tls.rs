@@ -296,6 +296,7 @@ fn suite_bit(tls: &TlsClient, session: &ClientConnection) -> Option<u64> {
 /// layer. `userspace` forces the userspace relay regardless of mode.
 pub(crate) async fn establish<C: Context>(
     reactor: &C::Reactor,
+    context: &C,
     mut connection: ConnectionLease<C>,
     tls: &TlsClient,
     userspace: bool,
@@ -425,8 +426,13 @@ pub(crate) async fn establish<C: Context>(
             return Ok(Established::Ready(connection));
         }
     }
-    let app = relay(session, &connection.socket()).map_err(uring_runtime::Error::from_io)?;
+    // The relay's queue and scratch are payload copies outside `HttpIo`
+    // buffers; admit them before spawning so they count against the budget.
+    let charge = context.charge(RELAY_ALLOCATION)?;
+    let (app, relay) = spawn_relay(session, &connection.socket(), charge)
+        .map_err(uring_runtime::Error::from_io)?;
     connection.replace_socket(Rc::new(app));
+    connection.attach_relay(relay);
     USERSPACE.fetch_add(1, Ordering::Relaxed);
     log_once(&USERSPACE_LOGGED, "racer: origin HTTPS uses userspace TLS");
     Ok(Established::Ready(connection))
@@ -653,8 +659,47 @@ impl ControlRecords {
     }
 }
 
-/// Start the userspace relay and return the plaintext end for the pool.
-fn relay(session: ClientConnection, tcp: &Descriptor) -> std::io::Result<Descriptor> {
+/// Decrypted plaintext queued toward the pool end of the relay.
+const RELAY_QUEUE: usize = 256 * 1024;
+
+/// Scratch for one read from either side of the relay.
+const RELAY_SCRATCH: usize = 64 * 1024;
+
+/// Bytes charged per userspace relay for its queue and scratch buffers.
+pub const RELAY_ALLOCATION: usize = RELAY_QUEUE + RELAY_SCRATCH;
+
+/// A running userspace relay and the charge for its buffers.
+///
+/// Dropping it shuts down the plaintext socket so the relay observes a
+/// hangup, joins the relay thread, and only then releases the charge. The
+/// relay never blocks without polling the plaintext socket, so the join is
+/// bounded by one nonblocking pass of its loop.
+pub(crate) struct Relay<K> {
+    app: OwnedFd,
+
+    thread: Option<std::thread::JoinHandle<()>>,
+
+    charge: Option<K>,
+}
+
+impl<K> Drop for Relay<K> {
+    fn drop(&mut self) {
+        // SAFETY: shutdown on a live owned descriptor.
+        unsafe { libc::shutdown(self.app.as_raw_fd(), libc::SHUT_RDWR) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        drop(self.charge.take());
+    }
+}
+
+/// Start the userspace relay, returning the plaintext end for the pool and
+/// the handle that retains `charge` until the relay thread exits.
+fn spawn_relay<K>(
+    session: ClientConnection,
+    tcp: &Descriptor,
+    charge: K,
+) -> std::io::Result<(Descriptor, Relay<K>)> {
     // SAFETY: dup of a live descriptor; the result is immediately owned.
     let net = unsafe { libc::fcntl(tcp.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if net < 0 {
@@ -678,20 +723,34 @@ fn relay(session: ClientConnection, tcp: &Descriptor) -> std::io::Result<Descrip
     // SAFETY: both descriptors are fresh and owned here.
     let (pool_end, relay_end) =
         unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
-    std::thread::Builder::new()
+    // SAFETY: dup of a live descriptor; the result is immediately owned.
+    let control = unsafe { libc::fcntl(pool_end.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if control < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a fresh descriptor.
+    let control = unsafe { OwnedFd::from_raw_fd(control) };
+    let thread = std::thread::Builder::new()
         .name("racer-tls-relay".into())
         .spawn(move || relay_loop(session, net, relay_end))?;
-    Ok(Descriptor::from(pool_end))
+    Ok((
+        Descriptor::from(pool_end),
+        Relay {
+            app: control,
+            thread: Some(thread),
+            charge: Some(charge),
+        },
+    ))
 }
 
 /// Shuttle bytes until either side closes or fails.
 fn relay_loop(mut session: ClientConnection, net: OwnedFd, app: OwnedFd) {
-    const CAP: usize = 256 * 1024;
+    const CAP: usize = RELAY_QUEUE;
     let net = Descriptor::from(net);
     let app = Descriptor::from(app);
     let mut to_app = Vec::with_capacity(CAP);
     let mut sent = 0;
-    let mut scratch = vec![0; 64 * 1024];
+    let mut scratch = vec![0; RELAY_SCRATCH];
     let mut net_eof = false;
     loop {
         // Move decrypted plaintext out of rustls while there is room.

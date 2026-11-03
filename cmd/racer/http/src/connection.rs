@@ -319,6 +319,9 @@ pub struct ConnectionLease<C: Context> {
 
     /// Kernel TLS receive state; `Some` once the socket carries kernel TLS.
     kernel_tls: Option<Box<crate::tls::ControlRecords>>,
+
+    /// Userspace TLS relay and its buffer charge; dropped after the socket.
+    relay: Option<crate::tls::Relay<C::Charge>>,
 }
 
 /// A head result and the connection and decoded-storage charge it retains.
@@ -1218,6 +1221,7 @@ impl<C: Context> ConnectionLease<C> {
             request_is_head: false,
             close: false,
             kernel_tls: None,
+            relay: None,
         }
     }
 
@@ -1234,6 +1238,11 @@ impl<C: Context> ConnectionLease<C> {
     /// Swap in the plaintext end of a userspace TLS relay.
     pub(crate) fn replace_socket(&mut self, fd: Rc<Descriptor>) {
         self.fd = fd;
+    }
+
+    /// Retain a userspace TLS relay and its buffer charge with this connection.
+    pub(crate) fn attach_relay(&mut self, relay: crate::tls::Relay<C::Charge>) {
+        self.relay = Some(relay);
     }
 
     /// Borrow the connection's live policy.
@@ -1404,6 +1413,7 @@ impl<C: Context> Drop for ConnectionLease<C> {
                     reservation,
                     since: uring_runtime::environment::now(),
                     kernel_tls: self.kernel_tls.take(),
+                    relay: self.relay.take(),
                 })
         } else {
             None
@@ -1739,6 +1749,7 @@ impl<C: Context> HttpPool<C> {
             let mut lease =
                 ConnectionLease::new(idle.fd, idle.reservation, idle.state, slot.0.take());
             lease.kernel_tls = idle.kernel_tls;
+            lease.relay = idle.relay;
             return Ok((lease, None));
         }
         if let Some(e) = rejected {
@@ -1790,8 +1801,15 @@ impl<C: Context> HttpPool<C> {
         };
         let mut userspace = false;
         loop {
-            match crate::tls::establish::<C>(&self.reactor, connection, tls, userspace, scope)
-                .await?
+            match crate::tls::establish::<C>(
+                &self.reactor,
+                &self.context,
+                connection,
+                tls,
+                userspace,
+                scope,
+            )
+            .await?
             {
                 crate::tls::Established::Ready(ready) => return Ok(ready),
                 crate::tls::Established::Retry(mut retry) if !userspace => {
@@ -1973,6 +1991,8 @@ struct Idle<C: Context> {
     since: Instant,
 
     kernel_tls: Option<Box<crate::tls::ControlRecords>>,
+
+    relay: Option<crate::tls::Relay<C::Charge>>,
 }
 
 /// Active and idle connections belonging to one endpoint generation.
