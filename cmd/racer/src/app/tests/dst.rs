@@ -640,6 +640,8 @@ mod faults {
                 node.workers[0].app.control = node.control.clone();
                 staged.push(CachePublication {
                     proposal: RefCell::new(None),
+                    local: None,
+                    served: Rc::new(RefCell::new(None)),
                     node: node.workers[0].app.node.clone(),
                     listeners: node.workers[0].app.prepared_listeners.clone(),
                     capacity: node.config.limits.metadata_entries.get(),

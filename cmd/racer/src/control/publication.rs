@@ -124,7 +124,7 @@ impl PublicationTarget {
         let lifecycle = self.lifecycle.borrow();
         let transition = lifecycle
             .as_ref()
-            .map(|l| l.stage(&prepared.caches))
+            .map(|l| l.stage_for(&prepared.caches, Some(&prepared.membership)))
             .transpose()?;
         self.accept(prepared.clone(), transition)?;
         Ok(())
@@ -237,9 +237,10 @@ fn project(
         }
         old.membership.clone()
     } else {
-        Arc::new(Membership::validate_with_predecessor(
+        Arc::new(Membership::validate_with_pools(
             publication.membership_version,
             publication.members.into_iter().map(Member::from).collect(),
+            publication.pools.clone(),
             current.map(|old| old.membership.as_ref()),
         )?)
     };

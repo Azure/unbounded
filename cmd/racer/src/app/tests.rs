@@ -1878,6 +1878,8 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     second.memory.publish(late1.clone()).unwrap();
     let adapter = CachePublication {
         proposal: RefCell::new(None),
+        local: None,
+        served: Rc::new(RefCell::new(None)),
         node: node.clone(),
         listeners: first.prepared_listeners.clone(),
         capacity: config.limits.metadata_entries.get(),
@@ -4442,6 +4444,8 @@ mod cache_publication {
         let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
         let adapter = CachePublication {
             proposal: RefCell::new(None),
+            local: None,
+            served: Rc::new(RefCell::new(None)),
             node: node.clone(),
             listeners: worker.prepared_listeners.clone(),
             capacity: config.limits.metadata_entries.get(),
@@ -4480,6 +4484,8 @@ mod cache_publication {
             .unwrap();
         let mut adapter = CachePublication {
             proposal: RefCell::new(None),
+            local: None,
+            served: Rc::new(RefCell::new(None)),
             node: node.clone(),
             listeners: Rc::new(RefCell::new(None)),
             capacity: 0,
@@ -4500,6 +4506,81 @@ mod cache_publication {
         assert_eq!(
             store.cursor().unwrap(),
             Some(racer_control_wire::PublicationSequence(1))
+        );
+    }
+
+    /// Sockets are bound only for caches whose pool has this node. Joining or
+    /// leaving the pool alone proposes again, so sockets follow membership.
+    #[test]
+    fn sockets_are_bound_only_on_pool_members_and_unbound_on_leave() {
+        use crate::topology::tests::pool_tests::{NARROW, pooled};
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let (mut worker, _, _) = crate::app::tests::local_worker(&config, &node, 0);
+        let (mut second, _, _) = crate::app::tests::local_worker(&config, &node, 1);
+        let mut narrow = crate::app::tests::definition();
+        narrow.id = racer_control_wire::CacheId(NARROW.into());
+        let local = crate::topology::tests::fixtures::member(0, 4).node;
+        let adapter = CachePublication {
+            proposal: RefCell::new(None),
+            local: Some(local.clone()),
+            served: worker.served_caches.clone(),
+            node: node.clone(),
+            listeners: worker.prepared_listeners.clone(),
+            capacity: config.limits.metadata_entries.get(),
+        };
+        let outside = pooled(1, 4, vec![1, 2], None);
+        assert!(!outside.serves(&narrow.id, &local));
+        let definitions = std::slice::from_ref(&narrow);
+        assert!(matches!(
+            adapter.stage_for(definitions, Some(&outside)),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            adapter.served.borrow().as_deref().map(Vec::as_slice),
+            Some(&[][..])
+        );
+        // The control worker prepares listeners for the served caches only.
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        worker.poll_cache_preparation(&mut cx).unwrap();
+        second.poll_cache_preparation(&mut cx).unwrap();
+        assert_eq!(
+            worker
+                .prepared_listeners
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .definitions(),
+            &[][..]
+        );
+        adapter
+            .stage_for(definitions, Some(&outside))
+            .unwrap()
+            .commit();
+        // Joining the pool, with the same definitions, proposes again.
+        let generation = adapter.proposal.borrow().as_ref().unwrap().0;
+        let inside = pooled(2, 4, vec![0, 1, 2], Some(&outside));
+        assert!(matches!(
+            adapter.stage_for(definitions, Some(&inside)),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            adapter.proposal.borrow().as_ref().unwrap().0,
+            generation + 1
+        );
+        assert_eq!(
+            adapter.served.borrow().as_deref().map(Vec::as_slice),
+            Some(definitions)
+        );
+        // Leaving it proposes again without the cache.
+        let left = pooled(3, 4, vec![1, 2], Some(&inside));
+        assert!(matches!(
+            adapter.stage_for(definitions, Some(&left)),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            adapter.served.borrow().as_deref().map(Vec::as_slice),
+            Some(&[][..])
         );
     }
 }

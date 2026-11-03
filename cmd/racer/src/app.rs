@@ -1045,6 +1045,12 @@ pub struct WorkerApplication {
 
     prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
 
+    /// Caches whose sockets this node binds ([`CachePublication`]).
+    served_caches: ServedCaches,
+
+    /// This node.
+    local: NodeId,
+
     cache_prepare_task: Option<Operation<'static, ()>>,
 
     cache_preparing_generation: u64,
@@ -1522,6 +1528,8 @@ impl WorkerApplication {
             caches: Vec::new(),
             slab_directory: config.slab_directory.clone(),
             prepared_listeners: Rc::new(std::cell::RefCell::new(None)),
+            served_caches: Rc::new(RefCell::new(None)),
+            local: config.node.clone(),
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
@@ -2594,8 +2602,22 @@ pub(crate) struct CachePublication {
 
     capacity: usize,
 
-    proposal: RefCell<Option<(u64, Arc<Vec<CacheDefinition>>)>>,
+    /// Generation, proposed definitions, and the definitions this node serves.
+    proposal: RefCell<Option<CacheProposal>>,
+
+    /// This node, or `None` to serve every cache (fixtures without a membership).
+    local: Option<NodeId>,
+
+    /// Caches whose client and origin sockets the control worker binds: those whose
+    /// pool has this node. Shared with the control worker's listener preparation.
+    served: ServedCaches,
 }
+
+/// Rollout generation, proposed definitions, and served definitions.
+type CacheProposal = (u64, Arc<Vec<CacheDefinition>>, Arc<Vec<CacheDefinition>>);
+
+/// Definitions of the caches whose sockets this node binds, set with each proposal.
+pub(crate) type ServedCaches = Rc<RefCell<Option<Arc<Vec<CacheDefinition>>>>>;
 
 /// Reserved worker barrier and the control worker's prepared listeners.
 struct Transition<'a> {
@@ -2617,23 +2639,44 @@ impl CacheTransition for Transition<'_> {
 
 impl CachePublication {
     /// Propose changed definitions or reserve the acknowledged cut for atomic commit.
+    #[cfg(test)]
     pub(crate) fn stage(
         &self,
         definitions: &[CacheDefinition],
     ) -> Result<Box<dyn CacheTransition + '_>> {
+        self.stage_for(definitions, None)
+    }
+
+    /// Like [`Self::stage`], binding sockets only for the caches whose pool in
+    /// `membership` has this node. A change of the served caches alone is a
+    /// new proposal, so a node that leaves a pool unbinds its sockets.
+    pub(crate) fn stage_for(
+        &self,
+        definitions: &[CacheDefinition],
+        membership: Option<&crate::topology::Membership>,
+    ) -> Result<Box<dyn CacheTransition + '_>> {
         racer_control_wire::validate_definitions(definitions)?;
+        let served: Vec<CacheDefinition> = match (&self.local, membership) {
+            (Some(local), Some(membership)) => definitions
+                .iter()
+                .filter(|definition| membership.serves(&definition.id, local))
+                .cloned()
+                .collect(),
+            _ => definitions.to_vec(),
+        };
         let mut proposal = self.proposal.borrow_mut();
-        if proposal
-            .as_ref()
-            .is_none_or(|(_, old)| old.as_slice() != definitions)
-        {
+        if proposal.as_ref().is_none_or(|(_, old, old_served)| {
+            old.as_slice() != definitions || old_served.as_slice() != served
+        }) {
             if definitions.len() > self.capacity {
                 return Err(Error::Overloaded);
             }
             let value = Arc::new(definitions.to_vec());
+            let served = Arc::new(served);
+            *self.served.borrow_mut() = Some(served.clone());
             let generation = self.node.cache_rollout.propose(value.clone())?;
             self.listeners.borrow_mut().take();
-            *proposal = Some((generation, value));
+            *proposal = Some((generation, value, served));
             return Err(Error::Unavailable);
         }
         let generation = proposal.as_ref().ok_or(Error::Internal)?.0;
@@ -2649,7 +2692,7 @@ impl CachePublication {
             .borrow_mut()
             .take()
             .ok_or(Error::Unavailable)?;
-        if listeners.definitions() != definitions {
+        if listeners.definitions() != served {
             return Err(Error::Unavailable);
         }
         Ok(Box::new(Transition {
@@ -2667,6 +2710,8 @@ impl WorkerApplication {
                 node: self.node.clone(),
                 listeners: self.prepared_listeners.clone(),
                 proposal: RefCell::new(None),
+                local: Some(self.local.clone()),
+                served: self.served_caches.clone(),
                 capacity: self
                     .runtime
                     .admission
@@ -2708,8 +2753,14 @@ impl WorkerApplication {
                 let clients = self.clients.clone();
                 let prepared = self.prepared_listeners.clone();
                 let startup = scope(self.timeout)?;
+                // Bind only the caches whose pool has this node.
+                let served = self
+                    .served_caches
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| definitions.clone());
                 self.cache_prepare_task = Some(Box::pin(async move {
-                    *prepared.borrow_mut() = Some(clients.prepare(&definitions, &startup).await?);
+                    *prepared.borrow_mut() = Some(clients.prepare(&served, &startup).await?);
                     Ok(())
                 }));
             }
