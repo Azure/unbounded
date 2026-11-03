@@ -278,10 +278,175 @@ func TestManualBootstrapHandler_BuildAgentConfig(t *testing.T) {
 	require.NotEmpty(t, cfg.Cluster.Version) // fake client returns empty string but it's still set
 	require.Contains(t, cfg.Kubelet.Auth.BootstrapToken, "abc123.")
 	require.Equal(t, "10.0.0.15", cfg.Kubelet.NodeIP)
-	require.Equal(t, map[string]string{"env": "prod"}, cfg.Kubelet.Labels)
+	require.Equal(t, map[string]string{"env": "prod", "unbounded-cloud.io/site": "dc1"}, cfg.Kubelet.Labels)
 	require.Equal(t, []string{"dedicated=gpu:NoSchedule"}, cfg.Kubelet.RegisterWithTaints)
 	require.Equal(t, "ghcr.io/azure/rootfs:v1", cfg.OCIImage)
 	require.Equal(t, "file:///opt/unbounded/artifacts/v1.31.2", cfg.OfflineArtifacts.Source)
+}
+
+func TestWithSiteNodeLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   map[string]string
+	}{
+		{
+			name: "nil map gets the site label",
+			want: map[string]string{"unbounded-cloud.io/site": "dc1"},
+		},
+		{
+			name:   "other labels are kept and the site label is added",
+			labels: map[string]string{"env": "prod"},
+			want:   map[string]string{"env": "prod", "unbounded-cloud.io/site": "dc1"},
+		},
+		{
+			name:   "user canonical site label wins",
+			labels: map[string]string{"unbounded-cloud.io/site": "other"},
+			want:   map[string]string{"unbounded-cloud.io/site": "other"},
+		},
+		{
+			name:   "user deprecated site label wins",
+			labels: map[string]string{"net.unbounded-cloud.io/site": "other"},
+			want:   map[string]string{"net.unbounded-cloud.io/site": "other"},
+		},
+		{
+			name: "both site labels are kept",
+			labels: map[string]string{
+				"unbounded-cloud.io/site":     "other",
+				"net.unbounded-cloud.io/site": "another",
+			},
+			want: map[string]string{
+				"unbounded-cloud.io/site":     "other",
+				"net.unbounded-cloud.io/site": "another",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tt.want, withSiteNodeLabel(tt.labels, "dc1"))
+		})
+	}
+}
+
+func TestManualBootstrapHandler_BuildAgentConfig_SiteLabel(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	tests := []struct {
+		name       string
+		nodeLabels []string
+		want       map[string]string
+	}{
+		{
+			name: "no node labels",
+			want: map[string]string{"unbounded-cloud.io/site": "dc1"},
+		},
+		{
+			name:       "other node label",
+			nodeLabels: []string{"env=prod"},
+			want:       map[string]string{"env": "prod", "unbounded-cloud.io/site": "dc1"},
+		},
+		{
+			name:       "canonical site node label",
+			nodeLabels: []string{"unbounded-cloud.io/site=other"},
+			want:       map[string]string{"unbounded-cloud.io/site": "other"},
+		},
+		{
+			name:       "deprecated site node label",
+			nodeLabels: []string{"net.unbounded-cloud.io/site=other"},
+			want:       map[string]string{"net.unbounded-cloud.io/site": "other"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := &manualBootstrapHandler{
+				siteName:    "dc1",
+				machineName: "my-node",
+				nodeLabels:  tt.nodeLabels,
+				kubeCli:     kubeCli,
+				kubeConfig:  &rest.Config{Host: "https://my-api-server:6443"},
+				logger:      discardLogger(),
+			}
+
+			cfg, err := h.buildAgentConfig(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, tt.want, cfg.Kubelet.Labels)
+		})
+	}
+}
+
+// TestManualBootstrapHandler_Validate_SiteLabel: an invalid --site or site
+// --node-label fails before the kubeconfig is read.
+func TestManualBootstrapHandler_Validate_SiteLabel(t *testing.T) {
+	t.Parallel()
+
+	base := func() *manualBootstrapHandler {
+		return &manualBootstrapHandler{
+			siteName:       "dc1",
+			machineName:    "my-node",
+			kubeconfigPath: "/nonexistent",
+		}
+	}
+
+	valid := base()
+	valid.nodeLabels = []string{"unbounded-cloud.io/site=other"}
+	valid.kubeconfigPath = writeTempKubeconfig(t)
+	require.NoError(t, valid.validate(), "a user site label that differs from --site must pass")
+
+	for name, tc := range map[string]struct {
+		mutate   func(*manualBootstrapHandler)
+		wantErrs []string
+	}{
+		"site with a space": {
+			mutate:   func(h *manualBootstrapHandler) { h.siteName = "bad site" },
+			wantErrs: []string{`invalid --site "bad site"`},
+		},
+		"site longer than 63 characters": {
+			mutate:   func(h *manualBootstrapHandler) { h.siteName = strings.Repeat("a", 64) },
+			wantErrs: []string{"invalid --site"},
+		},
+		"site with a leading dash": {
+			mutate:   func(h *manualBootstrapHandler) { h.siteName = "-dc1" },
+			wantErrs: []string{`invalid --site "-dc1"`},
+		},
+		"empty canonical site node label": {
+			mutate:   func(h *manualBootstrapHandler) { h.nodeLabels = []string{"unbounded-cloud.io/site="} },
+			wantErrs: []string{"invalid --node-label", "unbounded-cloud.io/site"},
+		},
+		"empty deprecated site node label": {
+			mutate:   func(h *manualBootstrapHandler) { h.nodeLabels = []string{"net.unbounded-cloud.io/site="} },
+			wantErrs: []string{"invalid --node-label", "net.unbounded-cloud.io/site"},
+		},
+		"invalid canonical site node label": {
+			mutate:   func(h *manualBootstrapHandler) { h.nodeLabels = []string{"unbounded-cloud.io/site=bad value"} },
+			wantErrs: []string{"invalid --node-label", "unbounded-cloud.io/site"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := base()
+			tc.mutate(h)
+
+			err := h.validate()
+			require.Error(t, err)
+
+			for _, want := range tc.wantErrs {
+				require.ErrorContains(t, err, want)
+			}
+
+			require.NotContains(t, err.Error(), "kubeconfig")
+		})
+	}
 }
 
 func TestManualBootstrapHandler_BuildAgentConfig_KubernetesVersionOverride(t *testing.T) {
@@ -838,6 +1003,86 @@ func TestManualBootstrapHandler_Execute(t *testing.T) {
 		require.Contains(t, output, "my-node")
 		require.Contains(t, output, "abc123.")
 		require.Contains(t, output, "/etc/unbounded/agent/config.json")
+	})
+}
+
+// TestManualBootstrapHandler_Execute_SiteLabel: every variant hands the agent
+// a config whose kubelet labels carry the site from --site.
+func TestManualBootstrapHandler_Execute_SiteLabel(t *testing.T) {
+	t.Parallel()
+
+	kubeCli := newFakeCluster(t, "dc1")
+
+	newHandler := func(t *testing.T, out *bytes.Buffer) *manualBootstrapHandler {
+		t.Helper()
+
+		return &manualBootstrapHandler{
+			siteName:       "dc1",
+			machineName:    "my-node",
+			out:            out,
+			kubeCli:        kubeCli,
+			kubeConfig:     &rest.Config{Host: "https://my-api-server:6443"},
+			kubeconfigPath: writeTempKubeconfig(t),
+			logger:         discardLogger(),
+		}
+	}
+
+	t.Run("script", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+
+		h := newHandler(t, &buf)
+
+		require.NoError(t, h.execute(context.Background()))
+		require.Contains(t, buf.String(), `"unbounded-cloud.io/site": "dc1"`)
+	})
+
+	t.Run("cloud-init", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+
+		h := newHandler(t, &buf)
+		h.variant = string(variantCloudInit)
+
+		require.NoError(t, h.execute(context.Background()))
+		require.Contains(t, buf.String(), `"unbounded-cloud.io/site": "dc1"`)
+	})
+
+	t.Run("ignition", func(t *testing.T) {
+		t.Parallel()
+
+		var buf bytes.Buffer
+
+		h := newHandler(t, &buf)
+		h.variant = string(variantIgnition)
+		h.agentURL = "https://example.test/unbounded-agent-linux-amd64"
+		h.agentSHA256 = ignitionTestDigest
+
+		require.NoError(t, h.execute(context.Background()))
+
+		var cfg ignitionConfig
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &cfg))
+		require.NotNil(t, cfg.Storage)
+
+		var source string
+
+		for _, f := range cfg.Storage.Files {
+			if f.Path == "/etc/unbounded/agent/config.json" {
+				source = f.Contents.Source
+			}
+		}
+
+		encoded, ok := strings.CutPrefix(source, "data:;base64,")
+		require.True(t, ok, source)
+
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		require.NoError(t, err)
+
+		var written provision.UnboundedAgentConfig
+		require.NoError(t, json.Unmarshal(decoded, &written))
+		require.Equal(t, "dc1", written.Kubelet.Labels["unbounded-cloud.io/site"])
 	})
 }
 
