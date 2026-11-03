@@ -201,9 +201,21 @@ class TestHostRootStates(unittest.TestCase):
                     f"ExecStartPost={bin_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1\n")
         for missing in complete.splitlines():
             units = complete.replace(missing + "\n", "")
-            with self.subTest(missing=missing), patch.object(e2e, "ssh_capture", return_value=units):
+            with self.subTest(missing=missing), patch.object(e2e, "ssh_capture", return_value=units), \
+                    patch.object(e2e, "ISOLATION_MODE", "nspawn"):
                 with self.assertRaises(SystemExit):
                     e2e._daemon_unit_runs(bin_dir)
+
+    def test_the_other_modes_need_no_machine_hook(self):
+        """Only nspawn has a machine whose service override runs a lifecycle
+        helper; none and container run the node as host units."""
+        bin_dir = e2e.DAEMON_BIN_DIR
+        units = (f"ExecStart={bin_dir}/unbounded-agent-current daemon\n"
+                 f"ExecStart={bin_dir}/unbounded-agent-daemon-recovery.sh\n")
+        for mode in ("none", "container"):
+            with self.subTest(mode=mode), patch.object(e2e, "ssh_capture", return_value=units), \
+                    patch.object(e2e, "ISOLATION_MODE", mode):
+                e2e._daemon_unit_runs(bin_dir)
 
     def test_the_daemon_unit_must_name_the_expected_root(self):
         """A fresh host's unit runs the agent under the host root. A linked

@@ -1,0 +1,75 @@
+{
+  "run_id": "20260101-000000",
+  "started": "2026-01-01T00:00:00Z",
+  "finished": "2026-01-01T01:00:00Z",
+  "environment": {
+    "git commit": "0123456789ab",
+    "git branch": "impl/isolation-wp0",
+    "host": "runner",
+    "host base OS (VM)": "ubuntu2404"
+  },
+  "scenarios": [
+    {
+      "id": "T01",
+      "title": "Every ordered pair of modes",
+      "category": "transitions",
+      "suite": "isolation-matrix",
+      "isolation_mode": "",
+      "mode_label": "nspawn (default, no flag)",
+      "description": "Bootstrap with no flag, then change the mode through every ordered pair.",
+      "expected": "Each pair completes and each stop runs in the recorded mode.",
+      "notes": "",
+      "status": "pass",
+      "duration_s": 1500.0,
+      "log_path": "T01/suite.log",
+      "steps": [
+        {"index": 1, "name": "run-agent", "status": "pass", "duration_s": 300.0, "mode": "nspawn", "operation": "Join (bootstrap)"},
+        {"index": 2, "name": "validate-workload", "status": "pass", "duration_s": 40.0, "mode": "nspawn", "operation": "Workload and DNS"},
+        {"index": 3, "name": "change-to-none", "status": "pass", "duration_s": 400.0, "mode": "nspawn", "operation": "Mode change to none (reprovision)", "transition": {"from": "nspawn", "to": "none", "strategy": "reprovision"}},
+        {"index": 4, "name": "validate-workload", "status": "pass", "duration_s": 35.0, "mode": "none", "operation": "Workload and DNS"},
+        {"index": 5, "name": "change-to-nspawn", "status": "pass", "duration_s": 420.0, "mode": "none", "operation": "Mode change to nspawn (reprovision)", "transition": {"from": "none", "to": "nspawn", "strategy": "reprovision"}}
+      ],
+      "failure": null,
+      "evidence": {"machine": {"observed": "nspawn", "spec": ""}}
+    },
+    {
+      "id": "X01",
+      "title": "none: all operations",
+      "category": "operations",
+      "suite": "isolation-operations",
+      "isolation_mode": "none",
+      "mode_label": "none",
+      "description": "All operations in none mode.",
+      "expected": "Every operation passes.",
+      "notes": "",
+      "status": "fail",
+      "duration_s": 700.0,
+      "log_path": "X01/suite.log",
+      "steps": [
+        {"index": 1, "name": "run-agent", "status": "pass", "duration_s": 300.0, "mode": "none", "operation": "Join (bootstrap)"},
+        {"index": 2, "name": "validate-isolation-soft-reboot", "status": "fail", "duration_s": 90.0, "mode": "none", "operation": "NodeReboot (node stack restart)"},
+        {"index": 3, "name": "validate-workload", "status": "not-run", "duration_s": 0.0, "mode": "none", "operation": "Workload and DNS"}
+      ],
+      "failure": {"step": "validate-isolation-soft-reboot", "message": "NodeReboot rebooted the host", "log_excerpt": "[INFO]  [2/3] isolation-operations: validate-isolation-soft-reboot\n[ERROR] NodeReboot rebooted the host; it must restart only the node stack"},
+      "evidence": null
+    },
+    {
+      "id": "G01",
+      "title": "GPU workloads in none mode",
+      "category": "operations",
+      "suite": null,
+      "isolation_mode": "none",
+      "mode_label": "none",
+      "description": "NVIDIA wiring.",
+      "expected": "A GPU pod runs.",
+      "notes": "Needs hardware.",
+      "status": "skip",
+      "skip_reason": "needs GPU passthrough hardware, which a plain QEMU VM does not have",
+      "duration_s": 0.0,
+      "log_path": "G01/suite.log",
+      "steps": [],
+      "failure": null,
+      "evidence": null
+    }
+  ]
+}
