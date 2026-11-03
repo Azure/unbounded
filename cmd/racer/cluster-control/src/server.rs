@@ -1047,11 +1047,15 @@ async fn webhook_connection(
     }
 }
 
-/// Deadline for each ClusterCache GET made while answering a review. The
-/// webhook's `timeoutSeconds` is 5, so this leaves room for the reply.
-const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Shared budget for every API GET made while answering one review: all
+/// ClusterCaches and the Node run concurrently against one deadline. The
+/// webhook's `timeoutSeconds` is 5 (deploy/racer/mutating-webhook.yaml.tmpl),
+/// and the review body read and reply write share that window, so the
+/// lookups get 3 seconds and the rest keeps at least 2.
+const LOOKUP_BUDGET: Duration = Duration::from_secs(3);
 
-/// Reads each named ClusterCache with a direct GET. Seats do not watch
+/// Reads each named ClusterCache with a direct GET, all concurrently and all
+/// bounded by the same deadline `at`. Seats do not watch
 /// ClusterCaches; only the primary does, and a review must be answered by
 /// any seat. Any failure other than 404, including a timeout, is
 /// [`racer_admission::CacheLookup::Unavailable`], which denies the pod with
@@ -1060,17 +1064,16 @@ const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) async fn cache_lookups(
     api: &crate::kube::Kube,
     names: Vec<String>,
-    timeout: Duration,
+    at: Instant,
 ) -> std::collections::BTreeMap<String, racer_admission::CacheLookup> {
     use racer_admission::CacheLookup;
-    let mut out = std::collections::BTreeMap::new();
-    for name in names {
+    futures::future::join_all(names.into_iter().map(|name| async move {
         let path = format!(
             "{}/{}",
             crate::kube::paths::CACHES,
             crate::kube::escape(&name)
         );
-        let found = match exec::timeout(timeout, api.get(&path)).await {
+        let found = match exec::deadline(at, api.get(&path)).await {
             Ok(Ok(cache)) => match cache.get("spec").and_then(|s| s.get("nodeSelector")) {
                 None | Some(serde_json::Value::Null) => CacheLookup::Found(None),
                 Some(sel) => CacheLookup::Found(Some(sel.clone())),
@@ -1078,22 +1081,24 @@ pub(crate) async fn cache_lookups(
             Ok(Err(crate::kube::KubeError::NotFound)) => CacheLookup::NotFound,
             _ => CacheLookup::Unavailable,
         };
-        out.insert(name, found);
-    }
-    out
+        (name, found)
+    }))
+    .await
+    .into_iter()
+    .collect()
 }
 
 /// Reads the Node a pod is bound to with a direct GET, under the same
 /// fail-closed rules as [`cache_lookups`]: a 404 is `NotFound`, any other
-/// failure, including a timeout, is `Unavailable`.
+/// failure, including passing the deadline `at`, is `Unavailable`.
 pub(crate) async fn node_lookup(
     api: &crate::kube::Kube,
     name: &str,
-    timeout: Duration,
+    at: Instant,
 ) -> racer_admission::NodeLookup {
     use racer_admission::NodeLookup;
     let path = crate::kube::paths::node(&crate::kube::escape(name));
-    match exec::timeout(timeout, api.get(&path)).await {
+    match exec::deadline(at, api.get(&path)).await {
         Ok(Ok(node)) => {
             let labels = node
                 .get("metadata")
@@ -1112,6 +1117,31 @@ pub(crate) async fn node_lookup(
     }
 }
 
+/// Runs every GET a review needs concurrently under one deadline `at`.
+/// A pod bound with spec.nodeName skips the scheduler, so its Node is
+/// checked against a cache's selector. The Node GET starts alongside the
+/// cache GETs rather than after them so the review never pays for two
+/// serial round trips; admission ignores it when no cache has a selector.
+/// Pods naming no cache make no request at all.
+pub(crate) async fn review_lookups(
+    api: &crate::kube::Kube,
+    review: &racer_admission::Review,
+    at: Instant,
+) -> (
+    std::collections::BTreeMap<String, racer_admission::CacheLookup>,
+    Option<(racer_admission::NodeLookup, String)>,
+) {
+    let names = review.caches();
+    let node_name = review.node_name().filter(|_| !names.is_empty());
+    let node = async {
+        match node_name {
+            Some(name) => Some((node_lookup(api, &name, at).await, name)),
+            None => None,
+        }
+    };
+    futures::join!(cache_lookups(api, names, at), node)
+}
+
 /// Admission response bytes for one review body.
 pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
     let Some(image) = shared.config.object_image.as_deref() else {
@@ -1124,20 +1154,7 @@ pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
         Ok(r) => r,
         Err(_) => return http::response_head(400, &[], 0, false),
     };
-    let caches = cache_lookups(&shared.api, review.caches(), CACHE_LOOKUP_TIMEOUT).await;
-    // A pod bound with spec.nodeName skips the scheduler, so its Node is
-    // checked against the cache's selector. GET it only when some cache has
-    // a selector; admission ignores it otherwise.
-    let has_selector = caches
-        .values()
-        .any(|c| matches!(c, racer_admission::CacheLookup::Found(Some(_))));
-    let node = match review.node_name() {
-        Some(name) if has_selector => Some((
-            node_lookup(&shared.api, &name, CACHE_LOOKUP_TIMEOUT).await,
-            name,
-        )),
-        _ => None,
-    };
+    let (caches, node) = review_lookups(&shared.api, &review, Instant::now() + LOOKUP_BUDGET).await;
     let out = review.respond(
         image,
         &racer_admission::Lookups {
@@ -1436,7 +1453,7 @@ mod tests {
             let got = cache_lookups(
                 &kube,
                 names(&["pooled", "plain", "absent"]),
-                Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(2),
             )
             .await;
             assert_eq!(got["pooled"], CacheLookup::Found(Some(sel)));
@@ -1445,14 +1462,102 @@ mod tests {
 
             // An API error is not proof of absence: retryable.
             api.fail_next(&[403]);
-            let got = cache_lookups(&kube, names(&["plain"]), Duration::from_secs(2)).await;
+            let got = cache_lookups(
+                &kube,
+                names(&["plain"]),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await;
             assert_eq!(got["plain"], CacheLookup::Unavailable);
 
             // A slow API server times out the same way.
             let delay = Arc::new(std::sync::atomic::AtomicU64::new(1000));
             api.delay_gets(delay.clone());
-            let got = cache_lookups(&kube, names(&["plain"]), Duration::from_millis(100)).await;
+            let got = cache_lookups(
+                &kube,
+                names(&["plain"]),
+                Instant::now() + Duration::from_millis(100),
+            )
+            .await;
             assert_eq!(got["plain"], CacheLookup::Unavailable);
+            delay.store(0, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    /// A review naming two selector caches and a Node issues all three GETs
+    /// at once, so three slow GETs cost one round trip, not three.
+    #[test]
+    fn review_lookups_run_concurrently_under_one_deadline() {
+        use racer_admission::{CacheLookup, NodeLookup};
+        fake::run(|api, kube| async move {
+            let sel = serde_json::json!({"matchLabels": {"pool": "gpu"}});
+            for n in ["a", "b"] {
+                api.put_object(
+                    &format!("{}/{n}", crate::kube::paths::CACHES),
+                    serde_json::json!({"metadata": {"name": n}, "spec": {"nodeSelector": sel}}),
+                );
+            }
+            api.put_object(
+                &crate::kube::paths::node("n1"),
+                serde_json::json!({"metadata": {"name": "n1", "labels": {"pool": "gpu"}}}),
+            );
+            let body = serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "admission.k8s.io/v1",
+                "kind": "AdmissionReview",
+                "request": {
+                    "uid": "u",
+                    "kind": {"group": "", "version": "v1", "kind": "Pod"},
+                    "resource": {"group": "", "version": "v1", "resource": "pods"},
+                    "operation": "CREATE",
+                    "object": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "p", "namespace": "ns", "labels": {
+                            racer_admission::ENABLED_LABEL: racer_admission::ENABLED_VALUE,
+                            racer_admission::CLIENT_SOCKET_LABEL: racer_admission::ENABLED_VALUE,
+                        }, "annotations": {
+                            racer_admission::CACHE_ANNOTATION: "a",
+                            racer_admission::CLIENT_CACHE_ANNOTATION: "b",
+                        }},
+                        "spec": {"nodeName": "n1", "containers": [{"name": "app", "image": "app"}]},
+                    },
+                },
+            }))
+            .unwrap();
+            let review = racer_admission::Review::parse(&body).unwrap();
+            assert_eq!(review.caches(), ["a", "b"]);
+            let delay = Arc::new(std::sync::atomic::AtomicU64::new(400));
+            api.delay_gets(delay.clone());
+
+            // Three 400 ms GETs fit a 700 ms budget only if they overlap.
+            let started = Instant::now();
+            let (caches, node) =
+                review_lookups(&kube, &review, started + Duration::from_millis(700)).await;
+            assert!(started.elapsed() < Duration::from_millis(700));
+            assert_eq!(caches["a"], CacheLookup::Found(Some(sel.clone())));
+            assert_eq!(caches["b"], CacheLookup::Found(Some(sel.clone())));
+            let gpu = [("pool".to_owned(), "gpu".to_owned())].into();
+            assert_eq!(node, Some((NodeLookup::Found(gpu), "n1".to_owned())));
+
+            // Past the shared deadline every lookup is Unavailable, which
+            // admission answers with a retryable 503.
+            let started = Instant::now();
+            let (caches, node) =
+                review_lookups(&kube, &review, started + Duration::from_millis(100)).await;
+            assert!(started.elapsed() < Duration::from_millis(300));
+            assert_eq!(caches["a"], CacheLookup::Unavailable);
+            assert_eq!(caches["b"], CacheLookup::Unavailable);
+            assert_eq!(node, Some((NodeLookup::Unavailable, "n1".to_owned())));
+            let out = review.respond(
+                "img",
+                &racer_admission::Lookups {
+                    cache: &|n| caches[n].clone(),
+                    node: &|_| NodeLookup::Unavailable,
+                },
+            );
+            let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(out["response"]["allowed"], false);
+            assert_eq!(out["response"]["status"]["code"], 503);
             delay.store(0, std::sync::atomic::Ordering::SeqCst);
         });
     }
@@ -1465,7 +1570,7 @@ mod tests {
                 &crate::kube::paths::node("n1"),
                 serde_json::json!({"metadata": {"name": "n1", "labels": {"pool": "gpu"}}}),
             );
-            let t = Duration::from_secs(2);
+            let t = Instant::now() + Duration::from_secs(2);
             assert_eq!(
                 node_lookup(&kube, "n1", t).await,
                 NodeLookup::Found([("pool".to_owned(), "gpu".to_owned())].into())
@@ -1476,7 +1581,7 @@ mod tests {
             let delay = Arc::new(std::sync::atomic::AtomicU64::new(1000));
             api.delay_gets(delay.clone());
             assert_eq!(
-                node_lookup(&kube, "n1", Duration::from_millis(100)).await,
+                node_lookup(&kube, "n1", Instant::now() + Duration::from_millis(100)).await,
                 NodeLookup::Unavailable
             );
             delay.store(0, std::sync::atomic::Ordering::SeqCst);
