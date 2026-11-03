@@ -186,33 +186,38 @@ sequenceDiagram
   D->>D: install lock, binary activation lock, MarkInProgress
   D->>D: hook agent.upgrade.before
   D->>AB: download, verify sha256, install into the inactive blue or green binary
-  D->>AB: stage the plugin set beside it, from the plugin manifest or a copy of the running set
+  D->>AB: stage the distribution beside it, from a distribution manifest or a copy of the running one
   AB->>AB: candidate's version must say agent: v2
   AB->>AB: switch current link, keep last-good
   D->>D: write upgrade signal
   D->>SD: restart the daemon unit
-  SD->>N: start, Type=notify
-  N->>SD: READY=1 once its local checks pass and it can read its Machine
+  SD->>N: start; the unit waits for the readiness file
+  N->>SD: create the readiness file once its local checks pass and it can read its Machine
   N->>N: publish Complete from the signal, hook agent.upgrade.after
   SD-->>SD: if starts keep failing or timing out, the recovery unit restores last-good, whose daemon publishes Failed and fires agent.upgrade.after
 ```
 
 This is v1's mechanism
 (`cmd/agent/internal/daemon/controller_machineoperation.go:110-196`,
-`pkg/agent/agentbinary/upgrade.go:193-273`) with these additions:
+`pkg/agent/agentbinary/upgrade.go:193-273`) with these additions. Under an
+image agent runtime the steps are the same with an image in place of the
+binary: the candidate is pulled by digest through the agent runtime, the distribution comes from the image, and the
+selection file takes the place of the `current` and `last-good` links
+([agent runtime, section 7](12-agent-runtime.md#7-agentupgrade-by-image)).
 
 - **The operation completes only when the new daemon is ready.** The daemon
-  unit is `Type=notify`. After an AgentUpgrade, the new daemon sends `READY=1`
-  only when its local checks pass and it has registered or read its own Machine
-  with one authenticated API call, which proves it can reach the API
-  ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). It does not wait for its caches, so the size of the
-  cluster does not decide whether an upgrade succeeds. The old daemon therefore restarts the
-  unit through systemd, so that the new daemon's start is held to the start
-  timeout, rather than running the new binary in the same process as v1 does
-  (`cmd/agent/internal/cmd/daemon.go:50-59`). v1 has no such check on this
-  path: the new daemon reports the operation `Complete` as soon as it has
-  registered the Machine (`cmd/agent/internal/daemon/daemon.go:166-172`). Only
-  v1's host-driven activation waits, for a process that stays up for 3 seconds
+  unit waits for the readiness file ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). After an
+  AgentUpgrade, the new daemon creates it only when its local checks pass and
+  it has registered or read its own Machine with one authenticated API call,
+  which proves it can reach the API. It does not wait for its caches, so the
+  size of the cluster does not decide whether an upgrade succeeds. The old
+  daemon therefore restarts the unit through systemd, so that the new daemon's
+  start is held to the start timeout, rather than running the new binary in
+  the same process as v1 does (`cmd/agent/internal/cmd/daemon.go:50-59`). v1
+  has no such check on this path: the new daemon reports the operation
+  `Complete` as soon as it has registered the Machine
+  (`cmd/agent/internal/daemon/daemon.go:166-172`). Only v1's host-driven
+  activation waits, for a process that stays up for 3 seconds
   (`cmd/agent/internal/daemon/hostupgrade.go:23-26,110-146`).
 - **A daemon that never becomes ready is rolled back like one that crashes.**
   The unit sets `TimeoutStartSec=90s`, `RestartSec=10s`, `StartLimitBurst=3` and
@@ -229,44 +234,35 @@ This is v1's mechanism
   release, is rejected before the switch. On a host migrated from v1, the way
   back to v1 is `migrate --rollback` on the host, while the rollback window is
   open ([migrating from v1, section 8](10-migration-from-v1.md#8-rollback)).
-- **Plugins move with the binary.** The optional parameters
-  `pluginManifestURL` and `pluginManifestSHA256` name a plugin manifest:
-
-  ```json
-  {
-    "apiVersion": "plugin.agent.unbounded-cloud.io/v1alpha1",
-    "kind": "PluginManifest",
-    "plugins": [
-      { "name": "aks", "url": "https://example.com/aks-flex-node-plugin", "sha256": "4b1e...07" }
-    ]
-  }
-  ```
-
-  The old daemon downloads the manifest and every plugin in it, verifies each
-  against its SHA-256, and stages them in the plugin set beside the inactive
-  binary ([extensions, section 3](02-extensions.md#3-plugin-protocol)). Without a manifest, it copies the running set
-  there. The manifest must name exactly the plugins the configuration declares;
-  one that adds or drops a plugin is rejected before the switch, because which
-  plugins exist, and what they may do, are install-time settings. Switching
-  `current` then activates binary and plugins together, and the recovery unit
-  restoring `last-good` rolls both back. The new daemon checks every plugin
-  with `describe` before it reports ready, so a plugin that does not fit
-  the new binary is rolled back with it.
+- **The distribution moves with the binary.** The optional parameters
+  `distributionManifestURL` and `distributionManifestSHA256` name a
+  distribution manifest ([extensions, section 2.1](02-extensions.md#21-distributions)). The old daemon
+  downloads the manifest and every plugin and extension artifact in it,
+  verifies each against its SHA-256, and stages them beside the inactive
+  binary. Without a manifest, it copies the running distribution there. A
+  manifest that adds or drops a plugin or an extension, or widens what one may
+  do, is rejected before the switch. Switching `current` then activates binary
+  and distribution together, and the recovery unit restoring `last-good` rolls
+  both back. The new daemon checks every plugin with `describe` before it
+  reports ready, so a plugin that does not fit the new binary is rolled back
+  with it. Extension content takes effect at the next provision, so an upgrade
+  changes nothing else on the host.
 - **On a v1 host, upgrading to the v2 build migrates the host.** v1's daemon
   installs it as any candidate, and v2's daemon migrates the host when it
   first starts ([migrating from v1, section 2.1](10-migration-from-v1.md#21-how-a-host-migrates)).
 
-The hidden `agent-upgrade` command is the other way in. Host delivery automation
-runs it on the host, from a separately staged candidate binary, without a
+The hidden `agent-upgrade` command is the other way in. Automation for the
+`host` agent runtime runs it on the host, from a separately staged candidate binary, without a
 MachineOperation, as v1's hidden `agent-upgrade` command is run
 (`cmd/agent/internal/cmd/agentupgrade.go:63-70`). It uses the same activation:
 install into the inactive blue or green binary, switch the `current` link,
 restart the daemon unit and wait for it to report ready, rolling back if it does
 not (`pkg/agent/agentbinary/activation.go:83-246`). The `agent.upgrade.before`
 and `agent.upgrade.after` events fire on this path too, and
-`--plugin-manifest` with `--plugin-manifest-sha256` stage a new plugin set as
-the parameters do. Like an AgentUpgrade, it never installs a binary whose
-daemon is not v2's.
+`--distribution-manifest` with `--distribution-manifest-sha256` stage a new
+distribution as the parameters do. Under an image agent runtime it takes an
+image instead ([agent runtime, section 7](12-agent-runtime.md#7-agentupgrade-by-image)). Like an AgentUpgrade, it never
+installs an agent whose daemon is not v2's.
 
 ## 6. Reset
 
@@ -277,7 +273,7 @@ with `delete: true`.
 sequenceDiagram
   participant T as trigger
   participant St as state
-  participant Px as hooks
+  participant Px as hooks and status
   participant RT as NodeRuntime
   participant HN as hostnet
   participant HP as hostprep
@@ -289,10 +285,11 @@ sequenceDiagram
   T->>Px: hook node.stop.after, if a node was running
   T->>HN: host network reset, teardown scope
   T->>HP: replay the undo log
-  T->>St: remove node state, artifact cache, slots, any migration backup and /etc/unbounded/agent-v2
-  T->>T: remove the agent binary directory, /opt/unbounded/agent
+  T->>St: remove node state, artifact cache, slots and any migration backup
   T->>Px: hook agent.reset.after
-  T->>St: remove the install record
+  T->>Px: operation or goal only, report the result
+  T->>St: remove the install record and /etc/unbounded/agent-v2
+  T->>T: remove the agent directory, /opt/unbounded/agent, with the plugin store, and the plugins' state
   T->>T: operation or goal only, stop and remove the daemon unit last
 ```
 
@@ -301,6 +298,17 @@ so it cannot act during the reset (`cmd/agent/internal/daemon/reset.go:29-31`).
 When the daemon itself runs the reset, for an `AgentReset` operation or a goal
 with `delete: true`, it stops its own unit last, after it has reported the
 result.
+
+Under the `host` agent runtime the plugins live in the plugin store under
+`/opt/unbounded/agent`; under an image agent runtime they are in the image, and only
+their state is on the host ([agent runtime, section 6](12-agent-runtime.md#6-plugins)). The daemon's credentials are
+under `/etc/unbounded/agent-v2`. All of these are removed only after the last
+thing that needs them: `agent.reset.after` runs plugins, and
+reporting the result can need a plugin status reporter or the daemon's
+credentials, which can come from a plugin too
+([extensions, section 3](02-extensions.md#3-plugin-protocol)). Under an image agent runtime the same step also removes the
+agent's units and every image but the install image
+([agent runtime, section 8](12-agent-runtime.md#8-bootstrap-and-reset)).
 
 The agent binary directory is removed because v1 cannot be installed alongside
 v2 ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)), so nothing else uses it. v1's reset removes it the same way

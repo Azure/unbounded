@@ -134,8 +134,8 @@ sequenceDiagram
   D2->>H: phase Committing, run the commit (section 6.2)
   D2->>H: phase Committed
   D2->>SD: restart the daemon unit, which is now v2's
-  SD->>D2: start, Type=notify
-  D2->>SD: READY=1, once its local checks pass and its Machine is reachable
+  SD->>D2: start; the unit waits for the readiness file
+  D2->>SD: readiness file, once its local checks pass and its Machine is reachable
   D2->>MO: Complete
 ```
 
@@ -204,10 +204,10 @@ names ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-hos
 
 | Item | v1 | After the migration |
 |---|---|---|
-| The running node | The `kube1` or `kube2` machine, its rootfs and its state | Unchanged. `kube1` becomes slot `a`, `kube2` slot `b`. |
+| The running node | The `kube1` or `kube2` machine, its rootfs and its state | Unchanged. `kube1` becomes slot `a`, `kube2` slot `b`. The root file system stays as v1 unpacked it. v2's unpack, which differs from v1's ([v1 compatibility, section 2](08-v1-compatibility.md#2-behavior-changes-from-v1)), first runs at v2's first repave, which also closes the rollback window (section 8), so v1 never runs a machine that v2 unpacked. |
 | Machine and Node objects | | Unchanged |
 | Agent binary | `/opt/unbounded/agent/bin/unbounded-agent*` | The layout is shared. `last-good` names a v2 binary from the commit on, and the v1 binary that ran before the migration is kept in the backup. |
-| Daemon units | `unbounded-agent-daemon.service` and `unbounded-agent-daemon-recovery.service` (`pkg/agent/goalstates/constants.go:24,27`) | Same names, replaced by v2's at the commit. v2's daemon unit runs `<current> daemon`, as v1's does, and is `Type=notify` ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). |
+| Daemon units | `unbounded-agent-daemon.service` and `unbounded-agent-daemon-recovery.service` (`pkg/agent/goalstates/constants.go:24,27`) | Same names, replaced by v2's at the commit. v2's daemon unit runs `<current> daemon`, as v1's does, and waits for the readiness file ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). |
 | Install record | `/var/lib/unbounded/agent/install-state.json` (`cmd/agent/internal/installstate/store.go:21,85`) | `/var/lib/unbounded/agent-v2/install.json` |
 | Configuration | `/etc/unbounded/agent/`, including `kube{1,2}-applied-config.json` (`pkg/agent/goalstates/constants.go:17,97-101`) | `/etc/unbounded/agent-v2/config.json`, node state and the slot's saved bundle manifest |
 | Daemon credentials | `/etc/unbounded/agent/daemon-controller` (`cmd/agent/internal/daemon/daemon.go:108-110`) | Copied to `/etc/unbounded/agent-v2/`, then rotated as usual |
@@ -354,8 +354,20 @@ when it rolls back or adopts a machine. v1 never needs to, because v1 never
 runs on a host that v2 has changed (section 2). v2 reads the record before it
 does anything else:
 
-- **`Preparing`, `Prepared` or `Committing`:** the daemon continues the
-  migration, or, for a machine another consumer built, the migrate unit does.
+- **`Committing`:** the daemon continues the commit, or, for a machine another
+  consumer built, the migrate unit does. A commit never goes back.
+- **`Preparing` or `Prepared`:** the record is continued only if it still
+  describes the host. It records what it was prepared from: the operation
+  that started it, v1's install ID, the running machine and the digest of that
+  machine's applied config. If the record names an operation and v1's upgrade
+  signal names another one or none, or any of the others differ, the daemon
+  removes v2's staged files and the record and starts again from the checks
+  (section 5). This happens when
+  v2's daemon crash-loops before the commit: v1's recovery unit then restores
+  `last-good`, which is still the v1 binary, and records the failure in v1's
+  signal (`unbounded-agent-daemon-recovery.sh:19-26`), so v1 runs again
+  without anything writing `Abandoned`. v1 may repave before the next attempt,
+  after which a record prepared from `kube1` would describe the wrong machine.
 - **`Restoring`:** the migrate unit finishes the rollback. v2's daemon, if it
   starts first, starts the migrate unit and stands down with the deferred exit
   code, so only one process changes the host (section 8).
@@ -363,6 +375,14 @@ does anything else:
   started the migration:** the daemon does not migrate again. It finishes
   returning to v1 as in section 2.1. A signal that names another operation is
   handled as v1 handles it (`controller_machineoperation.go:257-297`).
+
+v1's recovery script calls `record-agent-upgrade-failure-signal` through
+`last-good`, which names the v2 binary from commit step 2, while v1's recovery
+unit is still installed until step 4. In the v2 build that command therefore
+writes the failure into the migration record while the record is in
+`Committing` or `Committed` and its operation has not been published, so v2's
+daemon reports it once the commit finishes; at any other time it writes v2's
+own upgrade signal.
 
 What a host reboot does in each phase:
 
@@ -415,6 +435,30 @@ release, inside the
 window or after it, before it switches anything ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). A
 rollback returns the host to exactly the state it had before the migration, so
 it never needs a binary from anywhere else.
+
+Starting `migrate --rollback` from the cluster was considered in two forms and
+rejected:
+
+- **An AgentUpgrade parameter** that has v2's daemon start the migrate unit.
+  v1 would publish the result from its upgrade signal, as it does for any
+  pending upgrade (`controller_machineoperation.go:277-285`).
+- **A new `AgentDowngrade` operation kind.** `OperationKind` is a closed enum
+  in the CRD (`api/machina/v1alpha3/machineoperation_types.go:54`), so this is
+  an API change. Agents and controllers that do not know it ignore it
+  (`pkg/agent/daemon/machineoperation.go:116`), so it would stay `Pending` on
+  every host that cannot run it. Between v2 releases it adds nothing, because
+  an AgentUpgrade to an earlier v2 release already goes back.
+
+Rolling forward covers the cases a cluster-started rollback would: a v2 daemon
+that runs but misbehaves takes an AgentUpgrade to a fixed v2 build, even in
+limited mode ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). A v2 daemon that cannot run
+could not receive an operation anyway, and is recovered on the host with
+`agent-upgrade` to a fixed build or `migrate --rollback`. What is left is a v2
+problem with no fixed build yet, during the experimental releases, where early
+migration is opt-in, or after the cutover, when v1 is no longer supported.
+
+`status --output json` shows whether the rollback window is still open, so an
+operator can see it before an unrelated repave closes it.
 
 ```mermaid
 sequenceDiagram
@@ -479,41 +523,116 @@ the way back open holds off on repaves.
 Other consumers, such as AKS Flex Node, build the same nspawn machines from
 `pkg/agent`, but with their own daemon, paths and configuration
 ([overview, section 1.3](README.md#13-how-aks-flex-node-consumes-v1-today)). They migrate with the v2 build's
-`migrate --adopt-machine --config <file>`, which runs in
-`unbounded-agent-migrate.service`. Converting AKS Flex Node hosts to the v2
-binary needs it, so it is part of the first implementation:
+`migrate --adopt-machine --config <file> --previous-agent <file>`, which runs
+in `unbounded-agent-migrate.service`. Converting AKS Flex Node hosts to v2
+needs it, so it is part of the first implementation.
 
-- The caller supplies the v2 configuration, including its plugins, hooks and
-  extensions, and its daemon credentials.
-- The caller stops and removes its own agent before running the command, and
-  restores it if the command rolls back.
-- The checks are reduced to the machine: exactly one `kube1` or `kube2` machine
-  is running and enabled, and no v1 or v2 install is present. Before the
-  commit, every configured plugin must also answer `describe` (section 6.2).
-- The phases and machine-level steps are the same as for v1: the bundle
-  manifest, node state, boot wiring and daemon. The backup holds only the
-  machine's override, which the commit replaces, and a rollback restores only
-  that. v2's undo log records only what v2 changes from then on.
-- Host preparation is brought up to v2's, which is the same for every
-  consumer. AKS Flex Node's copy of unbounded's host steps has missed some of
-  them (Azure/AKSFlexNode#423), so an adopted Flex host gains Docker's
-  `iptables: false` and has its own containerd and kubelet masked. The checks
-  before the commit list each host service that will be masked, as warnings
-  that name any that are running. The commit applies the steps and records
-  them in the undo log, so `reset` reverses them.
-- The goal version starts empty, as after a bootstrap, and is recorded on the
-  daemon's first check whose settings match
+### 9.1 The previous-agent descriptor
+
+v2 cannot know another consumer's units and files, so the consumer describes
+its agent, and v2 carries out the whole handoff, as it does for v1:
+
+```json
+{
+  "apiVersion": "agent.unbounded-cloud.io/v1alpha1",
+  "kind": "PreviousAgent",
+  "name": "aks-flex-node",
+  "units": ["aks-flex-node-agent.service", "aks-flex-node-agent-recovery.service"],
+  "replacedUnits": ["static-routes.service", "check-route-overlap.service"],
+  "files": ["/etc/systemd/system/systemd-nspawn@kube1.service.d/aks-flex-node-dependencies.conf"],
+  "operation": { "name": "upgrade-to-v2-m-01" },
+  "handBack": ["/opt/unbounded/agent/lib/aks-flex-node/aks-flex-node-last-good", "recover-agent-upgrade"]
+}
+```
+
+- `units` are stopped, disabled and backed up at the commit, and restored and
+  started again by an abandonment or a rollback.
+- `replacedUnits` are the previous agent's host units that one of the
+  configuration's extensions replaces under the same name, such as Flex's
+  static routes. They are backed up and removed at the commit, and the
+  extension check that refuses a host unit the agent did not create
+  ([extensions, section 2](02-extensions.md#2-declarative-extensions)) does not apply to them.
+- `files` are backed up and removed at the commit, and restored by a rollback.
+- `operation` is the previous agent's upgrade operation that installed the
+  bridge, if any. v2's daemon reports it once the commit finishes.
+- `handBack` is a command of the previous agent that an abandonment or a
+  rollback runs last, after restoring its units, so the previous agent can
+  return to its own last-good version and report the operation itself, as AKS
+  Flex Node's recovery does (`pkg/daemon/agent_upgrade.go:411-436` at Flex
+  `2c149e991`).
+
+### 9.2 Starting it: a bridge
+
+A consumer starts the migration through its own upgrade mechanism, so it can
+be started from the cluster, as requirement 3 asks. Its release installs a
+*bridge*: its own program, run by its own daemon unit in place of its agent,
+that writes the v2 configuration and the descriptor, installs the v2 agent,
+and starts `unbounded-agent-migrate.service`. v2 is the same in every case;
+only the bridge is the consumer's. For AKS Flex Node:
+
+| Flex install | How the bridge is delivered | What its unit runs |
+|---|---|---|
+| On the host, `main` | A Flex AgentUpgrade to an archive whose single member is `aks-flex-node-linux-<arch>` (`pkg/config/artifacts.go:10-20` at Flex `2c149e991`) | `aks-flex-node agent --config /etc/aks-flex-node/config.json` (`pkg/daemon/assets/aks-flex-node-agent.service`) |
+| In containers on ACL, Azure/AKSFlexNode#370 | A Flex AgentUpgrade to Flex's v2 image, built from the agent image, which also carries `aks-flex-node` and the `flex-agent-entrypoint` its old unit starts | `aks-flex-node flex-agent-entrypoint aks-flex-node agent --config ...` in the new image (`pkg/daemon/assets/aks-flex-node-agent-container.service:51-63` at #370 `c039f55`); the host keeps the `containerd` agent runtime |
+
+AKS Flex Node's plugin binary can serve as the bridge, the plugin and kubelet's
+exec credential, as `aks-flex-node` serves several roles today.
+
+On Azure Container Linux the bridge should configure the `containerd` agent
+runtime, even for a Flex host install: under the `host` agent runtime, ACL's
+SELinux policy keeps the agent from clearing its daemon unit's start limit
+after a failed upgrade, and under `containerd` it does not (validation task V12,
+[agent runtime, section 10](12-agent-runtime.md#10-host-requirements)).
+
+### 9.3 What the adoption checks and does
+
+- **The checks are reduced to the machine:** exactly one `kube1` or `kube2`
+  machine is running and enabled, and no v1 or v2 install is present. Before
+  the commit, every configured plugin must also answer `describe` (section
+  6.2).
+- **The configuration must describe the running node.** Its goal settings
+  become the applied settings, so they must be what the machine was built
+  from, not what the consumer was first configured with. AKS Flex Node records
+  only the applied Kubernetes version (`pkg/daemon/state.go:28-34` at Flex
+  `2c149e991`), and a repave changes the version in memory only
+  (`pkg/daemon/nodeoperator.go:147-155`), so its bridge takes the version from
+  `daemon-state.json`, not from `config.json`. Before the commit, the adoption
+  runs the machine's `kubelet --version` and refuses a version other than the
+  configuration's. Other differences between the rendered bundle and the
+  machine's files are reported as warnings, as for v1 (section 7).
+- **The phases and machine-level steps are the same as for v1:** the bundle
+  manifest, node state, boot wiring and daemon. The backup holds the machine's
+  override, which the commit replaces, and what the descriptor names. A
+  rollback restores those and runs `handBack`. v2's undo log records only what
+  v2 changes from then on.
+- **Host preparation is brought up to v2's,** which is the same for every
+  consumer. AKS Flex Node's copy of unbounded's host steps leaves some of them
+  out (Azure/AKSFlexNode#423), so an adopted Flex host gains Docker's
+  `iptables: false` and has the host's kubelet masked. The host's containerd is
+  left running, as on every v2 host
+  ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)), which matters on ACL, where it holds Arc's
+  agent image and, for a container install, runs the agent. The checks before the commit
+  list each host service that will be masked, as warnings that name any that
+  are running. The commit applies the steps and records them in the undo log,
+  so `reset` reverses them.
+- **The goal version starts empty,** as after a bootstrap, and is recorded on
+  the daemon's first check whose settings match
   ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)).
 
-## 10. Moving to the `host` runtime
+## 10. Changing the node runtime or the agent runtime
 
-The runtime is an install-time setting, chosen by the Machine's
-`spec.agent.runtime` ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)). A migrated host moves
-to the `host` runtime the same way any host changes runtime: set the field to
-`host`, then reinstall the host, either with a HostReplace or with `reset`
-followed by `start` with the configuration provisioning generates. Until
-then the Machine shows `RuntimeChangePending=True`. The Node registers again
-under the same name, and its pods are rescheduled, as in a repave.
+The node runtime and the agent runtime are install-time settings, chosen by
+the Machine's `spec.agent.nodeRuntime` and `spec.agent.agentRuntime`
+([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-node-runtime)). A migrated host moves to the `host` node
+runtime, or to an image agent runtime, the same way any host changes them: set the field, then
+reinstall the host, either with a HostReplace or with `reset` followed by
+`start` with the configuration provisioning generates. Until then the Machine
+shows `ReinstallPending=True`. The Node registers again under the same name,
+and its pods are rescheduled, as in a repave.
+
+The `host` runtime is not supported on Azure Container Linux
+([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)), so an ACL host stays on `nspawn-container`.
+Moving it to the `containerd` agent runtime works as above.
 
 ## 11. Changes outside `internal/agentv2`
 

@@ -64,17 +64,25 @@ Built-in providers:
   drift: it is an nspawn root filesystem image, which means nothing without
   nspawn, and the API requires one in every version
   (`api/machina/v1alpha3/machineconfiguration_types.go:137-140`). Counting it
-  as drift would repave, and wipe, a `host` node for nothing. The template's
+  as drift would repave a `host` node, with new, empty state, for nothing. The template's
   LocalDNS settings still apply.
 - `static`: the goal settings in the agent's copy of the configuration file,
   `/etc/unbounded/agent-v2/config.json`, are the goal; the version is their
   digest. The daemon watches the file. An operator changes the goal by editing
   its goal settings. Edits to install-time settings are ignored and logged as a
   warning ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).
-- `plugin`: delegates to a plugin ([extensions, section 3](02-extensions.md#3-plugin-protocol)). The daemon calls `goal.get` on
-  every Node event and every `control.goal.pollInterval`, which defaults to 10
-  minutes with up to 10% random jitter. The interval applies only to this
-  source.
+- `plugin`: delegates to a plugin ([extensions, section 3](02-extensions.md#3-plugin-protocol)). The daemon calls `goal.get`
+  every `control.goal.pollInterval`, which defaults to 10 minutes with up to
+  10% random jitter, and when its Node changes in a way the goal can depend on:
+  the Node is created or deleted, its UID changes, its taints or labels
+  change, or its `Ready` condition changes. Node changes that only update
+  status, such as heartbeats, image lists and resource usage, do not trigger a
+  call. Calls are at least 30 seconds apart; a trigger inside that interval
+  is coalesced into one call at its end. AKS Flex Node reads the ARM Machine on
+  every event for its Node (`pkg/daemon/repave_reconciler.go:131-142` at Flex
+  `2c149e991`), but in-process, with cached credentials; a v2 plugin call is a
+  new process each time ([extensions, section 3](02-extensions.md#3-plugin-protocol)), so v2 does not
+  call on every event. The interval applies only to this source.
 
 Bootstrap does not ask the goal source for a goal. It builds the first node
 from the configuration file and records an empty goal version. The daemon
@@ -92,15 +100,15 @@ machina owns that field and branches on it, and a Machine in `Pending`,
 
 | Machine field | Written | As in v1 |
 |---|---|---|
-| `AgentBootstrapped` condition | During bootstrap: `Running`, then `Succeeded`, or a failure reason. v2 adds two reasons: `NodeStartFailed` when the `host` runtime cannot start the node, where v1's `NSpawnFailed` would be misleading, and `RuntimeUnsupported` when the host fails a capability probe for the requested runtime ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)). | Yes, plus the two reasons (`cmd/agent/internal/cmd/bootstrap.go:260-272`, `cmd/agent/internal/daemon/bootstrap_status.go:85-112`) |
+| `AgentBootstrapped` condition | During bootstrap: `Running`, then `Succeeded`, or a failure reason. v2 adds two reasons: `NodeStartFailed` when the `host` runtime cannot start the node, where v1's `NSpawnFailed` would be misleading, and `RuntimeUnsupported` when the host fails a capability probe for the requested node runtime or agent runtime ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities), [agent runtime, section 10](12-agent-runtime.md#10-host-requirements)). | Yes, plus the two reasons (`cmd/agent/internal/cmd/bootstrap.go:260-272`, `cmd/agent/internal/daemon/bootstrap_status.go:85-112`) |
 | `RepavePending` condition and `status.configuration` | Whenever the daemon records a goal version: after a repave, and on any check whose goal settings match the applied ones (section 5) | The same fields and values (`controller_node.go:54-68,116-133`). v1 writes them only when it handles a Node deletion, so v2 can write them earlier, but only when nothing needs to change. |
 | `status.observedProvisioningFormat` | When the daemon starts and registers the Machine | Yes (`cmd/agent/internal/daemon/daemon.go:327,340,350`) |
-| `AgentHealthy` condition | `True` with reason `Healthy` while the daemon works normally; `False` with reason `NodeNotRegistered`, `RepaveFailed`, `StateMismatch`, `StateCorrupt` or `PackageOwnedNodePath`, with the attempt count and last error in the message where they apply | New |
-| `RuntimeChangePending` condition | `True` when `spec.agent.runtime` differs from the runtime installed on the host, until a reinstall applies it ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)) | New |
-| `status.agent.runtime` | The runtime installed on the host, when the daemon starts | New |
+| `AgentHealthy` condition | `True` with reason `Healthy` while the daemon works normally; `False` with reason `NodeNotRegistered`, `RepaveFailed`, `StateMismatch` or `StateCorrupt`, with the attempt count and last error in the message where they apply | New |
+| `ReinstallPending` condition | `True` with reason `NodeRuntimeChanged` when `spec.agent.nodeRuntime` differs from the node runtime installed on the host, or `AgentRuntimeChanged` when `spec.agent.agentRuntime` differs from the agent runtime installed, until a reinstall applies it ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)) | New |
+| `status.agent.nodeRuntime` and `status.agent.agentRuntime` | The node runtime and agent runtime installed on the host, when the daemon starts | New |
 
-A requested runtime change is not a health problem, which is why it has its own
-condition rather than a reason on `AgentHealthy`. The daemon can already update
+A requested node runtime or agent runtime change is not a health problem, which is why
+it has its own condition rather than a reason on `AgentHealthy`. The daemon can already update
 Machine status (`deploy/machina/07-bootstrapper-rbac.yaml.tmpl:17-19`), so none
 of this needs new permissions. The phases the status reporter receives
 ([extensions, section 3](02-extensions.md#3-plugin-protocol)), such as `Pending`, are not written to the Machine, so
@@ -223,15 +231,29 @@ record, not here.
 ### State files
 
 The rules for every v2 state file: the install record, node state, the host
-preparation undo log, the host runtime's ownership and active-slot records,
+preparation undo log, the host runtime's installed record,
 saved bundle manifests, and the migration record on a host migrated from v1.
 
-- Each file has a `schemaVersion`, is written and synced to disk before it is
-  used, and has a `.sha256` sidecar.
+- Each file has a `schemaVersion` and carries the SHA-256 of its own payload
+  inside it, in one JSON document: `{"schemaVersion": 1, "sha256": "...",
+  "payload": {...}}`. It is written to a temporary file in the same
+  directory, synced, renamed over the old file, and the directory synced,
+  before it is used. A crash therefore leaves the old file or the new one,
+  never a mix. A separate `.sha256` file, as AKS Flex Node uses
+  (`pkg/daemon/state.go:140-143` at Flex `2c149e991`), cannot be replaced in
+  the same step as its data file. A crash between the two writes would leave
+  a mismatch on a host that is healthy, which here would mean `StateCorrupt`
+  and limited mode.
 - New fields are only ever added, never renamed or removed, and older readers
   ignore fields they don't know. An upgrade can roll back to the `last-good`
   binary ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)), which must still be able to read what the newer binary
   wrote.
+- A field added to anything the install check fingerprints must be absent at
+  its default, so records written before it existed keep the same
+  fingerprint, as v1 requires (`cmd/agent/internal/installstate/store.go:172-185`).
+  Otherwise every installed host would read as a different installation after
+  an upgrade, and `start` would ask for a reset. Fixture tests with literal
+  fingerprints enforce it.
 - If a file has an unknown `schemaVersion` or fails its checksum, the daemon
   makes no changes, reports `StateCorrupt` and runs in limited mode (section 5).
   `reset` still runs, using the conservative paths described in
@@ -265,8 +287,17 @@ flowchart TD
   D -- Steady --> S["status.report Ready, or Provisioning while the Node does not exist"]
 ```
 
-The daemon reports ready to systemd, with `READY=1` (the daemon unit is
-`Type=notify`), once its local checks pass: its state files are readable,
+The daemon reports ready by creating the readiness file,
+`/run/unbounded-agent/ready`. Its unit is `Type=exec`; it removes the file
+before each start and waits for it in `ExecStartPost=`, which the unit's start
+timeout also bounds, so a daemon that never becomes ready fails its start like
+one that crashes. This is the same under every agent runtime. The agent never
+uses systemd's readiness notification, `Type=notify` and `sd_notify`: under the
+`containerd` agent runtime it cannot work, because the daemon runs in a scope of its own and
+systemd accepts notifications only from the unit's control group, and
+validation task V9 showed the unit's start timing out
+([agent runtime, section 3.1](12-agent-runtime.md#31-readiness)). One mechanism serves every agent runtime. The daemon creates the
+file once its local checks pass: its state files are readable,
 `Recover` has compared the host with the state (section 4), and every
 configured plugin has answered `describe` with the methods the configuration
 uses, the calls made in parallel ([extensions, section 3](02-extensions.md#3-plugin-protocol)). Right after an AgentUpgrade,

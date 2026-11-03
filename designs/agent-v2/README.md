@@ -26,10 +26,11 @@ The design is split into the documents below. Read this README first.
 | [09. Implementation](09-implementation.md) | Package layout, export policy, risks, and the exit criteria for the first official v2 release | Implementers, release owners |
 | [10. Migrating from v1](10-migration-from-v1.md) | How a v1 host, or a host built by another `pkg/agent` consumer, moves to v2 without replacing its node, and the cutover at the first official v2 release | v1 maintainers, AKS Flex Node maintainers, operators |
 | [11. Testing](11-testing.md) | Unit and golden tests, running the v1 end-to-end suites on v2, the migration suite, checking reset with a host snapshot, CI and validation tasks | Everyone |
+| [12. Agent runtime](12-agent-runtime.md) | How the agent itself is delivered and runs: as a host binary, or as an OCI image run by containerd or systemd-nspawn; how an image agent runtime reaches the host; adding an agent runtime; AgentUpgrade by image | Consumers, and host and OS reviewers |
 
 Please focus review comments on the external contract in documents 01 and 02,
 the interfaces in documents 03 and 04, document 07, the migration path in
-document 10, and the testing plan in document 11.
+document 10, the testing plan in document 11, and agent runtimes in document 12.
 
 Documents 01 and 02, and section 1 of document 06, are what a consumer builds
 against. Everything in them is versioned and experimental until the
@@ -59,6 +60,12 @@ We also want to change how downstream projects consume the agent. AKS Flex
 Node currently imports `pkg/agent` and builds its own agent from the pieces.
 The goal is for consumers to use the agent *binary*, customizing it through
 well-defined hook points.
+
+The agent itself reaches a host through an *agent runtime*: as a binary
+installed on the host, or as an OCI image that the host's containerd runs, as
+on Azure Container Linux, or that systemd-nspawn runs, as on a container
+operating system without containerd ([agent runtime](12-agent-runtime.md)). Where the node runs is a
+separate choice, the *node runtime*.
 
 This design proposes v2: a new implementation, shipped as a second build of
 each release and marked experimental until it replaces v1.
@@ -122,17 +129,41 @@ Several patterns in Flex point to missing extension points:
 - It copies unbounded's list of host tasks so it can add its own
   (`pkg/daemon/start.go`), so new unbounded host tasks are silently missed. It
   has already missed the Docker, containerd and kubelet steps unbounded added
-  in #563 (Azure/AKSFlexNode#423).
+  in #563 (Azure/AKSFlexNode#423). Its preflight still runs unbounded's
+  `containerd-active` and `kubelet-active` checks, which warn that bootstrap
+  will disable those services, although Flex never does.
 - It re-composes the node start sequence in three places (`pkg/daemon/start.go`,
   `pkg/daemon/nodeoperator.go`).
 - It writes content directly into the machine directory after provisioning
-  (`pkg/daemon/install.go`, `pkg/npd/download.go`).
+  (`pkg/daemon/install.go`, `pkg/npd/download.go`). It downloads Node Problem
+  Detector at every node start, at the version its configuration names, so a
+  Flex release can change it without a reinstall (`pkg/daemon/start.go:53-55`).
 - Its `scripts/uninstall.sh` hardcodes unbounded unit and path names.
 - It copies an unexported marker name from unbounded's `internal/hostroot`
   (`pkg/daemon/hostroot_move.go`).
 
+Other facts about Flex that this design relies on:
+
+- Its daemon never writes to the ARM Machine; status updates are logged and
+  skipped (`pkg/aksmachine/client_armapi.go:126-130`). The goal version is the
+  Machine's `properties.eTag`.
+- It reads the ARM Machine on every event for its own Node and every
+  `machineReconcileInterval`, 10 minutes by default
+  (`pkg/daemon/repave_reconciler.go:131-157`).
+- It records only the applied settings version, the applied Kubernetes version
+  and the active machine (`pkg/daemon/state.go:28-34`). A repave changes the
+  Kubernetes version in memory only (`pkg/daemon/nodeoperator.go:147-155`), so
+  after a repave `config.json` no longer describes the running node.
+
 Flex needs about a dozen customization points. It does not need the whole
 library.
+
+Azure/AKSFlexNode#370 adds a second way to run the Flex agent on Azure
+Container Linux: in privileged containers of the agent's image, run by the
+host's containerd, with nothing of the agent installed on the host, and
+upgraded by image (`hack/acl-container/DESIGN.md:20-22` at `c039f55`). v2's
+`containerd` agent runtime takes over that model ([agent runtime](12-agent-runtime.md)), and a Flex host
+running that way migrates as in [migrating from v1, section 9](10-migration-from-v1.md#9-hosts-built-by-other-pkgagent-consumers).
 
 ### 1.4 Terms
 
@@ -140,28 +171,33 @@ library.
 |---|---|
 | Host | The machine the agent runs on: a virtual machine or a bare-metal server. |
 | Node | The Kubernetes worker: kubelet, containerd, LocalDNS and the pods they run. In v1 it always runs in an nspawn container on the host. |
-| Runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). [Node runtime, section 1](03-node-runtime.md#1-node-runtime) defines the interface. A Machine chooses it with `spec.agent.runtime` ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)). |
-| Slot | One of two places, `a` and `b`, where a runtime keeps a node's content. One slot holds the running node; the other is used to build a replacement during a repave. For `nspawn-container`, a slot is a whole machine, v1's `kube1` or `kube2`, including the node's state. For `host`, a slot holds only staged binaries and rendered files; the node's state lives in shared host paths and is wiped on a slot change. |
+| Node runtime, or runtime | Where the node runs: directly on the host (`host`) or in an nspawn container (`nspawn-container`). [Node runtime, section 1](03-node-runtime.md#1-node-runtime) defines the interface. A Machine chooses it with `spec.agent.nodeRuntime` ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-node-runtime)). Where only the node is concerned, this design says "runtime". |
+| Agent runtime | How the agent itself reaches and runs on the host: as a binary installed on the host (`host`), or as an OCI image run by the host's containerd (`containerd`), which targets Azure Container Linux, or by systemd-nspawn (`systemd-nspawn`). The last two are the *image agent runtimes*. Independent of the node runtime, except that the image agent runtimes support only `nspawn-container`. A Machine chooses it with `spec.agent.agentRuntime` ([agent runtime, section 1](12-agent-runtime.md#1-agent-runtimes)). |
+| Agent image | The OCI image of the agent that each release publishes, `ghcr.io/azure/unbounded-agent`, which a consumer builds its own image from ([agent runtime, section 2](12-agent-runtime.md#2-images)). |
+| Distribution | A consumer's plugin executables and extension definitions, versioned together and changed only with the agent, by an AgentUpgrade ([extensions, section 2.1](02-extensions.md#21-distributions)). |
+| Plugin store | Under the `host` agent runtime, where plugin executables are kept on the host and run from, `/opt/unbounded/agent/plugins`, one set beside each agent binary. Under an image agent runtime there is none: plugins stay in the image and run inside the agent's container ([extensions, section 3](02-extensions.md#3-plugin-protocol)). |
+| Readiness file | `/run/unbounded-agent/ready`, which the daemon creates once it is ready and its unit waits for, under every agent runtime ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). |
+| Slot | One of two places, `a` and `b`, where a runtime keeps a node's content. One slot holds the running node; the other is used to build a replacement during a repave. For `nspawn-container`, a slot is a whole machine, v1's `kube1` or `kube2`, including the node's state. For `host`, a slot holds staged binaries, rendered files and the node's state, in directories of its own that host mount units bind onto the standard paths while the slot is active. |
 | Repave | Replacing the node with a new one, built from the desired configuration in the other slot. The new node registers with Kubernetes as a fresh Node. A repave is triggered by deleting the Kubernetes Node object ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)). Not to be confused with `kubectl unbounded machine repave`, which creates a `HostReplace` MachineOperation (`cmd/kubectl-unbounded/app/machine_repave.go:24-25,47`). |
 | Goal | The desired configuration for this machine, from machina, a plugin or the configuration file. It carries only goal settings, not install-time settings ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). Its version is an opaque label from the goal source, compared for equality only. Whether to repave depends on the settings, not the version: a machina version can be edited in place (issue #1038). |
 | Drift | A difference between the goal and the applied configuration that needs a repave to take effect, such as a new Kubernetes version. |
 | Bundle | The rendered description of one node: files, binaries, units and start order ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). Not related to v1's offline artifact bundles. |
 | Node manager | The runtime-independent component that drives bootstrap, repave, reboot and reset by calling the runtime ([control and state, section 3](04-control-and-state.md#3-node-manager)). |
 | Reset | Removing the node, the agent and everything they created from the host ([lifecycles, section 6](05-lifecycles.md#6-reset)). The runtime's part of a reset is its `Teardown` method; [host runtime cleanup, section 9](07-host-runtime-cleanup.md#9-teardown) describes it for the `host` runtime. |
-| Slot change | For the `host` runtime, starting a slot whose content differs from what last ran. The runtime wipes node state first ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-wipe-and-slot-changes)). |
+| Slot change | For the `host` runtime, starting a slot other than the active one. The runtime stops the node, unmounts the old slot's state and binds the new slot's ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-slot-changes)). |
 | Enabled slot | The slot systemd starts at boot. `Start` enables a slot and `Stop` disables it ([node runtime, section 1](03-node-runtime.md#1-node-runtime)). |
 | Old and new slot | During a repave, the slot the running node is in and the slot its replacement is built in ([lifecycles, section 2](05-lifecycles.md#2-repave)). |
 | Bundle manifest | The record of a provisioned bundle, saved in its slot by `Provision`, from which boot hooks and `Recover` work without rendering again ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). |
 | Boot unit | The unit that must start before a runtime's node does, and that host-side prerequisites attach to ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
 | Boot hook | Runtime-owned work that systemd runs around the boot unit, through `boot-hook`. Not a lifecycle hook ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)). |
 | Lifecycle hook | A plugin call at a fixed point in a lifecycle, such as `node.start.after` ([extensions, section 1](02-extensions.md#lifecycle-hook-events)). |
-| Install-time and goal settings | The two parts of the configuration. Install-time settings, such as the runtime and plugins, change only through a reset, except that an AgentUpgrade can replace plugin executables; goal settings can come from a goal source ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). |
+| Install-time and goal settings | The two parts of the configuration. Install-time settings, such as the node runtime, the agent runtime and the plugins, change only through a reset, except that an AgentUpgrade can replace the distribution; goal settings can come from a goal source ([CLI and configuration, section 2](01-cli-and-configuration.md#install-time-settings-and-goal-settings)). |
 | Applied state | `state.Applied`: the goal version, settings and bundle digest of the running node, and any approved repave ([control and state, section 4](04-control-and-state.md#4-state)). |
 | Approved repave | A repave the daemon has approved by seeing the Node deleted with drift, saved as `state.Applied.Repave` until it commits ([control and state, section 4](04-control-and-state.md#4-state)). |
 | Install record | v2's record of its installation, `/var/lib/unbounded/agent-v2/install.json`, which also tells v1 and v2 apart on a host ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)). |
 | Undo log | The host preparation undo log, replayed by reset ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). |
 | Host network reset | The node manager's cleanup of links, routes, rules and firewall state after a node stops ([host changes, section 2](06-host-changes.md#2-host-network-reset)). |
-| Ownership record and active-slot record | The `host` runtime's records of the host paths it owns and of the slot installed into them ([host runtime cleanup, sections 3 and 8](07-host-runtime-cleanup.md#3-ownership-and-adoption)). |
+| Installed record and active link | The `host` runtime's record of the units, files and mount points it installed, and the link that names the slot whose state is bound onto the standard paths ([host runtime cleanup, section 3](07-host-runtime-cleanup.md#3-node-state-per-slot)). |
 | Leftover | Something a cleanup could not remove, reported rather than ignored ([host runtime cleanup, section 10](07-host-runtime-cleanup.md#10-post-conditions)). |
 | v1 build and v2 build | The two builds of each experimental release, from the same source and version. The v1 build has only v1's commands; the v2 build has only v2's, at the top level. Installing the v2 build on a v1 host migrates it. From the first official v2 release only the v2 build is published ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
 | First official v2 release | The release that replaces v1 with v2. Its daemon migrates every v1 host it starts on ([migrating from v1, section 2](10-migration-from-v1.md#2-release-plan-and-cutover)). |
@@ -188,15 +224,28 @@ library.
   official v2 release, when every remaining v1 host moves. Any release since
   the oldest supported v1 release can migrate, and no v1 release needs a change
   to be rolled back to ([migrating from v1](10-migration-from-v1.md)).
+- **G7.** The agent can be delivered as a binary on the host or as an OCI
+  image that the host's containerd or systemd-nspawn runs. The `containerd`
+  agent runtime targets Azure Container Linux, so an ACL host needs nothing of
+  the agent installed on it. The commands, configuration, lifecycles and
+  plugin protocol are the same under every agent runtime, and a new one can be
+  added through one interface ([agent runtime](12-agent-runtime.md)).
 
 ### 2.2 Non-goals
 
 - Other runtime kinds, including virtual machines. The runtime kind is an open
   set, but nothing in the interface is designed for a specific future kind.
-- Machina API changes, apart from the Machine's runtime field, its two new
-  conditions and two new `AgentBootstrapped` reasons ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
-  The runtime must survive a reinstall, which wipes the host, so it has to be
-  stored in the cluster ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-runtime)).
+- The `host` node runtime on Azure Container Linux, and under an image agent
+  runtime on any host. On ACL the host's containerd is part of the read-only OS
+  image and holds ACL's own images, and the `containerd` agent runtime runs on
+  the host's containerd; the `host` node runtime would own it, stop it and
+  replace its state at every slot change. No one needs the `host` node runtime
+  with the `systemd-nspawn` agent runtime ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities),
+  [agent runtime, section 1.1](12-agent-runtime.md#11-why-the-image-agent-runtimes-support-only-nspawn-container)).
+- Machina API changes, apart from the Machine's node and agent runtime fields,
+  its two new conditions and two new `AgentBootstrapped` reasons ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
+  The node and agent runtimes must survive a reinstall, which wipes the host,
+  so they have to be stored in the cluster ([CLI and configuration, section 2](01-cli-and-configuration.md#choosing-the-node-runtime)).
 - Changing `pkg/agent` behavior for its existing consumers, apart from the
   additive v2 detection check ([v1 compatibility, section 4](08-v1-compatibility.md#4-existing-packages-used-as-libraries)).
 
@@ -216,6 +265,9 @@ stays open:
   objects, so the agent needs no change. This depends on AKS accepting the CRD
   in its clusters.
 
+**Registry credentials for the image agent runtimes.** Pulling the agent image from a
+registry that needs credentials is not designed yet ([agent runtime, section 11](12-agent-runtime.md#11-open-questions)).
+
 ## 4. Architecture overview
 
 ```mermaid
@@ -225,6 +277,10 @@ flowchart TB
     PLG["Plugin executables"]
     EXT["Declarative extensions"]
   end
+  subgraph AgentRuntime["Agent runtime"]
+    DH["host: binary under /opt/unbounded/agent"]
+    DO["containerd, systemd-nspawn: agent image run in a container"]
+  end
   subgraph Agent["unbounded-agent, v2 build (internal/agentv2)"]
     CLI["cli: start, preflight, daemon, reset, status, migrate, agent-upgrade, version, boot-hook, convert-config"]
     BOOT["bootstrap coordinator"]
@@ -232,18 +288,21 @@ flowchart TB
     NM["nodemanager"]
     CTRL["control: goal sources, status reporters, operations"]
     CRED["credentials"]
-    HK["hooks and plugin client"]
+    HK["hooks and plugin executor"]
     SPEC["nodespec"]
     BUN["bundle renderer"]
     HP["hostprep"]
     ART["artifact cache"]
     ST["state"]
+    HFS["hostfs: every host path, under / or /host"]
     RTI{{"runtime.NodeRuntime"}}
   end
   CFG --> CLI
-  PLG -. exec protocol .- HK
+  PLG -. one call per process: systemd unit, or child in the agent's container .- HK
   EXT --> BUN
   EXT --> HP
+  DH --> CLI
+  DO --> CLI
   CLI --> BOOT --> NM
   CLI --> DAE --> NM
   DAE --> CTRL
@@ -255,6 +314,8 @@ flowchart TB
   CTRL --> HK
   CRED --> HK
   NM --> HK
+  HP --> HFS
+  ST --> HFS
   RTI --> RTH["host"]
   RTI --> RTN["nspawn-container"]
 ```

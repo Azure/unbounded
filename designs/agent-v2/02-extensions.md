@@ -15,15 +15,17 @@ repository baseline, citation conventions and terms.
 Use the first mechanism that fits, in this order. There are no in-process Go
 plugins: consumers never link agent code.
 
-Lifecycle hooks are the escape hatch. No current consumer needs one: every AKS
-Flex Node customization maps to configuration, an extension or a provider
-(section 5). Hooks exist for side effects at fixed points that nothing else
-covers, such as sending lifecycle telemetry, collecting diagnostics before a
-reset, registering the node with an external system after it joins, or
-migrating a consumer's own files after an upgrade. Without them, a consumer
-with such a need would go back to linking `pkg/agent`, which goal G3 rules
-out. Most hooks should use the `Ignore` failure policy, so a broken hook
-cannot block the node.
+Lifecycle hooks are a supported part of the first release, not a fallback to be
+added later. They exist for side effects at fixed points that the other
+mechanisms do not cover, such as sending lifecycle telemetry, collecting
+diagnostics before a reset, registering the node with an external system after
+it joins, or migrating a consumer's own files after an upgrade. No consumer
+uses one yet: every AKS Flex Node customization maps to configuration, an
+extension or a provider (section 5). They are in the first contract anyway, so
+that a consumer with such a need never has to go back to linking `pkg/agent`,
+which goal G3 rules out, or wait for a new configuration `apiVersion`. Most
+hooks should use the `Ignore` failure policy, so a broken hook cannot block the
+node.
 
 ### Lifecycle hook events
 
@@ -79,7 +81,7 @@ fields specific to each event.
 | `agent.upgrade.before` | Before the new binary is staged, in the daemon or the `agent-upgrade` command | current version, operation name if any | `Fail` |
 | `agent.upgrade.after` | In the daemon that publishes the upgrade result | old and new version, operation name if any | `Ignore` |
 | `agent.reset.before` | Before reset begins | trigger (`CLI`, `Operation` or `Goal`) | `Ignore` |
-| `agent.reset.after` | After reset, before the daemon unit is removed | trigger, leftovers | `Ignore` |
+| `agent.reset.after` | After reset, before the agent directory, with its plugins, and the daemon unit are removed | trigger, leftovers | `Ignore` |
 
 The order of events in each lifecycle:
 
@@ -188,8 +190,9 @@ Rules:
     digest. Restarts and reboots do not render it again; a changed value
     reaches the node at its next provision.
   - Templates apply to node content only. Host files and units are installed
-    once, at bootstrap, so a value that later changed through a goal would
-    leave them stale.
+    at bootstrap, and again only at a provision after the distribution
+    changed (section 2.1), not at every goal change, so a templated value that
+    a goal changed would leave them stale.
   - When the configuration loads, in `start`, `preflight` and the daemon, each
     template is rendered with placeholder values, so a misspelled variable
     fails with the extension, the file or unit, and the name, before anything
@@ -208,12 +211,54 @@ Rules:
   it does not own.
 - `cleanup` declares state the extension's workloads create ([host runtime cleanup, section 13](07-host-runtime-cleanup.md#13-extension-cleanup-declarations)).
 - Everything an extension creates is recorded in state and removed by reset.
-- Extensions are install-time settings: changing or removing one needs a reset
-  and a new install ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)).
+- Which extensions exist is an install-time setting: adding or removing one
+  needs a reset and a new install ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)). Their
+  content can change with the agent, as part of the distribution (section 2.1).
 
 This replaces the hardcoded `systemd-nspawn@` dependencies in v1's assets and
 in Flex, such as Flex's static routes with
 `RequiredBy=systemd-nspawn@.service`.
+
+### 2.1 Distributions
+
+A consumer's *distribution* is its plugin executables and its extension
+definitions. They are versioned together, and they change only with the agent,
+so a consumer release can ship a new Node Problem Detector, a fixed static
+route script or a new plugin without a reinstall. AKS Flex Node can do this
+today, because it downloads Node Problem Detector at every node start
+(`pkg/daemon/start.go:53-55` at Flex `2c149e991`); without distributions, v2
+would take that away.
+
+```json
+{
+  "apiVersion": "agent.unbounded-cloud.io/v1alpha1",
+  "kind": "DistributionManifest",
+  "plugins": [
+    { "name": "aks", "url": "https://example.com/aks-flex-node-plugin", "sha256": "4b1e...07" }
+  ],
+  "extensions": [ { "name": "node-problem-detector", "artifacts": [], "node": {}, "host": {} } ]
+}
+```
+
+- At first install, the distribution is the configuration file's plugins and
+  extensions, or, under an image agent runtime, the image's manifest at
+  `/usr/share/unbounded-agent/distribution.json`, where `url` is a path in the
+  image ([agent runtime, section 2](12-agent-runtime.md#2-images)).
+- An AgentUpgrade can carry a new one: under the `host` agent runtime as a manifest
+  named by the `distributionManifestURL` and `distributionManifestSHA256`
+  parameters, under an image agent runtime inside the new image. Without one, the
+  running distribution is kept ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)).
+- A new distribution must name exactly the plugins and extensions that are
+  installed, and must not widen what they may do. It may change plugin
+  executables and extension artifacts, files, units and templates. It may not
+  change plugin permissions, credentials, environment or timeouts, hooks, or
+  an extension's `sharedHostPaths`, `agentDependencies` or `cleanup`. A
+  manifest that does is rejected before the switch.
+- The distribution is staged beside the new agent and switched with it, so a
+  rollback restores both.
+- Extension content takes effect at the next provision, host and node content
+  alike. An AgentUpgrade therefore changes nothing on the host but the agent
+  and its plugin store, and a rollback has nothing else to undo.
 
 ## 3. Plugin protocol
 
@@ -221,14 +266,14 @@ A plugin is a compiled executable owned by the consumer. The agent runs it
 with its configured arguments and the method name, a JSON request on stdin, and
 reads a JSON response from stdout. A non-zero exit or an `error` object means
 failure. stderr goes to the agent log, size-bounded. Secrets travel only on
-stdin, never in arguments or the environment.
+stdin or as declared credentials, never in arguments or the environment.
 
 ```json
 {
   "apiVersion": "plugin.agent.unbounded-cloud.io/v1alpha1",
   "kind": "Request",
   "method": "goal.get",
-  "context": { "machineName": "m-01", "nodeName": "m-01", "runtime": "host", "agentVersion": "..." },
+  "context": { "machineName": "m-01", "nodeName": "m-01", "nodeRuntime": "host", "agentRuntime": "host", "agentVersion": "..." },
   "payload": {
     "node": { "exists": true, "uid": "...", "labels": {}, "taints": [] },
     "applied": { "goalVersion": "..." }
@@ -239,9 +284,9 @@ stdin, never in arguments or the environment.
 | Method | Request payload | Response payload |
 |---|---|---|
 | `describe` | None | `{protocolVersions[], methods[]}` |
-| `goal.register` | `{machineName, nodeName, runtime, agentVersion, kubernetesVersion, provisioningFormat}` | None |
+| `goal.register` | `{machineName, nodeName, nodeRuntime, agentRuntime, agentVersion, kubernetesVersion, provisioningFormat}` | None |
 | `goal.get` | Node observation, applied state | `{version, settings, delete}`. `settings` holds goal settings only ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)). `delete` is `true` when the machine is being removed and the node must be reset. |
-| `status.report` | `{phase, reason, message, appliedVersion, runtime, attempts, leftovers}` | None |
+| `status.report` | `{phase, reason, message, appliedVersion, nodeRuntime, agentRuntime, attempts, leftovers}` | None |
 | `credentials.bootstrap` | None | `{apiServer, caCertBase64, token}` |
 | `credentials.cluster` | None | A Kubernetes `ExecCredential` |
 | `preflight.check` | Configuration summary | `[{name, severity, message}]` |
@@ -255,7 +300,7 @@ stdin, never in arguments or the environment.
 | `Ready` | The node is running and the daemon has seen its Node object | None |
 | `Pending` | A repave is waiting for the Node to be deleted | None |
 | `Reconciling` | A repave or reboot is in progress | None |
-| `Failed` | The agent cannot make progress without a retry or an operator | `StateMismatch` ([control and state, section 4](04-control-and-state.md#4-state)), `StateCorrupt` ([control and state, section 4](04-control-and-state.md#4-state)), `RepaveFailed` ([lifecycles, section 2](05-lifecycles.md#2-repave)), `PackageOwnedNodePath` ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)) |
+| `Failed` | The agent cannot make progress without a retry or an operator | `StateMismatch` ([control and state, section 4](04-control-and-state.md#4-state)), `StateCorrupt` ([control and state, section 4](04-control-and-state.md#4-state)), `RepaveFailed` ([lifecycles, section 2](05-lifecycles.md#2-repave)) |
 | `Resetting` | A reset is in progress | None |
 
 `attempts` is set while a repave is being retried, and `leftovers` lists
@@ -281,62 +326,86 @@ Operational rules:
   after 5 seconds.
 - **Output limits:** a response larger than 1 MiB on stdout is a failure. Only
   the first 64 KiB of stderr is logged.
-- **Pinned executables.** Every plugin has a `sha256` in the configuration,
-  and the agent runs only an executable with that digest. The executable and
-  every parent directory must also be owned by root and not writable by group
-  or others.
-- **What is checked is what runs.** The agent starts each call as a transient
-  systemd service (`systemd-run --pipe --wait --collect`), named
-  `unbounded-agent-plugin-<name>-<id>.service`, whose command is the agent's
-  own hidden `plugin-exec`. Inside the sandbox, `plugin-exec` opens the
-  stored plugin, hashes it through the open file descriptor, and replaces
-  itself with that same descriptor through `execveat(2)` with `AT_EMPTY_PATH`.
-  A file swapped after the check is never the one that runs.
-- **Statically linked executables only.** `plugin-exec` refuses a file that is
-  not ELF. A `#!` script cannot be run safely from a descriptor: its
-  interpreter either reopens the script by path or cannot reach it at all, and
-  the interpreter and everything it loads are not pinned (`execveat(2)` manual
-  page). It also refuses a dynamically linked executable, because only the
-  executable is pinned and the shared libraries it would load come from the
-  host. `preflight` and `start` report the same before anything runs. A Go
-  plugin built with `CGO_ENABLED=0` is static, as this repository's own
-  release builds are (`.goreleaser.yml:34-35`).
-- **Sandboxed and unprivileged by default.** Each call's unit applies these
-  settings. A plugin asks for more only through `plugins[].permissions`, which
-  is an install-time setting ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)):
+- **What a plugin sees is the same under every agent runtime:** the request on
+  stdin and the response on stdout, a clean environment, `STATE_DIRECTORY` and
+  `CACHE_DIRECTORY`, which persist across calls and upgrades, and
+  `CREDENTIALS_DIRECTORY`, which holds its declared credentials. How each call
+  runs, and how far it is sandboxed, depends on the agent runtime: below for
+  the `host` agent runtime, and in [agent runtime, section 6](12-agent-runtime.md#6-plugins) for the image agent runtimes, where each
+  call is a child process inside the agent's container, run from the image,
+  with no file system sandbox.
+- **Under the `host` agent runtime, one transient unit per call.** The agent starts each
+  call with `systemd-run --pipe --wait --collect` as
+  `unbounded-agent-plugin-<name>-<id>.service`, which runs the plugin
+  executable from the plugin store directly. A call costs 50 to 70 ms on the
+  host matrix's systemd versions (validation task V8,
+  [testing, section 7](11-testing.md#7-validation-tasks)).
+- **Pinned executables.** Under the `host` agent runtime the agent runs only an
+  executable whose SHA-256 matches the distribution: the configuration's
+  `sha256` at first install, or the distribution manifest after an upgrade. It
+  checks the digest when it stages the executable into the store, and again
+  before each call. The store and every parent directory are owned by root and
+  not writable by group or others, so replacing an executable between the
+  check and the run already needs root on the host. The executable must be a
+  statically linked ELF file. A dynamically linked one would load libraries
+  from the host that nothing pins, and a `#!` script would run an interpreter
+  that nothing pins. `preflight` and `start` refuse either. A Go plugin built
+  with `CGO_ENABLED=0` is static, as this repository's own release builds are
+  (`.goreleaser.yml:34-35`). Under an image agent runtime the image digest pins the
+  plugins, and the image's libraries are pinned with them. A plugin used as
+  kubelet's exec credential runs in the node, so it must be statically linked
+  under every agent runtime ([agent runtime, section 6.1](12-agent-runtime.md#61-kubelets-exec-credential)).
+- **The plugin store**, under the `host` agent runtime only, is
+  `/opt/unbounded/agent/plugins/`. It holds the plugin set beside each of the
+  `blue` and `green` binaries, each with the manifest of its plugins' names and
+  digests. It must not be under a path that plugins cannot see: a unit cannot
+  run an executable inside `InaccessiblePaths=` (V8).
+- **Under the `host` agent runtime, sandboxed and unprivileged by default.** Each call's
+  unit applies these settings. A plugin asks for more only through
+  `plugins[].permissions`, which is an install-time setting
+  ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)):
 
   | | Default | Declared with |
   |---|---|---|
-  | User | A dynamic unprivileged user (`DynamicUser=yes`) | `root: true` runs it as root, with every other setting unchanged |
-  | Capabilities | None (an empty `CapabilityBoundingSet=`, and `NoNewPrivileges=yes`) | `capabilities`, granted as bounding and ambient capabilities |
-  | Filesystem | The OS read-only (`ProtectSystem=strict`), no home directories (`ProtectHome=yes`), a private `/tmp` and no devices. The agent's and the node's private paths are inaccessible: `/etc/unbounded`, `/var/lib/unbounded`, `/etc/kubernetes`, `/var/lib/kubelet` and `/var/lib/machines`. | `paths`: `read` makes a path readable that would otherwise be inaccessible, and `write` makes a path writable. The agent's own credentials and state can never be granted. |
+  | User | A dynamic user of the plugin's own, `DynamicUser=yes` with `User=unbounded-plugin-<name>`, so it keeps the same UID across calls | `root: true` runs it as root, with every other setting unchanged |
+  | Capabilities | None: an empty `CapabilityBoundingSet=` and `NoNewPrivileges=yes` | `capabilities`, granted as bounding and ambient capabilities |
+  | File system | The OS read-only (`ProtectSystem=strict`), no home directories (`ProtectHome=yes`), a private `/tmp` and no devices (`PrivateDevices=yes`). The agent's and the node's private paths are inaccessible: `/etc/unbounded`, `/var/lib/unbounded`, `/etc/kubernetes`, `/var/lib/kubelet` and `/var/lib/machines`. | `paths`: `read` makes a path readable that would otherwise be inaccessible, and, with `root: true`, `write` makes it writable. Neither changes file permissions: a dynamic user can write only its own directories, and read only what any user may read (V8). |
+  | Its own state | A state directory and a cache directory that persist across calls and upgrades, `StateDirectory=` and `CacheDirectory=` named `unbounded-agent-plugins/<name>`, for token caches and the like | Always present |
+  | Secrets | None | `credentials`: each file is passed with `LoadCredential=` and read from `$CREDENTIALS_DIRECTORY`, which works for a dynamic user although the file is root's alone (V8) |
+  | Other processes | Hidden (`ProtectProc=invisible`) | Not configurable |
   | Network | Allowed, because providers call cloud and cluster APIs | Not configurable |
-  | Run time | `RuntimeMaxSec=` set to the call's timeout, and `TimeoutStopSec=5s` | `plugins[].timeouts` and `hooks[].timeout` |
+  | Run time | `RuntimeMaxSec=` set to the call's timeout, and `TimeoutStopSec=5s`. Every process the call started ends with the unit, including one that daemonized (V8). | `plugins[].timeouts` and `hooks[].timeout` |
+
+  An identity that only root can use, such as Azure Arc's managed identity,
+  whose challenge key under `/var/opt/azcmagent/tokens` only root may read,
+  needs `root: true` under every agent runtime. Under an image agent runtime a plugin runs
+  as an unprivileged UID of its own with only its declared capabilities,
+  unless it declares `root: true`, and `permissions.paths` does not apply
+  ([agent runtime, section 6](12-agent-runtime.md#6-plugins)).
 
 - **A clean environment.** The plugin's environment holds only `PATH`, set to
-  `/usr/sbin:/usr/bin:/sbin:/bin`, `LANG=C.UTF-8`, and the literal values in
-  `plugins[].env`, such as proxy settings, which cannot set `PATH` or any
-  `LD_` name. Nothing from the agent's own environment passes through.
+  `/usr/sbin:/usr/bin:/sbin:/bin`, `LANG=C.UTF-8`, `STATE_DIRECTORY`,
+  `CACHE_DIRECTORY` and `CREDENTIALS_DIRECTORY`, the other variables systemd
+  sets for the unit under the `host` agent runtime, and the literal values in
+  `plugins[].env`, such as proxy settings, which cannot set `PATH` or any `LD_`
+  name. Nothing from the agent's own environment passes through (V8).
 - **An audit log.** Every call writes one line to the agent's log: the plugin,
-  the method, the SHA-256 that was run, the unit name, the user, the granted
-  capabilities and writable paths, the duration, the exit status and the
-  response size. It never includes the request or the response, which can hold
+  the method, the SHA-256 or image digest that was run, the unit name under
+  the `host` agent runtime, the user, the granted capabilities and writable paths, the
+  duration, the exit status and the response size. It never includes the request or the response, which can hold
   secrets.
 - **Reset never fails because of a plugin.** During `reset` and other
   resets, `describe` failures, provider failures and hook failures are logged
   and reset continues. This is why the reset events default to `Ignore`.
-- **Plugins change only with the agent.** The agent keeps one plugin set
-  beside each of its blue and green binaries, under
-  `/opt/unbounded/agent/plugins/{blue,green}/`, with a manifest of each
-  plugin's name and SHA-256, and runs the set beside the binary that `current`
-  resolves to. `start` fills it at first install from each plugin's
-  `command[0]`, after checking its `sha256`. After that, only an AgentUpgrade
-  changes it: one with a plugin manifest stages the new executables beside the
-  new binary, and one without copies the running set. Switching `current`, or
-  restoring `last-good`, therefore always switches binary and plugins
-  together ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). The plugin's name, permissions, environment,
-  timeouts and hooks stay install-time settings, so an upgrade replaces a
-  plugin's code but never widens what it may do.
+- **Plugins change only with the agent.** Under the `host` agent runtime, `start` fills
+  the running set at first install, and after that only an AgentUpgrade changes
+  it, by staging a new distribution beside the new agent or copying the
+  running one there (section 2.1). Under an image agent runtime the plugins are in the
+  image, so they change exactly when the image does. Switching to the new agent, or recovery restoring the old one,
+  therefore always switches agent and plugins together
+  ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)). A plugin's name, permissions, credentials,
+  environment, timeouts and hooks stay install-time settings, so an upgrade
+  replaces a plugin's code but never widens what it may do.
 
 Goal changes from a plugin goal source are picked up by polling plus Node
 events ([control and state, section 1](04-control-and-state.md#1-control-plane-integration)).
@@ -371,14 +440,15 @@ type Client interface {
 | Reset on a deleting taint plus a missing ARM Machine | `goal.get` sees the Node's taints and returns `delete: true` |
 | Repave when the Node is missing and the goal is not applied, even after a daemon restart | Built in: a missing Node, or one with a new UID, counts as deleted ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 | Fresh bootstrap data before a repave | `credentials.bootstrap` provider, called before every provision |
-| Kubelet exec credential, binary copied into the rootfs | `credentials.kubelet.type: exec`; the runtime makes the command visible inside the node |
+| Kubelet exec credential, binary copied into the rootfs | `credentials.kubelet.type: exec` with `exec.plugin: aks`: the agent copies the plugin into the node and refreshes the running node's copy after an upgrade, as Flex does, and the service principal secret is a `secretEnv` from the plugin's `credentials` ([CLI and configuration, section 2](01-cli-and-configuration.md#2-configuration)) |
 | Daemon exec credential, host path rewritten | `credentials.daemon.type: plugin`; Flex's plugin implements `credentials.cluster` |
+| ARM access with Arc's managed identity, whose challenge key only root may read | A plugin with `root: true` and no capabilities (section 3) |
 | CSR group `aks-flex-node-daemons` | `credentials.daemon.csr.group` |
 | Static routes with `RequiredBy=systemd-nspawn@.service` | Host extension unit with `orderBeforeNode` |
 | Daemon unit ordered after `himdsd.service` when Arc is enabled | `agentDependencies.after` |
-| Host preparation steps copied from unbounded (`pkg/daemon/start.go:16-28`), which have since missed unbounded's Docker, containerd and kubelet steps (Azure/AKSFlexNode#423) | Built-in host preparation, the same for every consumer. An adopted host gains the missing steps, and adoption warns which host services will be masked ([migrating from v1, section 9](10-migration-from-v1.md#9-hosts-built-by-other-pkgagent-consumers)). |
+| Host preparation steps copied from unbounded (`pkg/daemon/start.go:16-28`), which leave out unbounded's Docker `iptables: false` step and the masking of the host's containerd and kubelet (Azure/AKSFlexNode#423) | Built-in host preparation, the same for every consumer. It masks the host's kubelet but leaves the host's containerd running, because the port checks already catch a real conflict and, on ACL, the host's containerd holds ACL's Arc agent image and runs the `containerd` agent runtime's agent ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). An adopted host gains the missing steps, and adoption warns which host services will be masked ([migrating from v1, section 9](10-migration-from-v1.md#9-hosts-built-by-other-pkgagent-consumers)). |
 | `additionalRequiredServices` and the udev-settle drop-in | `nodeDependencies.requires` |
-| NPD written into the rootfs and started with `systemd-run`, its unit rendered with the node name, API server and kubeconfig | Node extension: an artifact plus a templated unit with `start: AfterKubelet`, using `NodeName`, `APIServer` and `KubeletKubeconfigPath` |
+| NPD written into the rootfs and started with `systemd-run`, its unit rendered with the node name, API server and kubeconfig, at the version Flex's release names | Node extension: an artifact plus a templated unit with `start: AfterKubelet`, using `NodeName`, `APIServer` and `KubeletKubeconfigPath`. A Flex release changes it through its distribution (section 2.1). |
 | Arc and NPD preflight checks | `preflight.check`, plus automatic reachability checks for extension artifacts |
 | `maxPods`, reserved resources, forced labels | `kubelet.configuration` and `kubelet.labels` |
 | AKS LocalDNS template | `components.localDNS.corefileTemplate` plus the variable contract |
@@ -386,4 +456,5 @@ type Client interface {
 | ARM-backed MachineOperations, planned (`docs/design/agent-and-aks.md:16`) | Not yet: operations come only from the MachineOperation CRD ([overview, section 3](README.md#3-open-questions)) |
 | Startup gate around its reconcilers | Built in ([control and state, section 5](04-control-and-state.md#5-daemon-reconcile)) |
 | Own blue/green upgrade, signal file, recovery unit and unit names | Built in ([lifecycles, section 5](05-lifecycles.md#5-agentupgrade)) |
+| The container install on Azure Container Linux (Azure/AKSFlexNode#370): the agent image run by the host's containerd, `host-exec`, upgrade by `oci://` image | The `containerd` agent runtime, built in, with Flex's image built from the agent image ([agent runtime](12-agent-runtime.md)) |
 | Host-root move; `uninstall.sh` that hardcodes unbounded names | Not needed: `reset` plus the documented list of what v2 creates ([host changes, section 1](06-host-changes.md#1-what-v2-creates-on-the-host)) |

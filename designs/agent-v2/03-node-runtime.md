@@ -118,7 +118,7 @@ Rules every runtime must follow. A shared conformance suite,
    with empty kubelet and containerd state. Provisioning identical content
    again, with the same bundle digest, does not count as new content. The one
    exception to empty state is container image content, when the runtime is
-   configured to keep it (`runtime.host.repave.retainContainerImages`).
+   configured to keep it (`nodeRuntime.host.repave.retainContainerImages`).
 5. `Restart` keeps persistent node state. Volatile state under `/run` is lost,
    as it would be on a host reboot.
 6. At most one slot is enabled. `Start` enables its slot and disables the other;
@@ -127,7 +127,10 @@ Rules every runtime must follow. A shared conformance suite,
    systemd starts at boot.
 7. The node manager puts content into a node only through `Provision`. Boot
    hooks may change the node, for example NVIDIA wiring in the
-   `nspawn-container` post-start boot hook.
+   `nspawn-container` post-start boot hook. The one other exception is
+   kubelet's exec credential: when an AgentUpgrade or a rollback changes the
+   plugin it runs, the daemon replaces the running node's copy
+   ([agent runtime, section 6.1](12-agent-runtime.md#61-kubelets-exec-credential)).
 8. Runtimes do not download artifacts, call the Kubernetes API, or run plugins.
 
 The runtime is the only authority on which slot is enabled and running. The
@@ -210,7 +213,7 @@ func Render(spec *nodespec.NodeSpec, layout Layout, ext []extensions.Resolved) (
   because the nspawn layout is the same for both slots.
 - `Provision` always writes the secret files, even when the slot already holds
   a bundle with the same digest. Leaving secrets out of the digest keeps a new
-  token from causing a wipe on `host`; rewriting them is what puts the new
+  token from giving a `host` slot new, empty state; rewriting them is what puts the new
   token in the slot, for example when a repave is retried after the token it
   first used has expired. Everything else in a slot with the same digest is
   left as it is.
@@ -276,12 +279,15 @@ The LocalDNS network unit is not host preparation. Its settings come from the
 goal, and the host network reset removes it during a repave. The node manager
 writes it, with its helper, from the bundle's `HostUnits` before every
 `Start`, as v1 does at every node start
-(`pkg/agent/phases/nodestart/localdns.go:104-176`).
+(`pkg/agent/phases/nodestart/localdns.go:104-176`). v1 writes the helper, a
+script, under `/opt/unbounded/agent/libexec`. Under an image agent runtime
+nothing is written there: the unit runs `boot-hook localdns-network` in a
+short-lived container of the boot hook image instead ([agent runtime, section 3](12-agent-runtime.md#3-running-on-the-host)).
 
 On `nspawn-container`, the pre-start boot hook also finds the host's devices
 again and rewrites the machine's `.nspawn` file and unit override from the
-saved manifest and the devices it finds, using the current agent binary. v1's
-pre-start hook does the same (`pkg/agent/nspawnlifecycle/lifecycle.go:67-93`).
+saved manifest and the devices it finds, using the boot hook binary, or under
+an image agent runtime the boot hook image. v1's pre-start hook does the same (`pkg/agent/nspawnlifecycle/lifecycle.go:67-93`).
 A device that appears while the host boots, such as an InfiniBand device, is
 therefore visible inside the node without a repave. These are the runtime's
 host-side files, not node content, so they are not in the bundle digest and
@@ -351,7 +357,9 @@ the `current` link. As v1 does with its lifecycle helper
 (`pkg/agent/phases/rootfs/lifecycle_helper.go:34-37`), `Provision` writes this
 copy of the running binary every time, and a binary rollback does not revert
 it. It is therefore at least as new as the binary that saved the slot's
-manifest, and can always read it ([control and state, section 4](04-control-and-state.md#4-state)).
+manifest, and can always read it ([control and state, section 4](04-control-and-state.md#4-state)). Under an
+image agent runtime the boot hook units run a container of the boot hook image, which
+`Provision` records in the same way ([agent runtime, section 3.2](12-agent-runtime.md#32-boot-hooks)).
 
 ## 5. Runtimes
 
@@ -361,21 +369,22 @@ manifest, and can always read it ([control and state, section 4](04-control-and-
 | Provision | Unpack the OCI image; write the bundle, `.nspawn` file and unit override | Stage binaries and rendered files into the slot directory |
 | Start | `machinectl start`, then boot steps through `systemd-run -M` | Install units and configuration from the slot, then start `unbounded-node.target` (section 4) |
 | Enabled at boot | `machinectl enable` on `Start`, as v1 does (`pkg/agent/phases/nodestart/nspawn.go:99`), and `machinectl disable` on `Stop` (`pkg/agent/phases/reset/machine.go:39`) | `unbounded-node.target` is enabled on `Start` and disabled on `Stop` (section 4) |
-| Fresh state | A new rootfs | Wipe the owned paths ([host runtime cleanup, section 8](07-host-runtime-cleanup.md#8-wipe-and-slot-changes)) |
+| Fresh state | A new rootfs | New state directories for the slot, bound onto the standard paths ([host runtime cleanup, section 3](07-host-runtime-cleanup.md#3-node-state-per-slot)) |
 | `NodeAccess` | `systemd-run -M` | Direct |
 | NVIDIA | v1's bind mounts, library symlinks, driver root and CDI generation in the post-start boot hook | CDI generation with `nvidia-ctk cdi generate --driver-root /` in the pre-start boot hook, writing `/run/cdi/nvidia.yaml`, which containerd also reads as `/var/run/cdi` *(inference: containerd's default CDI directories)* |
 | NVIDIA Container Toolkit | From the GPU OCI image (`images/agent-ubuntu2404-nvidia/Containerfile:22-32`) | Shipped as an agent artifact (section 5.2) |
 | Devices and extra mounts | Bind mounts plus `DeviceAllow`, found again at every machine start (section 4) | Nothing to do; already visible |
 | Boot ID that kubelet reports | A new one at every machine start *(inference: systemd-nspawn gives each container boot its own boot ID)* | A new one at every node start (section 5.2) |
 | Shared host paths | Bind mounts | The paths themselves; `hostPath` must equal `nodePath` |
-| Kubelet exec credential command | Bind-mounted read-only at the same path | The path itself |
+| Kubelet exec credential command | A plugin is copied into the machine by `Provision`, and refreshed in the running machine after an upgrade changes it ([agent runtime, section 6.1](12-agent-runtime.md#61-kubelets-exec-credential)); a `command` is bind-mounted read-only at its own path | The plugin store, or the `command` path itself |
 | Resolver | Writes the node's `/etc/resolv.conf` | Never touches the host's `/etc/resolv.conf`. When LocalDNS is enabled, kubelet's `resolvConf` setting points at the LocalDNS resolver file (`pkg/agent/goalstates/resolve.go:163-166`, `pkg/agent/phases/nodestart/kubelet.go:129-130`); otherwise kubelet uses the host's resolver. |
-| Host requirements | The capabilities in section 5.3; mask the host's containerd and kubelet | The capabilities in section 5.3; own `containerd.service` and `kubelet.service`; mask docker |
+| Host requirements | The capabilities in section 5.3; mask the host's kubelet | The capabilities in section 5.3; own `containerd.service` and `kubelet.service`; mask docker |
 
 ### 5.1 `nspawn-container`
 
 This runtime is the parity reference. It wraps v1's nspawn code: OCI unpack,
-`.nspawn` and override rendering, `machinectl` start and stop, NVIDIA wiring,
+through v2's copy of it with two fixes, `internal/agentv2/ociimage`
+([v1 compatibility, section 3](08-v1-compatibility.md#3-code-copied-from-v1)), `.nspawn` and override rendering, `machinectl` start and stop, NVIDIA wiring,
 and machine removal. Slots map to v1's machine names (`a` is `kube1`, `b` is
 `kube2`), which keeps existing tooling and v1's existing-deployment detection
 working.
@@ -385,19 +394,34 @@ working.
 The node runs directly on the host:
 
 - `containerd.service`, `kubelet.service` and `localdns.service` keep their
-  standard names and run in `unboundednode.slice` ([host runtime cleanup, section 6](07-host-runtime-cleanup.md#6-terminate)).
+  standard names and run in `unboundednode.slice`; pods run in kubelet's
+  default `kubepods.slice` ([host runtime cleanup, section 6](07-host-runtime-cleanup.md#6-terminate)).
 - Binaries live in the enabled slot's directory; units point at them. A repave
   stages the new slot, then rewrites the units when it switches to that slot.
 - A host-owned kubelet or containerd that cannot be disabled is refused by the
   capability probes (section 5.3).
 - kubelet gets a boot ID of its own that changes at every node start, as it
   does in an nspawn container. The pre-start boot hook writes a random ID to
-  `/run/unbounded-node/boot_id`, and `kubelet.service` mounts it over
-  `/proc/sys/kernel/random/boot_id` with `BindReadOnlyPaths=`. A NodeReboot
-  therefore shows a new boot ID and a `Rebooted` event on the Node, as in v1,
-  even though the host's kernel did not restart *(inference: kubelet reports
-  the boot ID it reads from that file; validation task V6
+  `/run/unbounded-node/boot_id`. `kubelet.service` starts kubelet through a
+  wrapper that enters a new mount namespace whose mounts stay peers of the
+  host's, makes only the `/proc` mount in it private, and binds the file over
+  `/proc/sys/kernel/random/boot_id`, the file cadvisor reads by default. A
+  NodeReboot therefore shows a new boot ID and a `Rebooted` event on the Node,
+  as in v1, even though the host's kernel did not restart *(inference: kubelet
+  reports the boot ID cadvisor reads; validation task V6
   ([testing, section 7](11-testing.md#7-validation-tasks)))*.
+- `kubelet.service` and `containerd.service` use no systemd setting that gives
+  the unit a mount namespace, such as `BindReadOnlyPaths=`, `ProtectSystem=`,
+  `PrivateTmp=` or `ReadWritePaths=`. systemd makes every mount in such a
+  namespace a slave before anything else, so mounts the unit makes never reach
+  the host, and setting `MountFlags=shared` does not change that
+  (`systemd.exec(5)`, `MountFlags=`). kubelet mounts every secret, projected and
+  in-memory `emptyDir` volume itself, and containerd, in another unit, must see
+  those mounts to give them to containers. Validation task V6 showed a unit with
+  `BindReadOnlyPaths=` over the boot ID hiding its tmpfs volume mounts from the
+  host, and the wrapper above keeping them visible, with the fake boot ID
+  inside, the host's boot ID unchanged and unmounts reaching the host too, on
+  systemd 249, 252 and 255.
 
 NVIDIA Container Toolkit, as an artifact:
 
@@ -441,20 +465,24 @@ the ones each runtime needs:
 | Capability | `nspawn-container` | `host` |
 |---|---|---|
 | cgroup v2, unified hierarchy | Required | Required, and `cgroup.kill` must exist ([host runtime cleanup, section 6](07-host-runtime-cleanup.md#6-terminate)); the probe checks the file, not the kernel version |
-| systemd features the units use: `Requisite=`, `Type=notify`, `BindReadOnlyPaths=`, slice delegation | Required | Required |
+| systemd 247 or later, for the features the units and the plugin executor use: `Requisite=`, slice delegation, `DynamicUser=` with `StateDirectory=`, `LoadCredential=`, `ProtectProc=` ([extensions, section 3](02-extensions.md#3-plugin-protocol)) | Required | Required |
 | `systemd-nspawn` and `machinectl` | Present, or installable through a working package manager, as v1 installs `systemd-container` (`pkg/agent/phases/host/os.go:21-34`) | Not needed |
 | `nft`, `mountpoint`, `curl` | Present or installable | Present or installable |
-| Writable locations | `/var/lib/machines` and the agent's own directories | The slot directories, `/etc/systemd/system`, the agent's own directories and every path the runtime owns ([host runtime cleanup, section 4](07-host-runtime-cleanup.md#4-owned-resources)), such as `/var/lib/kubelet`, `/etc/kubernetes`, `/opt/cni/bin` and `/etc/cni/net.d` |
+| Writable locations | `/var/lib/machines` and the agent's own directories | The slot directories, `/etc/systemd/system` and the agent's own directories. Each per-slot node path ([host runtime cleanup, section 4](07-host-runtime-cleanup.md#4-node-paths)), such as `/var/lib/kubelet` or `/opt/cni/bin`, must exist or be creatable as a mount point; its contents are never written. |
 | Programs run from the slot directories | Not needed | The filesystem is not mounted `noexec`, and a test binary staged in a slot directory actually runs, which also covers an enforcing SELinux policy |
-| The host's own containerd and kubelet | Masked, as v1 does | None that cannot be disabled, such as a containerd shipped in a read-only operating system image and enabled there; if present, the probe fails |
-| No OS package owns files in the node's paths | Not needed: node state lives inside the machine | Required. A file in an owned path that `dpkg -S` or `rpm -qf` attributes to a package fails the probe, naming the package ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-paths-that-an-os-package-owns)). |
+| The host's own containerd and kubelet | The kubelet is masked, as v1 does. The containerd is left running; the kubelet and containerd port checks catch a real conflict ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). | Unused by anything else. The probe fails if the host's containerd has any namespace that holds images or containers, or if a host kubelet cannot be disabled. Azure Container Linux fails it: its containerd ships enabled in the read-only image and holds ACL's own images, and under the `containerd` agent runtime it runs the agent. The `host` runtime is not supported on ACL. |
+| The agent may run `systemctl reset-failed` on its own units | Checked under the `host` agent runtime, by trying it on a unit file of the agent's own. Upgrades and recovery clear the daemon unit's start limit with it. Azure Container Linux's SELinux policy denies host processes the `service reload` permission it needs on any unit backed by a unit file, whatever the file's label, so recovery after a failed upgrade waits out the start limit interval instead, and later failures can leave the daemon stopped (Azure/AKSFlexNode#385; validation task V12). A host that denies it is accepted with a warning that recommends the `containerd` agent runtime on ACL, under which the agent's container, running as `spc_t`, may run it ([agent runtime, section 10](12-agent-runtime.md#10-host-requirements)). | Same |
+| Under an image agent runtime: that agent runtime's probes, such as the host's containerd or systemd-nspawn, and an SELinux domain for privileged containers that may talk to systemd | Required ([agent runtime, section 10](12-agent-runtime.md#10-host-requirements)) | The image agent runtimes are not supported with `host` |
+| No OS package owns files in the node's paths or ships units with the node's names | Not needed: node state lives inside the machine | A warning, naming the packages and paths, not a refusal: the runtime never deletes a package's files, but a package's upgrades write into the slot's state, and its maintainer scripts act on the node's units ([host runtime cleanup, section 3.1](07-host-runtime-cleanup.md#31-packages-that-use-the-nodes-paths-or-unit-names)) |
 | NVIDIA driver, when GPUs are present | Required, as in v1 | Required, plus the toolkit artifact (section 5.2) |
 
 The probes are the support decision; the end-to-end host matrix only tests
 that each probe gives the expected result on each operating system
-([testing, section 6](11-testing.md#6-ci)). An immutable host, such as Azure Container Linux, is not named
-anywhere: it is supported for a runtime exactly when that runtime's probes pass
-on it.
+([testing, section 6](11-testing.md#6-ci)). No operating system is named in them, an immutable host such
+as Azure Container Linux included: a host is supported for a runtime, or for
+an agent runtime, exactly when the probes pass on it. The `containerd` agent
+runtime targets ACL and is tested only there ([agent runtime, section 1](12-agent-runtime.md#1-agent-runtimes)), and the
+`host` runtime is not supported on ACL, whose containerd fails the probe above.
 
 A Machine that asks for a runtime its host cannot run fails at bootstrap with
 the failing probe in the error, and the Machine's `AgentBootstrapped` condition

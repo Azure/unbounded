@@ -3,9 +3,10 @@
 Part of the [Unbounded Agent v2 design](README.md). The README has the status,
 repository baseline, citation conventions and terms.
 
-This document specifies how the `host` runtime stops, cleans up and removes a
-node that runs directly on the host. It has no container to throw away, so it
-must stop processes, unmount volumes and remove state itself.
+This document specifies how the `host` runtime keeps, stops, cleans up and
+removes a node that runs directly on the host. It has no container to throw
+away, so it must stop processes, unmount volumes and keep node state apart
+itself.
 
 ## 1. Why the host runtime needs explicit cleanup
 
@@ -14,125 +15,123 @@ runtime has no container, so it has to provide each guarantee itself.
 
 | Resource | `nspawn-container` gets it for free because | `host` must |
 |---|---|---|
-| Node processes: kubelet, containerd, shims, pods | Stopping the machine kills its whole cgroup scope (`pkg/agent/phases/reset/machine.go:33-91`) | Contain them in one slice and kill it (section 6) |
+| Node processes: kubelet, containerd, shims, pods | Stopping the machine kills its whole cgroup scope (`pkg/agent/phases/reset/machine.go:33-91`) | Contain them in slices and stop them (section 6) |
 | Pod mounts, overlay rootfs, `/run/netns/cni-*` | They live in the container's mount namespace and its `/run` *(inference)* | Unmount and remove them (section 7) |
-| kubelet, containerd and CNI state | A repave unpacks a new rootfs | Wipe the owned paths (section 8) |
-| Pod hostPath data | hostPaths resolve inside the rootfs, e.g. `/etc/wireguard`, `/opt/cni/bin` (`deploy/net/node/03-daemonset.yaml.tmpl:135-155`) and `/var/lib/gantry/libp2p` (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Wipe the known and declared paths, report the rest (sections 8 and 12) |
+| kubelet, containerd and CNI state | A repave unpacks a new rootfs | Keep each slot's state in a directory of its own and bind it onto the standard paths (section 3) |
+| Pod hostPath data | hostPaths resolve inside the rootfs, e.g. `/etc/wireguard`, `/opt/cni/bin` (`deploy/net/node/03-daemonset.yaml.tmpl:135-155`) and `/var/lib/gantry/libp2p` (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Keep known and declared paths in the slot's state, report the rest (sections 4 and 12) |
 | Network: links, routes, rules, nftables and iptables | Nothing: the network namespace is already shared (`pkg/agent/phases/rootfs/assets/nspawn.conf:20-21`) | The same network reset as today ([host changes, section 2](06-host-changes.md#2-host-network-reset)) |
 | eBPF pins | Each machine gets its own bpffs (`nspawn.conf:27-29`) | Pins land in the host's bpffs; only declared pins are cleaned (sections 12 and 13) |
 
 ## 2. Principles
 
-1. **Delete only what is provably owned.** A file or directory is deleted only
-   if it is in the ownership record or the installed-files manifest. Network
+1. **Delete only what is provably owned.** Node state lives in slot
+   directories under v2's own tree, so removing it never touches a path v2 did
+   not create. The standard paths, such as `/var/lib/kubelet`, are only mount
+   points: whatever the host had there is never changed or deleted. Network
    objects are the one exception, because the host network namespace keeps no
-   record of who created what. They are deleted when they match names that only
-   node components create, such as the `UNBOUNDED-*`, `KUBE-*` and `CNI-*`
+   record of who created what. They are deleted when they match names that
+   only node components create, such as the `UNBOUNDED-*`, `KUBE-*` and `CNI-*`
    iptables chains and unbounded-net's links, or when an extension declares
    them ([host changes, section 2](06-host-changes.md#2-host-network-reset)).
 2. **Never cross a mount or follow a symlink while deleting.** A mount found
    inside a tree being deleted aborts the deletion. Pod volumes are often bind
    mounts of host data, and deleting through one destroys that data.
-3. **Contain processes in a slice** that can be killed as a unit.
+3. **Contain processes in slices** that can be stopped as a unit.
 4. **Every level is idempotent and restartable.** Intent is written and
    synced to disk before acting.
 5. **Refuse to start on unclean state; clean up as much as possible on
-   teardown.** A failed check before starting a fresh node blocks the start.
+   teardown.** A failed check before starting a node blocks the start.
    Teardown runs every step even if some fail, then reports leftovers.
 6. **Report what cannot be cleaned** rather than ignoring it.
 
-## 3. Ownership and adoption
+## 3. Node state per slot
 
-The `host` runtime records every host path it owns in its ownership record,
-`/var/lib/unbounded/agent-v2/host-runtime/owned-paths.json`, mode 0600, written
-and synced to disk, with a `.sha256` sidecar.
+Each slot keeps the node's persistent state in its own directories, and host
+mount units bind the active slot's directories onto the standard paths:
+
+- Each persistent node path (section 4) has a directory in each slot,
+  `/var/lib/unbounded/agent-v2/slots/<slot>/state/<name>`, where the name is
+  the path escaped with `systemd-escape -p`, such as `var-lib-kubelet`.
+- The link `/var/lib/unbounded/agent-v2/slots/active` names the slot whose
+  state is in use. It is changed by writing a new link and renaming it over the
+  old one, so it always names one slot or the other.
+- For each path, a mount unit named for it, such as `var-lib-kubelet.mount`,
+  binds `slots/active/state/<name>` onto the path. `unbounded-node.target`
+  wants every mount unit, and the node units have `RequiresMountsFor=` on the
+  paths they use. The link is resolved when the mount is made, so a mount
+  never changes slot while it is mounted.
+- `Provision` creates the slot's state directories and writes the bundle's
+  content into them, such as `/etc/containerd/config.toml`, kubelet's
+  configuration and the CNI plugins. A slot provisioned with new content gets
+  new, empty state directories, which is how rule 4 of the
+  [node runtime, section 1](03-node-runtime.md#1-node-runtime) holds: the first start after new content
+  begins with empty kubelet and containerd state. The inactive slot's
+  directories are not mounted, so `Provision` can fill them while the active
+  slot runs.
+
+Validation task V10 ([testing, section 7](11-testing.md#7-validation-tasks)) ran kubelet 1.33 and containerd
+2.1.8 this way on Ubuntu 24.04. `/var/lib/kubelet` was a shared mount;
+in-memory `emptyDir` and downward API volumes reached their containers; a
+pod's Bidirectional mount under `/var/lib/kubelet/plugins` reached the host;
+kubelet reported node and image file system statistics; a slot change gave
+kubelet empty state; and a reboot right after the link changed brought the
+node back from the slot the link named.
+
+What the host had at a standard path stays where it was, hidden by the mount
+while the node runs and visible again after teardown. In V10, existing content
+in `/opt/cni/bin` and `/etc/cni/net.d` was byte-identical after teardown, and
+`dpkg --verify` was unchanged. There is therefore nothing to adopt: no
+adoption policies, no backups and no limit on their size.
+
+The runtime keeps an installed record,
+`/var/lib/unbounded/agent-v2/host-runtime/installed.json`, under the rules for
+state files in [control and state, section 4](04-control-and-state.md#4-state):
 
 ```json
 {
   "schemaVersion": 1,
   "installID": "4f1c...",
-  "paths": [
-    { "path": "/var/lib/kubelet", "class": "persistent", "created": true, "preexistingMount": false },
-    {
-      "path": "/opt/cni/bin", "class": "persistent", "created": false, "preexistingMount": false,
-      "adopted": "Preserve",
-      "backup": "/var/lib/unbounded/agent-v2/host-runtime/adopted/9c1e...",
-      "backupSHA256": "..."
-    }
-  ],
   "installedFiles": [ { "path": "/etc/systemd/system/kubelet.service", "sha256": "..." } ],
+  "createdMountPoints": [ "/var/lib/kubelet", "/etc/kubernetes" ],
   "rtTablesExisted": true,
   "observedHostPaths": [ "/var/lib/some-daemonset" ]
 }
 ```
 
-The runtime takes ownership of each path on the first slot change (section 8). It
-records the path before creating anything there. Original sysctl values are not
-kept here; the host preparation undo log keeps them for both runtimes
-([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)).
+It is written before the runtime creates anything it lists.
 
-| State of the path when the runtime takes ownership | Result |
-|---|---|
-| Absent | Create it; record `created: true` |
-| Exists and empty | Record `created: false` |
-| Exists and is a mount point, such as a dedicated disk for `/var/lib/containerd` | Record `preexistingMount: true`. The mount is never unmounted; only its contents are wiped. |
-| Contains a file that an OS package owns | Refused, whatever its adoption policy: a capability probe fails with `package-owned-node-path`, naming the path, the file and the package (section 3.1) |
-| Exists, non-empty, no `adoptExistingPaths` entry | Preflight error `existing-node-state`, listing the path |
-| Exists, non-empty, adoption policy `Preserve` | Copy the contents into a backup, then take ownership with `adopted: "Preserve"`. Teardown restores the backup. Kept for content no package owns until validation task V7 shows whether it is needed (section 3.1). |
-| Exists, non-empty, adoption policy `Discard` | Take ownership with `adopted: "Discard"`. The contents are deleted at the first wipe. Teardown leaves the path empty. |
+### 3.1 Packages that use the node's paths or unit names
 
-`Preserve` backups:
+v2 does not control the OS images it runs on. A package can ship files in a
+path the node uses, such as CNI plugins in `/opt/cni/bin`, or ship units with
+the node's names, such as a distribution's `containerd.service`.
 
-- live in `/var/lib/unbounded/agent-v2/host-runtime/adopted/<sha256-of-path>/`;
-- keep mode, ownership, extended attributes and SELinux labels;
-- are capped per path at `runtime.host.adoptPreserveMaxBytes`, 1 GiB by
-  default; above the cap, preflight fails and suggests `Discard`;
-- must stay within one filesystem; a mount inside the tree fails the adoption.
+- **Files under a node path** are hidden while the node runs and are never
+  deleted. A package upgrade while the node runs writes into the active
+  slot's state instead, so the next slot change discards it, and the
+  package's files underneath are older than its database says.
+- **Units with the node's names** collide with the `host` runtime's units,
+  which keep the standard names ([node runtime, section 5.2](03-node-runtime.md#52-host)) and take
+  precedence from `/etc/systemd/system`. The package's maintainer scripts then
+  act on the node's units: in V10, reinstalling Ubuntu's `containerd` package
+  restarted the node's containerd. A containerd restart keeps running
+  containers, because the shims outlive it
+  (`pkg/agent/phases/nodestart/assets/containerd.service:10-11`), but the
+  restart is not the node's to make.
 
-Preflight reports the adoption plan before anything changes: each path, its
-mode, and its size and file count.
+Neither deletes anything, so neither refuses the host. Preflight lists both as
+warnings, naming the packages and paths, and `status` shows them. Removing such
+a package, or using `nspawn-container`, avoids them.
 
-### 3.1 Paths that an OS package owns
+## 4. Node paths
 
-v2 does not control the OS images it runs on, and a package can ship files in
-a path the node needs, such as CNI plugins in `/opt/cni/bin` or a default
-`/etc/containerd/config.toml`. Neither adoption policy works for those files:
+**Per-slot** paths are bound from the active slot (section 3). **Volatile**
+paths are cleared by Unmount. The last column says which cleanup level
+removes each resource.
 
-- `Discard` deletes them, so the package's own checks (`dpkg --verify`,
-  `rpm -V`) fail, and a later upgrade or removal of the package misbehaves.
-- `Preserve` puts them back at teardown, but meanwhile a package upgrade writes
-  into a path the node owns, and the next wipe deletes what it wrote.
-
-So the `host` runtime never takes ownership of a file a package owns:
-
-1. **It refuses such a host.** Before ownership is taken, every file in each
-   owned path is looked up with `dpkg -S` or `rpm -qf`. Any match fails the
-   `package-owned-node-path` capability probe
-   ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)), naming the path, the file and the package. The fix
-   is to remove the package, or to use `nspawn-container`, which keeps node
-   state inside the machine. This is a documented limitation of the `host`
-   runtime.
-2. **It checks again before every wipe.** A package installed after bootstrap
-   can put files into an owned path. The slot change then stops before
-   anything is deleted, the old slot keeps running if it was, and the Machine
-   shows `AgentHealthy=False` with reason `PackageOwnedNodePath`.
-3. **How common this is decides `Preserve`.** Validation task V7 lists, for
-   every image in the host matrix, which owned paths exist and what is in
-   them, separating package-owned files from everything else
-   ([testing, section 7](11-testing.md#7-validation-tasks)). If content that no package owns turns up in practice,
-   `Preserve` stays for that content. If not, it is removed, leaving refusal
-   and `Discard`.
-
-Without an ownership record, Teardown is conservative (section 9).
-
-## 4. Owned resources
-
-**Volatile** paths are cleared by Unmount, and **persistent** paths by Wipe
-(section 5). The last column says which cleanup level removes each resource.
-
-| Path or resource | Created by | Cleared at | Notes |
+| Path or resource | Created by | Kept or cleared | Notes |
 |---|---|---|---|
-| Processes in `unboundednode.slice` | runtime, kubelet, containerd | Terminate | Section 6 |
+| Processes in `unboundednode.slice` and `kubepods.slice` | runtime, kubelet, containerd | Terminate | Section 6 |
 | Mounts under `/var/lib/kubelet`, `/var/lib/containerd`, `/run/containerd` | kubelet, containerd | Unmount | Section 7 |
 | `/run/netns/cni-*`, these entries only | containerd and CNI *(inference)* | Unmount | Section 7 |
 | `/run/containerd` | containerd; gantry hostPath (`deploy/gantry/chart/values.yaml:26`) | Unmount (volatile) | |
@@ -140,20 +139,20 @@ Without an ownership record, Teardown is conservative (section 9).
 | `/run/racer` | racer hostPath (`internal/racer/workload/workload.go:292`) | Unmount (volatile) | |
 | `/run/cdi/nvidia.yaml` | runtime pre-start boot hook | Unmount (volatile) | Regenerated on every start. containerd also reads it as `/var/run/cdi` *(inference: containerd's default CDI directories)*. |
 | `/run/unbounded-node/boot_id` | runtime pre-start boot hook | Unmount (volatile) | The boot ID kubelet sees; a new one on every start ([node runtime, section 5.2](03-node-runtime.md#52-host)) |
-| `/var/lib/kubelet` | kubelet, bundle | Wipe (persistent) | Includes kubelet's client certificates *(inference: kubelet's default certificate directory)*, so a wipe forces TLS bootstrapping again |
-| `/var/lib/containerd` | containerd | Wipe (persistent) | Images and gantry's content cache; see `retainContainerImages` (section 8) |
-| `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | Wipe (persistent) | Rewritten from the bundle on each slot change |
-| `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | Wipe (persistent) | Bundle plugins are installed again after the wipe |
-| `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:314-319`) | Wipe (persistent) | |
-| `/var/lib/cni` | CNI IPAM *(inference)* | Wipe (persistent) | |
-| `/var/log/pods`, `/var/log/containers` | kubelet *(inference)* | Wipe (persistent) | |
-| `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | Wipe (persistent) | The directory is left alone; the host may have its own WireGuard configuration |
-| `/var/lib/gantry` | gantry (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Wipe (persistent) | libp2p identity |
-| `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | Wipe (persistent) | |
-| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | Uninstall | A line-level edit. If the file did not exist when the runtime took ownership, and only default content remains, the file is removed. |
-| Slot directories | runtime | `Destroy`, or Uninstall | |
-| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, extension host units | runtime | Uninstall | The node manager writes the LocalDNS network unit and helper before every node start, and the host network reset removes them ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units) and [host changes, section 2](06-host-changes.md#2-host-network-reset)) |
-| Extension `cleanup.statePaths` | consumer | Unmount or Wipe, by the declared class | Section 13 |
+| `/var/lib/kubelet` | kubelet, bundle | Per slot | Includes kubelet's client certificates *(inference: kubelet's default certificate directory)*, so a new slot bootstraps TLS again |
+| `/var/lib/containerd` | containerd | Per slot | Images and gantry's content cache; see `retainContainerImages` (section 8) |
+| `/etc/kubernetes`, `/etc/containerd` including `certs.d` | bundle; gantry (`deploy/gantry/chart/values.yaml:34`) | Per slot | |
+| `/opt/cni/bin` | bundle; unbounded-net init container (`images/net/node-agent-init.sh:55-65`) | Per slot | |
+| `/etc/cni/net.d` | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:314-319`) | Per slot | |
+| `/var/lib/cni` | CNI IPAM *(inference)* | Per slot | |
+| `/var/log/pods`, `/var/log/containers` | kubelet *(inference)* | Per slot | |
+| `/var/lib/gantry` | gantry (`deploy/gantry/chart/templates/daemonset.yaml:134-135`) | Per slot | libp2p identity |
+| `/var/lib/racer` | racer (`internal/racer/workload/workload.go:292`) | Per slot | |
+| `/etc/wireguard/server.priv` and `server.pub`, these files only | unbounded-net (`cmd/unbounded-net-node/bootstrap_helpers.go:372`) | Deleted at a slot change | The directory may hold the host's own WireGuard configuration, so it is not bound; the two files are deleted by name |
+| `/etc/iproute2/rt_tables` lines `<id>\twg<id>` with id 51820 or higher | unbounded-net, only with policy routing (`internal/net/netlink/route_table_setup.go:28-105`) | Uninstall | A line-level edit. If the file did not exist at install, and only default content remains, the file is removed. |
+| Slot directories and the `active` link | runtime | `Destroy`, or Uninstall | |
+| Units and drop-ins: `kubelet`, `containerd`, `localdns` and its slice, `unboundednode.slice`, `unbounded-node.target`, `unbounded-node-prestart.service`, one mount unit for each per-slot path, extension host units | runtime | Uninstall | The node manager writes the LocalDNS network unit and helper before every node start, and the host network reset removes them ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units) and [host changes, section 2](06-host-changes.md#2-host-network-reset)) |
+| Extension `cleanup.statePaths` | consumer | Per slot, or Unmount, by the declared class | Section 13 |
 
 ## 5. Cleanup levels
 
@@ -162,25 +161,20 @@ Each level includes every level before it.
 | Level | Removes | `nspawn-container` equivalent |
 |---|---|---|
 | Terminate | All node processes | `machinectl terminate`, or stopping the machine |
-| Unmount | Node mounts, pod network namespace files under `/run/netns`, and the runtime directories under `/run` | The machine's mount namespace and `/run` going away |
-| Wipe | All persistent node state | A new rootfs |
-| Uninstall | Everything the runtime installed: units, files, slots, file edits, the ownership record | `machinectl remove` and removal of the nspawn configuration |
+| Unmount | Node mounts, pod network namespace files under `/run/netns`, the runtime directories under `/run`, and the per-slot state mounts | The machine's mount namespace and `/run` going away |
+| Uninstall | Everything the runtime installed: units, files, slots, file edits, the mount points it created, the installed record | `machinectl remove` and removal of the nspawn configuration |
 
-```mermaid
-flowchart LR
-  T1["Terminate"] --> U1["Unmount"] --> W["Wipe"] --> X["Uninstall"]
-  S["Stop, Restart"] -.->|runs up to| U1
-  A["Start after a slot change"] -.->|runs up to| W
-  T["Teardown"] -.->|runs up to| X
-```
+There is no wipe. A slot change binds another slot's state, and a slot's old
+state is removed with the slot.
 
 | Method | `host` runtime behavior |
 |---|---|
+| `Provision(slot)` | Create the slot's state directories, removing an earlier tree with the safe remover after checking no mount is inside it, then write the bundle's binaries and content into the slot. Same digest as the slot holds: rewrite only the secret files ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)). |
 | `Stop(slot)` | Terminate, then Unmount, then disable `unbounded-node.target` |
-| `Restart(slot)` | Terminate, Unmount, then restart `unbounded-node-prestart.service`, which runs the prerequisites and the pre-start boot hook again, then start the node units ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
-| `Start(slot)`, same slot and bundle as last time | Enable `unbounded-node.target`, restart `unbounded-node-prestart.service`, and start the target. No wipe. |
-| `Start(slot)` after a slot change | Terminate, Unmount, Wipe, verify, install the slot's content, write the active-slot record, then enable `unbounded-node.target`, restart `unbounded-node-prestart.service` and start the target (section 8) |
-| `Destroy(slot)` | Remove the slot directory only. Returns `ErrSlotEnabled` for the enabled slot. |
+| `Restart(slot)` | Terminate, Unmount everything but the per-slot state mounts, then restart `unbounded-node-prestart.service`, which runs the prerequisites and the pre-start boot hook again, then start the node units ([node runtime, section 4](03-node-runtime.md#4-host-boot-and-boot-units)) |
+| `Start(slot)`, the slot `active` names | Enable `unbounded-node.target`, restart `unbounded-node-prestart.service`, and start the target, which mounts the slot's state |
+| `Start(slot)`, another slot | Terminate, Unmount, verify, delete the WireGuard key files, point `active` at the slot, install the slot's units and host files, then enable `unbounded-node.target`, restart `unbounded-node-prestart.service` and start the target (section 8) |
+| `Destroy(slot)` | Remove the slot directory, its state included. Returns `ErrSlotEnabled` for the slot `active` names. |
 | `Teardown()` | Every level through Uninstall (section 9) |
 
 The host network reset is not a runtime method. The node manager runs it for
@@ -192,14 +186,20 @@ Containment:
 
 - `containerd.service`, `kubelet.service` and `localdns.service` get
   `Slice=unboundednode.slice`.
-- kubelet gets `cgroupDriver: systemd` and `cgroupRoot: /unboundednode`, so
-  pods land under `unboundednode-kubepods.slice` *(inference: kubelet's
-  systemd cgroup naming)*.
-- Shims start in `containerd.service`'s cgroup, so they are in the slice and
-  stop with it, even though `KillMode=process` keeps them alive when only
+- kubelet gets `cgroupDriver: systemd` and keeps its default cgroup root, so
+  pods land under `kubepods.slice`, as on any kubeadm-style node. Putting them
+  under the node's slice with `cgroupRoot: /unboundednode` was tried and
+  rejected: kubelet 1.33 refused to start with `cgroup ["unboundednode"] has
+  some missing controllers: hugetlb`, because systemd does not enable the
+  `hugetlb` controller for slices (V10). Writing `+hugetlb` into
+  `cgroup.subtree_control` by hand made it start, but that controller is
+  outside what systemd manages. Keeping the default also means no DaemonSet
+  can be surprised by an unusual pod cgroup path.
+- Shims start in `containerd.service`'s cgroup, so they are in the node's slice
+  and stop with it, even though `KillMode=process` keeps them alive when only
   containerd stops (`pkg/agent/phases/nodestart/assets/containerd.service:10-11`).
 - The slice name has no hyphen. systemd treats `-` as the slice hierarchy
-  separator, and kubelet escapes `-` in `cgroupRoot` *(inference)*.
+  separator *(inference)*.
 
 systemd does the stopping. Stopping a slice stops every unit in it: SIGTERM,
 then SIGKILL after each unit's stop timeout *(inference: systemd slice and
@@ -210,9 +210,9 @@ only as a backstop:
 sequenceDiagram
   participant HR as host runtime
   participant SD as systemd
-  participant CG as unboundednode.slice
+  participant CG as kubepods.slice and unboundednode.slice
   HR->>SD: stop kubelet.service, so it cannot restart pods
-  HR->>SD: stop unboundednode.slice, waiting up to stopGracePeriod
+  HR->>SD: stop kubepods.slice and unboundednode.slice, waiting up to stopGracePeriod
   HR->>CG: check populated 0
   alt still populated
     HR->>CG: write 1 to cgroup.kill
@@ -227,12 +227,15 @@ sequenceDiagram
 - `stopGracePeriod` defaults to 30 seconds and `killTimeout` to 15 seconds,
   matching v1's machine stop and terminate waits
   (`pkg/agent/phases/reset/machine.go:66,83`).
-- Signals go to the whole slice, not to each pod through the CRI. That matches
-  v1, where pods get SIGTERM and then SIGKILL as the machine scope stops
-  *(inference)*.
+- Signals go to the whole slices, not to each pod through the CRI. That
+  matches v1, where pods get SIGTERM and then SIGKILL as the machine scope
+  stops *(inference)*.
 - A process stuck in uninterruptible sleep, for example on a dead NFS mount,
-  leaves the cgroup populated. Terminate then fails, and Wipe never runs over
-  live state.
+  leaves a cgroup populated. Terminate then fails, and no slot change runs
+  over live state.
+- `kubepods.slice` belongs to the node because the `host` runtime owns
+  `kubelet.service`; no other kubelet may run on the host
+  ([node runtime, section 5.3](03-node-runtime.md#53-host-capabilities)).
 
 The `host` runtime's capability probes require the unified cgroup v2
 hierarchy and `cgroup.kill`, which needs Linux 5.14 or later *(inference:
@@ -244,85 +247,76 @@ kernel cgroup v2 interface)*. The probe checks for the file itself
 
 Unmount runs only after Terminate has verified that no node processes remain.
 
-1. Read `/proc/self/mountinfo`. Select mount points under the owned paths that
-   hold mounts (`/var/lib/kubelet`, `/var/lib/containerd`, `/run/containerd`)
-   and under `/run/netns/cni-*`. Leave out any path marked `preexistingMount`.
-2. Unmount deepest first: `umount2(path, 0)`; on `EBUSY`, retry three times one
-   second apart; then `umount2(path, MNT_DETACH)` and record a warning.
-3. Repeat until no selected mounts remain, at most five passes, since mounts
+1. Read `/proc/self/mountinfo`. Select mount points under `/run/containerd`
+   and `/run/netns/cni-*`, and under the per-slot paths when the state mounts
+   are to go too.
+2. Unmount `/run` mounts deepest first: `umount2(path, 0)`; on `EBUSY`, retry
+   three times one second apart; then `umount2(path, MNT_DETACH)` and record a
+   warning.
+3. Stop the per-slot state mount units. systemd stops the mount units for
+   mounts nested under them first, so pod volumes under `/var/lib/kubelet`
+   go with it; in V10 no mount was left under any per-slot path. A mount unit
+   is never detached lazily: if a process outside the node holds a per-slot
+   path, its mount stays (V10), and Unmount fails with `ErrMountsRemain`,
+   naming the process. A unit started with `WorkingDirectory=` under a
+   per-slot path gets `RequiresMountsFor=` on it from systemd, so systemd
+   stops that unit instead *(inference from V10: such a unit was stopped with
+   the mount)*.
+4. Repeat until no selected mounts remain, at most five passes, since mounts
    shared with other mount namespaces can reappear *(inference)*. If mounts
    remain, fail with `ErrMountsRemain`.
-4. For each pod network namespace file `/run/netns/cni-*`, unmount it if
+5. For each pod network namespace file `/run/netns/cni-*`, unmount it if
    needed, then delete it. With no processes using them, the kernel frees the
    namespaces and their veth peers disappear from the host *(inference)*.
-5. Clear volatile paths with the safe remover (section 8).
+6. Clear volatile paths with the safe remover (section 8).
 
-## 8. Wipe and slot changes
+## 8. Slot changes
 
-The active-slot record,
-`/var/lib/unbounded/agent-v2/host-runtime/active-slot.json`, holds
-`{schemaVersion, slot, bundleDigest, phase}` and follows the rules for state
-files in [control and state, section 4](04-control-and-state.md#4-state). When `Start` is called with a slot or bundle
-digest that differs from the record, the runtime is making a *slot change*, and
-it wipes node state first. This is how the `host` runtime keeps rule 4 of the
-[node runtime, section 1](03-node-runtime.md#1-node-runtime): the first time a slot starts after its content was
-provisioned, it begins with fresh state. The digest is read from the slot's
-saved bundle manifest and leaves out secret contents ([node runtime, section 2](03-node-runtime.md#2-node-spec-and-bundle)),
-so a refreshed bootstrap token never causes a wipe.
+When `Start` is called for a slot other than the one `active` names, the
+runtime is making a *slot change*:
 
-This record is the `host` runtime's own record of which slot is installed into
-the shared paths. The node manager keeps no copy of it. `Inspect` reports it
-like this:
+1. Terminate and Unmount, both verified, including the per-slot state mounts.
+2. Delete `/etc/wireguard/server.priv` and `server.pub`.
+3. Point `active` at the new slot, by renaming a new link over it, and sync
+   the directory.
+4. Install the slot's units and host files, and reload systemd.
+5. Enable and start `unbounded-node.target`, which mounts the new slot's
+   state.
+
+`Inspect` reports from the link and systemd:
 
 | Host state | `Inspect` reports for the slot |
 |---|---|
 | No slot directory, or no completion marker | Absent |
-| Complete slot directory, not the slot in the record | Provisioned |
-| The slot in the record, with phase `Wiping` or `Installing` | Provisioned: a slot change is in progress, and the next `Start` finishes it |
-| The slot in the record, phase `Active`, node units running | Running |
-| The slot in the record, phase `Active`, node units stopped | Stopped |
+| Complete slot directory, not the slot `active` names | Provisioned |
+| The slot `active` names, node units running | Running |
+| The slot `active` names, node units stopped | Stopped |
 
-`Enabled` is true for the slot in the record while `unbounded-node.target` is enabled.
+`Enabled` is true for the slot `active` names while `unbounded-node.target` is
+enabled.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Inactive
-  Inactive --> Wiping: Start, record does not match slot and digest
-  Wiping --> Installing: Terminate, Unmount and Wipe verified
-  Installing --> Active: slot content installed, record phase Active
-  Active --> Running: enable and start unbounded-node.target
-  Running --> Active: Stop, which disables unbounded-node.target
-  Active --> Running: Start, same slot and digest, no wipe
-  Wiping --> Wiping: crash, the next Start redoes the wipe
-  Installing --> Wiping: crash, the next Start redoes the wipe
-```
+A crash at any step leaves `active` naming the old slot or the new one, and
+whichever it names is what the next `Start`, or the next boot, mounts. V10
+checked a reboot between steps 3 and 5. A slot change never deletes anything
+under the standard paths; the old slot's state is removed by `Destroy` once
+the repave has committed ([lifecycles, section 2](05-lifecycles.md#2-repave)).
 
-Wipe:
+The safe remover, used by `Provision`, `Destroy` and Uninstall, opens with
+`O_NOFOLLOW`, compares `st_dev` with the root's device at every directory and
+aborts with `ErrMountInTree` on a mismatch, and unlinks symlinks without
+following them.
 
-1. Check the owned paths for package-owned files again (section 3.1). If any
-   are found, stop here: nothing has changed yet.
-2. Write `phase: Wiping` and sync it to disk.
-3. Terminate and Unmount, both verified.
-4. Clear every persistent path in the ownership record and every declared
-   `cleanup.statePaths` entry. Directories keep their mode and SELinux label;
-   only their contents are removed. The WireGuard entries are single files.
-5. The safe remover opens with `O_NOFOLLOW`, compares `st_dev` with the root's
-   device at every directory and aborts with `ErrMountInTree` on a mismatch,
-   unlinks symlinks without following them, and refuses if an owned path has
-   become a symlink.
-6. Delete declared eBPF pins (section 13).
-7. Verify (section 10). Write `phase: Installing`, install the slot's units,
-   configuration, binaries and CNI plugins, then write `phase: Active` with the
-   slot and digest.
+A Kubernetes upgrade repaves every host at once, so with an empty
+`/var/lib/containerd` in each new slot, every host pulls every image again at
+the same time. That strains registries with rate limits and slow links to edge
+sites, makes repaves of large GPU and machine learning images slow, and throws
+away gantry's peer-to-peer cache, which lives in `/var/lib/containerd`.
 
-A Kubernetes upgrade repaves every host at once, so without
-`runtime.host.repave.retainContainerImages` every host pulls every image again
-at the same time. That strains registries with rate limits and slow links to
-edge sites, makes repaves of large GPU and machine learning images slow, and
-throws away gantry's peer-to-peer cache, which lives in `/var/lib/containerd`.
-
-With `runtime.host.repave.retainContainerImages: true`, step 4 does not clear
-`/var/lib/containerd`. Instead it performs an image-preserving reset:
+With `nodeRuntime.host.repave.retainContainerImages: true`, `/var/lib/containerd`
+is not per slot: one directory,
+`/var/lib/unbounded/agent-v2/host-runtime/shared/var-lib-containerd`, is bound
+for every slot, and a slot change runs an image-preserving reset of it before
+step 3:
 
 1. Start a temporary maintenance containerd: the binary from the slot being
    switched to, a private configuration and socket under
@@ -338,20 +332,21 @@ With `runtime.host.repave.retainContainerImages: true`, step 4 does not clear
    (`io.containerd.grpc.v1.cri`). Nothing else inside containerd's root is
    deleted file by file, so its metadata stays consistent.
 5. If the maintenance instance did not report zero containers, tasks and
-   sandboxes, fall back to a full clear and log why.
+   sandboxes, fall back to emptying the directory and log why.
 
 This option does not apply to `nspawn-container`, where a repave always
-unpacks a new rootfs. The mechanism needs a prototype (validation task V2 in [testing, section 7](11-testing.md#7-validation-tasks)).
+unpacks a new rootfs. The mechanism needs a prototype (validation task V2 in
+[testing, section 7](11-testing.md#7-validation-tasks)).
 
 ## 9. Teardown
 
 ```mermaid
 flowchart TD
-  B["Terminate, Unmount, Wipe, best effort"] --> D["Stop, disable and remove installed units, daemon-reload, reset-failed"]
-  D --> E["Remove installed files, content checked against the manifest"]
-  E --> F["Owned paths: remove created ones, restore Preserve backups, clear the rest"]
+  B["Terminate and Unmount, including the per-slot state mounts, best effort"] --> D["Stop, disable and remove installed units, daemon-reload, reset-failed"]
+  D --> E["Remove installed files, content checked against the record"]
+  E --> F["Remove the mount points the runtime created, only if empty"]
   F --> G["Revert file edits: rt_tables lines"]
-  G --> I["Remove slots, the active-slot record and the ownership record"]
+  G --> I["Remove the slots, the active link and the installed record"]
   I --> J["Return leftovers"]
 ```
 
@@ -360,34 +355,30 @@ as resetting before it calls Teardown, and runs the host network reset and
 replays the host preparation undo log after it
 ([lifecycles, section 6](05-lifecycles.md#6-reset)).
 
-- A file whose content no longer matches the manifest is still removed, because
-  the path is owned. The mismatch is logged.
-- `Preserve` backups are deleted only after a verified restore.
-- The ownership record is removed last, so a crash anywhere earlier repeats the
-  full Teardown.
+- A file whose content no longer matches the record is still removed, because
+  the runtime installed it. The mismatch is logged.
+- The installed record is removed last, so a crash anywhere earlier repeats
+  the full Teardown.
+- Nothing under a standard path is deleted, so whatever the host had there
+  before the install is there again afterwards (V10).
 
-Without an ownership record, Teardown is conservative:
-
-- It removes only paths and units unique to v2: slot directories,
-  `unboundednode.slice`, `unbounded-node.target`,
-  `unbounded-node-prestart.service` and v2 state. Host preparation units, such
-  as `nftables-flush.service`, are reversed by the undo log after Teardown.
-- Every non-empty standard path in section 4 is reported as a leftover.
-- `reset --force-standard-paths` clears their contents, using the safe
-  remover. It never removes the directories.
-- The node manager still reverses host preparation, including the original
-  sysctl values, from its own undo log ([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). If that log is missing too, the
-  sysctl keys that could not be restored are reported.
+Without an installed record, Teardown still finds what it needs: the unit
+names and the slot directory are fixed. It removes those, and reports any
+standard path it cannot tell it created as a leftover instead of removing the
+empty mount point. The node manager still reverses host preparation,
+including the original sysctl values, from its own undo log
+([host changes, section 3](06-host-changes.md#3-host-preparation-and-its-reversal)). If that log is missing too, the sysctl keys
+that could not be restored are reported.
 
 ## 10. Post-conditions
 
 | After | Must be true | On violation |
 |---|---|---|
-| Terminate | `unboundednode.slice` reports `populated 0`; no process runs an executable from a slot directory | `ErrNodeBusy`; Wipe and Start do not run |
-| Unmount | No mounts under the owned paths apart from `preexistingMount` paths; no `/run/netns/cni-*` files | `ErrMountsRemain`; Wipe does not run |
-| Wipe | Every persistent owned path is empty; no declared pins remain | `ErrStateRemains`; the slot change does not continue |
+| Terminate | `kubepods.slice` and `unboundednode.slice` report `populated 0`; no process runs an executable from a slot directory | `ErrNodeBusy`; the slot change does not run |
+| Unmount | No mounts under `/run/containerd` and no `/run/netns/cni-*` files; when the state mounts are to go, no mount under any per-slot path | `ErrMountsRemain`; the slot change does not run |
+| Slot change | `active` names the new slot and every per-slot path is mounted from it | Error, retried by `Recover` |
 | Host network reset | No owned links, rules or tables; no `unbounded_localdns` table; on Teardown, no owned chains | Repave: error, retried by `Recover`. Teardown: leftover. |
-| Teardown | None of the runtime's owned resources remain; no ownership record | Leftovers reported; non-zero exit |
+| Teardown | None of the runtime's units, files, slots or created mount points remain; no installed record | Leftovers reported; non-zero exit |
 
 Leftovers are reported as `{kind, id, reason}` in `reset` output, in
 `status`, and through the status reporter.
@@ -397,22 +388,24 @@ Leftovers are reported as `{kind, id, reason}` in `reset` output, in
 | Interrupted during | Next action |
 |---|---|
 | Terminate or Unmount inside `Stop` | `Stop` is idempotent; `Recover` or the caller runs it again |
-| `phase: Wiping` or `Installing` | The next `Start` wipes again, then installs |
-| `phase: Active`, before the node target starts | `Start` with the same slot and digest, no wipe |
+| A slot change, before `active` changed | The next `Start` runs the slot change again |
+| A slot change, after `active` changed | The next `Start`, or the next boot, mounts the new slot's state and starts it |
+| `Provision` of the inactive slot | Its completion marker is missing, so it is Absent, and the next `Provision` recreates it |
 | Teardown | Run again from the beginning; every step tolerates absent state |
 | A repave | `nodemanager.Recover` ([lifecycles, section 2](05-lifecycles.md#2-repave)) drives the runtime methods above |
 
 ## 12. Not cleaned
 
-1. **Undeclared hostPath directories** outside the owned list. Whenever
+1. **Undeclared hostPath directories** outside the node paths. Whenever
    `Inspect` runs while containerd is running, the runtime lists the host
    sources of all container mounts through the CRI API and records them as
    `observedHostPaths`. The daemon calls `Inspect` on every reconcile, so the
    list stays current, and Terminate uses the last recorded list even when
-   containerd has already stopped. Wipe and Teardown report these paths but
-   never delete them, so the gap with `nspawn-container` stays visible.
+   containerd has already stopped. Slot changes and Teardown report these
+   paths but never delete them, so the gap with `nspawn-container` stays
+   visible.
 2. **Mounts made in the host mount namespace by privileged pods**, for example
-   through `nsenter -t 1` or bidirectional mount propagation, outside the owned
+   through `nsenter -t 1` or bidirectional mount propagation, outside the node
    paths.
 3. **eBPF pins** in the host's `/sys/fs/bpf` from other eBPF CNIs, unless
    declared. unbounded-net pins nothing; its program is attached only to
@@ -442,9 +435,10 @@ declare its state:
 }
 ```
 
-- The runtime takes ownership of declared paths under the same rules as
-  built-in ones (section 3).
-- `bpfPins` must be under `/sys/fs/bpf`.
+- A `persistent` state path is per slot, bound like the built-in ones
+  (section 3). A `volatile` one is cleared by Unmount.
+- `bpfPins` must be under `/sys/fs/bpf`. They are deleted at every slot change
+  and by Teardown.
 - Declared links are deleted only when both name and kind match.
 
 ## 14. Internal interfaces
@@ -457,14 +451,13 @@ type Level int
 
 const (
 	LevelTerminate Level = iota + 1 // no node processes
-	LevelUnmount                    // no node mounts, pod network namespace files or volatile state
-	LevelWipe                       // no persistent node state
+	LevelUnmount                    // no node mounts, pod network namespace files, volatile state or state mounts
 	LevelUninstall                  // nothing the runtime installed
 )
 
 type cleaner struct {
 	sys    SystemOps
-	owned  *OwnershipStore
+	record *InstalledStore
 	limits Limits // StopGracePeriod, KillTimeout, UnmountRetries
 	log    *slog.Logger
 }
@@ -475,10 +468,10 @@ func (c *cleaner) Verify(ctx context.Context, lvl Level) ([]runtime.Leftover, er
 // SystemOps is the boundary between the cleaner and the operating system.
 // Fakes drive unit tests for ordering and safety.
 type SystemOps interface {
-	Systemd() Systemd // Stop, Disable, DaemonReload, ResetFailed
+	Systemd() Systemd // Start, Stop, Disable, DaemonReload, ResetFailed, including mount units
 	Cgroups() Cgroups // Kill, Populated, Procs
 	Mounts() Mounts   // List, Unmount
-	FS() SafeFS       // ClearContents, RemoveTree, WriteDurable; never crosses st_dev or follows symlinks
+	FS() SafeFS       // RemoveTree, WriteDurable, ReplaceLink; never crosses st_dev or follows symlinks
 	Netns() Netns     // List with a prefix, Remove
 	CRI() CRI         // container mount sources, for observedHostPaths
 }
