@@ -1901,6 +1901,21 @@ mod established_sessions {
 /// own, or for a helper requester, it serves.
 #[test]
 fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
+    hot_page_shedding(false);
+}
+
+/// A hot owner never sheds a requester in its own mesh column of the page's
+/// pool: with more than 64 members the pool has several columns, and the
+/// same hot page that sheds a requester in another column is served to one
+/// in the owner's column.
+#[test]
+fn hot_page_owner_serves_its_column_mates() {
+    hot_page_shedding(true);
+}
+
+/// Drive a hot owner C with requester A, where A is in C's mesh column of the
+/// cache's pool exactly when `mate`.
+fn hot_page_shedding(mate: bool) {
     use crate::http::Codec;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
@@ -1924,40 +1939,60 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
             })
         }
     }
-    let signers = signers();
-    let sender = Forwarding::new(signers[0].clone());
-    let destination = Rc::new(Forwarding::new(signers[2].clone()));
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    // More than 64 members, so the pool has several columns, and A is not
-    // in C's column: C sheds A (column mates are never shed).
-    let build = |count: usize| {
-        let mut nodes: Vec<String> = [A, B, C].iter().map(|n| (*n).to_owned()).collect();
-        nodes.extend((4..count).map(|i| format!("{i:08}-1111-4111-8111-111111111111")));
-        Arc::new(
-            Membership::validate(
-                MembershipVersion(1),
-                nodes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, n)| Member {
-                        node: NodeId(n.clone()),
-                        shares: NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
-                        rails: vec![],
-                        site: String::new(),
-                    })
-                    .collect(),
-            )
-            .unwrap(),
+    // 80 members, so the pool has several columns. The requester is the
+    // first neighbor of C past A, B, and C that is in C's column exactly
+    // when `mate` (column mates are never shed).
+    let nodes: Vec<String> = [A, B, C]
+        .iter()
+        .map(|n| (*n).to_owned())
+        .chain((4..80).map(|i| format!("{i:08}-1111-4111-8111-111111111111")))
+        .collect();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| Member {
+                    node: NodeId(n.clone()),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
         )
-    };
-    let membership = (80..400)
-        .step_by(16)
-        .map(build)
-        .find(|m| !m.same_column(&CacheId(CACHE.into()), &NodeId(C.into()), &NodeId(A.into())))
-        .expect("A outside C's column");
+        .unwrap(),
+    );
+    assert!(
+        membership
+            .cache_pool(&CacheId(CACHE.into()))
+            .mesh
+            .is_some_and(|pool| pool.columns() > 1)
+    );
+    let requester_name = nodes[3..]
+        .iter()
+        .find(|n| {
+            let (owner, node) = (NodeId(C.into()), NodeId((*n).clone()));
+            // A direct requester must be one of C's mesh neighbors.
+            membership.is_neighbor(&owner, &node)
+                && membership.same_column(&CacheId(CACHE.into()), &owner, &node) == mate
+        })
+        .expect("a requester in or outside C's column as asked")
+        .as_str();
+    let signers: Vec<_> = crate::test_support::security::identities(
+        ClusterId(CLUSTER.into()),
+        &[A, B, C, requester_name].map(|name| NodeId(name.into())),
+        || crate::test_support::security::mac_test_key(CACHE),
+    )
+    .into_iter()
+    .map(|identity| identity.signatures)
+    .collect();
+    let destination = Rc::new(Forwarding::new(signers[2].clone()));
+    let sender = Forwarding::new(signers[3].clone());
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
@@ -2010,7 +2045,7 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
             .rank(membership.clone(), &object, PageNumber(number))
             .ordered;
         let owns = |n: &str| owners.contains(&NodeId(n.into()));
-        match (owns(C), owns(A)) {
+        match (owns(C), owns(requester_name)) {
             (true, false) => shed_page = shed_page.or(Some(number)),
             (false, false) => foreign_page = foreign_page.or(Some(number)),
             _ => {}
@@ -2025,6 +2060,7 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
             page: page_id(number),
             mode: FetchMode::CopyOnly,
         };
+        request.route.visited = vec![NodeId(requester_name.into())];
         let scope = request.origin.scope().clone();
         let (signed, binding) = sender.sign_request(request).unwrap();
         let response = futures::executor::block_on(server.dispatch(signed, &scope)).unwrap();
@@ -2042,18 +2078,20 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     assert_eq!(calls.get(), 1);
     drop(held);
     assert_eq!(server.streaming(&page_id(shed_page)), (0, 0));
-    // At the threshold a non-owner outside C's column is shed unserved.
+    // At the threshold a non-owner outside C's column is shed unserved, and
+    // a column mate is served.
     let held = server.hold_streaming(&page_id(shed_page), hot);
     assert_eq!(server.streaming(&page_id(shed_page)), (hot, hot));
-    assert!(ask(shed_page));
-    assert_eq!(calls.get(), 1);
+    assert_eq!(ask(shed_page), !mate);
+    let served = if mate { 2 } else { 1 };
+    assert_eq!(calls.get(), served);
     // Not while the page is less than half of what the owner is writing.
     let other = server.hold_streaming(&page_id(foreign_page), hot + 1);
     assert!(!ask(shed_page));
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.get(), served + 1);
     drop((held, other));
     // A node that does not own the page (for example a helper) never sheds.
     let _held = server.hold_streaming(&page_id(foreign_page), hot);
     assert!(!ask(foreign_page));
-    assert_eq!(calls.get(), 3);
+    assert_eq!(calls.get(), served + 2);
 }
