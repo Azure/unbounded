@@ -236,6 +236,7 @@ jobs:
 
       - name: Export digest
         env:
+          ARCH: ${{ matrix.arch }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
@@ -245,14 +246,16 @@ jobs:
             exit 1
           fi
 
+          # The file is named for the arch and holds the digest, so the merge
+          # job finds it by arch however many artifacts it downloads.
           mkdir -p "${RUNNER_TEMP}/digests"
-          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+          echo "$DIGEST" > "${RUNNER_TEMP}/digests/${ARCH}"
 
       - name: Upload digest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ needs.plan.outputs.key }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
           if-no-files-found: error
           # 7, not 1: match release.yaml's retry window so a
           # "re-run failed jobs" can still merge digests from arch
@@ -281,13 +284,16 @@ jobs:
           df -h /
 
       # The key's hash suffix keeps this pattern from matching other images
-      # whose names share a prefix (racer vs racer-object). Each artifact
-      # still keeps its own directory and only the planned arches are read.
+      # whose names share a prefix (racer vs racer-object). Each artifact holds
+      # one file named for its arch, so merging them into one directory is
+      # unambiguous and does not depend on how many artifacts matched (a single
+      # match is extracted without a per-artifact subdirectory).
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
           pattern: digests-${{ needs.plan.outputs.key }}-*
           path: ${{ runner.temp }}/digests
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -302,7 +308,6 @@ jobs:
         id: create
         env:
           IMAGE: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}
-          KEY: ${{ needs.plan.outputs.key }}
           MATRIX: ${{ needs.plan.outputs.matrix }}
           TAGS: ${{ inputs.tags }}
         run: |
@@ -310,13 +315,19 @@ jobs:
 
           sources=()
           while IFS= read -r arch; do
-            dir="${RUNNER_TEMP}/digests/digests-${KEY}-${arch}"
-            mapfile -t digests < <(ls "$dir")
-            if [[ "${#digests[@]}" -ne 1 ]]; then
-              echo "::error::Expected exactly one ${arch} digest in ${dir}, found ${#digests[@]}"
+            file="${RUNNER_TEMP}/digests/${arch}"
+            if [[ ! -f "$file" ]]; then
+              echo "::error::No ${arch} digest was downloaded (expected ${file})"
               exit 1
             fi
-            sources+=("${IMAGE}@sha256:${digests[0]}")
+
+            arch_digest="$(<"$file")"
+            if [[ ! "$arch_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Unexpected ${arch} digest in ${file}: '${arch_digest}'"
+              exit 1
+            fi
+
+            sources+=("${IMAGE}@${arch_digest}")
           done < <(jq -r '.include[].arch' <<<"$MATRIX")
 
           tag_args=()
