@@ -223,6 +223,19 @@ rule changes to use the mesh:
   asks a helper in another owner's column. A helper that is itself shed fails the probe, and the
   reader goes back to the owners, which wait or serve it once the burst drains.
 
+## Prefetch
+
+Prefetch (`designs/racer-prefetch.md`) follows the cache's pool, like reads:
+
+- Owners are ranked within the pool, so prefetch fills land on pool members only.
+- Only pool members accept tickets. Since client sockets are bound only on pool members, a
+  client reaches a member. A non-member answers `PUT` with `503 unavailable` and peer prefetch
+  operations with `StaleMembership`.
+- When a node leaves the pool, its tickets for the cache are canceled with `cache_removed`.
+  Pages whose owner left the pool are queued again, even if the owner is still a cluster member.
+- Prefetch peer operations carry no page body, so hot-page shedding does not apply to them.
+  Readers of a prefetched page reach its owners and are shed as usual.
+
 ## Clients and origins
 
 - The dataplane binds a cache's client and origin sockets only on members of the cache's pool.
