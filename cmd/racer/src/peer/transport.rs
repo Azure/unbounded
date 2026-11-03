@@ -441,7 +441,7 @@ impl Transfers {
                 .head,
         )?;
         if links.ready(&peer, rail).is_none() {
-            links.record_http_fallback();
+            links.record_fallback_no_link();
             return Ok(None);
         }
         let binding = Binding::request(
@@ -480,7 +480,7 @@ impl Transfers {
         let pending = match granted {
             Ok(pending) => pending,
             Err(error) if native_failure(error, scope) => {
-                links.record_http_fallback();
+                links.record_fallback_grant();
                 return Ok(None);
             }
             Err(error) => return Err(error),
