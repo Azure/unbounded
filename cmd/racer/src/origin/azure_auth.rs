@@ -363,7 +363,7 @@ impl AzureTokenSource {
         if let Some(token) = self.cache.fresh(SystemTime::now()) {
             return Ok(token);
         }
-        let _flight = self.flight.lock().await;
+        let _flight = self.flight_lock(scope).await?;
         scope.check()?;
         if let Some(token) = self.cache.fresh(SystemTime::now()) {
             return Ok(token);
@@ -382,6 +382,39 @@ impl AzureTokenSource {
                 }
                 _ => Err(error),
             },
+        }
+    }
+
+    /// Wait for the single-flight refresh lock under the waiter's own deadline
+    /// and cancellation. Giving up only drops this waiter; the fetch holding the
+    /// lock runs on under its own scope and still fills the cache.
+    async fn flight_lock(
+        &self,
+        scope: &RequestScope,
+    ) -> Result<futures::lock::MutexGuard<'_, ()>, AuthError> {
+        use futures::future::{Either, select};
+        use uring_runtime::reactor::timer::SleepMode;
+        if let Some(guard) = self.flight.try_lock() {
+            return Ok(guard);
+        }
+        #[cfg(test)]
+        let mode = if uring_runtime::environment::simulation_seed().is_some() {
+            SleepMode::ClockPoll
+        } else {
+            SleepMode::Kernel
+        };
+        #[cfg(not(test))]
+        let mode = SleepMode::Kernel;
+        let expiry = self.reactor.sleep_until(scope.deadline.0, mode, scope);
+        match select(self.flight.lock(), expiry).await {
+            Either::Left((guard, _)) => Ok(guard),
+            Either::Right((slept, _)) => {
+                slept?;
+                scope.check()?;
+                // The timer fired at the deadline; report it even if the
+                // clock reads a hair early.
+                Err(AuthError::DeadlineExceeded)
+            }
         }
     }
 

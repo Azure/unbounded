@@ -3,6 +3,7 @@ use crate::remote::tests::{MapResolver, serve, test_identity};
 use crate::test_support::enrollment::{Directory, drive, reactor, scope};
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 fn imds_endpoints(port: u16) -> AuthEndpoints {
     AuthEndpoints {
@@ -317,4 +318,75 @@ fn workload_identity_exchanges_federated_token_with_discovered_tenant() {
             )
         );
     }
+}
+
+fn stalled_source() -> Option<AzureTokenSource> {
+    let cache = AzureTokenCache::new(
+        AzureCredential::ManagedIdentity { client_id: None },
+        // Port 9 is never contacted: every case below waits on the lock or
+        // hits the cache.
+        imds_endpoints(9),
+    )
+    .unwrap();
+    source(cache, MapResolver::new(Vec::new()))
+}
+
+fn bearer_in(source: &AzureTokenSource, scope: &RequestScope) -> Result<Arc<str>, AuthError> {
+    drive(
+        &source.reactor,
+        Box::pin(async { Ok(source.bearer(scope).await) }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn refresh_lock_wait_observes_waiter_deadline() {
+    let Some(source) = stalled_source() else {
+        return;
+    };
+    // A stalled fetch holds the single-flight lock.
+    let fetch = source.flight.try_lock().unwrap();
+    let started = Instant::now();
+    let short = RequestScope::new(
+        crate::model::RequestId([8; 16]),
+        started + Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(
+        bearer_in(&source, &short).err(),
+        Some(AuthError::DeadlineExceeded)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // The stalled fetch completes and fills the cache for later requests.
+    source.cache.store(CachedToken {
+        token: "late".into(),
+        refresh: SystemTime::now() + Duration::from_secs(600),
+        expires: SystemTime::now() + Duration::from_secs(3600),
+    });
+    drop(fetch);
+    assert_eq!(&*bearer(&source).unwrap(), "late");
+}
+
+#[test]
+fn refresh_lock_wait_observes_waiter_cancellation() {
+    let Some(source) = stalled_source() else {
+        return;
+    };
+    let fetch = source.flight.try_lock().unwrap();
+    let waiter = scope();
+    let canceller = waiter.cancellation.clone();
+    let started = Instant::now();
+    let thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        canceller.cancel().unwrap();
+    });
+    assert_eq!(
+        bearer_in(&source, &waiter).err(),
+        Some(AuthError::Cancelled)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    thread.join().unwrap();
+    drop(fetch);
+    // The lock is free again for the next refresh.
+    assert!(source.flight.try_lock().is_some());
 }
