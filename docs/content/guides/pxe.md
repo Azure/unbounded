@@ -127,7 +127,7 @@ spec:
         key: bmc-01
 ```
 
-Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
+Store BMC passwords in a Secret referenced by `passwordRef`. `passwordRef.key` names the Secret key that holds the password and defaults to `password`. See the [CRD Reference]({{< relref "/reference/machina-crd" >}}) for all fields.
 
 ## Cloud-Init Customization
 

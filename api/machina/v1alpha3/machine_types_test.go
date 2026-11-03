@@ -76,7 +76,7 @@ func TestBootMediaStatusRoundTrip(t *testing.T) {
 	original := MachineOperationTargetStatus{MachineRef: "machine", BootMedia: &MachineOperationBootMediaStatus{
 		ID: "media", SourceServer: "10.0.0.1", Phase: "Installing", MachineUID: "machine-uid",
 		Netboot: &PXESpec{BootProtocol: PXEBootProtocolVirtualMedia, Image: "disk", Redfish: &RedfishSpec{
-			URL: "https://bmc", PasswordRef: SecretKeySelector{Name: "credentials", Namespace: "system", Key: "password"},
+			URL: "https://bmc", PasswordRef: RedfishPasswordSelector{Name: "credentials", Namespace: "system", Key: "password"},
 		}},
 		CertFingerprint: "fingerprint", ImageWritten: true, Cleaned: true,
 	}}

@@ -515,12 +515,13 @@ spec:
                               It is ignored when the endpoint exposes a single system selected by its URL.
                             type: string
                           passwordRef:
-                            description: PasswordRef references a secret containing
-                              the Redfish password.
+                            description: |-
+                              PasswordRef references a secret containing the Redfish password. Its key
+                              defaults to "password".
                             properties:
                               key:
-                                default: ssh-privatekey
-                                description: Key within the secret.
+                                default: password
+                                description: Key within the secret. Defaults to "password".
                                 type: string
                               name:
                                 description: Name of the secret.
@@ -792,12 +793,13 @@ spec:
                           It is ignored when the endpoint exposes a single system selected by its URL.
                         type: string
                       passwordRef:
-                        description: PasswordRef references a secret containing the
-                          Redfish password.
+                        description: |-
+                          PasswordRef references a secret containing the Redfish password. Its key
+                          defaults to "password".
                         properties:
                           key:
-                            default: ssh-privatekey
-                            description: Key within the secret.
+                            default: password
+                            description: Key within the secret. Defaults to "password".
                             type: string
                           name:
                             description: Name of the secret.
