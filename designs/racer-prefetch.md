@@ -478,6 +478,56 @@ Deferred: used-before-evict vs evicted-unused. It needs a per-page
 eviction. That is an index format question not settled here; implementation
 agents must not add it in this change.
 
+## Implementation notes
+
+The Rust server follows this document. The client-socket wire contract
+(paths, methods, JSON fields, status codes, error codes, headers) is as
+specified above. Where the server had to choose, it did the following.
+
+- Peer response outcome: the prefetch response uses the existing envelope
+  field `racer-outcome: prefetch` (this document's `racer-status` names the
+  same field). Requests carry `racer-mode: acquire`. The verifier accepts
+  results only for a `prefetch` request, only one record per requested page,
+  and only `resident` or `failed` code 0 for a probe (fill results never use
+  code 0).
+- `max_pending_bytes` bounds a ticket's dispatched (in-flight) bytes. An idle
+  ticket may always dispatch one page, even under a bound smaller than a page.
+  The node limit (`RACER_PREFETCH_NODE_PENDING_BYTES`) counts queued plus
+  in-flight bytes and is checked on each PUT that creates or changes a ticket.
+- Dispatch: one pump per node keeps up to 8 batches in flight. A batch is up
+  to `RACER_PREFETCH_CONCURRENT_FILLS` (at most 256) pages of one version
+  chosen by strict priority, round-robin across tickets, and ref order. Its
+  pages are then grouped by rank-0 owner (the warm plan's ranking). There is
+  no separate queue per owner.
+- Ticket limit: before answering 429 `ticket_limit`, the oldest retained
+  terminal ticket is dropped to make room.
+- TTL expiry: an unsettled ticket becomes CANCELLED (`expired`). A settled
+  ticket keeps its SUCCEEDED, PARTIAL, or FAILED state and releases its
+  interest. Retention (`RACER_PREFETCH_TICKET_RETENTION_SECS`) counts from
+  expiry or cancellation.
+- A ref to an empty object with offset 0 and no length succeeds with no
+  pages.
+- Membership change re-plans queued units (owners are ranked at dispatch) and
+  re-queues admitted pages of live tickets whose owner left. Units in flight
+  to a departed owner are not cancelled; their failure is retried and
+  re-ranked.
+- A unit that already failed for one ticket is reported failed to another
+  ticket that adds interest while the unit is still tracked.
+- Demand promotion is applied where a demand read starts on the owner
+  (`Work::Fetch`, `Work::FetchSealed`, and peer page acquisition), before it
+  joins the flight. `racer_prefetch_demand_wait_seconds` measures promotion
+  to fill completion.
+- Prefetch responses close the connection. The client socket accepts request
+  bodies up to 64 MiB so that `RACER_PREFETCH_MAX_BODY_BYTES` alone decides
+  413.
+- Version resolution for one PUT is bounded at 60 s (16 concurrent lookups);
+  one dispatch, including the owner's fills, at 120 s.
+- The former `racer_warm_held_*` gauges, which report spill holds, are
+  renamed `racer_held_*`.
+- Deferred: the owner does not check that it is the rank-0 owner of each
+  requested page; a per-owner dispatch queue and eager re-plan of in-flight
+  units are not implemented.
+
 ## Superseded statements
 
 - `designs/racer-unordered-fetch.md`: section 1 ("Warm progress is a completed
