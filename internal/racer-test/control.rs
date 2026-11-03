@@ -17,11 +17,41 @@ pub struct Control {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
+/// One published cache: identity plus optional mode and native origin.
+#[derive(Clone, Debug)]
+pub struct CacheSpec {
+    pub id: String,
+    pub name: String,
+    pub mode: wire::CacheMode,
+    pub origin: Option<wire::OriginDefinition>,
+}
+impl CacheSpec {
+    /// A cached cache without a native origin.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            mode: wire::CacheMode::Cached,
+            origin: None,
+        }
+    }
+}
 impl Control {
+    #[allow(dead_code)]
     pub fn start(root: &Path) -> Self {
         Self::start_with(root, vec![(CACHE.into(), NAME.into())])
     }
+    #[allow(dead_code)]
     pub fn start_with(root: &Path, caches: Vec<(String, String)>) -> Self {
+        Self::start_with_specs(
+            root,
+            caches
+                .into_iter()
+                .map(|(id, name)| CacheSpec::new(id, name))
+                .collect(),
+        )
+    }
+    pub fn start_with_specs(root: &Path, caches: Vec<CacheSpec>) -> Self {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params.key_usages = vec![
@@ -58,7 +88,7 @@ impl Control {
         fs::write(root.join("trust.pem"), ca.pem()).unwrap();
         fs::write(root.join("token"), "fixture.token").unwrap();
         // Runtime-generated test material, distinct for the two encryption purposes.
-        let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
+        let keys: Vec<_> = caches.iter().map(|spec| &spec.id).flat_map(|cache| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
             let mut material = [0; 32];
             getrandom::getrandom(&mut material).unwrap();
             serde_json::json!({"cache": cache, "id": STANDARD.encode(wire::KeyId::from_generation(1, id as u32).unwrap().0), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
@@ -79,16 +109,17 @@ impl Control {
             }],
             caches: caches
                 .into_iter()
-                .map(|(id, name)| {
-                    let (client_socket, origin_socket) = canonical_socket_paths(&name).unwrap();
+                .map(|spec| {
+                    let (client_socket, origin_socket) =
+                        canonical_socket_paths(&spec.name).unwrap();
                     CacheDefinition {
-                        id: CacheId(id),
-                        name,
+                        id: CacheId(spec.id),
+                        name: spec.name,
                         client_socket,
                         origin_socket,
                         priority: racer_control_wire::DEFAULT_PRIORITY,
-                        mode: racer_control_wire::CacheMode::Cached,
-                        origin: None,
+                        mode: spec.mode,
+                        origin: spec.origin,
                     }
                 })
                 .collect(),
