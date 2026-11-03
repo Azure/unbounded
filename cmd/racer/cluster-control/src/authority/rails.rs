@@ -103,8 +103,10 @@ pub fn encode_report(r: &Report) -> Result<String, wire::Error> {
 /// Encode a report annotation with per-disk status.
 ///
 /// When every disk does not fit in [`MAX_REPORT_BYTES`](crate::limits::MAX_REPORT_BYTES),
-/// claimed, rejected, and missing disks are kept before available and
-/// unavailable ones, each in ID order, and the rest are dropped. Kept disks
+/// claimed, rejected, and missing disks are kept first with only their ID,
+/// aliases, state, and reason, in ID order. Their device, size, model, and
+/// serial are added next while they fit, then available and unavailable
+/// disks in ID order, and the rest are dropped. Kept disks
 /// are written in ID order. Fails only when the report without disks does
 /// not fit.
 pub fn encode_report_with_disks(r: &Report, disks: &[DiskStatus]) -> Result<String, wire::Error> {
@@ -138,20 +140,55 @@ pub fn encode_report_full(
     if disks.is_empty() {
         return Ok(base);
     }
-    let mut ranked: Vec<&DiskStatus> = disks.iter().collect();
-    ranked.sort_by(|a, b| (!a.important(), &a.id).cmp(&(!b.important(), &b.id)));
     // `,"disks":[` plus `]`, then each entry and its separating comma.
     let mut size = base.len() + r#","disks":[]"#.len();
-    let mut kept = Vec::new();
-    for disk in ranked {
-        let entry = serde_json::to_string(disk).map_err(|_| wire::Error::InvalidRequest)?;
-        let cost = entry.len() + usize::from(!kept.is_empty());
-        if size + cost > crate::limits::MAX_REPORT_BYTES {
+    let limit = crate::limits::MAX_REPORT_BYTES;
+    let encode = |d: &DiskStatus| serde_json::to_string(d).map_err(|_| wire::Error::InvalidRequest);
+    let mut ranked: Vec<&DiskStatus> = disks.iter().collect();
+    ranked.sort_by(|a, b| (!a.important(), &a.id).cmp(&(!b.important(), &b.id)));
+    let split = ranked.partition_point(|d| d.important());
+    let (important, rest) = ranked.split_at(split);
+    // First the outcome of every important disk with only the names tools
+    // match approvals against, then their optional metadata, then the rest.
+    let mut kept: Vec<(DiskStatus, usize)> = Vec::new();
+    for disk in important {
+        let minimal = DiskStatus {
+            id: disk.id.clone(),
+            aliases: disk.aliases.clone(),
+            state: disk.state,
+            reason: disk.reason,
+            ..DiskStatus::missing(String::new())
+        };
+        let len = encode(&minimal)?.len();
+        let cost = len + usize::from(!kept.is_empty());
+        if size + cost > limit {
             continue;
         }
         size += cost;
-        kept.push(disk);
+        kept.push((minimal, len));
     }
+    for (entry, len) in &mut kept {
+        let Some(full) = important.iter().find(|d| d.id == entry.id) else {
+            continue;
+        };
+        let full_len = encode(full)?.len();
+        if size + full_len - *len > limit {
+            continue;
+        }
+        size += full_len - *len;
+        *entry = (*full).clone();
+        *len = full_len;
+    }
+    for disk in rest {
+        let len = encode(disk)?.len();
+        let cost = len + usize::from(!kept.is_empty());
+        if size + cost > limit {
+            continue;
+        }
+        size += cost;
+        kept.push(((*disk).clone(), len));
+    }
+    let mut kept: Vec<DiskStatus> = kept.into_iter().map(|(d, _)| d).collect();
     kept.sort_by(|a, b| a.id.cmp(&b.id));
     let s = serde_json::to_string(&ReportDto {
         shares: r.shares.get(),
@@ -431,5 +468,63 @@ pub(crate) mod tests {
         // The kept available disks are the lowest IDs.
         let available: Vec<_> = kept.iter().filter(|d| !d.important()).collect();
         assert_eq!(available[0].id, "wwn-a0000");
+    }
+
+    #[test]
+    fn oversize_disk_lists_keep_every_approved_outcome() {
+        use crate::disks::{DiskReason, DiskState};
+        let r = Report {
+            shares: NonZeroU32::new(8).unwrap(),
+            rdma_nics: Vec::new(),
+        };
+        // 256 approvals of 14-byte aliases fit the approval annotation, but
+        // full entries with metadata do not all fit the report.
+        let approved: Vec<String> = (0..256).map(|i| format!("nvme-x{i:08}")).collect();
+        assert!(approved.join(",").len() <= crate::disks::MAX_DISKS_ANNOTATION_BYTES);
+        let mut disks: Vec<DiskStatus> = approved
+            .iter()
+            .enumerate()
+            .map(|(i, alias)| DiskStatus {
+                id: format!("wwn-0x{i:016x}"),
+                aliases: vec![alias.clone(), format!("wwn-0x{i:016x}")],
+                dev: Some(format!("nvme{i}n1")),
+                size_bytes: Some(u64::MAX),
+                model: Some("M".repeat(40)),
+                serial: Some("S".repeat(20)),
+                state: if i % 2 == 0 {
+                    DiskState::Claimed
+                } else {
+                    DiskState::Rejected
+                },
+                reason: (i % 2 == 1).then_some(DiskReason::TooSmall),
+            })
+            .collect();
+        disks.push(disk("wwn-available", DiskState::Available));
+        let s = encode_report_with_disks(&r, &disks).unwrap();
+        assert!(s.len() <= crate::limits::MAX_REPORT_BYTES);
+        let kept = parse_report_disks(&s).unwrap();
+        for (i, alias) in approved.iter().enumerate() {
+            let d = kept.iter().find(|d| d.aliases.contains(alias)).unwrap();
+            assert_eq!(d.state, disks[i].state);
+            assert_eq!(d.reason, disks[i].reason);
+        }
+        // Some metadata was dropped, but what remains is whole.
+        assert!(kept.iter().any(|d| d.model.is_none()));
+        assert!(
+            kept.iter()
+                .filter(|d| d.model.is_some())
+                .all(|d| d.dev.is_some() && d.serial.is_some())
+        );
+        assert!(kept.windows(2).all(|w| w[0].id < w[1].id));
+        // With room, every entry keeps its metadata.
+        let small = Report {
+            shares: NonZeroU32::new(1).unwrap(),
+            rdma_nics: Vec::new(),
+        };
+        let few = &disks[..4];
+        assert_eq!(
+            parse_report_disks(&encode_report_with_disks(&small, few).unwrap()).unwrap(),
+            few
+        );
     }
 }
