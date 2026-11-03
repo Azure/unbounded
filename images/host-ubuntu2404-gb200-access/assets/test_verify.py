@@ -7,6 +7,14 @@ import unittest
 
 
 class VerifyTest(unittest.TestCase):
+    def test_pinned_package_install_resolves_dependencies(self):
+        customize = Path(__file__).with_name("customize.sh").read_text()
+        self.assertIn(
+            "apt-get install -y --no-install-recommends /tmp/ssh-import-id.deb",
+            customize,
+        )
+        self.assertNotIn("dpkg --install /tmp/ssh-import-id.deb", customize)
+
     def test_nvlink_policy_is_exact(self):
         config = Path(__file__).with_name("99-nvidia-disable-nvlink.conf")
         self.assertEqual(config.read_text(), "options nvidia NVreg_NvLinkDisable=1\n")
