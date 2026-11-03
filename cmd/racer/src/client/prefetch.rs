@@ -51,15 +51,21 @@ pub(super) async fn serve(
     let response = match parsed {
         Err(error) => crate::prefetch::service::error(error),
         Ok(request) => {
-            let mut body = Vec::new();
+            // Keep the admitted buffer, and its charge, alive until the
+            // handler finishes instead of copying into uncharged memory.
+            let mut owned = None;
             if let PrefetchRequest::Put { content_length, .. } = &request {
                 let length = usize::try_from(*content_length)
                     .map_err(|_| crate::error::Error::InvalidRequest)?;
                 let buffer = io.buffer(length)?;
                 let completed = io.read_body_exact(connection, buffer, &scope).await?;
                 connection = completed.lease;
-                body = completed.buffer.bytes()?.to_vec();
+                owned = Some(completed.buffer);
             }
+            let body: &[u8] = match &owned {
+                Some(buffer) => buffer.bytes()?,
+                None => &[],
+            };
             // A client disconnect ends a long-poll wait.
             let watch = crate::runtime::RequestScope {
                 body_deadlines: None,
@@ -70,7 +76,7 @@ pub(super) async fn serve(
             let socket = connection.socket();
             let mut disconnected = Some(io.disconnected(&connection, &watch));
             let mut handled = Box::pin(crate::prefetch::service::handle(
-                reads, cache, request, &body, &scope,
+                reads, cache, request, body, &scope,
             ));
             let response = std::future::poll_fn(|cx| {
                 if let Some(watcher) = disconnected.as_mut()
@@ -91,6 +97,8 @@ pub(super) async fn serve(
             if let Some(watcher) = disconnected.take() {
                 let _ = watcher.await;
             }
+            drop(handled);
+            drop(owned);
             response
         }
     };

@@ -4236,3 +4236,51 @@ fn sdk_prefetch_conformance_against_actual_uds() {
     };
     assert!(status.success(), "SDK prefetch fixture failed");
 }
+
+#[test]
+fn prefetch_put_bodies_stay_charged_while_versions_resolve() {
+    use crate::admission::ResourceClass;
+    let fixture = Fixture::new();
+    let origin = &fixture.worker.as_ref().unwrap().origin;
+    origin.block(RequestKind::Head);
+    fixture.reconcile(&[definition()]).unwrap();
+    let admission = fixture.listeners.admission.clone();
+    let baseline = admission.used(ResourceClass::RequestContext);
+    // Pad the JSON so each body dominates any other request charge.
+    let padding = " ".repeat(256 * 1024);
+    let put = |id: &str, key: char| {
+        let body = format!(
+            "{{\"refs\":[{{\"key\":\"{}\"}}]{padding}}}",
+            key.to_string().repeat(64)
+        );
+        format!(
+            "PUT /v1/prefetches/{id} HTTP/1.1\r\nHost: racer\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let mut sockets = Vec::new();
+    for (count, (id, key)) in [("a", '1'), ("b", '2')].into_iter().enumerate() {
+        let mut socket = fixture.connect();
+        let raw = put(id, key);
+        let mut sent = 0;
+        while sent < raw.len() {
+            match socket.write(&raw.as_bytes()[sent..]) {
+                Ok(n) => sent += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => fixture.pump(16),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        fixture.wait_for_origin(RequestKind::Head, count + 1);
+        sockets.push(socket);
+    }
+    // Both handlers are parked on version resolution; each body must still
+    // be charged rather than copied out of its admitted buffer.
+    let used = admission.used(ResourceClass::RequestContext) - baseline;
+    assert!(used >= 2 * padding.len(), "{used}");
+    origin.release(RequestKind::Head);
+    for mut socket in sockets {
+        let output = fixture.receive(&mut socket, true);
+        assert!(output.starts_with(b"HTTP/1.1 "), "{output:?}");
+    }
+}
