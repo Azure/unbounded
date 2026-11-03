@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 
 import racer
 import racer._wire as wire
+from fakeprefetch import PATH as PREFETCH_PATH
+from fakeprefetch import FakePrefetches
 
 
 @dataclass
@@ -32,10 +34,13 @@ class Seen:
     fds: int
     fd_kind: str | None = None
     credits: list = field(default_factory=list)
+    body: bytes = b""
 
 
 class FakeRacer:
-    """Serves HEAD, stream Get, host-read and gpu-read on a Unix socket.
+    """Serves HEAD, stream Get, host-read, gpu-read, and prefetch on a Unix socket.
+
+    Prefetch tickets live in self.prefetches (see fakeprefetch.FakePrefetches).
 
     old=True mimics a dataplane that predates host-read/gpu-read: the new
     paths fail key parsing and get 400. gpu_status is the answer to gpu-read
@@ -53,6 +58,7 @@ class FakeRacer:
         self.bad_frame = False
         self.truncate = False
         self.seen: list[Seen] = []
+        self.prefetches = FakePrefetches()
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.bind(path)
         self.sock.listen(16)
@@ -138,6 +144,23 @@ class FakeRacer:
             conn.close()
 
     def _dispatch(self, conn, method, target, headers, fds, seen, rest):
+        path = target.partition("?")[0]
+        if headers.get("host") == "racer" and (path == PREFETCH_PATH or path.startswith(PREFETCH_PATH + "/")):
+            body = rest or b""
+            try:
+                want = int(headers.get("content-length", "0"))
+            except ValueError:
+                want = 0
+            want = min(want, self.prefetches.max_body)
+            while len(body) < want:
+                got = conn.recv(65536)
+                if not got:
+                    return
+                body += got
+            seen.body = body
+            status, h, payload = self.prefetches.handle(method, target, headers, body)
+            self._send(conn, status, h, payload)
+            return
         if headers.get("host") != "racer" or not target.startswith(wire.OBJECT_PREFIX):
             self._error(conn, 400)
             return
