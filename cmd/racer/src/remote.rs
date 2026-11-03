@@ -188,8 +188,10 @@ impl RemoteEndpoint {
         match resolver.resolve(&self.0.host, self.0.port, scope).await {
             Ok(addresses) if !addresses.is_empty() => {
                 let mut cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
+                // Keep the rotation cursor: resetting it would send the
+                // attempt after a connect-failure re-resolve back to the
+                // first (possibly dead) address every time.
                 cache.addresses = addresses;
-                cache.next = 0;
                 cache.refreshed = Some(uring_runtime::environment::now());
                 Ok(())
             }
@@ -222,6 +224,16 @@ impl RemoteEndpoint {
         let index = cache.next % cache.addresses.len();
         cache.next = cache.next.wrapping_add(1);
         Ok(cache.addresses[index])
+    }
+
+    /// Number of distinct addresses a connect may try: 1 for IP literals,
+    /// otherwise the resolved count (0 until resolved).
+    pub fn address_count(&self) -> usize {
+        if self.0.literal.is_some() {
+            return 1;
+        }
+        let cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.addresses.len()
     }
 
     fn key(&self) -> (bool, &str, u16) {

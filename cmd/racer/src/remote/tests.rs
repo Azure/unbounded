@@ -242,6 +242,28 @@ fn resolution_caches_rotates_and_keeps_stale_addresses() {
     );
 }
 
+#[test]
+fn re_resolution_keeps_rotating_instead_of_pinning_the_first_address() {
+    let Some(reactor) = reactor() else { return };
+    let endpoint = RemoteEndpoint::http("origin.example", 80).unwrap();
+    let dead: SocketAddr = "10.0.0.1:80".parse().unwrap();
+    let live: SocketAddr = "10.0.0.2:80".parse().unwrap();
+    let resolver = MapResolver::new(vec![dead, live]);
+    let scope = scope();
+    assert_eq!(endpoint.address_count(), 0);
+    for _ in 0..4 {
+        drive(&reactor, Box::pin(endpoint.resolve(&resolver, &scope))).unwrap();
+        assert_eq!(endpoint.address_count(), 2);
+        assert_eq!(endpoint.address().unwrap(), dead);
+        // A failed connect expires the cache; the re-resolved set must not
+        // send the next attempt back to the dead first address.
+        endpoint.expire_addresses();
+        drive(&reactor, Box::pin(endpoint.resolve(&resolver, &scope))).unwrap();
+        assert_eq!(endpoint.address().unwrap(), live);
+    }
+    assert_eq!(RemoteEndpoint::http("[::1]", 1).unwrap().address_count(), 1);
+}
+
 fn json_response(body: &str, chunked: bool) -> Vec<u8> {
     if chunked {
         let (a, b) = body.split_at(body.len() / 2);

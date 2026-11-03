@@ -539,3 +539,60 @@ fn decoded_response_head_stays_charged_while_the_exchange_lives() {
     drop(f);
     server.join().unwrap();
 }
+
+fn refused_address() -> std::net::SocketAddr {
+    // Bind then drop, so connects to this port are refused.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+#[test]
+fn connect_failure_fails_over_to_the_next_resolved_address() {
+    let Some(reactor) = reactor() else { return };
+    let identity = test_identity(&["account.blob.example"]);
+    let blobs = Arc::new(Mutex::new(Blobs {
+        etag: "\"v1\"".into(),
+    }));
+    let state = blobs.clone();
+    let (address, accepted, server) = serve(Some(identity.server.clone()), 1, move |head, _| {
+        azure(head, &state)
+    });
+    let dead = std::net::SocketAddr::new(address.ip(), refused_address().port());
+    let url = format!(
+        "https://account.blob.example:{}/account/models",
+        address.port()
+    );
+    // The dead address is first, so the first connect is refused.
+    let f = fixture(
+        reactor,
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![dead, address]),
+        TrustRoots::fixed(http1::tls::client_config(identity.roots.clone())),
+        AnonymousOnly,
+    );
+    let reply = f.bootstrap("big").unwrap();
+    assert_eq!(reply.metadata.length, SIZE as u64);
+    for _ in 0..3 {
+        f.page("big", &reply.metadata.version.etag, 2).unwrap();
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    drop(f);
+    server.join().unwrap();
+}
+
+#[test]
+fn connect_failure_on_every_address_is_reported() {
+    let Some(reactor) = reactor() else { return };
+    let dead = refused_address();
+    let url = format!("http://account.blob.example:{}/account/models", dead.port());
+    let f = fixture(
+        reactor,
+        &url,
+        AzureCredential::Anonymous,
+        MapResolver::new(vec![dead, refused_address()]),
+        TrustRoots::at("/nonexistent/racer-bundle.pem".into()),
+        AnonymousOnly,
+    );
+    assert!(f.bootstrap("big").is_err());
+}

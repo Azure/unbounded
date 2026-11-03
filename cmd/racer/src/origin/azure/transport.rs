@@ -176,16 +176,30 @@ impl AzureTransport for PoolTransport {
                 matches!(&head.start, StartLine::Request { method, .. } if method == "HEAD");
             // HEAD may use the endpoint's priority headroom, so metadata checks
             // are not starved by page reads.
-            let checkout = if is_head {
-                self.pool.checkout_metadata(&endpoint, scope).await
-            } else {
-                self.pool.checkout_wait(&endpoint, scope).await
-            };
-            let lease = checkout.inspect_err(|error| {
-                if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
-                    remote.expire_addresses();
+            // Each fresh connect takes the endpoint's next rotated address, so
+            // a connect or TLS failure retries on the remaining resolved
+            // addresses (nothing has been sent yet) within the request scope.
+            let attempts = remote.address_count().max(1);
+            let mut attempt = 0;
+            let lease = loop {
+                attempt += 1;
+                let checkout = if is_head {
+                    self.pool.checkout_metadata(&endpoint, scope).await
+                } else {
+                    self.pool.checkout_wait(&endpoint, scope).await
+                };
+                match checkout {
+                    Ok(lease) => break lease,
+                    Err(Error::Io | Error::Os(_) | Error::Unavailable)
+                        if attempt < attempts && scope.check().is_ok() => {}
+                    Err(error) => {
+                        if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
+                            remote.expire_addresses();
+                        }
+                        return Err(error);
+                    }
                 }
-            })?;
+            };
             let sent = self.io.send_head(lease, head, scope).await?;
             let response = self
                 .io
