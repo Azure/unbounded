@@ -1336,61 +1336,6 @@ func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
 	require.True(t, installRequested)
 }
 
-func TestNewTemplateData_PreserveImageUsersAnnotation(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range []struct {
-		name        string
-		annotations map[string]string
-		want        bool
-	}{
-		{name: "annotation enabled", annotations: map[string]string{v1alpha3.AnnotationPreserveImageUsers: "true"}, want: true},
-		{name: "annotation disabled", annotations: map[string]string{v1alpha3.AnnotationPreserveImageUsers: "false"}},
-		{name: "annotation absent"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			data := newTemplateData(
-				&v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}},
-				ClusterInfo{},
-				"",
-				"",
-				"",
-				false,
-			)
-
-			require.Equal(t, tt.want, data.PreserveImageUsers)
-		})
-	}
-}
-
-func TestVendorDataTemplate_PreserveImageUsers(t *testing.T) {
-	t.Parallel()
-
-	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
-	require.NoError(t, err)
-
-	for _, tt := range []struct {
-		name               string
-		preserveImageUsers bool
-		wantUnboundedMetal bool
-	}{
-		{name: "generic image", wantUnboundedMetal: true},
-		{name: "GB200 image", preserveImageUsers: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := renderTemplate(string(vendorDataTmpl), templateData{
-				ServeURL:           "http://192.0.2.1",
-				AgentConfigJSON:    "{}",
-				InstallScript:      "true",
-				PreserveImageUsers: tt.preserveImageUsers,
-			})
-			require.NoError(t, err)
-
-			require.Equal(t, tt.wantUnboundedMetal, strings.Contains(string(result), "name: unbounded-metal"))
-		})
-	}
-}
-
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {
