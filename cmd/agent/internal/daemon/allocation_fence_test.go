@@ -412,7 +412,8 @@ func TestVerifyAllocationLaunch_TokenCheck(t *testing.T) {
 			}
 
 			err := verifyAllocationLaunch(context.Background(), discardLogger(), allocationConfig(t, testAllocationUID), opts)
-			assert.Equal(t, int32(1), newClient.Load())
+			// Every read selects its credential and builds its client again.
+			assert.Equal(t, creates.Load(), newClient.Load())
 
 			if tc.wantMoreCalls {
 				assert.Greater(t, creates.Load(), tc.wantCreates)
@@ -575,8 +576,200 @@ func TestVerifyAllocationLaunch_CertificateDoesNotFallBack(t *testing.T) {
 
 	err := verifyAllocationLaunch(context.Background(), discardLogger(), allocationConfig(t, testAllocationUID), opts)
 	require.ErrorIs(t, err, ErrAllocationLaunchRefused)
+	assert.True(t, IsFinalAllocationLaunchRefusal(err), "a certificate still valid after the read is final: %v", err)
 	assert.Equal(t, int32(1), reads.Load())
 	assert.Equal(t, int32(0), creates.Load())
+}
+
+// TestVerifyAllocationLaunch_CredentialReselected pins that every read selects
+// its credential again, so the stored certificate can change between reads or
+// during one.
+func TestVerifyAllocationLaunch_CredentialReselected(t *testing.T) {
+	t.Parallel()
+
+	valid := func(t *testing.T, dir string) { storeDaemonCertificate(t, dir, time.Now().Add(time.Hour)) }
+	expired := func(t *testing.T, dir string) { storeDaemonCertificate(t, dir, time.Now().Add(-time.Minute)) }
+	unavailable := apierrors.NewServiceUnavailable("api server is down")
+	unauthorized := apierrors.NewUnauthorized("credentials rejected")
+	forbidden := apierrors.NewForbidden(schema.GroupResource{Group: "unbounded-cloud.io", Resource: "machines"}, "test-machine", errors.New("denied"))
+
+	// hook runs inside the n-th read of its kind and returns the error that
+	// read fails with, or nil to let it through.
+	type hook func(t *testing.T, dir string, n int32) error
+
+	for _, tc := range []struct {
+		name           string
+		stored         func(t *testing.T, dir string)
+		onMachineRead  hook
+		onCreate       hook
+		wantAllowed    bool
+		wantCredential string
+		wantReads      int32
+		wantCreates    int32
+		wantClients    int32
+	}{
+		{
+			// The API is down, the certificate expires, and the API recovers.
+			name:   "expired between reads, token accepted",
+			stored: valid,
+			onMachineRead: func(t *testing.T, dir string, _ int32) error {
+				expired(t, dir)
+
+				return unavailable
+			},
+			wantAllowed:    true,
+			wantCredential: allocationCredentialBootstrapToken,
+			wantReads:      1,
+			wantCreates:    1,
+			wantClients:    2,
+		},
+		{
+			name:   "expired between reads, token revoked",
+			stored: valid,
+			onMachineRead: func(t *testing.T, dir string, _ int32) error {
+				expired(t, dir)
+
+				return unavailable
+			},
+			onCreate:    func(*testing.T, string, int32) error { return unauthorized },
+			wantReads:   1,
+			wantCreates: 1,
+			wantClients: 2,
+		},
+		{
+			name:   "expired during the read",
+			stored: valid,
+			onMachineRead: func(t *testing.T, dir string, _ int32) error {
+				expired(t, dir)
+
+				return unauthorized
+			},
+			wantAllowed:    true,
+			wantCredential: allocationCredentialBootstrapToken,
+			wantReads:      1,
+			wantCreates:    1,
+			wantClients:    2,
+		},
+		{
+			name:   "expired during the read, token revoked",
+			stored: valid,
+			onMachineRead: func(t *testing.T, dir string, _ int32) error {
+				expired(t, dir)
+
+				return unauthorized
+			},
+			onCreate:    func(*testing.T, string, int32) error { return unauthorized },
+			wantReads:   1,
+			wantCreates: 1,
+			wantClients: 2,
+		},
+		{
+			name:   "stored during the call",
+			stored: func(*testing.T, string) {},
+			onCreate: func(t *testing.T, dir string, _ int32) error {
+				valid(t, dir)
+
+				return unavailable
+			},
+			wantAllowed:    true,
+			wantCredential: allocationCredentialDaemonCertificate,
+			wantReads:      1,
+			wantCreates:    1,
+			wantClients:    2,
+		},
+		{
+			name:          "forbidden from a valid certificate",
+			stored:        valid,
+			onMachineRead: func(*testing.T, string, int32) error { return forbidden },
+			wantReads:     1,
+			wantCreates:   0,
+			wantClients:   1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				buf     bytes.Buffer
+				clients atomic.Int32
+				reads   atomic.Int32
+				creates atomic.Int32
+			)
+
+			opts := testAllocationLaunchOptions(t)
+			opts.timeout = 10 * time.Second
+			tc.stored(t, opts.credentialDir)
+
+			opts.newClient = func(cfg *rest.Config, _ client.Options) (client.WithWatch, error) {
+				clients.Add(1)
+
+				return fake.NewClientBuilder().
+					WithScheme(newScheme()).
+					WithObjects(allocationMachine(testAllocationUID)).
+					WithInterceptorFuncs(interceptor.Funcs{
+						Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts2 ...client.GetOption) error {
+							n := reads.Add(1)
+
+							if cfg.BearerToken != "" {
+								t.Error("Machine read with the bootstrap token")
+							}
+
+							if tc.onMachineRead != nil {
+								if err := tc.onMachineRead(t, opts.credentialDir, n); err != nil {
+									return err
+								}
+							}
+
+							return c.Get(ctx, key, obj, opts2...)
+						},
+						Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error {
+							n := creates.Add(1)
+
+							if cfg.BearerToken == "" {
+								t.Error("SelfSubjectReview created with the certificate")
+							}
+
+							if tc.onCreate != nil {
+								return tc.onCreate(t, opts.credentialDir, n)
+							}
+
+							return nil
+						},
+					}).
+					Build(), nil
+			}
+
+			log := slog.New(slog.NewJSONHandler(&buf, nil))
+			err := verifyAllocationLaunch(context.Background(), log, allocationConfig(t, testAllocationUID), opts)
+
+			assert.Equal(t, tc.wantReads, reads.Load(), "Machine reads")
+			assert.Equal(t, tc.wantCreates, creates.Load(), "SelfSubjectReview creates")
+			assert.Equal(t, tc.wantClients, clients.Load(), "client constructions")
+
+			if !tc.wantAllowed {
+				require.ErrorIs(t, err, ErrAllocationLaunchRefused)
+				assert.True(t, IsFinalAllocationLaunchRefusal(err), "final: %v", err)
+
+				return
+			}
+
+			require.NoError(t, err)
+
+			var allowed map[string]any
+
+			for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal([]byte(line), &entry))
+
+				if entry["msg"] == "allocation launch allowed" {
+					allowed = entry
+				}
+			}
+
+			require.NotNil(t, allowed, "no allow line in %s", buf.String())
+			assert.Equal(t, tc.wantCredential, allowed["credential"])
+		})
+	}
 }
 
 func TestVerifyAllocationLaunch_LogsOneLine(t *testing.T) {

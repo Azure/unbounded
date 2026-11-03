@@ -16,6 +16,7 @@ import (
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -161,11 +162,13 @@ func defaultAllocationLaunchOptions() allocationLaunchOptions {
 // VerifyAllocationLaunch decides whether an allocation-backed host may start
 // its node. It returns nil at once for any other host.
 //
-// With a stored, unexpired daemon-controller certificate it reads the Machine
-// live and allows only a Machine that binds this allocation UID, is not fenced
-// and is not being deleted. Before that certificate exists it asks the API
-// server to review the bootstrap token, which is revoked when the allocation
-// is fenced. It never falls back from the certificate to the token.
+// Every read selects its credential again. With a stored, unexpired
+// daemon-controller certificate the read gets the Machine live and allows only
+// a Machine that binds this allocation UID, is not fenced and is not being
+// deleted. Otherwise it asks the API server to review the bootstrap token,
+// which is revoked when the allocation is fenced. A read never falls back from
+// the certificate to the token; a certificate that expires during a call only
+// moves the next read to the token.
 //
 // It fails closed: every refusal wraps ErrAllocationLaunchRefused, and reads
 // that keep failing transiently refuse once the retry budget is spent.
@@ -188,35 +191,84 @@ func verifyAllocationLaunch(ctx context.Context, log *slog.Logger, cfg *provisio
 		return refuseAllocationLaunch(log, cfg, uid, allocationCredentialNone, fmt.Errorf("build bootstrap rest config: %w", err))
 	}
 
-	certCfg, found, err := daemoncred.StoredRESTConfig(bootstrapCfg, cfg.NodeName, daemoncred.ControllerCertificateOptions{
-		Name:          daemonControllerCertificateName,
-		SignerName:    daemoncred.DefaultControllerCertificateSignerName,
-		DaemonGroup:   daemonControllerGroup,
-		CredentialDir: opts.credentialDir,
-		WaitTimeout:   daemonControllerCertWaitTimeout,
-	})
-	if err != nil {
-		return refuseAllocationLaunch(log, cfg, uid, allocationCredentialDaemonCertificate, fmt.Errorf("load stored daemon controller certificate: %w", err))
+	storedCertificate := func() (*rest.Config, bool, error) {
+		return daemoncred.StoredRESTConfig(bootstrapCfg, cfg.NodeName, daemoncred.ControllerCertificateOptions{
+			Name:          daemonControllerCertificateName,
+			SignerName:    daemoncred.DefaultControllerCertificateSignerName,
+			DaemonGroup:   daemonControllerGroup,
+			CredentialDir: opts.credentialDir,
+			WaitTimeout:   daemonControllerCertWaitTimeout,
+		})
 	}
 
-	if found {
-		c, err := opts.newClient(certCfg, client.Options{Scheme: newScheme()})
+	read := func(ctx context.Context) allocationRead {
+		certCfg, found, err := storedCertificate()
 		if err != nil {
-			return refuseAllocationLaunch(log, cfg, uid, allocationCredentialDaemonCertificate, fmt.Errorf("build daemon controller client: %w", err))
+			return finalAllocationRead(allocationCredentialDaemonCertificate, fmt.Errorf("load stored daemon controller certificate: %w", err))
 		}
 
-		return verifyAllocationMachine(ctx, log, c, cfg, opts)
+		if !found {
+			return readWithBootstrapToken(ctx, opts, bootstrapCfg)
+		}
+
+		return readWithDaemonCertificate(ctx, opts, certCfg, cfg.MachineName, uid, storedCertificate)
 	}
 
+	return checkAllocationLaunch(ctx, log, cfg, uid, opts, read)
+}
+
+// readWithDaemonCertificate reads the Machine with the stored certificate.
+//
+// The client presents no certificate once the stored one has expired, so a
+// rejection is final only while the certificate is still stored and
+// unexpired. A certificate that expired during the read makes the read
+// transient, and the next read selects the token.
+func readWithDaemonCertificate(
+	ctx context.Context,
+	opts allocationLaunchOptions,
+	certCfg *rest.Config,
+	machineName, uid string,
+	storedCertificate func() (*rest.Config, bool, error),
+) allocationRead {
+	c, err := opts.newClient(certCfg, client.Options{Scheme: newScheme()})
+	if err != nil {
+		return finalAllocationRead(allocationCredentialDaemonCertificate, fmt.Errorf("build daemon controller client: %w", err))
+	}
+
+	err = checkAllocationMachine(ctx, c, machineName, uid)
+	if err == nil || (!apierrors.IsUnauthorized(err) && !apierrors.IsForbidden(err)) {
+		return machineAllocationRead(err)
+	}
+
+	_, stillFound, recheckErr := storedCertificate()
+
+	switch {
+	case recheckErr != nil:
+		return finalAllocationRead(allocationCredentialDaemonCertificate, fmt.Errorf("load stored daemon controller certificate: %w", recheckErr))
+	case !stillFound:
+		return allocationRead{
+			credential: allocationCredentialDaemonCertificate,
+			err:        fmt.Errorf("daemon controller certificate expired during the read: %w", err),
+		}
+	default:
+		return finalAllocationRead(allocationCredentialDaemonCertificate, err)
+	}
+}
+
+// readWithBootstrapToken reviews the bootstrap token.
+func readWithBootstrapToken(ctx context.Context, opts allocationLaunchOptions, bootstrapCfg *rest.Config) allocationRead {
 	c, err := opts.newClient(bootstrapCfg, client.Options{Scheme: newScheme()})
 	if err != nil {
-		return refuseAllocationLaunch(log, cfg, uid, allocationCredentialBootstrapToken, fmt.Errorf("build bootstrap client: %w", err))
+		return finalAllocationRead(allocationCredentialBootstrapToken, fmt.Errorf("build bootstrap client: %w", err))
 	}
 
-	read := func(ctx context.Context) error { return reviewBootstrapToken(ctx, c) }
+	err = reviewBootstrapToken(ctx, c)
 
-	return checkAllocationLaunch(ctx, log, cfg, uid, allocationCredentialBootstrapToken, opts, read, bootstrapTokenRefusalIsFinal,
-		"the API server accepts the bootstrap token")
+	return allocationRead{
+		credential: allocationCredentialBootstrapToken,
+		err:        err,
+		final:      err != nil && bootstrapTokenRefusalIsFinal(err),
+	}
 }
 
 // verifyAllocationMachine runs the guard with the daemon's own credential:
@@ -232,59 +284,90 @@ func verifyAllocationMachine(ctx context.Context, log *slog.Logger, reader clien
 		return refuseAllocationLaunch(log, cfg, uid, allocationCredentialDaemonCertificate, errAllocationIdentityMalformed)
 	}
 
-	read := func(ctx context.Context) error { return checkAllocationMachine(ctx, reader, cfg.MachineName, uid) }
+	read := func(ctx context.Context) allocationRead {
+		return machineAllocationRead(checkAllocationMachine(ctx, reader, cfg.MachineName, uid))
+	}
 
-	return checkAllocationLaunch(ctx, log, cfg, uid, allocationCredentialDaemonCertificate, opts, read, machineRefusalIsFinal,
-		"the Machine binds this allocation, is not fenced and is not being deleted")
+	return checkAllocationLaunch(ctx, log, cfg, uid, opts, read)
+}
+
+// allocationRead is the outcome of one guard read.
+type allocationRead struct {
+	// credential is the credential the read used.
+	credential string
+	// err is nil when the read allows.
+	err error
+	// final reports that reading again cannot change a refusal.
+	final bool
+}
+
+func finalAllocationRead(credential string, err error) allocationRead {
+	return allocationRead{credential: credential, err: err, final: true}
+}
+
+func machineAllocationRead(err error) allocationRead {
+	return allocationRead{
+		credential: allocationCredentialDaemonCertificate,
+		err:        err,
+		final:      err != nil && machineRefusalIsFinal(err),
+	}
+}
+
+// allocationAllowedCause says why a read with credential allowed.
+func allocationAllowedCause(credential string) string {
+	if credential == allocationCredentialBootstrapToken {
+		return "the API server accepts the bootstrap token"
+	}
+
+	return "the Machine binds this allocation, is not fenced and is not being deleted"
 }
 
 // checkAllocationLaunch reads until one read allows, a read refuses for good,
-// or the budget is spent.
+// or the budget is spent. The budget covers every read of the call, whichever
+// credential each read selected.
 func checkAllocationLaunch(
 	ctx context.Context,
 	log *slog.Logger,
 	cfg *provision.AgentConfig,
-	uid, credential string,
+	uid string,
 	opts allocationLaunchOptions,
-	read func(context.Context) error,
-	final func(error) bool,
-	allowed string,
+	read func(context.Context) allocationRead,
 ) error {
 	readCtx, cancel := context.WithTimeout(ctx, opts.timeout)
 	defer cancel()
 
-	var lastErr error
+	last := allocationRead{credential: allocationCredentialNone}
 
 	for {
 		if err := readCtx.Err(); err != nil {
 			cause := fmt.Errorf("%w: %w", errAllocationLaunchUnconfirmed, err)
-			if lastErr != nil {
-				cause = fmt.Errorf("%w: %w: last error: %w", errAllocationLaunchUnconfirmed, err, lastErr)
+			if last.err != nil {
+				cause = fmt.Errorf("%w: %w: last error: %w", errAllocationLaunchUnconfirmed, err, last.err)
 			}
 
-			return refuseAllocationLaunch(log, cfg, uid, credential, cause)
+			return refuseAllocationLaunch(log, cfg, uid, last.credential, cause)
 		}
 
-		lastErr = read(readCtx)
-		if lastErr == nil {
+		last = read(readCtx)
+		if last.err == nil {
 			log.Info("allocation launch allowed",
 				"allocation_uid", uid,
 				"machine", cfg.MachineName,
-				"credential", credential,
-				"cause", allowed)
+				"credential", last.credential,
+				"cause", allocationAllowedCause(last.credential))
 
 			return nil
 		}
 
-		if final(lastErr) {
-			return refuseAllocationLaunch(log, cfg, uid, credential, lastErr)
+		if last.final {
+			return refuseAllocationLaunch(log, cfg, uid, last.credential, last.err)
 		}
 
 		log.Warn("cannot confirm the allocation yet; reading again",
 			"allocation_uid", uid,
 			"machine", cfg.MachineName,
-			"credential", credential,
-			"error", lastErr)
+			"credential", last.credential,
+			"error", last.err)
 
 		timer := time.NewTimer(opts.interval)
 		select {
