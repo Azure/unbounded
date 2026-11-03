@@ -7,6 +7,11 @@ import unittest
 
 
 class VerifyTest(unittest.TestCase):
+    def test_boot_kernel_discovery_uses_boot_artifact(self):
+        customize = Path(__file__).with_name("customize.sh").read_text()
+        self.assertIn("set -- /boot/vmlinuz-*", customize)
+        self.assertNotIn("readlink -f /vmlinuz", customize)
+
     def test_pinned_package_install_resolves_dependencies(self):
         customize = Path(__file__).with_name("customize.sh").read_text()
         self.assertIn(

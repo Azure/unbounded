@@ -37,9 +37,10 @@ cloud-init schema --config-file /etc/cloud/cloud.cfg.d/90-gb200-access-users.cfg
 grep -qx 'options nvidia NVreg_NvLinkDisable=1' "${nvlink_config}" ||
     fail "rootfs GPU NVLink policy changed"
 
-kernel_release="$(readlink -f /vmlinuz)"
-kernel_release="${kernel_release##*/vmlinuz-}"
-test -n "${kernel_release}" || fail "boot kernel cannot be resolved"
+set -- /boot/vmlinuz-*
+test "$#" -eq 1 && test -f "$1" ||
+    fail "expected exactly one boot kernel"
+kernel_release="${1##*/vmlinuz-}"
 modinfo -k "${kernel_release}" nvidia >/dev/null ||
     fail "NVIDIA module is missing from the boot kernel"
 
