@@ -55,7 +55,7 @@ on:
         type: string
         default: ""
       cache-scope:
-        description: GitHub Actions cache scope prefix; the arch is appended. Defaults to the image name.
+        description: GitHub Actions cache scope prefix; the arch is appended. Defaults to the image name with characters outside [A-Za-z0-9._-] replaced by -.
         required: false
         type: string
         default: ""
@@ -107,6 +107,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       registry: ${{ steps.plan.outputs.registry }}
       cache-scope: ${{ steps.plan.outputs.cache-scope }}
+      key: ${{ steps.plan.outputs.key }}
     steps:
       - name: Plan native builds
         id: plan
@@ -142,10 +143,24 @@ jobs:
             exit 1
           fi
 
+          # Artifact names cannot contain "/", but nested image names such as
+          # inventory/viewer do. Derive an artifact-safe key: the name with
+          # anything outside [A-Za-z0-9._-] replaced by "-", plus a short hash
+          # of the raw name. The hash keeps distinct names distinct
+          # (inventory/viewer vs inventory-viewer) and stops the merge job's
+          # download pattern from matching another image's artifacts by
+          # prefix (racer vs racer-object).
+          safe="$(LC_ALL=C sed 's/[^A-Za-z0-9._-]/-/g' <<<"$NAME")"
+          hash="$(printf '%s' "$NAME" | sha256sum | cut -c1-8)"
+
+          # The default cache scope uses the sanitized name without the hash,
+          # so existing caches for plain names stay valid. A collision there
+          # only shares a cache, which is harmless.
           {
             echo "matrix={\"include\":${include}}"
             echo "registry=${REGISTRY,,}"
-            echo "cache-scope=${CACHE_SCOPE:-$NAME}"
+            echo "cache-scope=${CACHE_SCOPE:-$safe}"
+            echo "key=${safe}-${hash}"
           } >> "$GITHUB_OUTPUT"
           echo "Image: ${REGISTRY,,}/${NAME}"
           jq . <<<"$include"
@@ -236,7 +251,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: digests-${{ inputs.name }}-${{ matrix.arch }}
+          name: digests-${{ needs.plan.outputs.key }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -253,13 +268,13 @@ jobs:
     outputs:
       digest: ${{ steps.create.outputs.digest }}
     steps:
-      # The pattern can also match other images whose names share this prefix
-      # (racer matches racer-object), so each artifact keeps its own directory
-      # and only this image's planned arches are read below.
+      # The key's hash suffix keeps this pattern from matching other images
+      # whose names share a prefix (racer vs racer-object). Each artifact
+      # still keeps its own directory and only the planned arches are read.
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
         with:
-          pattern: digests-${{ inputs.name }}-*
+          pattern: digests-${{ needs.plan.outputs.key }}-*
           path: ${{ runner.temp }}/digests
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -275,7 +290,7 @@ jobs:
         id: create
         env:
           IMAGE: ${{ needs.plan.outputs.registry }}/${{ inputs.name }}
-          NAME: ${{ inputs.name }}
+          KEY: ${{ needs.plan.outputs.key }}
           MATRIX: ${{ needs.plan.outputs.matrix }}
           TAGS: ${{ inputs.tags }}
         run: |
@@ -283,7 +298,7 @@ jobs:
 
           sources=()
           while IFS= read -r arch; do
-            dir="${RUNNER_TEMP}/digests/digests-${NAME}-${arch}"
+            dir="${RUNNER_TEMP}/digests/digests-${KEY}-${arch}"
             mapfile -t digests < <(ls "$dir")
             if [[ "${#digests[@]}" -ne 1 ]]; then
               echo "::error::Expected exactly one ${arch} digest in ${dir}, found ${#digests[@]}"
