@@ -751,7 +751,9 @@ func TestHostOperationDoesNotWaitForAllocationOperation(t *testing.T) {
 			}}}
 			registration, err := publicmachineops.NewProvider(
 				testLongRunningProviderName,
-				publicmachineops.WithLongRunningOperation(kind, allocation.Begin, allocation.Poll),
+				publicmachineops.WithCapacity(allocation.ResolveClass, allocation.PlanAllocation),
+				publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostAllocate, allocation.Begin, allocation.Poll),
+				publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostRelease, allocation.Begin, allocation.Poll),
 				publicmachineops.WithLongRunningOperation(unboundedv1alpha3.OperationHostHardReboot, hostReboot.Begin, hostReboot.Poll),
 			)
 			require.NoError(t, err)
@@ -774,6 +776,9 @@ func TestHostOperationDoesNotWaitForAllocationOperation(t *testing.T) {
 			require.NotContains(t, updated.Status.Message, "waiting for older host operation")
 			require.Equal(t, unboundedv1alpha3.OperationPhaseInProgress, updated.Status.Phase)
 			require.Zero(t, allocation.beginCalls)
+			require.Zero(t, allocation.pollCalls)
+			require.Zero(t, allocation.resolveCalls)
+			require.Zero(t, allocation.planCalls)
 		})
 	}
 }

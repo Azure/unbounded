@@ -29,6 +29,9 @@ type OperationRequest struct {
 	Parameters      map[string]string
 	ReplaceUserData string
 	Auth            *OperationAuth
+	// Allocation is the allocation input for HostAllocate and HostRelease. It
+	// is nil for every other operation kind.
+	Allocation *AllocationRequest
 }
 
 // OperationAuth is the provider-facing credential material resolved for an
@@ -57,6 +60,9 @@ func (a *OperationAuth) RequiredSecretValue(key string) (string, error) {
 type OperationResult struct {
 	ProviderID        string
 	CleanupProviderID string
+	// Allocation is the allocation result reported by HostAllocate. It is
+	// nil for every other operation kind.
+	Allocation *AllocationResult
 }
 
 // ProviderOperation is the provider-neutral representation of a resumable
