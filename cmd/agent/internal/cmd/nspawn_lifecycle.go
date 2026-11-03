@@ -116,7 +116,9 @@ func nspawnPreStart(authorize, regenerate func() error) error {
 // authorizeNSpawnStart runs the allocation launch guard before every start of
 // the nspawn machine: at boot, from machinectl start, from systemctl restart
 // and from Restart=on-failure. A refusal fails the pre-start, so the machine
-// does not start, and systemd runs the pre-start again.
+// does not start. systemd runs the pre-start again only after a transient
+// refusal. A final refusal exits with goalstates.NSpawnPreStartRefusedExitCode
+// and is not retried; the next start request checks again.
 //
 // It checks the slot's applied config when that loads. Otherwise it checks the
 // allocation launch record, which bootstrap writes before the node first
