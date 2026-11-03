@@ -620,4 +620,4 @@ fn decode_chunked(mut bytes: &[u8], limit: usize) -> Result<Option<Zeroizing<Vec
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
