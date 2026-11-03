@@ -32,7 +32,7 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 		SecurityProfile                                    struct{ WorkloadIdentity struct{ Enabled bool } }
 		OidcIssuerProfile                                  struct{ Enabled bool }
 	}
-	if err := h.azureJSON(ctx, &cluster, "aks", "show", "--ids", h.clusterID); err != nil {
+	if err := h.azureJSON(ctx, &cluster, "aks", "show", "--name", clusterID.Name, "--resource-group", clusterID.ResourceGroupName); err != nil {
 		return err
 	}
 
@@ -78,7 +78,8 @@ func (h *attachACRHandler) configureIdentityBinding(ctx context.Context, acrID *
 	}
 
 	if !cluster.OidcIssuerProfile.Enabled || !cluster.SecurityProfile.WorkloadIdentity.Enabled {
-		if _, err := h.runAzure(ctx, "aks", "update", "--ids", h.clusterID, "--enable-oidc-issuer", "--enable-workload-identity"); err != nil {
+		if _, err := h.runAzure(ctx, "aks", "update", "--name", clusterID.Name, "--resource-group", clusterID.ResourceGroupName,
+			"--enable-oidc-issuer", "--enable-workload-identity"); err != nil {
 			return fmt.Errorf("enable AKS identity-binding prerequisites: %w", err)
 		}
 	}

@@ -275,9 +275,10 @@ Private plaintext HTTP registries are not supported by this mode.
 
 #### ACR Attachment and Explicit Authentication on Flex Nodes
 
-The following describes the intended `gantry attach-acr` workflow for a compatible
-plugin/operator release. It is not available in the `v0.8.0` deployment baseline,
-and the managed authentication path has **not been live-validated**.
+The `gantry attach-acr` workflow requires a compatible plugin/operator release.
+It is not available in the `v0.8.0` deployment baseline. Managed authentication
+and private-image peer transfer have been live-validated on AKS 1.36.5 with Linux
+Flex nodes. Verify private pulls and peer transfer separately in your environment.
 
 Deploy Gantry independently of authentication. In particular,
 `hack/scripts/aks-flex-cluster.sh` creates a cluster with Gantry but no ACR
@@ -337,6 +338,13 @@ shared identity. Kubelet requests the short-lived Pod-bound tokens and passes
 them to the credential provider for image pulls. No application Pod or
 ServiceAccount annotations, token volumes, or other edits are needed. This is
 shared pull access, not per-application registry or cached-content isolation.
+
+The operator grants `request-serviceaccounts-token-audience` only for the
+configured audience, binding individually named Linux Flex kubelets rather than
+the `system:nodes` group. Membership follows eligible node additions, relabeling,
+and removal. Switching to external policy revokes these operator-owned grants.
+Kubernetes still checks that each token request is bound to a Pod on the
+requesting node.
 
 There is no custom broker, exec adapter, or token-exchange service. Pull
 authentication needs no VM/VMSS identity assignments or IMDS fallback. Initial

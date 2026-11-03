@@ -76,14 +76,14 @@ func TestLateACRAdditionPlansAuthenticationWithoutChangingSource(t *testing.T) {
 	require.False(t, result.Ready)
 	require.Equal(t, "RegistryAuthInstalling", result.Reason)
 	require.Positive(t, result.RequeueAfter)
-	require.Len(t, operations, 6)
+	require.Len(t, operations, 8)
 
 	var ds appsv1.DaemonSet
 
 	for _, op := range operations {
 		if op.Object.GetKind() == "DaemonSet" {
 			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(op.Object.Object, &ds))
-			require.Len(t, op.DependsOn, 5)
+			require.Len(t, op.DependsOn, 7)
 		}
 	}
 
@@ -140,7 +140,7 @@ func TestNodeAuthInstallationModes(t *testing.T) {
 			require.NoError(t, err)
 
 			if tc.install {
-				require.Len(t, operations, 6, "kubelet authentication must survive a Gantry storage-backend change")
+				require.Len(t, operations, 8, "kubelet authentication must survive a Gantry storage-backend change")
 				require.NotNil(t, result)
 			} else {
 				require.Empty(t, operations)
@@ -287,4 +287,126 @@ func TestInvalidAuthPolicyStopsPlanning(t *testing.T) {
 	plan, _, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("flex", nil)})
 	require.ErrorContains(t, err, "mode must")
 	require.Nil(t, plan)
+}
+
+func TestRegistryAuthAudienceIsLimitedToLinuxFlexNodeUsers(t *testing.T) {
+	node := func(name, os, pool string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+			"kubernetes.io/os": os, registryauth.FlexNodeLabel: pool,
+		}}}
+	}
+	flex := node("flex-a", "linux", registryauth.FlexNodeValue)
+	env := testEnv(t, flex, node("native", "linux", "VirtualMachineScaleSets"),
+		node("windows", "windows", registryauth.FlexNodeValue))
+	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding"}
+	check := func(expected ...string) {
+		t.Helper()
+		operations, err := planRegistryAuthAudience(t.Context(), env, cfg)
+		require.NoError(t, err)
+		require.Len(t, operations, 2)
+
+		var role rbacv1.ClusterRole
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[0].Object.Object, &role))
+		require.Equal(t, []rbacv1.PolicyRule{{
+			APIGroups: []string{""}, Resources: []string{cfg.Audience},
+			Verbs: []string{"request-serviceaccounts-token-audience"},
+		}}, role.Rules)
+
+		var binding rbacv1.ClusterRoleBinding
+		require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(operations[1].Object.Object, &binding))
+		require.Equal(t, rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name}, binding.RoleRef)
+
+		var subjects []string
+
+		for _, subject := range binding.Subjects {
+			require.Equal(t, rbacv1.UserKind, subject.Kind)
+			require.Equal(t, rbacv1.GroupName, subject.APIGroup)
+			subjects = append(subjects, subject.Name)
+		}
+
+		require.Equal(t, expected, subjects)
+		require.Equal(t, []component.ObjectRef{operations[0].Ref()}, operations[1].DependsOn)
+	}
+	check("system:node:flex-a")
+
+	future := node("flex-b", "linux", registryauth.FlexNodeValue)
+	require.NoError(t, env.Client.Create(t.Context(), future))
+	check("system:node:flex-a", "system:node:flex-b")
+
+	flex.Labels[registryauth.FlexNodeLabel] = "VirtualMachineScaleSets"
+	require.NoError(t, env.Client.Update(t.Context(), flex))
+	check("system:node:flex-b")
+	require.NoError(t, env.Client.Delete(t.Context(), future))
+	check()
+}
+
+func TestRegistryAuthAudienceOwnershipAndRevocation(t *testing.T) {
+	cfg := registryauth.Config{Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding"}
+
+	for _, foreign := range []bool{false, true} {
+		t.Run(fmt.Sprint(foreign), func(t *testing.T) {
+			env := testEnv(t)
+			operations, err := planRegistryAuthAudience(t.Context(), env, cfg)
+			require.NoError(t, err)
+
+			for _, op := range operations {
+				object := op.Object.DeepCopy()
+				if foreign {
+					object.SetLabels(nil)
+				}
+
+				object.SetUID("existing-audience")
+				require.NoError(t, env.Client.Create(t.Context(), object))
+			}
+
+			operations, err = planRegistryAuthAudience(t.Context(), env, cfg)
+			if foreign {
+				require.ErrorContains(t, err, "unowned registry-auth")
+			} else {
+				require.NoError(t, err)
+
+				for _, op := range operations {
+					require.Equal(t, component.OpApply, op.Kind)
+					require.Equal(t, "existing-audience", string(op.Object.GetUID()))
+					require.NotEmpty(t, op.Object.GetResourceVersion())
+				}
+			}
+
+			operations, err = planRegistryAuthAudience(t.Context(), env, registryauth.Config{Mode: registryauth.ExternalMode})
+			require.NoError(t, err)
+
+			if foreign {
+				require.Empty(t, operations)
+			} else {
+				require.Len(t, operations, 2)
+
+				for _, op := range operations {
+					require.Equal(t, component.OpDelete, op.Kind)
+					require.Equal(t, "existing-audience", string(op.Object.GetUID()))
+					require.NotEmpty(t, op.Object.GetResourceVersion())
+				}
+			}
+		})
+	}
+}
+
+func TestRegistryAuthAudienceRevokedAfterHelperDeletion(t *testing.T) {
+	env := testEnv(t, authSource("mode: external"))
+	operations, err := planRegistryAuthAudience(t.Context(), env, registryauth.Config{
+		Mode: registryauth.IdentityBindingMode, Audience: "api://AKSIdentityBinding",
+	})
+	require.NoError(t, err)
+
+	for _, op := range operations {
+		require.NoError(t, env.Client.Create(t.Context(), op.Object))
+	}
+
+	operations, result, err := planRegistryAuth(t.Context(), env)
+	require.NoError(t, err)
+	require.Nil(t, result)
+	require.Len(t, operations, 2)
+
+	for _, op := range operations {
+		require.Equal(t, component.OpDelete, op.Kind)
+	}
 }

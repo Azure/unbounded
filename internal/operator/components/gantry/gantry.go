@@ -256,6 +256,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, registryAuthName, workload.DataplaneDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
+	b.Watches(&corev1.Node{}, env.RequestSingleton(), builder.WithPredicates(predicate.LabelChangedPredicate{}))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))
 	b.Watches(&schedulingv1.PriorityClass{}, env.RequestSingleton(),
 		builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {

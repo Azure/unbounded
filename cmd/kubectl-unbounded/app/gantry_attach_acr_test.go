@@ -61,12 +61,23 @@ func attachFixture(t *testing.T) (*attachACRHandler, *fake.Clientset, *[]string)
 		calls = append(calls, strings.Join(args, " "))
 		switch strings.Join(args[:min(2, len(args))], " ") {
 		case "acr show":
+			require.Equal(t, []string{"acr", "show", "--name", "central", "--resource-group", "registry-rg"}, args)
+
 			return json.Marshal(map[string]string{"id": attachACRID, "loginServer": "central.azurecr.io", "roleAssignmentMode": "LegacyRegistryPermissions"})
 		case "aks show":
+			require.Equal(t, []string{"aks", "show", "--name", "cluster", "--resource-group", "cluster-rg"}, args)
+
 			return json.Marshal(map[string]any{
 				"id": attachClusterID, "location": "eastus", "fqdn": "cluster.example.com", "provisioningState": "Succeeded",
 				"oidcIssuerProfile": map[string]bool{"enabled": true}, "securityProfile": map[string]any{"workloadIdentity": map[string]bool{"enabled": true}},
 			})
+		case "aks update":
+			require.Equal(t, []string{
+				"aks", "update", "--name", "cluster", "--resource-group", "cluster-rg",
+				"--enable-oidc-issuer", "--enable-workload-identity",
+			}, args)
+
+			return []byte("{}"), nil
 		case "identity list":
 			return []byte("[]"), nil
 		case "identity create":
@@ -320,6 +331,28 @@ func TestGantryAttachACRRejectsWrongClusterBeforeAzureWrites(t *testing.T) {
 	h.restConfig.Host = "https://different.example.com"
 	require.ErrorContains(t, h.execute(t.Context()), "does not match")
 	require.Len(t, *calls, 2)
+}
+
+func TestGantryAttachACREnablesPrerequisitesWithNamedCluster(t *testing.T) {
+	h, _, calls := managedAttachFixture(t)
+	run := h.runAzure
+	h.runAzure = func(ctx context.Context, args ...string) ([]byte, error) {
+		data, err := run(ctx, args...)
+		if err != nil || !strings.HasPrefix(strings.Join(args, " "), "aks show ") {
+			return data, err
+		}
+
+		var cluster map[string]any
+		if err := json.Unmarshal(data, &cluster); err != nil {
+			return nil, err
+		}
+
+		cluster["oidcIssuerProfile"] = map[string]bool{"enabled": false}
+
+		return json.Marshal(cluster)
+	}
+	require.NoError(t, h.execute(t.Context()))
+	require.Contains(t, *calls, "aks update --name cluster --resource-group cluster-rg --enable-oidc-issuer --enable-workload-identity")
 }
 
 func TestGantryAttachACRManagedRerunsReuseOwnedResources(t *testing.T) {

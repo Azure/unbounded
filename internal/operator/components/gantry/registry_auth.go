@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,8 +30,9 @@ import (
 )
 
 const (
-	registryAuthName = "gantry-acr-auth"
-	registryAuthHash = "unbounded-cloud.io/registry-auth-config-hash"
+	registryAuthName         = "gantry-acr-auth"
+	registryAuthHash         = "unbounded-cloud.io/registry-auth-config-hash"
+	registryAuthAudienceName = "gantry-acr-kubelet-token-audience"
 )
 
 func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Operation, *component.Result, error) {
@@ -53,6 +55,11 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 
 	active := cfg.Mode == registryauth.IdentityBindingMode
 
+	audienceOperations, err := planRegistryAuthAudience(ctx, env, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var existing appsv1.DaemonSet
 
 	err = env.LiveReader().Get(ctx, client.ObjectKey{Namespace: env.Namespace, Name: registryAuthName}, &existing)
@@ -66,7 +73,7 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 	}
 
 	if !active && !registryAuthOwned(&existing) && !registryAuthOwned(&retained) {
-		return nil, nil, nil
+		return audienceOperations, nil, nil
 	}
 
 	payload, err := json.Marshal(cfg)
@@ -77,7 +84,8 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 	hash := sha256.Sum256(payload)
 	digest := hex.EncodeToString(hash[:])
 	objects, workload := registryAuthObjects(env, payload, digest)
-	operations := make([]component.Operation, 0, len(objects))
+
+	operations := append([]component.Operation(nil), audienceOperations...)
 
 	if !active {
 		var binding rbacv1.ClusterRoleBinding
@@ -94,6 +102,9 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 	}
 
 	var dependencies []component.ObjectRef
+	for _, op := range audienceOperations {
+		dependencies = append(dependencies, op.Ref())
+	}
 
 	for _, object := range objects {
 		current := &unstructured.Unstructured{}
@@ -150,6 +161,95 @@ func planRegistryAuth(ctx context.Context, env *component.Env) ([]component.Oper
 	}
 
 	return operations, &result, nil
+}
+
+func planRegistryAuthAudience(ctx context.Context, env *component.Env, cfg registryauth.Config) ([]component.Operation, error) {
+	active := cfg.Mode == registryauth.IdentityBindingMode
+	metadata := metav1.ObjectMeta{
+		Name: registryAuthAudienceName,
+		Labels: map[string]string{
+			"app.kubernetes.io/name":       registryAuthName,
+			"app.kubernetes.io/managed-by": installationManagerOperator,
+		},
+	}
+	role := &rbacv1.ClusterRole{
+		TypeMeta:   metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRole"},
+		ObjectMeta: metadata,
+	}
+	binding := &rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"},
+		ObjectMeta: metadata,
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name},
+	}
+
+	if active {
+		var nodes corev1.NodeList
+		if err := env.LiveReader().List(ctx, &nodes, client.MatchingLabels{
+			"kubernetes.io/os": "linux", registryauth.FlexNodeLabel: registryauth.FlexNodeValue,
+		}); err != nil {
+			return nil, fmt.Errorf("list Linux Flex nodes for credential-provider audience authorization: %w", err)
+		}
+
+		sort.Slice(nodes.Items, func(i, j int) bool { return nodes.Items[i].Name < nodes.Items[j].Name })
+
+		for _, node := range nodes.Items {
+			if node.DeletionTimestamp == nil {
+				binding.Subjects = append(binding.Subjects, rbacv1.Subject{
+					Kind: rbacv1.UserKind, APIGroup: rbacv1.GroupName, Name: "system:node:" + node.Name,
+				})
+			}
+		}
+
+		// NodeRestriction separately checks that the token is bound to a Pod on the requesting node.
+		role.Rules = []rbacv1.PolicyRule{{
+			APIGroups: []string{""}, Resources: []string{cfg.Audience},
+			Verbs: []string{"request-serviceaccounts-token-audience"},
+		}}
+	}
+
+	var operations []component.Operation
+
+	for _, object := range []client.Object{role, binding} {
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(object.GetObjectKind().GroupVersionKind())
+
+		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(object), current)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+
+		kind := component.OpCreateIfAbsent
+
+		if err == nil {
+			if !registryAuthOwned(current) {
+				if !active {
+					continue
+				}
+
+				return nil, fmt.Errorf("refusing to overwrite an unowned registry-auth %s/%s", current.GetKind(), current.GetName())
+			}
+
+			kind = component.OpApply
+
+			object.SetUID(current.GetUID())
+			object.SetResourceVersion(current.GetResourceVersion())
+		} else if !active {
+			continue
+		}
+
+		if !active {
+			kind = component.OpDelete
+		}
+
+		op := component.Operation{Kind: kind, Object: component.ToUnstructured(object), Component: "gantry"}
+		if active && object == binding {
+			op.DependsOn = []component.ObjectRef{operations[0].Ref()}
+		}
+
+		operations = append(operations, op)
+	}
+
+	return operations, nil
 }
 
 func registryAuthOwned(object client.Object) bool {

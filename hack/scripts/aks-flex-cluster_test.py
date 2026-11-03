@@ -241,6 +241,8 @@ elif command == "systemctl":
     if a[0] == "start": s["host_active"] = True; save()
     elif a[0] == "is-active": sys.exit(0 if s.get("host_active",True) else 1)
     else: raise RuntimeError((command,a))
+elif command == "cloud-init": sys.exit(s.get("cloud_init_exit",0))
+elif command == "apt-get": sys.exit(77)
 else: raise RuntimeError(command)
 '''
 
@@ -254,7 +256,7 @@ class DeploymentTests(unittest.TestCase):
         self.bin.mkdir()
         self.model = self.root / "cloud.json"
         self.model.write_text(json.dumps({"groups": {}, "resources": {}, "roles": [], "joined": [], "bootstraps": {}}))
-        for tool in ("az", "curl", "kubectl", "kubectl-unbounded", "ssh", "systemctl", "sleep", "timeout"):
+        for tool in ("az", "curl", "kubectl", "kubectl-unbounded", "ssh", "systemctl", "sleep", "timeout", "cloud-init", "apt-get"):
             file = self.bin / tool
             file.write_text(MOCK)
             file.chmod(0o700)
@@ -595,6 +597,21 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("partial node deployment exists", result.stderr)
         self.assertEqual(self.calls(), [])
+
+    def test_remote_cloud_init_continues_only_on_success_or_recoverable_warnings(self):
+        remote, _ = self.remote_script()
+        for code in (0, 2, 1, 3):
+            with self.subTest(code=code):
+                self.modify(cloud_init_exit=code)
+                before = len(self.calls())
+                result = subprocess.run(["bash", str(remote)], env=self.env, text=True, capture_output=True, timeout=5)
+                continued = code in (0, 2)
+                self.assertEqual(result.returncode, 77 if continued else code, result.stderr)
+                calls = self.calls()[before:]
+                self.assertEqual(calls[0], ["cloud-init", "status", "--wait"])
+                self.assertEqual(any(call[0] == "apt-get" for call in calls), continued)
+                if code == 2:
+                    self.assertIn("recoverable warnings", result.stderr)
 
     def test_component_query_failure_is_not_treated_as_missing_workload(self):
         self.modify(fail_get="deployment/unbounded-net-controller")

@@ -151,7 +151,7 @@ func (h *attachACRHandler) execute(ctx context.Context) error {
 	}
 
 	var registry struct{ ID, LoginServer, RoleAssignmentMode string }
-	if err := h.azureJSON(ctx, &registry, "acr", "show", "--ids", h.acrID); err != nil {
+	if err := h.azureJSON(ctx, &registry, "acr", "show", "--name", acrID.Name, "--resource-group", acrID.ResourceGroupName); err != nil {
 		return err
 	}
 

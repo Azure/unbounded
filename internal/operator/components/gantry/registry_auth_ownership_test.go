@@ -116,16 +116,22 @@ func TestRegistryAuthPinsOwnedUpdatesAndPreservesRestartLease(t *testing.T) {
 	env := testEnv(t, fixtures...)
 	operations, _, err := planRegistryAuth(t.Context(), env)
 	require.NoError(t, err)
-	require.Len(t, operations, 5)
+	require.Len(t, operations, 7)
 
 	for _, op := range operations {
 		require.NotEqual(t, "Lease", op.Object.GetKind())
+
+		if op.Object.GetKind() == "ClusterRole" || op.Object.GetKind() == "ClusterRoleBinding" {
+			require.Equal(t, component.OpCreateIfAbsent, op.Kind)
+			continue
+		}
+
 		require.Equal(t, component.OpApply, op.Kind)
 		require.Equal(t, "owned-"+op.Object.GetKind(), string(op.Object.GetUID()))
 		require.NotEmpty(t, op.Object.GetResourceVersion())
 
 		if op.Object.GetKind() == "DaemonSet" {
-			require.Len(t, op.DependsOn, 4)
+			require.Len(t, op.DependsOn, 6)
 		}
 	}
 

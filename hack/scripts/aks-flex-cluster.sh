@@ -657,7 +657,13 @@ if [[ -e /etc/systemd/nspawn/kube1.nspawn || -e /etc/systemd/nspawn/kube2.nspawn
   echo 'partial node deployment exists; inspect/reset this host explicitly before retrying' >&2
   exit 78
 fi
-cloud-init status --wait
+cloud_init_status=0
+cloud-init status --wait || cloud_init_status=$?
+case "$cloud_init_status" in
+  0) ;;
+  2) echo 'cloud-init completed with recoverable warnings; continuing bootstrap' >&2 ;;
+  *) exit "$cloud_init_status" ;;
+esac
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq util-linux nftables systemd-container
 install -d -m 0700 /run/aks-flex-node-bootstrap
