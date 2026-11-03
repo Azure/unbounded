@@ -645,6 +645,9 @@ fn column_mates(members: &Members, a: u32, b: u32) -> bool {
 /// `mesh_edges_changed` (each comparison walks every member's neighbors).
 pub const MESH_CHURN_MAX: usize = 8192;
 
+/// Most membership changes compared per run; later ones are not measured.
+pub const MESH_CHURN_SAMPLES: u64 = 32;
+
 /// Mesh v2 measurements of a run (`designs/racer-mesh-v2.md`, "Simulator").
 #[derive(Default)]
 struct MeshMetrics {
@@ -5204,14 +5207,22 @@ impl NodeWorld {
     }
 
     /// Record the edges the newest membership changed from the one before it, if both are
-    /// retained and the cluster is at most [`MESH_CHURN_MAX`] members (the comparison walks every
-    /// member's neighbors).
+    /// retained, the cluster is at most [`MESH_CHURN_MAX`] members, and fewer than
+    /// [`MESH_CHURN_SAMPLES`] changes were measured (each comparison walks every member's
+    /// neighbors).
     fn note_mesh_churn(&mut self, before: Option<u64>) {
         let Some(before) = before.filter(|_| self.versions.history_len() > 0) else {
             return;
         };
         let latest = self.versions.latest();
-        if latest.number == before || latest.members.members().len() > MESH_CHURN_MAX {
+        let sampled = self
+            .metrics
+            .histogram("mesh_edges_changed")
+            .map_or(0, |h| h.count());
+        if latest.number == before
+            || latest.members.members().len() > MESH_CHURN_MAX
+            || sampled >= MESH_CHURN_SAMPLES
+        {
             return;
         }
         let Some(old) = self.versions.get(before).map(|v| v.members.clone()) else {
