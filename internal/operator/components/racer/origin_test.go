@@ -145,6 +145,81 @@ func TestLeftoverOriginsArePruned(t *testing.T) {
 	liveDataplane(t, env)
 }
 
+func deletedOrigins(plan *component.Plan) []string {
+	var deleted []string
+
+	for _, op := range plan.Operations {
+		if op.Kind == component.OpDelete && strings.HasPrefix(op.Object.GetName(), originPrefix) {
+			deleted = append(deleted, op.Object.GetKind()+"/"+op.Object.GetName())
+		}
+	}
+
+	return deleted
+}
+
+func setDataplaneStatus(t *testing.T, env *component.Env, status appsv1.DaemonSetStatus) {
+	t.Helper()
+
+	ds := liveDataplane(t, env)
+	ds.Status = status
+	require.NoError(t, env.Client.Status().Update(t.Context(), ds))
+}
+
+func TestLeftoverOriginsWaitForDataplaneRollout(t *testing.T) {
+	env := testEnv(t, originCache("a", nil))
+	initialize(t, env)
+	leftoverOrigin(t, env, "a", component.FieldOwner)
+	leftoverOrigin(t, env, "gone", component.FieldOwner)
+
+	// Some nodes still run the old dataplane: keep the origins and requeue.
+	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 1, NumberAvailable: 3})
+	plan, result := planResult(t, env)
+	require.Empty(t, deletedOrigins(plan))
+	require.True(t, result.Ready)
+	require.Equal(t, pendingRequeue, result.RequeueAfter)
+	require.Contains(t, result.Message, "legacy origin")
+	persist(t, env, plan)
+
+	for _, cache := range []string{"a", "gone"} {
+		ds, sa := originExists(t, env, cache)
+		require.True(t, ds && sa, cache)
+	}
+
+	// Updated but not yet available still waits.
+	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberAvailable: 2, NumberUnavailable: 1})
+	require.Empty(t, deletedOrigins(planPass(t, env)))
+
+	// A live template without the native-origin marker is an old dataplane.
+	ds := liveDataplane(t, env)
+	delete(ds.Spec.Template.Annotations, nativeOriginAnnotation)
+	require.NoError(t, env.Client.Update(t.Context(), ds))
+	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberAvailable: 3})
+	done, err := nativeOriginRolledOut(t.Context(), env)
+	require.NoError(t, err)
+	require.False(t, done)
+
+	// Restore the template and complete the rollout: the origins go.
+	persist(t, env, planPass(t, env))
+	ds = liveDataplane(t, env)
+	setDataplaneStatus(t, env, appsv1.DaemonSetStatus{ObservedGeneration: ds.Generation, DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberAvailable: 3})
+	plan, result = planResult(t, env)
+	require.Len(t, deletedOrigins(plan), 4)
+	require.Equal(t, time.Hour, result.RequeueAfter)
+}
+
+func TestLeftoverOriginsWaitForDataplane(t *testing.T) {
+	env := testEnv(t, originCache("a", nil))
+	initialize(t, env)
+	leftoverOrigin(t, env, "a", component.FieldOwner)
+	require.NoError(t, env.Client.Delete(t.Context(), liveDataplane(t, env)))
+
+	// With no dataplane DaemonSet yet, it is planned and the origins wait.
+	plan, result := planResult(t, env)
+	dataplaneOp(t, plan)
+	require.Empty(t, deletedOrigins(plan))
+	require.Equal(t, pendingRequeue, result.RequeueAfter)
+}
+
 func TestOriginInvalidCacheIsReported(t *testing.T) {
 	env := testEnv(t, originCache("bad", nil), originCache("good", nil))
 	initialize(t, env)

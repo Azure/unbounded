@@ -209,13 +209,20 @@ func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, 
 		return nil, component.Result{}, err
 	}
 
-	invalid, err := planOrigins(ctx, env, plan)
+	invalid, originsWaiting, err := planOrigins(ctx, env, plan)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
 	if len(invalid) != 0 {
 		return plan, component.NotReadyAfter(reasonOriginInvalid, "Racer origins invalid for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
+	}
+
+	if originsWaiting {
+		// Legacy origin DaemonSets stay until every dataplane Pod reads
+		// origins in-process; their workloads are watched, but the rollout
+		// is re-checked soon regardless.
+		return plan, component.ReconciledAfter("Racer dataplane installation reconciled; waiting for the dataplane rollout before removing legacy origin DaemonSets", pendingRequeue), nil
 	}
 
 	if cleaning {
