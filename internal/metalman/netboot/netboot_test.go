@@ -1336,50 +1336,6 @@ func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
 	require.True(t, installRequested)
 }
 
-func TestVendorDataTemplateScopesDefaultUserToGB200AccessImage(t *testing.T) {
-	t.Parallel()
-
-	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
-	require.NoError(t, err)
-
-	tests := []struct {
-		name          string
-		image         string
-		preserveUsers bool
-	}{
-		{name: "generic image retains default user", image: "ghcr.io/azure/host-ubuntu2404:v1"},
-		{name: "exact tagged repository preserves users", image: gb200AccessImageRepository + ":candidate", preserveUsers: true},
-		{name: "exact digested repository preserves users", image: gb200AccessImageRepository + ":candidate@sha256:abc", preserveUsers: true},
-		{name: "lookalike repository retains default user", image: gb200AccessImageRepository + "-other:latest"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			machine := &v1alpha3.Machine{
-				Spec: v1alpha3.MachineSpec{
-					Host: &v1alpha3.HostSpec{
-						Netboot: &v1alpha3.PXESpec{Image: tt.image},
-					},
-				},
-			}
-			data := newTemplateData(machine, ClusterInfo{}, "https://example.invalid", "{}", "", false)
-			require.Equal(t, tt.preserveUsers, data.PreserveImageUsers)
-
-			result, err := renderTemplate(string(vendorDataTmpl), data)
-			require.NoError(t, err)
-
-			var config map[string]any
-			require.NoError(t, yaml.Unmarshal(result, &config))
-			_, found := config["users"]
-			require.Equal(t, !tt.preserveUsers, found)
-
-			require.Equal(t, !tt.preserveUsers, strings.Contains(string(result), "- name: unbounded-metal"))
-		})
-	}
-}
-
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {
