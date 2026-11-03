@@ -436,6 +436,27 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
     }
 
+    /// As [`Self::record_http_fallback`], because no ready link to the peer existed.
+    pub fn record_fallback_no_link(&self) {
+        self.record_http_fallback();
+        self.record(crate::telemetry::Event::RdmaFallbackNoLink, 1);
+    }
+
+    /// As [`Self::record_http_fallback`], because the grant failed, typically
+    /// with every page buffer in use.
+    pub fn record_fallback_grant(&self) {
+        self.record_http_fallback();
+        self.record(crate::telemetry::Event::RdmaFallbackGrant, 1);
+    }
+
+    /// Free page buffers across the active rails.
+    pub fn free_buffers(&self) -> usize {
+        self.active()
+            .iter()
+            .filter_map(|m| self.client.buffers(m.rail.0, rdma_verbs::BufferState::Free))
+            .sum()
+    }
+
     /// The local node.
     pub fn local(&self) -> &NodeId {
         &self.local

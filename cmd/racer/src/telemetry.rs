@@ -3315,6 +3315,9 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
             Self::RdmaPagesLanded => "racer_rdma_pages_landed_total",
             Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
+            Self::RdmaFallbackNoLink => "racer_rdma_fallback_no_link_total",
+            Self::RdmaFallbackGrant => "racer_rdma_fallback_grant_total",
+            Self::RdmaActivationFailure => "racer_rdma_activation_failures_total",
             Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
             Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",
             Self::RdmaHeadCount => "racer_rdma_head_nanoseconds_count",
@@ -3387,6 +3390,8 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
             Self::MemoryPressureLevel => "racer_memory_pressure_level",
+            Self::RdmaFreeBuffers => "racer_rdma_free_buffers",
+            Self::RdmaActive => "racer_rdma_active",
 }
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.
