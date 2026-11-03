@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"mime"
 	"net/http"
 	"sort"
@@ -781,7 +780,7 @@ func decodeCursor(cursor string, t *ticket) (int, *prefetchFailure) {
 		return 0, invalidRequest("invalid cursor")
 	}
 
-	var numbers [3]uint64
+	var numbers [2]uint64
 
 	for i := range numbers {
 		n, err := strconv.ParseUint(parts[i], 10, 64)
@@ -792,15 +791,17 @@ func decodeCursor(cursor string, t *ticket) (int, *prefetchFailure) {
 		numbers[i] = n
 	}
 
+	// Bit size 31 keeps the offset within int32, so the int conversion is exact.
+	offset, err := strconv.ParseUint(parts[2], 10, 31)
+	if err != nil {
+		return 0, invalidRequest("invalid cursor")
+	}
+
 	if numbers[0] != t.generation || numbers[1] != t.sequence {
 		return 0, invalidRequest("cursor belongs to another generation or sequence")
 	}
 
-	if numbers[2] > math.MaxInt32 {
-		return 0, invalidRequest("invalid cursor")
-	}
-
-	return int(numbers[2]), nil
+	return int(offset), nil
 }
 
 func (p *Prefetches) status(r *http.Request, id string) (int, any, *prefetchFailure) {

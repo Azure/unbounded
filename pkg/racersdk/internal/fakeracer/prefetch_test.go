@@ -492,6 +492,18 @@ func TestPrefetchOutcomesWaitAndPaging(t *testing.T) {
 	if r := call(t, h, "GET", path+"?cursor="+cursor, ""); r.code != 400 {
 		t.Fatalf("cursor without refs: %+v", r)
 	}
+
+	generation, _, _ := strings.Cut(cursor, ".")
+
+	if r := call(t, h, "GET", path+"?refs=all&cursor="+generation+".1.0", ""); r.code != 200 {
+		t.Fatalf("current cursor: %+v", r)
+	}
+
+	for _, offset := range []string{"2147483648", "18446744073709551616"} {
+		if r := call(t, h, "GET", path+"?refs=all&cursor="+generation+".1."+offset, ""); r.code != 400 {
+			t.Fatalf("cursor offset %s: %+v", offset, r)
+		}
+	}
 }
 
 func TestPrefetchList(t *testing.T) {
