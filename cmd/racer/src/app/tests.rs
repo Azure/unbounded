@@ -5152,6 +5152,32 @@ fn discovery_falls_back_to_bootstrap_without_latest_approval() {
 }
 
 #[test]
+fn applied_approval_drops_ids_revoked_during_discovery() {
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let kept = |v: &[&str]| {
+        v.iter()
+            .map(|id| devices::Approval {
+                id: (*id).to_owned(),
+                rdev: None,
+                outcome: devices::Outcome::Missing,
+            })
+            .collect::<Vec<_>>()
+    };
+    let approved = ids(&["nvme-a", "nvme-b", "nvme-c"]);
+    // Nothing revoked: the full set applies.
+    assert_eq!(
+        applied_approval(&approved, &kept(&["nvme-a", "nvme-b", "nvme-c"])),
+        approved
+    );
+    // A revoked ID leaves the baseline, so reapproving it is a change.
+    let applied = applied_approval(&approved, &kept(&["nvme-c", "nvme-a"]));
+    assert_eq!(applied, ids(&["nvme-a", "nvme-c"]));
+    assert!(!crate::control::same_disks(&applied, &approved));
+    // Everything revoked.
+    assert!(applied_approval(&approved, &[]).is_empty());
+}
+
+#[test]
 fn serving_approval_requires_storage_applied_disks() {
     let disks = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let applied = disks(&["nvme-a", "nvme-b"]);

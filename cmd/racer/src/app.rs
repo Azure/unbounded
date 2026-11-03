@@ -525,6 +525,9 @@ impl Application {
                 .as_ref()
                 .is_none_or(|managed| current_approval(managed).iter().any(|a| a == id))
         });
+        // Discovery drops IDs revoked while it waited; baseline on what it
+        // applied so a later reapproval still differs and restarts.
+        let approved = applied_approval(&approved, &discovery.approvals);
         let approvals = discovery
             .approvals
             .iter()
@@ -594,6 +597,15 @@ fn current_approval(managed: &crate::control::Managed) -> Vec<String> {
         .as_ref()
         .and_then(|control| control.approved_disks())
         .unwrap_or_else(|| managed.disks.clone())
+}
+
+/// IDs of `approved` that discovery kept, in approval order.
+fn applied_approval(approved: &[String], kept: &[devices::Approval]) -> Vec<String> {
+    approved
+        .iter()
+        .filter(|id| kept.iter().any(|a| &a.id == *id))
+        .cloned()
+        .collect()
 }
 
 /// Require the serving enrollment approval to equal the set storage applied,
