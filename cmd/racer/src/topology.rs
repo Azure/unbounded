@@ -24,7 +24,7 @@ use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::environment::Deadline;
 
-pub use ::topology::MAX_DEGREE;
+pub use ::topology::RDMA_PEERS;
 pub use ::topology::{Maintenance, SLOT_COUNT};
 
 // Application wire/hash schemas are independent of the topology implementation.
@@ -37,8 +37,10 @@ pub(crate) fn hash_bytes(hash: &mut Sha256, value: &[u8]) {
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
 
-/// Shared capacity bound for every supported topology, including first-hop masks.
-const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
+/// Default bound on tracked link failure records per worker. Mesh v2 degree
+/// grows with pool size (about 940 peers in a 100,000 member pool), so this
+/// is a generous fixed bound until capacities derive from the local peer count.
+pub const LINK_HEALTH_CAPACITY: usize = 4096;
 
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
@@ -52,7 +54,7 @@ pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
     /// Construct independent worker-local circuit state for all possible neighbors.
     fn default() -> Self {
-        Self::new(MAX_DEGREE)
+        Self::new(LINK_HEALTH_CAPACITY)
     }
 }
 impl LinkHealth {
@@ -892,11 +894,12 @@ pub(crate) mod tests {
         use std::num::NonZeroU32;
         use std::sync::Arc;
 
-        // Fixed next-hop vectors for the 32-ring overlay.
+        // Fixed next-hop vectors for the mesh v2 default pool.
         // N=1500, source=0, destination=1499, request=[1;16]; weights 1 at
         // multiples of 3 and 4 elsewhere; attempts encoded as big-endian u128.
+        // The primary delegate is unique, so every attempt picks it.
         pub(crate) const NEXT_HOPS: [(u128, usize); 4] =
-            [(0, 1301), (1, 1301), (2, 251), (127, 251)];
+            [(0, 350), (1, 350), (2, 350), (127, 350)];
 
         pub(crate) fn member(index: usize, shares: u32) -> Member {
             Member {
@@ -1053,23 +1056,23 @@ pub(crate) mod tests {
             assert_eq!(health.tracked_links(), 0);
         }
         #[test]
-        fn default_tracks_all_64_neighbors_without_eviction() {
+        fn default_tracks_link_health_capacity_without_eviction() {
             let health = LinkHealth::default();
             let independent = LinkHealth::default();
             let now = Instant::now();
-            for i in 0..64 {
+            for i in 0..LINK_HEALTH_CAPACITY {
                 health
                     .observe_at(&NodeId(format!("peer-{i}")), LinkOutcome::Timeout, now)
                     .unwrap();
             }
-            assert_eq!(health.tracked_links(), 64);
+            assert_eq!(health.tracked_links(), LINK_HEALTH_CAPACITY);
             assert_eq!(independent.tracked_links(), 0);
             assert!(
                 independent
                     .available_at(&NodeId("peer-0".into()), now)
                     .unwrap()
             );
-            for i in 0..64 {
+            for i in 0..LINK_HEALTH_CAPACITY {
                 assert!(
                     !health
                         .available_at(&NodeId(format!("peer-{i}")), now)
@@ -1687,7 +1690,8 @@ pub(crate) mod tests {
         /// and an open circuit or a silent intermediate still blocks.
         #[test]
         fn a_ping_reaches_the_silent_neighbor_it_tests() {
-            let members = membership(64);
+            // Above the 64 member full mesh, so a non-neighbor exists.
+            let members = membership(200);
             let source = &members.members()[0].node;
             let neighbors = members.neighbors(source).unwrap();
             let target = neighbors[0].clone();

@@ -586,7 +586,7 @@ impl Links {
                     }),
                     pool_bytes,
                     buffer_len: BUFFER_LEN,
-                    max_links: 2 * crate::topology::MAX_DEGREE,
+                    max_links: crate::topology::RDMA_PEERS,
                     grants_per_link: self.grants_per_link,
                     idle: LINK_IDLE,
                     guard,

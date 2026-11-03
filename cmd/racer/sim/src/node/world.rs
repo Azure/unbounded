@@ -51,7 +51,9 @@ use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 use topology::{PathQuery, Placement};
 
-use super::state::{COMPONENTS, Disk, Ids, Members, Node, Shared, Versions, record_bytes};
+use super::state::{
+    COMPONENTS, Disk, Ids, MAX_SUSPECTS, Members, Node, Shared, Versions, record_bytes,
+};
 use super::state::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
 use crate::config::Config;
 use crate::engine::Fixed;
@@ -3352,7 +3354,7 @@ impl NodeWorld {
                     .observe("dead_member_link_age_s", (now - since) / SECONDS);
             }
             let _ = n.links.failure(&next, instant, link_backoff);
-            if !n.suspects.contains(&next) && n.suspects.len() < topology::MAX_DEGREE {
+            if !n.suspects.contains(&next) && n.suspects.len() < MAX_SUSPECTS {
                 n.suspects.push(next);
             }
             self.engine.after(

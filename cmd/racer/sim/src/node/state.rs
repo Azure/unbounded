@@ -12,6 +12,13 @@ use flow_control::{Charge, Circuits, Policy, Quotas, Rejection};
 use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
 use racer_control_wire::{CacheId, NodeId};
+
+/// Link failure records per node, matching the dataplane's
+/// `LINK_HEALTH_CAPACITY` (mesh v2 degree grows with pool size).
+pub const LINK_CAPACITY: usize = 4096;
+
+/// Most suspected peers a node tracks (the v1 overlay degree bound).
+pub const MAX_SUSPECTS: usize = 64;
 use racer_core::admission::{Floors, Limits, Rules};
 use racer_core::cache::TickLru;
 use racer_core::liveness::{Rank0Watch, SILENCE_CAPACITY, Silence, WATCH_CAPACITY, WATCH_TTL};
@@ -23,7 +30,7 @@ use racer_core::read::{Error, WorkerMap};
 use racer_object_wire::model::{
     CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, WorkerId,
 };
-use topology::{MAX_DEGREE, Member, Paths, Placement};
+use topology::{Member, Paths, Placement};
 
 pub use racer_core::admission::ResourceClass;
 
@@ -208,7 +215,7 @@ impl Node {
                 )
                 .with_queue(config.search_queue as usize),
             ),
-            links: Circuits::new(MAX_DEGREE, Duration::from_secs(1)),
+            links: Circuits::new(LINK_CAPACITY, Duration::from_secs(1)),
             suspects: Vec::new(),
             disk,
             retention: Retention::new(config.history_bytes, disk_pages, now),

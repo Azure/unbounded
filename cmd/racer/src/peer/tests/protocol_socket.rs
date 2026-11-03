@@ -1548,7 +1548,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     ));
     let neighbors = membership.neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
-    assert!(neighbors.len() <= crate::topology::MAX_DEGREE);
+    assert!(neighbors.len() <= membership.inner.max_degree());
     for member in membership.members() {
         let endpoint = network.endpoint(&membership, &member.node);
         if neighbors.contains(&member.node) {
