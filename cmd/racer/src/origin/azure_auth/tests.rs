@@ -187,7 +187,7 @@ fn managed_identity_caches_refreshes_and_invalidates() {
         // Short lifetimes: refresh at half-life (one second).
         ok(
             &token_json(&format!("token-{index}"), "\"expires_in\":\"2\""),
-            index % 2 == 0,
+            index.is_multiple_of(2),
         )
     });
     let cache = AzureTokenCache::new(
