@@ -981,7 +981,8 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 #
 # Knobs (all overridable on the command line or environment):
 #   TRIVY            Enable scanning when non-empty. Default: unset (no scan).
-#   TRIVY_VERSION    Trivy CLI version. Default: 0.69.3 (matches CI).
+#   TRIVY_VERSION    Trivy CLI version. Default: 0.70.0 (matches the TRIVY_VERSION
+#                    default in hack/scripts/setup-trivy.sh, used by CI).
 #   TRIVY_SEVERITY   Comma-separated severities. Default: CRITICAL,HIGH.
 #   TRIVY_EXIT_CODE  Exit code on findings. Default: 1 (fail). Set 0 to warn-only.
 #   TRIVY_IMAGE      Override the trivy container image entirely.
@@ -990,7 +991,7 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 #                    Default: $$HOME/.cache/trivy.
 
 TRIVY            ?=
-TRIVY_VERSION    ?= 0.69.3
+TRIVY_VERSION    ?= 0.70.0
 TRIVY_SEVERITY   ?= CRITICAL,HIGH
 TRIVY_EXIT_CODE  ?= 1
 TRIVY_IMAGE      ?= aquasec/trivy:$(TRIVY_VERSION)
