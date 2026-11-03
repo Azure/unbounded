@@ -90,17 +90,8 @@ data:
   # RACER_DIRTY_BYTES: "134217728"
   # RACER_REGISTERED_BYTES: "134217728"
   # RACER_REQUEST_CONTEXT_BYTES: "67108864"
-  # HEAD max-age requests warm exact versions; acceptance is not fill completion.
-  # TTL starts at admission, including time spent filling. Both seconds limits
-  # accept 1..86400. Background credentials stay charged and zeroizing in memory.
-  RACER_WARM_MAX_TTL_SECS: "3600"
-  RACER_WARM_FILL_TIMEOUT_SECS: "600"
-  # Node-wide tracked versions (1..1024), including completed jobs until expiry;
-  # in-flight pages per job (1..64). Reads cannot jump ahead of the warm pipeline.
-  RACER_WARM_MAX_JOBS: "16"
-  RACER_WARM_WINDOW_PAGES: "2"
   # Per-worker percentage of segments and page-index entries (1..100).
-  # Charge one whole segment per page to protect hard holds under fragmentation.
+  # Spill holds charge one whole segment per page to stay safe under fragmentation.
   # Existing local copies are not rewritten. Free-segment reserves still apply.
   RACER_RETAINED_SEGMENT_PERCENT: "50"
   # File slab size is per worker. Byte admission budgets above are node-wide
