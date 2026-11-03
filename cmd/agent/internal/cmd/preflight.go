@@ -30,6 +30,7 @@ type preflightHandler struct {
 	output                string
 	writer                io.Writer
 	checks                []preflight.Checker
+	overrides             *configOverrides
 }
 
 func newCmdPreflight(cmdCtx *CommandContext) *cobra.Command {
@@ -49,6 +50,7 @@ func (handler *preflightHandler) command() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&handler.configPath, "config", "", "Path to agent config file")
+	handler.overrides = addIsolationFlag(cmd)
 	cmd.Flags().StringSliceVar(
 		&handler.ignorePreflightErrors,
 		"ignore-preflight-errors",
@@ -74,7 +76,12 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		}
 	}
 
-	cfg, err := loadConfig(logger)
+	var overrides configOverrides
+	if h.overrides != nil {
+		overrides = *h.overrides
+	}
+
+	cfg, err := loadConfigWith(logger, overrides)
 	if err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/base64"
 	"os"
 	"os/signal"
@@ -20,6 +21,8 @@ import (
 )
 
 func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
+	var overrides *configOverrides
+
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Bootstrap the host, rootfs, and start the node",
@@ -28,53 +31,62 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 			defer cancel()
 
-			cmdCtx.Setup()
-
-			cmdCtx.Logger.Info("starting unbounded-agent",
-				"version", version.Version,
-				"commit", version.GitCommit,
-			)
-
-			if err := daemon.MigrateHostRoot(cmdCtx.Logger); err != nil {
-				return err
-			}
-
-			cfg, err := loadConfig(cmdCtx.Logger)
-			if err != nil {
-				return err
-			}
-
-			log := cmdCtx.Logger
-
-			if err := cfg.Validate(); err != nil {
-				return err
-			}
-
-			id, err := bootstrapIdentity(cfg)
-			if err != nil {
-				return err
-			}
-
-			stages := &agentStages{log: log, cfg: cfg}
-
-			outcome, err := bootstrap.New(log, installstate.DefaultStore(), stages, stages).Run(ctx, id)
-			if err != nil {
-				return err
-			}
-
-			if outcome.AlreadyComplete {
-				log.Info("installation already complete")
-			}
-
-			// Safe when bootstrap never reached credential setup: the reporter
-			// reports through a nil-receiver check.
-			stages.reporter.Succeeded(ctx)
-
-			return nil
+			return runStart(ctx, cmdCtx, *overrides)
 		},
 	}
 
+	overrides = addIsolationFlag(cmd)
+
 	return cmd
+}
+
+// runStart is the start command: it loads the configuration the environment
+// names, applies the command line overrides, and runs the bootstrap stages of the configured isolation mode. The
+// isolation-reprovision command runs it after a reset.
+func runStart(ctx context.Context, cmdCtx *CommandContext, overrides configOverrides) error {
+	cmdCtx.Setup()
+
+	cmdCtx.Logger.Info("starting unbounded-agent",
+		"version", version.Version,
+		"commit", version.GitCommit,
+	)
+
+	if err := daemon.MigrateHostRoot(cmdCtx.Logger); err != nil {
+		return err
+	}
+
+	cfg, err := loadConfigWith(cmdCtx.Logger, overrides)
+	if err != nil {
+		return err
+	}
+
+	log := cmdCtx.Logger
+
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	id, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	stages := &agentStages{log: log, cfg: cfg}
+
+	outcome, err := bootstrap.New(log, installstate.DefaultStore(), stages, stages).Run(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	if outcome.AlreadyComplete {
+		log.Info("installation already complete")
+	}
+
+	// Safe when bootstrap never reached credential setup: the reporter
+	// reports through a nil-receiver check.
+	stages.reporter.Succeeded(ctx)
+
+	return nil
 }
 
 func syncAttestedKubeletConfig(cfg *provision.AgentConfig, nodeStart *goalstates.NodeStart) {

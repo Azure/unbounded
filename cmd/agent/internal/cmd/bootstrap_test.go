@@ -256,3 +256,47 @@ func TestClassifyNodeStartFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestBootstrapFingerprintIncludesANonDefaultIsolation(t *testing.T) {
+	cfg, err := loadConfigFromFile(filepath.Join("testdata", "bootstrap-v1", "input.json"))
+	require.NoError(t, err)
+
+	unset, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+
+	// The default mode, spelled out or not, keeps the recorded fingerprint.
+	cfg.Isolation = "nspawn"
+	explicit, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+	require.Equal(t, unset, explicit)
+
+	// Another mode is another installation: a host installed in one mode
+	// refuses a start in a different one until it is reset.
+	fingerprints := map[string]bool{unset.ConfigFingerprint: true}
+
+	for _, mode := range []string{"none", "container"} {
+		cfg.Isolation = mode
+		id, err := bootstrapIdentity(cfg)
+		require.NoError(t, err)
+		require.False(t, fingerprints[id.ConfigFingerprint], "%s must not share a fingerprint", mode)
+
+		fingerprints[id.ConfigFingerprint] = true
+	}
+
+	store := installstate.NewStore(t.TempDir(), filepath.Join(t.TempDir(), "lock"))
+
+	cfg.Isolation = "none"
+	installed, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+
+	record, err := installstate.NewRecord(installed.MachineName, installed.ConfigFingerprint)
+	require.NoError(t, err)
+	require.NoError(t, store.Save(record))
+
+	cfg.Isolation = "container"
+	other, err := bootstrapIdentity(cfg)
+	require.NoError(t, err)
+
+	_, _, err = installstate.Admit(store, other.MachineName, other.ConfigFingerprint)
+	require.ErrorContains(t, err, "installation intent differs")
+}
