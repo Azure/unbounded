@@ -25,6 +25,8 @@
 pub mod identity;
 pub mod request;
 pub mod response;
+pub mod tokens;
+pub mod transport;
 
 use self::identity::AzureObject;
 use self::request::{AzureMethod, ByteRange};
@@ -207,6 +209,27 @@ impl AzureLimits {
             .ok()
             .and_then(|caches| caches.get(cache).map(|c| c.load(Ordering::Acquire)))
             .unwrap_or(0)
+    }
+}
+
+/// Process-wide Azure origin state shared by every worker: the concurrency
+/// limits, the token caches, and the lazily loaded TLS trust roots.
+#[derive(Clone, Debug)]
+pub struct AzureNode {
+    pub limits: Arc<AzureLimits>,
+    pub tokens: Arc<tokens::AzureTokenCaches>,
+    pub trust: Arc<transport::TrustRoots>,
+}
+
+impl AzureNode {
+    /// Token endpoints and the trust bundle path come from the environment.
+    /// Nothing is read from disk or the network until a cache needs it.
+    pub fn from_env() -> Self {
+        Self {
+            limits: Arc::default(),
+            tokens: Arc::new(tokens::AzureTokenCaches::from_env()),
+            trust: Arc::new(transport::TrustRoots::from_env()),
+        }
     }
 }
 
