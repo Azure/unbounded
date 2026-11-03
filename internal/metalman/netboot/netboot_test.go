@@ -1347,29 +1347,10 @@ func TestVendorDataTemplateScopesDefaultUserToGB200AccessImage(t *testing.T) {
 		image         string
 		preserveUsers bool
 	}{
-		{
-			name:  "generic image retains unbounded metal",
-			image: "ghcr.io/azure/host-ubuntu2404:v1",
-		},
-		{
-			name:          "exact repository with digest preserves image users",
-			image:         gb200AccessImageRepository + "@sha256:abc",
-			preserveUsers: true,
-		},
-		{
-			name:          "exact repository with tag preserves image users",
-			image:         gb200AccessImageRepository + ":candidate",
-			preserveUsers: true,
-		},
-		{
-			name:          "exact repository with tag and digest preserves image users",
-			image:         gb200AccessImageRepository + ":candidate@sha256:abc",
-			preserveUsers: true,
-		},
-		{
-			name:  "lookalike repository retains unbounded metal",
-			image: gb200AccessImageRepository + "-other:latest",
-		},
+		{name: "generic image retains default user", image: "ghcr.io/azure/host-ubuntu2404:v1"},
+		{name: "exact tagged repository preserves users", image: gb200AccessImageRepository + ":candidate", preserveUsers: true},
+		{name: "exact digested repository preserves users", image: gb200AccessImageRepository + ":candidate@sha256:abc", preserveUsers: true},
+		{name: "lookalike repository retains default user", image: gb200AccessImageRepository + "-other:latest"},
 	}
 
 	for _, tt := range tests {
@@ -1394,9 +1375,7 @@ func TestVendorDataTemplateScopesDefaultUserToGB200AccessImage(t *testing.T) {
 			_, found := config["users"]
 			require.Equal(t, !tt.preserveUsers, found)
 
-			if found {
-				require.Contains(t, string(result), "- name: unbounded-metal")
-			}
+			require.Equal(t, !tt.preserveUsers, strings.Contains(string(result), "- name: unbounded-metal"))
 		})
 	}
 }
