@@ -49,6 +49,9 @@ pub struct LinkHealth {
     /// (`racer_core::liveness`). A ping carries the
     /// page of the last unanswered exchange.
     silence: std::cell::RefCell<Silence<NodeId, crate::model::PageId>>,
+    /// Destinations whose routes skip relays that left an exchange
+    /// unanswered (`racer_core::liveness::Detours`).
+    detours: std::cell::RefCell<racer_core::liveness::Detours<NodeId>>,
 }
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
@@ -88,6 +91,9 @@ impl LinkHealth {
                 racer_core::liveness::HANG_AFTER,
                 SILENCE_PING_TIMEOUT,
             )),
+            detours: std::cell::RefCell::new(racer_core::liveness::Detours::new(
+                racer_core::liveness::SILENCE_CAPACITY,
+            )),
         }
     }
     /// Silence timing (`racer_core::liveness::Silence::new`):
@@ -106,7 +112,9 @@ impl LinkHealth {
         );
     }
     /// An exchange for `page` sent to `peer` at `sent` ended unanswered; see
-    /// `Silence::timed_out`. Returns whether a ping is wanted.
+    /// `Silence::timed_out`. Returns whether a ping is wanted. Later routes
+    /// to `peer` also detour around the relay that may have eaten it
+    /// (`Detours::timed_out`).
     pub fn silence_timed_out(
         &self,
         peer: &NodeId,
@@ -114,13 +122,15 @@ impl LinkHealth {
         sent: Instant,
         needed: u32,
     ) -> bool {
-        self.silence.borrow_mut().timed_out(
-            peer.clone(),
-            page,
-            sent,
-            uring_runtime::environment::now(),
-            needed,
-        )
+        let now = uring_runtime::environment::now();
+        self.detours.borrow_mut().timed_out(peer.clone(), sent, now);
+        self.silence
+            .borrow_mut()
+            .timed_out(peer.clone(), page, sent, now, needed)
+    }
+    /// Detour level for routes to `peer` (`Detours::level`).
+    pub fn detour_level(&self, peer: &NodeId, now: Instant) -> u8 {
+        self.detours.borrow().level(peer, now)
     }
     /// `peer` answered an exchange: it is not hung.
     pub fn silence_answered(&self, peer: &NodeId) {
@@ -1010,6 +1020,10 @@ impl Paths {
     /// able to reach the peer it holds silent. Circuit
     /// health and peer admission still apply, and silent intermediate
     /// neighbors are still routed around.
+    ///
+    /// Routes skip the relays from `Membership::detour` at this worker's
+    /// detour level for the destination (`LinkHealth::detour_level`); a ping
+    /// uses at least level 1, so it takes the alternate relay.
     pub fn shortest_probe_async<'a>(
         &'a self,
         membership: std::sync::Arc<crate::topology::Membership>,
@@ -1036,6 +1050,17 @@ impl Paths {
                 .collect::<Result<Vec<_>>>()?;
             let exempt = ping.then_some(&budget.destination);
             let blocked = self.blocked(&membership, source, exempt)?;
+            // Skip relays that may have eaten earlier exchanges with the
+            // destination. A ping always detours: it must not cross the
+            // primary relay that may have eaten the exchanges it follows up.
+            let mut level = self
+                .health
+                .detour_level(&budget.destination, uring_runtime::environment::now());
+            if ping {
+                level = level.max(1);
+            }
+            let mut hint = blocked.clone();
+            hint.extend(membership.inner.detour(source, to, level));
             let mut seed = [0; 32];
             seed[..16].copy_from_slice(&budget.request.0);
             seed[16..].copy_from_slice(&budget.attempt.0);
@@ -1045,7 +1070,7 @@ impl Paths {
                     to,
                     links: budget.remaining_links,
                     visited: &visited,
-                    blocked: &blocked,
+                    blocked: &hint,
                     seed: &seed,
                 };
                 let mut operation = std::pin::pin!(self.inner.route(&membership.inner, query));
@@ -2153,6 +2178,59 @@ pub(crate) mod tests {
                 &scope,
                 ping,
             ))
+        }
+        /// A route to a non-neighbor takes the primary relay until an
+        /// exchange with the destination goes unanswered, then the disjoint
+        /// alternate relay, then neither. A ping always skips the primary
+        /// relay, and the destination is never marked silent by the detour.
+        #[test]
+        fn timeouts_detour_routes_and_pings_around_the_primary_relay() {
+            let members = membership(1500);
+            let source = &members.members()[0].node;
+            let to = 1499;
+            assert!(!members.inner.is_neighbor(0, to));
+            let pool = &members.inner.pools()[0];
+            let primary = &members.members()[pool.primary(0, to).unwrap()].node;
+            let alternate = &members.members()[pool.alternate(0, to).unwrap()].node;
+            assert_ne!(primary, alternate);
+            let destination = &members.members()[to].node;
+            let health = Rc::new(LinkHealth::default());
+            let paths = Paths::new(health.clone(), 8);
+            let request = budget(&members, to, NORMAL_LINKS);
+            let route = |ping| probe(&paths, &members, source, &request, ping).unwrap();
+            assert_eq!(route(false).nodes[1], *primary);
+            assert_eq!(route(true).nodes[1], *alternate);
+            assert_eq!(route(true).nodes.len(), 3);
+            let page = crate::model::PageId {
+                version: crate::model::ObjectVersion {
+                    object: crate::topology::tests::fixtures::object(),
+                    etag: crate::model::StrongEtag::test_value("v"),
+                },
+                number: PageNumber(0),
+            };
+            let sent = Instant::now() - Duration::from_secs(5);
+            health.silence_timed_out(
+                destination,
+                page.clone(),
+                sent,
+                racer_core::liveness::NO_PING,
+            );
+            assert_eq!(route(false).nodes[1], *alternate);
+            assert_eq!(route(true).nodes[1], *alternate);
+            assert!(!health.silent(destination));
+            // An exchange sent on the detour also went unanswered: skip both.
+            health.silence_timed_out(
+                destination,
+                page,
+                Instant::now(),
+                racer_core::liveness::NO_PING,
+            );
+            for ping in [false, true] {
+                let nodes = route(ping).nodes;
+                assert!(!nodes.contains(primary) && !nodes.contains(alternate));
+                assert!(nodes.len() <= 4);
+                assert_eq!(nodes.last(), Some(destination));
+            }
         }
         /// An origin's recovery ping to a neighbor it holds
         /// silent goes over the direct link; other requests route around it,
