@@ -416,35 +416,58 @@ fn hot_page_readers_fan_out_through_helpers() {
     );
 }
 
-/// [`hot_page_storm`] under the mesh v2 rule: owners never shed their own column, and a shed
-/// reader asks the middle node of its primary path, a column mate of the owner that shed it. The
-/// page reaches origin once and helpers serve copies. An owner's fan-in for the page is bounded by
-/// its column (at most `3T / 2` members) plus the other owners and the bodies it streams before it
-/// starts shedding, which is about twice the v1 bound here (`T` = 32 against about 22 hashed
-/// helpers): on these slow NICs a few reads time out.
+/// [`hot_page_storm`] under the mesh v2 rule: owners shed readers outside their column once they
+/// stream `hot_page_bodies` copies, and their column mates (the helpers) once they stream
+/// `hot_page_exempt_bodies`. A shed reader asks the middle node of its primary path to an owner,
+/// starting at a hashed owner (`helper_start`) so every owner's column helps. The page reaches
+/// origin once, every read completes, and no owner streams more copies at once than under v1.
 #[test]
 fn mesh_hot_page_readers_fan_out_through_column_helpers() {
     let config = hot_page_storm();
-    let reads = u64::from(config.nodes) + 1;
-    let threshold = racer_core::read::budget::hot_page_bodies(config.page_bytes) as u64;
     let mut v1 = config.clone();
     v1.node.mesh_helpers = false;
-    let report = run(config, 5);
+    let report = run(config.clone(), 5);
     let v1 = run(v1, 5);
-    assert_eq!(counter(&report, "origin_requests"), 1, "{report}");
-    assert!(counter(&report, "hot_page_sheds") > 0, "{report}");
-    assert!(counter(&report, "helper_copies") > 0, "{report}");
-    let failed = counter(&report, "reads_failed");
-    assert_eq!(counter(&report, "reads_completed") + failed, reads);
-    assert!(failed * 25 <= reads, "{failed} of {reads} failed: {report}");
-    let mesh = &report["mesh"];
-    let column = mesh["default_pool"]["target_column_size"].as_u64().unwrap();
-    let fanin = mesh["page_peak_fanin"].as_u64().unwrap();
-    let bound = column * 3 / 2 + topology::REPLICAS as u64 + threshold;
-    assert!(fanin <= bound, "fan-in {fanin} over {bound}: {mesh}");
-    // The v1 rule for comparison (reported, not asserted): its bound is the hashed helper set.
+    let fanin = assert_bounded_hot_page_storm(&config, &report);
     let v1_fanin = v1["mesh"]["page_peak_fanin"].as_u64().unwrap();
-    eprintln!("page fan-in: mesh v2 {fanin}, v1 {v1_fanin}");
+    assert!(
+        fanin <= v1_fanin,
+        "mesh v2 fan-in {fanin} over v1 {v1_fanin}"
+    );
+}
+
+/// [`hot_page_storm`] on 2,048 nodes: the column (about 64 nodes) is twice the shed threshold, so
+/// without the exempt cap the column alone would pile onto the owner.
+#[test]
+fn mesh_hot_page_storm_stays_bounded_on_a_large_pool() {
+    let nodes = 2048;
+    let mut config = hot_page_storm();
+    config.nodes = nodes;
+    config.storms = vec![
+        Storm::new(0, 0, 1, 1),
+        Storm::new(5 * SECONDS, 0, nodes, MILLIS),
+    ];
+    let report = run(config.clone(), 5);
+    assert_bounded_hot_page_storm(&config, &report);
+}
+
+/// Every read of a [`hot_page_storm`]-like config completes, the page reaches origin once, helpers
+/// serve copies, and peak fan-in for the page is at most the exempt cap plus the other owners.
+/// Returns the peak fan-in.
+fn assert_bounded_hot_page_storm(config: &Config, report: &Value) -> u64 {
+    use racer_core::read::budget::{hot_page_bodies, hot_page_exempt_bodies};
+    let reads = u64::from(config.nodes) + 1;
+    assert_eq!(counter(report, "origin_requests"), 1, "{report}");
+    assert!(counter(report, "hot_page_sheds") > 0, "{report}");
+    assert!(counter(report, "helper_copies") > 0, "{report}");
+    assert_eq!(counter(report, "reads_failed"), 0, "{report}");
+    assert_eq!(counter(report, "reads_completed"), reads, "{report}");
+    let mesh = &report["mesh"];
+    let fanin = mesh["page_peak_fanin"].as_u64().unwrap();
+    let cap = hot_page_exempt_bodies(hot_page_bodies(config.page_bytes)) as u64;
+    let bound = cap + topology::REPLICAS as u64 - 1;
+    assert!(fanin <= bound, "fan-in {fanin} over {bound}: {mesh}");
+    fanin
 }
 
 /// With the origin far slower than the demand, rank 0's request for a page

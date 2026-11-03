@@ -184,17 +184,24 @@ descriptors.
 v1 relied on bounded degree to cap owner fan-in. v2 has larger degree, so the shed and helper
 rule changes to use the mesh:
 
-- An owner never sheds a requester in its own column (in the page's pool), or another owner. At
-  most `T * 3/2` such nodes exist, so owner fan-in for one page is bounded by the column size.
-- An owner sheds other readers the same way as before (2 hot bodies of one page).
+- An owner never sheds another owner, so owners always reach each other.
+- An owner sheds other readers the same way as before (2 hot bodies of one page, 32 for
+  1 MiB pages).
+- It sheds its own column mates (in the page's pool) only after 2 more bodies. Column mates are
+  the helpers, so they keep a little room. Owner fan-in for one page is at most the threshold
+  plus 2 plus the other owners, whatever the column size. Without this cap the whole column
+  (up to `3T / 2` nodes) could stream from the owner at once.
 - A shed reader `r` asks its helper: `delegate(r, col(o))`, the middle node of its primary path.
-  The helper is a column mate of the owner, and coalesces every reader that delegates to it
-  (about `C` readers) into one fetch.
-- So a hot page becomes a 2 level tree: the owner feeds at most one column (about `sqrt(2k)`
-  helpers), and each helper feeds about `sqrt(k/2)` readers. v1 used about `sqrt(N)` helpers
+  The owner `o` is picked by a hash of `r` among the first 3 owners, so every owner's column
+  helps, not only rank 0's. The helper is a column mate of the owner, and coalesces every reader
+  that delegates to it into one fetch. If that owner shares `r`'s column, the next owner is used.
+- So a hot page becomes a 2 level tree: each owner feeds part of its column (about `sqrt(2k)`
+  helpers), and each helper feeds about `sqrt(k/2) / 3` readers. v1 used about `sqrt(N)` helpers
   hashed over all nodes, which could be any distance away. v2 helpers are always 1 hop from both
   the reader and the owner.
-- Helpers do not chain. They are never owners, so they never reach origin.
+- Helpers do not chain. They are never owners, so they never reach origin. A shed column mate
+  asks a helper in another owner's column. A helper that is itself shed fails the probe, and the
+  reader goes back to the owners, which wait or serve it once the burst drains.
 
 ## Clients and origins
 
@@ -245,9 +252,11 @@ These are in `cmd/racer/sim/tests/mesh_scenarios.rs` and the `mesh` section of e
   all their links are RDMA.
 - A join or leave changes about `T + 3C` edges (82 at 512, 271 at 4,000, 630 at 20,000).
   Leaving a pool of exactly a power of four rebuilds most of the mesh.
-- Hot page storm, 512 nodes on 32 MiB/s NICs: peak bodies of the page at one owner are 54
-  with the v2 rule, 37 with v1, and 14 of 513 reads time out (none with v1). The column
-  exemption admits up to `3T / 2` column mates at once.
+- Hot page storm, 512 nodes on 32 MiB/s NICs: with an uncapped column and every reader using
+  rank 0's column, peak bodies of the page at one node were 54 (37 with v1). With the cap and
+  hashed owner choice they are 36, every read completes, and origin is hit once. At 2,048 nodes:
+  35 (v1 50, 10 failed reads). At 4,096 nodes, still too many readers for a 2 level tree on these
+  NICs: 41 (v1 61), 0 to 10 failed reads by seed (v1 253).
 - Every route takes the same primary delegate. A hung delegate keeps failing the same reader,
   and the reader's ping of the healthy owner crosses it too. Owners also send every probe of
   rank 0 through one delegate, so relay limits are reached sooner. Both are open questions.
