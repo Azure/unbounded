@@ -120,7 +120,17 @@ func (nspawnPlan) EnsureNodeStarted(ctx context.Context, s *agentStages) error {
 		return err
 	}
 
-	if err := s.nodeStartTask(registered).Do(ctx); err != nil {
+	// The record has to reach disk before the node can start: after a crash,
+	// the nspawn pre-start relies on it whenever the slot has no applied config.
+	persist := func(cfg *provision.AgentConfig) error {
+		if err := daemon.PersistAllocationLaunchConfig(cfg); err != nil {
+			return err
+		}
+
+		return fsutil.SyncFilesystems(goalstates.AgentConfigDir)
+	}
+
+	if err := guardNodeStart(ctx, s.log, &s.cfg.AgentConfig, persist, daemon.VerifyAllocationLaunch, s.nodeStartTask(registered).Do); err != nil {
 		return err
 	}
 
