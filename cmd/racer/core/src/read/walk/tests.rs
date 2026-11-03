@@ -228,7 +228,7 @@ fn walks() {
         ("metadata never delegates", with(owner(1), &|c| c.page_operation = false), budget(8, 16), nothing, &[MISS], "0C2S:8/16/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/16/4"),
         // Handoff targets: copy-only after predecessors, never predecessor evidence; a stale one
         // is only a miss; a copy wins; non-page walks ignore them.
-        ("handoff", with(owner(1), &|c| c.handoff = 2), budget(8, 32), nothing, &[OVL, MISS], "0A4F:5/4/4 3C3Sh:8/32/8 4C2Sh:8/32/8 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("handoff", with(owner(1), &|c| c.handoff = 2), budget(8, 32), nothing, &[OVL, MISS], "0A4F:5/4/4 3C3Sh:8/32/8 4C2Sh:8/32/8 => Exhausted { funding: false } 8/32/8 r0"),
         ("stale handoff", with(owner(0), &|c| c.handoff = 1), budget(8, 32), nothing, &[STALE], "3C2Sh:8/32/4 => Origin { rank: 0, evidence: [] } 8/32/4"),
         ("handoff copy", with(owner(0), &|c| c.handoff = 3), budget(8, 32), nothing, &[MISS, MISS, MISS, MISS, COPY], "3C4Sh:8/32/4 4C3Sh:8/32/4 => Copy 8/32/4"),
         ("metadata handoff", with(owner(0), &|c| { c.handoff = 3; c.page_operation = false; }), budget(8, 32), nothing, &[], "=> Origin { rank: 0, evidence: [] } 8/32/4"),
@@ -264,7 +264,7 @@ fn walks() {
         ("hedge continuation, no outcome", with(reader(2), &|c| c.continuation.primary_consumed = true), budget(32, 96), nothing, &[VU], "1A1S:32/96/4 => Exhausted { funding: false } 32/96/4"),
         // Predecessors that held the same rank under the previous membership are asked under it;
         // handoff targets never are; a copy from one wins; readers and metadata ignore the bits.
-        ("previous", with(owner(2), &|c| { c.previous = 0b01; c.handoff = 1; }), budget(8, 32), nothing, &[OVL, MISS], "0A4Fp:5/4/4 1C3S:8/32/8 3C2Sh:8/32/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 8/32/8"),
+        ("previous", with(owner(2), &|c| { c.previous = 0b01; c.handoff = 1; }), budget(8, 32), nothing, &[OVL, MISS], "0A4Fp:5/4/4 1C3S:8/32/8 3C2Sh:8/32/8 => Exhausted { funding: false } 8/32/8 r0"),
         ("previous copy", with(owner(1), &|c| c.previous = 0b01), budget(8, 32), nothing, &[COPY], "0A2Fp:2/4/4 => Copy 8/32/4"),
         ("previous, reader", with(reader(3), &|c| c.previous = 0b111), budget(8, 32), nothing, &[MISS], "0A3S:8/32/4 1A2S:8/32/4 2A1S:8/32/4 => Exhausted { funding: false } 8/32/4"),
         ("previous, metadata", with(owner(1), &|c| { c.previous = 0b01; c.page_operation = false; }), budget(8, 32), nothing, &[MISS], "0C2S:8/32/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
@@ -305,7 +305,7 @@ fn walks() {
         ("rank 0 silent, miss", owner(2), budget(8, 32), nothing, &[TIMEOUT, MISS], "0A3F:2/4/4 1C2S:8/32/8 => Exhausted { funding: false } 8/32/8 r0"),
         // Only an owner's probe of rank 0 timing out withholds origin.
         ("rank 0 unreachable", owner(1), budget(8, 32), nothing, &[T_UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
-        ("rank 0 overloaded", owner(1), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("rank 0 overloaded", owner(1), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
         ("rank 0 miss", owner(1), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
         ("rank 0 shed", owner(1), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
         ("rank 1 silent", owner(2), budget(8, 32), nothing, &[MISS, TIMEOUT], "0A3F:2/4/4 1C2S:8/32/4 => Origin { rank: 2, evidence: [CopyMiss, Unreachable] } 8/32/8"),
@@ -319,8 +319,8 @@ fn walks() {
         // readers and rank 0 ignore it.
         ("fetching, silent", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[TIMEOUT], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
         ("fetching, unreachable", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[T_UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
-        ("fetching, transport overload", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[T_OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
-        ("fetching, overloaded", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("fetching, transport overload", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[T_OVL], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
+        ("fetching, overloaded", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
         ("fetching, shed", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[SHED], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/4"),
         ("fetching, miss", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [CopyMiss] } 8/32/4"),
         ("fetching, relay unreachable", rank0(1, Rank0State::Fetching), budget(8, 32), nothing, &[UNR], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Unreachable] } 8/32/8"),
@@ -349,10 +349,17 @@ fn walks() {
         ("granted, rank 0 silent, fetching", with(rank0(1, Rank0State::Fetching), &|c| { c.handoff = 2; c.granted = 2; }), budget(8, 32), nothing, &[TIMEOUT, MISS], "0A4F:5/4/4 3C7Fhg:1/8/4 4C6Fhg:1/8/4 => Exhausted { funding: false } 8/32/8 r0"),
         // A relay's `Overloaded` on an owner's route to rank 0 gives authority after one probe,
         // without a retry; never a reader's.
-        ("relay overload, rank 1", owner(1), budget(owner_funding_min(1), 8), nothing, &[OVL, MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 3/8/8"),
-        ("relay overload, rank 2", owner(2), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 4/8/8"),
-        ("relay overload, rank 1, fetching", rank0(1, Rank0State::Fetching), budget(owner_funding_min(1), 8), nothing, &[OVL, MISS], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 3/8/8"),
-        ("relay overload, rank 2, fetching", rank0(2, Rank0State::Fetching), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 4/8/8"),
+        ("relay overload, rank 1", owner(1), budget(owner_funding_min(1), 8), nothing, &[OVL, MISS], "0A2F:2/4/4 => Exhausted { funding: false } 3/8/8 r0"),
+        ("relay overload, rank 2", owner(2), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Exhausted { funding: false } 4/8/8 r0"),
+        ("relay overload, rank 1, fetching", rank0(1, Rank0State::Fetching), budget(owner_funding_min(1), 8), nothing, &[OVL, MISS], "0A2F:2/4/4 => Exhausted { funding: false } 3/8/8 r0"),
+        ("relay overload, rank 2, fetching", rank0(2, Rank0State::Fetching), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Exhausted { funding: false } 4/8/8 r0"),
+        // A relay that sheds the probe of rank 0 says nothing of rank 0's fetch: like a timeout,
+        // it withholds origin authority until rank 0 is overdue, so a dead rank 0 cannot hang.
+        ("relay overload, overdue", rank0(1, Rank0State::Overdue), budget(owner_funding_min(1), 8), nothing, &[OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 3/8/8"),
+        ("transport overload, overdue", rank0(1, Rank0State::Overdue), budget(8, 32), nothing, &[T_OVL], "0A2F:2/4/4 => Origin { rank: 1, evidence: [Overloaded] } 8/32/8"),
+        ("relay overload, rank 2, overdue", rank0(2, Rank0State::Overdue), budget(owner_funding_min(2), 8), nothing, &[OVL, MISS], "0A3F:2/4/4 1C2S:4/8/8 => Origin { rank: 2, evidence: [Overloaded, CopyMiss] } 4/8/8"),
+        ("relay overload, failed", rank0(1, Rank0State::Failed), budget(8, 32), nothing, &[OVL], "0A2F:2/4/4 => Exhausted { funding: false } 8/32/8 r0"),
+        ("relay overload, rank 2 copy", rank0(2, Rank0State::Fetching), budget(8, 32), nothing, &[OVL, COPY], "0A3F:2/4/4 1C2S:8/32/8 => Copy 8/32/8 r0"),
         ("relay overload, reader", reader(3), budget(8, 16), nothing, &[OVL], "0A3S:8/16/4 1A2S:8/16/8 2A1S:8/16/8 => Exhausted { funding: false } 8/16/8"),
         // Rank 0 answering that its own acquisition failed withholds origin only while this
         // owner's own origin request failed recently; probes match `Probe(Unreachable)`.

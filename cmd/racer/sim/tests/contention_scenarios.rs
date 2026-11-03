@@ -475,19 +475,17 @@ fn assert_bounded_hot_page_storm(config: &Config, report: &Value) -> u64 {
 ///
 /// Mesh v2 routes every owner's probe of rank 0 over one fixed delegate, so relays concentrate.
 /// With the default 16 relay transfers, a relay sheds a delegated probe of rank 0 (`Overloaded` on
-/// the route), and the owner treats it as a busy owner, not an unanswered rank 0, and fetches
-/// origin too (`core/src/read/walk.rs` `CandidateWalk::complete` sets `saw_busy`, not `rank0_unanswered`). That case is
-/// [`relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch`]. Here relays have room, so the
-/// test covers what it was written for: rank 0 timeouts.
+/// the route); the owner treats that like an unanswered rank 0 and leaves the fetch to it. That
+/// case is [`relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch`]. Here relays have room,
+/// so the test covers what it was written for: rank 0 timeouts.
 #[test]
 fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
     slow_origin(32);
 }
 
-/// Known gap under mesh v2 (see [`owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch`]):
-/// with default relay capacity, 2 pages reach origin twice. Needs a core fix.
+/// Default relay capacity (see [`owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch`]): a
+/// relay that sheds an owner's probe of rank 0 does not grant that owner origin authority.
 #[test]
-#[ignore = "mesh v2: a relay-shed probe of rank 0 grants origin authority (core walk.rs)"]
 fn relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch() {
     slow_origin(16);
 }
@@ -1094,11 +1092,9 @@ fn join_after_read(seed: u64) -> (Vec<u32>, Value) {
 /// previous owners copy-only before origin, so a page read before the join is mostly not fetched
 /// again after it.
 ///
-/// One corner still refetches: a reader asks a joined rank 2 first, which delegates to a joined
-/// rank 0 with only rank 0's origin credit (`owner_funding`), so rank 0 has no credit for its
-/// handoff probes (`core/src/read/walk.rs` `CandidateWalk::next` breaks on
-/// `remaining_attempts() < 2`) and goes to origin. Mesh v2 hash domains place both new owners on a
-/// page for most seeds. [`joined_owners_never_refetch`] is the strict form.
+/// A reader may ask a joined rank 2 first, which delegates to a joined rank 0 with only rank 0's
+/// origin credit (`owner_funding`); rank 0 asks its previous owners on their own grants, so it
+/// still copies before origin. [`joined_owners_never_refetch`] is the strict form.
 #[test]
 fn joined_owners_copy_from_previous_owners() {
     for seed in [1, 7] {
@@ -1119,8 +1115,7 @@ fn joined_owners_copy_from_previous_owners() {
     }
 }
 
-/// Strict form of [`joined_owners_copy_from_previous_owners`]: needs a core fix that funds a
-/// delegated rank 0's handoff probes.
+/// Strict form of [`joined_owners_copy_from_previous_owners`]: no page is fetched again.
 #[test]
 #[ignore = "core: a delegated rank 0 has no credit for handoff probes (walk.rs)"]
 fn joined_owners_never_refetch() {

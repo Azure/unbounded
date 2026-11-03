@@ -923,6 +923,9 @@ impl CandidateWalk {
             // Overloaded on the route to the owner or by the owner: load,
             // not a missing owner ([`shared_share_short`]).
             self.saw_busy = true;
+            // A congested route to rank 0 says nothing about rank 0's own fetch: like a timeout,
+            // leave the fetch to rank 0 unless it is overdue, so origin is not asked twice.
+            self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
         }
         if pending.helper {
             // The helper does not consume a visit-order position. Its
