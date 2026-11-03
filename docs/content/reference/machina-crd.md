@@ -185,6 +185,48 @@ spec:
       name: remote-example-auth
 ```
 
+### spec.allocationRef and spec.fenced
+
+A Machine created for a `MachineAllocation` names it in `allocationRef`, and
+`fenced` forbids the agent from starting that Machine's node again.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `allocationRef` | UIDReference | No | - | The `MachineAllocation` this Machine was created for. Can be set only when the Machine is created. |
+| `allocationRef.name` | string | Yes | - | Allocation name. |
+| `allocationRef.uid` | string | Yes | - | Allocation UID. |
+| `fenced` | bool | No | `false` | Forbids the agent from starting this Machine's node again. Can only change from `false` to `true`. Requires `allocationRef`. |
+
+The API server enforces these rules:
+
+| Rule | Message |
+|------|---------|
+| `allocationRef` cannot be added, removed, or changed after create, including by an update that drops the whole `spec`. | `allocationRef is immutable` |
+| `fenced` cannot go from `true` back to `false` or be removed, including by an update that drops the whole `spec`. | `fenced cannot be unset` |
+| `fenced: true` needs `allocationRef`, on create and on update. | `fenced requires allocationRef` |
+
+An agent whose kubelet `providerID` starts with
+`unbounded:///machineallocations/` treats the rest of it as its allocation UID
+and checks before every node start: at bootstrap, at every start of the nspawn
+machine (including after a host reboot), before a Node Recreation, and before a
+`NodeReboot`. Once the agent holds its daemon-controller certificate, it reads
+the Machine live with it and allows the start only when the Machine's
+`allocationRef.uid` is this allocation's UID, `fenced` is not set, and the
+Machine is not being deleted. Before that certificate exists, it checks that
+the API server still accepts its bootstrap token. It never falls back from the
+certificate to the token.
+
+The agent refuses closed. A fenced, deleting, missing, or foreign Machine, or a
+rejected credential, refuses at once. Other failures are read again every 10
+seconds for up to 5 minutes, then refuse. A refused bootstrap reports Reason
+`AllocationLaunchRefused` on the `AgentBootstrapped` condition, and a refused
+`NodeReboot` finishes `Failed` with Reason `AllocationLaunchRefused`. A refused
+start of the nspawn machine is retried by systemd. A Node Recreation refused
+for a transient failure is tried again after 5 minutes.
+
+The agent does not register a Machine for an allocation host. Fencing only
+stops new starts: a node that is already running is not stopped.
+
 ## MachineOperation
 
 | Property | Value |
