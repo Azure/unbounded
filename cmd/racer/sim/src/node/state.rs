@@ -21,7 +21,9 @@ pub const LINK_CAPACITY: usize = 4096;
 pub const MAX_SUSPECTS: usize = 64;
 use racer_core::admission::{Floors, Limits, Rules};
 use racer_core::cache::TickLru;
-use racer_core::liveness::{Rank0Watch, SILENCE_CAPACITY, Silence, WATCH_CAPACITY, WATCH_TTL};
+use racer_core::liveness::{
+    Detours, Rank0Watch, SILENCE_CAPACITY, Silence, WATCH_CAPACITY, WATCH_TTL,
+};
 use racer_core::read::flight::{FlightLimits, PageFlights, Reserve};
 use racer_core::read::hints::{
     HINT_CAPACITY, HINT_TTL, NOTICE_CAPACITY, OrphanNotices, SuccessorHints,
@@ -176,6 +178,9 @@ pub struct Node {
     pub rank0: Rank0Watch<u64, u32>,
     /// Next hops that left exchanges unanswered (production `LinkHealth::silence`).
     pub silence: Silence<u32, u64>,
+    /// Destinations whose routes skip relays that left an exchange unanswered (production
+    /// `LinkHealth::detours`).
+    pub detours: Detours<u32>,
     /// Silence pings and copy offers in flight.
     pub pings: u8,
     pub offers: u8,
@@ -242,6 +247,7 @@ impl Node {
                 Duration::from_nanos(config.read_timeout_ns / 2),
                 Duration::from_nanos(config.attempt_timeout_ns),
             ),
+            detours: Detours::new(SILENCE_CAPACITY),
             recent_sheds: Vec::new(),
             pings: 0,
             offers: 0,

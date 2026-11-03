@@ -663,15 +663,12 @@ fn hung_peers_are_found_and_recovered_peers_are_used_again() {
     assert_eq!(late, 0, "{report}");
 }
 
-/// Known gap under mesh v2: a route takes the primary delegate path (`Pool::primary`) every time,
-/// and the silence check only blames the destination over the last link. A hung delegate keeps
-/// eating the same reader's probes, and the reader's ping of the healthy owner crosses the same
-/// hung relay, so the owner is wrongly marked silent. The ring overlay spread retries over many
-/// equally short routes (picked by probe seed), which hid this. Needs a core or topology fix:
-/// route a retry and a silence ping of a destination over `Pool::alternate`, which shares no
-/// middle node with the primary path.
+/// Under mesh v2 a route takes one fixed relay (`Pool::primary`), so a hung relay eats every
+/// exchange and retry over it. A requester whose exchange went unanswered detours
+/// (`liveness::Detours`, `Membership::detour`): later routes to that destination take the
+/// alternate relay, which is never the primary one, and its silence pings always do, so a healthy
+/// owner behind a hung relay is not marked silent.
 #[test]
-#[ignore = "mesh v2: hung relays sit on fixed routes (core/topology fix needed)"]
 fn hung_relays_are_routed_around() {
     let forever = 45 * SECONDS;
     let (early, late, report) = hang(GRID, true, false, forever);

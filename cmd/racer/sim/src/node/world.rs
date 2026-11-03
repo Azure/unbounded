@@ -3151,7 +3151,8 @@ impl NodeWorld {
         let worker = (m.probe % u64::from(self.fabric.workers)) as u8;
         let paths = self.nodes[holder as usize].paths.clone();
         let held = members.clone();
-        let hint = blocked.clone();
+        let mut hint = blocked.clone();
+        hint.extend(self.detour(holder, m.dest, own_ping, &members));
         let future: TaskFuture = Box::pin(async move {
             let query = PathQuery {
                 from,
@@ -3203,13 +3204,34 @@ impl NodeWorld {
         blocked
     }
 
+    /// First hops a route from `holder` to `dest` skips to avoid relays that may have eaten its
+    /// exchanges (production `Paths::detour`). A ping detours at least once: it must not cross
+    /// the primary relay that may have eaten the exchanges it follows up.
+    fn detour(&self, holder: u32, dest: u32, ping: bool, members: &Members) -> Vec<usize> {
+        let (Some(from), Some(to)) = (
+            members.position(&holder.to_be_bytes()),
+            members.position(&dest.to_be_bytes()),
+        ) else {
+            return Vec::new();
+        };
+        let instant = self.instant(self.now());
+        let level = self.nodes[holder as usize].detours.level(&dest, instant);
+        members.detour(from, to, if ping { level.max(1) } else { level })
+    }
+
     /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester asks whether `dest`
     /// hangs (production `request_traced`).
     fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos, needed: u32) {
-        if !self.config.node.silence {
+        let Some((node, page)) = self.fills.get(&id).map(|f| (f.node, f.page)) else {
             return;
-        }
-        if let Some((node, page)) = self.fills.get(&id).map(|f| (f.node, f.page)) {
+        };
+        // Production `LinkHealth::silence_timed_out`: later routes to `dest` skip the relay that
+        // may have eaten this exchange.
+        let (sent_at, at) = (self.instant(sent), self.instant(self.now()));
+        self.nodes[node as usize]
+            .detours
+            .timed_out(dest, sent_at, at);
+        if self.config.node.silence {
             self.silence_timeout(node, dest, page, sent, needed);
         }
     }
