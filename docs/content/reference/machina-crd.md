@@ -220,9 +220,21 @@ The agent refuses closed. A fenced, deleting, missing, or foreign Machine, or a
 rejected credential, refuses at once. Other failures are read again every 10
 seconds for up to 5 minutes, then refuse. A refused bootstrap reports Reason
 `AllocationLaunchRefused` on the `AgentBootstrapped` condition, and a refused
-`NodeReboot` finishes `Failed` with Reason `AllocationLaunchRefused`. A refused
-start of the nspawn machine is retried by systemd. A Node Recreation refused
-for a transient failure is tried again after 5 minutes.
+`NodeReboot` finishes `Failed` with Reason `AllocationLaunchRefused`. A Node
+Recreation refused for a transient failure is tried again after 5 minutes.
+
+Every start of the nspawn machine runs the check in its pre-start, the
+`unbounded-agent-regenerate-config@<slot>` unit:
+
+- A transient refusal is retried every 10 seconds.
+- A final refusal exits with status `77`. systemd does not retry it, the
+  `unbounded-agent-regenerate-config@<slot>` unit is left failed, and so is the
+  start of the nspawn machine. A `NodeReboot` whose restart is refused this way
+  finishes `Failed` with Reason `ExecutionFailed`.
+- The node stays down until something starts it again: a host reboot, a
+  `NodeReboot`, or a Node Recreation. Each such start checks again.
+- The agent daemon still starts, so `HostSoftReboot` and `AgentReset` still
+  complete on such a host.
 
 The agent does not register a Machine for an allocation host. Fencing only
 stops new starts: a node that is already running is not stopped.
