@@ -232,9 +232,10 @@ fn scan(
 /// Per-disk status from one bounded scan. When the scan exceeds its working
 /// budget, for example on a host with many loop devices, the optional
 /// inventory is dropped but approved disks still report the outcome recorded
-/// at startup, so a writer waiting on a claim or rejection still sees it. The
-/// same fallback applies when the mount table cannot be read, so no disk is
-/// reported available while its mount state is unknown.
+/// at startup, so a writer waiting on a claim or rejection still sees it. When
+/// only the mount table cannot be read, the inventory is kept and classified
+/// with unknown mount state, so unapproved disks report `io-error` rather than
+/// disappearing or reporting available.
 fn statuses(
     walk: &Walk,
     sys_root: &Path,
@@ -253,12 +254,12 @@ fn statuses(
         Ok((found, Ok(mounts))) => {
             crate::hardware::classify_disks(&found.block_devices, Some(&mounts), context)
         }
-        Ok((_, Err(error))) => {
+        Ok((found, Err(error))) => {
             eprintln!(
-                "racer: disk status scan: {}: {error}; reporting approved disks only",
+                "racer: disk status scan: {}: {error}; mount state unknown",
                 path.display()
             );
-            crate::hardware::classify_disks(&[], Some(&[]), context)
+            crate::hardware::classify_disks(&found.block_devices, None, context)
         }
         Err(abort) => {
             eprintln!("racer: disk status scan stopped: {abort:?}; reporting approved disks only");
@@ -386,6 +387,46 @@ mod tests {
         // Without approvals the fallback is empty rather than an error.
         let walk = Walk::new(Arc::default(), 0);
         assert!(statuses(&walk, &f.0.join("sys"), &f.0, &Context::default()).is_empty());
+    }
+
+    #[test]
+    fn unreadable_mount_table_keeps_disks_as_io_errors() {
+        let f = super::super::devices::tests::Fixture::new();
+        let write = |path: &str, value: &str| {
+            let path = f.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, value).unwrap();
+        };
+        write("sys/block/nvme0n1/dev", "259:0\n");
+        write("sys/block/nvme0n1/size", "7501476528\n");
+        std::fs::create_dir_all(f.0.join("disk/by-id")).unwrap();
+        std::os::unix::fs::symlink("../../nvme0n1", f.0.join("disk/by-id/nvme-eui.0001")).unwrap();
+        let mut context = Context {
+            segment_bytes: 64 << 20,
+            mountinfo: Some(f.0.join("no-mountinfo")),
+            ..Default::default()
+        };
+        let walk = Walk::new(Arc::default(), WORKING_BYTES);
+        let disks = statuses(&walk, &f.0.join("sys"), &f.0, &context);
+        let got: Vec<_> = disks
+            .iter()
+            .map(|d| (d.id.as_str(), d.state, d.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [(
+                "nvme-eui.0001",
+                DiskState::Unavailable,
+                Some(racer_cluster_control::disks::DiskReason::IoError)
+            )]
+        );
+        // A readable empty mount table reports the same disk available.
+        write("mountinfo", "");
+        context.mountinfo = Some(f.0.join("mountinfo"));
+        let walk = Walk::new(Arc::default(), WORKING_BYTES);
+        let disks = statuses(&walk, &f.0.join("sys"), &f.0, &context);
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].state, DiskState::Available);
     }
 
     /// Control whose disk report blocks until released, standing in for a
