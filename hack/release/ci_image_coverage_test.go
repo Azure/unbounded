@@ -143,11 +143,13 @@ type imageWorkflow struct {
 }
 
 type imageJob struct {
-	RunsOn   any `yaml:"runs-on"`
+	If       string `yaml:"if"`
+	RunsOn   any    `yaml:"runs-on"`
 	Strategy struct {
 		Matrix map[string]any `yaml:"matrix"`
 	} `yaml:"strategy"`
 	Steps []struct {
+		If   string            `yaml:"if"`
 		Uses string            `yaml:"uses"`
 		With map[string]string `yaml:"with"`
 	} `yaml:"steps"`
@@ -362,8 +364,26 @@ func runnerPlatform(runsOn string) string {
 	return "linux/amd64"
 }
 
+// conditionalBuilds selects how imageBuilds treats a build step whose job or
+// step has an `if` condition. The test does not evaluate conditions, so each
+// side of the comparison takes the conservative choice.
+type conditionalBuilds int
+
+const (
+	// includeConditional counts conditional builds. The release side uses it
+	// so that a condition never shrinks the set of builds CI must cover.
+	includeConditional conditionalBuilds = iota
+	// excludeConditional drops conditional builds. The CI side uses it so that
+	// a build that may be skipped, such as one guarded by
+	// `matrix.arch == 'amd64'`, never counts as coverage. None of the ci.yaml
+	// build-images or release-images build steps or jobs has a condition
+	// today; if one gains a condition that is always true on pull_request,
+	// allow it here explicitly rather than counting all conditions.
+	excludeConditional
+)
+
 // imageBuilds returns every image build in a workflow, one per platform.
-func imageBuilds(data []byte) (map[imageBuild][]string, error) {
+func imageBuilds(data []byte, conditional conditionalBuilds) (map[imageBuild][]string, error) {
 	var wf imageWorkflow
 	if err := yaml.Unmarshal(data, &wf); err != nil {
 		return nil, err
@@ -372,6 +392,10 @@ func imageBuilds(data []byte) (map[imageBuild][]string, error) {
 	builds := map[imageBuild][]string{}
 
 	for name, job := range wf.Jobs {
+		if conditional == excludeConditional && strings.TrimSpace(job.If) != "" {
+			continue
+		}
+
 		combos, err := matrixCombinations(job.Strategy.Matrix)
 		if err != nil {
 			return nil, fmt.Errorf("job %s: %w", name, err)
@@ -380,6 +404,10 @@ func imageBuilds(data []byte) (map[imageBuild][]string, error) {
 		for _, combo := range combos {
 			for _, step := range job.Steps {
 				if !strings.HasPrefix(step.Uses, "docker/build-push-action@") {
+					continue
+				}
+
+				if conditional == excludeConditional && strings.TrimSpace(step.If) != "" {
 					continue
 				}
 
@@ -444,7 +472,7 @@ func missingBuilds(release, ci map[imageBuild][]string) []string {
 	return missing
 }
 
-func readImageBuilds(t *testing.T, path string) map[imageBuild][]string {
+func readImageBuilds(t *testing.T, path string, conditional conditionalBuilds) map[imageBuild][]string {
 	t.Helper()
 
 	data, err := os.ReadFile(path)
@@ -452,7 +480,7 @@ func readImageBuilds(t *testing.T, path string) map[imageBuild][]string {
 		t.Fatal(err)
 	}
 
-	builds, err := imageBuilds(data)
+	builds, err := imageBuilds(data, conditional)
 	if err != nil {
 		t.Fatalf("%s: %v", path, err)
 	}
@@ -463,8 +491,8 @@ func readImageBuilds(t *testing.T, path string) map[imageBuild][]string {
 func TestCIBuildsEveryReleaseImage(t *testing.T) {
 	t.Parallel()
 
-	release := readImageBuilds(t, releaseWorkflow)
-	ci := readImageBuilds(t, ciWorkflow)
+	release := readImageBuilds(t, releaseWorkflow, includeConditional)
+	ci := readImageBuilds(t, ciWorkflow, excludeConditional)
 
 	// Guard against the parser quietly finding nothing, which would make the
 	// coverage check vacuous.
@@ -500,7 +528,7 @@ jobs:
           platforms: linux/arm64
           build-args: |
             VERSION=${{ github.ref_name }}
-`))
+`), includeConditional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +544,7 @@ jobs:
           platforms: linux/arm64
           build-args: |
             RACER_NATIVE_CUDA=false
-`))
+`), excludeConditional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +565,7 @@ jobs:
           platforms: linux/arm64
           build-args: |
             RACER_NATIVE_RDMA=false
-`))
+`), excludeConditional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,7 +611,7 @@ jobs:
       - uses: docker/build-push-action@v7
         with:
           file: images/e/Containerfile
-`))
+`), includeConditional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,12 +659,12 @@ jobs:
   net:
     runs-on: ${{ matrix.runner }}
     strategy:
-      matrix:` + matrix + `
+      matrix:`+matrix+`
     steps:
       - uses: docker/build-push-action@v7
         with:
           file: images/net/Containerfile
-`))
+`), includeConditional)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -679,13 +707,13 @@ func TestImageBuildsMatrixFallback(t *testing.T) {
 			builds, err := imageBuilds([]byte(`
 jobs:
   net:
-    runs-on: ubuntu-latest` + tc.strategy + `
+    runs-on: ubuntu-latest`+tc.strategy+`
     steps:
       - uses: docker/build-push-action@v7
         with:
           file: images/net/Containerfile
           platforms: linux/amd64
-`))
+`), includeConditional)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -747,7 +775,7 @@ jobs:
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := imageBuilds([]byte(workflow)); err == nil {
+			if _, err := imageBuilds([]byte(workflow), includeConditional); err == nil {
 				t.Fatal("imageBuilds succeeded, want an error")
 			}
 		})
@@ -799,7 +827,7 @@ jobs:
             VERSION=${{ needs.version.outputs.tag }}
             GIT_COMMIT=${{ github.sha }}
             INSTALLER_KERNEL=${{ matrix.component.kernel }}
-`))
+`), includeConditional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -821,7 +849,7 @@ jobs:
           build-args: |
             VERSION=v0.0.0-ci
             ${{ matrix.component.kernel && format('INSTALLER_KERNEL={0}', matrix.component.kernel) || '' }}
-`))
+`), excludeConditional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -837,5 +865,88 @@ jobs:
 
 	if !slices.Equal(got, want) {
 		t.Fatalf("missingBuilds = %q, want %q", got, want)
+	}
+}
+
+func TestMissingBuildsIgnoresConditionalCIBuilds(t *testing.T) {
+	t.Parallel()
+
+	release, err := imageBuilds([]byte(`
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/a/Containerfile
+          platforms: linux/${{ matrix.arch }}
+`), includeConditional)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, ciWorkflow := range map[string]string{
+		"step if": `
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: docker/build-push-action@v7
+        if: matrix.arch == 'amd64'
+        with:
+          file: images/a/Containerfile
+          platforms: linux/${{ matrix.arch }}
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/a/Containerfile
+          platforms: linux/amd64
+`,
+		"job if": `
+jobs:
+  images-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/a/Containerfile
+          platforms: linux/amd64
+  images-arm64:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v7
+        with:
+          file: images/a/Containerfile
+          platforms: linux/arm64
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ci, err := imageBuilds([]byte(ciWorkflow), excludeConditional)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got := missingBuilds(release, ci)
+			want := []string{"images/a/Containerfile (linux/arm64), built by release job images"}
+
+			if !slices.Equal(got, want) {
+				t.Fatalf("missingBuilds = %q, want %q", got, want)
+			}
+
+			// The release side keeps conditional builds as required.
+			if all, err := imageBuilds([]byte(ciWorkflow), includeConditional); err != nil {
+				t.Fatal(err)
+			} else if _, ok := all[imageBuild{File: "images/a/Containerfile", Platform: "linux/arm64"}]; !ok {
+				t.Errorf("includeConditional dropped the conditional arm64 build: %v", all)
+			}
+		})
 	}
 }
