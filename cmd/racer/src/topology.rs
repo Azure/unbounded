@@ -898,8 +898,7 @@ pub(crate) mod tests {
         // N=1500, source=0, destination=1499, request=[1;16]; weights 1 at
         // multiples of 3 and 4 elsewhere; attempts encoded as big-endian u128.
         // The primary delegate is unique, so every attempt picks it.
-        pub(crate) const NEXT_HOPS: [(u128, usize); 4] =
-            [(0, 350), (1, 350), (2, 350), (127, 350)];
+        pub(crate) const NEXT_HOPS: [(u128, usize); 4] = [(0, 350), (1, 350), (2, 350), (127, 350)];
 
         pub(crate) fn member(index: usize, shares: u32) -> Member {
             Member {

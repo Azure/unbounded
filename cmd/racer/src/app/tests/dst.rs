@@ -1189,6 +1189,13 @@ mod scenarios {
         healthy_relayed_page_reads_with_mode(true);
     }
 
+    /// Cluster size for relayed read scenarios: above the 64 member full mesh
+    /// of mesh v2, so some reads need a relay.
+    const RELAY_NODES: usize = 65;
+
+    /// Nodes that read in the healthy relayed scenario.
+    const READERS: usize = 40;
+
     fn healthy_relayed_page_reads_with_mode(opaque: bool) {
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -1202,7 +1209,7 @@ mod scenarios {
         // exceeds resident capacity and forces receive admission to reclaim idle data.
         harness.payload_regression = true;
         harness.update(1);
-        for _ in 0..40 {
+        for _ in 0..RELAY_NODES {
             harness.add(None);
         }
         for node in &harness.nodes {
@@ -1210,7 +1217,7 @@ mod scenarios {
                 assert_eq!(worker.app.peers.opaque_relay(), opaque);
             }
         }
-        for node in 0..40 {
+        for node in 0..READERS {
             let mut client = harness.request_on(1, true, false, node);
             client.first = 0;
             client.end = client.size;
@@ -1219,9 +1226,12 @@ mod scenarios {
             client.request = format!("POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: {}\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), 2 * PAGE_BYTES, client.tag, client.size - 1).into_bytes();
             harness.exchange(client, false);
         }
-        assert_eq!(harness.coverage.success, 40);
+        assert_eq!(harness.coverage.success, READERS);
         assert_eq!(harness.coverage.failures, 0);
-        assert_eq!(harness.coverage.bytes, 40 * (4 * PAGE_BYTES as usize + 257));
+        assert_eq!(
+            harness.coverage.bytes,
+            READERS * (4 * PAGE_BYTES as usize + 257)
+        );
         assert!(harness.coverage.relay_turns > 0);
     }
 
@@ -1248,7 +1258,7 @@ mod scenarios {
         for object in 1..=4 {
             harness.update(object);
         }
-        for _ in 0..40 {
+        for _ in 0..RELAY_NODES {
             harness.add(None);
         }
         // Exercise success, then controlled receive pressure after success headers,

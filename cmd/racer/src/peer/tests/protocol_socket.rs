@@ -738,7 +738,8 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
             planned.nodes
         );
     }
-    assert!(selected.len() > 1);
+    // Mesh v2: the primary delegate is unique, so every attempt picks it.
+    assert_eq!(selected.len(), 1);
 }
 
 #[test]

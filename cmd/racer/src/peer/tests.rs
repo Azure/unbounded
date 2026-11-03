@@ -2006,28 +2006,50 @@ mod subscriptions {
         )));
         // Full protocol membership; the local provider has negligible weight. The
         // signed unavailable response below proves all 64 endpoints were ineligible.
-        // Keep authenticated ingress A adjacent to C on ring zero. Positional
-        // adjacency is not a property of the stable hashed overlay.
-        let ring_key = |id: &str| {
+        // Keep authenticated ingress A adjacent to C in the mesh v2 default pool:
+        // either A and C share a column, or no other member of A's column puts a
+        // ring point between C's delegate key and A's first point after it, so A
+        // is C's delegate in A's column. 100,000 members with one Site have 256
+        // columns.
+        let digest = |domain: &[u8], id: &str, point: Option<u32>| {
             use sha2::Digest;
-            let mut hash = crate::topology::hash_domain(b"racer/overlay/sha256-rings-32/v1\0");
-            hash.update(0u32.to_be_bytes());
-            hash.update(u64::try_from(id.len()).unwrap().to_be_bytes());
-            hash.update(id.as_bytes());
-            crate::topology::hash_finish(hash)
+            let mut hash = crate::topology::hash_domain(domain);
+            crate::topology::hash_bytes(&mut hash, id.as_bytes());
+            if let Some(point) = point {
+                hash.update(point.to_be_bytes());
+            }
+            u64::from_be_bytes(crate::topology::hash_finish(hash)[..8].try_into().unwrap())
         };
-        let (a, c) = (ring_key(A), ring_key(C));
-        let (low, high) = (a.min(c), a.max(c));
+        let column = |id: &str| ::topology::jump(digest(b"racer/mesh/v2/column\0", id, None), 256);
+        let points = |id: &str| -> Vec<u64> {
+            (0..16u32)
+                .map(|v| digest(b"racer/mesh/v2/point\0", id, Some(v)))
+                .collect()
+        };
+        let key_c = digest(b"racer/mesh/v2/delegate\0", C, None);
+        let first_a = points(A)
+            .into_iter()
+            .filter(|&p| p >= key_c)
+            .min()
+            .unwrap_or_else(|| points(A).into_iter().min().unwrap());
+        let in_arc = |p: u64| {
+            if first_a >= key_c {
+                p >= key_c && p <= first_a
+            } else {
+                p >= key_c || p <= first_a
+            }
+        };
+        let same = column(A) == column(C);
         let membership = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
                 (0..)
                     .filter(|i| {
-                        if *i < 2 {
+                        if *i < 2 || same {
                             return true;
                         }
-                        let key = ring_key(&format!("member-{i:06}"));
-                        key < low || key > high
+                        let id = format!("member-{i:06}");
+                        column(&id) != column(A) || !points(&id).into_iter().any(in_arc)
                     })
                     .take(100_000)
                     .map(|i| Member {
