@@ -248,6 +248,7 @@ impl Config {
             peer_admission: crate::peer::Config {
                 total: to_usize(raw.peer_inflight_max.unwrap_or(256))?,
                 per_peer: to_usize(raw.peer_per_neighbor_max.unwrap_or(32))?,
+                recovery: Duration::from_millis(raw.peer_admission_recovery_ms.unwrap_or(1000)),
             },
             peer_receive: crate::peer::receive::Config {
                 active: to_usize(raw.peer_receive_max.unwrap_or(0))?,
@@ -792,6 +793,7 @@ const ENV_NAMES: &[&str] = &[
     "REPLICA_SELECTION",
     "PEER_INFLIGHT_MAX",
     "PEER_PER_NEIGHBOR_MAX",
+    "PEER_ADMISSION_RECOVERY_MS",
     "SHARES",
     "PEER_RECEIVE_MAX",
     "PEER_RECEIVE_QUEUE_MAX",
@@ -887,6 +889,8 @@ struct RawConfig {
     peer_inflight_max: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     peer_per_neighbor_max: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    peer_admission_recovery_ms: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     shares: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -2063,15 +2067,23 @@ mod tests {
         let config = parse(&[
             ("RACER_PEER_INFLIGHT_MAX", "8"),
             ("RACER_PEER_PER_NEIGHBOR_MAX", "2"),
+            ("RACER_PEER_ADMISSION_RECOVERY_MS", "10"),
         ])
         .unwrap();
         assert_eq!(config.peer_admission.total, 8);
         assert_eq!(config.peer_admission.per_peer, 2);
+        assert_eq!(config.peer_admission.recovery, Duration::from_millis(10));
+        assert_eq!(
+            parse(&[]).unwrap().peer_admission.recovery,
+            Duration::from_secs(1)
+        );
         for overrides in [
             vec![("RACER_PEER_INFLIGHT_MAX", "0")],
             vec![("RACER_PEER_INFLIGHT_MAX", "65537")],
             vec![("RACER_PEER_PER_NEIGHBOR_MAX", "0")],
             vec![("RACER_PEER_PER_NEIGHBOR_MAX", "257")],
+            vec![("RACER_PEER_ADMISSION_RECOVERY_MS", "0")],
+            vec![("RACER_PEER_ADMISSION_RECOVERY_MS", "60001")],
         ] {
             assert!(parse(&overrides).is_err());
         }

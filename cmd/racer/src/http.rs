@@ -741,6 +741,7 @@ pub(crate) mod tests {
                         crate::peer::Config {
                             total: 1,
                             per_peer: 1,
+                            ..Default::default()
                         },
                         metrics.clone(),
                     )
@@ -2522,6 +2523,7 @@ pub(crate) mod tests {
                     crate::peer::Config {
                         total: 1,
                         per_peer: 1,
+                        ..Default::default()
                     },
                     metrics.clone(),
                 )
