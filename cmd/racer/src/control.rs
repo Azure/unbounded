@@ -141,6 +141,10 @@ pub struct Snapshot {
     /// Cache namespaces admitted by this publication.
     pub caches: Vec<CacheDefinition>,
 
+    /// Node pools of `caches`, as validated from the publication. Not yet
+    /// used for placement.
+    pub pools: Vec<racer_control_wire::Pool>,
+
     content_hash: [u8; 32],
 
     membership_hash: [u8; 32],
@@ -155,6 +159,7 @@ impl Snapshot {
             sequence: PublicationSequence(1),
             membership,
             caches: Vec::new(),
+            pools: Vec::new(),
             content_hash: [0; 32],
             membership_hash: [0; 32],
         }
@@ -264,36 +269,40 @@ impl Availability {
             .unwrap()
             .map_or(1, |snapshot| snapshot.sequence.0 + 1);
         PublicationTarget::new(self.keys.cluster().clone(), self.publications.clone())
-            .apply(Publication {
-                schema_version: SCHEMA_VERSION,
-                cluster: self.keys.cluster().clone(),
-                sequence: PublicationSequence(sequence),
-                membership_version: racer_control_wire::MembershipVersion(1),
-                members: vec![wire::Member {
-                    node: self.keys.node().clone(),
-                    shares: std::num::NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:7443".into(),
-                    rails: vec![],
-                    site: String::new(),
-                }],
-                caches: caches
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (id, mode))| {
-                        let name = format!("rotation-{i}");
-                        let (client_socket, origin_socket) =
-                            wire::canonical_socket_paths(&name).unwrap();
-                        CacheDefinition {
-                            id,
-                            name,
-                            client_socket,
-                            origin_socket,
-                            priority: racer_control_wire::DEFAULT_PRIORITY,
-                            mode,
-                        }
-                    })
-                    .collect(),
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: SCHEMA_VERSION,
+                    cluster: self.keys.cluster().clone(),
+                    sequence: PublicationSequence(sequence),
+                    membership_version: racer_control_wire::MembershipVersion(1),
+                    members: vec![wire::Member {
+                        node: self.keys.node().clone(),
+                        shares: std::num::NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:7443".into(),
+                        rails: vec![],
+                        site: String::new(),
+                    }],
+                    caches: caches
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (id, mode))| {
+                            let name = format!("rotation-{i}");
+                            let (client_socket, origin_socket) =
+                                wire::canonical_socket_paths(&name).unwrap();
+                            CacheDefinition {
+                                id,
+                                name,
+                                client_socket,
+                                origin_socket,
+                                priority: racer_control_wire::DEFAULT_PRIORITY,
+                                mode,
+                            }
+                        })
+                        .collect(),
+                }
+                .with_default_pool(),
+            )
             .unwrap();
     }
 }
@@ -992,8 +1001,9 @@ pub(crate) mod tests {
             let store = store(2);
             let first = store.apply(publication(1)).unwrap();
             let before = crate::topology::scored_members();
+            // Cache-only: pools, and so membership, are unchanged.
             let mut next = publication(2);
-            next.caches.clear();
+            next.caches[0].priority = 1;
             let prepared = store.project(next).unwrap();
             assert_eq!(
                 crate::topology::scored_members(),
@@ -1260,7 +1270,7 @@ pub(crate) mod tests {
             let mut history = vec![first.clone()];
             for sequence in 2..40 {
                 let mut next = publication(sequence);
-                next.caches.clear();
+                next.caches[0].priority = sequence as u16;
                 let snapshot = store.apply(next).unwrap();
                 assert!(Arc::ptr_eq(&first.membership, &snapshot.membership));
                 history.push(snapshot);
@@ -1331,7 +1341,7 @@ pub(crate) mod tests {
             let first = store.apply(publication(1)).unwrap();
             assert!(Arc::ptr_eq(&first, &store.apply(publication(1)).unwrap()));
             let mut changed = publication(1);
-            changed.caches[0].id = CacheId("66666666-6666-4666-8666-666666666666".into());
+            changed.caches[0].priority = 1;
             assert!(matches!(store.apply(changed), Err(Error::Replay)));
             let second = store.apply(membership(2, 2)).unwrap();
             assert!(matches!(store.apply(publication(1)), Err(Error::Replay)));

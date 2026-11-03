@@ -248,6 +248,7 @@ fn project(
         sequence: publication.sequence,
         membership,
         caches: publication.caches,
+        pools: publication.pools,
         content_hash,
         membership_hash,
     }))

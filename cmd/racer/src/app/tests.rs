@@ -402,7 +402,7 @@ impl ControlFixture {
         std::fs::write(&config.service_account_token, b"fixture.token").unwrap();
         let mut fixture = Self {
             bundle: Arc::new(Mutex::new(wire::KeyringBundle {
-                schema_version: 1,
+                schema_version: racer_control_wire::SCHEMA_VERSION,
                 cluster: config.cluster.clone(),
                 generation: wire::BundleGeneration(1),
                 peer_trust_roots: vec![ca.der().to_vec()],
@@ -680,10 +680,12 @@ pub(super) fn publication(
     caches: Vec<racer_control_wire::CacheDefinition>,
 ) -> state::Publication {
     state::Publication {
-        schema_version: 1,
+        pools: Vec::new(),
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
-        membership_version: racer_control_wire::MembershipVersion(1),
+        // Pools cover the caches, so each catalog takes its own version.
+        membership_version: racer_control_wire::MembershipVersion(sequence),
         members: vec![racer_control_wire::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -693,6 +695,7 @@ pub(super) fn publication(
         }],
         caches,
     }
+    .with_default_pool()
 }
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
@@ -1854,7 +1857,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     first
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
@@ -1912,6 +1915,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     }
     let rejected = adapter.stage(&[]).unwrap();
     let mut invalid = publication(&config, 2, vec![]);
+    invalid.membership_version.0 = 1;
     invalid.members[0].peer_endpoint = "127.0.0.1:7444".into();
     assert!(matches!(
         first.snapshots.apply_staged(invalid, Some(rejected)),
@@ -2564,7 +2568,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*worker.keys.peer_trust_roots().unwrap()).clone(),
@@ -2954,7 +2958,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     keys.install(wire::KeyringBundle {
-        schema_version: 1,
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(2),
         peer_trust_roots: roots.clone(),
@@ -2967,7 +2971,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let lease = keys.lease(Some(&cache), key.id, KeyPurpose::Page).unwrap();
     keys.install(wire::KeyringBundle {
-        schema_version: 1,
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(3),
         peer_trust_roots: roots,
@@ -3435,7 +3439,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: roots.clone(),
@@ -3523,7 +3527,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(3),
             peer_trust_roots: roots,

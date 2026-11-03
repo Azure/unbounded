@@ -487,13 +487,15 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
         published.clone(),
     );
     let mut publication = racer_control_wire::Publication {
+        pools: Vec::new(),
         schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: f.keys.cluster().clone(),
         sequence: racer_control_wire::PublicationSequence(1),
         membership_version: racer_control_wire::MembershipVersion(1),
         members: vec![],
         caches: vec![],
-    };
+    }
+    .with_default_pool();
     publication.members = (0..1000)
         .map(|i| racer_control_wire::Member {
             node: racer_control_wire::NodeId(format!("22222222-2222-4222-8222-{i:012}")),
@@ -3211,26 +3213,30 @@ impl Fixture {
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths(settings.name).unwrap();
         snapshots
-            .apply(Publication {
-                schema_version: SCHEMA_VERSION,
-                cluster: self.keys.cluster().clone(),
-                sequence: PublicationSequence(1),
-                membership_version: membership.version,
-                members: membership
-                    .members()
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect(),
-                caches: vec![CacheDefinition {
-                    id: self.context.object.cache.clone(),
-                    name: settings.name.into(),
-                    client_socket,
-                    origin_socket,
-                    priority: racer_control_wire::DEFAULT_PRIORITY,
-                    mode: racer_control_wire::CacheMode::Cached,
-                }],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: SCHEMA_VERSION,
+                    cluster: self.keys.cluster().clone(),
+                    sequence: PublicationSequence(1),
+                    membership_version: membership.version,
+                    members: membership
+                        .members()
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect(),
+                    caches: vec![CacheDefinition {
+                        id: self.context.object.cache.clone(),
+                        name: settings.name.into(),
+                        client_socket,
+                        origin_socket,
+                        priority: racer_control_wire::DEFAULT_PRIORITY,
+                        mode: racer_control_wire::CacheMode::Cached,
+                    }],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         let owners = fill.dependencies.metadata_owner.clone();
         let metadata = Rc::new(MetadataService::new(
@@ -3523,27 +3529,31 @@ pub(super) fn adapter_client(
     let (client_socket, origin_socket) =
         racer_control_wire::canonical_socket_paths("fixture").unwrap();
     snapshots
-        .apply(Publication {
-            schema_version: SCHEMA_VERSION,
-            cluster: f.keys.cluster().clone(),
-            sequence: PublicationSequence(1),
-            membership_version: f.membership.version,
-            members: f
-                .membership
-                .members()
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-            caches: vec![racer_control_wire::CacheDefinition {
-                id: f.context.object.cache.clone(),
-                name: "fixture".into(),
-                client_socket,
-                origin_socket,
-                priority: racer_control_wire::DEFAULT_PRIORITY,
-                mode: racer_control_wire::CacheMode::Cached,
-            }],
-        })
+        .apply(
+            Publication {
+                pools: Vec::new(),
+                schema_version: SCHEMA_VERSION,
+                cluster: f.keys.cluster().clone(),
+                sequence: PublicationSequence(1),
+                membership_version: f.membership.version,
+                members: f
+                    .membership
+                    .members()
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                caches: vec![racer_control_wire::CacheDefinition {
+                    id: f.context.object.cache.clone(),
+                    name: "fixture".into(),
+                    client_socket,
+                    origin_socket,
+                    priority: racer_control_wire::DEFAULT_PRIORITY,
+                    mode: racer_control_wire::CacheMode::Cached,
+                }],
+            }
+            .with_default_pool(),
+        )
         .unwrap();
     adapter.client(
         snapshots,

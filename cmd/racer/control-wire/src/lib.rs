@@ -143,6 +143,34 @@ pub struct Publication {
     pub pools: Vec<Pool>,
 }
 
+impl Publication {
+    /// Replace the pools with one default pool holding every cache.
+    pub fn with_default_pool(mut self) -> Self {
+        self.pools = default_pools(&self.caches);
+        self
+    }
+}
+
+/// One default pool holding every cache, ranked by the highest cache
+/// priority, or no pools for an empty catalog.
+pub fn default_pools(caches: &[CacheDefinition]) -> Vec<Pool> {
+    if caches.is_empty() {
+        return Vec::new();
+    }
+    let mut ids: Vec<CacheId> = caches.iter().map(|c| c.id.clone()).collect();
+    ids.sort();
+    vec![Pool {
+        id: PoolId::default_pool(),
+        rank: caches
+            .iter()
+            .map(|c| u64::from(c.priority))
+            .max()
+            .unwrap_or(0),
+        members: None,
+        caches: ids,
+    }]
+}
+
 /// The transport supplies the projected bearer token, never a DTO or diagnostic.
 #[derive(Clone)]
 pub struct EnrollmentRequest {
@@ -2588,6 +2616,16 @@ mod codec {
             let mut no_pools: Value = serde_json::from_str(&raw).unwrap();
             no_pools.as_object_mut().unwrap().remove("pools");
             assert!(decode_publication(&serde_json::to_vec(&no_pools).unwrap()).is_err());
+        }
+
+        /// The default pool helper covers every cache with the top priority.
+        #[test]
+        fn default_pool_helper() {
+            let p = decode_publication(&fixture("publication.json")).unwrap();
+            let mut q = p.clone();
+            q.pools.clear();
+            assert_eq!(q.with_default_pool().pools, p.pools);
+            assert!(crate::default_pools(&[]).is_empty());
         }
 
         /// Membership bytes cover pools, so pool changes take a new version.

@@ -2559,7 +2559,7 @@ impl Harness {
     }
     fn bundle(&self, config: &Config, _generation: u64) -> wire::KeyringBundle {
         wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(u64::from(self.key_epoch) + 1),
             peer_trust_roots: vec![self.ca.der().to_vec()],
