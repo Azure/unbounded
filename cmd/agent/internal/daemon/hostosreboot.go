@@ -240,8 +240,10 @@ func (t *machineOperationTarget) reader() client.Reader {
 // isOutOfBandHostOperation reports whether kind is a host operation that a
 // provider or BMC executes rather than the agent on the host. It matches the
 // operations machine-ops-controller and metalman serialize among themselves.
+// HostAllocate and HostRelease are not out-of-band host operations, because
+// they act on a MachineAllocation rather than on an existing host.
 func isOutOfBandHostOperation(kind v1alpha3.OperationKind) bool {
-	return strings.HasPrefix(string(kind), "Host") && kind != v1alpha3.OperationHostSoftReboot
+	return strings.HasPrefix(string(kind), "Host") && kind != v1alpha3.OperationHostSoftReboot && !kind.IsAllocationOperation()
 }
 
 // unfinishedOutOfBandHostOperation returns the name of the oldest out-of-band
