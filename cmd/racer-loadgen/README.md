@@ -200,6 +200,30 @@ bounds catalog hashing and origin startup; UDS origin readiness also has a
 dataplane has successfully acquired data. The UDS readiness probe talks directly
 to the origin and does not warm measured objects in Racer.
 
+### Large blobs and coordinated starts
+
+These flags help when many nodes load one very large blob, such as 1 TB:
+
+- `--trusted-blob-digests=sha256:...` (comma-separated, one per catalog index,
+  starting at 0) skips startup hashing for those blobs. Use digests computed
+  earlier for the same seed, index, and size. A wrong digest is not detected
+  at startup.
+- `--start-at=<unix seconds>` waits until that time after `--start-delay`, so
+  pods that become ready at different times start together.
+- `--page-credits=N` (UDS only, 0-64) sets how many pages Racer may send ahead
+  of each read. The dataplane's fetch window for a read is the smaller of this
+  and `RACER_RANGE_WINDOW_PAGES`; 0 keeps the SDK default of 2.
+- `--range-bytes=N` (UDS only, requires `--verify=false`) reads each blob as
+  byte ranges pinned to one ETag. `--range-parallel` ranges run at once (raise
+  `--blob-concurrency` to at least the same value, since it sizes the SDK
+  connection pool). A range that fails mid-transfer resumes at its first
+  unread byte, up to `--range-retries` times, and counts in
+  `racer_loadgen_range_resumes_total`. `--range-rotate` starts each pod at a
+  range derived from its host name, so nodes do not all request the same
+  pages at the same moment. `--range-cohorts=K` instead splits pods into K
+  cohorts (by the trailing number of `--node-name` when it has one); a cohort
+  starts at the same range, and cohorts start evenly spaced across the blob.
+
 ## Memory and measurement
 
 By default, reads drain with `io.Copy` to an open `/dev/null` file reused for the
@@ -208,6 +232,10 @@ allowing the zero-copy splice path rather than copying whole objects into Go
 memory. `--verify=true` uses a 32 KiB read buffer to hash each object, so bytes
 are copied into Go memory. Protocol, socket, origin, and runtime allocations
 still contribute to RSS; there is no fixed page-storage budget per read.
+
+Failure log lines carry a `cause` attribute that names the error class
+(`unexpected_eof`, `unavailable`, `deadline_exceeded`, and so on) without the error
+text, which can contain URLs or credentials.
 
 Metrics:
 
@@ -219,8 +247,9 @@ Metrics:
   verified operations. Failed batches and the default `--verify=false` receive
   no credit; enable `--verify` when measuring verified goodput.
 - `racer_loadgen_received_bytes_total` counts bytes delivered to the consumer,
-  including failed operations. Drain bytes are counted when `io.Copy` returns,
-  including on failure. This is **not wire traffic**; SDK framing is excluded.
+  including failed operations. Direct UDS drains credit bytes every second
+  while they run (from the SDK object's `Progress`), and the rest when `io.Copy`
+  returns, including on failure. This is **not wire traffic**; SDK framing is excluded.
 - UDS origin metrics count callback operations and bytes generated for the SDK,
   not HTTP socket writes. They are not network throughput counters.
 

@@ -252,8 +252,8 @@ pub(crate) fn link_up(w: &mut World) -> u64 {
 
 #[test]
 fn constants_and_keys() {
-    assert_eq!(BUFFER_LEN % 4096, 0);
-    const { assert!(BUFFER_LEN >= MAX_CIPHERTEXT && BUFFER_LEN - MAX_CIPHERTEXT < 4096) };
+    assert_eq!(BUFFER_LEN % (2 << 20), 0);
+    const { assert!(BUFFER_LEN >= MAX_CIPHERTEXT && BUFFER_LEN - MAX_CIPHERTEXT < (2 << 20)) };
     assert_eq!(buffer_count(2 * BUFFER_LEN - 1), 1);
     assert_eq!(buffer_count(2 * BUFFER_LEN), 2);
     assert_eq!(grants_per_link(0), 1);

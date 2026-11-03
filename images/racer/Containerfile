@@ -19,9 +19,26 @@ ARG CUDA_NVCC_PACKAGE=cuda-nvcc-12-9
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
 WORKDIR /src
 
+# rdma-core from source: distribution releases predate RC QP support for
+# Azure MANA (rdma-core 54). The verbs adapter builds against it and the
+# runtime stage ships its libraries and providers under /usr/local.
+ARG RDMA_CORE_VERSION=v65.0
+ARG RDMA_CORE_COMMIT=58e40801bfed5a8befc0881594820fa0a0baa4a1
 RUN case "$RACER_NATIVE_RDMA" in \
         true) apt-get update && apt-get install -y --no-install-recommends \
-            libibverbs-dev pkg-config && rm -rf /var/lib/apt/lists/* ;; \
+            cmake ninja-build pkg-config libnl-3-dev libnl-route-3-dev python3 \
+            && rm -rf /var/lib/apt/lists/* \
+            && git clone --depth 1 --branch "$RDMA_CORE_VERSION" \
+                https://github.com/linux-rdma/rdma-core.git /tmp/rdma-core \
+            && test "$(git -C /tmp/rdma-core rev-parse HEAD)" = "$RDMA_CORE_COMMIT" \
+            && cmake -S /tmp/rdma-core -B /tmp/rdma-core/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 -DENABLE_STATIC=0 \
+            && ninja -C /tmp/rdma-core/build install \
+            && DESTDIR=/out ninja -C /tmp/rdma-core/build install \
+            && rm -rf /out/usr/local/include /out/usr/local/share /out/usr/local/bin \
+                /out/usr/local/sbin /out/usr/local/libexec /out/usr/local/lib/pkgconfig \
+            && rm -rf /tmp/rdma-core && ldconfig ;; \
         false) ;; \
         *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
     esac
@@ -153,7 +170,7 @@ RUN set -eu; \
     esac
 RUN set -eu; \
     case "$RACER_NATIVE_RDMA" in \
-        true) set -- libibverbs1 ibverbs-providers ;; \
+        true) set -- libnl-3-200 libnl-route-3-200 ;; \
         false) set -- ;; \
         *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
     esac; \
@@ -169,6 +186,8 @@ RUN set -eu; \
 # Install /unbounded/bin/racer and, with RDMA or CUDA, the verbs
 # adapter and CUDA shim under /usr/local/lib where the dynamic loader finds it by soname.
 COPY --from=builder /out/ /
+# Pick up rdma-core and the verbs adapter under /usr/local/lib.
+RUN ldconfig
 COPY LICENSE NOTICE /unbounded/licenses/
 # cuFile reads its configuration from CUFILE_ENV_PATH_JSON. Images built
 # without CUDA never load cuFile, so the file and variable are inert there.

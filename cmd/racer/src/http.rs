@@ -553,6 +553,11 @@ impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
             .metrics
             .record(crate::telemetry::Event::DeliveryDirectBytes, count as u64);
     }
+    fn delivered_bytes(&self, count: usize) {
+        self.delivery
+            .metrics
+            .record(crate::telemetry::Event::DeliveryBytes, count as u64);
+    }
     fn pipe_drained(&self) {
         self.delivery
             .metrics
@@ -741,6 +746,7 @@ pub(crate) mod tests {
                         crate::peer::Config {
                             total: 1,
                             per_peer: 1,
+                            ..Default::default()
                         },
                         metrics.clone(),
                     )
@@ -2522,6 +2528,7 @@ pub(crate) mod tests {
                     crate::peer::Config {
                         total: 1,
                         per_peer: 1,
+                        ..Default::default()
                     },
                     metrics.clone(),
                 )

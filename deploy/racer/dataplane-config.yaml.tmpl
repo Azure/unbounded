@@ -73,7 +73,7 @@ data:
   # Byte admission budgets default to per-I/O-worker amounts that are multiplied
   # by the final I/O worker count, so automatic sizing works on any core count:
   # plaintext 64 MiB, ciphertext 128 MiB, dirty 160 MiB, request context 32 MiB,
-  # and registered 96 MiB (native RDMA only) per worker. Setting a key below
+  # and registered 384 MiB (native RDMA only) per worker. Setting a key below
   # makes it an authoritative node-wide value that is divided across workers;
   # startup fails if it cannot fund at least half of the planned I/O workers.
   # Each worker needs roughly 115 MiB of these byte budgets at minimum

@@ -16,11 +16,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -35,6 +37,8 @@ type options struct {
 	metricsListen  string
 	startDelay     time.Duration
 	duration       time.Duration
+	startAt        int64
+	blobDigests    string
 	catalogImages  int
 	catalogBlobs   int
 	catalogWorkers int
@@ -82,6 +86,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.BoolVar(&opts.pull.DiagnoseIntegrity, "diagnose-integrity", false, "Compare deterministic bytes and retain bounded page hashes on integrity failure (requires verify)")
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
+	f.StringVar(&opts.blobDigests, "trusted-blob-digests", "", "Comma-separated digests computed earlier for the first catalog blobs (same seed and size); skips hashing them at startup")
+	f.IntVar(&opts.pull.PageCredits, "page-credits", 0, "UDS only: pages Racer may send ahead of each read, 0-64 (0 uses the SDK default of 2); bounds Racer's per-read fetch window")
+	f.Int64Var(&opts.pull.RangeBytes, "range-bytes", 0, "UDS only: read each blob as pinned byte ranges of this size, resuming a failed range at its first unread byte (0 reads whole objects); requires verify=false")
+	f.IntVar(&opts.pull.RangeParallel, "range-parallel", 0, "UDS only: concurrent ranges per blob with range-bytes (0 means 1)")
+	f.IntVar(&opts.pull.RangeRetries, "range-retries", 0, "UDS only: resumes allowed per range with range-bytes")
+	f.BoolVar(&opts.pull.RangeRotate, "range-rotate", false, "UDS only: start each process at a host-name-derived range with range-bytes")
+	f.IntVar(&opts.pull.RangeCohorts, "range-cohorts", 0, "UDS only: split processes into this many cohorts by host name; a cohort starts at the same range and cohorts start evenly spaced across the blob (overrides range-rotate)")
+	f.Int64Var(&opts.startAt, "start-at", 0, "Optional Unix time in seconds; after start-delay, wait until then before starting workers so many pods start together")
 
 	if err := f.Parse(args); err != nil {
 		return opts, err
@@ -140,8 +152,16 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, fmt.Errorf("catalog-workers must be in [1, %d]", maxCatalogWorkers)
 	}
 
-	if opts.startDelay < 0 || opts.duration < 0 {
-		return opts, errors.New("start-delay and duration must be nonnegative")
+	if opts.pull.RangeBytes < 0 || opts.pull.RangeParallel < 0 || opts.pull.RangeRetries < 0 || opts.pull.RangeCohorts < 0 {
+		return opts, errors.New("range-bytes, range-parallel, and range-retries must be nonnegative")
+	}
+
+	if opts.pull.RangeBytes > 0 && (opts.pull.Backend != "uds" || opts.pull.Verify || opts.pull.DiagnoseIntegrity) {
+		return opts, errors.New("range-bytes requires backend=uds and verify=false")
+	}
+
+	if opts.startDelay < 0 || opts.duration < 0 || opts.startAt < 0 {
+		return opts, errors.New("start-delay, duration, and start-at must be nonnegative")
 	}
 
 	if opts.catalogImages < 1 || opts.catalogImages > maxCatalogImages {
@@ -288,7 +308,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	if opts.pull.Backend == "s3" {
 		catalog, err = newBlobCatalog(startupCtx, "benchmark/s3", opts.image.Seed, opts.s3.Count, opts.s3.Bytes)
 	} else if opts.catalogBlobs > 0 {
-		catalog, err = newBlobCatalogWithWorkers(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes, opts.catalogWorkers)
+		catalog, err = newBlobCatalogWithWorkers(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes, opts.catalogWorkers, splitDigests(opts.blobDigests)...)
 	} else {
 		catalog, err = newCatalog(startupCtx, opts.image, opts.catalogImages)
 	}
@@ -356,7 +376,7 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 		ready.Store(catalog)
 		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "cache", p.opts.Cache, "concurrency", opts.pull.Concurrency)
 
-		if waitPullDelay(ctx, opts.startDelay) {
+		if waitPullDelay(ctx, opts.startDelay) && waitPullDelay(ctx, untilStart(opts.startAt, time.Now())) {
 			loadCtx := ctx
 
 			if opts.duration > 0 {
@@ -381,4 +401,17 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 	}
 
 	return err
+}
+
+// splitDigests parses a comma-separated digest list; empty yields none.
+func splitDigests(list string) []digest.Digest {
+	var out []digest.Digest
+
+	for _, field := range strings.Split(list, ",") {
+		if field = strings.TrimSpace(field); field != "" {
+			out = append(out, digest.Digest(field))
+		}
+	}
+
+	return out
 }
