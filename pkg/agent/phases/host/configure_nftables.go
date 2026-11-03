@@ -10,11 +10,15 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/reset"
 )
@@ -31,14 +35,26 @@ var nftablesFlushServiceTemplate = template.Must(
 	template.New("nftables-flush.service").Parse(nftablesFlushServiceTmpl),
 )
 
+//go:embed assets/nftables-flush-node.service
+var nftablesFlushNodeServiceTmpl string
+
+var nftablesFlushNodeServiceTemplate = template.Must(
+	template.New("nftables-flush-node.service").Parse(nftablesFlushNodeServiceTmpl),
+)
+
 //go:embed assets/nftables-clear.nft
 var nftablesClearRules []byte
 
 type configureNFTables struct {
 	log *slog.Logger
-	// machineRegistered reports whether any nspawn machine is registered, and
-	// is injectable so the replay behavior can be tested without a host.
+	// machineRegistered reports whether a node is already registered (an nspawn
+	// machine, or the running node units in the other modes), and is injectable
+	// so the replay behavior can be tested without a host.
 	machineRegistered func(context.Context, *slog.Logger) (bool, error)
+	// nodeUnits are the host units of the node stack in the isolation modes
+	// that do not run an nspawn machine. Empty selects the nspawn unit, which
+	// the machines order themselves after.
+	nodeUnits []string
 }
 
 // ConfigureNFTables returns a task that installs a oneshot systemd unit which
@@ -46,7 +62,42 @@ type configureNFTables struct {
 // This ensures stale rules (e.g. left behind by Docker) do not interfere with
 // Kubernetes networking.
 func ConfigureNFTables(log *slog.Logger) phases.Task {
-	return &configureNFTables{log: log, machineRegistered: anyMachineRegistered}
+	return ConfigureNFTablesFor(log, isolation.ModeNSpawn)
+}
+
+// ConfigureNFTablesFor is ConfigureNFTables for an isolation mode. The nspawn
+// mode, and the empty mode, install exactly the unit they always did. The other
+// modes have no nspawn machine to order against and no machined to ask about
+// registered machines (their hosts do not install systemd-container), so the
+// unit is ordered before the node's own units and "is a node running" is
+// answered from those units.
+func ConfigureNFTablesFor(log *slog.Logger, mode isolation.Mode) phases.Task {
+	switch mode {
+	case isolation.ModeNone:
+		units := []string{none.UnitContainerd, none.UnitKubelet}
+
+		return &configureNFTables{log: log, nodeUnits: units, machineRegistered: anyUnitActive(units)}
+	case isolation.ModeContainer:
+		units := []string{container.UnitName(goalstates.NSpawnMachineKube1), container.UnitName(goalstates.NSpawnMachineKube2)}
+
+		return &configureNFTables{log: log, nodeUnits: units, machineRegistered: anyUnitActive(units)}
+	default:
+		return &configureNFTables{log: log, machineRegistered: anyMachineRegistered}
+	}
+}
+
+// anyUnitActive reports whether any of the units is active or starting. A unit
+// that systemctl cannot report as active counts as not running.
+func anyUnitActive(units []string) func(context.Context, *slog.Logger) (bool, error) {
+	return func(ctx context.Context, log *slog.Logger) (bool, error) {
+		for _, unit := range units {
+			if executil.RunCmdAt(ctx, log, slog.LevelDebug, executil.Systemctl(), "is-active", "--quiet", unit) == nil {
+				return true, nil
+			}
+		}
+
+		return false, nil
+	}
 }
 
 // anyMachineRegistered reports whether either node slot is registered. It fails
@@ -82,15 +133,30 @@ func (c *configureNFTables) ensureNFTablesClearRules() error {
 	return utilio.WriteFile(nftablesClearPath, nftablesClearRules, 0o600)
 }
 
+// renderFlushUnit renders the flush unit for the node's isolation mode.
+func (c *configureNFTables) renderFlushUnit() (*bytes.Buffer, error) {
+	var buf bytes.Buffer
+
+	tmpl, data := nftablesFlushServiceTemplate, map[string]string{"NFTablesClearPath": nftablesClearPath}
+	if len(c.nodeUnits) > 0 {
+		tmpl = nftablesFlushNodeServiceTemplate
+		data["Before"] = strings.Join(c.nodeUnits, " ")
+	}
+
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("rendering %s template: %w", nftablesFlushUnit, err)
+	}
+
+	return &buf, nil
+}
+
 // ensureNFTablesFlushUnit installs, enables, and starts the nftables-flush.service
 // oneshot unit. The unit runs nft with the clean rules file before any
 // systemd-nspawn machine starts.
 func (c *configureNFTables) ensureNFTablesFlushUnit(ctx context.Context) error {
-	var buf bytes.Buffer
-	if err := nftablesFlushServiceTemplate.Execute(&buf, map[string]string{
-		"NFTablesClearPath": nftablesClearPath,
-	}); err != nil {
-		return fmt.Errorf("rendering %s template: %w", nftablesFlushUnit, err)
+	buf, err := c.renderFlushUnit()
+	if err != nil {
+		return err
 	}
 
 	unitPath := filepath.Join(goalstates.SystemdSystemDir, nftablesFlushUnit)
@@ -152,7 +218,12 @@ func (c *configureNFTables) shouldStartFlush(ctx context.Context) (bool, error) 
 	}
 
 	if registered {
-		c.log.Info("nspawn machine is registered; leaving the live nftables ruleset alone",
+		what := "nspawn machine"
+		if len(c.nodeUnits) > 0 {
+			what = "node"
+		}
+
+		c.log.Info(what+" is registered; leaving the live nftables ruleset alone",
 			"unit", nftablesFlushUnit,
 		)
 

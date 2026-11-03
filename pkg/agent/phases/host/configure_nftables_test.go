@@ -13,6 +13,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/Azure/unbounded/pkg/agent/isolation"
+	"github.com/Azure/unbounded/pkg/agent/isolation/container"
+	"github.com/Azure/unbounded/pkg/agent/isolation/none"
 )
 
 func nftablesTask(registered bool, err error) *configureNFTables {
@@ -114,5 +118,77 @@ func TestNFTablesFlushUnitOutranksTheImageFirewall(t *testing.T) {
 	// firewall on a host that had deliberately disabled one.
 	for _, dependency := range []string{"Wants=", "Requires=", "BindsTo="} {
 		assert.NotContains(t, unit, dependency+"iptables.service")
+	}
+}
+
+// The nspawn flush unit is rendered from the unchanged template. Before the
+// isolation modes existed that was the only unit; nspawn and the default mode must keep producing it.
+func TestConfigureNFTablesForNSpawnRendersTheOriginalUnit(t *testing.T) {
+	t.Parallel()
+
+	var want bytes.Buffer
+	require.NoError(t, nftablesFlushServiceTemplate.Execute(&want, map[string]string{"NFTablesClearPath": nftablesClearPath}))
+
+	for _, mode := range []isolation.Mode{"", isolation.ModeNSpawn} {
+		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), mode).(*configureNFTables)
+		require.True(t, ok)
+		assert.Empty(t, c.nodeUnits)
+
+		got, err := c.renderFlushUnit()
+		require.NoError(t, err)
+		assert.Equal(t, want.String(), got.String())
+		assert.Contains(t, got.String(), "RequiredBy=systemd-nspawn@.service")
+	}
+
+	plain, ok := ConfigureNFTables(slog.New(slog.DiscardHandler)).(*configureNFTables)
+	require.True(t, ok)
+	assert.Empty(t, plain.nodeUnits)
+}
+
+func TestConfigureNFTablesForHostModesOrdersTheFlushBeforeTheNodeUnits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		mode  isolation.Mode
+		units []string
+	}{
+		{isolation.ModeNone, []string{none.UnitContainerd, none.UnitKubelet}},
+		{isolation.ModeContainer, []string{container.UnitName("kube1"), container.UnitName("kube2")}},
+	}
+
+	for _, tt := range tests {
+		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), tt.mode).(*configureNFTables)
+		require.True(t, ok)
+		assert.Equal(t, tt.units, c.nodeUnits)
+
+		got, err := c.renderFlushUnit()
+		require.NoError(t, err)
+
+		unit := got.String()
+		assert.Contains(t, unit, "Before="+strings.Join(tt.units, " "))
+		assert.Contains(t, unit, "WantedBy=multi-user.target")
+		assert.Contains(t, unit, "After=iptables.service ip6tables.service nftables.service")
+		assert.Contains(t, unit, "ExecStart=/usr/sbin/nft -f "+nftablesClearPath)
+		assert.NotContains(t, unit, "systemd-nspawn")
+	}
+}
+
+// The host modes cannot ask machined: their hosts do not install
+// systemd-container, which is what failed the none bootstrap. They look at the
+// node units instead, and no units active means a fresh host that may flush.
+func TestConfigureNFTablesForHostModesDoesNotNeedMachinectl(t *testing.T) {
+	for _, mode := range []isolation.Mode{isolation.ModeNone, isolation.ModeContainer} {
+		c, ok := ConfigureNFTablesFor(slog.New(slog.DiscardHandler), mode).(*configureNFTables)
+		require.True(t, ok)
+
+		// A unit name no host has: systemctl reports it inactive (or is absent
+		// on a test machine), and neither is an error for the caller.
+		registered, err := anyUnitActive([]string{"unbounded-test-no-such-unit.service"})(t.Context(), slog.New(slog.DiscardHandler))
+		require.NoError(t, err)
+		assert.False(t, registered)
+
+		start, err := c.shouldStartFlush(t.Context())
+		require.NoError(t, err)
+		assert.True(t, start, "nothing in the node units is active on a fresh host")
 	}
 }

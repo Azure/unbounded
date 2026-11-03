@@ -1,0 +1,22 @@
+[Unit]
+Description=Flush nftables rules to a clean state
+# Used for the isolation modes that run the node stack as host units rather than
+# as an nspawn machine (none and container). The node units do not order
+# themselves after this unit, so it orders itself before them: the flush hands a
+# clean ruleset to a node that has not started yet, and must finish before it
+# starts. Before= on a unit that is not installed is a no-op.
+#
+# Some hosts load a default firewall at boot. Azure Container Linux enables
+# iptables.service, which installs an INPUT policy of drop; ordering after it
+# keeps that firewall from being applied after this flush. Ordering after it is
+# a no-op on hosts that do not have it.
+After=iptables.service ip6tables.service nftables.service
+Before={{.Before}}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f {{.NFTablesClearPath}}
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

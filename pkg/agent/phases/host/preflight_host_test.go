@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/isolation"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
@@ -209,7 +210,7 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	deps.stat = statNotExist()
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, isolation.DefaultMode).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 }
@@ -225,7 +226,7 @@ func TestCheckExistingDeploymentFindsTheRecoveryScript(t *testing.T) {
 	deps.stat = statOnlyExists(script)
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, isolation.DefaultMode).Check(context.Background())
 
 	require.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -243,7 +244,7 @@ func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {
 		return "", errors.New("not found")
 	}
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, isolation.DefaultMode).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -258,7 +259,7 @@ func TestCheckExistingDeploymentDetectsPartialArtifact(t *testing.T) {
 	deps.stat = statOnlyExists("/var/lib/machines/kube1")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps, isolation.DefaultMode).Check(context.Background())
 
 	assert.Len(t, results, 1)
 	assert.Equal(t, preflight.SeverityError, results[0].Severity)
@@ -273,7 +274,7 @@ func TestEnsureNoExistingDeploymentReturnsResetInstruction(t *testing.T) {
 	deps.stat = statOnlyExists("/etc/systemd/system/unbounded-agent-daemon.service")
 	deps.outputCmd = outputWith("", errors.New("not found"))
 
-	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps)
+	err := ensureNoExistingDeployment(context.Background(), slog.New(slog.DiscardHandler), deps, isolation.DefaultMode)
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "node reset is needed")
