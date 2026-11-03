@@ -123,7 +123,6 @@ fn check_key(key: &str) -> Result<(), String> {
             && p.len() <= 253
             && p.split('.').all(|l| {
                 !l.is_empty()
-                    && l.len() <= 63
                     && !l.starts_with('-')
                     && !l.ends_with('-')
                     && l.bytes()
@@ -156,4 +155,33 @@ fn label_name(s: &str) -> bool {
         && b[b.len() - 1].is_ascii_alphanumeric()
         && b.iter()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_prefix_matches_kubernetes_dns_subdomain() {
+        // apimachinery limits only the whole prefix (253), not each label.
+        let long = format!("{}.example/key", "a".repeat(64));
+        assert!(check_key(&long).is_ok());
+        let max = format!(
+            "{}/key",
+            [
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(61)
+            ]
+            .join(".")
+        );
+        assert!(check_key(&max).is_ok());
+        let over = format!("{}/key", "a".repeat(254));
+        assert!(check_key(&over).is_err());
+        assert!(check_key("a..b/key").is_err());
+        assert!(check_key("-a.example/key").is_err());
+        assert!(check_key("A.example/key").is_err());
+        assert!(check_key("/key").is_err());
+    }
 }

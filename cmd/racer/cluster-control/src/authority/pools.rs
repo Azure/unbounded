@@ -238,7 +238,6 @@ fn valid_key(s: &str) -> bool {
                 && prefix.split('.').all(|label| {
                     let b = label.as_bytes();
                     !b.is_empty()
-                        && b.len() <= 63
                         && b[0].is_ascii_alphanumeric()
                         && b[b.len() - 1].is_ascii_alphanumeric()
                         && b.iter()
@@ -577,5 +576,29 @@ mod tests {
         assert_eq!(before[0].nodes, Some(BTreeSet::from(["n1".into()])));
         assert_eq!(after[0].nodes, Some(BTreeSet::from(["n2".into()])));
         assert_eq!(before[0].id, after[0].id);
+    }
+
+    #[test]
+    fn key_prefix_matches_kubernetes_dns_subdomain() {
+        // apimachinery limits only the whole prefix (253), not each label.
+        let long = format!("{}.example/key", "a".repeat(64));
+        assert!(valid_key(&long));
+        let max = format!(
+            "{}/key",
+            [
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(61)
+            ]
+            .join(".")
+        );
+        assert!(valid_key(&max));
+        let over = format!("{}/key", "a".repeat(254));
+        assert!(!valid_key(&over));
+        assert!(!valid_key("a..b/key"));
+        assert!(!valid_key("-a.example/key"));
+        assert!(!valid_key("A.example/key"));
+        assert!(!valid_key("/key"));
     }
 }
