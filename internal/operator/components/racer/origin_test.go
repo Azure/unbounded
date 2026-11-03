@@ -799,3 +799,95 @@ func TestOriginEscapesContainerURLVariableReferences(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, spec.args, "--container-url="+testContainerURL)
 }
+
+func TestOriginRestrictToCacheNodeSelector(t *testing.T) {
+	zone := corev1.NodeSelectorRequirement{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}
+	arch := corev1.NodeSelectorRequirement{Key: "arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}
+	required := func(terms ...corev1.NodeSelectorTerm) *corev1.Affinity {
+		return &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: terms}}}
+	}
+	term := func(reqs ...corev1.NodeSelectorRequirement) corev1.NodeSelectorTerm {
+		return corev1.NodeSelectorTerm{MatchExpressions: reqs}
+	}
+	pool := corev1.NodeSelectorRequirement{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu"}}
+
+	tests := []struct {
+		name     string
+		affinity *corev1.Affinity
+		selector *metav1.LabelSelector
+		want     *corev1.Affinity
+	}{
+		{name: "nil selector", affinity: required(term(zone)), want: required(term(zone))},
+		{name: "empty selector", affinity: nil, selector: &metav1.LabelSelector{}, want: nil},
+		{name: "match labels without affinity", selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}, want: required(term(pool))},
+		{
+			name:     "expressions",
+			affinity: required(term(zone)),
+			selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "a", Operator: metav1.LabelSelectorOpIn, Values: []string{"x"}},
+				{Key: "b", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"y"}},
+				{Key: "c", Operator: metav1.LabelSelectorOpExists},
+				{Key: "d", Operator: metav1.LabelSelectorOpDoesNotExist},
+			}},
+			want: required(term(zone,
+				corev1.NodeSelectorRequirement{Key: "a", Operator: corev1.NodeSelectorOpIn, Values: []string{"x"}},
+				corev1.NodeSelectorRequirement{Key: "b", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"y"}},
+				corev1.NodeSelectorRequirement{Key: "c", Operator: corev1.NodeSelectorOpExists},
+				corev1.NodeSelectorRequirement{Key: "d", Operator: corev1.NodeSelectorOpDoesNotExist},
+			)),
+		},
+		{
+			name:     "every existing term",
+			affinity: required(term(zone), term(arch)),
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}},
+			want:     required(term(zone, pool), term(arch, pool)),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := originMirror{affinity: tt.affinity, nodeSelector: map[string]string{"keep": "me"}}
+			got, err := in.clone().restrictTo(tt.selector)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got.affinity)
+			require.Equal(t, map[string]string{"keep": "me"}, got.nodeSelector)
+		})
+	}
+
+	_, err := originMirror{}.restrictTo(&metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "a", Operator: metav1.LabelSelectorOpIn}}})
+	require.ErrorContains(t, err, "invalid spec.nodeSelector")
+}
+
+func TestOriginInvalidNodeSelectorIsIsolated(t *testing.T) {
+	bad := originCache("bad", nil)
+	bad.Spec.NodeSelector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "pool", Operator: metav1.LabelSelectorOpIn}}}
+	good := originCache("good", nil)
+	good.Spec.NodeSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "gpu"}}
+	env := testEnv(t, bad, good)
+	initialize(t, env)
+
+	plan, result := planResult(t, env)
+	require.False(t, result.Ready)
+	require.Equal(t, "OriginInvalid", result.Reason)
+	require.Contains(t, result.Message, "bad (invalid spec.nodeSelector")
+	require.NotContains(t, result.Message, "good")
+
+	found := false
+
+	for _, op := range plan.Operations {
+		require.NotEqual(t, originName("bad"), op.Object.GetName(), "%s", op.Ref())
+
+		if op.Object.GetName() == originName("good") && op.Object.GetKind() == "DaemonSet" {
+			obj := &appsv1.DaemonSet{}
+			require.NoError(t, env.Scheme.Convert(op.Object, obj, nil))
+
+			for _, term := range obj.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+				require.Contains(t, term.MatchExpressions, corev1.NodeSelectorRequirement{Key: "pool", Operator: corev1.NodeSelectorOpIn, Values: []string{"gpu"}})
+			}
+
+			found = true
+		}
+	}
+
+	require.True(t, found, "no good origin DaemonSet in plan:\n%s", plan.Summary())
+}

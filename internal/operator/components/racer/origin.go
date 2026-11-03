@@ -250,6 +250,78 @@ func (m originMirror) clone() originMirror {
 	}
 }
 
+// restrictTo adds the cache's spec.nodeSelector to the required node
+// affinity, so the origin runs only on nodes that hold the cache. Required
+// terms are ORed, so every existing term gets the requirements; with no
+// required affinity, one term is created. The dataplane nodeSelector map is
+// left unchanged. A nil or empty selector leaves m unchanged.
+func (m originMirror) restrictTo(selector *metav1.LabelSelector) (originMirror, error) {
+	reqs, err := nodeSelectorRequirements(selector)
+	if err != nil || len(reqs) == 0 {
+		return m, err
+	}
+
+	if m.affinity == nil {
+		m.affinity = &corev1.Affinity{}
+	}
+
+	if m.affinity.NodeAffinity == nil {
+		m.affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+
+	na := m.affinity.NodeAffinity
+	if na.RequiredDuringSchedulingIgnoredDuringExecution == nil || len(na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
+		na.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{}}}
+	}
+
+	terms := na.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	for i := range terms {
+		terms[i].MatchExpressions = append(terms[i].MatchExpressions, slices.Clone(reqs)...)
+	}
+
+	return m, nil
+}
+
+// nodeSelectorRequirements converts a label selector into node selector
+// requirements. matchLabels become In requirements in sorted key order.
+func nodeSelectorRequirements(selector *metav1.LabelSelector) ([]corev1.NodeSelectorRequirement, error) {
+	if selector == nil {
+		return nil, nil
+	}
+
+	// Validate with the apimachinery parser so errors match Kubernetes.
+	if _, err := metav1.LabelSelectorAsSelector(selector); err != nil {
+		return nil, fmt.Errorf("invalid spec.nodeSelector: %w", err)
+	}
+
+	var reqs []corev1.NodeSelectorRequirement
+
+	for _, key := range slices.Sorted(maps.Keys(selector.MatchLabels)) {
+		reqs = append(reqs, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{selector.MatchLabels[key]}})
+	}
+
+	for _, expr := range selector.MatchExpressions {
+		var op corev1.NodeSelectorOperator
+
+		switch expr.Operator {
+		case metav1.LabelSelectorOpIn:
+			op = corev1.NodeSelectorOpIn
+		case metav1.LabelSelectorOpNotIn:
+			op = corev1.NodeSelectorOpNotIn
+		case metav1.LabelSelectorOpExists:
+			op = corev1.NodeSelectorOpExists
+		case metav1.LabelSelectorOpDoesNotExist:
+			op = corev1.NodeSelectorOpDoesNotExist
+		default:
+			return nil, fmt.Errorf("invalid spec.nodeSelector: unsupported operator %q", expr.Operator)
+		}
+
+		reqs = append(reqs, corev1.NodeSelectorRequirement{Key: expr.Key, Operator: op, Values: slices.Clone(expr.Values)})
+	}
+
+	return reqs, nil
+}
+
 // originPlacement follows the node-level constraints (node affinity, node
 // selector, tolerations) and image pull secrets of the live dataplane
 // DaemonSet, including user overrides, so origins run wherever the dataplane
@@ -483,7 +555,13 @@ func planOrigins(ctx context.Context, env *component.Env, plan *component.Plan) 
 			continue
 		}
 
-		err = planOrigin(ctx, env, plan, cache, spec, mirror.clone())
+		cacheMirror, err := mirror.clone().restrictTo(cache.Spec.NodeSelector)
+		if err != nil {
+			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
+			continue
+		}
+
+		err = planOrigin(ctx, env, plan, cache, spec, cacheMirror)
 		if errors.Is(err, errNotOwned) {
 			invalid = append(invalid, fmt.Sprintf("%s (%v)", cache.Name, err))
 			continue
