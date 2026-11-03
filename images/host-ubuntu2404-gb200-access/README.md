@@ -20,10 +20,9 @@ image:
 NVLink and NVLS are deliberately disabled. Local CUDA and fallback collectives
 remain available.
 
-MetalMan omits its generic vendor user only for the exact
-`ghcr.io/azure/host-ubuntu2404-gb200-access` repository so the baked users
-survive vendor-data merging. Generic and lookalike images retain the existing
-vendor user.
+MetalMan preserves image-baked users for the exact GB200 test and production
+image repositories so they survive vendor-data merging. Generic and lookalike
+images retain the existing vendor user.
 
 The embedded agent is available at:
 

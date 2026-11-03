@@ -181,7 +181,10 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 
 const userDataPath = "cloud-init/user-data"
 
-const gb200AccessImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-access"
+const (
+	gb200TestImageRepository       = "ghcr.io/azure/host-ubuntu2404-gb200-access"
+	gb200ProductionImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167"
+)
 
 // defaultUserData is the minimal cloud-config returned when no custom
 // user-data ConfigMap is configured on the Machine.
@@ -366,7 +369,7 @@ func preservesImageUsers(imageRef string) bool {
 		repository = repository[:colon]
 	}
 
-	return repository == gb200AccessImageRepository
+	return repository == gb200TestImageRepository || repository == gb200ProductionImageRepository
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {

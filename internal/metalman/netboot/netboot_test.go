@@ -1336,6 +1336,22 @@ func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
 	require.True(t, installRequested)
 }
 
+func TestPreservesImageUsers(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		image string
+		want  bool
+	}{
+		{image: gb200TestImageRepository + ":candidate", want: true},
+		{image: gb200ProductionImageRepository + "@sha256:abc", want: true},
+		{image: gb200TestImageRepository + "-other:latest"},
+		{image: "ghcr.io/azure/host-ubuntu2404:latest"},
+	} {
+		require.Equal(t, tt.want, preservesImageUsers(tt.image), tt.image)
+	}
+}
+
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {
