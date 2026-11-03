@@ -132,7 +132,12 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
 	}
+
 	templateData.PreStartCommand, templateData.PostStartCommand = nspawnLifecycleCommands(goalState, machineName)
+	if goalState.UsesLifecycleHelper() {
+		templateData.PreStartRefusedExitCode = goalstates.NSpawnPreStartRefusedExitCode
+	}
+
 	templateData.ApplyGrants(goalState.Grants())
 
 	if n := len(templateData.HostDevicePaths); n > 0 {

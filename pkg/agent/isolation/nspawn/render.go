@@ -77,6 +77,10 @@ type TemplateData struct {
 	// PreStartCommand and PostStartCommand are the lifecycle hooks' commands.
 	PreStartCommand  string
 	PostStartCommand string
+	// PreStartRefusedExitCode is the pre-start exit code that must not be
+	// restarted. It is set only for the agent's lifecycle helper, whose exit
+	// codes the agent controls; zero renders no directive.
+	PreStartRefusedExitCode int
 }
 
 // ApplyGrants fills the device, mount and library fields of d from backend
