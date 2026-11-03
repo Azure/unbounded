@@ -149,8 +149,8 @@ spec:
 | Field | Meaning |
 |-------|---------|
 | `metadataTTL` | Optional. How long object metadata is reused; not negative. Default `30s` |
-| `requestTimeout` | Optional. Limit for each upstream request; positive. Default `1m` |
-| `maxConcurrentRequests` | Optional. Upstream requests for this cache on each node, 1 to 65536. Default `512` |
+| `requestTimeout` | Optional. Limit for each origin operation, including token acquisition and one retry after an authentication challenge; positive. Default `1m` |
+| `maxConcurrentRequests` | Optional. Upstream operations in flight for this cache on each node, 1 to 65536. Operations over the limit fail as overloaded rather than wait. Default `512` |
 | `azure.containerURL` | Required. The one blob container the cache may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
 | `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
 | `azure.credential.default` | The node's managed identity, through the Azure Instance Metadata Service (IMDS). Optional `clientID` selects a user-assigned identity |
@@ -291,7 +291,7 @@ as CPU count or memory, are still checked only by the dataplane at startup.
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
 | `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; 1..1024 |
 | `RACER_CLIENT_CONNECTIONS` | Unset: `64` per final I/O worker | Connection admission; an explicit value is node-wide and divided among I/O workers, 1..65,536. A quarter of each worker's share (less one slot, at least one) bounds its outbound peer and origin connections, so raise it when many concurrent page reads to different peers are refused as `Overloaded` |
-| `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
+| `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer. Also caps connections to each Azure Blob endpoint (scheme, host, and port), which caches in the same storage account share |
 | `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps; each 1..65,536, and the per-neighbor cap at most the in-flight cap |
 | `RACER_PEER_ADMISSION_RECOVERY_MS` | `1000` | Least time between one-slot recoveries of the node-wide peer-exchange limit after local pressure halved it; 1..60,000 ms. Lower values let bulk transfers regain concurrency faster |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |

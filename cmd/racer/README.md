@@ -16,7 +16,9 @@ load the module on the node (`modprobe tls`) or list it in `/etc/modules-load.d`
 
 - `RACER_ORIGIN_TRUST_BUNDLE`: PEM trust roots for origin and token endpoint
   HTTPS. Defaults to `/etc/ssl/certs/ca-certificates.crt`, which the Racer image
-  installs.
+  installs. Loaded on first HTTPS use, so nodes whose origins use only
+  plain HTTP never read it. If it cannot be loaded, HTTPS origin requests fail as
+  unavailable (retried after 30 seconds) and startup is unaffected.
 - `RACER_AZURE_FEDERATED_TOKEN_FILE`: projected service account token for Azure
   workload identity; reread on every token exchange.
 - `RACER_AZURE_AUTHORITY_HOST`: Entra authority for workload identity. Defaults
