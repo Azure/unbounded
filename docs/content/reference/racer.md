@@ -184,9 +184,32 @@ Sidecars attach with `racer.unbounded-cloud.io/object-cache: <ClusterCache name>
 They can read any blob in the cache's container. Racer rejects requests for any
 other container with `403`.
 
-If the spec is not valid, the operator reports `OriginInvalid`. Earlier
-versions ran a `racer-origin-<cache>` DaemonSet and ServiceAccount per cache;
-the operator deletes them on upgrade.
+If the spec is not valid, the operator reports `OriginInvalid`.
+
+#### Upgrading from per-cache origin DaemonSets
+
+Earlier versions ran a `racer-origin-<cache>` DaemonSet and ServiceAccount per
+cache. The operator deletes them on upgrade, and the `racer` dataplane pod
+reads the origin instead. Do these steps before you upgrade:
+
+- **`workloadIdentity` caches.** The old federated credential trusts
+  `system:serviceaccount:<Racer namespace>:racer-origin-<cache>`. That does not
+  cover the new token, so reads fail until the identity also trusts the `racer`
+  ServiceAccount. Add a federated credential to each identity with your cluster's
+  OIDC issuer, subject `system:serviceaccount:<Racer namespace>:racer`, and
+  audience `api://AzureADTokenExchange`. See
+  [Private Containers]({{< relref "guides/azure-blob-cache" >}}#private-containers)
+  for an `az` example. Remove the old `racer-origin-<cache>` credentials after
+  the rollout.
+- **`default` caches.** The dataplane gets tokens from IMDS on its own node. Attach
+  the identity to every Racer node.
+- **`default.secretRef` caches.** This field was removed. Racer cannot read the
+  Secret. If the cluster-control service still sees the field, it rejects the
+  whole catalog and keeps the last published one, so no cache changes take
+  effect. Before you upgrade, change the cache's `credential` to
+  `workloadIdentity` or `default` with an identity attached to the nodes. You
+  can edit `credential` in place; only `containerURL` is immutable. Then delete
+  the Secret if nothing else uses it.
 
 ## Node requirements
 

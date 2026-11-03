@@ -129,6 +129,10 @@ az identity federated-credential create \
   --audience api://AzureADTokenExchange
 ```
 
+If you upgrade from a version that ran a `racer-origin-<cache>` DaemonSet per
+cache, add this credential before you upgrade. See
+[Upgrading from per-cache origin DaemonSets]({{< relref "reference/racer" >}}#upgrading-from-per-cache-origin-daemonsets).
+
 Any cache that names this identity can read what the identity can read.
 Limit who can create ClusterCaches accordingly.
 
