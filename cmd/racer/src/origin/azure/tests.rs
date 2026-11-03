@@ -25,6 +25,7 @@ struct Fake {
     sent: RefCell<Vec<MessageHead>>,
     finished: Rc<Cell<usize>>,
     read: Rc<Cell<usize>>,
+    discarded: Rc<Cell<usize>>,
 }
 
 struct FakeExchange {
@@ -32,6 +33,7 @@ struct FakeExchange {
     body: Vec<u8>,
     finished: Rc<Cell<usize>>,
     read: Rc<Cell<usize>>,
+    discarded: Rc<Cell<usize>>,
 }
 
 impl AzureTransport for Rc<Fake> {
@@ -52,6 +54,7 @@ impl AzureTransport for Rc<Fake> {
                 body: next.body,
                 finished: self.finished.clone(),
                 read: self.read.clone(),
+                discarded: self.discarded.clone(),
             })
         })
     }
@@ -84,11 +87,23 @@ impl AzureExchange for FakeExchange {
             Ok(buffer)
         })
     }
+    fn discard<'a>(self, _scope: &'a RequestScope) -> Operation<'a, ()>
+    where
+        Self: 'a,
+    {
+        self.discarded.set(self.discarded.get() + 1);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Records credentials and returns a token for every non-anonymous one.
+/// `rejections` records `rejected` calls; `retry` is its answer.
 #[derive(Default)]
-struct Tokens(RefCell<Vec<AzureCredential>>);
+struct Tokens(
+    RefCell<Vec<AzureCredential>>,
+    RefCell<Vec<(Option<Vec<u8>>, bool)>>,
+    Cell<bool>,
+);
 
 impl AzureTokenSource for Rc<Tokens> {
     fn bearer<'a>(
@@ -103,6 +118,12 @@ impl AzureTokenSource for Rc<Tokens> {
                 _ => Some(BearerToken::new(b"secret-token".to_vec())?),
             })
         })
+    }
+    fn rejected(&self, _: &AzureCredential, challenge: Option<&[u8]>, sent: bool) -> bool {
+        self.1
+            .borrow_mut()
+            .push((challenge.map(<[u8]>::to_vec), sent));
+        self.2.get()
     }
 }
 
@@ -972,4 +993,46 @@ mod router {
         assert_eq!(adapter.0.get(), 1);
         assert!(fake.sent.borrow().is_empty());
     }
+}
+
+#[test]
+fn unauthorized_retries_once_when_the_token_source_allows() {
+    let h = harness();
+    let context = context("k", "");
+    let challenge: &[u8] =
+        b"Bearer authorization_uri=https://login.microsoftonline.com/t/oauth2/authorize";
+    h.push(
+        401,
+        &[("Content-Length", b"0"), ("WWW-Authenticate", challenge)],
+        Vec::new(),
+    );
+    assert_eq!(
+        h.metadata(&context, MetadataSelector::Fresh).map(|_| ()),
+        Err(Error::OriginRejected)
+    );
+    assert_eq!(*h.tokens.1.borrow(), vec![(Some(challenge.to_vec()), true)]);
+    assert_eq!(h.fake.discarded.get(), 1);
+    h.tokens.2.set(true);
+    for _ in 0..2 {
+        h.push(
+            401,
+            &[("Content-Length", b"0"), ("WWW-Authenticate", challenge)],
+            Vec::new(),
+        );
+    }
+    h.blob(200, 4, None, &[]);
+    // Retried once, then the second 401 is final.
+    assert_eq!(
+        h.metadata(&context, MetadataSelector::Fresh).map(|_| ()),
+        Err(Error::OriginRejected)
+    );
+    assert_eq!(
+        h.metadata(&context, MetadataSelector::Fresh)
+            .unwrap()
+            .metadata
+            .length,
+        4
+    );
+    assert_eq!(h.tokens.1.borrow().len(), 2);
+    assert_eq!(h.fake.sent.borrow().len(), 4);
 }

@@ -88,6 +88,12 @@ pub trait AzureTokenSource {
         credential: &'a AzureCredential,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<BearerToken>>;
+
+    /// Storage answered 401 to a request for `credential`. `challenge` is its
+    /// `WWW-Authenticate` value and `sent` whether the request carried a bearer
+    /// token. Drop a rejected token or learn a tenant from the challenge, and
+    /// return whether one retry may succeed. The origin retries at most once.
+    fn rejected(&self, credential: &AzureCredential, challenge: Option<&[u8]>, sent: bool) -> bool;
 }
 
 /// Token source for deployments without credential providers: anonymous
@@ -107,6 +113,10 @@ impl AzureTokenSource for AnonymousOnly {
                 _ => Err(Error::Unavailable),
             }
         })
+    }
+
+    fn rejected(&self, _: &AzureCredential, _: Option<&[u8]>, _: bool) -> bool {
+        false
     }
 }
 
@@ -145,6 +155,12 @@ pub trait AzureExchange {
         buffer: PlaintextBuffer,
         scope: &'a RequestScope,
     ) -> Operation<'a, PlaintextBuffer>
+    where
+        Self: 'a;
+
+    /// Give up on an error response. Implementations may read a small,
+    /// length-framed body to keep the connection; otherwise it is abandoned.
+    fn discard<'a>(self, scope: &'a RequestScope) -> Operation<'a, ()>
     where
         Self: 'a;
 }
@@ -271,14 +287,9 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             .unwrap_or(scope.deadline.0);
         scope.deadline = Deadline(scope.deadline.0.min(limit));
         scope.check()?;
-        let token = self
-            .tokens
-            .bearer(&definition.azure.credential, &scope)
-            .await?;
         Ok(Begun {
             object,
             scope,
-            token,
             _permit: permit,
         })
     }
@@ -292,21 +303,47 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
         if_match: Option<&StrongEtag>,
     ) -> Result<T::Exchange> {
         let url = &definition.azure.container_url;
-        let head = request::head(
-            url,
-            &begun.object,
-            method,
-            range,
-            if_match,
-            begun.token.as_ref().map(BearerToken::as_bytes),
-        )?;
-        let exchange = self
-            .transport
-            .exchange(url, head, &begun.scope)
-            .await
-            .map_err(transport_error)?;
-        begun.scope.check()?;
-        Ok(exchange)
+        let credential = &definition.azure.credential;
+        let mut retried = false;
+        loop {
+            let token = self.tokens.bearer(credential, &begun.scope).await?;
+            let head = request::head(
+                url,
+                &begun.object,
+                method,
+                range,
+                if_match,
+                token.as_ref().map(BearerToken::as_bytes),
+            )?;
+            let sent = token.is_some();
+            drop(token);
+            let exchange = self
+                .transport
+                .exchange(url, head, &begun.scope)
+                .await
+                .map_err(transport_error)?;
+            begun.scope.check()?;
+            if retried || status(exchange.head())? != 401 {
+                return Ok(exchange);
+            }
+            // Expired or revoked tokens, and workload identity before its
+            // tenant is known, earn one retry. Anything else is final.
+            let challenge = response::field(exchange.head(), "WWW-Authenticate")
+                .ok()
+                .flatten();
+            if !self.tokens.rejected(credential, challenge, sent) {
+                return Ok(exchange);
+            }
+            let _ = exchange.discard(&begun.scope).await;
+            retried = true;
+        }
+    }
+
+    /// Classify an error response, then release its connection.
+    async fn reject(&self, exchange: T::Exchange, pinned: bool, scope: &RequestScope) -> Error {
+        let error = classify(exchange.head(), pinned);
+        let _ = exchange.discard(scope).await;
+        error
     }
 
     async fn read(
@@ -368,7 +405,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             }
             // The range is unsatisfiable only for an empty blob.
             416 => {
-                drop(exchange);
+                let _ = exchange.discard(&begun.scope).await;
                 let metadata = self.head(definition, &begun, &context.object, None).await?;
                 if metadata.length != 0 {
                     // Replaced between the two requests; let the caller retry.
@@ -379,7 +416,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
                     page_zero: None,
                 });
             }
-            _ => return Err(classify(head, false)),
+            _ => return Err(self.reject(exchange, false, &begun.scope).await),
         };
         let metadata = metadata(
             &context.object,
@@ -420,7 +457,7 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             .await?;
         let head = exchange.head();
         if status(head)? != 200 {
-            return Err(classify(head, pin.is_some()));
+            return Err(self.reject(exchange, pin.is_some(), &begun.scope).await);
         }
         let blob = response::blob(head, &begun.object)?;
         // Recheck the pin even if the service ignored If-Match.
@@ -490,11 +527,10 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             )
             .await?;
         let head = exchange.head();
-        if status(head)? != 206 {
-            return Err(match status(head)? {
-                200 => Error::Internal,
-                _ => classify(head, true),
-            });
+        match status(head)? {
+            206 => {}
+            200 => return Err(Error::Internal),
+            _ => return Err(self.reject(exchange, true, &begun.scope).await),
         }
         let blob = response::blob(head, &begun.object)?;
         if blob.etag != page.version.etag {
@@ -528,7 +564,6 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
 struct Begun {
     object: AzureObject,
     scope: RequestScope,
-    token: Option<BearerToken>,
     _permit: AzurePermit,
 }
 
