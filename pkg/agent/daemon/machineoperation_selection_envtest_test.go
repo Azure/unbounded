@@ -5,9 +5,12 @@ package daemon
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -73,9 +77,35 @@ func TestEnvtestMachineOperationSelection(t *testing.T) {
 	assert.ElementsMatch(t, []string{"own", "selector"}, machineOperationNames(ops))
 
 	t.Run("caches", func(t *testing.T) {
-		mgr, err := ctrl.NewManager(cfg, manager.Options{
+		// Record every list or watch of MachineOperations that the API server
+		// does not filter, which would download every operation in the cluster.
+		var (
+			mu         sync.Mutex
+			unfiltered []string
+		)
+
+		mgrCfg := rest.CopyConfig(cfg)
+		mgrCfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet &&
+					strings.HasSuffix(req.URL.Path, "/machineoperations") &&
+					!strings.Contains(req.URL.Query().Get("fieldSelector"), machinav1alpha3.MachineOperationMachineRefField) {
+					mu.Lock()
+
+					unfiltered = append(unfiltered, req.URL.String())
+					mu.Unlock()
+				}
+
+				return rt.RoundTrip(req)
+			})
+		})
+
+		mgr, err := ctrl.NewManager(mgrCfg, manager.Options{
 			Scheme:  scheme,
 			Metrics: metricsserver.Options{BindAddress: "0"},
+			// As in the agent daemon, read MachineOperations from the API
+			// server rather than from an informer over every operation.
+			Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&machinav1alpha3.MachineOperation{}}}},
 		})
 		require.NoError(t, err)
 
@@ -89,8 +119,21 @@ func TestEnvtestMachineOperationSelection(t *testing.T) {
 			"machine-1",
 			"node-1",
 			MachineOperationHandlers{
-				machinav1alpha3.OperationNodeReboot: func(_ context.Context, _ MachineOperationStore[int64], op MachineOperation) (ctrl.Result, error) {
+				machinav1alpha3.OperationNodeReboot: func(ctx context.Context, store MachineOperationStore[int64], op MachineOperation) (ctrl.Result, error) {
+					if err := store.MarkInProgress(ctx, op, "rebooting"); err != nil {
+						return ctrl.Result{}, err
+					}
+
+					if err := store.Finish(ctx, op, MachineOperationResult[int64]{
+						Phase:   machinav1alpha3.OperationPhaseComplete,
+						Reason:  "Succeeded",
+						Message: "rebooted",
+					}); err != nil {
+						return ctrl.Result{}, err
+					}
+
 					dispatched <- op.Name
+
 					return ctrl.Result{}, nil
 				},
 			},
@@ -135,6 +178,21 @@ func TestEnvtestMachineOperationSelection(t *testing.T) {
 		}
 
 		assert.ElementsMatch(t, []string{"own", "selector"}, names)
+
+		for name, phase := range map[string]machinav1alpha3.OperationPhase{
+			"own":      machinav1alpha3.OperationPhaseComplete,
+			"selector": machinav1alpha3.OperationPhaseComplete,
+			"other":    "",
+		} {
+			var op machinav1alpha3.MachineOperation
+			require.NoError(t, c.Get(ctx, client.ObjectKey{Name: name}, &op))
+			assert.Equal(t, phase, op.Status.Phase, name)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		assert.Empty(t, unfiltered, "the daemon listed or watched every MachineOperation")
 	})
 
 	t.Run("fallback", func(t *testing.T) {
@@ -158,4 +216,10 @@ func TestEnvtestMachineOperationSelection(t *testing.T) {
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []string{"own", "selector"}, machineOperationNames(ops))
 	})
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
