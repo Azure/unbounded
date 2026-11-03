@@ -785,6 +785,130 @@ fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
     assert_eq!(index.hold_expiry(&id.version), None);
     assert!(f.store.writer.waiters.borrow().is_empty());
 }
+fn assert_prefetch_released(f: &Fixture) {
+    assert_eq!(f.store.writer.pending_count(), 0);
+    assert_eq!(f.store.writer.queued_count(), 0);
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    assert!(f.store.writer.waiters.borrow().is_empty());
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    f.store.writer.reclaim_idle_buffer();
+    assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+}
+
+#[test]
+fn prefetch_cancel_before_submission_removes_queued_ticket() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    // A busy background writer keeps the copy queued and unsubmitted.
+    f.store.writer.busy.set(true);
+    let busy = Busy(&f.store.writer);
+    let request = scope();
+    let mut prefetch = f.store.writer.persist_prefetched(copy, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(prefetch.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.pending_count(), 1);
+    assert_eq!(f.store.writer.waiters.borrow().len(), 1);
+    request.cancel().unwrap();
+    assert!(prefetch.as_mut().poll(&mut cx).is_pending());
+    drop(busy);
+    assert_eq!(
+        prefetch.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    );
+    drop(prefetch);
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    assert_prefetch_released(&f);
+}
+
+#[test]
+fn prefetch_cancel_waits_for_accepted_write() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    simulation.inject("write", Fault::Delay(6)).unwrap();
+    let request = scope();
+    let mut prefetch = f.store.writer.persist_prefetched(copy, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(prefetch.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.store.writer.writes_in_flight(), 1);
+    request.cancel().unwrap();
+    for _ in 0..4 {
+        assert!(prefetch.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(f.store.writer.writes_in_flight(), 1);
+    }
+    assert_eq!(drive(&f.reactor, prefetch), Err(Error::Cancelled));
+    assert_eq!(f.store.writer.writes_in_flight(), 0);
+    let _ = f.store.writer.index().lookup(&id).unwrap();
+    assert_prefetch_released(&f);
+}
+
+#[test]
+fn prefetch_write_failure_is_not_admitted() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    let simulation = Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
+    // Progress absorbs cache I/O failures, so the caller sees no admission.
+    assert_eq!(
+        drive(
+            &f.reactor,
+            f.store.writer.persist_prefetched(copy, &scope())
+        ),
+        Err(Error::Unavailable)
+    );
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    assert_prefetch_released(&f);
+    // The failure is not sticky: a retry persists the copy.
+    drive(
+        &f.reactor,
+        f.store.writer.persist_prefetched(f.copy(1, 113), &scope()),
+    )
+    .unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+}
+
+#[test]
+fn prefetch_unheld_queued_copy_discarded_is_not_admitted() {
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
+    let _environment = simulation.enter();
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let copy = f.copy(1, 113);
+    let id = copy.ciphertext.envelope().page.clone();
+    f.store.writer.busy.set(true);
+    let busy = Busy(&f.store.writer);
+    let request = scope();
+    let mut prefetch = f.store.writer.persist_prefetched(copy, &request);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(prefetch.as_mut().poll(&mut cx).is_pending());
+    // Without a hold, the queued copy is discardable under pressure.
+    assert_eq!(f.store.writer.discard_unsubmitted(), 1);
+    drop(busy);
+    assert_eq!(
+        prefetch.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Unavailable))
+    );
+    drop(prefetch);
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+    assert_prefetch_released(&f);
+}
+
 #[test]
 fn disk_observability_publication_read_and_pending_cleanup() {
     let f = Fixture::new();
