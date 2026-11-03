@@ -26,8 +26,16 @@ use std::time::Instant;
 /// Signed `Accept` extension naming the receiver's in-band grant.
 pub const GRANT_HEADER: &str = "racer-rdma-grant";
 
-/// Page buffer length: `MAX_CIPHERTEXT` rounded up to 4 KiB.
-pub const BUFFER_LEN: usize = (MAX_CIPHERTEXT + 4095) & !4095;
+/// Page buffer length: `MAX_CIPHERTEXT` rounded up to 2 MiB.
+///
+/// Whole 2 MiB pages keep every buffer huge-page aligned, which devices without
+/// memory windows need: their grants register the granted buffer itself, and
+/// a registration covering whole huge pages is cheap and still ends inside the
+/// buffer (see `bind` in `verbs/native/verbs.c`).
+pub const BUFFER_LEN: usize = (MAX_CIPHERTEXT + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+
+/// Huge page size buffers are aligned to.
+const HUGE_PAGE: usize = 2 << 20;
 
 /// A ready link with no grant, write, or release this long closes.
 pub const LINK_IDLE: Duration = Duration::from_secs(120);
