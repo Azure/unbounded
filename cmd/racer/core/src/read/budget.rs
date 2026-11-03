@@ -395,8 +395,10 @@ mod budget_tests {
 }
 
 // Overflow fan-out for hot pages. An owner streaming [`hot_page_bodies`] bodies sheds further
-// readers ([`shed_hot_page`]); a shed non-owner asks one of the page's [`fanout_width`] hash-chosen
-// helpers ([`crate::read::walk::WalkConfig::helper`]). A helper probe carries at most
+// readers ([`shed_hot_page`]), except its column mates in the page's pool and the other owners; a
+// shed non-owner asks its mesh helper ([`mesh_helper`], [`crate::read::walk::WalkConfig::helper`]):
+// the middle node of its primary path to the owner, a column mate of the owner. [`fanout_helper`]
+// and [`is_helper`] are the v1 hashed helpers, kept for comparison. A helper probe carries at most
 // [`HELPER_ATTEMPTS`] and only walks starting with [`HELPER_MIN_ATTEMPTS`] may ask one, so requests
 // never chain. Helpers are non-owners, so they never reach origin.
 
@@ -473,13 +475,14 @@ pub const fn hot_page_bodies(page_bytes: u64) -> usize {
 /// Whether `local` sheds `requester`'s request for a page it is already writing to at least
 /// `threshold` requesters ([`hot_page_bodies`]), when that page is at least half of the `all`
 /// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop). Only one
-/// of the first three ranked `owners` sheds, and never sheds another owner or one of the page's
-/// helpers (`helper`, evaluated last), so the owner's NIC feeds at most [`fanout_width`] helpers.
+/// of the first three ranked `owners` sheds, and never sheds another owner or an `exempt`
+/// requester (evaluated last). With mesh helpers, `exempt` is true for `local`'s column mates in
+/// the page's pool, so the owner's NIC feeds at most one column.
 pub fn shed_hot_page<N: PartialEq>(
     owners: &[N],
     local: &N,
     requester: &N,
-    helper: impl FnOnce() -> bool,
+    exempt: impl FnOnce() -> bool,
     streaming: usize,
     all: usize,
     threshold: usize,
@@ -489,11 +492,28 @@ pub fn shed_hot_page<N: PartialEq>(
         && streaming * 2 >= all
         && owners.contains(local)
         && !owners.contains(requester)
-        && !helper()
+        && !exempt()
 }
 
-/// Whether the member at `position` is one of `page`'s helpers (any reader
-/// may pick it; see [`fanout_helper`]). At most [`fanout_width`] hashes.
+/// The helper a shed reader asks: for the first of the (at most three) ranked `owners` whose
+/// `helper_of(owner)` exists and is not `excluded`, that helper. `helper_of` is the middle node
+/// of the reader's primary mesh path to the owner (`delegate(reader, column(owner))`), so it is a
+/// column mate of the owner and a direct neighbor of the reader. `excluded` must be true for the
+/// reader and the page's owners. `None` when the reader shares a column with every owner, or no
+/// helper is eligible: the reader then has no helper to ask.
+pub fn mesh_helper<N>(
+    owners: &[N],
+    helper_of: impl Fn(&N) -> Option<N>,
+    excluded: impl Fn(&N) -> bool,
+) -> Option<N> {
+    owners[..owners.len().min(3)]
+        .iter()
+        .filter_map(helper_of)
+        .find(|helper| !excluded(helper))
+}
+
+/// v1: whether the member at `position` is one of `page`'s hashed helpers (any
+/// reader may pick it; see [`fanout_helper`]). At most [`fanout_width`] hashes.
 pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: usize) -> bool {
     let cache = object.cache.0.as_bytes();
     let key = &object.key.0[..];
@@ -502,6 +522,7 @@ pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: 
         .any(|j| fnv(&[cache, key, &number, &j.to_le_bytes()]) as usize % members == position)
 }
 
+/// v1 hashed helper (superseded by [`mesh_helper`]).
 /// Position (in membership order) of the member `requester` asks to acquire `page` for it, or
 /// `None` when the membership has no eligible helper. `excluded(position)` must be true for the
 /// page's owners and the requester. Starting at `hash(requester, page) % width`, takes the first
@@ -624,6 +645,26 @@ mod fanout_tests {
             helpers += usize::from(is_helper(&object(), PageNumber(9), p, members));
         }
         assert!(helpers <= fanout_width(members), "{helpers}");
+    }
+
+    #[test]
+    fn mesh_helper_is_the_first_eligible_owner_delegate() {
+        // Reader 9; owner 1 shares its column (no helper), owner 2's delegate is 20.
+        let delegate = |owner: &u32| match owner {
+            1 => None,
+            2 => Some(20),
+            3 => Some(30),
+            4 => Some(40),
+            _ => unreachable!("only the first three owners are asked"),
+        };
+        let excluded = |node: &u32| [9, 1, 2, 3].contains(node);
+        assert_eq!(mesh_helper(&[1, 2, 3, 4], delegate, excluded), Some(20));
+        // A delegate that is itself an owner or the reader is skipped.
+        let delegate = |owner: &u32| Some(if *owner == 2 { 3 } else { 9 });
+        assert_eq!(mesh_helper(&[1, 2, 3], delegate, excluded), None);
+        // Sharing a column with every owner: no helper.
+        assert_eq!(mesh_helper(&[1, 2, 3], |_| None, excluded), None::<u32>);
+        assert_eq!(mesh_helper(&[], |_: &u32| Some(5), |_| false), None);
     }
 
     #[test]

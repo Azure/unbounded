@@ -22,7 +22,7 @@ use racer_core::liveness::{
 use racer_core::read::Error;
 use racer_core::read::Source;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
-use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
+use racer_core::read::budget::{hot_page_bodies, mesh_helper, shed_hot_page};
 use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
     Due, NOTICE_LINKS, OfferEnd, notice_indexes, notice_target, should_notice,
@@ -623,6 +623,21 @@ fn err_name(e: Error) -> &'static str {
         Error::Io => "error_io",
         Error::Os(_) => "error_os",
     }
+}
+
+/// Whether `a` and `b` share a column of the default pool (production
+/// `Membership::same_column`).
+fn column_mates(members: &Members, a: u32, b: u32) -> bool {
+    let (Some(a), Some(b)) = (
+        members.position(&a.to_be_bytes()),
+        members.position(&b.to_be_bytes()),
+    ) else {
+        return false;
+    };
+    members
+        .pools()
+        .first()
+        .is_some_and(|pool| pool.same_column(a, b))
 }
 
 /// Bodies in `map[key]` still streaming at `now`; drops finished ones.
@@ -3504,23 +3519,23 @@ impl NodeWorld {
     }
 
     /// The member fill `id`'s node asks to acquire its page (production
-    /// `CandidatePolicy::fanout_helper`): one of the page's helpers, never an owner or the node
-    /// itself, preferring a direct overlay neighbor.
+    /// `CandidatePolicy::fanout_helper`): the middle node of its primary mesh path to an owner,
+    /// never an owner or the node itself. The simulator has one default pool.
     fn fanout_helper(&self, id: u64) -> Option<u32> {
         let fill = &self.fills[&id];
-        let (node, page) = (fill.node, fill.page);
+        let node = fill.node;
         let members = &self.versions.get(fill.core.version)?.members;
-        let me = members.position(&node.to_be_bytes());
-        let at = |p: usize| members.members()[p].node;
-        fanout_helper(
-            &self.ids.object(page),
-            self.ids.number(page),
-            self.ids.node(node),
-            members.members().len(),
-            |p| at(p) == node || fill.core.owners.contains(&at(p)),
-            |p| me.is_some_and(|me| members.is_neighbor(me, p)),
+        let pool = members.pools().first()?;
+        let me = members.position(&node.to_be_bytes())?;
+        let owners: Vec<u32> = fill.core.owners.iter().copied().collect();
+        mesh_helper(
+            &owners,
+            |owner| {
+                let owner = members.position(&owner.to_be_bytes())?;
+                pool.helper(me, owner).map(|p| members.members()[p].node)
+            },
+            |n| *n == node || owners.contains(n),
         )
-        .map(at)
     }
 
     /// Bodies of one page an owner streams before it may shed (production `hot_page_threshold`).
@@ -3533,8 +3548,8 @@ impl NodeWorld {
 
     /// Production hot-page shed (`racer_core::read::budget::shed_hot_page`): an owner already
     /// streaming [`Self::hot_page_threshold`] bodies of `page`, at least half of all bodies it
-    /// streams, answers `Overloaded` to a requester that is neither an owner nor a helper of the
-    /// page.
+    /// streams, answers `Overloaded` to a requester that is neither an owner nor in the owner's
+    /// column.
     fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
         let now = self.now();
         let streaming = live_ends(&mut self.streaming, (dest, page), now);
@@ -3552,14 +3567,15 @@ impl NodeWorld {
         let Some(members) = self.versions.get(version).map(|v| &v.members) else {
             return false;
         };
-        let helper = || {
-            members.position(&requester.to_be_bytes()).is_some_and(|p| {
-                let (object, number) = (self.ids.object(page), self.ids.number(page));
-                is_helper(&object, number, p, members.members().len())
-            })
-        };
+        let column_mate = || column_mates(members, dest, requester);
         shed_hot_page(
-            &owners, &dest, &requester, helper, streaming, all, threshold,
+            &owners,
+            &dest,
+            &requester,
+            column_mate,
+            streaming,
+            all,
+            threshold,
         )
     }
 
@@ -5129,20 +5145,11 @@ mod shed_tests {
         assert_eq!(owners.len(), 3);
         let owner = owners[0];
         assert!(world.owners_at(owner, w, page, false).is_empty());
-        let helper = |n: u32| {
-            members.position(&n.to_be_bytes()).is_some_and(|p| {
-                is_helper(
-                    &world.ids.object(page),
-                    world.ids.number(page),
-                    p,
-                    members.members().len(),
-                )
-            })
-        };
+        let mate = |n: u32| column_mates(&members, owner, n);
         let reader = (0..nodes)
-            .find(|n| !owners.contains(n) && !helper(*n) && *n != ranker)
+            .find(|n| !owners.contains(n) && !mate(*n) && *n != ranker)
             .unwrap();
-        let helper_node = (0..nodes).find(|n| !owners.contains(n) && helper(*n));
+        let helper_node = (0..nodes).find(|n| !owners.contains(n) && mate(*n) && *n != owner);
         let threshold = world.hot_page_threshold();
         let busy = vec![SECONDS; threshold];
         world.streaming.insert((owner, page), busy.clone());
@@ -5150,7 +5157,7 @@ mod shed_tests {
         assert!(world.shed_hot(owner, reader, page));
         assert!(!world.shed_hot(owner, owners[1], page), "owners are exempt");
         if let Some(h) = helper_node {
-            assert!(!world.shed_hot(owner, h, page), "helpers are exempt");
+            assert!(!world.shed_hot(owner, h, page), "column mates are exempt");
         }
         // A non-owner never sheds, cached ranking or not.
         let busy = vec![SECONDS; threshold];

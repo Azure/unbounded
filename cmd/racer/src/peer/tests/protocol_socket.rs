@@ -1907,7 +1907,6 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use racer_core::read::budget::is_helper;
     use std::cell::Cell;
     use std::num::NonZeroU32;
     let hot = crate::peer::server::hot_page_threshold();
@@ -1931,25 +1930,34 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let mut nodes: Vec<String> = [A, B, C].iter().map(|n| (*n).to_owned()).collect();
-    nodes.extend((4..16).map(|i| format!("{i:08}-1111-4111-8111-111111111111")));
-    let membership = Arc::new(
-        Membership::validate(
-            MembershipVersion(1),
-            nodes
-                .iter()
-                .enumerate()
-                .map(|(i, n)| Member {
-                    node: NodeId(n.clone()),
-                    shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
-                    rails: vec![],
-                    site: String::new(),
-                })
-                .collect(),
+    // More than 64 members, so the pool has several columns, and A is not
+    // in C's column: C sheds A (column mates are never shed).
+    let build = |count: usize| {
+        let mut nodes: Vec<String> = [A, B, C].iter().map(|n| (*n).to_owned()).collect();
+        nodes.extend((4..count).map(|i| format!("{i:08}-1111-4111-8111-111111111111")));
+        Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| Member {
+                        node: NodeId(n.clone()),
+                        shares: NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                        rails: vec![],
+                        site: String::new(),
+                    })
+                    .collect(),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    );
+    };
+    let membership = (80..400)
+        .step_by(16)
+        .map(build)
+        .find(|m| !m.same_column(&CacheId(CACHE.into()), &NodeId(C.into()), &NodeId(A.into())))
+        .expect("A outside C's column");
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
@@ -1993,30 +2001,22 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
         },
         number: PageNumber(number),
     };
-    // Pages C owns, split by whether requester A is an owner or a helper.
+    // Pages C owns that A does not, and pages neither owns.
     let placement = crate::topology::Placement::new(64);
-    let a = membership.position(&NodeId(A.into())).unwrap();
     let mut shed_page = None;
-    let mut helper_page = None;
     let mut foreign_page = None;
     for number in 0..4096 {
         let owners = placement
             .rank(membership.clone(), &object, PageNumber(number))
             .ordered;
         let owns = |n: &str| owners.contains(&NodeId(n.into()));
-        let helper = is_helper(&object, PageNumber(number), a, membership.members().len());
-        match (owns(C), owns(A), helper) {
-            (true, false, false) => shed_page = shed_page.or(Some(number)),
-            (true, false, true) => helper_page = helper_page.or(Some(number)),
-            (false, false, false) => foreign_page = foreign_page.or(Some(number)),
+        match (owns(C), owns(A)) {
+            (true, false) => shed_page = shed_page.or(Some(number)),
+            (false, false) => foreign_page = foreign_page.or(Some(number)),
             _ => {}
         }
     }
-    let (shed_page, helper_page, foreign_page) = (
-        shed_page.unwrap(),
-        helper_page.expect("A helps some page C owns"),
-        foreign_page.unwrap(),
-    );
+    let (shed_page, foreign_page) = (shed_page.unwrap(), foreign_page.unwrap());
     let mut attempt = 0u8;
     let mut ask = |number: u64| {
         attempt += 1;
@@ -2042,7 +2042,7 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     assert_eq!(calls.get(), 1);
     drop(held);
     assert_eq!(server.streaming(&page_id(shed_page)), (0, 0));
-    // At the threshold a non-owner, non-helper reader is shed unserved.
+    // At the threshold a non-owner outside C's column is shed unserved.
     let held = server.hold_streaming(&page_id(shed_page), hot);
     assert_eq!(server.streaming(&page_id(shed_page)), (hot, hot));
     assert!(ask(shed_page));
@@ -2052,13 +2052,8 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     assert!(!ask(shed_page));
     assert_eq!(calls.get(), 2);
     drop((held, other));
-    // A helper of the page is always served.
-    let held = server.hold_streaming(&page_id(helper_page), hot);
-    assert!(!ask(helper_page));
-    assert_eq!(calls.get(), 3);
-    drop(held);
     // A node that does not own the page (for example a helper) never sheds.
     let _held = server.hold_streaming(&page_id(foreign_page), hot);
     assert!(!ask(foreign_page));
-    assert_eq!(calls.get(), 4);
+    assert_eq!(calls.get(), 3);
 }

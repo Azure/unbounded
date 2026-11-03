@@ -395,16 +395,17 @@ impl PeerServer {
 
     /// Whether to answer a page request with `Overloaded` because this node owns the page and is
     /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
-    /// all the bodies it is writing. The requester then asks one of the page's helpers, which,
-    /// like the page's owners, is never shed. The ranking is only computed for a page that is
-    /// already hot, and stays in this server's placement cache.
+    /// all the bodies it is writing. The page's other owners and this node's column mates in the
+    /// page's pool are never shed: the column mates are the helpers shed readers ask, so owner
+    /// fan-in for one page stays bounded by the column size. The ranking is only computed for a
+    /// page that is already hot, and stays in this server's placement cache.
     fn shed_hot_page(
         &self,
         page: &crate::model::PageId,
         requester: &racer_control_wire::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        use racer_core::read::budget::{is_helper, shed_hot_page};
+        use racer_core::read::budget::shed_hot_page;
         let threshold = hot_page_threshold();
         let (streaming, all) = self.streaming(page);
         if streaming < threshold {
@@ -412,17 +413,13 @@ impl PeerServer {
         }
         let (object, number) = (&page.version.object, page.number);
         let owners = self.placement.rank(membership.clone(), object, number);
-        let helper = || {
-            membership
-                .position(requester)
-                .is_ok_and(|p| is_helper(object, number, p, membership.members().len()))
-        };
         let local = &self.relay.network.local;
+        let column_mate = || membership.same_column(&object.cache, local, requester);
         shed_hot_page(
             &owners.ordered,
             local,
             requester,
-            helper,
+            column_mate,
             streaming,
             all,
             threshold,
