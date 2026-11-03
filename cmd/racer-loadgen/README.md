@@ -220,7 +220,9 @@ These flags help when many nodes load one very large blob, such as 1 TB:
   unread byte, up to `--range-retries` times, and counts in
   `racer_loadgen_range_resumes_total`. `--range-rotate` starts each pod at a
   range derived from its host name, so nodes do not all request the same
-  pages at the same moment.
+  pages at the same moment. `--range-cohorts=K` instead splits pods into K
+  cohorts (by the trailing number of `--node-name` when it has one); a cohort
+  starts at the same range, and cohorts start evenly spaced across the blob.
 
 ## Memory and measurement
 
