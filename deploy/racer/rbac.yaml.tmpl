@@ -17,6 +17,8 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # The primary watches ClusterCaches. Seats GET one per admission review to
+  # check that it exists and read its nodeSelector.
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercaches"]
     verbs: ["get", "list", "watch"]
