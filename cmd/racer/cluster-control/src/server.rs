@@ -1013,7 +1013,7 @@ async fn webhook_connection(
                     )
                     .await
                     {
-                        Ok(Ok(body)) => Ok(webhook_reply(shared, &body)),
+                        Ok(Ok(body)) => Ok(webhook_reply(shared, &body).await),
                         Ok(Err(HttpError::TooLarge)) => Err(status(413, true)),
                         Ok(Err(HttpError::Invalid)) => Err(status(400, true)),
                         _ => return,
@@ -1047,27 +1047,69 @@ async fn webhook_connection(
     }
 }
 
+/// Deadline for each ClusterCache GET made while answering a review. The
+/// webhook's `timeoutSeconds` is 5, so this leaves room for the reply.
+const CACHE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Reads each named ClusterCache with a direct GET. Seats do not watch
+/// ClusterCaches; only the primary does, and a review must be answered by
+/// any seat. Any failure other than 404, including a timeout, is
+/// [`racer_admission::CacheLookup::Unavailable`], which denies the pod with
+/// a retryable status. A 404, including one because the CRD is not
+/// installed, is `NotFound`.
+pub(crate) async fn cache_lookups(
+    api: &crate::kube::Kube,
+    names: Vec<String>,
+    timeout: Duration,
+) -> std::collections::BTreeMap<String, racer_admission::CacheLookup> {
+    use racer_admission::CacheLookup;
+    let mut out = std::collections::BTreeMap::new();
+    for name in names {
+        let path = format!(
+            "{}/{}",
+            crate::kube::paths::CACHES,
+            crate::kube::escape(&name)
+        );
+        let found = match exec::timeout(timeout, api.get(&path)).await {
+            Ok(Ok(cache)) => match cache.get("spec").and_then(|s| s.get("nodeSelector")) {
+                None | Some(serde_json::Value::Null) => CacheLookup::Found(None),
+                Some(sel) => CacheLookup::Found(Some(sel.clone())),
+            },
+            Ok(Err(crate::kube::KubeError::NotFound)) => CacheLookup::NotFound,
+            _ => CacheLookup::Unavailable,
+        };
+        out.insert(name, found);
+    }
+    out
+}
+
 /// Admission response bytes for one review body.
-pub fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
+pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
     let Some(image) = shared.config.object_image.as_deref() else {
         return status(503, false);
     };
     if !shared.has_authority() {
         return status(503, false);
     }
-    match racer_admission::admit(body, image) {
-        Ok(out) => {
-            let mut r = http::response_head(
-                200,
-                &[("Content-Type", "application/json")],
-                out.len(),
-                false,
-            );
-            r.extend(out);
-            r
-        }
-        Err(_) => http::response_head(400, &[], 0, false),
-    }
+    let review = match racer_admission::Review::parse(body) {
+        Ok(r) => r,
+        Err(_) => return http::response_head(400, &[], 0, false),
+    };
+    let caches = cache_lookups(&shared.api, review.caches(), CACHE_LOOKUP_TIMEOUT).await;
+    let out = review.respond(image, &|name| {
+        caches
+            .get(name)
+            .cloned()
+            .unwrap_or(racer_admission::CacheLookup::Unavailable)
+    });
+    let mut r = http::response_head(
+        200,
+        &[("Content-Type", "application/json")],
+        out.len(),
+        false,
+    );
+    r.extend(out);
+    r
 }
 
 /// Check a server certificate against a pin before any credential is sent.
@@ -1323,6 +1365,45 @@ mod tests {
             .unwrap();
         let _ = conn.read_response_body(&head, 1 << 20).await;
         (head.status, head.headers)
+    }
+
+    #[test]
+    fn cache_lookups_map_api_results() {
+        use racer_admission::CacheLookup;
+        fake::run(|api, kube| async move {
+            let path = |n: &str| format!("{}/{n}", crate::kube::paths::CACHES);
+            let sel = serde_json::json!({"matchLabels": {"pool": "gpu"}});
+            api.put_object(
+                &path("pooled"),
+                serde_json::json!({"metadata": {"name": "pooled"}, "spec": {"nodeSelector": sel}}),
+            );
+            api.put_object(
+                &path("plain"),
+                serde_json::json!({"metadata": {"name": "plain"}, "spec": {}}),
+            );
+            let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let got = cache_lookups(
+                &kube,
+                names(&["pooled", "plain", "absent"]),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert_eq!(got["pooled"], CacheLookup::Found(Some(sel)));
+            assert_eq!(got["plain"], CacheLookup::Found(None));
+            assert_eq!(got["absent"], CacheLookup::NotFound);
+
+            // An API error is not proof of absence: retryable.
+            api.fail_next(&[403]);
+            let got = cache_lookups(&kube, names(&["plain"]), Duration::from_secs(2)).await;
+            assert_eq!(got["plain"], CacheLookup::Unavailable);
+
+            // A slow API server times out the same way.
+            let delay = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+            api.delay_gets(delay.clone());
+            let got = cache_lookups(&kube, names(&["plain"]), Duration::from_millis(100)).await;
+            assert_eq!(got["plain"], CacheLookup::Unavailable);
+            delay.store(0, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     #[test]
