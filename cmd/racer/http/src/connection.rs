@@ -1760,12 +1760,7 @@ impl<C: Context> HttpPool<C> {
             result => result?,
         };
         let address = endpoint.address()?;
-        let domain = match &address {
-            SocketAddress::Inet(a) if a.is_ipv4() => libc::AF_INET,
-            SocketAddress::Inet(_) => libc::AF_INET6,
-            SocketAddress::Unix(_) => libc::AF_UNIX,
-        };
-        let fd = Descriptor::socket(domain)?;
+        let fd = Descriptor::socket(socket_domain(&address))?;
         if matches!(address, SocketAddress::Inet(_)) {
             fd.enable_tcp_nodelay(self.config.tcp_nodelay)?;
         }
@@ -1787,6 +1782,45 @@ impl<C: Context> HttpPool<C> {
         let Some(address) = address else {
             return Ok(connection);
         };
+        let mut connection = self
+            .connect_socket(connection, address.clone(), scope)
+            .await?;
+        let Some(tls) = endpoint.tls() else {
+            return Ok(connection);
+        };
+        let mut userspace = false;
+        loop {
+            match crate::tls::establish::<C>(&self.reactor, connection, tls, userspace, scope)
+                .await?
+            {
+                crate::tls::Established::Ready(ready) => return Ok(ready),
+                crate::tls::Established::Retry(mut retry) if !userspace => {
+                    // The kernel rejected the negotiated keys after the socket
+                    // switched to the `tls` ULP. Close it and redo TCP and the
+                    // handshake on a fresh socket under the same scope.
+                    scope.check()?;
+                    let fd = Descriptor::socket(socket_domain(&address))?;
+                    if matches!(address, SocketAddress::Inet(_)) {
+                        fd.enable_tcp_nodelay(self.config.tcp_nodelay)?;
+                    }
+                    retry.replace_socket(Rc::new(fd));
+                    connection = self.connect_socket(retry, address.clone(), scope).await?;
+                    userspace = true;
+                }
+                crate::tls::Established::Retry(_) => {
+                    return Err(uring_runtime::Error::Unavailable.into());
+                }
+            }
+        }
+    }
+
+    /// Complete the TCP connect for a prepared lease.
+    async fn connect_socket(
+        &self,
+        connection: ConnectionLease<C>,
+        address: SocketAddress,
+        scope: &C::Scope,
+    ) -> Result<C, ConnectionLease<C>> {
         // Observation is shared separately from the completion-owned connection.
         // A guard references policy without moving it out of the operation's fence.
         let charge = self.context.charge(ConnectOwner::<C>::allocation())?;
@@ -1810,15 +1844,11 @@ impl<C: Context> HttpPool<C> {
                 .connect_failed(errno.get());
         }
         drop(result?);
-        let connection = observation
+        Ok(observation
             .connection
             .borrow_mut()
             .take()
-            .expect("connect owner");
-        match endpoint.tls() {
-            Some(tls) => crate::tls::establish::<C>(&self.reactor, connection, tls, scope).await,
-            None => Ok(connection),
-        }
+            .expect("connect owner"))
     }
 
     /// Evict idle owners and drop their policies after releasing the pool borrow.
@@ -2250,6 +2280,15 @@ fn rejected_head<C: Context>(
 }
 
 /// Connection framing, ownership, policy, and cancellation regression tests.
+/// Socket domain for a connect address.
+fn socket_domain(address: &SocketAddress) -> libc::c_int {
+    match address {
+        SocketAddress::Inet(a) if a.is_ipv4() => libc::AF_INET,
+        SocketAddress::Inet(_) => libc::AF_INET6,
+        SocketAddress::Unix(_) => libc::AF_UNIX,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

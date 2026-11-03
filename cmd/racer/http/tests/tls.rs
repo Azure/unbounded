@@ -524,6 +524,67 @@ fn wrong_server_name_fails_handshake() {
     server.join().unwrap();
 }
 
+/// Auto mode reconnects with userspace TLS when the kernel rejects the
+/// negotiated keys, and later connections to that endpoint skip kernel TLS.
+#[cfg(feature = "test-util")]
+#[test]
+fn auto_falls_back_to_userspace_when_key_install_fails() {
+    if !kernel_tls_available() {
+        return;
+    }
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, accepted) = serve(listener, Some(&identity), false, 3);
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Auto);
+    http1::tls::fail_next_key_installs(1);
+    let kernel = fetch(&fixture, &endpoint, 1, true).unwrap();
+    assert!(!kernel, "fallback connection uses userspace TLS");
+    assert_eq!(accepted.load(Ordering::SeqCst), 2, "one fresh reconnect");
+    // A new connection for the same endpoint goes straight to userspace.
+    fixture.pool.close();
+    drop(fixture);
+    let fixture = self::fixture();
+    http1::tls::fail_next_key_installs(1);
+    assert!(!fetch(&fixture, &endpoint, 1, true).unwrap());
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "no reconnect once learned"
+    );
+    fixture.pool.close();
+    drop(fixture);
+    http1::tls::fail_next_key_installs(0);
+    server.join().unwrap();
+}
+
+/// Kernel mode keeps failing hard when key installation fails.
+#[cfg(feature = "test-util")]
+#[test]
+fn kernel_mode_fails_when_key_install_fails() {
+    if !kernel_tls_available() {
+        return;
+    }
+    let identity = identity(&["localhost"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server, accepted) = serve(listener, Some(&identity), false, 1);
+    let fixture = fixture();
+    let endpoint = tls_endpoint(&identity, address, TlsMode::Kernel);
+    http1::tls::fail_next_key_installs(1);
+    let scope = scope();
+    let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
+    assert!(matches!(
+        result.err(),
+        Some(Error::Runtime(uring_runtime::Error::Unavailable))
+    ));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    http1::tls::fail_next_key_installs(0);
+    drop(fixture);
+    server.join().unwrap();
+}
+
 /// Report client CPU per GiB for each record-layer placement:
 /// `cargo test -p http1 --release --test tls -- --ignored --nocapture cpu_per_gib`.
 #[test]

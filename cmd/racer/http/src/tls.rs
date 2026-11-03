@@ -14,6 +14,10 @@
 //!   thread owns the TCP socket and a rustls session and exchanges plaintext
 //!   with the pooled connection over a Unix socket pair. This costs extra
 //!   copies and a thread per connection, so it exists for correctness only.
+//!   In Auto mode, if the kernel rejects the negotiated keys after the socket
+//!   switched to the `tls` ULP, the socket is closed and the connection is
+//!   redone on a fresh socket with userspace TLS; the endpoint then skips
+//!   kernel TLS for that cipher suite. Kernel mode fails instead.
 //!
 //! The handshake reads one TLS record at a time so no bytes beyond the final
 //! handshake record are buffered in userspace before the secrets move to the
@@ -90,6 +94,11 @@ pub struct TlsClient {
     name: ServerName<'static>,
 
     mode: TlsMode,
+
+    /// Bit `i` is set once the kernel rejected the traffic keys for the `i`th
+    /// configured cipher suite; Auto mode then uses userspace TLS directly.
+    /// Shared by clones so one endpoint learns once.
+    rejected_suites: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for TlsClient {
@@ -111,6 +120,7 @@ impl TlsClient {
             config,
             name,
             mode: TlsMode::Auto,
+            rejected_suites: Arc::default(),
         })
     }
 
@@ -246,13 +256,51 @@ pub fn kernel_tls_loaded() -> bool {
         .is_ok_and(|ulps| ulps.split_whitespace().any(|ulp| ulp == "tls"))
 }
 
-/// Complete the handshake on a freshly connected lease and place its record layer.
+/// Outcome of [`establish`].
+pub(crate) enum Established<C: Context> {
+    /// The lease carries a usable record layer.
+    Ready(ConnectionLease<C>),
+
+    /// Auto mode attached the kernel `tls` ULP but the kernel rejected the
+    /// traffic keys. The socket cannot revert to plain TCP and the session's
+    /// secrets are consumed, so the caller must reconnect on a fresh socket and
+    /// call [`establish`] again with `userspace` set.
+    Retry(ConnectionLease<C>),
+}
+
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    static FAIL_KEY_INSTALL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Make the next `count` kernel TLS key installations on this thread fail with
+/// `EOPNOTSUPP` after the `tls` ULP attaches, as an unsupported cipher would.
+#[cfg(feature = "test-util")]
+pub fn fail_next_key_installs(count: u32) {
+    FAIL_KEY_INSTALL.with(|c| c.set(count));
+}
+
+/// Index of the negotiated suite within the client's provider, if trackable.
+fn suite_bit(tls: &TlsClient, session: &ClientConnection) -> Option<u64> {
+    let suite = session.negotiated_cipher_suite()?.suite();
+    let index = tls
+        .config
+        .crypto_provider()
+        .cipher_suites
+        .iter()
+        .position(|s| s.suite() == suite)?;
+    (index < 64).then(|| 1u64 << index)
+}
+
+/// Complete the handshake on a freshly connected lease and place its record
+/// layer. `userspace` forces the userspace relay regardless of mode.
 pub(crate) async fn establish<C: Context>(
     reactor: &C::Reactor,
     mut connection: ConnectionLease<C>,
     tls: &TlsClient,
+    userspace: bool,
     scope: &C::Scope,
-) -> crate::connection::Result<C, ConnectionLease<C>> {
+) -> crate::connection::Result<C, Established<C>> {
     let mut session = ClientConnection::new(tls.config.clone(), tls.name.clone())
         .map_err(|_| uring_runtime::Error::InvalidConfiguration)?;
     let fd = connection.socket();
@@ -287,10 +335,15 @@ pub(crate) async fn establish<C: Context>(
     }
     scope.check()?;
     drop(fd);
+    let suite = suite_bit(tls, &session);
     let kernel = match tls.mode {
+        _ if userspace => false,
         TlsMode::Userspace => false,
         TlsMode::Kernel => true,
-        TlsMode::Auto => !KERNEL_UNAVAILABLE.load(Ordering::Relaxed),
+        TlsMode::Auto => {
+            !KERNEL_UNAVAILABLE.load(Ordering::Relaxed)
+                && suite.is_none_or(|bit| tls.rejected_suites.load(Ordering::Relaxed) & bit == 0)
+        }
     };
     if kernel {
         let fd = connection.socket();
@@ -315,17 +368,42 @@ pub(crate) async fn establish<C: Context>(
             let secrets = session
                 .dangerous_extract_secrets()
                 .map_err(|_| uring_runtime::Error::Os(libc::EPROTO))?;
-            let installed = install(raw, version, secrets.tx, TLS_TX)
-                .and_then(|()| install(raw, version, secrets.rx, TLS_RX));
+            #[cfg(any(test, feature = "test-util"))]
+            let injected = FAIL_KEY_INSTALL.with(|c| {
+                let count = c.get();
+                c.set(count.saturating_sub(1));
+                count > 0
+            });
+            #[cfg(not(any(test, feature = "test-util")))]
+            let injected = false;
+            let installed = if injected {
+                Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            } else {
+                install(raw, version, secrets.tx, TLS_TX)
+                    .and_then(|()| install(raw, version, secrets.rx, TLS_RX))
+            };
             if let Err(error) = installed {
-                // The socket is half switched and unusable; later connections
-                // still try kernel TLS unless the failure is permanent.
+                // The socket is half switched and unusable. Auto mode remembers
+                // the rejected suite for this endpoint and asks for a fresh
+                // connection with userspace TLS; Kernel mode fails.
                 KERNEL_FAILURES.fetch_add(1, Ordering::Relaxed);
+                if tls.mode == TlsMode::Kernel {
+                    log_once(
+                        &USERSPACE_LOGGED,
+                        &format!("racer: kernel TLS key install failed ({error})"),
+                    );
+                    return Err(uring_runtime::Error::Unavailable.into());
+                }
+                if let Some(bit) = suite {
+                    tls.rejected_suites.fetch_or(bit, Ordering::Relaxed);
+                }
                 log_once(
                     &USERSPACE_LOGGED,
-                    &format!("racer: kernel TLS key install failed ({error})"),
+                    &format!(
+                        "racer: kernel TLS key install failed ({error}); reconnecting with userspace TLS"
+                    ),
                 );
-                return Err(uring_runtime::Error::Unavailable.into());
+                return Ok(Established::Retry(connection));
             }
             if version == Some(ProtocolVersion::TLSv1_3) {
                 // Lets the kernel decrypt in place; it retries if a record is padded.
@@ -344,14 +422,14 @@ pub(crate) async fn establish<C: Context>(
             KERNEL.fetch_add(1, Ordering::Relaxed);
             log_once(&KERNEL_LOGGED, "racer: origin HTTPS uses kernel TLS");
             connection.enable_kernel_tls();
-            return Ok(connection);
+            return Ok(Established::Ready(connection));
         }
     }
     let app = relay(session, &connection.socket()).map_err(uring_runtime::Error::from_io)?;
     connection.replace_socket(Rc::new(app));
     USERSPACE.fetch_add(1, Ordering::Relaxed);
     log_once(&USERSPACE_LOGGED, "racer: origin HTTPS uses userspace TLS");
-    Ok(connection)
+    Ok(Established::Ready(connection))
 }
 
 /// Wait for socket readiness, retaining the connection's admission slot.
