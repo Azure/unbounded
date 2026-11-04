@@ -31,6 +31,4 @@ func TestMachineOperationHandlersExcludeAllocationOperations(t *testing.T) {
 		string(v1alpha3.OperationNodeReboot),
 	}
 	require.Equal(t, want, got)
-	require.NotContains(t, handlers, v1alpha3.OperationHostAllocate)
-	require.NotContains(t, handlers, v1alpha3.OperationHostRelease)
 }

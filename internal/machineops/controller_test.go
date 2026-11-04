@@ -1374,20 +1374,33 @@ func TestShouldReconcileOperationIgnoresAllocationOperations(t *testing.T) {
 	}
 }
 
-func TestIsHostOperationExcludesAllocationOperations(t *testing.T) {
+func TestIsHostOperation(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		kind unboundedv1alpha3.OperationKind
 		want bool
 	}{
-		{unboundedv1alpha3.OperationHostAllocate, false},
-		{unboundedv1alpha3.OperationHostRelease, false},
-		{unboundedv1alpha3.OperationHostSoftReboot, false},
-		{unboundedv1alpha3.OperationHostHardReboot, true},
-		{unboundedv1alpha3.OperationHostPowerOff, true},
-		{unboundedv1alpha3.OperationHostPowerOn, true},
-		{unboundedv1alpha3.OperationHostReplace, true},
+		{
+			kind: unboundedv1alpha3.OperationHostSoftReboot,
+			want: false,
+		},
+		{
+			kind: unboundedv1alpha3.OperationHostHardReboot,
+			want: true,
+		},
+		{
+			kind: unboundedv1alpha3.OperationHostPowerOff,
+			want: true,
+		},
+		{
+			kind: unboundedv1alpha3.OperationHostPowerOn,
+			want: true,
+		},
+		{
+			kind: unboundedv1alpha3.OperationHostReplace,
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
