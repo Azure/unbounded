@@ -567,6 +567,101 @@ fn hotpath() {
     assert!(disk.close(), "brd teardown failed");
 }
 
+/// Allocations made by dataplane threads per warm memory hit and warm disk hit.
+///
+/// Counts are only meaningful in the `alloc_probe` test binary, which installs
+/// the counting global allocator. Client and driver threads are excluded. Each
+/// measured window is one GET plus one Inspect fence; the mean cost of a bare
+/// Inspect is measured separately and subtracted.
+#[test]
+#[ignore = "release-only allocation probe; run via the alloc_probe test binary"]
+fn warm_page_allocations() {
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(!cfg!(debug_assertions), "run with --release");
+    }
+    use super::counting_alloc;
+    counting_alloc::exclude_current_thread();
+    let rounds: usize = std::env::var("RACER_ALLOC_PROBE_ROUNDS")
+        .map_or(8, |value| value.parse().expect("unsigned rounds"));
+    const KEYS: usize = 8;
+    let mut plan = default_plan();
+    plan.pairs.truncate(1);
+    plan.max_threads = 3; // One I/O thread, one crypto thread, and the caller.
+    let ids = vec![WorkerId(0)];
+    let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
+    let keys = balanced_keys(&map, 1, KEYS);
+    let scratch = Scratch::new();
+    let (send, receive) = mpsc::sync_channel(256);
+    let commands = vec![send];
+    let factory = Arc::new(Factory {
+        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
+        root: scratch.path.clone(),
+        commands: Mutex::new(BTreeMap::from([(0, receive)])),
+        directory: Arc::new(WorkerDirectory::new(map, ids, 256).unwrap()),
+        slab_bytes: 256 * MIB,
+    });
+    let mut group = WorkerGroup::new(plan);
+    group.start(factory, &scope()).unwrap();
+    for key in &keys {
+        assert_eq!(get(&mut connect(&commands[0]), *key, true).unwrap(), 200);
+        inspect_all(&commands, false);
+    }
+    commands[0].send(Command::Offline).unwrap();
+    inspect_all(&commands, false);
+    let origin = inspect(&commands[0], false).origin_calls;
+    // One unmeasured warm sweep per mode settles lazily grown structures.
+    for key in &keys {
+        assert_eq!(get(&mut connect(&commands[0]), *key, false).unwrap(), 200);
+        inspect(&commands[0], true);
+        assert_eq!(get(&mut connect(&commands[0]), *key, false).unwrap(), 200);
+        inspect(&commands[0], false);
+    }
+    let window = |evict: bool, read: bool| {
+        let mut total = (0u64, 0u64);
+        for _ in 0..rounds {
+            for key in &keys {
+                if evict {
+                    inspect(&commands[0], true);
+                }
+                let before = counting_alloc::snapshot();
+                if read {
+                    assert_eq!(get(&mut connect(&commands[0]), *key, false).unwrap(), 200);
+                }
+                inspect(&commands[0], false);
+                let after = counting_alloc::snapshot();
+                total.0 += after.0 - before.0;
+                total.1 += after.1 - before.1;
+            }
+        }
+        let n = (rounds * KEYS) as f64;
+        (total.0 as f64 / n, total.1 as f64 / n)
+    };
+    let fence = window(false, false);
+    let memory = window(false, true);
+    let disk = window(true, true);
+    let stats = inspect(&commands[0], false);
+    assert_eq!(stats.origin_calls, origin, "warm probe contacted origin");
+    assert!(stats.failures.is_empty(), "{:?}", stats.failures);
+    assert!(
+        memory.0 > 0.0,
+        "counting allocator not installed; run the alloc_probe test binary"
+    );
+    println!(
+        "ALLOC_PROBE {{\"page_bytes\":{P},\"pages_per_mode\":{},\"fence_allocs\":{:.2},\"fence_bytes\":{:.1},\"memory_hit_allocs\":{:.2},\"memory_hit_bytes\":{:.1},\"disk_hit_allocs\":{:.2},\"disk_hit_bytes\":{:.1}}}",
+        rounds * KEYS,
+        fence.0,
+        fence.1,
+        memory.0 - fence.0,
+        memory.1 - fence.1,
+        disk.0 - fence.0,
+        disk.1 - fence.1,
+    );
+    group.drain(&scope()).unwrap();
+    group.shutdown(&scope()).unwrap();
+    group.join().unwrap();
+}
+
 fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurrency: usize) {
     let workers = default.pairs.len();
     preflight(workers, &budgets(), slab_bytes(workers));

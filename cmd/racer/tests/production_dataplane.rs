@@ -106,6 +106,10 @@ const TIMEOUT: Duration = Duration::from_secs(40);
 
 #[path = "production_dataplane/hotpath.rs"]
 mod hotpath;
+// Installed as the global allocator only by tests/alloc_probe.rs.
+#[path = "support/counting_alloc.rs"]
+#[allow(dead_code)]
+pub(crate) mod counting_alloc;
 use racer as dataplane;
 #[path = "support/enrollment.rs"]
 #[allow(dead_code)]
