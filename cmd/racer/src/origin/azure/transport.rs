@@ -227,36 +227,44 @@ impl AzureTransport for PoolTransport {
             // This exchange's own walk over the addresses, so concurrent
             // checkouts rotating the shared cursor cannot make a retry repeat
             // an address it already tried while skipping a healthy one.
-            let endpoint = Endpoint::Remote(remote.address_sequence());
+            let sequence = remote.address_sequence();
+            let endpoint = Endpoint::Remote(sequence.clone());
             let is_head =
                 matches!(&head.start, StartLine::Request { method, .. } if method == "HEAD");
             // HEAD may use the endpoint's priority headroom, so metadata checks
             // are not starved by page reads.
             // The first fresh connect takes the endpoint's next rotated address
-            // and each retry the following resolved address, so a connect or TLS failure retries on the remaining resolved
-            // addresses (nothing has been sent yet) within the request scope.
-            // Each non-final attempt runs under a narrowed scope (see
-            // [`attempt_scope`]), so a stalled connect or handshake counts as a
-            // connect failure. Only checkout is narrowed: a reused idle
-            // connection returns at once, and the send and response read below
-            // use the full request scope.
+            // and each retry the following resolved address, so a connect or
+            // TLS failure retries on the remaining resolved addresses (nothing
+            // has been sent yet) within the request scope.
+            // Each checkout that still has untried addresses after it runs
+            // under a narrowed scope (see [`attempt_scope`]), so a stalled
+            // connect or handshake counts as a connect failure. Attempts are
+            // counted by addresses actually taken, so a checkout that times out
+            // while waiting for pool admission retries without spending an
+            // address. Only checkout is narrowed: a reused idle connection
+            // returns at once, and the send and response read below use the
+            // full request scope.
             let attempts = remote.address_count().max(1);
-            let mut attempt = 0;
             let lease = loop {
-                attempt += 1;
-                let attempt_scope = attempt_scope(scope, attempts - attempt + 1);
+                let before = sequence.addresses_taken();
+                let attempt_scope = attempt_scope(scope, attempts.saturating_sub(before));
                 let checkout = if is_head {
                     self.pool.checkout_metadata(&endpoint, &attempt_scope).await
                 } else {
                     self.pool.checkout_wait(&endpoint, &attempt_scope).await
                 };
+                let taken = sequence.addresses_taken();
                 match checkout {
                     Ok(lease) => break lease,
+                    // An admission wait that hit the narrowed deadline took no
+                    // address; wait again under a fresh share of the request.
+                    Err(Error::DeadlineExceeded) if taken == before && scope.check().is_ok() => {}
                     // A narrowed attempt's deadline is a stalled connect;
                     // the request scope check rules out the request's own.
                     Err(
                         Error::Io | Error::Os(_) | Error::Unavailable | Error::DeadlineExceeded,
-                    ) if attempt < attempts && scope.check().is_ok() => {}
+                    ) if taken > before && taken < attempts && scope.check().is_ok() => {}
                     Err(error) => {
                         if matches!(error, Error::Io | Error::Os(_) | Error::Unavailable) {
                             remote.expire_addresses();

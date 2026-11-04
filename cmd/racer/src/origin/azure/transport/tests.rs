@@ -716,3 +716,73 @@ fn endpoints_for_unpublished_origins_are_dropped() {
     transport.retain(&[]);
     assert_eq!(transport.endpoint_count(), 0);
 }
+
+#[test]
+fn admission_wait_does_not_spend_an_address_attempt() {
+    let Some(reactor) = reactor() else { return };
+    let blobs = Arc::new(Mutex::new(Blobs {
+        etag: "\"v1\"".into(),
+    }));
+    let state = blobs.clone();
+    let (address, accepted, server) = serve(None, 2, move |head, _| azure(head, &state));
+    let dead = std::net::SocketAddr::new(address.ip(), refused_address().port());
+    let admission = reactor.admission().clone();
+    // One connection per endpoint, so a second exchange waits for admission.
+    let transport = PoolTransport::new(
+        Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 1)),
+        Rc::new(crate::http::client_io(reactor.clone(), admission)),
+        Rc::new(MapResolver::new(vec![address, dead])),
+        Arc::new(TrustRoots::at("/nonexistent/racer-bundle.pem".into())),
+    );
+    let url = format!(
+        "http://account.blob.example:{}/account/models",
+        address.port()
+    );
+    let container = AzureContainerUrl::parse(&url).unwrap();
+    let head = || MessageHead {
+        start: StartLine::Request {
+            method: "HEAD".into(),
+            target: "/account/models/small".into(),
+        },
+        headers: vec![
+            http1::Header::new("Host", container.host_header().as_bytes()),
+            http1::Header::new("x-ms-version", b"2026-12-06"),
+        ],
+    };
+    // The first exchange takes the healthy address and holds the only slot.
+    let scope = scope();
+    let held = drive(&reactor, transport.exchange(&container, head(), &scope)).unwrap();
+    let held = std::cell::RefCell::new(Some(held));
+
+    // The second exchange starts on the dead address. Its first narrowed
+    // checkout (half of 2s) expires while waiting for admission; the slot
+    // frees after that. The wait must not spend an attempt, so the refused
+    // connect still fails over to the healthy address.
+    let mut scope = scope.clone();
+    let started = Instant::now();
+    scope.deadline.0 = started + Duration::from_secs(2);
+    let release = started + Duration::from_millis(1300);
+    let waiting = transport.exchange(&container, head(), &scope);
+    let freeing = std::future::poll_fn(|_| {
+        if Instant::now() >= release {
+            drop(held.borrow_mut().take());
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    });
+    let exchange = drive(
+        &reactor,
+        Box::pin(async move { futures::future::join(waiting, freeing).await.0 }),
+    )
+    .unwrap();
+    assert_eq!(
+        exchange.head().unique("Content-Length").unwrap(),
+        Some(&b"5"[..])
+    );
+    exchange.finish().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(1300));
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    drop(transport);
+    server.join().unwrap();
+}

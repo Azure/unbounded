@@ -267,6 +267,17 @@ impl RemoteEndpoint {
         Self(self.0.clone(), Some(Arc::default()))
     }
 
+    /// Addresses this [`Self::address_sequence`] clone has handed to connects.
+    /// Always 0 for IP literals and for endpoints that are not sequences.
+    pub fn addresses_taken(&self) -> usize {
+        self.1.as_ref().map_or(0, |sequence| {
+            sequence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map_or(0, |current| current.taken)
+        })
+    }
+
     /// Number of distinct addresses a connect may try: 1 for IP literals,
     /// otherwise the resolved count (0 until resolved).
     pub fn address_count(&self) -> usize {
