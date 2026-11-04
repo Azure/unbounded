@@ -128,6 +128,29 @@ func TestServePXEPullFlags(t *testing.T) {
 	}
 }
 
+func TestValidatePullFlags(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		concurrency int
+		chunkSize   int64
+		wantErr     bool
+	}{
+		{name: "defaults", concurrency: imagepull.DefaultConcurrency, chunkSize: imagepull.DefaultChunkSize},
+		{name: "zero means default", concurrency: 0, chunkSize: 0},
+		{name: "minimum chunk", concurrency: 1, chunkSize: 64 << 10},
+		{name: "negative concurrency", concurrency: -1, chunkSize: imagepull.DefaultChunkSize, wantErr: true},
+		{name: "negative chunk", concurrency: 1, chunkSize: -1, wantErr: true},
+		{name: "chunk below minimum", concurrency: 1, chunkSize: 64<<10 - 1, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePullFlags(tt.concurrency, tt.chunkSize)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validatePullFlags(%d, %d) error = %v, wantErr %v", tt.concurrency, tt.chunkSize, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestParseRegistryMirror(t *testing.T) {
 	for _, tt := range []struct {
 		in, want string

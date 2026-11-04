@@ -68,6 +68,10 @@ func ServePXECmd() *cobra.Command {
 		Use:   "serve-pxe",
 		Short: "Run PXE servers and BMC control loop",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := validatePullFlags(pullConcurrency, pullChunkSize); err != nil {
+				return err
+			}
+
 			ctx := ctrl.SetupSignalHandler()
 			cfg := ctrl.GetConfigOrDie()
 
@@ -452,4 +456,22 @@ func parseNamespacedSecretReference(ref string) (*v1alpha3.NamespacedSecretRefer
 	}
 
 	return &v1alpha3.NamespacedSecretReference{Namespace: namespace, Name: name}, nil
+}
+
+// minPullChunkSize is the smallest accepted --pull-chunk-size. Smaller
+// chunks would turn a layer pull into an excessive number of requests.
+const minPullChunkSize = 64 << 10
+
+// validatePullFlags rejects invalid --pull-concurrency and --pull-chunk-size
+// values. Zero selects the imagepull default for either flag.
+func validatePullFlags(concurrency int, chunkSize int64) error {
+	if concurrency < 0 {
+		return fmt.Errorf("--pull-concurrency must not be negative, got %d", concurrency)
+	}
+
+	if chunkSize < 0 || (chunkSize > 0 && chunkSize < minPullChunkSize) {
+		return fmt.Errorf("--pull-chunk-size must be 0 (default) or at least %d bytes, got %d", minPullChunkSize, chunkSize)
+	}
+
+	return nil
 }
