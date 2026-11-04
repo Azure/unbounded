@@ -4125,3 +4125,271 @@ mod message {
         ));
     }
 }
+
+mod uring_cmd {
+    //! Raw-result passthrough and owner retention for 16-byte URING_CMD operations.
+    use super::*;
+
+    // Every payload in these tests is a filler byte pattern sent either to a
+    // descriptor whose driver rejects URING_CMD (socket, pipe) or to the
+    // simulated kernel, which never dereferences it. No payload names memory.
+
+    fn submit<'a, L: 'static>(
+        reactor: &'a Reactor,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, i32, Error> {
+        // SAFETY: see the module note; the payload references no memory.
+        unsafe { reactor.uring_cmd(fd, cmd_op, cmd, lease, scope) }
+    }
+
+    #[cfg(feature = "simulation")]
+    fn submit_reserved<'a, L: 'static>(
+        reactor: &'a Reactor,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, i32, Error> {
+        // SAFETY: see the module note; the payload references no memory.
+        unsafe { reactor.uring_cmd_reserved(fd, cmd_op, cmd, lease, capacity, scope) }
+    }
+
+    #[test]
+    /// An unsupported descriptor completes with a raw negative errno, not Err.
+    fn real_unsupported_descriptor_returns_negative_result() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let scope = scope();
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let (read, _write) = std::io::pipe().unwrap();
+        for fd in [
+            Descriptor::from(socket),
+            Descriptor::from(std::os::fd::OwnedFd::from(read)),
+        ] {
+            let drops = Rc::new(Cell::new(0));
+            let result = drive(
+                &reactor,
+                submit(
+                    &reactor,
+                    Rc::new(fd),
+                    0x20,
+                    [7; 16],
+                    Lease(drops.clone()),
+                    &scope,
+                ),
+            )
+            .unwrap();
+            eprintln!("uring_cmd on unsupported descriptor completed with {result}");
+            assert!(result < 0);
+            assert_eq!(drops.get(), 1);
+        }
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[cfg(feature = "simulation")]
+    mod simulated {
+        use super::*;
+        use simulation::Simulation;
+
+        #[test]
+        /// Scripted results, including negative ones, are returned raw to the caller.
+        fn scripted_results_pass_through_raw() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+            let request = scope();
+            let (fd, _peer) = sim.socket_pair();
+            let fd = Rc::new(fd);
+            for result in [0, 5, -libc::ENODEV, -libc::EINTR, -libc::EAGAIN] {
+                let mut op = submit(&reactor, fd.clone(), 0x21, [1; 16], (), &request);
+                assert!(poll(&mut op).is_pending());
+                // Commands stay outstanding until the simulated kernel completes them.
+                for _ in 0..4 {
+                    reactor.poll_budgeted(4).unwrap();
+                    assert!(poll(&mut op).is_pending());
+                }
+                sim.complete_uring_cmd(&fd, 0x21, Some([1; 16]), result)
+                    .unwrap();
+                assert_eq!(drive(&reactor, op).unwrap(), result);
+                assert_eq!(sim.scripted_uring_cmds(), 0);
+            }
+            assert_eq!(reactor.in_flight(), 0);
+        }
+
+        #[test]
+        /// Scripted results match only the descriptor, opcode, and payload given.
+        fn scripted_results_match_command_identity() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
+            let request = scope();
+            let (fd, _peer) = sim.socket_pair();
+            let fd = Rc::new(fd);
+            let mut first = submit(&reactor, fd.clone(), 1, [1; 16], (), &request);
+            let mut second = submit(&reactor, fd.clone(), 1, [2; 16], (), &request);
+            assert!(poll(&mut first).is_pending());
+            assert!(poll(&mut second).is_pending());
+            sim.complete_uring_cmd(&fd, 2, None, 9).unwrap();
+            sim.complete_uring_cmd(&fd, 1, Some([2; 16]), 3).unwrap();
+            reactor.poll_budgeted(4).unwrap();
+            reactor.poll_budgeted(4).unwrap();
+            assert!(poll(&mut first).is_pending());
+            assert!(matches!(poll(&mut second), Poll::Ready(Ok(3))));
+            assert_eq!(sim.scripted_uring_cmds(), 1);
+            sim.complete_uring_cmd(&fd, 1, None, -libc::ENODEV).unwrap();
+            assert_eq!(drive(&reactor, first).unwrap(), -libc::ENODEV);
+        }
+
+        #[test]
+        /// Dropping the future keeps the descriptor and lease until the kernel fence.
+        fn abandoned_command_retains_owners_until_fence() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+            let request = scope();
+            let (fd, _peer) = sim.socket_pair();
+            let fd = Rc::new(fd);
+            let weak = Rc::downgrade(&fd);
+            let drops = Rc::new(Cell::new(0));
+            let mut op = submit(
+                &reactor,
+                fd.clone(),
+                1,
+                [0; 16],
+                Lease(drops.clone()),
+                &request,
+            );
+            assert!(poll(&mut op).is_pending());
+            reactor.poll_budgeted(4).unwrap();
+            drop(op);
+            let probe = fd.clone();
+            drop(fd);
+            reactor.poll_budgeted(4).unwrap();
+            assert_eq!(drops.get(), 0);
+            assert_eq!(reactor.in_flight(), 1);
+            sim.complete_uring_cmd(&probe, 1, None, 0).unwrap();
+            drop(probe);
+            for _ in 0..4 {
+                reactor.poll_budgeted(4).unwrap();
+            }
+            assert_eq!(drops.get(), 1);
+            assert_eq!(reactor.in_flight(), 0);
+            assert!(weak.upgrade().is_none());
+        }
+
+        #[test]
+        /// A command partition admits its commands when ordinary slots are
+        /// full, refuses commands beyond its size, and coexists with the
+        /// ordinary reserved partition.
+        fn command_partition_is_dedicated() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(5))));
+            let request = scope();
+            let (fd, _peer) = sim.socket_pair();
+            let fd = Rc::new(fd);
+            let control = reactor.reserve_submissions(1, ()).unwrap();
+            assert!(matches!(
+                reactor.reserve_command_submissions(5, ()),
+                Err(Error::InvalidConfiguration)
+            ));
+            let commands = reactor.reserve_command_submissions(2, ()).unwrap();
+            assert!(matches!(
+                reactor.reserve_command_submissions(1, ()),
+                Err(Error::InvalidConfiguration)
+            ));
+            // Two ordinary slots remain.
+            let mut ordinary: Vec<_> = (0..2)
+                .map(|n| submit(&reactor, fd.clone(), 9, [n; 16], (), &request))
+                .collect();
+            for op in &mut ordinary {
+                assert!(poll(op).is_pending());
+            }
+            let mut full = submit(&reactor, fd.clone(), 9, [7; 16], (), &request);
+            assert!(matches!(
+                poll(&mut full),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            let mut first = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [1; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
+            let mut second = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [2; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
+            assert!(poll(&mut first).is_pending());
+            assert!(poll(&mut second).is_pending());
+            let mut third = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [3; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
+            assert!(matches!(
+                poll(&mut third),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            sim.complete_uring_cmd(&fd, 1, Some([1; 16]), -libc::ENODEV)
+                .unwrap();
+            assert_eq!(drive(&reactor, first).unwrap(), -libc::ENODEV);
+            // The consumed result freed its slot.
+            let mut again = submit_reserved(
+                &reactor,
+                fd.clone(),
+                1,
+                [4; 16],
+                (),
+                commands.clone(),
+                &request,
+            );
+            assert!(poll(&mut again).is_pending());
+            drop((ordinary, second, again, control, commands));
+        }
+
+        #[test]
+        /// Scope cancellation fences an outstanding command and releases its owners.
+        fn cancellation_fences_outstanding_command() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
+            let request = scope();
+            let (fd, _peer) = sim.socket_pair();
+            let drops = Rc::new(Cell::new(0));
+            let mut op = submit(
+                &reactor,
+                Rc::new(fd),
+                1,
+                [0; 16],
+                Lease(drops.clone()),
+                &request,
+            );
+            assert!(poll(&mut op).is_pending());
+            reactor.poll_budgeted(4).unwrap();
+            request.cancellation.cancel().unwrap();
+            assert!(matches!(drive(&reactor, op), Err(Error::Cancelled)));
+            assert_eq!(drops.get(), 1);
+            assert_eq!(reactor.in_flight(), 0);
+        }
+    }
+}

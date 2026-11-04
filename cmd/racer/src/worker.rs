@@ -737,6 +737,18 @@ struct IoService {
     built: Result<Box<dyn Service<RequestScope>>>,
     reporter: Option<FailureReporter<Error>>,
 }
+/// Wrap a built service the way `build_lane` does, for lifecycle tests.
+#[cfg(test)]
+pub(crate) fn io_service(
+    runtime: WorkerRuntime,
+    built: Box<dyn Service<RequestScope>>,
+) -> Box<dyn Service<RequestScope>> {
+    Box::new(IoService {
+        runtime,
+        built: Ok(built),
+        reporter: None,
+    })
+}
 impl Service<RequestScope> for IoService {
     fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
         if let Ok(service) = &mut self.built {
@@ -782,7 +794,11 @@ impl Service<RequestScope> for IoService {
         })
     }
     fn stop_admission(&mut self) -> Result<()> {
-        self.runtime.admission.stop();
+        // A service serving ublk reads defers this and stops the quotas once
+        // its devices are stopped.
+        if !self.runtime.admission.policy().stop_deferred() {
+            self.runtime.admission.stop();
+        }
         match &mut self.built {
             Ok(service) => service.stop_admission(),
             Err(_) => Ok(()),
@@ -795,6 +811,10 @@ impl Service<RequestScope> for IoService {
         }
     }
     fn close(&mut self) -> Result<()> {
+        // Backstop for a deferred stop that drain never released.
+        if !self.runtime.admission.is_stopped() {
+            self.runtime.admission.stop();
+        }
         let inner = match &mut self.built {
             Ok(service) => service.close(),
             Err(_) => Ok(()),
@@ -855,6 +875,40 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 mod tests {
     use super::*;
     use racer_control_wire::CacheId;
+
+    fn plain_io_service() -> (IoService, Rc<flow_control::Quotas<AdmissionPolicy>>) {
+        let limits = crate::test_support::cluster::config(false).limits;
+        let (port, _engine) = security::pair(WorkerId(0), 0, limits.queue_entries);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+        let service = IoService {
+            runtime: WorkerRuntime {
+                reactor: Rc::new(Reactor::new(admission.clone())),
+                admission: admission.clone(),
+                crypto: Rc::new(CryptoClient::new(port)),
+            },
+            built: Err(Error::Io),
+            reporter: None,
+        };
+        (service, admission)
+    }
+
+    #[test]
+    fn stop_admission_stops_quotas_unless_deferred() {
+        let (mut service, admission) = plain_io_service();
+        service.stop_admission().unwrap();
+        assert!(admission.is_stopped());
+
+        let (mut service, admission) = plain_io_service();
+        admission.policy().defer_stop(true);
+        service.stop_admission().unwrap();
+        assert!(!admission.is_stopped());
+        admission
+            .reserve(None, crate::admission::ResourceClass::Plaintext, 4096)
+            .expect("deferred quotas still admit");
+        // Close is the backstop when drain never released the deferral.
+        let _ = service.close();
+        assert!(admission.is_stopped());
+    }
 
     #[test]
     fn exact_twenty_endpoint_pairs_close_independently() {

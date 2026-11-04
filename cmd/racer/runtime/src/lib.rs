@@ -272,6 +272,11 @@ pub mod mailbox {
             lock(&self.state).admission = Admission::Closed;
         }
 
+        /// Whether new commands are admitted.
+        pub fn is_open(&self) -> bool {
+            lock(&self.state).admission == Admission::Open
+        }
+
         /// Count capacity retained by accepted commands and unread receipts.
         pub fn outstanding(&self) -> usize {
             self.credits.outstanding.load(Ordering::Acquire)

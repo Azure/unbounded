@@ -78,6 +78,10 @@ pub struct Reactor<S: Scope, B: Budget> {
     ordinary: Rc<Cell<usize>>,
 
     reserved: RefCell<Weak<SubmissionCapacity>>,
+
+    /// A second partition kept for long-lived passthrough commands such as
+    /// ublk FETCH, so they never compete with [`Self::reserved`] traffic.
+    commands: RefCell<Weak<SubmissionCapacity>>,
 }
 
 /// Caller-owned event sink, invoked only when admission fails.
@@ -1041,6 +1045,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             queue_entries,
             ordinary: Rc::new(Cell::new(0)),
             reserved: RefCell::default(),
+            commands: RefCell::default(),
             state: RefCell::new(State {
                 ring: None,
                 wake: None,
@@ -1169,15 +1174,42 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
 
     /// Partition existing queue capacity using a caller-owned prepaid charge.
     /// Only one live partition is allowed. Its slots include unread completions;
-    /// ordinary slots instead become reusable at the kernel fence.
+    /// ordinary slots instead become reusable at the kernel fence. Long-lived
+    /// operations such as [`Self::uring_cmd`] (for example ublk FETCH) occupy
+    /// ordinary slots until their kernel completion, so size queues to cover
+    /// every such command plus the remaining traffic.
     pub fn reserve_submissions<C: 'static>(
         &self,
         capacity: usize,
         charge: C,
     ) -> Result<Rc<SubmissionCapacity>> {
-        if self.reserved.borrow().upgrade().is_some()
-            || self.ordinary.get() > self.queue_entries.saturating_sub(capacity)
-            || capacity > self.queue_entries
+        self.reserve_partition(&self.reserved, capacity, charge)
+    }
+
+    /// Like [`Self::reserve_submissions`], but for a separate partition used
+    /// only by [`Self::uring_cmd_reserved`]. It is independent of the
+    /// [`Self::reserve_submissions`] partition, so long-lived passthrough
+    /// commands (ublk FETCH and COMMIT_AND_FETCH) can neither be refused
+    /// because ordinary or control traffic filled the queue nor starve it.
+    /// Only one live command partition is allowed.
+    pub fn reserve_command_submissions<C: 'static>(
+        &self,
+        capacity: usize,
+        charge: C,
+    ) -> Result<Rc<SubmissionCapacity>> {
+        self.reserve_partition(&self.commands, capacity, charge)
+    }
+
+    fn reserve_partition<C: 'static>(
+        &self,
+        slot: &RefCell<Weak<SubmissionCapacity>>,
+        capacity: usize,
+        charge: C,
+    ) -> Result<Rc<SubmissionCapacity>> {
+        let partitioned = self.partitioned();
+        if slot.borrow().upgrade().is_some()
+            || capacity > self.queue_entries.saturating_sub(partitioned)
+            || self.ordinary.get() > self.queue_entries - partitioned - capacity
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -1187,8 +1219,26 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             active: Rc::new(Cell::new(0)),
             capacity,
         });
-        *self.reserved.borrow_mut() = Rc::downgrade(&reserved);
+        *slot.borrow_mut() = Rc::downgrade(&reserved);
         Ok(reserved)
+    }
+
+    /// Queue entries held by live partitions, which ordinary work cannot use.
+    fn partitioned(&self) -> usize {
+        [&self.reserved, &self.commands]
+            .iter()
+            .filter_map(|slot| slot.borrow().upgrade())
+            .map(|pool| pool.capacity)
+            .sum()
+    }
+
+    /// Whether `pool` is one of this reactor's live partitions.
+    fn owns_partition(&self, pool: &Rc<SubmissionCapacity>) -> bool {
+        [&self.reserved, &self.commands].iter().any(|slot| {
+            slot.borrow()
+                .upgrade()
+                .is_some_and(|own| Rc::ptr_eq(&own, pool))
+        })
     }
 
     /// Retain a budget guard independently of the concrete accounting implementation.
@@ -1267,13 +1317,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             + std::mem::size_of::<Signal>()
             + std::mem::size_of::<libc::sockaddr_storage>();
         let (reservation, active) = if let Some(pool) = &capacity {
-            if !self
-                .reserved
-                .borrow()
-                .upgrade()
-                .is_some_and(|own| Rc::ptr_eq(&own, pool))
-                || bytes > SUBMISSION_BYTES
-            {
+            if !self.owns_partition(pool) || bytes > SUBMISSION_BYTES {
                 return Err(Error::InvalidConfiguration.into());
             }
             if pool.active.get() >= pool.capacity {
@@ -1290,11 +1334,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 pool.active.clone(),
             )
         } else {
-            let reserved = self
-                .reserved
-                .borrow()
-                .upgrade()
-                .map_or(0, |pool| pool.capacity);
+            let reserved = self.partitioned();
             if self.ordinary.get() >= self.queue_entries - reserved {
                 reject(
                     RejectionReason::OrdinaryFull,
@@ -1317,7 +1357,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             return Err(Error::Unavailable.into());
         }
         let available = capacity.as_ref().map_or_else(
-            || self.queue_entries - self.reserved.borrow().upgrade().map_or(0, |p| p.capacity),
+            || self.queue_entries - self.partitioned(),
             |pool| pool.capacity,
         );
         if state.entries.len() >= self.queue_entries || active.get() >= available {
@@ -2023,6 +2063,98 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         scope: &'a S,
     ) -> Operation<'a, u32, S::Error> {
         self.readiness_capacity(fd, interest, lease, Some(capacity), scope)
+    }
+
+    /// Submit a 16-byte `IORING_OP_URING_CMD` and return the raw CQE result.
+    ///
+    /// The command payload is copied into the SQE. The CQE result is returned
+    /// as `Ok(res)` even when negative, because passthrough protocols such as
+    /// ublk use negative values (for example `-ENODEV` or `UBLK_IO_RES_ABORT`)
+    /// as protocol signals. `EINTR` and `EAGAIN` are not retried. Only
+    /// reactor-level failures (admission, initialization, scope checks, and
+    /// cancellation) are returned as `Err`.
+    ///
+    /// The command may stay outstanding indefinitely (ublk FETCH completes only
+    /// when a block request arrives); the reactor imposes no timeout. The
+    /// caller's scope deadline and cancellation still apply: cancellation
+    /// publishes an `AsyncCancel`, and `fd` and `lease` stay retained until the
+    /// kernel's final CQE fence even if this future is dropped. While pending
+    /// the command occupies an ordinary submission slot.
+    ///
+    /// # Safety
+    ///
+    /// `cmd` is passed to the driver behind `fd` uninterpreted, and may encode
+    /// user addresses (for example ublk `ublksrv_io_cmd.addr` without
+    /// `UBLK_F_USER_COPY`, or a control command's buffer). The caller must
+    /// know the semantics of `cmd_op` for `fd`, and any memory the command
+    /// makes the kernel read or write must stay valid, and not be accessed in
+    /// a conflicting way by Rust code, for the whole time the kernel owns the
+    /// command: until the final CQE fence, which can come after the returned
+    /// future is dropped. Keeping that memory owned by `lease` satisfies the
+    /// lifetime part, since the reactor retains `lease` until the fence.
+    /// Commands that carry no user addresses have no extra requirement.
+    pub unsafe fn uring_cmd<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, i32, S::Error> {
+        self.uring_cmd_capacity(fd, cmd_op, cmd, lease, None, scope)
+    }
+
+    /// Like [`Self::uring_cmd`], but admitted from a partition made by
+    /// [`Self::reserve_command_submissions`] (or
+    /// [`Self::reserve_submissions`]). The slot stays taken until the result
+    /// is consumed, so a partition sized to the number of commands that may
+    /// be outstanding at once never refuses one.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`Self::uring_cmd`].
+    pub unsafe fn uring_cmd_reserved<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a S,
+    ) -> Operation<'a, i32, S::Error> {
+        self.uring_cmd_capacity(fd, cmd_op, cmd, lease, Some(capacity), scope)
+    }
+
+    fn uring_cmd_capacity<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        scope: &'a S,
+    ) -> Operation<'a, i32, S::Error> {
+        Box::pin(async move {
+            let sqe = submission!(
+                self,
+                simulation::Op::UringCmd {
+                    fd: fd.clone(),
+                    cmd_op,
+                    cmd
+                },
+                opcode::UringCmd16::new(types::Fd(fd.as_raw_fd()), cmd_op)
+                    .cmd(cmd)
+                    .build()
+            );
+            self.submit_reserved(sqe, scope, false, capacity, move |result| {
+                drop((fd, lease));
+                match result? {
+                    KernelResult::Value(res) => Ok(res),
+                    KernelResult::Accepted(_) => Err(Error::Io.into()),
+                }
+            })?
+            .await
+        })
     }
 
     fn readiness_capacity<'a, L: 'static>(

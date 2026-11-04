@@ -111,6 +111,20 @@ struct World {
     partitions: BTreeSet<(SocketAddress, SocketAddress)>,
 
     disk: disk::State,
+
+    uring_cmds: Vec<UringCmdCompletion>,
+}
+
+/// A scripted completion for the oldest matching outstanding `UringCmd`.
+#[derive(Debug)]
+struct UringCmdCompletion {
+    fd: u64,
+
+    cmd_op: u32,
+
+    cmd: Option<[u8; 16]>,
+
+    result: i32,
 }
 
 /// The kernel-side state of an open simulated descriptor.
@@ -319,6 +333,7 @@ impl Simulation {
             endpoint: None,
             partitions: BTreeSet::new(),
             disk: disk::State::default(),
+            uring_cmds: Vec::new(),
         })));
         sim.create_dir_all(Path::new("/")).unwrap();
         sim.disk().sync_all().unwrap();
@@ -442,6 +457,40 @@ impl Simulation {
         }
         self.0.borrow_mut().reject_submissions = count;
         Ok(())
+    }
+
+    /// Script the CQE result of an outstanding or future `uring_cmd` on `fd`.
+    ///
+    /// Simulated `uring_cmd` operations never complete on their own, matching
+    /// commands such as ublk FETCH that wait indefinitely for kernel work. Each
+    /// scripted result completes exactly one command whose descriptor and
+    /// `cmd_op` match and, when `cmd` is `Some`, whose 16-byte payload matches.
+    /// The result is delivered raw, including negative values. Commands advance
+    /// on the next reactor submission turn.
+    pub fn complete_uring_cmd(
+        &self,
+        fd: &Descriptor,
+        cmd_op: u32,
+        cmd: Option<[u8; 16]>,
+        result: i32,
+    ) -> io::Result<()> {
+        let fd = self.handle(fd)?.id;
+        let mut w = self.0.borrow_mut();
+        if w.uring_cmds.len() >= 16384 {
+            return Err(errno(libc::ENOSPC));
+        }
+        w.uring_cmds.push(UringCmdCompletion {
+            fd,
+            cmd_op,
+            cmd,
+            result,
+        });
+        Ok(())
+    }
+
+    /// Count scripted `uring_cmd` results not yet consumed by a command.
+    pub fn scripted_uring_cmds(&self) -> usize {
+        self.0.borrow().uring_cmds.len()
     }
 
     /// Allocates a deterministic identifier shared with resource creation.
@@ -578,6 +627,14 @@ pub(super) enum Op {
         dir: Rc<Descriptor>,
 
         name: CString,
+    },
+    /// A 16-byte passthrough command; completes only through scripted results.
+    UringCmd {
+        fd: Rc<Descriptor>,
+
+        cmd_op: u32,
+
+        cmd: [u8; 16],
     },
 }
 
@@ -840,6 +897,7 @@ impl Op {
             Self::Mkdir { .. } => "mkdir",
             Self::Rename { .. } => "rename",
             Self::Unlink { .. } => "unlink",
+            Self::UringCmd { .. } => "uring_cmd",
         }
     }
 
@@ -853,6 +911,7 @@ impl Op {
             } | Self::Poll { .. }
                 | Self::Accept(_)
                 | Self::Connect { .. }
+                | Self::UringCmd { .. }
         )
     }
 
@@ -966,6 +1025,18 @@ impl Op {
                 let path = sim.0.borrow().path(Some(dir), c_path(name))?;
                 sim.unlink(&path)?;
                 Ok(KernelResult::Value(0))
+            }
+            Self::UringCmd { fd, cmd_op, cmd } => {
+                let id = sim.handle(fd)?.id;
+                let mut w = sim.0.borrow_mut();
+                let index = w
+                    .uring_cmds
+                    .iter()
+                    .position(|c| {
+                        c.fd == id && c.cmd_op == *cmd_op && c.cmd.is_none_or(|c| c == *cmd)
+                    })
+                    .ok_or_else(|| errno(libc::EAGAIN))?;
+                Ok(KernelResult::Value(w.uring_cmds.remove(index).result))
             }
         }
     }

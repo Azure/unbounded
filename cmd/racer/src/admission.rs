@@ -31,6 +31,11 @@ pub struct AdmissionPolicy {
 
     /// Published cache priorities. Clones share one table.
     weights: crate::priority::Weights,
+
+    /// Set while ublk devices may still send reads. Worker shutdown then leaves
+    /// the quotas open and the owning application stops them later. Clones
+    /// share one flag.
+    stop_deferred: Arc<AtomicBool>,
 }
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
@@ -38,6 +43,7 @@ impl Clone for AdmissionPolicy {
             rules: self.rules.clone(),
             observer: self.observer.clone(),
             weights: self.weights.clone(),
+            stop_deferred: self.stop_deferred.clone(),
         }
     }
 }
@@ -53,7 +59,19 @@ impl AdmissionPolicy {
             ),
             observer: OnceLock::new(),
             weights: crate::priority::Weights::default(),
+            stop_deferred: Arc::default(),
         }
+    }
+    /// Leave the quotas open when worker shutdown begins. The caller that sets
+    /// this must call `Quotas::stop` itself once the deferral ends.
+    pub fn defer_stop(&self, deferred: bool) {
+        self.stop_deferred
+            .store(deferred, std::sync::atomic::Ordering::Release);
+    }
+    /// Whether worker shutdown must leave the quotas open.
+    pub fn stop_deferred(&self) -> bool {
+        self.stop_deferred
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     /// Shared priority table. Call `Quotas::reweigh` after updating it.
     pub fn weights(&self) -> &crate::priority::Weights {
