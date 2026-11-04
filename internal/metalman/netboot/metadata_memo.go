@@ -134,19 +134,33 @@ func (m *MetadataMemo) getPinned(ctx context.Context, digest string, fetch func(
 	return m.lookup(ctx, "digest "+digest, fetch)
 }
 
-func (m *MetadataMemo) lookup(ctx context.Context, key string, fetch func(context.Context) (*ImageMetadata, error)) (*ImageMetadata, error) {
+// cached returns the unexpired entry for key, if any.
+func (m *MetadataMemo) cached(key string) (metadataEntry, bool) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if e, ok := m.entries[key]; ok && m.now().Before(e.expires) {
-		m.mu.Unlock()
-		return e.meta, e.err
+	e, ok := m.entries[key]
+	if !ok || !m.now().Before(e.expires) {
+		return metadataEntry{}, false
 	}
 
-	m.mu.Unlock()
+	return e, true
+}
+
+func (m *MetadataMemo) lookup(ctx context.Context, key string, fetch func(context.Context) (*ImageMetadata, error)) (*ImageMetadata, error) {
+	if e, ok := m.cached(key); ok {
+		return e.meta, e.err
+	}
 
 	// The shared fetch must not be canceled when the first caller goes away,
 	// since other callers may be waiting on it.
 	ch := m.group.DoChan(key, func() (any, error) {
+		// A flight for key may have completed and cached its result
+		// between the lookup above and this flight starting.
+		if e, ok := m.cached(key); ok {
+			return e.meta, e.err
+		}
+
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.fetchTimeout())
 		defer cancel()
 

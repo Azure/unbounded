@@ -698,3 +698,56 @@ func TestMetadataMemoFallsBackWhenMirrorStalls(t *testing.T) {
 	require.Equal(t, "shimx64.efi", meta.DHCPBootImageName)
 	require.Positive(t, stalls.Load(), "mirror never stalled")
 }
+
+func TestMetadataMemoRechecksCacheInsideFlight(t *testing.T) {
+	base := time.Unix(1000, 0)
+
+	// The first clock read (the lookup before the flight) sees the entry
+	// expired; later reads (inside the flight) see it fresh, as if another
+	// flight had stored it in between.
+	var reads atomic.Int32
+
+	memo := &MetadataMemo{Now: func() time.Time {
+		if reads.Add(1) == 1 {
+			return base.Add(time.Second)
+		}
+
+		return base.Add(-time.Second)
+	}}
+	memo.entries = map[string]metadataEntry{
+		"digest sha256:abc": {meta: &ImageMetadata{HTTPBootPath: "cached.efi"}, expires: base},
+	}
+
+	var calls atomic.Int32
+
+	meta, err := memo.getPinned(t.Context(), "sha256:abc", func(context.Context) (*ImageMetadata, error) {
+		calls.Add(1)
+		return &ImageMetadata{HTTPBootPath: "fetched.efi"}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, "cached.efi", meta.HTTPBootPath)
+	require.Zero(t, calls.Load(), "flight must reuse the entry stored before it started")
+
+	// A memoized failure found inside the flight is returned as is.
+	reads.Store(0)
+
+	memo.entries["digest sha256:bad"] = metadataEntry{err: ErrImageUnavailable, expires: base}
+
+	_, err = memo.getPinned(t.Context(), "sha256:bad", func(context.Context) (*ImageMetadata, error) {
+		calls.Add(1)
+		return &ImageMetadata{}, nil
+	})
+	require.ErrorIs(t, err, ErrImageUnavailable)
+	require.Zero(t, calls.Load())
+
+	// A truly missing entry is still fetched.
+	reads.Store(0)
+
+	meta, err = memo.getPinned(t.Context(), "sha256:new", func(context.Context) (*ImageMetadata, error) {
+		calls.Add(1)
+		return &ImageMetadata{HTTPBootPath: "fetched.efi"}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, "fetched.efi", meta.HTTPBootPath)
+	require.EqualValues(t, 1, calls.Load())
+}
