@@ -251,10 +251,11 @@ impl SubscriptionFixture {
             origin_socket,
             priority: racer_control_wire::DEFAULT_PRIORITY,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         };
         snapshots
             .apply(Publication {
-                schema_version: 1,
+                schema_version: racer_control_wire::SCHEMA_VERSION,
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
@@ -266,6 +267,7 @@ impl SubscriptionFixture {
                     site: String::new(),
                 }],
                 caches: vec![cache.clone()],
+                pools: racer_control_wire::default_pools(std::slice::from_ref(&cache)),
             })
             .unwrap();
         let directory = Arc::new(

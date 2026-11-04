@@ -197,7 +197,17 @@ pub struct MessageCompletion<B: 'static, L: 'static = ()> {
 
     /// The kernel reported `MSG_CTRUNC`: ancillary data did not fit.
     pub truncated: bool,
+
+    /// Kernel TLS record content type (`TLS_GET_RECORD_TYPE`) of the received
+    /// bytes, present only on kernel TLS receive sockets. 23 is application data.
+    pub tls_record_type: Option<u8>,
 }
+
+/// Linux `SOL_TLS` socket level.
+pub const SOL_TLS: i32 = 282;
+
+/// Linux `TLS_GET_RECORD_TYPE` control message type at [`SOL_TLS`].
+pub const TLS_GET_RECORD_TYPE: i32 = 2;
 
 /// Heap-pinned `msghdr`, `iovec`, and control storage for one `RecvMsg`.
 /// Any descriptors the kernel installed are closed when this is dropped.
@@ -253,6 +263,36 @@ impl MessageHeader {
     /// Whether the kernel truncated ancillary data on the completed receive.
     fn truncated(&self) -> bool {
         self.header.msg_flags & libc::MSG_CTRUNC != 0
+    }
+
+    /// Kernel TLS record type reported in the control buffer, if any.
+    // Control lengths are usize on glibc but narrower on other libcs.
+    #[allow(clippy::unnecessary_cast)]
+    fn tls_record_type(&self) -> Option<u8> {
+        let capacity = self.control.len() * std::mem::size_of::<u64>();
+        let used = (self.header.msg_controllen as usize).min(capacity);
+        if self.header.msg_control.is_null() {
+            return None;
+        }
+        let base = self.control.as_ptr().cast::<u8>();
+        // SAFETY: CMSG_LEN(0) is the aligned header size.
+        let data = unsafe { libc::CMSG_LEN(0) } as usize;
+        let mut offset = 0;
+        while offset + std::mem::size_of::<libc::cmsghdr>() <= used {
+            // SAFETY: the header lies inside the initialized control buffer.
+            let cmsg: libc::cmsghdr = unsafe { std::ptr::read_unaligned(base.add(offset).cast()) };
+            let length = cmsg.cmsg_len as usize;
+            if length < std::mem::size_of::<libc::cmsghdr>() || offset + length > used {
+                break;
+            }
+            if cmsg.cmsg_level == SOL_TLS && cmsg.cmsg_type == TLS_GET_RECORD_TYPE && length > data
+            {
+                // SAFETY: the one-byte payload is inside this control message.
+                return Some(unsafe { *base.add(offset + data) });
+            }
+            offset += length.next_multiple_of(std::mem::size_of::<usize>());
+        }
+        None
     }
 
     /// Take ownership of every `SCM_RIGHTS` descriptor in the control buffer.
@@ -1855,7 +1895,9 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     }
 
     /// Receive like [`Self::recv`], also accepting `SCM_RIGHTS` descriptors with
-    /// `MSG_CMSG_CLOEXEC`. Descriptors are owned before this returns; a dropped
+    /// `MSG_CMSG_CLOEXEC` and reporting kernel TLS record types. On a kernel TLS
+    /// socket a non-application record is returned here (instead of failing with
+    /// `EIO` as plain `recv` does) and never merged with application data. Descriptors are owned before this returns; a dropped
     /// or failed wait closes any the kernel delivered. Simulated sockets carry
     /// no ancillary data and always report none.
     pub fn recv_msg<'a, B: IoBuffer, L: 'static>(
@@ -1907,6 +1949,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 )
                 .await?;
             let truncated = header.truncated();
+            let tls_record_type = header.tls_record_type();
             let descriptors = header.take_descriptors();
             let Completion {
                 buffer,
@@ -1919,6 +1962,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 lease,
                 descriptors,
                 truncated,
+                tls_record_type,
             })
         })
     }

@@ -52,6 +52,8 @@
 
 pub mod connection;
 
+pub mod tls;
+
 mod transfer;
 
 pub use transfer::{delivery, relay};

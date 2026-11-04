@@ -12,9 +12,18 @@ use flow_control::{Charge, Circuits, Policy, Quotas, Rejection};
 use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
 use racer_control_wire::{CacheId, NodeId};
+
+/// Link failure records per node, matching the dataplane's
+/// `LINK_HEALTH_CAPACITY` (mesh v2 degree grows with pool size).
+pub const LINK_CAPACITY: usize = 4096;
+
+/// Most suspected peers a node tracks (the v1 overlay degree bound).
+pub const MAX_SUSPECTS: usize = 64;
 use racer_core::admission::{Floors, Limits, Rules};
 use racer_core::cache::TickLru;
-use racer_core::liveness::{Rank0Watch, SILENCE_CAPACITY, Silence, WATCH_CAPACITY, WATCH_TTL};
+use racer_core::liveness::{
+    Detours, Rank0Watch, SILENCE_CAPACITY, Silence, WATCH_CAPACITY, WATCH_TTL,
+};
 use racer_core::read::flight::{FlightLimits, PageFlights, Reserve};
 use racer_core::read::hints::{
     HINT_CAPACITY, HINT_TTL, NOTICE_CAPACITY, OrphanNotices, SuccessorHints,
@@ -23,7 +32,7 @@ use racer_core::read::{Error, WorkerMap};
 use racer_object_wire::model::{
     CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, WorkerId,
 };
-use topology::{MAX_DEGREE, Member, Paths, Placement};
+use topology::{Member, Paths, Placement};
 
 pub use racer_core::admission::ResourceClass;
 
@@ -169,6 +178,9 @@ pub struct Node {
     pub rank0: Rank0Watch<u64, u32>,
     /// Next hops that left exchanges unanswered (production `LinkHealth::silence`).
     pub silence: Silence<u32, u64>,
+    /// Destinations whose routes skip relays that left an exchange unanswered (production
+    /// `LinkHealth::detours`).
+    pub detours: Detours<u32>,
     /// Silence pings and copy offers in flight.
     pub pings: u8,
     pub offers: u8,
@@ -208,7 +220,7 @@ impl Node {
                 )
                 .with_queue(config.search_queue as usize),
             ),
-            links: Circuits::new(MAX_DEGREE, Duration::from_secs(1)),
+            links: Circuits::new(LINK_CAPACITY, Duration::from_secs(1)),
             suspects: Vec::new(),
             disk,
             retention: Retention::new(config.history_bytes, disk_pages, now),
@@ -235,6 +247,7 @@ impl Node {
                 Duration::from_nanos(config.read_timeout_ns / 2),
                 Duration::from_nanos(config.attempt_timeout_ns),
             ),
+            detours: Detours::new(SILENCE_CAPACITY),
             recent_sheds: Vec::new(),
             pings: 0,
             offers: 0,
@@ -618,6 +631,11 @@ impl Versions {
     }
 
     /// Latest version number, 0 before any (combined mode).
+    /// Versions retained.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
     pub fn latest_number(&self) -> u64 {
         self.history.back().map_or(0, |v| v.number)
     }

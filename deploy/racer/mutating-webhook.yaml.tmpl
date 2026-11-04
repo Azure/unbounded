@@ -8,6 +8,10 @@
 # The operator never sets caBundle: the Racer primary publishes it and the
 # racer-webhook endpoints. Until then, opted-in Pod creation fails closed. The
 # operator namespace is excluded so the dataplane itself can always start.
+# The handler GETs the ClusterCache the pod names and adds its nodeSelector to
+# the pod's required node affinity. An unknown cache is denied. If the lookup
+# fails, the handler denies with a retryable 503, matching failurePolicy: Fail,
+# so a pod is never admitted without its cache's node affinity.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:

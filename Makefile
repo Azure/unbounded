@@ -870,7 +870,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
 unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
 

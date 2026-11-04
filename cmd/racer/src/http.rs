@@ -333,10 +333,14 @@ pub enum Endpoint {
         path: PathBuf,
     },
     Peer(String),
+    /// Origin reached by DNS name or IP over HTTP or HTTPS. Resolve it with
+    /// [`crate::remote::RemoteEndpoint::resolve`] before checkout.
+    Remote(crate::remote::RemoteEndpoint),
 }
 impl http1::connection::Endpoint<Error> for Endpoint {
     fn address(&self) -> Result<SocketAddress> {
         Ok(match self {
+            Self::Remote(remote) => SocketAddress::Inet(remote.address()?),
             Self::Unix(path) | Self::Origin { path, .. } => SocketAddress::Unix(path.clone()),
             Self::Peer(value) => {
                 SocketAddress::Inet(value.parse().map_err(|_| Error::InvalidConfiguration)?)
@@ -346,20 +350,34 @@ impl http1::connection::Endpoint<Error> for Endpoint {
     fn capacity(&self, config: &http1::connection::PoolConfig) -> usize {
         match self {
             Self::Peer(_) => config.per_endpoint,
+            // Remote origins share the origin connection cap
+            // (`origin_connections_per_cache`), not the neighbor cap.
             _ => config.secondary_cap,
         }
     }
     fn priority_headroom(&self) -> usize {
-        usize::from(matches!(self, Self::Origin { .. }))
+        usize::from(matches!(self, Self::Origin { .. } | Self::Remote(_)))
+    }
+    fn tls(&self) -> Option<&http1::tls::TlsClient> {
+        match self {
+            Self::Remote(remote) => remote.tls(),
+            _ => None,
+        }
     }
     fn allocation(&self) -> usize {
         match self {
             Self::Unix(path) => path.as_os_str().len(),
             Self::Origin { cache, path } => cache.0.len() + path.as_os_str().len(),
             Self::Peer(value) => value.len(),
+            Self::Remote(remote) => remote.host().len(),
         }
     }
 }
+/// Bound on distinct endpoints per worker pool. Peer endpoints are keyed by
+/// next hop, so the bound must cover the local mesh degree plus origins and
+/// sockets. Entries exist only while traffic uses them and idle entries are
+/// evicted first, so this is a cap, not a preallocation.
+pub const MAX_ENDPOINTS: usize = crate::topology::LINK_HEALTH_CAPACITY + 64;
 pub fn new_pool(
     reactor: Rc<Reactor>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -369,7 +387,7 @@ pub fn new_pool(
         reactor,
         admission,
         per_endpoint,
-        256,
+        MAX_ENDPOINTS,
         Duration::from_secs(30),
     )
 }
@@ -722,6 +740,17 @@ fn validate_slice(page: &VerifiedPage, slice: PageSlice) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn peer_limits_cover_mesh_degree() {
+        // Mesh v2 degree is about 2.83 * sqrt(pool size); a 100,000 member
+        // pool gives about 900 peers. Four such overlapping pools still fit.
+        let degree = (2.83 * 100_000f64.sqrt()).ceil() as usize;
+        assert!(4 * degree <= crate::topology::LINK_HEALTH_CAPACITY);
+        const {
+            assert!(crate::peer::CAPACITY >= crate::topology::LINK_HEALTH_CAPACITY);
+            assert!(MAX_ENDPOINTS > crate::topology::LINK_HEALTH_CAPACITY);
+        }
+    }
     use crate::model::RequestId;
     use http1::Header;
     use http1::StartLine;
@@ -737,6 +766,23 @@ pub(crate) mod tests {
     use uring_runtime::reactor::IoBuffer;
 
     /// Optional gates and response outcomes must not change completion ownership.
+    #[test]
+    fn remote_endpoints_use_the_origin_connection_cap() {
+        use http1::connection::Endpoint as _;
+        let config = http1::connection::PoolConfig {
+            per_endpoint: 2,
+            secondary_cap: 12,
+            max_endpoints: 1,
+            idle_timeout: Duration::from_secs(1),
+            waiter_cap: 1,
+            tcp_nodelay: true,
+        };
+        let remote =
+            Endpoint::Remote(crate::remote::RemoteEndpoint::http("127.0.0.1", 80).unwrap());
+        assert_eq!(remote.capacity(&config), 12);
+        assert_eq!(Endpoint::Peer("127.0.0.1:1".into()).capacity(&config), 2);
+    }
+
     #[test]
     fn exchange_owners_report_only_finished_verification_and_release_on_idle() {
         use crate::telemetry::{Event, Gauge, Metrics};

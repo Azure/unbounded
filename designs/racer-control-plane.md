@@ -96,9 +96,11 @@ explicit thread budget. It must not add an unbounded thread pool or block data
 I/O on API requests. API operations, TLS handshakes, request bodies, active
 connections, long polls, and shutdown all need bounds.
 
-Keep the existing control wire schema and canonical hashes. Moving the
-implementation to Rust does not require changing the data-path contract.
-Protocol fixtures belong to the Rust control-wire crate rather than the deleted
+The control wire is at schema version 2 (`SCHEMA_VERSION`; version 1 is
+rejected) and delta version 2. Publications carry per-cache node pools, which
+the primary computes from each ClusterCache's `spec.nodeSelector` and member
+Node labels; see `racer-mesh-v2.md`. The canonical membership bytes, and so the
+membership version, cover members and pools. Protocol fixtures belong to the Rust control-wire crate rather than the deleted
 Go controller. Standalone test endpoints may still exercise the client without
 Kubernetes; managed deployments do not depend on a fixed controller URL or an
 operator-generated trust bundle.

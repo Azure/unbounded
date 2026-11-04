@@ -165,6 +165,11 @@ entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
 the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
+ACR attachment is separate from deployment and preserves existing authentication
+by default. For operator-managed AKS Flex clusters, see the
+[ACR attachment guide](../../docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+for commands, managed-auth opt-in, compatible versions, and limitations.
+
 Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
 resident reconciler checks the default `hosts.toml` every five seconds and
 atomically restores the chart-owned payload when the file is missing or

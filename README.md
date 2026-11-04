@@ -123,6 +123,33 @@ After a few minutes your remote node appears with status **Ready**.
 For the full walkthrough including pod networking verification, see the
 [Getting Started Guide](https://unbounded-cloud.io/guides/getting-started/).
 
+### AKS Flex: create the entire cluster with one script
+
+Create one AKS system node and three automatically bootstrapped VMSS workers,
+with Unbounded networking and Gantry:
+
+```bash
+bash hack/scripts/aks-flex-cluster.sh \
+    --name my-flex-cluster \
+    --location canadacentral \
+    --subscription "<subscription-uuid>" \
+    --yes
+```
+
+Requires an authenticated Azure CLI >= 2.90.0 and a subscription supporting the
+AKS Flex preview. Run `bash hack/scripts/aks-flex-cluster.sh --help` for tools
+and options; add `--plan` to preview without creating resources.
+
+Keep the state directory (`tmp/aks-flex/my-flex-cluster/` by default), which
+contains the kubeconfig and SSH key. Rerun with the same arguments to resume
+provisioning. Scale workers separately with `az vmss scale`; reruns preserve
+capacity. The script is not an upgrade or teardown tool.
+
+Gantry starts without ACR authentication. See the
+[ACR attachment guide](docs/content/guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+to enable it with a compatible plugin/operator; the script's pinned `v0.8.0`
+baseline does not include managed authentication.
+
 ## Documentation
 
 Full documentation is available at **[unbounded-cloud.io](https://unbounded-cloud.io/)**.

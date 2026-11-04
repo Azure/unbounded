@@ -294,7 +294,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let source_store =
         PublicationTarget::new(ClusterId(CLUSTER.into()), source_publications.clone());
     let mut publication = Publication {
-        schema_version: 1,
+        pools: Vec::new(),
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
@@ -305,6 +306,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             origin_socket: "/run/racer/remote/origin/socket".into(),
             priority: racer_control_wire::DEFAULT_PRIORITY,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         }],
         members: (0..4)
             .map(|i| racer_control_wire::Member {
@@ -315,7 +317,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 site: String::new(),
             })
             .collect(),
-    };
+    }
+    .with_default_pool();
     let first = source_store.apply(publication.clone()).unwrap();
     publication.sequence.0 = 2;
     let cache_only = source_store.apply(publication.clone()).unwrap();
@@ -916,6 +919,7 @@ fn metadata_coordinator_with_newer_publication(
     ));
     let snapshots = Rc::new(PublicationTarget::new(ClusterId(CLUSTER.into()), published));
     let mut publication = Publication {
+        pools: Vec::new(),
         schema_version: SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
@@ -933,8 +937,10 @@ fn metadata_coordinator_with_newer_publication(
             origin_socket: "/run/racer/remote/origin/socket".into(),
             priority: racer_control_wire::DEFAULT_PRIORITY,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         }],
-    };
+    }
+    .with_default_pool();
     snapshots.apply(publication.clone()).unwrap();
     if newer_publication {
         publication.sequence.0 += 1;

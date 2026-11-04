@@ -22,7 +22,8 @@ const (
 )
 
 // TestObjectCacheFromAzureOrigin installs Racer through the operator from a
-// ClusterCache with an anonymous Azure origin, then reads a public blob
+// ClusterCache with an anonymous Azure origin, which the Racer dataplane
+// reads directly, then reads a public blob
 // through the injected racer-object sidecar using both the S3 and Azure APIs.
 func TestObjectCacheFromAzureOrigin(t *testing.T) {
 	requireAzureEgress(t, containerURL+"/"+blobKey)
@@ -41,7 +42,6 @@ func TestObjectCacheFromAzureOrigin(t *testing.T) {
 	h.applyCache()
 	h.installRacer()
 	h.checkDataplaneHardware()
-	h.rollout("daemonset", "racer-origin-"+cacheName, 5*time.Minute)
 	h.waitWebhook()
 
 	for i, api := range apis {

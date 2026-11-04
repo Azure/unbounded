@@ -13,7 +13,7 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // The bounded regex checks label lengths without a costly CEL split/all loop.
 // Whether spec.origin is set is fixed at creation. Cache entries are keyed by
 // the ClusterCache UID, not by their source, so removing and re-adding origin,
-// or switching between a managed origin and a self-deployed one, would serve
+// or switching between the Racer Azure Blob origin and a self-deployed one, would serve
 // entries fetched from a different source.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=ccache
@@ -31,9 +31,10 @@ type ClusterCache struct {
 
 // ClusterCacheSpec configures optional cache features.
 type ClusterCacheSpec struct {
-	// Origin deploys a managed racer-object origin for this cache. The operator runs
-	// one origin pod per dataplane node. Origin can be set only at creation and
-	// cannot be removed later; leave it unset to deploy your own origin.
+	// Origin makes the Racer dataplane read this cache's objects directly from
+	// object storage, with no separate origin process. Origin can be set only
+	// at creation and cannot be removed later; leave it unset to deploy your
+	// own origin.
 	// +optional
 	Origin *ObjectOrigin `json:"origin,omitempty"`
 
@@ -64,6 +65,14 @@ type ClusterCacheSpec struct {
 	// passthrough, data previously cached for it is dropped.
 	// +optional
 	Passthrough *Passthrough `json:"passthrough,omitempty"`
+
+	// NodeSelector selects, by Node labels, the Racer nodes that store, serve,
+	// and read this cache. When unset or empty, every Racer node does.
+	// Changing it moves the cache to a new pool of nodes with no migration:
+	// pages are refilled from the origin. The Racer admission webhook
+	// restricts client pods that use this cache to matching nodes.
+	// +optional
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
 }
 
 // PassthroughRoute selects which node's origin serves a passthrough read.
@@ -88,7 +97,7 @@ type Passthrough struct {
 	// Route selects which node's origin serves a read. Peers routes pages to
 	// their owner nodes and shares origin reads cluster-wide. Local reads from
 	// the reading node's own origin, so every reading node needs an origin
-	// (a managed spec.origin runs one per dataplane node). When unset, Peers.
+	// (spec.origin is served by every dataplane node). When unset, Peers.
 	// +kubebuilder:default=Peers
 	// +optional
 	Route PassthroughRoute `json:"route,omitempty"`
@@ -126,24 +135,25 @@ func (s ClusterCacheSpec) EffectivePriority() int32 {
 	return *s.Priority
 }
 
-// ObjectOrigin configures a managed object storage origin.
+// ObjectOrigin configures an object storage origin that the Racer dataplane
+// reads directly.
 // Exactly one provider must be set. Only azure is supported today.
 // +kubebuilder:validation:XValidation:rule="has(self.azure)",message="azure is required"
 type ObjectOrigin struct {
 	// MetadataTTL bounds how long object metadata is reused before it is revalidated.
-	// It must not be negative. When unset, the racer-object default applies.
+	// It must not be negative. When unset, 30s.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="metadataTTL must not be negative"
 	// +optional
 	MetadataTTL *metav1.Duration `json:"metadataTTL,omitempty"`
 
 	// RequestTimeout bounds each upstream request. It must be positive.
-	// When unset, the racer-object default applies.
+	// When unset, 1m.
 	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="requestTimeout must be positive"
 	// +optional
 	RequestTimeout *metav1.Duration `json:"requestTimeout,omitempty"`
 
-	// MaxConcurrentRequests bounds concurrent upstream requests per origin pod.
-	// When unset, the racer-object default applies.
+	// MaxConcurrentRequests bounds concurrent upstream requests for this cache
+	// on each dataplane node. When unset, 512.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65536
 	// +optional
@@ -173,7 +183,8 @@ type AzureOrigin struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="containerURL is immutable; create a new ClusterCache for a different container"
 	ContainerURL string `json:"containerURL"`
 
-	// Credential selects how the origin authenticates. When omitted, requests are anonymous.
+	// Credential selects how the Racer dataplane authenticates. When omitted,
+	// requests are anonymous.
 	// +optional
 	Credential *AzureCredential `json:"credential,omitempty"`
 }
@@ -181,29 +192,32 @@ type AzureOrigin struct {
 // AzureCredential selects one Azure authentication method.
 // +kubebuilder:validation:XValidation:rule="[has(self.default), has(self.workloadIdentity)].filter(x, x).size() == 1",message="exactly one of default or workloadIdentity is required"
 type AzureCredential struct {
-	// Default uses DefaultAzureCredential, such as a managed identity or
-	// service principal environment variables from a Secret.
+	// Default uses the node's managed identity through the Azure Instance
+	// Metadata Service (IMDS).
 	// +optional
 	Default *AzureDefaultCredential `json:"default,omitempty"`
 
-	// WorkloadIdentity uses Microsoft Entra Workload ID. The cluster must run
-	// the Azure Workload Identity webhook, and the identity must trust the
-	// origin's ServiceAccount.
+	// WorkloadIdentity uses Microsoft Entra Workload ID. The Racer dataplane
+	// exchanges a projected token for its own ServiceAccount (audience
+	// api://AzureADTokenExchange), so the identity needs a federated
+	// credential for the Racer dataplane ServiceAccount. No webhook is needed.
 	// +optional
 	WorkloadIdentity *AzureWorkloadIdentityCredential `json:"workloadIdentity,omitempty"`
 }
 
-// AzureDefaultCredential configures DefaultAzureCredential.
-// +kubebuilder:validation:XValidation:rule="!(has(self.clientID) && has(self.secretRef))",message="clientID and secretRef are mutually exclusive"
+// AzureDefaultCredential configures the node managed identity.
+// +kubebuilder:validation:XValidation:rule="!has(self.secretRef)",message="secretRef is no longer supported; use clientID or workloadIdentity"
 type AzureDefaultCredential struct {
-	// ClientID selects a user-assigned managed identity.
+	// ClientID selects a user-assigned managed identity. When unset, the
+	// system-assigned identity, or the only user-assigned identity, is used.
 	// +kubebuilder:validation:Pattern=`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
 	// +optional
 	ClientID string `json:"clientID,omitempty"`
 
-	// SecretRef names a Secret in the operator namespace whose keys are
-	// injected as environment variables, for example AZURE_CLIENT_ID,
-	// AZURE_TENANT_ID, and AZURE_CLIENT_SECRET.
+	// SecretRef is deprecated and unsupported. The Racer dataplane cannot
+	// read Secret credentials, so a cache that sets it is rejected. It stays
+	// in the schema only so that stored caches which still set it are not
+	// pruned into a managed identity credential and instead fail closed.
 	// +optional
 	SecretRef *SecretReference `json:"secretRef,omitempty"`
 }
@@ -214,7 +228,8 @@ type AzureWorkloadIdentityCredential struct {
 	// +kubebuilder:validation:Pattern=`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
 	ClientID string `json:"clientID"`
 
-	// TenantID overrides the tenant configured by the webhook.
+	// TenantID is the identity's Microsoft Entra tenant. When unset, it is
+	// discovered from the storage account's bearer challenge.
 	// +kubebuilder:validation:Pattern=`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
 	// +optional
 	TenantID string `json:"tenantID,omitempty"`
@@ -227,11 +242,9 @@ type ClusterCacheList struct {
 	Items           []ClusterCache `json:"items"`
 }
 
-// SecretReference names a Secret in the operator namespace.
+// SecretReference names a Secret. Deprecated: see AzureDefaultCredential.SecretRef.
 type SecretReference struct {
-	// Name of the Secret. It must be a DNS-1123 subdomain.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
-	Name string `json:"name"`
+	// Name of the Secret.
+	// +optional
+	Name string `json:"name,omitempty"`
 }

@@ -1886,7 +1886,7 @@ pub mod identity {
             let installer = BundleInstaller::new(keys());
             assert_eq!(installer.generation(), None);
             let mut bundle = racer_control_wire::KeyringBundle {
-                schema_version: 1,
+                schema_version: racer_control_wire::SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![first.der().to_vec(), second.der().to_vec()],
@@ -1952,7 +1952,7 @@ pub mod identity {
                 Arc::new(KeyEpochs::default()),
             ));
             let bundle = |generation, roots| racer_control_wire::KeyringBundle {
-                schema_version: 1,
+                schema_version: racer_control_wire::SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,

@@ -600,6 +600,7 @@ pub(crate) mod tests {
             client_socket: client,
             priority: wire::DEFAULT_PRIORITY,
             mode: wire::CacheMode::Cached,
+            origin: None,
             origin_socket: origin,
         }
     }

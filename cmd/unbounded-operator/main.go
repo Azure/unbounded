@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -34,6 +35,7 @@ import (
 	racerv1alpha1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/clusterinfo"
 	"github.com/Azure/unbounded/internal/operator"
+	"github.com/Azure/unbounded/internal/operator/components/gantry"
 	"github.com/Azure/unbounded/internal/unbounded"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -78,6 +80,7 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.imageRegistry, "image-registry", envStringDefault("UNBOUNDED_IMAGE_REGISTRY", "ghcr.io/azure"), "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images (defaults to $UNBOUNDED_IMAGE_REGISTRY or ghcr.io/azure)")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
 	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
+	cmd.AddCommand(registryAuthCommands()...)
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
@@ -202,6 +205,9 @@ func run(ctx context.Context, cfg config) error {
 		// reads must bypass the cache.
 		Cache: cache.Options{
 			DefaultNamespaces: map[string]cache.Config{namespace: {}},
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Node{}: {Label: labels.SelectorFromSet(gantry.RegistryAuthNodeSelector())},
+			},
 		},
 
 		Metrics:                       metricsserver.Options{BindAddress: cfg.metricsAddr},
@@ -217,6 +223,12 @@ func run(ctx context.Context, cfg config) error {
 
 	if err := (&operator.CRDReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup CRD controller: %w", err)
+	}
+
+	if err := (&gantry.RegistryAuthAudienceReconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Namespace: namespace,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup registry-auth audience controller: %w", err)
 	}
 
 	if err := (&operator.SiteReconciler{

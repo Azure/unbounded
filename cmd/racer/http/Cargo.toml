@@ -16,7 +16,15 @@ uring-runtime = { path = "../runtime" }
 httparse = "1"
 zeroize = "1"
 libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+rcgen = { version = "0.13", features = ["pem", "ring"] }
 
 [[test]]
 name = "pool"
+required-features = ["test-util"]
+
+[[test]]
+name = "tls"
 required-features = ["test-util"]
