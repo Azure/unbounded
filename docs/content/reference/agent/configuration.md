@@ -49,6 +49,11 @@ for command usage, exit behavior, and the current check list.
 }
 ```
 
+Opt-in registry authentication on AKS Flex nodes is configured through the
+operator, not these agent settings. See the
+[ACR attachment guide](../../guides/gantry.md#acr-attachment-and-explicit-authentication-on-flex-nodes)
+for the workflow and requirements.
+
 ## Fields
 
 | Field | Description |

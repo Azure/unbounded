@@ -15,7 +15,19 @@ ARG RACER_NATIVE_RDMA=true
 # first gpu-read, and turns GPU reads off then if no GPU is usable. Set false
 # for a smaller image without GPU reads.
 ARG RACER_NATIVE_CUDA=true
-ARG CUDA_NVCC_PACKAGE=cuda-nvcc-12-9
+# nvcc comes from NVIDIA's distribution-neutral redist archives rather than the
+# debian12 apt repo: that repo has no CUDA 12 packages for sbsa (arm64), so the
+# arm64 build could not install cuda-nvcc-12-9. The archives are pinned by
+# sha256 per architecture and match the runtime stage's CUDA 12.9 release
+# (redistrib_12.9.1.json). nvcc implicitly includes cuda_runtime.h, which
+# comes from cuda_cudart.
+ARG CUDA_REDIST_URL=https://developer.download.nvidia.com/compute/cuda/redist
+ARG CUDA_NVCC_VERSION=12.9.86
+ARG CUDA_NVCC_SHA256_X86_64=7a1a5b652e5ef85c82b721d10672fc9a2dbaab44e9bd3c65a69517bf53998c35
+ARG CUDA_NVCC_SHA256_SBSA=0aa1fce92dbae76c059c27eefb9d0ffb58e1291151e44ff7c7f1fc2dd9376c0d
+ARG CUDA_CUDART_VERSION=12.9.79
+ARG CUDA_CUDART_SHA256_X86_64=1f6ad42d4f530b24bfa35894ccf6b7209d2354f59101fd62ec4a6192a184ce99
+ARG CUDA_CUDART_SHA256_SBSA=8b422a3b2cb8452cb678181b0bf9d7aa7342df168b5319c5488ae3b8514101fc
 ENV RUSTFLAGS="-C force-frame-pointers=yes"
 WORKDIR /src
 
@@ -47,17 +59,24 @@ RUN set -eu; \
     case "$RACER_NATIVE_CUDA" in \
         true) \
             case "$(uname -m)" in \
-                x86_64) repo=x86_64 ;; \
-                aarch64) repo=sbsa ;; \
+                x86_64) arch=x86_64; \
+                    nvcc_sha=$CUDA_NVCC_SHA256_X86_64; cudart_sha=$CUDA_CUDART_SHA256_X86_64 ;; \
+                aarch64) arch=sbsa; \
+                    nvcc_sha=$CUDA_NVCC_SHA256_SBSA; cudart_sha=$CUDA_CUDART_SHA256_SBSA ;; \
                 *) echo "unsupported CUDA architecture $(uname -m)" >&2; exit 1 ;; \
             esac; \
-            curl -fsSL -o /tmp/cuda-keyring.deb \
-                "https://developer.download.nvidia.com/compute/cuda/repos/debian12/$repo/cuda-keyring_1.1-1_all.deb"; \
-            dpkg -i /tmp/cuda-keyring.deb; \
-            rm /tmp/cuda-keyring.deb; \
-            apt-get update; \
-            apt-get install -y --no-install-recommends "$CUDA_NVCC_PACKAGE"; \
-            rm -rf /var/lib/apt/lists/* ;; \
+            mkdir -p /usr/local/cuda/targets; \
+            for component in "cuda_nvcc $CUDA_NVCC_VERSION $nvcc_sha" \
+                "cuda_cudart $CUDA_CUDART_VERSION $cudart_sha"; do \
+                set -- $component; \
+                archive="$1-linux-$arch-$2-archive.tar.xz"; \
+                curl -fsSL -o "/tmp/$archive" "$CUDA_REDIST_URL/$1/linux-$arch/$archive"; \
+                echo "$3  /tmp/$archive" | sha256sum -c -; \
+                tar -xJf "/tmp/$archive" -C /usr/local/cuda --strip-components=1; \
+                rm "/tmp/$archive"; \
+            done; \
+            ln -s .. "/usr/local/cuda/targets/$arch-linux"; \
+            /usr/local/cuda/bin/nvcc --version ;; \
         false) ;; \
         *) echo "RACER_NATIVE_CUDA must be true or false" >&2; exit 1 ;; \
     esac

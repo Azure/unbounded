@@ -73,7 +73,8 @@ pub struct ScaledLimits {
 }
 
 pub struct Config {
-    pub warm: crate::read::warm::Config,
+    pub spill: crate::read::spill::Config,
+    pub prefetch: crate::prefetch::Config,
     pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
     /// Order in which a non-owner requester visits a page's ranked owners.
@@ -220,13 +221,36 @@ impl Config {
             _ => return Err(Error::InvalidConfiguration),
         };
         let mut config = Self {
-            warm: crate::read::warm::Config {
-                max_ttl: Duration::from_secs(raw.warm_max_ttl_secs.unwrap_or(3600)),
-                fill_timeout: Duration::from_secs(raw.warm_fill_timeout_secs.unwrap_or(600)),
-                max_jobs: to_usize(raw.warm_max_jobs.unwrap_or(16))?,
-                window: to_usize(raw.warm_window_pages.unwrap_or(2))?,
+            spill: crate::read::spill::Config {
                 retained_percent: to_usize(raw.retained_segment_percent.unwrap_or(50))?,
                 range_spill_pages: to_usize(raw.range_spill_pages.unwrap_or(0))?,
+            },
+            prefetch: {
+                let d = crate::prefetch::Config::default();
+                crate::prefetch::Config {
+                    max_body_bytes: raw.prefetch_max_body_bytes.unwrap_or(d.max_body_bytes),
+                    max_refs: raw.prefetch_max_refs.unwrap_or(d.max_refs),
+                    max_tickets: raw.prefetch_max_tickets.unwrap_or(d.max_tickets),
+                    max_ttl_secs: raw.prefetch_max_ttl_secs.unwrap_or(d.max_ttl_secs),
+                    ticket_retention_secs: raw
+                        .prefetch_ticket_retention_secs
+                        .unwrap_or(d.ticket_retention_secs),
+                    max_wait_secs: raw.prefetch_max_wait_secs.unwrap_or(d.max_wait_secs),
+                    default_pending_bytes: raw
+                        .prefetch_default_pending_bytes
+                        .unwrap_or(d.default_pending_bytes),
+                    max_pending_bytes: raw
+                        .prefetch_max_pending_bytes
+                        .unwrap_or(d.max_pending_bytes),
+                    node_pending_bytes: raw
+                        .prefetch_node_pending_bytes
+                        .unwrap_or(d.node_pending_bytes),
+                    concurrent_fills: raw.prefetch_concurrent_fills.unwrap_or(d.concurrent_fills),
+                    origin_bytes_per_sec: raw
+                        .prefetch_origin_bytes_per_sec
+                        .unwrap_or(d.origin_bytes_per_sec),
+                    max_attempts: raw.prefetch_max_attempts.unwrap_or(d.max_attempts),
+                }
             },
             send_crc_pair: raw
                 .send_crc_pair
@@ -512,7 +536,8 @@ impl Config {
                         .is_some_and(|n| n <= self.max_threads) => {}
             _ => return Err(Error::InvalidConfiguration),
         }
-        self.warm.validate()?;
+        self.spill.validate()?;
+        self.prefetch.validate()?;
         if let Some(pair) = &self.send_crc_pair {
             pair.validate()?;
         }
@@ -782,11 +807,19 @@ const ENV_NAMES: &[&str] = &[
     "MAX_THREADS",
     "IO_WORKERS",
     "CRYPTO_HELPERS",
-    "WARM_MAX_TTL_SECS",
-    "WARM_FILL_TIMEOUT_SECS",
-    "WARM_MAX_JOBS",
-    "WARM_WINDOW_PAGES",
     "RETAINED_SEGMENT_PERCENT",
+    "PREFETCH_MAX_BODY_BYTES",
+    "PREFETCH_MAX_REFS",
+    "PREFETCH_MAX_TICKETS",
+    "PREFETCH_MAX_TTL_SECS",
+    "PREFETCH_TICKET_RETENTION_SECS",
+    "PREFETCH_MAX_WAIT_SECS",
+    "PREFETCH_DEFAULT_PENDING_BYTES",
+    "PREFETCH_MAX_PENDING_BYTES",
+    "PREFETCH_NODE_PENDING_BYTES",
+    "PREFETCH_CONCURRENT_FILLS",
+    "PREFETCH_ORIGIN_BYTES_PER_SEC",
+    "PREFETCH_MAX_ATTEMPTS",
     "PAGE_HEDGE_DELAY_MS",
     "PAGE_HEDGE_SLOTS",
     "PAGE_HEDGE_BYTES",
@@ -869,13 +902,29 @@ struct RawConfig {
     #[serde(default, deserialize_with = "decimal")]
     crypto_helpers: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
-    warm_max_ttl_secs: Option<u64>,
+    prefetch_max_body_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
-    warm_fill_timeout_secs: Option<u64>,
+    prefetch_max_refs: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
-    warm_max_jobs: Option<u64>,
+    prefetch_max_tickets: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
-    warm_window_pages: Option<u64>,
+    prefetch_max_ttl_secs: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_ticket_retention_secs: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_max_wait_secs: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_default_pending_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_max_pending_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_node_pending_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_concurrent_fills: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_origin_bytes_per_sec: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    prefetch_max_attempts: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     retained_segment_percent: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1719,39 +1768,114 @@ mod tests {
         })
     }
     #[test]
-    fn warm_defaults_and_environment_limits_are_bounded() {
-        let warm = parse(&[]).unwrap().warm;
-        assert_eq!(warm.max_ttl, Duration::from_secs(3600));
-        assert_eq!(warm.fill_timeout, Duration::from_secs(600));
-        assert_eq!(
-            (
-                warm.max_jobs,
-                warm.window,
-                warm.retained_percent,
-                warm.range_spill_pages
-            ),
-            (16, 2, 50, 0)
-        );
-        let warm = parse(&[
-            ("RACER_WARM_MAX_JOBS", "8"),
-            ("RACER_WARM_WINDOW_PAGES", "4"),
+    fn spill_defaults_and_environment_limits_are_bounded() {
+        let spill = parse(&[]).unwrap().spill;
+        assert_eq!((spill.retained_percent, spill.range_spill_pages), (50, 0));
+        let spill = parse(&[
+            ("RACER_RETAINED_SEGMENT_PERCENT", "100"),
             ("RACER_RANGE_SPILL_PAGES", "1024"),
         ])
         .unwrap()
-        .warm;
+        .spill;
         assert_eq!(
-            (warm.max_jobs, warm.window, warm.range_spill_pages),
-            (8, 4, 1024)
+            (spill.retained_percent, spill.range_spill_pages),
+            (100, 1024)
         );
         for (name, value) in [
-            ("RACER_WARM_MAX_TTL_SECS", "0"),
-            ("RACER_WARM_FILL_TIMEOUT_SECS", "0"),
-            ("RACER_WARM_MAX_JOBS", "0"),
-            ("RACER_WARM_WINDOW_PAGES", "65"),
+            ("RACER_RETAINED_SEGMENT_PERCENT", "0"),
             ("RACER_RETAINED_SEGMENT_PERCENT", "101"),
             ("RACER_RANGE_SPILL_PAGES", "1025"),
         ] {
-            assert!(parse(&[(name, value)]).is_err());
+            assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
+        }
+    }
+
+    #[test]
+    fn prefetch_defaults_and_bounds() {
+        let prefetch = parse(&[]).unwrap().prefetch;
+        assert_eq!(prefetch, crate::prefetch::Config::default());
+        assert_eq!(prefetch.max_body_bytes, 4194304);
+        assert_eq!(prefetch.max_refs, 16384);
+        assert_eq!(prefetch.max_tickets, 1024);
+        assert_eq!(prefetch.max_ttl_secs, 3600);
+        assert_eq!(prefetch.ticket_retention_secs, 300);
+        assert_eq!(prefetch.max_wait_secs, 60);
+        assert_eq!(prefetch.default_pending_bytes, 1 << 30);
+        assert_eq!(prefetch.max_pending_bytes, 16 << 30);
+        assert_eq!(prefetch.node_pending_bytes, 64 << 30);
+        assert_eq!(prefetch.concurrent_fills, 16);
+        assert_eq!(prefetch.origin_bytes_per_sec, 0);
+        assert_eq!(prefetch.max_attempts, 5);
+        // Inclusive bounds are accepted.
+        for (name, value) in [
+            ("RACER_PREFETCH_MAX_BODY_BYTES", "4096"),
+            ("RACER_PREFETCH_MAX_BODY_BYTES", "67108864"),
+            ("RACER_PREFETCH_MAX_REFS", "1"),
+            ("RACER_PREFETCH_MAX_REFS", "1048576"),
+            ("RACER_PREFETCH_MAX_TICKETS", "65536"),
+            ("RACER_PREFETCH_MAX_TTL_SECS", "86400"),
+            ("RACER_PREFETCH_TICKET_RETENTION_SECS", "0"),
+            ("RACER_PREFETCH_MAX_WAIT_SECS", "600"),
+            ("RACER_PREFETCH_DEFAULT_PENDING_BYTES", "16777216"),
+            ("RACER_PREFETCH_MAX_PENDING_BYTES", "1125899906842624"),
+            ("RACER_PREFETCH_NODE_PENDING_BYTES", "4503599627370496"),
+            ("RACER_PREFETCH_CONCURRENT_FILLS", "1024"),
+            ("RACER_PREFETCH_ORIGIN_BYTES_PER_SEC", "1099511627776"),
+            ("RACER_PREFETCH_MAX_ATTEMPTS", "32"),
+        ] {
+            assert!(parse(&[(name, value)]).is_ok(), "{name}={value}");
+        }
+        for (name, value) in [
+            ("RACER_PREFETCH_MAX_BODY_BYTES", "4095"),
+            ("RACER_PREFETCH_MAX_BODY_BYTES", "67108865"),
+            ("RACER_PREFETCH_MAX_REFS", "0"),
+            ("RACER_PREFETCH_MAX_REFS", "1048577"),
+            ("RACER_PREFETCH_MAX_TICKETS", "0"),
+            ("RACER_PREFETCH_MAX_TICKETS", "65537"),
+            ("RACER_PREFETCH_MAX_TTL_SECS", "0"),
+            ("RACER_PREFETCH_MAX_TTL_SECS", "86401"),
+            ("RACER_PREFETCH_TICKET_RETENTION_SECS", "86401"),
+            ("RACER_PREFETCH_MAX_WAIT_SECS", "0"),
+            ("RACER_PREFETCH_MAX_WAIT_SECS", "601"),
+            ("RACER_PREFETCH_DEFAULT_PENDING_BYTES", "16777215"),
+            ("RACER_PREFETCH_MAX_PENDING_BYTES", "16777215"),
+            ("RACER_PREFETCH_MAX_PENDING_BYTES", "1125899906842625"),
+            ("RACER_PREFETCH_NODE_PENDING_BYTES", "16777215"),
+            ("RACER_PREFETCH_NODE_PENDING_BYTES", "4503599627370497"),
+            ("RACER_PREFETCH_CONCURRENT_FILLS", "0"),
+            ("RACER_PREFETCH_CONCURRENT_FILLS", "1025"),
+            ("RACER_PREFETCH_ORIGIN_BYTES_PER_SEC", "1099511627777"),
+            ("RACER_PREFETCH_MAX_ATTEMPTS", "0"),
+            ("RACER_PREFETCH_MAX_ATTEMPTS", "33"),
+        ] {
+            assert!(parse(&[(name, value)]).is_err(), "{name}={value}");
+        }
+        // The default per-ticket bound may not exceed the per-ticket cap.
+        assert!(
+            parse(&[
+                ("RACER_PREFETCH_MAX_PENDING_BYTES", "33554432"),
+                ("RACER_PREFETCH_DEFAULT_PENDING_BYTES", "67108864"),
+            ])
+            .is_err()
+        );
+        let prefetch = parse(&[
+            ("RACER_PREFETCH_MAX_PENDING_BYTES", "33554432"),
+            ("RACER_PREFETCH_DEFAULT_PENDING_BYTES", "16777216"),
+        ])
+        .unwrap()
+        .prefetch;
+        assert_eq!(prefetch.max_pending_bytes, 33554432);
+    }
+
+    #[test]
+    fn removed_warm_keys_are_not_known() {
+        for key in [
+            "WARM_MAX_TTL_SECS",
+            "WARM_FILL_TIMEOUT_SECS",
+            "WARM_MAX_JOBS",
+            "WARM_WINDOW_PAGES",
+        ] {
+            assert!(!ENV_NAMES.contains(&key), "{key}");
         }
     }
 

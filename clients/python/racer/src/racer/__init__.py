@@ -15,6 +15,7 @@ from .client import (
 )
 from .errors import (
     NotFound,
+    PrefetchError,
     ProtocolError,
     RacerError,
     StatusError,
@@ -23,6 +24,16 @@ from .errors import (
     VersionUnavailable,
 )
 from ._wire import PAGE_SIZE
+from .prefetch import (
+    PrefetchBytes,
+    PrefetchCoverage,
+    PrefetchRef,
+    PrefetchRefStatus,
+    PrefetchSpec,
+    PrefetchStatus,
+    PrefetchWindow,
+    split_prefetch,
+)
 from .host import HostBuffer
 from .keys import Request, canonical_json, object_key, object_request
 
@@ -36,6 +47,14 @@ __all__ = [
     "HostBuffer",
     "Metadata",
     "NotFound",
+    "PrefetchBytes",
+    "PrefetchCoverage",
+    "PrefetchError",
+    "PrefetchRef",
+    "PrefetchRefStatus",
+    "PrefetchSpec",
+    "PrefetchStatus",
+    "PrefetchWindow",
     "ProtocolError",
     "RacerError",
     "ReadResult",
@@ -49,4 +68,5 @@ __all__ = [
     "object_key",
     "object_request",
     "socket_path_for",
+    "split_prefetch",
 ]

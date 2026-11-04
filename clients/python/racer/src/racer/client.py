@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import json
 import logging
 import os
 import re
@@ -18,10 +19,13 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Callable, Optional
 
 from . import _wire as wire
-from .errors import ProtocolError, RacerError, StatusError, TruncatedError, UnsatisfiableRange
+from . import prefetch as _prefetch
+from .errors import PrefetchError, ProtocolError, RacerError, StatusError, TruncatedError, UnsatisfiableRange
+from .prefetch import PrefetchSpec, PrefetchStatus
 from .keys import Request
 
 OnPage = Optional[Callable[[int, int], None]]
@@ -133,7 +137,6 @@ class Metadata:
     size: int
     expires_at_ms: int
     content_type: str | None = None
-    retain_until_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -368,14 +371,12 @@ class Client:
 
     # Stat ------------------------------------------------------------------
 
-    def stat(self, request: Request, if_match: str | None = None, retain_seconds: int | None = None) -> Metadata:
-        """HEAD an object. retain_seconds asks Racer to keep it warm."""
+    def stat(self, request: Request, if_match: str | None = None) -> Metadata:
+        """HEAD an object."""
         head = f"HEAD {wire.OBJECT_PREFIX}{request.hex} HTTP/1.1\r\nHost: racer\r\n"
         if if_match:
             wire.validate_etag(if_match)
             head += "If-Match: " + if_match + "\r\n"
-        if retain_seconds:
-            head += f"Cache-Control: max-age={int(retain_seconds)}\r\n"
         head += self._context_headers(request) + "\r\n"
         conn = self._connect()
         try:
@@ -390,14 +391,140 @@ class Client:
         m = _response_metadata(h)
         if m is None or (if_match and m.etag != if_match):
             raise ProtocolError("bad HEAD metadata")
-        retain = h.get("racer-retain-until")
-        return Metadata(
-            etag=m.etag,
-            size=size,
-            expires_at_ms=m.expires_at_ms,
-            content_type=m.content_type,
-            retain_until_ms=wire.decimal(retain) if retain is not None else None,
-        )
+        return Metadata(etag=m.etag, size=size, expires_at_ms=m.expires_at_ms, content_type=m.content_type)
+
+    # Prefetch --------------------------------------------------------------
+
+    def prefetch(self, prefetch_id: str, spec: PrefetchSpec) -> PrefetchStatus:
+        """Create or update a prefetch ticket (designs/racer-prefetch.md).
+
+        Racer loads the missing pages in the background; nothing is pinned.
+        Resubmitting the same spec is idempotent. Raises PrefetchError when
+        Racer rejects the request.
+        """
+        _prefetch.validate_id(prefetch_id)
+        body = _prefetch.encode_body(spec)
+        headers = "Content-Type: application/json\r\n"
+        if spec.authorization:
+            headers += "Authorization: " + spec.authorization + "\r\n"
+        status, data = self._json_call("PUT", f"{_prefetch.PREFETCH_PATH}/{prefetch_id}", headers, body)
+        return self._decode_status(data, status == 201)
+
+    def prefetch_status(
+        self,
+        prefetch_id: str,
+        wait: float | timedelta | None = None,
+        coverage: bool = False,
+        refs: str | None = None,
+        cursor: str | None = None,
+    ) -> PrefetchStatus:
+        """Return a ticket's status.
+
+        wait (seconds or timedelta) blocks until the ticket settles or the
+        wait ends. coverage probes resident bytes. refs is None, "failed",
+        or "all"; continue paging with cursor=status.next_cursor.
+        """
+        _prefetch.validate_id(prefetch_id)
+        target = f"{_prefetch.PREFETCH_PATH}/{prefetch_id}"
+        query = _prefetch.status_query(wait, coverage, refs, cursor)
+        if query:
+            target += "?" + query
+        _, data = self._json_call("GET", target, "", None, _prefetch.wait_seconds(wait))
+        return self._decode_status(data)
+
+    def cancel_prefetch(self, prefetch_id: str) -> PrefetchStatus:
+        """Cancel a ticket and return its canceled status. Nothing is evicted."""
+        _prefetch.validate_id(prefetch_id)
+        _, data = self._json_call("DELETE", f"{_prefetch.PREFETCH_PATH}/{prefetch_id}", "", None)
+        return self._decode_status(data)
+
+    def list_prefetches(self) -> list[PrefetchStatus]:
+        """Return summaries of this cache's tickets on this node, sorted by id."""
+        _, data = self._json_call("GET", _prefetch.PREFETCH_PATH, "", None)
+        if not isinstance(data, dict) or not isinstance(data.get("prefetches"), list):
+            raise ProtocolError("bad prefetch list")
+        return [self._decode_status(s) for s in data["prefetches"]]
+
+    @staticmethod
+    def _decode_status(data, created: bool = False) -> PrefetchStatus:
+        try:
+            return _prefetch.decode_status(data, created)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError("bad prefetch status") from exc
+
+    def _json_call(self, method: str, target: str, headers: str, body: bytes | None, wait: float = 0.0):
+        head = f"{method} {target} HTTP/1.1\r\nHost: racer\r\n" + headers
+        if body is not None:
+            head += f"Content-Length: {len(body)}\r\n"
+        raw = self._head_bytes(head + "\r\n") + (body or b"")
+        conn = _Conn(self.socket_path, None if self.timeout is None else self.timeout + wait)
+        try:
+            try:
+                conn.send_head(raw)
+            except (BrokenPipeError, ConnectionResetError) as send_err:
+                # Racer may reject an oversized body before reading it. Recover
+                # a complete rejection response if one is readable; otherwise
+                # surface the original send error.
+                try:
+                    h = wire.parse_response_head(conn.read_head())
+                    payload = self._read_body(conn, h)
+                except Exception:
+                    raise send_err from None
+            else:
+                h = wire.parse_response_head(conn.read_head())
+                payload = self._read_body(conn, h)
+        finally:
+            conn.close()
+        if h.status not in (200, 201):
+            raise self._prefetch_error(h, payload)
+        try:
+            return h.status, json.loads(payload)
+        except ValueError as exc:
+            raise ProtocolError("bad prefetch JSON") from exc
+
+    @staticmethod
+    def _read_body(conn: _Conn, h: wire.ResponseHead) -> bytes:
+        if h.get("transfer-encoding") is not None:
+            raise ProtocolError("unexpected Transfer-Encoding")
+        length = h.get("content-length")
+        if length is not None:
+            n = wire.decimal(length)
+            if n > _prefetch.MAX_RESPONSE_BYTES:
+                raise ProtocolError("prefetch response too large")
+            return conn.read_exact(n)
+        out = bytearray(conn.buf)
+        conn.buf.clear()
+        while True:
+            chunk = conn.sock.recv(65536)
+            if not chunk:
+                return bytes(out)
+            out += chunk
+            if len(out) > _prefetch.MAX_RESPONSE_BYTES:
+                raise ProtocolError("prefetch response too large")
+
+    @staticmethod
+    def _prefetch_error(h: wire.ResponseHead, payload: bytes) -> PrefetchError:
+        retry = None
+        value = (h.get("retry-after") or "").strip()
+        # Accept only ASCII digits: str.isdigit() also accepts characters such
+        # as superscripts that int() rejects. Malformed or oversized values
+        # leave retry as None so the status and error code still surface.
+        if value.isascii() and value.isdigit():
+            try:
+                retry = float(int(value))
+            except (ValueError, OverflowError):
+                retry = None
+        code, message = "", ""
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict) and isinstance(data.get("code"), str) and data["code"]:
+                code = data["code"]
+                message = data.get("message") if isinstance(data.get("message"), str) else ""
+        except ValueError:
+            # Non-JSON or malformed bodies are expected (e.g. from proxies or
+            # older servers); keep the empty code/message defaults.
+            code, message = "", ""
+        return PrefetchError(h.status, code, message, retry)
 
     # Shared response checks ------------------------------------------------
 

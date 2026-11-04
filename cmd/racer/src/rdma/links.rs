@@ -449,6 +449,14 @@ impl Links {
         self.record(crate::telemetry::Event::RdmaFallbackGrant, 1);
     }
 
+    /// Count a page body delivered over HTTP because its hop qualified for RDMA by Site and
+    /// rail but the edge is not an RDMA edge: at least one end did not take
+    /// it among its `RDMA_PEERS` best ranked edges. Not an HTTP fallback,
+    /// since the page never planned RDMA.
+    pub fn record_fallback_overflow(&self) {
+        self.record(crate::telemetry::Event::RdmaFallbackOverflow, 1);
+    }
+
     /// Free page buffers across the active rails.
     pub fn free_buffers(&self) -> usize {
         self.active()
@@ -586,7 +594,7 @@ impl Links {
                     }),
                     pool_bytes,
                     buffer_len: BUFFER_LEN,
-                    max_links: 2 * crate::topology::MAX_DEGREE,
+                    max_links: crate::topology::RDMA_PEERS,
                     grants_per_link: self.grants_per_link,
                     idle: LINK_IDLE,
                     guard,

@@ -108,7 +108,7 @@ providers whose own CRD has meaningful schema, status, or reconciliation.
 | `host.image` | string | No | Preserve current image | Opaque image identifier interpreted by the selected provider. |
 | `host.netboot` | PXESpec | For new Metalman Machines | -- | Network boot image, DHCP, Redfish, and cloud-init settings owned by Metalman. |
 | `host.azure.resourceID` | string | For Azure VMs | -- | Immutable full Azure Resource Manager VM ID. The provider is inferred as `AzureVM`. |
-| `host.external.provider` | string | For external hosts | -- | Registered provider controller and credential key, such as `OCIInstance`, `ANS`, or a private provider. |
+| `host.external.provider` | string | For external hosts | -- | Registered provider controller and credential key, such as `ANS` or a private provider. |
 | `host.external.providerID` | string | Provider-dependent | -- | Opaque provider identity; mutable only to support provider replacement handoff. |
 | `host.external.machineRef` | ProviderMachineReference | Provider-dependent | -- | Optional cluster-scoped provider-owned resource for rich provider state. |
 
@@ -174,15 +174,15 @@ spec:
 apiVersion: unbounded-cloud.io/v1alpha3
 kind: MachineOperationCredential
 metadata:
-  name: remote-oci
+  name: remote-example
 spec:
   siteName: remote
-  provider: OCIInstance
+  provider: ExampleCloud
   auth:
     mode: ExternalPlugin
     secretRef:
       namespace: unbounded-system
-      name: remote-oci-auth
+      name: remote-example-auth
 ```
 
 ## MachineOperation
@@ -225,19 +225,6 @@ The Azure VM provider handles:
 `HostReplace` for `AzureVM` destructively replaces the VM: it reads the existing VM model, detaches NICs and data disks, deletes the VM resource, and recreates the same VM name with fresh cloud-init custom data that installs `unbounded-agent`. An explicit host image may be an Azure resource ID or a `publisher:offer:sku:version` reference; an omitted image preserves the existing image reference. The old OS disk is not reused. Operation completion means the replacement VM create operation completed; it does not mean the Kubernetes `Node` is Ready. The `Machine` controller continues tracking whether the Kubernetes `Node` disappears and rejoins. Configure `machine-ops-controller --api-server-endpoint` with an API server address reachable from replaced hosts; the generated agent bootstrap config uses that value.
 
 This replacement flow avoids Azure standalone VM `customData` immutability during native reimage. It intentionally destroys host-local state on the old OS disk. The initial implementation retains the existing blocking clone-delete-create flow; a controller crash after deletion can require manual recovery because the captured VM model is not yet durably checkpointed.
-
-The OCI instance provider handles:
-
-| Operation | OCI action |
-|-----------|------------|
-| `HostHardReboot` | `RESET` |
-| `HostPowerOff` | `STOP` |
-| `HostPowerOn` | `START` |
-| `HostReplace` | `STOP` old instance, `LaunchInstance` replacement, patch `Machine.spec.host.external.providerID`, then terminate old instance |
-
-`HostReplace` for `OCIInstance` creates a replacement instance because OCI launch `user_data` is immutable after instance creation. The controller stops the old instance, launches a new instance in the same availability domain, subnet, shape, and fault domain, requests a public IP for bootstrap egress, patches `Machine.spec.host.external.providerID` to the new instance OCID after the replacement reaches `RUNNING`, and then terminates the old instance. The replacement reuses the original `Machine` name as the kubelet node name so it rejoins through the existing Kubernetes `Node` object. Operation completion means the replacement is running, provider ID handoff succeeded, and old-instance cleanup succeeded; it does not wait for the Kubernetes `Node` to become Ready.
-
-The OCI replacement flow copies display name, defined tags, freeform tags, selected agent/availability/shape settings, and primary VNIC subnet/NSG/source-destination-check settings. It adds Unbounded freeform tags for idempotent retry lookup. It does not preserve the exact private IP, boot volume, or attached data volumes; active attached data volumes fail the operation before the old instance is stopped. An omitted host image preserves the source instance image. `spec.parameters.imageID` remains as a temporary compatibility override, while new callers should use the Machine or MachineConfiguration host image. Set `spec.parameters.sshAuthorizedKeys` to append SSH authorized keys to replacement metadata for break-glass debugging.
 
 Metalman handles bare-metal host operations for Machines with
 `spec.host.netboot.redfish` (or deprecated `spec.pxe.redfish`) and no external
@@ -388,33 +375,6 @@ metadata:
 spec:
   machineRef: azure-worker-01
   operationKind: HostHardReboot
-  ttlSecondsAfterFinished: 300
-```
-
-**OCI instance with external power operations:**
-
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: Machine
-metadata:
-  name: oci-worker-01
-spec:
-  host:
-    external:
-      provider: OCIInstance
-      providerID: oci://ocid1.instance.oc1...
-  configurationRef:
-    name: oci-workers
-```
-
-```yaml
-apiVersion: unbounded-cloud.io/v1alpha3
-kind: MachineOperation
-metadata:
-  name: oci-worker-01-poweroff
-spec:
-  machineRef: oci-worker-01
-  operationKind: HostPowerOff
   ttlSecondsAfterFinished: 300
 ```
 

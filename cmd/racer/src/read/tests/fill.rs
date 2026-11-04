@@ -487,13 +487,15 @@ fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
         published.clone(),
     );
     let mut publication = racer_control_wire::Publication {
+        pools: Vec::new(),
         schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: f.keys.cluster().clone(),
         sequence: racer_control_wire::PublicationSequence(1),
         membership_version: racer_control_wire::MembershipVersion(1),
         members: vec![],
         caches: vec![],
-    };
+    }
+    .with_default_pool();
     publication.members = (0..1000)
         .map(|i| racer_control_wire::Member {
             node: racer_control_wire::NodeId(format!("22222222-2222-4222-8222-{i:012}")),
@@ -3126,6 +3128,9 @@ pub(super) struct Fixture {
     pub(super) page: PageId,
     pub(super) scope: RequestScope,
     pub(super) directory: std::path::PathBuf,
+    /// Node pools that [`Fixture::read_graph`] publishes; the default pool
+    /// holding this fixture's cache when `None`.
+    pub(super) pools: Option<Vec<racer_control_wire::Pool>>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -3212,29 +3217,36 @@ impl Fixture {
         ));
         let (client_socket, origin_socket) =
             racer_control_wire::canonical_socket_paths(settings.name).unwrap();
-        snapshots
-            .apply(Publication {
-                schema_version: SCHEMA_VERSION,
-                cluster: self.keys.cluster().clone(),
-                sequence: PublicationSequence(1),
-                membership_version: membership.version,
-                members: membership
-                    .members()
-                    .iter()
-                    .cloned()
-                    .map(Into::into)
-                    .collect(),
-                caches: vec![CacheDefinition {
-                    id: self.context.object.cache.clone(),
-                    name: settings.name.into(),
-                    client_socket,
-                    origin_socket,
-                    priority: racer_control_wire::DEFAULT_PRIORITY,
-                    mode: racer_control_wire::CacheMode::Cached,
-                    origin: None,
-                }],
-            })
-            .unwrap();
+        let publication = Publication {
+            pools: Vec::new(),
+            schema_version: SCHEMA_VERSION,
+            cluster: self.keys.cluster().clone(),
+            sequence: PublicationSequence(1),
+            membership_version: membership.version,
+            members: membership
+                .members()
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            caches: vec![CacheDefinition {
+                id: self.context.object.cache.clone(),
+                name: settings.name.into(),
+                client_socket,
+                origin_socket,
+                priority: racer_control_wire::DEFAULT_PRIORITY,
+                mode: racer_control_wire::CacheMode::Cached,
+                origin: None,
+            }],
+        };
+        let publication = match &self.pools {
+            Some(pools) => Publication {
+                pools: pools.clone(),
+                ..publication
+            },
+            None => publication.with_default_pool(),
+        };
+        snapshots.apply(publication).unwrap();
         let owners = fill.dependencies.metadata_owner.clone();
         let metadata = Rc::new(MetadataService::new(
             fill.dependencies.candidates.clone(),
@@ -3479,6 +3491,7 @@ fn fixture_with_caches(
         context,
         membership,
         page,
+        pools: None,
         scope: RequestScope::new(
             RequestId([1; 16]),
             Instant::now() + Duration::from_secs(600),
@@ -3526,28 +3539,32 @@ pub(super) fn adapter_client(
     let (client_socket, origin_socket) =
         racer_control_wire::canonical_socket_paths("fixture").unwrap();
     snapshots
-        .apply(Publication {
-            schema_version: SCHEMA_VERSION,
-            cluster: f.keys.cluster().clone(),
-            sequence: PublicationSequence(1),
-            membership_version: f.membership.version,
-            members: f
-                .membership
-                .members()
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-            caches: vec![racer_control_wire::CacheDefinition {
-                id: f.context.object.cache.clone(),
-                name: "fixture".into(),
-                client_socket,
-                origin_socket,
-                priority: racer_control_wire::DEFAULT_PRIORITY,
-                mode: racer_control_wire::CacheMode::Cached,
-                origin: None,
-            }],
-        })
+        .apply(
+            Publication {
+                pools: Vec::new(),
+                schema_version: SCHEMA_VERSION,
+                cluster: f.keys.cluster().clone(),
+                sequence: PublicationSequence(1),
+                membership_version: f.membership.version,
+                members: f
+                    .membership
+                    .members()
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
+                caches: vec![racer_control_wire::CacheDefinition {
+                    id: f.context.object.cache.clone(),
+                    name: "fixture".into(),
+                    client_socket,
+                    origin_socket,
+                    priority: racer_control_wire::DEFAULT_PRIORITY,
+                    mode: racer_control_wire::CacheMode::Cached,
+                    origin: None,
+                }],
+            }
+            .with_default_pool(),
+        )
         .unwrap();
     adapter.client(
         snapshots,
@@ -4156,7 +4173,6 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             let mut response = drive(
                 coordinator.read(
                     ClientRequest {
-                        retain: None,
                         kind,
                         origin: OriginContext {
                             object: f.context.object.clone(),

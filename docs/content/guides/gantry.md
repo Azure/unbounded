@@ -273,6 +273,54 @@ registry, the flow is:
 Requester-delegated private-registry authentication requires an HTTPS origin.
 Private plaintext HTTP registries are not supported by this mode.
 
+#### ACR Attachment and Explicit Authentication on Flex Nodes
+
+Attach an existing ACR to Gantry without changing authentication:
+
+```bash
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id "$ACR_ID"
+```
+
+To also enable managed private-image authentication on current and future
+Linux Flex workers, opt into AKS identity bindings:
+
+```bash
+kubectl unbounded gantry attach-acr \
+  --acr-resource-id "$ACR_ID" \
+  --auth-mode aks-identity-binding \
+  --cluster-resource-id "$AKS_ID"
+```
+
+`ACR_ID` and `AKS_ID` are full Azure resource IDs in the same subscription.
+Use `--kubeconfig /path/to/kubeconfig` to select a cluster; otherwise the current
+context is used. This requires a compatible plugin/operator release, not the
+Azure deployment script's pinned `v0.8.0` baseline.
+
+**Warning:** managed attachment may restart all targeted kubelets concurrently
+without draining nodes. You are responsible for the impact on existing workloads.
+
+Managed authentication uses the stock `acr-credential-provider` and one shared,
+pull-only identity. Application Pods and ServiceAccounts need no changes, and
+new Flex workers inherit the policy without another attachment command.
+Native AKS nodes and customer-owned providers remain untouched; conflicting
+providers or ownership must be resolved explicitly. Shared identity access is
+not per-tenant isolation.
+
+Requirements:
+
+- Linux Flex kubelets >= 1.34 with
+  `KubeletServiceAccountTokenForCredentialProviders` enabled.
+- AKS identity bindings available and their token proxy reachable from every
+  worker. API-server VNet integration is unsupported.
+- Administrative Azure/Kubernetes permissions for attachment, and installation
+  images accessible before private ACR authentication is configured.
+
+The command waits for installation, not proof of a successful private-image pull.
+Verify a private pull and Gantry peer distribution separately. Removing the
+selected upstream while retaining managed policy reports a configuration error;
+rerun attachment to restore it.
+
 #### Shared-Identity Authentication
 
 Shared identity is a compatibility mode for environments where kubelet or CRI

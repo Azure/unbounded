@@ -45,7 +45,6 @@ mod duplex_release {
                 coordinator(&f, &signers[0], &membership, NoPeer::requester());
             let response = futures::executor::block_on(local.read(
                 ClientRequest {
-                    retain: None,
                     kind: ReadKind::Subscription {
                         pin: Some(f.page.version.etag.clone()),
                         range: None,
@@ -232,7 +231,6 @@ mod duplex_release {
         )
         .unwrap();
         let request = ClientRequest {
-            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(PAGE_BYTES - 1)),
@@ -768,7 +766,6 @@ fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
         coordinator(&f, &signers[0], &membership, NoPeer::requester());
     let open = |credits, start| {
         let request = ClientRequest {
-            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start)),
@@ -897,7 +894,6 @@ fn fetch_window_is_not_an_unreleased_credit_ceiling() {
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let mut stream = match futures::executor::block_on(local.read(
             ClientRequest {
-                retain: None,
                 kind: ReadKind::Subscription {
                     pin: Some(f.page.version.etag.clone()),
                     range: Some(ByteRange::From(start)),
@@ -1032,7 +1028,6 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
     let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
     let mut stream = match futures::executor::block_on(local.read(
         ClientRequest {
-            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(0)),
@@ -1115,7 +1110,6 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
             coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
-            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: None,
@@ -1467,7 +1461,6 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
     let open = |index: usize, start: u64| {
         let f = &fixtures[index];
         let request = ClientRequest {
-            retain: None,
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start * PAGE_BYTES)),
@@ -1492,7 +1485,6 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
     let mut a2 = open(0, 0);
     let mut b = open(1, 2);
     let warm_request = ClientRequest {
-        retain: None,
         kind: ReadKind::Subscription {
             pin: Some(fixtures[0].page.version.etag.clone()),
             range: None,
@@ -1914,7 +1906,6 @@ fn read_range(
 ) -> Vec<u64> {
     let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
     let request = ClientRequest {
-        retain: None,
         kind: ReadKind::Subscription {
             pin: Some(f.page.version.etag.clone()),
             range: None,

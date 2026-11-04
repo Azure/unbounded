@@ -870,7 +870,7 @@ metalman-build: ## Build the metalman binary (no lint/test)
 metalman: test metalman-build ## Build the metalman controller (implies test)
 
 unbounded-operator-build: machina-manifests token-refresher-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build the unbounded-operator binary (no lint/test)
-	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)/main.go
+	$(GOBUILD) -ldflags '$(STAMP_LDFLAGS)' -o $(UNBOUNDED_OPERATOR_BIN) $(UNBOUNDED_OPERATOR_CMD)
 
 unbounded-operator: test unbounded-operator-build ## Build the unbounded-operator (implies test)
 
@@ -981,7 +981,7 @@ inventory-manifests: ## Render inventory deployment manifests into deploy/invent
 #
 # Knobs (all overridable on the command line or environment):
 #   TRIVY            Enable scanning when non-empty. Default: unset (no scan).
-#   TRIVY_VERSION    Trivy CLI version. Default: 0.69.3 (matches CI).
+#   TRIVY_VERSION    Trivy CLI version. Default: 0.69.3.
 #   TRIVY_SEVERITY   Comma-separated severities. Default: CRITICAL,HIGH.
 #   TRIVY_EXIT_CODE  Exit code on findings. Default: 1 (fail). Set 0 to warn-only.
 #   TRIVY_IMAGE      Override the trivy container image entirely.

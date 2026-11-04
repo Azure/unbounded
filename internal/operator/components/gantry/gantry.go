@@ -7,8 +7,9 @@
 // components it defaults to enabled: it is deployed unless every Site explicitly
 // opts out via spec.components.gantry.enabled=false.
 //
-// The unbounded agent manages the per-node containerd wiring, so the operator
-// installs only the Gantry workload and its Kubernetes configuration.
+// The unbounded agent manages the per-node containerd mirror wiring. The
+// operator also reconciles optional ACR kubelet authentication on AKS Flex nodes
+// when an administrator explicitly enables managed authentication.
 //
 // When ClusterCache/gantry exists, the operator switches an installation it
 // reconciles to the Racer backend: Gantry then serves registry content
@@ -207,7 +208,15 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		}
 
 		kind := component.OpApply
+
 		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") {
+			var existing coordinationv1.Lease
+			if err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), &existing); err == nil {
+				continue
+			} else if !apierrors.IsNotFound(err) {
+				return nil, component.Result{}, fmt.Errorf("read chair Lease/%s: %w", obj.GetName(), err)
+			}
+
 			kind = component.OpCreateIfAbsent
 		}
 
@@ -225,6 +234,20 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		plan.Add(op)
 	}
 
+	authOperations, authResult, err := planRegistryAuth(ctx, env)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	for _, op := range authOperations {
+		op.DependsOn = append(op.DependsOn, dependsOn...)
+		plan.Add(op)
+	}
+
+	if result.Ready && authResult != nil {
+		result = *authResult
+	}
+
 	return plan, result, nil
 }
 
@@ -235,10 +258,10 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// the Sites as well would run one redundant pass per Site for a single
 	// ConfigMap edit.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
+		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName, registryAuthName))))
 	// The racer DaemonSet supplies the agent placement in Racer mode.
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, workload.DataplaneDaemonSetName))))
+		builder.WithPredicates(registryAuthWorkloadEvents(env, env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, registryAuthName, workload.DataplaneDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))
@@ -423,8 +446,8 @@ func stampConfigHash(obj *unstructured.Unstructured, annotation, hash string) er
 
 // planConfig hashes the gantry config payload and, when no config exists,
 // returns the operation that creates the embedded default. An existing
-// operator or user-managed payload (for example an edited upstream_registries
-// list) is never applied over, so the returned operation is create-if-absent.
+// operator or user-managed payload is never overwritten, so the returned
+// operation is create-if-absent.
 //
 // See net.planConfig for why the hash is computed at plan time and what happens
 // if another writer wins the create.

@@ -837,7 +837,8 @@ fn open_fixture_storage(
 fn fixture_publication() -> Publication {
     let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
     Publication {
-        schema_version: 1,
+        pools: Vec::new(),
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
@@ -858,6 +859,7 @@ fn fixture_publication() -> Publication {
             origin: None,
         }],
     }
+    .with_default_pool()
 }
 
 fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {

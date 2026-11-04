@@ -95,22 +95,10 @@ impl FromIterator<PageNumber> for HoldPages {
 /// Holders of one member page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PageHolders {
-    /// All holders, including `warm`.
+    /// Reader holders; each releases its pages individually.
     pub count: u32,
-    /// Holders added by warm jobs. Warm cleanup ([`super::catalog::Index::release_hold`])
-    /// drops only these from unpublished pages, so independent readers keep theirs.
-    pub warm: u32,
     /// Epoch of the reservation that made this page a member.
     pub since: HoldEpoch,
-}
-
-/// Who a reservation adds as a holder.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HolderKind {
-    /// A reader that releases its pages individually.
-    Reader,
-    /// A warm job, released by warm cleanup and expiry.
-    Warm,
 }
 
 /// Held writes in flight, per page. A page released from the hold keeps its
@@ -169,16 +157,7 @@ impl Hold {
     pub fn single_holders(pages: &HoldPages, since: HoldEpoch) -> HashMap<PageNumber, PageHolders> {
         pages
             .iter()
-            .map(|page| {
-                (
-                    page,
-                    PageHolders {
-                        count: 1,
-                        warm: 0,
-                        since,
-                    },
-                )
-            })
+            .map(|page| (page, PageHolders { count: 1, since }))
             .collect()
     }
 

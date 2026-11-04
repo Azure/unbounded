@@ -758,6 +758,23 @@ pub(crate) fn link_allowed(
         && theirs.rails.iter().any(|m| m.rail == rail)
 }
 
+/// Whether the responder refuses a link setup from `peer` on `rail`: an
+/// error when the pair fails [`link_allowed`] (no membership, Site, or rail),
+/// and `403` when the edge is not an RDMA edge of the membership because at
+/// least one end did not take it among its `RDMA_PEERS` best. The initiator
+/// backs off on `403` and pages use HTTP.
+pub(crate) fn link_refusal(
+    membership: Option<&crate::topology::Membership>,
+    local: &NodeId,
+    peer: &NodeId,
+    rail: RailId,
+) -> Result<Option<u16>> {
+    let Some(membership) = membership.filter(|m| link_allowed(m, local, peer, rail)) else {
+        return Err(Error::Unauthorized);
+    };
+    Ok((!crate::rdma::is_rdma_edge(membership, local, peer)).then_some(403))
+}
+
 /// Initiator side of one link setup on an authenticated connection: open the
 /// link, send the signed `RdmaLink` request, verify the signed response, and
 /// connect. Any failure breaks the attempt, which backs the link off.
@@ -786,7 +803,8 @@ pub(crate) async fn link_exchange(
         let received = io.receive_head(connection, scope).await?;
         if !matches!(received.value.start, StartLine::Response { status: 200 }) {
             // 409: our offer lost the tie-break; the peer's offer replaces it.
-            // 429 and 503: try again after backoff.
+            // 403 (not an RDMA edge in the responder's membership), 429 and
+            // 503: try again after backoff.
             return Err(Error::Unavailable);
         }
         let mut connection = received.connection;
@@ -874,7 +892,8 @@ impl Transfers {
 
     /// Responder side of an `RdmaLink` setup: verify the signed offer, check
     /// membership, rate limit and tie-break, accept, and answer signed. Declined
-    /// offers get `409` (our concurrent offer wins), `429` (rate limit or
+    /// offers get `403` (the edge is not an RDMA edge), `409` (our concurrent
+    /// offer wins), `429` (rate limit or
     /// overload), or `503` (no RDMA here) and never reach the owner.
     pub(crate) async fn serve_link(
         &self,
@@ -900,8 +919,11 @@ impl Transfers {
         let local = self.signatures.node();
         let reply = match &self.links {
             None => link_status(503),
-            Some(_) if !membership.is_ok_and(|m| link_allowed(&m, local, &peer, rail)) => {
-                return Err(Error::Unauthorized);
+            Some(_)
+                if let Some(status) =
+                    link_refusal(membership.ok().as_deref(), local, &peer, rail)? =>
+            {
+                link_status(status)
             }
             Some(links) => match links.admit_setup(&peer, rail) {
                 crate::rdma::SetupAdmission::Conflict => link_status(409),
@@ -1075,7 +1097,54 @@ pub enum RelayResponse {
         connection: Box<crate::http::ConnectionLease>,
 
         length: usize,
+
+        /// Links to charge one overflow page once the opaque body is
+        /// relayed in full, set only when this hop is an overflow edge.
+        overflow: Option<Rc<crate::rdma::Links>>,
     },
+}
+
+/// Whether the hop from `local` to `peer` carries `operation` over HTTP only
+/// because the edge is an overflow edge (see [`crate::rdma::is_overflow`]).
+pub(crate) fn overflow_hop(
+    plan: TransportPlan,
+    membership: Option<&crate::topology::Membership>,
+    operation: &super::protocol::Operation,
+    local: &racer_control_wire::NodeId,
+    peer: &racer_control_wire::NodeId,
+) -> bool {
+    plan == TransportPlan::Http
+        && membership
+            .zip(super::rail_hint(operation))
+            .is_some_and(|(membership, page)| {
+                crate::rdma::is_overflow(membership, &page, local, peer)
+            })
+}
+
+/// Whether a validated HTTP response of `length` body bytes delivered a page.
+/// Misses, signed overloads, and other bodiless outcomes deliver none.
+pub(crate) fn delivers_page_body<P, G>(
+    response: &racer_core::read::PeerResponse<P, G>,
+    length: usize,
+) -> bool {
+    use racer_core::read::PeerResponse;
+    length != 0
+        && matches!(
+            response,
+            PeerResponse::Page { .. }
+                | PeerResponse::Selected { .. }
+                | PeerResponse::Bootstrap {
+                    page_zero: Some(_),
+                    ..
+                }
+        )
+}
+
+/// Count one page body delivered over HTTP on an overflow edge.
+pub(crate) fn record_overflow(overflow: Option<&crate::rdma::Links>, delivered: bool) {
+    if delivered && let Some(links) = overflow {
+        links.record_fallback_overflow();
+    }
 }
 
 pub struct Transfers {
@@ -1274,6 +1343,16 @@ impl Transfers {
             if native.is_some() {
                 self.record_rdma_stage(Event::RdmaGrantCount, Event::RdmaGrantNs, granting);
             }
+            // Overflow counts only page bodies this hop actually receives.
+            let overflow = self.links.clone().filter(|_| {
+                overflow_hop(
+                    plan,
+                    membership.as_deref(),
+                    &request.request.operation,
+                    self.signatures.node(),
+                    &peer,
+                )
+            });
             if let TransportPlan::Rdma { rail } = plan
                 && membership.is_some()
                 && self
@@ -1350,6 +1429,7 @@ impl Transfers {
                     authentication,
                     connection: Box::new(received.connection),
                     length,
+                    overflow,
                 });
             }
             if let Some(timing) = timing.as_deref_mut() {
@@ -1377,6 +1457,10 @@ impl Transfers {
             )?;
             validate_body_length(&response.response, length)?;
             connection.finish_exchange()?;
+            record_overflow(
+                overflow.as_deref(),
+                delivers_page_body(&response.response, length),
+            );
             Ok(RelayResponse::Complete(response))
         })
     }
@@ -1574,6 +1658,159 @@ pub(crate) async fn relay_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overflow counts a page only when its body arrives over an overflow
+    /// edge, once per hop, and never for bodiless outcomes or other edges.
+    #[test]
+    fn overflow_counts_only_delivered_page_bodies() {
+        use crate::rdma::tests::rails_tests::{mesh_with_budget, page};
+        use crate::telemetry::Event;
+        use racer_core::read::PeerResponse;
+        type Response = PeerResponse<(), ()>;
+
+        let membership = mesh_with_budget(40, 16);
+        let nodes: Vec<_> = membership
+            .members()
+            .iter()
+            .map(|m| m.node.clone())
+            .collect();
+        let operation = super::super::protocol::Operation::Page {
+            page: page(0),
+            mode: super::super::protocol::FetchMode::CopyOnly,
+        };
+        let hop = |a, b| {
+            overflow_hop(
+                TransportPlan::Http,
+                Some(&membership),
+                &operation,
+                &nodes[a],
+                &nodes[b],
+            )
+        };
+        let edge = |a, b| crate::rdma::is_rdma_edge(&membership, &nodes[a], &nodes[b]);
+        let pick = |want_rdma: bool| {
+            (1..nodes.len())
+                .find(|&b| membership.is_neighbor(&nodes[0], &nodes[b]) && edge(0, b) == want_rdma)
+                .expect("edge kind present")
+        };
+        let (overflow, rdma) = (pick(false), pick(true));
+        assert!(hop(0, overflow));
+        assert!(!hop(0, rdma));
+        // A planned RDMA hop, no membership, or a bodiless operation is never overflow.
+        assert!(!overflow_hop(
+            TransportPlan::Rdma { rail: RailId(7) },
+            Some(&membership),
+            &operation,
+            &nodes[0],
+            &nodes[overflow],
+        ));
+        assert!(!overflow_hop(
+            TransportPlan::Http,
+            None,
+            &operation,
+            &nodes[0],
+            &nodes[overflow],
+        ));
+        let offer = super::super::protocol::Operation::Page {
+            page: page(0),
+            mode: super::super::protocol::FetchMode::Offer,
+        };
+        assert!(!overflow_hop(
+            TransportPlan::Http,
+            Some(&membership),
+            &offer,
+            &nodes[0],
+            &nodes[overflow],
+        ));
+
+        let metadata = || crate::model::ObjectMetadata {
+            content_type: None,
+            version: page(0).version,
+            length: 8,
+            expires_at: crate::model::ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        };
+        let body = Response::Page {
+            metadata: metadata(),
+            ciphertext: (),
+        };
+        assert!(delivers_page_body(&body, 8));
+        assert!(delivers_page_body(
+            &Response::Selected {
+                metadata: metadata(),
+                ciphertext: (),
+                grant: (),
+            },
+            8
+        ));
+        for bodiless in [Response::Miss, Response::Overloaded, Response::NotFound] {
+            assert!(!delivers_page_body(&bodiless, 0));
+        }
+
+        let w = crate::rdma::links::tests::world();
+        let (w, metrics, _) = crate::rdma::links::tests::send_in_place::metered(w);
+        let links = Some(&*w.a.links);
+        let count = || metrics.count(Event::RdmaFallbackOverflow);
+        // Overflow edge, delivered page: once.
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            delivers_page_body(&body, 8),
+        );
+        assert_eq!(count(), 1);
+        // Overflow edge, copy miss or signed overload: none.
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            delivers_page_body(&Response::Miss, 0),
+        );
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            delivers_page_body(&Response::Overloaded, 0),
+        );
+        // Overflow edge, failed exchange or failed relay body: none.
+        record_overflow(links.filter(|_| hop(0, overflow)), false);
+        assert_eq!(count(), 1);
+        // A relay hop on an overflow edge counts its relayed body once.
+        let relayed: Result<()> = Ok(());
+        record_overflow(
+            links.filter(|_| hop(0, overflow)),
+            relayed.is_ok() && 8 != 0,
+        );
+        assert_eq!(count(), 2);
+        // A non-overflow edge never counts, body or not.
+        record_overflow(links.filter(|_| hop(0, rdma)), true);
+        assert_eq!(count(), 2);
+        assert_eq!(metrics.count(Event::RdmaHttpFallback), 0);
+    }
+    #[test]
+    fn link_refusal_admits_only_rdma_edges() {
+        let rail = RailId(7);
+        let small = crate::rdma::tests::rails_tests::mesh(8);
+        let a = &small.members()[0].node;
+        let b = &small.members()[1].node;
+        assert_eq!(link_refusal(Some(&small), a, b, rail), Ok(None));
+        assert_eq!(link_refusal(None, a, b, rail), Err(Error::Unauthorized));
+        assert_eq!(
+            link_refusal(Some(&small), a, b, RailId(99)),
+            Err(Error::Unauthorized)
+        );
+        // Over the peer budget, an eligible edge one end did not take gets 403.
+        let large = crate::rdma::tests::rails_tests::mesh_with_budget(40, 16);
+        let nodes: Vec<_> = large.members().iter().map(|m| m.node.clone()).collect();
+        let (mut refused, mut admitted) = (0, 0);
+        for b in &nodes[1..] {
+            match link_refusal(Some(&large), &nodes[0], b, rail).unwrap() {
+                None => {
+                    assert!(crate::rdma::is_rdma_edge(&large, &nodes[0], b));
+                    admitted += 1;
+                }
+                Some(status) => {
+                    assert_eq!(status, 403);
+                    assert!(!crate::rdma::is_rdma_edge(&large, &nodes[0], b));
+                    refused += 1;
+                }
+            }
+        }
+        assert!(admitted > 0 && refused > 0);
+    }
     #[test]
     fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
         let scope = RequestScope::new(
@@ -1695,6 +1932,8 @@ mod tests {
             /// Responder starts its own setup first (simultaneous offers).
             responder_opens: bool,
             sites: [&'static str; 2],
+            /// Responder membership override; `sites` builds it otherwise.
+            membership: Option<std::sync::Arc<crate::topology::Membership>>,
         }
 
         fn link_setup(
@@ -1708,7 +1947,10 @@ mod tests {
         ) {
             use crate::rdma::links::tests::world_for;
             let signers = crate::peer::tests::signers();
-            let membership = test_membership(&signers, &[0, 2], &case.sites);
+            let membership = case
+                .membership
+                .clone()
+                .unwrap_or_else(|| test_membership(&signers, &[0, 2], &case.sites));
             let responder = 2 - case.initiator;
             let mut w = world_for(
                 [
@@ -1832,6 +2074,7 @@ mod tests {
                     responder_links: true,
                     responder_opens: false,
                     sites: ["site1", "site1"],
+                    membership: None,
                 });
                 client.unwrap();
                 serve.unwrap();
@@ -1859,6 +2102,7 @@ mod tests {
                 responder_links: true,
                 responder_opens: true,
                 sites: ["site1", "site1"],
+                membership: None,
             });
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
@@ -1885,6 +2129,7 @@ mod tests {
                 responder_links: false,
                 responder_opens: false,
                 sites: ["site1", "site1"],
+                membership: None,
             });
             assert_eq!(client, Err(Error::Unavailable));
             serve.unwrap();
@@ -1895,6 +2140,7 @@ mod tests {
                     responder_links: true,
                     responder_opens: false,
                     sites,
+                    membership: None,
                 });
                 assert!(client.is_err());
                 assert_eq!(serve, Err(Error::Unauthorized));
@@ -1905,6 +2151,69 @@ mod tests {
                     "rejected offers never reach the owner"
                 );
             }
+        }
+
+        /// Members 0 and 2 of the test signers in one Site and rail, plus
+        /// `fillers` more, with each node taking at most `budget` RDMA peers.
+        fn budget_membership(
+            signers: &[Rc<Signatures>],
+            fillers: usize,
+            budget: usize,
+        ) -> std::sync::Arc<crate::topology::Membership> {
+            let base = test_membership(signers, &[0, 2], &["site1", "site1"]);
+            let template = base.members()[0].clone();
+            let mut members = base.members().to_vec();
+            for i in 0..fillers {
+                let mut member = template.clone();
+                member.node = NodeId(format!("filler-{i}"));
+                member.peer_endpoint = format!("127.0.0.1:{}", 10_000 + i);
+                members.push(member);
+            }
+            let mut membership =
+                crate::topology::Membership::validate(MembershipVersion(1), members).unwrap();
+            membership.rdma_edges = crate::rdma::RdmaEdges::with_budget(budget);
+            std::sync::Arc::new(membership)
+        }
+
+        #[test]
+        fn signed_link_setup_refuses_a_qualifying_non_rdma_edge() {
+            let signers = crate::peer::tests::signers();
+            let (a, b) = (signers[0].node(), signers[2].node());
+            let refused = (8..64)
+                .map(|fillers| budget_membership(&signers, fillers, 1))
+                .find(|m| !crate::rdma::is_rdma_edge(m, a, b))
+                .expect("some mesh leaves the edge out");
+            // The same Site and rail under the default budget is an RDMA edge.
+            let admitted = budget_membership(&signers, 8, crate::topology::RDMA_PEERS);
+            assert!(crate::rdma::is_rdma_edge(&admitted, a, b));
+            assert_eq!(link_refusal(Some(&refused), a, b, RailId(7)), Ok(Some(403)));
+            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                initiator: 0,
+                responder_links: true,
+                responder_opens: false,
+                sites: ["site1", "site1"],
+                membership: Some(refused),
+            });
+            assert_eq!(client, Err(Error::Unavailable));
+            serve.unwrap();
+            assert!(w.a.links.ready(&peer, RailId(7)).is_none());
+            assert_eq!(
+                w.b.links.state(&local, RailId(7)),
+                rdma_verbs::LinkState::Idle,
+                "refused offers never reach the owner"
+            );
+            let (w, client, serve, local, peer) = link_setup(LinkSetupCase {
+                initiator: 0,
+                responder_links: true,
+                responder_opens: false,
+                sites: ["site1", "site1"],
+                membership: Some(admitted),
+            });
+            client.unwrap();
+            serve.unwrap();
+            let (_, ours) = w.a.links.ready(&peer, RailId(7)).expect("initiator ready");
+            let (_, theirs) = w.b.links.ready(&local, RailId(7)).expect("responder ready");
+            assert_eq!(ours, theirs);
         }
 
         #[test]

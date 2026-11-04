@@ -319,7 +319,6 @@ impl WorkerApplication {
         if self.checkpoint_generation != generation {
             // Stop starting batches while existing SQEs drain, then freeze only
             // this shard. No queue-idle requirement can starve a busy checkpoint.
-            // The storage snapshot also pauses and fences warm-owned progress.
             if self.writer_task.is_some() {
                 return Ok(());
             }
@@ -1218,7 +1217,7 @@ mod tests {
         assert!(filtered.shards[0].index.entries.is_empty());
         assert_eq!(filtered.shards[0].index.metadata.len(), 1);
         keys.install(racer_control_wire::KeyringBundle {
-            schema_version: 1,
+            schema_version: racer_control_wire::SCHEMA_VERSION,
             cluster: keys.cluster().clone(),
             generation: racer_control_wire::BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),

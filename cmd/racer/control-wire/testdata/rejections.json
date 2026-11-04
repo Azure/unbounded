@@ -30,8 +30,8 @@
   {
     "name": "unknown unpaired surrogate",
     "file": "publication.json",
-    "old": "\"schema_version\":1",
-    "new": "\"schema_version\":1,\"\\udc00\":0",
+    "old": "\"schema_version\":2",
+    "new": "\"schema_version\":2,\"\\udc00\":0",
     "code": "invalid_request"
   },
   {
@@ -51,29 +51,29 @@
   {
     "name": "duplicate top field",
     "file": "publication.json",
-    "old": "\"schema_version\":1",
-    "new": "\"schema_version\":1,\"schema_version\":1",
+    "old": "\"schema_version\":2",
+    "new": "\"schema_version\":2,\"schema_version\":2",
     "code": "invalid_request"
   },
   {
     "name": "escaped duplicate",
     "file": "publication.json",
-    "old": "\"schema_version\":1",
-    "new": "\"schema_version\":1,\"schema_versi\\u006fn\":1",
+    "old": "\"schema_version\":2",
+    "new": "\"schema_version\":2,\"schema_versi\\u006fn\":1",
     "code": "invalid_request"
   },
   {
     "name": "unknown duplicate",
     "file": "publication.json",
-    "old": "\"schema_version\":1",
-    "new": "\"schema_version\":1,\"future\":{\"x\":1,\"x\":2}",
+    "old": "\"schema_version\":2",
+    "new": "\"schema_version\":2,\"future\":{\"x\":1,\"x\":2}",
     "code": "invalid_request"
   },
   {
     "name": "unknown top field",
     "file": "publication.json",
-    "old": "\"schema_version\":1",
-    "new": "\"schema_version\":1,\"future\":0",
+    "old": "\"schema_version\":2",
+    "new": "\"schema_version\":2,\"future\":0",
     "code": "invalid_request"
   },
   {
@@ -114,8 +114,8 @@
   {
     "name": "unknown version",
     "file": "publication.json",
-    "old": "\"schema_version\":1",
-    "new": "\"schema_version\":2",
+    "old": "\"schema_version\":2",
+    "new": "\"schema_version\":1",
     "code": "unsupported_version"
   },
   {

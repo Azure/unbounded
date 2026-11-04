@@ -15,33 +15,36 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
-	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk/internal/wire"
 )
 
-// NewHandler serves client-socket HEAD and subscriptions through transport, which
-// must reach an origin at http://racer. Client and origin requests share one
-// object path, so the caller must expose this handler only on the client socket. The caller owns transport and server lifetime,
+// NewHandler serves client-socket HEAD, subscriptions, and the prefetch API
+// through transport, which must reach an origin at http://racer. Client and
+// origin requests share one object path, so the caller must expose this handler
+// only on the client socket. The caller owns transport and server lifetime,
 // including canceling request contexts to close hijacked subscription sockets.
+// Prefetch tickets use a default [Prefetches] in which every ref succeeds.
 func NewHandler(transport http.RoundTripper) http.Handler {
-	return NewHandlerWithWarm(transport, nil)
+	return NewHandlerWithPrefetch(transport, NewPrefetches(PrefetchConfig{}))
 }
 
-// WarmPolicy scripts retention acceptance after a successful origin HEAD.
-// Zero refuses retention. The fake does not cache or load object pages.
-type WarmPolicy func(context.Context, wire.Request, wire.Metadata) (time.Time, error)
-
-// NewHandlerWithWarm adds a scripted warming policy. Nil refuses all retention.
-func NewHandlerWithWarm(transport http.RoundTripper, warm WarmPolicy) http.Handler {
+// NewHandlerWithPrefetch serves prefetch requests from prefetches.
+func NewHandlerWithPrefetch(transport http.RoundTripper, prefetches *Prefetches) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wire.PrefetchPath || strings.HasPrefix(r.URL.Path, wire.PrefetchPath+"/") {
+			prefetches.ServeHTTP(w, r)
+			return
+		}
+
 		if r.Method == http.MethodPost {
 			serveSubscription(w, r, transport)
 			return
 		}
 
-		serveHead(w, r, transport, warm)
+		serveHead(w, r, transport)
 	})
 }
 
@@ -355,14 +358,14 @@ func fetchPage(ctx context.Context, transport http.RoundTripper, request wire.Re
 	return res, response, err
 }
 
-func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripper, warm WarmPolicy) {
+func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripper) {
 	descriptor, err := wire.ParseClientHead(r)
 	if err != nil {
 		writeError(w, 400)
 		return
 	}
 
-	res, response, err := fetchPage(r.Context(), transport, descriptor, nil)
+	res, _, err := fetchPage(r.Context(), transport, descriptor, nil)
 	if res != nil {
 		defer closeBody(res.Body)
 	}
@@ -373,39 +376,8 @@ func serveHead(w http.ResponseWriter, r *http.Request, transport http.RoundTripp
 		return
 	}
 
-	var retain time.Time
-	if err == nil && descriptor.RetainSeconds != 0 && warm != nil {
-		retain, err = warm(r.Context(), descriptor, response.Metadata)
-		if err != nil {
-			status := 502
-			if errors.As(err, &typed) && typed.Status != 0 {
-				status = typed.Status
-			}
-
-			writeError(w, status)
-
-			return
-		}
-
-		if !retain.IsZero() {
-			check := response.Metadata
-
-			check.ExpiresAt = retain
-			if check.Validate() != nil {
-				writeError(w, 502)
-				return
-			}
-		}
-	}
-
 	for name, values := range res.Header {
 		w.Header()[name] = values
-	}
-	// An origin cannot grant retention on behalf of the cache.
-	w.Header().Del("Racer-Retain-Until")
-
-	if !retain.IsZero() {
-		w.Header().Set("Racer-Retain-Until", strconv.FormatInt(retain.UnixMilli(), 10))
 	}
 
 	w.WriteHeader(res.StatusCode)

@@ -285,7 +285,8 @@ pub mod cluster {
         let count = NonZeroUsize::new(16).unwrap();
         let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
         Config {
-            warm: Default::default(),
+            spill: Default::default(),
+            prefetch: Default::default(),
             send_crc_pair: None,
             page_hedge: Default::default(),
             replica_selection: Default::default(),
@@ -538,20 +539,24 @@ impl ReadWorker {
         ));
         let snapshots = Rc::new(PublicationTarget::new(keys.cluster().clone(), publications));
         snapshots
-            .apply(Publication {
-                schema_version: 1,
-                cluster: keys.cluster().clone(),
-                sequence: PublicationSequence(1),
-                membership_version: MembershipVersion(1),
-                members: vec![racer_control_wire::Member {
-                    node: keys.node().clone(),
-                    shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:1".into(),
-                    rails: vec![],
-                    site: String::new(),
-                }],
-                caches: vec![cache.clone()],
-            })
+            .apply(
+                Publication {
+                    pools: Vec::new(),
+                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    cluster: keys.cluster().clone(),
+                    sequence: PublicationSequence(1),
+                    membership_version: MembershipVersion(1),
+                    members: vec![racer_control_wire::Member {
+                        node: keys.node().clone(),
+                        shares: NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:1".into(),
+                        rails: vec![],
+                        site: String::new(),
+                    }],
+                    caches: vec![cache.clone()],
+                }
+                .with_default_pool(),
+            )
             .unwrap();
         let directory = Arc::new(
             WorkerDirectory::new(

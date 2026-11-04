@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -679,4 +680,97 @@ func TestVerifierRequiresAnAssetListWhenArtifactsAreDeclared(t *testing.T) {
 
 	requireCode(t, code, 2, output)
 	requireContains(t, output, "completeness cannot be checked")
+}
+
+// identityRegexps returns the --certificate-identity-regexp passed to every
+// cosign call whose arguments contain marker. cosign evaluates the flag with
+// Go's regexp package, so compiling it here tests the policy as enforced.
+func identityRegexps(t *testing.T, calls, marker string) []*regexp.Regexp {
+	t.Helper()
+
+	var found []*regexp.Regexp
+
+	for _, line := range strings.Split(calls, "\n") {
+		if !strings.Contains(line, marker) {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field == "--certificate-identity-regexp" && i+1 < len(fields) {
+				found = append(found, regexp.MustCompile(fields[i+1]))
+			}
+		}
+	}
+
+	if len(found) == 0 {
+		t.Fatalf("no cosign call containing %q\n%s", marker, calls)
+	}
+
+	return found
+}
+
+func TestVerifierImageIdentityPolicy(t *testing.T) {
+	requireVerifier(t)
+	t.Parallel()
+
+	r := newRelease(t)
+
+	output, code := r.run(nil)
+	requireCode(t, code, 0, output)
+
+	const base = "https://github.com/Azure/unbounded/.github/workflows/"
+
+	cases := []struct {
+		identity string
+		want     bool
+	}{
+		{base + "multiarch-image.yaml@refs/tags/" + verifyTag, true},
+		{base + "release.yaml@refs/tags/" + verifyTag, true},
+		{base + "multiarch-image.yaml@refs/tags/v9.9.8", false},
+		{base + "multiarch-image.yaml@refs/heads/main", false},
+		{base + "release.yaml@refs/heads/main", false},
+		{base + "images.yaml@refs/tags/" + verifyTag, false},
+		{base + "multiarch-imageXyaml@refs/tags/" + verifyTag, false},
+		{"https://github.com/fork/unbounded/.github/workflows/multiarch-image.yaml@refs/tags/" + verifyTag, false},
+	}
+
+	for _, re := range identityRegexps(t, r.cosignCalls(), "verify --certificate") {
+		for _, tc := range cases {
+			if got := re.MatchString(tc.identity); got != tc.want {
+				t.Errorf("image policy %q on %q: got %v, want %v", re, tc.identity, got, tc.want)
+			}
+		}
+	}
+}
+
+func TestVerifierBlobIdentityRequiresReleaseWorkflow(t *testing.T) {
+	requireVerifier(t)
+	t.Parallel()
+
+	r := newRelease(t)
+
+	output, code := r.run(nil)
+	requireCode(t, code, 0, output)
+
+	const base = "https://github.com/Azure/unbounded/.github/workflows/"
+
+	cases := []struct {
+		identity string
+		want     bool
+	}{
+		{base + "release.yaml@refs/tags/" + verifyTag, true},
+		{base + "multiarch-image.yaml@refs/tags/" + verifyTag, false},
+		{base + "release.yaml@refs/tags/v9.9.8", false},
+		{base + "release.yaml@refs/heads/main", false},
+		{"https://github.com/fork/unbounded/.github/workflows/release.yaml@refs/tags/" + verifyTag, false},
+	}
+
+	for _, re := range identityRegexps(t, r.cosignCalls(), "verify-blob") {
+		for _, tc := range cases {
+			if got := re.MatchString(tc.identity); got != tc.want {
+				t.Errorf("blob policy %q on %q: got %v, want %v", re, tc.identity, got, tc.want)
+			}
+		}
+	}
 }

@@ -53,7 +53,7 @@ use racer_core::read::{self, DIRECT_AHEAD, SlotKind};
 pub(crate) const REQUESTED_FLIGHTS: u16 = 4;
 const _: () = assert!(REQUESTED_FLIGHTS <= racer_core::subscriptions::MAX_SUBSCRIPTION_FLIGHTS);
 
-/// Spill fills (hold plus warm fill) a read keeps in flight.
+/// Spill fills (hold plus spill fill) a read keeps in flight.
 const SPILL_FILLS: usize = 2;
 
 /// Lifetime of a read's spill hold. Holds are renewed by nothing; a page that
@@ -518,8 +518,8 @@ enum Slot {
 enum Spilling {
     /// Reserving this read's hold on the page's owning worker.
     Holding(Operation<'static, HoldEpoch>),
-    /// Filling the held page through the warm path, which persists it.
-    Warming(Operation<'static, ()>),
+    /// Filling the held page, which persists it under the hold.
+    Filling(Operation<'static, ()>),
     /// Published under this read's hold.
     Spilled,
 }
@@ -712,7 +712,7 @@ impl RangeStream {
             .open(self.metadata.version.clone())?;
         self.credits = Some(credits);
         self.lease = Some(lease);
-        let limit = self.directory.warm.config().range_spill_pages;
+        let limit = self.directory.spill_config().range_spill_pages;
         self.spill = (limit != 0 && !self.passthrough).then(|| Spill {
             limit,
             refused: false,
@@ -830,7 +830,7 @@ impl RangeStream {
                 Some(Spilling::Spilled) if sealed => {
                     Box::pin(async move { directory.cached_page(page, &scope).await })
                 }
-                Some(Spilling::Warming(warming)) if sealed => Box::pin(async move {
+                Some(Spilling::Filling(warming)) if sealed => Box::pin(async move {
                     let _ = warming.await;
                     directory.cached_page(page, &scope).await
                 }),
@@ -839,7 +839,7 @@ impl RangeStream {
                 Some(Spilling::Spilled) => {
                     Box::pin(async move { directory.held_page(page, &scope).await.map(Some) })
                 }
-                Some(Spilling::Warming(warming)) => Box::pin(async move {
+                Some(Spilling::Filling(warming)) => Box::pin(async move {
                     warming.await?;
                     directory.held_page(page, &scope).await.map(Some)
                 }),
@@ -1162,10 +1162,9 @@ impl RangeStream {
 
     /// The demand and pages of the next selection, if any. Pages that another
     /// window of this version is selecting are left to that selection's
-    /// fan-out. While a warm job runs for the version, reads only fetch pages
-    /// directly, each waiting for the warm job to finish that page.
+    /// fan-out.
     fn plan_selection(&self) -> Result<Option<(racer_core::subscriptions::Demand, BTreeSet<u64>)>> {
-        if self.passthrough || self.directory.warm.contains(&self.metadata.version) {
+        if self.passthrough {
             return Ok(None);
         }
         let Some(lease) = self.lease.as_ref() else {
@@ -1176,8 +1175,7 @@ impl RangeStream {
 
     /// Select the next share of the remaining holes from a peer provider. Pages that another
     /// window of this version is selecting are left to that selection's
-    /// fan-out. While a warm job runs for the version, reads only fetch pages
-    /// directly, each waiting for the warm job to finish that page.
+    /// fan-out.
     fn start_selection(&mut self, scope: &RequestScope) -> Result<bool> {
         let Some((demand, pages)) = self.plan_selection()? else {
             return Ok(false);
@@ -1337,7 +1335,7 @@ impl RangeStream {
         };
         let mut changed = false;
         let mut release = Vec::new();
-        let mut warm = Vec::new();
+        let mut fill = Vec::new();
         spill.pages.retain(|number, state| {
             match state {
                 Spilling::Holding(op) => {
@@ -1356,10 +1354,10 @@ impl RangeStream {
                         return false;
                     }
                     spill.held.insert(*number, epoch);
-                    warm.push(*number);
+                    fill.push(*number);
                     true
                 }
-                Spilling::Warming(op) => {
+                Spilling::Filling(op) => {
                     let Poll::Ready(result) = op.as_mut().poll(cx) else {
                         return true;
                     };
@@ -1373,7 +1371,7 @@ impl RangeStream {
                     }
                     // A failed spill fill (origin refusal, version change, no
                     // disk) would likely fail again, and each retry takes a
-                    // fresh warm budget. Stop spilling: the page is fetched
+                    // fresh fill budget. Stop spilling: the page is fetched
                     // through the window like any other.
                     spill.refused = true;
                     false
@@ -1381,10 +1379,10 @@ impl RangeStream {
                 Spilling::Spilled => true,
             }
         });
-        for number in warm {
+        for number in fill {
             let operation = self.start_spill_fill(PageNumber(number));
             if let Some(spill) = self.spill.as_mut() {
-                spill.pages.insert(number, Spilling::Warming(operation));
+                spill.pages.insert(number, Spilling::Filling(operation));
             }
         }
         if !release.is_empty() {
@@ -1399,7 +1397,7 @@ impl RangeStream {
             version: self.metadata.version.clone(),
             number,
         };
-        match self.directory.start_warm_page(
+        match self.directory.start_spill_page(
             page,
             self.metadata.immutable(),
             self.membership.clone(),
@@ -1411,15 +1409,13 @@ impl RangeStream {
         }
     }
 
-    /// Start holds for pages past the window, while no warm job covers the
-    /// version (its own holds already cover those pages).
+    /// Start holds for pages past the window.
     fn admit_spill(&mut self, scope: &RequestScope) -> bool {
         let start = self.page_at(self.slots.len());
-        let warming = self.directory.warm.contains(&self.metadata.version);
         let Some(spill) = self.spill.as_mut() else {
             return false;
         };
-        if spill.refused || warming {
+        if spill.refused {
             return false;
         }
         let remaining = scope
@@ -1467,9 +1463,6 @@ impl RangeStream {
     /// acquiring the first slice. Already admitted pages retain their original deadlines
     /// and retry budgets; only newly admitted, distinct pages get child scopes.
     pub(crate) fn enable_progress(&mut self, timeout: Duration) {
-        if self.directory.warm.contains(&self.metadata.version) {
-            return;
-        }
         if matches!(self.budget, RangeBudget::ClientPages { .. }) {
             self.budget = RangeBudget::ProgressingPages { timeout };
         }
@@ -2667,7 +2660,7 @@ pub(super) mod tests {
         }
     }
     #[test]
-    fn active_warm_job_issues_no_selection_and_spill_stays_off_by_default() {
+    fn spill_stays_off_by_default() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
         let mut metadata = metadata();
         metadata.length = 4 * PAGE_BYTES;
@@ -2679,29 +2672,13 @@ pub(super) mod tests {
         );
         stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
         assert!(stream.spill.is_none());
-        for _ in 0..4 {
-            stream.inject(Slot::Missing { select: true });
-        }
-        let (job, _) = f.streams.directory.warm.begin(&metadata.version).unwrap();
-        let scope = stream.operation_scope();
-        // Each page waits for the warm job through its own direct fill.
-        assert_eq!(stream.start_selection(&scope), Ok(false));
-        assert!(stream.selections.is_empty());
-        assert!(
-            stream
-                .slots
-                .iter()
-                .all(|slot| matches!(slot, Slot::Missing { select: true }))
-        );
-        job.stop();
     }
     #[test]
     fn passthrough_stream_issues_no_selection_and_never_spills() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
         f.streams
             .directory
-            .warm
-            .configure(crate::read::warm::Config {
+            .configure_spill(crate::read::spill::Config {
                 range_spill_pages: 4,
                 ..Default::default()
             })
@@ -3001,7 +2978,6 @@ pub(super) mod tests {
                 .unwrap();
             stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
             let response = ReadResponse {
-                retain_until: None,
                 metadata,
                 payload: crate::read::ReadPayload::Stream(stream),
             };

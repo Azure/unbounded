@@ -4,9 +4,11 @@
 package unboundedoperator
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -383,6 +385,78 @@ func TestOperatorImageAndComponentRegistryShareRegistry(t *testing.T) {
 	want := registry + "/unbounded-operator:" + tag
 	if image != want {
 		t.Fatalf("operator image %q does not match component registry %q (want %q)", image, registry, want)
+	}
+}
+
+func TestRegistryAuthMigrationLeaseDeletionIsNamespaceAndNameScoped(t *testing.T) {
+	outputDir := t.TempDir()
+	if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
+		"Namespace": "custom-system", "OperatorImage": "operator:test", "ImageRegistry": "ghcr.io",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outputDir, "02-rbac.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	foundRole, foundBinding := false, false
+
+	for {
+		var document struct {
+			Kind     string `yaml:"kind"`
+			Metadata struct {
+				Name      string `yaml:"name"`
+				Namespace string `yaml:"namespace"`
+			} `yaml:"metadata"`
+			Rules []struct {
+				APIGroups     []string `yaml:"apiGroups"`
+				Resources     []string `yaml:"resources"`
+				ResourceNames []string `yaml:"resourceNames"`
+				Verbs         []string `yaml:"verbs"`
+			} `yaml:"rules"`
+			RoleRef struct {
+				Kind string `yaml:"kind"`
+				Name string `yaml:"name"`
+			} `yaml:"roleRef"`
+			Subjects []struct {
+				Name      string `yaml:"name"`
+				Namespace string `yaml:"namespace"`
+			} `yaml:"subjects"`
+		}
+		if err := decoder.Decode(&document); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rule := range document.Rules {
+			if contains(rule.APIGroups, "coordination.k8s.io") && contains(rule.Resources, "leases") && contains(rule.Verbs, "delete") {
+				if document.Kind != "Role" || document.Metadata.Namespace != "custom-system" ||
+					len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != "gantry-acr-auth-restart" ||
+					len(rule.Verbs) != 1 {
+					t.Fatalf("overbroad Lease deletion permission: %+v", document)
+				}
+
+				foundRole = true
+			}
+		}
+
+		if document.Kind == "RoleBinding" && document.RoleRef.Name == "unbounded-operator-registry-auth-migration" {
+			if document.Metadata.Namespace != "custom-system" || document.RoleRef.Kind != "Role" ||
+				len(document.Subjects) != 1 || document.Subjects[0].Name != "unbounded-operator" ||
+				document.Subjects[0].Namespace != "custom-system" {
+				t.Fatalf("incorrect migration RoleBinding: %+v", document)
+			}
+
+			foundBinding = true
+		}
+	}
+
+	if !foundRole || !foundBinding {
+		t.Fatal("migration Lease deletion permission or its operator binding is missing")
 	}
 }
 

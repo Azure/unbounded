@@ -948,17 +948,19 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         return Err(Error::Unauthorized);
     }
     let typed = route::Outcome::from_wire(&outcome);
-    if let Some(action) = typed.warm_action() {
-        if field(request, "racer-operation")? != "warm"
-            || field(request, "racer-warm-action")? != action
-        {
+    if typed.is_prefetch() {
+        // Results answer exactly the requested pages, in order, and a probe
+        // reports only residency.
+        if field(request, "racer-operation")? != "prefetch" {
             return Err(Error::Unauthorized);
         }
-        if typed == route::Outcome::Held
-            && number(response, "racer-warm-until")? > number(request, "racer-warm-until")?
-        {
-            // An owner may shorten a hold to its own TTL cap, never extend the ask.
-            // Longer pre-existing holds are reported as the requested expiry.
+        let pages = protocol::decode_binary(field(request, "racer-prefetch-pages")?.as_bytes())?;
+        let results =
+            protocol::decode_binary(field(response, "racer-prefetch-results")?.as_bytes())?;
+        let probe = field(request, "racer-prefetch-action")? == "probe";
+        let pages = racer_core::prefetch::decode_pages(&pages).ok_or(Error::Unauthorized)?;
+        let results = racer_core::prefetch::decode_results(&results).ok_or(Error::Unauthorized)?;
+        if !racer_core::prefetch::results_answer(&results, pages.len(), probe) {
             return Err(Error::Unauthorized);
         }
         return Ok(());
@@ -2031,65 +2033,83 @@ mod tests {
             sender.verify_response(reply, &binding).unwrap();
         }
     }
-    fn warm_request(id: u8, action: crate::peer::protocol::WarmAction) -> PeerRequest {
+    fn prefetch_request(id: u8, action: crate::peer::protocol::PrefetchAction) -> PeerRequest {
         let mut request = request(id);
-        request.operation = Operation::Warm {
+        request.operation = Operation::Prefetch {
             version: ObjectVersion {
                 object: request.origin.object.clone(),
                 etag: StrongEtag::parse(b"\"version\"").unwrap(),
             },
-            lease: [id; 16],
             action,
         };
         request.route.remaining_attempts = 4;
         request.route.destination = node(1);
         request
     }
+    fn prefetch_fill(pages: Vec<u64>) -> crate::peer::protocol::PrefetchAction {
+        crate::peer::protocol::PrefetchAction::Fill {
+            pages,
+            length: 8 * PAGE_BYTES + 1,
+            content_type: Some(
+                crate::model::ContentType::parse(b"application/octet-stream").unwrap(),
+            ),
+            priority: racer_core::prefetch::Priority::High,
+        }
+    }
     #[test]
-    fn warm_actions_round_trip_and_bind_their_acknowledgements() {
+    fn prefetch_actions_round_trip_and_bind_their_results() {
+        use crate::peer::protocol::PrefetchAction;
         use crate::peer::protocol::SecurityCodec;
-        use crate::peer::protocol::WarmAction;
         use crate::peer::protocol::decode_envelope;
         use crate::peer::protocol::encode_envelope;
+        use racer_core::prefetch::{FailCode, PageResult};
         let signatures = network(2);
         let f: Vec<_> = signatures
             .iter()
             .map(|s| Forwarding::new(s.clone()))
             .collect();
-        let until = std::time::UNIX_EPOCH + Duration::from_millis(4_102_444_800_123);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
         let codec =
             SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
+        let fill_results = vec![
+            PageResult::Admitted,
+            PageResult::Resident,
+            PageResult::Deferred {
+                retry_after_ms: 300,
+            },
+            PageResult::Failed(FailCode::Unavailable),
+        ];
+        let probe_results = vec![
+            PageResult::Resident,
+            PageResult::Failed(FailCode::NotResident),
+        ];
         for (id, action, good, wrong) in [
             (
                 21,
-                WarmAction::Hold { pages: 9, until },
-                PeerResponse::Held { until },
-                PeerResponse::Warmed,
+                prefetch_fill(vec![0, 2, 5, 8]),
+                PeerResponse::Prefetch(fill_results.clone()),
+                // Too few results.
+                PeerResponse::Prefetch(fill_results[..3].to_vec()),
             ),
             (
                 22,
-                WarmAction::Fill {
-                    page: PageNumber(8),
-                    length: 8 * PAGE_BYTES + 1,
-                    content_type: Some(
-                        crate::model::ContentType::parse(b"application/octet-stream").unwrap(),
-                    ),
-                },
-                PeerResponse::Warmed,
-                PeerResponse::Released,
+                PrefetchAction::Probe { pages: vec![1, 9] },
+                PeerResponse::Prefetch(probe_results.clone()),
+                // A probe never reports admitted.
+                PeerResponse::Prefetch(vec![PageResult::Admitted, PageResult::Resident]),
             ),
             (
                 23,
-                WarmAction::Release,
-                PeerResponse::Released,
-                PeerResponse::Held { until },
+                prefetch_fill(vec![3]),
+                PeerResponse::Prefetch(vec![PageResult::Admitted]),
+                // A fill never reports code 0.
+                PeerResponse::Prefetch(vec![PageResult::Failed(FailCode::NotResident)]),
             ),
         ] {
             let (signed, binding) = f[0]
-                .sign_request_to(warm_request(id, action.clone()), &node(1))
+                .sign_request_to(prefetch_request(id, action.clone()), &node(1))
                 .unwrap();
             let scope = signed.request.origin.scope().clone();
             let (auth, _) = decode_envelope(
@@ -2098,108 +2118,83 @@ mod tests {
             )
             .unwrap();
             let decoded = codec.request(auth, &scope).unwrap();
-            let Operation::Warm {
+            let Operation::Prefetch {
                 version,
-                lease,
                 action: decoded_action,
             } = &decoded.request.operation
             else {
-                panic!("warm operation expected");
+                panic!("prefetch operation expected");
             };
             assert_eq!(version.etag, StrongEtag::parse(b"\"version\"").unwrap());
-            assert_eq!(lease, &[id; 16]);
             assert_eq!(decoded_action, &action);
             let admitted = f[1].verify_request(signed).unwrap();
+            let expected = match &good {
+                PeerResponse::Prefetch(results) => results.clone(),
+                _ => unreachable!(),
+            };
             let response = f[1].sign_response(admitted.binding(), good).unwrap();
             let verified = f[0].verify_response(response, &binding).unwrap();
-            match (verified.response(), &action) {
-                (PeerResponse::Held { until: got }, WarmAction::Hold { .. }) => {
-                    assert_eq!(*got, until)
-                }
-                (PeerResponse::Warmed, WarmAction::Fill { .. })
-                | (PeerResponse::Released, WarmAction::Release) => {}
-                _ => panic!("acknowledgement changed"),
+            match verified.response() {
+                PeerResponse::Prefetch(results) => assert_eq!(results, &expected),
+                _ => panic!("results changed"),
             }
             assert!(
                 f[1].sign_response(admitted.binding(), wrong)
                     .ok()
                     .is_none_or(|response| f[0].verify_response(response, &binding).is_err()),
-                "acknowledgement for another warm action accepted"
+                "results that do not answer the request accepted"
             );
-            // Refusals stay request-bound and need no action-specific shape.
+            // Whole-operation refusals stay request-bound.
             let response = f[1]
                 .sign_response(admitted.binding(), PeerResponse::Overloaded)
                 .unwrap();
             f[0].verify_response(response, &binding).unwrap();
         }
-        // An owner may shorten a hold but never report a later expiry.
-        let (signed, binding) = f[0]
-            .sign_request_to(
-                warm_request(24, WarmAction::Hold { pages: 1, until }),
-                &node(1),
-            )
-            .unwrap();
-        let admitted = f[1].verify_request(signed).unwrap();
-        let later = PeerResponse::Held {
-            until: until + Duration::from_millis(1),
-        };
-        assert!(
-            f[1].sign_response(admitted.binding(), later)
-                .ok()
-                .is_none_or(|response| f[0].verify_response(response, &binding).is_err())
-        );
-        let earlier = PeerResponse::Held {
-            until: until - Duration::from_secs(1),
-        };
-        let response = f[1].sign_response(admitted.binding(), earlier).unwrap();
-        f[0].verify_response(response, &binding).unwrap();
-        // Data acknowledgements are not valid answers to a data request.
+        // Prefetch results are not valid answers to a data request.
         let (signed, binding) = f[0].sign_request_to(request(25), &node(1)).unwrap();
         let admitted = f[1].verify_request(signed).unwrap();
         assert!(
-            f[1].sign_response(admitted.binding(), PeerResponse::Warmed)
-                .ok()
-                .is_none_or(|response| f[0].verify_response(response, &binding).is_err())
+            f[1].sign_response(
+                admitted.binding(),
+                PeerResponse::Prefetch(vec![PageResult::Resident])
+            )
+            .ok()
+            .is_none_or(|response| f[0].verify_response(response, &binding).is_err())
         );
     }
     #[test]
-    fn malformed_warm_requests_are_rejected_at_encode_and_decode() {
-        use crate::peer::protocol::MAX_WARM_PAGES;
+    fn malformed_prefetch_requests_are_rejected_at_encode_and_decode() {
+        use crate::peer::protocol::PrefetchAction;
         use crate::peer::protocol::SecurityCodec;
-        use crate::peer::protocol::WarmAction;
         use crate::peer::protocol::request_head;
-        let until = std::time::UNIX_EPOCH + Duration::from_secs(4_102_444_800);
+        let fill = |pages: Vec<u64>, length| PrefetchAction::Fill {
+            pages,
+            length,
+            content_type: None,
+            priority: racer_core::prefetch::Priority::Normal,
+        };
         for action in [
-            WarmAction::Hold { pages: 0, until },
-            WarmAction::Hold {
-                pages: MAX_WARM_PAGES + 1,
-                until,
-            },
-            WarmAction::Hold {
-                pages: 1,
-                until: std::time::UNIX_EPOCH,
-            },
-            WarmAction::Fill {
-                page: PageNumber(MAX_WARM_PAGES),
-                length: u64::MAX,
-                content_type: None,
-            },
-            WarmAction::Fill {
-                page: PageNumber(2),
-                length: 2 * PAGE_BYTES,
-                content_type: None,
-            },
-            WarmAction::Fill {
-                page: PageNumber(0),
-                length: 0,
-                content_type: None,
-            },
+            fill(vec![], PAGE_BYTES),
+            fill(vec![1, 0], 2 * PAGE_BYTES),
+            fill(vec![1, 1], 2 * PAGE_BYTES),
+            fill(vec![2], 2 * PAGE_BYTES),
+            fill(vec![0], 0),
+            fill((0..257).collect(), 257 * PAGE_BYTES),
+            PrefetchAction::Probe { pages: vec![] },
+            PrefetchAction::Probe { pages: vec![4, 4] },
         ] {
             assert!(
-                request_head(&warm_request(31, action.clone())).is_err(),
+                request_head(&prefetch_request(31, action.clone())).is_err(),
                 "{action:?}"
             );
         }
+        assert!(
+            request_head(&prefetch_request(
+                31,
+                fill((0..256).collect(), 256 * PAGE_BYTES)
+            ))
+            .is_ok()
+        );
         let signatures = network(2);
         let sender = Forwarding::new(signatures[0].clone());
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -2208,10 +2203,7 @@ mod tests {
         let codec =
             SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
         let (signed, _) = sender
-            .sign_request_to(
-                warm_request(32, WarmAction::Hold { pages: 3, until }),
-                &node(1),
-            )
+            .sign_request_to(prefetch_request(32, prefetch_fill(vec![1, 4])), &node(1))
             .unwrap();
         let scope = signed.request.origin.scope().clone();
         let decode = |change: &dyn Fn(&mut Vec<http1::Header>)| {
@@ -2226,78 +2218,47 @@ mod tests {
             )
         };
         assert!(decode(&|_| {}).is_ok());
-        let set = |name: &'static str, value: &'static [u8]| {
+        let set = |name: &'static str, value: Vec<u8>| {
             move |headers: &mut Vec<http1::Header>| {
-                headers.iter_mut().find(|h| h.name == name).unwrap().value = value.to_vec();
+                headers.iter_mut().find(|h| h.name == name).unwrap().value = value.clone();
             }
         };
+        let pages = |list: &[u64]| {
+            crate::peer::protocol::binary(
+                &list
+                    .iter()
+                    .flat_map(|p| p.to_be_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .into_bytes()
+        };
         for (name, value) in [
-            ("racer-warm-pages", b"0".as_slice()),
-            ("racer-warm-pages", b"4294967297"),
-            ("racer-warm-pages", b"-1"),
-            ("racer-warm-until", b"0"),
-            ("racer-warm-until", b"soon"),
-            ("racer-warm-action", b"steal"),
-            ("racer-warm-lease", b"AAAA"),
-            ("racer-mode", b"copy"),
+            ("racer-prefetch-pages", pages(&[])),
+            ("racer-prefetch-pages", pages(&[4, 1])),
+            ("racer-prefetch-pages", pages(&[1, 9])),
+            ("racer-prefetch-pages", b"AAAA".to_vec()),
+            ("racer-prefetch-action", b"hold".to_vec()),
+            ("racer-object-length", b"0".to_vec()),
+            ("racer-object-length", b"-1".to_vec()),
+            ("racer-priority", b"urgent".to_vec()),
+            ("racer-content-type", b"not a type".to_vec()),
+            ("racer-mode", b"copy".to_vec()),
         ] {
             assert!(
-                decode(&set(name, value)).is_err(),
+                decode(&set(name, value.clone())).is_err(),
                 "accepted {name}={value:?}"
             );
         }
-        for name in ["racer-warm-pages", "racer-warm-until", "racer-warm-lease"] {
+        for name in [
+            "racer-prefetch-pages",
+            "racer-prefetch-action",
+            "racer-object-length",
+            "racer-priority",
+        ] {
             assert!(
                 decode(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
                     .is_err(),
                 "accepted missing {name}"
-            );
-        }
-        let (signed, _) = sender
-            .sign_request_to(
-                warm_request(
-                    33,
-                    WarmAction::Fill {
-                        page: PageNumber(1),
-                        length: PAGE_BYTES + 1,
-                        content_type: Some(
-                            crate::model::ContentType::parse(b"text/plain").unwrap(),
-                        ),
-                    },
-                ),
-                &node(1),
-            )
-            .unwrap();
-        let decode_fill = |change: &dyn Fn(&mut Vec<http1::Header>)| {
-            let mut head = clone_head(&signed.authentication.original);
-            change(&mut head.head.headers);
-            codec.request(
-                ForwardedHead {
-                    original: Arc::new(head),
-                    hops: vec![],
-                },
-                &scope,
-            )
-        };
-        assert!(decode_fill(&|_| {}).is_ok());
-        for (name, value) in [
-            ("racer-length", b"0".as_slice()),
-            ("racer-length", b"4194304"),
-            ("racer-length", b"-1"),
-            ("racer-length", b"big"),
-            ("racer-metadata-version", b"2"),
-            ("racer-content-type", b"not a type"),
-        ] {
-            assert!(
-                decode_fill(&set(name, value)).is_err(),
-                "accepted fill {name}={value:?}"
-            );
-        }
-        for name in ["racer-length", "racer-metadata-version", "racer-page"] {
-            assert!(
-                decode_fill(&|headers: &mut Vec<http1::Header>| headers.retain(|h| h.name != name))
-                    .is_err(),
-                "accepted fill missing {name}"
             );
         }
     }

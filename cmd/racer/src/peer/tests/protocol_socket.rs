@@ -738,7 +738,8 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
             planned.nodes
         );
     }
-    assert!(selected.len() > 1);
+    // Mesh v2: the primary delegate is unique, so every attempt picks it.
+    assert_eq!(selected.len(), 1);
 }
 
 #[test]
@@ -1548,7 +1549,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     ));
     let neighbors = membership.neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
-    assert!(neighbors.len() <= crate::topology::MAX_DEGREE);
+    assert!(neighbors.len() <= membership.inner.max_degree());
     for member in membership.members() {
         let endpoint = network.endpoint(&membership, &member.node);
         if neighbors.contains(&member.node) {
@@ -1900,13 +1901,27 @@ mod established_sessions {
 /// own, or for a helper requester, it serves.
 #[test]
 fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
+    hot_page_shedding(false);
+}
+
+/// A hot owner sheds a requester in its own mesh column of the page's pool
+/// only past the exempt cap: with more than 64 members the pool has several
+/// columns, and the same hot page that sheds a requester in another column is
+/// served to one in the owner's column until the cap.
+#[test]
+fn hot_page_owner_serves_its_column_mates() {
+    hot_page_shedding(true);
+}
+
+/// Drive a hot owner C with requester A, where A is in C's mesh column of the
+/// cache's pool exactly when `mate`.
+fn hot_page_shedding(mate: bool) {
     use crate::http::Codec;
     use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use racer_core::read::budget::is_helper;
     use std::cell::Cell;
     use std::num::NonZeroU32;
     let hot = crate::peer::server::hot_page_threshold();
@@ -1924,14 +1939,17 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
             })
         }
     }
-    let signers = signers();
-    let sender = Forwarding::new(signers[0].clone());
-    let destination = Rc::new(Forwarding::new(signers[2].clone()));
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     )));
-    let mut nodes: Vec<String> = [A, B, C].iter().map(|n| (*n).to_owned()).collect();
-    nodes.extend((4..16).map(|i| format!("{i:08}-1111-4111-8111-111111111111")));
+    // 80 members, so the pool has several columns. The requester is the
+    // first neighbor of C past A, B, and C that is in C's column exactly
+    // when `mate` (column mates are never shed).
+    let nodes: Vec<String> = [A, B, C]
+        .iter()
+        .map(|n| (*n).to_owned())
+        .chain((4..80).map(|i| format!("{i:08}-1111-4111-8111-111111111111")))
+        .collect();
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -1949,6 +1967,32 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
         )
         .unwrap(),
     );
+    assert!(
+        membership
+            .cache_pool(&CacheId(CACHE.into()))
+            .mesh
+            .is_some_and(|pool| pool.columns() > 1)
+    );
+    let requester_name = nodes[3..]
+        .iter()
+        .find(|n| {
+            let (owner, node) = (NodeId(C.into()), NodeId((*n).clone()));
+            // A direct requester must be one of C's mesh neighbors.
+            membership.is_neighbor(&owner, &node)
+                && membership.same_column(&CacheId(CACHE.into()), &owner, &node) == mate
+        })
+        .expect("a requester in or outside C's column as asked")
+        .as_str();
+    let signers: Vec<_> = crate::test_support::security::identities(
+        ClusterId(CLUSTER.into()),
+        &[A, B, C, requester_name].map(|name| NodeId(name.into())),
+        || crate::test_support::security::mac_test_key(CACHE),
+    )
+    .into_iter()
+    .map(|identity| identity.signatures)
+    .collect();
+    let destination = Rc::new(Forwarding::new(signers[2].clone()));
+    let sender = Forwarding::new(signers[3].clone());
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
@@ -1992,30 +2036,22 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
         },
         number: PageNumber(number),
     };
-    // Pages C owns, split by whether requester A is an owner or a helper.
+    // Pages C owns that A does not, and pages neither owns.
     let placement = crate::topology::Placement::new(64);
-    let a = membership.position(&NodeId(A.into())).unwrap();
     let mut shed_page = None;
-    let mut helper_page = None;
     let mut foreign_page = None;
     for number in 0..4096 {
         let owners = placement
             .rank(membership.clone(), &object, PageNumber(number))
             .ordered;
         let owns = |n: &str| owners.contains(&NodeId(n.into()));
-        let helper = is_helper(&object, PageNumber(number), a, membership.members().len());
-        match (owns(C), owns(A), helper) {
-            (true, false, false) => shed_page = shed_page.or(Some(number)),
-            (true, false, true) => helper_page = helper_page.or(Some(number)),
-            (false, false, false) => foreign_page = foreign_page.or(Some(number)),
+        match (owns(C), owns(requester_name)) {
+            (true, false) => shed_page = shed_page.or(Some(number)),
+            (false, false) => foreign_page = foreign_page.or(Some(number)),
             _ => {}
         }
     }
-    let (shed_page, helper_page, foreign_page) = (
-        shed_page.unwrap(),
-        helper_page.expect("A helps some page C owns"),
-        foreign_page.unwrap(),
-    );
+    let (shed_page, foreign_page) = (shed_page.unwrap(), foreign_page.unwrap());
     let mut attempt = 0u8;
     let mut ask = |number: u64| {
         attempt += 1;
@@ -2024,6 +2060,7 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
             page: page_id(number),
             mode: FetchMode::CopyOnly,
         };
+        request.route.visited = vec![NodeId(requester_name.into())];
         let scope = request.origin.scope().clone();
         let (signed, binding) = sender.sign_request(request).unwrap();
         let response = futures::executor::block_on(server.dispatch(signed, &scope)).unwrap();
@@ -2041,23 +2078,31 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     assert_eq!(calls.get(), 1);
     drop(held);
     assert_eq!(server.streaming(&page_id(shed_page)), (0, 0));
-    // At the threshold a non-owner, non-helper reader is shed unserved.
+    // At the threshold a non-owner outside C's column is shed unserved, and
+    // a column mate is served.
     let held = server.hold_streaming(&page_id(shed_page), hot);
     assert_eq!(server.streaming(&page_id(shed_page)), (hot, hot));
-    assert!(ask(shed_page));
-    assert_eq!(calls.get(), 1);
+    assert_eq!(ask(shed_page), !mate);
+    let served = if mate { 2 } else { 1 };
+    assert_eq!(calls.get(), served);
     // Not while the page is less than half of what the owner is writing.
     let other = server.hold_streaming(&page_id(foreign_page), hot + 1);
     assert!(!ask(shed_page));
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.get(), served + 1);
     drop((held, other));
-    // A helper of the page is always served.
-    let held = server.hold_streaming(&page_id(helper_page), hot);
-    assert!(!ask(helper_page));
-    assert_eq!(calls.get(), 3);
-    drop(held);
     // A node that does not own the page (for example a helper) never sheds.
-    let _held = server.hold_streaming(&page_id(foreign_page), hot);
+    let held = server.hold_streaming(&page_id(foreign_page), hot);
     assert!(!ask(foreign_page));
-    assert_eq!(calls.get(), 4);
+    assert_eq!(calls.get(), served + 2);
+    drop(held);
+    // Past the exempt cap a column mate is shed too, so the column cannot pile onto C.
+    let cap = racer_core::read::budget::hot_page_exempt_bodies(hot);
+    let held = server.hold_streaming(&page_id(shed_page), cap - 1);
+    assert_eq!(ask(shed_page), !mate);
+    let served = served + usize::from(mate) + 2;
+    assert_eq!(calls.get(), served);
+    drop(held);
+    let _held = server.hold_streaming(&page_id(shed_page), cap);
+    assert!(ask(shed_page));
+    assert_eq!(calls.get(), served);
 }
