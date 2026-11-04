@@ -336,6 +336,7 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 
 	if node != nil {
 		agent = node.Spec.Agent
+
 		bootLease = selectBootLease(node, requestIP)
 		if netboot := node.Spec.Netboot(); netboot != nil {
 			preserveImageUsers = preservesImageUsers(netboot.Image)

@@ -1394,6 +1394,7 @@ func TestVendorDataTemplateUserPreservationOnlyChangesUsers(t *testing.T) {
 	require.Contains(t, generic, "users")
 	require.Contains(t, generic["users"], map[string]any{"name": "unbounded-metal", "lock_passwd": true, "shell": "/bin/bash", "sudo": "ALL=(ALL) NOPASSWD:ALL"})
 	require.NotContains(t, preserved, "users")
+
 	for _, key := range []string{"reporting", "write_files", "runcmd"} {
 		require.Equal(t, generic[key], preserved[key], key)
 	}
