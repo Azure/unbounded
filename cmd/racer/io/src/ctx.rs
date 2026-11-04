@@ -11,10 +11,7 @@
 //! with seeded nonces.
 use crate::{Error, Result};
 use std::{
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,10 +35,16 @@ struct VirtualState {
 
     wall_origin: SystemTime,
 
-    elapsed: AtomicU64,
+    times: Mutex<VirtualTimes>,
+}
 
-    /// Wall time as nanoseconds since the Unix epoch.
-    wall: AtomicU64,
+/// Mutable virtual time, updated together so readers never see a torn advance.
+/// `Duration` and `SystemTime` keep the full range of the host types.
+#[derive(Debug)]
+struct VirtualTimes {
+    elapsed: Duration,
+
+    wall: SystemTime,
 }
 
 impl Clock {
@@ -113,43 +116,56 @@ impl VirtualClock {
 
     /// Test support: a virtual clock with explicit anchors.
     pub fn new_at(origin: Instant, wall: SystemTime) -> Self {
-        let wall_nanos = wall
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos().min(u64::MAX as u128) as u64);
         Self(Arc::new(VirtualState {
             origin,
             wall_origin: wall,
-            elapsed: AtomicU64::new(0),
-            wall: AtomicU64::new(wall_nanos),
+            times: Mutex::new(VirtualTimes {
+                elapsed: Duration::ZERO,
+                wall,
+            }),
         }))
+    }
+
+    /// Lock the mutable times; no code panics while holding the lock.
+    fn times(&self) -> std::sync::MutexGuard<'_, VirtualTimes> {
+        self.0
+            .times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Current virtual monotonic time.
     pub fn now(&self) -> Instant {
-        self.0.origin + Duration::from_nanos(self.0.elapsed.load(Ordering::Acquire))
+        self.0.origin + self.times().elapsed
     }
 
     /// Current virtual wall time.
     pub fn wall_now(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_nanos(self.0.wall.load(Ordering::Acquire))
+        self.times().wall
     }
 
     /// Total monotonic time advanced since creation.
     pub fn elapsed(&self) -> Duration {
-        Duration::from_nanos(self.0.elapsed.load(Ordering::Acquire))
+        self.times().elapsed
     }
 
-    /// Advance monotonic and wall time together.
+    /// Advance monotonic and wall time together, or change neither on overflow.
     pub fn advance(&self, duration: Duration) -> Result<()> {
-        let nanos = u64::try_from(duration.as_nanos()).map_err(|_| Error::InvalidInput)?;
-        let elapsed = self.0.elapsed.load(Ordering::Acquire);
-        let wall = self.0.wall.load(Ordering::Acquire);
-        let (Some(next), Some(next_wall)) = (elapsed.checked_add(nanos), wall.checked_add(nanos))
-        else {
-            return Err(Error::InvalidInput);
-        };
-        self.0.elapsed.store(next, Ordering::Release);
-        self.0.wall.store(next_wall, Ordering::Release);
+        let mut times = self.times();
+        let elapsed = times
+            .elapsed
+            .checked_add(duration)
+            .ok_or(Error::InvalidInput)?;
+        self.0
+            .origin
+            .checked_add(elapsed)
+            .ok_or(Error::InvalidInput)?;
+        let wall = times
+            .wall
+            .checked_add(duration)
+            .ok_or(Error::InvalidInput)?;
+        times.elapsed = elapsed;
+        times.wall = wall;
         Ok(())
     }
 
@@ -164,12 +180,7 @@ impl VirtualClock {
 
     /// Correct wall time without changing monotonic time or the anchor.
     pub fn set_wall_time(&self, wall: SystemTime) -> Result<()> {
-        let nanos = wall
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|since| u64::try_from(since.as_nanos()).ok())
-            .ok_or(Error::InvalidInput)?;
-        self.0.wall.store(nanos, Ordering::Release);
+        self.times().wall = wall;
         Ok(())
     }
 }
@@ -384,6 +395,22 @@ mod tests {
         assert!(clock.advance(Duration::MAX).is_err());
         clock.advance_to(start).unwrap();
         assert_eq!(clock.elapsed(), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn virtual_clock_keeps_full_duration_range_and_rejects_overflow_atomically() {
+        let clock = VirtualClock::new_at(Instant::now(), UNIX_EPOCH - Duration::from_secs(1));
+        assert_eq!(clock.wall_now(), UNIX_EPOCH - Duration::from_secs(1));
+        let beyond_nanos = Duration::from_secs(u64::MAX / 1_000_000_000 + 1);
+        clock.advance(beyond_nanos).unwrap();
+        assert_eq!(clock.elapsed(), beyond_nanos);
+        assert_eq!(
+            clock.wall_now(),
+            UNIX_EPOCH - Duration::from_secs(1) + beyond_nanos
+        );
+        let (now, wall) = (clock.now(), clock.wall_now());
+        assert!(clock.advance(Duration::MAX).is_err());
+        assert_eq!((clock.now(), clock.wall_now()), (now, wall));
     }
 
     #[test]
