@@ -10,9 +10,13 @@
 pub mod cancel;
 pub mod ctx;
 pub mod error;
+pub mod exec;
 pub mod pin;
+pub mod ring;
 pub mod signal;
+pub mod sim;
 
 pub use cancel::{CancelToken, Deadline};
 pub use ctx::{Clock, Rng, WorkerCtx};
 pub use error::{Error, Result};
+pub use ring::{Driver, IoClass, OpCtx, Reactor};
