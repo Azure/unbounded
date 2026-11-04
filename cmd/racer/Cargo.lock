@@ -851,15 +851,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "racer-admission"
-version = "0.1.0"
-dependencies = [
- "base64",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "racer-cluster-control"
 version = "0.1.0"
 dependencies = [
@@ -868,7 +859,6 @@ dependencies = [
  "getrandom",
  "httparse",
  "libc",
- "racer-admission",
  "racer-control-wire",
  "racer-core",
  "racer-crypto",

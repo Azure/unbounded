@@ -857,7 +857,7 @@ pub fn block_devices(annotations: &std::collections::BTreeMap<String, String>) -
 }
 
 /// Concurrent admission bodies held in memory, each up to
-/// [`racer_admission::MAX_REQUEST_BYTES`].
+/// [`crate::webhook::MAX_REQUEST_BYTES`].
 const MAX_ADMISSION_BODIES: usize = 8;
 
 /// One webhook listener with its own budget, for tests.
@@ -970,7 +970,7 @@ fn webhook_route(head: &Head) -> Result<(), u16> {
             && seconds.bytes().all(|b| b.is_ascii_digit())
             && seconds.parse::<u8>().is_ok_and(|v| (1..=30).contains(&v))
     });
-    if path != racer_admission::PATH || !query_valid {
+    if path != crate::webhook::PATH || !query_valid {
         return Err(404);
     }
     if head.method != "POST" {
@@ -1009,7 +1009,7 @@ async fn webhook_connection(
                     permit = Some(slot);
                     match exec::timeout(
                         io,
-                        conn.read_request_body(&head, racer_admission::MAX_REQUEST_BYTES),
+                        conn.read_request_body(&head, crate::webhook::MAX_REQUEST_BYTES),
                     )
                     .await
                     {
@@ -1058,15 +1058,15 @@ const LOOKUP_BUDGET: Duration = Duration::from_secs(3);
 /// bounded by the same deadline `at`. Seats do not watch
 /// ClusterCaches; only the primary does, and a review must be answered by
 /// any seat. Any failure other than 404, including a timeout, is
-/// [`racer_admission::CacheLookup::Unavailable`], which denies the pod with
+/// [`crate::webhook::CacheLookup::Unavailable`], which denies the pod with
 /// a retryable status. A 404, including one because the CRD is not
 /// installed, is `NotFound`.
 pub(crate) async fn cache_lookups(
     api: &crate::kube::Kube,
     names: Vec<String>,
     at: Instant,
-) -> std::collections::BTreeMap<String, racer_admission::CacheLookup> {
-    use racer_admission::CacheLookup;
+) -> std::collections::BTreeMap<String, crate::webhook::CacheLookup> {
+    use crate::webhook::CacheLookup;
     futures::future::join_all(names.into_iter().map(|name| async move {
         let path = format!(
             "{}/{}",
@@ -1095,8 +1095,8 @@ pub(crate) async fn node_lookup(
     api: &crate::kube::Kube,
     name: &str,
     at: Instant,
-) -> racer_admission::NodeLookup {
-    use racer_admission::NodeLookup;
+) -> crate::webhook::NodeLookup {
+    use crate::webhook::NodeLookup;
     let path = crate::kube::paths::node(&crate::kube::escape(name));
     match exec::deadline(at, api.get(&path)).await {
         Ok(Ok(node)) => {
@@ -1125,11 +1125,11 @@ pub(crate) async fn node_lookup(
 /// Pods naming no cache make no request at all.
 pub(crate) async fn review_lookups(
     api: &crate::kube::Kube,
-    review: &racer_admission::Review,
+    review: &crate::webhook::Review,
     at: Instant,
 ) -> (
-    std::collections::BTreeMap<String, racer_admission::CacheLookup>,
-    Option<(racer_admission::NodeLookup, String)>,
+    std::collections::BTreeMap<String, crate::webhook::CacheLookup>,
+    Option<(crate::webhook::NodeLookup, String)>,
 ) {
     let names = review.caches();
     let node_name = review.node_name().filter(|_| !names.is_empty());
@@ -1150,23 +1150,23 @@ pub async fn webhook_reply(shared: &Shared, body: &[u8]) -> Vec<u8> {
     if !shared.has_authority() {
         return status(503, false);
     }
-    let review = match racer_admission::Review::parse(body) {
+    let review = match crate::webhook::Review::parse(body) {
         Ok(r) => r,
         Err(_) => return http::response_head(400, &[], 0, false),
     };
     let (caches, node) = review_lookups(&shared.api, &review, Instant::now() + LOOKUP_BUDGET).await;
     let out = review.respond(
         image,
-        &racer_admission::Lookups {
+        &crate::webhook::Lookups {
             cache: &|name| {
                 caches
                     .get(name)
                     .cloned()
-                    .unwrap_or(racer_admission::CacheLookup::Unavailable)
+                    .unwrap_or(crate::webhook::CacheLookup::Unavailable)
             },
             node: &|name| match &node {
                 Some((found, n)) if n == name => found.clone(),
-                _ => racer_admission::NodeLookup::Unavailable,
+                _ => crate::webhook::NodeLookup::Unavailable,
             },
         },
     );
@@ -1437,7 +1437,7 @@ mod tests {
 
     #[test]
     fn cache_lookups_map_api_results() {
-        use racer_admission::CacheLookup;
+        use crate::webhook::CacheLookup;
         fake::run(|api, kube| async move {
             let path = |n: &str| format!("{}/{n}", crate::kube::paths::CACHES);
             let sel = serde_json::json!({"matchLabels": {"pool": "gpu"}});
@@ -1488,7 +1488,7 @@ mod tests {
     /// at once, so three slow GETs cost one round trip, not three.
     #[test]
     fn review_lookups_run_concurrently_under_one_deadline() {
-        use racer_admission::{CacheLookup, NodeLookup};
+        use crate::webhook::{CacheLookup, NodeLookup};
         fake::run(|api, kube| async move {
             let sel = serde_json::json!({"matchLabels": {"pool": "gpu"}});
             for n in ["a", "b"] {
@@ -1513,18 +1513,18 @@ mod tests {
                         "apiVersion": "v1",
                         "kind": "Pod",
                         "metadata": {"name": "p", "namespace": "ns", "labels": {
-                            racer_admission::ENABLED_LABEL: racer_admission::ENABLED_VALUE,
-                            racer_admission::CLIENT_SOCKET_LABEL: racer_admission::ENABLED_VALUE,
+                            crate::webhook::ENABLED_LABEL: crate::webhook::ENABLED_VALUE,
+                            crate::webhook::CLIENT_SOCKET_LABEL: crate::webhook::ENABLED_VALUE,
                         }, "annotations": {
-                            racer_admission::CACHE_ANNOTATION: "a",
-                            racer_admission::CLIENT_CACHE_ANNOTATION: "b",
+                            crate::webhook::CACHE_ANNOTATION: "a",
+                            crate::webhook::CLIENT_CACHE_ANNOTATION: "b",
                         }},
                         "spec": {"nodeName": "n1", "containers": [{"name": "app", "image": "app"}]},
                     },
                 },
             }))
             .unwrap();
-            let review = racer_admission::Review::parse(&body).unwrap();
+            let review = crate::webhook::Review::parse(&body).unwrap();
             assert_eq!(review.caches(), ["a", "b"]);
             let delay = Arc::new(std::sync::atomic::AtomicU64::new(400));
             api.delay_gets(delay.clone());
@@ -1550,7 +1550,7 @@ mod tests {
             assert_eq!(node, Some((NodeLookup::Unavailable, "n1".to_owned())));
             let out = review.respond(
                 "img",
-                &racer_admission::Lookups {
+                &crate::webhook::Lookups {
                     cache: &|n| caches[n].clone(),
                     node: &|_| NodeLookup::Unavailable,
                 },
@@ -1564,7 +1564,7 @@ mod tests {
 
     #[test]
     fn node_lookup_maps_api_results() {
-        use racer_admission::NodeLookup;
+        use crate::webhook::NodeLookup;
         fake::run(|api, kube| async move {
             api.put_object(
                 &crate::kube::paths::node("n1"),
@@ -1990,11 +1990,11 @@ mod tests {
             let [v4, v6] = dual_stack_webhooks(&shared, &WebhookBudget::new(4, 1));
             let mut a = connect(v4, &pin).await.unwrap();
             a.tls
-                .write_all(&post_head(racer_admission::PATH, 100))
+                .write_all(&post_head(crate::webhook::PATH, 100))
                 .await
                 .unwrap();
             exec::sleep(Duration::from_millis(100)).await;
-            let mut req = post_head(racer_admission::PATH, 2);
+            let mut req = post_head(crate::webhook::PATH, 2);
             req.extend_from_slice(b"{}");
             let mut b = connect(v6, &pin).await.unwrap();
             b.tls.write_all(&req).await.unwrap();
@@ -2024,11 +2024,11 @@ mod tests {
             .unwrap();
             let mut a = connect(address, &pin).await.unwrap();
             a.tls
-                .write_all(&post_head(racer_admission::PATH, 100))
+                .write_all(&post_head(crate::webhook::PATH, 100))
                 .await
                 .unwrap();
             exec::sleep(Duration::from_millis(100)).await;
-            let mut req = post_head(racer_admission::PATH, 2);
+            let mut req = post_head(crate::webhook::PATH, 2);
             req.extend_from_slice(b"{}");
             let mut b = connect(address, &pin).await.unwrap();
             b.tls.write_all(&req).await.unwrap();
@@ -2072,62 +2072,62 @@ mod tests {
             .unwrap();
             let json = [("Content-Type", "application/json")];
             let cases: [Case<'_>; 13] = [
-                ("POST", format!("{}?x=1", racer_admission::PATH), &json, 404),
+                ("POST", format!("{}?x=1", crate::webhook::PATH), &json, 404),
                 (
                     "POST",
-                    format!("{}?timeout=5s&x=1", racer_admission::PATH),
+                    format!("{}?timeout=5s&x=1", crate::webhook::PATH),
                     &json,
                     404,
                 ),
                 (
                     "POST",
-                    format!("{}?timeout=0s", racer_admission::PATH),
+                    format!("{}?timeout=0s", crate::webhook::PATH),
                     &json,
                     404,
                 ),
                 (
                     "POST",
-                    format!("{}?timeout=31s", racer_admission::PATH),
+                    format!("{}?timeout=31s", crate::webhook::PATH),
                     &json,
                     404,
                 ),
                 (
                     "POST",
-                    format!("{}?timeout=05s", racer_admission::PATH),
+                    format!("{}?timeout=05s", crate::webhook::PATH),
                     &json,
                     404,
                 ),
                 (
                     "POST",
-                    format!("{}?timeout=5s&timeout=5s", racer_admission::PATH),
+                    format!("{}?timeout=5s&timeout=5s", crate::webhook::PATH),
                     &json,
                     404,
                 ),
                 ("POST", "/other".into(), &json, 404),
-                ("GET", racer_admission::PATH.into(), &json, 405),
+                ("GET", crate::webhook::PATH.into(), &json, 405),
                 (
                     "POST",
-                    racer_admission::PATH.into(),
+                    crate::webhook::PATH.into(),
                     &[("Content-Type", "text/plain")],
                     415,
                 ),
                 // Valid route, but no object image configured.
-                ("POST", racer_admission::PATH.into(), &json, 503),
+                ("POST", crate::webhook::PATH.into(), &json, 503),
                 (
                     "POST",
-                    format!("{}?timeout=1s", racer_admission::PATH),
+                    format!("{}?timeout=1s", crate::webhook::PATH),
                     &json,
                     503,
                 ),
                 (
                     "POST",
-                    format!("{}?timeout=5s", racer_admission::PATH),
+                    format!("{}?timeout=5s", crate::webhook::PATH),
                     &json,
                     503,
                 ),
                 (
                     "POST",
-                    format!("{}?timeout=30s", racer_admission::PATH),
+                    format!("{}?timeout=30s", crate::webhook::PATH),
                     &json,
                     503,
                 ),
@@ -2142,12 +2142,12 @@ mod tests {
             }
             // Oversized declared body: 413 before reading it.
             let mut c = connect(address, &pin).await.unwrap();
-            let big = (racer_admission::MAX_REQUEST_BYTES + 1).to_string();
+            let big = (crate::webhook::MAX_REQUEST_BYTES + 1).to_string();
             c.tls
                 .write_all(
                     format!(
                         "POST {} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {big}\r\n\r\n",
-                        racer_admission::PATH
+                        crate::webhook::PATH
                     )
                     .as_bytes(),
                 )
@@ -2160,7 +2160,7 @@ mod tests {
                 .write_all(
                     format!(
                         "POST {} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{{",
-                        racer_admission::PATH
+                        crate::webhook::PATH
                     )
                     .as_bytes(),
                 )

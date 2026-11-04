@@ -55,6 +55,7 @@ mod shared;
 pub mod step;
 #[cfg(test)]
 mod tests;
+pub mod webhook;
 
 pub use config::{Config, Rotation, SeatPolicy};
 pub use control::{Bootstrap, Diagnostics, Handle, Role, start};

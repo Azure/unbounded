@@ -91,8 +91,6 @@ COPY cmd/racer/controlplane/Cargo.toml ./controlplane/Cargo.toml
 COPY cmd/racer/controlplane/src ./controlplane/src
 COPY cmd/racer/cluster-control/Cargo.toml ./cluster-control/Cargo.toml
 COPY cmd/racer/cluster-control/src ./cluster-control/src
-COPY cmd/racer/admission/Cargo.toml ./admission/Cargo.toml
-COPY cmd/racer/admission/src ./admission/src
 COPY cmd/racer/core/Cargo.toml ./core/Cargo.toml
 COPY cmd/racer/core/src ./core/src
 COPY cmd/racer/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
