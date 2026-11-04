@@ -273,6 +273,7 @@ def start_fixture(blank_efi: Path, active_efi: Path) -> None:
             "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
             "--record", str(RECORD), "--efi-source", str(blank_efi),
             "--efi-active", str(active_efi), "--bridge", BRIDGE,
+            "--netboot-image", NETBOOT_IMAGE,
             "--username", "smoke", "--password", "smoke"],
           "redfish.log")
     time.sleep(1)

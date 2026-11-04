@@ -19,6 +19,8 @@ import json
 import shutil
 import ssl
 import subprocess
+import tarfile
+import urllib.request
 import tempfile
 import threading
 import time
@@ -26,6 +28,67 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+
+OCI_ACCEPT = ", ".join((
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+))
+
+
+def parse_image_ref(ref: str) -> tuple[str, str, str]:
+    """Split registry/repo:tag (or @digest) into (registry, repository, reference)."""
+    registry, _, rest = ref.partition("/")
+    if not rest:
+        raise ValueError(f"image reference {ref!r} has no registry host")
+    if "@" in rest:
+        repository, _, reference = rest.partition("@")
+    else:
+        repository, sep, reference = rest.rpartition(":")
+        if not sep or "/" in reference:
+            repository, reference = rest, "latest"
+    return registry, repository, reference
+
+
+def select_manifest(index: dict[str, Any], os_name: str = "linux", arch: str = "amd64") -> str:
+    """Return the digest of the platform manifest in an image index."""
+    for entry in index.get("manifests", []):
+        platform = entry.get("platform", {})
+        if platform.get("os") == os_name and platform.get("architecture") == arch:
+            return str(entry["digest"])
+    raise ValueError(f"image index has no {os_name}/{arch} manifest")
+
+
+def oci_read_file(ref: str, name: str) -> bytes:
+    """Read one file from an image on a plain-HTTP registry, top layer first.
+
+    This bypasses metalman so that staging never records boot progress.
+    """
+    registry, repository, reference = parse_image_ref(ref)
+    base = f"http://{registry}/v2/{repository}"
+
+    def get(url: str, accept: str | None = None) -> bytes:
+        request = urllib.request.Request(url, headers={"Accept": accept} if accept else {})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read()
+
+    manifest = json.loads(get(f"{base}/manifests/{reference}", OCI_ACCEPT))
+    if "manifests" in manifest:
+        manifest = json.loads(get(f"{base}/manifests/{select_manifest(manifest)}", OCI_ACCEPT))
+    wanted = name.lstrip("/")
+    for layer in reversed(manifest.get("layers", [])):
+        with tempfile.TemporaryFile() as blob:
+            blob.write(get(f"{base}/blobs/{layer['digest']}"))
+            blob.seek(0)
+            with tarfile.open(fileobj=blob, mode="r:*") as archive:
+                for member in archive:
+                    if member.name.removeprefix("./").lstrip("/") == wanted and member.isfile():
+                        stream = archive.extractfile(member)
+                        assert stream is not None
+                        return stream.read()
+    raise FileNotFoundError(f"{name} not found in {ref}")
 
 
 def virsh(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -45,6 +108,7 @@ class State:
         self.efi_source = Path(args.efi_source) if args.efi_source else None
         self.efi_active = Path(args.efi_active) if args.efi_active else None
         self.bridge = args.bridge
+        self.netboot_image = args.netboot_image
         self.manage_boot_order = args.manage_boot_order
         self.username = args.username
         self.password = args.password
@@ -112,7 +176,7 @@ class State:
         return "On" if result.returncode == 0 and "running" in result.stdout else "Off"
 
     def set_efi_boundary(self, enabled: bool) -> None:
-        if not all((self.efi_source, self.efi_active, self.bridge)):
+        if not all((self.efi_source, self.efi_active, self.bridge, self.netboot_image)):
             raise ValueError("UefiHttp requested without HTTP boundary arguments")
 
         assert self.efi_source is not None
@@ -127,10 +191,14 @@ class State:
                 with subprocess.Popen(["mktemp", "-d"], stdout=subprocess.PIPE, text=True) as proc:
                     artifact_dir = Path(proc.communicate()[0].strip())
                 entrypoint = boot_url.rsplit("/", 1)[-1]
-                # metalman keeps no image cache; fetch every artifact,
-                # including the entrypoint, from its HTTP server.
+                # Read the entrypoint straight from the registry. Fetching it
+                # through metalman would record the sticky BootLoaderDownloaded
+                # condition before power-on and mask a failed firmware fetch;
+                # fetch_boot_entrypoint performs that request after power-on.
+                (artifact_dir / "http-entrypoint.efi").write_bytes(
+                    oci_read_file(str(self.netboot_image), f"disk/{entrypoint}")
+                )
                 for path, url in (
-                    ("http-entrypoint.efi", f"{base_url}/{entrypoint}"),
                     ("grubx64.efi", f"{base_url}/grubx64.efi"),
                     ("vmlinuz", f"{base_url}/vmlinuz"),
                     ("initrd", f"{base_url}/initrd"),
@@ -353,6 +421,8 @@ def main() -> None:
     parser.add_argument("--efi-source")
     parser.add_argument("--efi-active")
     parser.add_argument("--bridge")
+    parser.add_argument("--netboot-image",
+                        help="plain-HTTP registry image used to stage the UefiHttp entrypoint")
     parser.add_argument("--username", default="")
     parser.add_argument("--password", default="")
     parser.add_argument("--manage-boot-order", action="store_true")
