@@ -18,7 +18,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -1506,4 +1508,72 @@ func assertHybridEFI(t *testing.T, iso []byte) []byte {
 	require.Equal(t, start, uint64(binary.LittleEndian.Uint32(catalog[40:44]))*2048)
 
 	return fat
+}
+
+func TestMediaPrepareFetchTimeoutDoesNotBlockOtherMedia(t *testing.T) {
+	stall := imagepulltest.WithMiddleware(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/blobs/") {
+				<-r.Context().Done()
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	})
+	p, m, op, _ := mediaFixtureImages(t, "amd64", nil, nil, stall)
+
+	var calls []string
+
+	p.Run = mockMediaRunner(t, &calls)
+	p.FetchTimeout = 500 * time.Millisecond
+	id := op.Status.Targets[0].BootMedia.ID
+	other := strings.Repeat("d", 32)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := p.Prepare(t.Context(), m, op, id)
+		done <- err
+	}()
+
+	// Wait until Prepare holds its per-media lock.
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		return p.locks[id] != nil
+	}, 5*time.Second, 5*time.Millisecond)
+
+	// Unrelated media IDs are not blocked by the stalled fetch.
+	unblocked := make(chan struct{})
+
+	go func() {
+		defer close(unblocked)
+
+		assert.NoError(t, p.Release(t.Context(), other))
+
+		_, err := p.OpenISO(t.Context(), "ub-"+other+".iso")
+		assert.Error(t, err)
+	}()
+
+	select {
+	case <-unblocked:
+	case <-done:
+		t.Fatal("Prepare finished before the unrelated media calls")
+	}
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Prepare was not bounded by FetchTimeout")
+	}
+
+	require.Empty(t, calls)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	require.Empty(t, p.locks)
 }

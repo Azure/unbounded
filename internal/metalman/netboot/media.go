@@ -58,7 +58,62 @@ type MediaProvider struct {
 	TFTPServer string
 	// Run optionally replaces the bounded command runner for tests.
 	Run func(context.Context, string, ...string) error
-	mu  sync.Mutex
+	// FetchTimeout bounds the registry reads (metadata, EFI payloads, and
+	// installer template) for one Prepare or OpenISO call. Zero uses
+	// DefaultMediaFetchTimeout.
+	FetchTimeout time.Duration
+
+	// mu guards locks. Each media ID has its own lock so a stalled build for
+	// one machine does not block OpenISO or Release for unrelated machines.
+	mu    sync.Mutex
+	locks map[string]*mediaLock
+}
+
+// DefaultMediaFetchTimeout bounds registry reads when building boot media.
+const DefaultMediaFetchTimeout = 5 * time.Minute
+
+type mediaLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock serializes work on a single media ID and returns its unlock function.
+func (p *MediaProvider) lock(id string) func() {
+	p.mu.Lock()
+	if p.locks == nil {
+		p.locks = map[string]*mediaLock{}
+	}
+
+	l := p.locks[id]
+	if l == nil {
+		l = &mediaLock{}
+		p.locks[id] = l
+	}
+
+	l.refs++
+	p.mu.Unlock()
+
+	l.mu.Lock()
+
+	return func() {
+		l.mu.Unlock()
+
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		l.refs--
+		if l.refs == 0 {
+			delete(p.locks, id)
+		}
+	}
+}
+
+func (p *MediaProvider) fetchTimeout() time.Duration {
+	if p.FetchTimeout > 0 {
+		return p.FetchTimeout
+	}
+
+	return DefaultMediaFetchTimeout
 }
 
 var _ bootmedia.Provider = (*MediaProvider)(nil)
@@ -156,8 +211,7 @@ func (p *MediaProvider) owner(ctx context.Context, id string) (*mediaOwner, erro
 }
 
 func (p *MediaProvider) Prepare(ctx context.Context, machine *v1alpha3.Machine, op *v1alpha3.MachineOperation, id string) (bootmedia.Source, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	defer p.lock(id)()
 
 	o, err := p.owner(ctx, id)
 	if err != nil {
@@ -182,8 +236,7 @@ func (p *MediaProvider) Release(_ context.Context, id string) error {
 		return fmt.Errorf("invalid media ID or cache directory")
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	defer p.lock(id)()
 
 	return os.RemoveAll(filepath.Join(p.CacheDir, "bootmedia", id))
 }
@@ -201,9 +254,11 @@ func (p *MediaProvider) OpenISO(ctx context.Context, name string) (*os.File, err
 	}
 
 	id := strings.TrimSuffix(rest, ".iso")
+	if !mediaIDPattern.MatchString(id) {
+		return nil, fmt.Errorf("invalid media filename")
+	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	defer p.lock(id)()
 
 	o, err := p.owner(ctx, id)
 	if err != nil {
@@ -295,7 +350,11 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 
 	netbootSrc := mediaNetbootSource(spec)
 
-	meta, err := p.Resolver.ImageMetadata(ctx, netbootSrc)
+	// Bound the registry fetch phase; the build below has its own timeout.
+	fetchCtx, cancelFetch := context.WithTimeout(ctx, p.fetchTimeout())
+	defer cancelFetch()
+
+	meta, err := p.Resolver.ImageMetadata(fetchCtx, netbootSrc)
 	if err != nil {
 		return "", err
 	}
@@ -321,7 +380,7 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 	var efiPaths []string
 
 	for _, name := range []string{shim, grub} {
-		path, err := p.materializeEFI(ctx, netbootSrc, name, efiDir)
+		path, err := p.materializeEFI(fetchCtx, netbootSrc, name, efiDir)
 		if err != nil {
 			return "", err
 		}
@@ -331,9 +390,11 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 
 	// Validate the live installer template and its static values before any
 	// BMC power action, but never copy the rendered install intent into the ISO.
-	if _, err := p.installerConfig(ctx, o); err != nil {
+	if _, err := p.installerConfig(fetchCtx, o); err != nil {
 		return "", err
 	}
+
+	cancelFetch()
 
 	config, err := bootstrapConfig(spec.DHCPLeases[0], u, o.status().ID)
 	if err != nil {
