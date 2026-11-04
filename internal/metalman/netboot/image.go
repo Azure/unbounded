@@ -37,6 +37,10 @@ type ImageMetadata struct {
 	HTTPBootPath      string `yaml:"httpBootPath"`
 	// MediaFormat gates the scoped installer callback and bootstrap layout.
 	MediaFormat string `yaml:"mediaFormat"`
+
+	// missing reports that the image has no metadata.yaml. Such results are
+	// memoized only for the short failure TTL.
+	missing bool
 }
 
 // ImageSource identifies an image that boot artifacts are read from, together
@@ -199,7 +203,7 @@ func (f *FileResolver) fetchMetadata(ctx context.Context, src ImageSource) (*Ima
 	data, _, err := img.ReadFile(ctx, path.Join(imageDiskDir, metadataFile))
 	if err != nil {
 		if errors.Is(err, imagepull.ErrNotFound) {
-			return &ImageMetadata{}, nil
+			return &ImageMetadata{missing: true}, nil
 		}
 
 		return nil, fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, metadataFile, err)

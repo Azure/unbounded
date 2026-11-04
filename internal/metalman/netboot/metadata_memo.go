@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -69,6 +70,12 @@ func newMetadataKey(src ImageSource) metadataKey {
 	return k
 }
 
+// flightKey encodes k as a singleflight key. Each field is quoted, so
+// distinct keys never encode to the same string.
+func (k metadataKey) flightKey() string {
+	return fmt.Sprintf("%q %q %q %q %t", k.ref, k.architecture, k.secretNamespace, k.secretName, k.hasSecret)
+}
+
 func (m *MetadataMemo) now() time.Time {
 	if m.Now != nil {
 		return m.Now()
@@ -77,8 +84,10 @@ func (m *MetadataMemo) now() time.Time {
 	return time.Now()
 }
 
-func (m *MetadataMemo) ttl(err error) time.Duration {
-	if err != nil {
+// ttl returns how long a lookup result is reused. Failures and images without
+// metadata.yaml use ErrorTTL, so a newly pushed metadata.yaml is seen quickly.
+func (m *MetadataMemo) ttl(meta *ImageMetadata, err error) time.Duration {
+	if err != nil || meta == nil || meta.missing {
 		if m.ErrorTTL == 0 {
 			return DefaultMetadataErrorTTL
 		}
@@ -107,18 +116,13 @@ func (m *MetadataMemo) get(ctx context.Context, src ImageSource, fetch func(cont
 
 	// The shared fetch must not be canceled when the first caller goes away,
 	// since other callers may be waiting on it.
-	flightKey := key.ref + "\x00" + key.architecture + "\x00" + key.secretNamespace + "\x00" + key.secretName
-	if key.hasSecret {
-		flightKey += "\x00s"
-	}
-
-	ch := m.group.DoChan(flightKey, func() (any, error) {
+	ch := m.group.DoChan(key.flightKey(), func() (any, error) {
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metadataFetchTimeout)
 		defer cancel()
 
 		meta, err := fetch(fetchCtx, src)
 
-		if ttl := m.ttl(err); ttl > 0 {
+		if ttl := m.ttl(meta, err); ttl > 0 {
 			m.mu.Lock()
 			if m.entries == nil {
 				m.entries = map[metadataKey]metadataEntry{}

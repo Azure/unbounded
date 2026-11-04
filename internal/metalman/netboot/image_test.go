@@ -423,10 +423,61 @@ func TestMetadataMemo(t *testing.T) {
 	require.Equal(t, "shim-5", meta.DHCPBootImageName)
 }
 
+func TestMetadataFlightKeyIsCollisionFree(t *testing.T) {
+	a := metadataKey{ref: "a\x00b", architecture: "c"}
+	b := metadataKey{ref: "a", architecture: "b\x00c"}
+	require.NotEqual(t, a.flightKey(), b.flightKey())
+
+	c := metadataKey{ref: "r", secretNamespace: "a", secretName: "b", hasSecret: true}
+	d := metadataKey{ref: "r", secretNamespace: "a", secretName: "b"}
+	require.NotEqual(t, c.flightKey(), d.flightKey())
+	require.Equal(t, c.flightKey(), c.flightKey())
+}
+
+func TestMetadataMemoMissingMetadataUsesErrorTTL(t *testing.T) {
+	now := time.Unix(1000, 0)
+	memo := &MetadataMemo{TTL: time.Minute, ErrorTTL: 5 * time.Second, Now: func() time.Time { return now }}
+
+	var calls atomic.Int32
+
+	fetch := func(context.Context, ImageSource) (*ImageMetadata, error) {
+		calls.Add(1)
+		return &ImageMetadata{missing: true}, nil
+	}
+
+	src := ImageSource{Ref: "r"}
+	_, err := memo.get(t.Context(), src, fetch)
+	require.NoError(t, err)
+	_, err = memo.get(t.Context(), src, fetch)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, calls.Load())
+
+	now = now.Add(6 * time.Second)
+	_, err = memo.get(t.Context(), src, fetch)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, calls.Load(), "missing metadata is refetched after ErrorTTL")
+}
+
+func TestFetchMetadataMissingIsMarked(t *testing.T) {
+	images := newTestImages(t)
+	images.Push(t, "ghcr.io/test/nometa:v1", map[string][]byte{"vmlinuz": []byte("k")})
+	images.Push(t, "ghcr.io/test/meta:v1", map[string][]byte{"metadata.yaml": []byte("dhcpBootImageName: x\n")})
+	resolver := &FileResolver{Puller: images.Puller}
+
+	meta, err := resolver.fetchMetadata(t.Context(), ImageSource{Ref: "ghcr.io/test/nometa:v1"})
+	require.NoError(t, err)
+	require.True(t, meta.missing)
+
+	meta, err = resolver.fetchMetadata(t.Context(), ImageSource{Ref: "ghcr.io/test/meta:v1"})
+	require.NoError(t, err)
+	require.False(t, meta.missing)
+}
+
 func TestMetadataMemoDefaults(t *testing.T) {
 	memo := &MetadataMemo{}
-	require.Equal(t, DefaultMetadataTTL, memo.ttl(nil))
-	require.Equal(t, DefaultMetadataErrorTTL, memo.ttl(errors.New("x")))
+	require.Equal(t, DefaultMetadataTTL, memo.ttl(&ImageMetadata{}, nil))
+	require.Equal(t, DefaultMetadataErrorTTL, memo.ttl(&ImageMetadata{missing: true}, nil))
+	require.Equal(t, DefaultMetadataErrorTTL, memo.ttl(nil, errors.New("x")))
 
 	memo.ErrorTTL = -1
 
