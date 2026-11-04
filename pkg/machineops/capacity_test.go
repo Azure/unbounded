@@ -41,27 +41,46 @@ func TestNewProviderRegistersCapacity(t *testing.T) {
 	t.Parallel()
 
 	classRequest := ClassRequest{
-		ClassName:      "general",
-		ClassUID:       "class-uid",
-		SiteName:       "site-a",
-		ProviderConfig: ProviderConfig{Data: map[string]string{"region": "westus3", "subnet": "subnet-a"}},
-		Auth:           &OperationAuth{Mode: unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity},
+		ClassName: "general",
+		ClassUID:  "class-uid",
+		SiteName:  "site-a",
+		ProviderConfig: ProviderConfig{
+			Data: map[string]string{
+				"region": "westus3",
+				"subnet": "subnet-a",
+			},
+		},
+		Auth: &OperationAuth{
+			Mode: unboundedv1alpha3.MachineOperationCredentialAuthWorkloadIdentity,
+		},
 	}
-	classResolution := ClassResolution{Offerings: []unboundedv1alpha3.MachineClassOffering{{
-		Name:         "standard-d4-1",
-		InstanceType: "Standard_D4s_v5",
-		Zone:         "1",
-		CapacityType: unboundedv1alpha3.CapacityTypeOnDemand,
-		Availability: unboundedv1alpha3.OfferingAvailable,
-	}}}
+	classResolution := ClassResolution{
+		Offerings: []unboundedv1alpha3.MachineClassOffering{
+			{
+				Name:         "standard-d4-1",
+				InstanceType: "Standard_D4s_v5",
+				Zone:         "1",
+				CapacityType: unboundedv1alpha3.CapacityTypeOnDemand,
+				Availability: unboundedv1alpha3.OfferingAvailable,
+			},
+		},
+	}
 	planRequest := AllocationPlanRequest{
 		AllocationName: "alloc-1",
 		AllocationUID:  "alloc-uid",
 		HostName:       "general-abc12",
-		ProviderConfig: ProviderConfig{Data: map[string]string{"image": "ubuntu-24.04", "region": "westus3"}},
-		Offering:       classResolution.Offerings[0],
+		ProviderConfig: ProviderConfig{
+			Data: map[string]string{
+				"image":  "ubuntu-24.04",
+				"region": "westus3",
+			},
+		},
+		Offering: classResolution.Offerings[0],
 	}
-	plan := AllocationPlan{ProviderID: "example://westus3/general-abc12", HostImage: "ubuntu-24.04"}
+	plan := AllocationPlan{
+		ProviderID: "example://westus3/general-abc12",
+		HostImage:  "ubuntu-24.04",
+	}
 
 	bundle := func(resolveClass ResolveClassFunc, planAllocation PlanAllocationFunc) []ProviderOption {
 		return []ProviderOption{
@@ -155,14 +174,16 @@ func TestNewProviderRegistersCapacity(t *testing.T) {
 			resolution, err := capacity.ResolveClass(context.Background(), classRequest)
 			require.NoError(t, err)
 			require.Equal(t, classResolution, resolution)
-			require.Equal(t, []ClassRequest{classRequest}, resolvedRequests)
-			require.Equal(t, classRequest.ProviderConfig, resolvedRequests[0].ProviderConfig)
+			require.Equal(t, []ClassRequest{
+				classRequest,
+			}, resolvedRequests)
 
 			planned, err := capacity.PlanAllocation(context.Background(), planRequest)
 			require.NoError(t, err)
 			require.Equal(t, plan, planned)
-			require.Equal(t, []AllocationPlanRequest{planRequest}, plannedRequests)
-			require.Equal(t, planRequest.ProviderConfig, plannedRequests[0].ProviderConfig)
+			require.Equal(t, []AllocationPlanRequest{
+				planRequest,
+			}, plannedRequests)
 		})
 	}
 }
@@ -176,8 +197,11 @@ func TestCapacityInvokersReturnCallbackErrors(t *testing.T) {
 		permanent bool
 	}{
 		{
-			name:      "permanent error",
-			err:       &PermanentError{Reason: "InvalidConfig", Err: errors.New("region is required")},
+			name: "permanent error",
+			err: &PermanentError{
+				Reason: "InvalidConfig",
+				Err:    errors.New("region is required"),
+			},
 			permanent: true,
 		},
 		{
@@ -208,11 +232,15 @@ func TestCapacityInvokersReturnCallbackErrors(t *testing.T) {
 			capacity, ok := provider.Capacity()
 			require.True(t, ok)
 
-			resolution, err := capacity.ResolveClass(context.Background(), ClassRequest{ClassName: "general"})
+			resolution, err := capacity.ResolveClass(context.Background(), ClassRequest{
+				ClassName: "general",
+			})
 			require.Same(t, tt.err, err)
 			require.Equal(t, ClassResolution{}, resolution)
 
-			planned, err := capacity.PlanAllocation(context.Background(), AllocationPlanRequest{AllocationName: "alloc-1"})
+			planned, err := capacity.PlanAllocation(context.Background(), AllocationPlanRequest{
+				AllocationName: "alloc-1",
+			})
 			require.Same(t, tt.err, err)
 			require.Equal(t, AllocationPlan{}, planned)
 
@@ -276,23 +304,38 @@ func TestNewProviderRejectsInvalidCapacityRegistration(t *testing.T) {
 		message string
 	}{
 		{
-			name:    "nil resolve callback",
-			options: []ProviderOption{WithCapacity(nil, testPlanAllocation), allocateLongRunning(), releaseLongRunning()},
+			name: "nil resolve callback",
+			options: []ProviderOption{
+				WithCapacity(nil, testPlanAllocation),
+				allocateLongRunning(),
+				releaseLongRunning(),
+			},
 			message: "resolve class function is required",
 		},
 		{
-			name:    "nil plan callback",
-			options: []ProviderOption{WithCapacity(testResolveClass, nil), allocateLongRunning(), releaseLongRunning()},
+			name: "nil plan callback",
+			options: []ProviderOption{
+				WithCapacity(testResolveClass, nil),
+				allocateLongRunning(),
+				releaseLongRunning(),
+			},
 			message: "plan allocation function is required",
 		},
 		{
-			name:    "duplicate capacity",
-			options: []ProviderOption{capacity(), capacity(), allocateLongRunning(), releaseLongRunning()},
+			name: "duplicate capacity",
+			options: []ProviderOption{
+				capacity(),
+				capacity(),
+				allocateLongRunning(),
+				releaseLongRunning(),
+			},
 			message: `capacity is already registered for provider "ExampleCloud"`,
 		},
 		{
-			name:    "capacity with no operations",
-			options: []ProviderOption{capacity()},
+			name: "capacity with no operations",
+			options: []ProviderOption{
+				capacity(),
+			},
 			message: `provider "ExampleCloud" registers capacity without HostAllocate`,
 		},
 		{
@@ -304,13 +347,19 @@ func TestNewProviderRejectsInvalidCapacityRegistration(t *testing.T) {
 			message: `provider "ExampleCloud" registers capacity without HostAllocate`,
 		},
 		{
-			name:    "capacity without HostAllocate",
-			options: []ProviderOption{capacity(), releaseLongRunning()},
+			name: "capacity without HostAllocate",
+			options: []ProviderOption{
+				capacity(),
+				releaseLongRunning(),
+			},
 			message: `provider "ExampleCloud" registers capacity without HostAllocate`,
 		},
 		{
-			name:    "capacity without HostRelease",
-			options: []ProviderOption{capacity(), allocateLongRunning()},
+			name: "capacity without HostRelease",
+			options: []ProviderOption{
+				capacity(),
+				allocateLongRunning(),
+			},
 			message: `provider "ExampleCloud" registers capacity without HostRelease`,
 		},
 		{
@@ -332,23 +381,32 @@ func TestNewProviderRejectsInvalidCapacityRegistration(t *testing.T) {
 			message: `provider "ExampleCloud" must register HostRelease as a long-running operation`,
 		},
 		{
-			name:    "long-running HostAllocate without capacity",
-			options: []ProviderOption{allocateLongRunning()},
+			name: "long-running HostAllocate without capacity",
+			options: []ProviderOption{
+				allocateLongRunning(),
+			},
 			message: `provider "ExampleCloud" registers HostAllocate without capacity`,
 		},
 		{
-			name:    "long-running HostRelease without capacity",
-			options: []ProviderOption{releaseLongRunning()},
+			name: "long-running HostRelease without capacity",
+			options: []ProviderOption{
+				releaseLongRunning(),
+			},
 			message: `provider "ExampleCloud" registers HostRelease without capacity`,
 		},
 		{
-			name:    "both long-running without capacity",
-			options: []ProviderOption{allocateLongRunning(), releaseLongRunning()},
+			name: "both long-running without capacity",
+			options: []ProviderOption{
+				allocateLongRunning(),
+				releaseLongRunning(),
+			},
 			message: `provider "ExampleCloud" registers HostAllocate without capacity`,
 		},
 		{
-			name:    "immediate HostAllocate without capacity",
-			options: []ProviderOption{WithImmediateOperation(unboundedv1alpha3.OperationHostAllocate, testExecute)},
+			name: "immediate HostAllocate without capacity",
+			options: []ProviderOption{
+				WithImmediateOperation(unboundedv1alpha3.OperationHostAllocate, testExecute),
+			},
 			message: `provider "ExampleCloud" registers HostAllocate without capacity`,
 		},
 		{
@@ -360,13 +418,21 @@ func TestNewProviderRejectsInvalidCapacityRegistration(t *testing.T) {
 			message: `provider "ExampleCloud" registers HostRelease without capacity`,
 		},
 		{
-			name:    "cleanup on HostAllocate in a full bundle",
-			options: []ProviderOption{capacity(), allocateLongRunning(WithCleanup(testCleanup)), releaseLongRunning()},
+			name: "cleanup on HostAllocate in a full bundle",
+			options: []ProviderOption{
+				capacity(),
+				allocateLongRunning(WithCleanup(testCleanup)),
+				releaseLongRunning(),
+			},
 			message: `cleanup is not valid for allocation operation "HostAllocate"`,
 		},
 		{
-			name:    "cleanup on HostRelease in a full bundle",
-			options: []ProviderOption{capacity(), allocateLongRunning(), releaseLongRunning(WithCleanup(testCleanup))},
+			name: "cleanup on HostRelease in a full bundle",
+			options: []ProviderOption{
+				capacity(),
+				allocateLongRunning(),
+				releaseLongRunning(WithCleanup(testCleanup)),
+			},
 			message: `cleanup is not valid for allocation operation "HostRelease"`,
 		},
 	}
