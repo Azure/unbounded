@@ -4,9 +4,12 @@
 package netboot
 
 import (
+	"bytes"
+	"io"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -112,4 +115,63 @@ func TestTFTPMediaLeaseAuthorization(t *testing.T) {
 			}
 		})
 	}
+}
+
+// slowTFTPReaderFrom waits before reading, simulating a transfer that runs
+// longer than the lookup timeout.
+type slowTFTPReaderFrom struct {
+	tftpReaderFrom
+	delay time.Duration
+}
+
+func (r *slowTFTPReaderFrom) ReadFrom(src io.Reader) (int64, error) {
+	time.Sleep(r.delay)
+	return r.tftpReaderFrom.ReadFrom(src)
+}
+
+func TestTFTPTransferOutlivesLookupTimeout(t *testing.T) {
+	payload := bytes.Repeat([]byte("kernel"), 2<<20)
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{"vmlinuz": payload})
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-slow"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:      "ghcr.io/test/image:v1",
+			DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:09", IPv4: "10.0.1.59", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	srv := &TFTPServer{
+		FileResolver:  FileResolver{Puller: puller, Reader: fc},
+		LookupTimeout: 50 * time.Millisecond,
+	}
+
+	var out bytes.Buffer
+
+	rf := &slowTFTPReaderFrom{tftpReaderFrom: tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.59"}, delay: 300 * time.Millisecond}
+	require.NoError(t, srv.readHandler("vmlinuz", rf))
+	require.Equal(t, payload, out.Bytes())
+}
+
+func TestTFTPTransferTimeoutAbortsTransfer(t *testing.T) {
+	payload := bytes.Repeat([]byte("kernel"), 2<<20)
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{"vmlinuz": payload})
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-slow"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:      "ghcr.io/test/image:v1",
+			DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:09", IPv4: "10.0.1.59", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	srv := &TFTPServer{
+		FileResolver:    FileResolver{Puller: puller, Reader: fc},
+		TransferTimeout: 100 * time.Millisecond,
+	}
+
+	var out bytes.Buffer
+
+	rf := &slowTFTPReaderFrom{tftpReaderFrom: tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.59"}, delay: 300 * time.Millisecond}
+	require.Error(t, srv.readHandler("vmlinuz", rf))
 }

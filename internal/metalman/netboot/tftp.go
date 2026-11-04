@@ -23,6 +23,26 @@ type TFTPServer struct {
 	FileResolver
 	StatusRecorder TFTPStatusRecorder
 	Media          *MediaProvider
+
+	// LookupTimeout bounds machine lookup and file resolution for one
+	// request. Zero means defaultTFTPLookupTimeout.
+	LookupTimeout time.Duration
+	// TransferTimeout caps one whole transfer, including streaming the file.
+	// Zero means defaultTFTPTransferTimeout.
+	TransferTimeout time.Duration
+}
+
+const (
+	defaultTFTPLookupTimeout   = 3 * time.Minute
+	defaultTFTPTransferTimeout = time.Hour
+)
+
+func orDefault(d, def time.Duration) time.Duration {
+	if d <= 0 {
+		return def
+	}
+
+	return d
 }
 
 type TFTPStatusRecorder interface {
@@ -53,8 +73,27 @@ func (t *TFTPServer) Start(ctx context.Context) error {
 }
 
 func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// transferCtx lives for the whole transfer: opened files are bound to it
+	// and stream until the transfer finishes. ctx only bounds lookups.
+	transferCtx, cancelTransfer := context.WithTimeout(context.Background(), orDefault(t.TransferTimeout, defaultTFTPTransferTimeout))
+	defer cancelTransfer()
+
+	ctx, cancel := context.WithTimeout(transferCtx, orDefault(t.LookupTimeout, defaultTFTPLookupTimeout))
 	defer cancel()
+
+	// openWithin runs open with transferCtx, aborting it if the lookup
+	// timeout expires first. Once open returns, the lookup timeout no longer
+	// applies to the returned file.
+	openWithin := func(open func(context.Context) error) error {
+		stop := context.AfterFunc(ctx, cancelTransfer)
+		err := open(transferCtx)
+
+		if !stop() && err == nil {
+			return fmt.Errorf("opening %s: %w", filename, context.DeadlineExceeded)
+		}
+
+		return err
+	}
 	// Rack managers fetch the ISO using their own IP, not the host lease.
 	if t.Media != nil && (strings.HasPrefix(filename, "ub-") || strings.HasSuffix(filename, ".iso")) {
 		log := slog.With("proto", "tftp", "filename", filename)
@@ -62,6 +101,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 			log = log.With("ip", transfer.RemoteAddr().IP.String())
 		}
 
+		// The ISO is a local file and is not bound to ctx.
 		file, err := t.Media.OpenISO(ctx, filename)
 		if err != nil {
 			log.Warn("rejecting boot media transfer", "err", err)
@@ -114,8 +154,20 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no netboot image", node.Name)
 	}
 
-	resolved, err := t.ResolveFileByPathForIP(ctx, filename, node, src, ip)
+	var resolved *ResolvedFile
+
+	err = openWithin(func(c context.Context) error {
+		var err error
+
+		resolved, err = t.ResolveFileByPathForIP(c, filename, node, src, ip)
+
+		return err
+	})
 	if err != nil {
+		if resolved != nil {
+			resolved.Close() //nolint:errcheck,gosec // Best-effort close on failure.
+		}
+
 		log.Warn("resolving file", "node", node.Name, "err", err)
 		return err
 	}
@@ -139,7 +191,11 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return err
 	}
 
-	t.recordBootLoaderDownloaded(ctx, log, node, src, filename)
+	// The lookup ctx may have expired during a long transfer.
+	recordCtx, cancelRecord := context.WithTimeout(context.Background(), orDefault(t.LookupTimeout, defaultTFTPLookupTimeout))
+	defer cancelRecord()
+
+	t.recordBootLoaderDownloaded(recordCtx, log, node, src, filename)
 
 	return nil
 }
