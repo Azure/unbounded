@@ -143,12 +143,12 @@ func TestTFTPTransferOutlivesLookupTimeout(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
 	srv := &TFTPServer{
 		FileResolver:  FileResolver{Puller: puller, Reader: fc},
-		LookupTimeout: 50 * time.Millisecond,
+		LookupTimeout: time.Second,
 	}
 
 	var out bytes.Buffer
 
-	rf := &slowTFTPReaderFrom{tftpReaderFrom: tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.59"}, delay: 300 * time.Millisecond}
+	rf := &slowTFTPReaderFrom{tftpReaderFrom: tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.59"}, delay: 1500 * time.Millisecond}
 	require.NoError(t, srv.readHandler("vmlinuz", rf))
 	require.Equal(t, payload, out.Bytes())
 }

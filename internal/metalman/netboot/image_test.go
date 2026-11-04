@@ -227,9 +227,11 @@ func TestHTTPServerPullsFileForEveryRequest(t *testing.T) {
 	}
 
 	// Image content is never cached: each request fetches the manifest
-	// and the layer again.
+	// and the layer again. The puller may read a layer more than once per
+	// request (for example to build its layer index), so only a floor is
+	// asserted for blobs.
 	require.Equal(t, 2, f.images.Registry.Count(imagepulltest.KindManifest))
-	require.Equal(t, 2, f.images.Registry.Count(imagepulltest.KindBlob))
+	require.GreaterOrEqual(t, f.images.Registry.Count(imagepulltest.KindBlob), 2)
 }
 
 func TestHTTPServerFileErrors(t *testing.T) {
