@@ -3814,7 +3814,7 @@ pub(crate) fn gpu_slot(
         telemetry.attach_helper(gpu.clone());
         if let Some(links) = links {
             links.set_gpu_landing(gpu.clone(), landing_bytes);
-            telemetry.attach_links(links);
+            telemetry.attach_landing(links.gpu_landing().clone());
         }
     };
     let mode = config.enable_gpu;

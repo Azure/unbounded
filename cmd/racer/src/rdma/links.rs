@@ -106,25 +106,8 @@ pub struct LinkNode {
     /// the first worker to see a new membership sends the request.
     retained: Mutex<std::sync::Weak<crate::topology::Membership>>,
 
-    /// GPU helper and per-GPU landing bytes, when `gpu-read` pages may land
-    /// in GPU memory (GPUDirect RDMA).
-    gpu_landing: Mutex<Option<(Arc<crate::gpu::GpuHelper>, u64)>>,
-
-    /// Landing was configured after the current rails attached theirs, so
-    /// the owner must attach landings on the rails already active. Set and
-    /// cleared under the `gpu_landing` lock, so an activation that reads the
-    /// new configuration consumes it and rails never attach twice.
-    landing_pending: std::sync::atomic::AtomicBool,
-
-    /// GPU landing slices registered this round, by rail and GPU.
-    landings: Mutex<HashMap<(u16, i32), Arc<crate::gpu::GpuLanding>>>,
-
-    /// NIC slots in each registered landing slice this round, by rail and GPU.
-    landing_slots: Mutex<HashMap<(u16, i32), usize>>,
-
-    /// Landing grants that found no free slot, by rail and GPU. Kept across
-    /// rounds so the metric only grows.
-    landing_exhausted: Mutex<HashMap<(u16, i32), u64>>,
+    /// GPU landing state, owned by the GPU side; this node drives it.
+    gpu_landing: Arc<crate::gpu_landing::GpuLandingRegistry>,
 }
 
 /// Split each GPU's landing buffer of `slots` page slots across `rails`.
@@ -214,6 +197,8 @@ impl LinkNode {
     }
 
     fn settle(&self, rails: Vec<RailMapping>) {
+        self.gpu_landing
+            .set_rails(rails.iter().map(|mapping| mapping.rail.0).collect());
         *Self::lock(&self.active) = rails;
         self.settled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -227,91 +212,48 @@ impl LinkNode {
     /// lazily on the first `gpu-read`) marks those rails pending; the owner
     /// worker attaches them on its next turn (see [`Self::take_landing_pending`]).
     pub fn set_gpu_landing(&self, helper: Arc<crate::gpu::GpuHelper>, bytes: u64) {
-        let mut landing = Self::lock(&self.gpu_landing);
-        *landing = (bytes != 0).then_some((helper, bytes));
-        self.landing_pending
-            .store(landing.is_some(), std::sync::atomic::Ordering::Release);
+        self.gpu_landing.configure(helper, bytes);
     }
 
     /// Whether landing still needs attaching on the rails already active.
     /// Clears the mark; the caller must then attach them.
     pub fn take_landing_pending(&self) -> bool {
-        let _landing = Self::lock(&self.gpu_landing);
-        self.landing_pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        self.gpu_landing.take_pending()
     }
 
-    /// The landing configuration, consuming any pending mark: the caller
-    /// attaches with it.
-    fn take_gpu_landing(&self) -> Option<(Arc<crate::gpu::GpuHelper>, u64)> {
-        let landing = Self::lock(&self.gpu_landing);
-        self.landing_pending
-            .store(false, std::sync::atomic::Ordering::Release);
-        landing.clone()
+    /// The GPU landing registry this node drives.
+    pub fn gpu_landing(&self) -> &Arc<crate::gpu_landing::GpuLandingRegistry> {
+        &self.gpu_landing
     }
 
     /// GPU `ordinal`'s landing slice on `rail` this round, if any.
     pub fn landing(&self, rail: RailId, ordinal: i32) -> Option<Arc<crate::gpu::GpuLanding>> {
-        Self::lock(&self.landings).get(&(rail.0, ordinal)).cloned()
+        self.gpu_landing.landing(rail.0, ordinal)
     }
 
-    /// Landing state of each active rail, for metrics: the rail, and the
-    /// `(ordinal, slots)` of each GPU landing slice registered on it.
+    /// Landing state of each active rail, for metrics.
     pub fn landing_state(&self) -> Vec<(u16, Vec<(i32, usize)>)> {
-        let slots = Self::lock(&self.landing_slots);
-        let mut rails: Vec<u16> = Self::lock(&self.active)
-            .iter()
-            .map(|mapping| mapping.rail.0)
-            .collect();
-        rails.sort_unstable();
-        rails.dedup();
-        rails
-            .into_iter()
-            .map(|rail| {
-                let mut gpus: Vec<(i32, usize)> = slots
-                    .iter()
-                    .filter(|((r, _), _)| *r == rail)
-                    .map(|(&(_, ordinal), &count)| (ordinal, count))
-                    .collect();
-                gpus.sort_unstable();
-                (rail, gpus)
-            })
-            .collect()
+        self.gpu_landing.state()
     }
 
     /// Count one landing grant on `rail` for GPU `ordinal` that found no
     /// free slot.
     pub fn count_landing_exhausted(&self, rail: RailId, ordinal: i32) {
-        let mut counts = Self::lock(&self.landing_exhausted);
-        let count = counts.entry((rail.0, ordinal)).or_default();
-        *count = count.saturating_add(1);
+        self.gpu_landing.count_exhausted(rail.0, ordinal);
     }
 
-    /// Landing exhaustion counts for metrics: every slice registered this
-    /// round (0 if none yet) and every slice that ever exhausted, sorted by
-    /// rail then GPU ordinal.
+    /// Landing exhaustion counts for metrics.
     pub fn landing_exhausted(&self) -> Vec<((u16, i32), u64)> {
-        let counts = Self::lock(&self.landing_exhausted);
-        let mut keys: Vec<(u16, i32)> = Self::lock(&self.landing_slots)
-            .keys()
-            .chain(counts.keys())
-            .copied()
-            .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.into_iter()
-            .map(|key| (key, counts.get(&key).copied().unwrap_or(0)))
-            .collect()
+        self.gpu_landing.exhausted()
     }
 
     /// Whether GPU landing is configured (GPU decrypt and RDMA both on).
     pub fn gpu_landing_configured(&self) -> bool {
-        Self::lock(&self.gpu_landing).is_some()
+        self.gpu_landing.configured()
     }
 
     fn reset(&self) {
-        Self::lock(&self.landings).clear();
-        Self::lock(&self.landing_slots).clear();
+        self.gpu_landing.clear_round();
         Self::lock(&self.active).clear();
         self.settled
             .store(false, std::sync::atomic::Ordering::Release);
@@ -628,7 +570,7 @@ impl Links {
     /// log: pages then land in host memory as usual. A GPU whose buffer no
     /// rail registered drops it again, which frees the GPU memory.
     pub(crate) async fn attach_landings(&self, rails: &[RailMapping], scope: &RequestScope) {
-        let Some((helper, bytes)) = self.node.take_gpu_landing() else {
+        let Some((helper, bytes)) = self.node.gpu_landing.take_config() else {
             return;
         };
         let slots = (bytes / BUFFER_LEN as u64) as usize;
@@ -689,8 +631,9 @@ impl Links {
                             "racer: stage=gpu-landing rail={} ordinal={ordinal} state=enabled slots={slots}",
                             rail.0
                         );
-                        LinkNode::lock(&self.node.landings).insert((rail.0, ordinal), slice);
-                        LinkNode::lock(&self.node.landing_slots).insert((rail.0, ordinal), slots);
+                        self.node
+                            .gpu_landing
+                            .register(rail.0, ordinal, slice, slots);
                     }
                     Err(error) => eprintln!(
                         "racer: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",

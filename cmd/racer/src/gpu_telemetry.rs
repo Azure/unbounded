@@ -12,7 +12,6 @@
 use crate::error::Error;
 use crate::gpu::CufileDisable;
 use crate::gpu::GpuHelper;
-use crate::rdma::LinkNode;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -82,7 +81,7 @@ pub const BASE_SERIES: usize = GpuReadOutcome::ALL.len() + 2;
 pub struct GpuTelemetry {
     helper: OnceLock<Arc<GpuHelper>>,
     slot: OnceLock<Arc<crate::gpu_slot::GpuSlot>>,
-    links: OnceLock<Arc<LinkNode>>,
+    landing: OnceLock<Arc<crate::gpu_landing::GpuLandingRegistry>>,
     requests: [AtomicU64; GpuReadOutcome::ALL.len()],
 }
 
@@ -99,9 +98,9 @@ impl GpuTelemetry {
         let _ = self.slot.set(slot);
     }
 
-    /// Report GPU landing state from this link node. Later calls are ignored.
-    pub fn attach_links(&self, links: Arc<LinkNode>) {
-        let _ = self.links.set(links);
+    /// Report GPU landing state from this registry. Later calls are ignored.
+    pub fn attach_landing(&self, landing: Arc<crate::gpu_landing::GpuLandingRegistry>) {
+        let _ = self.landing.set(landing);
     }
 
     /// Count one `gpu-read` request head.
@@ -253,10 +252,10 @@ impl GpuTelemetry {
         ] {
             writeln!(out, "# TYPE {name} {kind}\n{name} {value}")?;
         }
-        if let Some(links) = self.links.get()
-            && links.gpu_landing_configured()
+        if let Some(landing) = self.landing.get()
+            && landing.configured()
         {
-            let rails = links.landing_state();
+            let rails = landing.state();
             writeln!(out, "# TYPE racer_gpu_landing_enabled gauge")?;
             for (rail, state) in &rails {
                 writeln!(
@@ -275,7 +274,7 @@ impl GpuTelemetry {
                 }
             }
             writeln!(out, "# TYPE racer_gpu_landing_exhausted_total counter")?;
-            for ((rail, ordinal), count) in links.landing_exhausted() {
+            for ((rail, ordinal), count) in landing.exhausted() {
                 writeln!(
                     out,
                     "racer_gpu_landing_exhausted_total{{rail=\"{rail}\",ordinal=\"{ordinal}\"}} {count}"
@@ -381,8 +380,8 @@ mod tests {
         helper.counters().cufile_disabled(CufileDisable::FileOpen);
         let telemetry = GpuTelemetry::default();
         telemetry.attach_helper(helper.clone());
-        let links = Arc::new(LinkNode::default());
-        telemetry.attach_links(links.clone());
+        let links = Arc::new(crate::rdma::LinkNode::default());
+        telemetry.attach_landing(links.gpu_landing().clone());
         let text = render(&telemetry);
         for name in [
             "racer_gpu_read_requests_total",
