@@ -1,35 +1,19 @@
-# Project Signal: certification alignment
+# Project Signal: certification controller
 
-**Status:** Alignment proposal grounded in the current implementation stack.
+**Status:** Proposed design, grounded in the current implementation stack.
 
-## Decision requested
+## Overview
 
-Agree on a small certification foundation: **a Suite defines what runs, a
-Profile selects participants, and a Run records exactly what happened.**
+Project Signal establishes a reproducible certification lifecycle for compute
+capacity. **A Suite defines what runs, a Profile selects participants, and a Run
+pins the execution plan and records its outcome.**
 Signal owns certification policy and eligibility; Argo Workflows sequences
 execution; an adapter runs the selected backend and reports evidence.
 
-This replaces the broader lifecycle-platform proposal. Day 1 trust maintenance
-and Day 2 recovery remain the direction, not prerequisites for landing the
-certification foundation. This document does not approve every implementation
-detail or claim that the stack has landed.
-
-## Current review baseline
-
-The implementation is split into four reviewable layers:
-
-| Layer | PR | Responsibility |
-|---|---|---|
-| Contracts | [#1021](https://github.com/Azure/unbounded/pull/1021) | Suite, Profile, Run, and generated CRDs |
-| Controller | [#1023](https://github.com/Azure/unbounded/pull/1023) | Admission, snapshots, reservations, orchestration, evidence, and eligibility |
-| Adapter | [#1025](https://github.com/Azure/unbounded/pull/1025) | Pod/MPIJob execution and per-check results |
-| Deployment | [#1026](https://github.com/Azure/unbounded/pull/1026) | Images, RBAC, WorkflowTemplate, and controller Deployment |
-
-The baseline below is the stack at
-[`bb5da95a4b70`](https://github.com/Azure/unbounded/commit/bb5da95a4b7031bcb6832a7db8f3b89bc3147636).
-Source references use that revision because these files are not yet on the
-design PR's base branch. Runner delivery is separate in
-[#1001](https://github.com/Azure/unbounded/pull/1001).
+The initial design covers operator-requested certification, retained evidence,
+and eligibility projection. Recurring trust maintenance and automated lifecycle
+recovery are separate extensions. Existing controllers retain ownership of
+provisioning and host operations.
 
 ## Problem and boundary
 
@@ -53,7 +37,7 @@ flowchart LR
     Controller --> State["Run status and Node eligibility"]
 ```
 
-## Three resources, one execution contract
+## Resource model
 
 | Resource | Owns | Does not own |
 |---|---|---|
@@ -71,7 +55,7 @@ The current schema bounds participants and check counts for resource safety.
 Those limits are implementation guardrails, not the product abstraction.
 See [API ownership](#implementation-references).
 
-## One run, end to end
+## Certification lifecycle
 
 1. An operator requests certification by setting the Node's
    `signal.unbounded-cloud.io/certification-request` label to a Profile name.
@@ -114,7 +98,7 @@ checks to execute; an execution-boundary failure prevents downstream execution
 and produces an inconclusive outcome. MPI workloads are quiesced between checks.
 See [execution and results](#implementation-references).
 
-### Outcome, evidence, and release are different
+### Outcomes, evidence, and release
 
 | Outcome | Certification meaning | Current lifecycle behavior |
 |---|---|---|
@@ -135,7 +119,7 @@ backend evidence. Logs are bounded, not an unlimited archive. This stack has no
 automatic final-evidence retention policy; operators own access and retention.
 See [evidence and projection](#implementation-references).
 
-## What this foundation does not commit us to
+## Non-goals
 
 - Recurring or idle-triggered certification, automatic retries, fleet-wide
   concurrency policy, queue integration, draining, or eviction.
@@ -150,28 +134,60 @@ Pod suites do not. Runner packaging and actual diagnostic coverage remain
 separate concerns. The stack's execution contracts do not by themselves prove
 accelerator health, collective correctness, or soak qualification.
 
-Day 1 can later add evidence freshness and revalidation. Day 2 can later request
-existing lifecycle operations, leaving execution with their existing owners.
-The proposed safety rule for that extension is simple: **operation completion
-must not restore trust without new certification evidence.** Neither capability
-is claimed as implemented by this stack.
+Future Day 1 extensions cover evidence freshness and revalidation. Future Day 2
+extensions request existing lifecycle operations without taking over their
+execution. **Operation completion must not restore trust without new
+certification evidence.** Neither extension is part of the current stack.
 
-## Alignment questions
+## Design requirements
 
-1. **Ownership:** Is Suite = executable plan, Profile = participant policy,
-   Run = immutable execution the right foundation?
-2. **Execution:** Is Argo sequencing plus a narrow Pod/MPIJob adapter sufficient
-   for the first version, without a generalized orchestration platform?
-3. **Safety:** Can the first version require operator-arranged safe capacity,
-   with explicit non-pass release and separate cleanup conditions, rather than
-   promise workload-aware idle admission or automatic recovery?
-4. **Scope:** Can we review and land the four layers independently, then design
-   recurring certification and Day 2 policy as separate extensions?
+1. **Immutable execution:** Admission must resolve and snapshot the selected
+   policy, scripts, runner image, and participant identities. Changes to source
+   resources must not alter an admitted Run.
+2. **Single policy owner:** The Signal controller owns certification eligibility.
+   Argo and backend execution status must not independently grant eligibility.
+3. **Evidence-backed outcomes:** A pass requires accepted evidence for every
+   required check. Missing or invalid evidence must not become a pass, and
+   execution interruption must remain distinct from diagnostic failure.
+4. **Explicit capacity protection:** Deployments must supply safe test capacity.
+   The controller reserves and cordons participants; it does not infer workload
+   idleness or drain Nodes. Reservation and cleanup mutations must be fenced by
+   resource identity and ownership.
+5. **Independent release state:** Diagnostic verdict, eligibility, workload
+   cleanup, and reservation release must remain separately observable. Explicit
+   release must not change a non-passing verdict into a pass.
+6. **Retained evidence:** Final evidence must be persisted before terminal status
+   and retained independently of temporary execution resources. Operators own
+   evidence access and retention policy.
 
-Agreement here establishes the boundary, not production readiness. Layer review
-still needs to verify snapshot isolation, reservation ownership, result
-validation, cancellation, retained evidence, and cleanup. Hardware qualification
-requires separate end-to-end evidence for the selected runner and environment.
+## Acceptance criteria
+
+Contract and lifecycle tests must demonstrate snapshot isolation, Run UID
+fencing, result identity and digest validation, fail-closed evidence handling,
+cancellation, ownership-safe cleanup, and release behavior for passing and
+non-passing Runs. Recovery tests must demonstrate that controller restarts do
+not reinterpret admitted policy or release resources belonging to another Run.
+
+These criteria establish correctness of the certification control plane, not
+hardware qualification. Qualification requires separate end-to-end evidence for
+the selected runner and environment.
+
+## Implementation baseline
+
+The implementation is split into four independently reviewable layers:
+
+| Layer | PR | Responsibility |
+|---|---|---|
+| Contracts | [#1021](https://github.com/Azure/unbounded/pull/1021) | Suite, Profile, Run, and generated CRDs |
+| Controller | [#1023](https://github.com/Azure/unbounded/pull/1023) | Admission, snapshots, reservations, orchestration, evidence, and eligibility |
+| Adapter | [#1025](https://github.com/Azure/unbounded/pull/1025) | Pod/MPIJob execution and per-check results |
+| Deployment | [#1026](https://github.com/Azure/unbounded/pull/1026) | Images, RBAC, WorkflowTemplate, and controller Deployment |
+
+The baseline is the stack at
+[`bb5da95a4b70`](https://github.com/Azure/unbounded/commit/bb5da95a4b7031bcb6832a7db8f3b89bc3147636).
+Source references use that revision because these files are not yet on the
+design PR's base branch. Runner delivery is separate in
+[#1001](https://github.com/Azure/unbounded/pull/1001).
 
 ## Implementation references
 
