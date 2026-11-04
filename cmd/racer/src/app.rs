@@ -26,6 +26,7 @@ use crate::control::publication::PublicationTarget;
 use crate::control::rails::RailJournal;
 use crate::control::session::Session;
 use crate::control::transient;
+use crate::enrollment::Enrollment;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -87,7 +88,6 @@ use crate::worker::WorkerRuntime;
 use controlplane::Published;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::NodeId;
-use racer_crypto::enrollment::Enrollment;
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::KeyEpochs;
@@ -230,7 +230,9 @@ impl NodeState {
             publications: Arc::new(Published::new(Snapshot::retention(2))),
             metrics: workers.iter().copied().zip(metrics).collect(),
             failures: crate::telemetry::Failures::default(),
-            keys: Arc::new(KeyEpochs::default()),
+            keys: Arc::new(KeyEpochs::with_clock(
+                crate::enrollment::migration_wall_clock(),
+            )),
             control_worker: WorkerId(0),
             cache_rollout: controlplane::Rollout::new(workers.iter().copied()),
             workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
@@ -643,7 +645,7 @@ async fn start_control(
     control: &Session,
     reactor: Rc<Reactor>,
     startup: &RequestScope,
-) -> Result<racer_crypto::enrollment::LocalSigningIdentity> {
+) -> Result<crate::enrollment::LocalSigningIdentity> {
     loop {
         startup.check()?;
         let turn = control_turn(startup, CONTROL_TURN)?;

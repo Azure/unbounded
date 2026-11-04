@@ -3,12 +3,12 @@
 use super::publication::{PublicationCodec, PublicationTarget};
 use super::rails::RailJournal;
 use super::{ControlEndpoint, ReactorControlIo, transient};
+use crate::enrollment::{Enrollment, LocalSigningIdentity};
 use crate::error::{Error, Operation, Result};
 use crate::runtime::RequestScope;
 use controlplane::feed::{Identity, Preparation, RejectionPolicy, Schedule};
 use controlplane::{Client, Codec, Credentials, Feed, Sync, Target};
 use racer_control_wire as wire;
-use racer_crypto::enrollment::{Enrollment, LocalSigningIdentity};
 use racer_crypto::identity::{BundleInstaller, Keyring};
 use sha2::{Digest, Sha256};
 use std::{

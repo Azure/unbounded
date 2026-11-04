@@ -1076,9 +1076,9 @@ fn enrolled_identity(
     scratch: &Scratch,
     control: &control::Control,
     processes: usize,
-) -> racer_crypto::enrollment::LocalSigningIdentity {
+) -> racer::enrollment::LocalSigningIdentity {
+    use racer::enrollment::Enrollment;
     use racer_control_wire::ClusterId;
-    use racer_crypto::enrollment::Enrollment;
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,

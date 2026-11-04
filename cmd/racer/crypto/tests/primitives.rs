@@ -11,8 +11,8 @@ fn identity_module_public_api_preserves_key_and_error_contracts() {
     use racer_control_wire::{CacheId, ClusterId, NodeId};
     use racer_crypto::identity::{
         Certificates, Error as IdentityError, KeyEpochs, KeyLease, KeyPurpose, Keyring,
-        PendingIdentity, Result as IdentityResult, SigningIdentity, VerifiedPeer, canonical_uuid,
-        unix_time,
+        PendingIdentity, Result as IdentityResult, SigningIdentity, VerifiedPeer, WallClock,
+        canonical_uuid,
     };
     use std::{rc::Rc, sync::Arc};
 
@@ -33,7 +33,7 @@ fn identity_module_public_api_preserves_key_and_error_contracts() {
     let peer: IdentityResult<VerifiedPeer> =
         certificates.verify_signed(&[], &node, b"message", &[]);
     assert!(matches!(peer, Err(IdentityError::MissingKey)));
-    let _time = unix_time();
+    let _time = WallClock::host().unix_time();
 
     let key = SigningKey::from_seed(&[42; 32]);
     let encoded = key.to_pkcs8_der().unwrap();
@@ -650,7 +650,7 @@ mod identity_workflows {
     };
     use racer_crypto::identity::{
         Certificates, Error, KeyEpochs, KeyPurpose, Keyring, PendingIdentity, SigningIdentity,
-        unix_time,
+        WallClock,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::{
@@ -672,16 +672,19 @@ mod identity_workflows {
     /// TLS time follows the current scope and clamps/truncates epoch offsets.
     #[test]
     fn tls_time_uses_current_scoped_wall_clock_clamps_and_truncates() {
-        let clock = uring_runtime::environment::SimulationClock::new(71);
-        let _environment = clock.environment(0).enter();
-        for (wall, seconds) in [
+        let wall = std::sync::Arc::new(std::sync::Mutex::new(UNIX_EPOCH));
+        let clock = {
+            let wall = wall.clone();
+            WallClock::new(move || *wall.lock().unwrap())
+        };
+        for (wall_time, seconds) in [
             (UNIX_EPOCH - Duration::from_nanos(1), 0),
             (UNIX_EPOCH, 0),
             (UNIX_EPOCH + Duration::from_millis(1999), 1),
             (UNIX_EPOCH + Duration::from_secs(10), 10),
         ] {
-            clock.set_wall_time(wall);
-            assert_eq!(unix_time().as_secs(), seconds);
+            *wall.lock().unwrap() = wall_time;
+            assert_eq!(clock.unix_time().as_secs(), seconds);
         }
     }
 
@@ -705,7 +708,13 @@ mod identity_workflows {
         assert_eq!(cert.validity().not_before.timestamp(), 1_577_836_800);
         assert_eq!(cert.validity().not_after.timestamp(), 1_893_456_000);
         pending
-            .accept(cluster, node, chain, &[ca.der().to_vec()])
+            .accept(
+                cluster,
+                node,
+                chain,
+                &[ca.der().to_vec()],
+                &WallClock::host(),
+            )
             .unwrap();
     }
 
@@ -721,6 +730,7 @@ mod identity_workflows {
                 NodeId(NODE.into()),
                 chain.clone(),
                 &roots,
+                &WallClock::host(),
             )
             .unwrap();
         let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes.as_slice()));
@@ -741,6 +751,7 @@ mod identity_workflows {
             &bytes,
             chain.clone(),
             &roots,
+            &WallClock::host(),
         )
         .unwrap();
         assert_eq!(
@@ -754,7 +765,8 @@ mod identity_workflows {
                     identity.cluster().clone(),
                     identity.node().clone(),
                     chain.clone(),
-                    &roots
+                    &roots,
+                    &WallClock::host()
                 )
                 .is_err()
         );
@@ -764,7 +776,8 @@ mod identity_workflows {
                 NodeId("other".into()),
                 &bytes,
                 chain,
-                &roots
+                &roots,
+                &WallClock::host()
             )
             .is_err()
         );
@@ -784,12 +797,18 @@ mod identity_workflows {
             assert!(
                 PendingIdentity::recover(&secret)
                     .unwrap()
-                    .accept(cluster, node, chain.clone(), &roots)
+                    .accept(cluster, node, chain.clone(), &roots, &WallClock::host())
                     .is_err()
             );
         }
         let identity = pending
-            .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+            .accept(
+                cluster.clone(),
+                node.clone(),
+                chain.clone(),
+                &roots,
+                &WallClock::host(),
+            )
             .unwrap();
         let keys = Rc::new(keyring(roots));
         let certificates = Certificates::new(cluster.clone(), keys.clone());
@@ -879,7 +898,8 @@ mod identity_workflows {
                         ClusterId(CLUSTER.into()),
                         NodeId(NODE.into()),
                         chain,
-                        &roots
+                        &roots,
+                        &WallClock::host()
                     )
                     .is_err(),
                 "case {case}"
@@ -1201,9 +1221,7 @@ mod identity_workflows {
     /// Accepted identities and cached peer keys share conservative validity boundaries.
     #[test]
     fn accepted_chain_validity_is_enforced_at_expiry_and_after_clock_rollback() {
-        let clock = uring_runtime::environment::SimulationClock::new(97);
-        let _environment = clock.environment(0).enter();
-        clock.set_wall_time(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let clock = TestClock::at(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let (pending, chain, roots) = issued_with(|params| {
             params.not_before = rcgen::date_time_ymd(2020, 1, 1);
             params.not_after = rcgen::date_time_ymd(2030, 1, 1);
@@ -1212,11 +1230,17 @@ mod identity_workflows {
         let cluster = ClusterId(CLUSTER.into());
         let identity = Arc::new(
             pending
-                .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+                .accept(
+                    cluster.clone(),
+                    node.clone(),
+                    chain.clone(),
+                    &roots,
+                    &clock.wall(),
+                )
                 .unwrap(),
         );
         assert_eq!(identity.expires_at_seconds(), 1_893_456_000);
-        let keys = Rc::new(keyring(roots));
+        let keys = Rc::new(keyring_with(roots, clock.wall()));
         keys.install_signing_identity(identity.clone()).unwrap();
         let certificates = Certificates::new(cluster, keys.clone());
         let signature = identity.sign(b"validity").unwrap();
@@ -1246,12 +1270,38 @@ mod identity_workflows {
         );
     }
 
+    /// Settable wall time shared by a test and the clocks it hands out.
+    struct TestClock(Arc<std::sync::Mutex<std::time::SystemTime>>);
+
+    impl TestClock {
+        /// Start at the given wall time.
+        fn at(wall: std::time::SystemTime) -> Self {
+            Self(Arc::new(std::sync::Mutex::new(wall)))
+        }
+
+        /// Move wall time to an arbitrary instant, including backward.
+        fn set_wall_time(&self, wall: std::time::SystemTime) {
+            *self.0.lock().unwrap() = wall;
+        }
+
+        /// A crypto clock reading this test's wall time.
+        fn wall(&self) -> WallClock {
+            let wall = self.0.clone();
+            WallClock::new(move || *wall.lock().unwrap())
+        }
+    }
+
     /// Install one active key per purpose using only the public bundle interface.
     fn keyring(roots: Vec<Vec<u8>>) -> Keyring {
+        keyring_with(roots, WallClock::host())
+    }
+
+    /// Install one active key per purpose, checking identities against `clock`.
+    fn keyring_with(roots: Vec<Vec<u8>>, clock: WallClock) -> Keyring {
         let keys = Keyring::new(
             ClusterId(CLUSTER.into()),
             NodeId(NODE.into()),
-            Arc::new(KeyEpochs::default()),
+            Arc::new(KeyEpochs::with_clock(clock)),
         );
         keys.install(bundle(1, roots)).unwrap();
         keys

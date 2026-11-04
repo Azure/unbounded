@@ -37,12 +37,20 @@ fn signatures() -> Signatures {
     let node = NodeId("00000001-1111-4111-8111-111111111111".into());
     let (pending, chain) = issue(&ca, &key, &cluster, &node, |_| {});
     let identity = pending
-        .accept(cluster.clone(), node.clone(), chain, &roots)
+        .accept(
+            cluster.clone(),
+            node.clone(),
+            chain,
+            &roots,
+            &racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+        )
         .unwrap();
     let keys = Rc::new(Keyring::new(
         cluster.clone(),
         node,
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+        )),
     ));
     keys.install(KeyringBundle {
         schema_version: SCHEMA_VERSION,

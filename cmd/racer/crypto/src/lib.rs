@@ -21,7 +21,6 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-pub mod enrollment;
 #[cfg(target_arch = "x86_64")]
 mod ghash_x86;
 
@@ -631,7 +630,6 @@ pub mod identity {
         rc::Rc,
         sync::{Arc, Mutex},
     };
-    use uring_runtime::environment;
     use x509_parser::{extensions::GeneralName, parse_x509_certificate};
     use zeroize::Zeroizing;
 
@@ -678,12 +676,76 @@ pub mod identity {
         expires: u64,
 
         valid_from: u64,
+
+        clock: WallClock,
+    }
+
+    /// Per-node wall clock injected at construction, so identity checks need no
+    /// ambient runtime state. Host builds read `SystemTime::now`; simulations pass
+    /// their virtual clock.
+    #[derive(Clone)]
+    pub struct WallClock(Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>);
+
+    impl WallClock {
+        /// Read the host wall clock.
+        pub fn host() -> Self {
+            Self(Arc::new(std::time::SystemTime::now))
+        }
+
+        /// Read wall time from a caller-owned source, such as a simulated clock.
+        pub fn new(now: impl Fn() -> std::time::SystemTime + Send + Sync + 'static) -> Self {
+            Self(Arc::new(now))
+        }
+
+        /// Current wall time.
+        pub fn now(&self) -> std::time::SystemTime {
+            (self.0)()
+        }
+
+        /// Wall time for rustls, clamped to the Unix epoch for pre-epoch clocks.
+        /// This retains rustls's whole-second truncation and does not set certificate policy.
+        pub fn unix_time(&self) -> rustls::pki_types::UnixTime {
+            rustls::pki_types::UnixTime::since_unix_epoch(
+                self.now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default(),
+            )
+        }
+    }
+
+    impl std::fmt::Debug for WallClock {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("WallClock")
+        }
     }
 
     /// Shared publication lock for complete epochs and their signing identity.
-    #[derive(Default)]
     pub struct KeyEpochs {
         state: Mutex<State>,
+
+        clock: WallClock,
+    }
+
+    impl Default for KeyEpochs {
+        /// Epochs checked against the host wall clock.
+        fn default() -> Self {
+            Self::with_clock(WallClock::host())
+        }
+    }
+
+    impl KeyEpochs {
+        /// Epochs whose identity and trust checks read the given wall clock.
+        pub fn with_clock(clock: WallClock) -> Self {
+            Self {
+                state: Mutex::default(),
+                clock,
+            }
+        }
+
+        /// The wall clock used for identity and trust checks.
+        pub fn clock(&self) -> &WallClock {
+            &self.clock
+        }
     }
 
     /// A cluster/node view of shared epochs, responsible for admission and rotation.
@@ -843,8 +905,9 @@ pub mod identity {
     }
 
     /// An authenticated leaf key and the conservative lifetime of its trust snapshot.
-    pub(super) struct ValidatedChain {
-        pub(super) key: VerifyingKey,
+    pub struct ValidatedChain {
+        /// The validated leaf public key.
+        pub key: VerifyingKey,
 
         valid_from: u64,
 
@@ -900,13 +963,18 @@ pub mod identity {
     }
 
     impl PendingIdentity {
-        /// Generate a key from the scoped runtime entropy source.
+        /// Generate a key from operating-system entropy.
         pub fn generate() -> Result<Self> {
             let mut seed = Zeroizing::new([0u8; 32]);
-            environment::fill_random(&mut *seed).map_err(|_| Error::Unavailable)?;
-            Ok(Self {
-                key: SigningKey::from_seed(&seed),
-            })
+            getrandom::getrandom(&mut *seed).map_err(|_| Error::Unavailable)?;
+            Ok(Self::from_seed(&seed))
+        }
+
+        /// Derive a key from caller-supplied entropy, such as a seeded simulation source.
+        pub fn from_seed(seed: &[u8; 32]) -> Self {
+            Self {
+                key: SigningKey::from_seed(seed),
+            }
         }
 
         /// Recover a bounded Ed25519 PKCS8 key without accepting a certificate.
@@ -946,8 +1014,9 @@ pub mod identity {
             node: NodeId,
             chain: Vec<Vec<u8>>,
             roots: &[Vec<u8>],
+            clock: &WallClock,
         ) -> Result<SigningIdentity> {
-            let verified = verify_chain(roots, &chain, &cluster, &node)?;
+            let verified = verify_chain(clock, roots, &chain, &cluster, &node)?;
             if verified.key != self.key.verifying_key() {
                 return Err(Error::Unauthorized);
             }
@@ -958,6 +1027,7 @@ pub mod identity {
                 expires: verified.expires,
                 valid_from: verified.valid_from,
                 chain,
+                clock: clock.clone(),
             })
         }
     }
@@ -975,8 +1045,9 @@ pub mod identity {
             pkcs8: &[u8],
             chain: Vec<Vec<u8>>,
             roots: &[Vec<u8>],
+            clock: &WallClock,
         ) -> Result<Self> {
-            PendingIdentity::recover(pkcs8)?.accept(cluster, node, chain, roots)
+            PendingIdentity::recover(pkcs8)?.accept(cluster, node, chain, roots, clock)
         }
 
         /// Return the cluster authenticated by the certificate.
@@ -996,7 +1067,7 @@ pub mod identity {
 
         /// Sign the exact message only within the accepted validity interval.
         pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-            let now = unix_time().as_secs();
+            let now = self.clock.unix_time().as_secs();
             if now < self.valid_from || now >= self.expires {
                 return Err(Error::Unauthorized);
             }
@@ -1048,7 +1119,8 @@ pub mod identity {
         /// Reuse exact-chain validation only while roots and time remain valid.
         fn key(&self, chain: &[Vec<u8>], expected: &NodeId) -> Result<VerifyingKey> {
             let roots = self.keys.peer_trust_roots()?;
-            let now = unix_time().as_secs();
+            let clock = self.keys.epochs.clock();
+            let now = clock.unix_time().as_secs();
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
             cache.retain(|entry| {
                 Arc::ptr_eq(&entry.roots, &roots) && now >= entry.checked && now < entry.until
@@ -1060,7 +1132,7 @@ pub mod identity {
                 return Ok(entry.key);
             }
             drop(cache);
-            let verified = verify_chain(&roots, chain, &self.cluster, expected)?;
+            let verified = verify_chain(clock, &roots, chain, &self.cluster, expected)?;
             let mut cache = self.cache.lock().map_err(|_| Error::Unavailable)?;
             // At most 64 exact, wire-bounded chains (4 MiB of chain bytes).
             if cache.len() == 64 {
@@ -1443,7 +1515,8 @@ pub mod identity {
 
         /// Prepare outside the lock, then validate the transition and publish once.
         fn install_inner(&self, bundle: &KeyringBundle) -> Result<BundleGeneration> {
-            let validated = ValidatedBundle::prepare(bundle, &self.cluster, &self.node)?;
+            let validated =
+                ValidatedBundle::prepare(self.epochs.clock(), bundle, &self.cluster, &self.node)?;
             let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
             let published = validated.transition(state.published.as_ref())?;
             if let Some(published) = published {
@@ -1455,7 +1528,12 @@ pub mod identity {
 
     impl<'a> ValidatedBundle<'a> {
         /// Validate bounded input and fingerprint its original, order-sensitive form.
-        fn prepare(bundle: &'a KeyringBundle, cluster: &ClusterId, node: &NodeId) -> Result<Self> {
+        fn prepare(
+            clock: &WallClock,
+            bundle: &'a KeyringBundle,
+            cluster: &ClusterId,
+            node: &NodeId,
+        ) -> Result<Self> {
             if bundle.schema_version != SCHEMA_VERSION
                 || &bundle.cluster != cluster
                 || bundle.cache_keys.len() > 4096
@@ -1465,7 +1543,7 @@ pub mod identity {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            root_store(&bundle.peer_trust_roots)?;
+            root_store(clock, &bundle.peer_trust_roots)?;
             let mut hash = Sha256::new();
             hash.update(b"racer/keyring/bundle/v1\0");
             hash.update((bundle.peer_trust_roots.len() as u64).to_be_bytes());
@@ -1620,12 +1698,13 @@ pub mod identity {
             }
             let roots = self.peer_trust_roots()?;
             let verified = verify_chain(
+                self.epochs.clock(),
                 &roots,
                 identity.certificate_chain(),
                 &self.cluster,
                 &self.node,
             )?;
-            let checked = unix_time().as_secs();
+            let checked = self.epochs.clock().unix_time().as_secs();
             let mut state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
             if !state
                 .published
@@ -1651,7 +1730,7 @@ pub mod identity {
             if identity.node() != &self.node || identity.cluster() != &self.cluster {
                 return Err(Error::Unauthorized);
             }
-            let now = unix_time().as_secs();
+            let now = self.epochs.clock().unix_time().as_secs();
             let identity = identity.clone();
             let published = state.published.as_ref().ok_or(Error::MissingKey)?;
             if Arc::ptr_eq(&installed.roots, &published.roots)
@@ -1663,6 +1742,7 @@ pub mod identity {
             let roots = published.roots.clone();
             drop(state);
             let verified = verify_chain(
+                self.epochs.clock(),
                 &roots,
                 identity.certificate_chain(),
                 &self.cluster,
@@ -1761,19 +1841,9 @@ pub mod identity {
         (reference_group(reference), reference.id.0)
     }
 
-    /// Scoped wall time for rustls, clamped to the Unix epoch for pre-epoch clocks.
-    /// This retains rustls's whole-second truncation and does not set certificate policy.
-    pub fn unix_time() -> rustls::pki_types::UnixTime {
-        rustls::pki_types::UnixTime::since_unix_epoch(
-            environment::wall_now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Shared enrollment/activation policy for bounded roots, client-auth chains,
-    /// canonical node URI, and a non-CA Ed25519 leaf without certificate-signing usage.
-    pub(super) fn verify_chain(
+    /// Validate a node client-auth chain against roots at the clock's current time.
+    pub fn verify_chain(
+        clock: &WallClock,
         roots: &[Vec<u8>],
         chain: &[Vec<u8>],
         cluster: &ClusterId,
@@ -1787,7 +1857,7 @@ pub mod identity {
             return Err(Error::Unauthorized);
         }
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store(roots)?),
+            Arc::new(root_store(clock, roots)?),
             Arc::new(rustls::crypto::ring::default_provider()),
         )
         .build()
@@ -1798,7 +1868,7 @@ pub mod identity {
             .map(|c| CertificateDer::from(c.as_slice()))
             .collect();
         verifier
-            .verify_client_cert(&leaf, &intermediates, unix_time())
+            .verify_client_cert(&leaf, &intermediates, clock.unix_time())
             .map_err(|_| Error::Unauthorized)?;
         let (rest, cert) = parse_x509_certificate(&chain[0]).map_err(|_| Error::Unauthorized)?;
         if !rest.is_empty()
@@ -1859,7 +1929,7 @@ pub mod identity {
     }
 
     /// Parse bounded CA roots and require every configured root to be valid now.
-    pub(super) fn root_store(roots: &[Vec<u8>]) -> Result<RootCertStore> {
+    pub fn root_store(clock: &WallClock, roots: &[Vec<u8>]) -> Result<RootCertStore> {
         if roots.is_empty() || roots.len() > 32 {
             return Err(Error::Unauthorized);
         }
@@ -1869,7 +1939,7 @@ pub mod identity {
                 return Err(Error::Unauthorized);
             }
             let (rest, cert) = parse_x509_certificate(root).map_err(|_| Error::Unauthorized)?;
-            let now = unix_time().as_secs();
+            let now = clock.unix_time().as_secs();
             let now = i64::try_from(now).map_err(|_| Error::Unauthorized)?;
             let now = x509_parser::time::ASN1Time::from_timestamp(now)
                 .map_err(|_| Error::Unauthorized)?;
@@ -2087,13 +2157,16 @@ pub mod identity {
         /// Cached chains still require current roots, time, exact bytes, and signatures.
         #[test]
         fn cache_requires_exact_chain_current_trust_time_and_fresh_signature() {
-            let clock = environment::SimulationClock::new(93);
-            let _environment = clock.environment(0).enter();
+            let wall = Arc::new(Mutex::new(std::time::SystemTime::now()));
+            let clock = {
+                let wall = wall.clone();
+                WallClock::new(move || *wall.lock().unwrap())
+            };
             let (pending, chain, roots) = issued();
             let keys = Rc::new(Keyring::new(
                 ClusterId(CLUSTER.into()),
                 NodeId(NODE.into()),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(clock.clone())),
             ));
             let bundle = |generation, roots| racer_control_wire::KeyringBundle {
                 schema_version: racer_control_wire::SCHEMA_VERSION,
@@ -2109,6 +2182,7 @@ pub mod identity {
                     NodeId(NODE.into()),
                     chain.clone(),
                     &roots,
+                    &clock,
                 )
                 .unwrap();
             let certs = Certificates::new(ClusterId(CLUSTER.into()), keys.clone());
@@ -2127,13 +2201,12 @@ pub mod identity {
             let mut changed = chain.clone();
             changed[0].push(0);
             assert!(certs.verify(&changed, &node).is_err());
-            let original = environment::wall_now();
+            let original = clock.now();
             let (_, until) = validity(chain.iter().chain(roots.iter())).unwrap();
-            clock.set_wall_time(
-                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(until + 1),
-            );
+            *wall.lock().unwrap() =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(until + 1);
             assert!(certs.verify(&chain, &node).is_err());
-            clock.set_wall_time(original);
+            *wall.lock().unwrap() = original;
             certs.verify(&chain, &node).unwrap();
             let (_, _, replacement) = issued();
             keys.install(bundle(2, replacement)).unwrap();
@@ -2620,6 +2693,7 @@ pub mod identity {
                         NodeId(NODE.into()),
                         chain,
                         &roots,
+                        &WallClock::host(),
                     )
                     .unwrap(),
             );

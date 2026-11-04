@@ -535,6 +535,7 @@ pub(crate) mod tests {
                 wire::NodeId(NODE.into()),
                 real,
                 &[issuer.der().to_vec()],
+                &racer_crypto::identity::WallClock::host(),
             )
             .unwrap();
         // Wrong cluster and unknown root.

@@ -163,14 +163,14 @@ impl From<racer_crypto::identity::BundleError> for Error {
     }
 }
 
-impl From<racer_crypto::enrollment::Error> for Error {
-    fn from(error: racer_crypto::enrollment::Error) -> Self {
+impl From<crate::enrollment::Error> for Error {
+    fn from(error: crate::enrollment::Error) -> Self {
         match error {
-            racer_crypto::enrollment::Error::Unauthorized => Self::Unauthorized,
-            racer_crypto::enrollment::Error::CorruptRecord => Self::CorruptRecord,
-            racer_crypto::enrollment::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            racer_crypto::enrollment::Error::Io => Self::Io,
-            racer_crypto::enrollment::Error::Wire(error) => error.into(),
+            crate::enrollment::Error::Unauthorized => Self::Unauthorized,
+            crate::enrollment::Error::CorruptRecord => Self::CorruptRecord,
+            crate::enrollment::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            crate::enrollment::Error::Io => Self::Io,
+            crate::enrollment::Error::Wire(error) => error.into(),
         }
     }
 }
@@ -356,7 +356,7 @@ mod tests {
     /// Foundation errors retain authentication and wire distinctions.
     #[test]
     fn control_foundation_errors_preserve_boundary_meanings() {
-        use racer_crypto::enrollment::Error as Enrollment;
+        use crate::enrollment::Error as Enrollment;
         use racer_crypto::identity::BundleError;
         use uring_runtime::reactor::filesystem::secure::AccessError;
         for (source, expected) in [

@@ -11,6 +11,7 @@ pub mod app;
 pub mod client;
 pub mod config;
 pub mod control;
+pub mod enrollment;
 pub mod error;
 pub mod gpu;
 pub mod gpu_slot;

@@ -47,7 +47,9 @@ const CACHE: &str = "33333333-3333-4333-8333-333333333333";
 fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() {
     let cluster = ClusterId(CLUSTER.into());
     let node = NodeId(NODE.into());
-    let epochs = Arc::new(KeyEpochs::default());
+    let epochs = Arc::new(KeyEpochs::with_clock(
+        racer::enrollment::migration_wall_clock(),
+    ));
     let publisher = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
     let worker = Rc::new(Keyring::new(cluster.clone(), node.clone(), epochs.clone()));
     let foreign = Keyring::new(ClusterId(CACHE.into()), node.clone(), epochs.clone());
@@ -62,7 +64,13 @@ fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() 
     let roots = vec![ca.der().to_vec()];
     let identity = Arc::new(
         pending
-            .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
+            .accept(
+                cluster.clone(),
+                node.clone(),
+                chain.clone(),
+                &roots,
+                &racer::enrollment::migration_wall_clock(),
+            )
             .unwrap(),
     );
     let installer = BundleInstaller::new(publisher.clone());
@@ -138,7 +146,9 @@ fn fixture() -> (Rc<Keyring>, BundleInstaller, KeyringBundle) {
     let keys = Rc::new(Keyring::new(
         ClusterId(CLUSTER.into()),
         NodeId(NODE.into()),
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            racer::enrollment::migration_wall_clock(),
+        )),
     ));
     let installer = BundleInstaller::new(keys.clone());
     let bundle = KeyringBundle {

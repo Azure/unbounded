@@ -33,12 +33,20 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
             let node = node(i);
             let (pending, chain) = issue(&ca, &key, &cluster, &node, |_| {});
             let identity = pending
-                .accept(cluster.clone(), node.clone(), chain, &roots)
+                .accept(
+                    cluster.clone(),
+                    node.clone(),
+                    chain,
+                    &roots,
+                    &racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+                )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node,
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(
+                    racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+                )),
             ));
             keys.install(KeyringBundle {
                 schema_version: SCHEMA_VERSION,

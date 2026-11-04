@@ -8,12 +8,12 @@
 //! returning an identity. Cancellation and abandoned writes are fenced through
 //! the caller's host; transport retries and inventory remain application policy.
 
-use crate::identity;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire::{
     self as wire, ClusterId, EnrollmentId, EnrollmentRequest, EnrollmentResponse, NodeId,
     RailMapping,
 };
+use racer_crypto::identity;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
@@ -30,6 +30,13 @@ use uring_runtime::{
     },
 };
 use zeroize::{Zeroize, Zeroizing};
+
+/// MIGRATION: bridges the ambient `uring_runtime` wall clock (virtual under
+/// simulation) into racer-crypto's injected clock. Replace with the node's
+/// `racer_io::WorkerCtx` clock when the root crate moves to racer-io.
+pub fn migration_wall_clock() -> identity::WallClock {
+    identity::WallClock::new(uring_runtime::environment::wall_now)
+}
 
 /// Enrollment validation failures, separate from caller-owned filesystem errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,7 +200,7 @@ impl<H: Host> Enrollment<H> {
 
     /// Validate all roots before atomically replacing the enrollment trust snapshot.
     pub fn set_peer_trust_roots(&self, roots: Vec<Vec<u8>>) -> Result<(), Error> {
-        identity::root_store(&roots).map_err(|_| Error::Unauthorized)?;
+        identity::root_store(&migration_wall_clock(), &roots).map_err(|_| Error::Unauthorized)?;
         *self.roots.borrow_mut() = roots;
         Ok(())
     }
@@ -291,6 +298,7 @@ impl<H: Host> Enrollment<H> {
             return Err(Error::Unauthorized);
         }
         let public = identity::verify_chain(
+            &migration_wall_clock(),
             &self.roots.borrow(),
             &r.certificate_chain,
             &self.cluster,
@@ -308,7 +316,7 @@ impl<H: Host> Enrollment<H> {
             return Err(Error::Unauthorized);
         }
         let private_material = decode_private_key(&p.private_key)?;
-        let key = crate::SigningKey::from_pkcs8_der(&private_material)
+        let key = racer_crypto::SigningKey::from_pkcs8_der(&private_material)
             .map_err(|_| Error::CorruptRecord)?;
         if public.key != key.verifying_key() {
             return Err(Error::Unauthorized);
@@ -535,6 +543,7 @@ impl LocalSigningIdentity {
             &self.private_material,
             self.certificate_chain.clone(),
             roots,
+            &migration_wall_clock(),
         )
         .map(Arc::new)
     }
@@ -636,7 +645,8 @@ fn decode_private_key(encoded: &EncodedPrivateKey) -> Result<Zeroizing<Vec<u8>>,
 fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error> {
     use x509_parser::prelude::FromDer;
     let secret = decode_private_key(&pending.private_key)?;
-    let key = crate::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
+    let key =
+        racer_crypto::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
     let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr)
         .map_err(|_| Error::CorruptRecord)?;
     if csr

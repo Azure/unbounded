@@ -159,7 +159,13 @@ pub fn signing_identity(
     );
     std::sync::Arc::new(
         pending
-            .accept(cluster, node, chain, &[ca.der().to_vec()])
+            .accept(
+                cluster,
+                node,
+                chain,
+                &[ca.der().to_vec()],
+                &racer_crypto::identity::WallClock::new(uring_runtime::environment::wall_now),
+            )
             .unwrap(),
     )
 }

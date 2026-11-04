@@ -493,7 +493,9 @@ fn interop_keys() -> racer_crypto::identity::Keyring {
     let keys = Keyring::new(
         cluster.clone(),
         NodeId("22222222-2222-4222-8222-222222222222".into()),
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            crate::enrollment::migration_wall_clock(),
+        )),
     );
     let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

@@ -870,7 +870,9 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
     let keys = Rc::new(Keyring::new(
         ClusterId(CLUSTER.into()),
         NodeId(NODE.into()),
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            racer::enrollment::migration_wall_clock(),
+        )),
     ));
     // The wire fixture reuses material across purposes; the real keyring
     // requires distinct material. These are deterministic test-only keys.
@@ -908,7 +910,9 @@ fn identities(bundle: &mut serde_json::Value, keys: &Keyring) -> Rc<Keyring> {
     let sender = Rc::new(Keyring::new(
         ClusterId(CLUSTER.into()),
         NodeId(REQUESTER.into()),
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            racer::enrollment::migration_wall_clock(),
+        )),
     ));
     for keyring in [keys, sender.as_ref()] {
         keyring

@@ -853,7 +853,9 @@ pub(crate) mod security {
         let keys = Keyring::new(
             ClusterId(CLUSTER.into()),
             NodeId(NODE.into()),
-            Arc::new(KeyEpochs::default()),
+            Arc::new(KeyEpochs::with_clock(
+                crate::enrollment::migration_wall_clock(),
+            )),
         );
         let mut initial = rotation_bundle(1, roots);
         // rotation_bundle(1) intentionally has different suffixes and material,
@@ -963,12 +965,20 @@ pub(crate) mod security {
             .map(|node| {
                 let (pending, chain) = issue(&ca, &ca_key, &cluster, node, |_| {});
                 let identity = pending
-                    .accept(cluster.clone(), node.clone(), chain, &roots)
+                    .accept(
+                        cluster.clone(),
+                        node.clone(),
+                        chain,
+                        &roots,
+                        &crate::enrollment::migration_wall_clock(),
+                    )
                     .unwrap();
                 let keys = Rc::new(Keyring::new(
                     cluster.clone(),
                     node.clone(),
-                    Arc::new(KeyEpochs::default()),
+                    Arc::new(KeyEpochs::with_clock(
+                        crate::enrollment::migration_wall_clock(),
+                    )),
                 ));
                 keys.install(KeyringBundle {
                     schema_version: SCHEMA_VERSION,

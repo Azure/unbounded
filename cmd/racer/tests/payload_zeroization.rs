@@ -228,7 +228,9 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     let keys = Keyring::new(
         ClusterId("11111111-1111-4111-8111-111111111111".into()),
         NodeId("22222222-2222-4222-8222-222222222222".into()),
-        Arc::new(KeyEpochs::default()),
+        Arc::new(KeyEpochs::with_clock(
+            racer::enrollment::migration_wall_clock(),
+        )),
     );
     let mut bundle: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),

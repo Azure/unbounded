@@ -85,8 +85,8 @@ mod tests {
     //! Journal durability and abandoned-attempt fencing before enrollment.
 
     use super::*;
+    use crate::enrollment::Enrollment;
     use crate::test_support::enrollment::drive;
-    use racer_crypto::enrollment::Enrollment;
     use std::{
         num::NonZeroU32,
         path::Path,

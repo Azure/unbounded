@@ -484,6 +484,7 @@ pub(crate) mod tests {
     //! Control transport, publication, and durable identity lifecycle scenarios.
 
     use super::*;
+    use crate::enrollment::{Enrollment, LocalSigningIdentity};
     use crate::test_support::enrollment as testing;
     use crate::test_support::projected_file;
     use futures::TryFutureExt;
@@ -493,7 +494,6 @@ pub(crate) mod tests {
     use racer_control_wire::encode_enrollment_request;
     use racer_control_wire::encode_publication;
     use racer_control_wire::validate_definitions;
-    use racer_crypto::enrollment::{Enrollment, LocalSigningIdentity};
     use std::num::NonZeroU32;
 
     #[test]
@@ -641,7 +641,9 @@ pub(crate) mod tests {
             let keys = Rc::new(Keyring::new(
                 publication.cluster,
                 publication.members[0].node.clone(),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(
+                    crate::enrollment::migration_wall_clock(),
+                )),
             ));
             let installer = BundleInstaller::new(keys.clone());
             let (ca, _) = testing::ca();
@@ -763,7 +765,9 @@ pub(crate) mod tests {
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 NodeId("22222222-2222-4222-8222-222222222222".into()),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(
+                    crate::enrollment::migration_wall_clock(),
+                )),
             ));
             Session::new(
                 ControlEndpoint {

@@ -499,12 +499,20 @@ pub(crate) mod tests {
             let cluster = ClusterId(CLUSTER.into());
             let node = NodeId(NODE.into());
             let identity = pending
-                .accept(cluster.clone(), node.clone(), chain, &roots)
+                .accept(
+                    cluster.clone(),
+                    node.clone(),
+                    chain,
+                    &roots,
+                    &crate::enrollment::migration_wall_clock(),
+                )
                 .unwrap();
             let keys = Rc::new(Keyring::new(
                 cluster.clone(),
                 node.clone(),
-                Arc::new(KeyEpochs::default()),
+                Arc::new(KeyEpochs::with_clock(
+                    crate::enrollment::migration_wall_clock(),
+                )),
             ));
             keys.install(KeyringBundle {
                 schema_version: SCHEMA_VERSION,

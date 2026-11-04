@@ -899,7 +899,9 @@ mod router {
             Rc::new(racer_crypto::identity::Keyring::new(
                 ClusterId("cluster".into()),
                 node.clone(),
-                Arc::new(racer_crypto::identity::KeyEpochs::default()),
+                Arc::new(racer_crypto::identity::KeyEpochs::with_clock(
+                    crate::enrollment::migration_wall_clock(),
+                )),
             )),
             h.admission.clone(),
         ));
