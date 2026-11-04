@@ -259,7 +259,11 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
 		var err error
 
-		isBootLoader, err = h.isHTTPBootLoaderDownload(r.Context(), src, path)
+		// Classify with the netboot image, which holds the metadata, rather
+		// than the per-path source. For disk.img.gz the source is the OS
+		// image, and searching it for metadata.yaml would index its large
+		// layers under the metadata fetch timeout.
+		isBootLoader, err = h.isHTTPBootLoaderDownload(r.Context(), h.NetbootImageSource(node), path)
 		if err != nil {
 			// Without metadata the request cannot be classified, and serving
 			// it could hand out the boot loader with no active install. Fail

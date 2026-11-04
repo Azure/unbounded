@@ -4081,3 +4081,60 @@ func TestHTTPServer_HTTPBootWithoutMetadataServesFiles(t *testing.T) {
 	require.Equal(t, []byte("kernel"), body)
 	require.Empty(t, recorder.bootLoaderEvents())
 }
+
+func TestHTTPServer_DiskDownloadClassifiedWithNetbootImage(t *testing.T) {
+	images := newTestImages(t)
+	images.Push(t, "ghcr.io/test/os:v1", map[string][]byte{"disk.img.gz": []byte("disk")})
+	images.Push(t, "ghcr.io/test/netboot:v1", map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-split"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:        "ghcr.io/test/os:v1",
+			NetbootImage: "ghcr.io/test/netboot:v1",
+			BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+			DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:11", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	srv := &HTTPServer{FileResolver: FileResolver{Puller: images.Puller, Reader: fc, Metadata: &MetadataMemo{}}}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.RemoteAddr = "10.0.1.61:4321"
+		w := httptest.NewRecorder()
+		normalizePath(http.HandlerFunc(srv.handleFile)).ServeHTTP(w, r)
+
+		return w
+	}
+
+	// A metadata lookup against the OS image would fail; the disk download
+	// must not depend on it.
+	_, err := srv.Metadata.get(t.Context(), DiskImageSource(node), func(context.Context, ImageSource) (*ImageMetadata, error) {
+		return nil, fmt.Errorf("%w: disk metadata timed out", ErrImageUnavailable)
+	})
+	require.Error(t, err)
+
+	w := get("/disk.img.gz")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "disk", w.Body.String())
+
+	// The boot loader is still classified from the netboot image and gated.
+	w = get("/shimx64.efi")
+	require.Equal(t, http.StatusNotFound, w.Code)
+
+	// A netboot metadata failure fails the disk download closed too.
+	srv.Metadata = &MetadataMemo{}
+	_, err = srv.Metadata.get(t.Context(), srv.NetbootImageSource(node), func(context.Context, ImageSource) (*ImageMetadata, error) {
+		return nil, fmt.Errorf("%w: registry down", ErrImageUnavailable)
+	})
+	require.Error(t, err)
+
+	w = get("/disk.img.gz")
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
