@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 pub mod budget;
+pub mod cohort;
 pub mod errors;
 pub mod flight;
 pub mod hints;
