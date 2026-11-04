@@ -166,6 +166,15 @@ impl GpuTelemetry {
                 helper.free_slots(device.ordinal)
             )?;
         }
+        writeln!(out, "# TYPE racer_gpu_executor_queued gauge")?;
+        for device in helper.devices() {
+            writeln!(
+                out,
+                "racer_gpu_executor_queued{{ordinal=\"{}\"}} {}",
+                device.ordinal,
+                helper.queued(device.ordinal)
+            )?;
+        }
         let counters = helper.counters();
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         writeln!(
@@ -242,6 +251,11 @@ impl GpuTelemetry {
                 "racer_gpu_peer_bounces_total",
                 "counter",
                 load(&counters.peer_bounces),
+            ),
+            (
+                "racer_gpu_executor_queue_full_total",
+                "counter",
+                load(&counters.queue_full),
             ),
             (
                 "racer_gpu_open_requests",
@@ -389,6 +403,8 @@ mod tests {
             "racer_gpu_standby",
             "racer_gpu_decrypt_available",
             "racer_gpu_staging_slots_free",
+            "racer_gpu_executor_queued",
+            "racer_gpu_executor_queue_full_total",
             "racer_gpu_cufile_enabled",
             "racer_gpu_cufile_disabled_total",
             "racer_gpu_read_pages_total",

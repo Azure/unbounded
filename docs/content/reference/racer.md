@@ -1393,6 +1393,7 @@ The rest are reported only when `racer_gpu_enabled` is 1:
 |--------|------|---------|
 | `racer_gpu_decrypt_available{ordinal,uuid}` | gauge | 1 when the GPU can decrypt sealed pages. 0 means pages for it are decrypted by the CPU. |
 | `racer_gpu_staging_slots_free{ordinal}` | gauge | Free cuFile staging slots on the GPU. |
+| `racer_gpu_executor_queued{ordinal}` | gauge | Pages queued or running on the GPU's executor. |
 | `racer_gpu_cufile_enabled` | gauge | 1 while cuFile reads are on. A driver-level failure turns it off until restart. |
 | `racer_gpu_cufile_disabled_total{reason}` | counter | Times cuFile was turned off for the node: `driver_open`, `staging_register`, or `file_open` (a file registration error other than unsupported). |
 | `racer_gpu_cufile_unsupported_total` | counter | Devices (`st_dev`) whose files cuFile reported as unsupported. Files on such a device are read through host memory; cuFile stays on for other devices. |
@@ -1406,6 +1407,7 @@ The rest are reported only when `racer_gpu_enabled` is 1:
 | `racer_gpu_peer_copy_bytes_total` | counter | Encrypted bytes copied between GPUs over a peer path. |
 | `racer_gpu_peer_failures_total` | counter | Peer copies that failed. Each turns that GPU pair's peer path off until restart. |
 | `racer_gpu_peer_bounces_total` | counter | Encrypted pages moved from another GPU through host memory, because the pair has no peer path or it was turned off. |
+| `racer_gpu_executor_queue_full_total` | counter | Pages refused because their GPU's executor queue was full. The read fails as overloaded. |
 | `racer_gpu_open_requests` | gauge | `gpu-read` requests that hold GPU resources now. |
 | `racer_gpu_leaked_resources` | gauge | GPU resources leaked on purpose after a failed release. |
 
