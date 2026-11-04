@@ -600,6 +600,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 &mut **shared.rng.borrow_mut(),
             )?
         };
+        log_rejected_caches(&plan.rejected_caches);
         if plan.refused_roots > 0 {
             // Root slots are full. Those seats stay unready until slots free up.
             shared.last_error.set(Some(crate::Error::Unavailable));
@@ -1207,4 +1208,20 @@ mod seat_ready_tests {
         assert!(!seat_ready(Some("6"), Some(5), Some(4)));
         assert!(!seat_ready(Some("5"), None, Some(4)));
     }
+}
+
+/// Report ClusterCaches left out for an invalid `spec.nodeSelector`, once per
+/// change of the set so a steady state does not repeat on every pass.
+fn log_rejected_caches(rejected: &[String]) {
+    thread_local! {
+        static LAST: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    LAST.with_borrow_mut(|last| {
+        if last.as_slice() != rejected {
+            for name in rejected.iter().filter(|n| !last.contains(n)) {
+                eprintln!("racer: ClusterCache {name} left out: invalid spec.nodeSelector");
+            }
+            *last = rejected.to_vec();
+        }
+    });
 }

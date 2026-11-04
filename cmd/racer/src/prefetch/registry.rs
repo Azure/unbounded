@@ -810,25 +810,41 @@ impl Registry {
     }
 
     /// Re-plan after a membership change: admitted pages of live tickets
-    /// whose owner left are queued again.
-    pub fn requeue_departed(&mut self, is_member: impl Fn(&NodeId) -> bool) {
+    /// whose owner no longer serves the page's cache are queued again. An
+    /// owner can leave a cache's pool and still be a cluster member.
+    pub fn requeue_departed(&mut self, serves: impl Fn(&CacheId, &NodeId) -> bool) {
+        let keys: Vec<UnitKey> = self.units.keys().cloned().collect();
+        self.requeue_departed_among(keys.iter(), serves);
+    }
+
+    /// Like [`Self::requeue_departed`], but only checks `keys`. The pump runs
+    /// this on just-completed units so a fill that lands after its owner left
+    /// the pool is not left settled against that owner.
+    pub fn requeue_departed_among<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a UnitKey>,
+        serves: impl Fn(&CacheId, &NodeId) -> bool,
+    ) {
         let mut requeued = Vec::new();
-        for (key, unit) in &mut self.units {
+        for key in keys {
+            let Some(unit) = self.units.get_mut(key) else {
+                continue;
+            };
             if unit.state == UnitState::Admitted
-                && unit.owner.as_ref().is_some_and(|owner| !is_member(owner))
+                && unit
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| !serves(&key.version.object.cache, owner))
                 && !unit.interest.is_empty()
             {
                 unit.state = UnitState::Queued;
                 unit.attempts = 0;
                 unit.not_before = None;
                 unit.owner = None;
-                requeued.push((
-                    key.clone(),
-                    unit.interest.iter().cloned().collect::<Vec<_>>(),
-                ));
+                requeued.push(unit.interest.iter().cloned().collect::<Vec<_>>());
             }
         }
-        for (_, interested) in requeued {
+        for interested in requeued {
             self.pending_bytes += page_bytes();
             for key in interested {
                 if let Some(ticket) = self.tickets.get_mut(&key) {

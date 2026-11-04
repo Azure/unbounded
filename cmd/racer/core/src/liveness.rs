@@ -294,6 +294,151 @@ fn holds<P>(e: &SilenceEntry<P>, now: Instant) -> bool {
     e.silent && now.saturating_duration_since(e.last) <= SILENCE_TTL
 }
 
+/// How long a detour lasts after the last unanswered exchange that set or renewed it.
+pub const DETOUR_TTL: Duration = SILENCE_TTL;
+
+/// Highest detour level: 1 skips the primary relay, 2 also skips the alternate relay.
+pub const MAX_DETOUR: u8 = 2;
+
+#[derive(Clone, Copy, Debug)]
+struct Detour {
+    level: u8,
+    /// When the current level began. Only exchanges sent after it can raise it.
+    since: Instant,
+    last: Instant,
+    seq: u64,
+}
+
+/// Mesh v2 routes to a destination over one fixed relay, so a hung relay eats every exchange
+/// and every retry. A requester whose exchange with a destination went unanswered detours: its
+/// later routes to that destination skip the primary relay and take the disjoint alternate
+/// (level 1). An exchange sent on the detour that also goes unanswered skips the alternate relay
+/// too (level 2, the 3-link fallbacks). Answers do not end a detour, since an answer over the
+/// alternate says nothing about the primary relay; it expires [`DETOUR_TTL`] after the last
+/// timeout. A direct link is never detoured.
+pub struct Detours<N> {
+    capacity: usize,
+    entries: HashMap<N, Detour>,
+    seq: u64,
+}
+
+impl<N: Eq + Hash + Clone> Detours<N> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: HashMap::new(),
+            seq: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// An exchange with `peer` sent at `sent` ended unanswered at `now`.
+    pub fn timed_out(&mut self, peer: N, sent: Instant, now: Instant) {
+        if let Some(entry) = self.entries.get_mut(&peer)
+            && now.saturating_duration_since(entry.last) <= DETOUR_TTL
+        {
+            if sent >= entry.since && entry.level < MAX_DETOUR {
+                entry.level += 1;
+                entry.since = now;
+            }
+            entry.last = entry.last.max(now);
+            return;
+        }
+        self.entries.remove(&peer);
+        self.make_room(now);
+        self.entries.insert(
+            peer,
+            Detour {
+                level: 1,
+                since: now,
+                last: now,
+                seq: self.seq,
+            },
+        );
+        self.seq += 1;
+    }
+
+    /// The detour level for routes to `peer` (0 for none).
+    pub fn level(&self, peer: &N, now: Instant) -> u8 {
+        self.entries
+            .get(peer)
+            .filter(|e| now.saturating_duration_since(e.last) <= DETOUR_TTL)
+            .map_or(0, |e| e.level)
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&N) -> bool) {
+        self.entries.retain(|n, _| keep(n));
+    }
+
+    fn make_room(&mut self, now: Instant) {
+        if self.entries.len() < self.capacity {
+            return;
+        }
+        self.entries
+            .retain(|_, e| now.saturating_duration_since(e.last) <= DETOUR_TTL);
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| (e.last, e.seq))
+                .map(|(n, _)| n.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
+mod detour_tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_raise_the_level_only_for_exchanges_sent_on_the_detour() {
+        let t = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut d = Detours::new(4);
+        assert_eq!(d.level(&1, t), 0);
+        d.timed_out(1, t, t + s);
+        assert_eq!(d.level(&1, t + s), 1);
+        // Sent before the detour began: an older primary exchange, not evidence against the
+        // alternate.
+        d.timed_out(1, t, t + 2 * s);
+        assert_eq!(d.level(&1, t + 2 * s), 1);
+        d.timed_out(1, t + s, t + 3 * s);
+        assert_eq!(d.level(&1, t + 3 * s), 2);
+        d.timed_out(1, t + 3 * s, t + 4 * s);
+        assert_eq!(d.level(&1, t + 4 * s), MAX_DETOUR);
+        assert_eq!(d.level(&2, t + 4 * s), 0);
+    }
+
+    #[test]
+    fn detours_expire_and_are_bounded() {
+        let t = Instant::now();
+        let mut d = Detours::new(2);
+        d.timed_out(1, t, t);
+        assert_eq!(d.level(&1, t + DETOUR_TTL), 1);
+        assert_eq!(d.level(&1, t + DETOUR_TTL + Duration::from_millis(1)), 0);
+        // An expired detour starts over at level 1.
+        let later = t + DETOUR_TTL * 2;
+        d.timed_out(1, later, later);
+        assert_eq!(d.level(&1, later), 1);
+        d.timed_out(2, later, later);
+        d.timed_out(3, later, later + Duration::from_millis(1));
+        assert_eq!(d.len(), 2);
+        assert_eq!(d.level(&1, later), 0, "the oldest entry is evicted");
+        d.retain(|&n| n != 2);
+        assert_eq!(d.len(), 1);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod silence_tests {

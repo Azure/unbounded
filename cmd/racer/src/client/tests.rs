@@ -2751,7 +2751,8 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
         state.clone(),
     ));
     let mut publication = Publication {
-        schema_version: 1,
+        pools: Vec::new(),
+        schema_version: racer_control_wire::SCHEMA_VERSION,
         cluster: keys.cluster().clone(),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
@@ -2763,7 +2764,8 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
             site: String::new(),
         }],
         caches: vec![definition()],
-    };
+    }
+    .with_default_pool();
     snapshots.apply(publication.clone()).unwrap();
     let reads = &fixture.listeners.reads;
     fixture.listeners.reads = Rc::new(crate::read::Coordinator::new(
@@ -2779,6 +2781,8 @@ fn production_snapshot_replacement_rejects_old_backlog_uid_with_503() {
     socket.write_all(&request("HEAD", "")).unwrap();
     publication.sequence = PublicationSequence(2);
     publication.caches[0].id = CacheId("00000000-0000-4000-8000-000000000003".into());
+    publication.pools = racer_control_wire::default_pools(&publication.caches);
+    publication.membership_version.0 += 1;
     let transition =
         futures::executor::block_on(fixture.listeners.prepare(&publication.caches, &scope()))
             .unwrap();

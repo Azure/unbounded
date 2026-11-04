@@ -63,35 +63,39 @@ impl Control {
             getrandom::getrandom(&mut material).unwrap();
             serde_json::json!({"cache": cache, "id": STANDARD.encode(wire::KeyId::from_generation(1, id as u32).unwrap().0), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
         })).collect();
-        let bundle = serde_json::json!({"schema_version": 1, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
+        let bundle = serde_json::json!({"schema_version": racer_control_wire::SCHEMA_VERSION, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
         let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
-        let publication = Arc::new(Mutex::new(wire::Publication {
-            schema_version: 1,
-            cluster: ClusterId(CLUSTER.into()),
-            sequence: wire::PublicationSequence(1),
-            membership_version: MembershipVersion(1),
-            members: vec![Member {
-                node: NodeId(NODE.into()),
-                shares: NonZeroU32::new(1).unwrap(),
-                peer_endpoint: "127.0.0.1:7443".into(),
-                rails: vec![],
-                site: String::new(),
-            }],
-            caches: caches
-                .into_iter()
-                .map(|(id, name)| {
-                    let (client_socket, origin_socket) = canonical_socket_paths(&name).unwrap();
-                    CacheDefinition {
-                        id: CacheId(id),
-                        name,
-                        client_socket,
-                        origin_socket,
-                        priority: racer_control_wire::DEFAULT_PRIORITY,
-                        mode: racer_control_wire::CacheMode::Cached,
-                    }
-                })
-                .collect(),
-        }));
+        let publication = Arc::new(Mutex::new(
+            wire::Publication {
+                pools: Vec::new(),
+                schema_version: racer_control_wire::SCHEMA_VERSION,
+                cluster: ClusterId(CLUSTER.into()),
+                sequence: wire::PublicationSequence(1),
+                membership_version: MembershipVersion(1),
+                members: vec![Member {
+                    node: NodeId(NODE.into()),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+                caches: caches
+                    .into_iter()
+                    .map(|(id, name)| {
+                        let (client_socket, origin_socket) = canonical_socket_paths(&name).unwrap();
+                        CacheDefinition {
+                            id: CacheId(id),
+                            name,
+                            client_socket,
+                            origin_socket,
+                            priority: racer_control_wire::DEFAULT_PRIORITY,
+                            mode: racer_control_wire::CacheMode::Cached,
+                        }
+                    })
+                    .collect(),
+            }
+            .with_default_pool(),
+        ));
         let published = publication.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
@@ -193,7 +197,7 @@ impl Control {
                         200,
                         wire::encode_enrollment_response(&wire::EnrollmentResponse {
                             block_devices: None,
-                            schema_version: 1,
+                            schema_version: racer_control_wire::SCHEMA_VERSION,
                             cluster: request.cluster,
                             node: NodeId(node.into()),
                             enrollment: request.enrollment,

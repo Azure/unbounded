@@ -236,3 +236,174 @@ fn bad_bodies_and_draining_nodes_get_json_errors() {
     assert_eq!(json(&response)["code"], "unavailable");
     endpoint.uninstall().unwrap();
 }
+
+/// Two members where the fixture cache's selector pool holds only `pool`.
+/// Publishes the same pools from `f`.
+fn pooled_membership(
+    f: &mut Fixture,
+    signers: &[Rc<crate::peer::protocol::Signatures>],
+    pool: &[usize],
+) -> std::sync::Arc<crate::topology::Membership> {
+    use crate::topology::Member;
+    use racer_control_wire::{MembershipVersion, Pool, PoolId};
+    let mut nodes: Vec<_> = signers.iter().map(|s| s.node().clone()).collect();
+    nodes.sort();
+    let members = nodes
+        .iter()
+        .map(|node| Member {
+            node: node.clone(),
+            shares: std::num::NonZeroU32::new(1).unwrap(),
+            peer_endpoint: "127.0.0.1:8000".into(),
+            rails: vec![],
+            site: String::new(),
+        })
+        .collect();
+    let mut selected: Vec<u32> = pool
+        .iter()
+        .map(|&i| nodes.iter().position(|n| n == signers[i].node()).unwrap() as u32)
+        .collect();
+    selected.sort();
+    let pools = vec![Pool {
+        id: PoolId("sel-0123456789abcdef0123456789abcdef".into()),
+        rank: 1 << 32,
+        members: Some(selected),
+        caches: vec![f.context.object.cache.clone()],
+    }];
+    f.pools = Some(pools.clone());
+    std::sync::Arc::new(
+        crate::topology::Membership::validate_with_pools(
+            MembershipVersion(1),
+            members,
+            pools,
+            None,
+        )
+        .unwrap(),
+    )
+}
+
+/// A lagging sender that still carries a retained membership in which this
+/// node was a pool member is refused once the current membership moved this
+/// node out of the cache's pool.
+#[test]
+fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let retained = pooled_membership(&mut f, &signers, &[0]);
+    let current = pooled_membership(&mut f, &signers, &[1]);
+    assert!(retained.serves(&f.context.object.cache, signers[0].node()));
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &current, NoPeer::requester());
+    let context = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    for action in [
+        crate::peer::protocol::PrefetchAction::Probe { pages: vec![0] },
+        crate::peer::protocol::PrefetchAction::Fill {
+            pages: vec![0],
+            length: PAGE_BYTES + 7,
+            content_type: None,
+            priority: racer_core::prefetch::Priority::default(),
+        },
+    ] {
+        let response = futures::executor::block_on(crate::prefetch::service::serve(
+            &local,
+            f.page.version.clone(),
+            action,
+            retained.clone(),
+            &context,
+            &f.scope,
+        ))
+        .unwrap();
+        assert!(matches!(response, PeerResponse::StaleMembership));
+    }
+    endpoint.uninstall().unwrap();
+}
+
+/// Pages are placed only over the cache's pool. With this node the only
+/// pool member, it owns every page, so no peer is asked.
+#[test]
+#[allow(clippy::disallowed_methods)] // Real disk writes need wall time.
+fn put_ranks_owners_only_within_the_cache_pool() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut f = fixture_with(4 * PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = pooled_membership(&mut f, &signers, &[0]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let body = put_body(&f);
+    let put = PrefetchRequest::Put {
+        id: "t".into(),
+        content_length: body.len() as u64,
+        authorization: None,
+    };
+    let response = run(&mut f, &mut endpoint, &local, put, body.as_bytes());
+    assert_eq!(status_code(&response), 201, "{:?}", json(&response));
+    let mut status = json(&response);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && status["settled"] != true {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        status = json(&run(&mut f, &mut endpoint, &local, get("t"), b""));
+    }
+    assert_eq!(status["state"], "SUCCEEDED", "{status}");
+    assert_eq!(status["bytes"]["fetched_from_origin"], 5 * PAGE_BYTES);
+    for _ in 0..256 {
+        pump_worker(&mut endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    }
+    endpoint.uninstall().unwrap();
+}
+
+/// A node outside the cache's pool neither accepts tickets nor fills pages
+/// for peers: a peer that ranked it as owner used a stale membership.
+#[test]
+fn a_node_outside_the_cache_pool_refuses_tickets_and_fills() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = pooled_membership(&mut f, &signers, &[1]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let body = put_body(&f);
+    let put = PrefetchRequest::Put {
+        id: "t".into(),
+        content_length: body.len() as u64,
+        authorization: None,
+    };
+    let response = run(&mut f, &mut endpoint, &local, put, body.as_bytes());
+    assert_eq!(status_code(&response), 503);
+    assert_eq!(json(&response)["code"], "unavailable");
+    let context = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    for action in [
+        crate::peer::protocol::PrefetchAction::Probe { pages: vec![0] },
+        crate::peer::protocol::PrefetchAction::Fill {
+            pages: vec![0],
+            length: PAGE_BYTES + 7,
+            content_type: None,
+            priority: racer_core::prefetch::Priority::default(),
+        },
+    ] {
+        let response = futures::executor::block_on(crate::prefetch::service::serve(
+            &local,
+            f.page.version.clone(),
+            action,
+            membership.clone(),
+            &context,
+            &f.scope,
+        ))
+        .unwrap();
+        assert!(matches!(response, PeerResponse::StaleMembership));
+    }
+    endpoint.uninstall().unwrap();
+}

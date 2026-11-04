@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; no `status` |
+| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; optional `spec.passthrough` to proxy reads without caching; optional `spec.nodeSelector` to limit the cache to some nodes; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -117,6 +117,28 @@ spec:
   pages that a node read from its own origin.
 - `spec.passthrough` can be added, changed, or removed at any time. When a cache
   switches to passthrough, data previously cached for it is dropped.
+
+### Node selector
+
+Set `spec.nodeSelector` to a label selector to choose which Racer nodes store,
+serve, and read the cache, by Node labels. Unset or empty means every Racer
+node.
+
+```yaml
+spec:
+  nodeSelector:
+    matchLabels:
+      pool: gpu
+```
+
+- Client pods that use the cache can be scheduled only on matching nodes. The
+  Racer admission webhook adds this restriction. A pod that sets
+  `spec.nodeName` skips the scheduler, so the webhook rejects it unless that
+  Node matches the selector.
+- A managed `spec.origin` runs only on matching nodes.
+- Changing the selector moves the cache to a new set of nodes. Cached data is
+  not moved; pages are read from the origin again. Prefetch tickets on nodes
+  that leave are canceled with `cache_removed`.
 
 The controller and dataplane must run the same version. A mismatched pair
 rejects the cache catalog.
@@ -689,7 +711,7 @@ bodies.
 | `409` | `cache_uid_mismatch`, `payload_mismatch`, `stale_sequence`, `stale_generation`, `passthrough` | See above. A `PUT` to a [passthrough](#passthrough) cache is `409 passthrough` |
 | `413` | `too_large` | Body over `RACER_PREFETCH_MAX_BODY_BYTES` or refs over `RACER_PREFETCH_MAX_REFS` |
 | `429` | `ticket_limit`, `pending_limit` | Node ticket or pending-byte limit. `Retry-After` gives the seconds to wait (currently 5) |
-| `503` | `unavailable` | Node is draining or the cache is not ready |
+| `503` | `unavailable` | Node is draining, the cache is not ready, or this node is not one of the cache's selected nodes |
 
 Before answering `429 ticket_limit`, Racer drops the oldest finished ticket to
 make room.
@@ -699,9 +721,10 @@ make room.
 - **Priority.** `high` goes before `normal`, and `normal` before `low`. Within a
   priority, tickets take turns. Within a ticket, refs go in order.
 - **Owners.** Each page goes to its first-ranked owner, which fills it through the
-  shared fill table and stores it with normal eviction. If membership changes,
-  queued pages go to the new owner, and stored pages of live tickets whose owner
-  left are queued again.
+  shared fill table and stores it with normal eviction. Owners are chosen only
+  from the cache's [node selector](#node-selector) nodes. If membership or the
+  selector changes, queued pages go to the new owner, and stored pages of live
+  tickets whose owner left the cluster or the cache's nodes are queued again.
 - **Shared work.** Tickets that want the same page share one fill.
 - **Demand reads come first.** A read that needs a page being prefetched joins
   that fill and takes it out of the prefetch limits. Queued prefetch work never
@@ -714,8 +737,8 @@ make room.
   `RACER_PREFETCH_MAX_ATTEMPTS` times per page. Then the ref fails with
   `budget_timeout` or `origin_error`.
 - **Cache changes.** Switching a cache to passthrough cancels its tickets
-  (`passthrough`). Removing the ClusterCache or changing its UID cancels them
-  (`cache_removed`).
+  (`passthrough`). Removing the ClusterCache, changing its UID, or a selector
+  change that drops this node cancels them (`cache_removed`).
 
 Read the prefetched data with the ETag from the ref status, or pin the ETag in
 the ref, so later reads select the same version.
@@ -1519,6 +1542,10 @@ while rails are active, and `racer_rdma_free_buffers` counts free page buffers.
 HTTP; `racer_rdma_fallback_no_link_total` and `racer_rdma_fallback_grant_total`
 split out the two common reasons: no ready link to the peer yet, and a grant that
 failed (usually because every page buffer was in use).
+`racer_rdma_fallback_overflow_total` counts page bodies received over HTTP because the hop
+qualified by Site and rail but was not among the 128 RDMA peers both nodes chose.
+The receiving node of each such hop counts each delivered body once. Requests that
+deliver no body, such as misses, overloads, and failed exchanges, do not count.
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json

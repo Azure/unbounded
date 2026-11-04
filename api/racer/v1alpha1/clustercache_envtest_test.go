@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -472,6 +473,22 @@ func TestEnvtestClusterCachePassthroughValidation(t *testing.T) {
 		cache := &ClusterCache{}
 		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
 		require.Nil(t, cache.Spec.Passthrough)
+		require.Nil(t, cache.Spec.NodeSelector)
+	})
+
+	t.Run("node selector round-trips", func(t *testing.T) {
+		name, err := create(map[string]any{"nodeSelector": map[string]any{
+			"matchLabels":      map[string]any{"pool": "gpu"},
+			"matchExpressions": []any{map[string]any{"key": "zone", "operator": "In", "values": []any{"a", "b"}}},
+		}})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.Equal(t, &metav1.LabelSelector{
+			MatchLabels:      map[string]string{"pool": "gpu"},
+			MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "zone", Operator: metav1.LabelSelectorOpIn, Values: []string{"a", "b"}}},
+		}, cache.Spec.NodeSelector)
 	})
 
 	update := func(t *testing.T, name string, passthrough any) error {

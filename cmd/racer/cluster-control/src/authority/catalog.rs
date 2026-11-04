@@ -1,9 +1,10 @@
 //! Cache catalog from ClusterCaches, like members.BuildCatalog in the old controller.
 
+use super::pools::Selector;
 use crate::kube;
 use racer_control_wire::{self as wire, CacheDefinition, CacheId};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// ClusterCache fields used here.
 #[derive(Clone, Debug, Default)]
@@ -15,6 +16,9 @@ pub struct CacheInfo {
     /// spec.passthrough as written; None when unset. Parsed by `build` so an
     /// invalid value fails the catalog instead of silently caching.
     pub passthrough: Option<Value>,
+    /// spec.nodeSelector as written; None when unset. Parsed by `build` so an
+    /// invalid selector drops only this cache.
+    pub node_selector: Option<Value>,
 }
 
 impl CacheInfo {
@@ -27,8 +31,22 @@ impl CacheInfo {
                 .pointer("/spec/passthrough")
                 .filter(|p| !p.is_null())
                 .cloned(),
+            node_selector: v
+                .pointer("/spec/nodeSelector")
+                .filter(|p| !p.is_null())
+                .cloned(),
         }
     }
+}
+
+/// Cache definitions sorted by UID, with their nonempty node selectors.
+#[derive(Clone, Debug, Default)]
+pub struct Catalog {
+    pub caches: Vec<CacheDefinition>,
+    /// Caches without an entry use the default pool.
+    pub selectors: BTreeMap<CacheId, Selector>,
+    /// Names of caches left out for an invalid node selector.
+    pub rejected: Vec<String>,
 }
 
 /// Map spec.passthrough to a cache mode. Absence caches; an object without a
@@ -46,14 +64,25 @@ fn mode(passthrough: Option<&Value>) -> Result<wire::CacheMode, wire::Error> {
     }
 }
 
-/// Build the catalog sorted by UID. Any invalid cache fails the whole catalog.
-pub fn build(caches: &[CacheInfo]) -> Result<Vec<CacheDefinition>, wire::Error> {
+/// Build the catalog sorted by UID. A cache with an invalid node selector is
+/// left out and named in [`Catalog::rejected`]; any other invalid cache fails
+/// the whole catalog.
+pub fn build(caches: &[CacheInfo]) -> Result<Catalog, wire::Error> {
     let (mut ids, mut names) = (HashSet::new(), HashSet::new());
     let mut out = Vec::with_capacity(caches.len());
+    let mut selectors = BTreeMap::new();
+    let mut rejected = Vec::new();
     for c in caches {
         if !wire::valid_uuid(&c.uid) || !ids.insert(&c.uid) || !names.insert(&c.name) {
             return Err(wire::Error::InvalidRequest);
         }
+        let selector = match Selector::parse(c.node_selector.as_ref()) {
+            Ok(s) => s,
+            Err(_) => {
+                rejected.push(c.name.clone());
+                continue;
+            }
+        };
         let (client, origin) = wire::canonical_socket_paths(&c.name)?;
         // The CRD bounds spec.priority; recheck so a skewed schema cannot publish
         // a catalog that every subscriber would reject.
@@ -69,9 +98,17 @@ pub fn build(caches: &[CacheInfo]) -> Result<Vec<CacheDefinition>, wire::Error> 
             priority: priority as u16,
             mode: mode(c.passthrough.as_ref())?,
         });
+        if let Some(s) = selector {
+            selectors.insert(CacheId(c.uid.clone()), s);
+        }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(out)
+    rejected.sort();
+    Ok(Catalog {
+        caches: out,
+        selectors,
+        rejected,
+    })
 }
 
 #[cfg(test)]
@@ -84,6 +121,7 @@ mod tests {
             name: name.into(),
             priority: None,
             passthrough: None,
+            node_selector: None,
         }
     }
 
@@ -93,7 +131,8 @@ mod tests {
             c("22222222-2222-4222-8222-222222222222", "b"),
             c("11111111-1111-4111-8111-111111111111", "a"),
         ])
-        .unwrap();
+        .unwrap()
+        .caches;
         assert_eq!(out[0].name, "a");
         assert_eq!(out[1].name, "b");
         let info = CacheInfo::from_json(&serde_json::json!({"metadata":{"uid":"u","name":"n"}}));
@@ -112,7 +151,8 @@ mod tests {
             with("11111111-1111-4111-8111-111111111111", "min", Some(0)),
             with("22222222-2222-4222-8222-222222222222", "unset", None),
         ])
-        .unwrap();
+        .unwrap()
+        .caches;
         let got: Vec<_> = out.iter().map(|d| (d.name.as_str(), d.priority)).collect();
         assert_eq!(
             got,
@@ -131,9 +171,9 @@ mod tests {
             &serde_json::json!({"metadata":{"uid":u,"name":"a"},"spec":{"priority":0}}),
         );
         assert_eq!(info.priority, Some(0));
-        assert_eq!(build(&[info]).unwrap()[0].priority, 0);
+        assert_eq!(build(&[info]).unwrap().caches[0].priority, 0);
         assert_eq!(
-            build(&[c(u, "a")]).unwrap()[0].priority,
+            build(&[c(u, "a")]).unwrap().caches[0].priority,
             wire::DEFAULT_PRIORITY
         );
         for (p, ok) in [(1000, true), (1001, false), (-1, false)] {
@@ -150,7 +190,7 @@ mod tests {
             let info = CacheInfo::from_json(
                 &serde_json::json!({"metadata":{"uid":u,"name":"a"},"spec":spec}),
             );
-            build(&[info]).map(|out| out[0].mode)
+            build(&[info]).map(|out| out.caches[0].mode)
         };
         assert_eq!(parse(serde_json::json!({})), Ok(wire::CacheMode::Cached));
         assert_eq!(
@@ -158,7 +198,7 @@ mod tests {
             Ok(wire::CacheMode::Cached)
         );
         assert_eq!(
-            build(&[c(u, "a")]).unwrap()[0].mode,
+            build(&[c(u, "a")]).unwrap().caches[0].mode,
             wire::CacheMode::Cached
         );
         for (spec, mode) in [
@@ -197,6 +237,55 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_selector_drops_only_that_cache() {
+        let info = |uid: &str, name: &str, selector: Value| {
+            CacheInfo::from_json(&serde_json::json!({
+                "metadata":{"uid":uid,"name":name},
+                "spec":{"nodeSelector":selector}
+            }))
+        };
+        let out = build(&[
+            info(
+                "11111111-1111-4111-8111-111111111111",
+                "bad",
+                serde_json::json!({"matchExpressions":[{"key":"gpu","operator":"In"}]}),
+            ),
+            info(
+                "22222222-2222-4222-8222-222222222222",
+                "gpu",
+                serde_json::json!({"matchLabels":{"gpu":"yes"}}),
+            ),
+            info(
+                "33333333-3333-4333-8333-333333333333",
+                "plain",
+                serde_json::json!({}),
+            ),
+            c("44444444-4444-4444-8444-444444444444", "unset"),
+        ])
+        .unwrap();
+        let names: Vec<_> = out.caches.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["gpu", "plain", "unset"]);
+        assert_eq!(out.rejected, ["bad"]);
+        assert_eq!(out.selectors.len(), 1);
+        assert!(
+            out.selectors
+                .contains_key(&CacheId("22222222-2222-4222-8222-222222222222".into()))
+        );
+        // A rejected cache still reserves its UID and name.
+        assert!(
+            build(&[
+                info(
+                    "11111111-1111-4111-8111-111111111111",
+                    "a",
+                    serde_json::json!([])
+                ),
+                c("11111111-1111-4111-8111-111111111111", "b"),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

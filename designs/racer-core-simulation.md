@@ -155,10 +155,39 @@ node.
 | `zipf`, `storm`, `churn`, `faults` | Data plane with synthetic membership |
 | `enrollment-storm`, `failover`, `ctl-churn`, `lagging` | Control plane only |
 | `full-cold-start`, `full-failover`, `full-churn`, `full-lagging` | Combined, using the control plan of the matching control scenario plus a Zipf read load |
+| `mesh`, `mesh-selector` | Topology only: the mesh v2 default pool (plus a 256 member selector pool) of `--nodes` members, no traffic |
 
 `sim/tests/contention_scenarios.rs` holds pressure and ablation tests (cold origin contention,
 warm fanout, shared NIC bandwidth, slow disk, partition recovery, hot pages, hung peers, stale
 membership, hedging, seed replay). Combined-mode ablation tests are in `sim/src/combined.rs`.
+`sim/tests/mesh_scenarios.rs` holds the mesh v2 scenarios (see below).
+
+### Mesh v2 metrics
+
+Every node run reports a `mesh` section (`sim/src/mesh.rs`, `NodeWorld::mesh_report`):
+
+- `degree`: peers per node (min, mean, max) of the newest membership; `default_pool`: its
+  column count and target column size.
+- `owner_peak_fanin`: most page bodies one node streamed at once. `page_peak_fanin` (and
+  `_at`): most bodies of one page one owner streamed at once. Histogram `page_fanin`.
+- `owner_peak_egress_bytes_per_s`: most page bytes one node sent (as owner or relay) in one
+  1 s window. `page_peak_egress_bytes_per_s`: the same for one page from its owner.
+- `links_rdma`, `links_tcp`, `rdma_fraction`, and histograms `hops_rdma_only` and
+  `hops_with_tcp` (links per page body by transport). An edge is RDMA when both ends share a
+  Site (one rail per node) and both took it among their `RDMA_PEERS` best ranked edges
+  (`Membership::rdma_peers`).
+- `edges_changed_per_publication` and `edges_changed_per_event`: edges added plus removed by
+  a membership change, for clusters up to 8,192 members and the first 32 changes of a run.
+
+`node.mesh_helpers` (default on) models the mesh v2 hot key rule: an owner never sheds a
+requester in its own column, and a shed reader asks `Pool::helper(reader, owner)`. Off gives
+the v1 rule (`is_helper`, `fanout_helper`).
+
+The topology-only scenarios report the same degree, sampled routes per pool (production
+`Paths::route`, no failures) by transport, routes that left the pool, and edges changed by one
+join and one leave. They build 20k member clusters in seconds:
+`make racer-sim ARGS='--scenario mesh --nodes 20000 --config sites1.json'` with
+`{"sites": 1}` in `sites1.json`.
 
 ## Memory budget
 

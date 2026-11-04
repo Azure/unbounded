@@ -174,6 +174,7 @@ pub enum Role {
     Churn = 5,
     Node = 6,
     Control = 7,
+    Mesh = 8,
 }
 
 /// Derives a deterministic [`SplitMix64`] per (role, index).

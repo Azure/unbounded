@@ -248,20 +248,31 @@ fn shared_routes_survive_cancellation_and_weight_only_successors() {
             .collect(),
     )
     .unwrap();
+    // Block every common neighbor, so the route is one of many equivalent
+    // 3-link fallbacks and weights decide the pick.
+    let ends = old.neighbors(9999);
+    let common: Vec<_> = old
+        .neighbors(0)
+        .into_iter()
+        .filter(|v| ends.contains(v))
+        .collect();
     let query = PathQuery {
         from: 0,
         to: 9999,
         links: 4,
         visited: &[],
-        blocked: &[],
+        blocked: &common,
         seed: b"successor-workflow",
     };
     let oracle = Paths::new(0);
     let expected_old = block_on(oracle.route(&old, query)).unwrap();
+    assert_eq!(expected_old.len(), 4);
+    let mut retry = common.clone();
+    retry.push(expected_old[1]);
     let alternate = block_on(oracle.route(
         &old,
         PathQuery {
-            blocked: &[expected_old[1]],
+            blocked: &retry,
             ..query
         },
     ))
