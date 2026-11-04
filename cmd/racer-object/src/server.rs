@@ -14,7 +14,7 @@ use crate::object::{
     bucket_key, identity, parse_condition, parse_range, s3_version, split_target, supported_header,
 };
 use crate::racer::{Client, Frame, Meta, Scratch, Subscription};
-use crate::splice::{Pipe, forward, send_more};
+use crate::splice::{ClientWatch, Pipe, forward, send_more};
 use std::io::IoSlice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -486,7 +486,10 @@ impl Conn {
             // the forwarded range exactly as the sidecar would, and the
             // result is cross-checked below.
             let sub = client.subscribe(&plan.id, None, range, &mut self.scratch);
-            let Some(sub) = watch_client(&self.stream, &mut self.rbuf, sub).await else {
+            let Some(sub) = ClientWatch::new(&self.stream, &mut self.rbuf, MAX_REQUEST_HEAD)
+                .guard(sub)
+                .await
+            else {
                 return Ok(Next::Abort);
             };
             let sub = sub?;
@@ -496,7 +499,10 @@ impl Conn {
                 .await;
         }
         let meta = client.stat(&plan.id, &mut self.scratch);
-        let Some(meta) = watch_client(&self.stream, &mut self.rbuf, meta).await else {
+        let Some(meta) = ClientWatch::new(&self.stream, &mut self.rbuf, MAX_REQUEST_HEAD)
+            .guard(meta)
+            .await
+        else {
             return Ok(Next::Abort);
         };
         let meta = meta?;
@@ -531,7 +537,10 @@ impl Conn {
         // Pin the version Stat selected, with the exact resolved range.
         let range = pinned_range(selection);
         let sub = client.subscribe(&plan.id, Some(&meta.etag), range, &mut self.scratch);
-        let Some(sub) = watch_client(&self.stream, &mut self.rbuf, sub).await else {
+        let Some(sub) = ClientWatch::new(&self.stream, &mut self.rbuf, MAX_REQUEST_HEAD)
+            .guard(sub)
+            .await
+        else {
             return Ok(Next::Abort);
         };
         let sub = sub.map_err(|f| match f {
@@ -564,7 +573,10 @@ impl Conn {
             self.body.clear();
             self.body.resize(length as usize, 0);
             let read = read_all(&mut sub, &mut self.body);
-            let Some(read) = watch_client(&self.stream, &mut self.rbuf, read).await else {
+            let Some(read) = ClientWatch::new(&self.stream, &mut self.rbuf, MAX_REQUEST_HEAD)
+                .guard(read)
+                .await
+            else {
                 return Ok(Next::Abort);
             };
             read?;
@@ -607,13 +619,16 @@ impl Conn {
     /// Forward every page, withholding the final byte until Racer confirms
     /// completion so truncation is never mistaken for a complete body.
     async fn forward_pages(&mut self, sub: &mut Subscription, first: Frame) -> bool {
+        // One watch for the whole body: after a half-close it stays off.
+        let stream = &self.stream;
+        let mut watch = ClientWatch::new(stream, &mut self.rbuf, MAX_REQUEST_HEAD);
         let mut pending = Some(first);
         loop {
             let frame = match pending.take() {
                 Some(frame) => frame,
-                None => match sub.next_frame().await {
-                    Ok(frame) => frame,
-                    Err(_) => return false,
+                None => match watch.guard(sub.next_frame()).await {
+                    Some(Ok(frame)) => frame,
+                    _ => return false,
                 },
             };
             let last = sub.last_page();
@@ -623,35 +638,42 @@ impl Conn {
             if sub.buffered() > 0 && remaining > 0 {
                 let chunk = sub.take_buffered(remaining as usize);
                 remaining -= chunk.len() as u64;
-                if write_all_more(&self.stream, chunk).await.is_err() {
+                if write_all_more(stream, chunk).await.is_err() {
                     return false;
                 }
             }
             if remaining > 0 {
                 let ok = match &self.pipe {
-                    Some(pipe) => forward(&sub.stream, pipe, &self.stream, remaining, true)
+                    Some(pipe) => forward(&sub.stream, pipe, stream, remaining, true, &mut watch)
                         .await
                         .is_ok(),
-                    None => copy(sub, &self.stream, remaining, &mut self.body).await,
+                    None => copy(sub, stream, remaining, &mut self.body, &mut watch).await,
                 };
                 if !ok {
                     return false;
                 }
             }
             if !last {
-                if sub.credit(&frame).await.is_err() {
+                if !matches!(watch.guard(sub.credit(&frame)).await, Some(Ok(()))) {
                     return false;
                 }
                 continue;
             }
             let mut final_byte = [0u8; 1];
-            if sub.read_exact(&mut final_byte).await.is_err() {
+            if !matches!(
+                watch.guard(sub.read_exact(&mut final_byte)).await,
+                Some(Ok(()))
+            ) {
                 return false;
             }
             // Racer may wait for the final credit before completing, or
             // complete without reading it; a 12-byte write never blocks on
             // an open socket, so sending it first cannot deadlock.
-            if sub.credit(&frame).await.is_err() || sub.complete().await.is_err() {
+            let done = async {
+                sub.credit(&frame).await?;
+                sub.complete().await
+            };
+            if !matches!(watch.guard(done).await, Some(Ok(()))) {
                 return false;
             }
             return self.stream.write_all(&final_byte).await.is_ok();
@@ -895,11 +917,17 @@ async fn write_all_more(stream: &TcpStream, data: &[u8]) -> std::io::Result<()> 
 }
 
 /// Userspace fallback when no pipe could be created.
-async fn copy(sub: &mut Subscription, dst: &TcpStream, mut len: u64, buf: &mut Vec<u8>) -> bool {
+async fn copy(
+    sub: &mut Subscription,
+    dst: &TcpStream,
+    mut len: u64,
+    buf: &mut Vec<u8>,
+    watch: &mut ClientWatch<'_>,
+) -> bool {
     buf.resize(256 << 10, 0);
     while len > 0 {
         let want = (len as usize).min(buf.len());
-        let Ok(n) = sub.read_some(&mut buf[..want]).await else {
+        let Some(Ok(n)) = watch.guard(sub.read_some(&mut buf[..want])).await else {
             return false;
         };
         if send_more(dst, &buf[..n]).await.is_err() {
@@ -912,47 +940,6 @@ async fn copy(sub: &mut Subscription, dst: &TcpStream, mut len: u64, buf: &mut V
 
 /// Read a whole (small) selection into `out`, which has the exact length,
 /// and validate completion.
-/// Run `fut` (a wait on Racer) while watching the client socket, like Go's
-/// background read: returns `None` if the client connection fails so the
-/// caller drops the Racer operation and frees the connection slot.
-///
-/// Readiness comes from the already-registered socket, so a quick Racer
-/// answer costs no extra syscall. Bytes that arrive are kept in `rbuf` as
-/// pipelined input. EOF (a valid half-close) or a full buffer just stops
-/// the watch and lets the request finish.
-async fn watch_client<F: Future>(
-    stream: &TcpStream,
-    rbuf: &mut Vec<u8>,
-    fut: F,
-) -> Option<F::Output> {
-    tokio::pin!(fut);
-    let mut watching = true;
-    loop {
-        tokio::select! {
-            biased;
-            out = &mut fut => return Some(out),
-            r = stream.readable(), if watching => {
-                if r.is_err() {
-                    return None;
-                }
-                if rbuf.len() >= MAX_REQUEST_HEAD {
-                    watching = false;
-                    continue;
-                }
-                if rbuf.capacity() - rbuf.len() < 2048 {
-                    rbuf.reserve(8192);
-                }
-                match stream.try_read_buf(rbuf) {
-                    Ok(0) => watching = false,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => return None,
-                }
-            }
-        }
-    }
-}
-
 async fn read_all(sub: &mut Subscription, out: &mut [u8]) -> Result<(), Failure> {
     let mut at = 0usize;
     loop {

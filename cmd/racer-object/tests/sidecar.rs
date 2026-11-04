@@ -3,8 +3,8 @@
 
 //! End-to-end tests over TCP that need no Racer: requests rejected before
 //! Racer is contacted, connection handling, worker plumbing, and shutdown.
-//! The Racer socket path never exists, so anything that reaches Racer is a
-//! 503. Reads through a real Racer are covered by the e2e/racer suite.
+//! The Racer socket path usually never exists, so anything that reaches
+//! Racer is a 503; a few tests bind a stalling listener there instead. Reads through a real Racer are covered by the e2e/racer suite.
 
 use racer_object::cli::Options;
 use racer_object::object::Api;
@@ -423,6 +423,80 @@ async fn client_reset_releases_slot() {
         .expect("slot was not released");
     assert_eq!(r.status, 405);
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn client_reset_mid_body_releases_slot() {
+    // Racer commits a 1 MiB body, sends one partial page, and stalls. A
+    // client that resets mid-body must free its slot without waiting out
+    // the Racer body timeout or the request deadline.
+    let dir = TempDir::new();
+    let path = dir.0.join("socket");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let racer = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut chunk = [0u8; 4096];
+            let n = conn.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            req.extend_from_slice(&chunk[..n]);
+        }
+        const SIZE: u64 = 1 << 20;
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\n\
+             Content-Type: application/octet-stream\r\nRacer-Object-Length: {SIZE}\r\n\
+             Racer-Range-Start: 0\r\nRacer-Range-End: {SIZE}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            SIZE + 2 * 21
+        )
+        .into_bytes();
+        // Page frame: kind 1, page 0, offset 0, length SIZE (big-endian).
+        out.push(1);
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&(SIZE as u32).to_be_bytes());
+        out.extend_from_slice(&[b'x'; 1000]);
+        conn.write_all(&out).await.unwrap();
+        // Stall; the sidecar dropping the subscription closes this socket.
+        let mut rest = [0u8; 64];
+        while conn.read(&mut rest).await.unwrap_or(0) > 0 {}
+    });
+    let mut options = options(Api::S3);
+    options.request_timeout = Duration::from_secs(30);
+    options.max_connections = 1;
+    let s = Sidecar::start_with(options, path, false).await;
+    let mut c = Client::connect(s.addr).await;
+    c.send("GET", "/bucket/key", &[]).await;
+    // Wait for the head and some payload so the body phase is underway.
+    let mut got = Vec::new();
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") || got.ends_with(b"\r\n\r\n") {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), c.stream.read(&mut chunk))
+            .await
+            .expect("no response head")
+            .unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        got.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&got)
+    );
+    c.stream.set_zero_linger().unwrap();
+    drop(c);
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), s.get("PUT", "/bucket/key", &[]))
+        .await
+        .expect("slot was not released");
+    assert_eq!(r.status, 405);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // The Racer subscription was dropped too.
+    tokio::time::timeout(Duration::from_secs(5), racer)
+        .await
+        .expect("Racer subscription not dropped")
+        .unwrap();
 }
 
 #[tokio::test]

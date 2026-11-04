@@ -106,6 +106,7 @@ pub async fn forward(
     dst: &TcpStream,
     mut len: u64,
     more: bool,
+    watch: &mut ClientWatch<'_>,
 ) -> Result<(), SpliceError> {
     let (src_fd, dst_fd) = (src.as_raw_fd(), dst.as_raw_fd());
     let (pipe_r, pipe_w) = (pipe.read.as_raw_fd(), pipe.write.as_raw_fd());
@@ -119,9 +120,11 @@ pub async fn forward(
                 Ok(0) => return Err(SpliceError::Source),
                 Ok(n) => break n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    match tokio::time::timeout(BODY_TIMEOUT, src.readable()).await {
-                        Ok(Ok(())) => {}
-                        _ => return Err(SpliceError::Source),
+                    let wait = tokio::time::timeout(BODY_TIMEOUT, src.readable());
+                    match watch.guard(wait).await {
+                        Some(Ok(Ok(()))) => {}
+                        Some(_) => return Err(SpliceError::Source),
+                        None => return Err(SpliceError::Destination),
                     }
                 }
                 Err(_) => return Err(SpliceError::Source),
@@ -161,6 +164,63 @@ pub async fn forward(
         }
     }
     Ok(())
+}
+
+/// Watches the client socket while the sidecar waits on Racer, like Go's
+/// background read, so a client reset drops the Racer operation and frees
+/// the connection slot instead of waiting out a Racer stall.
+///
+/// Readiness comes from the already-registered socket, so a Racer that is
+/// already readable costs no extra syscall. Bytes that arrive are appended
+/// to `rbuf` as pipelined input. EOF (a valid half-close) or a buffer at
+/// `cap` stops the watch for the rest of this value's lifetime, since the
+/// socket then stays readable and selecting on it would spin; a later reset
+/// is still caught by the next write.
+pub struct ClientWatch<'a> {
+    stream: &'a TcpStream,
+    rbuf: &'a mut Vec<u8>,
+    cap: usize,
+    watching: bool,
+}
+
+impl<'a> ClientWatch<'a> {
+    pub fn new(stream: &'a TcpStream, rbuf: &'a mut Vec<u8>, cap: usize) -> Self {
+        Self {
+            stream,
+            rbuf,
+            cap,
+            watching: true,
+        }
+    }
+
+    /// Run `fut`, returning `None` if the client connection failed first.
+    pub async fn guard<F: Future>(&mut self, fut: F) -> Option<F::Output> {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                biased;
+                out = &mut fut => return Some(out),
+                r = self.stream.readable(), if self.watching => {
+                    if r.is_err() {
+                        return None;
+                    }
+                    if self.rbuf.len() >= self.cap {
+                        self.watching = false;
+                        continue;
+                    }
+                    if self.rbuf.capacity() - self.rbuf.len() < 2048 {
+                        self.rbuf.reserve(8192);
+                    }
+                    match self.stream.try_read_buf(self.rbuf) {
+                        Ok(0) => self.watching = false,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => return None,
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Send `data` on `dst`, hinting with MSG_MORE that payload follows so the
