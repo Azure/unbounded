@@ -258,6 +258,8 @@ help: ## Show this help
 	@echo "  lint                             Run golangci-lint and actionlint"
 	@echo "  lint-actions                     Run actionlint over .github/workflows"
 	@echo "  test                             Run all tests"
+	@echo "  agent-envtest                    Run agent API-server tests with KUBEBUILDER_ASSETS"
+	@echo "  agent-envtest-ci                 Provision pinned assets and run agent API-server tests"
 	@echo "  build                            Compile all Go packages"
 	@echo "  generate                         Run go generate (deepcopy, CRDs, protobuf)"
 	@echo "  vulncheck                        Run govulncheck; fails only on vulnerabilities with final fixes"
@@ -634,6 +636,17 @@ racer-envtest: ## Run real API-server tests for Racer APIs and operator restrict
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
+
+.PHONY: agent-envtest agent-envtest-ci
+agent-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets and require agent envtest
+	@mkdir -p tmp/agent-envtest
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/agent-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+		$(MAKE) agent-envtest KUBEBUILDER_ASSETS="$$assets"
+
+agent-envtest: ## Run real API-server tests for the agent daemon's MachineOperation selection
+	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
+	@mkdir -p tmp/agent-envtest
+	TMPDIR="$(CURDIR)/tmp/agent-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./pkg/agent/daemon -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 RACER_IMAGE ?= $(CONTAINER_REGISTRY)/racer:$(VERSION_TAG)
 

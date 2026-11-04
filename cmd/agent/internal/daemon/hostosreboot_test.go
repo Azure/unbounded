@@ -6,10 +6,12 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -78,7 +80,7 @@ func TestReconcileHostOSReboot_CompletesAfterReboot(t *testing.T) {
 	assert.Equal(t, "boot-1", updated.Status.Targets[0].BootID)
 
 	// The daemon that starts after the reboot observes a new boot ID.
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", true, staticBootID("boot-2")))
 
 	updated = getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
@@ -128,7 +130,7 @@ func TestReconcileHostOSReboot_RebootCommandFails(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, op.rebootCalls)
 
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", true, staticBootID("boot-2")))
 	updated = getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
 }
@@ -190,7 +192,7 @@ func TestReconcileHostOSReboot_DaemonStoppingLeavesInProgress(t *testing.T) {
 	assert.Equal(t, v1alpha3.OperationPhaseInProgress, updated.Status.Phase, "the next daemon decides from the boot ID")
 
 	// The reboot happened after all.
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-2")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", true, staticBootID("boot-2")))
 
 	updated = getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseComplete, updated.Status.Phase)
@@ -214,7 +216,7 @@ func TestReconcileHostOSReboot_BootIDUnavailable(t *testing.T) {
 func TestPublishHostOSReboots_SameBootFails(t *testing.T) {
 	c := fakeStatusClient(issuedHostSoftRebootOperation("op-1", "test-machine", "boot-1"))
 
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", staticBootID("boot-1")))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", true, staticBootID("boot-1")))
 
 	updated := getMachineOperation(t, c, "op-1")
 	assert.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
@@ -237,7 +239,7 @@ func TestPublishHostOSReboots_IgnoresOtherOperations(t *testing.T) {
 		return "boot-2", nil
 	}
 
-	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", currentBootID))
+	require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", true, currentBootID))
 	assert.Zero(t, bootIDCalls)
 
 	for _, name := range []string{"op-other-machine", "op-no-boot-id", "op-other-kind"} {
@@ -245,10 +247,65 @@ func TestPublishHostOSReboots_IgnoresOtherOperations(t *testing.T) {
 	}
 }
 
+// TestPublishHostOSReboots_ListsOnlyThisMachinesOperations covers the
+// operations the daemon reports: those that name this machine and those that
+// select it by label, but none for other machines. Where the API server can
+// select by machine, the daemon must not list every operation in the cluster.
+func TestPublishHostOSReboots_ListsOnlyThisMachinesOperations(t *testing.T) {
+	for _, machineRefSelectable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("machineRefSelectable=%t", machineRefSelectable), func(t *testing.T) {
+			own := issuedHostSoftRebootOperation("op-own", "test-machine", "boot-1")
+			selector := issuedHostSoftRebootOperation("op-selector", "test-machine", "boot-1")
+			selector.Spec.MachineRef = ""
+			selector.Spec.MachineSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"pool": "a"}}
+			otherMachine := issuedHostSoftRebootOperation("op-other-machine", "other-machine", "boot-1")
+			c := machineOperationListingClient(machineRefSelectable, own, selector, otherMachine)
+
+			require.NoError(t, publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", machineRefSelectable, staticBootID("boot-2")))
+
+			assert.Equal(t, v1alpha3.OperationPhaseComplete, getMachineOperation(t, c, "op-own").Status.Phase)
+			assert.Equal(t, v1alpha3.OperationPhaseComplete, getMachineOperation(t, c, "op-selector").Status.Phase)
+			assert.Equal(t, v1alpha3.OperationPhaseInProgress, getMachineOperation(t, c, "op-other-machine").Status.Phase)
+		})
+	}
+}
+
+// machineOperationListingClient returns a fake client holding objs. If
+// machineRefSelectable, it fails any MachineOperation list not selected by
+// spec.machineRef, which would download every operation in the cluster.
+// Otherwise it rejects any list selected by it, like an API server that cannot
+// select by the field.
+func machineOperationListingClient(machineRefSelectable bool, objs ...client.Object) client.Client {
+	base := fake.NewClientBuilder().
+		WithScheme(fakeScheme()).
+		WithStatusSubresource(&v1alpha3.MachineOperation{}).
+		WithIndex(&v1alpha3.MachineOperation{}, v1alpha3.MachineOperationMachineRefField, machineOperationMachineRef).
+		WithObjects(objs...).
+		Build()
+
+	return interceptor.NewClient(base, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			var o client.ListOptions
+			o.ApplyOptions(opts)
+
+			if _, ok := list.(*v1alpha3.MachineOperationList); ok {
+				switch selected := o.FieldSelector != nil; {
+				case machineRefSelectable && !selected:
+					return errors.New("listed every MachineOperation")
+				case !machineRefSelectable && selected:
+					return apierrors.NewBadRequest("field label not supported: " + v1alpha3.MachineOperationMachineRefField)
+				}
+			}
+
+			return c.List(ctx, list, opts...)
+		},
+	})
+}
+
 func TestPublishHostOSReboots_LeavesInProgressWhenBootIDUnavailable(t *testing.T) {
 	c := fakeStatusClient(issuedHostSoftRebootOperation("op-1", "test-machine", "boot-1"))
 
-	err := publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", func() (string, error) {
+	err := publishHostSoftReboots(context.Background(), discardLogger(), c, "test-machine", true, func() (string, error) {
 		return "", errors.New("boot ID unavailable")
 	})
 	require.Error(t, err)

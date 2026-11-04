@@ -25,6 +25,7 @@ import (
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
+	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -173,7 +174,20 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		log.Warn("failed to publish and clear AgentUpgrade daemon signals", "error", err)
 	}
 
-	if err := publishHostSoftReboots(ctx, log, kubeClient, active.Config.MachineName, runOpts.NodeOperator.BootID); err != nil {
+	machineRefSelectable, err := daemon.MachineRefSelectable(ctx, kubeClient, active.Config.MachineName)
+	if err != nil {
+		return fmt.Errorf("check MachineOperation selection: %w", err)
+	}
+
+	if !machineRefSelectable {
+		log.Warn(
+			"API server cannot select MachineOperations by machine; the daemon watches every MachineOperation. "+
+				"Selecting needs Kubernetes 1.31 or later and the current MachineOperation CRD",
+			"field", v1alpha3.MachineOperationMachineRefField,
+		)
+	}
+
+	if err := publishHostSoftReboots(ctx, log, kubeClient, active.Config.MachineName, machineRefSelectable, runOpts.NodeOperator.BootID); err != nil {
 		log.Warn("failed to report HostSoftReboot operations", "error", err)
 	}
 
@@ -185,7 +199,16 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 		return ErrRestartRequested
 	}
 
-	return runController(ctx, log, controllerCfg, active.Config.MachineName, active.Config.NodeName, runOpts.NodeOperator, runOpts.installation)
+	return runController(
+		ctx,
+		log,
+		controllerCfg,
+		active.Config.MachineName,
+		active.Config.NodeName,
+		runOpts.NodeOperator,
+		runOpts.installation,
+		machineRefSelectable,
+	)
 }
 
 func discoverAndMigrate(ctx context.Context, log *slog.Logger, store *installstate.Store, operator nodeOperator) (*ActiveMachine, error) {

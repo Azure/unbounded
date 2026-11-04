@@ -15,9 +15,11 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	machinav1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 )
@@ -33,6 +35,9 @@ type MachinaMachineOperationReconciler struct {
 	machineName string
 	nodeName    string
 	handlers    MachineOperationHandlers
+	// caches, when set, are where SetupController watches MachineOperations;
+	// see WatchMachineOperationsIn.
+	caches []cache.Cache
 }
 
 // NewMachinaMachineOperationReconciler returns a reusable MachineOperation request
@@ -84,12 +89,26 @@ func NewMachinaMachineOperationReconcilerWithReader(
 	return &MachinaMachineOperationReconciler{client: c, reader: reader, machineName: machineName, nodeName: nodeName, handlers: handlers}, nil
 }
 
-// SetupController registers the MachineOperation watch for this reconciler.
+// WatchMachineOperationsIn makes SetupController watch MachineOperations in
+// caches, such as those AddMachineOperationCaches returns, instead of in the
+// manager's cache, which holds every MachineOperation in the cluster. Call it
+// before SetupController.
+func (r *MachinaMachineOperationReconciler) WatchMachineOperationsIn(caches ...cache.Cache) {
+	r.caches = caches
+}
+
+// SetupController registers the MachineOperation watches for this reconciler.
 func (r *MachinaMachineOperationReconciler) SetupController(b *builder.TypedBuilder[Request]) *builder.TypedBuilder[Request] {
-	return b.Watches(
-		&machinav1alpha3.MachineOperation{},
-		handler.TypedEnqueueRequestsFromMapFunc(r.mapMachineOperation),
-	)
+	enqueue := handler.TypedEnqueueRequestsFromMapFunc(r.mapMachineOperation)
+	if len(r.caches) == 0 {
+		return b.Watches(&machinav1alpha3.MachineOperation{}, enqueue)
+	}
+
+	for _, c := range r.caches {
+		b = b.WatchesRawSource(source.TypedKind[client.Object, Request](c, &machinav1alpha3.MachineOperation{}, enqueue))
+	}
+
+	return b
 }
 
 // ReconcileMachineOperation handles a queued MachineOperation request.
