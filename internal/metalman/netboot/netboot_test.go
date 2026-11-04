@@ -109,7 +109,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 		t.Errorf("healthz body: got %q, want %q", body, "ok")
 	}
 
-	// Test serving cached file (with source IP identification)
+	// Test serving an image file (with source IP identification)
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set(testPeerHeader, "10.0.1.50")
 

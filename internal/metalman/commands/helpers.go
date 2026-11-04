@@ -72,6 +72,8 @@ func SiteSelector(site string) (labels.Selector, error) {
 	return labels.NewSelector().Add(*req), nil
 }
 
+// DefaultCacheDir returns the default --cache-dir, which holds generated
+// boot media (ISOs). Netboot image files are not cached.
 func DefaultCacheDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
