@@ -2,16 +2,19 @@
 //! Layout and access policy are supplied by the application, just as for host sockets.
 
 use crate::publication::{Endpoint, Rename};
+use racer_io::{
+    ring::{Descriptor, SocketAddress},
+    sim::SimOs,
+};
 use std::{
     cell::RefCell,
     io,
     path::{Path, PathBuf},
 };
-use uring_runtime::reactor::{SocketAddress, descriptor::Descriptor, simulation::Simulation};
 
 /// A simulated listener and the exact directory entry it owns.
 pub struct BoundSocket {
-    sim: Simulation,
+    sim: SimOs,
 
     listener: Descriptor,
 
@@ -27,7 +30,7 @@ pub struct BoundSocket {
 impl BoundSocket {
     /// Create the directory and bind one socket without choosing its permission mode.
     /// Reject invalid basename components before creating any directory.
-    pub fn bind(sim: Simulation, directory: PathBuf, basename: &str) -> io::Result<Self> {
+    pub fn bind(sim: SimOs, directory: PathBuf, basename: &str) -> io::Result<Self> {
         crate::directory::component(basename.as_bytes())?;
         sim.create_dir_all(&directory)?;
         let directory_handle = sim.open(None, &directory, libc::O_PATH | libc::O_DIRECTORY)?;
@@ -148,8 +151,8 @@ impl Drop for BoundSocket {
 mod tests {
     use super::*;
     use crate::publication::{Publication, Replacement};
+    use racer_io::sim::Fault;
     use std::rc::Rc;
-    use uring_runtime::reactor::simulation::Fault;
 
     #[test]
     fn bind_rejects_invalid_names_without_mutation() {
@@ -172,7 +175,7 @@ mod tests {
             "é".repeat(128),
         ] {
             for directory in ["/new/nested", "/sockets"] {
-                let sim = Simulation::new();
+                let sim = SimOs::new();
                 let foreign =
                     BoundSocket::bind(sim.clone(), PathBuf::from("/foreign"), "socket").unwrap();
                 let file = Path::new("/foreign/file");
@@ -215,7 +218,7 @@ mod tests {
     #[test]
     fn bind_accepts_normal_components_and_cleans_up() {
         for basename in ["socket", ".hidden", "..suffix", "a\\b", "with space", "é"] {
-            let sim = Simulation::new();
+            let sim = SimOs::new();
             let directory = PathBuf::from("/new/nested");
             let socket = BoundSocket::bind(sim.clone(), directory.clone(), basename).unwrap();
             assert!(socket.owns(basename));
@@ -235,7 +238,7 @@ mod tests {
     #[test]
     fn bind_accepts_component_byte_limit_before_filesystem_errors() {
         for basename in ["x".repeat(255), format!("{}x", "é".repeat(127))] {
-            let sim = Simulation::new();
+            let sim = SimOs::new();
             sim.inject("open", Fault::Errno(libc::EIO)).unwrap();
             let error = BoundSocket::bind(sim, PathBuf::from("/sockets"), &basename)
                 .err()
@@ -246,7 +249,7 @@ mod tests {
 
     #[test]
     fn bind_preserves_occupied_foreign_paths() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let foreign = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
         sim.write_file(&directory.join("file"), b"foreign").unwrap();
@@ -264,8 +267,8 @@ mod tests {
 
     #[test]
     fn publication_rejects_independent_simulations() {
-        let first_sim = Simulation::new();
-        let second_sim = Simulation::new();
+        let first_sim = SimOs::new();
+        let second_sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let previous =
             Rc::new(BoundSocket::bind(first_sim.clone(), directory.clone(), "canonical").unwrap());
@@ -313,7 +316,7 @@ mod tests {
 
     #[test]
     fn publication_succeeds_with_cloned_simulation() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let previous =
             Rc::new(BoundSocket::bind(sim.clone(), directory.clone(), "canonical").unwrap());
@@ -336,7 +339,7 @@ mod tests {
 
     #[test]
     fn same_directory_rejects_replaced_directory() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let first = BoundSocket::bind(sim.clone(), directory.clone(), "first").unwrap();
         let second = BoundSocket::bind(sim.clone(), directory.clone(), "second").unwrap();
@@ -351,7 +354,7 @@ mod tests {
 
     #[test]
     fn same_directory_preserves_probe_errors() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let first = BoundSocket::bind(sim.clone(), PathBuf::from("/first"), "socket").unwrap();
         let second = BoundSocket::bind(sim.clone(), PathBuf::from("/second"), "socket").unwrap();
         assert!(!first.same_directory(&second).unwrap());
@@ -364,7 +367,7 @@ mod tests {
 
     #[test]
     fn set_mode_accepts_all_permission_bits() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let socket = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
         let path = directory.join("socket");
@@ -381,7 +384,7 @@ mod tests {
 
     #[test]
     fn set_mode_rejects_every_non_permission_bit_without_mutation() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let socket = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
         let path = directory.join("socket");
@@ -405,7 +408,7 @@ mod tests {
 
     #[test]
     fn set_mode_validates_mode_before_ownership() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let path = directory.join("socket");
         let socket = BoundSocket::bind(sim.clone(), directory, "socket").unwrap();
@@ -437,7 +440,7 @@ mod tests {
 
     #[test]
     fn set_mode_preserves_foreign_socket() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let path = directory.join("socket");
         let original = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
@@ -457,7 +460,7 @@ mod tests {
 
     #[test]
     fn set_mode_preserves_replacement_file() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let path = directory.join("socket");
         let original = BoundSocket::bind(sim.clone(), directory, "socket").unwrap();
@@ -479,7 +482,7 @@ mod tests {
 
     #[test]
     fn set_mode_rejects_missing_entry() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let original = BoundSocket::bind(sim.clone(), directory.clone(), "socket").unwrap();
         sim.unlink(&directory.join("socket")).unwrap();
@@ -499,7 +502,7 @@ mod tests {
     /// Publication bookkeeping follows renames and cleanup preserves replacement inodes.
     #[test]
     fn rename_and_drop_preserve_exact_inode_ownership() {
-        let sim = Simulation::new();
+        let sim = SimOs::new();
         let directory = PathBuf::from("/sockets");
         let first = BoundSocket::bind(sim.clone(), directory.clone(), "first").unwrap();
         first.set_mode(0o666).unwrap();

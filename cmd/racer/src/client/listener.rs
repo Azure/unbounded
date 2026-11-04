@@ -1400,9 +1400,12 @@ fn bind(
     #[cfg(test)]
     if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
-        let listener =
-            uds_endpoint::simulation::BoundSocket::bind(sim, directory.clone(), basename)
-                .map_err(|_| Error::Io)?;
+        let listener = uds_endpoint::simulation::BoundSocket::bind(
+            sim.os().clone(),
+            directory.clone(),
+            basename,
+        )
+        .map_err(|_| Error::Io)?;
         let bound = BoundListener {
             definition,
             listener: Listener::Sim(listener),

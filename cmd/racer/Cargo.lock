@@ -1321,7 +1321,7 @@ name = "uds-endpoint"
 version = "0.1.0"
 dependencies = [
  "libc",
- "uring-runtime",
+ "racer-io",
 ]
 
 [[package]]

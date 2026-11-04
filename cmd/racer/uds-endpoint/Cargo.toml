@@ -8,8 +8,7 @@ description = "Linux Unix socket filesystem ownership and crash recovery"
 
 [features]
 test-util = []
-simulation = ["dep:uring-runtime", "uring-runtime/simulation"]
 
 [dependencies]
 libc = "0.2"
-uring-runtime = { path = "../runtime", optional = true }
+racer-io = { path = "../io" }

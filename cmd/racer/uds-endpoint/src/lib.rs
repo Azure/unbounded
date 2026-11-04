@@ -1,6 +1,6 @@
 //! Linux Unix socket filesystem ownership. Application layout and access modes
-//! are supplied by callers. The optional simulation feature uses the runtime's
-//! simulated filesystem; production builds need no runtime dependency.
+//! are supplied by callers. [`simulation`] binds the same ownership model in a
+//! `racer-io` simulated filesystem.
 //! Directory mutation must be serialized by cooperating effective-UID owners.
 //! Hostile processes with the same UID (or root) are outside this boundary.
 
@@ -8,7 +8,6 @@
 
 mod directory;
 pub mod publication;
-#[cfg(feature = "simulation")]
 pub mod simulation;
 #[cfg(test)]
 mod tests;
