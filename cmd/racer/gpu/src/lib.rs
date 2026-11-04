@@ -551,6 +551,17 @@ impl Context {
         })
     }
 
+    /// A pool of reusable events for [`Stream::fence_in`] on this context,
+    /// keeping at most `limit` idle.
+    pub fn event_pool(&self, limit: usize) -> EventPool {
+        EventPool(Arc::new(EventPoolInner {
+            context: self.clone(),
+            idle: Mutex::new(Vec::new()),
+            limit,
+            created: AtomicU64::new(0),
+        }))
+    }
+
     /// Create a non-blocking stream.
     pub fn stream(&self) -> Result<Stream> {
         let shared = &self.0.shared;
@@ -842,6 +853,106 @@ pub struct Fence {
     raw: NonNull<c_void>,
 
     holds: Mutex<Vec<Retained>>,
+
+    /// Where the event goes back once the fence drops, or `None` to free it.
+    pool: Option<EventPool>,
+}
+
+/// CUDA events of one context kept for reuse by [`Stream::fence_in`], so a
+/// busy executor does not create and destroy an event per fence. Cheap to
+/// clone. Keeps at most `limit` idle events; more are freed when returned.
+#[derive(Clone)]
+pub struct EventPool(Arc<EventPoolInner>);
+
+struct EventPoolInner {
+    context: Context,
+
+    idle: Mutex<Vec<NonNull<c_void>>>,
+
+    limit: usize,
+
+    /// Events created so far, for tests and telemetry.
+    created: AtomicU64,
+}
+
+// SAFETY: the pool only stores idle event handles and passes them to shim
+// calls, which are thread safe; the list is behind a mutex.
+unsafe impl Send for EventPoolInner {}
+unsafe impl Sync for EventPoolInner {}
+
+impl EventPool {
+    /// Idle events held now.
+    pub fn idle(&self) -> usize {
+        self.0
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Events this pool has created so far.
+    pub fn created(&self) -> u64 {
+        self.0.created.load(Ordering::Relaxed)
+    }
+
+    /// The GPU the events belong to.
+    pub fn ordinal(&self) -> i32 {
+        self.0.context.ordinal()
+    }
+
+    /// An idle event, or a new one.
+    fn take(&self) -> Result<NonNull<c_void>> {
+        let idle = self
+            .0
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop();
+        if let Some(raw) = idle {
+            return Ok(raw);
+        }
+        let shared = &self.0.context.0.shared;
+        let raw = create(shared, |out| unsafe {
+            (shared.api.event)(self.0.context.0.raw.as_ptr(), out)
+        })?;
+        self.0.created.fetch_add(1, Ordering::Relaxed);
+        Ok(raw)
+    }
+
+    /// Take back an event whose recorded work has completed.
+    fn give(&self, raw: NonNull<c_void>) {
+        let mut idle = self
+            .0
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if idle.len() < self.0.limit {
+            idle.push(raw);
+            return;
+        }
+        drop(idle);
+        let shared = &self.0.context.0.shared;
+        if unsafe { (shared.api.event_free)(raw.as_ptr()) } != 0 {
+            shared.leak();
+        }
+    }
+}
+
+impl Drop for EventPoolInner {
+    /// Free the idle events, or leak one whose free fails.
+    fn drop(&mut self) {
+        let shared = &self.context.0.shared;
+        let idle = std::mem::take(
+            self.idle
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for raw in idle {
+            if unsafe { (shared.api.event_free)(raw.as_ptr()) } != 0 {
+                shared.leak();
+            }
+        }
+    }
 }
 
 impl Fence {
@@ -884,6 +995,24 @@ impl Drop for Fence {
     /// fails, leak the holds: the GPU may still use them.
     fn drop(&mut self) {
         let shared = self.context.0.shared.clone();
+        if let Some(pool) = self.pool.take() {
+            // Pooled: wait, then hand the event back for the next fence.
+            if unsafe { (shared.api.event_sync)(self.raw.as_ptr()) } == 0 {
+                self.release();
+                pool.give(self.raw);
+                return;
+            }
+            shared.leak();
+            let holds = std::mem::take(
+                &mut *self
+                    .holds
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            std::mem::forget(holds);
+            std::mem::forget(self.context.clone());
+            return;
+        }
         if unsafe { (shared.api.event_free)(self.raw.as_ptr()) } != 0 {
             shared.leak();
             let holds = std::mem::take(
@@ -1319,6 +1448,22 @@ impl Stream {
         let raw = create(shared, |out| unsafe {
             (shared.api.event)(self.context.0.raw.as_ptr(), out)
         })?;
+        self.record(raw, None)
+    }
+
+    /// [`Stream::fence`] with an event from `pool`, which gets it back when
+    /// the fence drops. `pool` must belong to this stream's context.
+    pub fn fence_in(&self, pool: &EventPool) -> Result<Fence> {
+        if !Arc::ptr_eq(&pool.0.context.0, &self.context.0) {
+            return Err(Error::WrongDevice);
+        }
+        let raw = pool.take()?;
+        self.record(raw, Some(pool.clone()))
+    }
+
+    /// Record `raw` on this stream and wrap it in a fence.
+    fn record(&self, raw: NonNull<c_void>, pool: Option<EventPool>) -> Result<Fence> {
+        let shared = self.shared();
         let rc = unsafe { (shared.api.event_record)(raw.as_ptr(), self.raw.as_ptr()) };
         let holds = if rc == 0 {
             std::mem::take(&mut *self.held())
@@ -1329,6 +1474,7 @@ impl Stream {
             context: self.context.clone(),
             raw,
             holds: Mutex::new(holds),
+            pool,
         };
         shared.check(rc)?;
         Ok(fence)

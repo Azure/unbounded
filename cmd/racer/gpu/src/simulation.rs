@@ -1520,6 +1520,18 @@ impl World {
         true
     }
 
+    /// The deferred failure of the stream an event marks, taken so it is
+    /// reported once, like a stream sync reports it. A real GPU reports a
+    /// failed launch or copy through every later query of the context.
+    fn event_error(&mut self, event: usize) -> c_int {
+        let Some((stream, _)) = self.events.get(&event).and_then(|e| e.mark) else {
+            return code::OK;
+        };
+        self.streams
+            .get_mut(&stream)
+            .map_or(code::OK, |s| std::mem::replace(&mut s.error, code::OK))
+    }
+
     /// Whether the event's captured work has run.
     fn reached(&self, event: usize) -> bool {
         match self.events.get(&event).and_then(|e| e.mark) {
@@ -1562,7 +1574,7 @@ unsafe extern "C" fn event_query(event: *mut c_void) -> c_int {
             return (code::EINVAL, handle);
         }
         if w.reached(handle) {
-            return (code::OK, handle);
+            return (w.event_error(handle), handle);
         }
         let delay = w.query_delay;
         let e = w.events.get_mut(&handle).expect("checked");
@@ -1571,7 +1583,7 @@ unsafe extern "C" fn event_query(event: *mut c_void) -> c_int {
             return (code::EBUSY, handle);
         }
         w.complete(handle);
-        (code::OK, handle)
+        (w.event_error(handle), handle)
     })
 }
 
@@ -1580,7 +1592,7 @@ unsafe extern "C" fn event_sync(event: *mut c_void) -> c_int {
         if !w.complete(id(event)) {
             return (code::EINVAL, id(event));
         }
-        (code::OK, id(event))
+        (w.event_error(id(event)), id(event))
     })
 }
 

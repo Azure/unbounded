@@ -838,6 +838,77 @@ fn fence_polls_to_completion_and_releases_holds() {
 }
 
 #[test]
+/// Pooled fences reuse their events instead of creating one per fence, keep
+/// at most the pool's limit idle, refuse another GPU's pool, and free the
+/// idle events when the pool drops.
+fn pooled_fences_reuse_events() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let other = gpu.context(1).unwrap();
+    let staging = ctx.staging(8192).unwrap();
+    let stream = ctx.stream().unwrap();
+    let pool = ctx.event_pool(2);
+    assert_eq!(pool.ordinal(), 0);
+    for round in 0..5u8 {
+        stream
+            .copy_from_host(Destination::Staging(&staging), 0, vec![round; 64])
+            .unwrap();
+        let fence = stream.fence_in(&pool).unwrap();
+        while !fence.poll().unwrap() {}
+        assert!(!staging.in_flight());
+    }
+    assert_eq!(pool.created(), 1, "one event serves every fence");
+    assert_eq!(pool.idle(), 1);
+    // Three live at once: one more than the limit is freed on return.
+    let fences: Vec<_> = (0..3).map(|_| stream.fence_in(&pool).unwrap()).collect();
+    assert_eq!(pool.created(), 3);
+    drop(fences);
+    assert_eq!(pool.idle(), 2);
+    assert_eq!(sim.live().events, 2);
+    assert_eq!(
+        stream.fence_in(&other.event_pool(1)).err(),
+        Some(Error::WrongDevice)
+    );
+    drop(pool);
+    assert_eq!(sim.live().events, 0);
+    assert_eq!(gpu.leaked(), 0);
+    assert!(sim.take_violations().is_empty());
+}
+
+#[test]
+/// A failed fence record leaves the event in the pool, and a fault on the
+/// query is reported by the poll.
+fn pooled_fence_faults_are_reported() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(8192).unwrap();
+    let stream = ctx.stream().unwrap();
+    let pool = ctx.event_pool(4);
+    stream
+        .copy_from_host(Destination::Staging(&staging), 0, vec![1; 64])
+        .unwrap();
+    sim.fault(Operation::EventRecord, -5);
+    assert!(stream.fence_in(&pool).is_err());
+    assert_eq!(pool.idle(), 1);
+    assert_eq!(
+        stream.retained_host_sources(),
+        1,
+        "holds stay on the stream"
+    );
+    let fence = stream.fence_in(&pool).unwrap();
+    sim.fault(Operation::EventQuery, -5);
+    assert!(fence.poll().is_err());
+    assert!(fence.poll().is_ok());
+    drop(fence);
+    assert_eq!(pool.created(), 1);
+    assert_eq!(gpu.leaked(), 0);
+}
+
+#[test]
 /// Ciphertext moves between GPUs through pinned host memory without a
 /// host-side wait: the destination stream waits on the source's fence.
 fn pinned_bounce_with_cross_gpu_wait() {
