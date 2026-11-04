@@ -77,9 +77,10 @@ fn counters(process: &Process) -> BTreeMap<String, u64> {
         .unwrap()
         .lines()
         .filter(|line| !line.starts_with('#'))
-        .map(|line| {
-            let (name, value) = line.split_once(' ').unwrap();
-            (name.into(), value.parse().unwrap())
+        // Labeled or non-integer samples (gauges, floats) are not counters.
+        .filter_map(|line| {
+            let (name, value) = line.rsplit_once(' ').unwrap();
+            Some((name.into(), value.parse().ok()?))
         })
         .collect()
 }
