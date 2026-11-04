@@ -99,6 +99,11 @@ env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
   CNI_PLUGINS_VERSION: v1.9.1
   RUN_TRIVY: ${{ vars.RELEASE_TRIVY_SCAN == 'true' }}
+  # By default, syft adds a file entry for every executable it can't tie to a
+  # package, with an all-zero SHA-1. Syft doesn't tie Python wheels' native
+  # libraries to their packages, so 12 MB of racer-vllm's 30 MB SBOM was these
+  # entries (mostly flashinfer cubins). The packages themselves are still listed.
+  SYFT_UNKNOWNS_EXECUTABLES_WITHOUT_PACKAGES: "false"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -1023,7 +1028,7 @@ jobs:
             --type spdxjson \
             "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
-      # Rekor can't take attestations this large (racer-vllm's SBOM is ~30 MB).
+      # Rekor can't take attestations this large (racer-vllm's SBOM is ~18 MB).
       # sign-blob logs only the digest.
       - name: Sign the SBOM
         if: matrix.component.large-sbom
