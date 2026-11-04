@@ -318,6 +318,13 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, src, path)
 }
 
+// isCleanEOF reports whether err is a bare io.EOF marking the end of the
+// content. Transport failures such as a dropped registry connection can wrap
+// io.EOF and must be treated as errors, not as a clean end.
+func isCleanEOF(err error) bool {
+	return err == io.EOF //nolint:errorlint // wrapped EOFs are transport errors
+}
+
 // errReadSeeker records the first error returned by the wrapped reader.
 // http.ServeContent ignores copy errors, so callers check err afterwards.
 type errReadSeeker struct {
@@ -327,7 +334,7 @@ type errReadSeeker struct {
 
 func (e *errReadSeeker) Read(p []byte) (int, error) {
 	n, err := e.rs.Read(p)
-	if err != nil && !errors.Is(err, io.EOF) && e.err == nil {
+	if err != nil && !isCleanEOF(err) && e.err == nil {
 		e.err = err
 	}
 
@@ -402,7 +409,7 @@ func serveResolved(w http.ResponseWriter, r *http.Request, name string, resolved
 		// consuming content, so ServeContent's later read reuses the stream.
 		if r.Method != http.MethodHead {
 			if _, err := f.Seek(primeOffset(r.Header.Get("Range"), f.Size()), io.SeekStart); err == nil {
-				if _, err := f.Read(nil); err != nil && !errors.Is(err, io.EOF) {
+				if _, err := f.Read(nil); err != nil && !isCleanEOF(err) {
 					serveFileError(w, err)
 					return false, nil
 				}

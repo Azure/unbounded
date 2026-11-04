@@ -5,6 +5,7 @@ package netboot
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -315,4 +316,27 @@ func TestPrimeOffset(t *testing.T) {
 	} {
 		require.Equal(t, want, primeOffset(rng, 100), "range %q", rng)
 	}
+}
+
+type eofReadSeeker struct{ err error }
+
+func (r eofReadSeeker) Read([]byte) (int, error)       { return 0, r.err }
+func (r eofReadSeeker) Seek(int64, int) (int64, error) { return 0, nil }
+
+func TestErrReadSeekerTreatsOnlyBareEOFAsClean(t *testing.T) {
+	wrapped := fmt.Errorf("Get blob: %w", io.EOF)
+
+	require.True(t, isCleanEOF(io.EOF))
+	require.False(t, isCleanEOF(wrapped))
+	require.False(t, isCleanEOF(io.ErrUnexpectedEOF))
+
+	clean := &errReadSeeker{rs: eofReadSeeker{err: io.EOF}}
+	_, err := clean.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, clean.err)
+
+	faulty := &errReadSeeker{rs: eofReadSeeker{err: wrapped}}
+	_, err = faulty.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	require.ErrorIs(t, faulty.err, wrapped)
 }
