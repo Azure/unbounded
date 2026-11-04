@@ -98,6 +98,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
   CNI_PLUGINS_VERSION: v1.9.1
+  RUN_TRIVY: ${{ vars.RELEASE_TRIVY_SCAN == 'true' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -139,6 +140,13 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "Release: ${TAG} (version: ${VERSION}, prerelease: ${IS_PRERELEASE})"
+
+      - name: Report skipped Trivy scans
+        if: env.RUN_TRIVY != 'true'
+        run: |
+          msg="Trivy image scans are off for this release. Set the repository variable RELEASE_TRIVY_SCAN to true to run them."
+          echo "::warning::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
@@ -387,6 +395,7 @@ jobs:
 
       # Trivy scan on a single-platform load build before pushing.
       - name: Build controller for scanning
+        if: env.RUN_TRIVY == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -405,6 +414,7 @@ jobs:
           cache-to: type=gha,scope=net-controller-${{ matrix.arch }},mode=max
 
       - name: Scan controller with Trivy
+        if: env.RUN_TRIVY == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
@@ -413,6 +423,7 @@ jobs:
           exit-code: "1"
 
       - name: Build node for scanning
+        if: env.RUN_TRIVY == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -431,6 +442,7 @@ jobs:
           cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
 
       - name: Scan node with Trivy (CRITICAL, gating)
+        if: env.RUN_TRIVY == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
@@ -444,6 +456,7 @@ jobs:
       # regressions surface in the workflow log; promote back to gating once
       # upstream ships a clean toolchain.
       - name: Scan node with Trivy (HIGH, report-only)
+        if: env.RUN_TRIVY == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
@@ -750,6 +763,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image for scanning
+        if: env.RUN_TRIVY == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -763,6 +777,7 @@ jobs:
           tags: scan/metalman:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy
+        if: env.RUN_TRIVY == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan/metalman:${{ needs.version.outputs.tag }}
@@ -886,6 +901,7 @@ jobs:
             platforms: linux/amd64
             trivy: false
             large: true
+            large-sbom: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
@@ -941,7 +957,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image for scanning
-        if: matrix.component.trivy
+        if: matrix.component.trivy && env.RUN_TRIVY == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -955,7 +971,7 @@ jobs:
           tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
 
       - name: Scan with Trivy
-        if: matrix.component.trivy
+        if: matrix.component.trivy && env.RUN_TRIVY == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
@@ -999,24 +1015,41 @@ jobs:
           upload-release-assets: false
 
       - name: Attest SBOM to image
+        # Opt-in: an unset matrix key compares equal to false.
+        if: ${{ !matrix.component.large-sbom }}
         run: |
           cosign attest --yes \
             --predicate sbom-${{ matrix.component.name }}.spdx.json \
             --type spdxjson \
             "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
-      # After the attestation, not before: the attestation is the
-      # authoritative, digest-bound copy, and it should never be blocked by the
-      # releases API having a bad minute.
+      # Rekor can't take attestations this large (racer-vllm's SBOM is ~30 MB).
+      # sign-blob logs only the digest.
+      - name: Sign the SBOM
+        if: matrix.component.large-sbom
+        run: |
+          cosign sign-blob --yes \
+            --bundle "sbom-${{ matrix.component.name }}.spdx.json.bundle.json" \
+            "sbom-${{ matrix.component.name }}.spdx.json"
+
+      # After the attestation or signature, so the releases API having a bad
+      # minute never blocks the authoritative copy.
       - name: Attach SBOM to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.version.outputs.tag }}
+          SBOM: sbom-${{ matrix.component.name }}.spdx.json
+          LARGE_SBOM: ${{ matrix.component.large-sbom }}
         run: |
           set -euo pipefail
 
-          gh release upload "$TAG" "sbom-${{ matrix.component.name }}.spdx.json" --clobber
+          assets=("$SBOM")
+          if [[ "$LARGE_SBOM" == "true" ]]; then
+            assets+=("${SBOM}.bundle.json")
+          fi
+
+          gh release upload "$TAG" "${assets[@]}" --clobber
 
   # ---------------------------------------------------------------------------
   # Package the same Gantry chart revision used to render the operator's
