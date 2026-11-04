@@ -7,11 +7,6 @@ use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
-/// Worker threads cap. The sidecar is I/O bound and mostly moves data with
-/// splice(2); a few threads saturate it, and fewer threads mean less
-/// scheduling overhead and memory in every pod.
-const MAX_WORKERS: usize = 4;
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match cli::parse(&args) {
@@ -33,11 +28,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(MAX_WORKERS);
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
+    // A single-threaded runtime. The sidecar is syscall bound and moves
+    // large bodies with splice(2), so one thread already matches the Go
+    // sidecar's throughput, while extra worker threads measurably raised
+    // CPU per request and per byte (work stealing and cross-thread wakeups).
+    // See README.md for the measurements.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
