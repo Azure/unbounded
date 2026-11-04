@@ -5,7 +5,7 @@
 //! prefetch fills and, optionally, origin bytes per second. A demand read that
 //! joins a prefetch flight promotes it, which returns its slot and tokens.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
@@ -192,8 +192,9 @@ pub const OWNER_LEASE_TTL: Duration = Duration::from_secs(300);
 /// Admissions of a key that is already filling join that fill: they take no
 /// slot and no tokens, but each holds a reference, and the slot is released
 /// only when the last reference finishes. Every admission returns a
-/// [`OwnerLease`] that must be passed back to [`OwnerBudget::finish`] exactly
-/// once; a lease from an entry that has since expired is ignored.
+/// [`OwnerLease`] with a unique id that is passed back to [`OwnerBudget::finish`];
+/// finishing a lease twice, or a lease from an entry that has since expired, is ignored, so a
+/// duplicated release can never drop another holder's reference.
 #[derive(Debug)]
 pub struct OwnerBudget<K> {
     concurrent: usize,
@@ -202,6 +203,7 @@ pub struct OwnerBudget<K> {
     refilled: Option<Instant>,
     ttl: Duration,
     generation: u64,
+    next_lease: u64,
     /// Entries holding a slot (not promoted).
     slots: usize,
     active: HashMap<K, OwnerEntry>,
@@ -210,7 +212,8 @@ pub struct OwnerBudget<K> {
 #[derive(Debug)]
 struct OwnerEntry {
     bytes: u64,
-    holders: u32,
+    /// Ids of the live leases referencing this fill.
+    holders: BTreeSet<u64>,
     generation: u64,
     promoted: bool,
     expires: Instant,
@@ -221,6 +224,14 @@ struct OwnerEntry {
 #[must_use = "a lease must be finished"]
 pub struct OwnerLease {
     generation: u64,
+    id: u64,
+}
+
+impl OwnerLease {
+    /// Unique id of this admission's reference.
+    pub fn id(self) -> u64 {
+        self.id
+    }
 }
 
 /// Why the owner deferred a fill.
@@ -244,6 +255,7 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
             refilled: None,
             ttl: OWNER_LEASE_TTL,
             generation: 0,
+            next_lease: 0,
             slots: 0,
             active: HashMap::new(),
         }
@@ -299,10 +311,13 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
         now: Instant,
     ) -> Result<OwnerLease, (Deferral, Duration)> {
         self.expire(now);
+        let id = self.next_lease;
         if let Some(entry) = self.active.get_mut(&key) {
-            entry.holders += 1;
+            self.next_lease += 1;
+            entry.holders.insert(id);
             return Ok(OwnerLease {
                 generation: entry.generation,
+                id,
             });
         }
         if self.slots >= self.concurrent {
@@ -326,19 +341,20 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
             self.tokens -= bytes as f64;
         }
         self.generation += 1;
+        self.next_lease += 1;
         let generation = self.generation;
         self.active.insert(
             key,
             OwnerEntry {
                 bytes,
-                holders: 1,
+                holders: BTreeSet::from([id]),
                 generation,
                 promoted: false,
                 expires: now.checked_add(self.ttl).unwrap_or(now),
             },
         );
         self.slots += 1;
-        Ok(OwnerLease { generation })
+        Ok(OwnerLease { generation, id })
     }
 
     /// Return one admission's reference. Returns true if this released the
@@ -351,8 +367,7 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
         if entry.generation != lease.generation {
             return false;
         }
-        entry.holders = entry.holders.saturating_sub(1);
-        if entry.holders > 0 {
+        if !entry.holders.remove(&lease.id) || !entry.holders.is_empty() {
             return false;
         }
         let promoted = entry.promoted;
@@ -396,6 +411,44 @@ impl<K: Eq + Hash + Clone> OwnerBudget<K> {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_leases_are_unique_and_finish_once() {
+        let now = Instant::now();
+        let mut owner = OwnerBudget::new(1, 0);
+        let a = owner.admit(1u8, 10, now).unwrap();
+        let b = owner.admit(1u8, 10, now).unwrap();
+        assert_ne!(a.id(), b.id());
+        // Finishing `a` twice must not drop `b`'s reference.
+        assert!(!owner.finish(&1, a));
+        assert!(!owner.finish(&1, a));
+        assert!(owner.holds(&1));
+        assert_eq!(owner.active(), 1);
+        assert!(owner.finish(&1, b));
+        assert!(!owner.holds(&1));
+        assert_eq!(owner.active(), 0);
+        assert!(!owner.finish(&1, b));
+    }
+
+    #[test]
+    fn owner_lease_expiry_releases_slot_and_ignores_late_finish() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let mut owner = OwnerBudget::new(1, 0).with_lease_ttl(ttl);
+        let old = owner.admit(1u8, 10, now).unwrap();
+        assert!(
+            owner
+                .expire(now + ttl - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(owner.expire(now + ttl), vec![1]);
+        assert_eq!(owner.active(), 0);
+        // A new fill of the same key; the expired lease cannot release it.
+        let new = owner.admit(1u8, 10, now + ttl).unwrap();
+        assert!(!owner.finish(&1, old));
+        assert!(owner.is_active(&1));
+        assert!(owner.finish(&1, new));
+    }
 
     #[test]
     fn priorities_round_trip_and_order() {
