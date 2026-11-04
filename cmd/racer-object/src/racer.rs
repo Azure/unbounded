@@ -1017,5 +1017,245 @@ mod tests {
             sub("HTTP/1.1 412 X\r\nContent-Length: 0\r\n\r\n", None),
             Err(Failure::PreconditionFailed)
         );
+        for (from, to) in [
+            ("Racer-Range-Start: 2", "Racer-Range-Start: 6"),
+            ("Racer-Range-End: 5", "Racer-Range-End: 11"),
+            ("Racer-Range-Start: 2", "Racer-Range-Start: 02"),
+            ("Racer-Object-Length: 10\r\n", ""),
+            ("Racer-Range-End: 5\r\n", ""),
+            ("application/octet-stream", "text/plain"),
+            ("ETag: \"v\"", "ETag: v"),
+            ("Racer-Expires-At: 1\r\n", ""),
+            (
+                "Connection: close",
+                "Connection: close\r\nContent-Range: bytes 2-4/10",
+            ),
+            (
+                "Connection: close",
+                "Connection: close\r\nContent-Encoding: gzip",
+            ),
+        ] {
+            assert_eq!(
+                sub(&ok.replace(from, to), None),
+                Err(Failure::BadGateway),
+                "{to}"
+            );
+        }
+        let (meta, ..) = sub(
+            &ok.replace("Connection", "Racer-Content-Type: text/plain\r\nConnection"),
+            Some(b"\"v\""),
+        )
+        .unwrap();
+        assert_eq!(meta.content_type.as_deref(), Some(&b"text/plain"[..]));
+        assert_eq!(
+            sub("HTTP/1.1 404 X\r\nContent-Length: 0\r\n\r\n", None),
+            Err(Failure::NotFound)
+        );
+        assert_eq!(
+            sub("HTTP/1.1 404 X\r\nContent-Length: 3\r\n\r\n", None),
+            Err(Failure::BadGateway)
+        );
+    }
+
+    fn id() -> Identity {
+        crate::object::identity(b"bucket", b"key", b"").unwrap()
+    }
+
+    #[test]
+    fn stat_requests() {
+        let id = id();
+        let mut out = b"stale".to_vec();
+        stat_request(&id, &mut out);
+        let want = format!(
+            "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: {}\r\n\r\n",
+            id.key_str(),
+            std::str::from_utf8(&id.metadata).unwrap()
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
+    fn subscribe_requests() {
+        let id = id();
+        let request = |pin: Option<&[u8]>, range| {
+            let mut out = b"stale".to_vec();
+            subscribe_request(&id, pin, range, &mut out);
+            String::from_utf8(out).unwrap()
+        };
+        let prefix = format!(
+            "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: 33554432\r\n",
+            id.key_str()
+        );
+        let metadata = format!(
+            "Racer-Metadata: {}\r\n\r\n",
+            std::str::from_utf8(&id.metadata).unwrap()
+        );
+        assert_eq!(
+            request(None, RangeSpec::Full),
+            format!("{prefix}{metadata}")
+        );
+        assert_eq!(
+            request(None, RangeSpec::Suffix(3)),
+            format!("{prefix}Range: bytes=-3\r\n{metadata}")
+        );
+        assert_eq!(
+            request(Some(b"\"v\""), RangeSpec::Closed(2, 5)),
+            format!("{prefix}Range: bytes=2-5\r\nIf-Match: \"v\"\r\n{metadata}")
+        );
+        assert_eq!(
+            request(Some(b"\"v\""), RangeSpec::Full),
+            format!("{prefix}If-Match: \"v\"\r\n{metadata}")
+        );
+    }
+
+    #[test]
+    fn credits() {
+        let f = Frame {
+            kind: PAGE_FRAME,
+            number: 0x0102,
+            offset: 0,
+            length: 0x0a0b0c0d,
+        };
+        assert_eq!(
+            credit_bytes(&f),
+            [0, 0, 0, 0, 0, 0, 1, 2, 0x0a, 0x0b, 0x0c, 0x0d]
+        );
+    }
+
+    fn page(number: u64, offset: u64, length: u32) -> Frame {
+        Frame {
+            kind: PAGE_FRAME,
+            number,
+            offset,
+            length,
+        }
+    }
+
+    fn complete(pages: u64, bytes: u64) -> Frame {
+        Frame {
+            kind: COMPLETE_FRAME,
+            number: pages,
+            offset: bytes,
+            length: 0,
+        }
+    }
+
+    #[test]
+    fn sequence_accepts_valid_streams() {
+        // Empty selection: completion only.
+        let mut s = Sequence::new(0, 0);
+        assert!(s.last_page());
+        assert_eq!(s.accept(&complete(0, 0)), Ok(()));
+        // A small range inside one page.
+        let mut s = Sequence::new(2, 5);
+        assert_eq!(s.accept(&page(0, 2, 3)), Ok(()));
+        assert!(s.last_page());
+        assert_eq!(s.accept(&complete(1, 3)), Ok(()));
+        // A small range crossing a page boundary.
+        let mut s = Sequence::new(PAGE_SIZE - 2, PAGE_SIZE + 3);
+        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), Ok(()));
+        assert!(!s.last_page());
+        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), Ok(()));
+        assert_eq!(s.accept(&complete(2, 5)), Ok(()));
+        // Full pages followed by a short last page.
+        let end = 2 * PAGE_SIZE + 1;
+        let mut s = Sequence::new(0, end);
+        assert_eq!(s.accept(&page(0, 0, PAGE_SIZE as u32)), Ok(()));
+        assert_eq!(s.accept(&page(1, PAGE_SIZE, PAGE_SIZE as u32)), Ok(()));
+        assert_eq!(s.accept(&page(2, 2 * PAGE_SIZE, 1)), Ok(()));
+        assert_eq!(s.accept(&complete(3, end)), Ok(()));
+    }
+
+    #[test]
+    fn sequence_rejects_invalid_frames() {
+        let bad = Err(Failure::BadGateway);
+        let fresh = || Sequence::new(PAGE_SIZE - 2, PAGE_SIZE + 3);
+        for f in [
+            // Unknown kind.
+            Frame {
+                kind: 3,
+                ..page(0, PAGE_SIZE - 2, 2)
+            },
+            // Empty page.
+            page(0, PAGE_SIZE - 2, 0),
+            // Wrong offset, length, or number.
+            page(0, PAGE_SIZE - 3, 3),
+            page(0, PAGE_SIZE - 2, 1),
+            page(1, PAGE_SIZE - 2, 2),
+            // Out of order: the second page first.
+            page(1, PAGE_SIZE, 3),
+            // Outside the selection.
+            page(1, PAGE_SIZE + 3, 1),
+            // Completion before any page (truncated stream).
+            complete(2, 5),
+            complete(0, 0),
+        ] {
+            assert_eq!(fresh().accept(&f), bad, "{f:?}");
+        }
+        // Completion after a partial delivery.
+        let mut s = fresh();
+        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), Ok(()));
+        assert_eq!(s.accept(&complete(2, 5)), bad);
+        assert_eq!(s.accept(&complete(1, 2)), bad);
+        // A repeated page.
+        assert_eq!(s.accept(&page(0, PAGE_SIZE - 2, 2)), bad);
+        // Extra pages after the last, and a mismatched completion.
+        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), Ok(()));
+        assert_eq!(s.accept(&page(1, PAGE_SIZE, 3)), bad);
+        assert_eq!(s.accept(&complete(2, 4)), bad);
+        assert_eq!(s.accept(&complete(3, 5)), bad);
+        assert_eq!(
+            s.accept(&Frame {
+                length: 1,
+                ..complete(2, 5)
+            }),
+            bad
+        );
+        assert_eq!(s.accept(&complete(2, 5)), Ok(()));
+    }
+
+    async fn read(chunks: &[&[u8]], close: bool) -> (Result<usize, HeadError>, Vec<u8>) {
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        let chunks: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        let writer = tokio::spawn(async move {
+            for c in chunks {
+                theirs.write_all(&c).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            if !close {
+                std::future::pending::<()>().await;
+            }
+        });
+        let mut buf = b"stale".to_vec();
+        let result = read_head(&mut ours, &mut buf).await;
+        writer.abort();
+        (result, buf)
+    }
+
+    #[tokio::test]
+    async fn response_heads() {
+        // Split across reads, including inside the terminator; body bytes
+        // that arrive with the head stay buffered.
+        let (r, buf) = read(&[b"HTTP/1.1 200 OK\r\nA: b\r", b"\n\r", b"\nbody"], false).await;
+        let len = r.ok().unwrap();
+        assert_eq!(&buf[..len], b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n");
+        assert_eq!(&buf[len..], b"body");
+        // EOF before anything arrived, and after a partial head.
+        let (r, _) = read(&[], true).await;
+        assert!(matches!(
+            r,
+            Err(HeadError::Io(io::ErrorKind::UnexpectedEof, false))
+        ));
+        let (r, _) = read(&[b"HTTP/1.1 200"], true).await;
+        assert!(matches!(
+            r,
+            Err(HeadError::Io(io::ErrorKind::UnexpectedEof, true))
+        ));
+        // Oversized heads, with and without a terminator.
+        let filler = format!("X: {}\r\n", "a".repeat(MAX_HEAD));
+        let (r, _) = read(&[b"HTTP/1.1 200 OK\r\n", filler.as_bytes(), b"\r\n"], true).await;
+        assert!(matches!(r, Err(HeadError::Protocol)));
+        let (r, _) = read(&[b"HTTP/1.1 200 OK\r\n", filler.as_bytes()], false).await;
+        assert!(matches!(r, Err(HeadError::Protocol)));
     }
 }
