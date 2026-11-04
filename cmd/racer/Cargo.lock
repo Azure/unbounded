@@ -935,6 +935,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-dst"
+version = "0.1.0"
+dependencies = [
+ "racer-io",
+]
+
+[[package]]
 name = "racer-gpu"
 version = "0.1.0"
 dependencies = [

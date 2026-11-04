@@ -1,0 +1,63 @@
+# Racer DST cost table, shared by Full and Model fidelity (plan D14, section 9.2).
+#
+# Every value is an unsigned integer (underscores allowed). Sections and keys
+# are fixed; `racer_dst::costs::Costs::parse` rejects unknown or missing keys.
+# Recalibrate from the Phase -1 / 9.4 perf harness when baselines move > 10%.
+#
+# Sources:
+#   [baseline]  tmp/baselines/README.md of the racer-refactor worktree, Phase -1
+#               baselines recorded 2026-11-04 on an AMD EPYC 9V74 Azure VM
+#               (noisy host, load 42-71 on 48 vCPUs; treat as order-of-magnitude).
+#   [racer-sim] cmd/racer/sim/src/config.rs `Config::default` / `Costs::default`
+#               at the time racer-dst was created; kept so Model fidelity can
+#               reproduce racer-sim reports (D14 behavioral parity).
+
+[crypto]
+# [baseline] "Crypto, 1 core, 16 MiB page: seal / open = 3.57 / 3.58 GiB/s".
+seal_bytes_per_sec = 3_833_258_311
+open_bytes_per_sec = 3_843_995_729
+# [baseline] "crc64 / copy_prefix_crc64 / memcpy = 10.2 / 5.74 / 9.2 GiB/s".
+# Kept for the D4 tag-only-vs-CRC comparison; CRC is removed in Phase 4.
+crc64_bytes_per_sec = 10_952_166_605
+memcpy_bytes_per_sec = 9_878_424_781
+# [racer-sim] Costs::default sign_ns / verify_ns (20 us / 40 us).
+sign_ns = 20_000
+verify_ns = 40_000
+
+[cpu]
+# [racer-sim] Config::default workers.
+workers = 2
+# [racer-sim] Costs::default request_ns (fixed per-request dispatch cost).
+request_ns = 5_000
+# [racer-sim] Costs::default ranking_chunk_ns.
+ranking_chunk_ns = 2_000
+# [racer-sim] Costs::default path_expand_ns_per_node.
+path_expand_ns_per_node = 50
+# [racer-sim] Costs::default control_handshake_ns (200 us).
+control_handshake_ns = 200_000
+
+[nic]
+# [racer-sim] nic_bps 1.25e9 B/s (10 Gbit/s) and chunk_bytes 1 MiB.
+bytes_per_sec = 1_250_000_000
+chunk_bytes = 1_048_576
+
+[disk]
+# [racer-sim] disk_read_bps / disk_write_bps / disk_latency_ns (100 us).
+read_bytes_per_sec = 2_000_000_000
+write_bytes_per_sec = 1_000_000_000
+latency_ns = 100_000
+
+[origin]
+# [racer-sim] origin_caches / origin_concurrency / origin_bps (5e9 B/s)
+# / origin_latency_ns (30 ms) / origin_retry_ns (50 ms).
+caches = 4
+concurrency = 64
+bytes_per_sec = 5_000_000_000
+latency_ns = 30_000_000
+retry_ns = 50_000_000
+
+[rtt]
+# [racer-sim] local_rtt_ns (200 us), remote_rtt_ns (20 ms), rtt_jitter_ns (5 ms).
+local_ns = 200_000
+remote_ns = 20_000_000
+jitter_ns = 5_000_000

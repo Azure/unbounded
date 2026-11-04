@@ -1,0 +1,659 @@
+//! The simulated world: nodes, their roles, and the one-thread scheduler.
+//!
+//! A [`World`] owns N nodes. Each node is a set of roles ([`SimRole`]) built
+//! by the scenario's node factory from a [`NodeEnv`]: the node's simulated
+//! operating system ([`SimOs`], disk and network), its virtual clock, the
+//! shared [`Choices`] stream and the trace. Production code runs each role on
+//! its own pinned thread with `racer_io::exec::run`; here one thread steps all
+//! roles of all nodes, and the scheduler, not the roles, moves time.
+//!
+//! # Scheduling
+//!
+//! Each iteration:
+//! 1. Deliver world events (faults) due at the current instant.
+//! 2. Collect runnable roles: last step said `Ready`, its `WaitUntil` deadline
+//!    has passed, or a wake source fired ([`SimRole::woken`]: a CQE, a
+//!    cross-role mailbox wake, a ready task). Order is `(node, role)` index.
+//! 3. If any are runnable, [`Choices`] picks one and it takes one bounded
+//!    step. Safety invariants and role-reported violations are checked.
+//! 4. Otherwise time jumps to the earliest of every role's deadline and the
+//!    next world event. With nothing left at all the world is quiescent: a
+//!    role that still reports pending work ([`SimRole::pending`]) has no wake
+//!    source that could ever finish it, which is a liveness failure.
+//!
+//! Roles never `park`: the simulated reactor's park would advance the shared
+//! clock on its own. Time only moves in step 4.
+//!
+//! # Clocks
+//!
+//! Every node has its own [`VirtualClock`] anchored at one world origin, all
+//! advanced together, so monotonic time agrees across nodes while wall time
+//! can be skewed per node ([`Fault::ClockSkew`]). Clock rate skew needs a
+//! racer-io clock with a rate; see the crate docs.
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use racer_io::{
+    Driver, Reactor, WorkerCtx,
+    ctx::VirtualClock,
+    exec::{Lane, Next, Role, Tick},
+    ring::Config,
+    sim::SimOs,
+};
+
+use crate::{
+    choices::Choices,
+    engine::{Engine, Nanos, TraceHash},
+    invariants::{Class, Probe, RoleState},
+    resources::Fabric,
+    scenario::Scenario,
+};
+
+/// A role as the DST scheduler sees it.
+///
+/// [`LaneRole`] adapts a `racer_io` [`Lane`]. Other roles (crypto helpers,
+/// RDMA owners) implement this directly over their racer-io parts.
+pub trait SimRole {
+    /// One bounded nonblocking step (`racer_io::exec::Role::step`).
+    fn step(&mut self) -> racer_io::Result<Next>;
+
+    /// Whether a wake source fired since the last step: a completion is
+    /// ready, a task was woken, or a cross-thread wake is pending.
+    fn woken(&self) -> bool;
+
+    /// Whether the role holds unfinished work (live tasks or in-flight I/O).
+    /// Used only for the "pending work with no wake" liveness check.
+    fn pending(&self) -> bool;
+}
+
+/// [`SimRole`] over a racer-io lane.
+pub struct LaneRole<T>(pub Lane<T>);
+
+impl<T: Tick> SimRole for LaneRole<T> {
+    fn step(&mut self) -> racer_io::Result<Next> {
+        self.0.step()
+    }
+
+    fn woken(&self) -> bool {
+        self.0.executor.has_ready() || self.0.reactor.has_ready()
+    }
+
+    fn pending(&self) -> bool {
+        !self.0.executor.is_empty() || self.0.reactor.in_flight() > 0
+    }
+}
+
+/// A lane [`Tick`] that finishes when its flag is set.
+#[derive(Clone, Debug, Default)]
+pub struct DoneFlag(pub Rc<Cell<bool>>);
+
+impl DoneFlag {
+    /// Mark the lane finished.
+    pub fn set(&self) {
+        self.0.set(true);
+    }
+}
+
+impl Tick for DoneFlag {
+    fn done(&self) -> bool {
+        self.0.get()
+    }
+}
+
+/// World faults. Crash, restart, slow peer and wall-clock skew act today;
+/// partition and heal are recorded in the trace only until Phase 6 gives
+/// nodes simulated network endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Power loss: drop every role and crash the node's simulated disk.
+    Crash {
+        /// Node index.
+        node: u32,
+    },
+    /// Rebuild the node's roles through the factory on the surviving disk.
+    Restart {
+        /// Node index.
+        node: u32,
+    },
+    /// Cut the network between two nodes (placeholder).
+    Partition {
+        /// First node.
+        a: u32,
+        /// Second node.
+        b: u32,
+    },
+    /// Undo [`Fault::Partition`] (placeholder).
+    Heal {
+        /// First node.
+        a: u32,
+        /// Second node.
+        b: u32,
+    },
+    /// Multiply the node's cost-model service times (1 = normal).
+    SlowPeer {
+        /// Node index.
+        node: u32,
+        /// Slowdown factor.
+        factor: u8,
+    },
+    /// Shift the node's wall clock by `offset_ns` (monotonic time unchanged).
+    ClockSkew {
+        /// Node index.
+        node: u32,
+        /// Signed wall-clock offset.
+        offset_ns: i64,
+    },
+}
+
+impl Fault {
+    fn code(self) -> (u64, u64, u64) {
+        match self {
+            Self::Crash { node } => (1, node.into(), 0),
+            Self::Restart { node } => (2, node.into(), 0),
+            Self::Partition { a, b } => (3, a.into(), b.into()),
+            Self::Heal { a, b } => (4, a.into(), b.into()),
+            Self::SlowPeer { node, factor } => (5, node.into(), factor.into()),
+            Self::ClockSkew { node, offset_ns } => (6, node.into(), offset_ns as u64),
+        }
+    }
+}
+
+/// Shared, world-clocked trace digest. Roles fold what they observe into it so
+/// a data divergence (not only a schedule divergence) fails the double-run.
+#[derive(Clone, Default)]
+pub struct Trace {
+    hash: Rc<RefCell<TraceHash>>,
+    now: Rc<Cell<Nanos>>,
+}
+
+impl Trace {
+    /// Fold a record at the current world time.
+    pub fn record(&self, tag: u64, a: u64, b: u64) {
+        self.hash.borrow_mut().record(self.now.get(), tag, a, b);
+    }
+
+    /// Fold bytes at the current world time.
+    pub fn record_bytes(&self, tag: u64, bytes: &[u8]) {
+        self.hash
+            .borrow_mut()
+            .record_bytes(self.now.get(), tag, bytes);
+    }
+
+    /// The digest so far.
+    pub fn value(&self) -> u64 {
+        self.hash.borrow().value()
+    }
+
+    /// Current world time.
+    pub fn now(&self) -> Nanos {
+        self.now.get()
+    }
+}
+
+/// Violations reported from inside roles (an `assert` that must not unwind
+/// through the executor). The world fails the run after the step that
+/// reported one.
+#[derive(Clone, Default)]
+pub struct Reporter(Rc<RefCell<Vec<String>>>);
+
+impl Reporter {
+    /// Report a safety violation.
+    pub fn violation(&self, message: impl Into<String>) {
+        self.0.borrow_mut().push(message.into());
+    }
+
+    fn take(&self) -> Option<String> {
+        let mut list = self.0.borrow_mut();
+        (!list.is_empty())
+            .then(|| list.join("; "))
+            .inspect(|_| list.clear())
+    }
+}
+
+/// What a node factory gets to build one node incarnation.
+#[derive(Clone)]
+pub struct NodeEnv {
+    /// Node index.
+    pub index: u32,
+    /// 0 at first start, +1 per restart.
+    pub incarnation: u32,
+    /// The node's simulated OS; survives crashes (the disk is crashed, not
+    /// replaced).
+    pub os: SimOs,
+    /// The node's clock.
+    pub clock: VirtualClock,
+    /// The world choice stream.
+    pub choices: Choices,
+    /// The world trace.
+    pub trace: Trace,
+    /// The world violation sink.
+    pub report: Reporter,
+}
+
+impl NodeEnv {
+    /// A simulated worker context: this node's clock and a seeded entropy
+    /// stream whose seed is drawn from [`Choices`].
+    pub fn worker_ctx(&self, stream: u64) -> WorkerCtx {
+        WorkerCtx::simulated(&self.clock, self.choices.seed(), stream)
+    }
+
+    /// A reactor on this node's `Driver::Sim` with `entries` operations.
+    pub fn reactor(&self, stream: u64, entries: u32) -> racer_io::Result<Reactor> {
+        Reactor::new(
+            Driver::Sim(self.os.clone()),
+            Config::new(entries),
+            self.worker_ctx(stream),
+        )
+    }
+}
+
+/// Named roles of one node incarnation.
+pub type Roles = Vec<(String, Box<dyn SimRole>)>;
+
+/// Builds one node incarnation. Called at start and at every restart.
+pub type NodeFactory = Rc<dyn Fn(&NodeEnv) -> racer_io::Result<Roles>>;
+
+struct Slot {
+    name: String,
+    role: Box<dyn SimRole>,
+    next: Next,
+}
+
+struct Node {
+    env: NodeEnv,
+    roles: Vec<Slot>,
+    up: bool,
+}
+
+/// Why a run failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    /// Invariant class.
+    pub class: Class,
+    /// Invariant or check name.
+    pub name: String,
+    /// World time.
+    pub at: Nanos,
+    /// Steps taken.
+    pub step: u64,
+    /// Details.
+    pub message: String,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} invariant {:?} failed at {} ns (step {}): {}",
+            self.class, self.name, self.at, self.step, self.message
+        )
+    }
+}
+
+/// Result of one run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    /// Trace digest (schedule, faults and role observations).
+    pub trace: u64,
+    /// Role steps taken.
+    pub steps: u64,
+    /// World time at the end.
+    pub end: Nanos,
+    /// Raw choices drawn.
+    pub draws: u64,
+    /// Whether the run ended quiescent (nothing runnable or scheduled).
+    pub quiescent: bool,
+    /// First failure, if any.
+    pub failure: Option<Failure>,
+}
+
+const TAG_STEP: u64 = 1;
+const TAG_FAULT: u64 = 2;
+const TAG_END: u64 = 3;
+
+/// A running world.
+pub struct World<'s> {
+    scenario: &'s Scenario,
+    choices: Choices,
+    engine: Engine<Fault>,
+    origin: Instant,
+    nodes: Vec<Node>,
+    trace: Trace,
+    report: Reporter,
+    /// The FIFO cost model (Model fidelity charges it; Full fidelity uses it
+    /// for slow-peer state until `Driver::Sim` takes latencies from it).
+    pub fabric: Fabric,
+    steps: u64,
+    steps_here: u64,
+}
+
+impl<'s> World<'s> {
+    /// Build the world for `scenario` over `choices`, starting every node.
+    pub fn new(scenario: &'s Scenario, choices: Choices) -> Result<Self, Failure> {
+        let origin = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let trace = Trace::default();
+        let report = Reporter::default();
+        let fabric = Fabric::new(scenario.nodes, scenario.sites, &scenario.costs, &choices);
+        let mut engine = Engine::new();
+        for (at, fault) in scenario.fault_schedule(&choices) {
+            engine.at(at, fault);
+        }
+        let mut world = Self {
+            scenario,
+            choices: choices.clone(),
+            engine,
+            origin,
+            nodes: Vec::new(),
+            trace,
+            report,
+            fabric,
+            steps: 0,
+            steps_here: 0,
+        };
+        for index in 0..scenario.nodes {
+            let env = NodeEnv {
+                index,
+                incarnation: 0,
+                os: if scenario.seeded_os {
+                    SimOs::seeded(choices.seed())
+                } else {
+                    SimOs::new()
+                },
+                clock: VirtualClock::new_at(origin, wall),
+                choices: choices.clone(),
+                trace: world.trace.clone(),
+                report: world.report.clone(),
+            };
+            world.nodes.push(Node {
+                env,
+                roles: Vec::new(),
+                up: false,
+            });
+            world.start(index as usize)?;
+        }
+        Ok(world)
+    }
+
+    fn fail(&self, class: Class, name: &str, message: impl Into<String>) -> Failure {
+        Failure {
+            class,
+            name: name.to_owned(),
+            at: self.engine.now(),
+            step: self.steps,
+            message: message.into(),
+        }
+    }
+
+    fn start(&mut self, node: usize) -> Result<(), Failure> {
+        let env = self.nodes[node].env.clone();
+        let roles = (self.scenario.factory)(&env).map_err(|e| {
+            self.fail(
+                Class::Safety,
+                "node-start",
+                format!("node {node} incarnation {}: {e:?}", env.incarnation),
+            )
+        })?;
+        let n = &mut self.nodes[node];
+        n.roles = roles
+            .into_iter()
+            .map(|(name, role)| Slot {
+                name,
+                role,
+                next: Next::Ready,
+            })
+            .collect();
+        n.up = true;
+        Ok(())
+    }
+
+    fn nanos(&self, at: Instant) -> Nanos {
+        at.saturating_duration_since(self.origin)
+            .as_nanos()
+            .min(u128::from(Nanos::MAX)) as Nanos
+    }
+
+    fn apply(&mut self, fault: Fault) -> Result<(), Failure> {
+        let (kind, a, b) = fault.code();
+        self.trace.record(TAG_FAULT, kind, a ^ (b << 32));
+        let valid = |n: u32| (n as usize) < self.nodes.len();
+        match fault {
+            Fault::Crash { node } if valid(node) => {
+                let n = &mut self.nodes[node as usize];
+                if n.up {
+                    n.roles.clear();
+                    n.up = false;
+                    n.env
+                        .os
+                        .disk()
+                        .crash()
+                        .map_err(|e| self.fail(Class::Safety, "crash", e.to_string()))?;
+                }
+            }
+            Fault::Restart { node } if valid(node) => {
+                if !self.nodes[node as usize].up {
+                    self.nodes[node as usize].env.incarnation += 1;
+                    self.start(node as usize)?;
+                }
+            }
+            Fault::SlowPeer { node, factor } if valid(node) => {
+                self.fabric.slow[node as usize] = factor.max(1);
+            }
+            Fault::ClockSkew { node, offset_ns } if valid(node) => {
+                let clock = &self.nodes[node as usize].env.clock;
+                let wall = clock.wall_now();
+                let shifted = if offset_ns >= 0 {
+                    wall.checked_add(Duration::from_nanos(offset_ns as u64))
+                } else {
+                    wall.checked_sub(Duration::from_nanos(offset_ns.unsigned_abs()))
+                };
+                shifted
+                    .and_then(|w| clock.set_wall_time(w).ok())
+                    .ok_or_else(|| self.fail(Class::Safety, "clock-skew", "out of range"))?;
+            }
+            Fault::Partition { .. } | Fault::Heal { .. } => {}
+            _ => {
+                return Err(self.fail(
+                    Class::Safety,
+                    "fault",
+                    format!("fault names a missing node: {fault:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, to: Nanos) -> Result<(), Failure> {
+        self.engine.advance_to(to);
+        self.trace.now.set(self.engine.now());
+        let at = self.origin + Duration::from_nanos(self.engine.now());
+        for node in &self.nodes {
+            node.env
+                .clock
+                .advance_to(at)
+                .map_err(|e| self.fail(Class::Safety, "clock", format!("{e:?}")))?;
+        }
+        self.steps_here = 0;
+        Ok(())
+    }
+
+    /// Snapshot of every role for invariant checks.
+    pub fn roles(&self) -> Vec<RoleState> {
+        let mut out = Vec::new();
+        for node in &self.nodes {
+            for slot in &node.roles {
+                out.push(RoleState {
+                    node: node.env.index,
+                    name: slot.name.clone(),
+                    next: slot.next,
+                    pending: slot.role.pending(),
+                });
+            }
+        }
+        out
+    }
+
+    fn check(&self, class: Class, quiescent: bool) -> Result<(), Failure> {
+        let checks: Vec<_> = self
+            .scenario
+            .invariants
+            .iter()
+            .filter(|i| i.class == class)
+            .collect();
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let roles = self.roles();
+        let probe = Probe {
+            now: self.engine.now(),
+            steps: self.steps,
+            quiescent,
+            roles: &roles,
+            up: self.nodes.iter().map(|n| n.up).collect(),
+        };
+        for inv in checks {
+            (inv.check)(&probe).map_err(|m| self.fail(class, &inv.name, m))?;
+        }
+        Ok(())
+    }
+
+    /// Run until quiescence, the scenario end time, or the step budget.
+    pub fn run(mut self) -> Outcome {
+        let result = self.run_inner();
+        let quiescent = matches!(result, Ok(true));
+        let failure = result.err();
+        self.trace.record(TAG_END, self.steps, self.choices.drawn());
+        Outcome {
+            trace: self.trace.value(),
+            steps: self.steps,
+            end: self.engine.now(),
+            draws: self.choices.drawn(),
+            quiescent,
+            failure,
+        }
+    }
+
+    /// `Ok(true)` when the world went quiescent.
+    fn run_inner(&mut self) -> Result<bool, Failure> {
+        let end = self.scenario.end;
+        loop {
+            while let Some(fault) = self.engine.pop_until(self.engine.now()) {
+                self.apply(fault)?;
+            }
+            if self.steps >= self.scenario.max_steps {
+                return Ok(false);
+            }
+            let now = self.engine.now();
+            let mut runnable = Vec::new();
+            for (n, node) in self.nodes.iter().enumerate() {
+                for (r, slot) in node.roles.iter().enumerate() {
+                    let due = match slot.next {
+                        Next::Ready => true,
+                        Next::Done => false,
+                        Next::WaitUntil(at) => self.nanos(at) <= now,
+                        Next::Idle => false,
+                    };
+                    if due || (slot.next != Next::Done && slot.role.woken()) {
+                        runnable.push((n, r));
+                    }
+                }
+            }
+            if !runnable.is_empty() {
+                let (n, r) = runnable[self.choices.index(runnable.len())];
+                let slot = &mut self.nodes[n].roles[r];
+                let next = slot.role.step();
+                self.steps += 1;
+                self.steps_here += 1;
+                let next = match next {
+                    Ok(next) => next,
+                    Err(e) => {
+                        let name = slot.name.clone();
+                        return Err(self.fail(
+                            Class::Safety,
+                            "role-error",
+                            format!("node {n} role {name}: {e:?}"),
+                        ));
+                    }
+                };
+                slot.next = next;
+                let code = match next {
+                    Next::Ready => 0,
+                    Next::Idle => 1,
+                    Next::Done => 2,
+                    Next::WaitUntil(at) => 3 + self.nanos(at),
+                };
+                self.trace
+                    .record(TAG_STEP, ((n as u64) << 32) | r as u64, code);
+                if let Some(message) = self.report.take() {
+                    return Err(self.fail(Class::Safety, "role-assert", message));
+                }
+                self.check(Class::Safety, false)?;
+                if self.steps_here > self.scenario.busy_limit {
+                    return Err(self.fail(
+                        Class::Liveness,
+                        "busy-loop",
+                        format!(
+                            "{} steps without time advancing (limit {})",
+                            self.steps_here, self.scenario.busy_limit
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let deadline = self
+                .nodes
+                .iter()
+                .flat_map(|n| n.roles.iter())
+                .filter_map(|s| match s.next {
+                    Next::WaitUntil(at) => Some(self.nanos(at)),
+                    _ => None,
+                })
+                .min();
+            let next = match (deadline, self.engine.next_at()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            match next {
+                Some(at) if at <= end => self.advance(at)?,
+                Some(_) => {
+                    self.advance(end)?;
+                    self.check(Class::Liveness, false)?;
+                    return Ok(false);
+                }
+                None => {
+                    let stuck: Vec<String> = self
+                        .nodes
+                        .iter()
+                        .flat_map(|n| n.roles.iter().map(move |s| (n.env.index, s)))
+                        .filter(|(_, s)| s.next != Next::Done && s.role.pending())
+                        .map(|(node, s)| format!("node {node} role {}", s.name))
+                        .collect();
+                    if !stuck.is_empty() {
+                        return Err(self.fail(
+                            Class::Liveness,
+                            "pending-without-wake",
+                            format!(
+                                "pending work with no timer, I/O or wake scheduled: {}",
+                                stuck.join(", ")
+                            ),
+                        ));
+                    }
+                    self.check(Class::Resource, true)?;
+                    self.check(Class::Liveness, true)?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
+/// Wall time of a node, for tests of [`Fault::ClockSkew`].
+pub fn wall_nanos(clock: &VirtualClock) -> u128 {
+    clock
+        .wall_now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
