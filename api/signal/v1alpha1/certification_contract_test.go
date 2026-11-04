@@ -43,6 +43,7 @@ func TestCertificationCheckListContract(t *testing.T) {
 			t.Parallel()
 
 			crd := readCRD(t, tt.file)
+
 			schema := crd.Spec.Versions[0].Schema.OpenAPIV3Schema
 			for _, property := range tt.schemaPath {
 				next, found := schema.Properties[property]
@@ -74,6 +75,7 @@ func TestCertificationRunChecksRemainImmutable(t *testing.T) {
 	t.Parallel()
 
 	crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
+
 	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
 	for _, validation := range spec.XValidations {
 		if validation.Rule == "self.checks == oldSelf.checks" {
