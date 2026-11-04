@@ -250,6 +250,9 @@ pub struct NodeEnv {
     pub trace: Trace,
     /// The world violation sink.
     pub report: Reporter,
+    /// The node's slowdown factor ([`Fault::SlowPeer`]); scales its OS
+    /// operation costs.
+    pub slow: Rc<Cell<u8>>,
 }
 
 impl NodeEnv {
@@ -346,8 +349,9 @@ pub struct World<'s> {
     nodes: Vec<Node>,
     trace: Trace,
     report: Reporter,
-    /// The FIFO cost model (Model fidelity charges it; Full fidelity uses it
-    /// for slow-peer state until `Driver::Sim` takes latencies from it).
+    /// The FIFO cost model (Model fidelity charges it). Full fidelity charges
+    /// node OS operations from the same cost table through
+    /// `SimOs::set_op_cost` ([`crate::costs::Costs::op`]).
     pub fabric: Fabric,
     steps: u64,
     steps_here: u64,
@@ -377,14 +381,25 @@ impl<'s> World<'s> {
             steps_here: 0,
         };
         for index in 0..scenario.nodes {
+            let os = if scenario.seeded_os {
+                SimOs::with_choices(choices.clone())
+            } else {
+                SimOs::new()
+            };
+            let slow = Rc::new(Cell::new(1u8));
+            let (costs, factor) = (scenario.costs, slow.clone());
+            os.set_op_cost(move |op| {
+                Duration::from_nanos(
+                    costs
+                        .op(op.kind, op.bytes)
+                        .saturating_mul(u64::from(factor.get())),
+                )
+            });
             let env = NodeEnv {
                 index,
                 incarnation: 0,
-                os: if scenario.seeded_os {
-                    SimOs::with_choices(choices.clone())
-                } else {
-                    SimOs::new()
-                },
+                os,
+                slow,
                 clock: VirtualClock::new_at(origin, wall),
                 choices: choices.clone(),
                 trace: world.trace.clone(),
@@ -466,6 +481,7 @@ impl<'s> World<'s> {
             }
             Fault::SlowPeer { node, factor } if valid(node) => {
                 self.fabric.slow[node as usize] = factor.max(1);
+                self.nodes[node as usize].env.slow.set(factor.max(1));
             }
             Fault::ClockSkew { node, offset_ns } if valid(node) => {
                 let clock = &self.nodes[node as usize].env.clock;

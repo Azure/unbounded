@@ -154,6 +154,22 @@ impl Costs {
         service_ns(bytes, self.crypto_seal_bytes_per_sec)
     }
 
+    /// Simulated OS operation latency for `kind` (a racer-io operation name,
+    /// see `racer_io::sim::OpDesc`) moving `bytes`. Disk operations pay the
+    /// disk latency plus transfer time; sends pay NIC serialization; waits
+    /// for a peer (receive, accept, poll) and closes are free here because
+    /// their time comes from the peer.
+    pub fn op(&self, kind: &str, bytes: u64) -> Nanos {
+        let disk = self.disk_latency_ns;
+        match kind {
+            "read" | "readv" => disk + service_ns(bytes, self.disk_read_bytes_per_sec),
+            "write" | "writev" => disk + service_ns(bytes, self.disk_write_bytes_per_sec),
+            "fsync" | "open" | "stat" | "mkdir" | "rename" | "unlink" => disk,
+            "send" | "sendmsg" | "splice" => service_ns(bytes, self.nic_bytes_per_sec),
+            _ => 0,
+        }
+    }
+
     /// AEAD open time for `bytes` on one core.
     pub fn open(&self, bytes: u64) -> Nanos {
         service_ns(bytes, self.crypto_open_bytes_per_sec)
@@ -208,6 +224,24 @@ mod tests {
         for (text, needle) in cases {
             let err = Costs::parse(&text).unwrap_err();
             assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn op_costs_follow_the_table() {
+        let c = Costs::checked_in();
+        assert_eq!(c.op("fsync", 0), c.disk_latency_ns);
+        assert_eq!(
+            c.op("write", 1 << 20),
+            c.disk_latency_ns + service_ns(1 << 20, c.disk_write_bytes_per_sec)
+        );
+        assert_eq!(
+            c.op("readv", 4096),
+            c.disk_latency_ns + service_ns(4096, c.disk_read_bytes_per_sec)
+        );
+        assert_eq!(c.op("send", 1000), service_ns(1000, c.nic_bytes_per_sec));
+        for free in ["recv", "accept", "poll", "close", "cancel"] {
+            assert_eq!(c.op(free, 1 << 20), 0, "{free}");
         }
     }
 

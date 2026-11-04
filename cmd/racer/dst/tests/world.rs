@@ -157,6 +157,36 @@ fn clock_rate_and_jump_skew_monotonic_time() {
 }
 
 #[test]
+fn os_operations_are_charged_from_the_cost_table() {
+    let base = Scenario::new("t")
+        .roles(|env| lane_pair(env, 2))
+        .with(all_roles_settled());
+    let mut costs = base.costs;
+    costs.disk_latency_ns = SECONDS;
+    let fast = run_twice(&base, &Source::Seed(5)).unwrap();
+    let slow_disk = run_twice(&base.clone().costs(costs), &Source::Seed(5)).unwrap();
+    assert_eq!((&fast.failure, &slow_disk.failure), (&None, &None));
+    // Each round's atomic write and read-back touch the disk several times.
+    assert!(
+        slow_disk.end >= fast.end + 4 * SECONDS,
+        "{fast:?} {slow_disk:?}"
+    );
+    let slow_peer = run_twice(
+        &base.clone().fault(
+            0,
+            Fault::SlowPeer {
+                node: 0,
+                factor: 200,
+            },
+        ),
+        &Source::Seed(5),
+    )
+    .unwrap();
+    assert_eq!(slow_peer.failure, None);
+    assert!(slow_peer.end > fast.end, "{fast:?} {slow_peer:?}");
+}
+
+#[test]
 fn pending_work_without_wake_is_a_liveness_failure() {
     let s = Scenario::new("t").roles(|env| {
         let mut roles: racer_dst::world::Roles = Vec::new();
