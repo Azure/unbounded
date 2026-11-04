@@ -19,8 +19,8 @@
 //!
 //! Endpoint circuits, adaptive admission, handoffs, and hedge alarms use distinct
 //! ownership rules. Pipes retain their charges while idle; socket-retained bytes
-//! are outside the pipe capacity budget. The `simulation` feature forwards the
-//! runtime's simulated descriptors without changing admission policy.
+//! are outside the pipe capacity budget. [`pipe::PipePool::simulated`] creates
+//! pipes in a simulated world without changing admission policy.
 //!
 //! [`coalesce`] provides worker-local keyed cohorts, shared results, and flight
 //! lifecycle tracking. Callers retain execution, admission, and result policy;

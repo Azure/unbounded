@@ -418,7 +418,6 @@ dependencies = [
  "libc",
  "page-alloc",
  "racer-io",
- "uring-runtime",
  "zeroize",
 ]
 

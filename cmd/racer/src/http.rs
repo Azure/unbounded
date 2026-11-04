@@ -29,12 +29,18 @@ pub fn new_pipe_pool(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 ) -> PipePool<AdmissionPolicy> {
     let waiter_limit = admission.policy().limits().queue_entries.get();
-    PipePool::new(
+    let pool = PipePool::new(
         admission,
         ResourceClass::Pipe,
         ResourceClass::RequestContext,
         waiter_limit,
-    )
+    );
+    // Migration shim: test worlds are still selected thread-locally.
+    #[cfg(test)]
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+        return pool.simulated(sim.os().clone());
+    }
+    pool
 }
 #[cfg(test)]
 pub(crate) fn acquire_wait<'a>(
