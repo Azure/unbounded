@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
@@ -272,7 +273,7 @@ def start_fixture(blank_efi: Path, active_efi: Path) -> None:
             "--cert", str(TMP / "redfish.crt"), "--key", str(TMP / "redfish.key"),
             "--record", str(RECORD), "--efi-source", str(blank_efi),
             "--efi-active", str(active_efi), "--bridge", BRIDGE,
-            "--cache-dir", str(TMP / "cache"), "--username", "smoke", "--password", "smoke"],
+            "--username", "smoke", "--password", "smoke"],
           "redfish.log")
     time.sleep(1)
 
@@ -288,7 +289,8 @@ def start_metalman_and_replace() -> None:
             f"--site={SITE}", f"--bind-address={SERVER_IP}", f"--serve-url={SERVE_URL}",
             f"--http-port={HTTP_PORT}",
             f"--dhcp-port={DHCP_PORT}",
-            f"--cache-dir={TMP / 'cache'}", f"--default-netboot-image={NETBOOT_IMAGE}"],
+            f"--cache-dir={TMP / 'cache'}",  # generated boot media (ISOs)
+            f"--default-netboot-image={NETBOOT_IMAGE}"],
           "metalman.log")
     machine = {
         "apiVersion": "unbounded-cloud.io/v1alpha3", "kind": "Machine",
@@ -321,23 +323,22 @@ def start_metalman_and_replace() -> None:
     else:
         raise RuntimeError("Redfish certificate fingerprint was not recorded")
 
-    log("Waiting for host and netboot OCI images to be cached")
-    cache_dir = TMP / "cache" / "oci"
+    # metalman pulls image files from the registry on every request, so
+    # there is nothing to warm up; wait until its HTTP server accepts
+    # connections before starting the operation.
+    log("Waiting for the metalman HTTP server")
     metalman_log = TMP / "metalman.log"
     for _ in range(300):
-        disk_dirs = list(cache_dir.glob("*/amd64/disk"))
-        host_ready = any((path / "disk.img.gz").is_file() for path in disk_dirs)
-        netboot_ready = any((path / "bootx64.efi").is_file() for path in disk_dirs)
         log_text = metalman_log.read_text(encoding="utf-8") if metalman_log.exists() else ""
-        host_published = any("OCI image cached" in line and f"image={HOST_IMAGE}" in line
-                             for line in log_text.splitlines())
-        netboot_published = any("OCI image cached" in line and f"image={NETBOOT_IMAGE}" in line
-                                for line in log_text.splitlines())
-        if host_ready and netboot_ready and host_published and netboot_published:
-            break
+        if "starting HTTP server" in log_text:
+            try:
+                with socket.create_connection((SERVER_IP, HTTP_PORT), timeout=2):
+                    break
+            except OSError:
+                pass
         time.sleep(1)
     else:
-        raise RuntimeError("host and netboot OCI images were not cached within 5 minutes")
+        raise RuntimeError("metalman HTTP server did not start within 5 minutes")
 
     operation = smoke.create_machine_operation(
         "http-smoke-host-replace", "HostReplace", machine_ref=NODE

@@ -45,6 +45,8 @@ MAC_ADDRESS = "52:54:00:aa:bb:01"
 REDFISH_PORT = 8443
 HTTP_PORT = 8880
 AGENT_DOWNLOAD_PORT = 8881
+# metalman --cache-dir: generated boot media (ISOs) only; image files are
+# pulled from the registry per request and never cached.
 CACHE_DIR = TMPDIR / "cache"
 ARTIFACT_DIR = TMPDIR / "artifacts"
 SERVE_URL = f"http://{SERVER_IP}:{HTTP_PORT}"
@@ -1258,7 +1260,7 @@ def main() -> None:
     proc = spawn([
         "sudo", "env", *metalman_env,
         str(BINARY), "serve-pxe", f"--site={SITE}", f"--bind-address={SERVER_IP}",
-        f"--cache-dir={CACHE_DIR}",
+        f"--cache-dir={CACHE_DIR}",  # generated boot media (ISOs)
         f"--serve-url={SERVE_URL}", "--dhcp-interface=virbr-smoke",
         f"--default-netboot-image={NETBOOT_IMAGE_NAME}",
         "--leader-elect-lease-duration=60s",
