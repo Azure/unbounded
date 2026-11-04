@@ -801,6 +801,7 @@ impl NativeQueuePair {
         stop_observer: Arc<std::sync::atomic::AtomicBool>,
         send_depth: u32,
         recv_depth: u32,
+        rng: &racer_io::Rng,
     ) -> Result<Rc<Self>> {
         if send_depth == 0 || recv_depth == 0 || send_depth.checked_add(recv_depth).is_none() {
             return Err(Error::InvalidConfiguration);
@@ -830,7 +831,7 @@ impl NativeQueuePair {
         let simulated = false;
         if simulated {
             psn = qpn.to_be_bytes();
-        } else if uring_runtime::environment::fill_random(&mut psn).is_err() {
+        } else if rng.fill(&mut psn).is_err() {
             if unsafe { (device.api.qp_free)(raw.as_ptr()) } != 0 {
                 quota.quarantine();
                 std::mem::forget(quota);
@@ -1597,6 +1598,7 @@ pub(crate) mod lifetime_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             32,
             4,
+            &racer_io::Rng::os(),
         )
         .unwrap();
         qp.connect(qp.endpoint, true).unwrap();
@@ -1790,6 +1792,7 @@ pub(crate) mod lifetime_tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             send,
             recv,
+            &racer_io::Rng::os(),
         )
         .unwrap();
         qp.connect(qp.endpoint, true).unwrap();
@@ -1918,6 +1921,7 @@ pub(crate) mod lifetime_tests {
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     send,
                     recv,
+                    &racer_io::Rng::os(),
                 ),
                 Err(Error::InvalidConfiguration)
             ));
@@ -2125,6 +2129,7 @@ pub(crate) mod lifetime_tests {
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 4,
                 4,
+                &racer_io::Rng::os(),
             )
             .unwrap()
         };

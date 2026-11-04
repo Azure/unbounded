@@ -575,7 +575,7 @@ struct Backoff {
 /// Not `Send`. Poll it with [`Self::poll_budgeted`], or host it with
 /// [`crate::WithNative::with_host`].
 pub struct Owner {
-    environment: uring_runtime::environment::Environment,
+    ctx: racer_io::WorkerCtx,
 
     #[cfg(any(test, feature = "simulation"))]
     simulation: Option<crate::simulation::Simulation>,
@@ -613,9 +613,9 @@ pub struct Owner {
 }
 
 impl Owner {
-    /// Build the owner. Call on the native thread; it captures that
-    /// thread's environment (and simulation, in tests).
-    pub fn new(port: OwnerPort) -> Self {
+    /// Build the owner. Call on the native thread; `ctx` supplies its time
+    /// and entropy (and it captures the thread's simulation, in tests).
+    pub fn new(port: OwnerPort, ctx: racer_io::WorkerCtx) -> Self {
         // Move the fields out; `OwnerPort::drop` must not mark the node dead.
         let port = std::mem::ManuallyDrop::new(port);
         // SAFETY: each field is read once out of a `ManuallyDrop`.
@@ -623,7 +623,7 @@ impl Owner {
             unsafe { (std::ptr::read(&port.channel), std::ptr::read(&port.shared)) };
 
         Self {
-            environment: uring_runtime::environment::Environment::current(),
+            ctx,
             #[cfg(any(test, feature = "simulation"))]
             simulation: crate::simulation::current(),
             channel,
@@ -670,8 +670,7 @@ impl Owner {
             return Ok(());
         }
 
-        let _environment = self.environment.enter();
-        let now = uring_runtime::environment::now();
+        let now = self.ctx.now();
         let closed = self.shared.closed.load(Ordering::Acquire);
 
         if !closed && self.closing {
@@ -1003,7 +1002,15 @@ impl Owner {
         self.next_epoch += 1;
         let quota = self.quota.as_ref().ok_or(Error::Unavailable)?;
 
-        Link::new(epoch, role, &device.device, quota, settings.limits, now)
+        Link::new(
+            epoch,
+            role,
+            &device.device,
+            quota,
+            settings.limits,
+            now,
+            &self.ctx.rng,
+        )
     }
 
     fn open(&mut self, key: LinkKey, now: Instant) -> Result<Opened> {
@@ -1156,7 +1163,7 @@ impl Owner {
         self.backoff.insert(
             key,
             Backoff {
-                until: now + jitter(delay),
+                until: now + jitter(delay, &self.ctx.rng),
                 delay,
             },
         );
@@ -1338,7 +1345,6 @@ impl Drop for Owner {
     /// Fail every op, destroy every link (leaking what cannot be
     /// destroyed), and leak pools that are still in use.
     fn drop(&mut self) {
-        let _environment = self.environment.enter();
         self.shared.alive.store(false, Ordering::Release);
         self.shared.closed.store(true, Ordering::Release);
         let keys: Vec<LinkKey> = self.links.keys().copied().collect();
@@ -1403,10 +1409,10 @@ fn opened(link: &Link) -> Opened {
 }
 
 /// `delay` plus or minus up to 20 %.
-fn jitter(delay: Duration) -> Duration {
+fn jitter(delay: Duration, rng: &racer_io::Rng) -> Duration {
     let mut bytes = [0u8; 2];
 
-    if uring_runtime::environment::fill_random(&mut bytes).is_err() {
+    if rng.fill(&mut bytes).is_err() {
         return delay;
     }
 
@@ -1441,7 +1447,7 @@ mod tests {
     /// Jitter stays within 20 % of the delay.
     fn jitter_is_bounded() {
         for _ in 0..100 {
-            let d = jitter(Duration::from_secs(10));
+            let d = jitter(Duration::from_secs(10), &racer_io::Rng::os());
             assert!(
                 d >= Duration::from_secs(8) && d <= Duration::from_secs(12),
                 "{d:?}"

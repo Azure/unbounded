@@ -2394,6 +2394,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 8,
                 4,
+                &racer_io::Rng::os(),
             )
             .unwrap()
         }
@@ -2419,6 +2420,7 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 8,
                 4,
+                &racer_io::Rng::os(),
             )
             .unwrap()
         };

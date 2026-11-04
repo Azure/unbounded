@@ -1769,7 +1769,11 @@ mod tests {
                     self.observed.native.lock().unwrap().push(clients.remove(0));
                     Box::new(rdma_verbs::WithNative::with_host(
                         page,
-                        rdma_verbs::Owner::new(port),
+                        rdma_verbs::Owner::new(
+                            port,
+                            // MIGRATION: the thread environment until workers receive a WorkerCtx.
+                            uring_runtime::environment::Environment::current().worker_ctx(),
+                        ),
                     ))
                 } else {
                     Box::new(page)

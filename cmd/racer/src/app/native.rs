@@ -95,7 +95,14 @@ impl NativeNode {
         let mut owner = self.owner.lock().map_err(|_| Error::Unavailable)?;
         Ok(match owner.take_if(|(hosted, _)| *hosted == worker) {
             // Build the owner here, on the native thread that polls it.
-            Some((_, port)) => Box::new(WithOwner::with_host(engine, rdma_verbs::Owner::new(port))),
+            Some((_, port)) => Box::new(WithOwner::with_host(
+                engine,
+                rdma_verbs::Owner::new(
+                    port,
+                    // MIGRATION: the thread environment until workers receive a WorkerCtx.
+                    uring_runtime::environment::Environment::current().worker_ctx(),
+                ),
+            )),
             None => Box::new(engine),
         })
     }

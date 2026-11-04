@@ -483,6 +483,7 @@ impl Link {
         quota: &Arc<GuardOwner>,
         limits: Limits,
         now: Instant,
+        rng: &racer_io::Rng,
     ) -> Result<Self> {
         let (send_depth, recv_depth) = depths(limits.grants).ok_or(Error::InvalidConfiguration)?;
         let send_slots = recv_depth;
@@ -492,6 +493,7 @@ impl Link {
             Arc::new(AtomicBool::new(false)),
             send_depth,
             recv_depth,
+            rng,
         )?;
         let control = NativeRegion::with_access(
             device.clone(),

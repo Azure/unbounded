@@ -238,7 +238,7 @@ fn activate(
     selector: impl FnOnce(&[crate::PortInfo]) -> Result<Vec<(u16, usize)>> + Send + 'static,
 ) -> (Result<Vec<crate::Selection>>, (Owner, crate::Client)) {
     let (mut clients, port) = node(1).unwrap();
-    let mut owner = Owner::new(port);
+    let mut owner = Owner::new(port, racer_io::WorkerCtx::host());
     let client = clients.remove(0);
     let activation = client.activate(NodeConfig {
         selector: Box::new(selector),

@@ -106,6 +106,17 @@ pub struct Guard {
 }
 
 impl Environment {
+    /// The explicit racer-io worker context equivalent to this environment.
+    // MIGRATION: bridges thread-local environments to WorkerCtx until every
+    // role receives its context explicitly.
+    pub fn worker_ctx(&self) -> racer_io::WorkerCtx {
+        #[cfg(feature = "simulation")]
+        if let Some(sim) = &self.simulated {
+            return sim.ctx.clone();
+        }
+        racer_io::WorkerCtx::host()
+    }
+
     /// Capture this thread's selected environment, or the host environment.
     pub fn current() -> Self {
         #[cfg(feature = "simulation")]
@@ -174,17 +185,14 @@ impl<F> Drop for Scoped<F> {
 #[cfg(feature = "simulation")]
 /// Return the active simulated world's seed, or None for a host environment.
 pub fn simulation_seed() -> Option<u64> {
-    Environment::current()
-        .simulated
-        .map(|sim| sim.clock.0.lock().unwrap().seed)
+    Environment::current().simulated.map(|sim| sim.clock.seed)
 }
 
 /// Read monotonic time from the selected environment.
 pub fn now() -> Instant {
     #[cfg(feature = "simulation")]
     if let Some(sim) = selected_simulation() {
-        let clock = sim.clock.0.lock().unwrap();
-        return clock.monotonic + clock.elapsed;
+        return sim.clock.clock.now();
     }
     Instant::now()
 }
@@ -193,8 +201,7 @@ pub fn now() -> Instant {
 pub fn wall_now() -> SystemTime {
     #[cfg(feature = "simulation")]
     if let Some(sim) = selected_simulation() {
-        let clock = sim.clock.0.lock().unwrap();
-        return clock.wall;
+        return sim.clock.clock.wall_now();
     }
     SystemTime::now()
 }
@@ -204,8 +211,7 @@ pub fn wall_now() -> SystemTime {
 pub fn clock_anchor() -> (Instant, SystemTime) {
     #[cfg(feature = "simulation")]
     if let Some(sim) = selected_simulation() {
-        let clock = sim.clock.0.lock().unwrap();
-        return (clock.monotonic, clock.wall_origin);
+        return racer_io::Clock::from(sim.clock.clock.clone()).anchor();
     }
 
     static ANCHOR: OnceLock<(Instant, SystemTime)> = OnceLock::new();
@@ -228,6 +234,9 @@ struct Simulated {
     clock: SimulationClock,
 
     entropy: std::sync::Arc<std::sync::Mutex<Entropy>>,
+
+    /// The same world clock with a racer-io entropy stream for migrated callers.
+    ctx: racer_io::WorkerCtx,
 }
 
 #[cfg(feature = "simulation")]
@@ -281,21 +290,12 @@ impl Entropy {
 /// stream ID and retain its Environment; cloning a role shares its entropy cursor.
 #[cfg(feature = "simulation")]
 #[derive(Clone, Debug)]
-pub struct SimulationClock(std::sync::Arc<std::sync::Mutex<Clock>>);
-
-#[cfg(feature = "simulation")]
-#[derive(Debug)]
-/// Clock anchors and mutable elapsed time shared by one simulated world.
-struct Clock {
+pub struct SimulationClock {
     seed: u64,
 
-    monotonic: Instant,
-
-    elapsed: std::time::Duration,
-
-    wall_origin: SystemTime,
-
-    wall: SystemTime,
+    // MIGRATION: the world clock is racer-io's so migrated roles that hold a
+    // WorkerCtx observe the same virtual time as thread-local environment users.
+    clock: racer_io::ctx::VirtualClock,
 }
 
 #[cfg(feature = "simulation")]
@@ -314,13 +314,10 @@ impl SimulationClock {
 
     /// Create a world with explicit monotonic and wall-clock anchors.
     pub fn new_at(seed: u64, monotonic: Instant, wall: SystemTime) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(Clock {
+        Self {
             seed,
-            monotonic,
-            elapsed: std::time::Duration::ZERO,
-            wall_origin: wall,
-            wall,
-        })))
+            clock: racer_io::ctx::VirtualClock::new_at(monotonic, wall),
+        }
     }
 
     /// Creates a fresh entropy stream. Call once per role incarnation and retain
@@ -344,12 +341,13 @@ impl SimulationClock {
                 clock: self.clone(),
                 entropy: std::sync::Arc::new(std::sync::Mutex::new(Entropy {
                     domain: domain.into(),
-                    seed: self.0.lock().unwrap().seed,
+                    seed: self.seed,
                     stream,
                     counter: 0,
                     block: [0; 32],
                     offset: 32,
                 })),
+                ctx: racer_io::WorkerCtx::simulated(&self.clock, self.seed, stream),
             }),
         }
     }
@@ -363,32 +361,30 @@ impl SimulationClock {
 
     /// Advance atomically or leave both clocks unchanged on overflow.
     pub fn checked_advance(&self, duration: std::time::Duration) -> crate::Result<()> {
-        let mut clock = self.0.lock().map_err(|_| crate::Error::Unavailable)?;
-        let elapsed = clock
-            .elapsed
+        // Keep the old contract: the monotonic instant itself must not overflow.
+        self.clock
+            .now()
             .checked_add(duration)
             .ok_or(crate::Error::InvalidInput)?;
-        clock
-            .monotonic
-            .checked_add(elapsed)
-            .ok_or(crate::Error::InvalidInput)?;
-        let wall = clock
-            .wall
-            .checked_add(duration)
-            .ok_or(crate::Error::InvalidInput)?;
-        clock.elapsed = elapsed;
-        clock.wall = wall;
-        Ok(())
+        self.clock.advance(duration)
     }
 
     /// Return the total monotonic time advanced since world creation.
     pub fn elapsed(&self) -> std::time::Duration {
-        self.0.lock().unwrap().elapsed
+        self.clock.elapsed()
     }
 
     /// Correct wall time without changing elapsed time or the stable anchor.
     pub fn set_wall_time(&self, wall: SystemTime) {
-        self.0.lock().unwrap().wall = wall;
+        self.clock
+            .set_wall_time(wall)
+            .expect("simulated wall time is after the Unix epoch");
+    }
+
+    /// The racer-io virtual clock backing this world.
+    // MIGRATION: lets migrated roles build a WorkerCtx on the same world clock.
+    pub fn virtual_clock(&self) -> &racer_io::ctx::VirtualClock {
+        &self.clock
     }
 }
 

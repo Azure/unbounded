@@ -70,7 +70,16 @@ fn side_with(
     let implicit = NativeRegion::implicit(device.clone(), quota.clone()).unwrap();
     let pool = Pool::new(region, implicit, LEN, quota.clone()).unwrap();
     let limits = Limits { grants, ..limits() };
-    let link = Link::new(Epoch(n.into()), role, &device, &quota, limits, now).unwrap();
+    let link = Link::new(
+        Epoch(n.into()),
+        role,
+        &device,
+        &quota,
+        limits,
+        now,
+        &racer_io::Rng::os(),
+    )
+    .unwrap();
     Side {
         link,
         pool,
@@ -1137,6 +1146,7 @@ fn implicit_region_is_required_and_send_only() {
         Arc::new(AtomicBool::new(false)),
         4,
         4,
+        &racer_io::Rng::os(),
     )
     .unwrap();
     let bytes = [0u8; 8];

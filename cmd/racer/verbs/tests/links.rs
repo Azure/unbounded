@@ -92,8 +92,7 @@ fn node(sim: &Simulation, n: u8, environment: &Environment) -> Node {
     let (clients, port) = rdma_verbs::node(2).unwrap();
     let owner = {
         let _scope = view.enter();
-        let _environment = environment.enter();
-        Owner::new(port)
+        Owner::new(port, environment.worker_ctx())
     };
     Node {
         clients,

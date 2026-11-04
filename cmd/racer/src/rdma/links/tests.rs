@@ -56,8 +56,8 @@ fn node(sim: &Simulation, n: u8, id: NodeId, environment: Option<&Environment>) 
     let (mut clients, port) = rdma_verbs::node(1).unwrap();
     let owner = {
         let _scope = view.enter();
-        let _environment = environment.map(Environment::enter);
-        Owner::new(port)
+        let ctx = environment.map_or_else(racer_io::WorkerCtx::host, Environment::worker_ctx);
+        Owner::new(port, ctx)
     };
     let limits = crate::test_support::cluster::config(true).limits;
     Node {
