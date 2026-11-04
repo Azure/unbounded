@@ -966,10 +966,11 @@ impl RangeStream {
                                 Ok(()) => Slot::Sealed(sealed),
                                 Err(error) => Slot::Ready(Err(error)),
                             },
-                            Err(error) => Slot::Ready(completed.and(Err(error))),
+                            // Sealed fills share the plaintext retry policy.
+                            Err(error) => self.retry_or(number, completed.and(Err(error))),
                         }
                     }
-                    Poll::Ready(Err(error)) => Slot::Ready(Err(error)),
+                    Poll::Ready(Err(error)) => self.retry_or(number, Err(error)),
                 },
                 _ => continue,
             };
@@ -2305,6 +2306,47 @@ pub(super) mod tests {
         stream.configure_subscription(2, 2 * PAGE_BYTES).unwrap();
         stream.budget = budget;
         stream
+    }
+    /// Sealed (GPU) fills retry `Overloaded` and `Unavailable` like plaintext fills instead of
+    /// ending the read on the first transient failure.
+    #[test]
+    fn transient_sealed_fill_failures_are_refetched_until_retries_run_out() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let failing = |error, transport: bool| -> Slot {
+            let budget = AcquisitionBudget::new(deadline, 8, 16);
+            Slot::FetchingSealed(Box::pin(async move {
+                if transport {
+                    Err(error)
+                } else {
+                    Ok((Err(error), budget))
+                }
+            }))
+        };
+        stream.inject(failing(Error::Overloaded, false));
+        stream.poll_slots(&mut cx).unwrap();
+        assert!(matches!(stream.slots[0], Slot::Missing { select: false }));
+        for retry in 1..PAGE_RETRIES {
+            stream.slots[0] = failing(Error::Unavailable, retry % 2 == 0);
+            stream.poll_slots(&mut cx).unwrap();
+            assert!(matches!(stream.slots[0], Slot::Missing { select: false }));
+        }
+        stream.slots[0] = failing(Error::Overloaded, false);
+        stream.poll_slots(&mut cx).unwrap();
+        assert!(matches!(
+            stream.slots[0],
+            Slot::Ready(Err(Error::Overloaded))
+        ));
+        // A non-transient failure is not retried.
+        let mut stream = stream_with_budget(&f, &metadata(), RangeBudget::ClientPages { deadline });
+        stream.inject(failing(Error::OriginForbidden, false));
+        stream.poll_slots(&mut cx).unwrap();
+        assert!(matches!(
+            stream.slots[0],
+            Slot::Ready(Err(Error::OriginForbidden))
+        ));
     }
     #[test]
     fn transient_fill_failures_are_refetched_until_retries_run_out() {
