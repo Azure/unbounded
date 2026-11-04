@@ -58,7 +58,7 @@ shutdown. Reads through a real Racer are covered by the kind-based suite in
   error codes, and the object identity (canonical JSON, byte for byte the same
   as `internal/racerobject`, and its SHA-256 key).
 - `src/racer.rs`: Racer client socket protocol. Metadata `HEAD` requests reuse
-  a pool of at most four idle connections. Reads are credit-paced
+  at most four idle connections, split across workers. Reads are credit-paced
   subscriptions on their own connection, with frame checks.
 - `src/server.rs`: a small HTTP/1.1 server with keep-alive and pipelining, and
   the request flow.
@@ -101,7 +101,8 @@ Request flow:
 
 `--workers=N` (1 to 256; default: usable CPUs, at most 4) starts N OS
 threads, each running its own single-threaded tokio runtime (epoll) with its
-own Racer idle connection pool. There is no work stealing:
+own share of the Racer idle connection pool (four in total, at least one per
+worker). There is no work stealing:
 
 - The first worker accepts every connection and hands it to the worker
   serving the fewest connections (one cross-thread wakeup per connection,

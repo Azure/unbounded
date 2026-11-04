@@ -32,7 +32,7 @@ const COMPLETE_FRAME: u8 = 2;
 /// Pages Racer may send ahead of the reader (the SDK default).
 const PAGE_CREDITS: u64 = 2;
 /// Racer holds an ingress slot per open connection, so only a few idle Stat
-/// connections are kept.
+/// connections are kept, shared across all workers.
 const STAT_IDLE: usize = 4;
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -87,6 +87,14 @@ impl Client {
             bulk_lane: Arc::new(Semaphore::new(max_connections)),
             jitter: AtomicU64::new(seed),
         }
+    }
+
+    /// Splits the idle Stat budget across `workers` per-worker pools so the
+    /// process as a whole keeps about `STAT_IDLE` idle connections (at least
+    /// one per worker). Call before creating siblings.
+    pub fn share_idle(mut self, workers: usize) -> Self {
+        self.max_idle = idle_share(self.max_idle, workers);
+        self
     }
 
     /// A client for another worker: its own idle pool (no cross-thread
@@ -866,9 +874,26 @@ impl Subscription {
     }
 }
 
+/// Per-worker idle Stat pool size: `total` split across `workers`, at least
+/// one each so every worker can reuse a connection.
+fn idle_share(total: usize, workers: usize) -> usize {
+    (total / workers.max(1)).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_shares() {
+        assert_eq!(idle_share(4, 1), 4);
+        assert_eq!(idle_share(4, 2), 2);
+        assert_eq!(idle_share(4, 3), 1);
+        assert_eq!(idle_share(4, 4), 1);
+        assert_eq!(idle_share(4, 256), 1);
+        assert_eq!(idle_share(1, 1), 1);
+        assert_eq!(idle_share(4, 0), 4);
+    }
 
     #[test]
     fn decimals() {

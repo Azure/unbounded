@@ -129,7 +129,7 @@ pub fn run_workers(
     setup: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let start_failed = || "could not start workers".to_string();
-    let client = racer::Client::new(socket, options.max_connections);
+    let client = racer::Client::new(socket, options.max_connections).share_idle(options.workers);
     let slots = Arc::new(Semaphore::new(options.max_connections));
     // Workers watch an internal channel so a failed start stops the rest.
     let (abort, stop) = watch::channel(false);
