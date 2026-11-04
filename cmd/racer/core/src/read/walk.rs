@@ -1116,15 +1116,46 @@ fn transient(outcome: ProbeOutcome) -> bool {
     )
 }
 
-/// Map a transport error to walk evidence; `None` is terminal.
-/// `HopBudgetExhausted` is local: the owner is unreachable within budget.
+/// Map a failed peer exchange to walk evidence; `None` is terminal for the read.
+///
+/// One owner's failure must not end a read that other owners can still serve, so only
+/// errors that say the read itself is over, or that every owner would answer the same
+/// way, are terminal:
+///
+/// | Error | Outcome |
+/// |---|---|
+/// | `Unavailable`, `Io`, `Os`, `HopBudgetExhausted` | `Unreachable` (next owner) |
+/// | `Overloaded` | `Overloaded` (next owner) |
+/// | `Unauthorized`, `InvalidRequest`, `HeaderTooLarge`, `CorruptRecord`, `MissingKey`, `Internal` | `UnusableCopy` (next owner) |
+/// | `Cancelled`, `DeadlineExceeded` | terminal: the caller's scope is over |
+/// | `OriginRejected`, `OriginForbidden` | terminal: the caller's credential is refused |
+/// | `NotFound`, `VersionUnavailable` | terminal: an authoritative answer |
+/// | `IncompatibleMembership`, `InvalidConfiguration` | terminal: local state is unusable |
+///
+/// `HopBudgetExhausted` is local: the owner is unreachable within budget. `Unauthorized`
+/// here is a peer response that failed verification (or a protocol mismatch), which says
+/// nothing about other owners. The dataplane maps its errors without a core counterpart
+/// (replay, stale flight, batch mismatch) to `Internal` first.
 pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
     match error {
         Error::Unavailable | Error::Io | Error::Os(_) | Error::HopBudgetExhausted => {
             Some(ProbeOutcome::Unreachable)
         }
         Error::Overloaded => Some(ProbeOutcome::Overloaded),
-        _ => None,
+        Error::Unauthorized
+        | Error::InvalidRequest
+        | Error::HeaderTooLarge
+        | Error::CorruptRecord
+        | Error::MissingKey
+        | Error::Internal => Some(ProbeOutcome::UnusableCopy),
+        Error::Cancelled
+        | Error::DeadlineExceeded
+        | Error::OriginRejected
+        | Error::OriginForbidden
+        | Error::NotFound
+        | Error::VersionUnavailable
+        | Error::IncompatibleMembership
+        | Error::InvalidConfiguration => None,
     }
 }
 
@@ -1277,6 +1308,8 @@ pub fn hedge_fallback(error: Error) -> bool {
             | Error::MissingKey
             | Error::InvalidRequest
             | Error::HeaderTooLarge
+            | Error::Unauthorized
+            | Error::Internal
     )
 }
 

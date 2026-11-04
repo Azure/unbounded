@@ -685,7 +685,8 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
                     assert_eq!(result.plaintext.bytes(), b"abc");
                     assert_eq!(result.ciphertext.bytes(), good.ciphertext.bytes());
                 }
-                "auth" => assert!(matches!(result, Err(Error::Unauthorized))),
+                // A last owner whose answer fails verification is that owner's unusable copy,
+                // not the read's end (formerly terminal `Unauthorized`).
                 "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
                 _ => assert!(matches!(result, Err(Error::Unavailable))),
             }
@@ -2554,7 +2555,7 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
 }
 
 #[test]
-fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
+fn unauthorized_after_corrupt_copy_falls_through_to_local_origin() {
     let _owner = Rc::new(uring_runtime::drivers::DriverQueue::new(1024)).enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
@@ -2565,15 +2566,13 @@ fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
         (ordered[1].clone(), Reply::Unauthorized),
     ]);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    assert!(matches!(
-        acquire(&mut f, &mut budget),
-        Err(Error::Unauthorized)
-    ));
-    assert_eq!(f.origin.calls.get(), 0);
+    // Formerly terminal `Unauthorized`: a verification failure is rank 1's unusable copy, so
+    // the local rank 2 owner fetches from origin. Both failures are transient evidence.
+    assert!(acquire(&mut f, &mut budget).is_ok());
+    assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(peers.calls.borrow().len(), 2);
-    // The Acquire to rank 0 spends its exchange and rank 0's origin credit.
-    assert_eq!(budget.remaining_attempts(), 5);
-    assert_unpublished(&f);
+    // The Acquire to rank 0 spends its exchange and rank 0's origin credit; rank 1 its exchange.
+    assert_eq!(budget.remaining_attempts(), 4);
 }
 
 #[test]

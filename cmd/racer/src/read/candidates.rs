@@ -443,10 +443,7 @@ impl CandidatePolicy {
         };
         match result {
             Ok(result) => Ok((Some(result), HedgeEnd::Won)),
-            Err(error)
-                if racer_core::read::Error::try_from(error)
-                    .is_ok_and(racer_core::read::walk::hedge_fallback) =>
-            {
+            Err(error) if racer_core::read::walk::hedge_fallback(peer_core_error(error)) => {
                 Ok((None, lost))
             }
             Err(error) => Err(error),
@@ -1494,7 +1491,7 @@ impl CandidatePolicy {
         let remaining = a.phase == Phase::Remaining;
         a.acquire = probe.mode == WalkMode::Acquire;
         a.sent = uring_runtime::environment::now();
-        let mut timed_out = false;
+        let mut exchanged = Exchanged::default();
         let response = self
             .request_traced(
                 &request_membership,
@@ -1515,7 +1512,7 @@ impl CandidatePolicy {
                     RequestMode::SharedRoute
                 },
                 Some((&mut a.trail, probe.canonical as u8)),
-                &mut timed_out,
+                &mut exchanged,
             )
             .await;
         FillEvent::Reply(match response {
@@ -1528,10 +1525,12 @@ impl CandidatePolicy {
                 FillReply::Answer { kind, signed }
             }
             // Sent but unanswered within the attempt's own bound.
-            Err(_) if timed_out && !remaining => FillReply::TimedOut,
+            Err(_) if exchanged.timed_out && !remaining => FillReply::TimedOut,
             Err(error) => FillReply::Failed {
                 error: a.core_error(error),
-                sent: true,
+                // A local failure before the request went out (planning, sealing, admission)
+                // is no evidence about the destination.
+                sent: exchanged.sent,
                 scope_live: scope.check().is_ok(),
             },
         })
@@ -1731,14 +1730,19 @@ impl CandidatePolicy {
         validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
         trail: &mut CandidateTrail,
     ) -> Result<Option<T>> {
-        let mut grants: Vec<(AcquisitionBudget, bool)> = targets
+        let mut grants: Vec<(AcquisitionBudget, Exchanged)> = targets
             .iter()
-            .map(|_| (racer_core::read::walk::granted_budget(deadline), false))
+            .map(|_| {
+                (
+                    racer_core::read::walk::granted_budget(deadline),
+                    Exchanged::default(),
+                )
+            })
             .collect();
         let node = |p: &u32| &membership.members()[*p as usize].node;
         let sent = uring_runtime::environment::now();
         let responses = futures::future::join_all(targets.iter().zip(grants.iter_mut()).map(
-            |(target, (grant, timed_out))| {
+            |(target, (grant, exchanged))| {
                 self.request_traced(
                     membership,
                     node(target),
@@ -1750,7 +1754,7 @@ impl CandidatePolicy {
                     remaining_opportunities,
                     RequestMode::FundedRoute,
                     None,
-                    timed_out,
+                    exchanged,
                 )
             },
         ))
@@ -1758,14 +1762,14 @@ impl CandidatePolicy {
         // Silence evidence as for a sequential granted probe: the destination's own answer clears
         // it, a timeout only demotes (a granted target is never rank 0).
         if let PeerOperation::Page { page: id, .. } = operation {
-            for ((target, (_, timed_out)), response) in targets.iter().zip(&grants).zip(&responses)
+            for ((target, (_, exchanged)), response) in targets.iter().zip(&grants).zip(&responses)
             {
                 let destination = node(target);
                 match response {
                     Ok(response) if response.origin().node() == destination => {
                         self.peers.link_health().silence_answered(destination);
                     }
-                    Err(_) if *timed_out => {
+                    Err(_) if exchanged.timed_out => {
                         let _ = self.peers.link_health().silence_timed_out(
                             destination,
                             id.clone(),
@@ -1793,12 +1797,7 @@ impl CandidatePolicy {
                         Err(error) => return Err(error),
                     }
                 }
-                Err(error)
-                    if racer_core::read::Error::try_from(error)
-                        .ok()
-                        .and_then(racer_core::read::walk::transport_outcome)
-                        .is_some()
-                        || scope.check().is_ok() => {}
+                Err(error) if peer_outcome(error).is_some() || scope.check().is_ok() => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1879,7 +1878,7 @@ impl CandidatePolicy {
                             probe.remaining_opportunities,
                             RequestMode::SharedRoute,
                             Some((&mut trail, probe.index as u8)),
-                            &mut false,
+                            &mut Exchanged::default(),
                         )
                         .await
                     {
@@ -1892,10 +1891,7 @@ impl CandidatePolicy {
                                 Err(outcome) => WalkOutcome::Probe(outcome),
                             }
                         }
-                        Err(error) => match racer_core::read::Error::try_from(error)
-                            .ok()
-                            .and_then(racer_core::read::walk::transport_outcome)
-                        {
+                        Err(error) => match peer_outcome(error) {
                             Some(outcome) => WalkOutcome::Transport(outcome),
                             None => return Err(error),
                         },
@@ -1975,7 +1971,7 @@ impl CandidatePolicy {
             remaining_opportunities,
             request_mode,
             None,
-            &mut false,
+            &mut Exchanged::default(),
         )
         .await
     }
@@ -1993,7 +1989,7 @@ impl CandidatePolicy {
         remaining_opportunities: u32,
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
-        timed_out: &mut bool,
+        exchanged: &mut Exchanged,
     ) -> Result<VerifiedResponse> {
         match self
             .request_delivered(
@@ -2008,7 +2004,7 @@ impl CandidatePolicy {
                 request_mode,
                 trail,
                 None,
-                timed_out,
+                exchanged,
             )
             .await?
         {
@@ -2047,7 +2043,7 @@ impl CandidatePolicy {
             RequestMode::SharedRoute,
             None,
             Some(ordinal),
-            &mut false,
+            &mut Exchanged::default(),
         )
         .await
     }
@@ -2072,9 +2068,9 @@ impl CandidatePolicy {
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
         landing: Option<i32>,
-        timed_out: &mut bool,
+        exchanged: &mut Exchanged,
     ) -> Result<Delivered> {
-        *timed_out = false;
+        *exchanged = Exchanged::default();
         let mut remote = [b'?'; 36];
         if trail.is_some() && racer_crypto::identity::canonical_uuid(&destination.0) {
             remote.copy_from_slice(destination.0.as_bytes());
@@ -2192,6 +2188,7 @@ impl CandidatePolicy {
             };
             let mut stopped = None;
             facts.site = CandidateSite::Exchange;
+            exchanged.sent = true;
             let response = std::future::poll_fn(|cx| {
                 registration.register(cx.waker());
                 if stopped.is_none() {
@@ -2284,13 +2281,13 @@ impl CandidatePolicy {
             // (`WalkOutcome::TimedOut`).
             match stop {
                 Some(Error::DeadlineExceeded) => {
-                    *timed_out = true;
+                    exchanged.timed_out = true;
                     Err(Error::Unavailable)
                 }
                 Some(error) => Err(error),
                 None => match response {
                     Err(Error::DeadlineExceeded) => {
-                        *timed_out = true;
+                        exchanged.timed_out = true;
                         Err(Error::Unavailable)
                     }
                     result => result,
@@ -2500,7 +2497,7 @@ impl CandidatePolicy {
         // A fresh grant: one local exchange, no remote attempts, and
         // `NOTICE_LINKS` route links.
         let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
-        let mut timed_out = false;
+        let mut exchanged = Exchanged::default();
         let response = self
             .request_traced(
                 &membership,
@@ -2513,7 +2510,7 @@ impl CandidatePolicy {
                 1,
                 RequestMode::FundedRoute,
                 None,
-                &mut timed_out,
+                &mut exchanged,
             )
             .await;
         racer_core::liveness::ping_verdict(match response {
@@ -2521,7 +2518,7 @@ impl CandidatePolicy {
                 response.origin().node() == peer,
                 matches!(response.response(), PeerResponse::Unavailable),
             )),
-            Err(error) => Err(timed_out || matches!(error, Error::DeadlineExceeded)),
+            Err(error) => Err(exchanged.timed_out || matches!(error, Error::DeadlineExceeded)),
         })
     }
 
@@ -3069,6 +3066,29 @@ pub(crate) async fn race(
 }
 fn recoverable(error: Error) -> bool {
     racer_core::read::Error::try_from(error).is_ok_and(racer_core::read::recoverable)
+}
+
+/// How far one peer exchange got.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Exchanged {
+    /// Sent but unanswered within the attempt's own bound.
+    pub(super) timed_out: bool,
+    /// The request was handed to the peer transport; failures before that
+    /// (planning, sealing, admission) are local.
+    pub(super) sent: bool,
+}
+
+/// A failed peer exchange as racer-core sees it. Dataplane errors without a core counterpart
+/// (`Replay`, `StaleFlight`, a prefetch batch mismatch, `BadGateway`, ...) come from one peer's
+/// answer or a protocol mismatch with it, so they become `Internal`, which the walk treats as
+/// that owner's unusable copy and moves on (`racer_core::read::walk::transport_outcome`).
+fn peer_core_error(error: Error) -> racer_core::read::Error {
+    racer_core::read::Error::try_from(error).unwrap_or(racer_core::read::Error::Internal)
+}
+
+/// Walk evidence for a failed peer exchange; `None` ends the read.
+fn peer_outcome(error: Error) -> Option<ProbeOutcome> {
+    racer_core::read::walk::transport_outcome(peer_core_error(error))
 }
 
 #[cfg(test)]
@@ -3878,7 +3898,17 @@ pub(super) mod tests {
             &scope,
             &mut budget,
         ));
-        assert!(matches!(result, Err(Error::Unauthorized)));
+        // A rank 0 answer that failed verification no longer ends the read (it used to return
+        // `Unauthorized`), but it is still not miss evidence: the origin authority records it
+        // as transient, so an origin miss cannot claim absence.
+        let Ok(CandidateResolution::Origin(authority)) = result else {
+            panic!("rank 1 must fall through to origin")
+        };
+        assert_eq!(
+            authority.predecessor_evidence,
+            vec![ProbeOutcome::UnusableCopy]
+        );
+        assert_eq!(policy.origin_miss_error(&authority), Error::Unavailable);
         let peer = Rc::new(ProbePeer {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
@@ -3913,6 +3943,153 @@ pub(super) mod tests {
         assert_eq!(peer.calls.borrow().len(), 3);
         assert!(peer.calls.borrow().iter().all(|(_, copy)| !copy));
     }
+    /// One owner's failed exchange is that owner's failure, not the read's: errors without a
+    /// core counterpart (replay, stale flight, protocol mismatch) and failed verification move
+    /// the walk to the next owner instead of ending it as `Internal`.
+    #[test]
+    fn peer_exchange_failure_tries_next_owner() {
+        for error in [
+            Error::Replay,
+            Error::StaleFlight,
+            Error::Unauthorized,
+            Error::Internal,
+            Error::InvalidRequest,
+            Error::CorruptRecord,
+            Error::MissingKey,
+            Error::BadGateway,
+        ] {
+            let (membership, placement, context, scope, credentials) = fixture();
+            let peer = Rc::new(ProbePeer {
+                calls: RefCell::new(vec![]),
+                error,
+            });
+            let policy = CandidatePolicy::new(
+                NodeId("outside".into()),
+                placement,
+                Requester::scripted(
+                    peer.clone(),
+                    ProbePeer::direct_hedge_available,
+                    ProbePeer::request,
+                    ProbePeer::request_direct,
+                ),
+                credentials,
+                Arc::new(controlplane::Published::new(
+                    crate::control::Snapshot::retention(2),
+                )),
+            );
+            let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
+            let result = futures::executor::block_on(policy.resolve_with_budget(
+                policy.candidates(membership, &context.object, PageNumber(0)),
+                &context,
+                PeerOperation::Metadata {
+                    object: context.object.clone(),
+                    selector: MetadataSelector::Fresh,
+                    mode: FetchMode::Acquire,
+                },
+                &scope,
+                &mut budget,
+            ));
+            assert_eq!(peer.calls.borrow().len(), 3, "{error:?}");
+            assert!(
+                matches!(result, Err(Error::Unavailable)),
+                "{error:?}: {:?}",
+                result.err()
+            );
+        }
+        // The caller's own scope ending stays terminal.
+        let (membership, placement, context, scope, credentials) = fixture();
+        let peer = Rc::new(ProbePeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Cancelled,
+        });
+        let policy = CandidatePolicy::new(
+            NodeId("outside".into()),
+            placement,
+            Requester::scripted(
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
+            credentials,
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
+        );
+        let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
+        let result = futures::executor::block_on(policy.resolve_with_budget(
+            policy.candidates(membership, &context.object, PageNumber(0)),
+            &context,
+            PeerOperation::Metadata {
+                object: context.object.clone(),
+                selector: MetadataSelector::Fresh,
+                mode: FetchMode::Acquire,
+            },
+            &scope,
+            &mut budget,
+        ));
+        assert_eq!(peer.calls.borrow().len(), 1);
+        assert!(
+            matches!(result, Err(Error::Cancelled)),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    /// A failure before the request leaves this node is reported as not sent, so the walk does
+    /// not count it against the destination; a transport failure after handing it over is.
+    #[test]
+    fn exchange_reports_whether_the_request_was_sent() {
+        let (membership, placement, context, scope, credentials) = fixture();
+        let peer = Rc::new(ProbePeer {
+            calls: RefCell::new(vec![]),
+            error: Error::Unavailable,
+        });
+        let policy = CandidatePolicy::new(
+            NodeId("outside".into()),
+            placement,
+            Requester::scripted(
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
+            credentials,
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
+        );
+        let destination = membership.members()[0].node.clone();
+        let operation = PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: MetadataSelector::Fresh,
+            mode: FetchMode::CopyOnly,
+        };
+        let mut exchange = |links| {
+            let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, links);
+            let mut exchanged = Exchanged::default();
+            let result = futures::executor::block_on(policy.request_traced(
+                &membership,
+                &destination,
+                &context,
+                &operation,
+                FetchMode::CopyOnly,
+                &scope,
+                &mut budget,
+                1,
+                RequestMode::SharedRoute,
+                None,
+                &mut exchanged,
+            ));
+            (result.err(), exchanged.sent)
+        };
+        // No links: planning fails locally, nothing is sent.
+        assert_eq!(exchange(0), (Some(Error::HopBudgetExhausted), false));
+        assert!(peer.calls.borrow().is_empty());
+        assert_eq!(exchange(8), (Some(Error::Unavailable), true));
+        assert_eq!(peer.calls.borrow().len(), 1);
+    }
+
     #[test]
     fn signed_failure_classification_preserves_auth_and_version_distinctions() {
         let operation = PeerOperation::Metadata {
@@ -4430,12 +4607,19 @@ pub(super) mod tests {
                 selector: MetadataSelector::Fresh,
                 mode: FetchMode::Acquire,
             };
-            assert!(matches!(
-                policy
-                    .resolve_with_budget(candidates, &context, operation, &scope, &mut budget)
-                    .await,
-                Err(Error::Unauthorized)
-            ));
+            // Formerly terminal `Unauthorized`; now the walk moves on, recording the failure as
+            // transient evidence rather than a miss.
+            let Ok(CandidateResolution::Origin(authority)) = policy
+                .resolve_with_budget(candidates, &context, operation, &scope, &mut budget)
+                .await
+            else {
+                panic!("rank 1 must fall through to origin")
+            };
+            assert_eq!(
+                authority.predecessor_evidence,
+                vec![ProbeOutcome::UnusableCopy]
+            );
+            assert_eq!(policy.origin_miss_error(&authority), Error::Unavailable);
             assert_eq!(peers.calls.borrow().len(), 1);
         });
     }

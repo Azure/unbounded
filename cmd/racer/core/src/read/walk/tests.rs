@@ -593,14 +593,22 @@ fn pure_rules() {
         assert_eq!((b.remaining_attempts(), b.remaining_links()), expected);
     }
     assert!(hedge_fallback(Error::CorruptRecord));
-    assert!(!hedge_fallback(Error::Unauthorized));
+    // A hedge whose peer answer failed verification falls back to the serial walk.
+    assert!(hedge_fallback(Error::Unauthorized));
     assert!(!hedge_fallback(Error::Cancelled));
     // A local hop budget shortfall is evidence, not terminal.
     for (error, outcome) in [
         (Error::Os(1), Some(ProbeOutcome::Unreachable)),
         (Error::Overloaded, Some(ProbeOutcome::Overloaded)),
-        (Error::Unauthorized, None),
+        (Error::Unauthorized, Some(ProbeOutcome::UnusableCopy)),
+        (Error::Internal, Some(ProbeOutcome::UnusableCopy)),
+        (Error::CorruptRecord, Some(ProbeOutcome::UnusableCopy)),
+        (Error::MissingKey, Some(ProbeOutcome::UnusableCopy)),
+        (Error::InvalidRequest, Some(ProbeOutcome::UnusableCopy)),
         (Error::DeadlineExceeded, None),
+        (Error::Cancelled, None),
+        (Error::OriginRejected, None),
+        (Error::OriginForbidden, None),
         (Error::HopBudgetExhausted, Some(ProbeOutcome::Unreachable)),
     ] {
         assert_eq!(transport_outcome(error), outcome);
@@ -1446,7 +1454,10 @@ fn fills() {
         // Every owner of a reader unreachable: exhausted. An empty ranking; a terminal error.
         ("exhausted", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true }), Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true }), Event::Reply(Reply::Failed { error: Error::Io, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(Transport(Unreachable))\nProbe(Probe { index: 2, canonical: 2, mode: Acquire, remaining_opportunities: 1, route: SharedRoute, previous: false }) outcome=Ok(Transport(Unreachable))\nDone(Err(Unavailable)) outcome=Ok(Transport(Unreachable)) notes=0x200\nv5 waits=0 handoff=[]"),
         ("empty ranking", false, production, vec![START, Event::Ranked(Ok(Ranked::new(5, &[], None)))], "Rank { ranking: Current, version: None }\nDone(Err(Unavailable))\nv0 waits=0 handoff=[]"),
-        ("terminal", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Unauthorized, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nDone(Err(Unauthorized)) outcome=Err(Unauthorized)\nv5 waits=0 handoff=[]"),
+        // The caller's scope ending is terminal (a failed verification used to be, too; it now
+        // moves to the next owner).
+        ("terminal", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Cancelled, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nDone(Err(Cancelled)) outcome=Err(Cancelled)\nv5 waits=0 handoff=[]"),
+        ("unverified answer", false, production, reader(&[Event::Reply(Reply::Failed { error: Error::Unauthorized, sent: true, scope_live: true })]), "Rank { ranking: Current, version: None }\nProbe(Probe { index: 0, canonical: 0, mode: Acquire, remaining_opportunities: 3, route: SharedRoute, previous: false })\nProbe(Probe { index: 1, canonical: 1, mode: Acquire, remaining_opportunities: 2, route: SharedRoute, previous: false }) outcome=Ok(Transport(UnusableCopy))\nv5 waits=0 handoff=[]"),
         // A stale reader refreshes to a newer membership; behind and a recent member of version
         // - 1 it walks there; owning the page there it waits instead; not a member it waits, and
         // without waits it skips.
