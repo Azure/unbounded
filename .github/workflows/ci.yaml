@@ -6,7 +6,12 @@ name: CI
 on:
   push:
     branches:
-      # Main is validated before merge by pull_request and merge_group.
+      # Main is validated before merge by pull_request and merge_group. Push
+      # runs on main exist to seed the Actions caches that pull requests
+      # restore: caches written by pull_request or merge_group runs are scoped
+      # to that ref and are not readable by other pull requests, so those runs
+      # only restore, and caches are saved only from push events.
+      - main
       # Keep push validation for supported release branches.
       - release-*
   pull_request:
