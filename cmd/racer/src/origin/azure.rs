@@ -1,8 +1,7 @@
 //! In-process Azure Blob origin.
 //!
 //! Serves caches whose publication carries `CacheDefinition::origin` directly
-//! from Azure Blob Storage, replacing the Go `racer-object origin` process.
-//! Request plan (fewer round trips than the Go origin's HEAD + GET per page):
+//! from Azure Blob Storage. Request plan:
 //!
 //! - bootstrap: one `GET` with `x-ms-range: bytes=0-<PAGE_BYTES-1>`. A 206
 //!   carries metadata, the size (from `Content-Range`), and page 0. An empty

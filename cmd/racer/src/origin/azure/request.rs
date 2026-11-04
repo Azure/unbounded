@@ -3,7 +3,7 @@
 //! Paths are escaped exactly as azblob v1.8.2 `container.Client.NewBlobClient`
 //! does: Go `url.PathEscape` over the whole blob name, so `/` inside a key is
 //! sent as `%2F`, which the service treats as the same name. Version IDs are
-//! appended as `?versionid=<url.QueryEscape(id)>`, as the Go origin did.
+//! appended as `?versionid=<url.QueryEscape(id)>`, as azblob does.
 
 use super::identity::AzureObject;
 use crate::error::Result;

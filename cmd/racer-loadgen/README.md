@@ -73,7 +73,8 @@ Recommended DaemonSet split:
 The synthetic origin implements object HEAD/GET, one closed/open/suffix byte
 range, strong quoted ETags, If-Match/If-None-Match (including wildcard conditions),
 and S3 XML errors. It is a direct S3 baseline only: Racer reads Azure Blob, not
-S3. The racer-object sidecar path is tested against a synthetic Racer SDK origin. ETags are quoted `sha256:<hex>`, not MD5.
+S3. The racer-object sidecar path is tested against a synthetic Racer SDK
+origin. ETags are quoted `sha256:<hex>`, not MD5.
 This is an **unauthenticated, read-only test fixture**, not a general S3 server:
 no listing, writes, versioning, date conditions, If-Range, or multipart reads.
 Keep it on a trusted benchmark network; it accepts signed requests without
