@@ -47,6 +47,7 @@ pub mod test_util {
 
 use std::{future::Future, pin::Pin};
 
+// MIGRATION: shared with `racer-io` until uring-runtime is deleted.
 /// Portable runtime failures, shared with `racer-io` during the migration.
 pub use racer_io::Error;
 
