@@ -391,7 +391,9 @@ enum InFlight {
 pub(crate) struct Link {
     // Declared first: dropped (stopped and freed) before the windows and
     // regions it may use.
-    qp: Rc<NativeQueuePair>,
+    /// The only ledger of posted work: each send-queue request carries its
+    /// [`InFlight`] record until it completes or the QP stops.
+    qp: Rc<NativeQueuePair<InFlight>>,
 
     windows: Vec<Rc<MemoryWindow>>,
 
@@ -423,8 +425,6 @@ pub(crate) struct Link {
     /// Receives we reposted but have not reported.
     owed: u32,
 
-    sq_used: u32,
-
     next_tag: u32,
 
     free_windows: Vec<usize>,
@@ -451,8 +451,6 @@ pub(crate) struct Link {
     consumed: VecDeque<u32>,
 
     outbox: VecDeque<Outgoing>,
-
-    inflight: BTreeMap<u64, InFlight>,
 
     /// Buffers held until the QP is destroyed.
     quarantine: Vec<Buffer>,
@@ -531,7 +529,6 @@ impl Link {
             credits: 0,
             unreturned: 0,
             owed: 0,
-            sq_used: 0,
             next_tag: 0,
             free_slots: (recv_depth..recv_depth + send_slots).rev().collect(),
             grants: BTreeMap::new(),
@@ -540,7 +537,6 @@ impl Link {
             waiting: BTreeMap::new(),
             consumed: VecDeque::new(),
             outbox: VecDeque::new(),
-            inflight: BTreeMap::new(),
             quarantine: Vec::new(),
             held: Vec::new(),
             created: now,
@@ -899,13 +895,14 @@ impl Link {
         let progressed = if self.phase == Phase::Created {
             Ok(0)
         } else {
-            self.qp.progress_with(|c| completions.push(c))
+            self.qp
+                .progress_with(|c, record| completions.push((c, record)))
         };
 
         // Completions before a failed one are still valid. A `Close` among
         // them means the peer closed first; anything else is an error.
-        for completion in completions {
-            match self.complete(pool, completion, now) {
+        for (completion, record) in completions {
+            match self.complete(pool, completion, record, now) {
                 Ok(()) => {}
                 Err(Break::PeerClosed) => return Err(Break::PeerClosed),
                 Err(error) if progressed.is_ok() => return Err(error),
@@ -949,14 +946,14 @@ impl Link {
         &mut self,
         pool: &Pool,
         c: WorkCompletion,
+        record: Option<InFlight>,
         now: Instant,
     ) -> std::result::Result<(), Break> {
         if (c.id >> 56) as u8 == RECV_CTL {
             return self.received(pool, c.id as u32, c, now);
         }
 
-        let inflight = self.inflight.remove(&c.id).ok_or(Break::Error)?;
-        self.sq_used -= 1;
+        let inflight = record.ok_or(Break::Error)?;
 
         match inflight {
             InFlight::Control { slot, done, close } => {
@@ -1266,7 +1263,7 @@ impl Link {
         let mut blocked = false;
         let mut i = 0;
 
-        while i < self.outbox.len() && self.sq_used < self.send_depth {
+        while i < self.outbox.len() && self.qp.sends() < self.send_depth {
             let item = &self.outbox[i];
             let need = item.credits();
 
@@ -1461,9 +1458,9 @@ impl Link {
         self.unreturned += 1;
     }
 
+    /// Attach `inflight` to the posted request `id` in the QP's ledger.
     fn track(&mut self, id: u64, inflight: InFlight) {
-        self.sq_used += 1;
-        self.inflight.insert(id, inflight);
+        self.qp.attach(id, inflight);
     }
 
     /// Fail every op with [`Error::Unavailable`], move every buffer to
@@ -1546,7 +1543,7 @@ impl Link {
             }
         }
 
-        for (_, inflight) in std::mem::take(&mut self.inflight) {
+        for inflight in self.qp.take_records() {
             match inflight {
                 InFlight::Write { source, done } => {
                     self.held.push(source.bytes);

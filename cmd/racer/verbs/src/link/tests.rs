@@ -1140,7 +1140,7 @@ fn implicit_region_is_required_and_send_only() {
     p.sim.implicit_odp(true);
     let implicit = NativeRegion::implicit(p.b.device.clone(), p.b.quota.clone()).unwrap();
     assert!(implicit.is_implicit());
-    let qp = NativeQueuePair::new_with_depth(
+    let qp = NativeQueuePair::<()>::new_with_depth(
         p.b.device.clone(),
         p.b.quota.clone(),
         Arc::new(AtomicBool::new(false)),

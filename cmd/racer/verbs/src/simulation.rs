@@ -2451,7 +2451,7 @@ mod tests {
     /// Successful completions from one progress call.
     fn drain(qp: &NativeQueuePair) -> Result<Vec<WorkCompletion>> {
         let mut out = Vec::new();
-        qp.progress_with(|c| out.push(c))?;
+        qp.progress_with(|c, _| out.push(c))?;
         Ok(out)
     }
 

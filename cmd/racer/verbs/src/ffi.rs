@@ -716,7 +716,7 @@ impl Drop for MemoryWindow {
 
 /// A posted work request. Keeps its region and window alive until it
 /// completes or the QP stops.
-struct Pending {
+struct Pending<T> {
     /// Expected completion opcode. Ignored for receives.
     opcode: u32,
 
@@ -729,9 +729,12 @@ struct Pending {
     _region: Rc<NativeRegion>,
 
     _window: Option<Rc<MemoryWindow>>,
+
+    /// The caller's record for this work, attached after a successful post.
+    user: Option<T>,
 }
 
-impl Pending {
+impl<T> Pending<T> {
     /// True if a successful completion `c` is what this work should produce.
     fn matches(&self, c: &Completion) -> bool {
         if c.status != 0 {
@@ -751,9 +754,10 @@ impl Pending {
 
 /// A queue pair (QP) and its completion queue.
 ///
-/// Tracks posted work. [`Self::stop`] is the only way to be sure the NIC is
-/// done with its memory.
-pub(crate) struct NativeQueuePair {
+/// Tracks posted work: this is the only ledger of work requests, and callers
+/// attach their own record `T` to each posted request with [`Self::attach`].
+/// [`Self::stop`] is the only way to be sure the NIC is done with its memory.
+pub(crate) struct NativeQueuePair<T = ()> {
     /// Keeps every QP and CQ leak charged to its owner.
     quota: Arc<GuardOwner>,
 
@@ -775,7 +779,11 @@ pub(crate) struct NativeQueuePair {
     connected: Cell<bool>,
 
     /// Posted work by ID.
-    pending: RefCell<BTreeMap<u64, Pending>>,
+    pending: RefCell<BTreeMap<u64, Pending<T>>>,
+
+    /// Records of work released by a successful stop, kept for
+    /// [`Self::take_records`] so the caller can still answer them.
+    released: RefCell<Vec<T>>,
 
     /// Send queue limit and current use.
     send_capacity: u32,
@@ -792,7 +800,7 @@ pub(crate) struct NativeQueuePair {
     failure: Cell<Option<Failure>>,
 }
 
-impl NativeQueuePair {
+impl<T> NativeQueuePair<T> {
     /// Create a QP with `send_depth` send and `recv_depth` receive WRs, and
     /// a CQ for both. Both depths must be nonzero.
     pub(crate) fn new_with_depth(
@@ -854,6 +862,7 @@ impl NativeQueuePair {
             terminating: Cell::new(false),
             connected: Cell::new(false),
             pending: RefCell::new(BTreeMap::new()),
+            released: RefCell::new(Vec::new()),
             send_capacity: send_depth,
             sends: Cell::new(0),
             recv_capacity: recv_depth,
@@ -906,7 +915,7 @@ impl NativeQueuePair {
     }
 
     /// Add `pending` under `id` and count it against its queue.
-    fn track(&self, id: u64, pending: Pending) {
+    fn track(&self, id: u64, pending: Pending<T>) {
         let counter = if pending.recv {
             &self.recvs
         } else {
@@ -917,7 +926,7 @@ impl NativeQueuePair {
     }
 
     /// Remove the work under `id` and release its queue slot.
-    fn untrack(&self, id: u64) -> Option<Pending> {
+    fn untrack(&self, id: u64) -> Option<Pending<T>> {
         let pending = self.pending.borrow_mut().remove(&id)?;
         let counter = if pending.recv {
             &self.recvs
@@ -938,12 +947,42 @@ impl NativeQueuePair {
         Ok(())
     }
 
+    /// Attach the caller's record to posted work `id`. It is handed back
+    /// with the work's completion, or by [`Self::take_records`].
+    pub(crate) fn attach(&self, id: u64, record: T) {
+        if let Some(pending) = self.pending.borrow_mut().get_mut(&id) {
+            pending.user = Some(record);
+        }
+    }
+
+    /// Posted send-queue work not yet completed.
+    pub(crate) fn sends(&self) -> u32 {
+        self.sends.get()
+    }
+
+    /// Take every attached record, leaving the work itself (and the memory
+    /// it holds) tracked until it completes or the QP stops.
+    pub(crate) fn take_records(&self) -> Vec<T> {
+        let mut records = std::mem::take(&mut *self.released.borrow_mut());
+        records.extend(
+            self.pending
+                .borrow_mut()
+                .values_mut()
+                .filter_map(|pending| pending.user.take()),
+        );
+        records
+    }
+
     /// Read up to 32 completions without blocking and report each successful
-    /// completion to `sink` after its work is released. Returns how many.
+    /// completion, with its attached record, to `sink` after its work is
+    /// released. Returns how many.
     ///
     /// Any failed or unexpected completion stops the QP and returns
     /// [`Error::Io`]. Tests can read the first one through `failure`.
-    pub(crate) fn progress_with(&self, mut sink: impl FnMut(WorkCompletion)) -> Result<usize> {
+    pub(crate) fn progress_with(
+        &self,
+        mut sink: impl FnMut(WorkCompletion, Option<T>),
+    ) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
         }
@@ -976,13 +1015,18 @@ impl NativeQueuePair {
                 return Err(Error::Io);
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            drop(self.untrack(c.id).ok_or(Error::Io)?);
-            sink(WorkCompletion {
-                id: c.id,
-                opcode: c.opcode,
-                byte_len: c.byte_len,
-                imm: (c.flags & WC_IMM != 0).then_some(c.imm),
-            });
+            let mut pending = self.untrack(c.id).ok_or(Error::Io)?;
+            let user = pending.user.take();
+            drop(pending);
+            sink(
+                WorkCompletion {
+                    id: c.id,
+                    opcode: c.opcode,
+                    byte_len: c.byte_len,
+                    imm: (c.flags & WC_IMM != 0).then_some(c.imm),
+                },
+                user,
+            );
         }
         Ok(n as usize)
     }
@@ -1006,7 +1050,8 @@ impl NativeQueuePair {
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         self.sends.set(0);
         self.recvs.set(0);
-        drop(pending);
+        let records = pending.into_values().filter_map(|mut p| p.user.take());
+        self.released.borrow_mut().extend(records);
         Ok(())
     }
 
@@ -1058,6 +1103,7 @@ impl NativeQueuePair {
                 length,
                 _region: region.clone(),
                 _window: window,
+                user: None,
             },
         );
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -1244,7 +1290,7 @@ impl NativeQueuePair {
     }
 }
 
-impl Drop for NativeQueuePair {
+impl<T> Drop for NativeQueuePair<T> {
     /// Stop, then free. If stop fails, leak the QP's work and device, since
     /// the NIC may still use them.
     fn drop(&mut self) {
@@ -1808,7 +1854,7 @@ pub(crate) mod lifetime_tests {
     /// Collect successful completions from one progress call.
     fn drain(qp: &NativeQueuePair) -> Result<Vec<WorkCompletion>> {
         let mut out = Vec::new();
-        qp.progress_with(|c| out.push(c))?;
+        qp.progress_with(|c, _| out.push(c))?;
         Ok(out)
     }
 
@@ -1884,6 +1930,45 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
+    /// The QP is the only ledger: an attached record comes back with its
+    /// completion, a failed post holds no record, and stop hands the rest back.
+    fn ledger_records_return_with_completion_or_after_stop() {
+        let (plain, _, _) = fixture();
+        let region =
+            NativeRegion::with_access(plain.device.clone(), 64, Access::CONTROL, quota().0)
+                .unwrap();
+        let qp = NativeQueuePair::<&'static str>::new_with_depth(
+            plain.device.clone(),
+            GuardOwner::new(Arc::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            4,
+            1,
+            &racer_io::Rng::os(),
+        )
+        .unwrap();
+        qp.connect(qp.endpoint, true).unwrap();
+        qp.send(wr(1), &region, 0, 8).unwrap();
+        qp.attach(wr(1), "first");
+        qp.send(wr(2), &region, 8, 8).unwrap();
+        qp.attach(wr(2), "second");
+        FAULTS.with_borrow_mut(|f| f.post_fails = true);
+        assert_eq!(qp.send(wr(3), &region, 16, 8), Err(Error::Io));
+        qp.attach(wr(3), "never posted");
+        FAULTS.with_borrow_mut(|f| f.post_fails = false);
+        assert_eq!(qp.sends(), 2);
+        complete(wr(2), 0, opcode::SEND);
+        let mut seen = Vec::new();
+        qp.progress_with(|c, record| seen.push((c.id, record)))
+            .unwrap();
+        assert_eq!(seen, [(wr(2), Some("second"))]);
+        assert_eq!(qp.sends(), 1);
+        qp.stop().unwrap();
+        assert_eq!(qp.sends(), 0);
+        assert_eq!(qp.take_records(), ["first"]);
+        assert!(qp.take_records().is_empty());
+    }
+
+    #[test]
     /// Bad ids, ranges, regions, and full queues are refused before the adapter.
     fn ranged_posts_validate_before_reaching_the_adapter() {
         let (qp, region) = ranged_fixture(2, 1);
@@ -1915,7 +2000,7 @@ pub(crate) mod lifetime_tests {
         // Zero depths are a configuration error.
         for (send, recv) in [(0, 1), (1, 0), (u32::MAX, 1)] {
             assert!(matches!(
-                NativeQueuePair::new_with_depth(
+                NativeQueuePair::<()>::new_with_depth(
                     qp.device.clone(),
                     GuardOwner::new(Arc::new(())),
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2149,7 +2234,7 @@ pub(crate) mod lifetime_tests {
             loop {
                 assert!(Instant::now() < until, "native CQ timeout");
                 let mut done = false;
-                qp.progress_with(|c| done |= c.id == id)?;
+                qp.progress_with(|c, _| done |= c.id == id)?;
                 if done {
                     return Ok(());
                 }
