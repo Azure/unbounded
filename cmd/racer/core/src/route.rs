@@ -284,10 +284,10 @@ pub fn exchange_evidence(
     admitted: bool,
 ) -> (
     Option<LinkOutcome>,
-    flow_control::AdaptiveOutcome,
+    crate::flow::AdaptiveOutcome,
     Option<bool>,
 ) {
-    use flow_control::AdaptiveOutcome as Outcome;
+    use crate::flow::AdaptiveOutcome as Outcome;
     match exchange {
         Exchange::Complete { overloaded: true } => {
             (Some(LinkOutcome::Success), Outcome::Neutral, Some(true))
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn exchange_evidence_never_blames_downstream() {
-        use flow_control::AdaptiveOutcome as A;
+        use crate::flow::AdaptiveOutcome as A;
         let failed = |fault, socket_failure| Exchange::Failed {
             fault,
             socket_failure,

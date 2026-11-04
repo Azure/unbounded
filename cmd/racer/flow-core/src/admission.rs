@@ -400,13 +400,13 @@ mod circuit {
     /// The authority belongs to one worker even when keys themselves are shared:
     ///
     /// ```compile_fail
-    /// use flow_control::Circuits;
+    /// use racer_flow_core::Circuits;
     /// let circuits = Circuits::<u8>::new(1, std::time::Duration::ZERO);
-    /// std::thread::spawn(move || drop(circuits));
+    /// std::thread::Builder::new().spawn(move || drop(circuits));
     /// ```
     ///
     /// ```compile_fail
-    /// use flow_control::Circuits;
+    /// use racer_flow_core::Circuits;
     /// fn require_sync<T: Sync>() {}
     /// require_sync::<Circuits<u8>>();
     /// ```

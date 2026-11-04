@@ -6,6 +6,9 @@
 
 pub mod admission;
 pub mod cache;
+/// Pure flow-control mechanisms (re-exported from `racer-flow-core` until the core -> object-wire ->
+/// http1 -> flow-control cycle is broken, after which the crate folds into this module).
+pub use racer_flow_core as flow;
 pub mod liveness;
 pub mod prefetch;
 pub mod read;

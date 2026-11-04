@@ -1,12 +1,12 @@
 //! Sans-IO page singleflight rules.
 //!
-//! Flight transitions run in `flow_control::coalesce::flight::state::State`; these step functions
+//! Flight transitions run in `crate::flow::coalesce::flight::state::State`; these step functions
 //! add the business decisions on top and are generic over the wake target `T` (production `Waker`s,
 //! simulator [`Token`]s).
 
+use crate::flow::coalesce::flight::Identity;
+use crate::flow::coalesce::flight::state::{Outcome, Phase, Published, State, WaiterPolicy};
 use crate::read::{Error, FailureKind, Result};
-use flow_control::coalesce::flight::Identity;
-use flow_control::coalesce::flight::state::{Outcome, Phase, Published, State, WaiterPolicy};
 use racer_object_wire::model::PageId;
 use std::cell::Cell;
 use std::collections::HashMap;

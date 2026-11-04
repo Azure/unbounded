@@ -417,6 +417,7 @@ dependencies = [
  "futures",
  "libc",
  "page-alloc",
+ "racer-flow-core",
  "racer-io",
  "zeroize",
 ]
@@ -890,8 +891,8 @@ dependencies = [
 name = "racer-core"
 version = "0.1.0"
 dependencies = [
- "flow-control",
  "racer-control-wire",
+ "racer-flow-core",
  "racer-object-wire",
  "sha2",
  "topology",
@@ -928,6 +929,13 @@ name = "racer-dst"
 version = "0.1.0"
 dependencies = [
  "racer-io",
+]
+
+[[package]]
+name = "racer-flow-core"
+version = "0.1.0"
+dependencies = [
+ "futures",
 ]
 
 [[package]]

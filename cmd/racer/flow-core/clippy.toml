@@ -1,0 +1,6 @@
+# racer-core is sans-IO: time and randomness are passed in by the caller.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "pass `now` in explicitly" },
+    { path = "std::time::SystemTime::now", reason = "pass `wall_ms` in explicitly" },
+    { path = "std::thread::spawn", reason = "racer-core must not create threads" },
+]

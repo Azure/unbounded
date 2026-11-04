@@ -123,11 +123,11 @@ fn find(text: &str) -> Vec<(usize, &'static str)> {
 #[test]
 fn sources_are_pure() {
     let (mut hits, mut files) = (Vec::new(), 0);
-    scan(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut hits,
-        &mut files,
-    );
+    // `racer-flow-core` is re-exported as `racer_core::flow` and held to the same rules.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for dir in [root.join("src"), root.join("../flow-core/src")] {
+        scan(&dir, &mut hits, &mut files);
+    }
     assert!(files > 0, "no sources scanned");
     assert!(
         hits.is_empty(),

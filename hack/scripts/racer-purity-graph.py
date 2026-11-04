@@ -11,7 +11,7 @@ import json
 import subprocess
 import sys
 
-PURE = ["racer-core", "topology", "racer-wire", "racer-authority"]
+PURE = ["racer-core", "racer-flow-core", "topology", "racer-wire", "racer-authority"]
 IO = ["uring-runtime", "http1", "page-alloc", "flow-control", "rdma-verbs", "racer-gpu", "io-uring"]
 
 

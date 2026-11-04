@@ -13,7 +13,7 @@ name = "racer_core"
 topology = { path = "../topology" }
 racer-object-wire = { path = "../object-wire" }
 racer-control-wire = { path = "../control-wire" }
-flow-control = { path = "../flow" }
+racer-flow-core = { path = "../flow-core" }
 sha2 = "0.10"
 
 [dev-dependencies]

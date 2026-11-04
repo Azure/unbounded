@@ -103,6 +103,8 @@ COPY cmd/racer/alloc/Cargo.toml ./alloc/Cargo.toml
 COPY cmd/racer/alloc/src ./alloc/src
 COPY cmd/racer/flow/Cargo.toml ./flow/Cargo.toml
 COPY cmd/racer/flow/src ./flow/src
+COPY cmd/racer/flow-core/Cargo.toml ./flow-core/Cargo.toml
+COPY cmd/racer/flow-core/src ./flow-core/src
 COPY cmd/racer/crypto/Cargo.toml ./crypto/Cargo.toml
 COPY cmd/racer/crypto/src ./crypto/src
 COPY cmd/racer/verbs/Cargo.toml ./verbs/Cargo.toml

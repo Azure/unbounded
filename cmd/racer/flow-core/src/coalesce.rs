@@ -142,11 +142,11 @@ impl<K: Clone + Eq + Hash, V, S: BuildHasher + Default> Table<K, V, S> {
 /// Handles cannot move or be shared across workers:
 /// ```compile_fail
 /// fn require_send<T: Send>() {}
-/// require_send::<flow_control::coalesce::Registration<u32, u32>>();
+/// require_send::<racer_flow_core::coalesce::Registration<u32, u32>>();
 /// ```
 /// ```compile_fail
 /// fn require_sync<T: Sync>() {}
-/// require_sync::<flow_control::coalesce::Registration<u32, u32>>();
+/// require_sync::<racer_flow_core::coalesce::Registration<u32, u32>>();
 /// ```
 pub struct Registration<K: Eq + Hash, V, S: BuildHasher = RandomState> {
     owner: Rc<RegistrationOwner<K, V, S>>,
@@ -676,17 +676,17 @@ pub mod flight {
     /// Owned membership with a synchronized, bounded sweep index.
     /// Direct map mutation is intentionally unavailable:
     /// ```compile_fail
-    /// let mut table = flow_control::coalesce::flight::Table::<u32, ()>::default();
+    /// let mut table = racer_flow_core::coalesce::flight::Table::<u32, ()>::default();
     /// table.entries.clear();
     /// ```
     /// Even an empty table belongs to its worker:
     /// ```compile_fail
     /// fn require_send<T: Send>() {}
-    /// require_send::<flow_control::coalesce::flight::Table<u32, ()>>();
+    /// require_send::<racer_flow_core::coalesce::flight::Table<u32, ()>>();
     /// ```
     /// ```compile_fail
     /// fn require_sync<T: Sync>() {}
-    /// require_sync::<flow_control::coalesce::flight::Table<u32, ()>>();
+    /// require_sync::<racer_flow_core::coalesce::flight::Table<u32, ()>>();
     /// ```
     pub struct Table<K, E, S = RandomState> {
         entries: HashMap<K, Indexed<E>, S>,

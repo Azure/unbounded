@@ -67,7 +67,7 @@ impl ResourceClass {
     }
 }
 
-impl flow_control::Class for ResourceClass {
+impl crate::flow::Class for ResourceClass {
     const COUNT: usize = 15;
     fn index(self) -> usize {
         self as usize
@@ -274,7 +274,7 @@ impl Rules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow_control::Class;
+    use crate::flow::Class;
 
     #[test]
     fn indices_follow_all_and_names_are_unique() {
