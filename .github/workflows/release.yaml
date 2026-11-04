@@ -98,6 +98,18 @@ concurrency:
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
   CNI_PLUGINS_VERSION: v1.9.1
+  # Trivy image scans run only when the repository variable RELEASE_TRIVY_SCAN
+  # is "true" (`gh variable set RELEASE_TRIVY_SCAN --body true`). They are off
+  # by default because get.trivy.dev, which the Trivy installer downloads from,
+  # stopped resolving on 2026-11-03 (aquasecurity/trivy#11533), and the install
+  # fails on any runner without a cached binary. It is a variable rather than a
+  # line in this file because this workflow only runs on tag pushes, and turning
+  # scans on or off should not take a commit and a new tag. `version` warns on
+  # every run with scans off. Per-image opt-outs stay in the component-images
+  # matrix (`trivy: false`).
+  #
+  # Not TRIVY_-prefixed: Trivy reads TRIVY_* environment variables as options.
+  RUN_TRIVY: ${{ vars.RELEASE_TRIVY_SCAN == 'true' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -139,6 +151,13 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "Release: ${TAG} (version: ${VERSION}, prerelease: ${IS_PRERELEASE})"
+
+      - name: Report skipped Trivy scans
+        if: env.RUN_TRIVY != 'true'
+        run: |
+          msg="Trivy image scans are off for this release. Set the repository variable RELEASE_TRIVY_SCAN to true to run them."
+          echo "::warning::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
@@ -384,6 +403,77 @@ jobs:
       - name: Compute Go version for Docker
         id: goversion
         run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      # Trivy scan on a single-platform load build before pushing.
+      - name: Build controller for scanning
+        if: env.RUN_TRIVY == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/net/Containerfile
+          target: controller
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: scan/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-controller-${{ matrix.arch }}
+          cache-to: type=gha,scope=net-controller-${{ matrix.arch }},mode=max
+
+      - name: Scan controller with Trivy
+        if: env.RUN_TRIVY == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/unbounded-net-controller:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      - name: Build node for scanning
+        if: env.RUN_TRIVY == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/net/Containerfile
+          target: node
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          build-args: |
+            GO_VERSION=${{ steps.goversion.outputs.go_version }}
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
+          tags: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-node-${{ matrix.arch }}
+          cache-to: type=gha,scope=net-node-${{ matrix.arch }},mode=max
+
+      - name: Scan node with Trivy (CRITICAL, gating)
+        if: env.RUN_TRIVY == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+
+      # HIGH findings are reported but do not gate the release: net-node bundles
+      # the upstream containernetworking/plugins CNI binaries, whose Go stdlib
+      # CVEs we cannot fix without an upstream rebuild. Keep the scan visible so
+      # regressions surface in the workflow log; promote back to gating once
+      # upstream ships a clean toolchain.
+      - name: Scan node with Trivy (HIGH, report-only)
+        if: env.RUN_TRIVY == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/unbounded-net-node:${{ needs.version.outputs.tag }}-${{ matrix.arch }}
+          format: table
+          severity: HIGH
+          exit-code: "0"
 
       - name: Push controller image
         id: push_controller
@@ -655,8 +745,8 @@ jobs:
           gh release upload "$TAG" sbom-${{ matrix.component.name }}.spdx.json --clobber
 
   # ---------------------------------------------------------------------------
-  # Build, push, sign, and SBOM-attest metalman after its default netboot image
-  # has been published.
+  # Build, scan, push, sign, and SBOM-attest metalman after its default netboot
+  # image has been published.
   # ---------------------------------------------------------------------------
   metalman-image:
     needs: [version, netboot-image]
@@ -682,6 +772,30 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image for scanning
+        if: env.RUN_TRIVY == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/metalman/Containerfile
+          push: false
+          load: true
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
+          tags: scan/metalman:${{ needs.version.outputs.tag }}
+
+      - name: Scan with Trivy
+        if: env.RUN_TRIVY == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/metalman:${{ needs.version.outputs.tag }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          trivyignores: images/metalman/.trivyignore
 
       - name: Build and push image
         id: push
@@ -739,7 +853,7 @@ jobs:
           gh release upload "$TAG" sbom-metalman.spdx.json --clobber
 
   # ---------------------------------------------------------------------------
-  # Build, push, sign, and SBOM-attest the component images that have no
+  # Build, scan, push, sign, and SBOM-attest the component images that have no
   # release-time image ordering requirements.
   # Go components cross-compile natively for amd64 and arm64; the host-* machine
   # images publish both platforms for PXE architecture support.
@@ -760,54 +874,70 @@ jobs:
           - name: machina
             file: images/machina/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: token-refresher
             file: images/token-refresher/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: machine-ops-controller
             file: images/machine-ops-controller/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: unbounded-operator
             file: images/unbounded-operator/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: orca
             file: images/orca/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: gantry
             file: images/gantry/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           # Includes GPU reads (CUDA shim and cuFile). The dataplane touches no
           # GPU until a client sends the first gpu-read.
           - name: racer
             file: images/racer/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: racer-object
             file: images/racer-object/Containerfile
             platforms: linux/amd64,linux/arm64
-          # vLLM with racer-client and racer-vllm. The vLLM base makes its SBOM
-          # too big to attest; see "Sign the SBOM" below.
+            trivy: true
+          # vLLM with racer-client and racer-vllm. The upstream vLLM base is
+          # not ours to patch, so it is not gated on Trivy. It also makes the
+          # SBOM too big to attest; see "Sign the SBOM" below.
           - name: racer-vllm
             file: images/racer-vllm/Containerfile
             platforms: linux/amd64
+            trivy: false
             large: true
             large-sbom: true
           - name: host-ubuntu2404
             file: images/host-ubuntu2404/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: false
           - name: host-azurelinux3
             file: images/host-azurelinux3/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: false
           - name: host-azurelinux3-nvidia
             file: images/host-azurelinux3-nvidia/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: false
           - name: inventory-aggregator
             file: images/inventory/aggregator/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: inventory-inspector
             file: images/inventory/inspector/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
           - name: inventory-viewer
             file: images/inventory/viewer/Containerfile
             platforms: linux/amd64,linux/arm64
+            trivy: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -837,6 +967,29 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image for scanning
+        if: matrix.component.trivy && env.RUN_TRIVY == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.component.file }}
+          push: false
+          load: true
+          build-args: |
+            VERSION=${{ needs.version.outputs.tag }}
+            GIT_COMMIT=${{ github.sha }}
+            CONTAINER_REGISTRY=${{ env.REGISTRY }}
+          tags: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
+
+      - name: Scan with Trivy
+        if: matrix.component.trivy && env.RUN_TRIVY == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/${{ matrix.component.name }}:${{ needs.version.outputs.tag }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
 
       - name: Build and push image
         id: push

@@ -226,8 +226,8 @@ func workflowImages(t *testing.T, path string) map[string]string {
 					continue
 				}
 
-				// No pushing build may carry a local-only scan/ tag; those
-				// builds are push:false and load into the daemon.
+				// Local scan-only builds push nothing; they load into the
+				// daemon under a fake scan/ registry for Trivy.
 				if strings.HasPrefix(tag, "scan/") {
 					t.Errorf("%s: job %q pushes a scan/ tag %q, which should be push:false", path, jobName, tag)
 

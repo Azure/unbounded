@@ -383,6 +383,28 @@ published as a release asset with a cosign signature bundle instead.
 It always creates the release as a **draft**. Prerelease is inferred from a `-`
 in the tag.
 
+### Image vulnerability scans
+
+`release.yaml` can scan the images with Trivy before it pushes them, and fail
+the release on what it finds. The scans run only when the repository variable
+`RELEASE_TRIVY_SCAN` is `true`, and they are off by default. Since 2026-11-03 the
+Trivy installer cannot reach `get.trivy.dev`
+([aquasecurity/trivy#11533](https://github.com/aquasecurity/trivy/discussions/11533)),
+so a scan fails before it starts. Every release run with scans off carries a
+warning saying so.
+
+```sh
+gh variable set RELEASE_TRIVY_SCAN --body true    # scans on
+gh variable set RELEASE_TRIVY_SCAN --body false   # scans off
+```
+
+The variable is read when the workflow runs, so changing it takes no commit and
+no new tag. GitHub documents that a re-run reads it again, which would let you
+turn scans off and re-run a release that failed in Trivy. That has not been
+tried here yet, and it only applies to tags whose `release.yaml` has the
+variable. Images that are never scanned, such as the host images and
+racer-vllm, are marked `trivy: false` in the `component-images` matrix.
+
 ### Soaking and publishing
 
 `release-upgrade.yaml` starts automatically when the build finishes. A release

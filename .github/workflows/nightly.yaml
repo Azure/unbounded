@@ -12,8 +12,8 @@ name: nightly
 # release to unbounded-stable. This one has no release and no tag: it builds
 # main HEAD, pushes images tagged `nightly-<shortsha>`, and lets the operator
 # reconcile them in, using the same deploy gate and smoke tests. Deliberately no
-# cosign or SBOM: the nightly cluster is a throwaway soak target, and the supply
-# chain stays on the release path.
+# cosign, SBOM or Trivy: the nightly cluster is a throwaway soak target, and the
+# supply chain stays on the release path.
 #
 # Schedule
 # --------
@@ -123,8 +123,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Build and push the net controller/node images for the snapshot (amd64).
   #
-  # Mirrors release.yaml's net-images job minus the multi-arch matrix, cosign
-  # signing, and SBOM attestation. The frontend is built inline
+  # Mirrors release.yaml's net-images job minus the multi-arch matrix, Trivy
+  # gating, cosign signing, and SBOM attestation. The frontend is built inline
   # (release.yaml shares it across a per-arch matrix via an artifact; we have a
   # single amd64 build, so inline is simpler) and staged into the embed dir.
   # ---------------------------------------------------------------------------
