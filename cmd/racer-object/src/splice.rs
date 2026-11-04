@@ -118,7 +118,13 @@ pub async fn forward(
         let mut filled = loop {
             match src.try_io(Interest::READABLE, || splice(src_fd, pipe_w, want, true)) {
                 Ok(0) => return Err(SpliceError::Source),
-                Ok(n) => break n,
+                Ok(n) => {
+                    // try_io bypasses tokio's coop budget, so charge it here:
+                    // with both sockets always ready this loop would otherwise
+                    // never yield and starve other connections on the worker.
+                    tokio::task::consume_budget().await;
+                    break n;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     let wait = tokio::time::timeout(BODY_TIMEOUT, src.readable());
                     match watch.guard(wait).await {
@@ -152,7 +158,10 @@ pub async fn forward(
         while filled > 0 {
             match dst.try_io(Interest::WRITABLE, || splice(pipe_r, dst_fd, filled, more)) {
                 Ok(0) => return Err(SpliceError::Destination),
-                Ok(n) => filled -= n,
+                Ok(n) => {
+                    filled -= n;
+                    tokio::task::consume_budget().await;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     match tokio::time::timeout(BODY_TIMEOUT, dst.writable()).await {
                         Ok(Ok(())) => {}
@@ -246,7 +255,11 @@ pub async fn send_more(dst: &TcpStream, mut data: &[u8]) -> io::Result<()> {
             }
         });
         match sent {
-            Ok(n) => data = &data[n..],
+            Ok(n) => {
+                data = &data[n..];
+                // See forward: try_io does not consume the coop budget.
+                tokio::task::consume_budget().await;
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 tokio::time::timeout(BODY_TIMEOUT, dst.writable())
                     .await
@@ -257,4 +270,67 @@ pub async fn send_more(dst: &TcpStream, mut data: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::io::Read;
+    use std::task::{Context, Poll};
+
+    /// Spend the rest of the coop budget without yielding.
+    async fn exhaust_budget() {
+        while tokio::task::coop::has_budget_remaining() {
+            tokio::task::consume_budget().await;
+        }
+    }
+
+    async fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
+        let mut fut = std::pin::pin!(fut);
+        std::future::poll_fn(|cx: &mut Context<'_>| Poll::Ready(fut.as_mut().poll(cx))).await
+    }
+
+    async fn tcp_pair() -> (TcpStream, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (b, _) = l.accept().unwrap();
+        (a, b)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_more_yields_when_budget_exhausted() {
+        let (dst, mut peer) = tcp_pair().await;
+        dst.writable().await.unwrap();
+        exhaust_budget().await;
+        // The socket is writable, so without a budget charge this would
+        // complete without ever returning to the scheduler.
+        assert!(poll_once(send_more(&dst, b"x")).await.is_pending());
+        send_more(&dst, b"y").await.unwrap();
+        let mut b = [0u8; 2];
+        peer.read_exact(&mut b).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_yields_when_budget_exhausted() {
+        let (src, mut feed) = UnixStream::pair().unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut feed, b"hello")
+            .await
+            .unwrap();
+        let (dst, mut peer) = tcp_pair().await;
+        let (client, _client_peer) = tcp_pair().await;
+        let mut rbuf = Vec::new();
+        let mut watch = ClientWatch::new(&client, &mut rbuf, 1024);
+        let pipe = Pipe::new().unwrap();
+        src.readable().await.unwrap();
+        dst.writable().await.unwrap();
+        exhaust_budget().await;
+        let fwd = forward(&src, &pipe, &dst, 5, false, &mut watch);
+        let mut fwd = std::pin::pin!(fwd);
+        assert!(poll_once(fwd.as_mut()).await.is_pending());
+        fwd.await.unwrap();
+        let mut b = [0u8; 5];
+        peer.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hello");
+    }
 }
