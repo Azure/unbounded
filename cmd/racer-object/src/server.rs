@@ -950,3 +950,350 @@ fn head_complete(buf: &[u8]) -> HeadState {
         Err(_) => HeadState::Invalid,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(api: Api, raw: &str) -> Option<Request> {
+        parse_request(api, raw.as_bytes())
+    }
+
+    fn s3(raw: &str) -> Option<Request> {
+        request(Api::S3, raw)
+    }
+
+    fn plan_of(api: Api, raw: &str) -> Result<Plan, Failure> {
+        request(api, raw).unwrap().plan.unwrap()
+    }
+
+    #[test]
+    fn connection_disposition() {
+        for (raw, connection, close) in [
+            (
+                "GET /b/k HTTP/1.1\r\nHost: x\r\n\r\n",
+                Connection::Default,
+                false,
+            ),
+            (
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, Close\r\n\r\n",
+                Connection::Close,
+                true,
+            ),
+            ("GET /b/k HTTP/1.0\r\n\r\n", Connection::Close, true),
+            (
+                "GET /b/k HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+                Connection::KeepAlive,
+                false,
+            ),
+            (
+                "GET /b/k HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n",
+                Connection::Close,
+                true,
+            ),
+            // A request body is never read: answer, then close.
+            (
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n",
+                Connection::Close,
+                true,
+            ),
+            (
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+                Connection::Close,
+                true,
+            ),
+            (
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: 000\r\n\r\n",
+                Connection::Default,
+                false,
+            ),
+            (
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n",
+                Connection::Close,
+                true,
+            ),
+        ] {
+            let r = s3(raw).unwrap();
+            assert_eq!((r.connection, r.close), (connection, close), "{raw}");
+            assert_eq!(r.head_len, raw.len());
+        }
+    }
+
+    #[test]
+    fn malformed_requests() {
+        for raw in [
+            // HTTP/1.1 needs exactly one Host.
+            "GET /b/k HTTP/1.1\r\n\r\n",
+            "GET /b/k HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+            // Content-Length must be digits and must not conflict.
+            "GET /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n",
+            "GET /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: \r\n\r\n",
+            "GET /b/k HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            // Invalid escapes are rejected before the method is checked.
+            "PUT /b/%zz HTTP/1.1\r\nHost: x\r\n\r\n",
+            "\x01\x02 nonsense\r\n\r\n",
+            "GET /b/k HTTP/1.1\r\nHost: x\r\n",
+        ] {
+            assert!(s3(raw).is_none(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn methods() {
+        let r = s3("HEAD /b/k HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert!(r.head && r.method_ok && !r.options_star && r.plan.is_some());
+        for method in ["PUT", "POST", "DELETE", "OPTIONS", "get"] {
+            let r = s3(&format!("{method} /b/k HTTP/1.1\r\nHost: x\r\n\r\n")).unwrap();
+            assert!(
+                !r.method_ok && !r.options_star && r.plan.is_none(),
+                "{method}"
+            );
+        }
+        let r = s3("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert!(r.options_star && !r.method_ok);
+    }
+
+    #[test]
+    fn pipelined_heads() {
+        let one = "GET /b/k HTTP/1.1\r\nHost: x\r\n\r\n";
+        let two = format!("{one}HEAD /b/k HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(matches!(head_complete(two.as_bytes()), HeadState::Complete(n) if n == one.len()));
+        assert_eq!(s3(&two).unwrap().head_len, one.len());
+        assert!(matches!(
+            head_complete(b"GET /b/k HTTP/1.1\r\nHost"),
+            HeadState::Partial
+        ));
+        assert!(matches!(
+            head_complete(b"\x01 x\r\n\r\n"),
+            HeadState::Invalid
+        ));
+        let mut many = String::from("GET /b/k HTTP/1.1\r\n");
+        for i in 0..=MAX_HEADERS {
+            many.push_str(&format!("X-{i}: v\r\n"));
+        }
+        many.push_str("\r\n");
+        assert!(matches!(
+            head_complete(many.as_bytes()),
+            HeadState::TooLarge
+        ));
+    }
+
+    #[test]
+    fn plans() {
+        let p = plan_of(
+            Api::S3,
+            "GET /b/k?versionId=v1 HTTP/1.1\r\nHost: x\r\nIf-Match: \"a\"\r\nIf-None-Match: *\r\nRange: bytes=1-2\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(p.version, b"v1");
+        assert_eq!(p.id, identity(b"b", b"k", b"v1").unwrap());
+        assert!(p.if_match.present && p.if_none.wildcard);
+        assert_eq!(p.range, Ok(RangeSpec::Closed(1, 2)));
+        // Azure prefers x-ms-range, and HEAD always reads the full blob.
+        let raw =
+            "GET /b/k HTTP/1.1\r\nHost: x\r\nRange: bytes=0-0\r\nx-ms-range: bytes=3-\r\n\r\n";
+        assert_eq!(
+            plan_of(Api::Azure, raw).unwrap().range,
+            Ok(RangeSpec::From(3))
+        );
+        let raw = "GET /b/k HTTP/1.1\r\nHost: x\r\nRange: bytes=0-0\r\n\r\n";
+        assert_eq!(
+            plan_of(Api::Azure, raw).unwrap().range,
+            Ok(RangeSpec::Closed(0, 0))
+        );
+        let raw = raw.replace("GET", "HEAD");
+        assert_eq!(
+            plan_of(Api::Azure, &raw).unwrap().range,
+            Ok(RangeSpec::Full)
+        );
+        // Range errors wait for Stat; everything else fails the plan.
+        let raw = "GET /b/k HTTP/1.1\r\nHost: x\r\nRange: bytes=2-1\r\n\r\n";
+        assert_eq!(
+            plan_of(Api::S3, raw).unwrap().range,
+            Err(Failure::BadRequest)
+        );
+        for (api, raw, want) in [
+            (
+                Api::S3,
+                "GET /b HTTP/1.1\r\nHost: x\r\n\r\n",
+                Failure::BadRequest,
+            ),
+            (
+                Api::S3,
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nIf-Match: bare\r\n\r\n",
+                Failure::BadRequest,
+            ),
+            (
+                Api::S3,
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nIf-None-Match: bare\r\n\r\n",
+                Failure::BadRequest,
+            ),
+            (
+                Api::S3,
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nIf-Range: \"v\"\r\n\r\n",
+                Failure::NotImplemented,
+            ),
+            (
+                Api::S3,
+                "GET /b/k?partNumber=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+                Failure::NotImplemented,
+            ),
+            (
+                Api::Azure,
+                "GET /b/k HTTP/1.1\r\nHost: x\r\nx-ms-lease-id: l\r\n\r\n",
+                Failure::NotImplemented,
+            ),
+            (
+                Api::Azure,
+                "GET /b/k?timeout=bad HTTP/1.1\r\nHost: x\r\n\r\n",
+                Failure::BadRequest,
+            ),
+        ] {
+            assert_eq!(plan_of(api, raw).err(), Some(want), "{raw}");
+        }
+    }
+
+    /// Response head without the Date header, which changes every second.
+    fn text(out: &[u8]) -> String {
+        String::from_utf8(out.to_vec())
+            .unwrap()
+            .split("\r\n")
+            .filter(|l| !l.starts_with("Date: "))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    fn selection(offset: u64, length: u64, size: u64, partial: bool) -> Selection {
+        Selection {
+            offset,
+            length,
+            size,
+            partial,
+        }
+    }
+
+    #[test]
+    fn success_heads() {
+        let mut out = Vec::new();
+        success_head(
+            &mut out,
+            Api::S3,
+            b"",
+            b"\"v\"",
+            None,
+            selection(0, 4, 4, false),
+            Connection::Default,
+        );
+        assert_eq!(
+            text(&out),
+            "HTTP/1.1 200 OK\r\nEtag: \"v\"\r\nAccept-Ranges: bytes\r\nContent-Length: 4\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        success_head(
+            &mut out,
+            Api::S3,
+            b"v1",
+            b"\"v\"",
+            Some(b"text/plain"),
+            selection(1, 2, 4, true),
+            Connection::Close,
+        );
+        assert_eq!(
+            text(&out),
+            "HTTP/1.1 206 Partial Content\r\nEtag: \"v\"\r\nAccept-Ranges: bytes\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nX-Amz-Version-Id: v1\r\nContent-Range: bytes 1-2/4\r\nConnection: close\r\n\r\n"
+        );
+        success_head(
+            &mut out,
+            Api::Azure,
+            b"v1",
+            b"\"v\"",
+            Some(b"text/plain"),
+            selection(0, 4, 4, false),
+            Connection::KeepAlive,
+        );
+        assert_eq!(
+            text(&out),
+            "HTTP/1.1 200 OK\r\nEtag: \"v\"\r\nAccept-Ranges: bytes\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nX-Ms-Version: 2026-02-06\r\nX-Ms-Blob-Type: BlockBlob\r\nX-Ms-Version-Id: v1\r\nConnection: keep-alive\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn not_modified_heads() {
+        let mut out = Vec::new();
+        not_modified_head(&mut out, Api::S3, b"v1", b"\"v\"", Connection::Default);
+        assert_eq!(
+            text(&out),
+            "HTTP/1.1 304 Not Modified\r\nEtag: \"v\"\r\n\r\n"
+        );
+        not_modified_head(&mut out, Api::Azure, b"", b"\"v\"", Connection::Default);
+        assert_eq!(
+            text(&out),
+            "HTTP/1.1 304 Not Modified\r\nEtag: \"v\"\r\nX-Ms-Version: 2026-02-06\r\nX-Ms-Blob-Type: BlockBlob\r\n\r\n"
+        );
+    }
+
+    fn meta(size: u64, content_type: Option<&[u8]>) -> Meta {
+        Meta {
+            size,
+            etag: b"\"v\"".to_vec(),
+            content_type: content_type.map(<[u8]>::to_vec),
+        }
+    }
+
+    #[test]
+    fn subscription_cross_checks() {
+        // Unconditional reads trust Racer only when it agrees with the
+        // sidecar's own resolution.
+        assert_eq!(
+            unpinned_selection(RangeSpec::Suffix(2), 10, 8, 10),
+            Ok(selection(8, 2, 10, true))
+        );
+        assert_eq!(
+            unpinned_selection(RangeSpec::Full, 0, 0, 0),
+            Ok(selection(0, 0, 0, false))
+        );
+        assert_eq!(
+            unpinned_selection(RangeSpec::Suffix(2), 10, 7, 10),
+            Err(Failure::BadGateway)
+        );
+        assert_eq!(
+            unpinned_selection(RangeSpec::From(20), 10, 0, 0),
+            Err(Failure::BadGateway)
+        );
+        // Pinned reads forward the exact range.
+        assert_eq!(pinned_range(selection(0, 0, 0, false)), RangeSpec::Full);
+        assert_eq!(
+            pinned_range(selection(0, 4, 4, false)),
+            RangeSpec::Closed(0, 3)
+        );
+        assert_eq!(
+            pinned_range(selection(3, 2, 9, true)),
+            RangeSpec::Closed(3, 4)
+        );
+        // ...and must match what Stat reported.
+        let stat = meta(10, Some(b"text/plain"));
+        let sel = selection(2, 4, 10, true);
+        assert_eq!(check_pinned(&stat, &stat, 2, 6, sel), Ok(()));
+        assert_eq!(
+            check_pinned(&stat, &meta(11, Some(b"text/plain")), 2, 6, sel),
+            Err(Failure::BadGateway)
+        );
+        assert_eq!(
+            check_pinned(&stat, &meta(10, None), 2, 6, sel),
+            Err(Failure::BadGateway)
+        );
+        assert_eq!(
+            check_pinned(&stat, &stat, 3, 6, sel),
+            Err(Failure::BadGateway)
+        );
+        assert_eq!(
+            check_pinned(&stat, &stat, 2, 5, sel),
+            Err(Failure::BadGateway)
+        );
+        // A short tail is reported as an unsatisfiable range, like Go's SDK.
+        let tail = selection(8, 4, 12, true);
+        assert_eq!(
+            check_pinned(&stat, &stat, 8, 10, tail),
+            Err(Failure::RangeNotSatisfiable(None))
+        );
+    }
+}
