@@ -59,6 +59,8 @@ scoping is inherent to the per-site component):
 
 When `--dhcp-interface` is set, metalman binds to the interface for broadcast DHCP, and the DHCP server requires leader election. Without it, metalman accepts relayed (unicast) DHCP packets and the DHCP server responds regardless of leader status. Leader election always runs at the manager level for the reconcilers.
 
+The operator sets `--registry-mirror=http://127.0.0.1:5000` on a Site's metalman when Gantry is enabled for that Site (the default), so image pulls go through the node-local Gantry mirror. If Gantry is not running on the metalman node, pulls fall back to the registry.
+
 ## Images
 
 Metalman uses a machine image and a netboot image for each PXE repave.

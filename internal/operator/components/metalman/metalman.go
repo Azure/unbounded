@@ -25,6 +25,7 @@ import (
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/operator/components/gantry"
 )
 
 // Component reconciles the per-Site metalman PXE controller.
@@ -332,6 +333,14 @@ func deployment(site *unboundedv1alpha3.Site, namespace string, cfg component.Co
 	args := []string{"serve-pxe", "--site=" + site.Name}
 	if site.Spec.Components.Metalman.DHCPAutoInterface != nil && *site.Spec.Components.Metalman.DHCPAutoInterface {
 		args = append(args, "--dhcp-auto-interface")
+	}
+
+	// The metalman pod is hostNetwork, so it can reach the node-local Gantry
+	// mirror. In Racer mode Gantry runs only where Racer runs, so the mirror
+	// may be absent on this node; metalman then falls back to the upstream
+	// registry on every mirror failure, so passing the flag is still safe.
+	if gantry.EnabledFor(site) {
+		args = append(args, "--registry-mirror="+gantry.NodeLocalMirrorURL)
 	}
 
 	replicas := int32(1)

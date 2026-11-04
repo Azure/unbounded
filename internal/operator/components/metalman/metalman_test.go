@@ -110,7 +110,7 @@ func TestDeployment(t *testing.T) {
 		t.Fatalf("image = %q", container.Image)
 	}
 
-	if got := container.Args; len(got) != 3 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" || got[2] != "--dhcp-auto-interface" {
+	if got := container.Args; len(got) != 4 || got[0] != "serve-pxe" || got[1] != "--site=rack-a" || got[2] != "--dhcp-auto-interface" || got[3] != "--registry-mirror=http://127.0.0.1:5000" {
 		t.Fatalf("args = %#v", got)
 	}
 
@@ -1021,5 +1021,48 @@ func TestMixedSitesShareBootstrapRestriction(t *testing.T) {
 
 	if n := deletes["Deployment/"+DeploymentName("rack-b")]; n != 0 {
 		t.Fatalf("enabled Site Deployment deleted %d times, want 0", n)
+	}
+}
+
+func TestDeploymentRegistryMirrorFollowsGantry(t *testing.T) {
+	disabled := false
+
+	tests := []struct {
+		name   string
+		gantry *unboundedv1alpha3.GantryComponentSpec
+		want   bool
+	}{
+		{name: "gantry default enabled", want: true},
+		{name: "gantry explicitly disabled", gantry: &unboundedv1alpha3.GantryComponentSpec{SiteComponentSpec: unboundedv1alpha3.SiteComponentSpec{Enabled: &disabled}}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			site := &unboundedv1alpha3.Site{
+				ObjectMeta: metav1.ObjectMeta{Name: "rack-a"},
+				Spec: unboundedv1alpha3.SiteSpec{Components: unboundedv1alpha3.SiteComponents{
+					Metalman: &unboundedv1alpha3.MetalmanComponentSpec{},
+					Gantry:   tt.gantry,
+				}},
+			}
+
+			args := deployment(site, component.DefaultNamespace, component.Config{}).Spec.Template.Spec.Containers[0].Args
+
+			found := false
+
+			for _, a := range args {
+				if strings.HasPrefix(a, "--registry-mirror") {
+					if a != "--registry-mirror=http://127.0.0.1:5000" {
+						t.Fatalf("unexpected mirror arg %q", a)
+					}
+
+					found = true
+				}
+			}
+
+			if found != tt.want {
+				t.Fatalf("registry mirror present = %v, want %v (args %#v)", found, tt.want, args)
+			}
+		})
 	}
 }

@@ -98,6 +98,12 @@ func (Component) Name() string { return "gantry" }
 // ConditionType implements component.ClusterComponent.
 func (Component) ConditionType() string { return "GantryReady" }
 
+// NodeLocalMirrorURL is the base URL of the Gantry registry mirror on every
+// node that runs the Gantry agent. The agent DaemonSet publishes the mirror
+// port as a hostPort bound to 127.0.0.1 (deploy/gantry/chart/templates/daemonset.yaml),
+// so only hostNetwork pods on the same node can reach it.
+const NodeLocalMirrorURL = "http://127.0.0.1:5000"
+
 // EnabledFor reports whether a Site enables the gantry component. Gantry
 // defaults to enabled: only an explicit enabled=false opts a Site out.
 func EnabledFor(site *unboundedv1alpha3.Site) bool {
