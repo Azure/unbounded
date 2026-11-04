@@ -153,8 +153,7 @@ func imagePaths(reqPath string) (tmpl, static string, err error) {
 // builds should not ship both. Errors from the registry wrap
 // ErrImageUnavailable; a missing file wraps imagepull.ErrNotFound.
 func (f *FileResolver) openImageFile(ctx context.Context, src ImageSource, reqPath string) (*imagepull.File, bool, error) {
-	tmplName, staticName, err := imagePaths(reqPath)
-	if err != nil {
+	if _, _, err := imagePaths(reqPath); err != nil {
 		return nil, false, err
 	}
 
@@ -163,10 +162,20 @@ func (f *FileResolver) openImageFile(ctx context.Context, src ImageSource, reqPa
 		return nil, false, err
 	}
 
+	return openFileInImage(ctx, img, reqPath)
+}
+
+// openFileInImage is openImageFile for an already resolved image.
+func openFileInImage(ctx context.Context, img *imagepull.Image, reqPath string) (*imagepull.File, bool, error) {
+	tmplName, staticName, err := imagePaths(reqPath)
+	if err != nil {
+		return nil, false, err
+	}
+
 	file, err := img.Open(ctx, tmplName, staticName)
 	if err != nil {
 		if errors.Is(err, imagepull.ErrNotFound) {
-			return nil, false, fmt.Errorf("file not found in image %q: %s: %w", src.Ref, reqPath, err)
+			return nil, false, fmt.Errorf("file not found in image %q: %s: %w", img.Source().Ref, reqPath, err)
 		}
 
 		return nil, false, fmt.Errorf("%w: %w", ErrImageUnavailable, err)
@@ -207,6 +216,11 @@ func (f *FileResolver) fetchMetadata(ctx context.Context, src ImageSource) (*Ima
 		return nil, err
 	}
 
+	return readImageMetadata(ctx, img)
+}
+
+// readImageMetadata reads and parses disk/metadata.yaml from img.
+func readImageMetadata(ctx context.Context, img *imagepull.Image) (*ImageMetadata, error) {
 	data, _, err := img.ReadFile(ctx, path.Join(imageDiskDir, metadataFile))
 	if err != nil {
 		if errors.Is(err, imagepull.ErrNotFound) {
@@ -218,7 +232,7 @@ func (f *FileResolver) fetchMetadata(ctx context.Context, src ImageSource) (*Ima
 
 	var m ImageMetadata
 	if err := yaml.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parsing %s in %q: %w", metadataFile, src.Ref, err)
+		return nil, fmt.Errorf("parsing %s in %q: %w", metadataFile, img.Source().Ref, err)
 	}
 
 	return &m, nil
@@ -232,4 +246,17 @@ func (f *FileResolver) ImageMetadata(ctx context.Context, src ImageSource) (*Ima
 	}
 
 	return f.Metadata.get(ctx, src, f.fetchMetadata)
+}
+
+// PinnedImageMetadata returns the parsed metadata of an already resolved
+// image. Results are memoized by manifest digest, so they always describe
+// img itself even after the tag it was resolved from moves.
+func (f *FileResolver) PinnedImageMetadata(ctx context.Context, img *imagepull.Image) (*ImageMetadata, error) {
+	if f.Metadata == nil {
+		return readImageMetadata(ctx, img)
+	}
+
+	return f.Metadata.getPinned(ctx, img.Digest(), func(ctx context.Context) (*ImageMetadata, error) {
+		return readImageMetadata(ctx, img)
+	})
 }

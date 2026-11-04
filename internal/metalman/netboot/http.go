@@ -254,16 +254,27 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isBootLoader := false
+	var (
+		isBootLoader bool
+		// pinned is the image this request reads content from, resolved
+		// once so that classification and content agree on one digest.
+		pinned *imagepull.Image
+	)
 
-	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
-		var err error
-
+	if netSrc := h.NetbootImageSource(node); node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP && h.Puller != nil && netSrc.Ref != "" {
 		// Classify with the netboot image, which holds the metadata, rather
 		// than the per-path source. For disk.img.gz the source is the OS
 		// image, and searching it for metadata.yaml would index its large
 		// layers under the metadata fetch timeout.
-		isBootLoader, err = h.isHTTPBootLoaderDownload(r.Context(), h.NetbootImageSource(node), path)
+		netImg, err := h.resolveImage(r.Context(), netSrc)
+		if err == nil {
+			isBootLoader, err = h.isHTTPBootLoaderDownload(r.Context(), netImg, path)
+		}
+
+		if path != "disk.img.gz" {
+			pinned = netImg
+		}
+
 		if err != nil {
 			// Without metadata the request cannot be classified, and serving
 			// it could hand out the boot loader with no active install. Fail
@@ -293,7 +304,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, src, ip)
+	resolved, err := h.resolveFile(r.Context(), path, node, src, pinned, ip)
 	if err != nil {
 		if errors.Is(err, ErrImageUnavailable) {
 			log.Info("image unavailable", "node", node.Name, "ref", src.Ref, "err", err)
@@ -774,15 +785,11 @@ func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *sl
 }
 
 // isHTTPBootLoaderDownload reports whether path is the HTTP boot loader named
-// by src's metadata. An image without metadata.yaml has no boot loader. A
+// by img's metadata. An image without metadata.yaml has no boot loader. A
 // failed metadata lookup is returned so the caller can fail closed rather
 // than treat the request as a follow-on artifact.
-func (h *HTTPServer) isHTTPBootLoaderDownload(ctx context.Context, src ImageSource, path string) (bool, error) {
-	if h.Puller == nil || src.Ref == "" {
-		return false, nil
-	}
-
-	meta, err := h.ImageMetadata(ctx, src)
+func (h *HTTPServer) isHTTPBootLoaderDownload(ctx context.Context, img *imagepull.Image, path string) (bool, error) {
+	meta, err := h.PinnedImageMetadata(ctx, img)
 	if err != nil {
 		return false, err
 	}

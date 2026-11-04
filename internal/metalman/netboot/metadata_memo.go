@@ -29,6 +29,12 @@ const (
 // the same image so that a DHCP storm causes one registry request. Failures
 // are memoized for ErrorTTL to avoid hammering an unavailable registry.
 //
+// Lookups by ImageSource (DHCP replies, boot media) are keyed by reference,
+// so after a mutable tag moves they may return the old image's metadata for
+// up to TTL. Lookups for an already resolved image (HTTP and TFTP file
+// requests, which pin one image per request) are keyed by manifest digest,
+// so the metadata always matches the content served from that image.
+//
 // Only the parsed metadata is memoized. Image content is never cached:
 // every file request pulls the file from the registry or mirror again.
 //
@@ -49,7 +55,7 @@ type MetadataMemo struct {
 	Now func() time.Time
 
 	mu      sync.Mutex
-	entries map[metadataKey]metadataEntry
+	entries map[string]metadataEntry
 	group   singleflight.Group
 }
 
@@ -115,9 +121,20 @@ func (m *MetadataMemo) ttl(meta *ImageMetadata, err error) time.Duration {
 	return m.TTL
 }
 
+// get returns the memoized metadata of src, keyed by reference.
 func (m *MetadataMemo) get(ctx context.Context, src ImageSource, fetch func(context.Context, ImageSource) (*ImageMetadata, error)) (*ImageMetadata, error) {
-	key := newMetadataKey(src)
+	return m.lookup(ctx, "ref "+newMetadataKey(src).flightKey(), func(ctx context.Context) (*ImageMetadata, error) {
+		return fetch(ctx, src)
+	})
+}
 
+// getPinned returns the memoized metadata of the image with manifest digest
+// digest. A digest names immutable content, so the entry cannot go stale.
+func (m *MetadataMemo) getPinned(ctx context.Context, digest string, fetch func(context.Context) (*ImageMetadata, error)) (*ImageMetadata, error) {
+	return m.lookup(ctx, "digest "+digest, fetch)
+}
+
+func (m *MetadataMemo) lookup(ctx context.Context, key string, fetch func(context.Context) (*ImageMetadata, error)) (*ImageMetadata, error) {
 	m.mu.Lock()
 
 	if e, ok := m.entries[key]; ok && m.now().Before(e.expires) {
@@ -129,16 +146,16 @@ func (m *MetadataMemo) get(ctx context.Context, src ImageSource, fetch func(cont
 
 	// The shared fetch must not be canceled when the first caller goes away,
 	// since other callers may be waiting on it.
-	ch := m.group.DoChan(key.flightKey(), func() (any, error) {
+	ch := m.group.DoChan(key, func() (any, error) {
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.fetchTimeout())
 		defer cancel()
 
-		meta, err := fetch(fetchCtx, src)
+		meta, err := fetch(fetchCtx)
 
 		if ttl := m.ttl(meta, err); ttl > 0 {
 			m.mu.Lock()
 			if m.entries == nil {
-				m.entries = map[metadataKey]metadataEntry{}
+				m.entries = map[string]metadataEntry{}
 			}
 
 			now := m.now()

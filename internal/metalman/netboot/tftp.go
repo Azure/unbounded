@@ -16,6 +16,7 @@ import (
 	"github.com/pin/tftp/v3"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
 )
 
 type TFTPServer struct {
@@ -154,12 +155,27 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		return fmt.Errorf("node %s has no netboot image", node.Name)
 	}
 
-	var resolved *ResolvedFile
+	var (
+		resolved *ResolvedFile
+		// img pins the request to one digest for content and the boot
+		// loader classification below.
+		img *imagepull.Image
+	)
 
 	err = openWithin(func(c context.Context) error {
 		var err error
 
-		resolved, err = t.ResolveFileByPathForIP(c, filename, node, src, ip)
+		if filename == userDataPath && node != nil {
+			resolved, err = t.ResolveFileByPathForIP(c, filename, node, src, ip)
+			return err
+		}
+
+		img, err = t.resolveImage(c, src)
+		if err != nil {
+			return err
+		}
+
+		resolved, err = t.ResolveFileFromImage(c, filename, node, img, ip)
 
 		return err
 	})
@@ -196,13 +212,13 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 	recordCtx, cancelRecord := context.WithTimeout(context.Background(), orDefault(t.LookupTimeout, defaultTFTPLookupTimeout))
 	defer cancelRecord()
 
-	t.recordBootLoaderDownloaded(recordCtx, log, node, src, filename)
+	t.recordBootLoaderDownloaded(recordCtx, log, node, img, filename)
 
 	return nil
 }
 
-func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, src ImageSource, filename string) {
-	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(ctx, src, filename) {
+func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, img *imagepull.Image, filename string) {
+	if node == nil || t.StatusRecorder == nil || !t.isInitialBootLoaderDownload(ctx, img, filename) {
 		return
 	}
 
@@ -211,12 +227,12 @@ func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.L
 	}
 }
 
-func (t *TFTPServer) isInitialBootLoaderDownload(ctx context.Context, src ImageSource, filename string) bool {
-	if t.Puller == nil || src.Ref == "" {
+func (t *TFTPServer) isInitialBootLoaderDownload(ctx context.Context, img *imagepull.Image, filename string) bool {
+	if img == nil {
 		return true
 	}
 
-	meta, err := t.ImageMetadata(ctx, src)
+	meta, err := t.PinnedImageMetadata(ctx, img)
 	if err != nil || meta.DHCPBootImageName == "" {
 		return true
 	}

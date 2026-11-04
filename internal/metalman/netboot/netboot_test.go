@@ -621,10 +621,13 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 		StatusRecorder: recorder,
 	}
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1"}, "grubx64.efi")
+	img, err := server.resolveImage(t.Context(), ImageSource{Ref: "ghcr.io/test/image:v1"})
+	require.NoError(t, err)
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, img, "grubx64.efi")
 	require.Empty(t, recorder.calls)
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1"}, "shimx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, img, "shimx64.efi")
 	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
 }
 
@@ -648,10 +651,13 @@ func TestTFTPServerRecordsInitialBootLoaderForTargetArchitecture(t *testing.T) {
 		StatusRecorder: recorder,
 	}
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1", Architecture: v1alpha3.PXEArchitectureARM64}, "shimx64.efi")
+	img, err := server.resolveImage(t.Context(), ImageSource{Ref: "ghcr.io/test/image:v1", Architecture: v1alpha3.PXEArchitectureARM64})
+	require.NoError(t, err)
+
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, img, "shimx64.efi")
 	require.Empty(t, recorder.calls)
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1", Architecture: v1alpha3.PXEArchitectureARM64}, "shimaa64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, img, "shimaa64.efi")
 	require.Equal(t, []string{"machine-arm:shimaa64.efi"}, recorder.calls)
 }
 
@@ -4006,10 +4012,7 @@ func TestHTTPServer_HTTPBootLoaderGateFailsClosedOnMetadataError(t *testing.T) {
 
 			// Seed the memo with a transient failure while the registry
 			// itself still serves files.
-			_, err := srv.Metadata.get(t.Context(), srv.NetbootImageSource(node), func(context.Context, ImageSource) (*ImageMetadata, error) {
-				return nil, fmt.Errorf("%w: registry down", ErrImageUnavailable)
-			})
-			require.Error(t, err)
+			seedPinnedMetadataFailure(t, &srv.FileResolver, srv.NetbootImageSource(node))
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /", srv.handleFile)
@@ -4130,11 +4133,118 @@ func TestHTTPServer_DiskDownloadClassifiedWithNetbootImage(t *testing.T) {
 
 	// A netboot metadata failure fails the disk download closed too.
 	srv.Metadata = &MetadataMemo{}
-	_, err = srv.Metadata.get(t.Context(), srv.NetbootImageSource(node), func(context.Context, ImageSource) (*ImageMetadata, error) {
-		return nil, fmt.Errorf("%w: registry down", ErrImageUnavailable)
-	})
-	require.Error(t, err)
+	seedPinnedMetadataFailure(t, &srv.FileResolver, srv.NetbootImageSource(node))
 
 	w = get("/disk.img.gz")
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+}
+
+// seedPinnedMetadataFailure memoizes a transient metadata failure for the
+// digest src currently resolves to, while the registry still serves files.
+func seedPinnedMetadataFailure(t *testing.T, f *FileResolver, src ImageSource) {
+	t.Helper()
+
+	img, err := f.resolveImage(t.Context(), src)
+	require.NoError(t, err)
+
+	_, err = f.Metadata.getPinned(t.Context(), img.Digest(), func(context.Context) (*ImageMetadata, error) {
+		return nil, fmt.Errorf("%w: registry down", ErrImageUnavailable)
+	})
+	require.Error(t, err)
+}
+
+func TestHTTPServer_TagMoveKeepsClassificationAndContentOnOneDigest(t *testing.T) {
+	const ref = "ghcr.io/test/netboot:v1"
+
+	images := newTestImages(t)
+	images.Push(t, ref, map[string][]byte{
+		"metadata.yaml": []byte("httpBootPath: shimA.efi\n"),
+		"shimA.efi":     []byte("loader-a"),
+		"shimB.efi":     []byte("stale-b"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-move"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:        ref,
+			BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+			DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:12", IPv4: "10.0.1.62", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	srv := &HTTPServer{FileResolver: FileResolver{Puller: images.Puller, Reader: fc, Metadata: &MetadataMemo{TTL: time.Hour}}}
+
+	get := func(path string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.RemoteAddr = "10.0.1.62:4321"
+		w := httptest.NewRecorder()
+		normalizePath(http.HandlerFunc(srv.handleFile)).ServeHTTP(w, r)
+
+		return w
+	}
+
+	// Image A: shimA.efi is the gated loader, shimB.efi is a plain file.
+	require.Equal(t, http.StatusNotFound, get("/shimA.efi").Code)
+
+	w := get("/shimB.efi")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "stale-b", w.Body.String())
+
+	// Move the tag to image B, whose loader is shimB.efi. The memo still
+	// holds A's metadata for an hour, yet the request must be classified
+	// with B's metadata because its content comes from B.
+	images.Push(t, ref, map[string][]byte{
+		"metadata.yaml": []byte("httpBootPath: shimB.efi\n"),
+		"shimB.efi":     []byte("loader-b"),
+	})
+
+	w = get("/shimB.efi")
+	require.Equal(t, http.StatusNotFound, w.Code, "new loader must be gated without an active install")
+	require.NotContains(t, w.Body.String(), "loader-b")
+	require.NotContains(t, w.Body.String(), "stale-b")
+
+	// The old loader is gone from B and is no longer classified as a loader.
+	w = get("/shimA.efi")
+	require.Equal(t, http.StatusNotFound, w.Code)
+	require.NotContains(t, w.Body.String(), "loader-a")
+}
+
+func TestPinnedImageMetadataIsKeyedByDigest(t *testing.T) {
+	const ref = "ghcr.io/test/netboot:v1"
+
+	images := newTestImages(t)
+	images.Push(t, ref, map[string][]byte{"metadata.yaml": []byte("httpBootPath: a.efi\n")})
+
+	resolver := &FileResolver{Puller: images.Puller, Metadata: &MetadataMemo{TTL: time.Hour}}
+	src := ImageSource{Ref: ref}
+
+	imgA, err := resolver.resolveImage(t.Context(), src)
+	require.NoError(t, err)
+
+	meta, err := resolver.PinnedImageMetadata(t.Context(), imgA)
+	require.NoError(t, err)
+	require.Equal(t, "a.efi", meta.HTTPBootPath)
+
+	images.Push(t, ref, map[string][]byte{"metadata.yaml": []byte("httpBootPath: b.efi\n")})
+
+	imgB, err := resolver.resolveImage(t.Context(), src)
+	require.NoError(t, err)
+	require.NotEqual(t, imgA.Digest(), imgB.Digest())
+
+	meta, err = resolver.PinnedImageMetadata(t.Context(), imgB)
+	require.NoError(t, err)
+	require.Equal(t, "b.efi", meta.HTTPBootPath)
+
+	// The old pinned image still reports its own metadata.
+	meta, err = resolver.PinnedImageMetadata(t.Context(), imgA)
+	require.NoError(t, err)
+	require.Equal(t, "a.efi", meta.HTTPBootPath)
+
+	// Without a memo, metadata is read directly.
+	direct := &FileResolver{Puller: images.Puller}
+	meta, err = direct.PinnedImageMetadata(t.Context(), imgB)
+	require.NoError(t, err)
+	require.Equal(t, "b.efi", meta.HTTPBootPath)
 }

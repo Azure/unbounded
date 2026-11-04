@@ -96,8 +96,7 @@ with parallel HTTP Range requests when the server supports them. HTTP downloads 
 Range requests. If the registry cannot be reached, HTTP requests get `503`
 with `Retry-After`, and Machine operations wait.
 
-Metalman keeps two small things in memory: the parsed `metadata.yaml` for
-about one minute, and an index of file names and SHA-256 digests for recently
+Metalman keeps two small things in memory: the parsed `metadata.yaml`, and an index of file names and SHA-256 digests for recently
 read layers. The first request that touches a layer downloads it once in full
 to build the index. After that, metalman answers requests for missing files
 without downloading any layer, skips layers that do not contain the requested
@@ -105,6 +104,13 @@ file, and checks that a file read from start to end matches its indexed digest.
 If a download fails or the digest does not match after the response has
 started, metalman aborts the connection instead of completing the response, and
 does not count the download toward boot progress.
+
+Each TFTP or HTTP request resolves the image tag once and reads both
+`metadata.yaml` and the requested file from that same image digest, so a tag
+that moves mid-boot never mixes one image's metadata with another's files.
+Metadata for a resolved digest is reused for about one minute. DHCP replies
+and Redfish boot settings look metadata up by tag and may use the previous
+image's metadata for up to one minute after the tag moves.
 
 Images are built, tagged, and pushed using standard container tooling:
 

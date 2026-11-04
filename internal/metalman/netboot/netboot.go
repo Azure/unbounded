@@ -197,6 +197,18 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 // Registry failures wrap ErrImageUnavailable; a missing file wraps
 // imagepull.ErrNotFound.
 func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, src ImageSource, requestIP string) (*ResolvedFile, error) {
+	return f.resolveFile(ctx, path, node, src, nil, requestIP)
+}
+
+// ResolveFileFromImage is ResolveFileByPathForIP for an image the caller has
+// already resolved, so that one request reads metadata and content from the
+// same manifest digest.
+func (f *FileResolver) ResolveFileFromImage(ctx context.Context, path string, node *v1alpha3.Machine, img *imagepull.Image, requestIP string) (*ResolvedFile, error) {
+	return f.resolveFile(ctx, path, node, ImageSource{}, img, requestIP)
+}
+
+// resolveFile resolves path from img, or from src when img is nil.
+func (f *FileResolver) resolveFile(ctx context.Context, path string, node *v1alpha3.Machine, src ImageSource, img *imagepull.Image, requestIP string) (*ResolvedFile, error) {
 	if path == userDataPath && node != nil {
 		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
 			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
@@ -207,7 +219,18 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		return &ResolvedFile{Data: []byte(defaultUserData), ContentType: "text/plain"}, nil
 	}
 
-	file, isTemplate, err := f.openImageFile(ctx, src, path)
+	var (
+		file       *imagepull.File
+		isTemplate bool
+		err        error
+	)
+
+	if img != nil {
+		file, isTemplate, err = openFileInImage(ctx, img, path)
+	} else {
+		file, isTemplate, err = f.openImageFile(ctx, src, path)
+	}
+
 	if err != nil {
 		return nil, err
 	}
