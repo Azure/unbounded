@@ -59,6 +59,111 @@ type Config struct {
 	GPUResourceCount       string
 }
 
+type Request struct {
+	Namespace       string
+	WorkflowName    string
+	RunName         string
+	ExecutionName   string
+	RunUID          types.UID
+	CheckIndex      int
+	ResultConfigMap string
+}
+
+func ResolveConfig(request Request, run *signalv1.CertificationRun) (Config, signalv1.CertificationCheckSnapshot, error) {
+	for name, value := range map[string]string{
+		"namespace":        request.Namespace,
+		"workflow-name":    request.WorkflowName,
+		"run-name":         request.RunName,
+		"execution-name":   request.ExecutionName,
+		"run-uid":          string(request.RunUID),
+		"result-configmap": request.ResultConfigMap,
+	} {
+		if value == "" {
+			return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf("%s is required", name)
+		}
+	}
+
+	for name, value := range map[string]string{
+		"namespace":        request.Namespace,
+		"workflow-name":    request.WorkflowName,
+		"run-name":         request.RunName,
+		"execution-name":   request.ExecutionName,
+		"result-configmap": request.ResultConfigMap,
+	} {
+		if errors := validation.IsDNS1123Subdomain(value); len(errors) > 0 {
+			return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf(
+				"%s is invalid: %s",
+				name,
+				strings.Join(errors, ", "),
+			)
+		}
+	}
+
+	if run == nil {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, errors.New("CertificationRun is required")
+	}
+
+	if run.Name != request.RunName {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf(
+			"CertificationRun name %q does not match requested run %q",
+			run.Name,
+			request.RunName,
+		)
+	}
+
+	if run.UID != request.RunUID {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf(
+			"CertificationRun UID %q does not match requested UID %q",
+			run.UID,
+			request.RunUID,
+		)
+	}
+
+	if request.CheckIndex < 0 || request.CheckIndex >= len(run.Spec.Checks) {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf(
+			"check-index %d is outside the CertificationRun suite of %d checks",
+			request.CheckIndex,
+			len(run.Spec.Checks),
+		)
+	}
+
+	participants := slices.Clone(run.Spec.Participants)
+	for index := range participants {
+		participants[index].Index = int32(index)
+	}
+
+	participantsJSON, err := json.Marshal(participants)
+	if err != nil {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf("encode participants: %w", err)
+	}
+
+	check := *run.Spec.Checks[request.CheckIndex].DeepCopy()
+	check.ID = signalv1.CheckID(fmt.Sprintf("R%02d", request.CheckIndex+1))
+	check.Order = int32(request.CheckIndex)
+
+	workloadPolicyJSON, err := json.Marshal(check.WorkloadPolicy)
+	if err != nil {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf("encode workload policy: %w", err)
+	}
+
+	return Config{
+		Namespace:              request.Namespace,
+		WorkflowName:           request.WorkflowName,
+		ExecutionName:          request.ExecutionName,
+		RunUID:                 request.RunUID,
+		ParticipantsJSON:       string(participantsJSON),
+		ParticipantCount:       len(participants),
+		ScriptConfigMap:        run.Spec.ScriptBundle.Name,
+		ScriptKey:              check.Script.Key,
+		ScriptDigest:           check.Script.Digest,
+		RunnerImage:            check.RunnerImage,
+		BackendKind:            string(check.Backend),
+		BackendDeadlineSeconds: int64(check.BackendActiveDeadline.Seconds()),
+		WorkloadPolicyJSON:     string(workloadPolicyJSON),
+		GPUResourceCount:       strconv.FormatInt(int64(check.GPUCount), 10),
+	}, check, nil
+}
+
 type Result struct {
 	ParticipantIndex int                `json:"participantIndex"`
 	ExecutionState   string             `json:"executionState"`

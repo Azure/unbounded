@@ -5,11 +5,14 @@ package signaladapter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -27,9 +31,12 @@ import (
 )
 
 var (
-	workflowGVR = schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "workflows"}
-	mpiJobGVR   = schema.GroupVersionResource{Group: "kubeflow.org", Version: "v2beta1", Resource: "mpijobs"}
-	podGVR      = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	workflowGVR         = schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "workflows"}
+	certificationRunGVR = schema.GroupVersionResource{
+		Group: "signal.unbounded-cloud.io", Version: "v1alpha1", Resource: "certificationruns",
+	}
+	mpiJobGVR = schema.GroupVersionResource{Group: "kubeflow.org", Version: "v2beta1", Resource: "mpijobs"}
+	podGVR    = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 )
 
 type Runner struct {
@@ -54,6 +61,15 @@ type objectIdentity struct {
 
 const maxResultLogBytes = 64 * 1024
 
+const (
+	resultDataKey              = "result.json"
+	resultDigestAnnotation     = "signal.unbounded-cloud.io/check-result-digest"
+	resultRunUIDAnnotation     = "signal.unbounded-cloud.io/check-result-run-uid"
+	resultCheckIDAnnotation    = "signal.unbounded-cloud.io/check-result-check-id"
+	resultCheckOrderAnnotation = "signal.unbounded-cloud.io/check-result-check-order"
+	runLabel                   = "signal.unbounded-cloud.io/run"
+)
+
 type resultLogSource struct {
 	content  string
 	err      error
@@ -63,6 +79,91 @@ type resultLogSource struct {
 type resultLogSnapshot struct {
 	current  resultLogSource
 	previous resultLogSource
+}
+
+func (r *Runner) ResolveRequest(
+	ctx context.Context,
+	request Request,
+) (Config, signalv1.CertificationCheckSnapshot, error) {
+	if r.Dynamic == nil {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, errors.New("dynamic Kubernetes client is required")
+	}
+
+	object, err := r.Dynamic.Resource(certificationRunGVR).Namespace(request.Namespace).
+		Get(ctx, request.RunName, metav1.GetOptions{})
+	if err != nil {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf("get CertificationRun: %w", err)
+	}
+
+	var run signalv1.CertificationRun
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.Object, &run); err != nil {
+		return Config{}, signalv1.CertificationCheckSnapshot{}, fmt.Errorf("decode CertificationRun: %w", err)
+	}
+
+	return ResolveConfig(request, &run)
+}
+
+func (r *Runner) PersistResult(
+	ctx context.Context,
+	request Request,
+	check signalv1.CertificationCheckSnapshot,
+	output AggregateOutput,
+) error {
+	if r.Dynamic == nil || r.Kubernetes == nil {
+		return errors.New("kubernetes clients are required")
+	}
+
+	if err := ValidateBackendEvidence(output.BackendEvidence); err != nil {
+		return err
+	}
+
+	content, err := json.Marshal(output)
+	if err != nil {
+		return fmt.Errorf("encode adapter result: %w", err)
+	}
+
+	workflow, err := r.Dynamic.Resource(workflowGVR).Namespace(request.Namespace).
+		Get(ctx, request.WorkflowName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get owning Workflow: %w", err)
+	}
+
+	controller := true
+	immutable := true
+	digest := sha256.Sum256(content)
+	result := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      request.ResultConfigMap,
+			Namespace: request.Namespace,
+			Labels: map[string]string{
+				runLabel: request.RunName,
+			},
+			Annotations: map[string]string{
+				resultDigestAnnotation:     "sha256:" + hex.EncodeToString(digest[:]),
+				resultRunUIDAnnotation:     string(request.RunUID),
+				resultCheckIDAnnotation:    string(check.ID),
+				resultCheckOrderAnnotation: strconv.FormatInt(int64(check.Order), 10),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: workflow.GetAPIVersion(),
+				Kind:       workflow.GetKind(),
+				Name:       workflow.GetName(),
+				UID:        workflow.GetUID(),
+				Controller: &controller,
+			}},
+		},
+		Immutable: &immutable,
+		BinaryData: map[string][]byte{
+			resultDataKey: content,
+		},
+	}
+
+	if _, err := r.Kubernetes.CoreV1().ConfigMaps(request.Namespace).
+		Create(ctx, result, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create check result ConfigMap: %w", err)
+	}
+
+	return nil
 }
 
 func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, error) {
