@@ -471,3 +471,27 @@ fn failure_codes() {
         assert!(!status_text(status).is_empty());
     }
 }
+
+#[test]
+fn many_distinct_query_names_are_grouped_linearly() {
+    let start = std::time::Instant::now();
+    let names: Vec<String> = (0..8000).map(|i| format!("p{i}=1")).collect();
+    let query = names.join("&");
+    assert!(query.len() <= 64 * 1024);
+    assert_eq!(
+        s3_version(query.as_bytes(), false),
+        Err(Failure::NotImplemented)
+    );
+    assert_eq!(
+        azure_version(query.as_bytes()),
+        Err(Failure::NotImplemented)
+    );
+    let bad = format!("{query}&p0=2");
+    assert_eq!(s3_version(bad.as_bytes(), false), Err(Failure::BadRequest));
+    let grouped_pairs = parse_query(query.as_bytes()).unwrap();
+    let groups = grouped(&grouped_pairs);
+    assert_eq!(groups.len(), 8000);
+    assert_eq!(groups[0].0, b"p0");
+    assert_eq!(groups[7999].0, b"p7999");
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+}

@@ -463,10 +463,14 @@ pub fn parse_query(raw: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
 /// Group parsed pairs by name, preserving first-seen order.
 fn grouped(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], Vec<&[u8]>)> {
     let mut groups: Vec<(&[u8], Vec<&[u8]>)> = Vec::new();
+    let mut index: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
     for (name, value) in pairs {
-        match groups.iter_mut().find(|(n, _)| *n == name.as_slice()) {
-            Some((_, values)) => values.push(value),
-            None => groups.push((name, vec![value])),
+        match index.entry(name.as_slice()) {
+            std::collections::hash_map::Entry::Occupied(e) => groups[*e.get()].1.push(value),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(groups.len());
+                groups.push((name, vec![value]));
+            }
         }
     }
     groups
