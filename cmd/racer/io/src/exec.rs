@@ -395,6 +395,21 @@ impl<T: Tick> Lane<T> {
     }
 }
 
+impl<T> Lane<T> {
+    /// Whether a step could make progress without waiting: a task is ready,
+    /// a completion (or runnable simulated operation) is ready, or a
+    /// cross-thread wake is pending.
+    pub fn has_pending_wake(&self) -> bool {
+        self.executor.has_ready() || self.reactor.has_ready()
+    }
+
+    /// Whether the lane holds unfinished work: live tasks or operations
+    /// awaiting their completion fences.
+    pub fn has_pending_work(&self) -> bool {
+        !self.executor.is_empty() || self.reactor.in_flight() > 0
+    }
+}
+
 impl<T: Tick> Role for Lane<T> {
     /// One lane turn.
     fn step(&mut self) -> Result<Next> {
@@ -428,6 +443,36 @@ impl<T: Tick> Role for Lane<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lane_reports_pending_wake_and_work() {
+        let os = crate::sim::SimOs::new();
+        let clock = crate::ctx::VirtualClock::new();
+        let reactor = Reactor::new(
+            crate::Driver::Sim(os.clone()),
+            crate::ring::Config::new(8),
+            crate::WorkerCtx::simulated(&clock, 1, 1),
+        )
+        .unwrap();
+        let mut lane = Lane::new(reactor, ());
+        assert!(!lane.has_pending_wake() && !lane.has_pending_work());
+        let (_left, right) = os.socket_pair();
+        let recv = lane.reactor.recv(
+            std::rc::Rc::new(right),
+            vec![0; 4],
+            (),
+            &crate::OpCtx::none(),
+        );
+        lane.executor.spawn_detached(async move {
+            let _ = recv.await;
+        });
+        assert!(lane.has_pending_wake() && lane.has_pending_work());
+        while lane.step().unwrap() == Next::Ready {}
+        // The receive waits for a peer: work is pending, nothing wakes it.
+        assert!(!lane.has_pending_wake());
+        assert!(lane.has_pending_work());
+        assert_eq!(lane.reactor.in_flight(), 1);
+    }
 
     #[test]
     fn tasks_run_once_per_wake_and_join() {
