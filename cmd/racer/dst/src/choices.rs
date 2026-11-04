@@ -29,14 +29,19 @@
 //! # Sharing
 //!
 //! `Choices` is a cheap handle: clones share one cursor and one recording.
+//! It implements [`racer_io::ctx::ChoiceSource`], so simulated OS scheduling
+//! and worker entropy draw from the same stream.
 //! Simulated components (origins, nodes) hold a clone, and the world stays
 //! single-threaded, so the interleaving of their draws is itself determined by
 //! the schedule.
-use std::{cell::RefCell, fmt, rc::Rc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 /// Handle to the shared choice stream.
 #[derive(Clone)]
-pub struct Choices(Rc<RefCell<Inner>>);
+pub struct Choices(Arc<Mutex<Inner>>);
 
 struct Inner {
     backend: Backend,
@@ -54,7 +59,7 @@ enum Backend {
 
 impl fmt::Debug for Choices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let inner = self.0.borrow();
+        let inner = self.lock();
         let kind = match &inner.backend {
             Backend::Seeded(_) => "seeded",
             Backend::Bytes { .. } => "bytes",
@@ -74,9 +79,23 @@ pub const fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+impl racer_io::ctx::ChoiceSource for Choices {
+    /// One raw draw ([`Choices::raw`]), so racer-io's simulated OS and
+    /// entropy share this stream.
+    fn next_u64(&mut self) -> u64 {
+        self.raw()
+    }
+}
+
 impl Choices {
+    /// The stream state. The world is single-threaded; the mutex only makes
+    /// the handle `Send` so racer-io's `Rng` can hold it.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn with(backend: Backend) -> Self {
-        Self(Rc::new(RefCell::new(Inner {
+        Self(Arc::new(Mutex::new(Inner {
             backend,
             record: None,
             drawn: 0,
@@ -111,23 +130,23 @@ impl Choices {
 
     /// Start recording raw draws from now on (see [`Self::recorded`]).
     pub fn recording(self) -> Self {
-        self.0.borrow_mut().record = Some(Vec::new());
+        self.lock().record = Some(Vec::new());
         self
     }
 
     /// Raw draws recorded so far; replaying them reproduces the run.
     pub fn recorded(&self) -> Option<Vec<u64>> {
-        self.0.borrow().record.clone()
+        self.lock().record.clone()
     }
 
     /// Number of raw draws taken so far.
     pub fn drawn(&self) -> u64 {
-        self.0.borrow().drawn
+        self.lock().drawn
     }
 
     /// One raw 64-bit draw. Every other helper is built on this.
     pub fn raw(&self) -> u64 {
-        let mut inner = self.0.borrow_mut();
+        let mut inner = self.lock();
         let value = match &mut inner.backend {
             Backend::Seeded(s) => {
                 let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);

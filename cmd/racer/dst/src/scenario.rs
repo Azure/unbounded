@@ -202,8 +202,8 @@ impl Scenario {
         self
     }
 
-    /// Use `SimOs::seeded` (operation delays, completion order and cancel
-    /// order drawn from a seed taken from [`Choices`]).
+    /// Draw node OS operation delays, completion order and cancel order from
+    /// [`Choices`] (`SimOs::with_choices`), or keep FIFO order.
     pub fn seeded_os(mut self, seeded: bool) -> Self {
         self.seeded_os = seeded;
         self

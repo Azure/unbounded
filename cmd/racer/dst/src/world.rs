@@ -37,7 +37,7 @@ use std::{
 };
 
 use racer_io::{
-    Driver, Reactor, WorkerCtx,
+    Driver, Reactor, Rng, WorkerCtx,
     ctx::VirtualClock,
     exec::{Lane, Next, Role, Tick},
     ring::Config,
@@ -234,10 +234,15 @@ pub struct NodeEnv {
 }
 
 impl NodeEnv {
-    /// A simulated worker context: this node's clock and a seeded entropy
-    /// stream whose seed is drawn from [`Choices`].
+    /// A simulated worker context: this node's clock and entropy drawn
+    /// straight from [`Choices`]. `stream` is kept for call-site stability;
+    /// every role shares the one world stream.
     pub fn worker_ctx(&self, stream: u64) -> WorkerCtx {
-        WorkerCtx::simulated(&self.clock, self.choices.seed(), stream)
+        let _ = stream;
+        WorkerCtx {
+            clock: self.clock.clone().into(),
+            rng: Rng::from_source(self.choices.clone()),
+        }
     }
 
     /// A reactor on this node's `Driver::Sim` with `entries` operations.
@@ -359,7 +364,7 @@ impl<'s> World<'s> {
                 index,
                 incarnation: 0,
                 os: if scenario.seeded_os {
-                    SimOs::seeded(choices.seed())
+                    SimOs::with_choices(choices.clone())
                 } else {
                     SimOs::new()
                 },
