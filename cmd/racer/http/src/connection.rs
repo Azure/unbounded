@@ -463,22 +463,20 @@ impl<C: Context> OwnedBuffer<C> {
 
 // SAFETY: fixed, private backing allocation and charge remain owned through completion.
 unsafe impl<C: Context> IoBuffer for OwnedBuffer<C> {
-    type Error = C::Error;
-
     /// Borrow the stable backing bytes.
-    fn bytes(&self) -> Result<C, &[u8]> {
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(&self.bytes)
     }
 
     /// Mutably borrow the stable backing bytes.
-    fn bytes_mut(&mut self) -> Result<C, &mut [u8]> {
+    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
         Ok(&mut self.bytes)
     }
 }
 
 impl<B: IoBuffer> BufferRange<B> {
     /// Validate a range against the buffer before constructing its view.
-    pub fn new<E: From<B::Error> + From<Error>>(
+    pub fn new<E: From<uring_runtime::Error> + From<Error>>(
         buffer: B,
         range: Range<usize>,
     ) -> std::result::Result<Self, E> {
@@ -496,15 +494,13 @@ impl<B: IoBuffer> BufferRange<B> {
 
 // SAFETY: the fixed view retains the complete stable backing owner.
 unsafe impl<B: IoBuffer> IoBuffer for BufferRange<B> {
-    type Error = B::Error;
-
     /// Borrow only the checked view.
-    fn bytes(&self) -> std::result::Result<&[u8], B::Error> {
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(&self.buffer.bytes()?[self.range.clone()])
     }
 
     /// Mutably borrow only the checked view.
-    fn bytes_mut(&mut self) -> std::result::Result<&mut [u8], B::Error> {
+    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
         Ok(&mut self.buffer.bytes_mut()?[self.range.clone()])
     }
 }
@@ -888,9 +884,7 @@ impl<C: Context> HttpIo<C> {
         buffer: B,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         Box::pin(async move {
             let length = buffer.bytes()?.len();
             self.read_body_range_impl(connection, buffer, 0..length, scope)
@@ -907,9 +901,7 @@ impl<C: Context> HttpIo<C> {
         mut buffer: B,
         scope: &C::Scope,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         if connection.kernel_tls.is_none() {
             return self
                 .reactor
@@ -955,9 +947,7 @@ impl<C: Context> HttpIo<C> {
         buffer: B,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         Box::pin(async move {
             let length = buffer.send_bytes()?.len();
             self.write_body_range_impl(connection, buffer, 0..length, scope)
@@ -991,9 +981,7 @@ impl<C: Context> HttpIo<C> {
         buffer: B,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         Box::pin(self.read_body_exact_impl(connection, buffer, scope))
     }
 
@@ -1004,9 +992,7 @@ impl<C: Context> HttpIo<C> {
         mut buffer: B,
         scope: &C::Scope,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         let length = buffer.bytes()?.len();
         let mut offset = 0;
         while offset < length {
@@ -1035,9 +1021,7 @@ impl<C: Context> HttpIo<C> {
         range: Range<usize>,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         Box::pin(self.read_body_range_impl(connection, buffer, range, scope))
     }
 
@@ -1049,9 +1033,7 @@ impl<C: Context> HttpIo<C> {
         range: Range<usize>,
         scope: &C::Scope,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         scope.check()?;
         connection.begin_io();
         if range.start > range.end || range.end > buffer.bytes()?.len() {
@@ -1113,9 +1095,7 @@ impl<C: Context> HttpIo<C> {
         range: Range<usize>,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         Box::pin(self.write_body_range_impl(connection, buffer, range, scope))
     }
 
@@ -1127,9 +1107,7 @@ impl<C: Context> HttpIo<C> {
         range: Range<usize>,
         scope: &C::Scope,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         scope.check()?;
         connection.begin_io();
         if range.start > range.end || range.end > buffer.send_bytes()?.len() {
@@ -2168,9 +2146,7 @@ impl<C: Context> HttpIo<C> {
         scope: &C::Scope,
         view: impl Fn(B, Range<usize>) -> Result<C, SendRange<B>>,
     ) -> Result<C, Completion<B, ConnectionLease<C>>>
-    where
-        C::Error: From<B::Error>,
-    {
+where {
         let mut offset = range.start;
         while offset < range.end {
             let completed = self
@@ -2206,7 +2182,7 @@ struct SendRange<B: SendBuffer> {
 
 impl<B: SendBuffer> SendRange<B> {
     /// Validate each head suffix before the reactor accesses its send view.
-    fn checked<E: From<B::Error> + From<Error>>(
+    fn checked<E: From<uring_runtime::Error> + From<Error>>(
         buffer: B,
         range: Range<usize>,
     ) -> std::result::Result<Self, E> {
@@ -2219,10 +2195,8 @@ impl<B: SendBuffer> SendRange<B> {
 
 // SAFETY: immutable fixed view retains its complete send owner.
 unsafe impl<B: SendBuffer> SendBuffer for SendRange<B> {
-    type Error = B::Error;
-
     /// Borrow the selected send suffix.
-    fn send_bytes(&self) -> std::result::Result<&[u8], B::Error> {
+    fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(&self.buffer.send_bytes()?[self.range.clone()])
     }
 }
@@ -2568,19 +2542,17 @@ mod tests {
 
     // SAFETY: the admitted backing owner keeps its fixed allocation and charge alive.
     unsafe impl IoBuffer for ObservedBuffer {
-        type Error = Failure;
-
         /// Record immutable access before returning bytes or the injected error.
-        fn bytes(&self) -> std::result::Result<&[u8], Failure> {
+        fn bytes(&self) -> uring_runtime::Result<&[u8]> {
             self.accesses.set(self.accesses.get() + 1);
             if self.reject {
-                return Err(uring_runtime::Error::Overloaded.into());
+                return Err(uring_runtime::Error::Overloaded);
             }
             self.bytes.bytes()
         }
 
         /// Expose the fixed mutable storage if a receive reaches it.
-        fn bytes_mut(&mut self) -> std::result::Result<&mut [u8], Failure> {
+        fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
             self.bytes.bytes_mut()
         }
     }

@@ -44,11 +44,8 @@ impl AsRef<[u8]> for ReadBuffer {
 
 // SAFETY: private non-resizing Vec retains allocation and quota through completion.
 unsafe impl IoBuffer for Buffer {
-    /// Buffer access uses the reactor's standard error boundary.
-    type Error = Error;
-
     /// Borrow the unconsumed region while retaining its stable allocation.
-    fn bytes(&self) -> Result<&[u8]> {
+    fn bytes(&self) -> crate::Result<&[u8]> {
         Ok(&self.data[self.start..self.end])
     }
 

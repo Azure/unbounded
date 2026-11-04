@@ -231,13 +231,12 @@ pub(super) mod fixtures {
 }
 
 #[test]
-/// Preserve application-specific buffer errors without publishing an operation.
+/// Map buffer access errors into the scope error without publishing an operation.
 fn operation_preserves_scope_and_buffer_errors_before_submission() {
-    /// Distinguish runtime failures from the application's buffer rejection.
+    /// Application boundary wrapping runtime failures.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum AppError {
         Runtime(Error),
-        Buffer,
     }
 
     impl From<Error> for AppError {
@@ -266,17 +265,14 @@ fn operation_preserves_scope_and_buffer_errors_before_submission() {
 
     // SAFETY: never exposes backing pointers; every accessor fails.
     unsafe impl IoBuffer for FailedBuffer {
-        /// Application rejection returned by either accessor.
-        type Error = AppError;
-
-        /// Reject immutable access with the application error.
-        fn bytes(&self) -> Result<&[u8], AppError> {
-            Err(AppError::Buffer)
+        /// Reject immutable access with a runtime error.
+        fn bytes(&self) -> crate::Result<&[u8]> {
+            Err(Error::Unavailable)
         }
 
-        /// Reject mutable access with the same application error.
-        fn bytes_mut(&mut self) -> Result<&mut [u8], AppError> {
-            Err(AppError::Buffer)
+        /// Reject mutable access with the same runtime error.
+        fn bytes_mut(&mut self) -> crate::Result<&mut [u8]> {
+            Err(Error::Unavailable)
         }
     }
     let reactor = super::Reactor::<AppScope, ()>::new(4, ());
@@ -286,7 +282,7 @@ fn operation_preserves_scope_and_buffer_errors_before_submission() {
         operation
             .as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref())),
-        Poll::Ready(Err(AppError::Buffer))
+        Poll::Ready(Err(AppError::Runtime(Error::Unavailable)))
     ));
     assert_eq!(reactor.in_flight(), 0);
     assert!(reactor.state.borrow().ring.is_none());
@@ -308,11 +304,8 @@ fn data_region_selects_accessor_without_relocating_backing() {
 
     // SAFETY: private initialized Vec storage never resizes and has no external aliases.
     unsafe impl IoBuffer for AccessBuffer {
-        /// Runtime classification for deliberately rejected allocation access.
-        type Error = Error;
-
         /// Count immutable access and optionally reject it before exposing bytes.
-        fn bytes(&self) -> Result<&[u8]> {
+        fn bytes(&self) -> crate::Result<&[u8]> {
             self.shared.set(self.shared.get() + 1);
             if self.reject {
                 Err(Error::Unavailable)
@@ -322,7 +315,7 @@ fn data_region_selects_accessor_without_relocating_backing() {
         }
 
         /// Count exclusive access and optionally reject it before exposing bytes.
-        fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        fn bytes_mut(&mut self) -> crate::Result<&mut [u8]> {
             self.exclusive.set(self.exclusive.get() + 1);
             if self.reject {
                 Err(Error::Unavailable)
@@ -2155,11 +2148,8 @@ struct Buffer(Vec<u8>, Rc<Cell<usize>>);
 
 // SAFETY: private fixed Vec owns independently allocated backing.
 unsafe impl IoBuffer for Buffer {
-    /// Runtime errors accepted by the test reactor's scope.
-    type Error = Error;
-
     /// Borrow the stable initialized test allocation immutably.
-    fn bytes(&self) -> Result<&[u8]> {
+    fn bytes(&self) -> crate::Result<&[u8]> {
         Ok(&self.0)
     }
 
@@ -3500,11 +3490,8 @@ mod vectored {
 
     // SAFETY: no owner mutates or resizes the shared Vec, so its bytes are stable.
     unsafe impl SendBuffer for SharedBody {
-        /// Runtime errors accepted by the test reactor's scope.
-        type Error = Error;
-
         /// Borrow the shared bytes without copying them.
-        fn send_bytes(&self) -> Result<&[u8]> {
+        fn send_bytes(&self) -> crate::Result<&[u8]> {
             Ok(&self.0)
         }
     }
@@ -3514,11 +3501,8 @@ mod vectored {
 
     // SAFETY: never yields a region.
     unsafe impl SharedWriteBuffer for RejectingBody {
-        /// Runtime errors accepted by the test reactor's scope.
-        type Error = Error;
-
         /// Refuse access like a body whose allocation was revoked.
-        fn write_bytes(&self) -> Result<&[u8]> {
+        fn write_bytes(&self) -> crate::Result<&[u8]> {
             Err(Error::Unavailable)
         }
     }
@@ -3789,16 +3773,13 @@ mod vectored {
 
         // SAFETY: the private Vec is never resized, so the window is stable.
         unsafe impl IoBuffer for Window {
-            /// Runtime errors accepted by the test reactor's scope.
-            type Error = Error;
-
             /// Borrow the window immutably.
-            fn bytes(&self) -> Result<&[u8]> {
+            fn bytes(&self) -> crate::Result<&[u8]> {
                 Ok(&self.storage[self.start..self.start + self.len])
             }
 
             /// Borrow the same window exclusively.
-            fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+            fn bytes_mut(&mut self) -> crate::Result<&mut [u8]> {
                 Ok(&mut self.storage[self.start..self.start + self.len])
             }
         }

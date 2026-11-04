@@ -1463,16 +1463,14 @@ impl<C: Charge> DetachedBuffer<C> {
 
 // SAFETY: owned aligned backing is initialized, stable, and live until Drop.
 unsafe impl<C: Charge> IoBuffer for AlignedBuffer<C> {
-    type Error = Error;
-
     /// Expose initialized stable bytes to the runtime.
-    fn bytes(&self) -> Result<&[u8]> {
-        AlignedBuffer::bytes(self)
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+        Ok(self.as_slice())
     }
 
     /// Give the runtime exclusive access without moving the allocation.
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-        AlignedBuffer::bytes_mut(self)
+    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+        Ok(self.as_mut_slice())
     }
 }
 

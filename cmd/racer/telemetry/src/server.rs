@@ -648,10 +648,8 @@ impl<C> Drop for Buffer<C> {
 
 // SAFETY: private fixed Vec retains its reservation and is not aliased.
 unsafe impl<C: 'static> IoBuffer for Buffer<C> {
-    type Error = Error;
-
     /// Expose only the remaining range of the current operation.
-    fn bytes(&self) -> Result<&[u8]> {
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(&self.bytes[self.pending.clone()])
     }
 

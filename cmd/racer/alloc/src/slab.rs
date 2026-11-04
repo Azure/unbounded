@@ -713,7 +713,7 @@ impl<C: Charge> Slab<C> {
         scope: &'a S,
     ) -> Operation<'a, (AlignedBuffer<C>, T), S::Error>
     where
-        S::Error: From<Error> + From<T::Error>,
+        S::Error: From<Error>,
     {
         Box::pin(async move {
             let (file, extent) = {

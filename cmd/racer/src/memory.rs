@@ -147,11 +147,10 @@ impl std::fmt::Debug for CiphertextBuffer {
 // SAFETY: the detached allocation is exclusively owned, stable, and live
 // until Drop, and is only exposed through these borrows.
 unsafe impl uring_runtime::reactor::IoBuffer for CiphertextBuffer {
-    type Error = Error;
-    fn bytes(&self) -> Result<&[u8]> {
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(self.as_slice())
     }
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
         Ok(self.as_mut_slice())
     }
 }
@@ -204,11 +203,10 @@ impl PlaintextBuffer {
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
 unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
-    type Error = Error;
-    fn bytes(&self) -> Result<&[u8]> {
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(self.0.bytes())
     }
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
         Ok(self.0.bytes_mut())
     }
 }
@@ -943,8 +941,7 @@ impl CiphertextPage {
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
 unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
-    type Error = Error;
-    fn send_bytes(&self) -> Result<&[u8]> {
+    fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(self.bytes())
     }
 }

@@ -1315,16 +1315,13 @@ mod reserved_capacity {
 
         // SAFETY: private stable Vec; mutation accessor fails without exposing aliases.
         unsafe impl IoBuffer for ReadOnly {
-            /// Report attempts to mutate the read-only buffer as runtime errors.
-            type Error = Error;
-
             /// Borrow the initialized bytes for sending.
-            fn bytes(&self) -> Result<&[u8]> {
+            fn bytes(&self) -> uring_runtime::Result<&[u8]> {
                 Ok(&self.0)
             }
 
             /// Reject mutable access so the test detects an incorrect send accessor.
-            fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+            fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
                 Err(Error::InvalidInput)
             }
         }
@@ -1436,16 +1433,13 @@ mod reserved_capacity {
 
         // SAFETY: private non-resizing Vec retains initialized backing across moves.
         unsafe impl IoBuffer for Owned {
-            /// Use runtime errors for buffer access results.
-            type Error = Error;
-
             /// Borrow the initialized bytes without transferring ownership.
-            fn bytes(&self) -> Result<&[u8]> {
+            fn bytes(&self) -> uring_runtime::Result<&[u8]> {
                 Ok(&self.0)
             }
 
             /// Borrow the initialized bytes for an operation that needs mutable storage.
-            fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+            fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
                 Ok(&mut self.0)
             }
         }

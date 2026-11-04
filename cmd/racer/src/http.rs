@@ -494,8 +494,7 @@ impl PageSendRange {
 }
 // SAFETY: fixed immutable view retains the complete verified plaintext page owner.
 unsafe impl SendBuffer for PageSendRange {
-    type Error = Error;
-    fn send_bytes(&self) -> Result<&[u8]> {
+    fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(&self.page.bytes()[self.range.clone()])
     }
 }

@@ -1366,9 +1366,7 @@ struct SharedBody(Rc<page_alloc::AlignedBuffer<()>>, std::ops::Range<usize>);
 // mutates it while the body is owned by a write.
 #[cfg(feature = "simulation")]
 unsafe impl uring_runtime::reactor::SharedWriteBuffer for SharedBody {
-    type Error = Error;
-
-    fn write_bytes(&self) -> Result<&[u8], Error> {
+    fn write_bytes(&self) -> uring_runtime::Result<&[u8]> {
         Ok(&self.0.as_slice()[self.1.clone()])
     }
 }

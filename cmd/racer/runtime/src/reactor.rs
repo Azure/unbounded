@@ -351,63 +351,9 @@ impl Drop for MessageHeader {
     }
 }
 
-/// An exclusively owned, stable backing allocation with an independent lifetime.
-///
-/// # Safety
-/// Moving the owner or calling either accessor must not relocate or resize its
-/// backing allocation. Accessors expose the same initialized region, with no
-/// independently accessible mutable aliases. Ownership includes the allocation's
-/// quota reservation; neither may be freed or recycled before the final fence.
-/// `'static` excludes request-scoped borrows; it does not require leaking memory.
-/// Derived raw pointers must remain valid across owner moves into completion
-/// closures. Stable addresses alone are insufficient: Box backing is retagged on
-/// moves in Miri's aliasing models. Use private, non-resizing Vec storage or an
-/// explicitly managed allocation; never reborrow its bytes while I/O is pending.
-/// Inline arrays cannot implement this contract: moving them relocates the bytes.
-pub unsafe trait IoBuffer: 'static {
-    /// Application error returned when access to this allocation is rejected.
-    type Error;
-
-    /// Borrow the initialized region after its previous operation has fenced.
-    fn bytes(&self) -> Result<&[u8], Self::Error>;
-
-    /// Exclusively borrow the same region before deriving a receive pointer.
-    fn bytes_mut(&mut self) -> Result<&mut [u8], Self::Error>;
-}
-
-/// Completion-owned immutable send storage. Shared aliases are permitted only
-/// when none can mutate or relocate the initialized bytes. The owner retains
-/// allocation admission through the final original/cancel completion fence.
-/// This trait deliberately grants no receive or mutable-buffer capability.
-///
-/// # Safety
-/// Accessors must expose the same initialized allocation across owner moves.
-/// No shared alias may mutate, resize, or free the bytes before completion.
-pub unsafe trait SendBuffer: 'static {
-    /// Application error returned when access to this allocation is rejected.
-    type Error;
-
-    /// Borrow initialized immutable bytes for one send operation.
-    fn send_bytes(&self) -> Result<&[u8], Self::Error>;
-}
-
-/// Completion-owned immutable storage for the body of a vectored file write.
-///
-/// This is the file-write counterpart of [`SendBuffer`] and carries the same
-/// contract. It is blanket-implemented for every [`SendBuffer`] (and therefore
-/// every [`IoBuffer`]), so shared, reference-counted bodies can be written
-/// without copying them into exclusive storage.
-///
-/// # Safety
-/// Accessors must expose the same initialized allocation across owner moves.
-/// No shared alias may mutate, resize, or free the bytes before completion.
-pub unsafe trait SharedWriteBuffer: 'static {
-    /// Application error returned when access to this allocation is rejected.
-    type Error;
-
-    /// Borrow initialized immutable bytes for one write operation.
-    fn write_bytes(&self) -> Result<&[u8], Self::Error>;
-}
+// MIGRATION: the buffer contracts are racer-io's; this re-export keeps old
+// import paths compiling until every crate imports racer_io directly.
+pub use racer_io::ring::{IoBuffer, SendBuffer, SharedWriteBuffer};
 
 /// Owners returned by [`Reactor::write_vectored_at`] after all applicable
 /// completion fences.
@@ -988,28 +934,6 @@ impl<S: Scope> FencedEntry<S> {
     }
 }
 
-// SAFETY: exclusive stable storage also meets immutable send requirements.
-unsafe impl<B: IoBuffer> SendBuffer for B {
-    /// Preserve the exclusive allocation's application error type.
-    type Error = B::Error;
-
-    /// Borrow exclusive storage immutably under the stronger IoBuffer contract.
-    fn send_bytes(&self) -> Result<&[u8], Self::Error> {
-        self.bytes()
-    }
-}
-
-// SAFETY: the SendBuffer contract is the SharedWriteBuffer contract.
-unsafe impl<B: SendBuffer> SharedWriteBuffer for B {
-    /// Preserve the send allocation's application error type.
-    type Error = B::Error;
-
-    /// Borrow the same immutable bytes a send would publish.
-    fn write_bytes(&self) -> Result<&[u8], Self::Error> {
-        self.send_bytes()
-    }
-}
-
 /// Reactor-owned vectored write state. The iovec array lives in stable
 /// syscall backing so its address survives moves into completion closures.
 struct VectoredInFlight<H: 'static, B: 'static, L: 'static> {
@@ -1513,9 +1437,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         buffer: &mut B,
         operation: BufferOperation,
     ) -> Result<(*mut u8, u32), S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         let (ptr, length) = match operation {
             BufferOperation::Read(_) | BufferOperation::Recv => {
                 let bytes = buffer.bytes_mut()?;
@@ -1537,9 +1459,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         operation: BufferOperation,
         policy: IssuePolicy,
     ) -> Result<Submission, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         Ok(submission!(
             self,
             {
@@ -1584,9 +1504,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         policy: IssuePolicy,
         capacity: Option<Rc<SubmissionCapacity>>,
     ) -> Operation<'a, Completion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         Box::pin(async move {
             scope.check()?;
             if matches!(operation, BufferOperation::Read(offset) | BufferOperation::Write(offset) if offset > i64::MAX as u64)
@@ -1623,7 +1541,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// async fn copy<S: Scope, Q: Budget, B: IoBuffer, L: 'static>(
     ///     reactor: &Reactor<S,Q>, fd: Rc<Descriptor>, buffer: B,
     ///     lease: L, scope: &S) -> Result<Completion<B,L>, S::Error>
-    /// where S::Error: From<B::Error> {
+    /// {
     ///     let read = reactor.read_at(fd.clone(), 0, buffer, lease, scope).await?;
     ///     reactor.write_at(fd, 0, read.buffer, read.lease, scope).await
     /// }
@@ -1634,7 +1552,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
     /// use uring_runtime::{Budget, Scope, reactor::{descriptor::Descriptor, IoBuffer, Reactor}};
     /// fn borrowed<S: Scope, Q: Budget, B: IoBuffer>(
     ///     reactor: &Reactor<S,Q>, fd: Rc<Descriptor>, buffer: B,
-    ///     lease: &u8, scope: &S) where S::Error: From<B::Error> {
+    ///     lease: &u8, scope: &S) {
     ///     let _future = reactor.read_at(fd, 0, buffer, lease, scope);
     /// }
     /// ```
@@ -1646,9 +1564,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, Completion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         self.buffer_io(
             file,
             buffer,
@@ -1669,9 +1585,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, Completion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         self.buffer_io(
             file,
             buffer,
@@ -1700,9 +1614,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, VectoredCompletion<H, T, L>, S::Error>
-    where
-        S::Error: From<H::Error> + From<T::Error>,
-    {
+where {
         Box::pin(async move {
             scope.check()?;
             if offset > i64::MAX as u64 {
@@ -1735,9 +1647,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         owned: &mut VectoredInFlight<H, T, L>,
         offset: u64,
     ) -> Result<Submission, S::Error>
-    where
-        S::Error: From<H::Error> + From<T::Error>,
-    {
+where {
         let header = owned.header.bytes()?;
         let body = owned.body.write_bytes()?;
         if header
@@ -1784,9 +1694,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, Completion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         self.buffer_io(
             fd,
             buffer,
@@ -1806,9 +1714,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         capacity: Rc<SubmissionCapacity>,
         scope: &'a S,
     ) -> Operation<'a, Completion<B>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         self.buffer_io(
             fd,
             buffer,
@@ -1828,9 +1734,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         capacity: Rc<SubmissionCapacity>,
         scope: &'a S,
     ) -> Operation<'a, Completion<B>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         self.buffer_io(
             fd,
             buffer,
@@ -1850,9 +1754,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, Completion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         Box::pin(async move {
             let retained_fd = fd.clone();
             let (owned, bytes) = self
@@ -1907,9 +1809,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, MessageCompletion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         Box::pin(async move {
             let retained_fd = fd.clone();
             let ((owned, mut header), bytes) = self
@@ -1978,9 +1878,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, Completion<B, L>, S::Error>
-    where
-        S::Error: From<B::Error>,
-    {
+where {
         Box::pin(async move {
             if offset > i64::MAX as u64 {
                 return Err(Error::InvalidInput.into());

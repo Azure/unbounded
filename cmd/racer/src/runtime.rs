@@ -780,11 +780,7 @@ mod tests {
                 use crate::memory::BufferPool;
                 use crate::peer::transport::WireBuffer;
                 use http1::connection::BufferRange;
-                fn check<B: IoBuffer>(buffer: B)
-                where
-                    Error: From<B::Error>,
-                    B::Error: std::fmt::Debug,
-                {
+                fn check<B: IoBuffer>(buffer: B) {
                     let mut range = BufferRange::new::<Error>(buffer, 1..2).unwrap();
                     let ptr = range.bytes_mut().unwrap().as_mut_ptr();
                     let finish: Box<dyn FnOnce() -> B> = Box::new(move || range.into_inner());
@@ -865,11 +861,10 @@ mod tests {
             struct Buffer(Vec<u8>);
             // SAFETY: private fixed Vec owns stable exclusive backing.
             unsafe impl IoBuffer for Buffer {
-                type Error = Error;
-                fn bytes(&self) -> Result<&[u8]> {
+                fn bytes(&self) -> uring_runtime::Result<&[u8]> {
                     Ok(&self.0)
                 }
-                fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+                fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
                     Ok(&mut self.0)
                 }
             }
@@ -1143,7 +1138,6 @@ mod tests {
             use crate::admission::AdmissionPolicy;
             use crate::admission::ResourceClass;
             use crate::error::Error;
-            use crate::error::Result;
             use crate::runtime::RequestScope;
             use std::cell::Cell;
             use std::ffi::CString;
@@ -1197,12 +1191,11 @@ mod tests {
                 }
                 // SAFETY: fixed range retains independently allocated aligned storage.
                 unsafe impl IoBuffer for View {
-                    type Error = Error;
-                    fn bytes(&self) -> Result<&[u8]> {
-                        Ok(&self.buffer.bytes()?[self.start..self.start + self.length])
+                    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+                        Ok(&self.buffer.as_slice()[self.start..self.start + self.length])
                     }
-                    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-                        Ok(&mut self.buffer.bytes_mut()?[self.start..self.start + self.length])
+                    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+                        Ok(&mut self.buffer.as_mut_slice()[self.start..self.start + self.length])
                     }
                 }
                 let (sim, _environment, r, scope) = setup();

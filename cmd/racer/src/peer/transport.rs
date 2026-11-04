@@ -1034,14 +1034,13 @@ impl WireBuffer {
 // SAFETY: both variants own stable, exclusive backing and their complete
 // reservation until dropped.
 unsafe impl IoBuffer for WireBuffer {
-    type Error = Error;
-    fn bytes(&self) -> Result<&[u8]> {
+    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
         match self {
             Self::Owned(buffer) => Ok(buffer.bytes()),
             Self::Aligned(buffer) => buffer.bytes(),
         }
     }
-    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
         match self {
             Self::Owned(buffer) => Ok(buffer.bytes_mut()),
             Self::Aligned(buffer) => buffer.bytes_mut(),

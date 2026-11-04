@@ -59,7 +59,7 @@ pub mod delivery {
         type Pipe: DeliveryPipe;
 
         /// Immutable view that retains its backing through runtime completion.
-        type View: SendBuffer<Error = C::Error>;
+        type View: SendBuffer;
 
         /// Return bytes not yet accepted by the socket.
         fn remaining(&self) -> usize;
@@ -104,7 +104,7 @@ pub mod delivery {
     /// Immutable delivery without pipe admission or staging storage.
     pub trait DirectOwner<C: Context>: 'static {
         /// Stable backing retained through each runtime completion fence.
-        type View: SendBuffer<Error = C::Error>;
+        type View: SendBuffer;
         /// Bytes not yet accepted by the socket.
         fn bytes(&self) -> &[u8];
         /// Advance the accepted cursor after a checked positive completion.
@@ -299,7 +299,7 @@ pub mod delivery {
     const TURN_CALLS: usize = 32;
 
     /// Retain either drained pipe bytes or an immutable backing view during a send.
-    enum Buffer<C: Context, V: SendBuffer<Error = C::Error>> {
+    enum Buffer<C: Context, V: SendBuffer> {
         /// Admitted scratch populated by a complete pipe drain.
         Pipe(OwnedBuffer<C>),
 
@@ -308,11 +308,9 @@ pub mod delivery {
     }
 
     // SAFETY: each variant retains stable immutable backing through completion.
-    unsafe impl<C: Context, V: SendBuffer<Error = C::Error>> SendBuffer for Buffer<C, V> {
-        type Error = C::Error;
-
+    unsafe impl<C: Context, V: SendBuffer> SendBuffer for Buffer<C, V> {
         /// Borrow stable bytes from the selected completion-owned buffer.
-        fn send_bytes(&self) -> Result<C, &[u8]> {
+        fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
             match self {
                 Self::Pipe(buffer) => buffer.send_bytes(),
                 Self::View(buffer) => buffer.send_bytes(),
@@ -488,10 +486,8 @@ pub mod delivery {
 
         // SAFETY: the immutable Rc backing is retained and cannot be mutated through this view.
         unsafe impl SendBuffer for View {
-            type Error = Failure;
-
             /// Borrow the immutable send range while retaining its backing owner.
-            fn send_bytes(&self) -> Result<Caller, &[u8]> {
+            fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
                 Ok(&self.bytes[self.range.clone()])
             }
         }
