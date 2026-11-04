@@ -11,6 +11,15 @@ inputs:
     description: Whether to launch the default e2e VM.
     required: false
     default: "true"
+outputs:
+  go-build-cache-key:
+    description: >-
+      Key for the Go build cache restored by this action. Save it from one job
+      after the builds, and only on push events.
+    value: ${{ steps.go-cache.outputs.cache-primary-key }}
+  go-build-cache-hit:
+    description: Whether the Go build cache was restored with an exact key match.
+    value: ${{ steps.go-cache.outputs.cache-hit }}
 runs:
   using: composite
   steps:
@@ -21,20 +30,33 @@ runs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger --name-match=kvm
 
+    # setup-go's built-in cache shares one key across every workflow and
+    # saves from pull requests too. The harness builds the same binaries in
+    # every job, so restore one build cache scoped to this suite instead.
     - name: Set up Go
       uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
         go-version-file: go.mod
+        cache: false
 
+    # Only GOCACHE is cached. Modules download quickly from the proxy, and
+    # leaving them out keeps the entry small.
+    - name: Restore Go build cache
+      id: go-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/go-build
+        key: go-build-e2e-agent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+        restore-keys: |
+          go-build-e2e-agent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-
+
+    # ovmf is the UEFI firmware an Ignition host boots through; qemu-utils
+    # also provides the qemu-nbd used to patch its boot command line.
     - name: Install system dependencies
-      shell: bash
-      run: |
-        sudo apt-get update
-        # ovmf is the UEFI firmware an Ignition host boots through; qemu-utils
-        # also provides the qemu-nbd used to patch its boot command line.
-        sudo apt-get install -y --no-install-recommends \
-          qemu-system-x86 qemu-utils genisoimage ovmf \
-          iptables
+      uses: ./.github/actions/apt-install-cached
+      with:
+        cache-name: agent-e2e-kind
+        packages: qemu-system-x86 qemu-utils genisoimage ovmf iptables
 
     - name: Create Kind cluster
       uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0

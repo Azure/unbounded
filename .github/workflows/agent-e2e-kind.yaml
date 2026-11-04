@@ -60,6 +60,10 @@ on:
       - .github/actions/agent-e2e-*/**
   workflow_dispatch:
 
+concurrency:
+  group: agent-e2e-kind-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   packages: read
@@ -253,6 +257,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up test control plane
+        id: control-plane
         uses: ./.github/actions/agent-e2e-kind-control-plane
         with:
           cluster-name: ${{ env.KIND_CLUSTER_NAME }}
@@ -269,6 +274,16 @@ jobs:
           python3 ./hack/agent/e2e-kind/monitor_suite.py --timeout 2700 -- \
             python3 ./hack/agent/e2e-kind/e2e.py --verbose run-suite --suite configuration \
             2>&1 | tee logs/configuration-suite.log
+
+      # Every job restores the Go build cache from the control-plane action.
+      # This job builds every binary the other jobs build, so it alone saves
+      # the cache, and only from push runs.
+      - name: Save Go build cache
+        if: github.event_name == 'push' && steps.control-plane.outputs.go-build-cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: ${{ steps.control-plane.outputs.go-build-cache-key }}
 
       - name: Collect logs
         if: always()
