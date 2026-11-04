@@ -31,4 +31,5 @@ pub mod primary;
 pub mod publication;
 pub mod rails;
 pub mod seat;
+pub mod shell;
 pub mod state;

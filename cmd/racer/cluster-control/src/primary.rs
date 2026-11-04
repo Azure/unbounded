@@ -3,8 +3,9 @@
 //!
 //! Holding the primary Lease does not authorize writes by itself. The first
 //! commit records this term in the state Secret. Every commit re-reads the
-//! Secret, checks the term (see [`state::Writer`]), and checks the Lease is
-//! still fresh by the monotonic clock.
+//! Secret, checks the term, and checks the Lease is still fresh by the
+//! monotonic clock. Those decisions are made by the pure
+//! [`crate::rules::shell::Shell`]; this module interprets its effects.
 
 use crate::rules::primary::{Contend, Inventory, PassInputs, PassPlan, discovery, plan_pass};
 use crate::{
@@ -18,7 +19,8 @@ use crate::{
         keyring::Policy,
         members::{NodeInfo, Ownership, PodInfo},
         publication::Image,
-        state::{self, Freshness, StateError, StateRecord, Term, Writer, lease_authority},
+        shell::{self, Effect, Event, PutResult, Shell},
+        state::{self, StateError, StateRecord, Term},
     },
     seat::{self, install_record, state_markers_match},
     shared::{Seat, SeatHolder, Shared},
@@ -115,8 +117,8 @@ fn primary_annotations(
 struct Term_ {
     shared: Rc<Shared>,
     seat: Rc<Seat>,
-    writer: RefCell<Writer>,
-    lease: Cell<Freshness>,
+    /// Writer fencing, Lease freshness, and the commit protocol.
+    shell: RefCell<Shell>,
     object: RefCell<Value>,
     alive: Rc<Cell<bool>>,
     inventory: Rc<RefCell<Inventory>>,
@@ -161,8 +163,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     let t = Rc::new(Term_ {
         shared: shared.clone(),
         seat: seat.clone(),
-        writer: RefCell::new(Writer::new(term)),
-        lease: Cell::new(lease_authority(started)),
+        shell: RefCell::new(Shell::new(term, started)),
         object: RefCell::new(object),
         alive: Rc::new(Cell::new(true)),
         inventory: Rc::new(RefCell::new(Inventory::default())),
@@ -272,7 +273,7 @@ async fn renew(t: Rc<Term_>) {
         {
             Ok(Ok(v)) => {
                 *t.object.borrow_mut() = v;
-                t.lease.set(lease_authority(started));
+                t.shell.borrow_mut().renewed(started);
             }
             Ok(Err(KubeError::Conflict)) => {
                 match lease::get(&t.shared.lease_api, &ns, annotations::PRIMARY_LEASE).await {
@@ -282,7 +283,7 @@ async fn renew(t: Rc<Term_>) {
                         if same_term(
                             &lease::observe(&v),
                             &t.shared.identity,
-                            t.writer.borrow().term(),
+                            t.shell.borrow().term(),
                         ) =>
                     {
                         *t.object.borrow_mut() = v;
@@ -294,13 +295,13 @@ async fn renew(t: Rc<Term_>) {
             }
             _ => {}
         }
-        if !t.lease.get().fresh(Instant::now()) || !seat_mine(&t.shared, &t.seat) {
+        if !t.shell.borrow().lease().fresh(Instant::now()) || !seat_mine(&t.shared, &t.seat) {
             t.alive.set(false);
             t.changed.notify();
             return;
         }
         // Renew on schedule, or early to publish changed discovery.
-        let _ = exec::deadline(started + limits::LEASE_RENEW, t.publish.changed(publish)).await;
+        let _ = exec::deadline(Shell::next_renewal(started), t.publish.changed(publish)).await;
     }
 }
 
@@ -311,8 +312,7 @@ async fn live_lease_uid(
     t: &Term_,
     current: Option<&StateRecord>,
 ) -> Result<Option<String>, StateError> {
-    let ours = t.writer.borrow().term().lease_uid.clone();
-    if current.is_none_or(|c| c.term.lease_uid == ours) {
+    if !t.shell.borrow().needs_live_uid(current) {
         return Ok(None);
     }
     let ns = &t.shared.config.namespace;
@@ -478,13 +478,6 @@ async fn read_state(shared: &Shared) -> Result<(Value, Option<StateRecord>), Sta
         None => None,
     };
     let record = state::decode(&uid, initialized, data.as_deref().map(Vec::as_slice))?;
-    // Never build on state older than what this process already accepted.
-    if let Some(hw) = &shared.serving.borrow().high_water {
-        match &record {
-            None => return Err(StateError::Wiped),
-            Some(r) => state::check_monotonic(hw, r)?,
-        }
-    }
     Ok((secret, record))
 }
 
@@ -567,115 +560,139 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
         service_account: shared.config.service_account.clone(),
     };
 
-    let mut attempts = 0;
+    let cluster = shared.cluster.borrow().clone();
+    let policy = Policy::from(shared.config.rotation);
+    let mut secret = Value::Null;
+    // (sequence, membership version) of the record the last read returned.
+    let mut read_counters: Option<(u64, u64)> = None;
+    let mut planned: Option<(Option<Image>, usize, usize)> = None;
+    let mut effect = t.shell.borrow_mut().begin();
     loop {
-        attempts += 1;
-        let read_started = Instant::now();
-        let (secret, current) = read_state(shared).await?;
-        let live_uid = live_lease_uid(t, current.as_ref()).await?;
-        t.writer
-            .borrow_mut()
-            .observe(current.as_ref(), live_uid.as_deref())?;
-        let cluster = shared.cluster.borrow().clone();
-        let previous_image = shared.serving.borrow().image.clone();
-        let policy = Policy::from(shared.config.rotation);
-        let plan = {
-            let inventory = t.inventory.borrow();
-            let writer = t.writer.borrow();
-            plan_pass(
-                &PassInputs {
-                    cluster: &cluster,
-                    pod_uid: &shared.config.pod_uid,
-                    seats: shared.config.seats,
-                    peer_port: shared.config.peer_port,
-                    policy: &policy,
-                    inventory: &inventory,
-                    synced: ready,
-                    ownership: &ownership,
-                    current: current.as_ref(),
-                    previous_image: previous_image.as_ref(),
-                    live: &live,
-                    writer: &writer,
-                    wall_unix: unix_now(),
-                    membership_changed_unix: t.membership_changed.get(),
-                },
-                &mut **shared.rng.borrow_mut(),
-            )?
-        };
-        log_rejected_caches(&plan.rejected_caches);
-        if plan.refused_roots > 0 {
-            // Root slots are full. Those seats stay unready until slots free up.
-            shared.last_error.set(Some(crate::Error::Unavailable));
-        }
-        let PassPlan {
-            next,
-            image,
-            desired,
-            eligible,
-            changed,
-            ..
-        } = plan;
-
-        if !changed {
-            if let Some(c) = current {
-                install_record(shared, c, read_started)?;
-                install_image(shared, image);
-            }
-            update_discovery(t, &live, desired, eligible).await;
-            return Ok(());
-        }
-        if let Some(c) = &current {
-            state::check_monotonic(c, &next)?;
-        }
-        if !t.lease.get().fresh(Instant::now()) || !t.writer.borrow().may_write() {
-            return Err(StateError::StaleTerm);
-        }
-        let encoded = state::encode(&next)?;
-        let state_b64 = zeroize::Zeroizing::new(STANDARD.encode(&*encoded));
-        let mut body = secret.clone();
-        // TODO(phase 7b): the JSON body still copies the encoded record into
-        // non-zeroizing strings; the racer-io shell writes it directly.
-        body["data"] = json!({
-            annotations::CLUSTER_KEY: STANDARD.encode(cluster.as_bytes()),
-            annotations::STATE_KEY: state_b64.as_str(),
-        });
-        if !body["metadata"]["annotations"].is_object() {
-            body["metadata"]["annotations"] = json!({});
-        }
-        body["metadata"]["annotations"][annotations::INITIALIZED] = cluster.clone().into();
-        body["metadata"]["annotations"][annotations::CLUSTER_ID] = cluster.clone().into();
-        let started = Instant::now();
-        // Recheck right before the write.
-        if !t.lease.get().fresh(started) {
-            return Err(StateError::StaleTerm);
-        }
-        match shared
-            .lease_api
-            .put(&paths::state(&shared.config.namespace), &body)
-            .await
-        {
-            Ok(_) => {
-                if current
+        effect = match effect {
+            Effect::ReadState => {
+                let started = Instant::now();
+                let read = read_state(shared).await;
+                let (object, current) = match read {
+                    Ok((object, current)) => (object, Ok(current)),
+                    Err(e) => (Value::Null, Err(e)),
+                };
+                secret = object;
+                read_counters = current
                     .as_ref()
-                    .is_none_or(|c| c.membership_version != next.membership_version)
-                {
-                    t.membership_changed.set(Some(unix_now()));
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(|c| (c.sequence, c.membership_version));
+                let live_uid = match &current {
+                    Ok(c) => live_lease_uid(t, c.as_ref()).await?,
+                    Err(_) => None,
+                };
+                let high_water = shared.serving.borrow().high_water.clone();
+                t.shell.borrow_mut().on(Event::StateRead {
+                    started,
+                    current,
+                    high_water: high_water.as_ref(),
+                    live_lease_uid: live_uid.as_deref(),
+                })
+            }
+            Effect::Plan => {
+                let previous_image = shared.serving.borrow().image.clone();
+                let plan = {
+                    let inventory = t.inventory.borrow();
+                    let shell = t.shell.borrow();
+                    plan_pass(
+                        &PassInputs {
+                            cluster: &cluster,
+                            pod_uid: &shared.config.pod_uid,
+                            seats: shared.config.seats,
+                            peer_port: shared.config.peer_port,
+                            policy: &policy,
+                            inventory: &inventory,
+                            synced: ready,
+                            ownership: &ownership,
+                            current: shell.current(),
+                            previous_image: previous_image.as_ref(),
+                            live: &live,
+                            writer: shell.writer(),
+                            wall_unix: unix_now(),
+                            membership_changed_unix: t.membership_changed.get(),
+                        },
+                        &mut **shared.rng.borrow_mut(),
+                    )?
+                };
+                log_rejected_caches(&plan.rejected_caches);
+                if plan.refused_roots > 0 {
+                    // Root slots are full. Those seats stay unready until slots free up.
+                    shared.last_error.set(Some(crate::Error::Unavailable));
                 }
-                // Seats learn the new record after this pass, so a seat
-                // still at the sequence this commit replaced keeps serving.
-                t.ready_floor.set(
-                    current
-                        .as_ref()
-                        .map(|c| (next.sequence, c.sequence, started + READY_FLOOR_GRACE)),
-                );
-                install_record(shared, next, started)?;
-                install_image(shared, image);
+                let PassPlan {
+                    next,
+                    image,
+                    desired,
+                    eligible,
+                    changed,
+                    ..
+                } = plan;
+                planned = Some((image, desired, eligible));
+                t.shell.borrow_mut().on(Event::Planned {
+                    now: Instant::now(),
+                    next: changed.then_some(next),
+                })
+            }
+            Effect::Put(next) => {
+                let encoded = state::encode(&next)?;
+                let state_b64 = zeroize::Zeroizing::new(STANDARD.encode(&*encoded));
+                let mut body = secret.clone();
+                // TODO(phase 7b): the JSON body still copies the encoded record
+                // into non-zeroizing strings; the racer-io shell writes it directly.
+                body["data"] = json!({
+                    annotations::CLUSTER_KEY: STANDARD.encode(cluster.as_bytes()),
+                    annotations::STATE_KEY: state_b64.as_str(),
+                });
+                if !body["metadata"]["annotations"].is_object() {
+                    body["metadata"]["annotations"] = json!({});
+                }
+                body["metadata"]["annotations"][annotations::INITIALIZED] = cluster.clone().into();
+                body["metadata"]["annotations"][annotations::CLUSTER_ID] = cluster.clone().into();
+                let started = Instant::now();
+                // Recheck right before the write.
+                t.shell.borrow().recheck(started)?;
+                let result = match shared
+                    .lease_api
+                    .put(&paths::state(&shared.config.namespace), &body)
+                    .await
+                {
+                    Ok(_) => PutResult::Ok,
+                    Err(KubeError::Conflict) => PutResult::Conflict,
+                    Err(_) => PutResult::Failed,
+                };
+                t.shell.borrow_mut().on(Event::PutDone { started, result })
+            }
+            Effect::Settle {
+                record,
+                confirmed,
+                committed,
+            } => {
+                let (image, desired, eligible) = planned.take().unwrap_or((None, 0, 0));
+                if let Some(record) = record {
+                    if committed {
+                        if read_counters.is_none_or(|(_, m)| m != record.membership_version) {
+                            t.membership_changed.set(Some(unix_now()));
+                        }
+                        // Seats learn the new record after this pass, so a seat
+                        // still at the sequence this commit replaced keeps serving.
+                        t.ready_floor.set(read_counters.map(|(sequence, _)| {
+                            (record.sequence, sequence, confirmed + READY_FLOOR_GRACE)
+                        }));
+                    }
+                    install_record(shared, *record, confirmed)?;
+                    install_image(shared, image);
+                }
                 update_discovery(t, &live, desired, eligible).await;
                 return Ok(());
             }
-            Err(KubeError::Conflict) if attempts < 3 => continue,
-            Err(_) => return Ok(()),
-        }
+            Effect::Done => return Ok(()),
+            Effect::Abort(e) => return Err(e),
+        };
     }
 }
 
@@ -714,8 +731,7 @@ async fn update_discovery(
         }
     }
     let webhooks = d.webhooks;
-    let fresh =
-        || t.alive.get() && t.writer.borrow().may_write() && t.lease.get().fresh(Instant::now());
+    let fresh = || t.alive.get() && t.shell.borrow().fresh(Instant::now());
     let _ = reconcile_webhook(
         shared,
         &webhooks,
@@ -846,12 +862,15 @@ pub async fn reconcile_webhook(
         .map(|b| parse_pem(&b))
         .unwrap_or_default();
     let desired: Vec<Vec<u8>> = seats.iter().map(|s| s.ca.clone()).collect();
-    let mut union = current.clone();
-    for d in &desired {
-        if !union.contains(d) {
-            union.push(d.clone());
-        }
-    }
+    let trust = shell::webhook_trust(
+        &current,
+        &desired,
+        &mut retired.borrow_mut(),
+        now,
+        WEBHOOK_TRUST_GRACE,
+        annotations::MAX_SEATS,
+    );
+    let union = trust.before;
     if !fresh() {
         return Ok(());
     }
@@ -890,29 +909,7 @@ pub async fn reconcile_webhook(
         Err(KubeError::NotFound) => {}
         Err(e) => return Err(e),
     }
-    // Keep removed trust for a bounded grace. At most one retired CA per
-    // seat slot is kept; the oldest go first.
-    let keep = {
-        let mut r = retired.borrow_mut();
-        r.retain(|ca, _| !desired.contains(ca) && union.contains(ca));
-        for ca in union.iter().filter(|c| !desired.contains(c)) {
-            r.entry(ca.clone()).or_insert(now);
-        }
-        r.retain(|_, at| now.duration_since(*at) < WEBHOOK_TRUST_GRACE);
-        while r.len() > annotations::MAX_SEATS {
-            let oldest = r.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone());
-            if let Some(k) = oldest {
-                r.remove(&k);
-            }
-        }
-        r.keys().cloned().collect::<Vec<_>>()
-    };
-    // Keep union order so an unchanged set is not rewritten.
-    let target: Vec<Vec<u8>> = union
-        .iter()
-        .filter(|c| desired.contains(c) || keep.contains(c))
-        .cloned()
-        .collect();
+    let target = trust.after;
     if union != target && fresh() {
         patch_ca_bundle(shared, &mwc, &target).await?;
     }

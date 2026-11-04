@@ -711,7 +711,7 @@ pub fn install_record(
 ) -> Result<(), state::StateError> {
     let cluster = shared.cluster.borrow().clone();
     let mut s = shared.serving.borrow_mut();
-    if rules::admit(s.high_water.as_ref(), &record).is_err() {
+    if crate::rules::shell::accept_record(s.high_water.as_ref(), &record).is_err() {
         // A rollback is never accepted.
         drop(s);
         fail_closed(shared);
