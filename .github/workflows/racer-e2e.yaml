@@ -29,6 +29,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/racer-e2e.yaml
+      - .github/actions/setup-go-cached/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -57,6 +58,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/racer-e2e.yaml
+      - .github/actions/setup-go-cached/**
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:

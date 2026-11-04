@@ -16,6 +16,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/gantry-e2e.yaml
+      - .github/actions/setup-go-cached/**
   push:
     branches:
       - main
@@ -31,6 +32,7 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/gantry-e2e.yaml
+      - .github/actions/setup-go-cached/**
   schedule:
     - cron: "41 8 * * *"
   workflow_dispatch:

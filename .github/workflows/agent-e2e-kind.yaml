@@ -28,6 +28,8 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
+      - .github/actions/apt-install-cached/**
       - .github/actions/agent-e2e-*/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
@@ -57,6 +59,8 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/agent-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
+      - .github/actions/apt-install-cached/**
       - .github/actions/agent-e2e-*/**
   workflow_dispatch:
 

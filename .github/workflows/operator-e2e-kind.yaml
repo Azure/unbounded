@@ -16,6 +16,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/operator-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
   push:
     # release-* included so a cherry-pick onto a release branch gets the same
     # post-merge validation as main. The pull_request trigger above is
@@ -32,6 +33,7 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/operator-e2e-kind.yaml
+      - .github/actions/setup-go-cached/**
   workflow_dispatch:
 
 concurrency:
