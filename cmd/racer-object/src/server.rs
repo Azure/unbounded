@@ -616,68 +616,89 @@ impl Conn {
         Ok(if ok { next } else { Next::Abort })
     }
 
-    /// Forward every page, withholding the final byte until Racer confirms
-    /// completion so truncation is never mistaken for a complete body.
     async fn forward_pages(&mut self, sub: &mut Subscription, first: Frame) -> bool {
-        // One watch for the whole body: after a half-close it stays off.
-        let stream = &self.stream;
-        let mut watch = ClientWatch::new(stream, &mut self.rbuf, MAX_REQUEST_HEAD);
-        let mut pending = Some(first);
-        loop {
-            let frame = match pending.take() {
-                Some(frame) => frame,
-                None => match watch.guard(sub.next_frame()).await {
-                    Some(Ok(frame)) => frame,
-                    _ => return false,
-                },
-            };
-            let last = sub.last_page();
-            let mut remaining = u64::from(frame.length) - u64::from(last);
-            // Bytes that arrived with the frame header are written from
-            // userspace; the rest is spliced.
-            if sub.buffered() > 0 && remaining > 0 {
-                let chunk = sub.take_buffered(remaining as usize);
-                remaining -= chunk.len() as u64;
-                if write_all_more(stream, chunk).await.is_err() {
-                    return false;
-                }
-            }
-            if remaining > 0 {
-                let ok = match &self.pipe {
-                    Some(pipe) => forward(&sub.stream, pipe, stream, remaining, true, &mut watch)
-                        .await
-                        .is_ok(),
-                    None => copy(sub, stream, remaining, &mut self.body, &mut watch).await,
-                };
-                if !ok {
-                    return false;
-                }
-            }
-            if !last {
-                if !matches!(watch.guard(sub.credit(&frame)).await, Some(Ok(()))) {
-                    return false;
-                }
-                continue;
-            }
-            let mut final_byte = [0u8; 1];
-            if !matches!(
-                watch.guard(sub.read_exact(&mut final_byte)).await,
-                Some(Ok(()))
-            ) {
+        forward_pages(
+            sub,
+            first,
+            &mut self.stream,
+            &mut self.rbuf,
+            self.pipe.as_ref(),
+            &mut self.body,
+        )
+        .await
+    }
+}
+
+/// Forward every page of `sub` to `stream`, withholding the final byte until
+/// Racer confirms completion so truncation is never mistaken for a complete body.
+/// `rbuf` buffers client bytes read while watching for a disconnect.
+async fn forward_pages(
+    sub: &mut Subscription,
+    first: Frame,
+    stream: &mut TcpStream,
+    rbuf: &mut Vec<u8>,
+    pipe: Option<&Pipe>,
+    body: &mut Vec<u8>,
+) -> bool {
+    // One watch for the whole body: after a half-close it stays off.
+    let out = stream;
+    let stream = &*out;
+    let mut watch = ClientWatch::new(stream, rbuf, MAX_REQUEST_HEAD);
+    let mut pending = Some(first);
+    loop {
+        let frame = match pending.take() {
+            Some(frame) => frame,
+            None => match watch.guard(sub.next_frame()).await {
+                Some(Ok(frame)) => frame,
+                _ => return false,
+            },
+        };
+        let last = sub.last_page();
+        let mut remaining = u64::from(frame.length) - u64::from(last);
+        // Bytes that arrived with the frame header are written from
+        // userspace; the rest is spliced.
+        if sub.buffered() > 0 && remaining > 0 {
+            let chunk = sub.take_buffered(remaining as usize);
+            remaining -= chunk.len() as u64;
+            if write_all_more(stream, chunk).await.is_err() {
                 return false;
             }
-            // Racer may wait for the final credit before completing, or
-            // complete without reading it; a 12-byte write never blocks on
-            // an open socket, so sending it first cannot deadlock.
-            let done = async {
-                sub.credit(&frame).await?;
-                sub.complete().await
-            };
-            if !matches!(watch.guard(done).await, Some(Ok(()))) {
-                return false;
-            }
-            return self.stream.write_all(&final_byte).await.is_ok();
         }
+        if remaining > 0 {
+            let ok = match pipe {
+                Some(pipe) => forward(&sub.stream, pipe, stream, remaining, true, &mut watch)
+                    .await
+                    .is_ok(),
+                None => copy(sub, stream, remaining, body, &mut watch).await,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if !last {
+            if !matches!(watch.guard(sub.credit(&frame)).await, Some(Ok(()))) {
+                return false;
+            }
+            continue;
+        }
+        let mut final_byte = [0u8; 1];
+        if !matches!(
+            watch.guard(sub.read_exact(&mut final_byte)).await,
+            Some(Ok(()))
+        ) {
+            return false;
+        }
+        // Racer may wait for the final credit before completing, or
+        // complete without reading it; a 12-byte write never blocks on
+        // an open socket, so sending it first cannot deadlock.
+        let done = async {
+            sub.credit(&frame).await?;
+            sub.complete().await
+        };
+        if !matches!(watch.guard(done).await, Some(Ok(()))) {
+            return false;
+        }
+        return out.write_all(&final_byte).await.is_ok();
     }
 }
 
@@ -1343,5 +1364,346 @@ mod tests {
             check_pinned(&stat, &stat, 8, 10, tail),
             Err(Failure::RangeNotSatisfiable(None))
         );
+    }
+}
+
+/// Function-level tests for `forward_pages`: the test plays Racer on one end
+/// of a Unix socket pair, writing raw frame bytes inline, and plays the
+/// client on a loopback TCP connection.
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::racer::{FRAME_SIZE, PAGE_SIZE};
+    use tokio::net::{TcpSocket, UnixStream};
+    use tokio::task::JoinHandle;
+
+    const PAGE: u8 = 1;
+    const COMPLETE: u8 = 2;
+
+    fn frame(kind: u8, number: u64, offset: u64, length: u32) -> [u8; FRAME_SIZE] {
+        let mut b = [0; FRAME_SIZE];
+        b[0] = kind;
+        b[1..9].copy_from_slice(&number.to_be_bytes());
+        b[9..17].copy_from_slice(&offset.to_be_bytes());
+        b[17..].copy_from_slice(&length.to_be_bytes());
+        b
+    }
+
+    fn credit(number: u64, length: u32) -> [u8; 12] {
+        let mut b = [0; 12];
+        b[..8].copy_from_slice(&number.to_be_bytes());
+        b[8..].copy_from_slice(&length.to_be_bytes());
+        b
+    }
+
+    /// Object bytes at absolute offsets `[first, end)`; a prime modulus keeps
+    /// the pattern from lining up with page or pipe sizes.
+    fn object(first: u64, end: u64) -> Vec<u8> {
+        (first..end).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The page frames covering `[first, end)`.
+    fn pages(first: u64, end: u64) -> Vec<(u64, u64, u32)> {
+        let mut out = Vec::new();
+        let mut at = first;
+        while at < end {
+            let number = at / PAGE_SIZE;
+            let stop = end.min((number + 1) * PAGE_SIZE);
+            out.push((number, at, (stop - at) as u32));
+            at = stop;
+        }
+        out
+    }
+
+    /// Server and client ends of a loopback TCP connection. `rcvbuf` shrinks
+    /// the client's receive buffer to force backpressure.
+    async fn tcp_pair(rcvbuf: Option<u32>) -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        if let Some(size) = rcvbuf {
+            socket.set_recv_buffer_size(size).unwrap();
+        }
+        let (client, accepted) = tokio::join!(
+            socket.connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        (accepted.unwrap().0, client.unwrap())
+    }
+
+    /// Read everything the client receives until EOF or error. `slow`
+    /// reads in small chunks and yields between them.
+    fn client_reader(mut client: TcpStream, slow: bool) -> JoinHandle<Vec<u8>> {
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; if slow { 4096 } else { 1 << 20 }];
+            let mut reads = 0u32;
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => return got,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+                reads += 1;
+                if slow && reads.is_multiple_of(8) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        })
+    }
+
+    /// How Racer misbehaves, if at all.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        None,
+        /// Close after this many payload bytes of the last page.
+        Truncate(usize),
+        /// Close after the payload without a completion frame.
+        NoCompletion,
+        /// Send this completion frame instead of the right one.
+        Completion([u8; FRAME_SIZE]),
+        /// Send this header instead of the second page's.
+        SecondFrame([u8; FRAME_SIZE]),
+    }
+
+    /// Play Racer for `[first, end)`: frame headers and payload, collecting
+    /// the credits received. The first page's header (and, if `split`, the
+    /// first 1000 payload bytes) are assumed already buffered by the caller.
+    fn racer(
+        mut racer: UnixStream,
+        first: u64,
+        end: u64,
+        split: bool,
+        fault: Fault,
+    ) -> JoinHandle<Vec<[u8; 12]>> {
+        tokio::spawn(async move {
+            let pages = pages(first, end);
+            let mut credits = Vec::new();
+            for (i, &(number, offset, length)) in pages.iter().enumerate() {
+                let last = i + 1 == pages.len();
+                let mut data = object(offset, offset + u64::from(length));
+                if i == 0 {
+                    if split {
+                        data.drain(..1000);
+                    }
+                } else {
+                    let header = match fault {
+                        Fault::SecondFrame(h) if i == 1 => h,
+                        _ => frame(PAGE, number, offset, length),
+                    };
+                    if racer.write_all(&header).await.is_err() {
+                        return credits;
+                    }
+                }
+                if let (true, Fault::Truncate(keep)) = (last, fault) {
+                    let keep = keep - if i == 0 && split { 1000 } else { 0 };
+                    let _ = racer.write_all(&data[..keep]).await;
+                    return credits;
+                }
+                if racer.write_all(&data).await.is_err() {
+                    return credits;
+                }
+                let mut c = [0u8; 12];
+                if racer.read_exact(&mut c).await.is_err() {
+                    return credits;
+                }
+                credits.push(c);
+            }
+            let completion = match fault {
+                Fault::NoCompletion => return credits,
+                Fault::Completion(f) => f,
+                _ => frame(COMPLETE, pages.len() as u64, end - first, 0),
+            };
+            let _ = racer.write_all(&completion).await;
+            credits
+        })
+    }
+
+    struct Outcome {
+        ok: bool,
+        got: Vec<u8>,
+        credits: Vec<[u8; 12]>,
+    }
+
+    /// Drive `forward_pages` over `[first, end)` the way `stream_body` does:
+    /// validate the first frame, then forward.
+    async fn run(
+        first: u64,
+        end: u64,
+        use_pipe: bool,
+        split: bool,
+        fault: Fault,
+        rcvbuf: Option<u32>,
+    ) -> Outcome {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (number, offset, length) = pages(first, end)[0];
+        let mut buffered = frame(PAGE, number, offset, length).to_vec();
+        if split {
+            buffered.extend_from_slice(&object(first, first + 1000));
+        }
+        let racer = racer(theirs, first, end, split, fault);
+        let mut sub = Subscription::for_test(ours, first, end, buffered);
+        let (mut server, client) = tcp_pair(rcvbuf).await;
+        let reader = client_reader(client, rcvbuf.is_some());
+        let pipe = use_pipe.then(|| Pipe::new().unwrap());
+        let head = sub.next_frame().await.unwrap();
+        let mut body = Vec::new();
+        let ok = forward_pages(
+            &mut sub,
+            head,
+            &mut server,
+            &mut Vec::new(),
+            pipe.as_ref(),
+            &mut body,
+        )
+        .await;
+        drop(server);
+        drop(sub);
+        let got = reader.await.unwrap();
+        let credits = racer.await.unwrap();
+        Outcome { ok, got, credits }
+    }
+
+    fn expected_credits(first: u64, end: u64) -> Vec<[u8; 12]> {
+        pages(first, end)
+            .into_iter()
+            .map(|(number, _, length)| credit(number, length))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn forwards_multiple_pages_exactly() {
+        let (first, end) = (0, PAGE_SIZE + 100_000);
+        for use_pipe in [true, false] {
+            let out = run(first, end, use_pipe, false, Fault::None, None).await;
+            assert!(out.ok, "pipe={use_pipe}");
+            assert!(out.got == object(first, end), "pipe={use_pipe}");
+            assert_eq!(out.credits, expected_credits(first, end));
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_unaligned_range_across_page_boundary() {
+        // Starts mid-page with payload already buffered past the header.
+        let (first, end) = (PAGE_SIZE - 70_000, PAGE_SIZE + 70_001);
+        for use_pipe in [true, false] {
+            let out = run(first, end, use_pipe, true, Fault::None, None).await;
+            assert!(out.ok, "pipe={use_pipe}");
+            assert!(out.got == object(first, end), "pipe={use_pipe}");
+            assert_eq!(out.credits, expected_credits(first, end));
+            assert_eq!(out.credits[0], credit(0, 70_000));
+            assert_eq!(out.credits[1], credit(1, 70_001));
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_exactly_under_backpressure() {
+        let (first, end) = (5, 600_005);
+        let out = run(first, end, true, true, Fault::None, Some(4096)).await;
+        assert!(out.ok);
+        assert!(out.got == object(first, end));
+        assert_eq!(out.credits, expected_credits(first, end));
+    }
+
+    #[tokio::test]
+    async fn fails_when_client_closes() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let end = 4 << 20;
+        let racer = racer(theirs, 0, end, false, Fault::None);
+        let mut sub = Subscription::for_test(ours, 0, end, frame(PAGE, 0, 0, end as u32).to_vec());
+        let (mut server, client) = tcp_pair(None).await;
+        drop(client);
+        let pipe = Pipe::new().unwrap();
+        let head = sub.next_frame().await.unwrap();
+        let ok = forward_pages(
+            &mut sub,
+            head,
+            &mut server,
+            &mut Vec::new(),
+            Some(&pipe),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!ok);
+        drop(sub);
+        // Racer never got the page's credit.
+        assert!(racer.await.unwrap().is_empty());
+    }
+
+    /// A failed transfer must never deliver the full Content-Length.
+    fn assert_incomplete(out: &Outcome, first: u64, end: u64) {
+        assert!(!out.ok);
+        let want = object(first, end);
+        assert!(
+            out.got.len() < want.len(),
+            "failed transfer looked complete"
+        );
+        assert!(want.starts_with(&out.got));
+    }
+
+    #[tokio::test]
+    async fn fails_on_truncated_payload() {
+        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let last = (end - PAGE_SIZE) as usize;
+        for keep in [0, 1, last / 2, last - 1] {
+            for use_pipe in [true, false] {
+                let out = run(first, end, use_pipe, false, Fault::Truncate(keep), None).await;
+                assert_incomplete(&out, first, end);
+                assert_eq!(out.credits, expected_credits(first, end)[..1]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_on_truncated_single_page() {
+        let (first, end) = (0, 200_000);
+        for keep in [1000, 150_000, 199_999] {
+            let out = run(first, end, true, true, Fault::Truncate(keep), None).await;
+            assert_incomplete(&out, first, end);
+            assert!(out.credits.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn withholds_final_byte_without_completion() {
+        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let out = run(first, end, true, false, Fault::NoCompletion, None).await;
+        assert_incomplete(&out, first, end);
+        assert_eq!(out.got.len() as u64, end - first - 1);
+        // The final credit is still sent before waiting for completion.
+        assert_eq!(out.credits, expected_credits(first, end));
+    }
+
+    #[tokio::test]
+    async fn withholds_final_byte_on_invalid_completion() {
+        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let bytes = end - first;
+        for bad in [
+            frame(COMPLETE, 1, bytes, 0),
+            frame(COMPLETE, 2, bytes - 1, 0),
+            frame(COMPLETE, 2, bytes, 1),
+            frame(PAGE, 2, bytes, 0),
+            frame(9, 2, bytes, 0),
+        ] {
+            let out = run(first, end, true, false, Fault::Completion(bad), None).await;
+            assert_incomplete(&out, first, end);
+            assert_eq!(out.got.len() as u64, bytes - 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_on_wrong_page_frame() {
+        let (first, end) = (0, PAGE_SIZE + 100_000);
+        let len = 100_000;
+        for bad in [
+            frame(PAGE, 2, PAGE_SIZE, len),
+            frame(PAGE, 0, PAGE_SIZE, len),
+            frame(PAGE, 1, PAGE_SIZE + 1, len),
+            frame(PAGE, 1, PAGE_SIZE, len - 1),
+            frame(COMPLETE, 1, PAGE_SIZE, 0),
+        ] {
+            let out = run(first, end, true, false, Fault::SecondFrame(bad), None).await;
+            assert_incomplete(&out, first, end);
+            // Only the first page was delivered.
+            assert_eq!(out.got.len() as u64, PAGE_SIZE);
+        }
     }
 }

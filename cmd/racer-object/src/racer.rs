@@ -792,6 +792,25 @@ impl Subscription {
         self.end == self.first
     }
 
+    /// A subscription over `stream` for `[first, end)` whose response head
+    /// was already consumed, with `buffered` body bytes read past it.
+    #[cfg(test)]
+    pub fn for_test(stream: UnixStream, first: u64, end: u64, buffered: Vec<u8>) -> Self {
+        let seq = Sequence::new(first, end);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        Self {
+            stream,
+            buf: buffered,
+            pos: 0,
+            meta: Meta::default(),
+            first,
+            end,
+            pages: seq.pages,
+            seq,
+            _permit: permit,
+        }
+    }
+
     /// Give the head buffer back to the connection's scratch space.
     pub fn recycle(self, scratch: &mut Scratch) {
         let mut buf = self.buf;
