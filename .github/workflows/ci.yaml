@@ -511,8 +511,32 @@ jobs:
         with:
           profile: build
 
+      - name: Compute envtest cache key
+        id: envtest-key
+        run: |
+          hash="$(grep -E '^(SETUP_ENVTEST|ENVTEST_K8S)_VERSION ' Makefile | sha256sum | cut -c1-16)"
+          echo "key=envtest-${RUNNER_OS}-${RUNNER_ARCH}-${{ steps.setup-go.outputs.go-version }}-${hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore envtest binaries
+        id: envtest-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin/setup-envtest-*
+            bin/envtest
+          key: ${{ steps.envtest-key.outputs.key }}
+
       - name: Provision envtest and run Racer API-server race tests
         run: timeout --signal=TERM --kill-after=10s 300s make racer-envtest-ci
+
+      - name: Save envtest binaries
+        if: github.event_name == 'push' && steps.envtest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin/setup-envtest-*
+            bin/envtest
+          key: ${{ steps.envtest-key.outputs.key }}
 
   racer-python:
     name: Racer Python Client
