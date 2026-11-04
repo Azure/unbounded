@@ -485,15 +485,21 @@ impl Conn {
             // Unconditional GET: one subscription, no Stat. Racer resolves
             // the forwarded range exactly as the sidecar would, and the
             // result is cross-checked below.
-            let sub = client
-                .subscribe(&plan.id, None, range, &mut self.scratch)
-                .await?;
+            let sub = client.subscribe(&plan.id, None, range, &mut self.scratch);
+            let Some(sub) = watch_client(&self.stream, &mut self.rbuf, sub).await else {
+                return Ok(Next::Abort);
+            };
+            let sub = sub?;
             let selection = unpinned_selection(range, sub.meta.size, sub.first, sub.end)?;
             return self
                 .stream_body(sub, &plan, selection, connection, next)
                 .await;
         }
-        let meta = client.stat(&plan.id, &mut self.scratch).await?;
+        let meta = client.stat(&plan.id, &mut self.scratch);
+        let Some(meta) = watch_client(&self.stream, &mut self.rbuf, meta).await else {
+            return Ok(Next::Abort);
+        };
+        let meta = meta?;
         if plan.if_match.present && !plan.if_match.matches(&meta.etag, false) {
             return Err(Failure::PreconditionFailed);
         }
@@ -524,14 +530,15 @@ impl Conn {
         }
         // Pin the version Stat selected, with the exact resolved range.
         let range = pinned_range(selection);
-        let sub = client
-            .subscribe(&plan.id, Some(&meta.etag), range, &mut self.scratch)
-            .await
-            .map_err(|f| match f {
-                // A pinned 416 has no Content-Range.
-                Failure::RangeNotSatisfiable(_) => Failure::RangeNotSatisfiable(None),
-                other => other,
-            })?;
+        let sub = client.subscribe(&plan.id, Some(&meta.etag), range, &mut self.scratch);
+        let Some(sub) = watch_client(&self.stream, &mut self.rbuf, sub).await else {
+            return Ok(Next::Abort);
+        };
+        let sub = sub.map_err(|f| match f {
+            // A pinned 416 has no Content-Range.
+            Failure::RangeNotSatisfiable(_) => Failure::RangeNotSatisfiable(None),
+            other => other,
+        })?;
         check_pinned(&meta, &sub.meta, sub.first, sub.end, selection)?;
         self.stream_body(sub, &plan, selection, connection, next)
             .await
@@ -556,7 +563,11 @@ impl Conn {
             // before committing anything, then send head and body together.
             self.body.clear();
             self.body.resize(length as usize, 0);
-            read_all(&mut sub, &mut self.body).await?;
+            let read = read_all(&mut sub, &mut self.body);
+            let Some(read) = watch_client(&self.stream, &mut self.rbuf, read).await else {
+                return Ok(Next::Abort);
+            };
+            read?;
             sub.recycle(&mut self.scratch);
             success_head(
                 &mut self.out,
@@ -901,6 +912,47 @@ async fn copy(sub: &mut Subscription, dst: &TcpStream, mut len: u64, buf: &mut V
 
 /// Read a whole (small) selection into `out`, which has the exact length,
 /// and validate completion.
+/// Run `fut` (a wait on Racer) while watching the client socket, like Go's
+/// background read: returns `None` if the client connection fails so the
+/// caller drops the Racer operation and frees the connection slot.
+///
+/// Readiness comes from the already-registered socket, so a quick Racer
+/// answer costs no extra syscall. Bytes that arrive are kept in `rbuf` as
+/// pipelined input. EOF (a valid half-close) or a full buffer just stops
+/// the watch and lets the request finish.
+async fn watch_client<F: Future>(
+    stream: &TcpStream,
+    rbuf: &mut Vec<u8>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return Some(out),
+            r = stream.readable(), if watching => {
+                if r.is_err() {
+                    return None;
+                }
+                if rbuf.len() >= MAX_REQUEST_HEAD {
+                    watching = false;
+                    continue;
+                }
+                if rbuf.capacity() - rbuf.len() < 2048 {
+                    rbuf.reserve(8192);
+                }
+                match stream.try_read_buf(rbuf) {
+                    Ok(0) => watching = false,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+}
+
 async fn read_all(sub: &mut Subscription, out: &mut [u8]) -> Result<(), Failure> {
     let mut at = 0usize;
     loop {

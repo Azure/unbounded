@@ -403,6 +403,47 @@ async fn request_timeout() {
 }
 
 #[tokio::test]
+async fn client_reset_releases_slot() {
+    // Racer never answers; a client that resets must free its slot.
+    let dir = TempDir::new();
+    let path = dir.0.join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let mut options = options(Api::S3);
+    options.request_timeout = Duration::from_secs(30);
+    options.max_connections = 1;
+    let s = Sidecar::start_with(options, path, false).await;
+    let mut c = Client::connect(s.addr).await;
+    c.send("GET", "/bucket/key", &[]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    c.stream.set_zero_linger().unwrap();
+    drop(c);
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), s.get("PUT", "/bucket/key", &[]))
+        .await
+        .expect("slot was not released");
+    assert_eq!(r.status, 405);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn half_close_still_answered() {
+    let dir = TempDir::new();
+    let path = dir.0.join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let mut options = options(Api::S3);
+    options.request_timeout = Duration::from_millis(300);
+    let s = Sidecar::start_with(options, path, false).await;
+    for method in ["GET", "HEAD"] {
+        let mut c = Client::connect(s.addr).await;
+        c.send(method, "/bucket/key", &[]).await;
+        c.stream.shutdown().await.unwrap();
+        let r = c.response(method == "HEAD").await;
+        assert_xml(&r, method, 503, "ServiceUnavailable");
+        assert!(c.closed().await);
+    }
+}
+
+#[tokio::test]
 async fn keep_alive_and_pipelining() {
     let s = Sidecar::start(Api::S3).await;
     let mut c = Client::connect(s.addr).await;
