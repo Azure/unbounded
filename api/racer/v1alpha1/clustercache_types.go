@@ -70,8 +70,7 @@ type ClusterCacheSpec struct {
 	// and read this cache. When unset or empty, every Racer node does.
 	// Changing it moves the cache to a new pool of nodes with no migration:
 	// pages are refilled from the origin. The Racer admission webhook
-	// restricts client pods that use this cache to matching nodes, and the
-	// managed origin DaemonSet (spec.origin) runs only on matching nodes.
+	// restricts client pods that use this cache to matching nodes.
 	// +optional
 	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
 }
