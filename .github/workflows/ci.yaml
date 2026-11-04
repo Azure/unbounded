@@ -436,6 +436,8 @@ jobs:
             kernels: false
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-gpu-cargo
+      # Make the pinned toolchain active so rust-cache keys on its rustc -vV.
+      RUSTUP_TOOLCHAIN: 1.96.0
       CARGO_BUILD_JOBS: "2"
       GPU_FEATURES: ${{ matrix.features }}
       LD_LIBRARY_PATH: ${{ github.workspace }}/bin/racer-gpu-native
@@ -446,19 +448,36 @@ jobs:
       - name: Set up pinned Rust
         run: timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
 
+      # Matrix entries differ only in workspace-crate features, and rust-cache
+      # prunes workspace crates, so one entry saves for all of them.
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: cmd/racer -> ../../bin/racer-gpu-cargo
+          shared-key: racer-gpu
+          save-if: ${{ github.event_name == 'push' && matrix.configuration == 'native-and-simulation' }}
+
       # Hosted runners have no GPU. nvcc (same package as the dataplane image)
       # compiles the decrypt kernels to PTX so they at least build; running
       # them needs .github/workflows/racer-gpu.yaml on a GPU runner. Kernel
       # math is covered by the C-core tests below and the kernel emulation step.
-      - name: Install nvcc
+      - name: Add CUDA apt repository
         if: matrix.kernels
         run: |
           timeout --signal=TERM --kill-after=10s 120s curl -fsSL -o "$RUNNER_TEMP/cuda-keyring.deb" \
             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
-          timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
-          timeout --signal=TERM --kill-after=10s 600s sudo apt-get install -y --no-install-recommends cuda-nvcc-12-9
-          echo /usr/local/cuda/bin >> "$GITHUB_PATH"
+          timeout --signal=TERM --kill-after=10s 120s sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+
+      - name: Install nvcc
+        if: matrix.kernels
+        uses: ./.github/actions/apt-install-cached
+        with:
+          packages: cuda-nvcc-12-9
+          cache-name: racer-gpu-nvcc
+
+      - name: Add nvcc to PATH
+        if: matrix.kernels
+        run: echo /usr/local/cuda/bin >> "$GITHUB_PATH"
 
       - name: Compile CUDA shim with kernels (not hardware validation)
         if: matrix.kernels
