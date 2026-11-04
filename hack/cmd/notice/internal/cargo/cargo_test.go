@@ -176,6 +176,81 @@ dependencies = [
 	}
 }
 
+func TestCollectorCollectsEveryCrateRoot(t *testing.T) {
+	root := t.TempDir()
+	cargoHome := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer/Cargo.toml": "[dependencies]\nshared = \"1\"\nonly-racer = \"1\"\n",
+		"cmd/racer/Cargo.lock": `version = 4
+[[package]]
+name = "shared"
+version = "1.0.0"
+[[package]]
+name = "only-racer"
+version = "1.0.0"
+[[package]]
+name = "racer"
+version = "0.1.0"
+dependencies = ["only-racer", "shared"]
+`,
+		"cmd/racer-object/Cargo.toml": "[package]\nname = \"racer-object\"\n[workspace]\n[dependencies]\nshared = \"1\"\nskew = \"2\"\n",
+		"cmd/racer-object/Cargo.lock": `version = 4
+[[package]]
+name = "shared"
+version = "1.0.0"
+[[package]]
+name = "skew"
+version = "2.0.0"
+[[package]]
+name = "racer-object"
+version = "0.1.0"
+dependencies = ["shared", "skew"]
+`,
+	})
+
+	for _, crate := range []string{"shared-1.0.0", "only-racer-1.0.0", "skew-2.0.0"} {
+		testutil.WriteTree(t, cargoHome, map[string]string{
+			"registry/src/index/" + crate + "/Cargo.toml.orig": "[package]\nlicense = \"MIT\"\n",
+			"registry/src/index/" + crate + "/LICENSE":         testutil.MITLicense("Copyright (c) 2026 Example"),
+		})
+	}
+
+	c := New(cargoHome)
+	if err := c.Precheck(root); err != nil {
+		t.Fatalf("Precheck: %v", err)
+	}
+
+	entries, err := c.Collect(root)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	got := map[string]int{}
+	for _, entry := range entries {
+		got[entry.Dependency]++
+	}
+
+	want := map[string]int{"shared": 1, "only-racer": 1, "skew": 1}
+	if len(got) != len(want) {
+		t.Fatalf("entries = %v, want %v", got, want)
+	}
+
+	for name, count := range want {
+		if got[name] != count {
+			t.Errorf("%s collected %d times, want %d", name, got[name], count)
+		}
+	}
+}
+
+func TestCollectorRejectsIncompleteSecondCrateRoot(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{"cmd/racer-object/Cargo.toml": "[package]\nname = \"racer-object\"\n"})
+
+	if err := New(t.TempDir()).Precheck(root); err == nil || !strings.Contains(err.Error(), "cmd/racer-object/Cargo.lock") {
+		t.Fatalf("Precheck error = %v; want missing racer-object lock", err)
+	}
+}
+
 func TestLockedDirectVersionsUsesQualifiedVersion(t *testing.T) {
 	direct := map[string]dependency{"rand": {packageName: "rand"}}
 	lock := `[[package]]
