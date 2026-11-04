@@ -78,6 +78,23 @@ func TestSiteCRDDefaultsTokenRefresherEnabled(t *testing.T) {
 	}
 }
 
+func TestSiteCRDMachinaCompatibility(t *testing.T) {
+	crd := findSiteCRD(t)
+
+	for _, version := range crd.Spec.Versions {
+		for _, column := range version.AdditionalPrinterColumns {
+			if column.Name == "Machina" {
+				t.Fatal("required machina must not display the deprecated enablement setting")
+			}
+		}
+
+		machina := nestedSchemaProp(t, version.Schema.OpenAPIV3Schema, "spec", "components", "machina")
+		if !strings.Contains(machina.Description, "ignored") {
+			t.Fatalf("machina compatibility field must be documented as ignored: %q", machina.Description)
+		}
+	}
+}
+
 // nestedSchemaProp walks Properties down the given path, failing the test if any
 // segment is missing.
 func nestedSchemaProp(t *testing.T, schema *apiextensionsv1.JSONSchemaProps, path ...string) *apiextensionsv1.JSONSchemaProps {

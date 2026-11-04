@@ -7,8 +7,6 @@ metadata:
     unbounded-cloud.io/site: "{{ .SiteName }}"
 spec:
   components:
-    machina:
-      enabled: {{ .EnableMachina }}
     metalman:
       enabled: {{ .EnableMetalman }}
     tokenRefresher:

@@ -161,8 +161,8 @@ Operational notes from the review hardening:
   labels and metalman targets either key so it can schedule before the
   upgraded net has converged node labels. Remove the deprecated affinity term in
   the same future release that removes the deprecated write/fallback.
-- Net and machina singletons are no longer auto-deleted when the last Site is
-  removed (or when no Site enables machina). Net is the dataplane and deleting
+- Net and machina are required singletons whenever any Site exists and are not
+  auto-deleted when the last Site is removed. Net is the dataplane and deleting
   net-node can cause a cluster-wide outage; singleton removal should be handled
   by a future explicit uninstall flow.
 - The hostNetwork net-controller and metalman Deployments use RollingUpdate with

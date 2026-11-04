@@ -508,9 +508,9 @@ func siteSpecWithoutComponents(site *unstructured.Unstructured) (map[string]any,
 }
 
 // detectComponents infers spec.components for a translated Site from the
-// workloads still running in the legacy namespaces. Machina is enabled only on
-// the cluster Site, and metalman is enabled where a per-site metalman Deployment
-// is detected.
+// workloads still running in the legacy namespaces. The deprecated machina
+// setting is preserved on the cluster Site for compatibility but is ignored by
+// reconciliation. Metalman is enabled where a per-site Deployment is detected.
 func (r *LegacyReaper) detectComponents(ctx context.Context, siteName string) (map[string]any, error) {
 	components := map[string]any{}
 
