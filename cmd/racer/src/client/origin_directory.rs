@@ -12,10 +12,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 
 /// UID that Racer origins run as. Keep in sync with the nonroot user of
-/// images/racer-object/Containerfile and images/racer-loadgen/Containerfile,
-/// and with the origin directory checks in cmd/racer-object/main.go
-/// (checkOriginDirectory) and cmd/racer-loadgen/origin_uds.go
-/// (checkOriginDirectory).
+/// images/racer-loadgen/Containerfile and with the origin directory checks in
+/// cmd/racer-loadgen/origin_uds.go (checkOriginDirectory).
 pub const ORIGIN_UID: u32 = 65532;
 /// GID that Racer origins run as. See [`ORIGIN_UID`].
 pub const ORIGIN_GID: u32 = 65532;
