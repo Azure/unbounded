@@ -572,6 +572,13 @@ func TestEarlyCloseCancelsInFlight(t *testing.T) {
 		t.Fatalf("Close took %v, want prompt cancellation", d)
 	}
 
+	// Canceled readers unwind asynchronously (for example a background layer
+	// index scan), so allow a short grace period before declaring a leak.
+	deadline := time.Now().Add(2 * time.Second)
+	for blobReaderGoroutines() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if n := blobReaderGoroutines(); n != 0 {
 		t.Fatalf("%d blob reader goroutines left after Close", n)
 	}
