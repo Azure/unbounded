@@ -143,9 +143,6 @@ pub const MAX_API_RESPONSE: usize = 256 * 1024 * 1024;
 /// Maximum single watch event line.
 pub const MAX_WATCH_EVENT: usize = 4 * 1024 * 1024;
 
-/// Maximum AdmissionReview request body.
-pub const MAX_ADMISSION_BYTES: usize = 3 * 1024 * 1024;
-
 /// Maximum bearer token length.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
 

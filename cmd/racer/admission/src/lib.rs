@@ -38,8 +38,10 @@ use serde_json::{Map, Value, json};
 
 /// HTTP path the webhook is served on.
 pub const PATH: &str = "/mutate-racer-object-sidecar";
-/// Largest accepted review body.
-pub const MAX_REQUEST_BYTES: usize = 7 * 1024 * 1024;
+/// Largest accepted review body: the Kubernetes API server's own 3 MiB
+/// request limit. The webhook server enforces this same constant on the
+/// declared and received body, so there is one admission limit.
+pub const MAX_REQUEST_BYTES: usize = 3 * 1024 * 1024;
 
 /// UID and GID the sidecar runs as.
 pub const SIDECAR_UID: i64 = 65532;

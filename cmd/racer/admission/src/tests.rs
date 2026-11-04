@@ -801,6 +801,13 @@ fn duplicate_keys_anywhere_are_rejected() {
 }
 
 #[test]
+fn size_limit_is_three_mib() {
+    assert_eq!(MAX_REQUEST_BYTES, 3 * 1024 * 1024);
+    let body = vec![b' '; 3 * 1024 * 1024 + 1];
+    assert_eq!(admit(&body, IMAGE), Err(Error::TooLarge(body.len())));
+}
+
+#[test]
 fn size_limit() {
     let mut big = review("UPDATE", &pod(json!({})));
     assert!(admit(&big, IMAGE).is_ok());
