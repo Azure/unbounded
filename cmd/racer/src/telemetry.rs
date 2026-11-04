@@ -50,15 +50,15 @@ pub const CONTROL_SLOTS: usize = server::CONTROL_SLOTS + server::JSON_CONTROL_SL
 /// discovered report (charged against `hardware::WORKING_BYTES` by
 /// `hardware::Walk`, which aborts with `response_too_large` when exhausted) is
 /// alive alongside the JSON buffer. The JSON buffer is allocated once with
-/// capacity `MAX_BODY_BYTES` (see `Bounded`), never grows, and becomes the
-/// result held for the response, so one `MAX_RESPONSE_BYTES` term covers both
+/// capacity `HARDWARE_BODY_BYTES` (see `Bounded`), never grows, and becomes the
+/// result held for the response, so one `HARDWARE_BODY_BYTES` term covers both
 /// the encoding buffer and the held result. The report is dropped before the
 /// result is published. The detached discovery helper's thread stack
 /// (`HARDWARE_STACK_BYTES`) is charged too, since a blocked sysfs read can keep
 /// the helper alive after diagnostics teardown.
 pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
     + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
-    + server::MAX_RESPONSE_BYTES
+    + HARDWARE_BODY_BYTES
     + crate::hardware::WORKING_BYTES
     + HARDWARE_STACK_BYTES;
 
@@ -66,6 +66,12 @@ pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
 const HARDWARE_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const _: () = assert!(server::MAX_BODY_BYTES <= server::MAX_RESPONSE_BYTES);
+const _: () = assert!(HARDWARE_BODY_BYTES <= server::MAX_BODY_BYTES);
+
+/// Largest `/debug/hardware` JSON body. Kept at its original 64 KiB bound,
+/// independent of the larger response buffer `/metrics` needs, so the
+/// hardware working budget does not grow with it.
+pub(crate) const HARDWARE_BODY_BYTES: usize = 64 * 1024 - 256;
 const _: () = assert!(RESERVED_BYTES >= server::RESERVED_BYTES + HARDWARE_BYTES);
 
 /// Deadline for one `/debug/hardware` request, covering discovery and the response.
@@ -218,7 +224,7 @@ pub(crate) type HardwareCharge = Arc<flow_control::Charge<AdmissionPolicy>>;
 /// Portion of `RESERVED_BYTES` funding one hardware discovery, its helper
 /// stack, and its result.
 const HARDWARE_BYTES: usize =
-    server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES;
+    HARDWARE_BODY_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES;
 impl DiagnosticIo {
     /// Explicit startup acquisition, using the worker's already-budgeted reactor.
     /// Must run before ordinary request admission fills the memory quota.
@@ -357,7 +363,7 @@ fn hardware_request(
     if active.strong_count() != 0 {
         return Err(server::BinaryError::Busy);
     }
-    let session = HardwareSession::start(prepare(), server::MAX_BODY_BYTES, charge.clone())?;
+    let session = HardwareSession::start(prepare(), HARDWARE_BODY_BYTES, charge.clone())?;
     *active = Arc::downgrade(&session.state);
     Ok(server::BinaryResponse {
         kind: server::BinaryKind::Json,
@@ -757,18 +763,18 @@ mod encode_report_tests {
             RESERVED_BYTES,
             server::RESERVED_BYTES
                 + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
-                + server::MAX_RESPONSE_BYTES
+                + HARDWARE_BODY_BYTES
                 + crate::hardware::WORKING_BYTES
                 + HARDWARE_STACK_BYTES
         );
         assert_eq!(HARDWARE_STACK_BYTES, 2 * 1024 * 1024);
         assert_eq!(
             HARDWARE_BYTES,
-            server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES
+            HARDWARE_BODY_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES
         );
         let report = crate::hardware::Report::default();
-        let body = encode_report(&report, server::MAX_BODY_BYTES).unwrap();
-        assert!(body.capacity() <= server::MAX_RESPONSE_BYTES);
+        let body = encode_report(&report, HARDWARE_BODY_BYTES).unwrap();
+        assert!(body.capacity() <= HARDWARE_BODY_BYTES);
     }
 
     #[test]
@@ -3933,7 +3939,7 @@ pub(crate) mod tests {
             let text = diagnostic_response(&telemetry, "/debug/hardware/");
             assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
             set_hardware(&telemetry, || crate::hardware::Report {
-                errors: vec!["x".repeat(::telemetry::server::MAX_BODY_BYTES)],
+                errors: vec!["x".repeat(crate::telemetry::HARDWARE_BODY_BYTES)],
                 ..Default::default()
             });
             let text = diagnostic_response(&telemetry, "/debug/hardware");
@@ -3988,7 +3994,7 @@ pub(crate) mod tests {
                 Err(abort)
             });
             let session =
-                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                HardwareSession::start(job, crate::telemetry::HARDWARE_BODY_BYTES, test_charge())
                     .unwrap();
             running.recv_timeout(Duration::from_secs(5)).unwrap();
             session.cancel();
@@ -4097,7 +4103,7 @@ pub(crate) mod tests {
                 Ok(crate::hardware::Report::default())
             });
             let session =
-                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                HardwareSession::start(job, crate::telemetry::HARDWARE_BODY_BYTES, test_charge())
                     .unwrap();
             let weak = Arc::downgrade(&session.state);
             // Dropping the session cancels without joining the blocked helper.
@@ -4172,7 +4178,7 @@ pub(crate) mod tests {
             use ::telemetry::server::BinarySession;
             let job: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
             let session =
-                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                HardwareSession::start(job, crate::telemetry::HARDWARE_BODY_BYTES, test_charge())
                     .unwrap();
             let fd = session.state.completion.try_clone().unwrap();
             let mut poll = libc::pollfd {
@@ -4838,6 +4844,11 @@ pub(crate) mod tests {
             finish(server, &scope, &reactor);
         }
 
+        /// Estimated largest catalog: key bundles are capped at
+        /// `racer_control_wire::MAX_BUNDLE_BYTES` (512 KiB), which holds
+        /// about 624 caches' keys.
+        const MAX_METRIC_CACHES: usize = 624;
+
         #[test]
         fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
             use crate::model::WorkerId;
@@ -4923,7 +4934,29 @@ pub(crate) mod tests {
                 cgroup_limit: Some(u64::MAX),
                 pressure_some_avg10: Some(100.0),
             });
+            // Every cache-labeled series at the maximum catalog, with
+            // maximum-length names and values, spread across all workers.
+            let caches: Vec<_> = (0..MAX_METRIC_CACHES)
+                .map(|index| crate::telemetry::CacheDiskUsage {
+                    cache: format!("{index:04}{}", "a".repeat(249)).into(),
+                    resident: u64::MAX,
+                    share: u64::MAX,
+                })
+                .collect();
+            for metrics in &workers {
+                metrics.observe_cache_disks(caches.clone());
+            }
             let text = diagnostic_text(&telemetry, "/metrics");
+            assert!(text.contains(&format!(
+                "racer_cache_disk_share_bytes{{cache=\"{:04}{}\"}}",
+                MAX_METRIC_CACHES - 1,
+                "a".repeat(249)
+            )));
+            assert!(
+                text.len() < ::telemetry::server::MAX_BODY_BYTES,
+                "{} bytes",
+                text.len()
+            );
             for name in [
                 "racer_admission_used{class=\"ordinary_outbound_connection\"}",
                 "racer_staging_pool_trimmed_total ",
@@ -5550,8 +5583,8 @@ pub(crate) mod tests {
             );
             assert_eq!(out.text.lines().count(), 65);
             assert!(out.text.contains("\nseq=2 "));
-            assert!(out.text.len() + 512 < MAX_RESPONSE_BYTES);
-            const { assert!(MAX_RESPONSE_BYTES <= 64 * 1024) };
+            // The full ring stays small regardless of the response buffer size.
+            assert!(out.text.len() + 512 < 64 * 1024);
             for forbidden in [
                 " key=",
                 " nonce=",

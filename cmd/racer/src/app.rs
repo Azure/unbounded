@@ -3566,7 +3566,8 @@ mod lifecycle_policy_tests {
                     "RACER_PLAINTEXT_BYTES" => Some("4294967296".into()),
                     "RACER_CIPHERTEXT_BYTES" => Some("8589934592".into()),
                     "RACER_DIRTY_BYTES" => Some("1073741824".into()),
-                    "RACER_REQUEST_CONTEXT_BYTES" => Some("268435456".into()),
+                    // Each worker funds the 1 MiB diagnostic response buffers.
+                    "RACER_REQUEST_CONTEXT_BYTES" => Some("536870912".into()),
                     "RACER_QUEUE_ENTRIES" | "RACER_CLIENT_CONNECTIONS" | "RACER_PIPES" => {
                         Some("1024".into())
                     }

@@ -26,7 +26,7 @@ use serde::Serialize;
 
 /// Working-memory budget for one discovery.
 ///
-/// The encoded response is capped at `MAX_BODY_BYTES` (about 64 KiB). The
+/// The encoded response is capped at `HARDWARE_BODY_BYTES` (about 64 KiB). The
 /// in-memory report is charged with per-entry overhead (string and vector
 /// headers, struct sizes) that pretty JSON does not carry, while JSON adds keys
 /// and indentation the structs do not, so the two are of similar magnitude. Four
@@ -34,7 +34,7 @@ use serde::Serialize;
 /// which is dropped before encoding, while still aborting long before a host
 /// whose report could never fit in one response exhausts memory. Defined here so
 /// the diagnostic memory reservation can charge it.
-pub const WORKING_BYTES: usize = 4 * ::telemetry::server::MAX_BODY_BYTES;
+pub const WORKING_BYTES: usize = 4 * crate::telemetry::HARDWARE_BODY_BYTES;
 
 /// Largest sysfs attribute read. Longer files are treated as malformed (`null`).
 pub const MAX_ATTRIBUTE_BYTES: usize = 4096;

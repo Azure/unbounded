@@ -39,7 +39,13 @@ pub const MAX_CONNECTIONS: usize = 4;
 pub const MAX_REQUEST_BYTES: usize = 1024;
 
 /// Fixed buffer capacity shared by request parsing and response formatting.
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+///
+/// `/metrics` is rendered whole into this buffer, so it must fit the largest
+/// catalog: about 624 caches with 253-byte names, two cache-labeled series
+/// each (about 400 KiB), plus 64 workers' quota series and the fixed GPU and
+/// prefetch families. 1 MiB leaves headroom; `racer` tests check the size at
+/// maximum cardinality.
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Bytes at the front of each response buffer reserved for the status line and headers.
 const HEAD_BYTES: usize = 256;
