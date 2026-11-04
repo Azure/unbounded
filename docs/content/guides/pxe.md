@@ -84,15 +84,6 @@ Go templates rendered per-machine at serve time; other files are served
 verbatim. A `metadata.yaml` file in the netboot image provides image-level
 configuration such as `dhcpBootImageName` and `httpBootPath`.
 
-{{< callout type="warning" >}}
-Metalman loads `.tmpl` files from the selected netboot OCI artifact and renders
-those artifact contents for each Machine. For a Machine pinned with
-`spec.host.netboot.netbootImage`, deploying a new Metalman controller image
-alone does not update its templates. To roll out a template change, publish a
-matching netboot artifact and select it explicitly, or update the configured
-default for Machines that omit `netbootImage`.
-{{< /callout >}}
-
 Images are built, tagged, and pushed using standard container tooling:
 
 ```bash
