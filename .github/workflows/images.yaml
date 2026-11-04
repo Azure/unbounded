@@ -72,6 +72,9 @@ jobs:
 
           if [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
+          elif [[ "$name" == host-azurelinux3-mshv ]]; then
+            # The Microsoft Hypervisor packages are x86_64 only.
+            platforms="linux/amd64"
           else
             platforms="linux/amd64,linux/arm64"
           fi
