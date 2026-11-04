@@ -17,10 +17,11 @@ use crate::racer::{Client, Frame, Scratch, Subscription};
 use crate::splice::{Pipe, forward, send_more};
 use std::io::IoSlice;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 /// Largest accepted request head. Go's net/http allows MaxHeaderBytes
 /// (32 KiB) plus 4 KiB of slack; matching it keeps every request the Go
@@ -56,12 +57,33 @@ struct Shared {
     client: Client,
 }
 
+/// An accepted connection handed to a worker with its slot.
+pub type Handoff = (std::net::TcpStream, OwnedSemaphorePermit);
+
+/// Another worker's inbox, as seen by the accepting worker.
+pub struct Peer {
+    pub inbox: mpsc::UnboundedSender<Handoff>,
+    /// Connections the worker is serving.
+    pub active: Arc<AtomicUsize>,
+}
+
+/// What a worker serves: the listener (the accepting worker, which hands
+/// connections to `peers` too) or connections handed to it.
+pub enum Source {
+    Listener {
+        listener: TcpListener,
+        peers: Vec<Peer>,
+    },
+    Inbox(mpsc::UnboundedReceiver<Handoff>),
+}
+
 /// Serve until `shutdown` turns true, then let in-flight requests finish for
-/// up to `SHUTDOWN_GRACE`.
+/// up to `SHUTDOWN_GRACE`. `active` counts this worker's connections.
 pub async fn serve(
-    listener: TcpListener,
+    source: Source,
     client: Client,
     config: Config,
+    active: Arc<AtomicUsize>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let shared = Arc::new(Shared {
@@ -70,40 +92,104 @@ pub async fn serve(
         header_timeout: config.request_timeout.min(HEADER_TIMEOUT),
         client,
     });
-    // Like Go's limited listener: take a slot before accepting, so excess
-    // connections wait in the kernel backlog instead of being accepted.
     let slots = config.slots;
-    loop {
-        let permit = tokio::select! {
-            biased;
-            _ = crate::stopped(&mut shutdown) => break,
-            permit = slots.clone().acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => break,
-            },
-        };
-        let stream = tokio::select! {
-            biased;
-            _ = crate::stopped(&mut shutdown) => break,
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(_) => {
-                    // Typically EMFILE or ECONNABORTED: back off briefly.
-                    drop(permit);
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    continue;
-                }
-            },
-        };
+    let conn_shutdown = shutdown.clone();
+    let spawn = |stream: TcpStream, permit: OwnedSemaphorePermit| {
         let shared = shared.clone();
-        let shutdown = shutdown.clone();
+        let shutdown = conn_shutdown.clone();
+        let active = active.clone();
+        active.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             Conn::new(stream, shared, shutdown).run().await;
+            active.fetch_sub(1, Ordering::Relaxed);
             drop(permit);
         });
+    };
+    match source {
+        Source::Listener { listener, peers } => {
+            let mut next = 0usize;
+            loop {
+                // Like Go's limited listener: take a slot before accepting,
+                // so excess connections wait in the kernel backlog instead
+                // of being accepted.
+                let permit = tokio::select! {
+                    biased;
+                    _ = crate::stopped(&mut shutdown) => break,
+                    permit = slots.clone().acquire_owned() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    },
+                };
+                let stream = tokio::select! {
+                    biased;
+                    _ = crate::stopped(&mut shutdown) => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => stream,
+                        Err(_) => {
+                            // Typically EMFILE or ECONNABORTED: back off briefly.
+                            drop(permit);
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            continue;
+                        }
+                    },
+                };
+                if peers.is_empty() {
+                    spawn(stream, permit);
+                    continue;
+                }
+                // Hand the connection to the worker serving the fewest,
+                // rotating the starting point to spread ties.
+                let workers = peers.len() + 1;
+                next = (next + 1) % workers;
+                let load = |i: usize| match i {
+                    0 => active.load(Ordering::Relaxed),
+                    i => peers[i - 1].active.load(Ordering::Relaxed),
+                };
+                let pick = (0..workers)
+                    .map(|k| (next + k) % workers)
+                    .min_by_key(|&i| load(i))
+                    .unwrap_or(0);
+                if pick == 0 {
+                    spawn(stream, permit);
+                } else if let Ok(stream) = stream.into_std() {
+                    // Count it now so back-to-back accepts see it.
+                    let peer = &peers[pick - 1];
+                    peer.active.fetch_add(1, Ordering::Relaxed);
+                    if peer.inbox.send((stream, permit)).is_err() {
+                        peer.active.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            drop(listener);
+        }
+        Source::Inbox(mut inbox) => loop {
+            let (stream, permit) = tokio::select! {
+                biased;
+                _ = crate::stopped(&mut shutdown) => {
+                    // Connections already accepted are served (and closed
+                    // when idle), as if accepted here.
+                    inbox.close();
+                    while let Ok((stream, permit)) = inbox.try_recv() {
+                        active.fetch_sub(1, Ordering::Relaxed);
+                        if let Ok(stream) = TcpStream::from_std(stream) {
+                            spawn(stream, permit);
+                        }
+                    }
+                    break;
+                }
+                handoff = inbox.recv() => match handoff {
+                    Some(handoff) => handoff,
+                    None => break,
+                },
+            };
+            // The accepting worker already counted this connection.
+            active.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(stream) = TcpStream::from_std(stream) {
+                spawn(stream, permit);
+            }
+        },
     }
-    drop(listener);
     // Every connection task, on any worker, holds one slot; all slots back
     // means all done. Workers drain in turn, each releasing them on return.
     let all = u32::try_from(config.max_connections).unwrap_or(u32::MAX);
