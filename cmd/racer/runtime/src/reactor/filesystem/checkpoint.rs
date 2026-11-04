@@ -257,7 +257,7 @@ impl<T, const HEADER: usize> Iterator for Candidates<T, HEADER> {
 enum CandidateFile {
     Real(std::fs::File),
     #[cfg(feature = "simulation")]
-    Sim(crate::reactor::simulation::Handle, u64),
+    Sim(crate::reactor::descriptor::Descriptor, u64),
 }
 
 impl CandidateFile {
@@ -267,11 +267,8 @@ impl CandidateFile {
             libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
         #[cfg(feature = "simulation")]
         if let Some(sim) = crate::reactor::simulation::Simulation::current() {
-            let handle = sim
-                .open(None, path, libc::O_RDONLY | flags)?
-                .into_sim()
-                .expect("simulated file");
-            return Ok(Self::Sim(handle, 0));
+            let file = sim.open(None, path, libc::O_RDONLY | flags)?;
+            return Ok(Self::Sim(file, 0));
         }
         OpenOptions::new()
             .read(true)
@@ -288,8 +285,8 @@ impl CandidateFile {
                 (m.is_file(), m.len())
             }
             #[cfg(feature = "simulation")]
-            Self::Sim(handle, _) => {
-                let m = handle.stat()?;
+            Self::Sim(file, _) => {
+                let m = file.as_sim().expect("simulated file").stat()?;
                 (
                     m.stx_mode as u32 & libc::S_IFMT == libc::S_IFREG,
                     m.stx_size,
@@ -309,8 +306,11 @@ impl Read for CandidateFile {
         match self {
             Self::Real(file) => file.read(bytes),
             #[cfg(feature = "simulation")]
-            Self::Sim(handle, offset) => {
-                let n = handle.file_read(*offset, bytes)?;
+            Self::Sim(file, offset) => {
+                let n = file
+                    .as_sim()
+                    .expect("simulated file")
+                    .file_read(*offset, bytes)?;
                 *offset += n as u64;
                 Ok(n)
             }

@@ -440,7 +440,7 @@ impl<P: Policy> PipeLease<P> {
             let pipe = self.resources.as_mut().unwrap();
             match (pipe.read.as_sim(), socket.as_sim()) {
                 (Some(read), Some(socket)) => {
-                    let sent = read.splice(socket, count.min(pipe.buffered))?;
+                    let sent = read.splice(&socket, count.min(pipe.buffered))?;
                     pipe.buffered -= sent;
                     return Ok(sent);
                 }

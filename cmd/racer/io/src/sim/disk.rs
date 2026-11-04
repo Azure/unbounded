@@ -1112,7 +1112,7 @@ impl Handle {
     }
 
     /// Writes a bounded sparse range without modifying durable shared pages.
-    pub(crate) fn file_write(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+    pub fn file_write(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         if offset > i64::MAX as u64 {
             return Err(errno(libc::EINVAL));
         }

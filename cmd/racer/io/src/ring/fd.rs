@@ -359,6 +359,20 @@ from_host!(
     std::os::unix::net::UnixDatagram
 );
 
+impl AsRawFd for Descriptor {
+    /// The host descriptor number.
+    ///
+    /// # Panics
+    /// Panics for a simulated descriptor; use [`Descriptor::raw`] instead.
+    fn as_raw_fd(&self) -> RawFd {
+        assert!(
+            !self.is_sim(),
+            "simulated descriptor reached a host syscall"
+        );
+        self.raw
+    }
+}
+
 impl AsFd for Descriptor {
     /// Borrow a host descriptor.
     ///

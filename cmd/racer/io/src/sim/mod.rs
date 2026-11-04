@@ -15,6 +15,8 @@ use std::{
     rc::Rc,
 };
 
+#[doc(hidden)]
+pub mod compat;
 mod driver;
 mod network;
 #[cfg(test)]
@@ -618,14 +620,10 @@ impl SimOs {
     }
 }
 
-/// Simulated view of an owned descriptor.
-trait AsSim {
-    fn as_sim(&self) -> Option<Handle>;
-}
-
-impl AsSim for Descriptor {
-    /// The resource view, if this descriptor is simulated.
-    fn as_sim(&self) -> Option<Handle> {
+impl Descriptor {
+    /// A non-owning view of the simulated resource, if this descriptor is
+    /// simulated. The descriptor keeps closing ownership.
+    pub fn as_sim(&self) -> Option<Handle> {
         self.sim_os().map(|os| os.view(self.raw()))
     }
 }

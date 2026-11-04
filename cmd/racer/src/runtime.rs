@@ -1171,7 +1171,8 @@ mod tests {
                     pipe.try_splice_descriptor(&a, 3).unwrap_err().kind(),
                     std::io::ErrorKind::WouldBlock
                 );
-                let b = b.into_sim().unwrap();
+                let b_owner = b;
+                let b = b_owner.as_sim().unwrap();
                 let mut bytes = [0; 2];
                 b.recv(&mut bytes).unwrap();
                 assert_eq!(&bytes, b"ab");

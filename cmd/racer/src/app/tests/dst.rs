@@ -1991,7 +1991,7 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> &uring_runtime::reactor::simulation::Handle {
+fn handle(fd: &Descriptor) -> uring_runtime::reactor::simulation::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {

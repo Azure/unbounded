@@ -391,11 +391,13 @@ pub async fn exchange_small(
     endpoint.resolve(resolver, scope).await?;
     let address = endpoint.address()?;
     let lease = Rc::new(reactor.reserve_connection(ResourceClass::ControlConnection)?);
-    let fd = Rc::new(Descriptor::socket(if address.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    })?);
+    let fd = Rc::new(uring_runtime::reactor::descriptor::socket(
+        if address.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        },
+    )?);
     reactor
         .connect_with_lease(
             fd.clone(),

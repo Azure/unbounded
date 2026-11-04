@@ -132,14 +132,7 @@ pub struct SubmissionCapacity {
 pub const SUBMISSION_BYTES: usize = 4096;
 
 /// An owned address; the encoded sockaddr remains pinned in the in-flight owner.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum SocketAddress {
-    /// IPv4 or IPv6 address, including port and any IPv6 scope identifier.
-    Inet(SocketAddr),
-    /// Filesystem pathname only. Abstract Unix addresses are unsupported; empty
-    /// paths and embedded NUL bytes are rejected by both backends.
-    Unix(PathBuf),
-}
+pub use racer_io::ring::SocketAddress;
 
 /// Cloneable cross-thread wake endpoint for worker command/crypto producers.
 #[derive(Clone)]
@@ -2506,7 +2499,7 @@ impl<S: Scope> State<S> {
             return submission_result(result);
         }
         #[cfg(feature = "simulation")]
-        if let Some(driver) = &self.simulation {
+        if let Some(driver) = &mut self.simulation {
             // This advances simulated kernel execution, not just SQ consumption.
             // Guard tests below use real rings rather than this simulation path.
             driver.submit();
@@ -2685,12 +2678,6 @@ impl<V> Table<V> {
         self.slots
             .iter()
             .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
-    }
-
-    /// Iterate live identifiers in order.
-    #[cfg(all(test, feature = "simulation"))]
-    fn keys(&self) -> impl Iterator<Item = &IoId> {
-        self.iter().map(|(id, _)| id)
     }
 
     /// Iterate live entries in identifier order.
@@ -3068,467 +3055,29 @@ pub mod timer {
 }
 
 pub mod descriptor {
-    //! Concrete OS resource owner. Simulated resources never have a raw descriptor.
+    //! Owned descriptors are shared with `racer-io`. These constructors consult
+    //! the thread-selected simulation (a migration shim; delete with this crate).
     use crate::{Error, Result};
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+    pub use racer_io::ring::Descriptor;
 
-    /// Owned host or simulation resource. `AsRawFd` and `AsFd` panic for simulated
-    /// handles: use `as_sim` or fallible `into_host` at explicit backend boundaries.
-    #[derive(Debug)]
-    pub struct Descriptor(Kind);
-
-    /// Backend-specific ownership, never a fabricated raw descriptor.
-    #[derive(Debug)]
-    enum Kind {
-        Real(OwnedFd),
+    /// Bind a nonblocking TCP listener in the currently selected environment.
+    pub fn tcp_listener(address: std::net::SocketAddr) -> Result<Descriptor> {
         #[cfg(feature = "simulation")]
-        Sim(super::simulation::Handle),
+        if let Some(sim) = super::simulation::Simulation::current() {
+            return sim
+                .listen(super::SocketAddress::Inet(address))
+                .map_err(|_| Error::Io);
+        }
+        Descriptor::tcp_listener(address).map_err(|_| Error::Io)
     }
 
-    impl Descriptor {
-        /// Borrow a simulated resource without exposing an invented host descriptor.
+    /// Create a nonblocking, close-on-exec stream socket in the selected environment.
+    pub fn socket(domain: i32) -> Result<Descriptor> {
         #[cfg(feature = "simulation")]
-        pub fn as_sim(&self) -> Option<&super::simulation::Handle> {
-            match &self.0 {
-                Kind::Sim(handle) => Some(handle),
-                Kind::Real(_) => None,
-            }
+        if let Some(sim) = super::simulation::Simulation::current() {
+            return sim.socket(domain).map_err(|_| Error::Io);
         }
-
-        /// Extract a simulated resource, returning the unchanged host owner on mismatch.
-        #[cfg(feature = "simulation")]
-        pub fn into_sim(self) -> std::result::Result<super::simulation::Handle, Self> {
-            match self.0 {
-                Kind::Sim(handle) => Ok(handle),
-                other => Err(Self(other)),
-            }
-        }
-
-        /// Set TCP_NODELAY for TCP callers, including disabling it when false.
-        pub fn enable_tcp_nodelay(&self, enabled: bool) -> Result<()> {
-            #[cfg(feature = "simulation")]
-            if self.as_sim().is_some() {
-                return Ok(());
-            }
-            let value: libc::c_int = enabled.into();
-            // SAFETY: the descriptor is owned and setsockopt reads one live integer.
-            let result = unsafe {
-                libc::setsockopt(
-                    self.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    libc::TCP_NODELAY,
-                    (&value as *const libc::c_int).cast(),
-                    std::mem::size_of_val(&value) as libc::socklen_t,
-                )
-            };
-            if result < 0 {
-                return Err(Error::Io);
-            }
-            Ok(())
-        }
-
-        /// Numeric socket identity only, sampled on failure while the owner is live.
-        pub fn tcp_tuple(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
-            #[cfg(feature = "simulation")]
-            if self.as_sim().is_some() {
-                return None;
-            }
-            // SAFETY: ManuallyDrop borrows this live descriptor without closing it.
-            let socket = std::mem::ManuallyDrop::new(unsafe {
-                std::net::TcpStream::from_raw_fd(self.as_raw_fd())
-            });
-            Some((socket.local_addr().ok()?, socket.peer_addr().ok()?))
-        }
-
-        /// The listener must already be nonblocking; accept4 flags apply only to the
-        /// accepted socket. EINTR is retried a bounded number of times; other errno
-        /// values, including EAGAIN, remain available to caller retry policy.
-        pub fn try_accept(&self) -> std::io::Result<Self> {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.accept();
-            }
-            // SAFETY: live listener; successful descriptor is immediately owned.
-            let fd = retry_interrupted(|| {
-                count(unsafe {
-                    libc::accept4(
-                        self.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                    ) as isize
-                })
-            })?;
-            Ok(unsafe { Self::from_raw_fd(fd as RawFd) })
-        }
-
-        /// Explicit extraction for host-only adapters. A simulated handle is rejected.
-        pub fn into_host(self) -> std::result::Result<OwnedFd, Self> {
-            match self.0 {
-                Kind::Real(fd) => Ok(fd),
-                #[cfg(feature = "simulation")]
-                other => Err(Self(other)),
-            }
-        }
-
-        /// Bind a nonblocking TCP listener in the currently selected environment.
-        pub fn tcp_listener(address: std::net::SocketAddr) -> Result<Self> {
-            #[cfg(feature = "simulation")]
-            if let Some(sim) = super::simulation::Simulation::current() {
-                return sim
-                    .listen(super::SocketAddress::Inet(address))
-                    .map_err(|_| Error::Io);
-            }
-            let listener = std::net::TcpListener::bind(address).map_err(|_| Error::Io)?;
-            listener.set_nonblocking(true).map_err(|_| Error::Io)?;
-            Ok(listener.into())
-        }
-
-        /// Create a nonblocking, close-on-exec stream socket for the requested family.
-        pub fn socket(domain: i32) -> Result<Self> {
-            #[cfg(feature = "simulation")]
-            if let Some(sim) = super::simulation::Simulation::current() {
-                return sim.socket(domain).map_err(|_| Error::Io);
-            }
-            let raw = unsafe {
-                libc::socket(
-                    domain,
-                    libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                    0,
-                )
-            };
-            if raw < 0 {
-                return Err(Error::Io);
-            }
-            Ok(unsafe { Self::from_raw_fd(raw) })
-        }
-
-        /// Enable O_NONBLOCK and FD_CLOEXEC, preserving other status/descriptor flags.
-        /// O_NONBLOCK affects duplicated descriptors sharing the open file description;
-        /// FD_CLOEXEC is local to this descriptor. Failure may leave partial changes.
-        pub fn set_nonblocking(&self) -> Result<()> {
-            #[cfg(feature = "simulation")]
-            if self.as_sim().is_some() {
-                return Ok(());
-            }
-            let fd = self.as_raw_fd();
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                let descriptor_flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0
-                    || descriptor_flags < 0
-                    || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
-                    || libc::fcntl(fd, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC) < 0
-                {
-                    return Err(Error::Io);
-                }
-            }
-            Ok(())
-        }
-
-        /// Send without waiting or raising SIGPIPE; preserve short progress and errno.
-        /// Only zero-progress EINTR is retried, for at most four attempts.
-        pub fn try_send(&self, bytes: &[u8]) -> std::io::Result<usize> {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.send(bytes);
-            }
-            retry_interrupted(|| {
-                count(unsafe {
-                    libc::send(
-                        self.as_raw_fd(),
-                        bytes.as_ptr().cast(),
-                        bytes.len(),
-                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                    )
-                })
-            })
-        }
-
-        /// Receive without waiting; preserve EOF, short progress, and errno.
-        /// Only zero-progress EINTR is retried, for at most four attempts.
-        pub fn try_recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.recv(bytes);
-            }
-            retry_interrupted(|| {
-                count(unsafe {
-                    libc::recv(
-                        self.as_raw_fd(),
-                        bytes.as_mut_ptr().cast(),
-                        bytes.len(),
-                        libc::MSG_DONTWAIT,
-                    )
-                })
-            })
-        }
-
-        /// Check for an idle connected socket without consuming any queued byte.
-        /// Unexpected data, EOF, and errors all make a pooled socket unsuitable.
-        pub fn idle_healthy(&self) -> bool {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.idle_healthy();
-            }
-            let mut byte = 0u8;
-            let result = unsafe {
-                libc::recv(
-                    self.as_raw_fd(),
-                    (&mut byte as *mut u8).cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
-        }
-
-        /// Full peer close, not a write-half shutdown. Consumes no bytes and never
-        /// competes with parsing, even during acquisition or response writes.
-        pub fn peer_disconnected(&self) -> bool {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.peer_disconnected();
-            }
-            self.host_closed(0)
-        }
-
-        /// Unlike POLLHUP, POLLRDHUP notices a peer FIN while our send side is open.
-        pub fn peer_read_closed(&self) -> bool {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.peer_read_closed();
-            }
-            self.host_closed(libc::POLLRDHUP)
-        }
-
-        /// Shut down one or both socket directions without releasing ownership.
-        pub fn shutdown(&self, how: i32) -> Result<()> {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.shutdown(how).map_err(Error::from_io);
-            }
-            // SAFETY: shutdown only changes this live owned descriptor's state.
-            if unsafe { libc::shutdown(self.as_raw_fd(), how) } < 0 {
-                return Err(Error::from_io(std::io::Error::last_os_error()));
-            }
-            Ok(())
-        }
-
-        /// Require a stream socket, rejecting files and other socket kinds.
-        pub fn validate_socket(&self) -> Result<()> {
-            #[cfg(feature = "simulation")]
-            if let Some(handle) = self.as_sim() {
-                return handle.validate_socket().map_err(|_| Error::InvalidInput);
-            }
-            let mut kind: libc::c_int = 0;
-            let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
-            let result = unsafe {
-                libc::getsockopt(
-                    self.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_TYPE,
-                    (&mut kind as *mut libc::c_int).cast(),
-                    &mut length,
-                )
-            };
-            if result < 0 || kind != libc::SOCK_STREAM {
-                return Err(Error::InvalidInput);
-            }
-            Ok(())
-        }
-
-        /// Inspect host closure flags without waiting or taking descriptor ownership.
-        fn host_closed(&self, interest: i16) -> bool {
-            let mut fd = libc::pollfd {
-                fd: self.as_raw_fd(),
-                events: interest,
-                revents: 0,
-            };
-            // SAFETY: poll only inspects one live descriptor and never waits.
-            (unsafe { libc::poll(&mut fd, 1, 0) > 0 })
-                && fd.revents & (interest | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-        }
-    }
-
-    impl AsRawFd for Descriptor {
-        /// Borrow a host descriptor number, rejecting simulated resources.
-        fn as_raw_fd(&self) -> RawFd {
-            match &self.0 {
-                Kind::Real(fd) => fd.as_raw_fd(),
-                #[cfg(feature = "simulation")]
-                Kind::Sim(_) => panic!("simulated descriptor reached a host syscall"),
-            }
-        }
-    }
-
-    impl AsFd for Descriptor {
-        /// Borrow host ownership for a syscall, rejecting simulated resources.
-        fn as_fd(&self) -> BorrowedFd<'_> {
-            match &self.0 {
-                Kind::Real(fd) => fd.as_fd(),
-                #[cfg(feature = "simulation")]
-                Kind::Sim(_) => panic!("simulated descriptor reached a host syscall"),
-            }
-        }
-    }
-
-    impl FromRawFd for Descriptor {
-        /// Assume sole closing ownership of a live host descriptor.
-        unsafe fn from_raw_fd(fd: RawFd) -> Self {
-            Self(Kind::Real(unsafe { OwnedFd::from_raw_fd(fd) }))
-        }
-    }
-
-    /// Implement closing-ownership transfer for supported host resource adapters.
-    macro_rules! from_host {
-        ($($ty:ty),*) => { $(impl From<$ty> for Descriptor {
-            /// Transfer a host resource's closing ownership into the reactor adapter.
-            fn from(value: $ty) -> Self { Self(Kind::Real(value.into())) }
-        })* };
-    }
-
-    from_host!(
-        OwnedFd,
-        std::fs::File,
-        std::net::TcpStream,
-        std::net::TcpListener,
-        std::net::UdpSocket,
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixListener,
-        std::os::unix::net::UnixDatagram
-    );
-
-    #[cfg(feature = "simulation")]
-    impl From<super::simulation::Handle> for Descriptor {
-        /// Retain a simulated owner without assigning it a host descriptor number.
-        fn from(handle: super::simulation::Handle) -> Self {
-            Self(Kind::Sim(handle))
-        }
-    }
-
-    /// Convert a syscall byte count without losing errno on failure.
-    fn count(value: isize) -> std::io::Result<usize> {
-        if value < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(value as usize)
-        }
-    }
-
-    /// Bound zero-progress EINTR retries, returning short success and other errors.
-    fn retry_interrupted<T>(mut syscall: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
-        for _ in 0..3 {
-            match syscall() {
-                Err(error) if error.raw_os_error() == Some(libc::EINTR) => (),
-                result => return result,
-            }
-        }
-        syscall()
-    }
-
-    #[cfg(all(test, feature = "simulation"))]
-    #[test]
-    /// Compare descriptor half-close behavior across host and simulated streams.
-    fn descriptor_half_close_matches_simulated_and_host_sockets() {
-        let sim = super::simulation::Simulation::new();
-        let simulated = sim.socket_pair();
-        let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
-        for (left, right) in [simulated, (left.into(), right.into())] {
-            left.try_send(b"x").unwrap();
-            left.shutdown(libc::SHUT_WR).unwrap();
-            assert!(right.peer_read_closed());
-            assert!(!right.peer_disconnected());
-            assert_eq!(right.try_recv(&mut [0; 1]).unwrap(), 1);
-            assert_eq!(right.try_recv(&mut [0; 1]).unwrap(), 0);
-            assert_eq!(right.try_send(b"r").unwrap(), 1);
-            assert_eq!(left.try_recv(&mut [0; 1]).unwrap(), 1);
-            assert_eq!(left.shutdown(123), Err(Error::Os(libc::EINVAL)));
-            drop(left);
-            assert!(right.peer_disconnected());
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        //! Host descriptor flags, bounded retries, and backend separation contracts.
-        use super::*;
-
-        #[test]
-        /// Preserve short success and errno while bounding interrupted syscall retries.
-        fn interrupted_syscalls_retry_boundedly_without_hiding_errno_or_short_success() {
-            let mut calls = 0;
-            let result: std::io::Result<()> = retry_interrupted(|| {
-                calls += 1;
-                Err(std::io::Error::from_raw_os_error(libc::EINTR))
-            });
-            assert_eq!(calls, 4);
-            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINTR));
-            let mut calls = 0;
-            assert_eq!(
-                retry_interrupted(|| {
-                    calls += 1;
-                    if calls == 1 {
-                        Err(std::io::Error::from_raw_os_error(libc::EINTR))
-                    } else {
-                        Ok(1)
-                    }
-                })
-                .unwrap(),
-                1
-            );
-            assert_eq!(calls, 2);
-            let result: std::io::Result<()> =
-                retry_interrupted(|| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)));
-            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EAGAIN));
-        }
-
-        #[test]
-        /// Check reversible TCP_NODELAY and nonblocking close-on-exec configuration.
-        fn nodelay_can_be_disabled_and_nonblocking_sets_cloexec() {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let fd = Descriptor::from(client.try_clone().unwrap());
-            fd.enable_tcp_nodelay(true).unwrap();
-            assert!(client.nodelay().unwrap());
-            fd.enable_tcp_nodelay(false).unwrap();
-            assert!(!client.nodelay().unwrap());
-            fd.set_nonblocking().unwrap();
-            assert_ne!(
-                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-                0
-            );
-            assert_ne!(
-                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-                0
-            );
-        }
-
-        #[test]
-        /// Keep the response direction usable after a peer's write-half close.
-        fn peer_write_half_close_does_not_imply_full_disconnect() {
-            let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
-            let fd = Descriptor::from(left);
-            right.shutdown(std::net::Shutdown::Write).unwrap();
-            assert!(fd.peer_read_closed());
-            assert!(!fd.peer_disconnected());
-            assert_eq!(fd.try_send(b"response").unwrap(), 8);
-            drop(right);
-            assert!(fd.peer_disconnected());
-        }
-
-        #[cfg(feature = "simulation")]
-        #[test]
-        /// Prevent simulated owners from crossing host syscall adapter boundaries.
-        fn raw_simulated_descriptor_access_panics_and_host_extraction_is_fallible() {
-            let sim = super::super::simulation::Simulation::new();
-            let (fd, _peer) = sim.socket_pair();
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fd.as_raw_fd())).is_err()
-            );
-            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fd.as_fd())).is_err());
-            assert!(fd.into_host().is_err());
-        }
+        Descriptor::socket(domain).map_err(|_| Error::Io)
     }
 }
 

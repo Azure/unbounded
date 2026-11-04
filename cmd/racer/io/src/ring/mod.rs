@@ -16,7 +16,7 @@
 //! as is and never replayed.
 
 mod buffer;
-mod fd;
+pub(crate) mod fd;
 #[doc(hidden)]
 pub mod op;
 pub mod ops;

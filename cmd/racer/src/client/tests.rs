@@ -866,8 +866,8 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     assert_eq!(sim.metadata(&path).unwrap().0, inode);
     assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
     let client = sim.connect(SocketAddress::Unix(path)).unwrap();
-    let client = client.into_sim().unwrap();
-    client
+    let client_handle = client.as_sim().unwrap();
+    client_handle
         .send(&request("HEAD", "If-Match: \"v1\"\r\n"))
         .unwrap();
     // Exercise the same retirement path without a host filesystem. The queued
@@ -890,7 +890,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
             .unwrap();
         reactor.poll_budgeted(16).unwrap();
         worker.poll(&mut Context::from_waker(futures::task::noop_waker_ref()));
-        match client.recv(&mut bytes) {
+        match client_handle.recv(&mut bytes) {
             Ok(n) => response.extend_from_slice(&bytes[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
             Err(e) => panic!("{e}"),

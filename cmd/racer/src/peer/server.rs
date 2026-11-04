@@ -120,7 +120,7 @@ impl PeerServer {
     ) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor> {
         // False preserves the accepted socket's existing application policy.
         if self.tcp_nodelay {
-            fd.enable_tcp_nodelay(true)?;
+            fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
         }
         Ok(fd)
     }
@@ -249,8 +249,7 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd =
-                Rc::new(uring_runtime::reactor::descriptor::Descriptor::tcp_listener(address)?);
+            let fd = Rc::new(uring_runtime::reactor::descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
