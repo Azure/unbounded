@@ -1,7 +1,8 @@
 name: Set up Go with shared caches
 description: >-
-  Install Go from go.mod and restore the shared module cache plus one build
-  cache profile. Caches are saved only from push events (main and release
+  Install Go from go.mod and restore the shared module cache (unless
+  restore-mod-cache is false) plus one build cache profile. Build cache keys
+  end in a UTC date, so each profile saves at most once per day per branch. Caches are saved only from push events (main and release
   branches), and only by the job that owns them, so pull request and
   merge_group runs restore what their base branch wrote without adding
   entries of their own. Call the post step (this action with
@@ -25,6 +26,10 @@ inputs:
     description: Whether this job owns the module cache and saves it on push. Exactly one job should set this.
     required: false
     default: "false"
+  restore-mod-cache:
+    description: Whether to restore the shared module cache. Set to "false" for jobs where module downloads are fast enough to skip it.
+    required: false
+    default: "true"
   extra-build-paths:
     description: Extra newline-separated paths stored with the build cache profile (for example the golangci-lint cache).
     required: false
@@ -63,7 +68,10 @@ runs:
           echo "mod-key=go-mod-${RUNNER_OS}-${RUNNER_ARCH}-${goversion}-${sum}"
           echo "build-prefix=${prefix}-"
           echo "build-sum-prefix=${prefix}-${sum}-"
-          echo "build-key=${prefix}-${sum}-${GITHUB_SHA}"
+          # A UTC date suffix instead of the commit SHA limits each profile
+          # to one saved entry per day per branch, which keeps churn in the
+          # repository cache low.
+          echo "build-key=${prefix}-${sum}-$(date -u +%Y%m%d)"
           echo "build-paths<<EOF"
           go env GOCACHE
           if [ -n "$EXTRA" ]; then printf '%s\n' "$EXTRA"; fi
@@ -71,7 +79,7 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     - name: Restore Go module cache
-      if: inputs.phase == 'restore'
+      if: inputs.phase == 'restore' && inputs.restore-mod-cache == 'true'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.keys.outputs.gomodcache }}
@@ -87,7 +95,7 @@ runs:
           ${{ steps.keys.outputs.build-sum-prefix }}
           ${{ steps.keys.outputs.build-prefix }}
 
-    # The module cache key has no commit suffix, so an existing entry is never
+    # The module cache key has no date or commit suffix, so an existing entry is never
     # overwritten; skip the save when it already exists.
     - name: Check for existing Go module cache
       id: mod-exists
@@ -112,8 +120,20 @@ runs:
         path: ${{ steps.keys.outputs.gomodcache }}
         key: ${{ steps.keys.outputs.mod-key }}
 
-    - name: Save Go build cache
+    # The build key changes once per day, so later pushes on the same day
+    # would build an archive only for the save to be rejected. Skip the save
+    # when the entry already exists.
+    - name: Check for existing Go build cache
+      id: build-exists
       if: inputs.phase == 'save' && inputs.save-build-cache == 'true' && github.event_name == 'push'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.build-paths }}
+        key: ${{ steps.keys.outputs.build-key }}
+        lookup-only: true
+
+    - name: Save Go build cache
+      if: inputs.phase == 'save' && inputs.save-build-cache == 'true' && github.event_name == 'push' && steps.build-exists.outputs.cache-hit != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.keys.outputs.build-paths }}
