@@ -106,6 +106,57 @@ fn clock_skew_moves_only_wall_time() {
 }
 
 #[test]
+fn clock_rate_and_jump_skew_monotonic_time() {
+    let clocks = Rc::new(RefCell::new(Vec::new()));
+    let seen = clocks.clone();
+    let s = Scenario::new("t")
+        .nodes(3)
+        .roles(move |env| {
+            seen.borrow_mut().push(env.clock.clone());
+            lane_pair(env, 3)
+        })
+        .fault(
+            0,
+            Fault::ClockRate {
+                node: 1,
+                ppm: 500_000,
+            },
+        )
+        .fault(
+            0,
+            Fault::ClockJump {
+                node: 2,
+                ns: SECONDS,
+            },
+        )
+        .with(all_roles_settled());
+    let out = run_twice(&s, &Source::Seed(2)).unwrap();
+    assert_eq!(out.failure, None);
+    assert!(out.quiescent);
+    let clocks = clocks.borrow();
+    let base = clocks[0].elapsed();
+    assert_eq!(clocks[0].reference_elapsed(), base);
+    // The fast node saw 1.5x the world time, the stepped one a second more.
+    assert_eq!(clocks[1].reference_elapsed(), base);
+    assert_eq!(clocks[1].elapsed(), base * 3 / 2);
+    assert_eq!(
+        clocks[2].elapsed(),
+        base + std::time::Duration::from_secs(1)
+    );
+    let bad = Scenario::new("t").fault(
+        0,
+        Fault::ClockRate {
+            node: 0,
+            ppm: -1_000_000,
+        },
+    );
+    assert_eq!(
+        bad.run(Choices::seeded(1)).failure.unwrap().name,
+        "clock-rate"
+    );
+}
+
+#[test]
 fn pending_work_without_wake_is_a_liveness_failure() {
     let s = Scenario::new("t").roles(|env| {
         let mut roles: racer_dst::world::Roles = Vec::new();
@@ -227,6 +278,8 @@ fn fault_mix_is_drawn_from_choices_and_shrinks_to_nothing() {
             clock_skew: 1,
             max_downtime: 10 * MILLIS,
             max_skew_ns: SECONDS,
+            clock_rate: 1,
+            max_rate_ppm: 1000,
         });
     assert!(s.fault_schedule(&Choices::replay(&[])).is_empty());
     let a = s.fault_schedule(&Choices::seeded(4));
@@ -250,6 +303,10 @@ fn fault_mix_is_drawn_from_choices_and_shrinks_to_nothing() {
     assert!(
         all.iter()
             .any(|(_, f)| matches!(f, Fault::ClockSkew { .. }))
+    );
+    assert!(
+        all.iter()
+            .any(|(_, f)| matches!(f, Fault::ClockRate { ppm, .. } if ppm.unsigned_abs() <= 1000))
     );
 }
 

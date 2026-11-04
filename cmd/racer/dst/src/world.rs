@@ -26,10 +26,12 @@
 //!
 //! # Clocks
 //!
-//! Every node has its own [`VirtualClock`] anchored at one world origin, all
-//! advanced together, so monotonic time agrees across nodes while wall time
-//! can be skewed per node ([`Fault::ClockSkew`]). Clock rate skew needs a
-//! racer-io clock with a rate; see the crate docs.
+//! Every node has its own [`VirtualClock`] anchored at one world origin. World
+//! time is each clock's reference time, so all clocks advance together. Wall
+//! time can be shifted per node ([`Fault::ClockSkew`]) and local monotonic
+//! time can drift ([`Fault::ClockRate`]) or step forward
+//! ([`Fault::ClockJump`]); role deadlines are mapped back to world time
+//! through their node's clock.
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -146,6 +148,21 @@ pub enum Fault {
         /// Signed wall-clock offset.
         offset_ns: i64,
     },
+    /// Run the node's monotonic and wall clocks `ppm` parts per million fast
+    /// (positive) or slow (negative) against world time from now on.
+    ClockRate {
+        /// Node index.
+        node: u32,
+        /// Rate deviation, `-999_999..=1_000_000`.
+        ppm: i32,
+    },
+    /// Step the node's monotonic and wall clocks forward by `ns`.
+    ClockJump {
+        /// Node index.
+        node: u32,
+        /// Forward step.
+        ns: u64,
+    },
 }
 
 impl Fault {
@@ -157,6 +174,8 @@ impl Fault {
             Self::Heal { a, b } => (4, a.into(), b.into()),
             Self::SlowPeer { node, factor } => (5, node.into(), factor.into()),
             Self::ClockSkew { node, offset_ns } => (6, node.into(), offset_ns as u64),
+            Self::ClockRate { node, ppm } => (7, node.into(), i64::from(ppm) as u64),
+            Self::ClockJump { node, ns } => (8, node.into(), ns),
         }
     }
 }
@@ -324,7 +343,6 @@ pub struct World<'s> {
     scenario: &'s Scenario,
     choices: Choices,
     engine: Engine<Fault>,
-    origin: Instant,
     nodes: Vec<Node>,
     trace: Trace,
     report: Reporter,
@@ -351,7 +369,6 @@ impl<'s> World<'s> {
             scenario,
             choices: choices.clone(),
             engine,
-            origin,
             nodes: Vec::new(),
             trace,
             report,
@@ -415,10 +432,13 @@ impl<'s> World<'s> {
         Ok(())
     }
 
-    fn nanos(&self, at: Instant) -> Nanos {
-        at.saturating_duration_since(self.origin)
-            .as_nanos()
-            .min(u128::from(Nanos::MAX)) as Nanos
+    /// World time at which `node`'s local clock reaches `at`.
+    fn nanos(&self, node: usize, at: Instant) -> Nanos {
+        self.nodes[node]
+            .env
+            .clock
+            .reference_at(at)
+            .map_or(0, |d| d.as_nanos().min(u128::from(Nanos::MAX)) as Nanos)
     }
 
     fn apply(&mut self, fault: Fault) -> Result<(), Failure> {
@@ -459,6 +479,20 @@ impl<'s> World<'s> {
                     .and_then(|w| clock.set_wall_time(w).ok())
                     .ok_or_else(|| self.fail(Class::Safety, "clock-skew", "out of range"))?;
             }
+            Fault::ClockRate { node, ppm } if valid(node) => {
+                self.nodes[node as usize]
+                    .env
+                    .clock
+                    .set_rate_ppm(i64::from(ppm))
+                    .map_err(|e| self.fail(Class::Safety, "clock-rate", format!("{e:?}")))?;
+            }
+            Fault::ClockJump { node, ns } if valid(node) => {
+                self.nodes[node as usize]
+                    .env
+                    .clock
+                    .jump(Duration::from_nanos(ns))
+                    .map_err(|e| self.fail(Class::Safety, "clock-jump", format!("{e:?}")))?;
+            }
             Fault::Partition { .. } | Fault::Heal { .. } => {}
             _ => {
                 return Err(self.fail(
@@ -474,11 +508,11 @@ impl<'s> World<'s> {
     fn advance(&mut self, to: Nanos) -> Result<(), Failure> {
         self.engine.advance_to(to);
         self.trace.now.set(self.engine.now());
-        let at = self.origin + Duration::from_nanos(self.engine.now());
+        let at = Duration::from_nanos(self.engine.now());
         for node in &self.nodes {
             node.env
                 .clock
-                .advance_to(at)
+                .advance_reference_to(at)
                 .map_err(|e| self.fail(Class::Safety, "clock", format!("{e:?}")))?;
         }
         self.steps_here = 0;
@@ -558,7 +592,7 @@ impl<'s> World<'s> {
                     let due = match slot.next {
                         Next::Ready => true,
                         Next::Done => false,
-                        Next::WaitUntil(at) => self.nanos(at) <= now,
+                        Next::WaitUntil(at) => self.nanos(n, at) <= now,
                         Next::Idle => false,
                     };
                     if due || (slot.next != Next::Done && slot.role.woken()) {
@@ -588,7 +622,7 @@ impl<'s> World<'s> {
                     Next::Ready => 0,
                     Next::Idle => 1,
                     Next::Done => 2,
-                    Next::WaitUntil(at) => 3 + self.nanos(at),
+                    Next::WaitUntil(at) => 3 + self.nanos(n, at),
                 };
                 self.trace
                     .record(TAG_STEP, ((n as u64) << 32) | r as u64, code);
@@ -611,9 +645,10 @@ impl<'s> World<'s> {
             let deadline = self
                 .nodes
                 .iter()
-                .flat_map(|n| n.roles.iter())
-                .filter_map(|s| match s.next {
-                    Next::WaitUntil(at) => Some(self.nanos(at)),
+                .enumerate()
+                .flat_map(|(n, node)| node.roles.iter().map(move |s| (n, s)))
+                .filter_map(|(n, s)| match s.next {
+                    Next::WaitUntil(at) => Some(self.nanos(n, at)),
                     _ => None,
                 })
                 .min();

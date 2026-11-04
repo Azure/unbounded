@@ -51,10 +51,14 @@ pub struct FaultMix {
     pub slow_peer: u64,
     /// Wall-clock skew of up to +-`max_skew_ns`.
     pub clock_skew: u64,
+    /// Clock rate drift of up to +-`max_rate_ppm`.
+    pub clock_rate: u64,
     /// Longest crash downtime or partition.
     pub max_downtime: Nanos,
     /// Largest wall-clock skew.
     pub max_skew_ns: u64,
+    /// Largest clock rate drift in parts per million (capped at 999_999).
+    pub max_rate_ppm: u32,
 }
 
 /// One scenario.
@@ -224,6 +228,7 @@ impl Scenario {
             mix.partition,
             mix.slow_peer,
             mix.clock_skew,
+            mix.clock_rate,
         ];
         let count = choices.below(u64::from(mix.max_faults) + 1);
         if self.nodes == 0 || weights.iter().all(|w| *w == 0) {
@@ -251,6 +256,17 @@ impl Scenario {
                         factor: choices.range(1, 16) as u8,
                     },
                 )),
+                4 => {
+                    let max = u64::from(mix.max_rate_ppm.min(999_999));
+                    let ppm = choices.below(max * 2 + 1) as i64 - max as i64;
+                    out.push((
+                        at,
+                        Fault::ClockRate {
+                            node: node(),
+                            ppm: ppm as i32,
+                        },
+                    ));
+                }
                 _ => {
                     let skew = choices.below(mix.max_skew_ns.saturating_mul(2) + 1) as i64
                         - mix.max_skew_ns as i64;

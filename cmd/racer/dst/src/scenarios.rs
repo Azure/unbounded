@@ -36,6 +36,8 @@ pub fn catalog() -> Vec<Scenario> {
                 clock_skew: 1,
                 max_downtime: 20 * MILLIS,
                 max_skew_ns: SECONDS,
+                clock_rate: 1,
+                max_rate_ppm: 200_000,
             })
             .with(all_roles_settled())
             .invariant("bounded-steps-per-node", Class::Safety, |probe| {
