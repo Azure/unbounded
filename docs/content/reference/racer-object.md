@@ -422,6 +422,10 @@ make racer-object-test
 ```
 
 This checks formatting, runs Clippy, and runs the Rust unit and integration
-tests for the sidecar, which serve requests against a fake Racer client socket
-that does not cache data. They do not establish live multi-node
-behavior, admission compatibility, or compatibility with every S3 or Azure SDK. Validate those in your own environment.
+tests for the sidecar. Unit tests cover the request rules, the Racer client
+socket protocol, and response building. Integration tests serve requests over
+TCP with no Racer listening, so they cover only requests that never reach
+Racer, connection handling, and the unavailable case. Reads through a real
+Racer are covered by the kind-based suite in `e2e/racer`. None of these
+establish live multi-node behavior, admission compatibility, or compatibility
+with every S3 or Azure SDK. Validate those in your own environment.

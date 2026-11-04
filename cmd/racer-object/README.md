@@ -46,8 +46,12 @@ cargo clippy --locked --manifest-path cmd/racer-object/Cargo.toml --all-targets 
 Set `RACER_OBJECT_VERSION`, `RACER_OBJECT_GIT_COMMIT`, and
 `RACER_OBJECT_BUILD_TIME` at build time to fill in `--version`.
 
-Integration tests in `tests/` run the server over TCP against an in-process
-fake Racer that speaks the client socket protocol and can inject failures.
+Unit tests in each module cover the request rules, the Racer client socket
+protocol (request bytes, response heads, and page frames), and response
+building. Integration tests in `tests/` run the server over TCP with no Racer
+listening, so they cover rejected requests, connection handling, workers, and
+shutdown. Reads through a real Racer are covered by the kind-based suite in
+[`e2e/racer`](../../e2e/racer).
 
 ## Design
 
@@ -105,45 +109,10 @@ own Racer idle connection pool. There is no work stealing:
   for up to 5 seconds. The debug listener runs on the first worker.
 - With one worker the binary runs a plain current_thread runtime.
 
-An earlier tokio work-stealing runtime with 2 to 4 threads raised CPU per
-request by 10 to 50 percent (table below). Separate runtimes keep the
-one-thread cost per request and per byte, so the default trades nothing
-measurable for up to 4 times the throughput. The cap of 4 bounds idle threads
-in pods without CPU limits; set `--workers=1` for the smallest footprint.
-
-### Measurements
-
-Loopback, one shared fake Racer (Go), the sidecar process CPU only. 16
-connections for 10 KiB objects, 8 for 1 MiB, 4 for 64 MiB. `rust-tN` is a
-tokio runtime with N worker threads; `rust-t0` is the single-threaded runtime
-that the binary uses.
-
-| Workload | Go CPU | rust-t0 | rust-t1 | rust-t2 | rust-t4 |
-|---|---|---|---|---|---|
-| 10 KiB GET, CPU per request | 600-680 us | 89-93 us | 88-94 us | 99-106 us | 115-122 us |
-| HEAD, CPU per request | 250-290 us | 46-51 us | 47-51 us | 53-65 us | 72-74 us |
-| 1 MiB GET, CPU per GB | 1.8-1.9 s | 0.66-0.72 s | 0.67-0.85 s | 0.80-0.91 s | 0.89-0.96 s |
-| 64 MiB GET, CPU per GB | 1.34-1.38 s | 0.58-0.65 s | 0.64-0.65 s | 0.81-0.84 s | 0.95-0.99 s |
-
-With one thread the throughput matched the Go sidecar in these runs (about
-7,000 to 10,000 small requests per second and 1.1 to 1.3 GB/s for large
-objects); the fake Racer was the limit.
-
-Workers, measured with `hack/racer-object-bench` (fake Racer in Rust on
-other CPUs, 10 s per scenario, sidecar CPU only). The host was busy with
-unrelated jobs (load average about 75 on 48 CPUs), so absolute throughput is
-low and noisy; compare columns, not with older runs.
-
-| Scenario, CPUs | Go | workers=1 | workers=2 | workers=4 |
-|---|---|---|---|---|
-| 4 KiB GET, 24 CPUs: rps, CPU us/req | 16,024, 302 | 10,387, 80 | 30,577, 65 | 51,900, 76 |
-| HEAD, 24 CPUs: rps, CPU us/req | 22,705, 169 | 27,934, 35 | 53,032, 37 | 107,159, 36 |
-| 1 MiB GET, 24 CPUs: GB/s, CPU s/GB | 5.45, 0.77 | 2.43, 0.39 | 4.49, 0.41 | 6.60, 0.43 |
-| 64 KiB range, 24 CPUs: GB/s, CPU s/GB | 0.72, 4.69 | 0.38, 2.19 | 0.86, 2.16 | 1.84, 1.99 |
-| 4 KiB GET, 2 CPUs: rps, CPU us/req | 7,975, 245 | 9,115, 88 | 26,303, 73 | 29,085, 67 |
-| 1 MiB GET, 2 CPUs: GB/s, CPU s/GB | 3.31, 0.60 | 2.28, 0.39 | 4.80, 0.42 | 4.50, 0.42 |
-
-Peak RSS was 4 MiB for every Rust setting and 18 to 57 MiB for Go.
+Separate single-threaded runtimes keep the one-thread cost per request and
+per byte; a shared work-stealing runtime adds cross-thread wakeups and costs
+more CPU per request. The cap of 4 bounds idle threads in pods without CPU
+limits; set `--workers=1` for the smallest footprint.
 
 ## Diagnostics
 
