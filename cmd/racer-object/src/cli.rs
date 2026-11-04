@@ -293,9 +293,22 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
         let int: u128 = if int.is_empty() { 0 } else { int.parse().ok()? };
         let mut nanos = int.checked_mul(scale)?;
         if !frac.is_empty() {
-            let digits = &frac[..frac.len().min(30)];
-            let f: u128 = digits.parse().ok()?;
-            nanos += f * scale / 10u128.pow(digits.len() as u32);
+            // Mirror Go's leadingFraction: keep digits while they fit in
+            // an i64, then scale in floating point so nothing overflows.
+            let (mut f, mut div) = (0u64, 1f64);
+            for c in frac.bytes() {
+                let Some(y) = f
+                    .checked_mul(10)
+                    .and_then(|x| x.checked_add(u64::from(c - b'0')))
+                    .filter(|&y| y <= i64::MAX as u64)
+                else {
+                    break;
+                };
+                f = y;
+                div *= 10.0;
+            }
+            let extra = (f as f64 * (scale as f64 / div)) as u128;
+            nanos = nanos.checked_add(extra)?;
         }
         total = total.checked_add(nanos)?;
         if total > i64::MAX as u128 {
@@ -614,6 +627,45 @@ mod tests {
         }
         for s in ["", "x", "1_0", "0x", "--1", "9223372036854775808"] {
             assert_eq!(parse_int(s), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn parse_duration_long_fractions() {
+        let d = parse_duration("0.123456789012345678901234567890h").unwrap();
+        assert!((d.as_secs_f64() - 444.444_440_4).abs() < 1e-3, "{d:?}");
+        let long = format!("1.{}s", "9".repeat(500));
+        let d = parse_duration(&long).unwrap();
+        assert!(d >= Duration::from_millis(1999) && d <= Duration::from_secs(2));
+        let zeros = format!("0.{}1h", "0".repeat(400));
+        assert_eq!(parse_duration(&zeros), Some(Duration::ZERO));
+        assert_eq!(
+            parse_duration("1h2m3.5s"),
+            Some(Duration::from_millis(3_723_500))
+        );
+        assert_eq!(parse_duration(".5ms"), Some(Duration::from_micros(500)));
+    }
+
+    #[test]
+    fn parse_duration_limits() {
+        assert_eq!(
+            parse_duration("9223372036854775807ns"),
+            Some(Duration::from_nanos(i64::MAX as u64))
+        );
+        assert_eq!(parse_duration("9223372036854775808ns"), None);
+        assert_eq!(
+            parse_duration("2562047h47m16.854775807s").map(|d| d.as_nanos()),
+            Some(i64::MAX as u128)
+        );
+        assert_eq!(parse_duration("2562048h"), None);
+        assert_eq!(parse_duration("2562047h47m17s"), None);
+        assert_eq!(parse_duration(&format!("{}h", "9".repeat(60))), None);
+        assert_eq!(
+            parse_duration(&format!("2562047.{}h", "9".repeat(60))),
+            None
+        );
+        for s in ["", ".", "1", "1x", "h", "1..5s"] {
+            assert_eq!(parse_duration(s), None, "{s}");
         }
     }
 }
