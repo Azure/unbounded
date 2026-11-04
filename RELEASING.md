@@ -376,7 +376,9 @@ before that.
 binaries via GoReleaser, the frontend, every container image, the offline agent
 artifacts and the manifests tarball. Everything is signed
 with keyless cosign, images carry SPDX SBOM attestations, and a digest-pinned
-release BOM records exactly what shipped.
+release BOM records exactly what shipped. The exception is racer-vllm, whose
+SBOM is too large for the public Rekor log to accept as an attestation. It is
+published as a release asset with a cosign signature bundle instead.
 
 It always creates the release as a **draft**. Prerelease is inferred from a `-`
 in the tag.
