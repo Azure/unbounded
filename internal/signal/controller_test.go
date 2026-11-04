@@ -33,7 +33,7 @@ func TestValidateCheckPlanVariableLengths(t *testing.T) {
 		t.Run(strconv.Itoa(count), func(t *testing.T) {
 			t.Parallel()
 
-			checks := profileCheckPlan(count, 2*time.Minute)
+			checks := suiteCheckPlan(count, 2*time.Minute)
 
 			deadline, err := validateCheckPlan(checks)
 			if err != nil {
@@ -51,7 +51,7 @@ func TestValidateCheckPlanVariableLengths(t *testing.T) {
 		t.Run("reject-"+strconv.Itoa(count), func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := validateCheckPlan(profileCheckPlan(count, time.Minute)); err == nil {
+			if _, err := validateCheckPlan(suiteCheckPlan(count, time.Minute)); err == nil {
 				t.Fatalf("validateCheckPlan() accepted %d checks", count)
 			}
 		})
@@ -91,16 +91,16 @@ func TestValidateRunCheckPlanAssignsPositionalIdentity(t *testing.T) {
 	}
 }
 
-func TestProfileChecksAssignsPositionalIdentity(t *testing.T) {
+func TestSuiteChecksAssignsPositionalIdentity(t *testing.T) {
 	t.Parallel()
 
-	profile := &signalv1.CertificationProfile{
-		Spec: signalv1.CertificationProfileSpec{
-			Checks: profileCheckPlan(signalv1.MaxCertificationChecks, time.Minute),
+	suite := &signalv1.CertificationSuite{
+		Spec: signalv1.CertificationSuiteSpec{
+			Checks: suiteCheckPlan(signalv1.MaxCertificationChecks, time.Minute),
 		},
 	}
 
-	checks := profileChecks(profile)
+	checks := suiteChecks(suite)
 
 	for _, index := range []int{0, 15, signalv1.MaxCertificationChecks - 1} {
 		wantID := signalv1.CheckID("R" + fmtCheckNumber(index+1))
@@ -111,6 +111,248 @@ func TestProfileChecksAssignsPositionalIdentity(t *testing.T) {
 		if checks[index].Order != int32(index) {
 			t.Fatalf("checks[%d].Order = %d, want %d", index, checks[index].Order, index)
 		}
+	}
+}
+
+func TestResolveSuite(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add signal scheme: %v", err)
+	}
+
+	profile := &signalv1.CertificationProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile"},
+		Spec: signalv1.CertificationProfileSpec{
+			Suite: signalv1.CertificationSuiteReference{Name: "suite"},
+		},
+	}
+	suite := &signalv1.CertificationSuite{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "suite",
+			UID:        types.UID("suite-uid"),
+			Generation: 7,
+		},
+		Spec: signalv1.CertificationSuiteSpec{
+			Checks: suiteCheckPlan(16, time.Minute),
+		},
+	}
+
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(suite).Build()
+	reconciler := &AdmissionReconciler{Client: kube, APIReader: kube}
+
+	resolved, checks, err := reconciler.resolveSuite(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("resolveSuite() error = %v", err)
+	}
+
+	if resolved.UID != suite.UID || resolved.Generation != suite.Generation {
+		t.Fatalf(
+			"resolved Suite identity = %s/%d, want %s/%d",
+			resolved.UID,
+			resolved.Generation,
+			suite.UID,
+			suite.Generation,
+		)
+	}
+
+	if len(checks) != 16 || checks[15].ID != "R16" || checks[15].Order != 15 {
+		t.Fatalf("resolved checks do not preserve positional identity: %#v", checks)
+	}
+
+	missingProfile := profile.DeepCopy()
+	missingProfile.Spec.Suite.Name = "missing"
+
+	if _, _, err := reconciler.resolveSuite(context.Background(), missingProfile); err == nil {
+		t.Fatal("resolveSuite() accepted a missing Suite")
+	}
+
+	invalidSuite := suite.DeepCopy()
+	invalidSuite.Name = "invalid"
+	invalidSuite.Spec.Checks = nil
+
+	invalidClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(invalidSuite).Build()
+	invalidReconciler := &AdmissionReconciler{Client: invalidClient, APIReader: invalidClient}
+	invalidProfile := profile.DeepCopy()
+	invalidProfile.Spec.Suite.Name = invalidSuite.Name
+
+	if _, _, err := invalidReconciler.resolveSuite(context.Background(), invalidProfile); err == nil {
+		t.Fatal("resolveSuite() accepted an empty Suite plan")
+	}
+}
+
+func TestSuiteWatchRequestsProfileNodes(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add signal scheme: %v", err)
+	}
+
+	suite := &signalv1.CertificationSuite{ObjectMeta: metav1.ObjectMeta{Name: "suite-a"}}
+	profile := &signalv1.CertificationProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile-a"},
+		Spec: signalv1.CertificationProfileSpec{
+			Suite: signalv1.CertificationSuiteReference{Name: suite.Name},
+		},
+	}
+	otherProfile := &signalv1.CertificationProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile-b"},
+		Spec: signalv1.CertificationProfileSpec{
+			Suite: signalv1.CertificationSuiteReference{Name: "suite-b"},
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-a",
+			Labels: map[string]string{RequestLabel: profile.Name},
+		},
+	}
+	otherNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-b",
+			Labels: map[string]string{RequestLabel: otherProfile.Name},
+		},
+	}
+
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(profile, otherProfile, node, otherNode).
+		WithIndex(&signalv1.CertificationProfile{}, profileSuiteNameField, profileSuiteIndex).
+		Build()
+	reconciler := &AdmissionReconciler{Client: kube}
+
+	requests := reconciler.requestsForSuite(context.Background(), suite)
+	if len(requests) != 1 || requests[0].Name != node.Name {
+		t.Fatalf("requestsForSuite() = %#v, want Node %s", requests, node.Name)
+	}
+}
+
+func TestSuiteSnapshotAndRunPinning(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	if err := signalv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add signal scheme: %v", err)
+	}
+
+	checks := suiteCheckPlan(2, time.Minute)
+	checks[0].ScriptKey = "first.sh"
+	checks[1].ScriptKey = "second.sh"
+	scripts := map[string]string{
+		"first.sh":  "echo first",
+		"second.sh": "echo second",
+	}
+	bundleDigest, err := signalv1.DeriveScriptBundleDigest(checks, scripts)
+	if err != nil {
+		t.Fatalf("derive script bundle digest: %v", err)
+	}
+
+	suite := &signalv1.CertificationSuite{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "suite",
+			UID:        types.UID("suite-uid"),
+			Generation: 4,
+		},
+		Spec: signalv1.CertificationSuiteSpec{
+			ScriptBundle: signalv1.ScriptBundleSource{
+				Name:   "suite-scripts",
+				Digest: bundleDigest,
+			},
+			Checks: checks,
+		},
+	}
+	profile := &signalv1.CertificationProfile{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "profile",
+			UID:        types.UID("profile-uid"),
+			Generation: 3,
+		},
+		Spec: signalv1.CertificationProfileSpec{
+			Participants: signalv1.ParticipantPolicy{Count: 1},
+			Suite:        signalv1.CertificationSuiteReference{Name: suite.Name},
+		},
+	}
+	immutable := true
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: suite.Spec.ScriptBundle.Name, Namespace: "scripts"},
+		Immutable:  &immutable,
+		Data:       scripts,
+	}
+
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(suite, source).Build()
+	reconciler := &AdmissionReconciler{
+		Client:          kube,
+		APIReader:       kube,
+		Namespace:       "project-signal",
+		ScriptNamespace: source.Namespace,
+		RunnerImage:     "registry.invalid/runner@sha256:" + strings.Repeat("a", 64),
+	}
+
+	resolvedSuite, resolvedChecks, err := reconciler.resolveSuite(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("resolveSuite() error = %v", err)
+	}
+
+	sourceScripts, err := reconciler.loadScriptBundle(
+		context.Background(),
+		resolvedSuite.Spec.ScriptBundle,
+		resolvedChecks,
+	)
+	if err != nil {
+		t.Fatalf("loadScriptBundle() error = %v", err)
+	}
+
+	snapshot, checkSnapshots, err := reconciler.createSnapshot(
+		context.Background(),
+		"run",
+		sourceScripts,
+		resolvedChecks,
+	)
+	if err != nil {
+		t.Fatalf("createSnapshot() error = %v", err)
+	}
+	snapshot.UID = types.UID("snapshot-uid")
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
+	participants := []signalv1.Participant{{NodeName: node.Name, NodeUID: types.UID("node-uid")}}
+	run := newCertificationRun(
+		"run",
+		reconciler.Namespace,
+		node,
+		profile,
+		resolvedSuite,
+		participants,
+		snapshot,
+		checkSnapshots,
+	)
+
+	if run.Spec.Suite.Name != suite.Name ||
+		run.Spec.Suite.UID != suite.UID ||
+		run.Spec.Suite.Generation != suite.Generation {
+		t.Fatalf("Run Suite pin = %#v, want %s/%s/%d", run.Spec.Suite, suite.Name, suite.UID, suite.Generation)
+	}
+
+	if run.Spec.ScriptBundle.Digest != bundleDigest ||
+		len(run.Spec.Checks) != len(checks) ||
+		run.Spec.Checks[0].Script.Digest != digestString(scripts["first.sh"]) ||
+		run.Spec.Checks[1].Script.Digest != digestString(scripts["second.sh"]) {
+		t.Fatalf("Run did not retain resolved script/check snapshots: %#v", run.Spec)
+	}
+
+	suite.Generation++
+	suite.Spec.Checks = nil
+	if run.Spec.Suite.Generation != 4 || len(run.Spec.Checks) != 2 {
+		t.Fatal("Run snapshots changed after the source Suite mutated")
 	}
 }
 
@@ -327,7 +569,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 	}
 }
 
-func profileCheckPlan(count int, deadline time.Duration) []signalv1.CertificationCheck {
+func suiteCheckPlan(count int, deadline time.Duration) []signalv1.CertificationCheck {
 	checks := make([]signalv1.CertificationCheck, count)
 	for index := range checks {
 		checks[index] = signalv1.CertificationCheck{

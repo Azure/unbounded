@@ -50,6 +50,7 @@ const (
 	ReservationLabel       = "signal.unbounded-cloud.io/reserved-by"
 	RunNodeLabel           = "signal.unbounded-cloud.io/request-node"
 	RunProfileLabel        = "signal.unbounded-cloud.io/profile"
+	RunSuiteLabel          = "signal.unbounded-cloud.io/suite"
 	RunTriggerAnnotation   = "signal.unbounded-cloud.io/trigger"
 	RunAdmissionAnnotation = "signal.unbounded-cloud.io/admission"
 	RunFinalizer           = "signal.unbounded-cloud.io/cleanup"
@@ -60,6 +61,7 @@ const (
 	checkResultCheckOrder  = "signal.unbounded-cloud.io/check-result-check-order"
 	runAdmissionReady      = "ready"
 	runAdmissionPending    = "pending"
+	profileSuiteNameField  = "spec.suite.name"
 
 	maxAdapterParticipants         = 8
 	maxAdapterReasonBytes          = 512
@@ -334,6 +336,8 @@ type AdmissionReconciler struct {
 	admissionMu     sync.Mutex
 }
 
+// +kubebuilder:rbac:groups=signal.unbounded-cloud.io,resources=certificationprofiles;certificationsuites,verbs=get;list;watch
+
 type RunReconciler struct {
 	client.Client
 	APIReader         client.Reader
@@ -348,10 +352,72 @@ func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&signalv1.CertificationProfile{},
+		profileSuiteNameField,
+		profileSuiteIndex,
+	); err != nil {
+		return fmt.Errorf("index CertificationProfiles by Suite: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}, builder.WithPredicates(predicate.LabelChangedPredicate{})).
+		Watches(
+			&signalv1.CertificationSuite{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForSuite),
+		).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
+}
+
+func profileSuiteIndex(object client.Object) []string {
+	profile, ok := object.(*signalv1.CertificationProfile)
+	if !ok || profile.Spec.Suite.Name == "" {
+		return nil
+	}
+
+	return []string{profile.Spec.Suite.Name}
+}
+
+func (r *AdmissionReconciler) requestsForSuite(ctx context.Context, object client.Object) []ctrl.Request {
+	suite, ok := object.(*signalv1.CertificationSuite)
+	if !ok {
+		return nil
+	}
+
+	var profiles signalv1.CertificationProfileList
+	if err := r.List(
+		ctx,
+		&profiles,
+		client.MatchingFields{profileSuiteNameField: suite.Name},
+	); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list CertificationProfiles for Suite", "suite", suite.Name)
+
+		return nil
+	}
+
+	profileNames := make(map[string]struct{}, len(profiles.Items))
+	for index := range profiles.Items {
+		profileNames[profiles.Items[index].Name] = struct{}{}
+	}
+
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Nodes requesting Suite", "suite", suite.Name)
+
+		return nil
+	}
+
+	requests := make([]ctrl.Request, 0)
+	for index := range nodes.Items {
+		node := &nodes.Items[index]
+		if _, requested := profileNames[node.Labels[RequestLabel]]; requested {
+			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKey{Name: node.Name}})
+		}
+	}
+
+	return requests
 }
 
 func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -413,19 +479,12 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return fmt.Errorf("get CertificationProfile %s: %w", profileName, err)
 	}
 
-	checks := profileChecks(&profile)
-	if _, err := validateCheckPlan(checks); err != nil {
-		return fmt.Errorf("profile %s checks: %w", profile.Name, err)
+	suite, checks, err := r.resolveSuite(ctx, &profile)
+	if err != nil {
+		return err
 	}
 
-	for index := range checks {
-		check := &checks[index]
-		if err := signalworkload.Validate(check.WorkloadPolicy); err != nil {
-			return fmt.Errorf("profile %s check %s workload policy: %w", profile.Name, check.ID, err)
-		}
-	}
-
-	sourceScripts, err := r.loadScriptBundle(ctx, profile.Spec.ScriptBundle, checks)
+	sourceScripts, err := r.loadScriptBundle(ctx, suite.Spec.ScriptBundle, checks)
 	if err != nil {
 		return err
 	}
@@ -516,36 +575,16 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return err
 	}
 
-	run := &signalv1.CertificationRun{
-		TypeMeta: metav1.TypeMeta{APIVersion: signalv1.GroupVersion.String(), Kind: "CertificationRun"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      runName,
-			Namespace: r.Namespace,
-			Labels: map[string]string{
-				RunNodeLabel:    node.Name,
-				RunProfileLabel: profile.Name,
-			},
-			Annotations: map[string]string{
-				RunTriggerAnnotation:   "manual",
-				RunAdmissionAnnotation: runAdmissionPending,
-			},
-			Finalizers: []string{RunFinalizer},
-		},
-		Spec: signalv1.CertificationRunSpec{
-			Profile: signalv1.PinnedProfile{
-				Name:       profile.Name,
-				UID:        profile.UID,
-				Generation: profile.Generation,
-			},
-			Participants: participants,
-			ScriptBundle: signalv1.ScriptBundleReference{
-				Name:   snapshot.Name,
-				UID:    snapshot.UID,
-				Digest: profile.Spec.ScriptBundle.Digest,
-			},
-			Checks: checkSnapshots,
-		},
-	}
+	run := newCertificationRun(
+		runName,
+		r.Namespace,
+		node,
+		&profile,
+		suite,
+		participants,
+		snapshot,
+		checkSnapshots,
+	)
 	if _, err := buildWorkflow(run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
@@ -583,6 +622,88 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	return nil
+}
+
+func newCertificationRun(
+	runName string,
+	namespace string,
+	node *corev1.Node,
+	profile *signalv1.CertificationProfile,
+	suite *signalv1.CertificationSuite,
+	participants []signalv1.Participant,
+	snapshot *corev1.ConfigMap,
+	checkSnapshots []signalv1.CertificationCheckSnapshot,
+) *signalv1.CertificationRun {
+	return &signalv1.CertificationRun{
+		TypeMeta: metav1.TypeMeta{APIVersion: signalv1.GroupVersion.String(), Kind: "CertificationRun"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      runName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				RunNodeLabel:    node.Name,
+				RunProfileLabel: profile.Name,
+				RunSuiteLabel:   suite.Name,
+			},
+			Annotations: map[string]string{
+				RunTriggerAnnotation:   "manual",
+				RunAdmissionAnnotation: runAdmissionPending,
+			},
+			Finalizers: []string{RunFinalizer},
+		},
+		Spec: signalv1.CertificationRunSpec{
+			Profile: signalv1.PinnedProfile{
+				Name:       profile.Name,
+				UID:        profile.UID,
+				Generation: profile.Generation,
+			},
+			Suite: signalv1.PinnedSuite{
+				Name:       suite.Name,
+				UID:        suite.UID,
+				Generation: suite.Generation,
+			},
+			Participants: participants,
+			ScriptBundle: signalv1.ScriptBundleReference{
+				Name:   snapshot.Name,
+				UID:    snapshot.UID,
+				Digest: suite.Spec.ScriptBundle.Digest,
+			},
+			Checks: checkSnapshots,
+		},
+	}
+}
+
+func (r *AdmissionReconciler) resolveSuite(
+	ctx context.Context,
+	profile *signalv1.CertificationProfile,
+) (*signalv1.CertificationSuite, []signalv1.CertificationCheck, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var suite signalv1.CertificationSuite
+	if err := reader.Get(ctx, client.ObjectKey{Name: profile.Spec.Suite.Name}, &suite); err != nil {
+		return nil, nil, fmt.Errorf(
+			"get CertificationSuite %s referenced by profile %s: %w",
+			profile.Spec.Suite.Name,
+			profile.Name,
+			err,
+		)
+	}
+
+	checks := suiteChecks(&suite)
+	if _, err := validateCheckPlan(checks); err != nil {
+		return nil, nil, fmt.Errorf("suite %s checks: %w", suite.Name, err)
+	}
+
+	for index := range checks {
+		check := &checks[index]
+		if err := signalworkload.Validate(check.WorkloadPolicy); err != nil {
+			return nil, nil, fmt.Errorf("suite %s check %s workload policy: %w", suite.Name, check.ID, err)
+		}
+	}
+
+	return &suite, checks, nil
 }
 
 func (r *AdmissionReconciler) resumeOrReleaseReservation(ctx context.Context, runName string) (bool, error) {
@@ -2464,6 +2585,7 @@ func (r *RunReconciler) evidenceDocument(
 		"runID":          string(run.UID),
 		"runName":        run.Name,
 		"profile":        run.Spec.Profile,
+		"suite":          run.Spec.Suite,
 		"participants":   run.Spec.Participants,
 		"scriptBundle":   run.Spec.ScriptBundle,
 		"workflow":       run.Status.Workflow,
@@ -3452,13 +3574,13 @@ func removeString(values []string, remove string) []string {
 	return result
 }
 
-func profileChecks(profile *signalv1.CertificationProfile) []signalv1.CertificationCheck {
-	checks := make([]signalv1.CertificationCheck, len(profile.Spec.Checks))
-	for index := range profile.Spec.Checks {
-		checks[index] = profile.Spec.Checks[index]
+func suiteChecks(suite *signalv1.CertificationSuite) []signalv1.CertificationCheck {
+	checks := make([]signalv1.CertificationCheck, len(suite.Spec.Checks))
+	for index := range suite.Spec.Checks {
+		checks[index] = suite.Spec.Checks[index]
 		checks[index].ID = signalv1.CheckID(fmt.Sprintf("R%02d", index+1))
 		checks[index].Order = int32(index)
-		checks[index].WorkloadPolicy = *profile.Spec.Checks[index].WorkloadPolicy.DeepCopy()
+		checks[index].WorkloadPolicy = *suite.Spec.Checks[index].WorkloadPolicy.DeepCopy()
 	}
 
 	return checks
