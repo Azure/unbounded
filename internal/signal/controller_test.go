@@ -246,6 +246,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 	}
 
 	checks := suiteCheckPlan(2, time.Minute)
+
 	checks[0].ScriptKey = "first.sh"
 	checks[1].ScriptKey = "second.sh"
 	scripts := map[string]string{
@@ -321,6 +322,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createSnapshot() error = %v", err)
 	}
+
 	snapshot.UID = types.UID("snapshot-uid")
 
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
@@ -350,6 +352,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 	}
 
 	suite.Generation++
+
 	suite.Spec.Checks = nil
 	if run.Spec.Suite.Generation != 4 || len(run.Spec.Checks) != 2 {
 		t.Fatal("Run snapshots changed after the source Suite mutated")

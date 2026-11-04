@@ -410,6 +410,7 @@ func (r *AdmissionReconciler) requestsForSuite(ctx context.Context, object clien
 	}
 
 	requests := make([]ctrl.Request, 0)
+
 	for index := range nodes.Items {
 		node := &nodes.Items[index]
 		if _, requested := profileNames[node.Labels[RequestLabel]]; requested {
