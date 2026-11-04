@@ -335,6 +335,8 @@ def start_metalman_and_replace() -> None:
                 with socket.create_connection((SERVER_IP, HTTP_PORT), timeout=2):
                     break
             except OSError:
+                # The log line can appear before the listener accepts
+                # connections; keep polling until the timeout.
                 pass
         time.sleep(1)
     else:
