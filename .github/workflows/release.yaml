@@ -98,17 +98,6 @@ concurrency:
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
   CNI_PLUGINS_VERSION: v1.9.1
-  # Trivy image scans run only when the repository variable RELEASE_TRIVY_SCAN
-  # is "true" (`gh variable set RELEASE_TRIVY_SCAN --body true`). They are off
-  # by default because get.trivy.dev, which the Trivy installer downloads from,
-  # stopped resolving on 2026-11-03 (aquasecurity/trivy#11533), and the install
-  # fails on any runner without a cached binary. It is a variable rather than a
-  # line in this file because this workflow only runs on tag pushes, and turning
-  # scans on or off should not take a commit and a new tag. `version` warns on
-  # every run with scans off. Per-image opt-outs stay in the component-images
-  # matrix (`trivy: false`).
-  #
-  # Not TRIVY_-prefixed: Trivy reads TRIVY_* environment variables as options.
   RUN_TRIVY: ${{ vars.RELEASE_TRIVY_SCAN == 'true' }}
 
 jobs:
@@ -906,8 +895,7 @@ jobs:
             platforms: linux/amd64,linux/arm64
             trivy: true
           # vLLM with racer-client and racer-vllm. The upstream vLLM base is
-          # not ours to patch, so it is not gated on Trivy. It also makes the
-          # SBOM too big to attest; see "Sign the SBOM" below.
+          # not ours to patch, so it is not gated on Trivy.
           - name: racer-vllm
             file: images/racer-vllm/Containerfile
             platforms: linux/amd64
@@ -1027,9 +1015,7 @@ jobs:
           upload-release-assets: false
 
       - name: Attest SBOM to image
-        # large-sbom is opt-in on purpose. A matrix key that is not set reads
-        # as null, and Actions compares null equal to false, so an opt-out
-        # flag tested with `!= false` would skip this step for every image.
+        # Opt-in: an unset matrix key compares equal to false.
         if: ${{ !matrix.component.large-sbom }}
         run: |
           cosign attest --yes \
@@ -1037,13 +1023,8 @@ jobs:
             --type spdxjson \
             "${{ env.REGISTRY }}/${{ matrix.component.name }}@${{ steps.push.outputs.digest }}"
 
-      # `cosign attest` uploads the whole SBOM to the public Rekor log. It
-      # failed to log racer-vllm's on every attempt of v0.19.0 and v0.20.0
-      # ("giving up after 2 attempt(s)"). At 30.7 MB that SBOM is eight times
-      # the largest one that has gone through, net-node's 3.8 MB. sign-blob logs
-      # only the digest, so size does not matter. The SBOM and its bundle go on
-      # the release instead of the registry, the same way the manifests tarball
-      # and the BOM do.
+      # Rekor can't take attestations this large (racer-vllm's SBOM is ~30 MB).
+      # sign-blob logs only the digest.
       - name: Sign the SBOM
         if: matrix.component.large-sbom
         run: |
@@ -1051,9 +1032,8 @@ jobs:
             --bundle "sbom-${{ matrix.component.name }}.spdx.json.bundle.json" \
             "sbom-${{ matrix.component.name }}.spdx.json"
 
-      # After the attestation or signature, not before: that is the
-      # authoritative copy, and it should never be blocked by the releases API
-      # having a bad minute.
+      # After the attestation or signature, so the releases API having a bad
+      # minute never blocks the authoritative copy.
       - name: Attach SBOM to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
