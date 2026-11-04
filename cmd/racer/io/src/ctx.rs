@@ -192,14 +192,54 @@ impl Default for VirtualClock {
     }
 }
 
-/// Entropy for one worker role: operating-system entropy or a seeded stream.
-#[derive(Clone, Debug)]
+/// An external stream of raw choices for simulation.
+///
+/// A deterministic simulation harness implements this over its single choice
+/// stream so that seeded entropy ([`Rng::from_source`]) and simulated OS
+/// scheduling ([`crate::sim::SimOs::with_choices`]) are drawn from it
+/// directly. Derived choices map the raw draw `0` to the simplest outcome
+/// (no delay, identity order, cancel CQE first), so shrinking a stream toward
+/// zeros simplifies the run.
+pub trait ChoiceSource {
+    /// The next raw 64-bit draw.
+    fn next_u64(&mut self) -> u64;
+}
+
+impl std::fmt::Debug for dyn ChoiceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChoiceSource")
+    }
+}
+
+impl ChoiceSource for Xoshiro {
+    fn next_u64(&mut self) -> u64 {
+        self.next()
+    }
+}
+
+/// A value in `0..bound` (`bound > 0`) from `source`; raw `0` yields `0`.
+pub(crate) fn below(source: &mut dyn ChoiceSource, bound: u64) -> u64 {
+    debug_assert!(bound > 0);
+    source.next_u64() % bound
+}
+
+/// Entropy for one worker role: operating-system entropy or a simulated stream.
+#[derive(Clone)]
 pub struct Rng(RngRepr);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum RngRepr {
     Os,
-    Seeded(Arc<Mutex<Xoshiro>>),
+    Simulated(Arc<Mutex<dyn ChoiceSource + Send>>),
+}
+
+impl std::fmt::Debug for Rng {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            RngRepr::Os => "Rng::Os",
+            RngRepr::Simulated(_) => "Rng::Simulated",
+        })
+    }
 }
 
 impl Rng {
@@ -211,24 +251,28 @@ impl Rng {
     /// Test support: a replayable stream. The same `(seed, stream)` always
     /// yields the same bytes; clones share one cursor.
     pub fn seeded(seed: u64, stream: u64) -> Self {
-        Self(RngRepr::Seeded(Arc::new(Mutex::new(Xoshiro::new(
-            seed, stream,
-        )))))
+        Self::from_source(Xoshiro::new(seed, stream))
     }
 
-    /// Whether this stream is seeded (never true in production).
+    /// Test support: entropy drawn from an external choice stream, one raw
+    /// draw per eight bytes. Clones share the source.
+    pub fn from_source(source: impl ChoiceSource + Send + 'static) -> Self {
+        Self(RngRepr::Simulated(Arc::new(Mutex::new(source))))
+    }
+
+    /// Whether this stream is simulated (never true in production).
     pub fn is_seeded(&self) -> bool {
-        matches!(self.0, RngRepr::Seeded(_))
+        matches!(self.0, RngRepr::Simulated(_))
     }
 
     /// Fill `bytes` with entropy.
     pub fn fill(&self, bytes: &mut [u8]) -> Result<()> {
         match &self.0 {
             RngRepr::Os => getrandom::getrandom(bytes).map_err(|_| Error::Unavailable),
-            RngRepr::Seeded(state) => {
+            RngRepr::Simulated(state) => {
                 let mut state = state.lock().map_err(|_| Error::Unavailable)?;
                 for chunk in bytes.chunks_mut(8) {
-                    let word = state.next().to_le_bytes();
+                    let word = state.next_u64().to_le_bytes();
                     chunk.copy_from_slice(&word[..chunk.len()]);
                 }
                 Ok(())
@@ -431,6 +475,30 @@ mod tests {
         for bound in [1, 2, 3, 1000] {
             assert!(x.below(bound) < bound);
         }
+    }
+
+    /// Counts up from a start value.
+    struct Counter(u64);
+
+    impl ChoiceSource for Counter {
+        fn next_u64(&mut self) -> u64 {
+            self.0 += 1;
+            self.0
+        }
+    }
+
+    #[test]
+    fn external_source_drives_entropy() {
+        let rng = Rng::from_source(Counter(0));
+        assert!(rng.is_seeded());
+        assert_eq!(rng.next_u64().unwrap(), 1);
+        let clone = rng.clone();
+        assert_eq!(clone.next_u64().unwrap(), 2, "clones share the source");
+        let mut bytes = [0; 10];
+        rng.fill(&mut bytes).unwrap();
+        assert_eq!(bytes, [3, 0, 0, 0, 0, 0, 0, 0, 4, 0]);
+        assert_eq!(below(&mut Counter(6), 7), 0);
+        assert!(WorkerCtx::simulated(&VirtualClock::new(), 1, 0).is_simulated());
     }
 
     #[test]

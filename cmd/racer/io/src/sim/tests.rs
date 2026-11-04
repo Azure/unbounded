@@ -1197,3 +1197,57 @@ mod driver {
         }
     }
 }
+
+mod choices {
+    use super::*;
+    use crate::{ctx::ChoiceSource, ring::op::Op};
+
+    /// Replays a fixed list of draws, then zeros.
+    struct Script(VecDeque<u64>);
+
+    impl ChoiceSource for Script {
+        fn next_u64(&mut self) -> u64 {
+            self.0.pop_front().unwrap_or(0)
+        }
+    }
+
+    fn fsync() -> Op {
+        Op::Fsync {
+            fd: 9999,
+            datasync: false,
+        }
+    }
+
+    fn run(driver: &mut SimDriver) -> Vec<u64> {
+        let now = std::time::Instant::now();
+        for _ in 0..64 {
+            driver.run_turn(now);
+        }
+        std::iter::from_fn(|| driver.next_cqe())
+            .map(|c| c.0)
+            .collect()
+    }
+
+    /// An all-zero source keeps submission order with no delays.
+    #[test]
+    fn zero_source_keeps_fifo_order() {
+        let mut driver = SimDriver::new(SimOs::with_choices(Script(VecDeque::new())), 8);
+        for id in 1..=4 {
+            driver.push(id, &fsync()).unwrap();
+        }
+        assert_eq!(run(&mut driver), [1, 2, 3, 4]);
+    }
+
+    /// Delays and execution order come straight from the source.
+    #[test]
+    fn source_draws_delays_and_order() {
+        // Push draws: delays 2, 0, 0. First turn shuffle (index 2 then 1):
+        // back 2 swaps ids[2] with ids[0], giving [3, 2, 1].
+        let script = Script([2, 0, 0, 2, 0].into());
+        let mut driver = SimDriver::new(SimOs::with_choices(script), 8);
+        for id in 1..=3 {
+            driver.push(id, &fsync()).unwrap();
+        }
+        assert_eq!(run(&mut driver), [3, 2, 1]);
+    }
+}

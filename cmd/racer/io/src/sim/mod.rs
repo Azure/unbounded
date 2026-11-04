@@ -105,9 +105,9 @@ struct World {
 
     disk: disk::State,
 
-    /// Seeded scheduling choices (submission delays, execution order, cancel
-    /// CQE order); `None` keeps FIFO order.
-    choices: Option<crate::ctx::Xoshiro>,
+    /// Scheduling choices (submission delays, execution order, cancel CQE
+    /// order); `None` keeps FIFO order.
+    choices: Option<Box<dyn crate::ctx::ChoiceSource>>,
 }
 
 /// The kernel-side state of an open simulated descriptor.
@@ -331,8 +331,16 @@ impl SimOs {
     /// execution order, cancel CQE order) come from `seed`. The same seed and
     /// the same workload always produce the same trace.
     pub fn seeded(seed: u64) -> Self {
+        Self::with_choices(crate::ctx::Xoshiro::new(seed, 0x51_u64))
+    }
+
+    /// A world whose scheduling choices (operation delays, execution order,
+    /// cancel CQE order) are drawn from `source`, for example a simulation
+    /// harness's choice stream. A source that only yields `0` behaves like
+    /// [`SimOs::new`]: no added delay, submission order, cancel CQE first.
+    pub fn with_choices(source: impl crate::ctx::ChoiceSource + 'static) -> Self {
         let os = Self::new();
-        os.0.borrow_mut().choices = Some(crate::ctx::Xoshiro::new(seed, 0x51_u64));
+        os.0.borrow_mut().choices = Some(Box::new(source));
         os
     }
 

@@ -113,7 +113,7 @@ impl SimDriver {
         }
         let mut w = self.os.0.borrow_mut();
         if let Some(choices) = &mut w.choices {
-            pending.delay += choices.below(3) as usize;
+            pending.delay += crate::ctx::below(choices.as_mut(), 3) as usize;
         }
         w.record(&format!("submit:{name}"), user_data, 0);
         drop(w);
@@ -131,7 +131,7 @@ impl SimDriver {
         let cancel = (id | CANCEL_BIT, if removed { 0 } else { -libc::ENOENT }, 0);
         let mut w = self.os.0.borrow_mut();
         let cancel_first = match &mut w.choices {
-            Some(choices) => choices.below(2) == 0,
+            Some(choices) => crate::ctx::below(choices.as_mut(), 2) == 0,
             None => w.cancel_first,
         };
         if removed {
@@ -172,8 +172,10 @@ impl SimDriver {
         self.seen = self.os.0.borrow().next_event;
         let mut ids: Vec<u64> = self.pending.keys().copied().collect();
         if let Some(choices) = &mut self.os.0.borrow_mut().choices {
+            // Fisher-Yates where a zero draw keeps the element in place.
             for index in (1..ids.len()).rev() {
-                ids.swap(index, choices.below(index as u64 + 1) as usize);
+                let back = crate::ctx::below(choices.as_mut(), index as u64 + 1) as usize;
+                ids.swap(index, index - back);
             }
         }
         let mut done = Vec::new();
