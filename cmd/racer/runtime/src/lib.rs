@@ -47,64 +47,8 @@ pub mod test_util {
 
 use std::{future::Future, pin::Pin};
 
-/// Portable runtime failures, preserving terminal operating-system diagnostics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    /// The operation's owner requested cancellation.
-    Cancelled,
-    /// The caller's deadline expired.
-    DeadlineExceeded,
-    /// A bounded queue or resource has no available capacity.
-    Overloaded,
-    /// A required resource cannot currently be used.
-    Unavailable,
-    /// An input value is invalid or cannot be represented.
-    InvalidInput,
-    /// The runtime was configured inconsistently or a required scope is absent.
-    InvalidConfiguration,
-    /// The requested resource does not exist.
-    NotFound,
-    /// The requested resource already exists.
-    AlreadyExists,
-    /// An I/O failure without a usable operating-system error code.
-    Io,
-    /// A terminal OS failure. This is diagnostic, not an instruction to retry.
-    Os(i32),
-}
-
-impl Error {
-    /// Preserve positive errno values while classifying common resource failures.
-    pub fn from_io(error: std::io::Error) -> Self {
-        match error.raw_os_error() {
-            Some(libc::ENOENT) => Self::NotFound,
-            Some(libc::EEXIST) => Self::AlreadyExists,
-            Some(libc::ECANCELED) => Self::Cancelled,
-            Some(errno) if errno > 0 => Self::Os(errno),
-            _ => Self::Io,
-        }
-    }
-}
-
-impl std::fmt::Display for Error {
-    /// Describe the failure without losing raw operating-system diagnostics.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Cancelled => "operation canceled",
-            Self::DeadlineExceeded => "deadline exceeded",
-            Self::Overloaded => "capacity exhausted",
-            Self::Unavailable => "resource unavailable",
-            Self::InvalidInput => "invalid input",
-            Self::InvalidConfiguration => "invalid configuration",
-            Self::NotFound => "resource not found",
-            Self::AlreadyExists => "resource already exists",
-            Self::Io => "I/O failure",
-            Self::Os(errno) => return write!(f, "OS error {errno}"),
-        })
-    }
-}
-
-// Preserve Copy errors, including raw errno, without fabricating an error source.
-impl std::error::Error for Error {}
+/// Portable runtime failures, shared with `racer-io` during the migration.
+pub use racer_io::Error;
 
 /// A runtime result, optionally using an application-owned error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

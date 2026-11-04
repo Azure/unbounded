@@ -1350,6 +1350,7 @@ dependencies = [
  "getrandom",
  "io-uring",
  "libc",
+ "racer-io",
  "sha2",
  "zeroize",
 ]

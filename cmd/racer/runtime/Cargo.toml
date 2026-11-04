@@ -12,6 +12,7 @@ test-util = []
 simulation = ["dep:sha2"]
 
 [dependencies]
+racer-io = { path = "../io" }
 futures = "0.3"
 getrandom = "0.2"
 io-uring = "0.7"
