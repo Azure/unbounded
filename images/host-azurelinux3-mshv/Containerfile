@@ -5,6 +5,14 @@
 # partition of the Microsoft Hypervisor (MSHV). Virtual machine monitors such
 # as Cloud Hypervisor use /dev/mshv on these machines instead of /dev/kvm.
 # The hypervisor runs on amd64 only.
+#
+# The hypervisor loader needs shim 15.8, because Azure Linux's shim 16
+# conflicts with mshv-bootloader-lx. With UEFI Secure Boot on, shim 15.8 halts
+# with "Bootloader has not verified loaded image" when another shim, such as
+# the one in Metalman's PXE chain, chainloads it. Secure Boot works when the
+# firmware starts the disk's boot entry directly, but the first boot after a
+# Metalman repave goes through the PXE chain, so Secure Boot must be off for
+# the repave to finish.
 
 FROM mcr.microsoft.com/azurelinux/base/core:3.0 AS rootfs
 ARG KERNEL_PACKAGE=kernel-mshv
