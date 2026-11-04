@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command line parsing compatible with the Go `flag` package as the Go
-//! sidecar used it, so existing pod specs keep working unchanged.
+//! Command line parsing. `--flag=value`, `--flag value`, and a single dash
+//! all work, so existing pod specs keep working unchanged.
 
 use crate::object::Api;
 use std::net::{IpAddr, SocketAddr};
@@ -44,7 +44,7 @@ pub fn default_workers() -> usize {
 const SOCKET_PATH_LIMIT: usize = 107;
 
 /// Version string (`<version> (commit: <commit>, built: <time>)`), set at
-/// build time like the Go `internal/version` ldflags.
+/// build time from `RACER_OBJECT_*` environment variables.
 pub fn version() -> String {
     format!(
         "{} (commit: {}, built: {})",
@@ -54,7 +54,7 @@ pub fn version() -> String {
     )
 }
 
-/// Flag usage in the format of Go's `flag.PrintDefaults`.
+/// Flag usage text.
 pub fn sidecar_usage() -> String {
     "Usage: racer-object sidecar [flags]
   -api string
@@ -106,7 +106,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut show_version = false;
 
     let mut rest = &args[1..];
-    // Go's flag package: flags stop at the first non-flag, "-" or "--".
+    // Flags stop at the first non-flag, "-" or "--".
     while let Some(arg) = rest.first() {
         if arg.len() < 2 || !arg.starts_with('-') {
             break;
@@ -216,7 +216,7 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
-/// Go `strconv.ParseInt(s, 0, 64)` as used by `flag.IntVar`: optional sign,
+/// Integer flag value: optional sign,
 /// base prefixes 0x/0o/0b/0, and underscores only with a prefix.
 pub fn parse_int(s: &str) -> Option<i64> {
     let (negative, digits) = match s.as_bytes().first()? {
@@ -237,7 +237,7 @@ pub fn parse_int(s: &str) -> Option<i64> {
         (10, lower.clone(), false)
     };
     if body.contains('_') {
-        // Go only allows underscores between digits after a base prefix.
+        // Underscores are allowed only between digits after a base prefix.
         if !prefixed || body.ends_with('_') || body.contains("__") {
             return None;
         }
@@ -251,7 +251,8 @@ pub fn parse_int(s: &str) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
-/// Go `time.ParseDuration` magnitude (the sign is handled by the caller,
+/// Duration magnitude in the `300ms`, `1.5h`, `5m` syntax (the sign is
+/// handled by the caller,
 /// which rejects negatives). `None` on syntax error or overflow.
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let mut s = s.strip_prefix(['-', '+']).unwrap_or(s);
@@ -306,7 +307,7 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
 }
 
 /// Racer cache names are DNS subdomains whose origin socket path fits in
-/// `sun_path` (Go `racersdk.validateCache`).
+/// `sun_path` (the same rule as `pkg/racersdk`).
 pub fn valid_cache(s: &str) -> bool {
     if s.is_empty()
         || s.len() > 253
@@ -325,7 +326,7 @@ pub fn valid_cache(s: &str) -> bool {
     })
 }
 
-/// Go `net.SplitHostPort`.
+/// Split `host:port` or `[host]:port`.
 fn split_host_port(s: &str) -> Option<(&str, &str)> {
     if let Some(rest) = s.strip_prefix('[') {
         let close = rest.find(']')?;
@@ -350,7 +351,7 @@ pub fn validate_listen(value: &str) -> Result<SocketAddr, String> {
     let port_error = || "--listen port must be between 0 and 65535".to_string();
     let (host, port) = split_host_port(value).ok_or_else(loopback)?;
     let ip: IpAddr = host.parse().map_err(|_| loopback())?;
-    // IPv4-mapped IPv6 loopback counts, as with Go's IsLoopback.
+    // IPv4-mapped IPv6 loopback counts as loopback.
     let ip = ip.to_canonical();
     if !ip.is_loopback() {
         return Err(loopback());

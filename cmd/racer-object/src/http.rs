@@ -74,9 +74,8 @@ pub fn imf_fixdate(secs: u64) -> [u8; 29] {
     b
 }
 
-/// Builds a response head in a reused buffer. Header names use Go's
-/// canonical spelling so responses match the Go sidecar byte for byte
-/// (apart from `Date`).
+/// Builds a response head in a reused buffer. Header names use canonical
+/// MIME capitalization (`X-Ms-Blob-Type`).
 pub struct HeadBuilder<'a> {
     out: &'a mut Vec<u8>,
 }
@@ -125,7 +124,7 @@ impl<'a> HeadBuilder<'a> {
         self
     }
 
-    /// Azure object headers (Go `writeAzureSidecarHeaders`).
+    /// Azure object headers.
     pub fn azure_object(&mut self, version: &[u8]) -> &mut Self {
         self.header("X-Ms-Blob-Type", b"BlockBlob");
         if !version.is_empty() {

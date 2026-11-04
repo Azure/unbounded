@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Optional diagnostics listener. It serves only `/healthz`; the Go pprof
-//! endpoints have no Rust equivalent (profile with `perf` instead).
+//! Optional diagnostics listener. It serves only `/healthz` (profile with
+//! `perf` instead).
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,7 +12,7 @@ use tokio::sync::watch;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD: usize = 8192;
 
-/// Bind like Go's `net.Listen("tcp", address)`: a host may be a name or IP,
+/// Bind a TCP listener: a host may be a name or IP,
 /// and an empty host means every interface.
 pub async fn bind(address: &str) -> std::io::Result<TcpListener> {
     if let Some(port) = address.strip_prefix(':') {

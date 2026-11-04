@@ -375,8 +375,7 @@ async fn racer_unavailable() {
                 &[][..],
                 &[("If-None-Match", r#""v""#)],
                 &[("Range", "bytes=0-1")],
-                // Range syntax errors still consult Racer first, as the Go
-                // sidecar's Stat did.
+                // Range syntax errors still consult Racer first.
                 &[("Range", "bytes=2-1")],
             ] {
                 let r = s.get(method, "/bucket/key", headers).await;
@@ -486,7 +485,7 @@ async fn connection_semantics() {
     assert_eq!(r.status, 503);
     let r = s.get("GET", "http://localhost/bucket", &[]).await;
     assert_eq!(r.status, 400);
-    // OPTIONS * is answered like net/http.
+    // OPTIONS * gets an empty 200.
     let r = s.get("OPTIONS", "*", &[]).await;
     assert_eq!((r.status, r.header("content-length")), (200, Some("0")));
 }
@@ -505,7 +504,7 @@ async fn header_too_large() {
         };
         assert_xml(&r, "GET", 431, code);
         assert_eq!(r.header("connection"), Some("close"));
-        // Just under Go's effective limit is accepted and reaches Racer.
+        // Just under the limit is accepted and reaches Racer.
         let ok = "x".repeat(32 << 10);
         let r = s.get("GET", "/bucket/key", &[("X-Ok", &ok)]).await;
         assert_eq!(r.status, 503);

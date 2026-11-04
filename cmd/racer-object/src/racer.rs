@@ -4,8 +4,8 @@
 //! Racer client-socket protocol: metadata `HEAD` and credit-paced
 //! subscription `POST` over HTTP/1.1 on a Unix socket.
 //!
-//! This mirrors `pkg/racersdk` (client.go, object.go) and
-//! `pkg/racersdk/internal/wire`. Errors are mapped straight to sidecar
+//! The protocol is the one `pkg/racersdk` and `pkg/racersdk/internal/wire`
+//! speak. Errors are mapped straight to sidecar
 //! failures with the SDK's classification: transport problems are
 //! unavailable (503), protocol violations are bad gateway (502), and Racer
 //! status codes keep their meaning.
@@ -233,7 +233,7 @@ impl Client {
     }
 }
 
-/// Metadata request (Go `Client.Stat`).
+/// Metadata request.
 pub fn stat_request(id: &Identity, request: &mut Vec<u8>) {
     request.clear();
     request.extend_from_slice(b"HEAD /v1/objects/");
@@ -457,7 +457,7 @@ fn token_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
 }
 
-/// Port of `wire.ValidateContentType`: a media type with unique parameters.
+/// Racer content type check: a media type with unique parameters.
 pub fn valid_content_type(s: &[u8]) -> bool {
     if s.is_empty() {
         return true;
@@ -532,8 +532,7 @@ pub fn valid_content_type(s: &[u8]) -> bool {
     true
 }
 
-/// Racer status to sidecar failure (Go `wire.StatusError` then the SDK
-/// sentinels then `sidecarSDKFailure`).
+/// Racer status to sidecar failure.
 fn status_failure(status: u16) -> Failure {
     match status {
         400 | 405 | 431 => Failure::BadRequest,
@@ -562,7 +561,7 @@ impl Head<'_> {
         })
     }
 
-    /// Validate a Stat response (Go `wire.ParseClientHeadResponse`).
+    /// Validate a metadata response.
     fn stat(&self) -> Result<Meta, Failure> {
         let bad = Failure::BadGateway;
         let length = self.content_length.and_then(decimal).ok_or(bad)?;
@@ -599,8 +598,7 @@ impl Head<'_> {
         Ok(meta)
     }
 
-    /// Validate a subscription response (Go `wire.ParseSubscriptionResponse`)
-    /// and return metadata plus the selected `[first, end)`.
+    /// Validate a subscription response and return metadata plus the selected `[first, end)`.
     fn subscription(&self, pin: Option<&[u8]>) -> Result<(Meta, u64, u64), Failure> {
         let bad = Failure::BadGateway;
         let length = self.content_length.and_then(decimal).ok_or(bad)?;
@@ -690,7 +688,7 @@ pub fn credit_bytes(f: &Frame) -> [u8; 12] {
     b
 }
 
-/// Frame validation state for one subscription (Go `wire.Sequence`).
+/// Frame validation state for one subscription.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Sequence {
     first: u64,
@@ -712,7 +710,7 @@ impl Sequence {
         }
     }
 
-    /// Validate the next frame header (Go `wire.Sequence.Accept`). Page
+    /// Validate the next frame header. Page
     /// frames advance the sequence.
     pub fn accept(&mut self, f: &Frame) -> Result<(), Failure> {
         let bad = Failure::BadGateway;
@@ -832,7 +830,7 @@ impl Subscription {
         Ok(())
     }
 
-    /// Read and validate the next frame header (Go `wire.Sequence.Accept`).
+    /// Read and validate the next frame header.
     pub async fn next_frame(&mut self) -> Result<Frame, Failure> {
         let mut raw = [0; FRAME_SIZE];
         self.read_exact(&mut raw).await?;

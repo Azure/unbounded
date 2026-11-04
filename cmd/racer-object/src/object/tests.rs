@@ -3,7 +3,8 @@
 
 use super::*;
 
-/// Golden values computed with the Go `racerobject.NewRequest`.
+/// Golden values match the keys computed by the in-tree `internal/racerobject`
+/// library, so both produce the same Racer keys.
 const GOLDEN: &[(&str, &str, &str, &str, &str)] = &[
     (
         "bucket",
@@ -160,8 +161,8 @@ fn paths() {
     ok("/bucket/a%3Fb%23c", "bucket", b"a?b#c");
     ok("/bucket/a%25zz", "bucket", b"a%zz");
     ok("http://host:80/bucket/key?x", "bucket", b"key");
-    // An invalid raw encoding (here a raw '|') makes Go re-encode the
-    // decoded path, so an escaped slash becomes a separator.
+    // An invalid raw encoding (here a raw '|') re-encodes the decoded
+    // path, so an escaped slash becomes a separator.
     ok("/a%2Fb/c|d", "a", b"b/c|d");
     for bad in ["/", "/bucket", "/bucket/", "/bucket%2Fkey", "//key", "*"] {
         assert!(split(bad).is_none(), "{bad}");
@@ -194,8 +195,8 @@ fn s3_queries() {
         ("versionId=a%7F", Failure::BadRequest),
         ("x-id=ListObjects", Failure::NotImplemented),
         ("x-id=HeadObject", Failure::NotImplemented),
-        // Go returns 501 here deterministically: the loop finishes on the
-        // unsupported name before the control-character check.
+        // 501: the unsupported name is reported before the
+        // control-character check.
         ("foo=1&versionId=%00", Failure::NotImplemented),
     ] {
         assert_eq!(v(q, false), Err(want), "{q}");

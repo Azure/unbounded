@@ -3,7 +3,8 @@
 
 //! Request semantics shared by the S3 and Azure APIs.
 //!
-//! This is a port of the Go `internal/racerobject` sidecar. Everything here is
+//! Object identities must match the in-tree `internal/racerobject` library
+//! byte for byte so both compute the same Racer keys. Everything here is
 //! pure (no I/O) so it can be tested exhaustively and so the hot path can reuse
 //! buffers owned by the connection.
 
@@ -82,7 +83,7 @@ impl Failure {
     }
 }
 
-/// Go's `http.StatusText` for every status the sidecar emits.
+/// Standard reason phrase for every status the sidecar emits.
 pub fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -112,7 +113,8 @@ pub fn status_text(status: u16) -> &'static str {
 pub struct Identity {
     /// Lowercase hex SHA-256 of `metadata`.
     pub key: [u8; 64],
-    /// Canonical schema-1 JSON, byte-identical to Go's `json.Marshal`.
+    /// Canonical schema-1 JSON, byte-identical to `internal/racerobject`
+    /// so the Racer key matches.
     pub metadata: Vec<u8>,
 }
 
@@ -155,8 +157,7 @@ pub fn identity(bucket: &[u8], key: &[u8], version: &[u8]) -> Option<Identity> {
         json_string(&mut json, version);
     }
     json.push(b'}');
-    // Racer rejects oversized or control-character metadata (Go's
-    // wire.ValidateOpaque). JSON escapes C0 controls but leaves DEL as is.
+    // Racer rejects oversized or control-character metadata. JSON escapes C0 controls but leaves DEL as is.
     if json.len() > MAX_CANONICAL || json.contains(&0x7f) {
         return None;
     }
@@ -175,8 +176,9 @@ pub fn identity(bucket: &[u8], key: &[u8], version: &[u8]) -> Option<Identity> {
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
-/// Append a JSON string exactly as Go's `encoding/json` encodes valid UTF-8,
-/// including its HTML-safe escapes and U+2028/U+2029 escapes.
+/// Append a JSON string in the canonical encoding used by
+/// `internal/racerobject`, including HTML-safe escapes and U+2028/U+2029
+/// escapes.
 fn json_string(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     let mut i = 0;
@@ -227,15 +229,15 @@ fn json_string(out: &mut Vec<u8>, s: &[u8]) {
 // Request target
 // ---------------------------------------------------------------------------
 
-/// A request target split the way Go's `url.ParseRequestURI` splits it.
+/// A request target split into raw path and query.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Target<'a> {
     pub path: &'a [u8],
     pub query: &'a [u8],
 }
 
-/// Split a request target. `None` means net/http would have rejected the
-/// request line itself (generic 400 before any handler runs).
+/// Split a request target. `None` means the request line itself is
+/// invalid (generic 400 before any routing).
 pub fn split_target(target: &[u8]) -> Option<Target<'_>> {
     if target.iter().any(|&c| c < 0x20 || c == 0x7f) {
         return None;
@@ -260,7 +262,7 @@ pub fn split_target(target: &[u8]) -> Option<Target<'_>> {
     } else {
         return None;
     };
-    // net/http rejects invalid escapes anywhere in the path.
+    // Invalid escapes anywhere in the path are rejected.
     if !valid_escapes(path) {
         return None;
     }
@@ -337,7 +339,7 @@ pub fn unescape(s: &[u8], plus_space: bool, out: &mut Vec<u8>) -> Option<()> {
     Some(())
 }
 
-/// Bytes Go's `url.shouldEscape(c, encodePath)` leaves alone.
+/// Bytes a path never needs escaped.
 fn path_safe(c: u8) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -357,7 +359,7 @@ fn path_safe(c: u8) -> bool {
         )
 }
 
-/// Go's `validEncoded(s, encodePath)`.
+/// Whether a raw path is already a valid encoding.
 fn valid_encoded(s: &[u8]) -> bool {
     s.iter().all(|&c| {
         matches!(
@@ -381,12 +383,11 @@ fn valid_encoded(s: &[u8]) -> bool {
     })
 }
 
-/// Split a raw path into decoded bucket and key the way Go's sidecar does with
-/// `URL.EscapedPath()`: split before decoding so an escaped slash is key data,
+/// Split a raw path into decoded bucket and key: split before decoding so an escaped slash is key data,
 /// then decode each part exactly once. No dot-segment or slash cleaning.
 pub fn bucket_key(raw: &[u8], bucket: &mut Vec<u8>, key: &mut Vec<u8>) -> bool {
-    // EscapedPath returns the raw path when it is a valid encoding, otherwise
-    // it re-encodes the decoded path, which turns %2F into a real slash.
+    // Use the raw path when it is a valid encoding, otherwise
+    // re-encode the decoded path, which turns %2F into a real slash.
     let mut reencoded = Vec::new();
     let escaped: &[u8] = if valid_encoded(raw) {
         raw
@@ -431,7 +432,8 @@ pub fn bucket_key(raw: &[u8], bucket: &mut Vec<u8>, key: &mut Vec<u8>) -> bool {
 // Query
 // ---------------------------------------------------------------------------
 
-/// Parse a raw query like Go's `url.ParseQuery`. `None` means a parse error.
+/// Parse a raw query (`&`-separated, `;` rejected, `+` is a space). `None`
+/// means a parse error.
 /// Pairs keep request order; names and values are decoded bytes.
 pub fn parse_query(raw: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut pairs = Vec::new();
@@ -476,9 +478,8 @@ fn has_control(s: &[u8]) -> bool {
 
 /// S3 query: only `versionId` and a matching `x-id` are allowed.
 ///
-/// Go iterates a map, so when one request mixes a malformed parameter (400)
-/// and an unsupported one (501) Go's answer is random. This port reports 400
-/// first; every case where Go is deterministic gives the same result.
+/// When one request mixes a malformed parameter (400) and an unsupported one
+/// (501), 400 wins.
 pub fn s3_version(raw: &[u8], head: bool) -> Result<Vec<u8>, Failure> {
     if raw.is_empty() {
         return Ok(Vec::new());

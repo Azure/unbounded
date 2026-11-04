@@ -23,9 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
-/// Largest accepted request head. Go's net/http allows MaxHeaderBytes
-/// (32 KiB) plus 4 KiB of slack; matching it keeps every request the Go
-/// sidecar accepted working.
+/// Largest accepted request head: 32 KiB of headers plus 4 KiB of slack
+/// for the request line.
 const MAX_REQUEST_HEAD: usize = (32 << 10) + 4096;
 const MAX_HEADERS: usize = 256;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,7 +109,7 @@ pub async fn serve(
         Source::Listener { listener, peers } => {
             let mut next = 0usize;
             loop {
-                // Like Go's limited listener: take a slot before accepting,
+                // Take a slot before accepting,
                 // so excess connections wait in the kernel backlog instead
                 // of being accepted.
                 let permit = tokio::select! {
@@ -282,7 +281,7 @@ impl Conn {
                     self.close().await;
                     return;
                 }
-                // Like Go's ErrAbortHandler: close without completing the
+                // Close without completing the
                 // body. The FIN after a short body (per Content-Length)
                 // tells the client the transfer failed; a reset could
                 // discard the head still queued behind MSG_MORE.
@@ -316,7 +315,7 @@ impl Conn {
             self.rpos = 0;
         }
         let header_timeout = self.shared.header_timeout;
-        // Go uses the header timeout for the first request and the idle
+        // Use the header timeout for the first request and the idle
         // timeout while waiting for the first byte of later ones.
         let mut deadline = tokio::time::Instant::now()
             + if first || !self.rbuf.is_empty() {
@@ -437,7 +436,7 @@ impl Conn {
             Next::KeepAlive
         };
         if request.options_star {
-            // net/http answers `OPTIONS *` itself before any handler.
+            // Answer `OPTIONS *` with an empty 200 before any routing.
             let mut h = HeadBuilder::new(&mut self.out, 200);
             h.header("Content-Length", b"0");
             h.finish(connection);
@@ -519,7 +518,7 @@ impl Conn {
             .subscribe(&plan.id, Some(&meta.etag), range, &mut self.scratch)
             .await
             .map_err(|f| match f {
-                // Go reports a pinned 416 without Content-Range.
+                // A pinned 416 has no Content-Range.
                 Failure::RangeNotSatisfiable(_) => Failure::RangeNotSatisfiable(None),
                 other => other,
             })?;
@@ -714,7 +713,7 @@ fn parse_request(api: Api, buf: &[u8]) -> Option<Request> {
     })
 }
 
-/// Success head (Go `sidecarRead.writeHeaders`) without the final CRLF.
+/// Success head without the final CRLF.
 pub(crate) fn success_head(
     out: &mut Vec<u8>,
     api: Api,
@@ -808,7 +807,7 @@ fn check_pinned(
     }
     let len = end - first;
     if first != selection.offset || len != selection.length {
-        // Go's SDK reports a short tail as an unsatisfiable range.
+        // A short tail is an unsatisfiable range.
         if end == sub.size && selection.length > len {
             return Err(Failure::RangeNotSatisfiable(None));
         }
@@ -817,8 +816,8 @@ fn check_pinned(
     Ok(())
 }
 
-/// Everything decided from the request alone (Go `sidecar.request` plus
-/// condition and range parsing).
+/// Everything decided from the request alone, including condition and
+/// range parsing.
 fn plan(api: Api, req: &httparse::Request<'_, '_>, head: bool) -> Result<Plan, Failure> {
     if !req
         .headers
@@ -1289,7 +1288,7 @@ mod tests {
             check_pinned(&stat, &stat, 2, 5, sel),
             Err(Failure::BadGateway)
         );
-        // A short tail is reported as an unsatisfiable range, like Go's SDK.
+        // A short tail is reported as an unsatisfiable range.
         let tail = selection(8, 4, 12, true);
         assert_eq!(
             check_pinned(&stat, &stat, 8, 10, tail),
