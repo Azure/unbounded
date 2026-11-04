@@ -1154,6 +1154,12 @@ struct Helper {
     /// A stream per GPU for reading ciphertext back to the host when it
     /// moves between GPUs without a peer path. Made on first use.
     utility: HashMap<i32, racer_gpu::Stream>,
+    /// One page-locked host slot per GPU, reused for every host-sourced copy
+    /// into that GPU (host ciphertext, plaintext, and ciphertext bounced from
+    /// another GPU), so those copies are DMA from pinned memory and the
+    /// bounce path allocates nothing per page. `None` after an allocation
+    /// failure: copies then read pageable memory as before.
+    pinned: HashMap<i32, Option<racer_gpu::PinnedBuffer>>,
     /// Request streams, by the GPU they write, whose failed sealed write
     /// could not be fenced. Their queued copies or decrypts may still write
     /// that GPU's scratch slots, so sealed writes there are refused until
@@ -1216,6 +1222,7 @@ fn helper_main(
                 requests: HashMap::new(),
                 landing: HashMap::new(),
                 utility: HashMap::new(),
+                pinned: HashMap::new(),
                 tainted: HashMap::new(),
                 state,
             }
@@ -1576,11 +1583,24 @@ impl Helper {
                 return result;
             }
         };
+        let ordinal = self
+            .requests
+            .get(&id)
+            .ok_or(Error::Internal)?
+            .import
+            .ordinal();
+        let pinned = self.pinned_for(ordinal, plaintext.bytes());
         let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let destination = racer_gpu::Destination::Import(&request.import);
-        let queued = request
-            .stream
-            .copy_from_host(destination, offset, plaintext.clone());
+        let length = plaintext.bytes().len() as u64;
+        let queued = match &pinned {
+            Some(pinned) => request
+                .stream
+                .copy_from_pinned(destination, offset, pinned, 0, length),
+            None => request
+                .stream
+                .copy_from_host(destination, offset, plaintext.clone()),
+        };
         // Synchronize even after a failed queue call: part of it may run.
         let synchronized = request.stream.synchronize();
         queued.and(synchronized).map_err(gpu_error)?;
@@ -1589,6 +1609,49 @@ impl Helper {
             .plaintext
             .fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// GPU `ordinal`'s pinned slot holding a copy of `bytes`, or `None` to
+    /// copy from pageable memory instead (no slot, slot busy after an
+    /// unfenced failure, or `bytes` too large).
+    fn pinned_for(&mut self, ordinal: i32, bytes: &[u8]) -> Option<racer_gpu::PinnedBuffer> {
+        let pinned = self.pinned_slot(ordinal)?;
+        pinned.write(0, bytes).ok()?;
+        Some(pinned)
+    }
+
+    /// GPU `ordinal`'s pinned slot, allocated on first use.
+    fn pinned_slot(&mut self, ordinal: i32) -> Option<racer_gpu::PinnedBuffer> {
+        if !self.pinned.contains_key(&ordinal) {
+            let context = self
+                .contexts
+                .iter()
+                .find(|context| context.ordinal() == ordinal)?;
+            let slot = context.pinned(SLOT_BYTES).map_err(|error| {
+                eprintln!("racer: stage=gpu ordinal={ordinal} state=pinned-failed reason={error}");
+            });
+            self.pinned.insert(ordinal, slot.ok());
+        }
+        self.pinned.get(&ordinal)?.clone()
+    }
+
+    /// Make a NIC's writes into landed ciphertext on GPU `owner` visible
+    /// before the GPU (or, for `remote`, another GPU's peer copy) reads it.
+    fn flush_landed(&self, owner: i32, remote: bool) -> Result<()> {
+        let context = self
+            .contexts
+            .iter()
+            .find(|context| context.ordinal() == owner)
+            .ok_or(Error::Internal)?;
+        let scope = if remote {
+            racer_gpu::RdmaScope::AllDevices
+        } else {
+            racer_gpu::RdmaScope::Owner
+        };
+        context.flush_rdma_writes(scope).map_err(|error| {
+            eprintln!("racer: stage=gpu ordinal={owner} state=rdma-flush-failed reason={error}");
+            Error::Unavailable
+        })
     }
 
     /// After a failed sealed write, make sure no queued GPU work still reads
@@ -1849,10 +1912,13 @@ impl Helper {
         if sealed.range.start >= sealed.range.end || sealed.range.end > length {
             return Err(Error::InvalidRange);
         }
-        if let SealedSource::Landed(landed) = &page.source
-            && landed.len() != length + 16
-        {
-            return Err(Error::Internal);
+        if let SealedSource::Landed(landed) = &page.source {
+            if landed.len() != length + 16 {
+                return Err(Error::Internal);
+            }
+            // The NIC wrote these bytes; the decrypt reads them twice
+            // (GHASH, then CTR), so they must be visible and final first.
+            self.flush_landed(landed.ordinal(), landed.ordinal() != ordinal)?;
         }
         // Ciphertext on another GPU comes into this GPU's scratch first.
         let remote = match &page.source {
@@ -1871,6 +1937,12 @@ impl Helper {
         if let Some(remote) = &remote {
             self.copy_remote(id, ordinal, remote, length + 16)?;
         }
+        let pinned = match &page.source {
+            SealedSource::Host(copy) if remote.is_none() => {
+                self.pinned_for(ordinal, copy.copy.ciphertext.bytes())
+            }
+            _ => None,
+        };
         let staging = self.staging.get(&ordinal).ok_or(Error::Internal)?;
         let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let stream = &request.stream;
@@ -1881,11 +1953,20 @@ impl Helper {
                 if bytes.len() as u64 != length + 16 {
                     return Err(Error::CorruptRecord);
                 }
-                let copied = stream.copy_from_host(
-                    racer_gpu::Destination::Staging(staging),
-                    CIPHERTEXT_SCRATCH,
-                    HostCiphertext(copy.copy.ciphertext.clone()),
-                );
+                let copied = match &pinned {
+                    Some(pinned) => stream.copy_from_pinned(
+                        racer_gpu::Destination::Staging(staging),
+                        CIPHERTEXT_SCRATCH,
+                        pinned,
+                        0,
+                        length + 16,
+                    ),
+                    None => stream.copy_from_host(
+                        racer_gpu::Destination::Staging(staging),
+                        CIPHERTEXT_SCRATCH,
+                        HostCiphertext(copy.copy.ciphertext.clone()),
+                    ),
+                };
                 if let Err(error) = copied {
                     let _ = stream.synchronize();
                     return Err(gpu_error(error));
@@ -2016,20 +2097,51 @@ impl Helper {
             let stream = context.stream().map_err(gpu_error)?;
             self.utility.insert(src, stream);
         }
-        let mut bytes = vec![0; usize::try_from(length).map_err(|_| Error::Internal)?];
+        let pinned = self.pinned_slot(dst).filter(|pinned| !pinned.in_flight());
         let utility = self.utility.get(&src).ok_or(Error::Internal)?;
-        utility
-            .read_staging(self.source_buffer(source)?, source.offset, &mut bytes)
-            .map_err(gpu_error)?;
         let request = self.requests.get(&id).ok_or(Error::Internal)?;
         let staging = self.staging.get(&dst).ok_or(Error::Internal)?;
-        let queued = request.stream.copy_from_host(
-            racer_gpu::Destination::Staging(staging),
-            CIPHERTEXT_SCRATCH,
-            bytes,
-        );
-        let synchronized = request.stream.synchronize();
-        queued.and(synchronized).map_err(gpu_error)?;
+        if let Some(pinned) = pinned {
+            // Device -> pinned host -> device with no host wait in between:
+            // the request stream waits on the utility stream's fence. A
+            // failure before the request stream is involved leaves it
+            // untouched, as a failed host read-back did.
+            let fence = utility
+                .copy_to_pinned(
+                    self.source_buffer(source)?,
+                    source.offset,
+                    &pinned,
+                    0,
+                    length,
+                )
+                .and_then(|()| utility.fence())
+                .map_err(gpu_error)?;
+            let queued = request.stream.wait_for(&fence).and_then(|()| {
+                request.stream.copy_from_pinned(
+                    racer_gpu::Destination::Staging(staging),
+                    CIPHERTEXT_SCRATCH,
+                    &pinned,
+                    0,
+                    length,
+                )
+            });
+            let synchronized = request.stream.synchronize();
+            queued.and(synchronized).map_err(gpu_error)?;
+            // Already complete with the request stream.
+            drop(fence);
+        } else {
+            let mut bytes = vec![0; usize::try_from(length).map_err(|_| Error::Internal)?];
+            utility
+                .read_staging(self.source_buffer(source)?, source.offset, &mut bytes)
+                .map_err(gpu_error)?;
+            let queued = request.stream.copy_from_host(
+                racer_gpu::Destination::Staging(staging),
+                CIPHERTEXT_SCRATCH,
+                bytes,
+            );
+            let synchronized = request.stream.synchronize();
+            queued.and(synchronized).map_err(gpu_error)?;
+        }
         self.state
             .counters
             .peer_bounces
@@ -2348,7 +2460,26 @@ mod tests {
             plaintext[10..20]
         );
         assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 2);
+        // The simulated GPU does not order RDMA writes: each decrypt flushed.
+        assert_eq!(helper.run(|| simulation().rdma_flushes()), 2);
         assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Landed ciphertext is not read when RDMA writes can be neither ordered
+    /// nor flushed; with native ordering no flush is needed.
+    fn landed_ciphertext_needs_ordered_or_flushed_rdma_writes() {
+        let helper = helper(&[None]);
+        let buffer = landing(&helper, 0, LENGTH).unwrap();
+        let plaintext: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let _fd = import(&helper, 1, 0);
+        helper.run(|| simulation().set_rdma_ordering(0, false));
+        let page = landed(&buffer, 0, &plaintext, false);
+        assert!(write(&helper, 1, page, 0..5000).is_err());
+        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 0);
+        helper.run(|| simulation().set_rdma_ordering(100, false));
+        write(&helper, 1, landed(&buffer, 0, &plaintext, false), 0..5000).unwrap();
+        assert_eq!(helper.run(|| simulation().rdma_flushes()), 0);
     }
 
     #[test]
@@ -2790,7 +2921,7 @@ mod tests {
         let page = staged(&helper, 0, &plaintext);
         helper.run(|| {
             simulation().fault(Operation::StreamSync, -5);
-            simulation().fault(Operation::CopyD2h, -5);
+            simulation().fault(Operation::CopyD2hAsync, -5);
             simulation().fault(Operation::StreamSync, -5);
         });
         assert!(write(&helper, 1, page, 0..5000).is_err());
@@ -2809,7 +2940,7 @@ mod tests {
         let page = staged(&helper, 0, &plaintext);
         helper.run(|| {
             simulation().fault(Operation::StreamSync, -5);
-            simulation().fault(Operation::CopyD2h, -5);
+            simulation().fault(Operation::CopyD2hAsync, -5);
         });
         assert!(write(&helper, 1, page, 0..5000).is_err());
         assert_eq!(helper.free_slots(0), free);
