@@ -1634,10 +1634,10 @@ struct DiskBody {
 }
 // SAFETY: the Arc-held ciphertext storage is never mutated after
 // construction, so the returned slice is stable while `self` is alive.
-unsafe impl uring_runtime::reactor::SharedWriteBuffer for DiskBody {
-    fn write_bytes(&self) -> uring_runtime::Result<&[u8]> {
+unsafe impl racer_io::ring::SharedWriteBuffer for DiskBody {
+    fn write_bytes(&self) -> racer_io::Result<&[u8]> {
         disk_body_prefix(&self.page, self.alignment, self.length)
-            .ok_or(uring_runtime::Error::InvalidConfiguration)
+            .ok_or(racer_io::Error::InvalidConfiguration)
     }
 }
 /// Large records share capacity classes while their disk extents stay exact.

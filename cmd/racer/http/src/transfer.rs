@@ -33,8 +33,9 @@ pub mod delivery {
 
     use crate::connection::{ConnectionLease, Context, OwnedBuffer, Result};
     use flow_control::{PipeLease, Policy, splice_unsupported};
+    use racer_io::ring::{IoBuffer, SendBuffer};
     use std::{io, task::Poll, time::Instant};
-    use uring_runtime::reactor::{IoBuffer, SendBuffer, descriptor::Descriptor};
+    use uring_runtime::reactor::descriptor::Descriptor;
 
     /// Nonblocking staging pipe. Writes/drains expose EINTR and EAGAIN; successful
     /// counts must be bounded by the supplied slice or requested count.
@@ -146,7 +147,7 @@ pub mod delivery {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let view = owner.view(count)?;
                     if view.send_bytes()?.len() != count {
-                        return Err(uring_runtime::Error::Io.into());
+                        return Err(racer_io::Error::Io.into());
                     }
                     observer.before_send(count, owner.bytes().len());
                     let completion = reactor
@@ -156,10 +157,10 @@ pub mod delivery {
                     observer.after_send(count, completion.bytes)?;
                     completion.bytes
                 }
-                Err(_) => return Err(uring_runtime::Error::Io.into()),
+                Err(_) => return Err(racer_io::Error::Io.into()),
             };
             if sent == 0 || sent > count {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_io::Error::Io.into());
             }
             observer.direct_bytes(sent);
             owner.advance(sent);
@@ -241,7 +242,7 @@ pub mod delivery {
                                 yield_once().await;
                                 continue;
                             }
-                            _ => return Err(uring_runtime::Error::Io.into()),
+                            _ => return Err(racer_io::Error::Io.into()),
                         }
                         observer.pipe_drained();
                         Buffer::Pipe(buffer)
@@ -259,7 +260,7 @@ pub mod delivery {
                     (owner, connection) = completion.lease;
                     observer.after_send(count, completion.bytes)?;
                     if completion.bytes > count {
-                        return Err(uring_runtime::Error::Io.into());
+                        return Err(racer_io::Error::Io.into());
                     }
                     // Reconstruct any unsent suffix from immutable backing, not the
                     // now-empty pipe. Subsequent backpressure owns immutable views.
@@ -267,10 +268,10 @@ pub mod delivery {
                     observer.direct_bytes(completion.bytes);
                     completion.bytes
                 }
-                Err(_) => return Err(uring_runtime::Error::Io.into()),
+                Err(_) => return Err(racer_io::Error::Io.into()),
             };
             if sent == 0 || sent > owner.remaining() {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_io::Error::Io.into());
             }
             owner.advance(sent);
             observer.delivered_bytes(sent);
@@ -310,7 +311,7 @@ pub mod delivery {
     // SAFETY: each variant retains stable immutable backing through completion.
     unsafe impl<C: Context, V: SendBuffer> SendBuffer for Buffer<C, V> {
         /// Borrow stable bytes from the selected completion-owned buffer.
-        fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
+        fn send_bytes(&self) -> racer_io::Result<&[u8]> {
             match self {
                 Self::Pipe(buffer) => buffer.send_bytes(),
                 Self::View(buffer) => buffer.send_bytes(),
@@ -487,7 +488,7 @@ pub mod delivery {
         // SAFETY: the immutable Rc backing is retained and cannot be mutated through this view.
         unsafe impl SendBuffer for View {
             /// Borrow the immutable send range while retaining its backing owner.
-            fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
+            fn send_bytes(&self) -> racer_io::Result<&[u8]> {
                 Ok(&self.bytes[self.range.clone()])
             }
         }
@@ -642,7 +643,7 @@ pub mod delivery {
             fn scope(&self, stalled_at: Instant) -> Result<Caller, TestScope> {
                 self.times.borrow_mut().push(stalled_at);
                 if self.scope_error.get() {
-                    return Err(uring_runtime::Error::DeadlineExceeded.into());
+                    return Err(racer_io::Error::DeadlineExceeded.into());
                 }
                 Ok(TestScope)
             }
@@ -806,8 +807,8 @@ pub mod delivery {
                     send(&Caller, &reactor, owner, connection, &observer),
                 );
                 let expected = match failure {
-                    "drain" => Failure::Runtime(uring_runtime::Error::Io),
-                    "scope" => Failure::Runtime(uring_runtime::Error::DeadlineExceeded),
+                    "drain" => Failure::Runtime(racer_io::Error::Io),
+                    "scope" => Failure::Runtime(racer_io::Error::DeadlineExceeded),
                     _ => Failure::Http(Error::Malformed),
                 };
                 assert!(matches!(result, Err(e) if e == expected));
@@ -971,8 +972,9 @@ pub mod relay {
 
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
     use flow_control::{MAX_PIPE_BYTES, PipeLease, Policy, splice_unsupported};
+    use racer_io::ring::IoBuffer;
     use std::{io, ops::Range, rc::Rc};
-    use uring_runtime::reactor::{IoBuffer, descriptor::Descriptor};
+    use uring_runtime::reactor::descriptor::Descriptor;
 
     /// Exact opaque HTTP body transit. Does not finish exchanges or select deadlines.
     pub struct Relay<C: Context, P: RelayPipe> {
@@ -1081,7 +1083,7 @@ pub mod relay {
             }
             scope.check()?;
             Ok(Rc::try_unwrap(state)
-                .map_err(|_| uring_runtime::Error::InvalidInput)?
+                .map_err(|_| racer_io::Error::InvalidInput)?
                 .into_inner())
         }
 
@@ -1122,7 +1124,7 @@ pub mod relay {
             // A requester may finish writing while still reading its response.
             // Reject only full disconnect here; sends report other write failures.
             if self.destination.socket().peer_disconnected() {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_io::Error::Io.into());
             }
             let mut wait = Step::Yield;
             for _ in 0..32 {
@@ -1152,7 +1154,7 @@ pub mod relay {
                         let n = self
                             .pipe
                             .drain(buffer.bytes_mut()?)
-                            .map_err(|_| uring_runtime::Error::Io)?;
+                            .map_err(|_| racer_io::Error::Io)?;
                         self.pending = 0..n;
                         continue;
                     }
@@ -1177,7 +1179,7 @@ pub mod relay {
                     self.pipe.receive(&self.source.socket(), remaining)
                 };
                 match result {
-                    Ok(0) => return Err(uring_runtime::Error::Io.into()),
+                    Ok(0) => return Err(racer_io::Error::Io.into()),
                     Ok(n) => {
                         if writing {
                             if !self.pending.is_empty() {
@@ -1204,7 +1206,7 @@ pub mod relay {
                         };
                         break;
                     }
-                    Err(_) => return Err(uring_runtime::Error::Io.into()),
+                    Err(_) => return Err(racer_io::Error::Io.into()),
                 }
             }
             if self.source.receive_remaining() == Some(0)
@@ -1334,7 +1336,7 @@ pub mod relay {
             /// Reserve counted bytes unless overload has been injected.
             fn charge(&self, n: usize) -> Result<Self, Charge> {
                 if self.reject.get() {
-                    return Err(uring_runtime::Error::Overloaded.into());
+                    return Err(racer_io::Error::Overloaded.into());
                 }
                 self.bytes.set(self.bytes.get() + n);
                 Ok(Charge(self.bytes.clone(), n))
@@ -1526,7 +1528,7 @@ pub mod relay {
                 drop(reader);
                 assert!(matches!(
                     relay.step(&f.io),
-                    Err(Failure::Runtime(uring_runtime::Error::Io))
+                    Err(Failure::Runtime(racer_io::Error::Io))
                 ));
                 assert_eq!(relay.destination.send_remaining(), Some(3));
             }
@@ -1650,9 +1652,9 @@ pub mod relay {
                     f.hooks.reject.set(failure == "allocation");
                 }
                 let expected = if failure == "allocation" {
-                    uring_runtime::Error::Overloaded
+                    racer_io::Error::Overloaded
                 } else {
-                    uring_runtime::Error::Io
+                    racer_io::Error::Io
                 };
                 assert!(matches!(relay.step(&f.io), Err(Failure::Runtime(e)) if e == expected));
                 assert!(!relay.source.is_reusable() && !relay.destination.is_reusable());
@@ -1725,7 +1727,7 @@ pub mod relay {
             f.hooks.reject.set(true);
             assert!(matches!(
                 relay.step(&f.io),
-                Err(Failure::Runtime(uring_runtime::Error::Overloaded))
+                Err(Failure::Runtime(racer_io::Error::Overloaded))
             ));
             assert!(relay.fallback.is_none());
             assert_eq!(relay.source.receive_remaining(), Some(3));
@@ -1792,7 +1794,7 @@ mod fixtures {
         Http(Error),
 
         /// A runtime transport or admission failure.
-        Runtime(uring_runtime::Error),
+        Runtime(racer_io::Error),
     }
 
     impl From<Error> for Failure {
@@ -1802,9 +1804,9 @@ mod fixtures {
         }
     }
 
-    impl From<uring_runtime::Error> for Failure {
+    impl From<racer_io::Error> for Failure {
         /// Preserve a runtime failure without reclassification.
-        fn from(e: uring_runtime::Error) -> Self {
+        fn from(e: racer_io::Error) -> Self {
             Self::Runtime(e)
         }
     }

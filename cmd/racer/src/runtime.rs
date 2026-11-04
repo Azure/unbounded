@@ -263,13 +263,13 @@ impl wire_codec::rest::Scope for RequestScope {
 pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl uring_runtime::Budget for AdmissionBudget {
     type Charge = flow_control::Charge<AdmissionPolicy>;
-    fn charge(&self, bytes: usize) -> uring_runtime::Result<flow_control::Charge<AdmissionPolicy>> {
+    fn charge(&self, bytes: usize) -> racer_io::Result<flow_control::Charge<AdmissionPolicy>> {
         self.0
             .reserve_completion(None, ResourceClass::RequestContext, bytes)
             .map_err(|error| match error {
-                flow_control::Error::InvalidInput => uring_runtime::Error::InvalidConfiguration,
-                flow_control::Error::Unavailable => uring_runtime::Error::Unavailable,
-                _ => uring_runtime::Error::Overloaded,
+                flow_control::Error::InvalidInput => racer_io::Error::InvalidConfiguration,
+                flow_control::Error::Unavailable => racer_io::Error::Unavailable,
+                _ => racer_io::Error::Overloaded,
             })
     }
 }
@@ -279,7 +279,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// Inline storage cannot meet the stable-buffer contract:
 /// ```compile_fail
 /// use racer::error::Result;
-/// use uring_runtime::reactor::IoBuffer;
+/// use racer_io::ring::IoBuffer;
 /// struct Inline([u8; 16]);
 /// impl IoBuffer for Inline {
 ///     type Error = racer::error::Error;
@@ -290,7 +290,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// Borrowed storage does not have an independent completion lifetime:
 /// ```compile_fail
 /// use racer::error::Result;
-/// use uring_runtime::reactor::IoBuffer;
+/// use racer_io::ring::IoBuffer;
 /// struct Borrowed<'a>(&'a mut [u8]);
 /// unsafe impl IoBuffer for Borrowed<'_> {
 ///     type Error = racer::error::Error;
@@ -301,7 +301,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// Audited production buffers own independent storage:
 /// ```
 /// use racer::{memory::PlaintextBuffer, admission::AdmissionPolicy};
-/// use uring_runtime::reactor::IoBuffer;
+/// use racer_io::ring::IoBuffer;
 /// use flow_control::Charge;
 /// use page_alloc::AlignedBuffer;
 /// fn independent<T: 'static>() {}
@@ -396,7 +396,7 @@ impl Reactor {
         self.core
             .reserve_submissions(capacity, (slots, memory))
             .map_err(|error| match error {
-                uring_runtime::Error::InvalidInput => Error::InvalidConfiguration,
+                racer_io::Error::InvalidInput => Error::InvalidConfiguration,
                 other => other.into(),
             })
     }
@@ -734,12 +734,12 @@ mod tests {
 
         mod tests {
             use super::*;
+            use racer_io::ring::IoBuffer;
             use std::os::unix::net::UnixStream;
             use std::task::Context;
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
-            use uring_runtime::reactor::IoBuffer;
             use uring_runtime::reactor::SocketAddress;
             use uring_runtime::reactor::descriptor::Descriptor;
             use uring_runtime::reactor::simulation;
@@ -861,10 +861,10 @@ mod tests {
             struct Buffer(Vec<u8>);
             // SAFETY: private fixed Vec owns stable exclusive backing.
             unsafe impl IoBuffer for Buffer {
-                fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+                fn bytes(&self) -> racer_io::Result<&[u8]> {
                     Ok(&self.0)
                 }
-                fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+                fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
                     Ok(&mut self.0)
                 }
             }
@@ -1183,7 +1183,7 @@ mod tests {
             fn direct_io_faults_check_address_offset_and_length_independently() {
                 use page_alloc::AlignedBuffer;
                 use page_alloc::Alignment;
-                use uring_runtime::reactor::IoBuffer;
+                use racer_io::ring::IoBuffer;
                 struct View {
                     buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
                     start: usize,
@@ -1191,10 +1191,10 @@ mod tests {
                 }
                 // SAFETY: fixed range retains independently allocated aligned storage.
                 unsafe impl IoBuffer for View {
-                    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+                    fn bytes(&self) -> racer_io::Result<&[u8]> {
                         Ok(&self.buffer.as_slice()[self.start..self.start + self.length])
                     }
-                    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+                    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
                         Ok(&mut self.buffer.as_mut_slice()[self.start..self.start + self.length])
                     }
                 }

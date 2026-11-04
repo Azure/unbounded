@@ -1,5 +1,6 @@
 //! End-to-end diagnostic ownership, formatting failure, and request-boundary workflows.
 
+use racer_io::Error;
 use std::{
     cell::RefCell,
     fmt,
@@ -12,7 +13,7 @@ use telemetry::{
     Lease, Metrics, Ring,
     server::{self, Event, Handler, Response, Server},
 };
-use uring_runtime::{Error, Operation, Scope, environment::Cancellation, reactor::Reactor};
+use uring_runtime::{Operation, Scope, environment::Cancellation, reactor::Reactor};
 
 telemetry::metrics! { Counter, COUNTERS, COUNTER_COUNT;
     Self::Completed => "completed_total",

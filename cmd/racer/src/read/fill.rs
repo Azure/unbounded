@@ -45,9 +45,9 @@ use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
 use crate::telemetry::{Detail, FillAdmissionSite};
+use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
-use uring_runtime::reactor::IoBuffer;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -2571,7 +2571,7 @@ impl Fill {
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        use uring_runtime::reactor::IoBuffer;
+        use racer_io::ring::IoBuffer;
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }

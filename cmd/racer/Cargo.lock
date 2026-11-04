@@ -212,6 +212,7 @@ name = "controlplane"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "racer-io",
  "uring-runtime",
  "wire-codec",
 ]
@@ -416,6 +417,7 @@ dependencies = [
  "futures",
  "libc",
  "page-alloc",
+ "racer-io",
  "uring-runtime",
  "zeroize",
 ]
@@ -547,6 +549,7 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
+ "racer-io",
  "rcgen",
  "rustls",
  "uring-runtime",
@@ -692,6 +695,7 @@ name = "page-alloc"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "racer-io",
  "uring-runtime",
  "zeroize",
 ]
@@ -705,6 +709,7 @@ dependencies = [
  "racer-control-wire",
  "racer-core",
  "racer-crypto",
+ "racer-io",
  "racer-object-wire",
  "sha2",
  "uring-runtime",
@@ -827,6 +832,7 @@ dependencies = [
  "racer-core",
  "racer-crypto",
  "racer-gpu",
+ "racer-io",
  "racer-object-wire",
  "rcgen",
  "rdma-verbs",
@@ -1001,6 +1007,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "libc",
+ "racer-io",
  "serde_json",
  "uring-runtime",
 ]
@@ -1244,6 +1251,7 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "httparse",
+ "racer-io",
  "uring-runtime",
  "zeroize",
 ]
@@ -1447,6 +1455,7 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
+ "racer-io",
  "rcgen",
  "rustls",
  "rustls-pemfile",

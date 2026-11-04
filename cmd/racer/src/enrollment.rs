@@ -812,16 +812,16 @@ mod tests {
     /// Independent component errors crossing the test host boundary.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Cause {
-        Runtime(uring_runtime::Error),
+        Runtime(racer_io::Error),
 
         Enrollment(Error),
 
         Access(secure::AccessError),
     }
 
-    impl From<uring_runtime::Error> for Failure {
+    impl From<racer_io::Error> for Failure {
         /// Retain the runtime cause before any replacement phase is attached.
-        fn from(e: uring_runtime::Error) -> Self {
+        fn from(e: racer_io::Error) -> Self {
             Self {
                 cause: Cause::Runtime(e),
                 phase: 0,
@@ -874,7 +874,7 @@ mod tests {
         /// Stop cancelled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
             if self.cancellation.is_cancelled() {
-                Err(uring_runtime::Error::Cancelled.into())
+                Err(racer_io::Error::Cancelled.into())
             } else {
                 Ok(())
             }
@@ -920,7 +920,7 @@ mod tests {
 
         /// Distinguish absent records from other filesystem and policy failures.
         fn is_missing(error: Failure) -> bool {
-            error == uring_runtime::Error::NotFound.into()
+            error == racer_io::Error::NotFound.into()
         }
     }
 
@@ -1529,9 +1529,9 @@ mod tests {
                 }
                 let expected = Failure {
                     cause: Cause::Runtime(if case == "cancel-rename" {
-                        uring_runtime::Error::Cancelled
+                        racer_io::Error::Cancelled
                     } else {
-                        uring_runtime::Error::Os(if case == "write" { 28 } else { 5 })
+                        racer_io::Error::Os(if case == "write" { 28 } else { 5 })
                     }),
                     phase: match case {
                         "rename" | "cancel-rename" => 1,
@@ -1577,7 +1577,7 @@ mod tests {
         );
         assert_eq!(files.next.get(), 1);
         assert!(
-            matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)), Err(error) if error == uring_runtime::Error::Overloaded.into())
+            matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)), Err(error) if error == racer_io::Error::Overloaded.into())
         );
         assert_eq!(files.next.get(), 1);
         drop(first);
@@ -1592,7 +1592,7 @@ mod tests {
         scope.cancellation.cancel().unwrap();
         let before = sim.trace().len();
         assert!(
-            matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == uring_runtime::Error::Cancelled.into())
+            matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == racer_io::Error::Cancelled.into())
         );
         assert_eq!(sim.trace().len(), before);
         assert_eq!(files.next.get(), 2);
@@ -1663,18 +1663,18 @@ mod tests {
         )
         .unwrap();
         for (name, limit, private, expected) in [
-            ("link", 5, false, uring_runtime::Error::Os(40).into()),
+            ("link", 5, false, racer_io::Error::Os(40).into()),
             (
                 "pending.json",
                 1024 * 1024 + 1,
                 true,
-                uring_runtime::Error::Overloaded.into(),
+                racer_io::Error::Overloaded.into(),
             ),
             (
                 "pending.json",
                 1,
                 true,
-                uring_runtime::Error::InvalidInput.into(),
+                racer_io::Error::InvalidInput.into(),
             ),
         ] {
             assert!(
@@ -1690,7 +1690,7 @@ mod tests {
                     .map_err(Failure::from)
             }),
         );
-        assert_eq!(result, Err(uring_runtime::Error::Overloaded.into()));
+        assert_eq!(result, Err(racer_io::Error::Overloaded.into()));
         assert!(sim.metadata(Path::new("/private/.large.stage")).is_err());
     }
 }

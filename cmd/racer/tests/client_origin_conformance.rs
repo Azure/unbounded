@@ -34,6 +34,7 @@ use racer::read::ReadResponse;
 use racer::runtime::Reactor;
 use racer::runtime::RequestScope;
 use racer_control_wire::CacheId;
+use racer_io::ring::IoBuffer;
 use std::future::Future;
 use std::io::Read;
 use std::io::Write;
@@ -46,7 +47,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::IoBuffer;
 
 const LIMIT: usize = 32768;
 const P: u64 = 16777216;

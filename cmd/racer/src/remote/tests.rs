@@ -410,7 +410,7 @@ fn pooled_remote_endpoint_range_reads() {
                     while offset < BODY {
                         let buffer = io.buffer(256 * 1024)?;
                         let read = io.read_body_exact(connection, buffer, &scope).await?;
-                        use uring_runtime::reactor::IoBuffer as _;
+                        use racer_io::ring::IoBuffer as _;
                         let bytes = read.buffer.bytes()?;
                         assert!(
                             bytes

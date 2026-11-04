@@ -7,10 +7,10 @@ use crate::read::Coordinator;
 use crate::runtime::Cancellation;
 use http1::MessageHead;
 use racer_control_wire::CacheId;
+use racer_io::ring::IoBuffer;
 use racer_object_wire::prefetch::PrefetchRequest;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::IoBuffer;
 
 /// Scope for a PUT, which resolves versions before answering.
 const PUT_TIMEOUT: Duration = Duration::from_secs(70);

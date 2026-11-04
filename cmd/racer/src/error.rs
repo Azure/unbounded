@@ -276,19 +276,19 @@ impl From<page_alloc::Error> for Error {
     }
 }
 
-impl From<uring_runtime::Error> for Error {
-    fn from(error: uring_runtime::Error) -> Self {
+impl From<racer_io::Error> for Error {
+    fn from(error: racer_io::Error) -> Self {
         match error {
-            uring_runtime::Error::Cancelled => Self::Cancelled,
-            uring_runtime::Error::DeadlineExceeded => Self::DeadlineExceeded,
-            uring_runtime::Error::Overloaded => Self::Overloaded,
-            uring_runtime::Error::Unavailable => Self::Unavailable,
-            uring_runtime::Error::InvalidConfiguration => Self::InvalidConfiguration,
-            uring_runtime::Error::InvalidInput => Self::InvalidRequest,
-            uring_runtime::Error::NotFound => Self::MissingKey,
-            uring_runtime::Error::AlreadyExists => Self::Replay,
-            uring_runtime::Error::Io => Self::Io,
-            uring_runtime::Error::Os(errno) => Self::Os(errno),
+            racer_io::Error::Cancelled => Self::Cancelled,
+            racer_io::Error::DeadlineExceeded => Self::DeadlineExceeded,
+            racer_io::Error::Overloaded => Self::Overloaded,
+            racer_io::Error::Unavailable => Self::Unavailable,
+            racer_io::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            racer_io::Error::InvalidInput => Self::InvalidRequest,
+            racer_io::Error::NotFound => Self::MissingKey,
+            racer_io::Error::AlreadyExists => Self::Replay,
+            racer_io::Error::Io => Self::Io,
+            racer_io::Error::Os(errno) => Self::Os(errno),
         }
     }
 }
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn runtime_errors_keep_racer_boundary_meanings() {
-        use uring_runtime::Error as RuntimeError;
+        use racer_io::Error as RuntimeError;
         for (runtime, racer) in [
             (RuntimeError::Cancelled, Error::Cancelled),
             (RuntimeError::DeadlineExceeded, Error::DeadlineExceeded),

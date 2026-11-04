@@ -24,6 +24,7 @@ use racer_control_wire::ClusterId;
 use racer_control_wire::KeyId;
 use racer_crypto::identity::Certificates;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,6 @@ use uring_runtime::environment::Deadline;
 use uring_runtime::environment::SimulationClock;
 #[cfg(test)]
 use uring_runtime::group::Service;
-use uring_runtime::reactor::IoBuffer;
 
 mod body_progress {
     use super::*;

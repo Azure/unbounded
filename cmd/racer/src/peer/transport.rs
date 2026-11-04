@@ -44,11 +44,11 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
+use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use uring_runtime::environment::now;
-use uring_runtime::reactor::IoBuffer;
 
 const HEADER: &str = "racer-payload-control";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1034,13 +1034,13 @@ impl WireBuffer {
 // SAFETY: both variants own stable, exclusive backing and their complete
 // reservation until dropped.
 unsafe impl IoBuffer for WireBuffer {
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         match self {
             Self::Owned(buffer) => Ok(buffer.bytes()),
             Self::Aligned(buffer) => buffer.bytes(),
         }
     }
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         match self {
             Self::Owned(buffer) => Ok(buffer.bytes_mut()),
             Self::Aligned(buffer) => buffer.bytes_mut(),

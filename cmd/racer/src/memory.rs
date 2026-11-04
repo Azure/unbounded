@@ -146,11 +146,11 @@ impl std::fmt::Debug for CiphertextBuffer {
 }
 // SAFETY: the detached allocation is exclusively owned, stable, and live
 // until Drop, and is only exposed through these borrows.
-unsafe impl uring_runtime::reactor::IoBuffer for CiphertextBuffer {
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+unsafe impl racer_io::ring::IoBuffer for CiphertextBuffer {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.as_slice())
     }
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(self.as_mut_slice())
     }
 }
@@ -202,11 +202,11 @@ impl PlaintextBuffer {
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
-unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+unsafe impl racer_io::ring::IoBuffer for PlaintextBuffer {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.0.bytes())
     }
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(self.0.bytes_mut())
     }
 }
@@ -940,8 +940,8 @@ impl CiphertextPage {
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
-unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
-    fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
+unsafe impl racer_io::ring::SendBuffer for CiphertextPage {
+    fn send_bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.bytes())
     }
 }
@@ -1747,7 +1747,7 @@ pub(crate) mod tests {
     use crate::model::Nonce;
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
-    use uring_runtime::reactor::IoBuffer;
+    use racer_io::ring::IoBuffer;
     /// Owner and reclamation contracts over real allocations.
     mod owners {
         use super::*;

@@ -112,7 +112,7 @@ fn dirty_pressure_skips_persistence_while_bootstrap_read_succeeds() {
             .buffers
             .plaintext(f.fill.reserve_bootstrap(&cache).unwrap(), 3)
             .unwrap();
-        uring_runtime::reactor::IoBuffer::bytes_mut(&mut plaintext)
+        racer_io::ring::IoBuffer::bytes_mut(&mut plaintext)
             .unwrap()
             .copy_from_slice(b"abc");
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);

@@ -21,7 +21,7 @@ pub trait Codec {
     type Version: Copy + Ord + Display;
 
     /// Domain errors preserve structured wire validation failures.
-    type Error: Copy + Send + From<Error> + From<rest::Error> + From<uring_runtime::Error> + 'static;
+    type Error: Copy + Send + From<Error> + From<rest::Error> + From<racer_io::Error> + 'static;
 
     /// Read the document's cursor.
     fn version(&self, document: &Self::Document) -> Self::Version;
@@ -595,7 +595,7 @@ where
     /// later fetch may supersede them without retaining a rejected delta base.
     pub async fn turn(&mut self, scope: &H::Scope) -> Result<(), H::Error> {
         if self.stopped.get() {
-            return Err(uring_runtime::Error::Cancelled.into());
+            return Err(racer_io::Error::Cancelled.into());
         }
         let now = uring_runtime::environment::now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
@@ -672,7 +672,7 @@ where
     /// preparation outlasts one tick.
     pub async fn settle(&mut self, scope: &H::Scope) -> Result<(), H::Error> {
         if self.stopped.get() {
-            return Err(uring_runtime::Error::Cancelled.into());
+            return Err(racer_io::Error::Cancelled.into());
         }
         let now = uring_runtime::environment::now();
         let scope = scope.narrowed(now.checked_add(self.schedule.turn).unwrap_or(now));
@@ -865,7 +865,7 @@ impl<C: Codec, T: Target<C>> Progress<C, T> {
                 Err(_) => {
                     self.queued = Some(document);
                     self.next_prepare = now.checked_add(jitter(schedule.retry_min)).unwrap_or(now);
-                    return Err(uring_runtime::Error::Io.into());
+                    return Err(racer_io::Error::Io.into());
                 }
             }
         }

@@ -75,7 +75,7 @@ pub enum Error {
     /// Preserve the identity component's failure classification.
     Identity(racer_crypto::identity::Error),
     /// Preserve the runtime component's failure classification.
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
 }
 
 /// A bounded wire mechanism result.
@@ -96,8 +96,8 @@ impl From<racer_crypto::identity::Error> for Error {
     }
 }
 
-impl From<uring_runtime::Error> for Error {
-    fn from(value: uring_runtime::Error) -> Self {
+impl From<racer_io::Error> for Error {
+    fn from(value: racer_io::Error) -> Self {
         Self::Runtime(value)
     }
 }

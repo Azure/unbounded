@@ -4,6 +4,7 @@ use http1::{
     Codec, Error, Header, MessageHead, StartLine,
     connection::{ConnectionLease, Context, Endpoint, HttpIo, OwnedBuffer},
 };
+use racer_io::ring::IoBuffer;
 use std::{
     future::Future,
     os::unix::net::UnixStream,
@@ -13,7 +14,7 @@ use std::{
 };
 use uring_runtime::{
     Scope,
-    reactor::{IoBuffer, Reactor, SocketAddress},
+    reactor::{Reactor, SocketAddress},
 };
 
 /// Keeps HTTP syntax failures distinct from transport failures.
@@ -21,7 +22,7 @@ use uring_runtime::{
 enum Failure {
     Http(Error),
 
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
 }
 
 impl From<Error> for Failure {
@@ -31,9 +32,9 @@ impl From<Error> for Failure {
     }
 }
 
-impl From<uring_runtime::Error> for Failure {
+impl From<racer_io::Error> for Failure {
     /// Preserve the runtime failure without mapping it to HTTP syntax.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_io::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -160,7 +161,7 @@ fn accept_retains_one_future_across_completions_and_preserves_errors() {
     }
     let mut active = FuturesUnordered::new();
     active.push(std::future::ready(()));
-    let failure = Failure::Runtime(uring_runtime::Error::Io);
+    let failure = Failure::Runtime(racer_io::Error::Io);
     assert_eq!(
         futures::executor::block_on(http1::connection::next_accepted(
             std::future::ready(Err::<(), _>(failure)),
@@ -207,10 +208,7 @@ fn disconnect_waits_for_work_cleanup_before_returning_failure() {
             work,
         ),
     );
-    assert_eq!(
-        result,
-        Err(Failure::Runtime(uring_runtime::Error::Cancelled))
-    );
+    assert_eq!(result, Err(Failure::Runtime(racer_io::Error::Cancelled)));
     assert!(canceled.get() && cleaned.get() && watch_canceled.get());
     assert_eq!(io.reactor().in_flight(), 0);
 }
@@ -230,7 +228,7 @@ mod disconnect_scopes {
 
         fn check(&self) -> Result<(), Failure> {
             if self.0.is_cancelled() {
-                Err(uring_runtime::Error::Cancelled.into())
+                Err(racer_io::Error::Cancelled.into())
             } else {
                 Ok(())
             }
@@ -331,7 +329,7 @@ mod disconnect_scopes {
             assert_eq!(
                 result,
                 if cancel {
-                    Err(Failure::Runtime(uring_runtime::Error::Cancelled))
+                    Err(Failure::Runtime(racer_io::Error::Cancelled))
                 } else {
                     Ok(7)
                 }
@@ -357,7 +355,7 @@ mod disconnect_scopes {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let connection = ConnectionLease::from_reserved(socket.into(), (), ()).unwrap();
         let parent = CancelScope(Cancellation::new().unwrap());
-        let error = Failure::Runtime(uring_runtime::Error::Overloaded);
+        let error = Failure::Runtime(racer_io::Error::Overloaded);
         let result = futures::executor::block_on(http1::connection::disconnect_fenced(
             &io,
             &connection,

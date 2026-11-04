@@ -770,8 +770,8 @@ mod inner {
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Failure;
 
-    impl From<uring_runtime::Error> for Failure {
-        fn from(_: uring_runtime::Error) -> Self {
+    impl From<racer_io::Error> for Failure {
+        fn from(_: racer_io::Error) -> Self {
             Self
         }
     }

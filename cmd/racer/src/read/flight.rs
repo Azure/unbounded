@@ -1069,7 +1069,7 @@ impl Flights {
                 let entered = match self.waiting.enter(page.clone(), cx) {
                     Ok(ticket) => ticket,
                     Err(error) => {
-                        reason = if error == uring_runtime::Error::Overloaded {
+                        reason = if error == racer_io::Error::Overloaded {
                             crate::telemetry::WaitGate::QueueFull
                         } else {
                             crate::telemetry::WaitGate::QueueAdmissionRejected

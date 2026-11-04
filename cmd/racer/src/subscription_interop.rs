@@ -36,6 +36,7 @@ use racer_control_wire::SCHEMA_VERSION;
 use racer_control_wire::{CacheId, ClusterId, NodeId};
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::IoBuffer;
 use runtime::Reactor;
 use runtime::RequestScope;
 use security::OriginContext;
@@ -47,7 +48,6 @@ use std::task::Context;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::IoBuffer;
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.

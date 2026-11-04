@@ -23,7 +23,7 @@ use uring_runtime::{Operation, Scope, reactor::Reactor};
 enum TestError {
     Alloc(Error),
 
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
 }
 
 impl From<Error> for TestError {
@@ -33,9 +33,9 @@ impl From<Error> for TestError {
     }
 }
 
-impl From<uring_runtime::Error> for TestError {
+impl From<racer_io::Error> for TestError {
     /// Preserve runtime errors without enriching them as synchronous allocator errors.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_io::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -584,7 +584,7 @@ fn roundtrip_short_io_and_runtime_errors() {
     sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
     assert!(matches!(
         drive(&reactor, read()),
-        Err(TestError::Runtime(uring_runtime::Error::Os(libc::EIO)))
+        Err(TestError::Runtime(racer_io::Error::Os(libc::EIO)))
     ));
     assert_eq!(reactor.in_flight(), 0);
     segments.begin_evict(SegmentId(0)).unwrap();
@@ -1365,8 +1365,8 @@ struct SharedBody(Rc<page_alloc::AlignedBuffer<()>>, std::ops::Range<usize>);
 // SAFETY: the Rc keeps the immutable allocation alive and unmoved; no alias
 // mutates it while the body is owned by a write.
 #[cfg(feature = "simulation")]
-unsafe impl uring_runtime::reactor::SharedWriteBuffer for SharedBody {
-    fn write_bytes(&self) -> uring_runtime::Result<&[u8]> {
+unsafe impl racer_io::ring::SharedWriteBuffer for SharedBody {
+    fn write_bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.0.as_slice()[self.1.clone()])
     }
 }
@@ -1479,7 +1479,7 @@ fn vectored_write_roundtrip_validation_and_faults() {
     );
     assert!(matches!(
         drive(&reactor, op),
-        Err(TestError::Runtime(uring_runtime::Error::Os(libc::EIO)))
+        Err(TestError::Runtime(racer_io::Error::Os(libc::EIO)))
     ));
     assert_eq!(slab.writes_in_flight(), 0);
     assert_eq!(reactor.in_flight(), 0);

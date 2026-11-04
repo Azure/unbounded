@@ -13,6 +13,7 @@ use crate::runtime::RequestScope;
 use flow_control::PipeLease;
 use flow_control::PipePool;
 use http1::MessageHead;
+use racer_io::ring::SendBuffer;
 #[cfg(test)]
 use std::io;
 use std::path::PathBuf;
@@ -20,7 +21,6 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::task::Waker;
 use std::time::Duration;
-use uring_runtime::reactor::SendBuffer;
 use uring_runtime::reactor::SocketAddress;
 use uring_runtime::reactor::descriptor::Descriptor;
 
@@ -494,7 +494,7 @@ impl PageSendRange {
 }
 // SAFETY: fixed immutable view retains the complete verified plaintext page owner.
 unsafe impl SendBuffer for PageSendRange {
-    fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn send_bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.page.bytes()[self.range.clone()])
     }
 }
@@ -753,6 +753,7 @@ pub(crate) mod tests {
     use crate::model::RequestId;
     use http1::Header;
     use http1::StartLine;
+    use racer_io::ring::IoBuffer;
     use std::future::Future;
     use std::io::Read;
     use std::io::Write;
@@ -762,7 +763,6 @@ pub(crate) mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::reactor::IoBuffer;
 
     /// Optional gates and response outcomes must not change completion ownership.
     #[test]

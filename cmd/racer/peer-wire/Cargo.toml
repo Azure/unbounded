@@ -15,6 +15,7 @@ racer-crypto = { path = "../crypto" }
 racer-control-wire = { path = "../control-wire" }
 racer-core = { path = "../core" }
 uring-runtime = { path = "../runtime" }
+racer-io = { path = "../io" }
 base64 = "0.22"
 sha2 = "0.10"
 

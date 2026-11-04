@@ -32,11 +32,11 @@ use racer::security::PageCryptoEngine;
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::reactor::IoBuffer;
 
 const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";

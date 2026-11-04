@@ -10,6 +10,7 @@ use crate::{
     AlignedBuffer, Alignment, Charge, Error, Extent, Result, SegmentGeometry, SegmentLease,
     Segments,
 };
+use racer_io::ring::SharedWriteBuffer;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -28,7 +29,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Operation, Scope,
-    reactor::{Reactor, SharedWriteBuffer, descriptor::Descriptor},
+    reactor::{Reactor, descriptor::Descriptor},
 };
 
 /// One logical segment's range on a caller-opened device.
@@ -1624,15 +1625,15 @@ mod tests {
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum TestError {
             Alloc(Error),
-            Runtime(uring_runtime::Error),
+            Runtime(racer_io::Error),
         }
         impl From<Error> for TestError {
             fn from(error: Error) -> Self {
                 Self::Alloc(error)
             }
         }
-        impl From<uring_runtime::Error> for TestError {
-            fn from(error: uring_runtime::Error) -> Self {
+        impl From<racer_io::Error> for TestError {
+            fn from(error: racer_io::Error) -> Self {
                 Self::Runtime(error)
             }
         }
@@ -1678,7 +1679,7 @@ mod tests {
                 (Fault::Short(512), TestError::Alloc(Error::Io)),
                 (
                     Fault::Errno(libc::EIO),
-                    TestError::Runtime(uring_runtime::Error::Os(libc::EIO)),
+                    TestError::Runtime(racer_io::Error::Os(libc::EIO)),
                 ),
             ] {
                 sim.inject(if write { "write" } else { "read" }, fault)

@@ -3,6 +3,7 @@ use flow_control::{Charge, Policy, Quotas, Rejection};
 use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy, PoolConfig};
 use http1::tls::{TlsClient, TlsMode, rustls};
 use http1::{Codec, Header, MessageHead, StartLine};
+use racer_io::ring::IoBuffer;
 use std::{
     future::Future,
     io::{Read, Write},
@@ -17,7 +18,7 @@ use std::{
 use uring_runtime::{
     Scope,
     environment::{Cancellation, now},
-    reactor::{IoBuffer, SocketAddress},
+    reactor::SocketAddress,
 };
 
 const PAGE: usize = 16 << 20;
@@ -25,7 +26,7 @@ const PAGE: usize = 16 << 20;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Error {
     Http(http1::Error),
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
     Quota(flow_control::Error),
 }
 impl From<http1::Error> for Error {
@@ -33,8 +34,8 @@ impl From<http1::Error> for Error {
         Self::Http(e)
     }
 }
-impl From<uring_runtime::Error> for Error {
-    fn from(e: uring_runtime::Error) -> Self {
+impl From<racer_io::Error> for Error {
+    fn from(e: racer_io::Error) -> Self {
         Self::Runtime(e)
     }
 }
@@ -95,10 +96,10 @@ impl Scope for RequestScope {
 
     fn check(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
-            return Err(uring_runtime::Error::Cancelled.into());
+            return Err(racer_io::Error::Cancelled.into());
         }
         if now() >= self.deadline {
-            return Err(uring_runtime::Error::DeadlineExceeded.into());
+            return Err(racer_io::Error::DeadlineExceeded.into());
         }
         Ok(())
     }
@@ -497,7 +498,7 @@ fn untrusted_certificate_fails_handshake() {
         let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
         assert!(matches!(
             result.err(),
-            Some(Error::Runtime(uring_runtime::Error::Os(libc::EPROTO)))
+            Some(Error::Runtime(racer_io::Error::Os(libc::EPROTO)))
         ));
         if mode == TlsMode::Userspace {
             break;
@@ -575,7 +576,7 @@ fn kernel_mode_fails_when_key_install_fails() {
     let result = drive(&fixture.reactor, fixture.pool.checkout(&endpoint, &scope));
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(uring_runtime::Error::Unavailable))
+        Some(Error::Runtime(racer_io::Error::Unavailable))
     ));
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
     http1::tls::fail_next_key_installs(0);
@@ -726,7 +727,7 @@ fn cancelled_fallback_reconnect_releases_connection() {
     http1::tls::fail_next_key_installs(0);
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(uring_runtime::Error::Cancelled))
+        Some(Error::Runtime(racer_io::Error::Cancelled))
     ));
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);
@@ -811,7 +812,7 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     };
     assert!(matches!(
         result.err(),
-        Some(Error::Runtime(uring_runtime::Error::Cancelled))
+        Some(Error::Runtime(racer_io::Error::Cancelled))
     ));
     drive(&fixture.reactor, fixture.reactor.drain()).unwrap();
     assert_released(&fixture, &endpoint);

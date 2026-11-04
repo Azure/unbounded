@@ -1749,7 +1749,7 @@ fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves()
     failures.write_protected(true, &mut text).unwrap();
     assert!(text.contains("total=1 retained=1"));
 }
-pub(super) use uring_runtime::reactor::IoBuffer;
+pub(super) use racer_io::ring::IoBuffer;
 
 pub(super) use crate::admission::AdmissionPolicy;
 pub(super) use crate::error::Error;

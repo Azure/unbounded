@@ -13,6 +13,7 @@ test-util = []
 futures = "0.3"
 flow-control = { path = "../flow" }
 uring-runtime = { path = "../runtime" }
+racer-io = { path = "../io" }
 httparse = "1"
 zeroize = "1"
 libc = "0.2"

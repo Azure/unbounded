@@ -76,9 +76,9 @@ impl Scope for TestScope {
     }
 }
 
-impl From<uring_runtime::Error> for Error {
+impl From<racer_io::Error> for Error {
     /// Preserve the original fixture's runtime-to-I/O error mapping.
-    fn from(_: uring_runtime::Error) -> Self {
+    fn from(_: racer_io::Error) -> Self {
         Self::IO
     }
 }

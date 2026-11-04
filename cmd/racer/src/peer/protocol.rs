@@ -2378,7 +2378,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
-            use uring_runtime::reactor::IoBuffer;
+            use racer_io::ring::IoBuffer;
             let n = crate::test_support::security::network(2);
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,

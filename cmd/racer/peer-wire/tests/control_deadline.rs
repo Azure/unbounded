@@ -109,12 +109,12 @@ fn head_and_sign_reject_unmappable_deadlines() {
     for deadline in [(wall_seconds + 1) * 1000, u64::MAX] {
         assert!(matches!(
             decode_deadline(deadline),
-            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
+            Err(Error::Runtime(racer_io::Error::InvalidInput))
         ));
         let binding = binding(deadline);
         assert!(matches!(
             binding.head(Phase::Finish, &[0; 32], 0, vec![]),
-            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
+            Err(Error::Runtime(racer_io::Error::InvalidInput))
         ));
         assert!(matches!(
             binding.sign(
@@ -125,7 +125,7 @@ fn head_and_sign_reject_unmappable_deadlines() {
                 0,
                 vec![]
             ),
-            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
+            Err(Error::Runtime(racer_io::Error::InvalidInput))
         ));
     }
 }

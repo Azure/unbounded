@@ -42,6 +42,7 @@ rdma-verbs = { path = "verbs" }
 racer-gpu = { path = "gpu" }
 page-alloc = { path = "alloc" }
 uring-runtime = { path = "runtime" }
+racer-io = { path = "io" }
 base64 = "0.22"
 futures = "0.3"
 getrandom = "0.2"

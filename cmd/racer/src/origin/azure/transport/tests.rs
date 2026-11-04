@@ -19,9 +19,9 @@ use crate::security::{OpaqueMetadata, OriginContext};
 use crate::test_support::enrollment::{Directory, drive, scope};
 use controlplane::Published;
 use racer_control_wire::{AzureCredential, CacheId, OriginDefinition};
+use racer_io::ring::IoBuffer;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
-use uring_runtime::reactor::IoBuffer;
 
 const SIZE: usize = 2 * PAGE_BYTES as usize + 5;
 

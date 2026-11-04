@@ -293,7 +293,7 @@ pub(crate) async fn establish<C: Context>(
     scope: &C::Scope,
 ) -> crate::connection::Result<C, Established<C>> {
     let mut session = ClientConnection::new(tls.config.clone(), tls.name.clone())
-        .map_err(|_| uring_runtime::Error::InvalidConfiguration)?;
+        .map_err(|_| racer_io::Error::InvalidConfiguration)?;
     let fd = connection.socket();
     let mut reader = RecordReader::default();
     loop {
@@ -303,25 +303,25 @@ pub(crate) async fn establish<C: Context>(
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     wait::<C>(reactor, &connection, libc::POLLOUT, scope).await?;
                 }
-                Err(_) => return Err(uring_runtime::Error::Io.into()),
+                Err(_) => return Err(racer_io::Error::Io.into()),
             }
         }
         if !session.is_handshaking() {
             break;
         }
         match session.read_tls(&mut reader.over(&fd)) {
-            Ok(0) => return Err(uring_runtime::Error::Io.into()),
+            Ok(0) => return Err(racer_io::Error::Io.into()),
             Ok(_) => {
                 if session.process_new_packets().is_err() {
                     // Send any alert rustls queued, best effort.
                     let _ = session.write_tls(&mut Socket(&fd));
-                    return Err(uring_runtime::Error::Os(libc::EPROTO).into());
+                    return Err(racer_io::Error::Os(libc::EPROTO).into());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 wait::<C>(reactor, &connection, libc::POLLIN, scope).await?;
             }
-            Err(_) => return Err(uring_runtime::Error::Io.into()),
+            Err(_) => return Err(racer_io::Error::Io.into()),
         }
     }
     scope.check()?;
@@ -342,7 +342,7 @@ pub(crate) async fn establish<C: Context>(
         if let Err(error) = set_ulp(raw) {
             KERNEL_FAILURES.fetch_add(1, Ordering::Relaxed);
             if tls.mode == TlsMode::Kernel {
-                return Err(uring_runtime::Error::Unavailable.into());
+                return Err(racer_io::Error::Unavailable.into());
             }
             if matches!(
                 error.raw_os_error(),
@@ -358,7 +358,7 @@ pub(crate) async fn establish<C: Context>(
             let version = session.protocol_version();
             let secrets = session
                 .dangerous_extract_secrets()
-                .map_err(|_| uring_runtime::Error::Os(libc::EPROTO))?;
+                .map_err(|_| racer_io::Error::Os(libc::EPROTO))?;
             #[cfg(any(test, feature = "test-util"))]
             let injected = FAIL_KEY_INSTALL.with(|c| {
                 let count = c.get();
@@ -383,7 +383,7 @@ pub(crate) async fn establish<C: Context>(
                         &USERSPACE_LOGGED,
                         &format!("racer: kernel TLS key install failed ({error})"),
                     );
-                    return Err(uring_runtime::Error::Unavailable.into());
+                    return Err(racer_io::Error::Unavailable.into());
                 }
                 if let Some(bit) = suite {
                     tls.rejected_suites.fetch_or(bit, Ordering::Relaxed);
@@ -419,8 +419,8 @@ pub(crate) async fn establish<C: Context>(
     // The relay's queue and scratch are payload copies outside `HttpIo`
     // buffers; admit them before spawning so they count against the budget.
     let charge = context.charge(RELAY_ALLOCATION)?;
-    let (app, relay) = spawn_relay(session, &connection.socket(), charge)
-        .map_err(uring_runtime::Error::from_io)?;
+    let (app, relay) =
+        spawn_relay(session, &connection.socket(), charge).map_err(racer_io::Error::from_io)?;
     connection.replace_socket(Rc::new(app));
     connection.attach_relay(relay);
     USERSPACE.fetch_add(1, Ordering::Relaxed);

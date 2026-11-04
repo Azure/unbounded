@@ -35,13 +35,13 @@ use http1::MessageHead;
 #[cfg(test)]
 use http1::StartLine;
 use racer_control_wire::CacheId;
+use racer_io::ring::IoBuffer;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::IoBuffer;
 
 pub mod direct;
 pub mod listener;

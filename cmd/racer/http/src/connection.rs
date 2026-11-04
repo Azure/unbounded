@@ -4,6 +4,7 @@
 //! allocation. The caller drives the reactor and ticks pool maintenance.
 
 use crate::{Codec, Error, MessageHead, Opaque, StartLine};
+use racer_io::{ring::IoBuffer, ring::SendBuffer};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -15,7 +16,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Scope,
-    reactor::{Completion, IoBuffer, Reactor, SendBuffer, SocketAddress, descriptor::Descriptor},
+    reactor::{Completion, Reactor, SocketAddress, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -89,7 +90,7 @@ pub async fn disconnect_fenced<C: Context, T>(
             watch = None;
             match result {
                 Ok(ready) if ready & events != 0 => {
-                    failure.get_or_insert(uring_runtime::Error::Cancelled.into());
+                    failure.get_or_insert(racer_io::Error::Cancelled.into());
                 }
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -104,7 +105,7 @@ pub async fn disconnect_fenced<C: Context, T>(
         // A FIN may be visible on the socket before its watch CQE is delivered.
         // Check once at the result boundary, not on every pending work poll.
         if result.is_ready() && failure.is_none() && socket.peer_read_closed() {
-            failure = Some(uring_runtime::Error::Cancelled.into());
+            failure = Some(racer_io::Error::Cancelled.into());
             cancel_exchange();
         }
         result
@@ -123,7 +124,7 @@ pub async fn disconnect_fenced<C: Context, T>(
 /// Caller-owned runtime, admission, and connection policy.
 pub trait Context: 'static {
     /// Common HTTP, runtime, and application error.
-    type Error: Copy + Send + PartialEq + From<Error> + From<uring_runtime::Error> + 'static;
+    type Error: Copy + Send + PartialEq + From<Error> + From<racer_io::Error> + 'static;
 
     /// Cancellation and deadline checks for each operation.
     type Scope: Scope<Error = Self::Error>;
@@ -444,7 +445,7 @@ impl<C: Context> OwnedBuffer<C> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(length)
-            .map_err(|_| C::Error::from(uring_runtime::Error::Overloaded))?;
+            .map_err(|_| C::Error::from(racer_io::Error::Overloaded))?;
         bytes.resize(length, 0);
         Ok(Self {
             bytes: bytes.into_boxed_slice().into_vec(),
@@ -464,19 +465,19 @@ impl<C: Context> OwnedBuffer<C> {
 // SAFETY: fixed, private backing allocation and charge remain owned through completion.
 unsafe impl<C: Context> IoBuffer for OwnedBuffer<C> {
     /// Borrow the stable backing bytes.
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.bytes)
     }
 
     /// Mutably borrow the stable backing bytes.
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(&mut self.bytes)
     }
 }
 
 impl<B: IoBuffer> BufferRange<B> {
     /// Validate a range against the buffer before constructing its view.
-    pub fn new<E: From<uring_runtime::Error> + From<Error>>(
+    pub fn new<E: From<racer_io::Error> + From<Error>>(
         buffer: B,
         range: Range<usize>,
     ) -> std::result::Result<Self, E> {
@@ -495,12 +496,12 @@ impl<B: IoBuffer> BufferRange<B> {
 // SAFETY: the fixed view retains the complete stable backing owner.
 unsafe impl<B: IoBuffer> IoBuffer for BufferRange<B> {
     /// Borrow only the checked view.
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.buffer.bytes()?[self.range.clone()])
     }
 
     /// Mutably borrow only the checked view.
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(&mut self.buffer.bytes_mut()?[self.range.clone()])
     }
 }
@@ -552,7 +553,7 @@ impl<C: Context> HttpIo<C> {
     /// Obtain admitted zeroed storage, reusing an exact-size idle buffer if present.
     pub fn buffer(&self, length: usize) -> Result<C, OwnedBuffer<C>> {
         if self.context.stopped() {
-            return Err(uring_runtime::Error::Unavailable.into());
+            return Err(racer_io::Error::Unavailable.into());
         }
         let idle = self.idle_buffer.borrow_mut().take();
         let mut buffer = match idle {
@@ -799,11 +800,11 @@ impl<C: Context> HttpIo<C> {
                     self.recv_data(connection, range, scope).await?
                 };
                 if completed.bytes == 0 || completed.bytes > end - used {
-                    return Err(uring_runtime::Error::Io.into());
+                    return Err(racer_io::Error::Io.into());
                 }
                 used = used
                     .checked_add(completed.bytes)
-                    .ok_or(uring_runtime::Error::Io)?;
+                    .ok_or(racer_io::Error::Io)?;
                 buffer = completed.buffer.into_inner();
                 connection = completed.lease;
             }
@@ -925,7 +926,7 @@ where {
                 }
                 Some(kind) => {
                     if received.bytes == 0 {
-                        return Err(uring_runtime::Error::Io.into());
+                        return Err(racer_io::Error::Io.into());
                     }
                     let control = connection.kernel_tls.as_mut().expect("kernel TLS");
                     let bytes = buffer.bytes_mut()?;
@@ -933,7 +934,7 @@ where {
                     bytes[..received.bytes].zeroize();
                     if absorbed.is_err() {
                         connection.poison();
-                        return Err(uring_runtime::Error::Os(libc::EPROTO).into());
+                        return Err(racer_io::Error::Os(libc::EPROTO).into());
                     }
                 }
             }
@@ -1000,7 +1001,7 @@ where {
                 .read_body_range_impl(connection, buffer, offset..length, scope)
                 .await?;
             if completed.bytes == 0 || completed.bytes > length - offset {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_io::Error::Io.into());
             }
             offset += completed.bytes;
             buffer = completed.buffer;
@@ -1076,7 +1077,7 @@ where {
             )
             .await?;
         if completed.bytes == 0 || completed.bytes > length {
-            return Err(uring_runtime::Error::Io.into());
+            return Err(racer_io::Error::Io.into());
         }
         connection = completed.lease;
         connection.consume_received(completed.bytes)?;
@@ -1502,7 +1503,7 @@ impl<C: Context> HttpPool<C> {
                 }
                 scope.check()?;
                 if self.state.borrow().closed || self.context.stopped() {
-                    return Poll::Ready(Err(uring_runtime::Error::Unavailable.into()));
+                    return Poll::Ready(Err(racer_io::Error::Unavailable.into()));
                 }
                 let first = self
                     .state
@@ -1518,13 +1519,13 @@ impl<C: Context> HttpPool<C> {
                 });
                 if turn && self.class_available(endpoint, priority) {
                     match self.prepare_connection_inner(endpoint, priority) {
-                        Err(e) if e == C::Error::from(uring_runtime::Error::Overloaded) => (),
+                        Err(e) if e == C::Error::from(racer_io::Error::Overloaded) => (),
                         result => return Poll::Ready(result),
                     }
                 }
                 if waiting.is_none() {
                     if self.state.borrow().waiting.len() >= self.config.waiter_cap {
-                        return Poll::Ready(Err(uring_runtime::Error::Overloaded.into()));
+                        return Poll::Ready(Err(racer_io::Error::Overloaded.into()));
                     }
                     let reservation = self.context.charge(
                         std::mem::size_of::<Waiting<C>>()
@@ -1602,14 +1603,14 @@ impl<C: Context> HttpPool<C> {
         priority: bool,
     ) -> Result<C, (ConnectionLease<C>, Option<SocketAddress>)> {
         if self.context.stopped() {
-            return Err(uring_runtime::Error::Unavailable.into());
+            return Err(racer_io::Error::Unavailable.into());
         }
         // All evicted policy and resource owners are dropped after releasing the borrow.
         let mut garbage = Vec::new();
         let prepared: Result<C, _> = (|| {
             let mut state = self.state.borrow_mut();
             if state.closed {
-                return Err(uring_runtime::Error::Unavailable.into());
+                return Err(racer_io::Error::Unavailable.into());
             }
             if !state.entries.contains_key(endpoint) {
                 if state.entries.len() >= self.config.max_endpoints {
@@ -1626,12 +1627,12 @@ impl<C: Context> HttpPool<C> {
                     }
                 }
                 if state.entries.len() >= self.config.max_endpoints {
-                    return Err(uring_runtime::Error::Overloaded.into());
+                    return Err(racer_io::Error::Overloaded.into());
                 }
                 state.next_generation = state
                     .next_generation
                     .checked_add(1)
-                    .ok_or(uring_runtime::Error::Unavailable)?;
+                    .ok_or(racer_io::Error::Unavailable)?;
                 let generation = state.next_generation;
                 state.entries.insert(
                     endpoint.clone(),
@@ -1644,11 +1645,11 @@ impl<C: Context> HttpPool<C> {
             let entry = state
                 .entries
                 .get_mut(endpoint)
-                .ok_or(uring_runtime::Error::Unavailable)?;
+                .ok_or(racer_io::Error::Unavailable)?;
             let now = uring_runtime::environment::now();
             entry.expire_idle(now, self.config.idle_timeout, &mut garbage);
             if entry.active >= endpoint.capacity(&self.config) {
-                return Err(uring_runtime::Error::Overloaded.into());
+                return Err(racer_io::Error::Overloaded.into());
             }
             entry.active += 1;
             Ok((entry.idle.pop(), entry.generation))
@@ -1696,7 +1697,7 @@ impl<C: Context> HttpPool<C> {
         if reused.is_none()
             && rejected
                 .as_ref()
-                .is_some_and(|e| *e == C::Error::from(uring_runtime::Error::Overloaded))
+                .is_some_and(|e| *e == C::Error::from(racer_io::Error::Overloaded))
         {
             // Idle sockets elsewhere in the pool (for example another cache's pages)
             // may hold the ordinary charges. Reclaim them like the fresh path does,
@@ -1742,7 +1743,7 @@ impl<C: Context> HttpPool<C> {
             }
         };
         let reservation = match reserve() {
-            Err(e) if e == C::Error::from(uring_runtime::Error::Overloaded) => {
+            Err(e) if e == C::Error::from(racer_io::Error::Overloaded) => {
                 self.clear_idle();
                 reserve()?
             }
@@ -1804,7 +1805,7 @@ impl<C: Context> HttpPool<C> {
                     userspace = true;
                 }
                 crate::tls::Established::Retry(_) => {
-                    return Err(uring_runtime::Error::Unavailable.into());
+                    return Err(racer_io::Error::Unavailable.into());
                 }
             }
         }
@@ -2159,7 +2160,7 @@ where {
                 )
                 .await?;
             if completed.bytes == 0 || completed.bytes > range.end - offset {
-                return Err(uring_runtime::Error::Io.into());
+                return Err(racer_io::Error::Io.into());
             }
             offset += completed.bytes;
             buffer = completed.buffer.buffer;
@@ -2182,7 +2183,7 @@ struct SendRange<B: SendBuffer> {
 
 impl<B: SendBuffer> SendRange<B> {
     /// Validate each head suffix before the reactor accesses its send view.
-    fn checked<E: From<uring_runtime::Error> + From<Error>>(
+    fn checked<E: From<racer_io::Error> + From<Error>>(
         buffer: B,
         range: Range<usize>,
     ) -> std::result::Result<Self, E> {
@@ -2196,7 +2197,7 @@ impl<B: SendBuffer> SendRange<B> {
 // SAFETY: immutable fixed view retains its complete send owner.
 unsafe impl<B: SendBuffer> SendBuffer for SendRange<B> {
     /// Borrow the selected send suffix.
-    fn send_bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn send_bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.buffer.send_bytes()?[self.range.clone()])
     }
 }
@@ -2292,7 +2293,7 @@ mod tests {
     enum Failure {
         Http(Error),
 
-        Runtime(uring_runtime::Error),
+        Runtime(racer_io::Error),
     }
 
     impl From<Error> for Failure {
@@ -2302,9 +2303,9 @@ mod tests {
         }
     }
 
-    impl From<uring_runtime::Error> for Failure {
+    impl From<racer_io::Error> for Failure {
         /// Preserve a runtime failure for assertions.
-        fn from(e: uring_runtime::Error) -> Self {
+        fn from(e: racer_io::Error) -> Self {
             Self::Runtime(e)
         }
     }
@@ -2484,10 +2485,10 @@ mod tests {
         /// Reserve counted bytes unless shutdown or overload is injected.
         fn charge(&self, n: usize) -> Result<Self, Charge> {
             if self.stopped.get() {
-                return Err(uring_runtime::Error::Unavailable.into());
+                return Err(racer_io::Error::Unavailable.into());
             }
             if self.reject_charge.get() {
-                return Err(uring_runtime::Error::Overloaded.into());
+                return Err(racer_io::Error::Overloaded.into());
             }
             self.used.set(self.used.get() + n);
             Ok(Charge(self.used.clone(), n))
@@ -2543,16 +2544,16 @@ mod tests {
     // SAFETY: the admitted backing owner keeps its fixed allocation and charge alive.
     unsafe impl IoBuffer for ObservedBuffer {
         /// Record immutable access before returning bytes or the injected error.
-        fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+        fn bytes(&self) -> racer_io::Result<&[u8]> {
             self.accesses.set(self.accesses.get() + 1);
             if self.reject {
-                return Err(uring_runtime::Error::Overloaded);
+                return Err(racer_io::Error::Overloaded);
             }
             self.bytes.bytes()
         }
 
         /// Expose the fixed mutable storage if a receive reaches it.
-        fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+        fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
             self.bytes.bytes_mut()
         }
     }
@@ -2583,7 +2584,7 @@ mod tests {
                 assert_eq!(accesses.get(), 0, "construction must not access storage");
                 assert_eq!(reactor.in_flight(), 0);
                 let expected = if reject {
-                    Failure::Runtime(uring_runtime::Error::Overloaded)
+                    Failure::Runtime(racer_io::Error::Overloaded)
                 } else {
                     Failure::Http(Error::Malformed)
                 };
@@ -2691,7 +2692,7 @@ mod tests {
             operation
                 .as_mut()
                 .poll(&mut std::task::Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Overloaded)))
+            Poll::Ready(Err(Failure::Runtime(racer_io::Error::Overloaded)))
         ));
         assert_eq!(hooks.used.get(), 0);
         assert_eq!(reactor.in_flight(), 0);
@@ -2725,7 +2726,7 @@ mod tests {
         hooks.stopped.set(true);
         assert!(matches!(
             io.buffer(32),
-            Err(Failure::Runtime(uring_runtime::Error::Unavailable))
+            Err(Failure::Runtime(racer_io::Error::Unavailable))
         ));
         io.reclaim_buffer();
         assert_eq!(hooks.used.get(), 0);
@@ -2794,7 +2795,7 @@ mod tests {
         assert_eq!(hooks.slots.get(), 1);
         assert!(matches!(
             pool.prepare_connection(&Key),
-            Err(Failure::Runtime(uring_runtime::Error::Overloaded))
+            Err(Failure::Runtime(racer_io::Error::Overloaded))
         ));
         // Replace an unconnected test descriptor with a healthy accepted pair.
         let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2822,7 +2823,7 @@ mod tests {
         pool.close();
         assert!(matches!(
             pool.prepare_connection(&Key),
-            Err(Failure::Runtime(uring_runtime::Error::Unavailable))
+            Err(Failure::Runtime(racer_io::Error::Unavailable))
         ));
     }
 
@@ -2906,7 +2907,7 @@ mod tests {
         assert_eq!(reactor.in_flight(), 0);
         assert_eq!(
             drive(&reactor, io.disconnected(&connection, &TestScope)),
-            Err(Failure::Runtime(uring_runtime::Error::Unavailable))
+            Err(Failure::Runtime(racer_io::Error::Unavailable))
         );
     }
 
@@ -3147,7 +3148,7 @@ mod tests {
         let mut cx = std::task::Context::from_waker(Waker::noop());
         assert!(matches!(
             checkout.as_mut().poll(&mut cx),
-            Poll::Ready(Err(Failure::Runtime(uring_runtime::Error::Overloaded)))
+            Poll::Ready(Err(Failure::Runtime(racer_io::Error::Overloaded)))
         ));
         drop(checkout);
         assert_eq!(reactor.in_flight(), 0);
@@ -3225,8 +3226,8 @@ mod tests {
     fn exact_body_read_rejects_short_framing_eof_and_missing_framing() {
         use std::io::Write;
         for (remaining, expected) in [
-            (Some(1), Failure::Runtime(uring_runtime::Error::Io)),
-            (Some(2), Failure::Runtime(uring_runtime::Error::Io)),
+            (Some(1), Failure::Runtime(racer_io::Error::Io)),
+            (Some(2), Failure::Runtime(racer_io::Error::Io)),
             (None, Failure::Http(Error::Malformed)),
         ] {
             let hooks = hooks();

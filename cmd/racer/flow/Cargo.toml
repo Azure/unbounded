@@ -15,3 +15,4 @@ libc = "0.2"
 zeroize = "1"
 page-alloc = { path = "../alloc" }
 uring-runtime = { path = "../runtime" }
+racer-io = { path = "../io" }

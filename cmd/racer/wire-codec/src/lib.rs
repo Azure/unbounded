@@ -296,7 +296,7 @@ pub mod rest {
     /// including cancellation cleanup. Futures run on the caller's sole I/O owner.
     pub trait Io: 'static {
         /// Caller errors preserve cancellation and transport failure classification.
-        type Error: Copy + Send + PartialEq + From<Error> + From<uring_runtime::Error> + 'static;
+        type Error: Copy + Send + PartialEq + From<Error> + From<racer_io::Error> + 'static;
 
         /// Caller policy governing each I/O operation.
         type Scope: Scope<Error = Self::Error>;
@@ -969,7 +969,7 @@ pub mod rest {
                 match ready {
                     Ok(()) => {}
                     Err(error)
-                        if error == uring_runtime::Error::DeadlineExceeded.into()
+                        if error == racer_io::Error::DeadlineExceeded.into()
                             || error == Error::Io.into()
                             || error == Error::Unavailable.into() =>
                     {
@@ -2053,7 +2053,7 @@ pub mod rest {
                         match query(io, *server, &name, kind, &attempt).await {
                             Ok(ips) => addresses
                                 .extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port))),
-                            Err(error) if error == uring_runtime::Error::Cancelled.into() => {
+                            Err(error) if error == racer_io::Error::Cancelled.into() => {
                                 return Err(error);
                             }
                             Err(_) => {

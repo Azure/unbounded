@@ -1338,14 +1338,14 @@ impl<P: Policy> Drop for ChargedBuffer<P> {
 }
 
 // SAFETY: private fixed backing and charge remain exclusively owned.
-unsafe impl<P: Policy> uring_runtime::reactor::IoBuffer for ChargedBuffer<P> {
+unsafe impl<P: Policy> racer_io::ring::IoBuffer for ChargedBuffer<P> {
     /// Borrow stable initialized backing while the runtime owns this buffer.
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.bytes)
     }
 
     /// Borrow stable mutable backing while the runtime owns this buffer.
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(&mut self.bytes)
     }
 }

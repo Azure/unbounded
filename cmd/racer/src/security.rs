@@ -28,6 +28,7 @@ use racer_crypto::TAG_LEN;
 use racer_crypto::identity::KeyLease;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::IoBuffer;
 use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -40,7 +41,6 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 use uring_runtime::offload;
-use uring_runtime::reactor::IoBuffer;
 use zeroize::Zeroizing;
 
 impl From<racer_crypto::identity::Error> for crate::error::Error {
@@ -391,7 +391,7 @@ impl PageCrypto {
                 .active(&page.version.object.cache, KeyPurpose::Page)?;
             let ciphertext = match &self.buffers {
                 Some(buffers) => {
-                    use uring_runtime::reactor::IoBuffer;
+                    use racer_io::ring::IoBuffer;
                     let length = plaintext
                         .bytes()?
                         .len()
@@ -1354,7 +1354,7 @@ pub struct CryptoJob {
 }
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
-        use uring_runtime::reactor::IoBuffer;
+        use racer_io::ring::IoBuffer;
         self.measurement.checksum_only = matches!(
             input,
             CryptoInput::Checksum { .. } | CryptoInput::VerifyEnvelope(_)
@@ -2060,10 +2060,10 @@ mod tests {
             use crate::telemetry::Event::*;
             use crate::telemetry::Metrics;
             use racer_crypto::TAG_LEN;
+            use racer_io::ring::IoBuffer;
             use std::rc::Rc;
             use std::time::Duration;
             use std::time::Instant;
-            use uring_runtime::reactor::IoBuffer;
 
             fn page() -> PageId {
                 PageId {
@@ -3269,9 +3269,9 @@ mod tests {
         mod channel_tests {
             #[cfg(test)]
             mod tests {
+                use racer_io::Error;
                 use std::task::Context;
                 use std::task::Poll;
-                use uring_runtime::Error;
                 use uring_runtime::channel::*;
 
                 #[test]
@@ -4288,7 +4288,7 @@ mod tests {
                 )
                 .unwrap();
             {
-                use uring_runtime::reactor::IoBuffer;
+                use racer_io::ring::IoBuffer;
                 plaintext.bytes_mut().unwrap().fill(index as u8 + 1);
             }
             // Fill reserves the exact ciphertext length; the pool upgrades it.

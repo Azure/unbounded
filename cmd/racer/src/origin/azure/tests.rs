@@ -5,11 +5,11 @@ use crate::model::{CacheKey, ContentType, RequestId};
 use crate::security::OpaqueMetadata;
 use futures::executor::block_on;
 use racer_control_wire::{AzureOriginDefinition, CacheId};
+use racer_io::ring::IoBuffer;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
-use uring_runtime::reactor::IoBuffer;
 
 const ETAG: &[u8] = b"\"0x8DC\"";
 

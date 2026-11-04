@@ -18,6 +18,7 @@
 //! The handler receives only the path and a bounded formatter, selects the response
 //! kind, and observes fixed transport events. Application routes, trusted response
 //! bodies, health, metric names, and connection admission remain with the caller.
+use racer_io::{Error, Result, ring::IoBuffer};
 use std::{
     cell::Cell,
     fmt::{self, Write},
@@ -27,8 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 use uring_runtime::{
-    Budget, Error, Operation, Result, environment,
-    reactor::{IoBuffer, Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
+    Budget, Operation, environment,
+    reactor::{Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -649,7 +650,7 @@ impl<C> Drop for Buffer<C> {
 // SAFETY: private fixed Vec retains its reservation and is not aliased.
 unsafe impl<C: 'static> IoBuffer for Buffer<C> {
     /// Expose only the remaining range of the current operation.
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(&self.bytes[self.pending.clone()])
     }
 

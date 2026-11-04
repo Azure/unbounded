@@ -16,12 +16,12 @@ use http1::connection::BufferRange;
 use racer_control_wire::CacheId;
 use racer_control_wire::ClusterId;
 use racer_crypto::{TAG_LEN, open, seal};
+use racer_io::ring::IoBuffer;
 use std::cell::Cell;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::task::Context;
 use std::task::Poll;
-use uring_runtime::reactor::IoBuffer;
 
 mod materialized_pairing {
     //! Distinct bodies make cross-exchange substitution visible across relay reuse.

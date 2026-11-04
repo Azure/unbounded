@@ -8,6 +8,7 @@ description = "Fixed metrics and bounded diagnostic primitives"
 
 [dependencies]
 uring-runtime = { path = "../runtime" }
+racer-io = { path = "../io" }
 httparse = "1"
 zeroize = "1"
 

@@ -50,7 +50,7 @@ const TURNS: usize = 200;
 enum TestError {
     Alloc(Error),
 
-    Runtime(uring_runtime::Error),
+    Runtime(racer_io::Error),
 }
 
 impl From<Error> for TestError {
@@ -60,9 +60,9 @@ impl From<Error> for TestError {
     }
 }
 
-impl From<uring_runtime::Error> for TestError {
+impl From<racer_io::Error> for TestError {
     /// Keep runtime categories visible.
-    fn from(error: uring_runtime::Error) -> Self {
+    fn from(error: racer_io::Error) -> Self {
         Self::Runtime(error)
     }
 }

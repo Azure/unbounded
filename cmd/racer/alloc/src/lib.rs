@@ -168,6 +168,7 @@ pub use demand::{
     DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
+use racer_io::ring::IoBuffer;
 #[cfg(feature = "simulation")]
 pub use segments::PhantomEntries;
 pub use segments::{
@@ -185,7 +186,6 @@ use std::{
     rc::{Rc, Weak},
     sync::{Arc, Mutex, MutexGuard, Weak as SyncWeak},
 };
-use uring_runtime::reactor::IoBuffer;
 
 /// Storage failures, separated from application record and admission policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1464,12 +1464,12 @@ impl<C: Charge> DetachedBuffer<C> {
 // SAFETY: owned aligned backing is initialized, stable, and live until Drop.
 unsafe impl<C: Charge> IoBuffer for AlignedBuffer<C> {
     /// Expose initialized stable bytes to the runtime.
-    fn bytes(&self) -> uring_runtime::Result<&[u8]> {
+    fn bytes(&self) -> racer_io::Result<&[u8]> {
         Ok(self.as_slice())
     }
 
     /// Give the runtime exclusive access without moving the allocation.
-    fn bytes_mut(&mut self) -> uring_runtime::Result<&mut [u8]> {
+    fn bytes_mut(&mut self) -> racer_io::Result<&mut [u8]> {
         Ok(self.as_mut_slice())
     }
 }

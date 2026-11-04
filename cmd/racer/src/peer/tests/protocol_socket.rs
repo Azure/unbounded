@@ -2,7 +2,7 @@
 
 use super::*;
 use racer_control_wire::CacheId;
-use uring_runtime::reactor::IoBuffer;
+use racer_io::ring::IoBuffer;
 
 #[test]
 fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
@@ -1414,7 +1414,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
-        use uring_runtime::reactor::IoBuffer;
+        use racer_io::ring::IoBuffer;
         let fd = reactor
             .accept(
                 Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
