@@ -712,13 +712,6 @@ notices:
     license:
       - name: BSD 3-Clause License
         link: https://go.googlesource.com/mod
-  - dependency: golang.org/x/net
-    ecosystem: go
-    copyright:
-      - Copyright 2009 The Go Authors.
-    license:
-      - name: BSD 3-Clause License
-        link: https://go.googlesource.com/net
   - dependency: golang.org/x/sync
     ecosystem: go
     copyright:
@@ -856,6 +849,15 @@ notices:
         link: https://docs.rs/crate/libc/0.2.190/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/libc/0.2.190/source/LICENSE-MIT
+  - dependency: libc
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) The Rust Project Developers
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/libc/0.2.191/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/libc/0.2.191/source/LICENSE-MIT
   - dependency: modernc.org/sqlite
     ecosystem: go
     copyright:
@@ -1008,6 +1010,13 @@ notices:
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
       - name: Apache License, Version 2.0
         link: https://github.com/kubernetes-sigs/yaml/blob/v1.6.0/LICENSE
+  - dependency: tokio
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) Tokio Contributors
+    license:
+      - name: MIT License
+        link: https://docs.rs/crate/tokio/1.54.1/source/LICENSE
   - dependency: x509-parser
     ecosystem: cargo
     copyright:
