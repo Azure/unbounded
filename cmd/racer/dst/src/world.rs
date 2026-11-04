@@ -80,11 +80,11 @@ impl<T: Tick> SimRole for LaneRole<T> {
     }
 
     fn woken(&self) -> bool {
-        self.0.executor.has_ready() || self.0.reactor.has_ready()
+        self.0.has_pending_wake()
     }
 
     fn pending(&self) -> bool {
-        !self.0.executor.is_empty() || self.0.reactor.in_flight() > 0
+        self.0.has_pending_work()
     }
 }
 
