@@ -169,6 +169,7 @@ func (t *TFTPServer) readHandler(filename string, rf io.ReaderFrom) error {
 		}
 
 		log.Warn("resolving file", "node", node.Name, "err", err)
+
 		return err
 	}
 	defer resolved.Close() //nolint:errcheck // read-only
