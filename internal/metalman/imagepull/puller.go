@@ -63,6 +63,10 @@ const (
 	// stuck; the read then resumes from the upstream registry at the
 	// current offset.
 	DefaultMirrorIdleTimeout = time.Minute
+	// DefaultMirrorQuarantine is the default time a blob the mirror served
+	// corrupted is read from the upstream registry only, across Images
+	// resolved by the same Puller.
+	DefaultMirrorQuarantine = 10 * time.Minute
 
 	// userAgent identifies requests made by this package.
 	userAgent = "unbounded-metalman-imagepull"
@@ -165,6 +169,13 @@ type Puller struct {
 	// reads resume from the upstream registry at the current offset. Zero
 	// means DefaultMirrorIdleTimeout; negative disables the bound.
 	MirrorIdleTimeout time.Duration
+	// MirrorQuarantine is how long a layer blob the mirror served
+	// corrupted is read from the upstream registry only, for every Image
+	// this Puller resolves. At most 1024 blobs are remembered; the oldest
+	// is forgotten first. Zero means DefaultMirrorQuarantine; negative
+	// disables the cross-Image memory, so only the Image that detected the
+	// corruption avoids the mirror.
+	MirrorQuarantine time.Duration
 
 	once     sync.Once
 	st       *pullerState
@@ -175,6 +186,8 @@ type Puller struct {
 type pullerState struct {
 	indexes *indexCache
 	budget  *budget
+	// quarantine is nil when Puller.MirrorQuarantine is negative.
+	quarantine *quarantine
 }
 
 func (p *Puller) state() *pullerState {
@@ -190,6 +203,10 @@ func (p *Puller) state() *pullerState {
 		}
 
 		p.st = &pullerState{indexes: newIndexCache(maxLayers), budget: newBudget(maxBytes)}
+
+		if ttl := durationOr(p.MirrorQuarantine, DefaultMirrorQuarantine); ttl > 0 {
+			p.st.quarantine = newQuarantine(ttl, maxQuarantined)
+		}
 	})
 
 	return p.st

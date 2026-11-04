@@ -91,7 +91,9 @@ registry if the mirror fails or stalls (no response headers within 30 seconds
 for a manifest or 5 minutes for a blob, or a blob download idle for 1 minute,
 in which case the download resumes from the registry). Each mirror request
 waits at most half of the time left in the operation's own deadline, so a
-stalled mirror always leaves time for the registry fallback. Layers are downloaded
+stalled mirror always leaves time for the registry fallback. If a layer
+from the mirror fails digest verification, it is read again from the registry,
+and that layer is read from the registry only, skipping the mirror, for the next 10 minutes. Layers are downloaded
 with parallel HTTP Range requests when the server supports them. HTTP downloads to clients also support
 Range requests. If the registry cannot be reached, HTTP requests get `503`
 with `Retry-After`, and Machine operations wait.

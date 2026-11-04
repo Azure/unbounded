@@ -30,8 +30,9 @@ const (
 // from the next endpoint at the current offset.
 //
 // When a mirror served any bytes of a blob that later fails verification,
-// the blob is marked so that later reads through this Image skip the
-// mirror and go to the upstream registry only.
+// the blob is marked so that later reads through this Image, and through
+// other Images of the same Puller until Puller.MirrorQuarantine elapses,
+// skip the mirror and go to the upstream registry only.
 func (i *Image) openBlob(ctx context.Context, desc ispec.Descriptor) (*blobStream, error) {
 	eps := i.eps
 	if i.mirrorAvoided(desc.Digest) {
@@ -64,6 +65,10 @@ func (b *blobStream) fromMirror() bool { return b.rr.mirrorBytes }
 func (i *Image) noteMismatch(d digest.Digest, r *resumeReader) {
 	if r.mirrorBytes {
 		i.badMirror.Store(d, true)
+
+		if len(i.eps) > 1 {
+			i.puller.state().quarantine.add(i.eps[0].name, d.String())
+		}
 	}
 }
 
@@ -73,9 +78,11 @@ func (i *Image) mirrorAvoided(d digest.Digest) bool {
 		return false
 	}
 
-	_, ok := i.badMirror.Load(d)
+	if _, ok := i.badMirror.Load(d); ok {
+		return true
+	}
 
-	return ok
+	return i.puller.state().quarantine.has(i.eps[0].name, d.String())
 }
 
 // resumeReader reads a blob from the first working endpoint and, when that
