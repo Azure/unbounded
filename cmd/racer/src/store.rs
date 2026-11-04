@@ -900,7 +900,14 @@ impl StoreWriter {
             page.ciphertext = copy;
         }
         if page.ciphertext.is_registered() {
-            let length = page.ciphertext.bytes().len();
+            // Copy out into storage aligned for this device, so persist writes
+            // the body in place and staging only covers the header block.
+            let device = self.slabs.alignment()?;
+            // The record body is padded to the record unit, which may be
+            // coarser than the device's length unit.
+            let alignment = Alignment::new(device.memory(), device.offset(), record_unit(device)?)
+                .map_err(|_| Error::InvalidConfiguration)?;
+            let length = page.ciphertext.rehome_capacity(alignment)?;
             let reservation = reserve_staging(length)?;
             reservation.validate(ResourceClass::Ciphertext, length)?;
             if !self.admission.owns(&reservation)
@@ -908,7 +915,7 @@ impl StoreWriter {
             {
                 return Err(Error::InvalidConfiguration);
             }
-            page.ciphertext = page.ciphertext.rehome(reservation)?;
+            page.ciphertext = page.ciphertext.rehome_aligned_to(reservation, alignment)?;
         }
         let full = self.pending.borrow().len() >= self.capacity.get();
         // A full queue picks its victim first, but discards it only once every

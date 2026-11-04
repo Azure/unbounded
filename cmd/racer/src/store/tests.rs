@@ -3363,6 +3363,57 @@ fn registered_persistence_reclaims_cached_pages_through_callback() {
     assert!(f.store.writer.is_idle());
 }
 
+/// A registered page copied out for the disk queue lands in storage aligned
+/// for this device, so its staging covers only the header block and persist
+/// writes the body in place.
+#[test]
+fn registered_page_copied_out_for_disk_is_device_aligned() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    page.ciphertext = crate::memory::BufferPool::new(f.admission.clone())
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    let alignment = f.store.writer.slabs.alignment().unwrap();
+    let reserved = std::cell::RefCell::new(Vec::new());
+    f.store
+        .writer
+        .enqueue_reclaiming(page, dirty, |amount| {
+            reserved.borrow_mut().push(amount);
+            f.admission
+                .reserve_completion(Some(&cache), ResourceClass::Ciphertext, amount)
+                .map_err(Error::from)
+        })
+        .unwrap();
+    let queued = f.store.writer.copy_only(&id).unwrap().unwrap();
+    assert!(!queued.ciphertext.is_registered());
+    assert!(queued.ciphertext.is_disk_aligned(alignment));
+    let reserved = reserved.borrow();
+    assert_eq!(reserved.len(), 2);
+    assert!(reserved[0] >= length && reserved[0].is_multiple_of(alignment.length()));
+    // Zero-copy staging: only the header block.
+    assert_eq!(reserved[1], staging_bytes(&queued, alignment).unwrap());
+    assert!(zero_copy_body(&queued, alignment).unwrap().is_some());
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+}
+
 #[test]
 fn registered_page_cached_then_persisted_is_copied_out_once() {
     use crate::rdma::links::tests::{link_up, receive_registered, world};

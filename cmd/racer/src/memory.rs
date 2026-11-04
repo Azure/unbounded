@@ -760,9 +760,20 @@ impl CiphertextPage {
     /// Rehome a completed receive before retaining it in another worker's cache.
     /// Admit the new charge first. Shared transport owners keep their original
     /// allocation and charge until fenced; only exclusive bytes can move in place.
-    pub(crate) fn rehome(
+    pub(crate) fn rehome(self, reservation: flow_control::Charge<AdmissionPolicy>) -> Result<Self> {
+        self.rehome_aligned_to(reservation, default_disk_alignment())
+    }
+    /// Charge a rehomed copy needs to land in zero-padded storage aligned for
+    /// `alignment`, so a disk write can use it without another copy.
+    pub(crate) fn rehome_capacity(&self, alignment: page_alloc::Alignment) -> Result<usize> {
+        padded_length(alignment, self.bytes().len())
+    }
+    /// [`Self::rehome`], copying into storage aligned for `alignment` (the
+    /// device's) when `reservation` covers [`Self::rehome_capacity`].
+    pub(crate) fn rehome_aligned_to(
         mut self,
         reservation: flow_control::Charge<AdmissionPolicy>,
+        alignment: page_alloc::Alignment,
     ) -> Result<Self> {
         reservation.validate(ResourceClass::Ciphertext, self.inner.capacity())?;
         if reservation.key() != Some(&self.envelope().page.version.object.cache) {
@@ -781,7 +792,6 @@ impl CiphertextPage {
             return Ok(self);
         }
         let length = self.bytes().len();
-        let alignment = default_disk_alignment();
         // Prefer a zero-padded aligned copy the store can write without
         // another copy; fall back to a Vec when the charge only covers the
         // exact length.
