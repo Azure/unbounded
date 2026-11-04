@@ -9,9 +9,9 @@ See the [Azure Blob guide](../../docs/content/guides/azure-blob-cache.md) for se
 requirements, request limits, and the security model.
 
 This directory is a standalone Rust crate (its own Cargo workspace). The
-request rules are a port of the Go library in
-[`internal/racerobject`](../../internal/racerobject), which other Go code still
-uses.
+object identity (canonical JSON and its SHA-256 Racer key) matches the
+in-tree library [`internal/racerobject`](../../internal/racerobject) byte for
+byte, so both compute the same keys.
 
 ## Example
 
@@ -28,10 +28,9 @@ Use `--api=s3` (the default) for S3 clients. Mount the cache's Racer client
 socket directory into the sidecar container. The sidecar connects to
 `/run/racer/<cache>/client/socket`.
 
-Flags are the same as the Go version: `--cache` (required), `--api`,
+Flags: `--cache` (required), `--api`,
 `--listen` (loopback IP and port), `--request-timeout`, `--max-connections`,
-`--debug-listen`, and `--version`. The Rust version adds `--workers` (see
-[Workers](#workers)). `--flag=value`, `--flag value`, and a
+`--workers` (see [Workers](#workers)), `--debug-listen`, and `--version`. `--flag=value`, `--flag value`, and a
 single dash all work. Invalid arguments print `racer-object: <message>` and
 exit with status 1.
 
@@ -57,7 +56,7 @@ shutdown. Reads through a real Racer are covered by the kind-based suite in
 
 - `src/object.rs`: request rules. Paths, queries, headers, conditions, ranges,
   error codes, and the object identity (canonical JSON, byte for byte the same
-  as Go `encoding/json`, and its SHA-256 key).
+  as `internal/racerobject`, and its SHA-256 key).
 - `src/racer.rs`: Racer client socket protocol. Metadata `HEAD` requests reuse
   a pool of at most four idle connections. Reads are credit-paced
   subscriptions on their own connection, with frame checks.
@@ -80,8 +79,14 @@ Request flow:
 - Larger bodies move from the Racer socket to the client socket with
   `splice(2)` through a pipe (1 MiB when the kernel allows it). The data never
   enters user space. The last byte is held back until Racer confirms the read
-  completed, so a cut-off read can never look complete. If Racer fails after
-  the head was sent, the sidecar closes the connection early.
+  completed, so a cut-off read can never look complete. If the first Racer
+  frame is broken, the client gets `502`. If Racer fails after the head was
+  sent, the sidecar closes the connection early.
+- Requests with a body get a response, then the connection closes.
+- Request heads over 36 KiB get `431` and malformed requests get `400`, both
+  as the S3 or Azure XML error, then the connection closes.
+- When an S3 query has both a malformed parameter (`400`) and an unsupported
+  one (`501`), the sidecar returns `400`.
 
 ### Why tokio and splice, not io_uring
 
@@ -121,8 +126,7 @@ listener. When set (for example `--debug-listen=127.0.0.1:6060`), it serves
 only `GET /healthz`, which returns 200. Health only means the listener is up,
 not that the cache is ready. A bind failure stops startup.
 
-The Go version also served `/debug/pprof/`. The Rust binary has no pprof.
-Profile it with `perf` instead; release builds keep line tables, and the
+Profile the sidecar with `perf`; release builds keep line tables, and the
 container image builds with frame pointers:
 
 ```sh
@@ -132,18 +136,3 @@ timeout --signal=TERM 60s perf report --stdio
 
 The listener has **no authentication or TLS**. `--debug-listen=:6060` binds
 all interfaces. Allow only trusted access.
-
-## Differences from the Go version
-
-- Bodies up to 64 KiB that fail before the end get an error status. Go sent
-  `200` and then cut the connection.
-- A large body whose first Racer frame is broken gets `502`. Go sent `200`
-  and then cut the connection.
-- Unconditional `GET` skips the metadata request to Racer.
-- Requests with a body get a response, then the connection closes.
-- Request heads over 36 KiB (Go's limit) and malformed requests get the S3 or
-  Azure XML error (`431` or `400`) instead of Go's plain text, then the
-  connection closes.
-- When an S3 query has both a malformed parameter (`400`) and an unsupported
-  one (`501`), Go picked one at random. Rust always returns `400`.
-- No pprof (see above).

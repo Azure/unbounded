@@ -50,8 +50,7 @@ Usage: `racer-object sidecar [flags]`.
 | `--debug-listen` | empty | Optional `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
 
-The sidecar is written in Rust. Earlier releases were written in Go and served
-pprof on `--debug-listen`; that endpoint is gone. To profile the sidecar, use
+To profile the sidecar, use
 `perf` or another sampling profiler on the node. The binary is built with frame
 pointers, so `perf record -g -p <pid>` gives usable call stacks.
 
