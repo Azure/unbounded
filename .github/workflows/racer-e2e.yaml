@@ -85,22 +85,13 @@ jobs:
       # saves from pull requests too. Use a build cache scoped to this suite
       # instead, saved only from push runs so pull requests restore the base
       # branch entry without adding their own.
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: false
-
       # Only GOCACHE is cached. Modules download quickly from the proxy, and
       # leaving them out keeps the entry small.
-      - name: Restore Go build cache
-        id: go-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cached
         with:
-          path: ~/.cache/go-build
-          key: go-build-e2e-racer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
-          restore-keys: |
-            go-build-e2e-racer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-
+          profile: e2e-racer
+          restore-mod-cache: "false"
 
       # The release binary avoids compiling kind on every run.
       - name: Install kind
@@ -163,12 +154,13 @@ jobs:
           RACER_E2E_SKIP_DATAPLANE_BUILD: "1"
         run: make e2e-racer
 
+      # Runs only when the steps above succeed; the action saves only on push.
       - name: Save Go build cache
-        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          path: ~/.cache/go-build
-          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+          phase: save
+          profile: e2e-racer
+          save-build-cache: "true"
 
       - name: Upload Racer e2e logs
         if: always()

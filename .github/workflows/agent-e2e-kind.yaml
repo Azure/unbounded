@@ -279,11 +279,11 @@ jobs:
       # This job builds every binary the other jobs build, so it alone saves
       # the cache, and only from push runs.
       - name: Save Go build cache
-        if: github.event_name == 'push' && steps.control-plane.outputs.go-build-cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          path: ~/.cache/go-build
-          key: ${{ steps.control-plane.outputs.go-build-cache-key }}
+          phase: save
+          profile: e2e-agent
+          save-build-cache: "true"
 
       - name: Collect logs
         if: always()
