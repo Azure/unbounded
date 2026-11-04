@@ -1,0 +1,18 @@
+//! Racer worker-local I/O: one concrete io_uring reactor, one local executor,
+//! cross-thread queues, CPU pinning, and secure filesystem primitives.
+//!
+//! The reactor drives either the Linux kernel (`Driver::Uring`) or a
+//! deterministic simulated operating system (`Driver::Sim`), chosen at
+//! construction. Simulation is ordinary code, not a cargo feature: time and
+//! randomness arrive through an explicit [`WorkerCtx`], never thread-local state.
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod cancel;
+pub mod ctx;
+pub mod error;
+pub mod pin;
+pub mod signal;
+
+pub use cancel::{CancelToken, Deadline};
+pub use ctx::{Clock, Rng, WorkerCtx};
+pub use error::{Error, Result};

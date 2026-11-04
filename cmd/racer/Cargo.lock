@@ -939,6 +939,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-io"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "io-uring",
+ "libc",
+ "zeroize",
+]
+
+[[package]]
 name = "racer-object-wire"
 version = "0.1.0"
 dependencies = [
