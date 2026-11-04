@@ -2,8 +2,8 @@
 
 Project Signal performs one certification run for a newly joined Node or a
 small, explicitly selected group of Nodes. The controller snapshots the
-approved profile and scripts, reserves and cordons every participant, runs 15
-ordered checks through Argo Workflows, persists one immutable evidence
+approved profile and scripts, reserves and cordons every participant, runs an
+ordered check suite through Argo Workflows, persists one immutable evidence
 document, and cleans up all temporary workloads.
 
 Project Signal does not integrate with Kueue. Queue admission and repeatable
@@ -18,8 +18,8 @@ fleet scheduling are intentionally deferred.
 - `project-signal-participant-adapter` creates Pod or MPIJob backends and
   captures typed evidence. Ordinary completed Pods remain until controller
   teardown. The adapter retains MPI workers long enough to prove their Node
-  identities, persists that evidence, and then deletes the MPIJob before the
-  next sequential check so its GPUs are released.
+  identities, persists each check result in an immutable ConfigMap, and then
+  deletes the MPIJob before the next sequential check so its GPUs are released.
   On setup, observation, or wall-clock deadline failures, the adapter first
   persists the available evidence and then quiesces uncertain backends.
 - `project-signal-participant-adapter` is a fixed WorkflowTemplate used by
@@ -69,8 +69,8 @@ certification suites:
 | `spec.participants.count` | Total Nodes selected for a Run |
 | `spec.participants.selector` | Labels every selected Node must match |
 | `spec.scriptBundle.name` | Immutable source ConfigMap containing the selected scripts |
-| `spec.scriptBundle.digest` | Aggregate SHA-256 digest of the 15 selected script contents in check order |
-| `spec.checks` | Exactly 15 ordered checks; position defines R01 through R15 |
+| `spec.scriptBundle.digest` | Aggregate SHA-256 digest of the selected script contents in check order |
+| `spec.checks` | Between 1 and 256 ordered checks; position defines the stable check ID starting at R01 |
 
 The requesting Node is participant zero. The remaining participants are
 selected deterministically from currently ready, schedulable, unreserved
@@ -80,7 +80,7 @@ participant set.
 
 The source ConfigMap must set `immutable: true` and must not use `binaryData`.
 The aggregate digest is derived by computing the algorithm-qualified SHA-256
-digest of each selected script's exact bytes, writing those 15 digest strings
+digest of each selected script's exact bytes, writing those digest strings
 with one newline after each string in Profile check order, and computing the
 SHA-256 digest of that manifest. Admission rejects the Profile if the current
 source bytes do not match the pinned aggregate digest. Unreferenced ConfigMap
@@ -120,7 +120,7 @@ kubectl label node <node-name> \
 
 Admission then:
 
-1. validates the Profile, all 15 checks, source ConfigMap immutability, and the pinned aggregate script digest;
+1. validates the Profile, every configured check, source ConfigMap immutability, and the pinned aggregate script digest;
 2. selects the requesting Node plus any additional participants;
 3. atomically records the Run reservation name, participant Node UID, and
    `spec.unschedulable=true` on each participant;
@@ -146,14 +146,14 @@ The Run spec snapshots:
 - Profile name, UID, and generation;
 - ordered participants with Node name and Node UID;
 - the immutable script bundle name, UID, and aggregate digest;
-- 15 ordered check snapshots;
+- the ordered check suite snapshot;
 - monotonic `cancel` and `release` actions.
 
-The controller derives the Workflow deadline from the 15 immutable backend
+The controller derives the Workflow deadline from the immutable backend
 deadlines plus a fixed one-minute evidence reserve for each check.
 
 Participant and check identity is positional. Participant zero is the
-requesting Node. Check positions zero through fourteen are R01 through R15.
+requesting Node. Check positions derive stable IDs starting at R01.
 The controller derives these identities after every API read rather than
 serializing duplicate index and ID fields.
 
@@ -222,14 +222,19 @@ The evidence document includes:
   controller.
 
 The adapter persists typed backend evidence and leaves completed ordinary Pods
-in place. MPIJobs use `cleanPodPolicy: None` so the launcher and every worker
-remain available for evidence capture. After that evidence is durable, the
-adapter terminates the retained MPI workers without their ordinary Pod grace
-period, deletes the MPIJob in the foreground, and waits for the complete
-ownership tree to disappear before completing the task. If any backend cannot
-be quiesced, the adapter task fails and later checks are skipped rather than
-overlapping execution. The controller deletes the Workflow and all remaining
-owned backends only after the final evidence document is durable.
+in place. For each check, it creates one immutable result ConfigMap owned by
+the Workflow. The controller verifies the ConfigMap's ownership, run and check
+identity annotations, content digest, and bounded `result.json` payload before
+including the result in the durable evidence document. MPIJobs use
+`cleanPodPolicy: None` so the launcher and every worker remain available for
+evidence capture. After that evidence is durable, the adapter terminates the
+retained MPI workers without their ordinary Pod grace period, deletes the
+MPIJob in the foreground, and waits for the complete ownership tree to
+disappear before completing the task. If any backend cannot be quiesced, the
+adapter task fails and later checks are skipped rather than overlapping
+execution. The controller deletes the Workflow, its owned per-check result
+ConfigMaps, and all remaining owned backends only after the final evidence
+document is durable.
 `WorkloadCleanupComplete=True` is the authoritative record that this
 controller-owned cleanup finished.
 
