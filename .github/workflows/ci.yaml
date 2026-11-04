@@ -555,11 +555,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The envtest suite runs with -race, so reuse the race build cache that
+      # the Test job saves.
       - name: Set up Go
         id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
-          profile: build
+          profile: race
 
       - name: Compute envtest cache key
         id: envtest-key
