@@ -216,6 +216,93 @@ func TestFileContentVerified(t *testing.T) {
 	}
 }
 
+func TestFileWithholdsTailOnDigestMismatch(t *testing.T) {
+	reg := ipt.NewRegistry(t)
+
+	content := append(randomBytes(4096, 9), []byte("TAILMARK")...)
+	ref, dgst := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{{
+		Entries:     []ipt.Entry{ipt.File("disk/file", content), ipt.File("disk/z", []byte("z"))},
+		Compression: ipt.Uncompressed,
+	}}})
+	layer := reg.LayerDigests(dgst)[0]
+	img := resolve(t, &imagepull.Puller{ChunkSize: 1024}, imagepull.Source{Ref: ref})
+
+	f, err := img.Open(t.Context(), "disk/file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close() //nolint:errcheck // test
+
+	corruptFile(t, reg, layer, "TAILMARK")
+
+	var (
+		got     []byte
+		lastErr error
+	)
+
+	buf := make([]byte, 1000)
+
+	for lastErr == nil {
+		var n int
+
+		n, lastErr = f.Read(buf)
+		got = append(got, buf[:n]...)
+	}
+
+	if !errors.Is(lastErr, imagepull.ErrDigestMismatch) {
+		t.Fatalf("Read err = %v, want ErrDigestMismatch", lastErr)
+	}
+
+	if len(got) >= len(content) {
+		t.Fatalf("delivered %d of %d bytes, want the final read withheld", len(got), len(content))
+	}
+
+	if bytes.Contains(got, []byte("tAILMARK")) {
+		t.Fatal("corrupted tail bytes were delivered")
+	}
+
+	if !bytes.Equal(got, content[:len(got)]) {
+		t.Fatal("delivered prefix differs from content")
+	}
+
+	// The error is sticky.
+	if _, err := f.Read(buf); !errors.Is(err, imagepull.ErrDigestMismatch) {
+		t.Fatalf("second Read err = %v, want ErrDigestMismatch", err)
+	}
+}
+
+func TestFileEmptyReadPrimesStream(t *testing.T) {
+	reg := ipt.NewRegistry(t)
+	content := randomBytes(3000, 23)
+	ref, _ := reg.PushFiles(t, "img", "v1", map[string][]byte{"disk/f": content})
+	img := resolve(t, &imagepull.Puller{}, imagepull.Source{Ref: ref})
+
+	f, err := img.Open(t.Context(), "disk/f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close() //nolint:errcheck // test
+
+	if _, err := f.Seek(100, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := f.Read(nil); n != 0 || err != nil {
+		t.Fatalf("empty Read = %d, %v", n, err)
+	}
+
+	reg.ResetRequests()
+
+	data, err := io.ReadAll(f)
+	if err != nil || !bytes.Equal(data, content[100:]) {
+		t.Fatalf("ReadAll = %d bytes, %v", len(data), err)
+	}
+
+	if n := reg.Count(ipt.KindBlob); n != 0 {
+		t.Fatalf("blob requests after priming = %d, want 0", n)
+	}
+}
+
 func TestFileVerifiedAfterRewind(t *testing.T) {
 	reg := ipt.NewRegistry(t)
 	content := randomBytes(3000, 21)

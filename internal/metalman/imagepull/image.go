@@ -389,8 +389,14 @@ func (i *Image) ReadFile(ctx context.Context, names ...string) ([]byte, string, 
 //
 // When the file is read sequentially from offset 0 to EOF, its content is
 // checked against the sha256 recorded in the layer index, and the final
-// Read returns an error wrapping ErrDigestMismatch instead of io.EOF on a
-// mismatch. Reads that start at a non-zero offset cannot be verified.
+// Read returns (0, err) with err wrapping ErrDigestMismatch on a mismatch:
+// the bytes of that final Read are withheld, so a streaming caller never
+// receives the complete corrupted content. Reads that start at a non-zero
+// offset cannot be verified.
+//
+// A Read with an empty buffer opens the layer and skips to the current
+// offset without consuming content. Callers can use it to surface fetch
+// errors before committing to a response.
 //
 // A File is not safe for concurrent use.
 type File struct {
@@ -469,14 +475,21 @@ func (f *File) Read(p []byte) (int, error) {
 
 	if errors.Is(err, io.EOF) {
 		if f.off < f.size {
-			return n, io.ErrUnexpectedEOF
+			// Wrap so that callers comparing with ==, such as io.ReadFull users
+			// that treat a bare io.ErrUnexpectedEOF as a short final block, see
+			// a failure.
+			return n, fmt.Errorf("imagepull: %s truncated: %w", f.name, io.ErrUnexpectedEOF)
 		}
 
 		err = nil
 	}
 
 	if err == nil && f.off == f.size {
-		err = f.verify()
+		// Withhold the final bytes on a mismatch so that a caller streaming
+		// the file never receives the complete corrupted content.
+		if err = f.verify(); err != nil {
+			return 0, err
+		}
 	}
 
 	return n, err

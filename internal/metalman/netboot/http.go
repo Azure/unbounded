@@ -14,12 +14,14 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
 )
 
 // cloudInitEvent represents a cloud-init webhook reporting event.
@@ -185,7 +187,10 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 				// GRUB's gzip arm64 kernel loader needs HTTP Range support.
 				// serveResolved preserves it for hybrid ISO boots.
-				serveResolved(w, r, path, resolved)
+				if _, err := serveResolved(w, r, path, resolved); err != nil {
+					log.Warn("serving boot media artifact", "ref", src.Ref, "err", err)
+					panic(http.ErrAbortHandler)
+				}
 
 				return
 			}
@@ -296,14 +301,114 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		log.Info("serving file", "node", node.Name, "size", len(resolved.Data))
 	}
 
-	serveResolved(w, r, path, resolved)
+	served, err := serveResolved(w, r, path, resolved)
+	if err != nil {
+		log.Warn("serving file", "node", node.Name, "err", err)
+		// The status line is already sent. Abort so the client sees a
+		// failed transfer rather than a complete response, and skip
+		// recording success.
+		panic(http.ErrAbortHandler)
+	}
+
+	if !served {
+		log.Warn("image file unavailable", "node", node.Name, "ref", src.Ref)
+		return
+	}
+
 	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, src, path)
+}
+
+// errReadSeeker records the first error returned by the wrapped reader.
+// http.ServeContent ignores copy errors, so callers check err afterwards.
+type errReadSeeker struct {
+	rs  io.ReadSeeker
+	err error
+}
+
+func (e *errReadSeeker) Read(p []byte) (int, error) {
+	n, err := e.rs.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) && e.err == nil {
+		e.err = err
+	}
+
+	return n, err
+}
+
+func (e *errReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	n, err := e.rs.Seek(offset, whence)
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+
+	return n, err
+}
+
+// primeOffset returns the offset at which ServeContent will start reading
+// for a single-range request, or 0 otherwise. A wrong guess only costs a
+// re-open of the layer stream.
+func primeOffset(rangeHeader string, size int64) int64 {
+	spec, ok := strings.CutPrefix(rangeHeader, "bytes=")
+	if !ok || strings.Contains(spec, ",") {
+		return 0
+	}
+
+	startStr, endStr, ok := strings.Cut(strings.TrimSpace(spec), "-")
+	if !ok {
+		return 0
+	}
+
+	if startStr == "" {
+		n, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil || n <= 0 {
+			return 0
+		}
+
+		return max(size-n, 0)
+	}
+
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0
+	}
+
+	return start
+}
+
+// serveFileError writes the response for a failure detected before any
+// content is sent.
+func serveFileError(w http.ResponseWriter, err error) {
+	if errors.Is(err, imagepull.ErrNotFound) {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Retry-After", "5")
+	http.Error(w, "file not yet available, retry later", http.StatusServiceUnavailable)
 }
 
 // serveResolved writes a resolved file. Streamed image files are served with
 // http.ServeContent, which supports Range requests and sets Content-Length.
-func serveResolved(w http.ResponseWriter, r *http.Request, name string, resolved *ResolvedFile) {
+//
+// The image file stream is primed before any header is written, so an
+// initial fetch failure yields 503 (or 404) instead of a truncated 200. A
+// served is false when such an error response was written. A non-nil error
+// means the response was committed and is incomplete or unverified; the
+// caller must abort it and must not record success.
+func serveResolved(w http.ResponseWriter, r *http.Request, name string, resolved *ResolvedFile) (served bool, err error) {
 	if resolved.File != nil {
+		f := resolved.File
+
+		// An empty read opens the layer and skips to the offset without
+		// consuming content, so ServeContent's later read reuses the stream.
+		if r.Method != http.MethodHead {
+			if _, err := f.Seek(primeOffset(r.Header.Get("Range"), f.Size()), io.SeekStart); err == nil {
+				if _, err := f.Read(nil); err != nil && !errors.Is(err, io.EOF) {
+					serveFileError(w, err)
+					return false, nil
+				}
+			}
+		}
+
 		// Set the type from the extension so that ServeContent does not sniff
 		// the content: sniffing reads the start of the file and seeks back,
 		// which would pull the file from the registry twice.
@@ -313,9 +418,11 @@ func serveResolved(w http.ResponseWriter, r *http.Request, name string, resolved
 		}
 
 		w.Header().Set("Content-Type", ctype)
-		http.ServeContent(w, r, name, resolved.File.ModTime(), resolved.File)
 
-		return
+		ers := &errReadSeeker{rs: f}
+		http.ServeContent(w, r, name, f.ModTime(), ers)
+
+		return true, ers.err
 	}
 
 	if resolved.ContentType != "" {
@@ -323,6 +430,8 @@ func serveResolved(w http.ResponseWriter, r *http.Request, name string, resolved
 	}
 
 	w.Write(resolved.Data) //nolint:errcheck // Best-effort HTTP response write.
+
+	return true, nil
 }
 
 const shimRevocationsNotPresentBody = "unbounded: no optional shim revocations file is present\n"

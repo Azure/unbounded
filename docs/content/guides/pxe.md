@@ -100,6 +100,9 @@ read layers. The first request that touches a layer downloads it once in full
 to build the index. After that, metalman answers requests for missing files
 without downloading any layer, skips layers that do not contain the requested
 file, and checks that a file read from start to end matches its indexed digest.
+If a download fails or the digest does not match after the response has
+started, metalman aborts the connection instead of completing the response, and
+does not count the download toward boot progress.
 
 Images are built, tagged, and pushed using standard container tooling:
 

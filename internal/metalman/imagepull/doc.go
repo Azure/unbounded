@@ -70,8 +70,9 @@
 // against their digest when a layer index is built, which happens before
 // any file is served from that layer. File content is then verified
 // against the sha256 recorded in the index whenever a File is read
-// sequentially from offset 0 to EOF; on a mismatch, Read returns an error
-// wrapping ErrDigestMismatch instead of io.EOF. Image.ReadFile always reads
+// sequentially from offset 0 to EOF; on a mismatch, the final Read returns
+// no bytes and an error wrapping ErrDigestMismatch, so a streaming caller
+// never receives the complete corrupted file. Image.ReadFile always reads
 // this way, so its result is verified. Reads that start at a non-zero
 // offset, such as HTTP Range requests served with http.ServeContent, cannot
 // be verified: the bytes returned come from a layer that has been verified
