@@ -876,28 +876,26 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
     ));
     // The wire fixture reuses material across purposes; the real keyring
     // requires distinct material. These are deterministic test-only keys.
-    let mut bundle: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+    let mut decoded = wire::decode_bundle(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/control-wire/testdata/bundle.json"
     )))
     .unwrap();
-    for (i, key) in bundle["cache_keys"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
+    decoded.cache_keys = std::mem::take(&mut decoded.cache_keys)
+        .into_iter()
         .enumerate()
-    {
-        key["id"] = base64::engine::general_purpose::STANDARD
-            .encode(
-                racer_control_wire::KeyId::from_generation(1, i as u32 + 1)
-                    .unwrap()
-                    .0,
+        .map(|(i, key)| {
+            let (mut key, state, _) = key.into_installation();
+            key.id = racer_control_wire::KeyId::from_generation(1, i as u32 + 1).unwrap();
+            racer_control_wire::CacheEncryptionKey::new(
+                key,
+                state,
+                zeroize::Zeroizing::new([i as u8 + 7; 32]),
             )
-            .into();
-        key["material"] = base64::engine::general_purpose::STANDARD
-            .encode([i as u8 + 7; 32])
-            .into();
-    }
+        })
+        .collect();
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(&wire::encode_bundle(&decoded).unwrap()).unwrap();
     let sender = identities(&mut bundle, &keys);
     (keys, sender)
 }

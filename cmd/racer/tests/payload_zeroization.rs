@@ -204,7 +204,6 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
 }
 
 fn failed_crypto_output_is_scrubbed(config: &Config) {
-    use base64::Engine;
     use racer::model::RequestId;
     use racer::model::WorkerId;
     use racer::runtime::RequestScope;
@@ -232,23 +231,24 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             racer::enrollment::migration_wall_clock(),
         )),
     );
-    let mut bundle: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+    let mut bundle = racer_control_wire::decode_bundle(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/control-wire/testdata/bundle.json"
     )))
     .unwrap();
-    for (i, key) in bundle["cache_keys"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
+    bundle.cache_keys = std::mem::take(&mut bundle.cache_keys)
+        .into_iter()
         .enumerate()
-    {
-        key["material"] = base64::engine::general_purpose::STANDARD
-            .encode([i as u8 + 7; 32])
-            .into();
-    }
-    keys.install(racer_control_wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap())
-        .unwrap();
+        .map(|(i, key)| {
+            let (key, state, _) = key.into_installation();
+            racer_control_wire::CacheEncryptionKey::new(
+                key,
+                state,
+                zeroize::Zeroizing::new([i as u8 + 7; 32]),
+            )
+        })
+        .collect();
+    keys.install(bundle).unwrap();
     let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
     // Unusual sizes isolate the admitted payload allocation from engine metadata.
     let length = 4093;
