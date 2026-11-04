@@ -148,7 +148,47 @@ int racer_gpu_copy_d2h(void *stream, void *dst, void *src, uint64_t src_offset, 
  * racer_gpu_verdict after racer_gpu_stream_sync. */
 int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *params, void *src,
                       uint64_t src_offset, void *dst, uint64_t dst_offset);
+/* Returns RACER_GPU_EBUSY while no decrypt is queued or the queued one has
+ * not completed yet. */
 int racer_gpu_verdict(void *stream, struct racer_gpu_verdict *out);
+
+/* Events mark a point in a stream. They let one thread keep several streams
+ * in flight and learn of completion without a blocking stream sync, and let
+ * a stream on one GPU wait for work on another (cuStreamWaitEvent). */
+int racer_gpu_event(void *context, void **out);
+/* Synchronizes the event, then destroys it. */
+int racer_gpu_event_free(void *event);
+/* Capture all work queued so far on `stream`. */
+int racer_gpu_event_record(void *event, void *stream);
+/* RACER_GPU_OK when the captured work has completed (or nothing was
+ * recorded), RACER_GPU_EBUSY while it is still running. */
+int racer_gpu_event_query(void *event);
+int racer_gpu_event_sync(void *event);
+/* Make later work on `stream` wait for the event's captured work. The event
+ * may belong to another context. */
+int racer_gpu_stream_wait(void *stream, void *event);
+
+/* Page-locked host memory, portable across contexts, for asynchronous host
+ * copies. `context` only needs to be current for the call. */
+int racer_gpu_host_alloc(void *context, uint64_t size, void **out);
+int racer_gpu_host_free(void *context, void *host);
+/* Page-lock existing host memory (cuMemHostRegister, portable). */
+int racer_gpu_host_register(void *context, void *host, uint64_t size);
+int racer_gpu_host_unregister(void *context, void *host);
+/* Queue a copy of staging bytes into host memory without waiting. `dst`
+ * should be page-locked; the caller keeps it alive until the copy completes. */
+int racer_gpu_copy_d2h_async(void *stream, void *dst, void *src, uint64_t src_offset,
+                             uint64_t length);
+
+/* Make GPUDirect RDMA writes into this context's memory visible to readers
+ * in `scope` before they read. Checks
+ * CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING once per context and
+ * calls cuFlushGPUDirectRDMAWrites only when the device does not order
+ * writes for that scope natively. Returns RACER_GPU_EUNSUPPORTED when
+ * writes are unordered and the flush is not available. */
+#define RACER_GPU_RDMA_SCOPE_OWNER 100u
+#define RACER_GPU_RDMA_SCOPE_ALL 200u
+int racer_gpu_flush_rdma(void *context, uint32_t scope);
 
 /* racer_gpu_file_open flags. */
 #define RACER_GPU_FILE_PCI_P2PDMA 1u /* set cuFile use_pci_p2pdma before the driver opens */

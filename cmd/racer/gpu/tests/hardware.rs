@@ -566,3 +566,41 @@ impl Drop for Allocation<'_> {
 fn check(call: &str, rc: c_int) {
     assert_eq!(rc, 0, "{call} failed with CUresult {rc}");
 }
+
+#[test]
+/// Events, pinned host memory and an RDMA flush query work on a real GPU:
+/// bytes go host -> staging -> pinned through fences, without a stream sync.
+fn fences_and_pinned_copies_round_trip() {
+    let Some((gpu, ordinal)) = setup("fences_and_pinned_copies_round_trip") else {
+        return;
+    };
+    let context = gpu.context(ordinal).unwrap();
+    let staging = context.staging(1 << 20).unwrap();
+    let pinned = context.pinned(1 << 20).unwrap();
+    let stream = context.stream().unwrap();
+    let bytes: Vec<u8> = (0..1 << 20).map(|i| (i % 253) as u8).collect();
+    pinned.write(0, &bytes).unwrap();
+    stream
+        .copy_from_pinned(Destination::Staging(&staging), 0, &pinned, 0, 1 << 20)
+        .unwrap();
+    let first = stream.fence().unwrap();
+    first.wait().unwrap();
+    pinned.write(0, &vec![0; 1 << 20]).unwrap();
+    stream
+        .copy_to_pinned(&staging, 0, &pinned, 0, 1 << 20)
+        .unwrap();
+    let second = stream.fence().unwrap();
+    while !second.poll().unwrap() {
+        std::thread::yield_now();
+    }
+    let mut out = vec![0; 1 << 20];
+    pinned.read(0, &mut out).unwrap();
+    assert!(out == bytes, "pinned round trip differs");
+    // Either ordered natively, flushed, or reported unsupported.
+    match context.flush_rdma_writes(racer_gpu::RdmaScope::Owner) {
+        Ok(()) | Err(racer_gpu::Error::Unsupported(_)) => {}
+        Err(error) => panic!("flush failed: {error}"),
+    }
+    drop((first, second, pinned, staging, stream, context));
+    assert_eq!(gpu.leaked(), 0);
+}

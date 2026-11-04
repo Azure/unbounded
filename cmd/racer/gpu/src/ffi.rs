@@ -116,6 +116,14 @@ impl Drop for RawDecrypt {
     }
 }
 
+/// `RACER_GPU_RDMA_SCOPE_*`: who must see GPUDirect RDMA writes.
+pub mod rdma_scope {
+    /// The GPU that owns the memory.
+    pub const OWNER: u32 = 100;
+    /// Every GPU, for peer copies out of landed memory.
+    pub const ALL: u32 = 200;
+}
+
 /// `RACER_GPU_MAX_DECRYPT`.
 pub const MAX_DECRYPT: u64 = 1 << 30;
 
@@ -217,6 +225,30 @@ native_api! {
     file_read: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> i64,
 
     dmabuf: unsafe extern "C" fn(*mut c_void, u64, u64, *mut c_int) -> c_int,
+
+    event: unsafe extern "C" fn(*mut c_void, Out) -> c_int,
+
+    event_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    event_record: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+
+    event_query: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    event_sync: unsafe extern "C" fn(*mut c_void) -> c_int,
+
+    stream_wait: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+
+    host_alloc: unsafe extern "C" fn(*mut c_void, u64, Out) -> c_int,
+
+    host_free: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+
+    host_register: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> c_int,
+
+    host_unregister: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+
+    copy_d2h_async: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64, u64) -> c_int,
+
+    flush_rdma: unsafe extern "C" fn(*mut c_void, u32) -> c_int,
 }
 
 impl Api {

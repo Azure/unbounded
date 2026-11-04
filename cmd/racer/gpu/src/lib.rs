@@ -47,6 +47,8 @@ pub mod simulation;
 
 pub use ffi::{MAX_AAD, MAX_DECRYPT, flag};
 
+use ffi::rdma_scope;
+
 use ffi::{Out, RawDecrypt, RawDevice, RawVerdict, Shared};
 use std::{
     ffi::{c_int, c_void},
@@ -430,6 +432,21 @@ unsafe impl Send for Stream {}
 unsafe impl Sync for Stream {}
 unsafe impl Send for GpuFile {}
 unsafe impl Sync for GpuFile {}
+unsafe impl Send for PinnedInner {}
+unsafe impl Sync for PinnedInner {}
+unsafe impl Send for Fence {}
+unsafe impl Sync for Fence {}
+unsafe impl Send for HostRegistration {}
+unsafe impl Sync for HostRegistration {}
+
+/// Who must see GPUDirect RDMA writes before they read the memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RdmaScope {
+    /// Work on the GPU that owns the memory (decrypt in place).
+    Owner,
+    /// Every GPU (a peer copy reads the memory from another GPU).
+    AllDevices,
+}
 
 /// A retained primary context. Clones share it; it is released when the last
 /// clone and every object made from it are gone.
@@ -479,6 +496,59 @@ impl Context {
             (shared.api.peer)(self.0.raw.as_ptr(), src.0.raw.as_ptr(), &mut access)
         })?;
         Ok(access != 0)
+    }
+
+    /// Make GPUDirect RDMA writes into this GPU's memory visible to readers
+    /// in `scope`. Call after a NIC wrote landed bytes and before queueing
+    /// work that reads them. Free when the GPU orders such writes natively
+    /// for `scope` (`CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING`);
+    /// otherwise calls `cuFlushGPUDirectRDMAWrites`, which blocks briefly.
+    /// [`Error::Unsupported`] when neither is available: the landed bytes
+    /// must not be read.
+    pub fn flush_rdma_writes(&self, scope: RdmaScope) -> Result<()> {
+        let scope = match scope {
+            RdmaScope::Owner => rdma_scope::OWNER,
+            RdmaScope::AllDevices => rdma_scope::ALL,
+        };
+        let shared = &self.0.shared;
+        shared.check(unsafe { (shared.api.flush_rdma)(self.0.raw.as_ptr(), scope) })
+    }
+
+    /// Allocate `size` bytes of page-locked host memory, usable by every
+    /// context, for asynchronous host copies.
+    pub fn pinned(&self, size: u64) -> Result<PinnedBuffer> {
+        let shared = &self.0.shared;
+        let raw = create(shared, |out| unsafe {
+            (shared.api.host_alloc)(self.0.raw.as_ptr(), size, out)
+        })?;
+        Ok(PinnedBuffer(Arc::new(PinnedInner {
+            context: self.clone(),
+            raw: raw.cast(),
+            size: usize::try_from(size).map_err(|_| Error::InvalidRequest)?,
+            in_flight: AtomicU32::new(0),
+        })))
+    }
+
+    /// Page-lock `length` bytes at `pointer` (`cuMemHostRegister`, portable),
+    /// so copies from them are asynchronous DMA instead of a staged copy.
+    /// Meant for long-lived pool slabs; registration is slow.
+    ///
+    /// # Safety
+    ///
+    /// The memory must stay mapped until the registration drops.
+    pub unsafe fn register_host(
+        &self,
+        pointer: *mut u8,
+        length: usize,
+    ) -> Result<HostRegistration> {
+        let shared = &self.0.shared;
+        shared.check(unsafe {
+            (shared.api.host_register)(self.0.raw.as_ptr(), pointer.cast(), length as u64)
+        })?;
+        Ok(HostRegistration {
+            context: self.clone(),
+            pointer: NonNull::new(pointer).ok_or(Error::InvalidRequest)?,
+        })
     }
 
     /// Create a non-blocking stream.
@@ -656,6 +726,178 @@ impl StagingBuffer {
     }
 }
 
+/// Page-locked host memory from [`Context::pinned`]. Clones share it.
+#[derive(Clone)]
+pub struct PinnedBuffer(Arc<PinnedInner>);
+
+struct PinnedInner {
+    context: Context,
+
+    raw: NonNull<u8>,
+
+    size: usize,
+
+    /// Streams or fences holding it until their work completes.
+    in_flight: AtomicU32,
+}
+
+impl Drop for PinnedInner {
+    /// Free, or leak on failure.
+    fn drop(&mut self) {
+        let shared = &self.context.0.shared;
+        if unsafe { (shared.api.host_free)(self.context.0.raw.as_ptr(), self.raw.as_ptr().cast()) }
+            != 0
+        {
+            shared.leak();
+            std::mem::forget(self.context.clone());
+        }
+    }
+}
+
+impl PinnedBuffer {
+    /// Bytes.
+    pub fn len(&self) -> usize {
+        self.0.size
+    }
+
+    /// Never true.
+    pub fn is_empty(&self) -> bool {
+        self.0.size == 0
+    }
+
+    /// Whether queued GPU work may still read or write it.
+    pub fn in_flight(&self) -> bool {
+        self.0.in_flight.load(Ordering::Acquire) > 0
+    }
+
+    /// Check `[offset, offset + length)` is inside and nothing uses it.
+    fn idle(&self, offset: usize, length: usize) -> Result<()> {
+        if self.in_flight() {
+            return Err(Error::Busy);
+        }
+        match offset.checked_add(length) {
+            Some(end) if end <= self.0.size => Ok(()),
+            _ => Err(Error::InvalidRange),
+        }
+    }
+
+    /// Copy `bytes` in at `offset`. [`Error::Busy`] while GPU work uses it.
+    pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.idle(offset, bytes.len())?;
+        // SAFETY: in range, and no GPU work or other writer uses it (the
+        // in-flight check; callers hand one buffer to one thread at a time).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.0.raw.as_ptr().add(offset),
+                bytes.len(),
+            )
+        };
+        Ok(())
+    }
+
+    /// Copy out `out.len()` bytes at `offset`. [`Error::Busy`] while GPU work
+    /// uses it.
+    pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        self.idle(offset, out.len())?;
+        // SAFETY: as for write.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.0.raw.as_ptr().add(offset),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        Ok(())
+    }
+}
+
+/// Host memory page-locked by [`Context::register_host`]. Unregistered on
+/// drop; leaked (left registered) if that fails.
+pub struct HostRegistration {
+    context: Context,
+
+    pointer: NonNull<u8>,
+}
+
+impl Drop for HostRegistration {
+    fn drop(&mut self) {
+        let shared = &self.context.0.shared;
+        if unsafe {
+            (shared.api.host_unregister)(self.context.0.raw.as_ptr(), self.pointer.as_ptr().cast())
+        } != 0
+        {
+            shared.leak();
+        }
+    }
+}
+
+/// A point in a stream's queued work, from [`Stream::fence`]. It owns the
+/// holds that work needs and releases them once the work completes, so an
+/// executor can keep many streams in flight and learn of completion by
+/// polling instead of a blocking stream sync.
+pub struct Fence {
+    context: Context,
+
+    raw: NonNull<c_void>,
+
+    holds: Mutex<Vec<Retained>>,
+}
+
+impl Fence {
+    /// Whether the captured work has completed. Releases the holds when it
+    /// has. Never blocks.
+    pub fn poll(&self) -> Result<bool> {
+        let shared = &self.context.0.shared;
+        let rc = unsafe { (shared.api.event_query)(self.raw.as_ptr()) };
+        if rc == ffi::code::EBUSY {
+            return Ok(false);
+        }
+        shared.check(rc)?;
+        self.release();
+        Ok(true)
+    }
+
+    /// Wait for the captured work, then release the holds.
+    pub fn wait(&self) -> Result<()> {
+        let shared = &self.context.0.shared;
+        shared.check(unsafe { (shared.api.event_sync)(self.raw.as_ptr()) })?;
+        self.release();
+        Ok(())
+    }
+
+    /// The GPU of the stream it marks.
+    pub fn ordinal(&self) -> i32 {
+        self.context.ordinal()
+    }
+
+    fn release(&self) {
+        self.holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+impl Drop for Fence {
+    /// Wait for the work (event free synchronizes), then release. If that
+    /// fails, leak the holds: the GPU may still use them.
+    fn drop(&mut self) {
+        let shared = self.context.0.shared.clone();
+        if unsafe { (shared.api.event_free)(self.raw.as_ptr()) } != 0 {
+            shared.leak();
+            let holds = std::mem::take(
+                &mut *self
+                    .holds
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            std::mem::forget(holds);
+            std::mem::forget(self.context.clone());
+        }
+    }
+}
+
 /// Where a stream writes.
 #[derive(Clone, Copy)]
 pub enum Destination<'a> {
@@ -674,13 +916,21 @@ enum Retained {
 
     /// Host bytes a queued copy may still read.
     Host(#[allow(dead_code)] Box<dyn AsRef<[u8]> + Send>),
+
+    Pinned(Arc<PinnedInner>),
 }
 
 impl Drop for Retained {
     /// Release one in-flight hold on staging memory.
     fn drop(&mut self) {
-        if let Self::Staging(inner) = self {
-            inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+        match self {
+            Self::Staging(inner) => {
+                inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+            Self::Pinned(inner) => {
+                inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
         }
     }
 }
@@ -983,6 +1233,124 @@ impl Stream {
         self.shared().check(rc)
     }
 
+    /// Check a pinned range and return its pointer and hold.
+    fn pinned(
+        &self,
+        buffer: &PinnedBuffer,
+        offset: u64,
+        length: u64,
+    ) -> Result<(*mut u8, Retained)> {
+        let inner = &buffer.0;
+        if !Arc::ptr_eq(&inner.context.0.shared, self.shared()) || length == 0 {
+            return Err(Error::InvalidRequest);
+        }
+        let end = offset.checked_add(length).ok_or(Error::InvalidRange)?;
+        if end > inner.size as u64 {
+            return Err(Error::InvalidRange);
+        }
+        inner.in_flight.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: offset is inside the allocation.
+        let pointer = unsafe { inner.raw.as_ptr().add(offset as usize) };
+        Ok((pointer, Retained::Pinned(inner.clone())))
+    }
+
+    /// Queue a DMA copy from page-locked host memory. The buffer is held
+    /// (and [`PinnedBuffer::write`] refuses it) until the work completes.
+    pub fn copy_from_pinned(
+        &self,
+        dst: Destination<'_>,
+        dst_offset: u64,
+        src: &PinnedBuffer,
+        src_offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        let (pointer, src_hold) = self.pinned(src, src_offset, length)?;
+        let (raw, dst_hold) = match self.destination(dst, dst_offset, length) {
+            Ok(found) => found,
+            Err(error) => {
+                drop(src_hold);
+                return Err(error);
+            }
+        };
+        let rc = unsafe {
+            (self.shared().api.copy_h2d)(self.raw.as_ptr(), raw, dst_offset, pointer.cast(), length)
+        };
+        self.retain([dst_hold, src_hold]);
+        self.shared().check(rc)
+    }
+
+    /// Queue a copy of staging bytes into page-locked host memory without
+    /// waiting. Read them with [`PinnedBuffer::read`] once a fence after
+    /// this completes.
+    pub fn copy_to_pinned(
+        &self,
+        src: &StagingBuffer,
+        src_offset: u64,
+        dst: &PinnedBuffer,
+        dst_offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        let (pointer, dst_hold) = self.pinned(dst, dst_offset, length)?;
+        let (raw, src_hold) = match self.source(src, src_offset, length) {
+            Ok(found) => found,
+            Err(error) => {
+                drop(dst_hold);
+                return Err(error);
+            }
+        };
+        let rc = unsafe {
+            (self.shared().api.copy_d2h_async)(
+                self.raw.as_ptr(),
+                pointer.cast(),
+                raw,
+                src_offset,
+                length,
+            )
+        };
+        self.retain([dst_hold, src_hold]);
+        self.shared().check(rc)
+    }
+
+    /// Mark everything queued so far. The holds move to the returned fence,
+    /// which releases them once the work completes. If recording fails the
+    /// holds stay with the stream until a later synchronize.
+    pub fn fence(&self) -> Result<Fence> {
+        let shared = self.shared();
+        let raw = create(shared, |out| unsafe {
+            (shared.api.event)(self.context.0.raw.as_ptr(), out)
+        })?;
+        let rc = unsafe { (shared.api.event_record)(raw.as_ptr(), self.raw.as_ptr()) };
+        let holds = if rc == 0 {
+            std::mem::take(&mut *self.held())
+        } else {
+            Vec::new()
+        };
+        let fence = Fence {
+            context: self.context.clone(),
+            raw,
+            holds: Mutex::new(holds),
+        };
+        shared.check(rc)?;
+        Ok(fence)
+    }
+
+    /// Make work queued on this stream after this call wait for `fence`'s
+    /// work, which may be on another GPU (`cuStreamWaitEvent`). Does not
+    /// block the calling thread.
+    pub fn wait_for(&self, fence: &Fence) -> Result<()> {
+        if !Arc::ptr_eq(&fence.context.0.shared, self.shared()) {
+            return Err(Error::InvalidRequest);
+        }
+        self.shared().check(unsafe {
+            (self.shared().api.stream_wait)(self.raw.as_ptr(), fence.raw.as_ptr())
+        })
+    }
+
+    /// The GPU this stream runs on.
+    pub fn ordinal(&self) -> i32 {
+        self.context.ordinal()
+    }
+
     /// Wait for all queued work, then release holds on the buffers it used.
     pub fn synchronize(&self) -> Result<()> {
         self.shared()
@@ -991,7 +1359,8 @@ impl Stream {
         Ok(())
     }
 
-    /// The verdict of the last decrypt, after [`Stream::synchronize`].
+    /// The verdict of the last decrypt, once a synchronize or a fence after
+    /// it has completed. [`Error::Busy`] before that.
     pub fn verdict(&self) -> Result<Verdict> {
         let mut raw = RawVerdict::default();
         self.shared()

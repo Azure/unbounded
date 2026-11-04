@@ -796,3 +796,150 @@ fn failed_readback_retains_landing_buffer() {
     drop(stream);
     assert_eq!(gpu.leaked(), 0);
 }
+
+#[test]
+/// A fence completes by polling, releases the stream's holds only then, and
+/// makes the verdict readable without a stream sync. Deferred mode answers
+/// "not ready" once before running the work.
+fn fence_polls_to_completion_and_releases_holds() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(8192).unwrap();
+    let dst = ctx.staging(8192).unwrap();
+    let stream = ctx.stream().unwrap();
+    let page = page(3000);
+    stream
+        .copy_from_host(Destination::Staging(&staging), 0, page.sealed.clone())
+        .unwrap();
+    stream
+        .decrypt(&page.request(), &staging, 0, Destination::Staging(&dst), 0)
+        .unwrap();
+    let fence = stream.fence().unwrap();
+    assert_eq!(
+        stream.retained_host_sources(),
+        0,
+        "holds moved to the fence"
+    );
+    assert!(staging.in_flight());
+    assert_eq!(stream.verdict(), Err(Error::Busy));
+    assert_eq!(fence.poll(), Ok(false));
+    assert!(staging.in_flight());
+    assert_eq!(fence.poll(), Ok(true));
+    assert!(!staging.in_flight());
+    assert_eq!(stream.verdict(), Ok(Verdict::Passed));
+    let mut out = vec![0; 3000];
+    stream.read_staging(&dst, 0, &mut out).unwrap();
+    assert_eq!(out, page.plaintext);
+    drop(fence);
+    assert_eq!(sim.live().events, 0);
+    assert!(sim.take_violations().is_empty());
+}
+
+#[test]
+/// Ciphertext moves between GPUs through pinned host memory without a
+/// host-side wait: the destination stream waits on the source's fence.
+fn pinned_bounce_with_cross_gpu_wait() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let (a, b) = (gpu.context(0).unwrap(), gpu.context(1).unwrap());
+    let src = a.staging(4096).unwrap();
+    let dst = b.staging(4096).unwrap();
+    let (sa, sb) = (a.stream().unwrap(), b.stream().unwrap());
+    let pinned = a.pinned(4096).unwrap();
+    let bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    sa.copy_from_host(Destination::Staging(&src), 0, bytes.clone())
+        .unwrap();
+    sa.copy_to_pinned(&src, 0, &pinned, 0, 4096).unwrap();
+    let staged = sa.fence().unwrap();
+    assert_eq!(pinned.write(0, &[1]), Err(Error::Busy));
+    sb.wait_for(&staged).unwrap();
+    sb.copy_from_pinned(Destination::Staging(&dst), 0, &pinned, 0, 4096)
+        .unwrap();
+    let done = sb.fence().unwrap();
+    done.wait().unwrap();
+    assert!(staged.poll().unwrap());
+    assert!(!pinned.in_flight());
+    let mut out = vec![0; 4096];
+    sb.read_staging(&dst, 0, &mut out).unwrap();
+    assert_eq!(out, bytes);
+    let mut host = vec![0; 4096];
+    pinned.read(0, &mut host).unwrap();
+    assert_eq!(host, bytes);
+    drop((staged, done, pinned));
+    assert_eq!(sim.live().host, 0);
+    assert!(sim.take_violations().is_empty());
+}
+
+#[test]
+/// Deferred mode catches ciphertext that changes between queueing a
+/// decrypt and running it (the kernels read it twice), and the decrypt
+/// fails instead of writing.
+fn deferred_mode_detects_source_mutation() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(8192).unwrap();
+    let dst = ctx.staging(8192).unwrap();
+    let stream = ctx.stream().unwrap();
+    let page = page(1000);
+    stream
+        .copy_from_host(Destination::Staging(&staging), 0, page.sealed.clone())
+        .unwrap();
+    stream.synchronize().unwrap();
+    stream
+        .decrypt(&page.request(), &staging, 0, Destination::Staging(&dst), 0)
+        .unwrap();
+    // A NIC or cuFile rewrites the slot while the decrypt is queued.
+    sim.poke_staging(0, 10, &[0xff; 4]);
+    assert!(stream.synchronize().is_err());
+    let violations = sim.take_violations();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("decrypt source"));
+    assert_eq!(stream.verdict(), Ok(Verdict::NotRun));
+}
+
+#[test]
+/// Immediate mode runs work when queued, as the simulation did before.
+fn immediate_mode_runs_work_when_queued() {
+    let sim = simulation();
+    sim.set_immediate(true);
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(4096).unwrap();
+    let stream = ctx.stream().unwrap();
+    stream
+        .copy_from_host(Destination::Staging(&staging), 0, vec![7u8; 16])
+        .unwrap();
+    // Changing the source now is harmless: the copy already ran.
+    sim.poke_staging(0, 0, &[1]);
+    stream.synchronize().unwrap();
+    assert!(sim.take_violations().is_empty());
+}
+
+#[test]
+/// RDMA flush: free when the GPU orders writes for the scope, a flush
+/// otherwise, and an error when neither is possible.
+fn rdma_flush_follows_write_ordering() {
+    use racer_gpu::RdmaScope;
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    ctx.flush_rdma_writes(RdmaScope::Owner).unwrap();
+    assert_eq!(sim.rdma_flushes(), 1);
+    sim.set_rdma_ordering(100, true);
+    ctx.flush_rdma_writes(RdmaScope::Owner).unwrap();
+    assert_eq!(sim.rdma_flushes(), 1);
+    ctx.flush_rdma_writes(RdmaScope::AllDevices).unwrap();
+    assert_eq!(sim.rdma_flushes(), 2);
+    sim.set_rdma_ordering(0, false);
+    assert!(matches!(
+        ctx.flush_rdma_writes(RdmaScope::Owner),
+        Err(Error::Unsupported(_))
+    ));
+}

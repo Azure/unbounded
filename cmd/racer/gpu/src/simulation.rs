@@ -6,8 +6,15 @@
 //! [`Simulation::allocate`] and passed as the shareable handle. Decryption
 //! runs the serial host emulation of the kernels (`native/gcm_host.c`).
 //!
-//! Work runs when queued, not on synchronize, so tests check ordering with
-//! [`Simulation::trace`] instead of timing.
+//! Queued work is deferred by default, as on a real GPU: copies and decrypts
+//! run when their stream synchronizes, when an event recorded after them is
+//! queried or synchronized, or when a stream that waits on such an event
+//! runs. Deferred mode fails loudly (panics) when a caller breaks the async
+//! contract: a source changed after its copy or decrypt was queued (the
+//! decrypt kernels read ciphertext twice, so this would let unauthenticated
+//! bytes through), or a buffer or host allocation was freed while queued
+//! work still uses it. [`Simulation::set_immediate`] runs work when queued
+//! instead. Tests check ordering with [`Simulation::trace`] instead of timing.
 //!
 //! # Basics
 //!
@@ -104,6 +111,18 @@ pub enum Operation {
     StagingUnregister,
     FileRead,
     Dmabuf,
+    Event,
+    EventFree,
+    EventRecord,
+    EventQuery,
+    EventSync,
+    StreamWait,
+    HostAlloc,
+    HostFree,
+    HostRegister,
+    HostUnregister,
+    CopyD2hAsync,
+    FlushRdma,
 }
 
 /// One call in the trace.
@@ -127,6 +146,8 @@ pub struct Live {
     pub imports: usize,
     pub staging: usize,
     pub files: usize,
+    pub events: usize,
+    pub host: usize,
 }
 
 /// A simulated set of GPUs, shared by clones. Deterministic.
@@ -152,14 +173,122 @@ struct SimContext {
     ordinal: i32,
 }
 
-/// A stream and its last verdict.
+/// A stream, its queued work and its last verdict.
 struct SimStream {
     context: usize,
 
-    /// 0 none, 1 queued, 2 synchronized, as in the shim.
+    /// 0 none, 1 queued, 2 complete, as in the shim.
     decrypt: u8,
 
     verdict: RawVerdict,
+
+    /// Work queued and not yet run (deferred mode).
+    queue: VecDeque<Pending>,
+
+    /// Items ever queued; an event records this count.
+    queued: u64,
+
+    /// Items run so far.
+    done: u64,
+
+    /// `queued` right after the last decrypt.
+    decrypt_seq: u64,
+
+    /// First failure of deferred work, reported by the next sync.
+    error: c_int,
+}
+
+impl SimStream {
+    fn new(context: usize) -> Self {
+        Self {
+            context,
+            decrypt: 0,
+            verdict: RawVerdict::default(),
+            queue: VecDeque::new(),
+            queued: 0,
+            done: 0,
+            decrypt_seq: 0,
+            error: code::OK,
+        }
+    }
+}
+
+/// Deferred work run by its stream.
+type Work = Box<dyn FnOnce(&mut World) -> c_int + Send>;
+
+/// One item in a stream's queue.
+enum Pending {
+    /// Run `work` after checking the sources did not change since queueing.
+    Run {
+        work: Work,
+        checks: Vec<Check>,
+        /// Buffers and host allocations the work touches.
+        uses: Vec<usize>,
+    },
+    /// Run stream `stream` up to item `seq` first (cuStreamWaitEvent).
+    Wait { stream: usize, seq: u64 },
+}
+
+/// A source range and its hash when the work was queued.
+struct Check {
+    what: &'static str,
+    source: Source,
+    hash: u64,
+}
+
+/// Bytes a queued item reads.
+#[derive(Clone, Copy)]
+enum Source {
+    Host(HostPtr, usize),
+    Staging {
+        buffer: usize,
+        offset: u64,
+        length: u64,
+    },
+}
+
+/// A host pointer queued work reads or writes. The Rust wrappers keep the
+/// memory alive until the work completes; deferred mode checks that.
+#[derive(Clone, Copy)]
+struct HostPtr(*mut u8);
+
+// SAFETY: only dereferenced under the world's lock, while the caller keeps
+// the memory alive per the async contract that deferred mode checks.
+unsafe impl Send for HostPtr {}
+
+impl HostPtr {
+    /// The pointer. A method, so closures capture the `Send` wrapper.
+    fn get(self) -> *mut u8 {
+        self.0
+    }
+}
+
+/// Whether a write to `a` may change bytes `b` reads.
+fn overlaps(a: Source, b: Source) -> bool {
+    let range = |source| match source {
+        Source::Host(pointer, length) => (0usize, pointer.get().addr() as u64, length as u64),
+        Source::Staging {
+            buffer,
+            offset,
+            length,
+        } => (buffer, offset, length),
+    };
+    let ((ka, sa, la), (kb, sb, lb)) = (range(a), range(b));
+    ka == kb && sa < sb + lb && sb < sa + la
+}
+
+/// A recorded event.
+struct SimEvent {
+    context: usize,
+    /// The stream and item count captured by the last record.
+    mark: Option<(usize, u64)>,
+    /// Queries answered "not ready" so far for the current mark.
+    polls: u32,
+}
+
+/// Page-locked host memory from `host_alloc`.
+struct HostMemory {
+    bytes: Box<[u8]>,
 }
 
 /// Device memory: client memfd or staging bytes.
@@ -280,6 +409,53 @@ struct World {
     no_kernels: bool,
 
     last_error: i32,
+
+    /// Run queued work when queued instead of deferring it.
+    immediate: bool,
+
+    /// Queries of a pending event that answer "not ready" before the work
+    /// runs, so callers exercise their polling paths.
+    query_delay: u32,
+
+    events: BTreeMap<usize, SimEvent>,
+
+    /// `host_alloc` memory by address.
+    host: BTreeMap<usize, HostMemory>,
+
+    /// `host_register` ranges by address.
+    registered: BTreeMap<usize, u64>,
+
+    /// `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING` of every GPU.
+    rdma_ordering: u32,
+
+    /// Whether cuFlushGPUDirectRDMAWrites is available.
+    rdma_flush: bool,
+
+    /// Flushes `flush_rdma` performed.
+    rdma_flushes: u64,
+
+    /// Ranges written by the work item now running. Queued items that read
+    /// them are rehashed: in-order GPU writes are legitimate.
+    written: Vec<Source>,
+
+    /// Async-contract violations deferred mode found and nobody took yet.
+    violations: Violations,
+}
+
+/// Recorded async-contract violations.
+#[derive(Default)]
+struct Violations(Vec<String>);
+
+impl Drop for Violations {
+    /// Fail loudly if a violation went unchecked. Shim functions cannot
+    /// unwind (they are `extern "C"`), so violations are recorded there and
+    /// raised here, when the simulation drops, or taken by
+    /// [`Simulation::take_violations`].
+    fn drop(&mut self) {
+        if !self.0.is_empty() && !std::thread::panicking() {
+            panic!("simulated GPU async-contract violations: {:?}", self.0);
+        }
+    }
 }
 
 impl Simulation {
@@ -297,6 +473,8 @@ impl Simulation {
             world: Arc::new(Mutex::new(World {
                 devices,
                 next: 0x1000,
+                query_delay: 1,
+                rdma_flush: true,
                 ..World::default()
             })),
         }
@@ -346,6 +524,58 @@ impl Simulation {
         }
     }
 
+    /// Run queued work when it is queued (`true`) or defer it until a sync
+    /// or event (`false`, the default).
+    pub fn set_immediate(&self, immediate: bool) {
+        self.world().immediate = immediate;
+    }
+
+    /// Queries of a pending event that answer "not ready" before its work
+    /// runs. Default 1.
+    pub fn set_query_delay(&self, polls: u32) {
+        self.world().query_delay = polls;
+    }
+
+    /// GPUDirect RDMA write ordering the GPUs report (0, 100 or 200), and
+    /// whether cuFlushGPUDirectRDMAWrites is available. Default: no native
+    /// ordering, flush available.
+    pub fn set_rdma_ordering(&self, ordering: u32, flush: bool) {
+        let mut world = self.world();
+        world.rdma_ordering = ordering;
+        world.rdma_flush = flush;
+    }
+
+    /// Async-contract violations found so far (a source changed after its
+    /// work was queued, or memory was freed while queued work used it), and
+    /// clear them. Unchecked violations panic when the simulation drops.
+    pub fn take_violations(&self) -> Vec<String> {
+        std::mem::take(&mut self.world().violations.0)
+    }
+
+    /// cuFlushGPUDirectRDMAWrites calls so far.
+    pub fn rdma_flushes(&self) -> u64 {
+        self.world().rdma_flushes
+    }
+
+    /// Write `bytes` at `offset` of a staging buffer as a NIC or another
+    /// agent would, outside any stream. For tests of the async contract.
+    pub fn poke_staging(&self, ordinal: i32, offset: u64, bytes: &[u8]) {
+        let mut world = self.world();
+        let World {
+            buffers, contexts, ..
+        } = &mut *world;
+        for buffer in buffers.values_mut() {
+            if contexts.get(&buffer.context).map(|c| c.ordinal) != Some(ordinal) {
+                continue;
+            }
+            if let Memory::Staging { bytes: memory, .. } = &mut buffer.memory
+                && offset as usize + bytes.len() <= memory.len()
+            {
+                memory[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+    }
+
     /// Behave like a shim built without decrypt kernels.
     pub fn disable_kernels(&self) {
         self.world().no_kernels = true;
@@ -372,6 +602,8 @@ impl Simulation {
             imports,
             staging,
             files: world.files.len(),
+            events: world.events.len(),
+            host: world.host.len(),
         }
     }
 }
@@ -501,38 +733,36 @@ unsafe extern "C" fn stream(context: *mut c_void, out: ffi::Out) -> c_int {
             return (code::EINVAL, 0);
         }
         let handle = give(w, out);
-        w.streams.insert(
-            handle,
-            SimStream {
-                context: id(context),
-                decrypt: 0,
-                verdict: RawVerdict::default(),
-            },
-        );
+        w.streams.insert(handle, SimStream::new(id(context)));
         (code::OK, handle)
     })
 }
 
 unsafe extern "C" fn stream_sync(stream: *mut c_void) -> c_int {
     with(Operation::StreamSync, |w| {
-        match w.streams.get_mut(&id(stream)) {
-            Some(s) => {
-                if s.decrypt == 1 {
-                    s.decrypt = 2;
-                }
-                (code::OK, id(stream))
-            }
-            None => (code::EINVAL, id(stream)),
+        let handle = id(stream);
+        let Some(upto) = w.streams.get(&handle).map(|s| s.queued) else {
+            return (code::EINVAL, handle);
+        };
+        w.run(handle, upto);
+        let s = w.streams.get_mut(&handle).expect("checked");
+        if s.decrypt == 1 {
+            s.decrypt = 2;
         }
+        (std::mem::replace(&mut s.error, code::OK), handle)
     })
 }
 
 unsafe extern "C" fn stream_free(stream: *mut c_void) -> c_int {
     with(Operation::StreamFree, |w| {
-        match w.streams.remove(&id(stream)) {
-            Some(_) => (code::OK, id(stream)),
-            None => (code::EINVAL, id(stream)),
-        }
+        let handle = id(stream);
+        // Like the shim, synchronize first.
+        let Some(upto) = w.streams.get(&handle).map(|s| s.queued) else {
+            return (code::EINVAL, handle);
+        };
+        w.run(handle, upto);
+        w.streams.remove(&handle);
+        (code::OK, handle)
     })
 }
 
@@ -590,6 +820,7 @@ unsafe extern "C" fn import_free(allocation: *mut c_void) -> c_int {
                 memory: Memory::Import { .. },
                 ..
             }) => {
+                w.check_unused(handle, "client import");
                 w.buffers.remove(&handle);
                 (code::OK, handle)
             }
@@ -636,6 +867,7 @@ unsafe extern "C" fn staging_free(staging: *mut c_void) -> c_int {
                 if *registered {
                     return (code::EBUSY, handle);
                 }
+                w.check_unused(handle, "staging buffer");
                 w.buffers.remove(&handle);
                 (code::OK, handle)
             }
@@ -645,6 +877,154 @@ unsafe extern "C" fn staging_free(staging: *mut c_void) -> c_int {
 }
 
 impl World {
+    /// Queue `work` on `stream`, or run it now in immediate mode. Returns
+    /// the result to give the caller: queue-time checks already passed, so
+    /// deferred work reports failures at the next sync.
+    fn enqueue(
+        &mut self,
+        stream: usize,
+        sources: &[(&'static str, Source)],
+        uses: Vec<usize>,
+        work: Work,
+    ) -> c_int {
+        if self.immediate {
+            let rc = work(self);
+            self.written.clear();
+            return rc;
+        }
+        let checks = sources
+            .iter()
+            .map(|&(what, source)| Check {
+                what,
+                source,
+                hash: self.hash(source),
+            })
+            .collect();
+        let s = self.streams.get_mut(&stream).expect("checked");
+        s.queue.push_back(Pending::Run { work, checks, uses });
+        s.queued += 1;
+        code::OK
+    }
+
+    /// Hash of a source's current bytes.
+    fn hash(&self, source: Source) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        match source {
+            Source::Host(pointer, length) => {
+                // SAFETY: the caller keeps queued host sources alive.
+                unsafe { std::slice::from_raw_parts(pointer.get(), length) }.hash(&mut hasher)
+            }
+            Source::Staging {
+                buffer,
+                offset,
+                length,
+            } => {
+                if let Some(bytes) = self.staging(buffer) {
+                    bytes[offset as usize..(offset + length) as usize].hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Run `stream`'s queued work up to item `upto`.
+    fn run(&mut self, stream: usize, upto: u64) {
+        loop {
+            let Some(s) = self.streams.get_mut(&stream) else {
+                return;
+            };
+            if s.done >= upto {
+                return;
+            }
+            let Some(item) = s.queue.pop_front() else {
+                return;
+            };
+            s.done += 1;
+            match item {
+                Pending::Wait { stream: other, seq } => self.run(other, seq),
+                Pending::Run { work, checks, .. } => {
+                    let mut rc = code::OK;
+                    for check in &checks {
+                        if self.hash(check.source) != check.hash {
+                            self.violation(format!(
+                                "{} changed after work reading it was queued",
+                                check.what
+                            ));
+                            rc = code::EDRIVER;
+                        }
+                    }
+                    if rc == code::OK {
+                        rc = work(self);
+                    }
+                    self.rehash_written();
+                    if let Some(s) = self.streams.get_mut(&stream)
+                        && rc != code::OK
+                        && s.error == code::OK
+                    {
+                        s.error = rc;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a broken async contract.
+    fn violation(&mut self, message: String) {
+        eprintln!("simulated GPU: {message}");
+        self.last_error = 0xbad;
+        self.violations.0.push(message);
+    }
+
+    /// Refresh the hashes of queued reads of ranges the last item wrote.
+    fn rehash_written(&mut self) {
+        let written = std::mem::take(&mut self.written);
+        if written.is_empty() {
+            return;
+        }
+        let mut stale = Vec::new();
+        for (stream, s) in &self.streams {
+            for (index, item) in s.queue.iter().enumerate() {
+                if let Pending::Run { checks, .. } = item {
+                    for (c, check) in checks.iter().enumerate() {
+                        if written.iter().any(|w| overlaps(*w, check.source)) {
+                            stale.push((*stream, index, c));
+                        }
+                    }
+                }
+            }
+        }
+        for (stream, index, c) in stale {
+            let source = match &self.streams[&stream].queue[index] {
+                Pending::Run { checks, .. } => checks[c].source,
+                Pending::Wait { .. } => continue,
+            };
+            let hash = self.hash(source);
+            if let Some(Pending::Run { checks, .. }) = self
+                .streams
+                .get_mut(&stream)
+                .and_then(|s| s.queue.get_mut(index))
+            {
+                checks[c].hash = hash;
+            }
+        }
+    }
+
+    /// Record a violation if queued work still uses buffer or host
+    /// allocation `handle`.
+    fn check_unused(&mut self, handle: usize, what: &str) {
+        let used = self.streams.values().any(|s| {
+            s.queue
+                .iter()
+                .any(|item| matches!(item, Pending::Run { uses, .. } if uses.contains(&handle)))
+        });
+        if used {
+            self.violation(format!(
+                "{what} {handle:#x} freed while queued work uses it"
+            ));
+        }
+    }
+
     /// Check that a stream and buffer exist and share a context.
     fn pair(&self, stream: *mut c_void, buffer: *mut c_void) -> Result<(), c_int> {
         let s = self.streams.get(&id(stream)).ok_or(code::EINVAL)?;
@@ -657,7 +1037,15 @@ impl World {
 
     /// Write bytes into a buffer, bounds already checked.
     fn write(&mut self, buffer: usize, offset: u64, bytes: &[u8]) -> c_int {
-        match &mut self.buffers.get_mut(&buffer).expect("checked").memory {
+        self.written.push(Source::Staging {
+            buffer,
+            offset,
+            length: bytes.len() as u64,
+        });
+        let Some(target) = self.buffers.get_mut(&buffer) else {
+            return code::EINVAL;
+        };
+        match &mut target.memory {
             Memory::Import { file } => match file.write_all_at(bytes, offset) {
                 Ok(()) => code::OK,
                 Err(_) => code::EDRIVER,
@@ -692,8 +1080,19 @@ unsafe extern "C" fn copy_h2d(
         if src.is_null() || !span(w.buffers[&id(dst)].size, offset, length) {
             return (code::ERANGE, id(dst));
         }
-        let bytes = unsafe { std::slice::from_raw_parts(src.cast::<u8>(), length as usize) };
-        (w.write(id(dst), offset, bytes), id(dst))
+        let source = HostPtr(src.cast::<u8>().cast_mut());
+        let (target, n) = (id(dst), length as usize);
+        let rc = w.enqueue(
+            id(stream),
+            &[("host source", Source::Host(source, n))],
+            vec![target, src.addr()],
+            Box::new(move |w: &mut World| {
+                // SAFETY: the caller keeps the source alive until completion.
+                let bytes = unsafe { std::slice::from_raw_parts(source.get(), n) };
+                w.write(target, offset, bytes)
+            }),
+        );
+        (rc, id(dst))
     })
 }
 
@@ -717,8 +1116,27 @@ unsafe extern "C" fn copy_d2d(
         {
             return (code::ERANGE, id(dst));
         }
-        let bytes = from[src_offset as usize..(src_offset + length) as usize].to_vec();
-        (w.write(id(dst), dst_offset, &bytes), id(dst))
+        let (target, source) = (id(dst), id(src));
+        let rc = w.enqueue(
+            id(stream),
+            &[(
+                "staging source",
+                Source::Staging {
+                    buffer: source,
+                    offset: src_offset,
+                    length,
+                },
+            )],
+            vec![target, source],
+            Box::new(move |w: &mut World| {
+                let Some(from) = w.staging(source) else {
+                    return code::EINVAL;
+                };
+                let bytes = from[src_offset as usize..(src_offset + length) as usize].to_vec();
+                w.write(target, dst_offset, &bytes)
+            }),
+        );
+        (rc, id(dst))
     })
 }
 
@@ -767,8 +1185,27 @@ unsafe extern "C" fn copy_peer(
         {
             return (code::ERANGE, id(dst));
         }
-        let bytes = from[src_offset as usize..(src_offset + length) as usize].to_vec();
-        (w.write(id(dst), dst_offset, &bytes), id(dst))
+        let (target, source) = (id(dst), id(src));
+        let rc = w.enqueue(
+            id(stream),
+            &[(
+                "staging source",
+                Source::Staging {
+                    buffer: source,
+                    offset: src_offset,
+                    length,
+                },
+            )],
+            vec![target, source],
+            Box::new(move |w: &mut World| {
+                let Some(from) = w.staging(source) else {
+                    return code::EINVAL;
+                };
+                let bytes = from[src_offset as usize..(src_offset + length) as usize].to_vec();
+                w.write(target, dst_offset, &bytes)
+            }),
+        );
+        (rc, id(dst))
     })
 }
 
@@ -789,6 +1226,12 @@ unsafe extern "C" fn copy_d2h(
         if dst.is_null() || !span(from.len() as u64, src_offset, length) {
             return (code::ERANGE, id(src));
         }
+        // Synchronous: earlier work on the stream runs first.
+        let upto = w.streams[&id(stream)].queued;
+        w.run(id(stream), upto);
+        let Some(from) = w.staging(id(src)) else {
+            return (code::EINVAL, id(src));
+        };
         let out = unsafe { std::slice::from_raw_parts_mut(dst.cast::<u8>(), length as usize) };
         out.copy_from_slice(&from[src_offset as usize..(src_offset + length) as usize]);
         let s = w.streams.get_mut(&id(stream)).expect("checked");
@@ -839,24 +1282,52 @@ unsafe extern "C" fn decrypt(
         if w.no_kernels {
             return (code::ENOKERNEL, id(dst));
         }
-        let sealed = &from[src_offset as usize..(src_offset + n + 16) as usize];
+        let _ = from;
+        // The shim copies the key schedule and AAD terms before returning.
         let aad = if p.aad_length == 0 {
-            &[][..]
+            Vec::new()
         } else {
-            unsafe { std::slice::from_raw_parts(p.aad, p.aad_length as usize) }
+            unsafe { std::slice::from_raw_parts(p.aad, p.aad_length as usize) }.to_vec()
         };
-        let mut out = zeroize::Zeroizing::new(vec![0; n as usize]);
-        let Some(verdict) = gcm::decrypt(&p.key, &p.nonce, aad, sealed, &mut out) else {
-            return (code::ENOMEM, id(dst));
-        };
-        let mut rc = code::OK;
-        if verdict.status == gcm::VERDICT_PASS && n > 0 {
-            rc = w.write(id(dst), dst_offset, &out);
-        }
-        let s = w.streams.get_mut(&id(stream)).expect("checked");
+        let key = zeroize::Zeroizing::new(p.key);
+        let nonce = zeroize::Zeroizing::new(p.nonce);
+        let (handle, source, target) = (id(stream), id(src), id(dst));
+        let s = w.streams.get_mut(&handle).expect("checked");
         s.decrypt = 1;
-        s.verdict = verdict;
-        (rc, id(dst))
+        s.verdict = RawVerdict::default();
+        let rc = w.enqueue(
+            handle,
+            &[(
+                "decrypt source (read twice: GHASH, then CTR)",
+                Source::Staging {
+                    buffer: source,
+                    offset: src_offset,
+                    length: n + 16,
+                },
+            )],
+            vec![source, target],
+            Box::new(move |w: &mut World| {
+                let Some(from) = w.staging(source) else {
+                    return code::EINVAL;
+                };
+                let sealed = &from[src_offset as usize..(src_offset + n + 16) as usize];
+                let mut out = zeroize::Zeroizing::new(vec![0; n as usize]);
+                let Some(verdict) = gcm::decrypt(&key, &nonce, &aad, sealed, &mut out) else {
+                    return code::ENOMEM;
+                };
+                let mut rc = code::OK;
+                if verdict.status == gcm::VERDICT_PASS && n > 0 {
+                    rc = w.write(target, dst_offset, &out);
+                }
+                if let Some(s) = w.streams.get_mut(&handle) {
+                    s.verdict = verdict;
+                }
+                rc
+            }),
+        );
+        let s = w.streams.get_mut(&handle).expect("checked");
+        s.decrypt_seq = s.queued;
+        (rc, target)
     })
 }
 
@@ -865,6 +1336,9 @@ unsafe extern "C" fn verdict(stream: *mut c_void, out: *mut RawVerdict) -> c_int
         let Some(s) = w.streams.get_mut(&id(stream)) else {
             return (code::EINVAL, 0);
         };
+        if s.decrypt == 1 && s.done >= s.decrypt_seq {
+            s.decrypt = 2;
+        }
         if s.decrypt != 2 || out.is_null() {
             return (code::EBUSY, id(stream));
         }
@@ -1016,6 +1490,234 @@ unsafe extern "C" fn dmabuf(
     })
 }
 
+unsafe extern "C" fn event(context: *mut c_void, out: ffi::Out) -> c_int {
+    with(Operation::Event, |w| {
+        if !w.contexts.contains_key(&id(context)) || out.is_null() {
+            return (code::EINVAL, 0);
+        }
+        let handle = give(w, out);
+        w.events.insert(
+            handle,
+            SimEvent {
+                context: id(context),
+                mark: None,
+                polls: 0,
+            },
+        );
+        (code::OK, handle)
+    })
+}
+
+impl World {
+    /// Run the work an event captured. Returns false for an unknown event.
+    fn complete(&mut self, event: usize) -> bool {
+        let Some(e) = self.events.get(&event) else {
+            return false;
+        };
+        if let Some((stream, seq)) = e.mark {
+            self.run(stream, seq);
+        }
+        true
+    }
+
+    /// Whether the event's captured work has run.
+    fn reached(&self, event: usize) -> bool {
+        match self.events.get(&event).and_then(|e| e.mark) {
+            Some((stream, seq)) => self.streams.get(&stream).is_none_or(|s| s.done >= seq),
+            None => true,
+        }
+    }
+}
+
+unsafe extern "C" fn event_free(event: *mut c_void) -> c_int {
+    with(Operation::EventFree, |w| {
+        if !w.complete(id(event)) {
+            return (code::EINVAL, id(event));
+        }
+        w.events.remove(&id(event));
+        (code::OK, id(event))
+    })
+}
+
+unsafe extern "C" fn event_record(event: *mut c_void, stream: *mut c_void) -> c_int {
+    with(Operation::EventRecord, |w| {
+        let (Some(e), Some(s)) = (w.events.get(&id(event)), w.streams.get(&id(stream))) else {
+            return (code::EINVAL, id(event));
+        };
+        if e.context != s.context {
+            return (code::EDEVICE, id(event));
+        }
+        let mark = (id(stream), s.queued);
+        let e = w.events.get_mut(&id(event)).expect("checked");
+        e.mark = Some(mark);
+        e.polls = 0;
+        (code::OK, id(event))
+    })
+}
+
+unsafe extern "C" fn event_query(event: *mut c_void) -> c_int {
+    with(Operation::EventQuery, |w| {
+        let handle = id(event);
+        if !w.events.contains_key(&handle) {
+            return (code::EINVAL, handle);
+        }
+        if w.reached(handle) {
+            return (code::OK, handle);
+        }
+        let delay = w.query_delay;
+        let e = w.events.get_mut(&handle).expect("checked");
+        if e.polls < delay {
+            e.polls += 1;
+            return (code::EBUSY, handle);
+        }
+        w.complete(handle);
+        (code::OK, handle)
+    })
+}
+
+unsafe extern "C" fn event_sync(event: *mut c_void) -> c_int {
+    with(Operation::EventSync, |w| {
+        if !w.complete(id(event)) {
+            return (code::EINVAL, id(event));
+        }
+        (code::OK, id(event))
+    })
+}
+
+unsafe extern "C" fn stream_wait(stream: *mut c_void, event: *mut c_void) -> c_int {
+    with(Operation::StreamWait, |w| {
+        let Some(e) = w.events.get(&id(event)) else {
+            return (code::EINVAL, id(stream));
+        };
+        let mark = e.mark;
+        let immediate = w.immediate;
+        let Some(s) = w.streams.get_mut(&id(stream)) else {
+            return (code::EINVAL, id(stream));
+        };
+        if let Some((other, seq)) = mark {
+            if immediate {
+                w.run(other, seq);
+            } else {
+                s.queue.push_back(Pending::Wait { stream: other, seq });
+                s.queued += 1;
+            }
+        }
+        (code::OK, id(stream))
+    })
+}
+
+unsafe extern "C" fn host_alloc(context: *mut c_void, size: u64, out: ffi::Out) -> c_int {
+    with(Operation::HostAlloc, |w| {
+        if !w.contexts.contains_key(&id(context)) || size == 0 || out.is_null() {
+            return (code::EINVAL, 0);
+        }
+        if size > 1 << 32 {
+            return (code::ENOMEM, 0);
+        }
+        let mut bytes = vec![0u8; size as usize].into_boxed_slice();
+        let pointer = bytes.as_mut_ptr();
+        w.host.insert(pointer.addr(), HostMemory { bytes });
+        unsafe { *out = pointer.cast() };
+        (code::OK, pointer.addr())
+    })
+}
+
+unsafe extern "C" fn host_free(context: *mut c_void, host: *mut c_void) -> c_int {
+    with(Operation::HostFree, |w| {
+        if !w.contexts.contains_key(&id(context)) || !w.host.contains_key(&host.addr()) {
+            return (code::EINVAL, host.addr());
+        }
+        w.check_unused(host.addr(), "pinned host buffer");
+        let memory = w.host.remove(&host.addr()).expect("checked");
+        drop(memory.bytes);
+        (code::OK, host.addr())
+    })
+}
+
+unsafe extern "C" fn host_register(context: *mut c_void, host: *mut c_void, size: u64) -> c_int {
+    with(Operation::HostRegister, |w| {
+        if !w.contexts.contains_key(&id(context)) || host.is_null() || size == 0 {
+            return (code::EINVAL, host.addr());
+        }
+        if w.registered.contains_key(&host.addr()) {
+            w.last_error = 712; // CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED
+            return (code::EDRIVER, host.addr());
+        }
+        w.registered.insert(host.addr(), size);
+        (code::OK, host.addr())
+    })
+}
+
+unsafe extern "C" fn host_unregister(context: *mut c_void, host: *mut c_void) -> c_int {
+    with(Operation::HostUnregister, |w| {
+        if !w.contexts.contains_key(&id(context)) || w.registered.remove(&host.addr()).is_none() {
+            w.last_error = 713; // CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED
+            return (code::EDRIVER, host.addr());
+        }
+        (code::OK, host.addr())
+    })
+}
+
+unsafe extern "C" fn copy_d2h_async(
+    stream: *mut c_void,
+    dst: *mut c_void,
+    src: *mut c_void,
+    src_offset: u64,
+    length: u64,
+) -> c_int {
+    with(Operation::CopyD2hAsync, |w| {
+        if let Err(rc) = w.pair(stream, src) {
+            return (rc, id(src));
+        }
+        let Some(from) = w.staging(id(src)) else {
+            return (code::EINVAL, id(src));
+        };
+        if dst.is_null() || !span(from.len() as u64, src_offset, length) {
+            return (code::ERANGE, id(src));
+        }
+        let (target, source) = (HostPtr(dst.cast()), id(src));
+        let rc = w.enqueue(
+            id(stream),
+            &[(
+                "staging source",
+                Source::Staging {
+                    buffer: source,
+                    offset: src_offset,
+                    length,
+                },
+            )],
+            vec![source, dst.addr()],
+            Box::new(move |w: &mut World| {
+                let Some(from) = w.staging(source) else {
+                    return code::EINVAL;
+                };
+                // SAFETY: the caller keeps the destination alive until completion.
+                let out = unsafe { std::slice::from_raw_parts_mut(target.get(), length as usize) };
+                out.copy_from_slice(&from[src_offset as usize..(src_offset + length) as usize]);
+                w.written.push(Source::Host(target, length as usize));
+                code::OK
+            }),
+        );
+        (rc, id(src))
+    })
+}
+
+unsafe extern "C" fn flush_rdma(context: *mut c_void, scope: u32) -> c_int {
+    with(Operation::FlushRdma, |w| {
+        if !w.contexts.contains_key(&id(context)) || (scope != 100 && scope != 200) {
+            return (code::EINVAL, id(context));
+        }
+        if w.rdma_ordering >= scope {
+            return (code::OK, id(context));
+        }
+        if !w.rdma_flush {
+            return (code::EUNSUPPORTED, id(context));
+        }
+        w.rdma_flushes += 1;
+        (code::OK, id(context))
+    })
+}
+
 /// The simulation's function table.
 pub(crate) fn api() -> Arc<Api> {
     Arc::new(Api {
@@ -1046,6 +1748,18 @@ pub(crate) fn api() -> Arc<Api> {
         staging_unregister,
         file_read,
         dmabuf,
+        event,
+        event_free,
+        event_record,
+        event_query,
+        event_sync,
+        stream_wait,
+        host_alloc,
+        host_free,
+        host_register,
+        host_unregister,
+        copy_d2h_async,
+        flush_rdma,
     })
 }
 
@@ -1055,4 +1769,48 @@ pub fn read_allocation(fd: &OwnedFd, offset: u64, length: usize) -> Vec<u8> {
     let mut out = vec![0; length];
     file.read_exact_at(&mut out, offset).expect("read memfd");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Freeing a buffer that queued work still uses is a violation, raised
+    /// when the simulation drops unless taken first.
+    fn free_before_complete_is_a_violation() {
+        let sim = Simulation::new(vec![SimDevice::new(0)]);
+        let _env = sim.enter();
+        let api = api();
+        let (mut context, mut stream, mut buffer) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        unsafe {
+            assert_eq!((api.init)(), code::OK);
+            assert_eq!((api.context)(0, &mut context), code::OK);
+            assert_eq!((api.stream)(context, &mut stream), code::OK);
+            assert_eq!((api.staging)(context, 4096, &mut buffer), code::OK);
+            let bytes = [1u8; 16];
+            assert_eq!(
+                (api.copy_h2d)(stream, buffer, 0, bytes.as_ptr().cast(), 16),
+                code::OK
+            );
+            assert_eq!((api.staging_free)(buffer), code::OK);
+            assert_eq!((api.stream_free)(stream), code::OK);
+        }
+        let violations = sim.take_violations();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("freed while queued work uses it"));
+    }
+
+    #[test]
+    #[should_panic(expected = "async-contract violations")]
+    /// An unchecked violation panics when the simulation drops.
+    fn unchecked_violation_panics_on_drop() {
+        let sim = Simulation::new(vec![SimDevice::new(0)]);
+        sim.world().violation("test".into());
+        drop(sim);
+    }
 }
