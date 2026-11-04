@@ -14,13 +14,7 @@ use std::{
 
 /// A kernel reactor, or `None` when io_uring is unavailable.
 pub(crate) fn kernel(entries: u32) -> Option<Reactor> {
-    match Reactor::new(
-        Driver::Uring,
-        Config {
-            queue_entries: entries,
-        },
-        WorkerCtx::host(),
-    ) {
+    match Reactor::new(Driver::Uring, Config::new(entries), WorkerCtx::host()) {
         Ok(reactor) => Some(reactor),
         Err(Error::Os(libc::ENOSYS | libc::EPERM))
             if std::env::var_os("RUNTIME_REQUIRE_IO_URING").is_none() =>
@@ -35,7 +29,7 @@ pub(crate) fn kernel(entries: u32) -> Option<Reactor> {
 fn simulated(os: &SimOs, clock: &crate::ctx::VirtualClock) -> Reactor {
     Reactor::new(
         Driver::Sim(os.clone()),
-        Config { queue_entries: 64 },
+        Config::new(64),
         WorkerCtx::simulated(clock, 1, 1),
     )
     .unwrap()
@@ -123,12 +117,7 @@ fn kernel_context_must_not_be_simulated() {
         Error::InvalidConfiguration
     );
     assert_eq!(
-        Reactor::new(
-            Driver::Uring,
-            Config { queue_entries: 0 },
-            WorkerCtx::host()
-        )
-        .unwrap_err(),
+        Reactor::new(Driver::Uring, Config::new(0), WorkerCtx::host()).unwrap_err(),
         Error::InvalidConfiguration
     );
 }
@@ -471,6 +460,54 @@ fn sim_socket_round_trip_and_eagain_retry() {
     }
     let error = block_on(&reactor, reactor.recv(right, vec![0; 8], (), &ctx)).unwrap_err();
     assert_eq!(error, Error::Os(libc::EINTR));
+}
+
+#[test]
+fn reserved_partition_is_kept_for_reserved_operations() {
+    let os = SimOs::new();
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = Reactor::new(
+        Driver::Sim(os.clone()),
+        Config {
+            queue_entries: 3,
+            reserved_entries: 1,
+        },
+        WorkerCtx::simulated(&clock, 1, 1),
+    )
+    .unwrap();
+    let (_left, right) = os.socket_pair();
+    let right = Rc::new(right);
+    let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    let ordinary = OpCtx::none();
+    let reserved = OpCtx::none().reserved();
+    let a = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &ordinary));
+    let b = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &ordinary));
+    let c = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &ordinary));
+    let d = executor.spawn(reactor.recv(right.clone(), vec![0; 1], (), &reserved));
+    let e = executor.spawn(reactor.recv(right, vec![0; 1], (), &reserved));
+    executor.run_ready(16);
+    assert_eq!(c.try_take().unwrap().unwrap_err(), Error::Overloaded);
+    assert_eq!(e.try_take().unwrap().unwrap_err(), Error::Overloaded);
+    assert_eq!(reactor.in_flight(), 3);
+    assert_eq!(reactor.stats().rejected, 2);
+    executor.block_on(&reactor, reactor.fence_all()).unwrap();
+    for handle in [a, b, d] {
+        assert_eq!(
+            executor.block_on(&reactor, handle).unwrap().unwrap_err(),
+            Error::Cancelled
+        );
+    }
+    assert!(
+        Reactor::new(
+            Driver::Sim(os),
+            Config {
+                queue_entries: 1,
+                reserved_entries: 2
+            },
+            WorkerCtx::simulated(&clock, 1, 1)
+        )
+        .is_err()
+    );
 }
 
 #[test]

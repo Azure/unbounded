@@ -21,6 +21,7 @@ mod fd;
 pub mod op;
 pub mod ops;
 pub(crate) mod owner;
+pub mod ready_set;
 pub(crate) mod uring;
 
 pub use buffer::{Completion, IoBuffer, SendBuffer, SharedWriteBuffer, VectoredCompletion};
@@ -78,6 +79,10 @@ pub struct OpCtx {
 
     /// Class used by [`Reactor::fence_class`].
     pub class: IoClass,
+
+    /// Draw from the reserved partition ([`Config::reserved_entries`]) so
+    /// control traffic is never starved by data operations.
+    pub reserved: bool,
 }
 
 impl OpCtx {
@@ -106,6 +111,12 @@ impl OpCtx {
         self
     }
 
+    /// Use the reserved partition.
+    pub fn reserved(mut self) -> Self {
+        self.reserved = true;
+        self
+    }
+
     /// The first reason this context forbids starting or delivering work.
     pub fn check(&self, now: Instant) -> Result<()> {
         if let Some(token) = &self.cancel {
@@ -129,12 +140,26 @@ pub struct Config {
     /// Maximum operations in flight. The SQ holds twice this many entries so
     /// every operation can also have a cancel in flight; the CQ twice the SQ.
     pub queue_entries: u32,
+
+    /// Slots usable only by operations with [`OpCtx::reserved`]; ordinary
+    /// operations are limited to `queue_entries - reserved_entries`.
+    pub reserved_entries: u32,
+}
+
+impl Config {
+    /// `queue_entries` operations, none reserved.
+    pub fn new(queue_entries: u32) -> Self {
+        Self {
+            queue_entries,
+            reserved_entries: 0,
+        }
+    }
 }
 
 impl Default for Config {
     /// 256 operations in flight.
     fn default() -> Self {
-        Self { queue_entries: 256 }
+        Self::new(256)
     }
 }
 
@@ -291,6 +316,8 @@ struct Slot {
 
     returns_fd: bool,
 
+    reserved: bool,
+
     retry_interest: u32,
 
     retry_fd: RawFd,
@@ -321,6 +348,7 @@ impl Slot {
             class: IoClass(0),
             deadline: None,
             returns_fd: false,
+            reserved: false,
             retry_interest: 0,
             retry_fd: -1,
             attempts: 0,
@@ -429,6 +457,9 @@ pub struct Stats {
     /// Original CQEs that triggered an internal retry.
     pub retries: u64,
 
+    /// Submissions rejected for lack of slots or SQ space.
+    pub rejected: u64,
+
     /// Cancels requested because a deadline expired.
     pub expired: u64,
 }
@@ -460,10 +491,34 @@ struct State {
 
     retries: u64,
 
+    rejected: u64,
+
     expired: u64,
+
+    /// Slot limits: ordinary and reserved partitions.
+    ordinary_limit: usize,
+
+    reserved_limit: usize,
+
+    ordinary_live: usize,
+
+    reserved_live: usize,
 
     /// Reused batch of wakers notified outside the state borrow.
     wakers: Vec<Waker>,
+}
+
+impl State {
+    /// Return a delivered or abandoned slot to its partition.
+    fn release_slot(&mut self, id: IoId) {
+        let reserved = self.slab.lookup(id).is_some_and(|slot| slot.reserved);
+        if reserved {
+            self.reserved_live -= 1;
+        } else {
+            self.ordinary_live -= 1;
+        }
+        self.slab.release(id);
+    }
 }
 
 struct Inner {
@@ -495,7 +550,7 @@ impl Reactor {
     /// never back a kernel reactor.
     pub fn new(driver: Driver, config: Config, ctx: WorkerCtx) -> Result<Self> {
         let entries = config.queue_entries;
-        if entries == 0 || entries > (1 << 20) {
+        if entries == 0 || entries > (1 << 20) || config.reserved_entries > entries {
             return Err(Error::InvalidConfiguration);
         }
         let (backend, wake) = match driver {
@@ -534,7 +589,12 @@ impl Reactor {
                 unfenced: 0,
                 wake_armed: false,
                 retries: 0,
+                rejected: 0,
                 expired: 0,
+                ordinary_limit: (entries - config.reserved_entries) as usize,
+                reserved_limit: config.reserved_entries as usize,
+                ordinary_live: 0,
+                reserved_live: 0,
                 wakers: Vec::new(),
             })),
         }));
@@ -584,6 +644,7 @@ impl Reactor {
                 Backend::Sim(_) => EnterStats::default(),
             },
             retries: state.retries,
+            rejected: state.rejected,
             expired: state.expired,
         }
     }
@@ -645,8 +706,17 @@ impl Reactor {
         if state.stopped {
             return Err(Error::Unavailable);
         }
-        let id = state.slab.alloc().ok_or(Error::Overloaded)?;
+        let full = if ctx.reserved {
+            state.reserved_live >= state.reserved_limit
+        } else {
+            state.ordinary_live >= state.ordinary_limit
+        };
+        let Some(id) = (!full).then(|| state.slab.alloc()).flatten() else {
+            state.rejected += 1;
+            return Err(Error::Overloaded);
+        };
         let slot = state.slab.lookup(id).expect("fresh slot");
+        slot.reserved = ctx.reserved;
         slot.owner.put(owner);
         slot.class = ctx.class;
         slot.deadline = ctx.deadline.instant();
@@ -669,7 +739,13 @@ impl Reactor {
             let slot = state.slab.lookup(id).expect("fresh slot");
             slot.owner.clear();
             state.slab.release(id);
+            state.rejected += 1;
             return Err(error);
+        }
+        if ctx.reserved {
+            state.reserved_live += 1;
+        } else {
+            state.ordinary_live += 1;
         }
         state.classes[ctx.class.0 as usize] += 1;
         state.unfenced += 1;
@@ -713,7 +789,7 @@ impl Reactor {
         let owner = unsafe { slot.owner.take::<O>() };
         let returns_fd = slot.returns_fd;
         let cancel = slot.cancel;
-        state.slab.release(id);
+        state.release_slot(id);
         drop(state);
         // Cancellation and deadline take precedence over a late success.
         let reason = cancel.or_else(|| ctx.check(self.now()).err());
@@ -763,7 +839,7 @@ impl Reactor {
         if let Some(result) = slot.done {
             let returns_fd = slot.returns_fd;
             discard_slot(slot, result);
-            state.slab.release(id);
+            state.release_slot(id);
             if returns_fd && result >= 0 {
                 Self::close_raw(&mut state, result);
             }
@@ -946,7 +1022,7 @@ impl Reactor {
         if slot.abandoned {
             let returns_fd = slot.returns_fd;
             discard_slot(slot, result);
-            state.slab.release(id);
+            state.release_slot(id);
             if returns_fd && result >= 0 {
                 Self::close_raw(state, result);
             }

@@ -21,7 +21,7 @@ fn backends(test: &str) -> Vec<(Reactor, PathBuf)> {
     let os = SimOs::new();
     let sim = Reactor::new(
         Driver::Sim(os),
-        Config { queue_entries: 32 },
+        Config::new(32),
         WorkerCtx::simulated(&VirtualClock::new(), 3, 0),
     )
     .unwrap();
