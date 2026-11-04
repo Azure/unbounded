@@ -927,6 +927,12 @@ mod tests {
         signal.write_all(&[1]).unwrap();
         let (socket, mut client) = UnixStream::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
+        // Read concurrently: a body near MAX_BODY_BYTES exceeds the socket buffer.
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
         let response = BinaryResponse {
             kind: BinaryKind::Json,
             duration,
@@ -971,9 +977,7 @@ mod tests {
             assert_eq!(json.active.get(), busy);
         }
         drop(owner);
-        let mut bytes = Vec::new();
-        client.read_to_end(&mut bytes).unwrap();
-        String::from_utf8(bytes).unwrap()
+        String::from_utf8(reader.join().unwrap()).unwrap()
     }
 
     /// Text-only owner with both producer kinds attached.
