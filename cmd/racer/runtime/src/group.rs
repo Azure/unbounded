@@ -133,7 +133,7 @@ pub struct FailureReporter<E: Copy> {
     control: Arc<Control<E>>,
 }
 
-impl<E: Copy> FailureReporter<E> {
+impl<E: Copy + PartialEq + From<Error>> FailureReporter<E> {
     /// Record the first failure and request that every lane stop admission.
     pub fn report(&self, error: E) {
         self.control.fail(error);
@@ -388,7 +388,7 @@ struct Control<E> {
     changed: Condvar,
 }
 
-impl<E: Copy> Control<E> {
+impl<E: Copy + PartialEq + From<Error>> Control<E> {
     /// Allocate per-lane barriers and initialize execution counters.
     fn new(lanes: usize, helpers: usize, auto_shutdown: bool) -> Self {
         Self {
@@ -427,9 +427,20 @@ impl<E: Copy> Control<E> {
     }
 
     /// Retain the first error and notify all threads to begin draining.
+    ///
+    /// A requested stop surfaces as `Error::Cancelled`. It yields to the first
+    /// real failure recorded after it, so drain, checkpoint, or fence errors
+    /// during a signaled stop are reported instead of a clean exit.
     fn fail(&self, error: E) {
         let mut state = self.lock();
-        state.error.get_or_insert(error);
+        let cancelled = E::from(Error::Cancelled);
+        match state.error {
+            None => state.error = Some(error),
+            Some(first) if first == cancelled && error != cancelled => {
+                state.error = Some(error);
+            }
+            Some(_) => {}
+        }
         state.phase = state.phase.max(Phase::Drain);
         self.changed.notify_all();
     }
@@ -500,13 +511,13 @@ impl<E: Copy> Control<E> {
 }
 
 /// Account thread exit without ever claiming it established an ownership fence.
-struct Exit<E: Copy + From<Error>> {
+struct Exit<E: Copy + PartialEq + From<Error>> {
     control: Arc<Control<E>>,
 
     lane: Option<usize>,
 }
 
-impl<E: Copy + From<Error>> Drop for Exit<E> {
+impl<E: Copy + PartialEq + From<Error>> Drop for Exit<E> {
     /// Record thread exit and publication closure, but never claim an ownership fence.
     fn drop(&mut self) {
         if let Some(lane) = self.lane {
@@ -526,14 +537,14 @@ fn attempt<T, E: From<Error>>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> 
 }
 
 /// Record an ordinary lifecycle error without interrupting ownership fencing.
-fn record<E: Copy>(control: &Control<E>, result: Result<(), E>) {
+fn record<E: Copy + PartialEq + From<Error>>(control: &Control<E>, result: Result<(), E>) {
     if let Err(error) = result {
         control.fail(error);
     }
 }
 
 /// Abort on a failed fence rather than unwind through externally owned resources.
-fn require_fence<E: Copy>(control: &Control<E>, result: Result<(), E>) {
+fn require_fence<E: Copy + PartialEq + From<Error>>(control: &Control<E>, result: Result<(), E>) {
     if let Err(error) = result {
         control.fail(error);
         // Returning would destroy resources whose ownership is still external.
@@ -1159,7 +1170,7 @@ fn drive_fence<S: Scope>(
 }
 
 /// Abort immediately if a fence future fails or panics while being polled.
-fn fence_operation<'a, E: Copy + From<Error> + 'a>(
+fn fence_operation<'a, E: Copy + PartialEq + From<Error> + 'a>(
     mut operation: Operation<'a, (), E>,
     control: &'a Control<E>,
 ) -> Operation<'a, (), E> {
@@ -1187,7 +1198,7 @@ fn diagnose_operation<'a, S: Scope>(
 }
 
 /// Rotate helper polling fairly and retain every future through its final fence.
-fn drive_helpers<E: Copy + From<Error>>(
+fn drive_helpers<E: Copy + PartialEq + From<Error>>(
     operations: Vec<Operation<'_, (), E>>,
     control: &Control<E>,
     waker: &Waker,
@@ -2251,6 +2262,7 @@ mod tests {
                 owner: Rc::new(thread::current().id()),
                 panic_poll: false,
                 stop: Arc::default(),
+                drain_error: None,
             }));
             let control = Control::new(1, usize::from(helper), true);
             let waker = crate::drivers::thread_waker(None);
@@ -2289,6 +2301,28 @@ mod tests {
             );
             assert_eq!(control.result(), Ok(()));
         }
+    }
+
+    /// A requested stop (`Cancelled`) yields to the first real failure after
+    /// it, so post-stop drain or checkpoint errors are not reported as a clean
+    /// stop. Real failures are never replaced.
+    #[test]
+    fn stop_yields_to_later_failures_but_failures_are_kept() {
+        let control = Control::<Error>::new(1, 0, false);
+        control.fail(Error::Cancelled);
+        assert_eq!(control.result(), Err(Error::Cancelled));
+        control.fail(Error::Cancelled);
+        assert_eq!(control.result(), Err(Error::Cancelled));
+        control.fail(Error::Io);
+        assert_eq!(control.result(), Err(Error::Io));
+        control.fail(Error::DeadlineExceeded);
+        control.fail(Error::Cancelled);
+        assert_eq!(control.result(), Err(Error::Io));
+
+        let control = Control::<Error>::new(1, 0, false);
+        control.fail(Error::DeadlineExceeded);
+        control.fail(Error::Cancelled);
+        assert_eq!(control.result(), Err(Error::DeadlineExceeded));
     }
 
     /// Failed fences and incomplete ownership stages abort before service destruction.
@@ -2804,6 +2838,8 @@ mod tests {
         panic_poll: bool,
 
         stop: Arc<AtomicBool>,
+
+        drain_error: Option<Error>,
     }
 
     /// Non-Send service that records lifecycle order and verifies owner-thread destruction.
@@ -2815,6 +2851,8 @@ mod tests {
         panic_poll: bool,
 
         stop: Arc<AtomicBool>,
+
+        drain_error: Option<Error>,
     }
 
     impl Factory<TestScope> for Recipe {
@@ -2829,6 +2867,7 @@ mod tests {
                 owner: Rc::new(thread::current().id()),
                 panic_poll: self.panic_poll,
                 stop: self.stop.clone(),
+                drain_error: self.drain_error,
             }))
         }
 
@@ -2876,7 +2915,7 @@ mod tests {
         fn drain<'a>(&'a mut self, _: &'a TestScope) -> Operation<'a, ()> {
             Box::pin(async {
                 self.events.lock().unwrap().push("drain");
-                Ok(())
+                self.drain_error.map_or(Ok(()), Err)
             })
         }
 
@@ -2910,6 +2949,7 @@ mod tests {
             events: Arc::default(),
             panic_poll,
             stop: Arc::default(),
+            drain_error: None,
         }
     }
 
@@ -2929,6 +2969,21 @@ mod tests {
                 "start", "stop", "drain", "close", "fence", "shutdown", "fence", "drop"
             ]
         );
+    }
+
+    /// A stop requested while running is a clean `Cancelled`, but a drain
+    /// failure after that stop is reported instead of being swallowed.
+    #[test]
+    fn drain_failure_after_stop_is_reported() {
+        for (drain_error, expected) in [(None, Error::Cancelled), (Some(Error::Io), Error::Io)] {
+            let plan = plan(1);
+            let mut factory = recipe(&plan, false);
+            factory.drain_error = drain_error;
+            factory.stop.store(true, Ordering::SeqCst);
+            let mut group = Group::new(plan);
+            assert_eq!(group.run(&factory, &TestScope), Err(expected));
+            assert!(factory.events.lock().unwrap().contains(&"drain"));
+        }
     }
 
     /// Dropping an owned group joins its lane after both fences and local destruction.

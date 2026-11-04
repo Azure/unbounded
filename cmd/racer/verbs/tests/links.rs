@@ -696,7 +696,7 @@ mod inner {
 
     use uring_runtime::{Operation, group::Service};
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Failure;
 
     impl From<uring_runtime::Error> for Failure {

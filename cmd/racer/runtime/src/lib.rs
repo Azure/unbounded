@@ -114,8 +114,10 @@ pub type Operation<'a, T, E = Error> = Pin<Box<dyn Future<Output = Result<T, E>>
 
 /// Caller-owned operation deadline and cancellation policy.
 pub trait Scope: Clone + 'static {
-    /// Caller-owned failures that can represent runtime failures.
-    type Error: Copy + Send + 'static + From<Error>;
+    /// Caller-owned failures that can represent runtime failures. Equality
+    /// lets lifecycle code tell a requested stop (`Error::Cancelled`) from a
+    /// real failure.
+    type Error: Copy + Send + 'static + From<Error> + PartialEq;
 
     /// Check admission, cancellation, and deadline policy before starting work.
     fn check(&self) -> Result<(), Self::Error>;

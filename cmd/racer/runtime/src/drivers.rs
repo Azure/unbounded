@@ -483,7 +483,7 @@ pub fn thread_waker(reactor: Option<ReactorWake>) -> Waker {
 /// Its completion fence runs to completion, then the first backend error wins.
 /// `wait` must be bounded. After it returns, wake the polling task so a surrounding
 /// driver schedules another turn before sleeping, including non-thread executors.
-pub fn drive_local_with<'a, T: 'a, E: Copy + 'a>(
+pub fn drive_local_with<'a, T: 'a, E: Copy + PartialEq + From<crate::Error> + 'a>(
     mut operation: Operation<'a, T, E>,
     reporter: Option<&'a FailureReporter<E>>,
     mut poll: impl FnMut(&Waker) -> Result<(), E> + 'a,
