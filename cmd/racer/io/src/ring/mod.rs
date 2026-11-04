@@ -1419,4 +1419,4 @@ impl Drop for Sleep {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

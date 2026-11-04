@@ -11,6 +11,7 @@ pub mod cancel;
 pub mod ctx;
 pub mod error;
 pub mod exec;
+pub mod fs;
 pub mod pin;
 pub mod ring;
 pub mod signal;
