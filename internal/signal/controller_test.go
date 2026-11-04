@@ -101,6 +101,7 @@ func TestProfileChecksAssignsPositionalIdentity(t *testing.T) {
 	}
 
 	checks := profileChecks(profile)
+
 	for _, index := range []int{0, 15, signalv1.MaxCertificationChecks - 1} {
 		wantID := signalv1.CheckID("R" + fmtCheckNumber(index+1))
 		if checks[index].ID != wantID {
@@ -121,6 +122,7 @@ func TestBuildWorkflowVariableSuiteIsSequentialAndBounded(t *testing.T) {
 			t.Parallel()
 
 			run := certificationRun(count)
+
 			workflow, err := buildWorkflow(run)
 			if err != nil {
 				t.Fatalf("buildWorkflow() error = %v", err)
@@ -143,11 +145,13 @@ func TestBuildWorkflowVariableSuiteIsSequentialAndBounded(t *testing.T) {
 			template := templates[0].(map[string]any)
 			dag := template["dag"].(map[string]any)
 			tasks := dag["tasks"].([]any)
+
 			if len(tasks) != count {
 				t.Fatalf("task count = %d, want %d", len(tasks), count)
 			}
 
 			resultNames := make(map[string]struct{}, count)
+
 			for index := range tasks {
 				task := tasks[index].(map[string]any)
 				if index == 0 {
@@ -163,6 +167,7 @@ func TestBuildWorkflowVariableSuiteIsSequentialAndBounded(t *testing.T) {
 
 				arguments := task["arguments"].(map[string]any)
 				parameters := arguments["parameters"].([]any)
+
 				if len(parameters) != 5 {
 					t.Fatalf("tasks[%d] parameter count = %d, want 5", index, len(parameters))
 				}
@@ -171,6 +176,7 @@ func TestBuildWorkflowVariableSuiteIsSequentialAndBounded(t *testing.T) {
 				for _, parameter := range parameters {
 					entry := parameter.(map[string]any)
 					name := entry["name"].(string)
+
 					switch name {
 					case "run-name", "execution-name", "run-uid", "check-index", "result-configmap":
 					default:
@@ -203,6 +209,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 
 	run := certificationRun(1)
 	check := &run.Spec.Checks[0]
+
 	if _, err := validateRunCheckPlan(run.Spec.Checks); err != nil {
 		t.Fatalf("validateRunCheckPlan() error = %v", err)
 	}
@@ -265,6 +272,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 	mutable.Immutable = nil
 	mutableClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mutable).Build()
 	mutableReconciler := &RunReconciler{Client: mutableClient, APIReader: mutableClient}
+
 	if _, err := mutableReconciler.readCheckResult(context.Background(), workflow, run, check); err == nil {
 		t.Fatal("readCheckResult() accepted a mutable ConfigMap")
 	}
@@ -273,6 +281,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 	wrongDigest.Annotations[checkResultDigest] = digestBytes([]byte("different"))
 	digestClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wrongDigest).Build()
 	digestReconciler := &RunReconciler{Client: digestClient, APIReader: digestClient}
+
 	if _, err := digestReconciler.readCheckResult(context.Background(), workflow, run, check); err == nil {
 		t.Fatal("readCheckResult() accepted a mismatched digest")
 	}
@@ -285,6 +294,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 		BackendResources: strings.Repeat("\x00", maxAdapterBackendOutputBytes),
 		BackendEvidence:  strings.Repeat("\x00", maxAdapterBackendEvidenceBytes),
 	}
+
 	maximumContent, err := json.Marshal(maximum)
 	if err != nil {
 		t.Fatalf("encode maximum result: %v", err)
@@ -306,6 +316,7 @@ func TestReadCheckResultEnforcesBoundedImmutableIdentity(t *testing.T) {
 		BackendResources: "[]",
 		BackendEvidence:  "{}",
 	}
+
 	oversizedContent, err := json.Marshal(oversized)
 	if err != nil {
 		t.Fatalf("encode oversized result: %v", err)

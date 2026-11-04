@@ -1620,7 +1620,7 @@ func validateWorkflowSize(workflow *unstructured.Unstructured) error {
 
 	if len(content) > maximumWorkflowSpecBytes {
 		return fmt.Errorf(
-			"Workflow object is %d bytes, maximum is %d",
+			"workflow object is %d bytes, maximum is %d",
 			len(content),
 			maximumWorkflowSpecBytes,
 		)
