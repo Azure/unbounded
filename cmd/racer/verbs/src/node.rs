@@ -936,13 +936,22 @@ impl Owner {
     }
 
     /// A new link on `key.rail`, if the rail exists and has room.
+    ///
+    /// Live and dying links are counted separately, each against
+    /// `max_links`: a link for `key` that the new one replaces does not count
+    /// as live, so a replacement on a full rail is admitted, and dying links
+    /// (whose QPs still exist until destroyed) cannot crowd out live ones.
     fn create(&mut self, key: LinkKey, role: Role, now: Instant) -> Result<Link> {
         let settings = self.settings.ok_or(Error::Unavailable)?;
         let device = self.devices.get(&key.rail).ok_or(Error::Unavailable)?;
-        let used = self.links.keys().filter(|k| k.rail == key.rail).count()
-            + self.dying.iter().filter(|d| d.key.rail == key.rail).count();
+        let live = self
+            .links
+            .keys()
+            .filter(|k| k.rail == key.rail && **k != key)
+            .count();
+        let dying = self.dying.iter().filter(|d| d.key.rail == key.rail).count();
 
-        if used >= settings.max_links {
+        if live >= settings.max_links || dying >= settings.max_links {
             return Err(Error::Overloaded);
         }
 
@@ -961,7 +970,16 @@ impl Owner {
             return Err(Error::Overloaded);
         }
 
-        let link = self.create(key, Role::Initiator, now)?;
+        let link = match self.create(key, Role::Initiator, now) {
+            Ok(link) => link,
+            Err(error) => {
+                // A missing rail is not a failure of this link.
+                if error != Error::Unavailable {
+                    self.back_off(key, false, now);
+                }
+                return Err(error);
+            }
+        };
         let opened = opened(&link);
         self.links.insert(key, link);
         self.dirty = true;
@@ -980,27 +998,40 @@ impl Owner {
             return Err(Error::InvalidRequest);
         }
 
-        // An authenticated setup replaces whatever we had.
-        if let Some(old) = self.links.remove(&key) {
-            self.dying.push(Dying { key, link: old });
-            self.dirty = true;
-        }
-
         let role = if initiator {
             Role::Initiator
         } else {
             Role::Responder
         };
-        let mut link = self.create(key, role, now)?;
-        link.connect(
+        // Build the replacement before retiring the old link, so a refused
+        // or failed setup leaves the current link in place.
+        let mut link = match self.create(key, role, now) {
+            Ok(link) => link,
+            Err(error) => {
+                // A missing rail is not a failure of this link.
+                if error != Error::Unavailable {
+                    self.back_off(key, false, now);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = link.connect(
             remote.endpoint,
             remote.recv_credits,
             remote.grants_per_link,
             link_id,
             now,
-        )?;
+        ) {
+            self.dying.push(Dying { key, link });
+            self.back_off(key, false, now);
+            self.dirty = true;
+            return Err(error);
+        }
         let opened = opened(&link);
-        self.links.insert(key, link);
+        // An authenticated setup replaces whatever we had.
+        if let Some(old) = self.links.insert(key, link) {
+            self.dying.push(Dying { key, link: old });
+        }
         self.dirty = true;
         Ok(opened)
     }
@@ -1063,21 +1094,28 @@ impl Owner {
                 let reset = link
                     .ready_since()
                     .is_some_and(|since| now.saturating_duration_since(since) >= BACKOFF_RESET);
-                let delay = match self.backoff.get(&key) {
-                    Some(previous) if !reset => (previous.delay * 2).min(BACKOFF_MAX),
-                    _ => BACKOFF_MIN,
-                };
-                self.backoff.insert(
-                    key,
-                    Backoff {
-                        until: now + jitter(delay),
-                        delay,
-                    },
-                );
+                self.back_off(key, reset, now);
             }
         }
 
         self.dying.push(Dying { key, link });
+        self.dirty = true;
+    }
+
+    /// Back `key` off after a failure: double the previous delay unless
+    /// `reset`, starting from `BACKOFF_MIN`.
+    fn back_off(&mut self, key: LinkKey, reset: bool, now: Instant) {
+        let delay = match self.backoff.get(&key) {
+            Some(previous) if !reset => (previous.delay * 2).min(BACKOFF_MAX),
+            _ => BACKOFF_MIN,
+        };
+        self.backoff.insert(
+            key,
+            Backoff {
+                until: now + jitter(delay),
+                delay,
+            },
+        );
         self.dirty = true;
     }
 

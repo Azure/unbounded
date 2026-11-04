@@ -464,6 +464,47 @@ fn setup_rules() {
 }
 
 #[test]
+/// A replacement setup on a full rail retires the old link instead of
+/// destroying it and then failing; a setup refused for capacity backs off.
+fn replacement_on_full_rail_succeeds_and_refusals_back_off() {
+    let mut w = world();
+    let (_, eb) = link_up(&mut w);
+    // b's rail is full: its link to a plus a setup to another peer.
+    let other = w.b.clients[0].open(LinkKey {
+        peer: [4; 32],
+        rail: 7,
+    });
+    wait(&mut w, &other).unwrap();
+    let spare = w.a.clients[0].open(LinkKey {
+        peer: [6; 32],
+        rail: 7,
+    });
+    let offer = Setup {
+        endpoint: wait(&mut w, &spare).unwrap().setup.endpoint,
+        recv_credits: 8,
+        grants_per_link: 2,
+    };
+    let replaced = w.b.clients[0].accept(TO_A, offer, ID + 1, false);
+    let replaced = wait(&mut w, &replaced).unwrap();
+    assert_ne!(replaced.epoch, eb);
+    assert!(!matches!(
+        w.b.clients[0].link(TO_A),
+        LinkState::Idle | LinkState::Backoff(_)
+    ));
+    // A new key on the full rail is refused and backs off.
+    let third = LinkKey {
+        peer: [5; 32],
+        rail: 7,
+    };
+    let refused = w.b.clients[0].accept(third, offer, ID + 2, false);
+    assert_eq!(wait(&mut w, &refused).err(), Some(Error::Overloaded));
+    assert!(matches!(w.b.clients[0].link(third), LinkState::Backoff(_)));
+    let reopen = w.b.clients[0].open(third);
+    assert_eq!(wait(&mut w, &reopen).err(), Some(Error::Overloaded));
+    shutdown(w);
+}
+
+#[test]
 /// Closing one node sends `Close`: the peer returns to `Idle`, not backoff.
 /// An idle link closes itself the same way.
 fn peer_close_and_idle_close() {
