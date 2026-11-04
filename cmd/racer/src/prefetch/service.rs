@@ -665,9 +665,19 @@ async fn run_pump(prefetch: Arc<Prefetch>, local: Rc<Coordinator>) {
         .await;
         if let Some(results) = next {
             let now = uring_runtime::environment::now();
+            let membership = local.current_membership();
             prefetch.with_registry(|registry| {
+                let mut completed = Vec::with_capacity(results.len());
                 for (unit, outcome, owner) in results {
                     registry.complete(&unit, outcome, owner, now);
+                    completed.push(unit);
+                }
+                // A pool change seen while these fills were in flight skipped
+                // them; recheck their owners now that they have settled.
+                if let Some(membership) = &membership {
+                    registry.requeue_departed_among(&completed, |cache, node| {
+                        membership.serves(cache, node)
+                    });
                 }
             });
             prefetch.wake_waiters();

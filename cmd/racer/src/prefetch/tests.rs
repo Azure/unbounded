@@ -602,6 +602,35 @@ fn owners_that_leave_the_cache_pool_are_requeued() {
 }
 
 #[test]
+fn fills_that_finish_after_their_owner_left_the_pool_are_requeued() {
+    let mut r = rig(Config::default());
+    r.put("t", spec("", &[&pages(KEY_A, 0, 1)])).unwrap();
+    let batch = r.registry.next_batch(r.now, 256).unwrap();
+    let units: Vec<UnitKey> = batch
+        .pages
+        .iter()
+        .map(|&page| UnitKey {
+            version: batch.metadata.version.clone(),
+            page,
+        })
+        .collect();
+    let departed = |cache_id: &CacheId, n: &NodeId| !(cache_id == &cache() && n.0 == "owner");
+    // The pool changes while the fill is in flight: the full scan skips it.
+    r.registry.requeue_departed(departed);
+    for unit in &units {
+        r.registry
+            .complete(unit, UnitOutcome::Admitted, Some(node("owner")), r.now);
+    }
+    assert!(r.status("t").settled);
+    // The pump rechecks just-completed units against current membership.
+    r.registry.requeue_departed_among(&units, departed);
+    let status = r.status("t");
+    assert!(!status.settled);
+    assert_eq!(status.bytes.queued, PAGE_BYTES);
+    assert_eq!(r.registry.next_batch(r.now, 256).unwrap().pages, vec![0]);
+}
+
+#[test]
 fn cache_removal_and_passthrough_cancel_tickets() {
     let mut r = rig(Config::default());
     r.put("t", spec("", &[&pages(KEY_A, 0, 1)])).unwrap();
