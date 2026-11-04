@@ -43,6 +43,9 @@ const CLOSE_LINGER: Duration = Duration::from_millis(500);
 pub struct Config {
     pub api: Api,
     pub request_timeout: Duration,
+    /// Connection slots, `max_connections` permits, shared by every worker
+    /// so the limit is global.
+    pub slots: Arc<Semaphore>,
     pub max_connections: usize,
 }
 
@@ -69,7 +72,7 @@ pub async fn serve(
     });
     // Like Go's limited listener: take a slot before accepting, so excess
     // connections wait in the kernel backlog instead of being accepted.
-    let slots = Arc::new(Semaphore::new(config.max_connections));
+    let slots = config.slots;
     loop {
         let permit = tokio::select! {
             biased;
@@ -101,7 +104,8 @@ pub async fn serve(
         });
     }
     drop(listener);
-    // Every connection task holds one slot; all slots back means all done.
+    // Every connection task, on any worker, holds one slot; all slots back
+    // means all done. Workers drain in turn, each releasing them on return.
     let all = u32::try_from(config.max_connections).unwrap_or(u32::MAX);
     let _ = tokio::time::timeout(SHUTDOWN_GRACE, slots.acquire_many(all)).await;
 }

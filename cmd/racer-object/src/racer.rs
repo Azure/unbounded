@@ -89,6 +89,19 @@ impl Client {
         }
     }
 
+    /// A client for another worker: its own idle pool (no cross-thread
+    /// wakeups), sharing this client's read limits so they stay global.
+    pub fn sibling(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            idle: Mutex::new(Vec::with_capacity(self.max_idle)),
+            max_idle: self.max_idle,
+            stat_lane: self.stat_lane.clone(),
+            bulk_lane: self.bulk_lane.clone(),
+            jitter: AtomicU64::new(self.jitter.load(Ordering::Relaxed).rotate_left(17) | 1),
+        }
+    }
+
     async fn admit(lane: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Failure> {
         match tokio::time::timeout(QUEUE_TIMEOUT, lane.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),

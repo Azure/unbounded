@@ -402,6 +402,7 @@ pub fn options(api: Api) -> Options {
         debug_listen: None,
         request_timeout: Duration::from_secs(10),
         max_connections: 16,
+        workers: 1,
     }
 }
 

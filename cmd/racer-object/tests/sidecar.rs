@@ -1035,3 +1035,87 @@ async fn connection_limit_queues_in_backlog() {
     drop(first);
     assert_eq!(second.response(false).await.status, 200);
 }
+
+#[tokio::test]
+async fn workers_share_listener_and_limits() {
+    let racer = FakeRacer::start().await;
+    let big: Vec<u8> = vec![9u8; 3 << 20];
+    racer.put("bucket", "key", "", Object::new("data", r#""v""#));
+    racer.put("bucket", "big", "", Object::new(big.clone(), r#""b""#));
+    let mut options = options(Api::S3);
+    options.workers = 4;
+    options.max_connections = 6;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let debug = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    debug.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let debug_addr = debug.local_addr().unwrap();
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let path = racer.path.clone();
+    let done = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        racer_object::run_workers(
+            &runtime,
+            listener,
+            Some(debug),
+            &options,
+            path,
+            shutdown,
+            || Ok(()),
+        )
+    });
+    let r = Client::connect(debug_addr)
+        .await
+        .request("GET", "/healthz", &[])
+        .await;
+    assert_eq!(r.status, 200);
+    // Many concurrent keep-alive connections, served across workers.
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let big = big.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut c = Client::connect(addr).await;
+            for _ in 0..4 {
+                let r = c.request("GET", "/bucket/key", &[]).await;
+                assert_eq!((r.status, r.body.as_slice()), (200, &b"data"[..]));
+                if i % 4 == 0 {
+                    let r = c.request("GET", "/bucket/big", &[]).await;
+                    assert_eq!(r.status, 200);
+                    assert!(r.body == big);
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    // The connection limit is global: with every slot held by an idle
+    // connection, one more is not served.
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        let mut c = Client::connect(addr).await;
+        assert_eq!(c.request("GET", "/bucket/key", &[]).await.status, 200);
+        held.push(c);
+    }
+    let mut extra = Client::connect(addr).await;
+    extra.send("GET", "/bucket/key", &[]).await;
+    let waited = tokio::time::timeout(Duration::from_millis(300), extra.try_response(false)).await;
+    assert!(waited.is_err(), "connection served past the global limit");
+    held.pop();
+    assert_eq!(extra.response(false).await.status, 200);
+    // Shutdown stops every worker and closes idle connections.
+    stop.send(true).unwrap();
+    for mut c in held {
+        assert!(c.closed().await);
+    }
+    assert!(extra.closed().await);
+    let result = tokio::task::spawn_blocking(move || done.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+}

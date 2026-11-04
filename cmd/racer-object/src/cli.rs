@@ -17,6 +17,8 @@ pub struct Options {
     pub debug_listen: Option<String>,
     pub request_timeout: Duration,
     pub max_connections: usize,
+    /// Serving threads, each with its own single-threaded runtime.
+    pub workers: usize,
 }
 
 /// What `main` should do.
@@ -28,6 +30,8 @@ pub enum Command {
 }
 
 const MAX_CONNECTIONS: i64 = 65536;
+const MAX_WORKERS: i64 = 256;
+const DEFAULT_WORKERS: i64 = 1;
 const SOCKET_PATH_LIMIT: usize = 107;
 
 /// Version string (`<version> (commit: <commit>, built: <time>)`), set at
@@ -58,6 +62,8 @@ pub fn sidecar_usage() -> String {
     \tPositive sidecar request timeout (default 5m0s)
   -version
     \tPrint version
+  -workers int
+    \tServing threads, each with its own event loop; 1..256 (default 1)
 "
     .to_string()
 }
@@ -87,6 +93,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut debug_listen = String::new();
     let mut timeout = Some(Duration::from_secs(300));
     let mut max_connections: i64 = 128;
+    let mut workers: i64 = DEFAULT_WORKERS;
     let mut show_version = false;
 
     let mut rest = &args[1..];
@@ -119,7 +126,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
         if !matches!(
             name,
-            "cache" | "api" | "listen" | "debug-listen" | "request-timeout" | "max-connections"
+            "cache"
+                | "api"
+                | "listen"
+                | "debug-listen"
+                | "request-timeout"
+                | "max-connections"
+                | "workers"
         ) {
             return Err(invalid());
         }
@@ -144,6 +157,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 timeout = (!value.starts_with('-')).then_some(d);
             }
             "max-connections" => max_connections = parse_int(&value).ok_or_else(invalid)?,
+            "workers" => workers = parse_int(&value).ok_or_else(invalid)?,
             _ => unreachable!("flag names are checked above"),
         }
     }
@@ -165,6 +179,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     if !(1..=MAX_CONNECTIONS).contains(&max_connections) {
         return Err("--max-connections must be between 1 and 65536".into());
     }
+    if !(1..=MAX_WORKERS).contains(&workers) {
+        return Err("--workers must be between 1 and 256".into());
+    }
     let api = match api.as_str() {
         "s3" => Api::S3,
         "azure" => Api::Azure,
@@ -178,6 +195,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         debug_listen: (!debug_listen.is_empty()).then_some(debug_listen),
         request_timeout,
         max_connections: max_connections as usize,
+        workers: workers as usize,
     }))
 }
 
@@ -361,6 +379,7 @@ mod tests {
         assert_eq!(o.request_timeout, Duration::from_secs(300));
         assert_eq!(o.max_connections, 128);
         assert_eq!(o.debug_listen, None);
+        assert_eq!(o.workers, DEFAULT_WORKERS as usize);
 
         let o = options(&[
             "sidecar",
@@ -393,6 +412,37 @@ mod tests {
         assert_eq!(o.listen, "[::1]:9".parse().unwrap());
         assert_eq!(o.max_connections, 16);
         assert_eq!(o.debug_listen.as_deref(), Some(":6060"));
+    }
+
+    #[test]
+    fn workers_flag() {
+        for (list, want) in [
+            (&["sidecar", CACHE, "--workers=4"][..], 4),
+            (&["sidecar", CACHE, "--workers", "2"], 2),
+            (&["sidecar", CACHE, "-workers=1"], 1),
+            (&["sidecar", CACHE, "--workers=256"], 256),
+            (&["sidecar", CACHE, "--workers=0x8"], 8),
+            (&["sidecar", CACHE, "--workers=3", "--workers=5"], 5),
+        ] {
+            assert_eq!(options(list).unwrap().workers, want, "{list:?}");
+        }
+        for value in ["0", "-1", "257", "65536"] {
+            assert_eq!(
+                options(&["sidecar", CACHE, &format!("--workers={value}")]).unwrap_err(),
+                "--workers must be between 1 and 256",
+            );
+        }
+        for value in ["", "x", "1.5", "4x", "99999999999999999999"] {
+            assert_eq!(
+                options(&["sidecar", CACHE, &format!("--workers={value}")]).unwrap_err(),
+                "invalid flags (use --help)",
+            );
+        }
+        assert_eq!(
+            options(&["sidecar", CACHE, "--workers"]).unwrap_err(),
+            "invalid flags (use --help)",
+        );
+        assert!(sidecar_usage().contains("  -workers int\n"));
     }
 
     #[test]

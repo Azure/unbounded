@@ -48,6 +48,10 @@ fn errors_exit_one_without_leaking() {
             &["sidecar", "--cache=c", "--listen=0.0.0.0:1"],
             "racer-object: --listen must use a loopback IP literal and port\n",
         ),
+        (
+            &["sidecar", "--cache=c", "--workers=0"],
+            "racer-object: --workers must be between 1 and 256\n",
+        ),
     ] {
         let out = bin().args(args).output().unwrap();
         assert_eq!(out.status.code(), Some(1), "{args:?}");
@@ -58,8 +62,14 @@ fn errors_exit_one_without_leaking() {
 
 #[test]
 fn sigterm_exits_zero() {
+    sigterm_exits_zero_with(&[]);
+    sigterm_exits_zero_with(&["--workers=4", "--debug-listen=127.0.0.1:0"]);
+}
+
+fn sigterm_exits_zero_with(extra: &[&str]) {
     let mut child = bin()
         .args(["sidecar", "--cache=c", "--listen=127.0.0.1:0"])
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -101,5 +111,14 @@ fn bind_failure_exits_one() {
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
         "racer-object: could not bind debug listener\n"
+    );
+    let out = bin()
+        .args(["sidecar", "--cache=c", &listen, "--workers=3"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stderr).unwrap(),
+        "racer-object: could not bind sidecar listener\n"
     );
 }

@@ -28,11 +28,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // A single-threaded runtime. The sidecar is syscall bound and moves
-    // large bodies with splice(2), so one thread already matches the Go
-    // sidecar's throughput, while extra worker threads measurably raised
-    // CPU per request and per byte (work stealing and cross-thread wakeups).
-    // See README.md for the measurements.
+    // Each worker is an OS thread with its own single-threaded runtime;
+    // workers do not steal work from each other. The sidecar is syscall
+    // bound and moves large bodies with splice(2), so one thread is the most
+    // efficient (CPU per request and per byte), while a work-stealing
+    // runtime measurably raised that cost. More workers raise the maximum
+    // throughput when CPU is available. With one worker (the default) this
+    // is a plain current_thread runtime. See README.md for the measurements.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -43,8 +45,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(async {
-        let (stop, shutdown) = watch::channel(false);
+    let socket = racer_object::socket_path(&options.cache);
+    let (stop, shutdown) = watch::channel(false);
+    let on_signal = move || {
         let (Ok(mut term), Ok(mut int)) = (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
@@ -58,9 +61,22 @@ fn main() -> ExitCode {
             }
             let _ = stop.send(true);
         });
-        let socket = racer_object::socket_path(&options.cache);
-        racer_object::run(options, socket, shutdown).await
-    });
+        Ok(())
+    };
+    let result = if options.workers == 1 {
+        runtime.block_on(async {
+            on_signal()?;
+            racer_object::run(options, socket, shutdown).await
+        })
+    } else {
+        runtime
+            .block_on(racer_object::bind(&options))
+            .and_then(|(listener, debug)| {
+                racer_object::run_workers(
+                    &runtime, listener, debug, &options, socket, shutdown, on_signal,
+                )
+            })
+    };
     // Do not wait for straggling tasks past the shutdown grace period.
     runtime.shutdown_background();
     match result {
