@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -470,8 +471,7 @@ func (p *MediaProvider) materializeEFI(ctx context.Context, src ImageSource, nam
 	}
 
 	if _, err := io.Copy(out, file); err != nil {
-		out.Close() //nolint:errcheck // Preserve the copy error.
-		return "", fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, name, err)
+		return "", errors.Join(fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, name, err), out.Close())
 	}
 
 	if err := out.Close(); err != nil {
