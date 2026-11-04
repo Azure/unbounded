@@ -55,14 +55,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The e2e package only uses the standard library, so a Go cache would
+      # save little. setup-go's built-in cache is off because it shares one
+      # key across every workflow and saves from pull requests too.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          cache: false
 
+      # The release binary avoids compiling kind on every run.
       - name: Install kind
-        run: go install sigs.k8s.io/kind@v0.30.0
+        env:
+          KIND_VERSION: v0.30.0
+          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  ${RUNNER_TEMP}/kind" | sha256sum --check -
+          sudo install -m 0755 "${RUNNER_TEMP}/kind" /usr/local/bin/kind
+          rm -f "${RUNNER_TEMP}/kind"
+          kind version
 
       # The suite skips when prerequisites are absent. Verify them first so CI
       # cannot report success without creating a cluster.
