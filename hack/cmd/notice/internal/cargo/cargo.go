@@ -160,11 +160,8 @@ func allVersions(root string) ([]crateVersion, error) {
 	return out, nil
 }
 
-// cargoFilesPresent reports whether Cargo inputs exist, and rejects incomplete inputs.
-func cargoFilesPresent(root string) (bool, error) {
-	return cargoFilesPresentAt(root, cratePath)
-}
-
+// cargoFilesPresentAt reports whether the Cargo inputs of the crate at cratePath exist, and rejects
+// incomplete inputs.
 func cargoFilesPresentAt(root, cratePath string) (bool, error) {
 	missing := make([]string, 0, 2)
 
