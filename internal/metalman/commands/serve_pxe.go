@@ -8,8 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,6 +26,7 @@ import (
 	"github.com/Azure/unbounded/internal/cloudprovider"
 	"github.com/Azure/unbounded/internal/metalman/attestation"
 	"github.com/Azure/unbounded/internal/metalman/dhcp"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	metalmachineops "github.com/Azure/unbounded/internal/metalman/machineops"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
@@ -59,6 +59,9 @@ func ServePXECmd() *cobra.Command {
 		operationPollInterval          time.Duration
 		defaultNetbootImage            string
 		defaultNetbootPullSecret       string
+		registryMirror                 string
+		pullConcurrency                int
+		pullChunkSize                  int64
 	)
 
 	cmd := &cobra.Command{
@@ -126,10 +129,6 @@ func ServePXECmd() *cobra.Command {
 			if err := mgr.GetFieldIndexer().IndexField(ctx, &v1alpha3.Machine{}, indexing.IndexMachineByBootstrapCredentialID,
 				indexing.IndexMachineByBootstrapCredentialIDFunc); err != nil {
 				return fmt.Errorf("indexing by bootstrap credential ID: %w", err)
-			}
-
-			if err := os.MkdirAll(filepath.Join(cacheDir, "sha256"), 0o755); err != nil {
-				return fmt.Errorf("creating cache dir: %w", err)
 			}
 
 			clientset, err := kubernetes.NewForConfig(cfg)
@@ -207,16 +206,15 @@ func ServePXECmd() *cobra.Command {
 				return err
 			}
 
-			ociCache := netboot.NewOCICache(cacheDir)
+			registryMirror, err = parseRegistryMirror(registryMirror)
+			if err != nil {
+				return err
+			}
 
-			if err := (&netboot.OCIReconciler{
-				Client:                      mgr.GetClient(),
-				Cache:                       ociCache,
-				Site:                        site,
-				DefaultNetbootRef:           defaultNetbootImage,
-				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
-			}).SetupWithManager(mgr); err != nil {
-				return fmt.Errorf("setting up OCI reconciler: %w", err)
+			puller := &imagepull.Puller{
+				Mirror:      registryMirror,
+				Concurrency: pullConcurrency,
+				ChunkSize:   pullChunkSize,
 			}
 
 			redfishPool := redfish.NewPool()
@@ -225,14 +223,16 @@ func ServePXECmd() *cobra.Command {
 			statusQueue := &metalmachineops.StatusQueue{Client: mgr.GetClient(), Site: site}
 
 			resolver := netboot.FileResolver{
-				Cache:             ociCache,
-				Reader:            mgr.GetClient(),
-				Cluster:           clusterInfoWatcher,
-				ServeURL:          serveURL,
-				DefaultNetbootRef: defaultNetbootImage,
-				KubernetesVersion: kubeVersion,
-				ClusterDNS:        clusterDNS,
-				ProviderLabels:    providerLabels,
+				Puller:                      puller,
+				Metadata:                    &netboot.MetadataMemo{},
+				Reader:                      mgr.GetClient(),
+				Cluster:                     clusterInfoWatcher,
+				ServeURL:                    serveURL,
+				DefaultNetbootRef:           defaultNetbootImage,
+				DefaultNetbootPullSecretRef: defaultNetbootPullSecretRef,
+				KubernetesVersion:           kubeVersion,
+				ClusterDNS:                  clusterDNS,
+				ProviderLabels:              providerLabels,
 			}
 
 			directClient, err := client.New(cfg, client.Options{Scheme: mgr.GetScheme()})
@@ -250,7 +250,7 @@ func ServePXECmd() *cobra.Command {
 				Resolver: &resolver, Client: directClient, CacheDir: cacheDir, TFTPServer: mediaTFTPServer,
 			}
 
-			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool, FileResolver: &resolver}).SetupWithManager(mgr); err != nil {
+			if err := (&redfish.Reconciler{Client: mgr.GetClient(), Pool: redfishPool}).SetupWithManager(mgr); err != nil {
 				return fmt.Errorf("setting up Redfish reconciler: %w", err)
 			}
 
@@ -297,7 +297,7 @@ func ServePXECmd() *cobra.Command {
 				Port:              dhcpPort,
 				Reader:            mgr.GetClient(),
 				ServerIP:          dhcpServerIP,
-				OCICache:          ociCache,
+				Images:            &resolver,
 				ServeURL:          serveURL,
 				DefaultNetbootRef: defaultNetbootImage,
 			}
@@ -360,6 +360,9 @@ func ServePXECmd() *cobra.Command {
 			PrintConfig("serve-url", serveURL)
 			PrintConfig("default-netboot-image", defaultNetbootImage)
 			PrintConfig("cache-dir", cacheDir)
+			PrintConfig("registry-mirror", puller.Mirror)
+			PrintConfig("pull-concurrency", fmt.Sprintf("%d", pullConcurrency))
+			PrintConfig("pull-chunk-size", fmt.Sprintf("%d", pullChunkSize))
 			PrintConfig("dhcp-interface", dhcpInterface)
 			PrintConfig("dhcp-port", fmt.Sprintf("%d", dhcpPort))
 			fmt.Println()
@@ -380,7 +383,10 @@ func ServePXECmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&site, "site", "", "Site label value to select Machines")
-	cmd.Flags().StringVar(&cacheDir, "cache-dir", DefaultCacheDir(), "Local directory for cached image artifacts")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", DefaultCacheDir(), "Local directory for generated boot media; netboot image files are pulled from the registry on every request and not cached")
+	cmd.Flags().StringVar(&registryMirror, "registry-mirror", "", "Optional registry mirror base URL, such as a node-local Gantry at http://127.0.0.1:5000; pulls try the mirror first and fall back to the upstream registry")
+	cmd.Flags().IntVar(&pullConcurrency, "pull-concurrency", imagepull.DefaultConcurrency, "Maximum parallel HTTP Range requests per image layer")
+	cmd.Flags().Int64Var(&pullChunkSize, "pull-chunk-size", imagepull.DefaultChunkSize, "Bytes requested per HTTP Range request when pulling image layers")
 	cmd.Flags().StringVar(&bindAddress, "bind-address", "0.0.0.0", "IP address to bind servers")
 	cmd.Flags().IntVar(&httpPort, "http-port", 8880, "Port for the HTTP artifact server")
 	cmd.Flags().IntVar(&healthPort, "health-port", 8081, "Port for the health/readiness probe server")
@@ -416,6 +422,23 @@ func resolveMediaTFTPServer(raw string, serverIP net.IP) (string, error) {
 	}
 
 	return "", nil
+}
+
+// parseRegistryMirror validates the --registry-mirror flag. Empty disables
+// the mirror.
+func parseRegistryMirror(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || (u.Path != "" && u.Path != "/") ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("--registry-mirror %q must be an http(s)://host[:port] URL", raw)
+	}
+
+	return strings.TrimSuffix(raw, "/"), nil
 }
 
 func parseNamespacedSecretReference(ref string) (*v1alpha3.NamespacedSecretReference, error) {

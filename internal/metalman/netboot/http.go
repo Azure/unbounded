@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"path"
@@ -121,7 +122,7 @@ func normalizePath(next http.Handler) http.Handler {
 }
 
 // cleanRequestPath removes duplicate slashes, dot segments, and trailing
-// slashes so authorization checks match the cache resolver's path cleaning.
+// slashes so authorization checks match the image resolver's path cleaning.
 func cleanRequestPath(p string) string {
 	if p == "" {
 		return "/"
@@ -161,28 +162,30 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 				log = log.With("handler", "bootmedia", "operation", o.op.Name)
 
-				ref := o.status().Netboot.NetbootImage
+				src := mediaNetbootSource(o.status().Netboot)
 				if path == "disk.img.gz" {
-					ref = o.status().Netboot.Image
+					src = mediaDiskSource(o.status().Netboot)
 				}
 
-				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(r.Context(), path, o.machine, ref, remote)
+				resolved, err := h.Media.Resolver.ResolveFileByPathForIP(r.Context(), path, o.machine, src, remote)
 				if err != nil {
-					log.Warn("boot media artifact unavailable", "ref", ref, "err", err)
+					log.Warn("boot media artifact unavailable", "ref", src.Ref, "err", err)
+
+					if errors.Is(err, ErrImageUnavailable) {
+						w.Header().Set("Retry-After", "5")
+					}
+
 					http.Error(w, "media artifact unavailable", http.StatusServiceUnavailable)
 
 					return
 				}
+				defer resolved.Close() //nolint:errcheck // read-only
 
-				log.Info("serving boot media artifact", "ref", ref, "range", r.Header.Get("Range"))
+				log.Info("serving boot media artifact", "ref", src.Ref, "range", r.Header.Get("Range"))
 
-				if resolved.DiskPath != "" {
-					// GRUB's gzip arm64 kernel loader needs HTTP Range support.
-					// ServeFile preserves it for hybrid ISO boots.
-					http.ServeFile(w, r, resolved.DiskPath)
-				} else {
-					w.Write(resolved.Data) //nolint:errcheck // Best-effort response.
-				}
+				// GRUB's gzip arm64 kernel loader needs HTTP Range support.
+				// serveResolved preserves it for hybrid ISO boots.
+				serveResolved(w, r, path, resolved)
 
 				return
 			}
@@ -234,12 +237,12 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	imageRef := node.Spec.Netboot().Image
+	src := DiskImageSource(node)
 	if path != "disk.img.gz" {
-		imageRef = h.NetbootImageRef(node)
+		src = h.NetbootImageSource(node)
 	}
 
-	if imageRef == "" {
+	if src.Ref == "" {
 		log.Warn("node has no image for requested path", "node", node.Name)
 		http.NotFound(w, r)
 
@@ -247,7 +250,7 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
-		h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
+		h.isHTTPBootLoaderDownload(r.Context(), src, path) {
 		installRequested, err := h.installRequested(r.Context(), node)
 		if err != nil {
 			log.Warn("checking active install operation", "node", node.Name, "err", err)
@@ -264,10 +267,10 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, imageRef, ip)
+	resolved, err := h.ResolveFileByPathForIP(r.Context(), path, node, src, ip)
 	if err != nil {
-		if errors.Is(err, ErrNotYetDownloaded) {
-			log.Info("file not yet downloaded", "node", node.Name)
+		if errors.Is(err, ErrImageUnavailable) {
+			log.Info("image unavailable", "node", node.Name, "ref", src.Ref, "err", err)
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "file not yet available, retry later", http.StatusServiceUnavailable)
 
@@ -285,19 +288,41 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+	defer resolved.Close() //nolint:errcheck // read-only
 
-	if resolved.DiskPath != "" {
-		log.Info("serving cached file", "node", node.Name)
-		http.ServeFile(w, r, resolved.DiskPath)
-		h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, imageRef, path)
+	if resolved.File != nil {
+		log.Info("serving image file", "node", node.Name, "size", resolved.File.Size(), "range", r.Header.Get("Range"))
+	} else {
+		log.Info("serving file", "node", node.Name, "size", len(resolved.Data))
+	}
+
+	serveResolved(w, r, path, resolved)
+	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, src, path)
+}
+
+// serveResolved writes a resolved file. Streamed image files are served with
+// http.ServeContent, which supports Range requests and sets Content-Length.
+func serveResolved(w http.ResponseWriter, r *http.Request, name string, resolved *ResolvedFile) {
+	if resolved.File != nil {
+		// Set the type from the extension so that ServeContent does not sniff
+		// the content: sniffing reads the start of the file and seeks back,
+		// which would pull the file from the registry twice.
+		ctype := mime.TypeByExtension(path.Ext(name))
+		if ctype == "" {
+			ctype = "application/octet-stream"
+		}
+
+		w.Header().Set("Content-Type", ctype)
+		http.ServeContent(w, r, name, resolved.File.ModTime(), resolved.File)
 
 		return
 	}
 
-	log.Info("serving file", "node", node.Name, "size", len(resolved.Data))
-	w.Header().Set("Content-Type", resolved.ContentType)
+	if resolved.ContentType != "" {
+		w.Header().Set("Content-Type", resolved.ContentType)
+	}
+
 	w.Write(resolved.Data) //nolint:errcheck // Best-effort HTTP response write.
-	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, imageRef, path)
 }
 
 const shimRevocationsNotPresentBody = "unbounded: no optional shim revocations file is present\n"
@@ -597,12 +622,12 @@ func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logge
 	}
 }
 
-func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, imageRef, path string) {
+func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, src ImageSource, path string) {
 	if h.StatusRecorder == nil || node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
 		return
 	}
 
-	if !h.isHTTPBootLoaderDownload(imageRef, node.Spec.Netboot().TargetArchitecture(), path) {
+	if !h.isHTTPBootLoaderDownload(ctx, src, path) {
 		return
 	}
 
@@ -611,12 +636,12 @@ func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *sl
 	}
 }
 
-func (h *HTTPServer) isHTTPBootLoaderDownload(imageRef, architecture, path string) bool {
-	if h.Cache == nil || imageRef == "" {
+func (h *HTTPServer) isHTTPBootLoaderDownload(ctx context.Context, src ImageSource, path string) bool {
+	if h.Puller == nil || src.Ref == "" {
 		return false
 	}
 
-	meta, err := h.Cache.MetadataForRefArchitecture(imageRef, architecture)
+	meta, err := h.ImageMetadata(ctx, src)
 	if err != nil {
 		return false
 	}

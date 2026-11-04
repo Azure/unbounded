@@ -14,13 +14,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
 
 type Reconciler struct {
-	Client       client.Client
-	Pool         *Pool
-	FileResolver *netboot.FileResolver
+	Client client.Client
+	Pool   *Pool
 }
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {

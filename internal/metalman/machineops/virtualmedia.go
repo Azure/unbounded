@@ -522,7 +522,7 @@ func (r *Reconciler) advanceVirtualMedia(ctx context.Context, op *v1alpha3.Machi
 	}
 
 	if err != nil {
-		if errors.Is(err, netboot.ErrNotYetDownloaded) {
+		if errors.Is(err, netboot.ErrImageUnavailable) {
 			target.Message = err.Error()
 			return targetChange{target: target}
 		}

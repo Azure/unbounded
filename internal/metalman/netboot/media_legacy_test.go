@@ -25,7 +25,11 @@ func TestMediaLegacyServingAfterLiveLeaseChange(t *testing.T) {
 			"empty provider site", "both sites empty", "different UID",
 		} {
 			t.Run(protocol+"/"+scenario, func(t *testing.T) {
-				p, m, op := mediaFixture(t, "amd64")
+				p, m, op, _ := mediaFixtureImages(t, "amd64", map[string][]byte{
+					"vmlinuz":            []byte("live kernel"),
+					"grub.cfg.tmpl":      []byte("install={{ .InstallRequested }}"),
+					"grub/grub.cfg.tmpl": []byte("install={{ .InstallRequested }}"),
+				}, nil)
 				m.Spec.Netboot().BootProtocol = protocol
 				m.Spec.Netboot().DHCPLeases[0].IPv4 = "192.0.2.40"
 				b := op.Status.Targets[0].BootMedia
@@ -72,11 +76,6 @@ func TestMediaLegacyServingAfterLiveLeaseChange(t *testing.T) {
 					WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
 				p.Client, p.Resolver.Reader = fc, fc
 				p.Resolver.Cluster = &StaticClusterInfo{}
-				require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), map[string][]byte{
-					"vmlinuz":            []byte("live kernel"),
-					"grub.cfg.tmpl":      []byte("install={{ .InstallRequested }}"),
-					"grub/grub.cfg.tmpl": []byte("install={{ .InstallRequested }}"),
-				}))
 				h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
 				tftp := &TFTPServer{Media: p, FileResolver: *p.Resolver}
 				ip := m.Spec.Netboot().DHCPLeases[0].IPv4

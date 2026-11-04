@@ -264,8 +264,8 @@ func validateMediaLease(spec *v1alpha3.PXESpec) error {
 }
 
 func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, error) {
-	if p.Resolver == nil || p.Resolver.Cache == nil || p.CacheDir == "" || net.ParseIP(p.TFTPServer).To4() == nil || (o.status().SourceServer != p.TFTPServer && (o.status().SourceServer != "" || o.status().Phase != "Preparing")) {
-		return "", fmt.Errorf("media resolver, cache, or advertised TFTP IPv4 is invalid or changed")
+	if p.Resolver == nil || p.Resolver.Puller == nil || p.CacheDir == "" || net.ParseIP(p.TFTPServer).To4() == nil || (o.status().SourceServer != p.TFTPServer && (o.status().SourceServer != "" || o.status().Phase != "Preparing")) {
+		return "", fmt.Errorf("media resolver, puller, cache directory, or advertised TFTP IPv4 is invalid or changed")
 	}
 
 	spec := o.status().Netboot
@@ -293,7 +293,9 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", fmt.Errorf("unsupported media architecture %q", arch)
 	}
 
-	meta, err := p.Resolver.Cache.MetadataForRefArchitecture(spec.NetbootImage, arch)
+	netbootSrc := mediaNetbootSource(spec)
+
+	meta, err := p.Resolver.ImageMetadata(ctx, netbootSrc)
 	if err != nil {
 		return "", err
 	}
@@ -302,23 +304,34 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 		return "", fmt.Errorf("netboot image lacks compatible %s media artifacts", mediaFormat)
 	}
 
+	root := filepath.Join(p.CacheDir, "bootmedia")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", err
+	}
+
+	// Stream the EFI payloads from the image into a temporary directory, since
+	// mcopy needs local files. This also validates them when the ISO is
+	// already built.
+	efiDir, err := os.MkdirTemp(root, ".efi-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(efiDir) //nolint:errcheck // Best-effort removal of EFI payloads.
+
 	var efiPaths []string
 
 	for _, name := range []string{shim, grub} {
-		path, tmpl, err := p.Resolver.Cache.ResolvePathForArchitecture(spec.NetbootImage, arch, name)
+		path, err := p.materializeEFI(ctx, netbootSrc, name, efiDir)
 		if err != nil {
 			return "", err
 		}
 
-		if tmpl {
-			return "", fmt.Errorf("media EFI payload must not be a template")
-		}
-
 		efiPaths = append(efiPaths, path)
 	}
+
 	// Validate the live installer template and its static values before any
 	// BMC power action, but never copy the rendered install intent into the ISO.
-	if _, err := p.installerConfig(o); err != nil {
+	if _, err := p.installerConfig(ctx, o); err != nil {
 		return "", err
 	}
 
@@ -373,6 +386,38 @@ func (p *MediaProvider) ensureISO(ctx context.Context, o *mediaOwner) (string, e
 	}
 
 	return iso, nil
+}
+
+// materializeEFI copies the static EFI payload name from src into dir and
+// returns its local path. Templates are rejected.
+func (p *MediaProvider) materializeEFI(ctx context.Context, src ImageSource, name, dir string) (string, error) {
+	file, tmpl, err := p.Resolver.openImageFile(ctx, src, name)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close() //nolint:errcheck // read-only
+
+	if tmpl {
+		return "", fmt.Errorf("media EFI payload must not be a template")
+	}
+
+	local := filepath.Join(dir, name)
+
+	out, err := os.OpenFile(local, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := io.Copy(out, file); err != nil {
+		out.Close() //nolint:errcheck // Preserve the copy error.
+		return "", fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, name, err)
+	}
+
+	if err := out.Close(); err != nil {
+		return "", err
+	}
+
+	return local, nil
 }
 
 // bootstrapConfig renders the lease already validated by ensureISO.

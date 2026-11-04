@@ -1,0 +1,224 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package netboot
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+
+	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
+)
+
+// ErrImageUnavailable reports that an image could not be read from its
+// registry, for example because the registry is unreachable, rejects the
+// credentials, or does not have the image yet. Callers should treat it as
+// transient and retry.
+var ErrImageUnavailable = errors.New("image unavailable")
+
+// imageDiskDir is the directory that holds boot artifacts inside an image,
+// following the kubevirt containerDisk convention.
+const imageDiskDir = "disk"
+
+// metadataFile is the image metadata file, relative to imageDiskDir.
+const metadataFile = "metadata.yaml"
+
+// ImageMetadata is the content of disk/metadata.yaml in a netboot image.
+type ImageMetadata struct {
+	DHCPBootImageName string `yaml:"dhcpBootImageName"`
+	HTTPBootPath      string `yaml:"httpBootPath"`
+	// MediaFormat gates the scoped installer callback and bootstrap layout.
+	MediaFormat string `yaml:"mediaFormat"`
+}
+
+// ImageSource identifies an image that boot artifacts are read from, together
+// with the pull secret that grants access to it.
+type ImageSource struct {
+	Ref           string
+	Architecture  string
+	PullSecretRef *v1alpha3.NamespacedSecretReference
+}
+
+func (s ImageSource) architecture() string {
+	return normalizeArchitecture(s.Architecture)
+}
+
+func normalizeArchitecture(architecture string) string {
+	if architecture == "" {
+		return v1alpha3.DefaultPXEArchitecture
+	}
+
+	return architecture
+}
+
+// NetbootImageSource returns the image that holds the network boot artifacts
+// (boot loaders, kernel, initrd, and templates) for node. An explicit
+// netboot image wins, then the configured default netboot image, then the
+// Machine's OS image. The pull secret follows the selected image.
+func (f *FileResolver) NetbootImageSource(node *v1alpha3.Machine) ImageSource {
+	if node == nil || node.Spec.Netboot() == nil {
+		return ImageSource{}
+	}
+
+	spec := node.Spec.Netboot()
+	arch := spec.TargetArchitecture()
+
+	switch {
+	case spec.NetbootImage != "":
+		return ImageSource{Ref: spec.NetbootImage, Architecture: arch, PullSecretRef: spec.NetbootPullSecretRef}
+	case f.DefaultNetbootRef != "":
+		return ImageSource{Ref: f.DefaultNetbootRef, Architecture: arch, PullSecretRef: f.DefaultNetbootPullSecretRef}
+	default:
+		return ImageSource{Ref: spec.Image, Architecture: arch, PullSecretRef: spec.PullSecretRef}
+	}
+}
+
+// DiskImageSource returns the image that holds the OS disk image for node.
+func DiskImageSource(node *v1alpha3.Machine) ImageSource {
+	if node == nil || node.Spec.Netboot() == nil {
+		return ImageSource{}
+	}
+
+	spec := node.Spec.Netboot()
+
+	return ImageSource{Ref: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef}
+}
+
+// mediaNetbootSource and mediaDiskSource return the frozen image sources of
+// an operation-owned boot media snapshot.
+func mediaNetbootSource(spec *v1alpha3.PXESpec) ImageSource {
+	return ImageSource{Ref: spec.NetbootImage, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.NetbootPullSecretRef}
+}
+
+func mediaDiskSource(spec *v1alpha3.PXESpec) ImageSource {
+	return ImageSource{Ref: spec.Image, Architecture: spec.TargetArchitecture(), PullSecretRef: spec.PullSecretRef}
+}
+
+// resolveImage resolves src to a pinned image, reading its pull secret first.
+// Every failure wraps ErrImageUnavailable.
+func (f *FileResolver) resolveImage(ctx context.Context, src ImageSource) (*imagepull.Image, error) {
+	if src.Ref == "" {
+		return nil, fmt.Errorf("%w: no image reference", ErrImageUnavailable)
+	}
+
+	if f.Puller == nil {
+		return nil, fmt.Errorf("%w: image puller is not configured", ErrImageUnavailable)
+	}
+
+	cred, err := pullCredential(ctx, f.Reader, src.Ref, src.PullSecretRef)
+	if err != nil {
+		return nil, fmt.Errorf("%w: image %q: %w", ErrImageUnavailable, src.Ref, err)
+	}
+
+	img, err := f.Puller.Resolve(ctx, imagepull.Source{Ref: src.Ref, Architecture: src.architecture(), Credential: cred})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrImageUnavailable, err)
+	}
+
+	return img, nil
+}
+
+// imagePaths validates reqPath and returns the template and static entry
+// names for it inside the image. reqPath must be relative and must stay
+// inside the disk directory.
+func imagePaths(reqPath string) (tmpl, static string, err error) {
+	if path.IsAbs(reqPath) || filepath.IsAbs(reqPath) || filepath.VolumeName(reqPath) != "" {
+		return "", "", fmt.Errorf("invalid request path %q: must be relative", reqPath)
+	}
+
+	cleaned := path.Clean(path.Join(imageDiskDir, reqPath))
+	if !strings.HasPrefix(cleaned, imageDiskDir+"/") {
+		return "", "", fmt.Errorf("invalid request path %q: resolves outside the image disk directory", reqPath)
+	}
+
+	return cleaned + ".tmpl", cleaned, nil
+}
+
+// openImageFile opens reqPath.tmpl or reqPath from the image in a single pass
+// over its layers. Layers are searched top-down, so a template in an upper
+// layer takes precedence over a static file in a lower layer and the other
+// way around. If both are in the same layer, the first tar entry wins; image
+// builds should not ship both. Errors from the registry wrap
+// ErrImageUnavailable; a missing file wraps imagepull.ErrNotFound.
+func (f *FileResolver) openImageFile(ctx context.Context, src ImageSource, reqPath string) (*imagepull.File, bool, error) {
+	tmplName, staticName, err := imagePaths(reqPath)
+	if err != nil {
+		return nil, false, err
+	}
+
+	img, err := f.resolveImage(ctx, src)
+	if err != nil {
+		return nil, false, err
+	}
+
+	file, err := img.Open(ctx, tmplName, staticName)
+	if err != nil {
+		if errors.Is(err, imagepull.ErrNotFound) {
+			return nil, false, fmt.Errorf("file not found in image %q: %s: %w", src.Ref, reqPath, err)
+		}
+
+		return nil, false, fmt.Errorf("%w: %w", ErrImageUnavailable, err)
+	}
+
+	return file, file.Name() == tmplName, nil
+}
+
+// readTemplateFile reads a template opened by openImageFile, bounded by
+// imagepull.MaxReadFileSize, and closes it.
+func readTemplateFile(file *imagepull.File) ([]byte, error) {
+	defer file.Close() //nolint:errcheck // read-only
+
+	if file.Size() > imagepull.MaxReadFileSize {
+		return nil, fmt.Errorf("template %s is %d bytes, larger than the %d byte limit", file.Name(), file.Size(), imagepull.MaxReadFileSize)
+	}
+
+	data := make([]byte, file.Size())
+	if _, err := io.ReadFull(file, data); err != nil {
+		return nil, fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, file.Name(), err)
+	}
+
+	return data, nil
+}
+
+// fetchMetadata reads and parses disk/metadata.yaml from src. An image
+// without metadata.yaml has empty metadata.
+func (f *FileResolver) fetchMetadata(ctx context.Context, src ImageSource) (*ImageMetadata, error) {
+	img, err := f.resolveImage(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+
+	data, _, err := img.ReadFile(ctx, path.Join(imageDiskDir, metadataFile))
+	if err != nil {
+		if errors.Is(err, imagepull.ErrNotFound) {
+			return &ImageMetadata{}, nil
+		}
+
+		return nil, fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, metadataFile, err)
+	}
+
+	var m ImageMetadata
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parsing %s in %q: %w", metadataFile, src.Ref, err)
+	}
+
+	return &m, nil
+}
+
+// ImageMetadata returns the parsed metadata of src. When the resolver has a
+// MetadataMemo, results are memoized briefly; image content is never cached.
+func (f *FileResolver) ImageMetadata(ctx context.Context, src ImageSource) (*ImageMetadata, error) {
+	if f.Metadata == nil {
+		return f.fetchMetadata(ctx, src)
+	}
+
+	return f.Metadata.get(ctx, src, f.fetchMetadata)
+}

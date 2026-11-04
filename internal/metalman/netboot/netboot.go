@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	pathpkg "path"
 	"strconv"
 	"strings"
@@ -24,21 +23,29 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
-// ErrNotYetDownloaded is returned when an OCI image has not yet been
-// pulled and unpacked to the local cache.
-var ErrNotYetDownloaded = fmt.Errorf("file not yet downloaded")
-
 // ResolvedFile is the result of resolving a file from an OCI image.
-// For static files on disk, DiskPath is set so callers can stream from disk.
-// For template files, Data holds the rendered content.
+// For static files, File streams the file from the registry; callers must
+// Close the ResolvedFile. For template files and generated content, Data
+// holds the rendered content.
 type ResolvedFile struct {
-	DiskPath    string // on-disk path for static files
-	Data        []byte // rendered content for template files
-	ContentType string // MIME type hint for the response
+	File        *imagepull.File // streamed content for static files
+	Data        []byte          // rendered content for template files
+	ContentType string          // MIME type hint for the response
+}
+
+// Close releases the streamed file, if any. It is safe to call on a nil
+// ResolvedFile.
+func (r *ResolvedFile) Close() error {
+	if r == nil || r.File == nil {
+		return nil
+	}
+
+	return r.File.Close()
 }
 
 // ClusterInfo holds the API server URL and CA certificate discovered from
@@ -65,48 +72,43 @@ type StaticClusterInfo struct {
 
 func (s *StaticClusterInfo) ClusterInfo() ClusterInfo { return s.Info }
 
+// FileResolver serves boot artifacts by pulling them from their OCI image
+// for every request. Image content is never cached; see MetadataMemo for
+// the only memoized data.
 type FileResolver struct {
-	Cache             *OCICache
-	Reader            client.Reader
-	Cluster           ClusterInfoProvider
-	ServeURL          string
-	DefaultNetbootRef string
-	KubernetesVersion string
-	ClusterDNS        string
-	ProviderLabels    map[string]string
+	// Puller reads files from images.
+	Puller *imagepull.Puller
+	// Metadata optionally memoizes parsed image metadata. Nil disables
+	// memoization.
+	Metadata *MetadataMemo
+	// Reader reads Machines, MachineOperations, ConfigMaps, and pull
+	// Secrets.
+	Reader                      client.Reader
+	Cluster                     ClusterInfoProvider
+	ServeURL                    string
+	DefaultNetbootRef           string
+	DefaultNetbootPullSecretRef *v1alpha3.NamespacedSecretReference
+	KubernetesVersion           string
+	ClusterDNS                  string
+	ProviderLabels              map[string]string
 }
 
+// NetbootImageRef returns the reference of NetbootImageSource.
 func (f *FileResolver) NetbootImageRef(node *v1alpha3.Machine) string {
-	if node == nil || node.Spec.Netboot() == nil {
-		return ""
-	}
-
-	if node.Spec.Netboot().NetbootImage != "" {
-		return node.Spec.Netboot().NetbootImage
-	}
-
-	if f.DefaultNetbootRef != "" {
-		return f.DefaultNetbootRef
-	}
-
-	return node.Spec.Netboot().Image
+	return f.NetbootImageSource(node).Ref
 }
 
-func (f *FileResolver) HTTPBootPath(node *v1alpha3.Machine) (string, error) {
+func (f *FileResolver) HTTPBootPath(ctx context.Context, node *v1alpha3.Machine) (string, error) {
 	if node == nil || node.Spec.Netboot() == nil {
 		return "", fmt.Errorf("node has no PXE config")
 	}
 
-	imageRef := f.NetbootImageRef(node)
-	if imageRef == "" {
+	src := f.NetbootImageSource(node)
+	if src.Ref == "" {
 		return "", fmt.Errorf("node %s has no netboot image", node.Name)
 	}
 
-	if f.Cache == nil {
-		return "", fmt.Errorf("OCI cache is not configured")
-	}
-
-	meta, err := f.Cache.MetadataForRefArchitecture(imageRef, node.Spec.Netboot().TargetArchitecture())
+	meta, err := f.ImageMetadata(ctx, src)
 	if err != nil {
 		return "", err
 	}
@@ -114,8 +116,8 @@ func (f *FileResolver) HTTPBootPath(node *v1alpha3.Machine) (string, error) {
 	return HTTPBootPathFromMetadata(meta), nil
 }
 
-func (f *FileResolver) HTTPBootURL(node *v1alpha3.Machine) (string, error) {
-	path, err := f.HTTPBootPath(node)
+func (f *FileResolver) HTTPBootURL(ctx context.Context, node *v1alpha3.Machine) (string, error) {
+	path, err := f.HTTPBootPath(ctx, node)
 	if err != nil {
 		return "", err
 	}
@@ -147,7 +149,7 @@ func JoinServeURLPath(serveURL, path string) (string, error) {
 
 	cleanPath := pathpkg.Clean(path)
 	if cleanPath == "." || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
-		return "", fmt.Errorf("invalid HTTP boot path %q: resolves outside cache directory", path)
+		return "", fmt.Errorf("invalid HTTP boot path %q: resolves outside the serve root", path)
 	}
 
 	base, err := url.Parse(serveURL)
@@ -185,11 +187,16 @@ const userDataPath = "cloud-init/user-data"
 // user-data ConfigMap is configured on the Machine.
 const defaultUserData = "#cloud-config\n"
 
-func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, imageRef string) (*ResolvedFile, error) {
-	return f.ResolveFileByPathForIP(ctx, path, node, imageRef, "")
+func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, src ImageSource) (*ResolvedFile, error) {
+	return f.ResolveFileByPathForIP(ctx, path, node, src, "")
 }
 
-func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, imageRef, requestIP string) (*ResolvedFile, error) {
+// ResolveFileByPathForIP resolves path from src. A path.tmpl entry in the
+// image takes precedence over path and is rendered for node. Static files
+// are streamed from the registry, so the caller must Close the result.
+// Registry failures wrap ErrImageUnavailable; a missing file wraps
+// imagepull.ErrNotFound.
+func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, src ImageSource, requestIP string) (*ResolvedFile, error) {
 	if path == userDataPath && node != nil {
 		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
 			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
@@ -200,79 +207,67 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 		return &ResolvedFile{Data: []byte(defaultUserData), ContentType: "text/plain"}, nil
 	}
 
-	architecture := v1alpha3.DefaultPXEArchitecture
-	if node != nil && node.Spec.Netboot() != nil {
-		architecture = node.Spec.Netboot().TargetArchitecture()
-	}
-
-	diskPath, isTemplate, err := f.Cache.ResolvePathForArchitecture(imageRef, architecture, path)
+	file, isTemplate, err := f.openImageFile(ctx, src, path)
 	if err != nil {
-		// Check if the image just hasn't been pulled yet
-		digest := f.Cache.DigestForArchitecture(imageRef, architecture)
-		if digest == "" {
-			return nil, ErrNotYetDownloaded
-		}
-
-		return nil, fmt.Errorf("file not found: %s", path)
+		return nil, err
 	}
 
-	if isTemplate {
-		content, err := os.ReadFile(diskPath)
+	if !isTemplate {
+		return &ResolvedFile{File: file}, nil
+	}
+
+	content, err := readTemplateFile(file)
+	if err != nil {
+		return nil, err
+	}
+
+	if node != nil {
+		ci := f.Cluster.ClusterInfo()
+
+		agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
+			Machine: node,
+			// Pin the kubelet node name to the Machine instead of letting the
+			// host pick one from its hostname. The machina CSR approver only
+			// approves bootstrap kubelet client certs whose CN is
+			// system:node:<status.bootstrap.nodeName>, which attestation
+			// records from the same Machine view. For virtual-media first
+			// boot, the media owner lookup pins NodeName() to the name the
+			// replacement captured, so config, approval, and completion agree.
+			NodeName: node.NodeName(),
+			Cluster: provision.ClusterEndpoint{
+				APIServer:    ci.ApiserverURL,
+				CACertBase64: ci.CACertBase64,
+				ClusterDNS:   f.ClusterDNS,
+				KubeVersion:  f.KubernetesVersion,
+			},
+			ProviderLabels: f.ProviderLabels,
+			AttestURL:      f.ServeURL,
+		})
+
+		// The MarshalIndent prefix "    " (4 spaces) must match the
+		// indentation level of the {{ .AgentConfigJSON }} placeholder
+		// inside vendor-data.tmpl so that all lines of the multi-line
+		// JSON are properly indented within the YAML content: | block.
+		agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
 		if err != nil {
-			return nil, fmt.Errorf("reading template %s: %w", path, err)
+			return nil, fmt.Errorf("marshal agent config: %w", err)
 		}
 
-		if node != nil {
-			ci := f.Cluster.ClusterInfo()
-
-			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
-				Machine: node,
-				// Pin the kubelet node name to the Machine instead of letting the
-				// host pick one from its hostname. The machina CSR approver only
-				// approves bootstrap kubelet client certs whose CN is
-				// system:node:<status.bootstrap.nodeName>, which attestation
-				// records from the same Machine view. For virtual-media first
-				// boot, the media owner lookup pins NodeName() to the name the
-				// replacement captured, so config, approval, and completion agree.
-				NodeName: node.NodeName(),
-				Cluster: provision.ClusterEndpoint{
-					APIServer:    ci.ApiserverURL,
-					CACertBase64: ci.CACertBase64,
-					ClusterDNS:   f.ClusterDNS,
-					KubeVersion:  f.KubernetesVersion,
-				},
-				ProviderLabels: f.ProviderLabels,
-				AttestURL:      f.ServeURL,
-			})
-
-			// The MarshalIndent prefix "    " (4 spaces) must match the
-			// indentation level of the {{ .AgentConfigJSON }} placeholder
-			// inside vendor-data.tmpl so that all lines of the multi-line
-			// JSON are properly indented within the YAML content: | block.
-			agentConfigJSON, err := json.MarshalIndent(agentConfig, "    ", "  ")
-			if err != nil {
-				return nil, fmt.Errorf("marshal agent config: %w", err)
-			}
-
-			installRequested, err := f.installRequested(ctx, node)
-			if err != nil {
-				return nil, err
-			}
-
-			data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
-			if err != nil {
-				return nil, err
-			}
-
-			return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
+		installRequested, err := f.installRequested(ctx, node)
+		if err != nil {
+			return nil, err
 		}
 
-		// No node context - return template content verbatim
-		return &ResolvedFile{Data: content, ContentType: "text/plain"}, nil
+		data, err := renderTemplate(string(content), newTemplateData(node, ci, f.ServeURL, string(agentConfigJSON), requestIP, installRequested))
+		if err != nil {
+			return nil, err
+		}
+
+		return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
 	}
 
-	// Static file - serve from disk
-	return &ResolvedFile{DiskPath: diskPath}, nil
+	// No node context - return template content verbatim
+	return &ResolvedFile{Data: content, ContentType: "text/plain"}, nil
 }
 
 func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {

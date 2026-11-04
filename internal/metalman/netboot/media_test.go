@@ -29,12 +29,27 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
+	"github.com/Azure/unbounded/internal/metalman/imagepull/imagepulltest"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 )
 
-func firstBootFixture(t *testing.T) (*HTTPServer, *v1alpha3.Machine, *v1alpha3.MachineOperation) {
+// firstBootFixture builds a media first-boot server. extra files are added to
+// the frozen netboot image, overriding the default cloud-init templates.
+func firstBootFixture(t *testing.T, extra ...map[string][]byte) (*HTTPServer, *v1alpha3.Machine, *v1alpha3.MachineOperation) {
 	t.Helper()
-	p, m, op := mediaFixture(t, "amd64")
+
+	files := map[string][]byte{}
+	for _, name := range []string{"meta-data", "vendor-data", "network-config"} {
+		files["cloud-init/"+name+".tmpl"] = []byte(`{{ .Machine.Name }} {{ .BootLease.IPv4 }} {{ .BootLease.Gateway }}`)
+	}
+
+	for _, e := range extra {
+		for name, data := range e {
+			files[name] = data
+		}
+	}
+
+	p, m, op, _ := mediaFixtureImages(t, "amd64", files, nil)
 	b := op.Status.Targets[0].BootMedia
 	now := metav1.Now()
 	b.ImageWritten, b.Cleaned, b.Released = true, true, true
@@ -51,13 +66,6 @@ func firstBootFixture(t *testing.T) (*HTTPServer, *v1alpha3.Machine, *v1alpha3.M
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
 	p.Client, p.Resolver.Reader = fc, fc
 	p.Resolver.Cluster = &StaticClusterInfo{}
-
-	files := map[string][]byte{}
-	for _, name := range []string{"meta-data", "vendor-data", "network-config"} {
-		files["cloud-init/"+name+".tmpl"] = []byte(`{{ .Machine.Name }} {{ .BootLease.IPv4 }} {{ .BootLease.Gateway }}`)
-	}
-
-	require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), files))
 
 	return &HTTPServer{Media: p, FileResolver: *p.Resolver, StatusRecorder: &recordingStatusRecorder{}}, m, op
 }
@@ -281,7 +289,10 @@ func TestMediaFirstBootIgnoresForwardedLease(t *testing.T) {
 func TestMediaPathAliasesAuthorization(t *testing.T) {
 	for _, scenario := range []string{"direct owner", "forged IP", "changed protocol", "changed protocol forged IP"} {
 		t.Run(scenario, func(t *testing.T) {
-			h, m, op := firstBootFixture(t)
+			h, m, op := firstBootFixture(t, map[string][]byte{
+				"grub/grub.cfg.tmpl": []byte("unscoped install configuration"),
+				"vmlinuz.tmpl":       []byte("unscoped kernel"),
+			})
 			b := op.Status.Targets[0].BootMedia
 			m.Spec.Netboot().NetbootImage = b.Netboot.NetbootImage
 			m.Spec.Netboot().CloudInit = b.Netboot.CloudInit.DeepCopy()
@@ -292,10 +303,6 @@ func TestMediaPathAliasesAuthorization(t *testing.T) {
 			}
 
 			require.NoError(t, h.Media.Client.Update(t.Context(), m))
-			require.NoError(t, populateOCICache(h.Media.CacheDir, strings.Repeat("a", 64), map[string][]byte{
-				"grub/grub.cfg.tmpl": []byte("unscoped install configuration"),
-				"vmlinuz.tmpl":       []byte("unscoped kernel"),
-			}))
 
 			remote, forwarded := "192.0.2.20", ""
 
@@ -492,9 +499,14 @@ func TestMediaArtifactForwardedAuthorization(t *testing.T) {
 	for _, protocol := range []string{v1alpha3.PXEBootProtocolPXE, v1alpha3.PXEBootProtocolHTTP} {
 		for _, scenario := range []string{"retained", "cleanup pending", "active media", "unclaimed", "other site", "successor"} {
 			t.Run(protocol+"/"+scenario, func(t *testing.T) {
-				p, m, old := mediaFixture(t, "amd64")
+				files := map[string][]byte{
+					"vmlinuz": []byte("live kernel"), "initrd": []byte("live initrd"), "init.cpio": []byte("live init.cpio"),
+					"grub.cfg": []byte("live grub config"), "grub/grub.cfg": []byte("live grub config"),
+					"disk.img.gz": []byte("live disk"),
+				}
+				p, m, old, images := mediaFixtureImages(t, "amd64", nil, files)
 				m.Spec.Netboot().BootProtocol = protocol
-				m.Spec.Netboot().NetbootImage = "test/live@sha256:" + strings.Repeat("d", 64)
+				m.Spec.Netboot().NetbootImage = images.Push(t, "test/live:v1", files)
 				old.Status.Phase = v1alpha3.OperationPhaseComplete
 				media := old.Status.Targets[0].BootMedia
 				media.Cleaned, media.Released = true, true
@@ -531,15 +543,6 @@ func TestMediaArtifactForwardedAuthorization(t *testing.T) {
 					require.NoError(t, fc.Create(t.Context(), next))
 				}
 
-				files := map[string][]byte{
-					"vmlinuz": []byte("live kernel"), "initrd": []byte("live initrd"), "init.cpio": []byte("live init.cpio"),
-					"grub.cfg": []byte("live grub config"), "grub/grub.cfg": []byte("live grub config"),
-					"disk.img.gz": []byte("live disk"),
-				}
-				require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("d", 64), files))
-				require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("b", 64), files))
-				p.Resolver.Cache.SetDigest(m.Spec.Netboot().NetbootImage, "sha256:"+strings.Repeat("d", 64))
-				p.Resolver.Cache.SetDigest(m.Spec.Netboot().Image, "sha256:"+strings.Repeat("b", 64))
 				h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
 
 				for path, content := range files {
@@ -570,7 +573,7 @@ func TestMediaArtifactForwardedAuthorization(t *testing.T) {
 func TestMediaReleasedHistorySuccessorPrecedence(t *testing.T) {
 	for _, protocol := range []string{v1alpha3.PXEBootProtocolPXE, v1alpha3.PXEBootProtocolHTTP} {
 		t.Run(protocol, func(t *testing.T) {
-			p, m, old := mediaFixture(t, "amd64")
+			p, m, old, _ := mediaFixtureImages(t, "amd64", map[string][]byte{"vmlinuz": []byte("successor kernel")}, nil)
 			old.Status.Phase = v1alpha3.OperationPhaseComplete
 			media := old.Status.Targets[0].BootMedia
 			media.Cleaned, media.Released, media.ImageWritten = true, true, true
@@ -579,7 +582,6 @@ func TestMediaReleasedHistorySuccessorPrecedence(t *testing.T) {
 			fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(old).WithObjects(m, old).
 				WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
 			p.Client, p.Resolver.Reader = fc, fc
-			require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), map[string][]byte{"vmlinuz": []byte("successor kernel")}))
 			h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
 			request := func() *httptest.ResponseRecorder {
 				r := httptest.NewRequest(http.MethodGet, "/vmlinuz", nil)
@@ -625,7 +627,17 @@ func TestMediaReleasedHistorySuccessorPrecedence(t *testing.T) {
 func mediaFixture(t *testing.T, arch string) (*MediaProvider, *v1alpha3.Machine, *v1alpha3.MachineOperation) {
 	t.Helper()
 
-	ref := "test/netboot@sha256:" + strings.Repeat("a", 64)
+	p, m, op, _ := mediaFixtureImages(t, arch, nil, nil)
+
+	return p, m, op
+}
+
+// mediaFixtureImages pushes a media-capable netboot image, with netbootExtra
+// added to its files, and a disk image holding diskFiles to an in-memory
+// registry. It returns a provider whose frozen media spec pins both images
+// by digest, together with the registry.
+func mediaFixtureImages(t *testing.T, arch string, netbootExtra, diskFiles map[string][]byte, opts ...imagepulltest.Option) (*MediaProvider, *v1alpha3.Machine, *v1alpha3.MachineOperation, *testImages) {
+	t.Helper()
 
 	shim, grub := "shimx64.efi", "grubx64.efi"
 	if arch == "arm64" {
@@ -634,14 +646,31 @@ func mediaFixture(t *testing.T, arch string) (*MediaProvider, *v1alpha3.Machine,
 
 	tmpl, err := os.ReadFile("../../../images/netboot/assets/grub.cfg.tmpl")
 	require.NoError(t, err)
-	cache := NewOCICache(t.TempDir())
-	require.NoError(t, populateOCICacheForArchitecture(cache.CacheDir, strings.Repeat("a", 64), arch, map[string][]byte{
+
+	netbootFiles := map[string][]byte{
 		"metadata.yaml": []byte("mediaFormat: " + mediaFormat + "\n"),
 		shim:            []byte("unchanged shim " + arch), grub: []byte("unchanged grub " + arch), "grub/grub.cfg.tmpl": tmpl,
-	}))
-	cache.SetDigestForArchitecture(ref, arch, "sha256:"+strings.Repeat("a", 64))
+	}
+
+	for name, data := range netbootExtra {
+		if data == nil {
+			delete(netbootFiles, name)
+			continue
+		}
+
+		netbootFiles[name] = data
+	}
+
+	if diskFiles == nil {
+		diskFiles = map[string][]byte{"disk.img.gz": []byte("disk")}
+	}
+
+	images := newTestImages(t, opts...)
+	ref := images.PushArch(t, "test/netboot:media", map[string]map[string][]byte{arch: netbootFiles})
+	diskRef := images.PushArch(t, "test/disk:media", map[string]map[string][]byte{arch: diskFiles})
+
 	m := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "host", UID: "host-uid", Labels: map[string]string{"unbounded-cloud.io/site": "site-a"}}, Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
-		Image: "test/disk@sha256:" + strings.Repeat("b", 64), NetbootImage: ref, Architecture: arch, BootProtocol: "VirtualMedia",
+		Image: diskRef, NetbootImage: ref, Architecture: arch, BootProtocol: "VirtualMedia",
 		DHCPLeases: []v1alpha3.DHCPLease{{MAC: "02:11:22:33:44:55", IPv4: "192.0.2.20", SubnetMask: "255.255.255.0", Gateway: "192.0.2.1"}},
 	}}}}
 	op := &v1alpha3.MachineOperation{ObjectMeta: metav1.ObjectMeta{Name: "replace", UID: "op-uid"}, Spec: v1alpha3.MachineOperationSpec{OperationKind: v1alpha3.OperationHostReplace}, Status: v1alpha3.MachineOperationStatus{
@@ -650,9 +679,9 @@ func mediaFixture(t *testing.T, arch string) (*MediaProvider, *v1alpha3.Machine,
 		}}},
 	}}
 	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(op).WithObjects(m, op).Build()
-	p := &MediaProvider{Site: "site-a", Resolver: &FileResolver{Cache: cache, Reader: fc, ServeURL: "http://192.0.2.2:8080"}, Client: fc, CacheDir: cache.CacheDir, TFTPServer: "192.0.2.2"}
+	p := &MediaProvider{Site: "site-a", Resolver: &FileResolver{Puller: images.Puller, Reader: fc, ServeURL: "http://192.0.2.2:8080"}, Client: fc, CacheDir: t.TempDir(), TFTPServer: "192.0.2.2"}
 
-	return p, m, op
+	return p, m, op, images
 }
 
 func mockMediaRunner(t *testing.T, calls *[]string) func(context.Context, string, ...string) error {
@@ -1104,7 +1133,7 @@ curl() {
 }
 
 func TestMediaFrozenArtifactsAfterPrepare(t *testing.T) {
-	p, m, op := mediaFixture(t, "amd64")
+	p, m, op, _ := mediaFixtureImages(t, "amd64", nil, map[string][]byte{"disk.img.gz": []byte("frozen disk")})
 
 	var calls []string
 
@@ -1112,10 +1141,6 @@ func TestMediaFrozenArtifactsAfterPrepare(t *testing.T) {
 	id := op.Status.Targets[0].BootMedia.ID
 	_, err := p.Prepare(t.Context(), m, op, id)
 	require.NoError(t, err)
-
-	frozen := op.Status.Targets[0].BootMedia.Netboot
-	p.Resolver.Cache.SetDigestForArchitecture(frozen.Image, "amd64", "sha256:"+strings.Repeat("b", 64))
-	require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("b", 64), map[string][]byte{"disk.img.gz": []byte("frozen disk")}))
 
 	m.Spec.Netboot().Image = "changed/image:latest"
 	m.Spec.Netboot().NetbootImage = "changed/boot:latest"
@@ -1151,8 +1176,7 @@ func TestMediaFrozenArtifactsAfterPrepare(t *testing.T) {
 }
 
 func TestMediaKernelHTTPRange(t *testing.T) {
-	p, _, _ := mediaFixture(t, "arm64")
-	require.NoError(t, populateOCICacheForArchitecture(p.CacheDir, strings.Repeat("a", 64), "arm64", map[string][]byte{"vmlinuz": []byte("gzip kernel payload")}))
+	p, _, _, _ := mediaFixtureImages(t, "arm64", map[string][]byte{"vmlinuz": []byte("gzip kernel payload")}, nil)
 	h := &HTTPServer{Media: p, FileResolver: *p.Resolver}
 
 	for _, alias := range requestPathAliases("/vmlinuz") {
@@ -1203,12 +1227,8 @@ func TestMediaIdentityAndOldImage(t *testing.T) {
 		require.ErrorContains(t, err, "identity")
 	})
 	t.Run("old image", func(t *testing.T) {
-		p, m, op := mediaFixture(t, "amd64")
-		meta, err := p.Resolver.Cache.MetadataForRefArchitecture(m.Spec.Netboot().NetbootImage, "amd64")
-		require.NoError(t, err)
-
-		meta.MediaFormat = ""
-		_, err = p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
+		p, m, op, _ := mediaFixtureImages(t, "amd64", map[string][]byte{"metadata.yaml": []byte("")}, nil)
+		_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
 		require.ErrorContains(t, err, "lacks compatible")
 	})
 }
@@ -1222,57 +1242,128 @@ func TestMediaNoInstallHalts(t *testing.T) {
 }
 
 func TestMediaRenderingRequestsInstall(t *testing.T) {
-	p, _, op := mediaFixture(t, "amd64")
-	require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), map[string][]byte{
+	p, _, op, _ := mediaFixtureImages(t, "amd64", map[string][]byte{
 		"grub/grub.cfg.tmpl": []byte("{{ .VirtualMedia }} {{ .InstallRequested }}"),
-	}))
+	}, nil)
 	o, err := p.owner(t.Context(), op.Status.Targets[0].BootMedia.ID)
 	require.NoError(t, err)
-	data, err := p.installerConfig(o)
+	data, err := p.installerConfig(t.Context(), o)
 	require.NoError(t, err)
 	require.Equal(t, "true true", string(data))
 }
 
 func TestMediaEFIArtifacts(t *testing.T) {
 	for _, arch := range []string{"amd64", "arm64"} {
-		for _, state := range []string{"legacy metadata", "missing shim", "missing grub", "template shim", "template grub"} {
+		suffix := "x64.efi"
+		if arch == "arm64" {
+			suffix = "aa64.efi"
+		}
+
+		t.Run(arch+"/legacy metadata", func(t *testing.T) {
+			p, m, op, _ := mediaFixtureImages(t, arch, map[string][]byte{
+				"metadata.yaml": []byte("mediaFormat: " + mediaFormat + "\nmediaShim: ignored\nmediaGrub: ignored\n"),
+			}, nil)
+
+			var calls []string
+
+			p.Run = mockMediaRunner(t, &calls)
+			_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
+			require.NoError(t, err, "legacy metadata fields must remain accepted")
+		})
+
+		for _, state := range []string{"missing shim", "missing grub", "template shim", "template grub"} {
 			t.Run(arch+"/"+state, func(t *testing.T) {
-				p, m, op := mediaFixture(t, arch)
-				dir := p.Resolver.Cache.DiskDirForArchitecture("sha256:"+strings.Repeat("a", 64), arch)
-				require.NoError(t, os.WriteFile(filepath.Join(dir, "metadata.yaml"), []byte("mediaFormat: "+mediaFormat+"\nmediaShim: ignored\nmediaGrub: ignored\n"), 0o600))
+				kind, payload, _ := strings.Cut(state, " ")
+				name := payload + suffix
+
+				extra := map[string][]byte{name: nil}
+				if kind == "template" {
+					extra[name+".tmpl"] = []byte("not an EFI binary")
+				}
+
+				p, m, op, _ := mediaFixtureImages(t, arch, extra, nil)
 
 				var calls []string
 
 				p.Run = mockMediaRunner(t, &calls)
-				id := op.Status.Targets[0].BootMedia.ID
-				_, err := p.Prepare(t.Context(), m, op, id)
-				require.NoError(t, err, "legacy metadata fields must remain accepted")
-
-				count := len(calls)
-
-				if state == "legacy metadata" {
-					return
-				}
-
-				suffix := "x64.efi"
-				if arch == "arm64" {
-					suffix = "aa64.efi"
-				}
-
-				_, payload, _ := strings.Cut(state, " ")
-				path := filepath.Join(dir, payload+suffix)
-				require.NoError(t, os.Remove(path))
-
-				if strings.HasPrefix(state, "template") {
-					require.NoError(t, os.WriteFile(path+".tmpl", []byte("not an EFI binary"), 0o600))
-				}
-
-				_, err = p.Prepare(t.Context(), m, op, id)
-				require.Error(t, err, "validate EFI files even when the ISO is cached")
-				require.Len(t, calls, count)
+				_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
+				require.Error(t, err)
+				require.Empty(t, calls, "no ISO build without valid EFI payloads")
 			})
 		}
+
+		t.Run(arch+"/cached ISO with unavailable image", func(t *testing.T) {
+			p, m, op, _ := mediaFixtureImages(t, arch, nil, nil)
+
+			var calls []string
+
+			p.Run = mockMediaRunner(t, &calls)
+			id := op.Status.Targets[0].BootMedia.ID
+			_, err := p.Prepare(t.Context(), m, op, id)
+			require.NoError(t, err)
+
+			count := len(calls)
+
+			// EFI payloads are validated even when the ISO is cached.
+			p.Resolver.Puller = unreachablePuller(t)
+			_, err = p.Prepare(t.Context(), m, op, id)
+			require.ErrorIs(t, err, ErrImageUnavailable)
+			require.Len(t, calls, count)
+		})
 	}
+}
+
+func TestMediaISOUsesEFIPayloadsFromImage(t *testing.T) {
+	for _, arch := range []string{"amd64", "arm64"} {
+		t.Run(arch, func(t *testing.T) {
+			p, m, op, _ := mediaFixtureImages(t, arch, nil, nil)
+
+			copied := map[string]string{}
+			runner := mockMediaRunner(t, new([]string))
+			p.Run = func(ctx context.Context, name string, args ...string) error {
+				// mcopy -i <fat> <from> ::/EFI/BOOT/<to>
+				if name == "mcopy" && len(args) == 4 && strings.HasPrefix(args[3], "::/EFI/BOOT/") && !strings.HasSuffix(args[3], ".cfg") {
+					data, err := os.ReadFile(args[2])
+					require.NoError(t, err)
+
+					copied[strings.TrimPrefix(args[3], "::/EFI/BOOT/")] = string(data)
+				}
+
+				return runner(ctx, name, args...)
+			}
+
+			_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
+			require.NoError(t, err)
+
+			boot, grub := "BOOTX64.EFI", "grubx64.efi"
+			if arch == "arm64" {
+				boot, grub = "BOOTAA64.EFI", "grubaa64.efi"
+			}
+
+			require.Equal(t, map[string]string{boot: "unchanged shim " + arch, grub: "unchanged grub " + arch}, copied)
+
+			// Temporary EFI payloads do not outlive the build.
+			entries, err := os.ReadDir(filepath.Join(p.CacheDir, "bootmedia"))
+			require.NoError(t, err)
+
+			for _, e := range entries {
+				require.False(t, strings.HasPrefix(e.Name(), ".efi-"), e.Name())
+			}
+		})
+	}
+}
+
+func TestMediaPrepareFailsWhenRegistryUnreachable(t *testing.T) {
+	p, m, op, _ := mediaFixtureImages(t, "amd64", nil, nil)
+
+	var calls []string
+
+	p.Run = mockMediaRunner(t, &calls)
+	p.Resolver.Puller = unreachablePuller(t)
+
+	_, err := p.Prepare(t.Context(), m, op, op.Status.Targets[0].BootMedia.ID)
+	require.ErrorIs(t, err, ErrImageUnavailable)
+	require.Empty(t, calls)
 }
 
 func TestInstallerTargetDiskExists(t *testing.T) {

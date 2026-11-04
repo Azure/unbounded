@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
@@ -49,50 +50,10 @@ func newScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// populateOCICache creates a fake OCI cache directory structure for testing.
-// Files are placed under {cacheDir}/oci/{digest}/amd64/disk/.
-func populateOCICache(cacheDir, digest string, files map[string][]byte) error {
-	return populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.DefaultPXEArchitecture, files)
-}
-
-func populateOCICacheForArchitecture(cacheDir, digest, architecture string, files map[string][]byte) error {
-	safe := fmt.Sprintf("sha256_%s", digest)
-	diskDir := filepath.Join(cacheDir, "oci", safe, architecture, "disk")
-
-	for path, content := range files {
-		fullPath := filepath.Join(diskDir, path)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-			return err
-		}
-
-		if err := os.WriteFile(fullPath, content, 0o644); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// setupOCICache creates an OCICache populated with test files.
-func setupOCICache(t *testing.T, imageRef, digest string, files map[string][]byte) *OCICache {
-	t.Helper()
-
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	if err := populateOCICache(cacheDir, digest, files); err != nil {
-		t.Fatal(err)
-	}
-
-	cache.SetDigest(imageRef, "sha256:"+digest)
-
-	return cache
-}
-
 func TestHTTPServer_ServeFiles(t *testing.T) {
 	vmlinuzData := []byte("test-vmlinuz-binary-data")
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "abc123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": vmlinuzData,
 	})
 
@@ -115,7 +76,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
@@ -197,7 +158,7 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 }
 
 func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpboot123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
 		"shimx64.efi":   []byte("shim"),
 		"vmlinuz":       []byte("kernel"),
@@ -273,7 +234,7 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 			recorder := &recordingStatusRecorder{}
 			srv := &HTTPServer{
 				FileResolver: FileResolver{
-					Cache:  cache,
+					Puller: puller,
 					Reader: fc,
 				},
 				StatusRecorder: recorder,
@@ -306,7 +267,7 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 }
 
 func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "revocations123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
 		"shimx64.efi":   []byte("shim"),
 	})
@@ -330,7 +291,7 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 		Build()
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
@@ -375,7 +336,7 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 }
 
 func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "pxerevocations123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
 		"shimx64.efi":   []byte("shim"),
 	})
@@ -398,7 +359,7 @@ func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
 		Build()
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
@@ -424,7 +385,7 @@ menuentry "Install" {
   linux /vmlinuz hostname={{ .Machine.Name }} ip={{ (index .Machine.Spec.PXE.DHCPLeases 0).IPv4 }}
 }`
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tmpl123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"grub/grub.cfg.tmpl": []byte(bootTemplate),
 	})
 
@@ -448,7 +409,7 @@ menuentry "Install" {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
 			ServeURL:          "http://10.0.1.1:8080",
@@ -491,7 +452,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	staticConfig := "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: false\n"
 
 	// Static file (no .tmpl suffix) served verbatim from disk
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "verb123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"cloud-init/network-config": []byte(staticConfig),
 	})
 
@@ -514,7 +475,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
@@ -549,7 +510,7 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 func TestHTTPServer_StaticFile(t *testing.T) {
 	staticContent := "autoinstall:\n  version: 1\n  identity:\n    hostname: server\n"
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "static123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"cloud-init/network-config": []byte(staticContent),
 	})
 
@@ -572,7 +533,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			DefaultNetbootRef: "ghcr.io/test/image:v1",
 		},
@@ -605,7 +566,7 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 }
 
 func TestHTTPServer_UnknownSourceIP(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "unkn123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("some-binary-data"),
 	})
 
@@ -617,7 +578,7 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
@@ -645,7 +606,7 @@ func TestHTTPServer_UnknownSourceIP(t *testing.T) {
 }
 
 func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "boot123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
 	})
 	recorder := &recordingTFTPStatusRecorder{}
@@ -656,29 +617,24 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 		},
 	}
 	server := &TFTPServer{
-		FileResolver:   FileResolver{Cache: cache},
+		FileResolver:   FileResolver{Puller: puller},
 		StatusRecorder: recorder,
 	}
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "grubx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1"}, "grubx64.efi")
 	require.Empty(t, recorder.calls)
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1"}, "shimx64.efi")
 	require.Equal(t, []string{"machine-1:shimx64.efi"}, recorder.calls)
 }
 
 func TestTFTPServerRecordsInitialBootLoaderForTargetArchitecture(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	require.NoError(t, populateOCICacheForArchitecture(cacheDir, "amd64digest", v1alpha3.PXEArchitectureAMD64, map[string][]byte{
-		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
-	}))
-	require.NoError(t, populateOCICacheForArchitecture(cacheDir, "arm64digest", v1alpha3.PXEArchitectureARM64, map[string][]byte{
-		"metadata.yaml": []byte("dhcpBootImageName: shimaa64.efi\n"),
-	}))
-	cache.SetDigestForArchitecture("ghcr.io/test/image:v1", v1alpha3.PXEArchitectureAMD64, "sha256:amd64digest")
-	cache.SetDigestForArchitecture("ghcr.io/test/image:v1", v1alpha3.PXEArchitectureARM64, "sha256:arm64digest")
+	images := newTestImages(t)
+	images.PushArch(t, "ghcr.io/test/image:v1", map[string]map[string][]byte{
+		v1alpha3.PXEArchitectureAMD64: {"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n")},
+		v1alpha3.PXEArchitectureARM64: {"metadata.yaml": []byte("dhcpBootImageName: shimaa64.efi\n")},
+	})
+	puller := images.Puller
 
 	recorder := &recordingTFTPStatusRecorder{}
 	node := &v1alpha3.Machine{
@@ -688,20 +644,20 @@ func TestTFTPServerRecordsInitialBootLoaderForTargetArchitecture(t *testing.T) {
 		},
 	}
 	server := &TFTPServer{
-		FileResolver:   FileResolver{Cache: cache},
+		FileResolver:   FileResolver{Puller: puller},
 		StatusRecorder: recorder,
 	}
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimx64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1", Architecture: v1alpha3.PXEArchitectureARM64}, "shimx64.efi")
 	require.Empty(t, recorder.calls)
 
-	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, "ghcr.io/test/image:v1", "shimaa64.efi")
+	server.recordBootLoaderDownloaded(t.Context(), testLogger(), node, ImageSource{Ref: "ghcr.io/test/image:v1", Architecture: v1alpha3.PXEArchitectureARM64}, "shimaa64.efi")
 	require.Equal(t, []string{"machine-arm:shimaa64.efi"}, recorder.calls)
 }
 
 func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	diskImageData := []byte("test-disk-image")
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "disk123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"disk.img.gz": diskImageData,
 		"vmlinuz":     []byte("kernel"),
 	})
@@ -725,7 +681,7 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 		StatusRecorder: recorder,
@@ -770,7 +726,7 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 
 func TestHTTPServer_UsesMachineImageForBootFilesWhenNetbootImageUnset(t *testing.T) {
 	vmlinuzData := []byte("kernel")
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "fallback123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"disk.img.gz": []byte("disk"),
 		"vmlinuz":     vmlinuzData,
 	})
@@ -793,7 +749,7 @@ func TestHTTPServer_UsesMachineImageForBootFilesWhenNetbootImageUnset(t *testing
 		Build()
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
@@ -1142,7 +1098,7 @@ func TestHTTPServer_NetworkConfigOmitsGatewayAndInvalidDNS(t *testing.T) {
 
 	const imageRef = "ghcr.io/test/netboot:v1"
 
-	cache := setupOCICache(t, imageRef, "network-config", map[string][]byte{
+	puller := setupImagePuller(t, imageRef, map[string][]byte{
 		"cloud-init/network-config.tmpl": networkTmpl,
 	})
 	node := &v1alpha3.Machine{
@@ -1158,7 +1114,7 @@ func TestHTTPServer_NetworkConfigOmitsGatewayAndInvalidDNS(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 	server := &HTTPServer{FileResolver: FileResolver{
-		Cache: cache, Reader: fc, Cluster: &StaticClusterInfo{}, DefaultNetbootRef: imageRef,
+		Puller: puller, Reader: fc, Cluster: &StaticClusterInfo{}, DefaultNetbootRef: imageRef,
 	}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", server.handleFile)
@@ -1525,7 +1481,7 @@ func TestVendorDataTemplate_AgentInstallEnv(t *testing.T) {
 func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 	customUserData := "#cloud-config\nssh_authorized_keys:\n  - ssh-rsa AAAA...\npackages:\n  - vim\n"
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmud123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1564,7 +1520,7 @@ func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 		Cluster: &StaticClusterInfo{Info: ClusterInfo{
 			ApiserverURL: "https://k8s.example.com",
@@ -1572,7 +1528,7 @@ func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 		ServeURL: "http://10.0.8.1:8080",
 	}
 
-	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
@@ -1583,7 +1539,7 @@ func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 }
 
 func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "fblud123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1606,7 +1562,7 @@ func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 		Cluster: &StaticClusterInfo{Info: ClusterInfo{
 			ApiserverURL: "https://k8s.example.com",
@@ -1614,13 +1570,13 @@ func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 		ServeURL: "http://10.0.8.1:8080",
 	}
 
-	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
 
-	if resolved.DiskPath != "" {
-		t.Errorf("expected no DiskPath for default user-data, got %q", resolved.DiskPath)
+	if resolved.File != nil {
+		t.Errorf("expected no streamed file for default user-data, got %q", resolved.File.Name())
 	}
 
 	if string(resolved.Data) != defaultUserData {
@@ -1631,7 +1587,7 @@ func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
 	customUserData := "#cloud-config\npackages:\n  - htop\n"
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmkey123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1670,7 +1626,7 @@ func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 		Cluster: &StaticClusterInfo{Info: ClusterInfo{
 			ApiserverURL: "https://k8s.example.com",
@@ -1678,7 +1634,7 @@ func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
 		ServeURL: "http://10.0.8.1:8080",
 	}
 
-	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
@@ -1689,7 +1645,7 @@ func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
 }
 
 func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmmiss123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1718,11 +1674,11 @@ func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 	}
 
-	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("expected fallback to default user-data, got error: %v", err)
 	}
@@ -1733,7 +1689,7 @@ func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
 }
 
 func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmerr123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1772,11 +1728,11 @@ func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 	}
 
-	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err == nil {
 		t.Fatal("expected error for non-NotFound client failure, got nil")
 	}
@@ -1787,7 +1743,7 @@ func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
 }
 
 func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmnokey123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1826,11 +1782,11 @@ func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 	}
 
-	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	_, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err == nil {
 		t.Fatal("expected error when ConfigMap key is missing")
 	}
@@ -1843,7 +1799,7 @@ func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
 func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
 	binaryUserData := []byte("#cloud-config\npackages:\n  - curl\n")
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "cmbin123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1881,11 +1837,11 @@ func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
 		Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 	}
 
-	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, "ghcr.io/test/image:v1")
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "cloud-init/user-data", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
@@ -1896,7 +1852,7 @@ func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
 }
 
 func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpcmmiss123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -1926,7 +1882,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
 			ServeURL:          "http://10.0.9.1:8080",
@@ -1963,7 +1919,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 	customUserData := "#cloud-config\nssh_authorized_keys:\n  - ssh-rsa AAAA...\n"
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpud123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
 	})
 
@@ -2003,7 +1959,7 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
 			ServeURL:          "http://10.0.9.1:8080",
@@ -2040,7 +1996,7 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 func TestResolveFileByPath_AgentConfig(t *testing.T) {
 	tmplContent := `{{ .AgentConfigJSON }}`
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "agentimg123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"config.tmpl": []byte(tmplContent),
 	})
 
@@ -2048,7 +2004,7 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	resolver := FileResolver{
-		Cache:  cache,
+		Puller: puller,
 		Reader: fc,
 		Cluster: &StaticClusterInfo{Info: ClusterInfo{
 			ApiserverURL: "https://k8s.example.com",
@@ -2068,7 +2024,7 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 		},
 	}
 
-	resolved, err := resolver.ResolveFileByPath(t.Context(), "config", nodeWithAgent, "ghcr.io/test/image:v1")
+	resolved, err := resolver.ResolveFileByPath(t.Context(), "config", nodeWithAgent, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath with agent: %v", err)
 	}
@@ -2086,7 +2042,7 @@ func TestResolveFileByPath_AgentConfig(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "node-without-agent"},
 	}
 
-	resolved, err = resolver.ResolveFileByPath(t.Context(), "config", nodeWithoutAgent, "ghcr.io/test/image:v1")
+	resolved, err = resolver.ResolveFileByPath(t.Context(), "config", nodeWithoutAgent, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath without agent: %v", err)
 	}
@@ -2106,13 +2062,14 @@ func TestHTTPServer_Start_Shutdown(t *testing.T) {
 
 	port := freePort(t)
 
-	cache := NewOCICache(t.TempDir())
+	// The test serves no image files, so the puller needs no registry.
+	puller := &imagepull.Puller{}
 
 	srv := &HTTPServer{
 		BindAddr: "127.0.0.1",
 		Port:     port,
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
@@ -2156,7 +2113,7 @@ func TestHTTPServer_StartWithMediaRoutes(t *testing.T) {
 		BindAddr: "127.0.0.1",
 		Port:     port,
 		FileResolver: FileResolver{
-			Cache:  NewOCICache(t.TempDir()),
+			Puller: &imagepull.Puller{},
 			Reader: fc,
 		},
 		Client: fc,
@@ -2215,7 +2172,7 @@ func TestHTTPServer_StartWithMediaRoutes(t *testing.T) {
 func TestTFTPServer_ResolveFileByPath(t *testing.T) {
 	vmlinuzData := []byte("tftp-vmlinuz-data")
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tftp123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": vmlinuzData,
 	})
 
@@ -2224,23 +2181,25 @@ func TestTFTPServer_ResolveFileByPath(t *testing.T) {
 
 	srv := &TFTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
 
-	resolved, err := srv.ResolveFileByPath(t.Context(), "vmlinuz", nil, "ghcr.io/test/image:v1")
+	resolved, err := srv.ResolveFileByPath(t.Context(), "vmlinuz", nil, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
 
-	if resolved.DiskPath == "" {
-		t.Fatal("expected DiskPath to be set for static file")
+	if resolved.File == nil {
+		t.Fatal("expected a streamed file for static file")
 	}
 
-	data, err := os.ReadFile(resolved.DiskPath)
+	data, err := io.ReadAll(resolved.File)
+	resolved.Close() //nolint:errcheck // test
+
 	if err != nil {
-		t.Fatalf("reading resolved disk path: %v", err)
+		t.Fatalf("reading resolved file: %v", err)
 	}
 
 	if string(data) != string(vmlinuzData) {
@@ -2248,13 +2207,13 @@ func TestTFTPServer_ResolveFileByPath(t *testing.T) {
 	}
 
 	// Test not found (wrong image)
-	_, err = srv.ResolveFileByPath(t.Context(), "vmlinuz", nil, "ghcr.io/test/nonexistent:v1")
+	_, err = srv.ResolveFileByPath(t.Context(), "vmlinuz", nil, ImageSource{Ref: "ghcr.io/test/nonexistent:v1"})
 	if err == nil {
 		t.Error("expected error for nonexistent image")
 	}
 
 	// Test not found (wrong path)
-	_, err = srv.ResolveFileByPath(t.Context(), "nonexistent/foo", nil, "ghcr.io/test/image:v1")
+	_, err = srv.ResolveFileByPath(t.Context(), "nonexistent/foo", nil, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err == nil {
 		t.Error("expected error for nonexistent file")
 	}
@@ -2265,7 +2224,7 @@ func TestTFTPServer_TemplateVerbatim(t *testing.T) {
 
 	// When requesting "configs/static", it finds configs/static.tmpl and renders as template
 	// Since node is nil, template content is returned verbatim
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tftptmpl123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"configs/static.tmpl": []byte(staticData),
 	})
 
@@ -2274,12 +2233,12 @@ func TestTFTPServer_TemplateVerbatim(t *testing.T) {
 
 	srv := &TFTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
 
-	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, "ghcr.io/test/image:v1")
+	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
@@ -2292,7 +2251,7 @@ func TestTFTPServer_TemplateVerbatim(t *testing.T) {
 func TestTFTPServer_StaticFile(t *testing.T) {
 	staticData := "static-config-no-template"
 
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tftpstatic123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"configs/static": []byte(staticData),
 	})
 
@@ -2301,21 +2260,23 @@ func TestTFTPServer_StaticFile(t *testing.T) {
 
 	srv := &TFTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
 
-	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, "ghcr.io/test/image:v1")
+	resolved, err := srv.ResolveFileByPath(t.Context(), "configs/static", nil, ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
 		t.Fatalf("ResolveFileByPath: %v", err)
 	}
 
-	if resolved.DiskPath == "" {
-		t.Fatal("expected DiskPath for static file")
+	if resolved.File == nil {
+		t.Fatal("expected a streamed file for static file")
 	}
 
-	data, err := os.ReadFile(resolved.DiskPath)
+	data, err := io.ReadAll(resolved.File)
+	resolved.Close() //nolint:errcheck // test
+
 	if err != nil {
 		t.Fatalf("reading: %v", err)
 	}
@@ -2369,7 +2330,7 @@ menuentry "Install {{ .Machine.Name }}" {
   initrd /initrd
 }`
 
-	cache := setupOCICache(t, "ghcr.io/test/e2e:v1", "e2e123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/e2e:v1", map[string][]byte{
 		"vmlinuz":            vmlinuzData,
 		"initrd":             initrdData,
 		"grub/grub.cfg.tmpl": []byte(bootTemplate),
@@ -2394,7 +2355,7 @@ menuentry "Install {{ .Machine.Name }}" {
 
 	httpSrv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:             cache,
+			Puller:            puller,
 			Reader:            fc,
 			Cluster:           &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
 			ServeURL:          "http://10.0.3.1:8080",
@@ -2460,19 +2421,10 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 	machineData := []byte("machine-disk-data")
 	netbootData := []byte("netboot-kernel-data")
 
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	if err := populateOCICache(cacheDir, "machine123", map[string][]byte{"disk.img.gz": machineData}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := populateOCICache(cacheDir, "netboot123", map[string][]byte{"vmlinuz": netbootData}); err != nil {
-		t.Fatal(err)
-	}
-
-	cache.SetDigest("ghcr.io/test/machine:v1", "sha256:machine123")
-	cache.SetDigest("ghcr.io/test/netboot:v1", "sha256:netboot123")
+	images := newTestImages(t)
+	images.Push(t, "ghcr.io/test/machine:v1", map[string][]byte{"disk.img.gz": machineData})
+	images.Push(t, "ghcr.io/test/netboot:v1", map[string][]byte{"vmlinuz": netbootData})
+	puller := images.Puller
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "split-node"},
@@ -2492,7 +2444,7 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	srv := &HTTPServer{FileResolver: FileResolver{Cache: cache, Reader: fc}}
+	srv := &HTTPServer{FileResolver: FileResolver{Puller: puller, Reader: fc}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
@@ -2531,14 +2483,10 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	alphaData := []byte("alpha-vmlinuz")
 	betaData := []byte("beta-vmlinuz")
 
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	populateOCICache(cacheDir, "alpha111", map[string][]byte{"vmlinuz": alphaData})
-	populateOCICache(cacheDir, "beta222", map[string][]byte{"vmlinuz": betaData})
-
-	cache.SetDigest("ghcr.io/test/alpha:v1", "sha256:alpha111")
-	cache.SetDigest("ghcr.io/test/beta:v1", "sha256:beta222")
+	images := newTestImages(t)
+	images.Push(t, "ghcr.io/test/alpha:v1", map[string][]byte{"vmlinuz": alphaData})
+	images.Push(t, "ghcr.io/test/beta:v1", map[string][]byte{"vmlinuz": betaData})
+	puller := images.Puller
 
 	alphaNode := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "alpha-node"},
@@ -2570,7 +2518,7 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 
 	srv := &HTTPServer{
 		FileResolver: FileResolver{
-			Cache:  cache,
+			Puller: puller,
 			Reader: fc,
 		},
 	}
@@ -2613,26 +2561,14 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 }
 
 func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
 	imageRef := "ghcr.io/test/netboot:v1"
-	digest := "multiarch-http"
 
-	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureAMD64, map[string][]byte{
-		"vmlinuz": []byte("amd64-vmlinuz"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureARM64, map[string][]byte{
-		"vmlinuz": []byte("arm64-vmlinuz"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureAMD64, "sha256:"+digest)
-	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureARM64, "sha256:"+digest)
+	images := newTestImages(t)
+	images.PushArch(t, imageRef, map[string]map[string][]byte{
+		v1alpha3.PXEArchitectureAMD64: {"vmlinuz": []byte("amd64-vmlinuz")},
+		v1alpha3.PXEArchitectureARM64: {"vmlinuz": []byte("arm64-vmlinuz")},
+	})
+	puller := images.Puller
 
 	amd64Node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "amd64-node"},
@@ -2664,7 +2600,7 @@ func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
 		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
 		Build()
 
-	srv := &HTTPServer{FileResolver: FileResolver{Cache: cache, Reader: fc}}
+	srv := &HTTPServer{FileResolver: FileResolver{Puller: puller, Reader: fc}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", srv.handleFile)
 
@@ -2699,9 +2635,9 @@ func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
 	}
 }
 
-func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
+func TestHTTPServer_503WhenImageUnavailable(t *testing.T) {
 	// Cache with NO digest set for the image
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "pending-node"},
@@ -2721,7 +2657,7 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 		Build()
 
 	srv := &HTTPServer{
-		FileResolver: FileResolver{Cache: cache, Reader: fc, DefaultNetbootRef: "ghcr.io/test/pending:v1"},
+		FileResolver: FileResolver{Puller: puller, Reader: fc, DefaultNetbootRef: "ghcr.io/test/pending:v1"},
 	}
 
 	mux := http.NewServeMux()
@@ -2730,7 +2666,7 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	ts := newTestPeerServer(mux)
 	defer ts.Close()
 
-	// File not yet pulled -- should get 503
+	// The image is not in the registry -- should get 503
 	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
 	req.Header.Set(testPeerHeader, "10.0.5.10")
 
@@ -2742,7 +2678,7 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("expected 503 for not-yet-downloaded file, got %d", resp.StatusCode)
+		t.Errorf("expected 503 for unavailable image, got %d", resp.StatusCode)
 	}
 
 	if ra := resp.Header.Get("Retry-After"); ra != "5" {
@@ -2750,22 +2686,22 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	}
 }
 
-func TestResolveFile_NotYetDownloaded(t *testing.T) {
-	cache := NewOCICache(t.TempDir())
+func TestResolveFile_ImageNotInRegistry(t *testing.T) {
+	puller := newTestImages(t).Puller
 
-	resolver := FileResolver{Cache: cache, Reader: nil}
+	resolver := FileResolver{Puller: puller, Reader: nil}
 
-	_, err := resolver.ResolveFileByPath(t.Context(), "vmlinuz", nil, "ghcr.io/test/missing:v1")
-	if !errors.Is(err, ErrNotYetDownloaded) {
-		t.Fatalf("expected ErrNotYetDownloaded, got: %v", err)
+	_, err := resolver.ResolveFileByPath(t.Context(), "vmlinuz", nil, ImageSource{Ref: "ghcr.io/test/missing:v1"})
+	if !errors.Is(err, ErrImageUnavailable) {
+		t.Fatalf("expected ErrImageUnavailable, got: %v", err)
 	}
 }
 
-func TestMetadataForRefArchitecture_NotYetDownloaded(t *testing.T) {
-	cache := NewOCICache(t.TempDir())
+func TestImageMetadata_ImageNotInRegistry(t *testing.T) {
+	resolver := FileResolver{Puller: newTestImages(t).Puller}
 
-	_, err := cache.MetadataForRefArchitecture("ghcr.io/test/missing:v1", "amd64")
-	require.ErrorIs(t, err, ErrNotYetDownloaded)
+	_, err := resolver.ImageMetadata(t.Context(), ImageSource{Ref: "ghcr.io/test/missing:v1", Architecture: "amd64"})
+	require.ErrorIs(t, err, ErrImageUnavailable)
 }
 
 func TestHTTPServer_DisablePXE(t *testing.T) {
@@ -2779,7 +2715,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
@@ -2792,7 +2728,7 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -2849,7 +2785,7 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -2860,7 +2796,7 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 	recorder := &recordingStatusRecorder{err: fmt.Errorf("simulated status failure")}
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -2884,7 +2820,7 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 }
 
 func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
@@ -2894,7 +2830,7 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
 	}
 
@@ -2920,24 +2856,17 @@ func TestHTTPServer_DisablePXE_UnknownIP(t *testing.T) {
 	}
 }
 
-func TestOCICache_Metadata(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	digest := "testdigest123"
+func TestFileResolverImageMetadata(t *testing.T) {
 	metadataContent := "dhcpBootImageName: shimx64.efi\nhttpBootPath: http/shimx64.efi\n"
 
-	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte(metadataContent),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
+	resolver := &FileResolver{Puller: puller}
 
-	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
-
-	meta, err := cache.MetadataForRef("ghcr.io/test/image:v1")
+	meta, err := resolver.ImageMetadata(t.Context(), ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
-		t.Fatalf("MetadataForRef: %v", err)
+		t.Fatalf("ImageMetadata: %v", err)
 	}
 
 	if meta.DHCPBootImageName != "shimx64.efi" {
@@ -2950,11 +2879,11 @@ func TestOCICache_Metadata(t *testing.T) {
 }
 
 func TestFileResolverHTTPBootURL(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpurl123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: /efi/bootx64.efi\n"),
 	})
 
-	resolver := &FileResolver{Cache: cache, ServeURL: "http://10.0.0.10:8880/base/"}
+	resolver := &FileResolver{Puller: puller, ServeURL: "http://10.0.0.10:8880/base/"}
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
 		Spec: v1alpha3.MachineSpec{
@@ -2962,17 +2891,17 @@ func TestFileResolverHTTPBootURL(t *testing.T) {
 		},
 	}
 
-	bootURL, err := resolver.HTTPBootURL(node)
+	bootURL, err := resolver.HTTPBootURL(t.Context(), node)
 	require.NoError(t, err)
 	require.Equal(t, "http://10.0.0.10:8880/base/efi/bootx64.efi", bootURL)
 }
 
 func TestFileResolverHTTPBootURLFallsBackToDHCPBootImageName(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpfallback123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n"),
 	})
 
-	resolver := &FileResolver{Cache: cache, ServeURL: "http://10.0.0.10:8880"}
+	resolver := &FileResolver{Puller: puller, ServeURL: "http://10.0.0.10:8880"}
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
 		Spec: v1alpha3.MachineSpec{
@@ -2980,7 +2909,7 @@ func TestFileResolverHTTPBootURLFallsBackToDHCPBootImageName(t *testing.T) {
 		},
 	}
 
-	bootURL, err := resolver.HTTPBootURL(node)
+	bootURL, err := resolver.HTTPBootURL(t.Context(), node)
 	require.NoError(t, err)
 	require.Equal(t, "http://10.0.0.10:8880/shimx64.efi", bootURL)
 }
@@ -2990,23 +2919,15 @@ func TestJoinServeURLPathRejectsTraversal(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestOCICache_MetadataNoFile(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	digest := "nometa123"
-
-	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+func TestFileResolverImageMetadataNoFile(t *testing.T) {
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	})
+	resolver := &FileResolver{Puller: puller}
 
-	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
-
-	meta, err := cache.MetadataForRef("ghcr.io/test/image:v1")
+	meta, err := resolver.ImageMetadata(t.Context(), ImageSource{Ref: "ghcr.io/test/image:v1"})
 	if err != nil {
-		t.Fatalf("MetadataForRef: %v", err)
+		t.Fatalf("ImageMetadata: %v", err)
 	}
 
 	if meta.DHCPBootImageName != "" {
@@ -3014,159 +2935,97 @@ func TestOCICache_MetadataNoFile(t *testing.T) {
 	}
 }
 
-func TestOCICache_ResolvePath(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	digest := "resolve123"
-
-	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+func TestFileResolverOpenImageFile(t *testing.T) {
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz":            []byte("kernel"),
 		"grub/grub.cfg.tmpl": []byte("template content"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
+	})
+	resolver := &FileResolver{Puller: puller}
+	src := ImageSource{Ref: "ghcr.io/test/image:v1"}
 
 	// Static file
-	diskPath, isTemplate, err := cache.ResolvePath("ghcr.io/test/image:v1", "vmlinuz")
-	if err != nil {
-		t.Fatalf("ResolvePath static: %v", err)
-	}
-
-	if isTemplate {
-		t.Error("vmlinuz should not be a template")
-	}
-
-	if !filepath.IsAbs(diskPath) {
-		t.Errorf("expected absolute path, got %q", diskPath)
-	}
+	file, isTemplate, err := resolver.openImageFile(t.Context(), src, "vmlinuz")
+	require.NoError(t, err)
+	require.False(t, isTemplate, "vmlinuz should not be a template")
+	require.Equal(t, "disk/vmlinuz", file.Name())
+	require.NoError(t, file.Close())
 
 	// Template file (.tmpl suffix stripped in request)
-	_, isTemplate, err = cache.ResolvePath("ghcr.io/test/image:v1", "grub/grub.cfg")
-	if err != nil {
-		t.Fatalf("ResolvePath template: %v", err)
-	}
-
-	if !isTemplate {
-		t.Error("grub/grub.cfg should be resolved as template (via grub/grub.cfg.tmpl)")
-	}
+	file, isTemplate, err = resolver.openImageFile(t.Context(), src, "grub/grub.cfg")
+	require.NoError(t, err)
+	require.True(t, isTemplate, "grub/grub.cfg should be resolved as template (via grub/grub.cfg.tmpl)")
+	require.NoError(t, file.Close())
 
 	// Not found
-	_, _, err = cache.ResolvePath("ghcr.io/test/image:v1", "nonexistent")
-	if err == nil {
-		t.Error("expected error for nonexistent file")
-	}
+	_, _, err = resolver.openImageFile(t.Context(), src, "nonexistent")
+	require.ErrorIs(t, err, imagepull.ErrNotFound)
+	require.NotErrorIs(t, err, ErrImageUnavailable)
 }
 
-func TestOCICache_ResolvePathForArchitecture(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	digest := "multiarch123"
+func TestFileResolverResolvesFileForArchitecture(t *testing.T) {
 	imageRef := "ghcr.io/test/multiarch:v1"
 
-	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureAMD64, map[string][]byte{
-		"vmlinuz": []byte("amd64 kernel"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	images := newTestImages(t)
+	images.PushArch(t, imageRef, map[string]map[string][]byte{
+		v1alpha3.PXEArchitectureAMD64: {"vmlinuz": []byte("amd64 kernel")},
+		v1alpha3.PXEArchitectureARM64: {"vmlinuz": []byte("arm64 kernel")},
+	})
+	resolver := &FileResolver{Puller: images.Puller}
 
-	if err := populateOCICacheForArchitecture(cacheDir, digest, v1alpha3.PXEArchitectureARM64, map[string][]byte{
-		"vmlinuz": []byte("arm64 kernel"),
-	}); err != nil {
-		t.Fatal(err)
-	}
+	for arch, want := range map[string]string{
+		v1alpha3.PXEArchitectureAMD64: "amd64 kernel",
+		v1alpha3.PXEArchitectureARM64: "arm64 kernel",
+	} {
+		resolved, err := resolver.ResolveFileByPath(t.Context(), "vmlinuz", nil, ImageSource{Ref: imageRef, Architecture: arch})
+		require.NoError(t, err, arch)
 
-	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureAMD64, "sha256:"+digest)
-	cache.SetDigestForArchitecture(imageRef, v1alpha3.PXEArchitectureARM64, "sha256:"+digest)
-
-	amd64Path, _, err := cache.ResolvePathForArchitecture(imageRef, v1alpha3.PXEArchitectureAMD64, "vmlinuz")
-	if err != nil {
-		t.Fatalf("ResolvePathForArchitecture amd64: %v", err)
-	}
-
-	arm64Path, _, err := cache.ResolvePathForArchitecture(imageRef, v1alpha3.PXEArchitectureARM64, "vmlinuz")
-	if err != nil {
-		t.Fatalf("ResolvePathForArchitecture arm64: %v", err)
-	}
-
-	if amd64Path == arm64Path {
-		t.Fatalf("architecture-specific paths should differ: %q", amd64Path)
-	}
-
-	amd64Data, err := os.ReadFile(amd64Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	arm64Data, err := os.ReadFile(arm64Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if string(amd64Data) != "amd64 kernel" {
-		t.Errorf("amd64 data = %q", amd64Data)
-	}
-
-	if string(arm64Data) != "arm64 kernel" {
-		t.Errorf("arm64 data = %q", arm64Data)
+		data, err := io.ReadAll(resolved.File)
+		require.NoError(t, err, arch)
+		require.NoError(t, resolved.Close())
+		require.Equal(t, want, string(data), arch)
 	}
 }
 
-func TestOCICache_ResolvePath_PathTraversal(t *testing.T) {
-	cacheDir := t.TempDir()
-	cache := NewOCICache(cacheDir)
-
-	digest := "traversal123"
-
-	// Place a file outside the cache that a traversal might reach.
-	secret := filepath.Join(cacheDir, "secret.txt")
-	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := populateOCICache(cacheDir, digest, map[string][]byte{
+func TestFileResolverRejectsPathTraversal(t *testing.T) {
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"vmlinuz": []byte("kernel"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	cache.SetDigest("ghcr.io/test/image:v1", "sha256:"+digest)
+		// A file outside disk/ that a traversal might reach.
+		"../secret.txt": []byte("secret"),
+	})
+	resolver := &FileResolver{Puller: puller}
+	src := ImageSource{Ref: "ghcr.io/test/image:v1"}
 
 	traversalCases := []string{
-		"../../../secret.txt",     // escapes diskDir to cacheDir root
-		"../../../../etc/passwd",  // escapes past cacheDir
-		"sub/../../../secret.txt", // sub-dir traversal escaping diskDir
+		"../secret.txt",          // escapes disk/ to the image root
+		"../../../../etc/passwd", // escapes past the image root
+		"sub/../../secret.txt",   // sub-dir traversal escaping disk/
 	}
 
 	for _, tc := range traversalCases {
-		_, _, err := cache.ResolvePath("ghcr.io/test/image:v1", tc)
-		if err == nil {
+		if _, _, err := resolver.openImageFile(t.Context(), src, tc); err == nil {
 			t.Errorf("expected error for traversal path %q, got none", tc)
 		}
 	}
 
 	// Absolute path must be rejected.
-	_, _, err := cache.ResolvePath("ghcr.io/test/image:v1", "/etc/passwd")
-	if err == nil {
+	if _, _, err := resolver.openImageFile(t.Context(), src, "/etc/passwd"); err == nil {
 		t.Error("expected error for absolute path, got none")
 	}
 
-	// Path resolving to diskDir itself must be rejected.
+	// Path resolving to the disk directory itself must be rejected.
 	for _, dots := range []string{".", ""} {
-		_, _, err := cache.ResolvePath("ghcr.io/test/image:v1", dots)
-		if err == nil {
-			t.Errorf("expected error for path %q resolving to diskDir, got none", dots)
+		if _, _, err := resolver.openImageFile(t.Context(), src, dots); err == nil {
+			t.Errorf("expected error for path %q resolving to the disk directory, got none", dots)
 		}
 	}
 
 	// Valid relative path must still work.
-	_, _, err = cache.ResolvePath("ghcr.io/test/image:v1", "vmlinuz")
+	file, _, err := resolver.openImageFile(t.Context(), src, "vmlinuz")
 	if err != nil {
-		t.Errorf("expected success for valid relative path, got: %v", err)
+		t.Fatalf("expected success for valid relative path, got: %v", err)
 	}
+
+	file.Close() //nolint:errcheck // test
 }
 
 func TestHandleCloudInitLog(t *testing.T) {
@@ -3396,7 +3255,7 @@ func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3408,7 +3267,7 @@ func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -3441,7 +3300,7 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3452,7 +3311,7 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
 	}
 
@@ -3503,7 +3362,7 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3514,7 +3373,7 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
 	}
 
@@ -3569,7 +3428,7 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3580,7 +3439,7 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
 	}
 
@@ -3657,7 +3516,7 @@ func TestCloudInitCondition_NoClientSkipsUpdate(t *testing.T) {
 func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
 	// When the IP doesn't match any Machine, recordCloudInitCondition
 	// should log a warning but the handler should still return 200.
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3667,7 +3526,7 @@ func TestCloudInitCondition_UnknownIPSkipsUpdate(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: &recordingStatusRecorder{},
 	}
 
@@ -3706,7 +3565,7 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 
 	injectedErr := fmt.Errorf("simulated conflict")
@@ -3720,7 +3579,7 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -3759,7 +3618,7 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3771,7 +3630,7 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 	recorder := &recordingStatusRecorder{}
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -3856,7 +3715,7 @@ func TestHTTPServerRecordsCloudInitDoneOnlyOnFinalSuccess(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3868,7 +3727,7 @@ func TestHTTPServerRecordsCloudInitDoneOnlyOnFinalSuccess(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -3915,7 +3774,7 @@ func TestHTTPServerDoesNotRecordCloudInitDoneOnFailure(t *testing.T) {
 		},
 	}
 
-	cache := NewOCICache(t.TempDir())
+	puller := newTestImages(t).Puller
 	scheme := newScheme(t)
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -3927,7 +3786,7 @@ func TestHTTPServerDoesNotRecordCloudInitDoneOnFailure(t *testing.T) {
 
 	srv := &HTTPServer{
 		Client:         fc,
-		FileResolver:   FileResolver{Cache: cache, Reader: fc},
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
 		StatusRecorder: recorder,
 	}
 
@@ -4079,7 +3938,7 @@ func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cache := setupOCICache(t, "ghcr.io/test/image:v1", "pin123", map[string][]byte{
+			puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 				"agent.json.tmpl": []byte(`{{ .AgentConfigJSON }}`),
 			})
 			node := &v1alpha3.Machine{
@@ -4093,11 +3952,11 @@ func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
 				},
 			}
 			f := &FileResolver{
-				Cache:   cache,
+				Puller:  puller,
 				Cluster: &StaticClusterInfo{Info: ClusterInfo{ApiserverURL: "https://k8s.example.com"}},
 			}
 
-			resolved, err := f.ResolveFileByPath(t.Context(), "agent.json", node, "ghcr.io/test/image:v1")
+			resolved, err := f.ResolveFileByPath(t.Context(), "agent.json", node, ImageSource{Ref: "ghcr.io/test/image:v1"})
 			require.NoError(t, err)
 
 			var cfg provision.UnboundedAgentConfig

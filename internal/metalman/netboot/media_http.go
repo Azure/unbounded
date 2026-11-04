@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -402,7 +401,7 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		data, err := p.installerConfig(o)
+		data, err := p.installerConfig(r.Context(), o)
 		if err != nil {
 			log.Error("rendering boot media installer config", "err", err)
 			http.Error(w, "media config unavailable", http.StatusServiceUnavailable)
@@ -480,8 +479,8 @@ func (p *MediaProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *MediaProvider) installerConfig(o *mediaOwner) ([]byte, error) {
-	if p.Resolver == nil || p.Resolver.Cache == nil {
+func (p *MediaProvider) installerConfig(ctx context.Context, o *mediaOwner) ([]byte, error) {
+	if p.Resolver == nil || p.Resolver.Puller == nil {
 		return nil, fmt.Errorf("media resolver unavailable")
 	}
 
@@ -495,7 +494,9 @@ func (p *MediaProvider) installerConfig(o *mediaOwner) ([]byte, error) {
 		return nil, fmt.Errorf("media requires digest-pinned images")
 	}
 
-	meta, err := p.Resolver.Cache.MetadataForRefArchitecture(spec.NetbootImage, spec.TargetArchitecture())
+	src := mediaNetbootSource(spec)
+
+	meta, err := p.Resolver.ImageMetadata(ctx, src)
 	if err != nil {
 		return nil, err
 	}
@@ -504,16 +505,17 @@ func (p *MediaProvider) installerConfig(o *mediaOwner) ([]byte, error) {
 		return nil, fmt.Errorf("incompatible media installer")
 	}
 
-	path, tmpl, err := p.Resolver.Cache.ResolvePathForArchitecture(spec.NetbootImage, spec.TargetArchitecture(), "grub/grub.cfg")
+	file, tmpl, err := p.Resolver.openImageFile(ctx, src, "grub/grub.cfg")
 	if err != nil {
 		return nil, err
 	}
 
 	if !tmpl {
+		file.Close() //nolint:errcheck // read-only
 		return nil, fmt.Errorf("media installer config must be a template")
 	}
 
-	content, err := os.ReadFile(path)
+	content, err := readTemplateFile(file)
 	if err != nil {
 		return nil, err
 	}

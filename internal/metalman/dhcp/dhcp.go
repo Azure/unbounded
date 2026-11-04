@@ -22,14 +22,18 @@ import (
 )
 
 type Server struct {
-	Interface         string
-	Port              int
-	Reader            client.Reader
-	ServerIP          net.IP
-	OCICache          *netboot.OCICache
+	Interface string
+	Port      int
+	Reader    client.Reader
+	ServerIP  net.IP
+	// Images reads netboot image metadata. Nil disables boot file options.
+	Images            *netboot.FileResolver
 	ServeURL          string
 	DefaultNetbootRef string
 }
+
+// metadataTimeout bounds the image metadata lookup for one DHCP reply.
+const metadataTimeout = 10 * time.Second
 
 func (s *Server) NeedLeaderElection() bool {
 	// Responding to unicast packets is always safe.
@@ -194,15 +198,24 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 		}
 	}
 
-	netbootImage := node.Spec.Netboot().NetbootImage
-	if netbootImage == "" {
-		netbootImage = s.DefaultNetbootRef
+	src := netboot.ImageSource{
+		Ref:           node.Spec.Netboot().NetbootImage,
+		Architecture:  node.Spec.Netboot().TargetArchitecture(),
+		PullSecretRef: node.Spec.Netboot().NetbootPullSecretRef,
+	}
+	if src.Ref == "" && s.Images != nil {
+		src.Ref = s.DefaultNetbootRef
+		src.PullSecretRef = s.Images.DefaultNetbootPullSecretRef
 	}
 
-	if netbootImage != "" && s.OCICache != nil && node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolVirtualMedia {
-		architecture := node.Spec.Netboot().TargetArchitecture()
+	netbootImage, architecture := src.Ref, src.Architecture
 
-		meta, err := s.OCICache.MetadataForRefArchitecture(netbootImage, architecture)
+	if netbootImage != "" && s.Images != nil && node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolVirtualMedia {
+		metaCtx, cancel := context.WithTimeout(ctx, metadataTimeout)
+		meta, err := s.Images.ImageMetadata(metaCtx, src)
+
+		cancel()
+
 		if err != nil {
 			log.Warn("OCI image metadata not available", "image", netbootImage, "architecture", architecture, "err", err)
 		} else if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {

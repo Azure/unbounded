@@ -1020,7 +1020,7 @@ func TestReconcilerFallsBackToBIOSHTTPBootURIForHostReplace(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
 	power := &recordingPowerClient{httpBootUnsupported: map[string]bool{machine.Name: true}}
 	reconciler := testReconciler(c, power, "rack-a")
-	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+	reconciler.HTTPBootURL = func(_ context.Context, m *v1alpha3.Machine) (string, error) {
 		require.Equal(t, machine.Name, m.Name)
 
 		return "http://10.0.0.10:8880/http/shimx64.efi", nil
@@ -1061,7 +1061,7 @@ func TestReconcilerUsesBIOSHTTPBootURIWhenStandardURIAbsent(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
 	power := &recordingPowerClient{httpBootURIAbsent: map[string]bool{machine.Name: true}}
 	reconciler := testReconciler(c, power, "rack-a")
-	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+	reconciler.HTTPBootURL = func(_ context.Context, m *v1alpha3.Machine) (string, error) {
 		require.Equal(t, machine.Name, m.Name)
 
 		return "http://10.0.0.10:8880/http/shimx64.efi", nil
@@ -1102,7 +1102,7 @@ func TestReconcilerFallsBackToBIOSWhenStaticInterfaceIsReadOnly(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
 	power := &recordingPowerClient{staticIPv4Unsupported: map[string]bool{machine.Name: true}}
 	reconciler := testReconciler(c, power, "rack-a")
-	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+	reconciler.HTTPBootURL = func(_ context.Context, m *v1alpha3.Machine) (string, error) {
 		require.Equal(t, machine.Name, m.Name)
 
 		return "http://10.0.0.10:8880/http/shimx64.efi", nil
@@ -1179,7 +1179,7 @@ func TestReconcilerRetriesHTTPHostReplaceWithoutStaticLease(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(machine, op, testRedfishSecret()).WithStatusSubresource(op, machine).Build()
 	power := &recordingPowerClient{}
 	reconciler := testReconciler(c, power, "rack-a")
-	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+	reconciler.HTTPBootURL = func(_ context.Context, m *v1alpha3.Machine) (string, error) {
 		require.Equal(t, machine.Name, m.Name)
 
 		return "http://10.0.0.10:8880/http/shimx64.efi", nil
@@ -1214,11 +1214,11 @@ func TestReconcilerWaitsForHTTPBootImage(t *testing.T) {
 	power := &recordingPowerClient{}
 	reconciler := testReconciler(c, power, "rack-a")
 	imageAvailable := false
-	reconciler.HTTPBootURL = func(m *v1alpha3.Machine) (string, error) {
+	reconciler.HTTPBootURL = func(_ context.Context, m *v1alpha3.Machine) (string, error) {
 		require.Equal(t, machine.Name, m.Name)
 
 		if !imageAvailable {
-			return "", fmt.Errorf("resolve HTTP boot image: %w", netboot.ErrNotYetDownloaded)
+			return "", fmt.Errorf("resolve HTTP boot image: %w", netboot.ErrImageUnavailable)
 		}
 
 		return "http://10.0.0.10:8880/http/shimx64.efi", nil

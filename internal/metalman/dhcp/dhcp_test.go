@@ -5,18 +5,20 @@ package dhcp
 
 import (
 	"net"
-	"os"
-	"path/filepath"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"oras.land/oras-go/v2/registry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
+	"github.com/Azure/unbounded/internal/metalman/imagepull/imagepulltest"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 )
@@ -121,29 +123,15 @@ func TestDHCPHandlerPXE(t *testing.T) {
 		},
 	}
 
-	// Set up OCI cache with metadata for the netboot image ref.
-	cacheDir := t.TempDir()
-	ociCache := netboot.NewOCICache(cacheDir)
-
-	digest := "sha256:abcdef1234567890"
-	ociCache.SetDigest(netbootImageRef, digest)
-
-	diskDir := filepath.Join(ociCache.DiskDir(digest))
-	if err := os.MkdirAll(diskDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"),
-		[]byte("dhcpBootImageName: shimx64.efi\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// Push an image with metadata for the netboot image ref.
+	images := newTestImages(t, netbootImageRef, "", "dhcpBootImageName: shimx64.efi\n")
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
 		Interface: "eth0",
 		Reader:    reader,
 		ServerIP:  serverIP,
-		OCICache:  ociCache,
+		Images:    images,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -207,28 +195,14 @@ func TestDHCPHandlerPXEUsesDefaultNetbootImage(t *testing.T) {
 		},
 	}
 
-	cacheDir := t.TempDir()
-	ociCache := netboot.NewOCICache(cacheDir)
-
-	digest := "sha256:default1234567890"
-	ociCache.SetDigestForArchitecture(netbootImageRef, v1alpha3.PXEArchitectureARM64, digest)
-
-	diskDir := filepath.Join(ociCache.DiskDirForArchitecture(digest, v1alpha3.PXEArchitectureARM64))
-	if err := os.MkdirAll(diskDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"),
-		[]byte("dhcpBootImageName: shimaa64.efi\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	images := newTestImages(t, netbootImageRef, v1alpha3.PXEArchitectureARM64, "dhcpBootImageName: shimaa64.efi\n")
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
 		Interface:         "eth0",
 		Reader:            reader,
 		ServerIP:          serverIP,
-		OCICache:          ociCache,
+		Images:            images,
 		DefaultNetbootRef: netbootImageRef,
 	}
 
@@ -276,27 +250,14 @@ func TestDHCPHandlerHTTPBootSuppressesPXEBootOptions(t *testing.T) {
 		},
 	}
 
-	cacheDir := t.TempDir()
-	ociCache := netboot.NewOCICache(cacheDir)
-
-	digest := "sha256:httpboot1234567890"
-	ociCache.SetDigest(netbootImageRef, digest)
-
-	diskDir := filepath.Join(ociCache.DiskDir(digest))
-	if err := os.MkdirAll(diskDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"), []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	images := newTestImages(t, netbootImageRef, "", "dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n")
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
 		Interface: "eth0",
 		Reader:    reader,
 		ServerIP:  serverIP,
-		OCICache:  ociCache,
+		Images:    images,
 	}
 
 	discover, err := dhcpv4.NewDiscovery(mac)
@@ -351,27 +312,14 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 		},
 	}
 
-	cacheDir := t.TempDir()
-	ociCache := netboot.NewOCICache(cacheDir)
-
-	digest := "sha256:httpclientboot1234567890"
-	ociCache.SetDigest(netbootImageRef, digest)
-
-	diskDir := filepath.Join(ociCache.DiskDir(digest))
-	if err := os.MkdirAll(diskDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"), []byte("dhcpBootImageName: pxe-shimx64.efi\nhttpBootPath: http/shimx64.efi\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	images := newTestImages(t, netbootImageRef, "", "dhcpBootImageName: pxe-shimx64.efi\nhttpBootPath: http/shimx64.efi\n")
 
 	reader := newFakeReader(t, node)
 	srv := &Server{
 		Interface: "eth0",
 		Reader:    reader,
 		ServerIP:  serverIP,
-		OCICache:  ociCache,
+		Images:    images,
 		ServeURL:  "http://10.0.1.254:8880/base/",
 	}
 
@@ -420,20 +368,8 @@ func TestDHCPHandlerVirtualMediaSuppressesBootHints(t *testing.T) {
 	}
 
 	serverIP := net.ParseIP("10.0.1.254").To4()
-	netbootImageRef := "ghcr.io/test/netboot@sha256:abcdef1234567890"
-	digest := "sha256:abcdef1234567890"
-	ociCache := netboot.NewOCICache(t.TempDir())
-	ociCache.SetDigest(netbootImageRef, digest)
-
-	diskDir := ociCache.DiskDir(digest)
-	if err := os.MkdirAll(diskDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(diskDir, "metadata.yaml"),
-		[]byte("dhcpBootImageName: pxe-shimx64.efi\nhttpBootPath: http/shimx64.efi\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	netbootImageRef := "ghcr.io/test/netboot:v1"
+	images := newTestImages(t, netbootImageRef, "", "dhcpBootImageName: pxe-shimx64.efi\nhttpBootPath: http/shimx64.efi\n")
 
 	for _, imageSource := range []string{"machine", "default"} {
 		t.Run(imageSource, func(t *testing.T) {
@@ -455,7 +391,7 @@ func TestDHCPHandlerVirtualMediaSuppressesBootHints(t *testing.T) {
 
 			srv := &Server{
 				Interface: "eth0", Reader: newFakeReader(t, node), ServerIP: serverIP,
-				OCICache: ociCache, ServeURL: "http://10.0.1.254:8880/base/",
+				Images: images, ServeURL: "http://10.0.1.254:8880/base/",
 				DefaultNetbootRef: netbootImageRef,
 			}
 
@@ -907,3 +843,97 @@ func (f *fakePacketConn) LocalAddr() net.Addr                { return &net.UDPAd
 func (f *fakePacketConn) SetDeadline(_ time.Time) error      { return nil }
 func (f *fakePacketConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (f *fakePacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+// newTestImages pushes an image whose disk/metadata.yaml is metadata to an
+// in-memory registry, tagged as ref for architecture arch (default amd64),
+// and returns a FileResolver that pulls from that registry.
+func newTestImages(t *testing.T, ref, arch, metadata string) *netboot.FileResolver {
+	t.Helper()
+
+	reg := imagepulltest.NewRegistry(t)
+
+	parsed, err := registry.ParseReference(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if arch == "" {
+		arch = v1alpha3.DefaultPXEArchitecture
+	}
+
+	reg.PushMultiArch(t, parsed.Repository, parsed.Reference, map[string]map[string][]byte{
+		arch: {"disk/metadata.yaml": []byte(metadata)},
+	})
+
+	return &netboot.FileResolver{
+		Puller: &imagepull.Puller{HTTPClient: &http.Client{Transport: &redirectTransport{host: reg.Host()}}},
+	}
+}
+
+// redirectTransport sends every request to host over plain HTTP, so tests
+// can use realistic registry hosts.
+type redirectTransport struct {
+	host string
+}
+
+func (rt *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.URL.Scheme = "http"
+	r.URL.Host = rt.host
+	r.Host = rt.host
+
+	resp, err := http.DefaultTransport.RoundTrip(r)
+	if resp != nil {
+		// Report the original request so that the registry client treats
+		// the response as coming from the original host.
+		resp.Request = req
+	}
+
+	return resp, err
+}
+
+func TestDHCPHandlerUnavailableImageOmitsBootFile(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f6")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-unavailable"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{NetbootImage: "ghcr.io/test/missing:v1", DHCPLeases: []v1alpha3.DHCPLease{{
+				MAC:        "aa:bb:cc:dd:ee:f6",
+				IPv4:       "10.0.1.16",
+				SubnetMask: "255.255.255.0",
+			}}},
+		},
+	}
+
+	// The registry has no image for the reference.
+	images := newTestImages(t, "ghcr.io/test/other:v1", "", "dhcpBootImageName: shimx64.efi\n")
+
+	srv := &Server{Interface: "eth0", Reader: newFakeReader(t, node), ServerIP: serverIP, Images: images}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakePacketConn{}
+	srv.handler(conn, &net.UDPAddr{IP: net.ParseIP("10.0.1.16"), Port: 68}, discover)
+
+	if conn.written == nil {
+		t.Fatal("expected DHCP response, got none")
+	}
+
+	resp, err := dhcpv4.FromBytes(conn.written)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.MessageType() != dhcpv4.MessageTypeOffer {
+		t.Errorf("expected Offer, got %s", resp.MessageType())
+	}
+
+	if bootfile := resp.BootFileNameOption(); bootfile != "" {
+		t.Errorf("expected no bootfile while the image is unavailable, got %s", bootfile)
+	}
+}

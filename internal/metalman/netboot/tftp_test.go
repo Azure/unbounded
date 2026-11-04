@@ -34,7 +34,9 @@ func TestTFTPMediaLeaseAuthorization(t *testing.T) {
 		"unclaimed IP", "no media claim", "unrelated PXE operation", "media client unavailable",
 	} {
 		t.Run(scenario, func(t *testing.T) {
-			p, m, old := mediaFixture(t, "amd64")
+			p, m, old, _ := mediaFixtureImages(t, "amd64", map[string][]byte{
+				"vmlinuz": []byte("live kernel"), "other-file": []byte("other content"),
+			}, nil)
 			m.Spec.Netboot().BootProtocol = v1alpha3.PXEBootProtocolPXE
 			media := old.Status.Targets[0].BootMedia
 			media.Phase = "Installing"
@@ -84,9 +86,6 @@ func TestTFTPMediaLeaseAuthorization(t *testing.T) {
 				p.Client = nil
 			}
 
-			require.NoError(t, populateOCICache(p.CacheDir, strings.Repeat("a", 64), map[string][]byte{
-				"vmlinuz": []byte("live kernel"), "other-file": []byte("other content"),
-			}))
 			server := &TFTPServer{Media: p, FileResolver: *p.Resolver}
 
 			for _, filename := range []string{"grub/grub.cfg", "/grub/grub.cfg", "vmlinuz", "other-file"} {

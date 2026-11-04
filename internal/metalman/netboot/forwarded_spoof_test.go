@@ -20,7 +20,7 @@ import (
 // TestHTTPServerIgnoresForwardedHeaders verifies that a peer that is not a
 // Machine cannot impersonate one by sending forwarding headers.
 func TestHTTPServerIgnoresForwardedHeaders(t *testing.T) {
-	cache := setupOCICache(t, "ghcr.io/test/image:v1", "spoof123", map[string][]byte{
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
 		"grub/grub.cfg.tmpl": []byte("hostname={{ .Machine.Name }}"),
 	})
 
@@ -47,7 +47,7 @@ func TestHTTPServerIgnoresForwardedHeaders(t *testing.T) {
 		return &HTTPServer{
 			Client: fc,
 			FileResolver: FileResolver{
-				Cache:             cache,
+				Puller:            puller,
 				Reader:            fc,
 				Cluster:           &StaticClusterInfo{},
 				DefaultNetbootRef: "ghcr.io/test/image:v1",

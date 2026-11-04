@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -152,10 +151,9 @@ func TestMediaFirstBootPinsCapturedNodeName(t *testing.T) {
 		"empty capture uses live name":    {liveRef: "node-new", want: "node-new"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			h, m, op := firstBootFixture(t)
-			require.NoError(t, populateOCICache(h.Media.CacheDir, strings.Repeat("a", 64), map[string][]byte{
+			h, m, op := firstBootFixture(t, map[string][]byte{
 				"cloud-init/vendor-data.tmpl": []byte(`{{ .AgentConfigJSON }}`),
-			}))
+			})
 
 			op.Status.Targets[0].BootMedia.NodeName = tc.captured
 			require.NoError(t, h.Media.Client.Status().Update(t.Context(), op))

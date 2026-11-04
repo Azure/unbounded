@@ -77,7 +77,7 @@ type Reconciler struct {
 	Site                  string
 	PowerClients          PowerClientFactory
 	BootMedia             bootmedia.Provider
-	HTTPBootURL           func(*v1alpha3.Machine) (string, error)
+	HTTPBootURL           func(context.Context, *v1alpha3.Machine) (string, error)
 	MaxConcurrentMachines int
 	MaxAttempts           int32
 	PollInterval          time.Duration
@@ -753,7 +753,7 @@ func (r *Reconciler) advanceReplace(ctx context.Context, op *v1alpha3.MachineOpe
 
 func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, machine *v1alpha3.Machine) error {
 	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
-		bootURL, staticConfig, err := r.httpBootConfig(machine)
+		bootURL, staticConfig, err := r.httpBootConfig(ctx, machine)
 		if err != nil {
 			return err
 		}
@@ -768,12 +768,12 @@ func (r *Reconciler) configureRepaveBoot(ctx context.Context, pc PowerClient, ma
 	return nil
 }
 
-func (r *Reconciler) httpBootConfig(machine *v1alpha3.Machine) (string, redfish.StaticIPv4Config, error) {
+func (r *Reconciler) httpBootConfig(ctx context.Context, machine *v1alpha3.Machine) (string, redfish.StaticIPv4Config, error) {
 	if r.HTTPBootURL == nil {
 		return "", redfish.StaticIPv4Config{}, fmt.Errorf("HTTP boot URL resolver is not configured")
 	}
 
-	bootURL, err := r.HTTPBootURL(machine)
+	bootURL, err := r.HTTPBootURL(ctx, machine)
 	if err != nil {
 		return "", redfish.StaticIPv4Config{}, err
 	}
@@ -869,8 +869,8 @@ func (r *Reconciler) waitForRepaveBoot(ctx context.Context, machine *v1alpha3.Ma
 	}
 
 	if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
-		if _, _, err := r.httpBootConfig(machine); err != nil {
-			if errors.Is(err, netboot.ErrNotYetDownloaded) {
+		if _, _, err := r.httpBootConfig(ctx, machine); err != nil {
+			if errors.Is(err, netboot.ErrImageUnavailable) {
 				target.Message = "waiting for OCI image to become available"
 
 				return targetChange{target: target}

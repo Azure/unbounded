@@ -5,8 +5,11 @@ package commands
 
 import (
 	"net"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
 )
 
 func TestServePXEMediaTFTPServerFlag(t *testing.T) {
@@ -95,5 +98,59 @@ func TestResolveMediaTFTPServer(t *testing.T) {
 				t.Errorf("resolveMediaTFTPServer() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestServePXEPullFlags(t *testing.T) {
+	cmd := ServePXECmd()
+
+	for name, want := range map[string]string{
+		"registry-mirror":  "",
+		"pull-concurrency": strconv.Itoa(imagepull.DefaultConcurrency),
+		"pull-chunk-size":  strconv.FormatInt(imagepull.DefaultChunkSize, 10),
+	} {
+		flag := cmd.Flags().Lookup(name)
+		if flag == nil {
+			t.Fatalf("serve-pxe must register --%s", name)
+		}
+
+		if flag.DefValue != want {
+			t.Errorf("--%s default = %q, want %q", name, flag.DefValue, want)
+		}
+	}
+
+	if err := cmd.ParseFlags([]string{"--registry-mirror=http://127.0.0.1:5000", "--pull-concurrency=2", "--pull-chunk-size=1048576"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, _ := cmd.Flags().GetInt64("pull-chunk-size"); got != 1<<20 {
+		t.Errorf("pull-chunk-size = %d", got)
+	}
+}
+
+func TestParseRegistryMirror(t *testing.T) {
+	for _, tt := range []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{in: "", want: ""},
+		{in: "  ", want: ""},
+		{in: "http://127.0.0.1:5000", want: "http://127.0.0.1:5000"},
+		{in: "https://mirror.example.com/", want: "https://mirror.example.com"},
+		{in: "127.0.0.1:5000", wantErr: true},
+		{in: "ftp://mirror.example.com", wantErr: true},
+		{in: "http://mirror.example.com/v2", wantErr: true},
+		{in: "http://user:pass@mirror.example.com", wantErr: true},
+		{in: "http://mirror.example.com?ns=x", wantErr: true},
+	} {
+		got, err := parseRegistryMirror(tt.in)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("parseRegistryMirror(%q) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			continue
+		}
+
+		if got != tt.want {
+			t.Errorf("parseRegistryMirror(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

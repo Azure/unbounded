@@ -28,6 +28,8 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
+	"github.com/Azure/unbounded/internal/metalman/imagepull"
+	"github.com/Azure/unbounded/internal/metalman/imagepull/imagepulltest"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -803,27 +805,22 @@ func TestVirtualMediaReadinessGraceSurvivesRestart(t *testing.T) {
 
 func TestVirtualMediaRealProviderCallbackAndPartialCleanup(t *testing.T) {
 	r, d, m, op := mediaFixture(t)
-	cache := netboot.NewOCICache(t.TempDir())
-	digest := strings.Repeat("a", 64)
-	ref := "test/netboot@sha256:" + digest
-
-	files := map[string]string{
-		"metadata.yaml": "mediaFormat: unbounded-uefi-v1\nmediaShim: shimx64.efi\nmediaGrub: grubx64.efi\n",
-		"shimx64.efi":   "shim", "grubx64.efi": "grub",
-		"grub/grub.cfg.tmpl": "config {{.MediaCallbackURL}}",
+	files := map[string][]byte{
+		"disk/metadata.yaml": []byte("mediaFormat: unbounded-uefi-v1\nmediaShim: shimx64.efi\nmediaGrub: grubx64.efi\n"),
+		"disk/shimx64.efi":   []byte("shim"), "disk/grubx64.efi": []byte("grub"),
+		"disk/grub/grub.cfg.tmpl": []byte("config {{.MediaCallbackURL}}"),
 	}
-	for name, data := range files {
-		path := filepath.Join(cache.CacheDir, "oci", "sha256_"+digest, "amd64", "disk", name)
-		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
-		require.NoError(t, os.WriteFile(path, []byte(data), 0o600))
-	}
+	reg := imagepulltest.NewRegistry(t)
+	_, digest := reg.PushFiles(t, "netboot", "v1", files)
+	ref := "test/netboot@" + digest
+	puller := &imagepull.Puller{HTTPClient: &http.Client{Transport: &redirectTransport{host: reg.Host()}}}
+	cacheDir := t.TempDir()
 
-	cache.SetDigestForArchitecture(ref, "amd64", "sha256:"+digest)
 	m.Spec.Netboot().NetbootImage = ref
 	m.Spec.Netboot().Image = "test/disk@sha256:" + strings.Repeat("b", 64)
 	m.Spec.Netboot().DHCPLeases = []v1alpha3.DHCPLease{{MAC: "02:11:22:33:44:55", IPv4: "192.0.2.20", SubnetMask: "255.255.255.0", Gateway: "192.0.2.1"}}
 	require.NoError(t, r.Update(t.Context(), m))
-	p := &netboot.MediaProvider{Site: r.Site, Client: r.Client, CacheDir: cache.CacheDir, TFTPServer: "192.0.2.2", Resolver: &netboot.FileResolver{Cache: cache, Reader: r.Client, ServeURL: "http://192.0.2.2:8080"}}
+	p := &netboot.MediaProvider{Site: r.Site, Client: r.Client, CacheDir: cacheDir, TFTPServer: "192.0.2.2", Resolver: &netboot.FileResolver{Puller: puller, Reader: r.Client, ServeURL: "http://192.0.2.2:8080"}}
 	builds := 0
 	p.Run = func(_ context.Context, command string, args ...string) error {
 		if command == "xorriso" {
@@ -1422,4 +1419,26 @@ func TestCloudInitReported(t *testing.T) {
 			require.Equal(t, tt.want, cloudInitReported(target))
 		})
 	}
+}
+
+// redirectTransport sends every request to host over plain HTTP, so tests
+// can use realistic registry hosts.
+type redirectTransport struct {
+	host string
+}
+
+func (rt *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.URL.Scheme = "http"
+	r.URL.Host = rt.host
+	r.Host = rt.host
+
+	resp, err := http.DefaultTransport.RoundTrip(r)
+	if resp != nil {
+		// Report the original request so that the registry client treats
+		// the response as coming from the original host.
+		resp.Request = req
+	}
+
+	return resp, err
 }
