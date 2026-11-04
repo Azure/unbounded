@@ -2,16 +2,19 @@
 
 Project Signal performs one certification run for a newly joined Node or a
 small, explicitly selected group of Nodes. The controller snapshots the
-approved profile and scripts, reserves and cordons every participant, runs an
-ordered check suite through Argo Workflows, persists one immutable evidence
-document, and cleans up all temporary workloads.
+approved Profile, referenced Suite, and scripts, reserves and cordons every
+participant, runs the ordered check suite through Argo Workflows, persists one
+immutable evidence document, and cleans up all temporary workloads.
 
 Project Signal does not integrate with Kueue. Queue admission and repeatable
 fleet scheduling are intentionally deferred.
 
 ## Components
 
-- `CertificationProfile` is cluster-scoped operator policy.
+- `CertificationSuite` is the cluster-scoped executable policy: it selects an
+  immutable script bundle and defines the ordered checks.
+- `CertificationProfile` is cluster-scoped admission policy: it defines
+  participant selection and references one Suite.
 - `CertificationRun` is a namespaced, immutable execution snapshot.
 - `project-signal-controller` admits Nodes, owns reservations and cordons,
   creates the Workflow, persists status and evidence, and performs teardown.
@@ -23,10 +26,11 @@ fleet scheduling are intentionally deferred.
   On setup, observation, or wall-clock deadline failures, the adapter first
   persists the available evidence and then quiesces uncertain backends.
 - `project-signal-participant-adapter` is a fixed WorkflowTemplate used by
-  every check. Profiles cannot replace it or pass arbitrary Workflow wiring.
+  every check. Profiles and Suites cannot replace it or pass arbitrary
+  Workflow wiring.
 
 Argo Workflows is required. The Kubeflow MPI Operator is required only when a
-profile contains an `MPIJob` check.
+referenced Suite contains an `MPIJob` check.
 
 ## First deployment
 
@@ -55,42 +59,36 @@ The install creates:
 - the controller Deployment.
 
 The controller requires cluster permission to get, list, watch, and patch
-Nodes because it owns participant reservation markers and cordons.
+Nodes because it owns participant reservation markers and cordons. It also
+watches Profiles and Suites so changes can trigger admission reconciliation.
 The deployment-owned runner image is copied into every immutable Run check
-snapshot. Profile authors cannot replace it.
+snapshot. Profile and Suite authors cannot replace it.
 
-## CertificationProfile contract
+## CertificationSuite contract
 
-A Profile contains only operator choices that legitimately vary between
-certification suites:
+A Suite contains the executable choices that vary between certification test
+plans:
 
 | Field | Meaning |
 |---|---|
-| `spec.participants.count` | Total Nodes selected for a Run |
-| `spec.participants.selector` | Labels every selected Node must match |
 | `spec.scriptBundle.name` | Immutable source ConfigMap containing the selected scripts |
 | `spec.scriptBundle.digest` | Aggregate SHA-256 digest of the selected script contents in check order |
 | `spec.checks` | Between 1 and 256 ordered checks; position defines the stable check ID starting at R01 |
 
-The requesting Node is participant zero. The remaining participants are
-selected deterministically from currently ready, schedulable, unreserved
-Nodes matching the participant selector and the resource floor derived from
-the largest per-Node check request. Every check runs on this complete immutable
-participant set.
-
 The source ConfigMap must set `immutable: true` and must not use `binaryData`.
 The aggregate digest is derived by computing the algorithm-qualified SHA-256
 digest of each selected script's exact bytes, writing those digest strings
-with one newline after each string in Profile check order, and computing the
-SHA-256 digest of that manifest. Admission rejects the Profile if the current
-source bytes do not match the pinned aggregate digest. Unreferenced ConfigMap
-keys are not part of the digest because they cannot execute in that Profile.
+with one newline after each string in Suite check order, and computing the
+SHA-256 digest of that manifest. Certification admission rejects the request
+if the current source bytes do not match the pinned aggregate digest.
+Unreferenced ConfigMap keys are not part of the digest because they cannot
+execute in that Suite.
 
 Each check contains:
 
 | Field | Meaning |
 |---|---|
-| `scriptKey` | Key in `spec.scriptBundle.name`; admission snapshots the verified bytes and records their SHA-256 digest |
+| `scriptKey` | Key in the Suite's `spec.scriptBundle.name`; admission snapshots the verified bytes and records their SHA-256 digest |
 | `backend` | `Pod` or `MPIJob` |
 | `backendActiveDeadline` | Backend execution deadline |
 | `gpuCount` | GPU request; must be positive for MPIJob |
@@ -107,7 +105,54 @@ Workload policy is intentionally constrained:
 - arbitrary PodSpec, Workflow, retry, TTL, queue, and cleanup settings are not
   accepted.
 
-Profile edits affect only future Runs.
+Suite edits affect only future Runs.
+
+## CertificationProfile contract
+
+A Profile contains the participant policy and references one Suite:
+
+| Field | Meaning |
+|---|---|
+| `spec.participants.count` | Total Nodes selected for a Run |
+| `spec.participants.selector` | Labels every selected Node must match |
+| `spec.suite.name` | Cluster-scoped Suite resolved and pinned at admission |
+
+The requesting Node is participant zero. The remaining participants are
+selected deterministically from currently ready, schedulable, unreserved
+Nodes matching the participant selector and the resource floor derived from
+the largest per-Node check request. Every Suite check runs on this complete
+immutable participant set. Profile edits affect only future Runs.
+
+For example, define the executable Suite separately from the participant
+Profile:
+
+```yaml
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationSuite
+metadata:
+  name: standard
+spec:
+  scriptBundle:
+    name: standard-scripts
+    digest: sha256:<aggregate-digest>
+  checks:
+    - scriptKey: node-readiness.sh
+      backend: Pod
+      backendActiveDeadline: 10m
+---
+apiVersion: signal.unbounded-cloud.io/v1alpha1
+kind: CertificationProfile
+metadata:
+  name: standard-pool
+spec:
+  participants:
+    count: 2
+    selector:
+      matchLabels:
+        signal.unbounded-cloud.io/certification-pool: standard
+  suite:
+    name: standard
+```
 
 ## Starting one certification
 
@@ -120,7 +165,7 @@ kubectl label node <node-name> \
 
 Admission then:
 
-1. validates the Profile, every configured check, source ConfigMap immutability, and the pinned aggregate script digest;
+1. resolves the Profile's Suite and validates every configured check, source ConfigMap immutability, and the pinned aggregate script digest;
 2. selects the requesting Node plus any additional participants;
 3. atomically records the Run reservation name, participant Node UID, and
    `spec.unschedulable=true` on each participant;
@@ -144,6 +189,7 @@ record and verify the scheduled Node UID; it cannot mutate Nodes.
 The Run spec snapshots:
 
 - Profile name, UID, and generation;
+- Suite name, UID, and generation;
 - ordered participants with Node name and Node UID;
 - the immutable script bundle name, UID, and aggregate digest;
 - the ordered check suite snapshot;
@@ -211,7 +257,7 @@ kubectl patch certificationrun -n project-signal <run-name> \
 
 The evidence document includes:
 
-- Run, Profile, participant, script-bundle, and Workflow identities;
+- Run, Profile, Suite, participant, script-bundle, and Workflow identities;
 - the immutable check snapshots and script contents;
 - aggregate execution state, verdict, reason, phase, and timestamps;
 - each positional check's verdict and timing;
