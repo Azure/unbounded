@@ -38,6 +38,11 @@ struct Pending {
 
     result: Option<i32>,
 
+    /// Execution was attempted and is waiting for readiness (`EAGAIN`).
+    /// Until then the operation still needs a turn of its own once its
+    /// delay runs out, even when nothing else in the world changes.
+    attempted: bool,
+
     disk_crash: Rc<disk::PendingCrash>,
 }
 
@@ -97,6 +102,7 @@ impl SimDriver {
             error: None,
             hold: 0,
             result: None,
+            attempted: false,
         };
         match fault {
             Some(Fault::Errno(n)) => pending.error = Some(n),
@@ -151,7 +157,7 @@ impl SimDriver {
             || self
                 .pending
                 .values()
-                .any(|p| p.delay != 0 || p.result.is_some())
+                .any(|p| p.delay != 0 || p.result.is_some() || !p.attempted)
     }
 
     /// Advance every pending operation by one turn, in identifier order or,
@@ -328,6 +334,7 @@ impl Pending {
                 .as_ref()
                 .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
         {
+            self.attempted = true;
             return None;
         }
         let result = result.unwrap_or_else(|error| -error.raw_os_error().unwrap_or(libc::EIO));

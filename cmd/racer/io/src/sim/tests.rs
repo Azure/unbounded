@@ -1145,3 +1145,55 @@ mod network {
         assert_eq!(&bytes[..count], b"reply");
     }
 }
+
+mod driver {
+    use super::*;
+    use crate::ring::op::Op;
+
+    /// Run turns until the driver reports nothing runnable, returning the
+    /// completions in order. Panics if it never settles.
+    fn drain(driver: &mut SimDriver) -> Vec<(u64, i32, u32)> {
+        let now = std::time::Instant::now();
+        for _ in 0..64 {
+            if !driver.runnable() {
+                break;
+            }
+            driver.run_turn(now);
+        }
+        assert!(!driver.runnable(), "driver never settled");
+        std::iter::from_fn(|| driver.next_cqe()).collect()
+    }
+
+    /// An operation whose submission delay counts down to zero must stay
+    /// runnable until it executes; it used to stall with no result.
+    #[test]
+    fn delayed_operation_stays_runnable_until_it_executes() {
+        let os = SimOs::new();
+        os.inject("fsync", Fault::Delay(2)).unwrap();
+        let mut driver = SimDriver::new(os, 8);
+        let op = Op::Fsync {
+            fd: 9999,
+            datasync: false,
+        };
+        driver.push(1, &op).unwrap();
+        assert_eq!(drain(&mut driver), [(1, -libc::EBADF, 0)]);
+    }
+
+    /// Every seed completes every delayed operation.
+    #[test]
+    fn seeded_delays_never_stall() {
+        for seed in 0..64 {
+            let mut driver = SimDriver::new(SimOs::seeded(seed), 8);
+            for id in 1..=4 {
+                let op = Op::Fsync {
+                    fd: 9999,
+                    datasync: false,
+                };
+                driver.push(id, &op).unwrap();
+            }
+            let mut done: Vec<u64> = drain(&mut driver).iter().map(|c| c.0).collect();
+            done.sort_unstable();
+            assert_eq!(done, [1, 2, 3, 4], "seed {seed}");
+        }
+    }
+}
