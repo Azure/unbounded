@@ -76,12 +76,18 @@ uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
 #
 # The hot path crosses crate boundaries on every operation (racer ->
 # uring-runtime -> flow-control -> page-alloc -> http1), so cross-crate inlining
-# is load bearing. `panic = "abort"` is deliberately absent: `catch_unwind` is
-# relied upon by the worker group and the reactor completion loop.
+# is load bearing.
+#
+# A panic in a release build aborts the process: a panicking worker, reactor
+# callback or helper thread leaves shared state that cannot be trusted, so the
+# node restarts instead of limping on. The remaining `catch_unwind` sites only
+# take effect in test builds (Cargo ignores `panic` for test targets) and are
+# removed with the worker group rewrite.
 [profile.release]
 debug = 1
 lto = "thin"
 codegen-units = 1
+panic = "abort"
 
 # Full-page crypto and exhaustive topology checks dominate unoptimized test runs.
 # Keep debug assertions, overflow checks, and debug info while optimizing hot loops.
