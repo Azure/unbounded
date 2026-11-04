@@ -203,11 +203,17 @@ impl Client {
                 Err(HeadError::Protocol) => return Err(Failure::BadGateway),
             };
             let head = parse_head(&scratch.response[..head_len])?;
-            let meta = head.stat()?;
-            if !head.close && scratch.response.len() == head_len {
+            let result = head.stat();
+            // Well-formed error responses (404, 412, ...) leave the
+            // connection in a clean state; only protocol violations and
+            // upstream 5xx gateway failures are not reused.
+            if result != Err(Failure::BadGateway)
+                && !head.close
+                && scratch.response.len() == head_len
+            {
                 self.recycle(stream, expires);
             }
-            return Ok(meta);
+            return result;
         }
     }
 
@@ -973,6 +979,86 @@ mod tests {
         assert_eq!(a.idle_total.load(Ordering::Relaxed), 0);
         b.recycle(conn(), far());
         assert_eq!(b.idle_len(), 1);
+    }
+
+    async fn serve_one(listener: tokio::net::UnixListener, responses: Vec<&'static [u8]>) {
+        use tokio::io::AsyncReadExt;
+        let (mut s, _) = listener.accept().await.unwrap();
+        for r in responses {
+            let mut buf = Vec::new();
+            while !buf.ends_with(b"\r\n\r\n") {
+                let mut b = [0u8; 1];
+                if s.read(&mut b).await.unwrap() == 0 {
+                    return;
+                }
+                buf.push(b[0]);
+            }
+            s.write_all(r).await.unwrap();
+        }
+        // Keep the connection open until the client hangs up.
+        let mut b = [0u8; 1];
+        let _ = s.read(&mut b).await;
+    }
+
+    fn sock(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[tokio::test]
+    async fn stat_error_reuses_connection() {
+        let path = sock("se");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let not_found: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        let server = tokio::spawn(serve_one(listener, vec![not_found, not_found]));
+        let client = Client::new(path.clone(), 64);
+        let mut scratch = Scratch::default();
+        assert_eq!(
+            client.stat(&id(), &mut scratch).await,
+            Err(Failure::NotFound)
+        );
+        assert_eq!(client.idle_len(), 1);
+        // The listener accepts once, so the second stat must reuse it.
+        assert_eq!(
+            client.stat(&id(), &mut scratch).await,
+            Err(Failure::NotFound)
+        );
+        assert_eq!(client.idle_len(), 1);
+        drop(client);
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stat_bad_error_not_pooled() {
+        for (name, resp) in [
+            (
+                "sb1",
+                &b"HTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\nx"[..],
+            ),
+            (
+                "sb2",
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                "sb3",
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            ),
+        ] {
+            let path = sock(name);
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(serve_one(listener, vec![resp]));
+            let client = Client::new(path.clone(), 64);
+            let mut scratch = Scratch::default();
+            assert!(client.stat(&id(), &mut scratch).await.is_err(), "{name}");
+            assert_eq!(client.idle_len(), 0, "{name}");
+            drop(client);
+            server.await.unwrap();
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]
