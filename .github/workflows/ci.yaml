@@ -901,6 +901,11 @@ jobs:
         id: goversion
         run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
 
+      # Caches are exported only on push (main and release branches) so PR
+      # and merge-queue runs restore without churning the shared 10 GB
+      # Actions cache. An empty cache-to disables the export. The net
+      # controller and node builds use separate scopes because each export
+      # replaces the scope's cache index.
       - name: Build controller image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
@@ -913,8 +918,8 @@ jobs:
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
             GIT_COMMIT=${{ github.sha }}
           tags: ${{ env.REGISTRY }}/unbounded-net-controller:ci-${{ matrix.arch }}
-          cache-from: type=gha,scope=build-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-controller-${{ matrix.arch }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=net-controller-{0}', matrix.arch) || '' }}
           outputs: type=oci,dest=${{ runner.temp }}/net-controller.oci.tar,oci-mediatypes=true
           provenance: false
 
@@ -930,8 +935,8 @@ jobs:
             CNI_PLUGINS_VERSION=${{ env.CNI_PLUGINS_VERSION }}
             GIT_COMMIT=${{ github.sha }}
           tags: ${{ env.REGISTRY }}/unbounded-net-node:ci-${{ matrix.arch }}
-          cache-from: type=gha,scope=build-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          cache-from: type=gha,scope=net-node-${{ matrix.arch }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=net-node-{0}', matrix.arch) || '' }}
           outputs: type=oci,dest=${{ runner.temp }}/net-node.oci.tar,oci-mediatypes=true
           provenance: false
 
@@ -946,7 +951,7 @@ jobs:
           push: false
           tags: racer-loadgen:ci
           cache-from: type=gha,scope=racer-loadgen-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=racer-loadgen-${{ matrix.arch }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=racer-loadgen-{0}', matrix.arch) || '' }}
           provenance: false
 
       - name: Smoke-test racer-loadgen entrypoint
@@ -963,7 +968,7 @@ jobs:
           push: false
           tags: racer-object:ci
           cache-from: type=gha,scope=racer-object-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=racer-object-${{ matrix.arch }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=racer-object-{0}', matrix.arch) || '' }}
           provenance: false
 
       - name: Smoke-test racer-object entrypoint
@@ -1037,4 +1042,4 @@ jobs:
           push: false
           provenance: false
           cache-from: type=gha,scope=cross-platform-${{ matrix.name }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=cross-platform-${{ matrix.name }}-${{ matrix.arch }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=cross-platform-{0}-{1}', matrix.name, matrix.arch) || '' }}
