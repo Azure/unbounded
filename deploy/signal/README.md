@@ -3,8 +3,9 @@
 Project Signal performs one certification run for a newly joined Node or a
 small, explicitly selected group of Nodes. The controller snapshots the
 approved Profile, referenced Suite, and scripts, reserves and cordons every
-participant, runs the ordered check suite through Argo Workflows, persists one
-immutable evidence document, and cleans up all temporary workloads.
+participant, runs the Suite's resolved executable plan through Argo Workflows,
+persists one immutable evidence document, and cleans up all temporary
+workloads.
 
 Project Signal does not integrate with Kueue. Queue admission and repeatable
 fleet scheduling are intentionally deferred.
@@ -12,7 +13,7 @@ fleet scheduling are intentionally deferred.
 ## Components
 
 - `CertificationSuite` is the cluster-scoped executable policy: it selects an
-  immutable script bundle and defines the ordered checks.
+  immutable script bundle and defines a named ordered executable plan.
 - `CertificationProfile` is cluster-scoped admission policy: it defines
   participant selection and references one Suite.
 - `CertificationRun` is a namespaced, immutable execution snapshot.
@@ -66,14 +67,19 @@ snapshot. Profile and Suite authors cannot replace it.
 
 ## CertificationSuite contract
 
-A Suite contains the executable choices that vary between certification test
-plans:
+A Suite is a named ordered executable plan. It owns the script bundle and
+check definitions that admission resolves into a Run:
 
 | Field | Meaning |
 |---|---|
 | `spec.scriptBundle.name` | Immutable source ConfigMap containing the selected scripts |
 | `spec.scriptBundle.digest` | Aggregate SHA-256 digest of the selected script contents in check order |
-| `spec.checks` | Between 1 and 256 ordered checks; position defines the stable check ID starting at R01 |
+| `spec.checks` | Ordered executable plan; position defines the stable check ID starting at R01 |
+
+**Implementation and safety limit:** a Suite currently accepts between 1 and
+256 checks. This guardrail bounds Kubernetes object growth, CEL evaluation
+cost, generated Workflow size, and evidence size. It is not the product
+abstraction exposed to operators.
 
 The source ConfigMap must set `immutable: true` and must not use `binaryData`.
 The aggregate digest is derived by computing the algorithm-qualified SHA-256
@@ -192,7 +198,7 @@ The Run spec snapshots:
 - Suite name, UID, and generation;
 - ordered participants with Node name and Node UID;
 - the immutable script bundle name, UID, and aggregate digest;
-- the ordered check suite snapshot;
+- the resolved executable plan snapshot;
 - monotonic `cancel` and `release` actions.
 
 The controller derives the Workflow deadline from the immutable backend
