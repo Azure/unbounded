@@ -1137,26 +1137,7 @@ fn transient(outcome: ProbeOutcome) -> bool {
 /// nothing about other owners. The dataplane maps its errors without a core counterpart
 /// (replay, stale flight, batch mismatch) to `Internal` first.
 pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
-    match error {
-        Error::Unavailable | Error::Io | Error::Os(_) | Error::HopBudgetExhausted => {
-            Some(ProbeOutcome::Unreachable)
-        }
-        Error::Overloaded => Some(ProbeOutcome::Overloaded),
-        Error::Unauthorized
-        | Error::InvalidRequest
-        | Error::HeaderTooLarge
-        | Error::CorruptRecord
-        | Error::MissingKey
-        | Error::Internal => Some(ProbeOutcome::UnusableCopy),
-        Error::Cancelled
-        | Error::DeadlineExceeded
-        | Error::OriginRejected
-        | Error::OriginForbidden
-        | Error::NotFound
-        | Error::VersionUnavailable
-        | Error::IncompatibleMembership
-        | Error::InvalidConfiguration => None,
-    }
+    super::errors::disposition(error).probe
 }
 
 /// What to do after a peer answered `StaleMembership`.

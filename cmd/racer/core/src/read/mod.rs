@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 pub mod budget;
+pub mod errors;
 pub mod flight;
 pub mod hints;
 pub mod walk;
@@ -477,17 +478,7 @@ pub fn recoverable(error: Error) -> bool {
 /// Translate an expected acquisition failure into the peer response that
 /// reports it. `None` means the error is internal and must propagate.
 pub fn peer_error(error: Error) -> Option<ResponseKind> {
-    Some(match error {
-        Error::NotFound => ResponseKind::NotFound,
-        Error::VersionUnavailable => ResponseKind::VersionUnavailable,
-        Error::Overloaded => ResponseKind::Overloaded,
-        Error::OriginRejected => ResponseKind::OriginRejected,
-        Error::OriginForbidden => ResponseKind::OriginForbidden,
-        Error::Unavailable | Error::HopBudgetExhausted | Error::DeadlineExceeded => {
-            ResponseKind::Unavailable
-        }
-        _ => return None,
-    })
+    errors::disposition(error).peer
 }
 
 /// Optional writes may use half of the aggregate class budget, with a floor sufficient for one
