@@ -1,7 +1,7 @@
 //! Event-driven read path over real node logic.
 //!
 //! One client page read: dispatch to a worker, then the memory and disk indexes. A miss joins the
-//! worker's `PageFlights`; the leader drives `racer_core::read::walk::Fill`, routing each probe hop
+//! worker's `FlightTable`; the leader drives `racer_core::read::walk::Fill`, routing each probe hop
 //! by hop (`decide_hop`, `search_budget`/`relay`). The destination applies `serve_action`. Only a
 //! walk that ends with validated origin authority reaches origin; publication inserts into memory
 //! and applies the `persist` rule.
@@ -311,6 +311,8 @@ struct Fill {
     worker: u8,
     page: u64,
     leader: u64,
+    /// The leader's retained flight operation, completed when the fill ends.
+    operation: Option<racer_core::read::flight::Operation>,
     token: u64,
     /// The acquisition's decisions (`racer_core::read::walk::Fill`).
     core: racer_core::read::walk::Fill,
@@ -1576,7 +1578,7 @@ impl NodeWorld {
             Ok(FlightEvent::Failed(e)) | Err(e) => Err(e),
             Ok(FlightEvent::Lead) if waiting.budget.is_some() => {
                 // The previous leader's origin attempt was rejected for its credentials
-                // (`PageFlights::finish`); this waiter fills with its own budget, as production
+                // (`FlightTable::finish`); this waiter fills with its own budget, as production
                 // re-elects in `Flights::fail`.
                 self.metrics.incr("flight_reelected");
                 let mut waiting = waiting;
@@ -1902,6 +1904,7 @@ impl NodeWorld {
                 worker: w,
                 page,
                 leader,
+                operation: retained.ok(),
                 token,
                 core,
                 budget,
@@ -5086,7 +5089,12 @@ impl NodeWorld {
                 .flights
                 .refresh(&page_id, self.base + Duration::from_nanos(now), &mut wakes);
         }
-        let completed = worker.flights.complete_operation(&page_id, &mut wakes);
+        let completed = match fill.operation {
+            Some(operation) => worker
+                .flights
+                .complete_operation(&page_id, operation, &mut wakes),
+            None => Err(racer_core::read::Error::Internal),
+        };
         let active = worker.flights.is_leader(&page_id, fill.leader);
         if !active {
             self.metrics.incr("flight_stale_finishes");

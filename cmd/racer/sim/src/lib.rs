@@ -32,7 +32,7 @@ pub mod node {
     //! and clocks are simulated. Per node:
     //!
     //! - one [`state::Worker`] per worker (default 2), each with a phantom
-    //!   `Placement` (shared ranking memo), a `PageFlights` singleflight table, a
+    //!   `Placement` (shared ranking memo), a `FlightTable` singleflight table, a
     //!   `TickLru` memory index and its own `flow_control::Quotas`; pages map to
     //!   workers with `WorkerMap::select`;
     //! - one phantom `Paths` route cache (shared route memo), link circuits

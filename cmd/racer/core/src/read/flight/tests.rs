@@ -2,10 +2,11 @@
 //! expiry, caps, and admission for the sans-IO page flight table.
 
 // The attribute below also marks this file as test-only for tests/purity.rs.
+use super::table::Waiter;
 #[cfg(test)]
 use super::*;
 use racer_control_wire::CacheId;
-use racer_object_wire::model::{CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
+use racer_object_wire::model::{CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag};
 use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::rc::Rc;
@@ -51,9 +52,10 @@ fn terminal(error: Error) -> std::result::Result<Acquired, FailureKind> {
 /// A flight table at `now` with admission `admit`, and its wake list. Times
 /// are whole seconds after `now`; pages are numbers.
 struct Fx<R> {
-    t: PageFlights<u32, u32, Acquired, R, RandomState>,
+    t: FlightTable<PageId, u32, u32, Acquired, R, RandomState>,
     now: Instant,
     wakes: Vec<u64>,
+    ops: Vec<Operation>,
     admit: Box<dyn FnMut(Reserve) -> Result<R>>,
 }
 
@@ -68,9 +70,10 @@ fn limited(limits: FlightLimits) -> Fx<()> {
 fn admitted<R>(limits: FlightLimits, admit: Box<dyn FnMut(Reserve) -> Result<R>>) -> Fx<R> {
     let now = Instant::now();
     Fx {
-        t: PageFlights::new(limits, split, now, RandomState::new()),
+        t: FlightTable::new(limits, split, now, RandomState::new()),
         now,
         wakes: Vec::new(),
+        ops: Vec::new(),
         admit,
     }
 }
@@ -135,11 +138,19 @@ impl<R> Fx<R> {
     }
 
     fn retain(&mut self, p: u64, id: u64) -> Result<()> {
-        self.t.retain_operation(&page(p), id, &mut self.wakes)
+        let op = self.t.retain_operation(&page(p), id, &mut self.wakes)?;
+        self.ops.push(op);
+        Ok(())
     }
 
     fn complete(&mut self, p: u64) -> Result<()> {
-        self.t.complete_operation(&page(p), &mut self.wakes)
+        // Without a retained operation, complete a handle no table issued.
+        let op = self.ops.pop().unwrap_or(Operation {
+            fence: Fence(u64::MAX),
+            incarnation: 0,
+            id: 0,
+        });
+        self.t.complete_operation(&page(p), op, &mut self.wakes)
     }
 
     fn handover(&mut self, p: u64, id: u64) {

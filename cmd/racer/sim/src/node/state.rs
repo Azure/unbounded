@@ -24,7 +24,7 @@ use racer_core::cache::TickLru;
 use racer_core::liveness::{
     Detours, Rank0Watch, SILENCE_CAPACITY, Silence, WATCH_CAPACITY, WATCH_TTL,
 };
-use racer_core::read::flight::{FlightLimits, PageFlights, Reserve};
+use racer_core::read::flight::{FlightLimits, FlightTable, Reserve};
 use racer_core::read::hints::{
     HINT_CAPACITY, HINT_TTL, NOTICE_CAPACITY, OrphanNotices, SuccessorHints,
 };
@@ -41,7 +41,7 @@ use crate::engine::{Fixed, Nanos, mix};
 use crate::phantom::{Phantom, SharedRoutes};
 
 /// Flight results carry the published page length.
-pub type Flights = PageFlights<u32, u32, u32, SimCharge, Fixed>;
+pub type Flights = FlightTable<PageId, u32, u32, u32, SimCharge, Fixed>;
 
 fn split(len: u32) -> Published<u32, u32> {
     Published::Complete(len)
@@ -83,7 +83,7 @@ impl Worker {
                 config.placement_entries as usize,
                 phantom.clone(),
             )),
-            flights: PageFlights::new(limits, split, now, Fixed::default()),
+            flights: FlightTable::new(limits, split, now, Fixed::default()),
             memory: TickLru::default(),
             quotas: SimQuotas::new(SimPolicy::new(config, rejections.clone())),
         }
@@ -834,7 +834,7 @@ pub fn reserve(
         .map_err(read_error)
 }
 
-/// A flight table reservation (`PageFlights::join`), held by the waiter or flight it admits as
+/// A flight table reservation (`FlightTable::join`), held by the waiter or flight it admits as
 /// production `Flights` holds it.
 pub fn flight_charge(quotas: &SimQuotas, kind: Reserve) -> Result<SimCharge, Error> {
     let class = match kind {
