@@ -15,6 +15,7 @@ pub mod pin;
 pub mod ring;
 pub mod signal;
 pub mod sim;
+pub mod xthread;
 
 pub use cancel::{CancelToken, Deadline};
 pub use ctx::{Clock, Rng, WorkerCtx};
