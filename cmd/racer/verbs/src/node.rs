@@ -114,11 +114,14 @@ pub struct NodeConfig {
     pub selector: Box<LinkSelector>,
 
     /// Registered bytes per selected device, split into receive page
-    /// buffers. Every selected device must also support implicit on-demand
-    /// paging, which writes read caller memory through.
+    /// buffers. A selected window-mode device must also support implicit
+    /// on-demand paging, which writes read caller memory through;
+    /// registration-mode devices register write sources per write instead.
     pub pool_bytes: usize,
 
-    /// Page buffer length (Racer: `MAX_CIPHERTEXT` rounded up to 4 KiB).
+    /// Page buffer length (Racer: `MAX_CIPHERTEXT` rounded up to 2 MiB). In
+    /// registration mode it must be a multiple of 2 MiB, or activation fails
+    /// with [`Error::InvalidConfiguration`].
     pub buffer_len: usize,
 
     /// Max links (QPs) per device.
@@ -653,6 +656,18 @@ impl Owner {
         }
     }
 
+    /// Nonblocking file descriptors whose readiness means
+    /// [`Self::poll_budgeted`] has work: each device's completion channel
+    /// and, in registration mode, its connection manager channel. Changes
+    /// with activation. Timers and commands still need the driver waker and
+    /// periodic polls.
+    pub fn poll_fds(&self) -> Vec<std::os::fd::RawFd> {
+        self.devices
+            .values()
+            .flat_map(|device| device.device.fds())
+            .collect()
+    }
+
     /// Close from the owner side. Same as [`Client::close`].
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Release);
@@ -937,9 +952,16 @@ impl Owner {
                     .take()
                     .ok_or(Error::InvalidConfiguration)?,
             );
+            // Registration-mode grants round up to whole 2 MiB pages within
+            // their buffer, so buffers must be whole pages.
+            if device.mode == ffi::Mode::Registration
+                && !(config.buffer_len as u64).is_multiple_of(ffi::HUGE)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
             // Writes read caller memory in place; there is no copy path.
-            // Probe implicit ODP first so an unsupported device fails before
-            // the receive pool is allocated and registered.
+            // Probe implicit ODP first (window mode) so an unsupported device
+            // fails before the receive pool is allocated and registered.
             let implicit =
                 NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
             let region = NativeRegion::with_access(
@@ -1195,6 +1217,12 @@ impl Owner {
 
     /// Poll every live link and break the failed ones.
     fn progress(&mut self, now: Instant) {
+        // Completion channel and connection manager events first: the
+        // links below re-arm and poll their CQs.
+        for device in self.devices.values() {
+            device.device.progress();
+        }
+
         let mut broken = Vec::new();
 
         for (key, link) in &mut self.links {

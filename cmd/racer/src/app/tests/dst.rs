@@ -779,6 +779,9 @@ mod faults {
                         NativeFault::Reorder => "reorder",
                         NativeFault::DuplicateImmediate => "duplicate-immediate",
                         NativeFault::ByteLength(_) => "byte-length",
+                        NativeFault::AddressError => "address-error",
+                        NativeFault::RouteError => "route-error",
+                        NativeFault::Timeout => "timeout",
                     }
                 ))
                 .or_default() += 1;

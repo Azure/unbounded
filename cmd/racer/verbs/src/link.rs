@@ -467,6 +467,10 @@ pub(crate) struct Link {
 
     close_sent: bool,
 
+    /// The QP was ready (connected and, in registration mode, established
+    /// by the connection manager) at some poll.
+    established: bool,
+
     /// Ops were failed by `destroy`.
     failed: bool,
 }
@@ -543,6 +547,7 @@ impl Link {
             ready_since: None,
             last_used: now,
             close_sent: false,
+            established: false,
             failed: false,
         })
     }
@@ -884,7 +889,9 @@ impl Link {
 
     /// Reap completions, run timers, and post queued work.
     pub(crate) fn poll(&mut self, pool: &Pool, now: Instant) -> std::result::Result<(), Break> {
-        if matches!(self.phase, Phase::Created | Phase::Connecting)
+        self.established |= self.qp.ready();
+
+        if (matches!(self.phase, Phase::Created | Phase::Connecting) || !self.established)
             && now >= self.created + SETUP_TIMEOUT
         {
             return Err(Break::Timeout);
@@ -1263,7 +1270,9 @@ impl Link {
         let mut blocked = false;
         let mut i = 0;
 
-        while i < self.outbox.len() && self.qp.sends() < self.send_depth {
+        // A registration-mode QP connects asynchronously: nothing posts
+        // until the connection manager established it.
+        while i < self.outbox.len() && self.qp.ready() && self.qp.sends() < self.send_depth {
             let item = &self.outbox[i];
             let need = item.credits();
 
@@ -1301,6 +1310,7 @@ impl Link {
                     pool.region_of(buffer),
                     pool.offset(buffer),
                     entry.length,
+                    u64::from(self.limits.buffer_len),
                 )?;
                 entry.key = key;
                 self.track(wr(BIND, tag), InFlight::Bind(tag));

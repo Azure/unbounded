@@ -726,11 +726,12 @@ mod tests {
         let (pool, charge) = pool(&sim, 1);
         let buffer = pool.take(BufferState::Binding).unwrap();
         let page = pool.own(buffer, 4).unwrap();
+        let live = sim.live_resources();
         drop(pool);
         assert_eq!(page.bytes(), [0; 4]);
         drop(page);
         assert_eq!(charge.get(), 1, "leaked region keeps the guard");
-        assert_eq!(sim.live_resources(), 3, "device and both regions stay");
+        assert_eq!(sim.live_resources(), live, "the device and regions stay");
     }
 
     #[test]
@@ -749,9 +750,10 @@ mod tests {
             }
             assert_eq!(pool.shared().state(0), state);
             assert!(pool.outstanding() == 0 && !pool.idle());
+            let live = sim.live_resources();
             drop(pool);
             assert_eq!(charge.get(), 1);
-            assert_eq!(sim.live_resources(), 3);
+            assert_eq!(sim.live_resources(), live);
         }
     }
 

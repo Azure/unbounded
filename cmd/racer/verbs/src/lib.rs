@@ -4,8 +4,10 @@
 //! All RDMA (libibverbs) calls run on the native thread. The I/O thread never
 //! touches RDMA. It talks to the native thread through bounded command queues.
 //!
-//! This crate spawns no threads and runs no executor. Time and randomness come
-//! from the current `uring-runtime` environment.
+//! This crate spawns no threads and runs no executor, and neither does its C
+//! adapter: the RDMA connection manager is an event-driven state machine the
+//! owner advances when polled. Time and randomness come from the current
+//! `uring-runtime` environment.
 //!
 //! # Basics
 //!
@@ -28,13 +30,23 @@
 //!
 //! # Direct sends
 //!
-//! Each device gets one implicit on-demand paging (ODP) MR over the whole
-//! address space. A [`Source`] write posts the caller's memory directly as
-//! its SGE; the owner holds the source `Arc` until the send completion, or
-//! until the QP is destroyed if the link breaks, and leaks it if destroy
-//! fails. Page buffers only receive. Activation fails with
-//! [`Error::Unavailable`] if a selected device lacks implicit ODP, and
-//! releases everything it built.
+//! A [`Source`] write posts the caller's memory directly; the owner holds the
+//! source `Arc` until the send completion, or until the QP is destroyed if
+//! the link breaks, and leaks it if destroy fails. Page buffers only receive.
+//!
+//! - Window mode (devices with memory windows, such as mlx5): each device
+//!   gets one implicit on-demand paging (ODP) MR over the whole address
+//!   space, and writes use it as their SGE. Activation fails with
+//!   [`Error::Unavailable`] if a selected device lacks implicit ODP, and
+//!   releases everything it built.
+//! - Registration mode (devices without memory windows or ODP, such as Azure
+//!   MANA): no ODP is needed. Each write registers its source while in
+//!   flight, each grant registers its buffer, and QPs connect through the
+//!   RDMA connection manager. [`NodeConfig::buffer_len`] must be a multiple
+//!   of 2 MiB.
+//!
+//! [`Owner::poll_fds`] returns the nonblocking completion and connection
+//! manager channel fds, for an owner thread that waits on them.
 //!
 //! # Stopping is the only fence
 //!
@@ -58,7 +70,9 @@
 //!
 //! # Limits
 //!
-//! - At most 64 ports. Uses GID index 0.
+//! - At most 64 ports. Window mode uses GID index 0; registration mode uses
+//!   the port's IPv4-mapped RoCE GID, whose address the connection manager
+//!   listens on (port `RACER_RDMA_CM_PORT`, else 18515).
 //! - Poll budgets count steps, not time. A slow NIC call blocks the thread.
 //! - The caller owns auth, topology, admission sizing, retries, and timeouts.
 //!

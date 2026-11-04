@@ -11,9 +11,12 @@ HTTP exchange sets up the link independently of page requests. A page request
 names a receive grant, and the response reports either the RDMA completion or
 an HTTP body. There is no per-page QP setup or extra HTTP control round trip.
 
-RDMA sends read immutable ciphertext directly through an implicit on-demand
-paging (ODP) region. ODP is required for RDMA activation. There is no staged
-RDMA send path or switch to enable one. Ordinary HTTP remains the transport
+RDMA sends read immutable ciphertext in place. On window-mode devices (mlx5)
+they go through an implicit on-demand paging (ODP) region, and ODP is
+required for activation. On registration-mode devices (MANA, no memory
+windows and no ODP) each write registers its source while it is in flight,
+and no ODP is needed; see [racer-verbs.md](racer-verbs.md), "Device modes".
+There is no staged RDMA send path or switch to enable one. Ordinary HTTP remains the transport
 for unavailable links and ineligible hops, not a second RDMA implementation.
 
 The main source files are:
@@ -30,7 +33,11 @@ The main source files are:
 `rdma_verbs::node` creates one `Client` per I/O worker and one `OwnerPort`.
 The owner runs on the crypto thread paired with the first I/O worker, through
 `WithOwner`, Racer's `WithNative<PageCryptoEngine, Owner>` alias. No separate
-RDMA thread is created. Only this owner posts verbs operations.
+RDMA thread is created, and the verbs adapter spawns none: in registration
+mode the RDMA connection manager is an event-driven state machine the owner
+advances on each poll, reading nonblocking event channels. `Owner::poll_fds`
+exposes the completion and connection manager channel fds for a future
+dedicated owner thread. Only this owner posts verbs operations.
 
 Each worker has a `Links` facade and a bounded command queue. Results return
 through one-shot `Op` cells. The owner publishes link snapshots; a worker that
@@ -40,9 +47,11 @@ cannot read a snapshot treats the link as unavailable for that request.
 Activation selects rails once for the node, using the owner's NUMA location.
 The registered-memory budget is split across the funded devices and rounded
 down to whole receive buffers on each device. Each device needs at least one
-receive buffer. Sends do not consume these buffers. Every selected device
-must support implicit ODP; failed activation does not enable a copied-send
-mode. Discovery or activation failure leaves ordinary HTTP available.
+receive buffer. Sends do not consume these buffers. Every selected
+window-mode device must support implicit ODP; registration-mode devices need
+none, but need a 2 MiB multiple buffer length (Racer's is). Failed activation
+does not enable a copied-send mode. Discovery or activation failure leaves
+ordinary HTTP available.
 
 Non-owner workers read the shared active rails rather than opening their own
 devices. Only the owner initiates activation or closes native resources.
@@ -226,8 +235,8 @@ registered-page retention, and client delivery can still copy data. See
 - `RACER_REGISTERED_BYTES` is one node-wide receive-pool budget. When unset,
   the total is 96 MiB times the final I/O worker count. An explicit value is
   the node total, not divided into separate worker pools.
-- Each receive buffer is `MAX_CIPHERTEXT` rounded up to 4 KiB, currently
-  16 MiB plus 4 KiB. Rail funding requires at least one such buffer per device.
+- Each receive buffer is `MAX_CIPHERTEXT` rounded up to 2 MiB, currently
+  18 MiB. Rail funding requires at least one such buffer per device.
   Unfunded rails are not activated.
 - `RACER_NEIGHBOR_CONNECTIONS_PER_WORKER` also sets the per-link grant limit, clamped
   to 1..4096. The two nodes use the smaller advertised limit for issued grants.
@@ -237,7 +246,8 @@ registered-page retention, and client delivery can still copy data. See
   `RACER_RDMA_ZERO_COPY` setting or broad remote-write MR escape hatch.
 
 These are admission and resource limits, not a process RSS limit. Implicit
-ODP source mappings do not replace receive-pool or ciphertext accounting.
+ODP source mappings and registration-mode source registrations do not
+replace receive-pool or ciphertext accounting.
 
 ## Validation
 
@@ -245,10 +255,12 @@ The setup codec and peer-wire tests cover exact encodings, signed fields,
 binding, replay, and malformed input. Link and transport tests cover both
 directions, setup races, stale guards and epochs, HTTP outcomes, bad completion
 metadata, cancellation, timeouts, and drain. Verbs tests cover required ODP,
-direct-source lifetimes, credits, revocation, faults, and failed destruction.
+registration mode and its connection manager (both device profiles run the
+link contract tests), direct-source lifetimes, credits, revocation, faults,
+and failed destruction.
 Memory, read, and store tests cover copy-out sharing and admission failure.
 
 Simulation and the native fault adapter do not model hardware ODP page faults
 or prove throughput. Validate bidirectional transfers, peer restart, forced
-link breaks, HTTP recovery, and provider memory-window behavior on target
-hardware. Mixed protocol versions are not supported; coordinate upgrades.
+link breaks, HTTP recovery, provider memory-window behavior, and
+registration-mode connection manager behavior on target hardware. Mixed protocol versions are not supported; coordinate upgrades.
