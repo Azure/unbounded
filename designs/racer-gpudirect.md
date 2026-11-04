@@ -175,10 +175,10 @@ A new crate, `cmd/racer/gpu`, follows the `verbs` pattern:
 
 - A small C shim, `libracer_gpu_cuda.so.1`, wraps the CUDA driver API, NVML and
   cuFile. Racer loads it with `dlopen` and checks `racer_gpu_abi()`.
-- Calls run on the GPU helper thread, never on I/O threads. The one
-  exception is cuFile reads, which run on four reader threads (below). The
+- Calls run on the GPU coordinator thread and the per-GPU executor threads,
+  never on I/O threads; cuFile reads run on four reader threads (below). The
   `racer-gpu` handles are `Send` and `Sync` and the shim is thread safe, so
-  the planned per-GPU executors (see "Executor model") can share them.
+  these threads share them (see "Executor model").
 - A simulation backend backs tests without GPUs. It can inject failures.
 - The Cargo feature is `cuda`. Without it, GPU mode is unavailable.
 
@@ -283,8 +283,8 @@ above:
   `racer_gpu_decrypt` (72 bytes, a reserved word at offset 44) and from the
   verdict (8 bytes), and adds events, pinned host memory and the RDMA flush
   (see "Executor model").
-- At startup the helper runs a zero-length decrypt on each GPU. A GPU whose
-  shim has no decrypt kernels, or a staging cap smaller than the two scratch
+- At startup the coordinator runs a zero-length decrypt on each GPU. A GPU whose
+  shim has no decrypt kernels, or a staging cap smaller than its scratch
   slots, gets plaintext pages only.
 - When the GPU rejects a page (tag mismatch), the read fails without a page frame
   and the page's owner drops that copy from memory and disk, as it does after a
@@ -401,24 +401,24 @@ result for each pair. `RACER_GPU_PEER=auto` (default) does this;
 `RACER_GPU_PEER=off` never enables peer access. `GpuHelper::peers(dst, src)`
 reports whether a pair has a working peer path.
 
-**Copy paths.** When a request decrypts shared ciphertext (`write_sealed`):
+**Copy paths.** When a request decrypts shared ciphertext (`queue_sealed`):
 
 - Same GPU: decrypt in place.
-- Other GPU with a peer path: `cuMemcpyPeerAsync` into the target GPU's
-  scratch slot, then decrypt.
+- Other GPU with a peer path: `cuMemcpyPeerAsync` into the ciphertext slot of
+  the page's scratch pair, then decrypt.
 - Other GPU without a peer path: copy through host memory (host bounce).
 
 If a peer copy fails, that direction of the pair is turned off until restart
 and the page takes the host bounce. Only the failed direction is turned off.
-After any failed `write_sealed`, the helper synchronizes the request stream
-(and the source GPU's utility stream). If the source cannot be fenced, its
-slot is never reused (`state=ciphertext-quarantined`). If the request stream
-cannot be fenced, queued work may still write the destination GPU's scratch
-slots, so that GPU is tainted (`state=scratch-tainted`): the helper keeps the
-stream alive, even past its request's release, and refuses later sealed
-writes on that GPU with `Unavailable` before touching scratch. Each refused
-write retries the fence; once every held stream synchronizes, the taint
-clears (`state=scratch-fenced`).
+After any failed page, the executor synchronizes the page's stream (and the
+source GPU's utility stream). If the source cannot be fenced, its slot is
+never reused (`state=ciphertext-quarantined`). If the page's stream cannot be
+fenced, queued work may still write its scratch pair, so that GPU is tainted
+(`state=scratch-tainted`): the executor sets the stream and pair aside, even
+past the request's release, and refuses later sealed pages on that GPU with
+`Unavailable` before touching scratch. Each refused page retries the fence;
+once every set-aside stream synchronizes, the taint clears
+(`state=scratch-fenced`) and the pairs come back.
 Lookups only share across GPUs that have a peer path. A request whose GPU
 cannot reach any fetch in flight leads a separate fetch, which requests on
 its own GPU, or on GPUs that can reach it, join.
@@ -457,46 +457,62 @@ copies and bytes, peer copy failures, and host bounces.
 - Ciphertext from host memory (memory cache, HTTP, host RDMA) is still copied
   to each GPU separately. Uploading it once and fanning out to other GPUs is
   future work.
-- All GPU work, except cuFile reads, still runs on the single `racer-gpu`
-  helper thread, so peer copies and decrypts for all GPUs are serial. See
-  "Executor model" for what is in place and what remains.
+- Each GPU runs at most four pages at once (one per stream). Whether more
+  streams, or more than one page per request in flight, pay off needs
+  measurement on hardware.
 
 ### Executor model
 
-What exists now:
-
-- **Events and fences.** `Stream::fence` records a CUDA event and moves the
-  stream's holds (buffers, host sources) into a `Fence`, which releases them
-  when `Fence::poll` (`cuEventQuery`, never blocks) or `Fence::wait` sees the
-  work complete. The verdict of a decrypt is readable once a fence after it
-  completes, not only after a stream sync (the shim records an internal event
-  after the verdict copy). `Stream::wait_for` (`cuStreamWaitEvent`) orders a
-  stream after a fence on another GPU.
-- **Pinned host staging.** Each GPU has one reused page-locked slot
+- **Threads.** A coordinator thread (`racer-gpu`) loads the backend, finds
+  GPUs, imports client allocations, runs cuFile registration and hands reads
+  to the cuFile reader threads, and allocates landing buffers. Each usable
+  GPU gets an executor thread (`racer-gpu-N`) that runs the page jobs of
+  requests imported on it. Every GPU thread calls `Gpu::enter_thread`, so
+  tests run them all on the simulated backend.
+- **Streams in flight.** An executor keeps up to four pages in flight
+  (`STREAMS` in `src/gpu.rs`), each on its own stream. A stream has at most
+  one decrypt outstanding, as the shim requires. A request has at most one
+  page running, so its pages land in order.
+- **Events and fences.** `Stream::fence_in` records an event from the GPU's
+  `EventPool` (no `cuEventCreate` per fence) and moves the stream's holds
+  (buffers, host sources) into a `Fence`, which releases them when
+  `Fence::poll` (`cuEventQuery`, never blocks) sees the work complete. The
+  executor completes pages by polling fences and never synchronizes a stream
+  on the success path. The verdict is read once the decrypt's fence
+  completes. A failed page synchronizes its stream; if that fails, the
+  stream and its scratch pair are set aside and the GPU refuses sealed
+  pages until they synchronize.
+- **Waiting.** With nothing in flight the executor sleeps on its queue's
+  condition variable. With fences pending it naps between polls, from 20 us
+  doubling to 1 ms, and a new page wakes it at once.
+- **Bounded queue.** Each executor accepts at most `queue_depth` page jobs,
+  queued or running (128 by default). More are refused with `Overloaded`
+  and counted in `racer_gpu_executor_queue_full_total`.
+- **Scratch pairs.** The first slots of each staging buffer are scratch
+  pairs (ciphertext, partial plaintext), one per stream when staging holds
+  at least 32 slots per pair, at least one. A page takes a pair only when it
+  copies host or other-GPU ciphertext in or decrypts part of a page; a page
+  that needs a pair while none is free waits, and later pages may pass it.
+  A partial-range decrypt stays two-phase: the copy out of scratch is queued
+  only after its verdict passed.
+- **Pinned host staging.** Each stream has one reused page-locked slot
   (`cuMemHostAlloc`, portable). Host ciphertext and plaintext are copied into
-  it and DMAed to the GPU; a busy or missing slot falls back to the pageable
-  copy. The cross-GPU bounce copies device to the destination's pinned slot
-  on the source GPU's utility stream, and the request stream waits on that
-  fence, so it allocates nothing per page and does not wait on the host in
-  between. `Context::register_host` (`cuMemHostRegister`) exists for
-  long-lived pool slabs, so their pages can be DMAed without the copy into the
-  pinned slot; nothing registers slabs yet.
+  it and DMAed to the GPU; a missing slot falls back to the pageable copy.
+  `Context::register_host` (`cuMemHostRegister`) exists for long-lived pool
+  slabs; nothing registers slabs yet.
+- **Cross-GPU copies.** A peer copy is queued on the page's stream with no
+  host wait; a failed queue call turns the pair off and the page bounces. A
+  bounce copies device to the stream's pinned slot on the source GPU's
+  utility stream, records a fence from the source GPU's pool, and the page's
+  stream waits on it (`Stream::wait_for`, `cuStreamWaitEvent`) before
+  copying in. The page keeps that fence until it is answered.
+- **Shutdown.** When the helper is dropped, the coordinator closes every
+  executor queue; each executor answers its queued and running pages, then
+  releases its imports, streams and events before the coordinator joins the
+  cuFile readers.
 - **Landing registry.** GPU landing state (configuration, per-round slices and
   slot counts, exhaustion counts) lives in `gpu_landing::GpuLandingRegistry`.
   The RDMA link node holds a handle and drives it; GPU telemetry reads it.
-
-What remains (target):
-
-- One executor thread per GPU instead of the single helper, each keeping
-  several request streams in flight and completing jobs by polling their
-  fences, with a bounded job queue per GPU (`try_send`, overload on full).
-- A scratch-slot allocator per GPU so several streams can each hold the
-  ciphertext and partial-plaintext scratch they need; a job that needs
-  scratch waits for a free pair. A partial-range decrypt stays two-phase: the
-  copy out of scratch is queued only after its verdict passed, so a failed
-  page never exposes stale scratch bytes.
-- Peer copies queued on the destination executor after `wait_for` on the
-  source's fence instead of a host sync.
 
 ### Disk layout v2
 
