@@ -4845,7 +4845,7 @@ pub(crate) mod tests {
         }
 
         /// Estimated largest catalog: key bundles are capped at
-        /// `racer_control_wire::MAX_BUNDLE_BYTES` (512 KiB), which holds
+        /// `racer_control_wire::MAX_BUNDLE_BYTES` (768 KiB), which holds
         /// about 624 caches' keys.
         const MAX_METRIC_CACHES: usize = 624;
 

@@ -1,6 +1,5 @@
 //! Minimal real TLS controller fixture: bearer enrollment, then mTLS publication.
 use super::*;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_control_wire::{
     self as wire, CacheDefinition, CacheId, ClusterId, Member, MembershipVersion, NodeId,
     canonical_socket_paths,
@@ -58,13 +57,38 @@ impl Control {
         fs::write(root.join("trust.pem"), ca.pem()).unwrap();
         fs::write(root.join("token"), "fixture.token").unwrap();
         // Runtime-generated test material, distinct for the two encryption purposes.
-        let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
-            let mut material = [0; 32];
-            getrandom::getrandom(&mut material).unwrap();
-            serde_json::json!({"cache": cache, "id": STANDARD.encode(wire::KeyId::from_generation(1, id as u32).unwrap().0), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
-        })).collect();
-        let bundle = serde_json::json!({"schema_version": racer_control_wire::SCHEMA_VERSION, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
-        let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
+        let keys: Vec<_> = caches
+            .iter()
+            .flat_map(|(cache, _)| {
+                [
+                    (wire::CacheKeyPurpose::Page, 7u32),
+                    (wire::CacheKeyPurpose::OriginCredentials, 8u32),
+                ]
+                .into_iter()
+                .map(move |(purpose, id)| {
+                    let mut material = zeroize::Zeroizing::new([0; 32]);
+                    getrandom::getrandom(&mut *material).unwrap();
+                    wire::CacheEncryptionKey::new(
+                        wire::CacheKeyRef {
+                            cache: CacheId(cache.clone()),
+                            id: wire::KeyId::from_generation(1, id).unwrap(),
+                            purpose,
+                        },
+                        wire::CacheKeyState::Active,
+                        material,
+                    )
+                })
+            })
+            .collect();
+        let bundle = wire::encode_bundle(&wire::KeyringBundle {
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
+            cluster: ClusterId(CLUSTER.into()),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: vec![ca.der().to_vec()],
+            cache_keys: keys,
+        })
+        .unwrap();
+        let bundle_bytes = bundle.clone();
         let publication = Arc::new(Mutex::new(
             wire::Publication {
                 pools: Vec::new(),
@@ -157,7 +181,7 @@ impl Control {
                     if head.starts_with("GET /v1/keyring?after=1 ") {
                         (204, Vec::new())
                     } else {
-                        (200, serde_json::to_vec(&bundle).unwrap())
+                        (200, bundle.to_vec())
                     }
                 } else if head.starts_with("POST /v1/bootstrap ") {
                     let binding = fields["authorization"]

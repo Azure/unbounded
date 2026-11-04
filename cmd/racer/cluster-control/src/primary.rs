@@ -472,10 +472,12 @@ async fn read_state(shared: &Shared) -> Result<(Value, Option<StateRecord>), Sta
         return Err(StateError::Invalid);
     }
     let data = match secret["data"][annotations::STATE_KEY].as_str() {
-        Some(s) => Some(STANDARD.decode(s).map_err(|_| StateError::Invalid)?),
+        Some(s) => Some(zeroize::Zeroizing::new(
+            STANDARD.decode(s).map_err(|_| StateError::Invalid)?,
+        )),
         None => None,
     };
-    let record = state::decode(&uid, initialized, data.as_deref())?;
+    let record = state::decode(&uid, initialized, data.as_deref().map(Vec::as_slice))?;
     // Never build on state older than what this process already accepted.
     if let Some(hw) = &shared.serving.borrow().high_water {
         match &record {
@@ -629,10 +631,13 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             return Err(StateError::StaleTerm);
         }
         let encoded = state::encode(&next)?;
+        let state_b64 = zeroize::Zeroizing::new(STANDARD.encode(&*encoded));
         let mut body = secret.clone();
+        // TODO(phase 7b): the JSON body still copies the encoded record into
+        // non-zeroizing strings; the racer-io shell writes it directly.
         body["data"] = json!({
             annotations::CLUSTER_KEY: STANDARD.encode(cluster.as_bytes()),
-            annotations::STATE_KEY: STANDARD.encode(&encoded),
+            annotations::STATE_KEY: state_b64.as_str(),
         });
         if !body["metadata"]["annotations"].is_object() {
             body["metadata"]["annotations"] = json!({});

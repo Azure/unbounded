@@ -10,6 +10,7 @@ use super::keyring::Durable;
 use crate::limits;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /// Record schema version.
 pub const VERSION: u32 = 1;
@@ -114,13 +115,33 @@ pub fn decode(
     Ok(Some(r))
 }
 
-/// Encode a record for the Secret.
-pub fn encode(r: &StateRecord) -> Result<Vec<u8>, StateError> {
-    let b = serde_json::to_vec(r).map_err(|_| StateError::Invalid)?;
-    if b.len() > MAX_BYTES {
-        return Err(StateError::TooLarge);
+/// Encode a record for the Secret. The output holds key material and is
+/// wiped on drop; it is written into a buffer reserved up front so no partial
+/// copy is freed unwiped.
+pub fn encode(r: &StateRecord) -> Result<Zeroizing<Vec<u8>>, StateError> {
+    struct Bounded(Zeroizing<Vec<u8>>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_BYTES - self.0.len() {
+                return Err(std::io::ErrorKind::FileTooLarge.into());
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    Ok(b)
+    let mut out = Bounded(Zeroizing::new(Vec::with_capacity(MAX_BYTES)));
+    serde_json::to_writer(&mut out, r).map_err(|e| {
+        if e.is_io() {
+            StateError::TooLarge
+        } else {
+            StateError::Invalid
+        }
+    })?;
+    Ok(out.0)
 }
 
 /// Check that `term` may write over `current`.

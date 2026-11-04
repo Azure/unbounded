@@ -4,9 +4,7 @@ use peer_wire::{
     control::{Binding, Phase},
     decode_deadline, encode_deadline,
 };
-use racer_control_wire::{
-    BundleGeneration, ClusterId, KeyringBundle, NodeId, RailId, SCHEMA_VERSION,
-};
+use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle, NodeId, RailId};
 use racer_crypto::identity::{
     Certificates, KeyEpochs, Keyring,
     test_util::{ca, issue},
@@ -53,7 +51,7 @@ fn signatures() -> Signatures {
         )),
     ));
     keys.install(KeyringBundle {
-        schema_version: SCHEMA_VERSION,
+        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
         cluster: cluster.clone(),
         generation: BundleGeneration(1),
         peer_trust_roots: roots,

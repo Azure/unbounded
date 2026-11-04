@@ -333,18 +333,26 @@ impl Codec for BundleCodec {
         Err(Error::InvalidRequest)
     }
 
+    /// Hash the canonical content directly: sorted roots and the compact
+    /// key table (canonical by construction), without re-encoding and
+    /// re-validating the whole JSON bundle on each poll.
     fn digest(&self, document: &Self::Document) -> Result<String> {
-        let mut canonical = document.clone();
-        canonical.peer_trust_roots.sort();
-        canonical.cache_keys.sort_by(|a, b| {
-            (&a.key.cache, a.key.purpose as u8, a.key.id.0).cmp(&(
-                &b.key.cache,
-                b.key.purpose as u8,
-                b.key.id.0,
-            ))
-        });
-        let bytes = Zeroizing::new(wire::encode_bundle(&canonical)?);
-        Ok(format!("{:x}", Sha256::digest(&*bytes)))
+        let mut hash = Sha256::new();
+        hash.update(b"racer/keyring/digest/v3\0");
+        hash.update(document.schema_version.to_be_bytes());
+        hash.update((document.cluster.0.len() as u64).to_be_bytes());
+        hash.update(document.cluster.0.as_bytes());
+        hash.update(document.generation.0.to_be_bytes());
+        let mut roots: Vec<_> = document.peer_trust_roots.iter().collect();
+        roots.sort();
+        hash.update((roots.len() as u64).to_be_bytes());
+        for root in roots {
+            hash.update((root.len() as u64).to_be_bytes());
+            hash.update(root);
+        }
+        let keys = wire::encode_cache_keys(&document.cache_keys)?;
+        hash.update(&*keys);
+        Ok(format!("{:x}", hash.finalize()))
     }
 }
 

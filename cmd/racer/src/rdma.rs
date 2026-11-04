@@ -490,7 +490,6 @@ pub(crate) mod tests {
             use racer_control_wire::BundleGeneration;
             use racer_control_wire::ClusterId;
             use racer_control_wire::KeyringBundle;
-            use racer_control_wire::SCHEMA_VERSION;
             use racer_crypto::identity::Certificates;
             use racer_crypto::identity::KeyEpochs;
             use racer_crypto::identity::Keyring;
@@ -515,7 +514,7 @@ pub(crate) mod tests {
                 )),
             ));
             keys.install(KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots,

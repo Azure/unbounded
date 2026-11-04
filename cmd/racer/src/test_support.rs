@@ -805,7 +805,6 @@ pub(crate) mod security {
     use racer_control_wire::ClusterId;
     use racer_control_wire::KeyringBundle;
     use racer_control_wire::NodeId;
-    use racer_control_wire::SCHEMA_VERSION;
     use racer_crypto::identity::Certificates;
     use racer_crypto::identity::KeyEpochs;
     use racer_crypto::identity::KeyLease;
@@ -886,7 +885,7 @@ pub(crate) mod security {
     }
     pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
         KeyringBundle {
-            schema_version: SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(generation),
             peer_trust_roots: roots,
@@ -981,7 +980,7 @@ pub(crate) mod security {
                     )),
                 ));
                 keys.install(KeyringBundle {
-                    schema_version: SCHEMA_VERSION,
+                    schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                     cluster: cluster.clone(),
                     generation: BundleGeneration(1),
                     peer_trust_roots: roots.clone(),

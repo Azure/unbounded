@@ -32,7 +32,6 @@ use racer_control_wire::CacheKeyPurpose;
 use racer_control_wire::CacheKeyRef;
 use racer_control_wire::CacheKeyState;
 use racer_control_wire::KeyringBundle;
-use racer_control_wire::SCHEMA_VERSION;
 use racer_control_wire::{CacheId, ClusterId, NodeId};
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::Keyring;
@@ -503,7 +502,7 @@ fn interop_keys() -> racer_crypto::identity::Keyring {
         .self_signed(&rcgen::KeyPair::generate().unwrap())
         .unwrap();
     keys.install(KeyringBundle {
-        schema_version: SCHEMA_VERSION,
+        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
         cluster,
         generation: BundleGeneration(1),
         peer_trust_roots: vec![ca.der().to_vec()],

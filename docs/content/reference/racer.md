@@ -1184,6 +1184,12 @@ operator creates it only for a new installation; it does not generate keys or
 reconcile the runtime's state back to an empty manifest. Back it up securely.
 Never log its data: it contains cache encryption keys.
 
+Each cache has one active page key. Key rotation keeps the replaced page key as
+a decrypt-only key, so cached pages stay readable for six more rotations (seven
+readable page keys in total) before their key is dropped. Origin credential keys
+are replaced without a decrypt-only history. Upgrading to the keyring bundle
+format version 3 needs a cold restart of every seat and node.
+
 Seats publish only committed state. A primary change preserves publication and
 keyring counters. Losing serving authority withdraws the seat rather than
 allowing an isolated former primary to keep writing. API access is needed for
@@ -1202,7 +1208,7 @@ its EndpointSlice and the injector's CA bundle. NetworkPolicy behavior depends
 on the CNI, especially with host-network Pods.
 
 The control protocol keeps its existing byte limits: 64 KiB for bootstrap,
-512 KiB for keyring bundles, and 64 MiB for publications. These are document
+768 KiB for keyring bundles, and 64 MiB for publications. These are document
 limits, not process memory limits.
 
 ### Operator-managed dataplane

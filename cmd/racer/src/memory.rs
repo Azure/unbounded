@@ -3687,9 +3687,13 @@ pub(crate) mod tests {
                 BufferPool::new(admission.clone()),
                 for_caches(keys.clone(), caches.clone()),
             );
-            use racer_control_wire::CacheKeyPurpose;
-            let mut previous: Vec<racer_control_wire::CacheKeyRef> = Vec::new();
-            for generation in 2u64..=6 {
+            use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyState};
+            // The authority default: the active page key plus RETAINED - 1
+            // decrypt keys stay readable. Pages of a key stay readable for
+            // RETAINED - 1 rotations and become unreadable after the next.
+            const RETAINED: usize = 7;
+            let mut history: Vec<Vec<CacheEncryptionKey>> = Vec::new();
+            for generation in 2u64..=(RETAINED as u64 + 3) {
                 let mut next = rotation_bundle(generation, roots.clone());
                 let templates = std::mem::take(&mut next.cache_keys);
                 for cache in 0u64..356 {
@@ -3703,13 +3707,30 @@ pub(crate) mod tests {
                         next.cache_keys.push(key);
                     }
                 }
-                keys.install(next.clone()).unwrap();
-                for key in previous {
-                    if key.purpose == CacheKeyPurpose::Page {
-                        assert!(!memory.availability.page(&key.cache, key.id));
+                let pages: Vec<_> = next
+                    .cache_keys
+                    .iter()
+                    .filter(|key| key.key.purpose == CacheKeyPurpose::Page)
+                    .cloned()
+                    .collect();
+                for old in history.iter().rev().take(RETAINED - 1) {
+                    for key in old {
+                        let mut key = key.clone();
+                        key.state = CacheKeyState::Decrypt;
+                        next.cache_keys.push(key);
                     }
                 }
-                previous = next.cache_keys.iter().map(|key| key.key.clone()).collect();
+                keys.install(next.clone()).unwrap();
+                for (age, old) in history.iter().rev().enumerate() {
+                    for key in old {
+                        assert_eq!(
+                            memory.availability.page(&key.key.cache, key.key.id),
+                            age < RETAINED - 1,
+                            "generation {generation} age {age}"
+                        );
+                    }
+                }
+                history.push(pages);
             }
             assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);

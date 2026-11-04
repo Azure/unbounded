@@ -402,7 +402,7 @@ impl ControlFixture {
         std::fs::write(&config.service_account_token, b"fixture.token").unwrap();
         let mut fixture = Self {
             bundle: Arc::new(Mutex::new(wire::KeyringBundle {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster: config.cluster.clone(),
                 generation: wire::BundleGeneration(1),
                 peer_trust_roots: vec![ca.der().to_vec()],
@@ -1672,7 +1672,7 @@ fn snapshot_refresh_purges_cache_entering_passthrough() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: wire::SCHEMA_VERSION,
+            schema_version: wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(1),
             peer_trust_roots: roots,
@@ -1776,7 +1776,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: wire::SCHEMA_VERSION,
+            schema_version: wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(1),
             peer_trust_roots: roots,
@@ -1858,7 +1858,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     first
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
@@ -2572,7 +2572,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*worker.keys.peer_trust_roots().unwrap()).clone(),
@@ -2962,7 +2962,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     keys.install(wire::KeyringBundle {
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(2),
         peer_trust_roots: roots.clone(),
@@ -2975,7 +2975,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let lease = keys.lease(Some(&cache), key.id, KeyPurpose::Page).unwrap();
     keys.install(wire::KeyringBundle {
-        schema_version: racer_control_wire::SCHEMA_VERSION,
+        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(3),
         peer_trust_roots: roots,
@@ -3443,7 +3443,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: roots.clone(),
@@ -3531,7 +3531,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: racer_control_wire::SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(3),
             peer_trust_roots: roots,
@@ -5011,7 +5011,7 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     worker
         .keys
         .install(wire::KeyringBundle {
-            schema_version: wire::SCHEMA_VERSION,
+            schema_version: wire::KEYRING_SCHEMA_VERSION,
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(1),
             peer_trust_roots: roots,

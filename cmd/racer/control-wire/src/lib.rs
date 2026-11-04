@@ -50,6 +50,10 @@ use std::time::Duration;
 /// Current control record schema version.
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// Keyring bundle schema version. Version 3 carries the compact key table and
+/// decrypt keys; it is incompatible with version 2 (flag day).
+pub const KEYRING_SCHEMA_VERSION: u32 = 3;
+
 /// Current incremental publication format version.
 pub const DELTA_VERSION: u32 = 2;
 
@@ -68,8 +72,33 @@ pub const TOKEN_AUDIENCE: &str = "racer-control";
 /// Maximum encoded enrollment request or response size.
 pub const MAX_ENROLLMENT_BYTES: usize = 64 * 1024;
 
-/// Maximum encoded keyring bundle size.
-pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
+/// Maximum encoded keyring bundle size. Sized so that at least 900 caches
+/// with the default seven retained page keys, a prepared rotation, and
+/// [`MAX_BUNDLE_ROOTS`] roots of [`MAX_ROOT_DER_BYTES`] fit.
+pub const MAX_BUNDLE_BYTES: usize = 768 * 1024;
+
+/// Most peer trust roots an authority puts in one bundle.
+pub const MAX_BUNDLE_ROOTS: usize = 32;
+
+/// Largest root certificate DER an authority accepts into a bundle.
+pub const MAX_ROOT_DER_BYTES: usize = 2048;
+
+/// Upper bound of readable page keys per cache (the active key plus decrypt
+/// keys). The authority's retention setting must not exceed it.
+pub const MAX_RETAINED_PAGE_KEYS: usize = 16;
+
+/// Most keys one cache can have in a bundle: retained page keys, one
+/// prepared page key, and one active plus one prepared origin key.
+pub const MAX_KEYS_PER_CACHE: usize = MAX_RETAINED_PAGE_KEYS + 3;
+
+/// Bytes of one key record in the compact key table.
+pub const KEY_RECORD_BYTES: usize = 16 + 32 + 1;
+
+/// Bytes of one cache group header in the compact key table.
+pub const KEY_GROUP_HEADER_BYTES: usize = 16 + 1;
+
+/// Upper bound on keys in any bundle that fits [`MAX_BUNDLE_BYTES`].
+pub const MAX_BUNDLE_KEYS: usize = MAX_BUNDLE_BYTES / KEY_RECORD_BYTES;
 
 /// Maximum encoded publication size.
 pub const MAX_PUBLICATION_BYTES: usize = 64 * 1024 * 1024;
@@ -212,12 +241,16 @@ pub enum CacheKeyPurpose {
     OriginCredentials,
 }
 
-/// Whether a key is staged for future use or currently active.
+/// Whether a key is staged for future use, currently active, or kept only
+/// to read pages sealed before the last rotations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheKeyState {
     Prepared,
 
     Active,
+
+    /// Readable, never used to seal. Only page keys enter this state.
+    Decrypt,
 }
 
 /// Cache, epoch ID, and purpose bound to one secret.
@@ -281,6 +314,15 @@ impl CacheEncryptionKey {
         )
     }
 }
+
+impl PartialEq for CacheEncryptionKey {
+    /// Compare reference, state, and material without exposing it.
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.state == other.state && self.material == other.material
+    }
+}
+
+impl Eq for CacheEncryptionKey {}
 
 impl Drop for CacheEncryptionKey {
     /// Wipe the source secret even after transferring a zeroizing copy.
@@ -1031,30 +1073,6 @@ mod codec {
             return Err(Error::InvalidRequest);
         }
         Ok(b)
-    }
-
-    /// Decode exactly one canonical key into fixed-size zeroizing storage.
-    fn key_material(s: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
-        // Decode directly into a zeroizing owner, including partially written error
-        // output. Neither decoding nor canonicality checking allocates secret bytes.
-        if s.len() != 44 {
-            return Err(Error::InvalidRequest);
-        }
-        let mut decoded = zeroize::Zeroizing::new([0; 32]);
-        let length = STANDARD
-            .decode_slice(s, &mut *decoded)
-            .map_err(|_| Error::InvalidRequest)?;
-        if length != decoded.len() {
-            return Err(Error::InvalidRequest);
-        }
-        let mut canonical = zeroize::Zeroizing::new([0; 44]);
-        STANDARD
-            .encode_slice(decoded.as_slice(), &mut *canonical)
-            .map_err(|_| Error::InvalidRequest)?;
-        if canonical.as_slice() != s.as_bytes() {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(decoded)
     }
 
     /// Require a nonempty list of fully consumed DER certificates.
@@ -1822,7 +1840,8 @@ mod codec {
         Ok(next)
     }
 
-    /// Complete wire keyring with encoded certificates and zeroizing key fields.
+    /// Complete wire keyring with encoded certificates and one compact,
+    /// zeroizing key table (see [`encode_cache_keys`]).
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Bundle {
@@ -1834,29 +1853,14 @@ mod codec {
 
         peer_trust_roots: Vec<String>,
 
-        cache_keys: Vec<Key>,
-    }
-
-    /// One key record whose material is owned even during partial deserialization.
-    #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Key {
-        cache: String,
-
-        id: String,
-
-        purpose: String,
-
-        state: String,
-
-        material: EncodedKeyMaterial,
+        cache_keys: EncodedKeyMaterial,
     }
 
     /// Own encoded secrets immediately, including during partial DTO construction.
     struct EncodedKeyMaterial(zeroize::Zeroizing<String>);
 
     impl Serialize for EncodedKeyMaterial {
-        /// Preserve the existing base64 string representation.
+        /// Preserve the base64 string representation.
         fn serialize<S: serde::Serializer>(
             &self,
             serializer: S,
@@ -1874,58 +1878,251 @@ mod codec {
         }
     }
 
+    /// Parse a canonical lowercase UUID into its 16 bytes.
+    pub fn uuid_bytes(value: &str) -> Option<[u8; 16]> {
+        if !valid_uuid(value) {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        let mut digits = value.bytes().filter(|b| *b != b'-');
+        for byte in &mut out {
+            let hi = (digits.next()? as char).to_digit(16)?;
+            let lo = (digits.next()? as char).to_digit(16)?;
+            *byte = (hi * 16 + lo) as u8;
+        }
+        Some(out)
+    }
+
+    /// Render 16 bytes as a canonical lowercase UUID.
+    pub fn uuid_string(bytes: &[u8; 16]) -> String {
+        let mut s = String::with_capacity(36);
+        for (i, b) in bytes.iter().enumerate() {
+            if matches!(i, 4 | 6 | 8 | 10) {
+                s.push('-');
+            }
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    const STATE_PREPARED: u8 = 0;
+    const STATE_ACTIVE: u8 = 1;
+    const STATE_DECRYPT: u8 = 2;
+    const STATE_MASK: u8 = 0b11;
+    const PURPOSE_ORIGIN: u8 = 0b100;
+
+    fn flags(key: &CacheEncryptionKey) -> u8 {
+        let state = match key.state {
+            CacheKeyState::Prepared => STATE_PREPARED,
+            CacheKeyState::Active => STATE_ACTIVE,
+            CacheKeyState::Decrypt => STATE_DECRYPT,
+        };
+        match key.key.purpose {
+            CacheKeyPurpose::Page => state,
+            CacheKeyPurpose::OriginCredentials => state | PURPOSE_ORIGIN,
+        }
+    }
+
+    fn purpose_rank(p: CacheKeyPurpose) -> u8 {
+        match p {
+            CacheKeyPurpose::Page => 0,
+            CacheKeyPurpose::OriginCredentials => 1,
+        }
+    }
+
+    /// Check the per-cache key rules shared by the wire bundle and the
+    /// authority's durable record:
+    /// - every cache ID is a canonical UUID and every key ID is unique per cache;
+    /// - every key was created at or before `generation`;
+    /// - each cache and purpose has exactly one active key and at most one
+    ///   prepared key;
+    /// - origin credential keys have no decrypt keys, and page keys have at
+    ///   most [`MAX_RETAINED_PAGE_KEYS`]` - 1` decrypt keys.
+    ///
+    /// Runs in `O(n log n)`.
+    pub fn validate_cache_keys(keys: &[CacheEncryptionKey], generation: u64) -> Result<()> {
+        if keys.len() > MAX_BUNDLE_KEYS {
+            return Err(Error::InvalidRequest);
+        }
+        let mut ids = HashSet::with_capacity(keys.len());
+        let mut groups: BTreeMap<(&str, u8), [usize; 3]> = BTreeMap::new();
+        for k in keys {
+            uuid(&k.key.cache.0)?;
+            let created = k.key.id.generation().ok_or(Error::InvalidRequest)?;
+            if created > generation
+                || !ids.insert((
+                    k.key.cache.0.as_str(),
+                    purpose_rank(k.key.purpose),
+                    k.key.id.0,
+                ))
+            {
+                return Err(Error::InvalidRequest);
+            }
+            let counts = groups
+                .entry((k.key.cache.0.as_str(), purpose_rank(k.key.purpose)))
+                .or_default();
+            counts[(flags(k) & STATE_MASK) as usize] += 1;
+        }
+        for ((_, purpose), [prepared, active, decrypt]) in groups {
+            let max_decrypt = if purpose == 0 {
+                MAX_RETAINED_PAGE_KEYS - 1
+            } else {
+                0
+            };
+            if active != 1 || prepared > 1 || decrypt > max_decrypt {
+                return Err(Error::InvalidRequest);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode keys as the compact binary key table: per cache, in ascending
+    /// cache UUID order, a group of `cache uuid (16) | key count (1)` followed
+    /// by `id (16) | material (32) | flags (1)` per key in ascending
+    /// `(purpose, id)` order. Flags bits 0-1 are the state (0 prepared,
+    /// 1 active, 2 decrypt) and bit 2 is set for origin credential keys.
+    ///
+    /// The output holds secrets and is wiped on drop.
+    pub fn encode_cache_keys(keys: &[CacheEncryptionKey]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let mut order: Vec<([u8; 16], u8, [u8; 16], &CacheEncryptionKey)> =
+            Vec::with_capacity(keys.len());
+        for k in keys {
+            let cache = uuid_bytes(&k.key.cache.0).ok_or(Error::InvalidRequest)?;
+            order.push((cache, purpose_rank(k.key.purpose), k.key.id.0, k));
+        }
+        order.sort_unstable_by_key(|a| (a.0, a.1, a.2));
+        let groups = order
+            .chunk_by(|a, b| a.0 == b.0)
+            .map(|g| g.len())
+            .collect::<Vec<_>>();
+        let mut out = zeroize::Zeroizing::new(Vec::with_capacity(
+            groups.len() * KEY_GROUP_HEADER_BYTES + keys.len() * KEY_RECORD_BYTES,
+        ));
+        let mut at = 0;
+        for len in groups {
+            let group = &order[at..at + len];
+            at += len;
+            if len > MAX_KEYS_PER_CACHE {
+                return Err(Error::InvalidRequest);
+            }
+            out.extend_from_slice(&group[0].0);
+            out.push(len as u8);
+            for (_, _, id, k) in group {
+                out.extend_from_slice(id);
+                out.extend_from_slice(&k.material);
+                out.push(flags(k));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode and validate a key table written by [`encode_cache_keys`].
+    /// Only the canonical encoding is accepted.
+    pub fn decode_cache_keys(raw: &[u8], generation: u64) -> Result<Vec<CacheEncryptionKey>> {
+        let mut keys = Vec::new();
+        let mut rest = raw;
+        let mut last_cache: Option<[u8; 16]> = None;
+        while !rest.is_empty() {
+            if rest.len() < KEY_GROUP_HEADER_BYTES {
+                return Err(Error::InvalidRequest);
+            }
+            let cache: [u8; 16] = rest[..16].try_into().map_err(|_| Error::InvalidRequest)?;
+            let count = rest[16] as usize;
+            rest = &rest[KEY_GROUP_HEADER_BYTES..];
+            if count == 0
+                || count > MAX_KEYS_PER_CACHE
+                || last_cache.is_some_and(|l| l >= cache)
+                || rest.len() < count * KEY_RECORD_BYTES
+            {
+                return Err(Error::InvalidRequest);
+            }
+            last_cache = Some(cache);
+            let cache_id = uuid_string(&cache);
+            let mut last: Option<(u8, [u8; 16])> = None;
+            for record in rest[..count * KEY_RECORD_BYTES].chunks_exact(KEY_RECORD_BYTES) {
+                let id: [u8; 16] = record[..16].try_into().map_err(|_| Error::InvalidRequest)?;
+                let flag = record[48];
+                let state = match flag & STATE_MASK {
+                    STATE_PREPARED => CacheKeyState::Prepared,
+                    STATE_ACTIVE => CacheKeyState::Active,
+                    STATE_DECRYPT => CacheKeyState::Decrypt,
+                    _ => return Err(Error::InvalidRequest),
+                };
+                if flag & !(STATE_MASK | PURPOSE_ORIGIN) != 0 {
+                    return Err(Error::InvalidRequest);
+                }
+                let purpose = if flag & PURPOSE_ORIGIN != 0 {
+                    CacheKeyPurpose::OriginCredentials
+                } else {
+                    CacheKeyPurpose::Page
+                };
+                let order = (purpose_rank(purpose), id);
+                if last.is_some_and(|l| l >= order) {
+                    return Err(Error::InvalidRequest);
+                }
+                last = Some(order);
+                let mut material = zeroize::Zeroizing::new([0u8; 32]);
+                material.copy_from_slice(&record[16..48]);
+                keys.push(CacheEncryptionKey::new(
+                    CacheKeyRef {
+                        cache: CacheId(cache_id.clone()),
+                        id: KeyId(id),
+                        purpose,
+                    },
+                    state,
+                    material,
+                ));
+            }
+            rest = &rest[count * KEY_RECORD_BYTES..];
+        }
+        validate_cache_keys(&keys, generation)?;
+        Ok(keys)
+    }
+
+    /// Encode a key table as canonical padded base64 in zeroizing storage.
+    pub fn encode_cache_keys_base64(
+        keys: &[CacheEncryptionKey],
+    ) -> Result<zeroize::Zeroizing<String>> {
+        let raw = encode_cache_keys(keys)?;
+        let mut out = zeroize::Zeroizing::new(String::with_capacity(raw.len().div_ceil(3) * 4));
+        STANDARD.encode_string(&*raw, &mut out);
+        Ok(out)
+    }
+
+    /// Decode a base64 key table from [`encode_cache_keys_base64`].
+    pub fn decode_cache_keys_base64(
+        encoded: &str,
+        generation: u64,
+    ) -> Result<Vec<CacheEncryptionKey>> {
+        if encoded.len() > MAX_BUNDLE_BYTES {
+            return Err(Error::InvalidRequest);
+        }
+        let mut raw = zeroize::Zeroizing::new(Vec::with_capacity(encoded.len() / 4 * 3));
+        STANDARD
+            .decode_vec(encoded, &mut raw)
+            .map_err(|_| Error::InvalidRequest)?;
+        let mut canonical = zeroize::Zeroizing::new(String::with_capacity(encoded.len()));
+        STANDARD.encode_string(&*raw, &mut canonical);
+        if canonical.as_str() != encoded {
+            return Err(Error::InvalidRequest);
+        }
+        decode_cache_keys(&raw, generation)
+    }
+
     /// Decode a bounded bundle with canonical keys and exactly one active key per group.
     pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
         let scratch = JsonScratch(strict_json(b, MAX_BUNDLE_BYTES)?);
         let r = Bundle::deserialize(&scratch.0).map_err(|_| Error::InvalidRequest)?;
-        header(r.schema_version, &r.cluster)?;
+        if r.schema_version != KEYRING_SCHEMA_VERSION {
+            return Err(Error::IncompatibleMembership);
+        }
+        uuid(&r.cluster)?;
         let generation = BundleGeneration(counter(&r.generation)?);
         let roots = certificates(&r.peer_trust_roots)?;
         if roots.iter().collect::<HashSet<_>>().len() != roots.len() {
             return Err(Error::InvalidRequest);
         }
-        let mut keys = Vec::new();
-        let mut seen = HashSet::new();
-        let mut active = BTreeMap::new();
-        for k in r.cache_keys {
-            uuid(&k.cache)?;
-            let purpose = match k.purpose.as_str() {
-                "page" => CacheKeyPurpose::Page,
-                "origin_credentials" => CacheKeyPurpose::OriginCredentials,
-                _ => return Err(Error::InvalidRequest),
-            };
-            let state = match k.state.as_str() {
-                "prepared" => CacheKeyState::Prepared,
-                "active" => CacheKeyState::Active,
-                _ => return Err(Error::InvalidRequest),
-            };
-            let id: [u8; 16] = bytes(&k.id)?
-                .try_into()
-                .map_err(|_| Error::InvalidRequest)?;
-            let created = KeyId(id).generation().ok_or(Error::InvalidRequest)?;
-            if created > generation.0 {
-                return Err(Error::InvalidRequest);
-            }
-            let material = key_material(&k.material.0)?;
-            if !seen.insert((k.cache.clone(), k.purpose.clone(), id)) {
-                return Err(Error::InvalidRequest);
-            }
-            *active
-                .entry((k.cache.clone(), k.purpose.clone()))
-                .or_insert(0) += usize::from(state == CacheKeyState::Active);
-            keys.push(CacheEncryptionKey {
-                key: CacheKeyRef {
-                    cache: CacheId(k.cache.clone()),
-                    id: KeyId(id),
-                    purpose,
-                },
-                state,
-                material: *material,
-            });
-        }
-        if active.values().any(|n| *n != 1) {
-            return Err(Error::InvalidRequest);
-        }
+        let keys = decode_cache_keys_base64(&r.cache_keys.0, generation.0)?;
         Ok(KeyringBundle {
             schema_version: r.schema_version,
             cluster: ClusterId(r.cluster),
@@ -1946,27 +2143,7 @@ mod codec {
                 .iter()
                 .map(|r| STANDARD.encode(r))
                 .collect(),
-            cache_keys: b
-                .cache_keys
-                .iter()
-                .map(|k| Key {
-                    cache: k.key.cache.0.clone(),
-                    id: STANDARD.encode(k.key.id.0),
-                    purpose: match k.key.purpose {
-                        CacheKeyPurpose::Page => "page",
-                        CacheKeyPurpose::OriginCredentials => "origin_credentials",
-                    }
-                    .into(),
-                    state: match k.state {
-                        CacheKeyState::Prepared => "prepared",
-                        CacheKeyState::Active => "active",
-                    }
-                    .into(),
-                    material: EncodedKeyMaterial(zeroize::Zeroizing::new(
-                        STANDARD.encode(k.material),
-                    )),
-                })
-                .collect(),
+            cache_keys: EncodedKeyMaterial(encode_cache_keys_base64(&b.cache_keys)?),
         };
         /// Bounded secret output that is erased unless successfully transferred.
         struct BundleOutput(zeroize::Zeroizing<Vec<u8>>);
@@ -2552,18 +2729,6 @@ mod codec {
             }
         }
 
-        /// Retirement is expressed by omission, never by an unsupported key state.
-        #[test]
-        fn retiring_state_is_rejected_with_active_key_present() {
-            let input = String::from_utf8(fixture("bundle.json")).unwrap();
-            let changed = input.replacen("\"state\":\"prepared\"", "\"state\":\"retiring\"", 1);
-            assert_ne!(changed, input);
-            assert_eq!(
-                decode_bundle(changed.as_bytes()).err(),
-                Some(Error::InvalidRequest)
-            );
-        }
-
         /// Hashes ignore ordering and cursors but bind cache and endpoint changes.
         #[test]
         fn hash_semantics() {
@@ -3023,105 +3188,174 @@ mod codec {
             }
         }
 
+        /// One raw key record for hand-built key tables.
+        fn record(generation: u64, suffix: u32, fill: u8, flags: u8) -> Vec<u8> {
+            let mut r = KeyId::from_generation(generation, suffix)
+                .unwrap()
+                .0
+                .to_vec();
+            r.extend_from_slice(&[fill; 32]);
+            r.push(flags);
+            r
+        }
+
+        /// One raw cache group for hand-built key tables.
+        fn group(cache: u8, records: &[Vec<u8>]) -> Vec<u8> {
+            let mut g = vec![cache; 16];
+            g.push(records.len() as u8);
+            for r in records {
+                g.extend_from_slice(r);
+            }
+            g
+        }
+
+        /// The fixture bundle with its key table replaced, without validation.
+        fn with_table(generation: &str, table: &[u8]) -> Vec<u8> {
+            let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
+            bundle["generation"] = generation.into();
+            bundle["cache_keys"] = STANDARD.encode(table).into();
+            serde_json::to_vec(&bundle).unwrap()
+        }
+
         /// Key syntax and future epochs preserve invalid-request classification.
         #[test]
         fn bundle_key_generation_maps_syntax_and_future_epochs_to_invalid_request() {
-            let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
-            bundle["generation"] = "1".into();
-            bundle["cache_keys"].as_array_mut().unwrap().truncate(1);
-            bundle["cache_keys"][0]["state"] = "active".into();
-            bundle["cache_keys"][0]["id"] = STANDARD
-                .encode(KeyId::from_generation(1, 0).unwrap().0)
-                .into();
-            assert!(decode_bundle(&serde_json::to_vec(&bundle).unwrap()).is_ok());
+            let ok = group(0x44, &[record(1, 0, 1, 1), record(1, 0, 2, 5)]);
+            assert!(decode_bundle(&with_table("1", &ok)).is_ok());
             for id in [
-                KeyId([1; 16]),
-                KeyId(*b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0"),
-                KeyId::from_generation(2, 0).unwrap(),
+                [1; 16],
+                *b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0",
+                KeyId::from_generation(2, 0).unwrap().0,
             ] {
-                bundle["cache_keys"][0]["id"] = STANDARD.encode(id.0).into();
-                assert!(matches!(
-                    decode_bundle(&serde_json::to_vec(&bundle).unwrap()),
-                    Err(Error::InvalidRequest)
-                ));
+                let mut bad = ok.clone();
+                bad[17..33].copy_from_slice(&id);
+                assert_eq!(
+                    decode_bundle(&with_table("1", &bad)).err(),
+                    Some(Error::InvalidRequest)
+                );
             }
         }
 
-        /// Secret base64 must have the exact length, padding, and unused-bit values.
+        /// The key table must be canonical padded base64.
         #[test]
-        fn key_material_requires_exact_length_canonical_padding_and_trailing_bits() {
-            let canonical = STANDARD.encode([0xa7; 32]);
-            assert_eq!(*key_material(&canonical).unwrap(), [0xa7; 32]);
-            let mut trailing_bits = canonical.clone().into_bytes();
-            assert_eq!(trailing_bits[42], b'c');
-            trailing_bits[42] = b'd';
-            let mut invalid_tail = canonical.clone().into_bytes();
-            invalid_tail[40] = b'!';
-            let mut embedded_padding = canonical.clone().into_bytes();
-            embedded_padding[20] = b'=';
+        fn key_table_requires_canonical_base64() {
+            let ok = group(0x44, &[record(1, 0, 1, 1), record(1, 0, 2, 5)]);
+            let canonical = STANDARD.encode(&ok);
+            assert!(decode_cache_keys_base64(&canonical, 1).is_ok());
             for malformed in [
                 canonical.trim_end_matches('=').to_owned(),
                 format!("{canonical}="),
                 format!("{canonical}\n"),
                 canonical.replace('=', " "),
-                String::from_utf8(trailing_bits).unwrap(),
-                String::from_utf8(invalid_tail).unwrap(),
-                String::from_utf8(embedded_padding).unwrap(),
-                STANDARD.encode([0xa7; 31]),
-                STANDARD.encode([0xa7; 33]),
-                String::new(),
+                String::new() + "!" + &canonical[1..],
             ] {
-                assert!(matches!(
-                    key_material(&malformed),
-                    Err(Error::InvalidRequest)
-                ));
-                let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
-                bundle["cache_keys"][0]["material"] = malformed.into();
-                assert!(matches!(
-                    decode_bundle(&serde_json::to_vec(&bundle).unwrap()),
-                    Err(Error::InvalidRequest)
-                ));
+                assert_eq!(
+                    decode_cache_keys_base64(&malformed, 1).err(),
+                    Some(Error::InvalidRequest)
+                );
             }
         }
 
         /// Missing or invalid later fields must drop the already-owned secret field.
         #[test]
-        fn encoded_material_is_owned_before_key_construction_completes() {
-            for suffix in [
-                "",
-                r#", "state": false"#,
-                r#", "state": "active", "unknown": 1"#,
-            ] {
-                let json = format!(
-                    r#"{{"cache":"cache","id":"id","purpose":"page","material":"secret"{suffix}}}"#
-                );
-                MATERIAL_DROPS.with(|drops| drops.set(0));
-                // Deserialize from Value exactly as decode_bundle does, preserving
-                // material-before-state ordering even with sorted JSON object keys.
-                let value: Value = serde_json::from_str(&json).unwrap();
-                assert!(Key::deserialize(&value).is_err());
-                assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
-            }
+        fn encoded_material_is_owned_before_bundle_construction_completes() {
+            let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
+            bundle.as_object_mut().unwrap().remove("schema_version");
             MATERIAL_DROPS.with(|drops| drops.set(0));
-            let key: Key = serde_json::from_str(r#"{"cache":"cache","id":"id","purpose":"page","material":"secret","state":"active"}"#).unwrap();
-            assert_eq!(key.material.0.as_str(), "secret");
+            assert!(Bundle::deserialize(&bundle).is_err());
+            assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
+            let bundle: Value = serde_json::from_str(BUNDLE).unwrap();
+            MATERIAL_DROPS.with(|drops| drops.set(0));
+            let decoded = Bundle::deserialize(&bundle).unwrap();
             assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 0);
-            drop(key);
+            drop(decoded);
             assert_eq!(MATERIAL_DROPS.with(|drops| drops.get()), 1);
         }
 
         /// Public bundle decoding preserves error classification after secret parsing.
         #[test]
-        fn bundle_rejects_missing_state_and_late_errors_after_material() {
-            for replacement in ["", r#""state":false,"#] {
-                let malformed = BUNDLE.replacen(r#""state":"prepared","#, replacement, 1);
+        fn bundle_rejects_late_errors_after_material() {
+            for (old, new) in [
+                (
+                    r#""generation":"18446744073709551615""#,
+                    r#""generation":"01""#,
+                ),
+                (r#""schema_version":3,"#, ""),
+            ] {
+                let malformed = BUNDLE.replacen(old, new, 1);
                 assert_ne!(malformed, BUNDLE);
                 MATERIAL_DROPS.with(|drops| drops.set(0));
                 assert!(matches!(
                     decode_bundle(malformed.as_bytes()),
-                    Err(Error::InvalidRequest)
+                    Err(Error::InvalidRequest | Error::IncompatibleMembership)
                 ));
                 assert!(MATERIAL_DROPS.with(|drops| drops.get()) > 0);
+            }
+        }
+
+        /// Decrypt keys are page-only and bounded; tables must be canonical.
+        #[test]
+        fn key_table_rules() {
+            let page_active = record(2, 0, 1, 1);
+            let origin_active = record(1, 0, 2, 5);
+            let base = |extra: &[Vec<u8>]| {
+                let mut records = vec![page_active.clone()];
+                records.extend_from_slice(extra);
+                records.push(origin_active.clone());
+                records
+            };
+            // Decrypt and prepared page keys, sorted by ID.
+            let good = group(0x44, &base(&[record(2, 1, 3, 2), record(2, 2, 4, 0)]));
+            let keys = decode_cache_keys(&good, 2).unwrap();
+            assert_eq!(keys[1].state, CacheKeyState::Decrypt);
+            assert_eq!(keys[2].state, CacheKeyState::Prepared);
+            assert_eq!(*encode_cache_keys(&keys).unwrap(), good);
+            // Maximum decrypt keys.
+            let decrypt: Vec<_> = (1..MAX_RETAINED_PAGE_KEYS as u32)
+                .map(|i| record(2, i, 3, 2))
+                .collect();
+            assert!(decode_cache_keys(&group(0x44, &base(&decrypt)), 2).is_ok());
+            let mut over = decrypt.clone();
+            over.push(record(2, MAX_RETAINED_PAGE_KEYS as u32, 3, 2));
+            for bad in [
+                group(0x44, &base(&over)),
+                // Two active page keys.
+                group(0x44, &base(&[record(2, 1, 3, 1)])),
+                // Two prepared page keys.
+                group(0x44, &base(&[record(2, 1, 3, 0), record(2, 2, 3, 0)])),
+                // Origin decrypt key.
+                group(
+                    0x44,
+                    &[
+                        page_active.clone(),
+                        origin_active.clone(),
+                        record(1, 1, 3, 6),
+                    ],
+                ),
+                // Unknown state and unknown flag bits.
+                group(0x44, &base(&[record(2, 1, 3, 3)])),
+                group(0x44, &base(&[record(2, 1, 3, 0x8)])),
+                // No active origin key.
+                group(0x44, &[page_active.clone(), record(1, 0, 2, 4)]),
+                // Unsorted keys.
+                group(
+                    0x44,
+                    &[
+                        record(2, 1, 3, 2),
+                        page_active.clone(),
+                        origin_active.clone(),
+                    ],
+                ),
+                // Empty group, duplicate or unsorted groups, truncation.
+                group(0x44, &[]),
+                [group(0x44, &base(&[])), group(0x44, &base(&[]))].concat(),
+                [group(0x45, &base(&[])), group(0x44, &base(&[]))].concat(),
+                group(0x44, &base(&[]))[..60].to_vec(),
+            ] {
+                assert_eq!(
+                    decode_cache_keys(&bad, 2).err(),
+                    Some(Error::InvalidRequest)
+                );
             }
         }
 
@@ -3194,20 +3428,6 @@ mod codec {
             );
             let nested = format!("{}{}", "[".repeat(65), "]".repeat(65));
             assert!(decode_enrollment_request(nested.as_bytes()).is_err());
-        }
-
-        /// Bundles reject ambiguous active keys and unsupported states or purposes.
-        #[test]
-        fn bundle_rejects_partial_key_epochs() {
-            for (old, new) in [
-                ("\"state\":\"prepared\"", "\"state\":\"active\""),
-                ("\"state\":\"active\"", "\"state\":\"retiring\""),
-                ("UktHMQAAAAAAAAABAAAAAA==", "UktHMQAAAAAAAAABAAAAAB=="),
-                ("UktHMQAAAAAAAAABAAAAAA==", "UktHMQAAAAAAAAABAAAAAA"),
-                ("\"purpose\":\"page\"", "\"purpose\":\"future\""),
-            ] {
-                assert!(decode_bundle(BUNDLE.replacen(old, new, 1).as_bytes()).is_err());
-            }
         }
     }
 }

@@ -1,10 +1,13 @@
 //! Durable keyring: cache keys, their rotation, and peer trust roots.
 //!
-//! Cache keys follow the removed Go controller:
-//! each cache has one active page key and one active origin credentials key.
+//! Each cache has one active page key and one active origin credentials key.
 //! A rotation first adds prepared keys, then activates them after
-//! `prepare_for`. Caches are never evicted to make room. Every change gets a
-//! new bundle generation; exhausted generations fail.
+//! `prepare_for`. On activation the old active page key becomes a `decrypt`
+//! key, so pages sealed under it stay readable; a cache keeps at most
+//! [`Policy::retained_page_keys`]` - 1` decrypt keys and drops the oldest.
+//! Old origin credentials keys are dropped on activation. Caches are never
+//! evicted to make room. Every change gets a new bundle generation; exhausted
+//! generations fail.
 //!
 //! Each seat offers an issuer root, reused across claims by the same Pod. A
 //! root is kept while a seat offers it,
@@ -20,20 +23,29 @@ use racer_control_wire::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Duration};
-use zeroize::Zeroize;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 /// Most trust roots in one bundle.
-pub const MAX_ROOTS: usize = 32;
+pub const MAX_ROOTS: usize = wire::MAX_BUNDLE_ROOTS;
 
-/// DER bytes reserved per root when computing catalog capacity.
-pub const RESERVED_ROOT_BYTES: usize = 1024;
+/// Largest root DER accepted, and reserved per root in catalog capacity.
+pub const MAX_ROOT_DER_BYTES: usize = wire::MAX_ROOT_DER_BYTES;
 
-/// Upper bound of one encoded cache key in a bundle.
-const KEY_COST: usize = 192;
+/// Readable page keys per cache (active plus decrypt) by default.
+pub const DEFAULT_RETAINED_PAGE_KEYS: usize = 7;
 
 /// Upper bound of the bundle envelope without roots and keys.
 const ENVELOPE: usize = 512;
+
+/// Bytes reserved in the state record for everything but keys and roots:
+/// the record fields and the retired root list.
+const STATE_RESERVE: usize = 64 * 1024;
+
+/// Upper bound of the state record fields of one root besides its DER.
+const ROOT_RECORD_OVERHEAD: usize = 256;
 
 /// Clock skew allowance.
 pub const SKEW: Duration = Duration::from_secs(60);
@@ -49,35 +61,62 @@ pub enum KeyringError {
     Entropy,
 }
 
-/// One stored cache key.
-#[derive(Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Key {
-    pub cache: String,
-    /// Hex of the 16 byte ID.
-    pub id: String,
-    /// `page` or `origin_credentials`.
-    pub purpose: String,
-    /// `prepared` or `active`.
-    pub state: String,
-    /// Base64 of 32 bytes.
-    pub material: String,
+/// Cache keys stored in the state record, in canonical order (cache, purpose,
+/// key ID). Serialized as the wire bundle's compact key table in base64, so
+/// durable and wire key IDs share one encoding. Debug output omits material.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct Keys(pub Vec<CacheEncryptionKey>);
+
+impl std::ops::Deref for Keys {
+    type Target = Vec<CacheEncryptionKey>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl std::fmt::Debug for Key {
+impl std::ops::DerefMut for Keys {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for Keys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Key({}/{}/{}/{})",
-            self.cache, self.purpose, self.id, self.state
-        )
+        f.debug_list()
+            .entries(self.0.iter().map(|k| {
+                format!(
+                    "Key({}/{:?}/{}/{:?})",
+                    k.key.cache.0,
+                    k.key.purpose,
+                    hex(&k.key.id.0),
+                    k.state
+                )
+            }))
+            .finish()
     }
 }
 
-impl Drop for Key {
-    fn drop(&mut self) {
-        self.material.zeroize();
+impl Serialize for Keys {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let encoded = wire::encode_cache_keys_base64(&self.0)
+            .map_err(|_| serde::ser::Error::custom("invalid cache keys"))?;
+        serializer.serialize_str(&encoded)
     }
+}
+
+impl<'de> Deserialize<'de> for Keys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+        // Generations are checked by `Durable::validate`.
+        wire::decode_cache_keys_base64(&encoded, u64::MAX)
+            .map(Keys)
+            .map_err(|_| serde::de::Error::custom("invalid cache keys"))
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// One trust root.
@@ -107,7 +146,7 @@ pub struct Retired {
 #[serde(deny_unknown_fields)]
 pub struct Durable {
     pub generation: u64,
-    pub keys: Vec<Key>,
+    pub keys: Keys,
     /// Unix seconds of the next preparation.
     pub next_rotation: u64,
     /// Unix seconds to activate prepared keys, or 0.
@@ -124,7 +163,7 @@ pub struct Offer {
     pub holder: String,
 }
 
-/// Rotation timing.
+/// Rotation timing and retention. An authority setting.
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
     pub interval: Duration,
@@ -132,6 +171,17 @@ pub struct Policy {
     /// Longest certificate any seat issues.
     pub certificate_lifetime: Duration,
     pub lease_duration: Duration,
+    /// Readable page keys per cache: the active key plus up to this many
+    /// minus one decrypt keys. In `1..=`[`wire::MAX_RETAINED_PAGE_KEYS`].
+    pub retained_page_keys: usize,
+}
+
+impl Policy {
+    /// `retained_page_keys` clamped to its valid range.
+    pub fn retained(&self) -> usize {
+        self.retained_page_keys
+            .clamp(1, wire::MAX_RETAINED_PAGE_KEYS)
+    }
 }
 
 impl From<crate::config::Rotation> for Policy {
@@ -141,6 +191,9 @@ impl From<crate::config::Rotation> for Policy {
             prepare_for: r.prepare_for,
             certificate_lifetime: wire::CERTIFICATE_LIFETIME,
             lease_duration: crate::limits::LEASE_DURATION,
+            // TODO: expose as an authority environment setting; the config
+            // table owns env parsing (cluster-control/src/config.rs).
+            retained_page_keys: DEFAULT_RETAINED_PAGE_KEYS,
         }
     }
 }
@@ -150,25 +203,24 @@ pub fn sha256(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
 
-fn purpose(p: &str) -> Result<CacheKeyPurpose, KeyringError> {
+const PURPOSES: [CacheKeyPurpose; 2] = [CacheKeyPurpose::Page, CacheKeyPurpose::OriginCredentials];
+
+fn purpose_rank(p: CacheKeyPurpose) -> u8 {
     match p {
-        "page" => Ok(CacheKeyPurpose::Page),
-        "origin_credentials" => Ok(CacheKeyPurpose::OriginCredentials),
-        _ => Err(KeyringError::Invalid),
+        CacheKeyPurpose::Page => 0,
+        CacheKeyPurpose::OriginCredentials => 1,
     }
 }
 
-const PURPOSES: [&str; 2] = ["page", "origin_credentials"];
-
-fn decode_hex16(s: &str) -> Result<[u8; 16], KeyringError> {
-    if s.len() != 32 {
-        return Err(KeyringError::Invalid);
-    }
-    let mut out = [0u8; 16];
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| KeyringError::Invalid)?;
-    }
-    Ok(out)
+/// Canonical key order, matching the compact key table.
+fn sort_keys(keys: &mut [CacheEncryptionKey]) {
+    keys.sort_by(|a, b| {
+        (&a.key.cache, purpose_rank(a.key.purpose), a.key.id.0).cmp(&(
+            &b.key.cache,
+            purpose_rank(b.key.purpose),
+            b.key.id.0,
+        ))
+    });
 }
 
 /// Facts of a root certificate needed here.
@@ -176,9 +228,10 @@ pub struct RootInfo {
     pub not_after: u64,
 }
 
-/// Check a root: CA, Ed25519, self-signed, valid now.
+/// Check a root: CA, Ed25519, self-signed, valid now, at most
+/// [`MAX_ROOT_DER_BYTES`] so catalog capacity always holds.
 pub fn inspect_root(der: &[u8], now: u64) -> Result<RootInfo, KeyringError> {
-    if der.is_empty() || der.len() > 16 * 1024 {
+    if der.is_empty() || der.len() > MAX_ROOT_DER_BYTES {
         return Err(KeyringError::Invalid);
     }
     let (rest, cert) =
@@ -203,44 +256,18 @@ pub fn inspect_root(der: &[u8], now: u64) -> Result<RootInfo, KeyringError> {
 impl Durable {
     /// Structural validation of a decoded keyring.
     pub fn validate(&self) -> Result<(), KeyringError> {
-        let mut active: BTreeMap<(String, String), usize> = BTreeMap::new();
-        let mut ids = std::collections::HashSet::new();
-        for k in &self.keys {
-            if !wire::valid_uuid(&k.cache) || !ids.insert(k.id.clone()) {
-                return Err(KeyringError::Invalid);
-            }
-            purpose(&k.purpose)?;
-            let id = KeyId(decode_hex16(&k.id)?);
-            if id.generation().is_none_or(|g| g > self.generation) {
-                return Err(KeyringError::Invalid);
-            }
-            let m = STANDARD
-                .decode(&k.material)
-                .map_err(|_| KeyringError::Invalid)?;
-            if m.len() != 32 {
-                return Err(KeyringError::Invalid);
-            }
-            match k.state.as_str() {
-                "active" => {
-                    *active
-                        .entry((k.cache.clone(), k.purpose.clone()))
-                        .or_default() += 1
-                }
-                "prepared" => {
-                    active
-                        .entry((k.cache.clone(), k.purpose.clone()))
-                        .or_default();
-                }
-                _ => return Err(KeyringError::Invalid),
-            }
-        }
-        if active.values().any(|n| *n != 1) || self.roots.len() > MAX_ROOTS {
+        wire::validate_cache_keys(&self.keys, self.generation)
+            .map_err(|_| KeyringError::Invalid)?;
+        if self.roots.len() > MAX_ROOTS {
             return Err(KeyringError::Invalid);
         }
         let mut hashes = std::collections::HashSet::new();
         for r in &self.roots {
             let der = STANDARD.decode(&r.der).map_err(|_| KeyringError::Invalid)?;
-            if !hashes.insert(sha256(&der)) || r.seat as usize >= crate::annotations::MAX_SEATS {
+            if der.len() > MAX_ROOT_DER_BYTES
+                || !hashes.insert(sha256(&der))
+                || r.seat as usize >= crate::annotations::MAX_SEATS
+            {
                 return Err(KeyringError::Invalid);
             }
         }
@@ -267,67 +294,60 @@ impl Durable {
     /// Caches with both active keys. This is the durable admission record.
     pub fn keyed_caches(&self) -> BTreeMap<String, bool> {
         let mut n: BTreeMap<String, usize> = BTreeMap::new();
-        for k in self.keys.iter().filter(|k| k.state == "active") {
-            *n.entry(k.cache.clone()).or_default() += 1;
+        for k in self
+            .keys
+            .iter()
+            .filter(|k| k.state == CacheKeyState::Active)
+        {
+            *n.entry(k.key.cache.0.clone()).or_default() += 1;
         }
         n.into_iter().map(|(k, v)| (k, v == 2)).collect()
     }
 
     /// Wire bundle for clients. Needs at least one root.
     pub fn bundle(&self, cluster: &str) -> Result<KeyringBundle, KeyringError> {
-        let mut keys = Vec::with_capacity(self.keys.len());
-        for k in &self.keys {
-            let mut m = zeroize::Zeroizing::new([0u8; 32]);
-            let decoded = zeroize::Zeroizing::new(
-                STANDARD
-                    .decode(&k.material)
-                    .map_err(|_| KeyringError::Invalid)?,
-            );
-            if decoded.len() != 32 {
-                return Err(KeyringError::Invalid);
-            }
-            m.copy_from_slice(&decoded);
-            keys.push(CacheEncryptionKey::new(
-                CacheKeyRef {
-                    cache: CacheId(k.cache.clone()),
-                    id: KeyId(decode_hex16(&k.id)?),
-                    purpose: purpose(&k.purpose)?,
-                },
-                if k.state == "active" {
-                    CacheKeyState::Active
-                } else {
-                    CacheKeyState::Prepared
-                },
-                m,
-            ));
-        }
         let b = KeyringBundle {
-            schema_version: wire::SCHEMA_VERSION,
+            schema_version: wire::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(cluster.into()),
             generation: BundleGeneration(self.generation),
             peer_trust_roots: self.root_ders(),
-            cache_keys: keys,
+            cache_keys: self.keys.0.clone(),
         };
         wire::encode_bundle(&b).map_err(|_| KeyringError::Invalid)?;
         Ok(b)
     }
 }
 
-/// Number of caches that always fit, with every cache in prepared overlap and
-/// [`MAX_ROOTS`] roots, under the bundle byte limit.
-pub fn catalog_capacity() -> usize {
-    let root_cost = RESERVED_ROOT_BYTES.div_ceil(3) * 4 + 3;
-    let available = wire::MAX_BUNDLE_BYTES - ENVELOPE - MAX_ROOTS * root_cost;
-    // Two purposes, each active plus prepared.
-    available / (4 * KEY_COST)
+/// Keys one cache holds at most with `retained` readable page keys: those,
+/// one prepared page key, and an active and a prepared origin key.
+pub fn keys_per_cache(retained: usize) -> usize {
+    retained.clamp(1, wire::MAX_RETAINED_PAGE_KEYS) + 3
+}
+
+/// Number of caches that always fit, with every cache holding
+/// [`keys_per_cache`] keys and [`MAX_ROOTS`] roots of [`MAX_ROOT_DER_BYTES`],
+/// under both the bundle byte limit and the state record limit. Computed
+/// from the compact key table encoding.
+pub fn catalog_capacity(retained: usize) -> usize {
+    let per_cache =
+        wire::KEY_GROUP_HEADER_BYTES + keys_per_cache(retained) * wire::KEY_RECORD_BYTES;
+    // Base64 plus the JSON quotes and comma.
+    let root_cost = MAX_ROOT_DER_BYTES.div_ceil(3) * 4 + 3;
+    let bundle = (wire::MAX_BUNDLE_BYTES - ENVELOPE - MAX_ROOTS * root_cost) / 4 * 3;
+    let state =
+        (super::state::MAX_BYTES - STATE_RESERVE - MAX_ROOTS * (root_cost + ROOT_RECORD_OVERHEAD))
+            / 4
+            * 3;
+    bundle.min(state) / per_cache
 }
 
 /// Keep keyed caches, then fill free slots in UID order. Never evicts.
 pub fn admit_catalog(
     catalog: &[CacheDefinition],
     durable: &Durable,
+    retained: usize,
 ) -> Result<Vec<CacheDefinition>, KeyringError> {
-    let capacity = catalog_capacity();
+    let capacity = catalog_capacity(retained);
     let keyed = durable.keyed_caches();
     let existing = catalog
         .iter()
@@ -352,10 +372,10 @@ pub fn admit_catalog(
 fn new_key(
     rng: &mut dyn Entropy,
     cache: &str,
-    purpose: &str,
-    state: &str,
+    purpose: CacheKeyPurpose,
+    state: CacheKeyState,
     generation: u64,
-) -> Result<Key, KeyringError> {
+) -> Result<CacheEncryptionKey, KeyringError> {
     let mut suffix = [0u8; 4];
     rng.fill(&mut suffix).map_err(|_| KeyringError::Entropy)?;
     let id = KeyId::from_generation(generation, u32::from_be_bytes(suffix))
@@ -363,13 +383,41 @@ fn new_key(
     let mut material = zeroize::Zeroizing::new([0u8; 32]);
     rng.fill(&mut *material)
         .map_err(|_| KeyringError::Entropy)?;
-    Ok(Key {
-        cache: cache.into(),
-        id: id.0.iter().map(|b| format!("{b:02x}")).collect(),
-        purpose: purpose.into(),
-        state: state.into(),
-        material: STANDARD.encode(*material),
-    })
+    Ok(CacheEncryptionKey::new(
+        CacheKeyRef {
+            cache: CacheId(cache.into()),
+            id,
+            purpose,
+        },
+        state,
+        material,
+    ))
+}
+
+/// Keep the newest `retained - 1` decrypt page keys of each cache.
+fn prune_decrypt(keys: &mut Vec<CacheEncryptionKey>, retained: usize) {
+    let keep = retained.clamp(1, wire::MAX_RETAINED_PAGE_KEYS) - 1;
+    let mut by_cache: BTreeMap<String, Vec<(u64, [u8; 16])>> = BTreeMap::new();
+    for k in keys.iter().filter(|k| k.state == CacheKeyState::Decrypt) {
+        by_cache
+            .entry(k.key.cache.0.clone())
+            .or_default()
+            .push((k.key.id.generation().unwrap_or(0), k.key.id.0));
+    }
+    let mut drop = BTreeSet::new();
+    for (cache, mut ids) in by_cache {
+        // Newest first.
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, id) in ids.into_iter().skip(keep) {
+            drop.insert((cache.clone(), id));
+        }
+    }
+    if !drop.is_empty() {
+        keys.retain(|k| {
+            k.state != CacheKeyState::Decrypt
+                || !drop.contains(&(k.key.cache.0.clone(), k.key.id.0))
+        });
+    }
 }
 
 /// Plan output.
@@ -418,19 +466,23 @@ pub fn plan_with(
 
     // Remove keys of deleted caches.
     if let Some(catalog) = catalog {
-        let wanted: std::collections::BTreeSet<&str> =
-            catalog.iter().map(|c| c.id.0.as_str()).collect();
-        d.keys.retain(|k| wanted.contains(k.cache.as_str()));
+        let wanted: BTreeSet<&str> = catalog.iter().map(|c| c.id.0.as_str()).collect();
+        d.keys.retain(|k| wanted.contains(k.key.cache.0.as_str()));
     }
 
     // Add missing keys.
     for c in catalog.unwrap_or_default() {
         for p in PURPOSES {
-            if !d.keys.iter().any(|k| k.cache == c.id.0 && k.purpose == p) {
+            if !d
+                .keys
+                .iter()
+                .any(|k| k.key.cache.0 == c.id.0 && k.key.purpose == p)
+            {
                 if creation == 0 {
                     return Err(KeyringError::Unavailable);
                 }
-                d.keys.push(new_key(rng, &c.id.0, p, "active", creation)?);
+                d.keys
+                    .push(new_key(rng, &c.id.0, p, CacheKeyState::Active, creation)?);
             }
         }
     }
@@ -439,18 +491,27 @@ pub fn plan_with(
         d.next_rotation = now + (policy.interval - policy.prepare_for).as_secs();
     }
     if d.activate_at != 0 && now >= d.activate_at {
-        let prepared: std::collections::BTreeSet<(String, String)> = d
+        let prepared: BTreeSet<(String, u8)> = d
             .keys
             .iter()
-            .filter(|k| k.state == "prepared")
-            .map(|k| (k.cache.clone(), k.purpose.clone()))
+            .filter(|k| k.state == CacheKeyState::Prepared)
+            .map(|k| (k.key.cache.0.clone(), purpose_rank(k.key.purpose)))
             .collect();
-        d.keys.retain(|k| {
-            !(k.state == "active" && prepared.contains(&(k.cache.clone(), k.purpose.clone())))
-        });
-        for k in &mut d.keys {
-            if k.state == "prepared" {
-                k.state = "active".into();
+        let replaced = |k: &CacheEncryptionKey| {
+            k.state == CacheKeyState::Active
+                && prepared.contains(&(k.key.cache.0.clone(), purpose_rank(k.key.purpose)))
+        };
+        // Old origin keys go; old page keys stay readable.
+        d.keys
+            .retain(|k| !(replaced(k) && k.key.purpose == CacheKeyPurpose::OriginCredentials));
+        for k in d.keys.iter_mut() {
+            if replaced(k) {
+                k.state = CacheKeyState::Decrypt;
+            }
+        }
+        for k in d.keys.iter_mut() {
+            if k.state == CacheKeyState::Prepared {
+                k.state = CacheKeyState::Active;
             }
         }
         d.activate_at = 0;
@@ -460,12 +521,20 @@ pub fn plan_with(
             return Err(KeyringError::Unavailable);
         }
         let mut prepared = Vec::new();
-        for k in d.keys.iter().filter(|k| k.state == "active") {
-            prepared.push(new_key(rng, &k.cache, &k.purpose, "prepared", creation)?);
+        for k in d.keys.iter().filter(|k| k.state == CacheKeyState::Active) {
+            prepared.push(new_key(
+                rng,
+                &k.key.cache.0,
+                k.key.purpose,
+                CacheKeyState::Prepared,
+                creation,
+            )?);
         }
         d.keys.extend(prepared);
         d.activate_at = now + policy.prepare_for.as_secs();
     }
+    prune_decrypt(&mut d.keys, policy.retained());
+    sort_keys(&mut d.keys);
 
     // Roots.
     let keep_after_offer = (policy.lease_duration + policy.certificate_lifetime + SKEW).as_secs();
@@ -571,6 +640,7 @@ pub(crate) mod tests {
             prepare_for: Duration::from_secs(3600),
             certificate_lifetime: Duration::from_secs(DAY),
             lease_duration: Duration::from_secs(30),
+            retained_page_keys: DEFAULT_RETAINED_PAGE_KEYS,
         }
     }
 
@@ -662,10 +732,21 @@ pub(crate) mod tests {
         let t3 = p3.durable.activate_at;
         let p4 = plan(&policy(), &p3.durable, &[cache(1)], &[offer], t3).unwrap();
         assert_eq!(p4.durable.generation, 3);
-        assert_eq!(p4.durable.keys.len(), 2);
-        assert!(p4.durable.keys.iter().all(|k| k.state == "active"));
-        let old: Vec<_> = d.keys.iter().map(|k| k.id.clone()).collect();
-        assert!(p4.durable.keys.iter().all(|k| !old.contains(&k.id)));
+        // New active page and origin keys, and the old page key kept for reads.
+        assert_eq!(p4.durable.keys.len(), 3);
+        p4.durable.validate().unwrap();
+        let old: Vec<_> = d.keys.iter().map(|k| k.key.id).collect();
+        for k in p4.durable.keys.iter() {
+            if old.contains(&k.key.id) {
+                assert_eq!(k.state, CacheKeyState::Decrypt);
+                assert_eq!(k.key.purpose, CacheKeyPurpose::Page);
+            } else {
+                assert_eq!(k.state, CacheKeyState::Active);
+            }
+        }
+        let b = p4.durable.bundle(CLUSTER).unwrap();
+        let encoded = wire::encode_bundle(&b).unwrap();
+        assert!(wire::decode_bundle(&encoded).unwrap().cache_keys == b.cache_keys);
     }
 
     #[test]
@@ -861,98 +942,249 @@ pub(crate) mod tests {
 
     #[test]
     fn capacity_never_evicts() {
-        let cap = catalog_capacity();
-        assert!(cap > 100);
+        let cap = catalog_capacity(DEFAULT_RETAINED_PAGE_KEYS);
+        assert!(cap >= 900, "{cap}");
+        assert!(catalog_capacity(1) > cap);
         let catalog: Vec<_> = (0..3).map(cache).collect();
         let mut d = Durable::default();
-        assert_eq!(admit_catalog(&catalog, &d).unwrap().len(), 3);
+        assert_eq!(
+            admit_catalog(&catalog, &d, DEFAULT_RETAINED_PAGE_KEYS)
+                .unwrap()
+                .len(),
+            3
+        );
         d.generation = 1;
         for c in &catalog {
             for p in PURPOSES {
                 d.keys
-                    .push(new_key(&mut OsEntropy, &c.id.0, p, "active", 1).unwrap());
+                    .push(new_key(&mut OsEntropy, &c.id.0, p, CacheKeyState::Active, 1).unwrap());
             }
         }
         assert_eq!(d.keyed_caches().len(), 3);
-        // A full bundle with every cache in overlap still encodes.
+    }
+
+    /// At maximum catalog, with every cache holding all retained page keys
+    /// and a prepared rotation, and every root slot used, the bundle and the
+    /// state record fit and decode.
+    #[test]
+    fn maximum_catalog_fits_bundle_and_state_record() {
+        let retained = DEFAULT_RETAINED_PAGE_KEYS;
+        let cap = catalog_capacity(retained);
         let t = now();
         let mut big = Durable {
-            generation: 2,
+            generation: 20,
             ..Default::default()
         };
+        let mut rng = SplitMix64::new(1);
         for i in 0..cap {
             let id = format!("{i:08x}-2222-4222-8222-222222222222");
-            for p in PURPOSES {
+            for g in 0..retained as u64 {
+                let state = if g == 0 {
+                    CacheKeyState::Active
+                } else {
+                    CacheKeyState::Decrypt
+                };
                 big.keys
-                    .push(new_key(&mut OsEntropy, &id, p, "active", 1).unwrap());
-                big.keys
-                    .push(new_key(&mut OsEntropy, &id, p, "prepared", 2).unwrap());
+                    .push(new_key(&mut rng, &id, CacheKeyPurpose::Page, state, 10 - g).unwrap());
             }
+            big.keys.push(
+                new_key(
+                    &mut rng,
+                    &id,
+                    CacheKeyPurpose::Page,
+                    CacheKeyState::Prepared,
+                    20,
+                )
+                .unwrap(),
+            );
+            big.keys.push(
+                new_key(
+                    &mut rng,
+                    &id,
+                    CacheKeyPurpose::OriginCredentials,
+                    CacheKeyState::Active,
+                    10,
+                )
+                .unwrap(),
+            );
+            big.keys.push(
+                new_key(
+                    &mut rng,
+                    &id,
+                    CacheKeyPurpose::OriginCredentials,
+                    CacheKeyState::Prepared,
+                    20,
+                )
+                .unwrap(),
+            );
         }
+        assert_eq!(big.keys.len(), cap * keys_per_cache(retained));
+        sort_keys(&mut big.keys);
         for i in 0..MAX_ROOTS {
-            let der = root(7);
+            // Pad to the largest accepted root so the reservation is exercised.
+            let mut der = root(7);
+            der.resize(MAX_ROOT_DER_BYTES, 0);
             big.roots.push(Root {
                 der: STANDARD.encode(&der),
                 seat: (i % 16) as u8,
-                holder: "h".into(),
+                holder: "11111111-1111-4111-8111-111111111111".into(),
                 not_after: t + DAY * 7,
                 retain_until: t + DAY,
             });
         }
         big.validate().unwrap();
-        big.bundle(CLUSTER).unwrap();
-        let state = serde_json::to_vec(&big).unwrap();
+        // Padded DER is not a certificate, so encode the wire key table and
+        // envelope with real roots and account the padding separately.
+        let mut wire_bundle = big.clone();
+        for r in &mut wire_bundle.roots {
+            r.der = STANDARD.encode(root(7));
+        }
+        let b = wire_bundle.bundle(CLUSTER).unwrap();
+        let encoded = wire::encode_bundle(&b).unwrap();
+        let real_roots: usize = wire_bundle.roots.iter().map(|r| r.der.len()).sum();
+        let padded_roots: usize = big.roots.iter().map(|r| r.der.len()).sum();
+        assert!(
+            encoded.len() - real_roots + padded_roots <= wire::MAX_BUNDLE_BYTES,
+            "{}",
+            encoded.len()
+        );
+        let decoded = wire::decode_bundle(&encoded).unwrap();
+        assert_eq!(decoded.cache_keys.len(), big.keys.len());
+        let record = super::super::state::StateRecord {
+            version: super::super::state::VERSION,
+            cluster: CLUSTER.into(),
+            term: super::super::state::Term {
+                lease_uid: "l".into(),
+                transitions: 1,
+                holder: "h".into(),
+            },
+            writer_pod_uid: "p".into(),
+            keyring: big.clone(),
+            ..Default::default()
+        };
+        let state = super::super::state::encode(&record).unwrap();
         assert!(
             state.len() < super::super::state::MAX_BYTES,
             "{}",
             state.len()
         );
+        let back = super::super::state::decode(CLUSTER, true, Some(&state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.keyring, big);
+    }
+
+    /// Pages stay readable for N - 1 rotations: each activation turns the old
+    /// page key into a decrypt key and drops the oldest beyond N - 1.
+    #[test]
+    fn rotation_retains_page_keys() {
+        let t = now();
+        let pol = Policy {
+            retained_page_keys: 3,
+            ..policy()
+        };
+        let mut d = plan(&pol, &Durable::default(), &[cache(1)], &[], t)
+            .unwrap()
+            .durable;
+        let first = d
+            .keys
+            .iter()
+            .find(|k| k.key.purpose == CacheKeyPurpose::Page)
+            .unwrap()
+            .key
+            .id;
+        let readable = |d: &Durable, id: KeyId| d.keys.iter().any(|k| k.key.id == id);
+        for rotation in 1..=3 {
+            d = plan(&pol, &d, &[cache(1)], &[], d.next_rotation)
+                .unwrap()
+                .durable;
+            d = plan(&pol, &d, &[cache(1)], &[], d.activate_at)
+                .unwrap()
+                .durable;
+            d.validate().unwrap();
+            let decrypt = d
+                .keys
+                .iter()
+                .filter(|k| k.state == CacheKeyState::Decrypt)
+                .count();
+            assert_eq!(decrypt, rotation.min(2), "rotation {rotation}");
+            assert_eq!(readable(&d, first), rotation < 3, "rotation {rotation}");
+            assert_eq!(
+                d.keys
+                    .iter()
+                    .filter(|k| k.key.purpose == CacheKeyPurpose::OriginCredentials)
+                    .count(),
+                1
+            );
+        }
+        // Lowering N prunes on the next pass.
+        let one = Policy {
+            retained_page_keys: 1,
+            ..policy()
+        };
+        let p = plan(&one, &d, &[cache(1)], &[], t).unwrap();
+        assert!(p.changed);
+        assert!(
+            p.durable
+                .keys
+                .iter()
+                .all(|k| k.state == CacheKeyState::Active)
+        );
+    }
+
+    #[test]
+    fn oversized_root_is_refused() {
+        let t = now();
+        let mut der = root(7);
+        der.resize(MAX_ROOT_DER_BYTES + 1, 0);
+        assert!(inspect_root(&der, t).is_err());
     }
 
     #[test]
     fn validate_rejects_bad_state() {
+        const C: &str = "11111111-1111-4111-8111-111111111111";
+        let key = |state, generation| {
+            new_key(&mut OsEntropy, C, CacheKeyPurpose::Page, state, generation).unwrap()
+        };
         let mut d = Durable {
             generation: 1,
             ..Default::default()
         };
-        d.keys.push(
-            new_key(
-                &mut OsEntropy,
-                "11111111-1111-4111-8111-111111111111",
-                "page",
-                "active",
-                1,
-            )
-            .unwrap(),
-        );
+        d.keys.push(key(CacheKeyState::Active, 1));
         d.validate().unwrap();
         let mut two = d.clone();
-        two.keys.push(
+        two.keys.push(key(CacheKeyState::Active, 1));
+        assert!(two.validate().is_err());
+        let mut future = d.clone();
+        future.keys[0] = key(CacheKeyState::Active, 5);
+        assert!(future.validate().is_err());
+        let mut origin_decrypt = d.clone();
+        origin_decrypt.keys.push(
             new_key(
                 &mut OsEntropy,
-                "11111111-1111-4111-8111-111111111111",
-                "page",
-                "active",
+                C,
+                CacheKeyPurpose::OriginCredentials,
+                CacheKeyState::Active,
                 1,
             )
             .unwrap(),
         );
-        assert!(two.validate().is_err());
-        let mut future = d.clone();
-        future.keys[0] = new_key(
-            &mut OsEntropy,
-            "11111111-1111-4111-8111-111111111111",
-            "page",
-            "active",
-            5,
-        )
-        .unwrap();
-        assert!(future.validate().is_err());
-        assert!(
-            format!("{:?}", d.keys[0])
-                .find(&d.keys[0].material)
-                .is_none()
+        origin_decrypt.keys.push(
+            new_key(
+                &mut OsEntropy,
+                C,
+                CacheKeyPurpose::OriginCredentials,
+                CacheKeyState::Decrypt,
+                1,
+            )
+            .unwrap(),
         );
+        assert!(origin_decrypt.validate().is_err());
+        // Debug never shows material, and the record round-trips.
+        let debug = format!("{d:?}");
+        assert!(debug.contains("Active") && !debug.contains("material"));
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(serde_json::from_str::<Durable>(&json).unwrap(), d);
     }
 
     #[test]

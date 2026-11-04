@@ -1496,7 +1496,7 @@ mod tests {
         #[test]
         fn offloaded_verification_observes_rotation_after_submission() {
             use crate::test_support::security::{ca, identities, mac_test_keys};
-            use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle, SCHEMA_VERSION};
+            use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle};
             for retire_roots in [false, true] {
                 let identities = identities(
                     ClusterId(node(99).0),
@@ -1524,7 +1524,7 @@ mod tests {
                 identities[2]
                     .keys
                     .install(KeyringBundle {
-                        schema_version: SCHEMA_VERSION,
+                        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                         cluster: ClusterId(node(99).0),
                         generation: BundleGeneration(2),
                         peer_trust_roots: roots,

@@ -1,7 +1,7 @@
 //! Mechanism fixtures and byte/authentication regression tests.
 
 use super::*;
-use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle, SCHEMA_VERSION};
+use racer_control_wire::{BundleGeneration, ClusterId, KeyringBundle};
 use racer_crypto::identity::{
     KeyEpochs,
     test_util::{ca, issue},
@@ -49,7 +49,7 @@ pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
                 )),
             ));
             keys.install(KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster: cluster.clone(),
                 generation: BundleGeneration(1),
                 peer_trust_roots: roots.clone(),

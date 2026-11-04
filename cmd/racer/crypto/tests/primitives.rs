@@ -646,7 +646,7 @@ fn assert_equivalent(bytes: &[u8]) {
 mod identity_workflows {
     use racer_control_wire::{
         BundleGeneration, CacheEncryptionKey, CacheId, CacheKeyRef, CacheKeyState, ClusterId,
-        KeyId, KeyringBundle, NodeId, SCHEMA_VERSION,
+        KeyId, KeyringBundle, NodeId,
     };
     use racer_crypto::identity::{
         Certificates, Error, KeyEpochs, KeyPurpose, Keyring, PendingIdentity, SigningIdentity,
@@ -1310,7 +1310,7 @@ mod identity_workflows {
     /// Construct fresh generation-bound keys with distinct purpose-specific material.
     fn bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
         KeyringBundle {
-            schema_version: SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(generation),
             peer_trust_roots: roots,

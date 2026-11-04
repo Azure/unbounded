@@ -194,7 +194,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
     // Selectors of caches that admission dropped are not needed: only pools
     // of admitted caches are published.
     let admitted = built.and_then(|c| {
-        keyring::admit_catalog(&c.caches, &durable)
+        keyring::admit_catalog(&c.caches, &durable, i.policy.retained())
             .ok()
             .map(|caches| (caches, c.selectors))
     });

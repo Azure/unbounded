@@ -317,6 +317,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

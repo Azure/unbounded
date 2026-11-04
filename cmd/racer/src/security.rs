@@ -3598,7 +3598,7 @@ mod tests {
                 );
                 let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
                 keys.install(KeyringBundle {
-                    schema_version: racer_control_wire::SCHEMA_VERSION,
+                    schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                     cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
                     generation: BundleGeneration(1),
                     peer_trust_roots: vec![ca.der().to_vec()],

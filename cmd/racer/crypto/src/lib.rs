@@ -616,14 +616,15 @@ pub mod identity {
     /// Check the canonical UUID spelling used by Racer identity bindings.
     pub use racer_control_wire::valid_uuid as canonical_uuid;
     use racer_control_wire::{
-        BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId,
-        SCHEMA_VERSION,
+        BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KEYRING_SCHEMA_VERSION,
+        KeyId, MAX_BUNDLE_KEYS, MAX_RETAINED_PAGE_KEYS, NodeId,
     };
     use rustls::{
         RootCertStore,
         pki_types::{CertificateDer, PrivatePkcs8KeyDer},
     };
     use sha2::{Digest, Sha256};
+    use std::collections::{HashMap, HashSet};
     use std::{
         cell::RefCell,
         collections::VecDeque,
@@ -860,6 +861,9 @@ pub mod identity {
         reference: CacheKeyRef,
 
         secret: Arc<Secret>,
+
+        /// Whether the key was active when leased. Only active keys seal.
+        sealable: bool,
     }
 
     /// The wire-defined purpose permanently bound to a key epoch.
@@ -1276,6 +1280,9 @@ pub mod identity {
             out: &mut [u8],
         ) -> Result<()> {
             self.bound_material(cache, self.id(), KeyPurpose::Page)?;
+            if !self.sealable {
+                return Err(Error::MissingKey);
+            }
             self.secret
                 .page_cipher
                 .seal(nonce, aad, input, out)
@@ -1367,6 +1374,9 @@ pub mod identity {
             input: &[u8],
             out: &mut [u8],
         ) -> Result<()> {
+            if !self.sealable {
+                return Err(Error::MissingKey);
+            }
             crate::seal_credentials(
                 self.bound_material(cache, self.id(), KeyPurpose::OriginCredentials)?,
                 nonce,
@@ -1507,7 +1517,7 @@ pub mod identity {
         ) -> Result<BundleGeneration> {
             // Bound private staging before allocating it, including direct callers
             // that do not pass through the wire decoder's byte limit.
-            if bundle.cache_keys.len() > 4096 {
+            if bundle.cache_keys.len() > MAX_BUNDLE_KEYS {
                 return Err(Error::InvalidConfiguration);
             }
             self.install_inner(&bundle.into())
@@ -1534,9 +1544,9 @@ pub mod identity {
             cluster: &ClusterId,
             node: &NodeId,
         ) -> Result<Self> {
-            if bundle.schema_version != SCHEMA_VERSION
+            if bundle.schema_version != KEYRING_SCHEMA_VERSION
                 || &bundle.cluster != cluster
-                || bundle.cache_keys.len() > 4096
+                || bundle.cache_keys.len() > MAX_BUNDLE_KEYS
                 || bundle.generation.0 == 0
                 || !canonical_uuid(&cluster.0)
                 || !canonical_uuid(&node.0)
@@ -1562,41 +1572,40 @@ pub mod identity {
             let fingerprint: [u8; 32] = hash.finalize().into();
             // Validate the downloaded epoch before acquiring the shared publication
             // lock. Existing immutable secret leases remain usable during validation.
-            for (i, candidate) in bundle.cache_keys.iter().enumerate() {
+            // Hashed checks keep validation O(n) for the largest catalogs.
+            let n = bundle.cache_keys.len();
+            let mut references = HashSet::with_capacity(n);
+            let mut materials = HashSet::with_capacity(n);
+            // Per cache and purpose: prepared, active, and decrypt counts.
+            let mut groups: HashMap<(&CacheId, u8), [usize; 3]> = HashMap::with_capacity(n);
+            for candidate in &bundle.cache_keys {
                 let generation = candidate
                     .key
                     .id
                     .generation()
                     .ok_or(Error::InvalidConfiguration)?;
-                if generation > bundle.generation.0 {
-                    return Err(Error::InvalidConfiguration);
-                }
-                if !canonical_uuid(&candidate.key.cache.0) {
-                    return Err(Error::InvalidConfiguration);
-                }
-                if bundle
-                    .cache_keys
-                    .iter()
-                    .filter(|k| {
-                        k.key.cache == candidate.key.cache
-                            && k.key.purpose == candidate.key.purpose
-                            && k.state == CacheKeyState::Active
-                    })
-                    .count()
-                    != 1
+                if generation > bundle.generation.0
+                    || !canonical_uuid(&candidate.key.cache.0)
+                    || !references.insert(reference_order(&candidate.key))
+                    || !materials.insert(&*candidate.material)
                 {
                     return Err(Error::InvalidConfiguration);
                 }
-                for other in &bundle.cache_keys[..i] {
-                    if candidate.key == other.key
-                        || candidate.material == other.material
-                        || (candidate.state == CacheKeyState::Active
-                            && other.state == CacheKeyState::Active
-                            && candidate.key.cache == other.key.cache
-                            && candidate.key.purpose == other.key.purpose)
-                    {
-                        return Err(Error::InvalidConfiguration);
-                    }
+                let counts = groups.entry(reference_group(&candidate.key)).or_default();
+                counts[match candidate.state {
+                    CacheKeyState::Prepared => 0,
+                    CacheKeyState::Active => 1,
+                    CacheKeyState::Decrypt => 2,
+                }] += 1;
+            }
+            for ((_, purpose), [prepared, active, decrypt]) in groups {
+                let max_decrypt = if purpose == KeyPurpose::Page as u8 {
+                    MAX_RETAINED_PAGE_KEYS - 1
+                } else {
+                    0
+                };
+                if active != 1 || prepared > 1 || decrypt > max_decrypt {
+                    return Err(Error::InvalidConfiguration);
                 }
             }
             Ok(Self {
@@ -1623,29 +1632,34 @@ pub mod identity {
                         Err(Error::InvalidConfiguration)
                     };
                 }
+                let by_reference: HashMap<_, &Entry> = current
+                    .entries
+                    .iter()
+                    .map(|e| (reference_order(&e.reference), e))
+                    .collect();
+                let by_material: HashMap<&[u8; 32], &CacheKeyRef> = current
+                    .entries
+                    .iter()
+                    .map(|e| (&*e.secret.material, &e.reference))
+                    .collect();
                 for candidate in &bundle.cache_keys {
                     let generation = candidate
                         .key
                         .id
                         .generation()
                         .ok_or(Error::InvalidConfiguration)?;
+                    let old = by_reference.get(&reference_order(&candidate.key));
                     // Removed IDs cannot reenter admission, even as prepared keys.
-                    if generation <= current.generation.0
-                        && !current.entries.iter().any(|e| e.reference == candidate.key)
-                    {
+                    if generation <= current.generation.0 && old.is_none() {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if let Some(old) = current
-                        .entries
-                        .iter()
-                        .find(|e| e.reference == candidate.key)
-                        && *old.secret.material != *candidate.material
-                    {
+                    if old.is_some_and(|old| *old.secret.material != *candidate.material) {
                         return Err(Error::InvalidConfiguration);
                     }
-                    if current.entries.iter().any(|e| {
-                        e.reference != candidate.key && *e.secret.material == *candidate.material
-                    }) {
+                    if by_material
+                        .get(&*candidate.material)
+                        .is_some_and(|r| **r != candidate.key)
+                    {
                         return Err(Error::InvalidConfiguration);
                     }
                 }
@@ -1659,8 +1673,11 @@ pub mod identity {
                     let retained = current.and_then(|current| {
                         current
                             .entries
-                            .iter()
-                            .find(|e| e.reference == candidate.key)
+                            .binary_search_by(|e| {
+                                reference_order(&e.reference).cmp(&reference_order(&candidate.key))
+                            })
+                            .ok()
+                            .map(|i| &current.entries[i])
                     });
                     Entry {
                         reference: candidate.key.clone(),
@@ -1769,7 +1786,8 @@ pub mod identity {
             Ok(identity)
         }
 
-        /// Admit a specific active or prepared epoch for its cache and purpose.
+        /// Admit a specific active, prepared, or decrypt epoch for its cache and
+        /// purpose. Only a lease of a key that was active when leased can seal.
         pub fn lease(
             &self,
             cache: Option<&CacheId>,
@@ -1796,6 +1814,7 @@ pub mod identity {
             Ok(KeyLease {
                 reference,
                 secret: entry.secret.clone(),
+                sealable: entry.state == CacheKeyState::Active,
             })
         }
 
@@ -1818,6 +1837,7 @@ pub mod identity {
             Ok(KeyLease {
                 reference: entry.reference.clone(),
                 secret: entry.secret.clone(),
+                sealable: true,
             })
         }
     }
@@ -2052,7 +2072,7 @@ pub mod identity {
             let (old_ca, _) = ca();
             let (new_ca, _) = ca();
             let old = racer_control_wire::KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![old_ca.der().to_vec()],
@@ -2100,7 +2120,7 @@ pub mod identity {
             let installer = BundleInstaller::new(keys());
             assert_eq!(installer.generation(), None);
             let mut bundle = racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster,
                 generation: BundleGeneration(2),
                 peer_trust_roots: vec![first.der().to_vec(), second.der().to_vec()],
@@ -2169,7 +2189,7 @@ pub mod identity {
                 Arc::new(KeyEpochs::with_clock(clock.clone())),
             ));
             let bundle = |generation, roots| racer_control_wire::KeyringBundle {
-                schema_version: racer_control_wire::SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,
@@ -2430,7 +2450,7 @@ pub mod identity {
                 KeyId::from_generation(3, 0).unwrap(),
             ] {
                 let bundle = racer_control_wire::KeyringBundle {
-                    schema_version: SCHEMA_VERSION,
+                    schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                     cluster: ClusterId(CLUSTER.into()),
                     generation: BundleGeneration(2),
                     peer_trust_roots: roots.clone(),
@@ -2452,7 +2472,7 @@ pub mod identity {
         /// Build a default pair with generation-one key IDs and configurable admission.
         fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
             KeyringBundle {
-                schema_version: SCHEMA_VERSION,
+                schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                 cluster: ClusterId(CLUSTER.into()),
                 generation: BundleGeneration(generation),
                 peer_trust_roots: roots,
@@ -2651,6 +2671,71 @@ pub mod identity {
             assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
         }
 
+        /// Decrypt keys are leased for reading but never seal or become active,
+        /// and only page keys may be decrypt keys, up to the retention bound.
+        #[test]
+        fn decrypt_keys_open_but_never_seal_or_activate() {
+            let keys = keys();
+            let cache = CacheId(CACHE.into());
+            let roots = (*keys.peer_trust_roots().unwrap()).clone();
+            let mut next = bundle(2, roots.clone(), CacheKeyState::Active);
+            next.cache_keys[0].key.id = KeyId::from_generation(2, 1).unwrap();
+            next.cache_keys[0].material = Zeroizing::new([9; 32]);
+            let mut old = bundle(1, roots.clone(), CacheKeyState::Decrypt).cache_keys;
+            old.truncate(1);
+            next.cache_keys.append(&mut old);
+            keys.install_inner(&next).unwrap();
+            let old_id = KeyId::from_generation(1, 1).unwrap();
+            let active = keys.active(&cache, KeyPurpose::Page).unwrap();
+            assert_ne!(active.id(), old_id);
+            let decrypt = keys.lease(Some(&cache), old_id, KeyPurpose::Page).unwrap();
+            let mut sealed = [0; 19];
+            assert_eq!(
+                decrypt.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
+                Err(Error::MissingKey)
+            );
+            active
+                .seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed)
+                .unwrap();
+            // Origin credential keys keep no decrypt history.
+            let mut origin = bundle(3, roots.clone(), CacheKeyState::Active);
+            origin.cache_keys[0].key.id = KeyId::from_generation(2, 1).unwrap();
+            origin.cache_keys[0].material = Zeroizing::new([9; 32]);
+            origin.cache_keys.push(CacheEncryptionKey {
+                key: CacheKeyRef {
+                    cache: cache.clone(),
+                    id: KeyId::from_generation(3, 9).unwrap(),
+                    purpose: CacheKeyPurpose::OriginCredentials,
+                },
+                state: CacheKeyState::Decrypt,
+                material: Zeroizing::new([10; 32]),
+            });
+            assert_eq!(
+                keys.install_inner(&origin),
+                Err(Error::InvalidConfiguration)
+            );
+            // At most MAX_RETAINED_PAGE_KEYS - 1 decrypt page keys.
+            let mut many = bundle(3, roots, CacheKeyState::Active);
+            many.cache_keys[0].key.id = KeyId::from_generation(2, 1).unwrap();
+            many.cache_keys[0].material = Zeroizing::new([9; 32]);
+            for i in 0..MAX_RETAINED_PAGE_KEYS as u32 {
+                let mut material = Zeroizing::new([11; 32]);
+                material[..4].copy_from_slice(&i.to_be_bytes());
+                many.cache_keys.push(CacheEncryptionKey {
+                    key: CacheKeyRef {
+                        cache: cache.clone(),
+                        id: KeyId::from_generation(3, 100 + i).unwrap(),
+                        purpose: CacheKeyPurpose::Page,
+                    },
+                    state: CacheKeyState::Decrypt,
+                    material,
+                });
+            }
+            assert_eq!(keys.install_inner(&many), Err(Error::InvalidConfiguration));
+            many.cache_keys.pop();
+            keys.install_inner(&many).unwrap();
+        }
+
         /// Capacity counts only current admission, not previously issued leases.
         #[test]
         fn capacity_is_bounded_by_current_bundle_not_outstanding_leases() {
@@ -2661,7 +2746,7 @@ pub mod identity {
             let roots = (*keys.peer_trust_roots().unwrap()).clone();
             let mut full = rotation_bundle(2, roots.clone());
             let template = full.cache_keys[0].clone();
-            full.cache_keys = (0..4096u32)
+            full.cache_keys = (0..MAX_BUNDLE_KEYS as u32)
                 .map(|i| {
                     let mut key = template.clone();
                     key.key.cache = CacheId(format!("{i:08x}-1111-4111-8111-111111111111"));
@@ -2671,12 +2756,12 @@ pub mod identity {
                 })
                 .collect();
             keys.install_inner(&full).unwrap();
-            assert_eq!(admitted_count(&keys), 4096);
+            assert_eq!(admitted_count(&keys), MAX_BUNDLE_KEYS);
             full.generation = BundleGeneration(3);
             full.cache_keys.push(template);
             assert_eq!(keys.install_inner(&full), Err(Error::InvalidConfiguration));
             assert_eq!(keys.generation().unwrap(), Some(2));
-            assert_eq!(admitted_count(&keys), 4096);
+            assert_eq!(admitted_count(&keys), MAX_BUNDLE_KEYS);
             keys.install_inner(&rotation_bundle(3, roots)).unwrap();
             assert_eq!(admitted_count(&keys), 2);
             assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);

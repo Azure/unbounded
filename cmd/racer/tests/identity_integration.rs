@@ -75,7 +75,7 @@ fn shared_identity_publication_revalidates_trust_without_revoking_held_owners() 
     );
     let installer = BundleInstaller::new(publisher.clone());
     let mut bundle = KeyringBundle {
-        schema_version: SCHEMA_VERSION,
+        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
         cluster: cluster.clone(),
         generation: BundleGeneration(1),
         peer_trust_roots: roots,
@@ -152,7 +152,7 @@ fn fixture() -> (Rc<Keyring>, BundleInstaller, KeyringBundle) {
     ));
     let installer = BundleInstaller::new(keys.clone());
     let bundle = KeyringBundle {
-        schema_version: SCHEMA_VERSION,
+        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         generation: BundleGeneration(1),
         peer_trust_roots: vec![ca.der().to_vec()],

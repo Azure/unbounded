@@ -1745,7 +1745,6 @@ mod subscriptions {
     use flow_control::subscriptions::Interval;
     use racer_control_wire::BundleGeneration;
     use racer_control_wire::KeyringBundle;
-    use racer_control_wire::SCHEMA_VERSION;
     use racer_core::subscriptions::Demand;
     use std::cell::Cell;
     use std::task::Context;
@@ -2620,7 +2619,7 @@ mod subscriptions {
             *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
         }
         keys.install(KeyringBundle {
-            schema_version: SCHEMA_VERSION,
+            schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
             cluster: ClusterId(CLUSTER.into()),
             generation: BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),

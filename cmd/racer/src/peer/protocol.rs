@@ -2646,7 +2646,7 @@ pub(crate) mod tests {
                 signer
                     .keys
                     .install(KeyringBundle {
-                        schema_version: SCHEMA_VERSION,
+                        schema_version: racer_control_wire::KEYRING_SCHEMA_VERSION,
                         cluster: signer.keys.cluster().clone(),
                         generation: BundleGeneration(2),
                         peer_trust_roots: (*signer.keys.peer_trust_roots().unwrap()).clone(),
