@@ -62,7 +62,7 @@ async fn handle(mut stream: TcpStream) {
         return;
     }
     let response = response(&buf);
-    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = tokio::time::timeout(READ_TIMEOUT, stream.write_all(response.as_bytes())).await;
     let _ = stream.shutdown().await;
 }
 

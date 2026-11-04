@@ -418,13 +418,23 @@ impl Conn {
         if self.body.is_empty() {
             slices = &mut slices[..1];
         }
-        while !slices.is_empty() {
-            match self.stream.write_vectored(slices).await {
-                Ok(0) | Err(_) => return Next::Abort,
-                Ok(n) => IoSlice::advance_slices(&mut slices, n),
+        // Bound the whole write: error responses are sent outside the
+        // request deadline, and a client that stops reading must not hold a
+        // connection slot forever. On expiry the connection is dropped.
+        let stream = &mut self.stream;
+        let write = tokio::time::timeout(self.shared.request_timeout, async {
+            while !slices.is_empty() {
+                match stream.write_vectored(slices).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => IoSlice::advance_slices(&mut slices, n),
+                }
             }
+            true
+        });
+        match write.await {
+            Ok(true) => next,
+            Ok(false) | Err(_) => Next::Abort,
         }
-        next
     }
 
     async fn handle(&mut self, request: &mut Request) -> Next {

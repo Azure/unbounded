@@ -555,6 +555,40 @@ async fn connection_limit_queues_in_backlog() {
 }
 
 #[tokio::test]
+async fn stalled_reader_releases_slot() {
+    // A client pipelines many requests and then a malformed one, and never
+    // reads. Once the send buffers fill, the response writes (including the
+    // final 400 sent outside any request deadline) must time out and close
+    // the connection so the only slot is released.
+    let mut options = options(Api::S3);
+    options.max_connections = 1;
+    options.request_timeout = Duration::from_millis(300);
+    let s = Sidecar::start_with(options, missing_socket(), false).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let stalled = socket.connect(s.addr).await.unwrap();
+    let (_read, mut write) = stalled.into_split();
+    let writer = tokio::spawn(async move {
+        let one = "PUT /bucket/key HTTP/1.1\r\nHost: x\r\n\r\n".repeat(1000);
+        for _ in 0..50 {
+            if write.write_all(one.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+        let _ = write.write_all(b"BOGUS\r\n\r\n").await;
+        // Keep the write half open.
+        std::future::pending::<()>().await;
+    });
+    let mut next = Client::connect(s.addr).await;
+    next.send("PUT", "/bucket/key", &[]).await;
+    let served = tokio::time::timeout(Duration::from_secs(10), next.response(false))
+        .await
+        .expect("slot not released by stalled reader");
+    assert_eq!(served.status, 405);
+    writer.abort();
+}
+
+#[tokio::test]
 async fn workers_share_listener_and_limits() {
     let mut options = options(Api::S3);
     options.workers = 4;
