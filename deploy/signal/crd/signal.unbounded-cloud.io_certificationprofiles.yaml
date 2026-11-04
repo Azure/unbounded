@@ -49,6 +49,8 @@ spec:
           spec:
             properties:
               checks:
+                description: Checks is an ordered suite. A check's position defines
+                  its stable ID.
                 items:
                   properties:
                     backend:
@@ -185,9 +187,10 @@ spec:
                   - message: MPIJob checks require a positive gpuCount
                     rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
                       > 0)
-                maxItems: 15
-                minItems: 15
+                maxItems: 256
+                minItems: 1
                 type: array
+                x-kubernetes-list-type: atomic
               participants:
                 properties:
                   count:

@@ -117,8 +117,11 @@ type CertificationRunSpec struct {
 	// +kubebuilder:validation:MaxItems=8
 	Participants []Participant         `json:"participants"`
 	ScriptBundle ScriptBundleReference `json:"scriptBundle"`
-	// +kubebuilder:validation:MinItems=15
-	// +kubebuilder:validation:MaxItems=15
+	// Checks is the immutable ordered snapshot of the Profile suite. A check's
+	// position defines its stable ID.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=256
+	// +listType=atomic
 	Checks  []CertificationCheckSnapshot `json:"checks"`
 	Cancel  bool                         `json:"cancel,omitempty"`
 	Release bool                         `json:"release,omitempty"`
@@ -190,7 +193,9 @@ type CertificationRunStatus struct {
 	Reason   string         `json:"reason,omitempty"`
 	Workflow WorkflowStatus `json:"workflow,omitempty"`
 	Evidence EvidenceStatus `json:"evidence,omitempty"`
-	// +kubebuilder:validation:MaxItems=15
+	// Checks remains positionally aligned with spec.checks.
+	// +kubebuilder:validation:MaxItems=256
+	// +listType=atomic
 	Checks []CheckStatus `json:"checks,omitempty"`
 	// +listType=map
 	// +listMapKey=type
