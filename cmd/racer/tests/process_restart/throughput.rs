@@ -1164,3 +1164,82 @@ fn production_remote_bootstrap_one_get_and_empty() {
         }
     }
 }
+
+fn context_switches(pid: u32) -> BTreeMap<String, (u64, u64)> {
+    let mut result = BTreeMap::new();
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let task = task.unwrap();
+        let Ok(status) = fs::read_to_string(task.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map_or(0, |value| value.trim().parse().unwrap())
+        };
+        let name = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Name:"))
+            .unwrap()
+            .trim();
+        result.insert(
+            format!("{name}:{}", task.file_name().to_string_lossy()),
+            (
+                field("voluntary_ctxt_switches:"),
+                field("nonvoluntary_ctxt_switches:"),
+            ),
+        );
+    }
+    result
+}
+
+/// Idle wake baseline: context switches per thread per second of an idle process.
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; idle wake baseline"]
+fn production_idle_wakes() {
+    let number = |name: &str, default: u64| {
+        std::env::var(name).map_or(default, |value| value.parse().expect("unsigned"))
+    };
+    let pairs = number("RACER_THROUGHPUT_PAIRS", 4) as usize;
+    let seconds = number("RACER_IDLE_SECONDS", 10);
+    let scratch = Scratch::new();
+    let profile = Profile::new(pairs, 113, 1);
+    let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+    let (mut process, _origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+    let pid = process.child.id();
+    // Let startup traffic settle before sampling.
+    thread::sleep(Duration::from_secs(3));
+    let before = context_switches(pid);
+    let cpu_before = observe(pid);
+    let start = Instant::now();
+    thread::sleep(Duration::from_secs(seconds));
+    let elapsed = start.elapsed().as_secs_f64();
+    let after = context_switches(pid);
+    let cpu_after = observe(pid);
+    let per_thread: BTreeMap<_, _> = after
+        .iter()
+        .map(|(name, (voluntary, involuntary))| {
+            let (v0, i0) = before.get(name).copied().unwrap_or((0, 0));
+            let cpu = cpu_after.threads.get(name).copied().unwrap_or(0)
+                - cpu_before.threads.get(name).copied().unwrap_or(0);
+            (
+                name.clone(),
+                json!({
+                    "voluntary_per_s": (voluntary - v0) as f64 / elapsed,
+                    "involuntary_per_s": (involuntary - i0) as f64 / elapsed,
+                    "cpu_fraction": cpu as f64 / 1e9 / elapsed,
+                }),
+            )
+        })
+        .collect();
+    let report = json!({"pairs": pairs, "seconds": elapsed, "pid": pid, "threads": per_thread});
+    println!("IDLE_WAKES {report}");
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(Path::new(env!("CARGO_MANIFEST_DIR")).join("target/idle-wakes.jsonl"))
+        .unwrap();
+    writeln!(output, "{report}").unwrap();
+    assert!(process.stop(libc::SIGTERM).success());
+}
