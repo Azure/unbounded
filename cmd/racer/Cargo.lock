@@ -923,6 +923,7 @@ dependencies = [
  "crc64fast",
  "ed25519-dalek",
  "futures",
+ "ghash",
  "poly1305",
  "racer-control-wire",
  "rcgen",

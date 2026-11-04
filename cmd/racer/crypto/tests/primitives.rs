@@ -2,6 +2,7 @@
 
 use racer_crypto::{
     SigningKey, TAG_LEN, VerifyingKey, copy_prefix_crc64, crc64, ct_eq, hmac_sha256, open, seal,
+    verify_tag,
 };
 
 /// The identity module keeps its public types and classified errors beside primitives.
@@ -991,6 +992,34 @@ mod identity_workflows {
         );
         assert_eq!(out, [0; 3]);
 
+        // Tag-only verification enforces the same bindings as open.
+        let (body, tag) = sealed.split_at(3);
+        page.verify_page_tag(&cache, page.id(), &[1; 24], &[b"a", b"ad"], body, tag)
+            .unwrap();
+        assert_eq!(
+            page.verify_page_tag(&cache, page.id(), &[1; 24], &[b"bad"], body, tag),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(
+            page.verify_page_tag(&cache, credentials.id(), &[1; 24], &[b"aad"], body, tag),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(
+            page.verify_page_tag(
+                &CacheId("wrong".into()),
+                page.id(),
+                &[1; 24],
+                &[b"aad"],
+                body,
+                tag
+            ),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(
+            credentials.verify_page_tag(&cache, credentials.id(), &[1; 24], &[b"aad"], body, tag),
+            Err(Error::MissingKey)
+        );
+
         // In-place open takes the body already copied out and the tag apart.
         let (body, tag) = sealed.split_at(3);
         let mut inout = [0; 3];
@@ -1293,6 +1322,71 @@ fn fill_random(state: &mut u64, bytes: &mut [u8]) {
         *state ^= *state >> 7;
         *state ^= *state << 17;
         *byte = *state as u8;
+    }
+}
+
+/// Tag-only verification accepts exactly what `open` and the reference
+/// XAES-256-GCM accept, for any split of the AAD, and rejects tampering.
+#[test]
+fn verify_tag_matches_open_and_reference_and_rejects_tampering() {
+    use xaes_256_gcm::{
+        Xaes256Gcm,
+        aead::{AeadInOut, KeyInit, inout::InOutBuf},
+    };
+    let mut state = 0x2545_f491_4f6c_dd1d;
+    for (round, length) in [0, 1, 15, 16, 17, 31, 4095, (1 << 16) + 5]
+        .into_iter()
+        .enumerate()
+    {
+        let mut key = [0; 32];
+        let mut nonce = [0; 24];
+        let mut aad = vec![0; round * 11 + (round % 3)];
+        let mut plaintext = vec![0; length];
+        fill_random(&mut state, &mut key);
+        fill_random(&mut state, &mut nonce);
+        fill_random(&mut state, &mut aad);
+        fill_random(&mut state, &mut plaintext);
+        let mut body = plaintext.clone();
+        let tag = Xaes256Gcm::new((&key).into())
+            .encrypt_inout_detached((&nonce).into(), &aad, InOutBuf::from(&mut body[..]))
+            .unwrap();
+        let mut sealed = body.clone();
+        sealed.extend_from_slice(&tag);
+        let mut out = vec![0; length];
+        open(&key, &nonce, &aad, &sealed, &mut out).unwrap();
+
+        // Every split of the AAD, including empty parts, hashes the same.
+        for first in 0..=aad.len().min(40) {
+            for second in [first, (first + 5).min(aad.len()), aad.len()] {
+                let parts: [&[u8]; 4] = [&aad[..first], &[], &aad[first..second], &aad[second..]];
+                verify_tag(&key, &nonce, &parts, &body, &tag).unwrap();
+            }
+        }
+        verify_tag(&key, &nonce, &[&aad], &body, &tag).unwrap();
+
+        // Tampered ciphertext, tag, AAD, nonce or key are all rejected.
+        if length > 0 {
+            let mut bad = body.clone();
+            bad[length / 2] ^= 1;
+            assert!(verify_tag(&key, &nonce, &[&aad], &bad, &tag).is_err());
+            assert!(open(&key, &nonce, &aad, &[&bad[..], &tag[..]].concat(), &mut out).is_err());
+        }
+        let mut bad_tag = tag;
+        bad_tag[15] ^= 0x80;
+        assert!(verify_tag(&key, &nonce, &[&aad], &body, &bad_tag).is_err());
+        assert!(verify_tag(&key, &nonce, &[&aad], &body, &tag[..15]).is_err());
+        let mut bad_aad = aad.clone();
+        bad_aad.push(0);
+        assert!(verify_tag(&key, &nonce, &[&bad_aad], &body, &tag).is_err());
+        let mut bad_nonce = nonce;
+        bad_nonce[0] ^= 1;
+        assert!(verify_tag(&key, &bad_nonce, &[&aad], &body, &tag).is_err());
+        bad_nonce = nonce;
+        bad_nonce[23] ^= 1;
+        assert!(verify_tag(&key, &bad_nonce, &[&aad], &body, &tag).is_err());
+        let mut bad_key = key;
+        bad_key[31] ^= 1;
+        assert!(verify_tag(&bad_key, &nonce, &[&aad], &body, &tag).is_err());
     }
 }
 

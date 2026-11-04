@@ -1,0 +1,56 @@
+//! Phase 0 benchmark gate: tag-only XAES-256-GCM verification versus the
+//! CRC64 integrity check and a full open, on 16 MiB pages.
+//!
+//! Run with:
+//! `cargo test --release -p racer-crypto --test page_verify_bench -- --ignored --nocapture`
+
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
+use racer_crypto::{TAG_LEN, crc64, open, seal, verify_tag};
+
+const PAGE: usize = 16 << 20;
+const ROUNDS: usize = 24;
+
+fn gib_per_sec(elapsed: Duration) -> f64 {
+    (PAGE * ROUNDS) as f64 / elapsed.as_secs_f64() / f64::from(1u32 << 30)
+}
+
+fn time(mut work: impl FnMut()) -> Duration {
+    // One warm-up pass, then the timed rounds.
+    work();
+    let start = Instant::now();
+    for _ in 0..ROUNDS {
+        work();
+    }
+    start.elapsed()
+}
+
+#[test]
+#[ignore = "release-mode throughput benchmark"]
+fn tag_verify_versus_crc64_versus_open_on_16_mib_pages() {
+    let key = [7u8; 32];
+    let nonce = [9u8; 24];
+    let aad = [3u8; 96];
+    let plaintext: Vec<u8> = (0..PAGE).map(|i| (i * 31 + 7) as u8).collect();
+    let mut sealed = vec![0u8; PAGE + TAG_LEN];
+    seal(&key, &nonce, &aad, &plaintext, &mut sealed).unwrap();
+    let (body, tag) = sealed.split_at(PAGE);
+    let mut out = vec![0u8; PAGE];
+
+    let crc = time(|| {
+        black_box(crc64(black_box(&sealed)));
+    });
+    let tag_verify = time(|| {
+        verify_tag(&key, &nonce, &[&aad], black_box(body), tag).unwrap();
+    });
+    let full = time(|| {
+        open(&key, &nonce, &aad, black_box(&sealed), &mut out).unwrap();
+    });
+    let (crc, tag_verify, full) = (gib_per_sec(crc), gib_per_sec(tag_verify), gib_per_sec(full));
+    eprintln!(
+        "crc64 {crc:.2} GiB/s, verify_tag {tag_verify:.2} GiB/s, open {full:.2} GiB/s, \
+         tag time / crc time {:.3}",
+        crc / tag_verify
+    );
+}

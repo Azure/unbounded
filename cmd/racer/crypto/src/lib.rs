@@ -263,6 +263,90 @@ impl PageCipher {
     }
 }
 
+impl PageCipher {
+    /// See [`verify_tag`].
+    pub(crate) fn verify_tag(
+        &self,
+        nonce: &[u8; 24],
+        aad: &[&[u8]],
+        ciphertext: &[u8],
+        tag: &[u8],
+    ) -> Result<(), Error> {
+        use aes::cipher::{BlockCipherEncrypt, KeyInit};
+        use ghash::universal_hash::UniversalHash;
+        if tag.len() != TAG_LEN {
+            return Err(Error(()));
+        }
+        let kx = self.derive_key(nonce)?;
+        let aes = aes::Aes256::new((&*kx).into());
+        // H = AES_K(0^128) keys GHASH.
+        let mut h = Zeroizing::new([0u8; 16]);
+        aes.encrypt_block((&mut *h).into());
+        let mut ghash = ghash::GHash::new((&*h).into());
+        // Stream AAD fields through a 16-byte carry so split fields hash
+        // exactly like their concatenation without staging them.
+        let mut carry = [0u8; 16];
+        let mut used = 0usize;
+        let mut aad_len = 0u64;
+        for part in aad {
+            aad_len += part.len() as u64;
+            let mut part = *part;
+            if used > 0 {
+                let take = part.len().min(16 - used);
+                carry[used..used + take].copy_from_slice(&part[..take]);
+                used += take;
+                part = &part[take..];
+                if used < 16 {
+                    continue;
+                }
+                ghash.update_padded(&carry);
+            }
+            let whole = part.len() & !15;
+            ghash.update_padded(&part[..whole]);
+            let tail = &part[whole..];
+            carry[..tail.len()].copy_from_slice(tail);
+            used = tail.len();
+        }
+        if used > 0 {
+            ghash.update_padded(&carry[..used]);
+        }
+        ghash.update_padded(ciphertext);
+        let mut lengths = [0u8; 16];
+        lengths[..8].copy_from_slice(&(aad_len * 8).to_be_bytes());
+        lengths[8..].copy_from_slice(&((ciphertext.len() as u64) * 8).to_be_bytes());
+        ghash.update_padded(&lengths);
+        let s = ghash.finalize();
+        // J0 = IV || 0^31 || 1 for a 96-bit IV.
+        let mut j0 = Zeroizing::new([0u8; 16]);
+        j0[..12].copy_from_slice(&nonce[12..]);
+        j0[15] = 1;
+        aes.encrypt_block((&mut *j0).into());
+        let mut expected = Zeroizing::new([0u8; 16]);
+        for i in 0..16 {
+            expected[i] = s[i] ^ j0[i];
+        }
+        if ct_eq(&expected[..], tag) {
+            Ok(())
+        } else {
+            Err(Error(()))
+        }
+    }
+}
+
+/// Check an XAES-256-GCM tag over `aad` (the concatenation of its parts) and
+/// `ciphertext` without decrypting. Accepts exactly the inputs [`open`]
+/// accepts, at the cost of one GHASH pass plus three AES blocks. Comparison is
+/// constant time. Nothing is allocated.
+pub fn verify_tag(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    aad: &[&[u8]],
+    ciphertext: &[u8],
+    tag: &[u8],
+) -> Result<(), Error> {
+    PageCipher::new(key).verify_tag(nonce, aad, ciphertext, tag)
+}
+
 fn seal_with<C>(
     cipher: &C,
     nonce: &[u8; 24],
@@ -1125,6 +1209,27 @@ pub mod identity {
             self.secret
                 .page_cipher
                 .open_in_place(nonce, aad, inout, tag)
+                .map_err(|_| Error::CorruptRecord)
+        }
+
+        /// Verify a page tag without decrypting. `aad` parts are hashed as
+        /// their concatenation. Checks cache, key ID and purpose like
+        /// [`Self::open_page`] and accepts exactly what it would accept.
+        // Keep borrowed buffer and expected-identity arguments explicit at this boundary.
+        #[allow(clippy::too_many_arguments)]
+        pub fn verify_page_tag(
+            &self,
+            cache: &CacheId,
+            id: KeyId,
+            nonce: &[u8; 24],
+            aad: &[&[u8]],
+            ciphertext: &[u8],
+            tag: &[u8],
+        ) -> Result<()> {
+            self.bound_material(cache, id, KeyPurpose::Page)?;
+            self.secret
+                .page_cipher
+                .verify_tag(nonce, aad, ciphertext, tag)
                 .map_err(|_| Error::CorruptRecord)
         }
 
