@@ -1071,6 +1071,47 @@ fn second_sight_full_queue_replaces_only_lower_value_unsubmitted_work() {
     assert_eq!(f.enqueue(f.copy(4, 113)), Err(Error::Overloaded));
 }
 
+/// A full-queue replacement that fails after choosing its victim (here, the
+/// staging reservation) leaves the victim queued.
+#[test]
+fn failed_full_queue_replacement_keeps_the_victim() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    let first = f.copy(1, 113);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy(2, 113);
+    let second_id = second.ciphertext.envelope().page.clone();
+    let preferred = f.copy(3, 113);
+    let preferred_id = preferred.ciphertext.envelope().page.clone();
+    let owner = preferred_id.clone();
+    f.store
+        .writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    let dirty = f
+        .admission
+        .reserve(
+            Some(&preferred.metadata.version.object.cache),
+            ResourceClass::DirtyCiphertext,
+            preferred.ciphertext.bytes().len(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.store
+            .writer
+            .enqueue_reclaiming(preferred, dirty, |_| Err(Error::Overloaded)),
+        Err(Error::Overloaded)
+    );
+    assert!(f.store.writer.copy_only(&first_id).unwrap().is_some());
+    assert!(f.store.writer.copy_only(&second_id).unwrap().is_some());
+    assert!(f.store.writer.copy_only(&preferred_id).unwrap().is_none());
+    assert_eq!(f.store.writer.pending_count(), 2);
+    assert_eq!(f.store.writer.queued_count(), 2);
+    assert_eq!(f.store.writer.discarded_count(), 0);
+}
+
 #[test]
 fn second_sight_pressure_never_discards_submitted_owner() {
     let f = Fixture::new();

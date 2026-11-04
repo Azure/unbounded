@@ -911,6 +911,10 @@ impl StoreWriter {
             page.ciphertext = page.ciphertext.rehome(reservation)?;
         }
         let full = self.pending.borrow().len() >= self.capacity.get();
+        // A full queue picks its victim first, but discards it only once every
+        // fallible step below has succeeded: a refused page must not cost an
+        // accepted one.
+        let mut displace = None;
         if full {
             let retention = self.retention();
             let scoring = self.scoring(&retention);
@@ -930,9 +934,7 @@ impl StoreWriter {
             if !self.index.is_held(&id) && scoring.rank(&id) <= rank {
                 return Err(Error::Overloaded);
             }
-            self.queue.borrow_mut().remove(position);
-            self.pending.borrow_mut().remove(&victim);
-            self.note_discard(1);
+            displace = Some((position, victim));
         }
         // Reserve the staging persist will need before queue acceptance. Thus
         // accepted dirty copies never wait for ciphertext holders to release
@@ -945,30 +947,34 @@ impl StoreWriter {
             return Err(Error::InvalidConfiguration);
         }
         let ticket = self.next.get();
-        self.next
-            .set(ticket.checked_add(1).ok_or(Error::Unavailable)?);
-        self.pending.borrow_mut().insert(
-            id.clone(),
-            Dirty {
-                hold: if self.index.is_held(&id) {
-                    Some(self.index.protect_hold(&id.version)?)
-                } else {
-                    None
-                },
-                _resident: self.index.track(&id)?,
-                _payload: self.retention().payload(
-                    u64::from(page.ciphertext.envelope().plaintext_length),
-                    false,
-                ),
-                _metric: self
-                    .metrics
-                    .lease(crate::telemetry::Gauge::PendingDiskWrites)?,
-                ticket,
-                page,
-                _reservation: Rc::new(dirty),
-                staging: Some(staging),
+        let next = ticket.checked_add(1).ok_or(Error::Unavailable)?;
+        let entry = Dirty {
+            hold: if self.index.is_held(&id) {
+                Some(self.index.protect_hold(&id.version)?)
+            } else {
+                None
             },
-        );
+            _resident: self.index.track(&id)?,
+            _payload: self.retention().payload(
+                u64::from(page.ciphertext.envelope().plaintext_length),
+                false,
+            ),
+            _metric: self
+                .metrics
+                .lease(crate::telemetry::Gauge::PendingDiskWrites)?,
+            ticket,
+            page,
+            _reservation: Rc::new(dirty),
+            staging: Some(staging),
+        };
+        // Nothing below fails: commit the replacement.
+        if let Some((position, victim)) = displace {
+            self.queue.borrow_mut().remove(position);
+            self.pending.borrow_mut().remove(&victim);
+            self.note_discard(1);
+        }
+        self.next.set(next);
+        self.pending.borrow_mut().insert(id.clone(), entry);
         self.queue.borrow_mut().push_back(id);
         Ok(ticket)
     }
