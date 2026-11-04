@@ -937,3 +937,80 @@ func TestDHCPHandlerUnavailableImageOmitsBootFile(t *testing.T) {
 		t.Errorf("expected no bootfile while the image is unavailable, got %s", bootfile)
 	}
 }
+
+// gatedTransport blocks every request until gate is closed.
+type gatedTransport struct {
+	gate <-chan struct{}
+	next http.RoundTripper
+}
+
+func (g *gatedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	<-g.gate
+	return g.next.RoundTrip(req)
+}
+
+func TestDHCPHandlerMetadataTimeoutWarmsMemo(t *testing.T) {
+	mac, _ := net.ParseMAC("aa:bb:cc:dd:ee:f7")
+	serverIP := net.ParseIP("10.0.1.254").To4()
+	netbootImageRef := "ghcr.io/test/slow-netboot:v1"
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-slow"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{NetbootImage: netbootImageRef, DHCPLeases: []v1alpha3.DHCPLease{{
+				MAC:        "aa:bb:cc:dd:ee:f7",
+				IPv4:       "10.0.1.17",
+				SubnetMask: "255.255.255.0",
+			}}},
+		},
+	}
+
+	images := newTestImages(t, netbootImageRef, "", "dhcpBootImageName: shimx64.efi\n")
+	gate := make(chan struct{})
+	images.Puller.HTTPClient.Transport = &gatedTransport{gate: gate, next: images.Puller.HTTPClient.Transport}
+	images.Metadata = &netboot.MetadataMemo{}
+
+	srv := &Server{
+		Interface: "eth0", Reader: newFakeReader(t, node), ServerIP: serverIP, Images: images,
+		MetadataTimeout: 20 * time.Millisecond,
+	}
+
+	discover, err := dhcpv4.NewDiscovery(mac)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bootFile := func() string {
+		conn := &fakePacketConn{}
+		srv.handler(conn, &net.UDPAddr{IP: net.ParseIP("10.0.1.17"), Port: 68}, discover)
+
+		if conn.written == nil {
+			t.Fatal("expected DHCP response, got none")
+		}
+
+		resp, err := dhcpv4.FromBytes(conn.written)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return resp.BootFileNameOption()
+	}
+
+	// The registry is stalled: the reply goes out without a boot file.
+	if got := bootFile(); got != "" {
+		t.Fatalf("expected no bootfile while the registry is stalled, got %q", got)
+	}
+
+	// The lookup continues in the background, so a retransmit is answered
+	// from the warmed memo.
+	close(gate)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for bootFile() != "shimx64.efi" {
+		if time.Now().After(deadline) {
+			t.Fatal("retransmit did not get the warmed boot file")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}

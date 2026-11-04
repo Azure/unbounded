@@ -30,10 +30,17 @@ type Server struct {
 	Images            *netboot.FileResolver
 	ServeURL          string
 	DefaultNetbootRef string
+	// MetadataTimeout bounds the image metadata lookup for one DHCP reply.
+	// Zero means defaultMetadataTimeout.
+	MetadataTimeout time.Duration
 }
 
-// metadataTimeout bounds the image metadata lookup for one DHCP reply.
-const metadataTimeout = 10 * time.Second
+// defaultMetadataTimeout bounds the image metadata lookup for one DHCP
+// reply. It is shorter than typical PXE DHCP retransmit intervals (4s, 8s,
+// ...), so a slow registry does not swallow the client's first exchange.
+// With a MetadataMemo the lookup keeps running after the timeout, so a
+// retransmitted request gets the warm answer.
+const defaultMetadataTimeout = 3 * time.Second
 
 func (s *Server) NeedLeaderElection() bool {
 	// Responding to unicast packets is always safe.
@@ -211,7 +218,12 @@ func (s *Server) handler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	netbootImage, architecture := src.Ref, src.Architecture
 
 	if netbootImage != "" && s.Images != nil && node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolVirtualMedia {
-		metaCtx, cancel := context.WithTimeout(ctx, metadataTimeout)
+		timeout := s.MetadataTimeout
+		if timeout <= 0 {
+			timeout = defaultMetadataTimeout
+		}
+
+		metaCtx, cancel := context.WithTimeout(ctx, timeout)
 		meta, err := s.Images.ImageMetadata(metaCtx, src)
 
 		cancel()
