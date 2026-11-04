@@ -673,8 +673,15 @@ func TestBasicAuth(t *testing.T) {
 	img := resolve(t, &imagepull.Puller{}, imagepull.Source{
 		Ref: ref, Credential: auth.Credential{Username: "user", Password: "secret"},
 	})
-	if data, _ := readFile(t, img, "disk/a"); string(data) != "a" {
-		t.Fatalf("data = %q", data)
+	if got := img.Source(); got.Credential != auth.EmptyCredential || got.Ref != ref {
+		t.Fatalf("Source() = %+v, want Ref %s and no credential", got, ref)
+	}
+
+	// Reads after Resolve, including a re-open, still authenticate.
+	for range 2 {
+		if data, _ := readFile(t, img, "disk/a"); string(data) != "a" {
+			t.Fatalf("data = %q", data)
+		}
 	}
 
 	_, err := (&imagepull.Puller{}).Resolve(t.Context(), imagepull.Source{Ref: ref})

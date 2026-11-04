@@ -608,9 +608,15 @@ func (p *Puller) Resolve(ctx context.Context, src Source) (*Image, error) {
 		}
 	}
 
+	// The credential is already captured by the endpoint clients in eps.
+	// Drop it from the stored Source so secret material does not live on
+	// in Image or in the Files opened from it.
+	kept := src
+	kept.Credential = auth.EmptyCredential
+
 	return &Image{
 		puller: p,
-		src:    src,
+		src:    kept,
 		eps:    eps,
 		digest: desc.Digest.String(),
 		layers: m.Layers,

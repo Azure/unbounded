@@ -67,7 +67,9 @@ type Image struct {
 // Digest returns the platform manifest digest.
 func (i *Image) Digest() string { return i.digest }
 
-// Source returns the source the image was resolved from.
+// Source returns the source the image was resolved from, with
+// Source.Credential cleared. The credential is held only by the
+// image's registry clients and is never exposed.
 func (i *Image) Source() Source { return i.src }
 
 // layerStream is an open, decompressed tar stream over one layer.
