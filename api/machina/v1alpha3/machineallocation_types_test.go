@@ -55,7 +55,9 @@ spec:
   requirements:
   - key: topology.kubernetes.io/zone
     operator: In
-    values: [eastus-1, eastus-2]
+    values:
+      - eastus-1
+      - eastus-2
     minValues: 1
   - key: unbounded-cloud.io/capacity-type
     operator: Exists
