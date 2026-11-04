@@ -594,7 +594,14 @@ impl Conn {
         }
         // Validate the first frame before committing so a broken stream
         // still gets a proper error status.
-        let first = sub.next_frame().await?;
+        let first = sub.next_frame();
+        let Some(first) = ClientWatch::new(&self.stream, &mut self.rbuf, MAX_REQUEST_HEAD)
+            .guard(first)
+            .await
+        else {
+            return Ok(Next::Abort);
+        };
+        let first = first?;
         success_head(
             &mut self.out,
             self.shared.api,

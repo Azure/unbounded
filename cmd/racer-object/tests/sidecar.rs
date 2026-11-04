@@ -500,6 +500,62 @@ async fn client_reset_mid_body_releases_slot() {
 }
 
 #[tokio::test]
+async fn client_reset_before_first_frame_releases_slot() {
+    // Racer answers a 1 MiB subscription head and stalls before any frame.
+    // The sidecar has not committed a response yet; a client reset must
+    // still free its slot and drop the Racer subscription.
+    let dir = TempDir::new();
+    let path = dir.0.join("socket");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (headed_tx, headed_rx) = tokio::sync::oneshot::channel();
+    let racer = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut chunk = [0u8; 4096];
+            let n = conn.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            req.extend_from_slice(&chunk[..n]);
+        }
+        const SIZE: u64 = 1 << 20;
+        let out = format!(
+            "HTTP/1.1 200 OK\r\nETag: \"v\"\r\nRacer-Expires-At: 1\r\n\
+             Content-Type: application/octet-stream\r\nRacer-Object-Length: {SIZE}\r\n\
+             Racer-Range-Start: 0\r\nRacer-Range-End: {SIZE}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            SIZE + 2 * 21
+        );
+        conn.write_all(out.as_bytes()).await.unwrap();
+        let _ = headed_tx.send(());
+        // Stall; the sidecar dropping the subscription closes this socket.
+        let mut rest = [0u8; 64];
+        while conn.read(&mut rest).await.unwrap_or(0) > 0 {}
+    });
+    let mut options = options(Api::S3);
+    options.request_timeout = Duration::from_secs(30);
+    options.max_connections = 1;
+    let s = Sidecar::start_with(options, path, false).await;
+    let mut c = Client::connect(s.addr).await;
+    c.send("GET", "/bucket/key", &[]).await;
+    tokio::time::timeout(Duration::from_secs(5), headed_rx)
+        .await
+        .expect("Racer never answered")
+        .unwrap();
+    // Let the sidecar parse the head and block on the first frame.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    c.stream.set_zero_linger().unwrap();
+    drop(c);
+    let r = tokio::time::timeout(Duration::from_secs(5), s.get("PUT", "/bucket/key", &[]))
+        .await
+        .expect("slot was not released");
+    assert_eq!(r.status, 405);
+    tokio::time::timeout(Duration::from_secs(5), racer)
+        .await
+        .expect("Racer subscription not dropped")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn half_close_still_answered() {
     let dir = TempDir::new();
     let path = dir.0.join("socket");
