@@ -116,7 +116,10 @@ The object-wire client parser gains a separate prefetch route:
 Unknown top-level or ref fields are 400 (strict parse). Duplicate refs are
 allowed and deduplicated at page level. The `Authorization` header applies to
 every ref, is kept in memory only, and is replaced by each accepted PUT (a PUT
-without it clears it).
+without it clears it). This includes a PUT with the same `(generation,
+sequence)` and body whose `Authorization` value differs: it is applied again
+with the new credential instead of being answered as a replay. Credentials
+belong to tickets, not to the units they share; see "Credentials" below.
 
 Refs are normalized into per-version page sets (16 MiB pages) right after etag
 resolution; the server does not retain the raw JSON. It keeps a SHA-256 of the
@@ -327,7 +330,27 @@ A per-node `PrefetchCoordinator` replaces `WarmRegistry`. It owns:
   `budget_timeout` (for deferrals and overload) or `origin_error`.
   `VersionUnavailable` fails only that ref (`version_changed`), giving PARTIAL.
   `NotFound` maps to `not_found`; `OriginRejected`/`OriginForbidden` to
-  `forbidden`.
+  `forbidden`, which fails only the tickets whose credential was refused (see
+  "Credentials").
+
+### Credentials
+
+A unit is shared by every ticket that wants it, but a credential belongs to the
+ticket that supplied it:
+
+- A fill of a unit uses the credential of the highest-priority live ticket
+  interested in it (ties broken by ticket key). A ticket without
+  `Authorization` is filled without a credential; it is never filled using
+  another ticket's token.
+- A batch carries one credential: units whose chosen credential differs from
+  the batch's first unit wait for a later batch.
+- When the origin refuses a fill (`forbidden`), the refs of every ticket
+  holding that credential fail `forbidden` for that unit, and the unit stays
+  queued for the remaining tickets with the next distinct credential, without
+  backoff. Each distinct credential is tried at most once per unit; when no
+  other credential is left, the unit fails as before.
+- A ticket that adds interest with a credential already refused for a tracked
+  unit fails that unit at once. A PUT with a new credential joins it again.
 - Membership change re-plans queued and in-flight-to-departed-owner units.
   Active windows (not settled or within TTL) re-queue admitted pages whose
   owner left the cluster or the cache's pool. A selector change publishes a new

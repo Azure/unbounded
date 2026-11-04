@@ -88,7 +88,10 @@ impl Rig {
     }
 
     fn put(&mut self, id: &str, spec: api::Spec) -> Result<(u16, api::Status), ErrorCode> {
-        match self.registry.check_put(&cache(), id, &spec, self.now) {
+        match self
+            .registry
+            .check_put(&cache(), id, &spec, &None, self.now)
+        {
             Err(e) => return Err(e.code),
             Ok(PutCheck::Replay(status)) => return Ok((200, *status)),
             Ok(PutCheck::Proceed) => {}
@@ -890,4 +893,199 @@ fn coverage_deadline_reserves_part_of_the_request_budget() {
     // No remaining budget means no probing.
     assert!(coverage_deadline(at, at).is_none());
     assert!(coverage_deadline(at + Duration::from_secs(1), at).is_none());
+}
+
+fn auth_spec(extra: &str, refs: &[&str]) -> api::Spec {
+    api::parse_spec(body(extra, refs).as_bytes(), true, &Config::default()).unwrap()
+}
+
+fn token(value: &str) -> super::registry::Credential {
+    Some(std::sync::Arc::new(zeroize::Zeroizing::new(
+        value.as_bytes().to_vec(),
+    )))
+}
+
+impl Rig {
+    fn put_with(
+        &mut self,
+        id: &str,
+        spec: api::Spec,
+        authorization: super::registry::Credential,
+    ) -> Result<(u16, api::Status), ErrorCode> {
+        match self
+            .registry
+            .check_put(&cache(), id, &spec, &authorization, self.now)
+        {
+            Err(e) => return Err(e.code),
+            Ok(PutCheck::Replay(status)) => return Ok((200, *status)),
+            Ok(PutCheck::Proceed) => {}
+        }
+        let resolved = self.resolve(&spec);
+        self.registry
+            .apply_put(&cache(), id, spec, resolved, authorization, self.now)
+            .map_err(|e| e.code)
+    }
+
+    /// The next batch's credential, completing each page with `outcome`.
+    fn fill_once(&mut self, outcome: UnitOutcome) -> Option<Option<Vec<u8>>> {
+        let batch = self.registry.next_batch(self.now, 256)?;
+        let credential = batch
+            .context
+            .authorization
+            .as_ref()
+            .map(|a| a.as_slice().to_vec());
+        for page in batch.pages {
+            let unit = UnitKey {
+                version: batch.metadata.version.clone(),
+                page,
+            };
+            self.registry
+                .complete(&unit, outcome, Some(node("owner")), self.now);
+        }
+        Some(credential)
+    }
+
+    fn outcome(&self, id: &str) -> (RefOutcome, Option<RefError>) {
+        let status = self
+            .registry
+            .status(&cache(), id, Some(RefsFilter::All), None)
+            .unwrap();
+        let entry = &status.refs.unwrap()[0];
+        (entry.outcome, entry.error)
+    }
+}
+
+/// A unit created by a ticket with a credential is filled for a
+/// higher-priority ticket without one using no credential: a ticket's fill
+/// never borrows another ticket's token.
+#[test]
+fn fills_use_the_highest_priority_ticket_credential() {
+    let mut r = rig(Config::default());
+    let page = pages(KEY_A, 0, 1);
+    r.put_with(
+        "low",
+        auth_spec("\"priority\":\"low\",", &[&page]),
+        token("Bearer low"),
+    )
+    .unwrap();
+    r.put_with("high", spec("\"priority\":\"high\",", &[&page]), None)
+        .unwrap();
+    assert_eq!(r.fill_once(UnitOutcome::Admitted), Some(None));
+    assert_eq!(r.outcome("high").0, RefOutcome::Succeeded);
+    assert_eq!(r.outcome("low").0, RefOutcome::Succeeded);
+}
+
+/// An origin refusal fails only the tickets holding the refused credential;
+/// the unit is retried once with each next distinct credential.
+#[test]
+fn rejected_credentials_fail_only_their_tickets() {
+    let mut r = rig(Config::default());
+    let page = pages(KEY_A, 0, 1);
+    r.put_with(
+        "a",
+        auth_spec("\"priority\":\"high\",", &[&page]),
+        token("Bearer a"),
+    )
+    .unwrap();
+    r.put_with(
+        "a2",
+        auth_spec("\"priority\":\"high\",", &[&page]),
+        token("Bearer a"),
+    )
+    .unwrap();
+    r.put_with(
+        "b",
+        auth_spec("\"priority\":\"normal\",", &[&page]),
+        token("Bearer b"),
+    )
+    .unwrap();
+    r.put_with("c", spec("\"priority\":\"low\",", &[&page]), None)
+        .unwrap();
+    let forbidden = UnitOutcome::Failed(RefError::Forbidden);
+    assert_eq!(r.fill_once(forbidden), Some(Some(b"Bearer a".to_vec())));
+    for id in ["a", "a2"] {
+        assert_eq!(
+            r.outcome(id),
+            (RefOutcome::Failed, Some(RefError::Forbidden))
+        );
+        assert!(r.status(id).settled);
+    }
+    assert_eq!(r.outcome("b").0, RefOutcome::Pending);
+    assert_eq!(r.fill_once(forbidden), Some(Some(b"Bearer b".to_vec())));
+    assert_eq!(r.outcome("b").1, Some(RefError::Forbidden));
+    // The ticket without a credential is filled without one.
+    assert_eq!(r.fill_once(UnitOutcome::Admitted), Some(None));
+    assert_eq!(r.outcome("c").0, RefOutcome::Succeeded);
+    assert_eq!(r.outcome("a").1, Some(RefError::Forbidden));
+    assert!(r.fill_once(UnitOutcome::Admitted).is_none());
+    // The last remaining credential's refusal fails the unit as before.
+    let mut r = rig(Config::default());
+    r.put_with("only", auth_spec("", &[&page]), token("Bearer x"))
+        .unwrap();
+    assert_eq!(r.fill_once(forbidden), Some(Some(b"Bearer x".to_vec())));
+    assert_eq!(
+        r.outcome("only"),
+        (RefOutcome::Failed, Some(RefError::Forbidden))
+    );
+    assert!(r.fill_once(UnitOutcome::Admitted).is_none());
+}
+
+/// Every accepted PUT replaces the credential, including a same-body replay
+/// with a rotated token, and a refused ticket is filled again with its new one.
+#[test]
+fn put_replaces_the_ticket_credential() {
+    let mut r = rig(Config::default());
+    let page = pages(KEY_A, 0, 1);
+    let body = auth_spec("\"generation\":1,\"sequence\":1,", &[&page]);
+    r.put_with("t", body.clone(), token("Bearer old")).unwrap();
+    // Same body, same token: a replay.
+    assert_eq!(
+        r.put_with("t", body.clone(), token("Bearer old"))
+            .unwrap()
+            .0,
+        200
+    );
+    // Same body, rotated token: accepted and used.
+    assert_eq!(
+        r.put_with("t", body.clone(), token("Bearer new"))
+            .unwrap()
+            .0,
+        200
+    );
+    assert_eq!(
+        r.fill_once(UnitOutcome::Failed(RefError::Forbidden)),
+        Some(Some(b"Bearer new".to_vec()))
+    );
+    assert_eq!(r.outcome("t").1, Some(RefError::Forbidden));
+    // Another holder keeps the unit queued; a refreshed token re-joins it.
+    let mut r = rig(Config::default());
+    r.put_with(
+        "other",
+        auth_spec("\"priority\":\"low\",", &[&page]),
+        token("Bearer other"),
+    )
+    .unwrap();
+    r.put_with(
+        "t",
+        auth_spec("\"priority\":\"high\",", &[&page]),
+        token("Bearer old"),
+    )
+    .unwrap();
+    assert_eq!(
+        r.fill_once(UnitOutcome::Failed(RefError::Forbidden)),
+        Some(Some(b"Bearer old".to_vec()))
+    );
+    r.put_with(
+        "t",
+        auth_spec("\"priority\":\"high\",\"sequence\":1,", &[&page]),
+        token("Bearer new"),
+    )
+    .unwrap();
+    assert_eq!(r.outcome("t").0, RefOutcome::Pending);
+    assert_eq!(
+        r.fill_once(UnitOutcome::Admitted),
+        Some(Some(b"Bearer new".to_vec()))
+    );
+    assert_eq!(r.outcome("t").0, RefOutcome::Succeeded);
+    assert_eq!(r.outcome("other").0, RefOutcome::Succeeded);
 }

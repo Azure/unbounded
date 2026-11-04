@@ -1045,7 +1045,7 @@ async fn handle_inner(
             let spec = api::parse_spec(body, authorization.is_some(), &config)?;
             let authorization = authorization.map(|a| Arc::new(Zeroizing::new(a.to_vec())));
             if let PutCheck::Replay(status) =
-                prefetch.with_registry(|r| r.check_put(cache, &id, &spec, now()))?
+                prefetch.with_registry(|r| r.check_put(cache, &id, &spec, &authorization, now()))?
             {
                 return Ok(json(200, &*status));
             }
