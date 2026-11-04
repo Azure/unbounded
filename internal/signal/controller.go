@@ -4,6 +4,7 @@
 package signal
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -53,6 +54,10 @@ const (
 	RunAdmissionAnnotation = "signal.unbounded-cloud.io/admission"
 	RunFinalizer           = "signal.unbounded-cloud.io/cleanup"
 	SnapshotRunLabel       = "signal.unbounded-cloud.io/run"
+	checkResultDigest      = "signal.unbounded-cloud.io/check-result-digest"
+	checkResultRunUID      = "signal.unbounded-cloud.io/check-result-run-uid"
+	checkResultCheckID     = "signal.unbounded-cloud.io/check-result-check-id"
+	checkResultCheckOrder  = "signal.unbounded-cloud.io/check-result-check-order"
 	runAdmissionReady      = "ready"
 	runAdmissionPending    = "pending"
 
@@ -63,11 +68,16 @@ const (
 	maxAdapterBackendEvidenceBytes = 24 * 1024
 	maxAdapterEvidenceTextBytes    = 512
 	adapterBackendEvidenceVersion  = "v1"
+	maxAdapterCheckResultFields    = maxAdapterReasonBytes +
+		maxAdapterMeasurementsBytes +
+		maxAdapterBackendOutputBytes +
+		maxAdapterBackendEvidenceBytes
+	maximumCheckResultBytes = 6*maxAdapterCheckResultFields + 4*1024
 )
 
 var runnerImageDigestPattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
 
-var workflowOutputLimits = map[string]int{
+var checkResultFieldLimits = map[string]int{
 	"backend-resources": maxAdapterBackendOutputBytes,
 	"backend-evidence":  maxAdapterBackendEvidenceBytes,
 	"measurements":      maxAdapterMeasurementsBytes,
@@ -76,11 +86,11 @@ var workflowOutputLimits = map[string]int{
 }
 
 const (
-	groupedCheckCount           = 15
 	adapterServiceAccountName   = "project-signal-adapter"
 	adapterWorkflowTemplateName = "project-signal-participant-adapter"
-	maximumWorkflowOutputBytes  = 768 * 1024
+	maximumWorkflowSpecBytes    = 768 * 1024
 	maximumStatusTextRunes      = 1024
+	checkResultDataKey          = "result.json"
 )
 
 var workflowGVK = schema.GroupVersionKind{
@@ -186,6 +196,15 @@ type adapterPartialResult struct {
 	Reason           string `json:"reason"`
 	Measurements     string `json:"measurements"`
 	ResultLog        any    `json:"resultLog,omitempty"`
+}
+
+type adapterCheckResult struct {
+	ExecutionState   string `json:"executionState"`
+	Verdict          string `json:"verdict"`
+	Reason           string `json:"reason"`
+	Measurements     string `json:"measurements"`
+	BackendResources string `json:"backend-resources"`
+	BackendEvidence  string `json:"backend-evidence"`
 }
 
 func minimumAdapterBackendEvidenceBytes(participantCount int) int {
@@ -1521,16 +1540,6 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 	for index := range checks {
 		check := &checks[index]
 
-		participantsJSON, marshalErr := json.Marshal(run.Spec.Participants)
-		if marshalErr != nil {
-			return nil, fmt.Errorf("encode check %s participants: %w", check.ID, marshalErr)
-		}
-
-		workloadPolicyJSON, encodeErr := signalworkload.Encode(check.WorkloadPolicy)
-		if encodeErr != nil {
-			return nil, fmt.Errorf("encode check %s workload policy: %w", check.ID, encodeErr)
-		}
-
 		taskName := checkTaskName(check)
 		task := map[string]any{
 			"name": taskName,
@@ -1539,14 +1548,7 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 				"template": "certification",
 			},
 			"arguments": map[string]any{
-				"parameters": checkWorkflowParameters(
-					run,
-					check,
-					run.Spec.Participants,
-					string(participantsJSON),
-					workloadPolicyJSON,
-					strconv.FormatInt(int64(check.GPUCount), 10),
-				),
+				"parameters": checkWorkflowParameters(run, check),
 			},
 		}
 
@@ -1588,34 +1590,43 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 		*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun")),
 	})
 
+	if err := validateWorkflowSize(workflow); err != nil {
+		return nil, err
+	}
+
 	return workflow, nil
 }
 
 func checkWorkflowParameters(
 	run *signalv1.CertificationRun,
 	check *signalv1.CertificationCheckSnapshot,
-	participants []signalv1.Participant,
-	participantsJSON string,
-	workloadPolicyJSON string,
-	gpuCount string,
 ) []any {
+	// Keep the Workflow bounded: the adapter resolves the immutable Run snapshot
+	// and writes the full result to the named immutable ConfigMap.
 	return []any{
+		map[string]any{"name": "run-name", "value": run.Name},
 		map[string]any{"name": "execution-name", "value": checkRunName(run.Name, check.ID)},
 		map[string]any{"name": "run-uid", "value": string(run.UID)},
-		map[string]any{"name": "participants-json", "value": participantsJSON},
-		map[string]any{"name": "participant-count", "value": fmt.Sprintf("%d", len(participants))},
-		map[string]any{"name": "script-configmap", "value": run.Spec.ScriptBundle.Name},
-		map[string]any{"name": "script-key", "value": check.Script.Key},
-		map[string]any{"name": "script-digest", "value": check.Script.Digest},
-		map[string]any{"name": "backend-kind", "value": string(check.Backend)},
-		map[string]any{
-			"name":  "backend-active-deadline-seconds",
-			"value": fmt.Sprintf("%d", int64(check.BackendActiveDeadline.Seconds())),
-		},
-		map[string]any{"name": "runner-image", "value": check.RunnerImage},
-		map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
-		map[string]any{"name": "gpu-resource-count", "value": gpuCount},
+		map[string]any{"name": "check-index", "value": strconv.FormatInt(int64(check.Order), 10)},
+		map[string]any{"name": "result-configmap", "value": checkResultName(run.Name, check.ID)},
 	}
+}
+
+func validateWorkflowSize(workflow *unstructured.Unstructured) error {
+	content, err := json.Marshal(workflow.Object)
+	if err != nil {
+		return fmt.Errorf("encode Workflow: %w", err)
+	}
+
+	if len(content) > maximumWorkflowSpecBytes {
+		return fmt.Errorf(
+			"Workflow object is %d bytes, maximum is %d",
+			len(content),
+			maximumWorkflowSpecBytes,
+		)
+	}
+
+	return nil
 }
 
 func validateGPUCount(gpuCount int32, backend signalv1.ExecutionBackend) error {
@@ -1636,7 +1647,7 @@ func (r *RunReconciler) finishGrouped(
 	workflow *unstructured.Unstructured,
 	workflowPhase string,
 ) (ctrl.Result, error) {
-	checks, verdict, reason := terminalCheckStatuses(workflow, run)
+	checks, verdict, reason := r.terminalCheckStatuses(ctx, workflow, run)
 	executionState := "Completed"
 
 	if workflowPhase != "Succeeded" {
@@ -1989,7 +2000,8 @@ func runningCheckStatuses(
 	return statuses
 }
 
-func terminalCheckStatuses(
+func (r *RunReconciler) terminalCheckStatuses(
+	ctx context.Context,
 	workflow *unstructured.Unstructured,
 	run *signalv1.CertificationRun,
 ) ([]signalv1.CheckStatus, string, string) {
@@ -2057,27 +2069,27 @@ func terminalCheckStatuses(
 			continue
 		}
 
-		outputs, outputErr := nodeWorkflowParameters(node)
+		outputs, outputErr := r.readCheckResult(ctx, workflow, run, check)
 		if outputErr != nil {
 			status.Phase = signalv1.CheckPhaseInconclusive
 			status.Verdict = "Inconclusive"
-			status.Reason = "OutputsRejected: " + outputErr.Error()
+			status.Reason = "ResultRejected: " + outputErr.Error()
 			aggregateVerdict = "Inconclusive"
-			aggregateReason = "one or more check outputs were malformed or incomplete"
+			aggregateReason = "one or more check results were missing, malformed, or incomplete"
 
 			continue
 		}
 
-		status.Verdict = outputs["verdict"]
-		status.Reason = outputs["reason"]
-		status.Measurements = outputs["measurements"]
+		status.Verdict = outputs.Verdict
+		status.Reason = outputs.Reason
+		status.Measurements = outputs.Measurements
 		allowPartialBackendEvidence := status.Verdict == "Inconclusive" &&
 			status.Reason == "BackendSetupFailed"
 
 		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
-			outputs["backend-evidence"],
+			outputs.BackendEvidence,
 			run.Spec.Participants,
-			outputs["backend-resources"],
+			outputs.BackendResources,
 			check.Backend,
 			run.Namespace,
 			allowPartialBackendEvidence,
@@ -2099,7 +2111,7 @@ func terminalCheckStatuses(
 		}
 
 		resources, resourceErr := backendResourceReferencesForParticipants(
-			outputs["backend-resources"],
+			outputs.BackendResources,
 			participantIndexes(run.Spec.Participants),
 			run.Namespace,
 			allowPartialBackendEvidence,
@@ -2154,6 +2166,118 @@ func terminalCheckStatuses(
 	return statuses, aggregateVerdict, aggregateReason
 }
 
+func (r *RunReconciler) readCheckResult(
+	ctx context.Context,
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+	check *signalv1.CertificationCheckSnapshot,
+) (adapterCheckResult, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var result corev1.ConfigMap
+	if err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: run.Namespace, Name: checkResultName(run.Name, check.ID)},
+		&result,
+	); err != nil {
+		return adapterCheckResult{}, fmt.Errorf("read check result ConfigMap: %w", err)
+	}
+
+	if result.Immutable == nil || !*result.Immutable {
+		return adapterCheckResult{}, errors.New("check result ConfigMap is mutable")
+	}
+
+	if !metav1.IsControlledBy(&result, workflow) {
+		return adapterCheckResult{}, errors.New("check result ConfigMap is not owned by the Workflow")
+	}
+
+	if result.Labels[SnapshotRunLabel] != run.Name ||
+		result.Annotations[checkResultRunUID] != string(run.UID) ||
+		result.Annotations[checkResultCheckID] != string(check.ID) ||
+		result.Annotations[checkResultCheckOrder] != strconv.FormatInt(int64(check.Order), 10) {
+		return adapterCheckResult{}, errors.New("check result ConfigMap identity does not match the run")
+	}
+
+	content, exists := result.BinaryData[checkResultDataKey]
+	if !exists {
+		return adapterCheckResult{}, errors.New("check result ConfigMap is missing result.json")
+	}
+
+	if len(content) > maximumCheckResultBytes {
+		return adapterCheckResult{}, fmt.Errorf(
+			"check result exceeds %d bytes",
+			maximumCheckResultBytes,
+		)
+	}
+
+	if result.Annotations[checkResultDigest] != digestBytes(content) {
+		return adapterCheckResult{}, errors.New("check result ConfigMap digest does not match its content")
+	}
+
+	return decodeCheckResult(content)
+}
+
+func decodeCheckResult(content []byte) (adapterCheckResult, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(content, &fields); err != nil {
+		return adapterCheckResult{}, fmt.Errorf("decode check result fields: %w", err)
+	}
+
+	for _, required := range []string{
+		"executionState",
+		"verdict",
+		"reason",
+		"measurements",
+		"backend-resources",
+		"backend-evidence",
+	} {
+		if _, exists := fields[required]; !exists {
+			return adapterCheckResult{}, fmt.Errorf("required field %q is missing", required)
+		}
+	}
+
+	var result adapterCheckResult
+
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&result); err != nil {
+		return adapterCheckResult{}, fmt.Errorf("decode check result: %w", err)
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return adapterCheckResult{}, errors.New("check result contains trailing JSON values")
+		}
+
+		return adapterCheckResult{}, fmt.Errorf("decode trailing check result value: %w", err)
+	}
+
+	values := map[string]string{
+		"verdict":           result.Verdict,
+		"reason":            result.Reason,
+		"measurements":      result.Measurements,
+		"backend-resources": result.BackendResources,
+		"backend-evidence":  result.BackendEvidence,
+	}
+	for name, limit := range checkResultFieldLimits {
+		value, exists := values[name]
+		if !exists {
+			continue
+		}
+
+		if len(value) > limit {
+			return adapterCheckResult{}, fmt.Errorf("%s exceeds %d bytes", name, limit)
+		}
+	}
+
+	return result, nil
+}
+
 func exactCheckNode(
 	nodes map[string]any,
 	workflowName string,
@@ -2179,45 +2303,6 @@ func exactCheckNode(
 	}
 
 	return match, count
-}
-
-func nodeWorkflowParameters(node map[string]any) (map[string]string, error) {
-	outputs, ok := node["outputs"].(map[string]any)
-	if !ok {
-		return nil, errors.New("task outputs are missing or malformed")
-	}
-
-	parameters, ok := outputs["parameters"].([]any)
-	if !ok {
-		return nil, errors.New("task output parameters are missing or malformed")
-	}
-
-	limits := map[string]int{
-		"verdict":           workflowOutputLimits["verdict"],
-		"reason":            workflowOutputLimits["reason"],
-		"measurements":      workflowOutputLimits["measurements"],
-		"backend-resources": workflowOutputLimits["backend-resources"],
-		"backend-evidence":  workflowOutputLimits["backend-evidence"],
-	}
-
-	decoded, err := decodeWorkflowParametersWithLimits(parameters, limits)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, required := range []string{
-		"verdict",
-		"reason",
-		"measurements",
-		"backend-resources",
-		"backend-evidence",
-	} {
-		if _, exists := decoded[required]; !exists {
-			return nil, fmt.Errorf("required parameter %q is missing", required)
-		}
-	}
-
-	return decoded, nil
 }
 
 func setCheckTimes(status *signalv1.CheckStatus, node map[string]any) {
@@ -2519,40 +2604,6 @@ func backendResourceReferencesForParticipants(
 	return references, nil
 }
 
-func decodeWorkflowParametersWithLimits(parameters []any, limits map[string]int) (map[string]string, error) {
-	outputs := make(map[string]string, len(parameters))
-	for _, raw := range parameters {
-		parameter, ok := raw.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("parameter entry is not an object")
-		}
-
-		name, nameOK := parameter["name"].(string)
-		value, valueOK := parameter["value"].(string)
-
-		if !nameOK || !valueOK {
-			return nil, fmt.Errorf("parameter name and value must be strings")
-		}
-
-		limit, allowed := limits[name]
-		if !allowed {
-			return nil, fmt.Errorf("unexpected parameter %q", name)
-		}
-
-		if len(value) > limit {
-			return nil, fmt.Errorf("parameter %q exceeds %d bytes", name, limit)
-		}
-
-		if _, duplicate := outputs[name]; duplicate {
-			return nil, fmt.Errorf("duplicate parameter %q", name)
-		}
-
-		outputs[name] = value
-	}
-
-	return outputs, nil
-}
-
 func groupedBackendEvidenceComplete(
 	content string,
 	participants []signalv1.Participant,
@@ -2829,7 +2880,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 			evidenceRun.Status.Workflow.Phase = phase
 		}
 
-		completed, _, _ := terminalCheckStatuses(workflow, run)
+		completed, _, _ := r.terminalCheckStatuses(ctx, workflow, run)
 
 		nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
 		if nodesErr != nil {
@@ -3414,8 +3465,8 @@ func profileChecks(profile *signalv1.CertificationProfile) []signalv1.Certificat
 }
 
 func validateCheckPlan(checks []signalv1.CertificationCheck) (time.Duration, error) {
-	if len(checks) != groupedCheckCount {
-		return 0, fmt.Errorf("must contain exactly %d checks", groupedCheckCount)
+	if err := validateCheckCount(len(checks)); err != nil {
+		return 0, err
 	}
 
 	deadlines := make([]time.Duration, len(checks))
@@ -3434,20 +3485,12 @@ func validateCheckPlan(checks []signalv1.CertificationCheck) (time.Duration, err
 		}
 	}
 
-	if fixedWorkflowOutputBytes() > maximumWorkflowOutputBytes {
-		return 0, fmt.Errorf(
-			"fixed aggregate check output budget is %d bytes, maximum is %d",
-			fixedWorkflowOutputBytes(),
-			maximumWorkflowOutputBytes,
-		)
-	}
-
 	return suiteDeadline, nil
 }
 
 func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) (time.Duration, error) {
-	if len(checks) != groupedCheckCount {
-		return 0, fmt.Errorf("run must contain exactly %d checks", groupedCheckCount)
+	if err := validateCheckCount(len(checks)); err != nil {
+		return 0, fmt.Errorf("run %w", err)
 	}
 
 	for index := range checks {
@@ -3472,27 +3515,19 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) (time.Du
 		}
 	}
 
-	if fixedWorkflowOutputBytes() > maximumWorkflowOutputBytes {
-		return 0, fmt.Errorf(
-			"fixed run aggregate check output budget is %d bytes, maximum is %d",
-			fixedWorkflowOutputBytes(),
-			maximumWorkflowOutputBytes,
-		)
-	}
-
 	return suiteDeadline, nil
 }
 
-func fixedWorkflowOutputBytes() int64 {
-	perCheck := int64(
-		workflowOutputLimits["verdict"] +
-			workflowOutputLimits["reason"] +
-			workflowOutputLimits["measurements"] +
-			workflowOutputLimits["backend-resources"] +
-			workflowOutputLimits["backend-evidence"],
-	)
+func validateCheckCount(count int) error {
+	if count < signalv1.MinCertificationChecks || count > signalv1.MaxCertificationChecks {
+		return fmt.Errorf(
+			"must contain between %d and %d checks",
+			signalv1.MinCertificationChecks,
+			signalv1.MaxCertificationChecks,
+		)
+	}
 
-	return groupedCheckCount * perCheck
+	return nil
 }
 
 func participantIndexes(participants []signalv1.Participant) []int32 {
@@ -3535,7 +3570,14 @@ func checkTaskName(check *signalv1.CertificationCheckSnapshot) string {
 func checkRunName(runName string, checkID signalv1.CheckID) string {
 	suffix := sanitizeTaskName(string(checkID))
 
-	candidate := runName + "-" + suffix
+	return boundedDNSName(runName + "-" + suffix)
+}
+
+func checkResultName(runName string, checkID signalv1.CheckID) string {
+	return boundedDNSName(runName + "-" + sanitizeTaskName(string(checkID)) + "-result")
+}
+
+func boundedDNSName(candidate string) string {
 	if len(candidate) <= 63 {
 		return candidate
 	}
