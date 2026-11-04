@@ -254,8 +254,25 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP &&
-		h.isHTTPBootLoaderDownload(r.Context(), src, path) {
+	isBootLoader := false
+
+	if node.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolHTTP {
+		var err error
+
+		isBootLoader, err = h.isHTTPBootLoaderDownload(r.Context(), src, path)
+		if err != nil {
+			// Without metadata the request cannot be classified, and serving
+			// it could hand out the boot loader with no active install. Fail
+			// closed until the metadata lookup succeeds.
+			log.Info("image metadata unavailable", "node", node.Name, "ref", src.Ref, "err", err)
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "image metadata unavailable, retry later", http.StatusServiceUnavailable)
+
+			return
+		}
+	}
+
+	if isBootLoader {
 		installRequested, err := h.installRequested(r.Context(), node)
 		if err != nil {
 			log.Warn("checking active install operation", "node", node.Name, "err", err)
@@ -315,7 +332,9 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, src, path)
+	if isBootLoader {
+		h.recordHTTPBootLoaderDownloaded(r.Context(), log, node, path)
+	}
 }
 
 // isCleanEOF reports whether err is a bare io.EOF marking the end of the
@@ -738,12 +757,10 @@ func (h *HTTPServer) recordBootImageWritten(ctx context.Context, log *slog.Logge
 	}
 }
 
-func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, src ImageSource, path string) {
-	if h.StatusRecorder == nil || node == nil || node.Spec.Netboot() == nil || node.Spec.Netboot().TargetBootProtocol() != v1alpha3.PXEBootProtocolHTTP {
-		return
-	}
-
-	if !h.isHTTPBootLoaderDownload(ctx, src, path) {
+// recordHTTPBootLoaderDownloaded records that node downloaded its HTTP boot
+// loader. The caller has already classified path as the boot loader.
+func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *slog.Logger, node *v1alpha3.Machine, path string) {
+	if h.StatusRecorder == nil || node == nil {
 		return
 	}
 
@@ -752,17 +769,21 @@ func (h *HTTPServer) recordHTTPBootLoaderDownloaded(ctx context.Context, log *sl
 	}
 }
 
-func (h *HTTPServer) isHTTPBootLoaderDownload(ctx context.Context, src ImageSource, path string) bool {
+// isHTTPBootLoaderDownload reports whether path is the HTTP boot loader named
+// by src's metadata. An image without metadata.yaml has no boot loader. A
+// failed metadata lookup is returned so the caller can fail closed rather
+// than treat the request as a follow-on artifact.
+func (h *HTTPServer) isHTTPBootLoaderDownload(ctx context.Context, src ImageSource, path string) (bool, error) {
 	if h.Puller == nil || src.Ref == "" {
-		return false
+		return false, nil
 	}
 
 	meta, err := h.ImageMetadata(ctx, src)
 	if err != nil {
-		return false
+		return false, err
 	}
 
-	return HTTPBootPathFromMetadata(meta) == strings.TrimPrefix(path, "/")
+	return HTTPBootPathFromMetadata(meta) == strings.TrimPrefix(path, "/"), nil
 }
 
 func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger, machineName string, ev *cloudInitEvent) {

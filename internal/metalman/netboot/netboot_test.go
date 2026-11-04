@@ -3966,3 +3966,118 @@ func TestResolveFile_AgentConfigPinsNodeName(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPServer_HTTPBootLoaderGateFailsClosedOnMetadataError(t *testing.T) {
+	const ref = "ghcr.io/test/image:v1"
+
+	puller := setupImagePuller(t, ref, map[string][]byte{
+		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),
+		"shimx64.efi":   []byte("shim"),
+		"vmlinuz":       []byte("kernel"),
+	})
+
+	for _, path := range []string{"shimx64.efi", "vmlinuz"} {
+		t.Run(path, func(t *testing.T) {
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-http"},
+				Spec: v1alpha3.MachineSpec{
+					PXE: &v1alpha3.PXESpec{
+						Image:        ref,
+						BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+						DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
+					},
+				},
+			}
+
+			fc := fake.NewClientBuilder().
+				WithScheme(newScheme(t)).
+				WithObjects(node).
+				WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+				Build()
+			recorder := &recordingStatusRecorder{}
+			srv := &HTTPServer{
+				FileResolver: FileResolver{
+					Puller:   puller,
+					Reader:   fc,
+					Metadata: &MetadataMemo{},
+				},
+				StatusRecorder: recorder,
+			}
+
+			// Seed the memo with a transient failure while the registry
+			// itself still serves files.
+			_, err := srv.Metadata.get(t.Context(), srv.NetbootImageSource(node), func(context.Context, ImageSource) (*ImageMetadata, error) {
+				return nil, fmt.Errorf("%w: registry down", ErrImageUnavailable)
+			})
+			require.Error(t, err)
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /", srv.handleFile)
+
+			ts := newTestPeerServer(mux)
+			defer ts.Close()
+
+			req, _ := http.NewRequest("GET", ts.URL+"/"+path, nil)
+			req.Header.Set(testPeerHeader, "10.0.1.60")
+
+			resp, err := http.DefaultClient.Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
+
+			require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+			require.Equal(t, "5", resp.Header.Get("Retry-After"))
+			require.NotContains(t, string(body), "shim")
+			require.NotContains(t, string(body), "kernel")
+			require.Empty(t, recorder.bootLoaderEvents())
+		})
+	}
+}
+
+func TestHTTPServer_HTTPBootWithoutMetadataServesFiles(t *testing.T) {
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
+		"vmlinuz": []byte("kernel"),
+	})
+
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-http"},
+		Spec: v1alpha3.MachineSpec{
+			PXE: &v1alpha3.PXESpec{
+				Image:        "ghcr.io/test/image:v1",
+				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
+				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
+			},
+		},
+	}
+
+	fc := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).
+		Build()
+	recorder := &recordingStatusRecorder{}
+	srv := &HTTPServer{
+		FileResolver:   FileResolver{Puller: puller, Reader: fc, Metadata: &MetadataMemo{}},
+		StatusRecorder: recorder,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", srv.handleFile)
+
+	ts := newTestPeerServer(mux)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/vmlinuz", nil)
+	req.Header.Set(testPeerHeader, "10.0.1.60")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, []byte("kernel"), body)
+	require.Empty(t, recorder.bootLoaderEvents())
+}
