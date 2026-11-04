@@ -49,7 +49,10 @@ scoping is inherent to the per-site component):
 | `--dhcp-interface` | *(none - relay mode)* | NIC for broadcast DHCP |
 | `--site` | *(none)* | Scope to machines with a specific site label |
 | `--http-port` | 8880 | HTTP server port |
-| `--cache-dir` | `~/.unbounded/metalman/cache` | Local cache for downloaded images |
+| `--cache-dir` | `~/.unbounded/metalman/cache` | Local directory for generated virtual media ISOs |
+| `--registry-mirror` | *(none)* | Optional registry mirror base URL, such as a node-local Gantry at `http://127.0.0.1:5000`. Pulls try the mirror first and fall back to the registry |
+| `--pull-concurrency` | 4 | Parallel HTTP Range requests per image layer |
+| `--pull-chunk-size` | 8388608 | Bytes per HTTP Range request |
 | `--health-port` | 8081 | Health/readiness probe port |
 | `--serve-url` | | External URL of this metalman instance |
 | `--default-netboot-image` | release-matched `netboot` image | PXE boot environment used when `spec.pxe.netbootImage` is omitted |
@@ -77,6 +80,12 @@ artifacts under `/disk/`. Files with a `.tmpl` suffix in the netboot image are
 Go templates rendered per-machine at serve time; other files are served
 verbatim. A `metadata.yaml` file in the netboot image provides image-level
 configuration such as `dhcpBootImageName` and `httpBootPath`.
+
+Metalman does not cache images. For each DHCP, TFTP, or HTTP request it reads
+the needed file from the registry, using the image's pull secret. HTTP
+downloads support Range requests. If the registry cannot be reached, HTTP
+requests get `503` with `Retry-After`, and Machine operations wait. Parsed
+`metadata.yaml` is kept in memory for about one minute.
 
 Images are built, tagged, and pushed using standard container tooling:
 

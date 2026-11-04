@@ -48,16 +48,20 @@ but the shipped ConfigMap (rendered from `deploy/machina/03-config.yaml.tmpl`) s
 
 Binary `cmd/metalman`, deployed as `metalman-controller` in `unbounded-system`.
 
-Runs three reconcilers and four network servers:
+Runs two reconcilers and four network servers:
 
 | Reconciler / Server     | Role                                                        |
 |-------------------------|-------------------------------------------------------------|
-| OCIReconciler           | Pulls and caches OCI netboot images from container registries. |
 | Redfish Reconciler      | TOFU TLS cert pinning for BMC Redfish endpoints. |
 | MachineOperation Reconciler | BMC power control, boot override, reboot, and repave operations via Redfish REST. |
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
 | TFTP server (UDP/69)    | Bootloader delivery.                                        |
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
+
+The DHCP, TFTP, and HTTP servers read boot files straight from the OCI
+images in the registry for each request. Metalman does not store image
+content on disk. It keeps only the parsed `metadata.yaml` in memory for about
+one minute.
 | Health server (TCP/8081)| Liveness and readiness probes.                              |
 
 Site-based scoping: the `--site` flag and the `unbounded-cloud.io/site` label

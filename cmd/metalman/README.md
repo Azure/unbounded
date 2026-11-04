@@ -57,10 +57,13 @@ everything needed to PXE-boot and manage bare metal hosts:
 | HTTP    | 8880/tcp    | HTTP     | Artifact serving, templated configs, attestation endpoints |
 | Health  | 8081/tcp    | HTTP     | Liveness/readiness probes |
 
-The controller also runs reconcilers for OCI image pulling (downloading and
-caching machine and netboot images from container registries), Redfish TLS
-certificate pinning, and `MachineOperation` host actions such as reboot and
-repave.
+The controller also runs reconcilers for Redfish TLS certificate pinning and
+`MachineOperation` host actions such as reboot and repave.
+
+Boot files are read from the machine and netboot OCI images in the registry
+for every request; nothing is cached on disk. Use `--registry-mirror` to read
+through a mirror such as a node-local Gantry. `--cache-dir` holds only the
+generated virtual media ISOs.
 
 When deployed inside a cluster, the container entrypoint is `metalman` and the
 operator passes `serve-pxe` as an argument:
