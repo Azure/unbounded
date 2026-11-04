@@ -33,6 +33,7 @@ func TestResolveRequestUsesImmutableRunSnapshot(t *testing.T) {
 		ResultConfigMap: "certification-run-r02-result",
 	}
 	run := certificationRun()
+
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(run)
 	if err != nil {
 		t.Fatal(err)
