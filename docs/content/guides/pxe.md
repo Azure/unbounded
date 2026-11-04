@@ -87,7 +87,9 @@ Metalman does not cache image content. For each DHCP, TFTP, or HTTP request
 it reads the needed file from the registry, using the image's pull secret.
 Tags are always resolved at the registry. Manifests by digest and layer blobs
 are read through `--registry-mirror` when one is set, falling back to the
-registry if the mirror fails. Layers are downloaded with parallel HTTP Range
+registry if the mirror fails or stalls (no response headers within 30 seconds
+for a manifest or 5 minutes for a blob, or a blob download idle for 1 minute,
+in which case the download resumes from the registry). Layers are downloaded with parallel HTTP Range
 requests when the server supports them. HTTP downloads to clients also support
 Range requests. If the registry cannot be reached, HTTP requests get `503`
 with `Retry-After`, and Machine operations wait.

@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	cplatforms "github.com/containerd/platforms"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -40,6 +42,27 @@ const (
 	// DefaultMaxIndexedLayers is the default number of layer indexes kept
 	// in memory by a Puller.
 	DefaultMaxIndexedLayers = 256
+
+	// DefaultMirrorManifestTimeout is the default bound on a mirror
+	// manifest (or other non-blob) request until response headers arrive.
+	// Manifests are small, and on a cold miss Gantry fetches one from the
+	// upstream registry in a single round trip, so a healthy mirror answers
+	// well within this; it is short enough to leave most of a typical
+	// caller budget for the upstream fallback.
+	DefaultMirrorManifestTimeout = 30 * time.Second
+	// DefaultMirrorBlobHeaderTimeout is the default bound on a mirror blob
+	// request until response headers arrive. It is generous because on a
+	// cold miss Gantry may download the whole blob from a peer or the
+	// upstream registry into its cache before it sends headers, which for a
+	// multi-gigabyte layer can take minutes. Falling back too early would
+	// duplicate that download against the upstream registry.
+	DefaultMirrorBlobHeaderTimeout = 5 * time.Minute
+	// DefaultMirrorIdleTimeout is the default bound on how long a mirror
+	// response body may go without delivering any bytes. Once headers are
+	// sent the mirror is streaming, so a minute of silence means it is
+	// stuck; the read then resumes from the upstream registry at the
+	// current offset.
+	DefaultMirrorIdleTimeout = time.Minute
 
 	// userAgent identifies requests made by this package.
 	userAgent = "unbounded-metalman-imagepull"
@@ -120,6 +143,21 @@ type Puller struct {
 	// the mirror, so that mirror failures fall back to the upstream
 	// registry quickly.
 	HTTPClient *http.Client
+	// MirrorManifestTimeout bounds each mirror request other than a blob
+	// request (manifests and token requests) until response headers
+	// arrive. When it expires the request fails and the upstream registry
+	// is tried. Zero means DefaultMirrorManifestTimeout; negative disables
+	// the bound. It applies even when HTTPClient is set.
+	MirrorManifestTimeout time.Duration
+	// MirrorBlobHeaderTimeout bounds each mirror blob request until
+	// response headers arrive. Zero means DefaultMirrorBlobHeaderTimeout;
+	// negative disables the bound.
+	MirrorBlobHeaderTimeout time.Duration
+	// MirrorIdleTimeout bounds how long a mirror response body may stall
+	// without delivering bytes. When it expires the read fails and blob
+	// reads resume from the upstream registry at the current offset. Zero
+	// means DefaultMirrorIdleTimeout; negative disables the bound.
+	MirrorIdleTimeout time.Duration
 
 	once     sync.Once
 	st       *pullerState
@@ -231,7 +269,17 @@ func (p *Puller) endpoints(ref registry.Reference, cred auth.Credential) ([]*end
 		}
 
 		hc := *base
-		hc.Transport = &nsTransport{base: base.Transport, host: mirrorHost, ns: ref.Registry}
+		hc.Transport = &nsTransport{
+			base: &timeoutTransport{
+				base:       base.Transport,
+				host:       mirrorHost,
+				manifest:   durationOr(p.MirrorManifestTimeout, DefaultMirrorManifestTimeout),
+				blobHeader: durationOr(p.MirrorBlobHeaderTimeout, DefaultMirrorBlobHeaderTimeout),
+				idle:       durationOr(p.MirrorIdleTimeout, DefaultMirrorIdleTimeout),
+			},
+			host: mirrorHost,
+			ns:   ref.Registry,
+		}
 		client := &auth.Client{Client: &hc, Credential: credFn, Cache: cache}
 		client.SetUserAgent(userAgent)
 
@@ -306,6 +354,144 @@ func (t *nsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r.URL.RawQuery = q.Encode()
 
 	return base.RoundTrip(r)
+}
+
+// durationOr returns def for zero, zero (no bound) for negative values, and
+// d otherwise.
+func durationOr(d, def time.Duration) time.Duration {
+	switch {
+	case d == 0:
+		return def
+	case d < 0:
+		return 0
+	default:
+		return d
+	}
+}
+
+// errMirrorTimeout reports that a mirror request exceeded a
+// timeoutTransport bound. It is distinct from the caller's context errors
+// so that callers fall back to the upstream registry.
+var errMirrorTimeout = errors.New("mirror request timed out")
+
+// timeoutTransport bounds requests to the mirror host independently of the
+// caller's context: each request must receive response headers within a
+// per-kind timeout, and the response body must deliver bytes at least once
+// per idle timeout. Bounds are applied with a derived context, so they work
+// with any base transport.
+type timeoutTransport struct {
+	base       http.RoundTripper
+	host       string
+	manifest   time.Duration
+	blobHeader time.Duration
+	idle       time.Duration
+}
+
+func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+
+	if req.URL.Host != t.host {
+		return base.RoundTrip(req)
+	}
+
+	header := t.manifest
+	if strings.Contains(req.URL.Path, "/blobs/") {
+		header = t.blobHeader
+	}
+
+	ctx, cancel := context.WithCancelCause(req.Context())
+
+	var timer *time.Timer
+	if header > 0 {
+		timer = time.AfterFunc(header, func() {
+			cancel(fmt.Errorf("%w: no response headers within %s", errMirrorTimeout, header))
+		})
+	}
+
+	resp, err := base.RoundTrip(req.WithContext(ctx))
+
+	if timer != nil && !timer.Stop() {
+		// The header timer fired; report it even if a response raced in.
+		if err == nil {
+			_ = resp.Body.Close() //nolint:errcheck // discarding response
+		}
+
+		cancel(nil)
+
+		return nil, context.Cause(ctx)
+	}
+
+	if err != nil {
+		cancel(nil)
+
+		if cause := context.Cause(ctx); errors.Is(cause, errMirrorTimeout) {
+			return nil, cause
+		}
+
+		return nil, err
+	}
+
+	resp.Body = newIdleBody(resp.Body, ctx, cancel, t.idle)
+
+	return resp, nil
+}
+
+// idleBody cancels its request when no Read completes within the idle
+// timeout, and releases the request context on Close.
+type idleBody struct {
+	rc     io.ReadCloser
+	ctx    context.Context //nolint:containedctx // reports the cancel cause
+	cancel context.CancelCauseFunc
+	idle   time.Duration
+	timer  *time.Timer
+}
+
+func newIdleBody(rc io.ReadCloser, ctx context.Context, cancel context.CancelCauseFunc, idle time.Duration) *idleBody { //nolint:revive // ctx follows rc for readability
+	b := &idleBody{rc: rc, ctx: ctx, cancel: cancel, idle: idle}
+	if idle > 0 {
+		b.timer = time.AfterFunc(idle, func() {
+			cancel(fmt.Errorf("%w: response body idle for %s", errMirrorTimeout, idle))
+		})
+		// The timer runs only while a Read is blocked, so a slow consumer
+		// does not trip it.
+		b.timer.Stop()
+	}
+
+	return b
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	if b.timer != nil {
+		b.timer.Reset(b.idle)
+	}
+
+	n, err := b.rc.Read(p)
+
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+
+	if err != nil {
+		if cause := context.Cause(b.ctx); errors.Is(cause, errMirrorTimeout) {
+			return n, cause
+		}
+	}
+
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+
+	err := b.rc.Close()
+	b.cancel(nil)
+
+	return err
 }
 
 // Resolve resolves src to a single-platform manifest and returns an Image

@@ -56,7 +56,12 @@
 // directly, because Gantry only serves content addressed by digest. A
 // mirror failure falls back to the upstream registry; if the mirror fails
 // in the middle of a blob, the download resumes from the upstream registry
-// at the current offset. Credentials are sent to the mirror too (see
+// at the current offset. Mirror requests are bounded independently of the
+// caller's context, so a mirror that accepts connections but stalls still
+// leaves time for the upstream registry: Puller.MirrorManifestTimeout and
+// Puller.MirrorBlobHeaderTimeout bound the wait for response headers, and
+// Puller.MirrorIdleTimeout bounds a stalled response body, after which the
+// download resumes from the upstream registry. Credentials are sent to the mirror too (see
 // Puller.Mirror).
 //
 // # Integrity
