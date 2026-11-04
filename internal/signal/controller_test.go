@@ -253,6 +253,7 @@ func TestSuiteSnapshotAndRunPinning(t *testing.T) {
 		"first.sh":  "echo first",
 		"second.sh": "echo second",
 	}
+
 	bundleDigest, err := signalv1.DeriveScriptBundleDigest(checks, scripts)
 	if err != nil {
 		t.Fatalf("derive script bundle digest: %v", err)
