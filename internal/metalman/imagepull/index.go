@@ -232,13 +232,27 @@ func (c *indexCache) len() int {
 
 // load returns the index for d, building it with build at most once at a
 // time per digest.
+//
+// The build runs with the context of the caller that started it (the
+// leader). Every caller, leader or waiter, stops waiting as soon as its own
+// ctx is done and returns ctx's error; the build keeps running in the
+// singleflight goroutine and its result is still cached and delivered to the
+// remaining waiters, so no goroutine is leaked. If a waiter receives a
+// cancellation error from a build it did not run (the leader's context was
+// canceled), and its own ctx is still live, it retries and becomes the new
+// leader. A caller whose own build failed returns that error unchanged.
 func (c *indexCache) load(ctx context.Context, d digest.Digest, build func(context.Context) (*layerIndex, error)) (*layerIndex, error) {
-	for attempt := 0; ; attempt++ {
+	for {
 		if idx, ok := c.get(d); ok {
 			return idx, nil
 		}
 
-		v, err, _ := c.sf.Do(string(d), func() (any, error) {
+		// ran is written by the singleflight goroutine before the result
+		// is sent on ch, so reading it after receiving is race free.
+		ran := false
+		ch := c.sf.DoChan(string(d), func() (any, error) {
+			ran = true
+
 			if idx, ok := c.get(d); ok {
 				return idx, nil
 			}
@@ -252,17 +266,24 @@ func (c *indexCache) load(ctx context.Context, d digest.Digest, build func(conte
 
 			return idx, nil
 		})
-		if err == nil {
-			return v.(*layerIndex), nil //nolint:errcheck,forcetypeassert // only *layerIndex is returned
+
+		var res singleflight.Result
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res = <-ch:
 		}
 
-		// The build may have run with another caller's context; retry
-		// with ours if that one was canceled.
-		if attempt < 2 && ctx.Err() == nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		if res.Err == nil {
+			return res.Val.(*layerIndex), nil //nolint:errcheck,forcetypeassert // only *layerIndex is returned
+		}
+
+		if !ran && ctx.Err() == nil && (errors.Is(res.Err, context.Canceled) || errors.Is(res.Err, context.DeadlineExceeded)) {
 			continue
 		}
 
-		return nil, err
+		return nil, res.Err
 	}
 }
 
