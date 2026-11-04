@@ -184,9 +184,16 @@ func readTemplateFile(file *imagepull.File) ([]byte, error) {
 		return nil, fmt.Errorf("template %s is %d bytes, larger than the %d byte limit", file.Name(), file.Size(), imagepull.MaxReadFileSize)
 	}
 
-	data := make([]byte, file.Size())
-	if _, err := io.ReadFull(file, data); err != nil {
+	// Read through EOF rather than exactly Size bytes: File.Read reports a
+	// content digest mismatch only at EOF, possibly together with the final
+	// bytes, and io.ReadFull would drop that error once the buffer is full.
+	data, err := io.ReadAll(io.LimitReader(file, file.Size()+1))
+	if err != nil {
 		return nil, fmt.Errorf("%w: reading %s: %w", ErrImageUnavailable, file.Name(), err)
+	}
+
+	if int64(len(data)) != file.Size() {
+		return nil, fmt.Errorf("%w: reading %s: got %d bytes, want %d", ErrImageUnavailable, file.Name(), len(data), file.Size())
 	}
 
 	return data, nil

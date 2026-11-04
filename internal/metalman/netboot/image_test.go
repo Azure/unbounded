@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -571,4 +572,63 @@ func TestMetadataMemoCanceledCallerDoesNotCancelSharedFetch(t *testing.T) {
 		return err == nil && meta.HTTPBootPath == "shim"
 	}, 5*time.Second, 10*time.Millisecond)
 	require.EqualValues(t, 1, calls.Load())
+}
+
+// corruptTemplateBlob replaces the served bytes of layer with a copy in
+// which the first occurrence of marker has one byte flipped. The layer must
+// be uncompressed so that the tar layout, and therefore the layer index,
+// stays valid.
+func corruptTemplateBlob(t *testing.T, reg *imagepulltest.Registry, repo, layer, marker string) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, reg.URL()+"/v2/"+repo+"/blobs/"+layer, nil)
+	require.NoError(t, err)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+
+	orig, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	require.NoError(t, err)
+
+	blob := bytes.Clone(orig)
+	i := bytes.Index(blob, []byte(marker))
+	require.GreaterOrEqual(t, i, 0, "marker %q not found", marker)
+
+	blob[i] ^= 0x20
+	reg.SetBlob(layer, blob)
+}
+
+func TestTemplateRejectsChangedBytesAfterIndexing(t *testing.T) {
+	const tmpl = "rendered for {{ .Machine.Name }} marker"
+
+	f := newFileServerFixture(t, map[string][]byte{"vmlinuz": []byte("kernel")})
+	_, dgst := f.images.Registry.Push(t, "test/netboot", "v1", imagepulltest.ImageSpec{Layers: []imagepulltest.Layer{{
+		Files:       diskFiles(map[string][]byte{"grub.cfg.tmpl": []byte(tmpl)}),
+		Compression: imagepulltest.Uncompressed,
+	}}})
+	layer := f.images.Registry.LayerDigests(dgst)[0]
+
+	// The first request indexes the layer and serves the good template.
+	w := f.get("/grub.cfg")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "rendered for pull-node marker", w.Body.String())
+
+	// The registry now serves changed template bytes at the same offsets.
+	corruptTemplateBlob(t, f.images.Registry, "test/netboot", layer, "marker")
+
+	w = f.get("/grub.cfg")
+	require.NotEqual(t, http.StatusOK, w.Code)
+	require.NotContains(t, w.Body.String(), "pull-node")
+	require.NotContains(t, w.Body.String(), "mArker")
+
+	// readTemplateFile itself surfaces the digest mismatch.
+	file, isTmpl, err := f.server.openImageFile(t.Context(), ImageSource{Ref: "ghcr.io/test/netboot:v1"}, "grub.cfg")
+	require.NoError(t, err)
+	require.True(t, isTmpl)
+
+	_, err = readTemplateFile(file)
+	require.ErrorIs(t, err, imagepull.ErrDigestMismatch)
+	require.ErrorIs(t, err, ErrImageUnavailable)
 }
