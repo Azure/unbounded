@@ -102,6 +102,10 @@ pub struct LinkNode {
     /// Source of reservation tokens for `initiating`.
     reservations: std::sync::atomic::AtomicU64,
 
+    /// The membership whose RDMA edges links were last trimmed to, so only
+    /// the first worker to see a new membership sends the request.
+    retained: Mutex<std::sync::Weak<crate::topology::Membership>>,
+
     /// GPU helper and per-GPU landing bytes, when `gpu-read` pages may land
     /// in GPU memory (GPUDirect RDMA).
     gpu_landing: Mutex<Option<(Arc<crate::gpu::GpuHelper>, u64)>>,
@@ -697,6 +701,29 @@ impl Links {
         }
     }
 
+    /// Close links to peers that are no longer RDMA edges of `membership`,
+    /// instead of leaving them until their idle timeout. Links on every
+    /// active rail to the remaining edge peers are kept. Runs once per
+    /// membership across the node's workers.
+    pub fn retain_edges(&self, membership: &Arc<crate::topology::Membership>) {
+        {
+            let mut retained = LinkNode::lock(&self.node.retained);
+            if std::ptr::eq(retained.as_ptr(), Arc::as_ptr(membership)) {
+                return;
+            }
+            *retained = Arc::downgrade(membership);
+        }
+        let rails = self.active();
+        if rails.is_empty() {
+            return;
+        }
+        let keep = crate::rdma::rdma_edge_peers(membership, &self.local)
+            .iter()
+            .flat_map(|peer| rails.iter().map(move |m| link_key(peer, m.rail)))
+            .collect();
+        self.client.retain(keep);
+    }
+
     /// Whether GPU `ordinal` has a landing slice on `rail` this round.
     pub fn has_landing(&self, rail: RailId, ordinal: i32) -> bool {
         self.node.landing(rail, ordinal).is_some()
@@ -1051,11 +1078,12 @@ impl Links {
             )
             .await;
         if let Err(error) = written {
-            // Cancellation or the deadline can win after the owner already
-            // consumed the tag. A `Release` for a consumed tag would wait for
-            // a grant that never comes, so break this epoch instead.
+            // Cancellation or the deadline can win before or after the owner
+            // consumed the tag. Release is idempotent per epoch: it frees a
+            // grant the write never used and completes at once for a tag
+            // already written, so the link survives either way.
             if matches!(error, Error::Cancelled | Error::DeadlineExceeded) {
-                self.client.break_link(key, epoch);
+                self.release_epoch(key, epoch, grant.tag);
             }
             return Err(error);
         }
@@ -1067,19 +1095,31 @@ impl Links {
     }
 
     /// Sender: decline the peer's grant if its link is still the granted one.
+    ///
+    /// Reads the link snapshot with [`Client::link_current`], never the
+    /// contended-reads-as-idle [`Client::link`]: a skipped release leaves the
+    /// peer's grant exposed until its deadline, which breaks the peer's link.
     pub fn release(&self, peer: &NodeId, grant: &AuthenticatedGrant) {
-        if let Some((epoch, link)) = self.ready(peer, grant.rail)
-            && link == grant.link
+        if !self.rail_ready(grant.rail) {
+            return;
+        }
+        let key = link_key(peer, grant.rail);
+        if let LinkState::Ready { epoch, link_id } = self.client.link_current(key)
+            && link_id == grant.link
         {
-            let key = link_key(peer, grant.rail);
-            let release = self.client.release(key, epoch, grant.tag);
-            // An op that failed before the owner saw it (full queue, owner
-            // gone) never sends `Release`; the peer would hold the window until
-            // its deadline. Break the epoch on the guaranteed path instead.
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            if let std::task::Poll::Ready(Err(_)) = release.poll(&mut cx) {
-                self.client.break_link(key, epoch);
-            }
+            self.release_epoch(key, epoch, grant.tag);
+        }
+    }
+
+    /// Send `Release` for `tag` on `key`'s link at `epoch`.
+    fn release_epoch(&self, key: LinkKey, epoch: Epoch, tag: u32) {
+        let release = self.client.release(key, epoch, tag);
+        // An op that failed before the owner saw it (full queue, owner
+        // gone) never sends `Release`; the peer would hold the window until
+        // its deadline. Break the epoch on the guaranteed path instead.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Err(_)) = release.poll(&mut cx) {
+            self.client.break_link(key, epoch);
         }
     }
 }

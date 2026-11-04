@@ -304,19 +304,19 @@ fn release_frees_without_exposing() {
         Some(Ok(Arrival::Released))
     ));
     assert_eq!(free(&p.a), 4);
+    // Release is idempotent per epoch: a tag already released completes at
+    // once instead of waiting for a Grant that never comes.
     assert_eq!(
         poll(&release(&mut p.b, granted.tag, now)),
-        None,
-        "an unknown tag waits for its Grant"
+        Some(Ok(())),
+        "a consumed tag completes at once"
     );
+    assert!(p.b.link.waiting.is_empty());
     // Release before the Grant arrives, replacing a waiting write.
     let waiting = write(&mut p.b, 2, vec![1], deadline, now);
     let early = release(&mut p.b, 2, now);
     assert_eq!(poll(&waiting), Some(Err(Error::Cancelled)));
-    assert_eq!(
-        poll(&release(&mut p.b, 2, now)),
-        Some(Err(Error::InvalidRequest))
-    );
+    assert_eq!(poll(&release(&mut p.b, 2, now)), Some(Ok(())));
     let second = grant(&mut p.a, 10, deadline, now);
     assert_eq!(pump(&mut p), (None, None));
     let second = poll(&second).unwrap().unwrap();
@@ -324,7 +324,25 @@ fn release_frees_without_exposing() {
     assert_eq!(poll(&early), Some(Ok(())));
     assert!(matches!(poll(&second.arrival), Some(Ok(Arrival::Released))));
     assert_eq!(free(&p.a), 4);
-    // Writing a released tag is just a wait for a new Grant.
+    // An unknown tag is answered at once and still released when its Grant
+    // arrives.
+    assert_eq!(poll(&release(&mut p.b, 3, now)), Some(Ok(())));
+    let third = grant(&mut p.a, 10, deadline, now);
+    assert_eq!(pump(&mut p), (None, None));
+    let third = poll(&third).unwrap().unwrap();
+    assert_eq!(third.tag, 3);
+    assert!(matches!(poll(&third.arrival), Some(Ok(Arrival::Released))));
+    assert_eq!(free(&p.a), 4);
+    // A pending release for a Grant that never arrives is forgotten at its
+    // deadline instead of waiting forever.
+    assert_eq!(poll(&release(&mut p.b, 50, now)), Some(Ok(())));
+    assert!(p.b.link.waiting.contains_key(&50));
+    p.now += Duration::from_secs(60);
+    assert_eq!(pump(&mut p), (None, None));
+    assert!(p.b.link.waiting.contains_key(&50));
+    p.now += Duration::from_secs(61);
+    let _ = p.b.link.poll(&p.b.pool, p.now);
+    assert!(!p.b.link.waiting.contains_key(&50));
     finish(p);
 }
 

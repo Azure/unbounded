@@ -394,6 +394,26 @@ pub fn is_rdma_edge(
             .is_ok()
 }
 
+/// Every peer whose edge to `local` uses RDMA (see [`is_rdma_edge`]).
+/// Empty when `local` is not a member.
+pub fn rdma_edge_peers(
+    membership: &crate::topology::Membership,
+    local: &racer_control_wire::NodeId,
+) -> Vec<racer_control_wire::NodeId> {
+    let Ok(position) = membership.position(local) else {
+        return Vec::new();
+    };
+    let members = membership.members();
+    membership
+        .rdma_edges
+        .peers(membership, position)
+        .iter()
+        .map(|&peer| &members[peer].node)
+        .filter(|peer| is_rdma_edge(membership, local, peer))
+        .cloned()
+        .collect()
+}
+
 fn validate_route(route: &Route) -> Result<()> {
     if route.nodes.is_empty()
         || route.nodes.len() > usize::from(FAILURE_LINKS) + 1
@@ -1025,6 +1045,27 @@ pub(crate) mod tests {
                 }
                 assert!(!is_rdma_edge(&membership, a, a));
             }
+        }
+        #[test]
+        fn rdma_edge_peers_lists_exactly_the_rdma_edges() {
+            let membership = mesh_with_budget(40, 16);
+            let nodes: Vec<_> = membership
+                .members()
+                .iter()
+                .map(|m| m.node.clone())
+                .collect();
+            for a in &nodes {
+                let mut peers = rdma_edge_peers(&membership, a);
+                peers.sort();
+                let mut expected: Vec<_> = nodes
+                    .iter()
+                    .filter(|b| is_rdma_edge(&membership, a, b))
+                    .cloned()
+                    .collect();
+                expected.sort();
+                assert_eq!(peers, expected);
+            }
+            assert!(rdma_edge_peers(&membership, &NodeId("absent".into())).is_empty());
         }
         #[test]
         fn rdma_edges_need_both_ends_within_the_peer_budget() {

@@ -287,8 +287,13 @@ enum Waiting {
         done: Completer<()>,
     },
 
+    /// A release requested before its `Grant` arrived. Sent when the grant
+    /// arrives; forgotten at `deadline`. `done` is `None` when the caller
+    /// was already answered (the tag was unknown at the time).
     Release {
-        done: Completer<()>,
+        done: Option<Completer<()>>,
+
+        deadline: Instant,
     },
 }
 
@@ -301,7 +306,7 @@ enum Outgoing {
 
         transfer: [u8; 16],
 
-        done: Completer<()>,
+        done: Option<Completer<()>>,
     },
 
     Credit,
@@ -440,6 +445,11 @@ pub(crate) struct Link {
 
     waiting: BTreeMap<u32, Waiting>,
 
+    /// Peer grant tags this epoch already wrote or released, newest last,
+    /// bounded by twice the grant cap. A repeated `Release` for one of them
+    /// completes at once instead of waiting for a grant that never comes.
+    consumed: VecDeque<u32>,
+
     outbox: VecDeque<Outgoing>,
 
     inflight: BTreeMap<u64, InFlight>,
@@ -526,6 +536,7 @@ impl Link {
             grant_cap: limits.grants,
             remote: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            consumed: VecDeque::new(),
             outbox: VecDeque::new(),
             inflight: BTreeMap::new(),
             quarantine: Vec::new(),
@@ -781,6 +792,7 @@ impl Link {
         }
 
         self.remote.remove(&tag);
+        self.mark_consumed(tag);
         self.outbox.push_back(Outgoing::Write {
             tag,
             source: Payload {
@@ -805,29 +817,62 @@ impl Link {
         self.last_used = now;
 
         if let Some(remote) = self.remote.remove(&tag) {
+            self.mark_consumed(tag);
             self.outbox.push_back(Outgoing::Release {
                 tag,
                 transfer: remote.transfer,
-                done,
+                done: Some(done),
             });
             return;
         }
 
+        let deadline = now + self.limits.idle;
+
         match self.waiting.remove(&tag) {
             Some(Waiting::Write { done: write, .. }) => {
                 let _ = write.complete(Err(Error::Cancelled));
-                self.waiting.insert(tag, Waiting::Release { done });
+                self.waiting.insert(
+                    tag,
+                    Waiting::Release {
+                        done: Some(done),
+                        deadline,
+                    },
+                );
             }
+            // Idempotent: the earlier release still sends when the grant
+            // arrives.
             Some(waiting @ Waiting::Release { .. }) => {
                 self.waiting.insert(tag, waiting);
-                let _ = done.complete(Err(Error::InvalidRequest));
+                let _ = done.complete(Ok(()));
+            }
+            // Already written or released this epoch: nothing left to do.
+            None if self.consumed.contains(&tag) => {
+                let _ = done.complete(Ok(()));
             }
             None if self.waiting.len() >= 2 * self.limits.grants as usize => {
                 let _ = done.complete(Err(Error::Overloaded));
             }
+            // Unknown tag: answer now, and still release the grant if it
+            // arrives before the deadline.
             None => {
-                self.waiting.insert(tag, Waiting::Release { done });
+                let _ = done.complete(Ok(()));
+                self.waiting.insert(
+                    tag,
+                    Waiting::Release {
+                        done: None,
+                        deadline,
+                    },
+                );
             }
+        }
+    }
+
+    /// Record that the peer's grant `tag` was written or released.
+    fn mark_consumed(&mut self, tag: u32) {
+        self.consumed.retain(|&t| t != tag);
+        self.consumed.push_back(tag);
+        while self.consumed.len() > 2 * self.limits.grants as usize {
+            self.consumed.pop_front();
         }
     }
 
@@ -1105,8 +1150,9 @@ impl Link {
                         deadline,
                         done,
                     }) => self.start_write(tag, source, deadline, done),
-                    Some(Waiting::Release { done }) => {
+                    Some(Waiting::Release { done, .. }) => {
                         self.remote.remove(&tag);
+                        self.mark_consumed(tag);
                         self.outbox.push_back(Outgoing::Release {
                             tag,
                             transfer: transfer_id,
@@ -1167,13 +1213,24 @@ impl Link {
         let expired: Vec<u32> = self
             .waiting
             .iter()
-            .filter(|(_, w)| matches!(w, Waiting::Write { deadline, .. } if now >= *deadline))
+            .filter(|(_, w)| {
+                matches!(w, Waiting::Write { deadline, .. } | Waiting::Release { deadline, .. }
+                    if now >= *deadline)
+            })
             .map(|(tag, _)| *tag)
             .collect();
 
         for tag in expired {
-            if let Some(Waiting::Write { done, .. }) = self.waiting.remove(&tag) {
-                let _ = done.complete(Err(Error::DeadlineExceeded));
+            match self.waiting.remove(&tag) {
+                Some(
+                    Waiting::Write { done, .. }
+                    | Waiting::Release {
+                        done: Some(done), ..
+                    },
+                ) => {
+                    let _ = done.complete(Err(Error::DeadlineExceeded));
+                }
+                Some(Waiting::Release { done: None, .. }) | None => {}
             }
         }
 
@@ -1188,7 +1245,9 @@ impl Link {
                     done,
                     ..
                 } if now >= deadline => {
+                    // Never posted: the grant is unused again.
                     self.remote.insert(tag, remote);
+                    self.consumed.retain(|&t| t != tag);
                     let _ = done.complete(Err(Error::DeadlineExceeded));
                 }
                 other => kept.push_back(other),
@@ -1328,7 +1387,7 @@ impl Link {
                         tag,
                         transfer_id: transfer,
                     },
-                    Some(done),
+                    done,
                     false,
                 )?;
             }
@@ -1459,8 +1518,15 @@ impl Link {
         }
 
         for (_, waiting) in std::mem::take(&mut self.waiting) {
-            let (Waiting::Write { done, .. } | Waiting::Release { done }) = waiting;
-            let _ = done.complete(Err(Error::Unavailable));
+            match waiting {
+                Waiting::Write { done, .. }
+                | Waiting::Release {
+                    done: Some(done), ..
+                } => {
+                    let _ = done.complete(Err(Error::Unavailable));
+                }
+                Waiting::Release { done: None, .. } => {}
+            }
         }
 
         for outgoing in self.outbox.drain(..) {
@@ -1469,7 +1535,9 @@ impl Link {
                     // Not posted: no NIC access, so the source drops now.
                     let _ = done.complete(Err(Error::Unavailable));
                 }
-                Outgoing::Release { done, .. } => {
+                Outgoing::Release {
+                    done: Some(done), ..
+                } => {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
                 _ => {}

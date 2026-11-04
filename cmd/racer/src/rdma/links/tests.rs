@@ -638,8 +638,10 @@ mod send_failures {
         }
     }
 
+    /// A write cancelled after the owner consumed its tag keeps the link:
+    /// the follow-up release completes at once for a consumed tag.
     #[test]
-    fn cancelled_after_the_write_lands_breaks_the_epoch() {
+    fn cancelled_after_the_write_lands_keeps_the_link() {
         let mut w = world();
         link_up(&mut w);
         let (pending, grant) = granted(&mut w, 3);
@@ -661,9 +663,15 @@ mod send_failures {
         links.release(&to, &grant);
         pump!(w);
         assert!(
-            links.ready(&to, RAIL).is_none(),
-            "ambiguous write broke the epoch"
+            links.ready(&to, RAIL).is_some(),
+            "an ambiguous write keeps the epoch"
         );
+        assert!(w.a.links.ready(&node_id(2), RAIL).is_some());
+        // The link still carries pages.
+        let (pending, grant) = granted(&mut w, 4);
+        let second = super::page(&w.b.admission.clone(), 17, 0x6b);
+        drive!(w, links.send(&to, &grant, &second, &super::scope())).unwrap();
+        assert_eq!(arrived(&mut w, &pending), vec![0x6b; 17]);
     }
 
     #[test]
@@ -1131,6 +1139,28 @@ fn restart_b(w: &mut World) {
     .unwrap();
     assert_eq!(rails.len(), 1);
     pump!(w);
+}
+
+/// A membership change closes links to peers that are no longer RDMA edges
+/// at once (here the local node left, so none are), without backoff, and a
+/// membership is applied only once.
+#[test]
+fn membership_change_closes_links_to_non_edges() {
+    let mut w = world();
+    let b = node_id(2);
+    link_up(&mut w);
+    let membership = crate::rdma::tests::rails_tests::mesh(8);
+    w.a.links.retain_edges(&membership);
+    pump!(w);
+    assert_eq!(w.a.links.state(&b, RAIL), LinkState::Idle);
+    assert_eq!(w.b.links.state(&node_id(1), RAIL), LinkState::Idle);
+    // No backoff: the link comes straight back, and the same membership
+    // does not close it again. (Wait out the per-peer setup rate limit.)
+    w.clock.advance(SETUP_INTERVAL);
+    link_up(&mut w);
+    w.a.links.retain_edges(&membership);
+    pump!(w);
+    assert!(w.a.links.ready(&b, RAIL).is_some());
 }
 
 /// After a peer restarts, the survivor's link stays `Ready`

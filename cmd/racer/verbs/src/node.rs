@@ -205,6 +205,9 @@ struct NodeShared {
     /// Breaks that did not fit in a command queue.
     breaks: Mutex<Vec<(LinkKey, Epoch)>>,
 
+    /// The latest [`Client::retain`] request, not yet applied.
+    retain: Mutex<Option<std::collections::BTreeSet<LinkKey>>>,
+
     closed: AtomicBool,
 
     drained: AtomicBool,
@@ -227,6 +230,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
         pools: RwLock::new(BTreeMap::new()),
         device_pools: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
+        retain: Mutex::new(None),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
         alive: AtomicBool::new(true),
@@ -307,6 +311,33 @@ impl Client {
             Ok(links) => links.get(&key).copied().unwrap_or(LinkState::Idle),
             Err(_) => LinkState::Idle,
         }
+    }
+
+    /// Snapshot of `key`'s link, waiting out a concurrent publish instead of
+    /// reading [`LinkState::Idle`]. For paths that must act on the current
+    /// link, such as releasing a peer's grant: skipping that release would
+    /// later break the peer's link at its grant deadline. The owner holds the
+    /// write lock only while copying the snapshot.
+    pub fn link_current(&self, key: LinkKey) -> LinkState {
+        self.shared
+            .links
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .unwrap_or(LinkState::Idle)
+    }
+
+    /// Close every link whose key is not in `keep`: ready links send `Close`
+    /// and drain, others break, and none backs off. Used when peers stop
+    /// being RDMA edges. The latest request wins; never lost to a full queue.
+    pub fn retain(&self, keep: std::collections::BTreeSet<LinkKey>) {
+        *self
+            .shared
+            .retain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(keep);
+        self.shared.owner.wake();
     }
 
     /// Start a link as initiator. Returns the local setup to sign and send.
@@ -672,6 +703,19 @@ impl Owner {
 
         for (key, epoch) in breaks {
             self.break_matching(key, epoch, now);
+        }
+
+        let retain = self
+            .shared
+            .retain
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+
+        if let Some(keep) = retain
+            && !self.closing
+        {
+            self.retain_links(&keep, now);
         }
 
         self.progress(now);
@@ -1119,6 +1163,29 @@ impl Owner {
         self.dirty = true;
     }
 
+    /// Close links whose keys are not in `keep`, without backoff.
+    fn retain_links(&mut self, keep: &std::collections::BTreeSet<LinkKey>, now: Instant) {
+        let gone: Vec<LinkKey> = self
+            .links
+            .keys()
+            .filter(|key| !keep.contains(key))
+            .copied()
+            .collect();
+
+        for key in gone {
+            self.backoff.remove(&key);
+            let link = self.links.get_mut(&key).unwrap();
+
+            if link.phase() == Phase::Ready {
+                link.close(now, link::CLOSE_GRACE);
+            } else if !matches!(link.phase(), Phase::Closing { .. }) {
+                self.break_link(key, Break::Closed, now);
+            }
+        }
+
+        self.dirty = true;
+    }
+
     /// Poll every live link and break the failed ones.
     fn progress(&mut self, now: Instant) {
         let mut broken = Vec::new();
@@ -1390,6 +1457,26 @@ mod tests {
         send::<OwnerPort>();
         send::<Source>();
         assert_eq!(node(0).err(), Some(Error::InvalidConfiguration));
+    }
+
+    #[test]
+    /// A contended snapshot reads as `Idle` through `link`, but
+    /// `link_current` waits for the publish and sees the real state.
+    fn link_current_waits_out_a_contended_snapshot() {
+        let (clients, port) = node(1).unwrap();
+        let key = LinkKey {
+            peer: [1; 32],
+            rail: 0,
+        };
+        let state = LinkState::Connecting(Epoch(3));
+        let client = clients.into_iter().next().unwrap();
+        let mut links = port.shared.links.write().unwrap();
+        assert_eq!(client.link(key), LinkState::Idle);
+        let reader = std::thread::spawn(move || client.link_current(key));
+        std::thread::sleep(Duration::from_millis(20));
+        links.insert(key, state);
+        drop(links);
+        assert_eq!(reader.join().unwrap(), state);
     }
 
     #[test]

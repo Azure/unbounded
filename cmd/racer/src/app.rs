@@ -1880,6 +1880,9 @@ impl WorkerApplication {
         if self.snapshot_sequence == Some(snapshot.sequence) {
             return Ok(());
         }
+        if let Some(links) = &self.links {
+            links.retain_edges(&snapshot.membership);
+        }
         let removed: std::collections::HashSet<_> = self
             .caches
             .iter()

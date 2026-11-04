@@ -505,6 +505,36 @@ fn replacement_on_full_rail_succeeds_and_refusals_back_off() {
 }
 
 #[test]
+/// `retain` closes links whose keys were dropped (a ready link sends
+/// `Close`, a setup breaks) without backoff on either side, and keeps the
+/// rest.
+fn retain_closes_dropped_links_without_backoff() {
+    let mut w = world();
+    link_up(&mut w);
+    let other = LinkKey {
+        peer: [4; 32],
+        rail: 7,
+    };
+    let opened = w.a.clients[0].open(other);
+    wait(&mut w, &opened).unwrap();
+    w.a.clients[1].retain([other].into());
+    pump(&mut w);
+    assert_eq!(w.a.clients[0].link(TO_B), LinkState::Idle);
+    assert_eq!(w.b.clients[0].link(TO_A), LinkState::Idle);
+    assert!(matches!(
+        w.a.clients[0].link(other),
+        LinkState::Connecting(_)
+    ));
+    w.a.clients[0].retain(Default::default());
+    pump(&mut w);
+    assert_eq!(w.a.clients[0].link(other), LinkState::Idle);
+    // Nothing backs off: the dropped peer can link again at once.
+    let again = w.a.clients[0].open(TO_B);
+    wait(&mut w, &again).unwrap();
+    shutdown(w);
+}
+
+#[test]
 /// Closing one node sends `Close`: the peer returns to `Idle`, not backoff.
 /// An idle link closes itself the same way.
 fn peer_close_and_idle_close() {
