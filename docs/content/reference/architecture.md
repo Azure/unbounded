@@ -57,12 +57,13 @@ Runs two reconcilers and four network servers:
 | DHCP server (UDP/67)    | Static IP assignment by MAC address.                        |
 | TFTP server (UDP/69)    | Bootloader delivery.                                        |
 | HTTP server (TCP/8880)  | Kernel, initrd, Go-templated configs, `/attest` (TPM), `/pxe/disable`. |
+| Health server (TCP/8081)| Liveness and readiness probes.                              |
 
 The DHCP, TFTP, and HTTP servers read boot files straight from the OCI
 images in the registry for each request. Metalman does not store image
-content on disk. It keeps only the parsed `metadata.yaml` in memory for about
-one minute.
-| Health server (TCP/8081)| Liveness and readiness probes.                              |
+content on disk. In memory it keeps the parsed `metadata.yaml` for about one
+minute, and a small index of file names and digests for recently read image
+layers.
 
 Site-based scoping: the `--site` flag and the `unbounded-cloud.io/site` label
 restrict each instance to a subset of Machines. Leader election is per-site.

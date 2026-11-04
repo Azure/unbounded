@@ -83,11 +83,21 @@ Go templates rendered per-machine at serve time; other files are served
 verbatim. A `metadata.yaml` file in the netboot image provides image-level
 configuration such as `dhcpBootImageName` and `httpBootPath`.
 
-Metalman does not cache images. For each DHCP, TFTP, or HTTP request it reads
-the needed file from the registry, using the image's pull secret. HTTP
-downloads support Range requests. If the registry cannot be reached, HTTP
-requests get `503` with `Retry-After`, and Machine operations wait. Parsed
-`metadata.yaml` is kept in memory for about one minute.
+Metalman does not cache image content. For each DHCP, TFTP, or HTTP request
+it reads the needed file from the registry, using the image's pull secret.
+Tags are always resolved at the registry. Manifests by digest and layer blobs
+are read through `--registry-mirror` when one is set, falling back to the
+registry if the mirror fails. Layers are downloaded with parallel HTTP Range
+requests when the server supports them. HTTP downloads to clients also support
+Range requests. If the registry cannot be reached, HTTP requests get `503`
+with `Retry-After`, and Machine operations wait.
+
+Metalman keeps two small things in memory: the parsed `metadata.yaml` for
+about one minute, and an index of file names and SHA-256 digests for recently
+read layers. The first request that touches a layer downloads it once in full
+to build the index. After that, metalman answers requests for missing files
+without downloading any layer, skips layers that do not contain the requested
+file, and checks that a file read from start to end matches its indexed digest.
 
 Images are built, tagged, and pushed using standard container tooling:
 
