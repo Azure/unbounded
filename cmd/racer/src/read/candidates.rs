@@ -4065,7 +4065,7 @@ pub(super) mod tests {
             selector: MetadataSelector::Fresh,
             mode: FetchMode::CopyOnly,
         };
-        let mut exchange = |links| {
+        let exchange = |links| {
             let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, links);
             let mut exchanged = Exchanged::default();
             let result = futures::executor::block_on(policy.request_traced(
