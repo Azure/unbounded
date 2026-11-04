@@ -78,13 +78,38 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: lint
           extra-build-paths: ~/.cache/golangci-lint
 
+      - name: Compute Go tools cache key
+        id: tools-key
+        run: |
+          # Hash only the pinned versions that install-tools uses, so unrelated
+          # Makefile edits do not invalidate the cache.
+          hash="$(grep -E '^(GOFUMPT|GOLANGCI_LINT|PROTOC_GEN_GO|PROTOC_GEN_GO_GRPC|CONTROLLER_GEN|ACTIONLINT)_VERSION ' Makefile | sha256sum | cut -c1-16)"
+          echo "key=go-tools-${RUNNER_OS}-${RUNNER_ARCH}-${{ steps.setup-go.outputs.go-version }}-${hash}" >> "$GITHUB_OUTPUT"
+          echo "dir=$(go env GOPATH)/bin" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go tools
+        id: tools-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.tools-key.outputs.dir }}
+          key: ${{ steps.tools-key.outputs.key }}
+
       - name: Install tools
+        if: steps.tools-cache.outputs.cache-hit != 'true'
         run: make install-tools
+
+      - name: Save Go tools
+        if: github.event_name == 'push' && steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.tools-key.outputs.dir }}
+          key: ${{ steps.tools-key.outputs.key }}
 
       - name: Lint
         run: make lint
@@ -114,6 +139,7 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: race
@@ -480,6 +506,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: build
@@ -518,6 +545,7 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: race
@@ -541,6 +569,7 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: build
@@ -566,6 +595,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: build
@@ -582,11 +612,29 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: build
 
+      - name: Compute Go tools cache key
+        id: tools-key
+        run: |
+          # Hash only the pinned versions that install-tools uses, so unrelated
+          # Makefile edits do not invalidate the cache.
+          hash="$(grep -E '^(GOFUMPT|GOLANGCI_LINT|PROTOC_GEN_GO|PROTOC_GEN_GO_GRPC|CONTROLLER_GEN|ACTIONLINT)_VERSION ' Makefile | sha256sum | cut -c1-16)"
+          echo "key=go-tools-${RUNNER_OS}-${RUNNER_ARCH}-${{ steps.setup-go.outputs.go-version }}-${hash}" >> "$GITHUB_OUTPUT"
+          echo "dir=$(go env GOPATH)/bin" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Go tools
+        id: tools-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.tools-key.outputs.dir }}
+          key: ${{ steps.tools-key.outputs.key }}
+
       - name: Install tools
+        if: steps.tools-cache.outputs.cache-hit != 'true'
         run: make install-tools
 
       - name: Install clang/llvm for bpf2go
@@ -629,6 +677,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: build
@@ -690,6 +739,7 @@ jobs:
         working-directory: frontend
 
       - name: Set up Go
+        id: setup-go
         uses: ./.github/actions/setup-go-cached
         with:
           profile: build
