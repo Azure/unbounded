@@ -29,7 +29,6 @@ use std::{
         fd::{FromRawFd, OwnedFd},
         unix::fs::{FileExt, MetadataExt},
     },
-    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -1018,8 +1017,8 @@ unsafe extern "C" fn dmabuf(
 }
 
 /// The simulation's function table.
-pub(crate) fn api() -> Rc<Api> {
-    Rc::new(Api {
+pub(crate) fn api() -> Arc<Api> {
+    Arc::new(Api {
         library: None,
         last_driver_error,
         init,

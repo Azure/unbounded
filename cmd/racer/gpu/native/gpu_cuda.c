@@ -8,8 +8,11 @@
  * RACER_GPU_PTX names a PTX file (see build-native-cuda.sh); without it, every
  * other call works and racer_gpu_decrypt returns RACER_GPU_ENOKERNEL.
  *
- * Every call runs on the dataplane's native helper thread. Each call pushes
- * the owning context and pops it before returning. */
+ * Calls may come from several threads (one executor per GPU, plus cuFile
+ * reader threads). Each call pushes the owning context and pops it before
+ * returning, and the shim's own lazy state (driver tables, kernel modules,
+ * peer bits) is guarded by load_lock or atomics. One stream is driven by one
+ * thread at a time. */
 #define _GNU_SOURCE
 #include "gpu_cuda.h"
 #include "cuda_private.h"
@@ -280,8 +283,18 @@ int racer_gpu_context_free(void *context) {
     return rc;
 }
 
+static int kernels_locked(struct gpu_context *c);
+
 /* Load the decrypt kernels into a context. Context must be current. */
 static int kernels(struct gpu_context *c) {
+    if (__atomic_load_n(&c->module_state, __ATOMIC_ACQUIRE) == 1 && c->ctr) return RACER_GPU_OK;
+    pthread_mutex_lock(&load_lock);
+    int rc = kernels_locked(c);
+    pthread_mutex_unlock(&load_lock);
+    return rc;
+}
+
+static int kernels_locked(struct gpu_context *c) {
     if (c->module_state == 0) {
         const char *image = PTX_IMAGE;
         c->module_state = -1;
@@ -294,7 +307,7 @@ static int kernels(struct gpu_context *c) {
             if (drv(cu.cuModuleUnload(c->module))) c->module_state = 1;
             return RACER_GPU_ENOKERNEL;
         }
-        c->module_state = 1;
+        __atomic_store_n(&c->module_state, 1, __ATOMIC_RELEASE);
     }
     return c->module_state == 1 && c->ctr ? RACER_GPU_OK : RACER_GPU_ENOKERNEL;
 }
@@ -551,7 +564,7 @@ int racer_gpu_copy_d2d(void *stream, void *dst, uint64_t dst_offset, void *src, 
 
 static int peer_enabled(const struct gpu_context *c, int32_t ordinal) {
     return ordinal >= 0 && ordinal < RACER_GPU_MAX_PEER_ORDINAL &&
-           (c->peers[ordinal / 64] >> (ordinal % 64)) & 1u;
+           (__atomic_load_n(&c->peers[ordinal / 64], __ATOMIC_ACQUIRE) >> (ordinal % 64)) & 1u;
 }
 
 int racer_gpu_peer(void *dst, void *src, int *access) {
@@ -561,7 +574,7 @@ int racer_gpu_peer(void *dst, void *src, int *access) {
     if (from->ordinal < 0 || from->ordinal >= RACER_GPU_MAX_PEER_ORDINAL) return RACER_GPU_EINVAL;
     uint64_t bit = 1ull << (from->ordinal % 64);
     if (d == from || d->dev == from->dev) {
-        d->peers[from->ordinal / 64] |= bit;
+        __atomic_fetch_or(&d->peers[from->ordinal / 64], bit, __ATOMIC_RELEASE);
         *access = 1;
         return RACER_GPU_OK;
     }
@@ -572,7 +585,7 @@ int racer_gpu_peer(void *dst, void *src, int *access) {
     CUresult result = cu.cuCtxEnablePeerAccess(from->ctx, 0);
     pop();
     if (result != CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED && (rc = drv(result))) return rc;
-    d->peers[from->ordinal / 64] |= bit;
+    __atomic_fetch_or(&d->peers[from->ordinal / 64], bit, __ATOMIC_RELEASE);
     *access = 1;
     return RACER_GPU_OK;
 }

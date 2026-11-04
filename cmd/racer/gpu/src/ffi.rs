@@ -1,14 +1,16 @@
 //! The C ABI of `libracer_gpu_cuda.so.1` (`native/gpu_cuda.h`) and its loader.
 //!
-//! Every safe type in `lib.rs` holds an `Rc<Shared>`, which holds the [`Api`]
+//! Every safe type in `lib.rs` holds an `Arc<Shared>`, which holds the [`Api`]
 //! symbol table, so the library stays loaded while any GPU object lives. The
 //! simulation backend builds the same table from Rust functions.
 use crate::{Error, Result};
 
 use std::{
-    cell::Cell,
     ffi::{c_int, c_void},
-    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
 };
 
 pub(crate) use crate::gcm::RawVerdict;
@@ -220,14 +222,14 @@ native_api! {
 impl Api {
     #[cfg(not(all(feature = "native", target_os = "linux")))]
     /// No native backend in this build.
-    pub(crate) fn load() -> Result<Rc<Self>> {
+    pub(crate) fn load() -> Result<Arc<Self>> {
         Err(Error::Unavailable)
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]
     /// Load `libracer_gpu_cuda.so.1` and check its ABI version. Does not
     /// initialize CUDA.
-    pub(crate) fn load() -> Result<Rc<Self>> {
+    pub(crate) fn load() -> Result<Arc<Self>> {
         use std::ptr::NonNull;
 
         unsafe {
@@ -261,10 +263,16 @@ impl Api {
             }
             let api = Self::symbols(library)?;
             std::mem::forget(guard);
-            Ok(Rc::new(api))
+            Ok(Arc::new(api))
         }
     }
 }
+
+// SAFETY: the table holds function pointers and a `dlopen` handle. The shim
+// is thread safe: every call pushes and pops its own context, and its lazy
+// state (driver tables, kernel modules, peer bits) is guarded in C.
+unsafe impl Send for Api {}
+unsafe impl Sync for Api {}
 
 impl Drop for Api {
     /// Unload the library. Leaked objects keep it loaded forever.
@@ -300,26 +308,26 @@ pub(crate) fn check(rc: c_int, last_driver_error: unsafe extern "C" fn() -> i32)
 
 /// The loaded backend and the leak counter every object shares.
 pub(crate) struct Shared {
-    pub(crate) api: Rc<Api>,
+    pub(crate) api: Arc<Api>,
 
-    pub(crate) leaks: Cell<u64>,
+    pub(crate) leaks: AtomicU64,
 
     /// `racer_gpu_file_open` flags.
-    pub(crate) file_flags: Cell<u32>,
+    pub(crate) file_flags: AtomicU32,
 }
 
 impl Shared {
     /// Map a shim result code to an error.
     pub(crate) fn check(&self, rc: c_int) -> Result<()> {
         if rc == code::ELEAKED {
-            self.leaks.set(self.leaks.get() + 1);
+            self.leaks.fetch_add(1, Ordering::Relaxed);
         }
         check(rc, self.api.last_driver_error)
     }
 
     /// Count a leaked resource and keep the library loaded for good.
-    pub(crate) fn leak(self: &Rc<Self>) {
-        self.leaks.set(self.leaks.get() + 1);
+    pub(crate) fn leak(self: &Arc<Self>) {
+        self.leaks.fetch_add(1, Ordering::Relaxed);
         std::mem::forget(self.clone());
     }
 }

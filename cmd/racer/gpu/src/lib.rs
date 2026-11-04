@@ -2,11 +2,13 @@
 //!
 //! Every CUDA, NVML and cuFile call goes through a small C shim,
 //! `libracer_gpu_cuda.so.1` (`native/gpu_cuda.c`), loaded with `dlopen` and
-//! checked with `racer_gpu_abi()`. All types here are `!Send`: build and use
-//! them on the dataplane's native helper thread, never on I/O threads. The
-//! one exception is [`FileReader`], which runs cuFile reads that
-//! [`GpuFile::detach`] prepared on other threads, so slow disk reads do not
-//! hold up the helper.
+//! checked with `racer_gpu_abi()`. The types here are `Send` and `Sync`, so
+//! the dataplane can run one executor thread per GPU and still reach another
+//! GPU's buffers for peer copies, but every call may block on the driver:
+//! use them on GPU executor threads, never on I/O threads. [`FileReader`]
+//! runs cuFile reads that [`GpuFile::detach`] prepared on other threads, so
+//! slow disk reads do not hold up an executor. A thread that is not the one
+//! that loaded a simulated backend calls [`Gpu::enter_thread`] first.
 //!
 //! # Basics
 //!
@@ -47,12 +49,14 @@ pub use ffi::{MAX_AAD, MAX_DECRYPT, flag};
 
 use ffi::{Out, RawDecrypt, RawDevice, RawVerdict, Shared};
 use std::{
-    cell::{Cell, RefCell},
     ffi::{c_int, c_void},
     ops::Range,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::NonNull,
-    rc::Rc,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
 };
 
 /// Result type for this crate.
@@ -199,9 +203,20 @@ fn create(shared: &Shared, call: impl FnOnce(Out) -> i32) -> Result<NonNull<c_vo
     NonNull::new(out).ok_or(Error::InvalidRequest)
 }
 
-/// A loaded GPU backend with CUDA initialized.
+/// A loaded GPU backend with CUDA initialized. Cheap to clone.
+#[derive(Clone)]
 pub struct Gpu {
-    shared: Rc<Shared>,
+    shared: Arc<Shared>,
+
+    /// The simulation the backend was loaded in.
+    #[cfg(any(test, feature = "simulation"))]
+    simulation: Option<simulation::Simulation>,
+}
+
+/// Returned by [`Gpu::enter_thread`].
+pub struct ThreadGuard {
+    #[cfg(any(test, feature = "simulation"))]
+    _environment: Option<simulation::Environment>,
 }
 
 impl Gpu {
@@ -215,13 +230,17 @@ impl Gpu {
         };
         #[cfg(not(any(test, feature = "simulation")))]
         let api = ffi::Api::load()?;
-        let shared = Rc::new(Shared {
+        let shared = Arc::new(Shared {
             api,
-            leaks: Cell::new(0),
-            file_flags: Cell::new(0),
+            leaks: AtomicU64::new(0),
+            file_flags: AtomicU32::new(0),
         });
         shared.check(unsafe { (shared.api.init)() })?;
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            #[cfg(any(test, feature = "simulation"))]
+            simulation: simulation::current(),
+        })
     }
 
     /// Every GPU, including ones that are not [`DeviceInfo::usable`].
@@ -249,7 +268,7 @@ impl Gpu {
     pub fn context(&self, ordinal: i32) -> Result<Context> {
         let shared = &self.shared;
         let raw = create(shared, |out| unsafe { (shared.api.context)(ordinal, out) })?;
-        Ok(Context(Rc::new(ContextInner {
+        Ok(Context(Arc::new(ContextInner {
             shared: shared.clone(),
             raw,
             ordinal,
@@ -259,7 +278,8 @@ impl Gpu {
     /// Open the cuFile driver if needed and register an `O_DIRECT` file.
     pub fn open_file(&self, fd: OwnedFd) -> Result<GpuFile> {
         let shared = &self.shared;
-        shared.check(unsafe { (shared.api.file_open)(shared.file_flags.get()) })?;
+        shared
+            .check(unsafe { (shared.api.file_open)(shared.file_flags.load(Ordering::Relaxed)) })?;
         let fd = cufile_descriptor(fd);
         let raw = create(shared, |out| unsafe {
             (shared.api.file)(fd.as_raw_fd(), out)
@@ -271,9 +291,22 @@ impl Gpu {
         })
     }
 
+    /// Make this backend usable on the calling thread. A no-op for the
+    /// native backend; a simulated backend is entered for as long as the
+    /// guard lives. Executor threads call this once when they start.
+    pub fn enter_thread(&self) -> ThreadGuard {
+        ThreadGuard {
+            #[cfg(any(test, feature = "simulation"))]
+            _environment: match (&self.simulation, simulation::current()) {
+                (Some(simulation), None) => Some(simulation.enter()),
+                _ => None,
+            },
+        }
+    }
+
     /// Resources leaked on purpose since this backend was loaded.
     pub fn leaked(&self) -> u64 {
-        self.shared.leaks.get()
+        self.shared.leaks.load(Ordering::Relaxed)
     }
 
     /// Ask cuFile to use PCI P2PDMA (`use_pci_p2pdma`) instead of
@@ -281,13 +314,13 @@ impl Gpu {
     /// and applies to [`FileReader`]s made after this call. When on, a
     /// cuFile that cannot set it fails to open.
     pub fn set_pci_p2pdma(&self, enabled: bool) {
-        let flags = self.shared.file_flags.get() & !ffi::file_flag::PCI_P2PDMA;
+        let flags = self.shared.file_flags.load(Ordering::Relaxed) & !ffi::file_flag::PCI_P2PDMA;
         let bit = if enabled {
             ffi::file_flag::PCI_P2PDMA
         } else {
             0
         };
-        self.shared.file_flags.set(flags | bit);
+        self.shared.file_flags.store(flags | bit, Ordering::Relaxed);
     }
 
     /// A handle that runs [`FileRead`]s on any thread. It does not keep the
@@ -296,7 +329,7 @@ impl Gpu {
     pub fn file_reader(&self) -> FileReader {
         FileReader {
             file_open: self.shared.api.file_open,
-            file_flags: self.shared.file_flags.get(),
+            file_flags: self.shared.file_flags.load(Ordering::Relaxed),
             file_read: self.shared.api.file_read,
             last_driver_error: self.shared.api.last_driver_error,
             #[cfg(any(test, feature = "simulation"))]
@@ -384,14 +417,28 @@ pub struct FileRead {
 // caller keep the file and staging buffer alive until the read is done.
 unsafe impl Send for FileRead {}
 
+// SAFETY for the `unsafe impl`s below: each type owns a shim handle and only
+// passes it to shim calls, which are thread safe. Interior state is atomic
+// or behind a mutex.
+unsafe impl Send for ContextInner {}
+unsafe impl Sync for ContextInner {}
+unsafe impl Send for ImportInner {}
+unsafe impl Sync for ImportInner {}
+unsafe impl Send for StagingInner {}
+unsafe impl Sync for StagingInner {}
+unsafe impl Send for Stream {}
+unsafe impl Sync for Stream {}
+unsafe impl Send for GpuFile {}
+unsafe impl Sync for GpuFile {}
+
 /// A retained primary context. Clones share it; it is released when the last
 /// clone and every object made from it are gone.
 #[derive(Clone)]
-pub struct Context(Rc<ContextInner>);
+pub struct Context(Arc<ContextInner>);
 
 /// The owned context handle.
 struct ContextInner {
-    shared: Rc<Shared>,
+    shared: Arc<Shared>,
 
     raw: NonNull<c_void>,
 
@@ -415,7 +462,7 @@ impl Context {
 
     /// Leaks seen by this context's backend.
     pub fn leaked(&self) -> u64 {
-        self.0.shared.leaks.get()
+        self.0.shared.leaks.load(Ordering::Relaxed)
     }
 
     /// Enable peer access so streams on this context can copy from `src`'s
@@ -423,7 +470,7 @@ impl Context {
     /// the two GPUs have no peer path (no NVLink or PCIe P2P), which is not
     /// an error. Returns `true` for the same GPU. Idempotent.
     pub fn enable_peer(&self, src: &Context) -> Result<bool> {
-        if !Rc::ptr_eq(&self.0.shared, &src.0.shared) {
+        if !Arc::ptr_eq(&self.0.shared, &src.0.shared) {
             return Err(Error::InvalidRequest);
         }
         let shared = &self.0.shared;
@@ -443,7 +490,7 @@ impl Context {
         Ok(Stream {
             context: self.clone(),
             raw,
-            retained: RefCell::new(Vec::new()),
+            retained: Mutex::new(Vec::new()),
         })
     }
 
@@ -464,12 +511,12 @@ impl Context {
         let raw = create(shared, |out| unsafe {
             (shared.api.import)(self.0.raw.as_ptr(), fd.as_raw_fd(), allocation_size, out)
         })?;
-        Ok(ImportedAllocation(Rc::new(ImportInner {
+        Ok(ImportedAllocation(Arc::new(ImportInner {
             context: self.clone(),
             raw,
             size: allocation_size,
             window,
-            fd: Cell::new(Some(fd)),
+            fd: Mutex::new(Some(fd)),
         })))
     }
 
@@ -480,18 +527,18 @@ impl Context {
         let raw = create(shared, |out| unsafe {
             (shared.api.staging)(self.0.raw.as_ptr(), size, out)
         })?;
-        Ok(StagingBuffer(Rc::new(StagingInner {
+        Ok(StagingBuffer(Arc::new(StagingInner {
             context: self.clone(),
             raw,
             size,
-            registered: Cell::new(false),
-            in_flight: Cell::new(0),
+            registered: AtomicBool::new(false),
+            in_flight: AtomicU32::new(0),
         })))
     }
 }
 
 /// A client allocation mapped into the dataplane's context for one request.
-pub struct ImportedAllocation(Rc<ImportInner>);
+pub struct ImportedAllocation(Arc<ImportInner>);
 
 /// The mapping. Freed when the handle and every stream using it let go.
 struct ImportInner {
@@ -503,7 +550,7 @@ struct ImportInner {
 
     window: Range<u64>,
 
-    fd: Cell<Option<OwnedFd>>,
+    fd: Mutex<Option<OwnedFd>>,
 }
 
 impl Drop for ImportInner {
@@ -513,7 +560,7 @@ impl Drop for ImportInner {
         let shared = &self.context.0.shared;
         if unsafe { (shared.api.import_free)(self.raw.as_ptr()) } != 0 {
             shared.leak();
-            std::mem::forget(self.fd.take());
+            std::mem::forget(self.fd.get_mut().ok().and_then(Option::take));
             std::mem::forget(self.context.clone());
         }
     }
@@ -537,7 +584,7 @@ impl ImportedAllocation {
 }
 
 /// Dataplane-owned device memory for ciphertext.
-pub struct StagingBuffer(Rc<StagingInner>);
+pub struct StagingBuffer(Arc<StagingInner>);
 
 /// The allocation.
 struct StagingInner {
@@ -547,17 +594,17 @@ struct StagingInner {
 
     size: u64,
 
-    registered: Cell<bool>,
+    registered: AtomicBool,
 
     /// Streams holding it until their next synchronize.
-    in_flight: Cell<u32>,
+    in_flight: AtomicU32,
 }
 
 impl Drop for StagingInner {
     /// Deregister from cuFile, then free. On failure leak.
     fn drop(&mut self) {
         let shared = &self.context.0.shared;
-        if self.registered.get()
+        if self.registered.load(Ordering::Relaxed)
             && unsafe { (shared.api.staging_unregister)(self.raw.as_ptr()) } != 0
         {
             shared.leak();
@@ -579,18 +626,19 @@ impl StagingBuffer {
 
     /// Whether a stream may still be using it.
     pub fn in_flight(&self) -> bool {
-        self.0.in_flight.get() > 0
+        self.0.in_flight.load(Ordering::Acquire) > 0
     }
 
     /// Register with cuFile so reads go straight to it.
     pub fn register_cufile(&self) -> Result<()> {
-        if self.0.registered.get() {
+        if self.0.registered.load(Ordering::Relaxed) {
             return Ok(());
         }
         let shared = &self.0.context.0.shared;
-        shared.check(unsafe { (shared.api.file_open)(shared.file_flags.get()) })?;
+        shared
+            .check(unsafe { (shared.api.file_open)(shared.file_flags.load(Ordering::Relaxed)) })?;
         shared.check(unsafe { (shared.api.staging_register)(self.0.raw.as_ptr()) })?;
-        self.0.registered.set(true);
+        self.0.registered.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -620,19 +668,19 @@ pub enum Destination<'a> {
 
 /// Something a stream keeps alive until synchronized.
 enum Retained {
-    Import(#[allow(dead_code)] Rc<ImportInner>),
+    Import(#[allow(dead_code)] Arc<ImportInner>),
 
-    Staging(Rc<StagingInner>),
+    Staging(Arc<StagingInner>),
 
     /// Host bytes a queued copy may still read.
-    Host(#[allow(dead_code)] Box<dyn AsRef<[u8]>>),
+    Host(#[allow(dead_code)] Box<dyn AsRef<[u8]> + Send>),
 }
 
 impl Drop for Retained {
     /// Release one in-flight hold on staging memory.
     fn drop(&mut self) {
         if let Self::Staging(inner) = self {
-            inner.in_flight.set(inner.in_flight.get() - 1);
+            inner.in_flight.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -684,12 +732,19 @@ pub struct Stream {
 
     raw: NonNull<c_void>,
 
-    retained: RefCell<Vec<Retained>>,
+    retained: Mutex<Vec<Retained>>,
 }
 
 impl Stream {
+    /// Holds on buffers and host bytes queued work may still use.
+    fn held(&self) -> MutexGuard<'_, Vec<Retained>> {
+        self.retained
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The backend state.
-    fn shared(&self) -> &Rc<Shared> {
+    fn shared(&self) -> &Arc<Shared> {
         &self.context.0.shared
     }
 
@@ -704,7 +759,7 @@ impl Stream {
         match dst {
             Destination::Import(import) => {
                 let inner = &import.0;
-                if !Rc::ptr_eq(&inner.context.0, &self.context.0) {
+                if !Arc::ptr_eq(&inner.context.0, &self.context.0) {
                     return Err(Error::WrongDevice);
                 }
                 if offset < inner.window.start || end > inner.window.end {
@@ -724,21 +779,21 @@ impl Stream {
         length: u64,
     ) -> Result<(*mut c_void, Retained)> {
         let inner = &staging.0;
-        if !Rc::ptr_eq(&inner.context.0, &self.context.0) {
+        if !Arc::ptr_eq(&inner.context.0, &self.context.0) {
             return Err(Error::WrongDevice);
         }
         let end = offset.checked_add(length).ok_or(Error::InvalidRange)?;
         if end > inner.size {
             return Err(Error::InvalidRange);
         }
-        inner.in_flight.set(inner.in_flight.get() + 1);
+        inner.in_flight.fetch_add(1, Ordering::AcqRel);
         Ok((inner.raw.as_ptr(), Retained::Staging(inner.clone())))
     }
 
     /// Keep holds until the next synchronize. Held even when the call
     /// failed, because part of it may have been queued.
     fn retain(&self, holds: impl IntoIterator<Item = Retained>) {
-        self.retained.borrow_mut().extend(holds);
+        self.held().extend(holds);
     }
 
     /// Queue a copy of host bytes. CUDA may keep reading page-locked host
@@ -748,10 +803,10 @@ impl Stream {
     /// such as an `Arc`, to avoid copying large buffers.
     pub fn copy_from_host<S>(&self, dst: Destination<'_>, offset: u64, bytes: S) -> Result<()>
     where
-        S: AsRef<[u8]> + 'static,
+        S: AsRef<[u8]> + Send + 'static,
     {
         // Box first so the bytes do not move after the pointer is taken.
-        let source: Box<dyn AsRef<[u8]>> = Box::new(bytes);
+        let source: Box<dyn AsRef<[u8]> + Send> = Box::new(bytes);
         let slice = (*source).as_ref();
         let (ptr, length) = (slice.as_ptr(), slice.len() as u64);
         if length == 0 {
@@ -768,8 +823,7 @@ impl Stream {
     /// Number of host sources held for queued copies. Test helper.
     #[doc(hidden)]
     pub fn retained_host_sources(&self) -> usize {
-        self.retained
-            .borrow()
+        self.held()
             .iter()
             .filter(|hold| matches!(hold, Retained::Host(_)))
             .count()
@@ -822,8 +876,8 @@ impl Stream {
             return Err(Error::InvalidRange);
         }
         let inner = &src.0;
-        if Rc::ptr_eq(&inner.context.0, &self.context.0)
-            || !Rc::ptr_eq(&inner.context.0.shared, self.shared())
+        if Arc::ptr_eq(&inner.context.0, &self.context.0)
+            || !Arc::ptr_eq(&inner.context.0.shared, self.shared())
         {
             return Err(Error::WrongDevice);
         }
@@ -832,7 +886,7 @@ impl Stream {
             return Err(Error::InvalidRange);
         }
         let (raw_dst, dst_hold) = self.destination(dst, dst_offset, length)?;
-        inner.in_flight.set(inner.in_flight.get() + 1);
+        inner.in_flight.fetch_add(1, Ordering::AcqRel);
         let src_hold = Retained::Staging(inner.clone());
         let rc = unsafe {
             (self.shared().api.copy_peer)(
@@ -879,7 +933,7 @@ impl Stream {
         }
         // copy_d2h synchronized the stream, so the landing buffer is final.
         out.copy_from_slice(&landing);
-        self.retained.borrow_mut().clear();
+        self.held().clear();
         Ok(())
     }
 
@@ -933,7 +987,7 @@ impl Stream {
     pub fn synchronize(&self) -> Result<()> {
         self.shared()
             .check(unsafe { (self.shared().api.stream_sync)(self.raw.as_ptr()) })?;
-        self.retained.borrow_mut().clear();
+        self.held().clear();
         Ok(())
     }
 
@@ -957,7 +1011,7 @@ impl Drop for Stream {
         let shared = self.context.0.shared.clone();
         if unsafe { (shared.api.stream_free)(self.raw.as_ptr()) } != 0 {
             shared.leak();
-            std::mem::forget(std::mem::take(&mut *self.retained.borrow_mut()));
+            std::mem::forget(std::mem::take(&mut *self.held()));
             std::mem::forget(self.context.clone());
         }
     }
@@ -1007,7 +1061,7 @@ fn stat(fd: &OwnedFd) -> Option<libc::stat> {
 
 /// A file registered with cuFile.
 pub struct GpuFile {
-    shared: Rc<Shared>,
+    shared: Arc<Shared>,
 
     raw: NonNull<c_void>,
 
