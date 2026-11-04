@@ -16,10 +16,14 @@
 //! Select ignored CRC hardware tests individually on supported hosts; they fail
 //! on unsupported hardware rather than silently skipping.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid` so the single SIMD GHASH module can opt in with a
+// scoped `allow`; every other module still rejects `unsafe`.
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod enrollment;
+#[cfg(target_arch = "x86_64")]
+mod ghash_x86;
 
 use chacha20poly1305::{
     KeyInit, Tag, XChaCha20Poly1305,
@@ -273,7 +277,6 @@ impl PageCipher {
         tag: &[u8],
     ) -> Result<(), Error> {
         use aes::cipher::{BlockCipherEncrypt, KeyInit};
-        use ghash::universal_hash::UniversalHash;
         if tag.len() != TAG_LEN {
             return Err(Error(()));
         }
@@ -282,7 +285,7 @@ impl PageCipher {
         // H = AES_K(0^128) keys GHASH.
         let mut h = Zeroizing::new([0u8; 16]);
         aes.encrypt_block((&mut *h).into());
-        let mut ghash = ghash::GHash::new((&*h).into());
+        let mut ghash = PageGhash::new(&h);
         // Stream AAD fields through a 16-byte carry so split fields hash
         // exactly like their concatenation without staging them.
         let mut carry = [0u8; 16];
@@ -329,6 +332,42 @@ impl PageCipher {
             Ok(())
         } else {
             Err(Error(()))
+        }
+    }
+}
+
+/// GHASH with an aggregated PCLMULQDQ/VPCLMULQDQ path on x86_64 and the
+/// portable `ghash` crate everywhere else (or when the CPU lacks CLMUL).
+enum PageGhash {
+    #[cfg(target_arch = "x86_64")]
+    Fast(ghash_x86::Ghash),
+    Portable(ghash::GHash),
+}
+
+impl PageGhash {
+    fn new(h: &[u8; 16]) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(fast) = ghash_x86::Ghash::new(h) {
+            return Self::Fast(fast);
+        }
+        Self::Portable(ghash::GHash::new(h.into()))
+    }
+
+    fn update_padded(&mut self, data: &[u8]) {
+        use ghash::universal_hash::UniversalHash;
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Fast(g) => g.update_padded(data),
+            Self::Portable(g) => g.update_padded(data),
+        }
+    }
+
+    fn finalize(self) -> [u8; 16] {
+        use ghash::universal_hash::UniversalHash;
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Fast(g) => g.finalize(),
+            Self::Portable(g) => g.finalize().into(),
         }
     }
 }
