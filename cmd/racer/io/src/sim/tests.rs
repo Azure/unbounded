@@ -1155,12 +1155,12 @@ mod driver {
     fn drain(driver: &mut SimDriver) -> Vec<(u64, i32, u32)> {
         let now = std::time::Instant::now();
         for _ in 0..64 {
-            if !driver.runnable() {
+            if !driver.runnable(now) {
                 break;
             }
             driver.run_turn(now);
         }
-        assert!(!driver.runnable(), "driver never settled");
+        assert!(!driver.runnable(now), "driver never settled");
         std::iter::from_fn(|| driver.next_cqe()).collect()
     }
 
@@ -1170,7 +1170,7 @@ mod driver {
     fn delayed_operation_stays_runnable_until_it_executes() {
         let os = SimOs::new();
         os.inject("fsync", Fault::Delay(2)).unwrap();
-        let mut driver = SimDriver::new(os, 8);
+        let mut driver = SimDriver::new(os, 8, crate::Clock::host());
         let op = Op::Fsync {
             fd: 9999,
             datasync: false,
@@ -1183,7 +1183,7 @@ mod driver {
     #[test]
     fn seeded_delays_never_stall() {
         for seed in 0..64 {
-            let mut driver = SimDriver::new(SimOs::seeded(seed), 8);
+            let mut driver = SimDriver::new(SimOs::seeded(seed), 8, crate::Clock::host());
             for id in 1..=4 {
                 let op = Op::Fsync {
                     fd: 9999,
@@ -1231,7 +1231,11 @@ mod choices {
     /// An all-zero source keeps submission order with no delays.
     #[test]
     fn zero_source_keeps_fifo_order() {
-        let mut driver = SimDriver::new(SimOs::with_choices(Script(VecDeque::new())), 8);
+        let mut driver = SimDriver::new(
+            SimOs::with_choices(Script(VecDeque::new())),
+            8,
+            crate::Clock::host(),
+        );
         for id in 1..=4 {
             driver.push(id, &fsync()).unwrap();
         }
@@ -1244,7 +1248,7 @@ mod choices {
         // Push draws: delays 2, 0, 0. First turn shuffle (index 2 then 1):
         // back 2 swaps ids[2] with ids[0], giving [3, 2, 1].
         let script = Script([2, 0, 0, 2, 0].into());
-        let mut driver = SimDriver::new(SimOs::with_choices(script), 8);
+        let mut driver = SimDriver::new(SimOs::with_choices(script), 8, crate::Clock::host());
         for id in 1..=3 {
             driver.push(id, &fsync()).unwrap();
         }

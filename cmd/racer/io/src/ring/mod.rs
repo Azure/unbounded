@@ -570,7 +570,7 @@ impl Reactor {
                 (Backend::Uring(ring), WakeHandle::new(Some(fd)))
             }
             Driver::Sim(os) => (
-                Backend::Sim(SimDriver::new(os, entries as usize * 2)),
+                Backend::Sim(SimDriver::new(os, entries as usize * 2, ctx.clock.clone())),
                 WakeHandle::new(None),
             ),
         };
@@ -1036,7 +1036,8 @@ impl Reactor {
     }
 
     /// Earliest instant at which [`Self::reap`] has timed work: an operation
-    /// deadline or a timer.
+    /// deadline, a timer, or (simulated driver) the end of an operation's
+    /// cost-model latency.
     pub fn next_deadline(&self) -> Option<Instant> {
         let mut state = self.state();
         let state = &mut *state;
@@ -1052,10 +1053,11 @@ impl Reactor {
         }
         let deadline = state.deadlines.peek().map(|Reverse((at, _))| *at);
         let timer = state.timers.next();
-        match (deadline, timer) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let latency = match &state.backend {
+            Backend::Sim(driver) => driver.next_ready_at(),
+            Backend::Uring(_) => None,
+        };
+        [deadline, timer, latency].into_iter().flatten().min()
     }
 
     /// Whether completions or a cross-thread wake are ready without waiting.
@@ -1063,9 +1065,10 @@ impl Reactor {
         if self.0.wake.is_pending() {
             return true;
         }
+        let now = self.now();
         match &mut self.state().backend {
             Backend::Uring(ring) => ring.has_cqes(),
-            Backend::Sim(driver) => driver.has_cqes() || driver.runnable(),
+            Backend::Sim(driver) => driver.has_cqes() || driver.runnable(now),
         }
     }
 
@@ -1087,7 +1090,7 @@ impl Reactor {
                 ring.wait(timeout)
             }
             Backend::Sim(driver) => {
-                if driver.has_cqes() || driver.runnable() || self.0.wake.is_pending() {
+                if driver.has_cqes() || driver.runnable(now) || self.0.wake.is_pending() {
                     return Ok(());
                 }
                 if let (Some(until), Some(clock)) = (until, self.0.ctx.clock.as_virtual()) {

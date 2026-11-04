@@ -108,6 +108,30 @@ struct World {
     /// Scheduling choices (submission delays, execution order, cancel CQE
     /// order); `None` keeps FIFO order.
     choices: Option<Box<dyn crate::ctx::ChoiceSource>>,
+
+    /// Virtual latency charged to each submitted operation.
+    cost: Option<OpCost>,
+}
+
+/// One submitted operation as the cost model sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpDesc {
+    /// The operation name, as used by [`SimOs::inject`] (`read`, `write`,
+    /// `fsync`, `send`, `recv`, `open`, ...).
+    pub kind: &'static str,
+
+    /// Bytes the operation asks to transfer (0 for metadata operations).
+    pub bytes: u64,
+}
+
+/// A shared cost model.
+#[derive(Clone)]
+struct OpCost(Rc<dyn Fn(&OpDesc) -> std::time::Duration>);
+
+impl std::fmt::Debug for OpCost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpCost")
+    }
 }
 
 /// The kernel-side state of an open simulated descriptor.
@@ -321,6 +345,7 @@ impl SimOs {
             partitions: BTreeSet::new(),
             disk: disk::State::default(),
             choices: None,
+            cost: None,
         })));
         sim.create_dir_all(Path::new("/")).unwrap();
         sim.disk().sync_all().unwrap();
@@ -342,6 +367,21 @@ impl SimOs {
         let os = Self::new();
         os.0.borrow_mut().choices = Some(Box::new(source));
         os
+    }
+
+    /// Charge virtual time to every operation submitted from now on: an
+    /// operation becomes eligible to execute `cost(desc)` after submission,
+    /// on the submitting reactor's clock. Without a cost model (the default)
+    /// operations cost nothing. Delays from faults and choices still count
+    /// driver turns on top of this.
+    pub fn set_op_cost(&self, cost: impl Fn(&OpDesc) -> std::time::Duration + 'static) {
+        self.0.borrow_mut().cost = Some(OpCost(Rc::new(cost)));
+    }
+
+    /// The virtual time charged to `desc` (zero without a cost model).
+    pub fn op_cost(&self, desc: &OpDesc) -> std::time::Duration {
+        let cost = self.0.borrow().cost.clone();
+        cost.map_or(std::time::Duration::ZERO, |cost| (cost.0)(desc))
     }
 
     /// Accesses this world's volatile and durable storage images.

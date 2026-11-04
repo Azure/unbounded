@@ -19,6 +19,9 @@ pub(crate) struct SimDriver {
 
     /// Operations were pushed since the last turn.
     dirty: bool,
+
+    /// The owning reactor's clock, for cost-model latency.
+    clock: crate::Clock,
 }
 
 /// One operation waiting for its turn.
@@ -38,6 +41,9 @@ struct Pending {
 
     result: Option<i32>,
 
+    /// Cost-model latency: the operation may not execute before this.
+    ready_at: Option<Instant>,
+
     /// Execution was attempted and is waiting for readiness (`EAGAIN`).
     /// Until then the operation still needs a turn of its own once its
     /// delay runs out, even when nothing else in the world changes.
@@ -48,7 +54,7 @@ struct Pending {
 
 impl SimDriver {
     /// A driver over `os` with room for `capacity` queued submissions.
-    pub(crate) fn new(os: SimOs, capacity: usize) -> Self {
+    pub(crate) fn new(os: SimOs, capacity: usize, clock: crate::Clock) -> Self {
         Self {
             os,
             pending: BTreeMap::new(),
@@ -56,6 +62,7 @@ impl SimDriver {
             capacity,
             seen: u64::MAX,
             dirty: false,
+            clock,
         }
     }
 
@@ -93,6 +100,11 @@ impl SimDriver {
         let name = op.name();
         let fault = self.os.0.borrow_mut().fault(name);
         let disk_paths = self.disk_paths(op, &paths);
+        let cost = self.os.op_cost(&OpDesc {
+            kind: name,
+            bytes: op_bytes(op),
+        });
+        let ready_at = (!cost.is_zero()).then(|| self.clock.now() + cost);
         let mut pending = Pending {
             disk_crash: self.os.0.borrow_mut().disk.watch(disk_paths),
             op: *op,
@@ -102,6 +114,7 @@ impl SimDriver {
             error: None,
             hold: 0,
             result: None,
+            ready_at,
             attempted: false,
         };
         match fault {
@@ -147,23 +160,27 @@ impl SimDriver {
         w.record("cancel", id, i64::from(removed));
     }
 
-    /// Whether a turn could make progress.
-    pub(crate) fn runnable(&self) -> bool {
-        if self.pending.is_empty() {
+    /// Whether a turn at `now` could make progress. Operations still
+    /// waiting out their cost-model latency do not count.
+    pub(crate) fn runnable(&self, now: Instant) -> bool {
+        let mut due = self.pending.values().filter(|p| p.due(now)).peekable();
+        if due.peek().is_none() {
             return false;
         }
         self.dirty
             || self.seen != self.os.0.borrow().next_event
-            || self
-                .pending
-                .values()
-                .any(|p| p.delay != 0 || p.result.is_some() || !p.attempted)
+            || due.any(|p| p.delay != 0 || p.result.is_some() || !p.attempted)
+    }
+
+    /// The earliest instant a latency-gated operation becomes due.
+    pub(crate) fn next_ready_at(&self) -> Option<Instant> {
+        self.pending.values().filter_map(|p| p.ready_at).min()
     }
 
     /// Advance every pending operation by one turn, in identifier order or,
     /// for a seeded world, in a seeded shuffled order.
-    pub(crate) fn run_turn(&mut self, _now: Instant) {
-        if !self.runnable() {
+    pub(crate) fn run_turn(&mut self, now: Instant) {
+        if !self.runnable(now) {
             return;
         }
         self.dirty = false;
@@ -181,6 +198,11 @@ impl SimDriver {
         let mut done = Vec::new();
         for id in ids {
             let mut pending = self.pending.remove(&id).expect("pending op");
+            if !pending.due(now) {
+                self.pending.insert(id, pending);
+                continue;
+            }
+            pending.ready_at = None;
             match pending.advance(&self.os, id) {
                 Some(result) => {
                     self.completed.push_back((id, result, 0));
@@ -308,7 +330,36 @@ fn decode_address(addr: *const libc::sockaddr, len: libc::socklen_t) -> io::Resu
     }
 }
 
+/// Bytes an operation asks to transfer, for the cost model.
+fn op_bytes(op: &Op) -> u64 {
+    // SAFETY: iovec arrays and message headers are pinned by the slot.
+    let iovecs = |iov: *const libc::iovec, n: u32| unsafe {
+        std::slice::from_raw_parts(iov, n as usize)
+            .iter()
+            .map(|iov| iov.iov_len as u64)
+            .sum()
+    };
+    match *op {
+        Op::Read { len, .. }
+        | Op::Write { len, .. }
+        | Op::Recv { len, .. }
+        | Op::Send { len, .. }
+        | Op::Splice { len, .. } => u64::from(len),
+        Op::Readv { iov, count, .. } | Op::Writev { iov, count, .. } => iovecs(iov, count),
+        // SAFETY: as above.
+        Op::RecvMsg { msg, .. } => unsafe { iovecs((*msg).msg_iov, (*msg).msg_iovlen as u32) },
+        // SAFETY: as above.
+        Op::SendMsg { msg, .. } => unsafe { iovecs((*msg).msg_iov, (*msg).msg_iovlen as u32) },
+        _ => 0,
+    }
+}
+
 impl Pending {
+    /// Whether the operation's cost-model latency has elapsed at `now`.
+    fn due(&self, now: Instant) -> bool {
+        self.ready_at.is_none_or(|at| at <= now)
+    }
+
     /// Execute once when ready, then hold the result for its full delay.
     fn advance(&mut self, os: &SimOs, id: u64) -> Option<i32> {
         if self.result.is_some() {

@@ -511,6 +511,58 @@ fn reserved_partition_is_kept_for_reserved_operations() {
 }
 
 #[test]
+fn sim_cost_model_charges_virtual_time() {
+    let os = SimOs::new();
+    let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = seen.clone();
+    os.set_op_cost(move |desc| {
+        log.borrow_mut().push(*desc);
+        match desc.kind {
+            "send" => Duration::from_millis(desc.bytes),
+            _ => Duration::ZERO,
+        }
+    });
+    let clock = crate::ctx::VirtualClock::new();
+    let reactor = simulated(&os, &clock);
+    let (left, right) = os.socket_pair();
+    let ctx = OpCtx::none();
+    let start = clock.now();
+    let executor = LocalExecutor::new(Some(reactor.wake_handle()));
+    let send = executor.spawn(reactor.send(Rc::new(left), b"abcde".to_vec(), (), &ctx));
+    reactor.reap(16).unwrap();
+    executor.run_ready(16);
+    reactor.reap(16).unwrap();
+    // Latency-gated: not runnable, but the reactor reports when it is due.
+    assert!(!send.is_finished());
+    assert!(!reactor.has_ready());
+    assert_eq!(
+        reactor.next_deadline(),
+        Some(start + Duration::from_millis(5))
+    );
+    executor.block_on(&reactor, send).unwrap().unwrap();
+    assert_eq!(clock.now() - start, Duration::from_millis(5));
+    let got = block_on(&reactor, reactor.recv(Rc::new(right), vec![0; 8], (), &ctx)).unwrap();
+    assert_eq!(&got.buffer[..got.bytes], b"abcde");
+    assert_eq!(clock.now() - start, Duration::from_millis(5));
+    let kinds: Vec<_> = seen.borrow().iter().map(|d| (d.kind, d.bytes)).collect();
+    assert_eq!(kinds, [("send", 5), ("recv", 8)]);
+    assert_eq!(
+        os.op_cost(&crate::sim::OpDesc {
+            kind: "send",
+            bytes: 2
+        }),
+        Duration::from_millis(2)
+    );
+    assert_eq!(
+        SimOs::new().op_cost(&crate::sim::OpDesc {
+            kind: "send",
+            bytes: 2
+        }),
+        Duration::ZERO
+    );
+}
+
+#[test]
 fn sim_deadline_advances_virtual_time_and_expires() {
     let os = SimOs::new();
     let clock = crate::ctx::VirtualClock::new();
