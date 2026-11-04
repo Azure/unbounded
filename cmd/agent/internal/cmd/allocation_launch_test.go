@@ -21,13 +21,17 @@ func allocationTestConfig(name string) *provision.AgentConfig {
 	return &provision.AgentConfig{
 		MachineName: name,
 		Kubelet: provision.AgentKubeletConfig{
-			Configuration: map[string]any{"providerID": v1alpha3.AllocationProviderIDPrefix + "6d3f0d6e-8d1a-4c1e-9f61-0d7b8f0b2a10"},
+			Configuration: map[string]any{
+				"providerID": v1alpha3.AllocationProviderIDPrefix + "6d3f0d6e-8d1a-4c1e-9f61-0d7b8f0b2a10",
+			},
 		},
 	}
 }
 
 func plainTestConfig(name string) *provision.AgentConfig {
-	return &provision.AgentConfig{MachineName: name}
+	return &provision.AgentConfig{
+		MachineName: name,
+	}
 }
 
 // recordingVerify returns a verify function that records the config it was
@@ -63,26 +67,63 @@ func TestAuthorizeNSpawnStart(t *testing.T) {
 		wantRefused  bool
 		wantErr      error
 	}{
-		{name: "applied allocation config", applied: loadResult{cfg: applied, found: true}, record: loadResult{cfg: record, found: true}, wantVerified: applied},
-		{name: "applied non-allocation config", applied: loadResult{cfg: appliedPlain, found: true}, wantVerified: appliedPlain},
+		{
+			name: "applied allocation config",
+			applied: loadResult{
+				cfg:   applied,
+				found: true,
+			},
+			record: loadResult{
+				cfg:   record,
+				found: true,
+			},
+			wantVerified: applied,
+		},
+		{
+			name: "applied non-allocation config",
+			applied: loadResult{
+				cfg:   appliedPlain,
+				found: true,
+			},
+			wantVerified: appliedPlain,
+		},
 		// A fence that lands after bootstrap's own check must still stop the
 		// first nspawn start, which happens before the applied config exists.
-		{name: "no applied config, record present", record: loadResult{cfg: record, found: true}, wantVerified: record},
-		{name: "no applied config, no record"},
 		{
-			name:         "applied config fails to load, record present",
-			applied:      loadResult{err: errors.New("checksum mismatch")},
-			record:       loadResult{cfg: record, found: true},
+			name: "no applied config, record present",
+			record: loadResult{
+				cfg:   record,
+				found: true,
+			},
 			wantVerified: record,
 		},
 		{
-			name:        "record cannot be read",
-			record:      loadResult{err: errors.New("decode allocation launch config: unexpected EOF")},
+			name: "no applied config, no record",
+		},
+		{
+			name: "applied config fails to load, record present",
+			applied: loadResult{
+				err: errors.New("checksum mismatch"),
+			},
+			record: loadResult{
+				cfg:   record,
+				found: true,
+			},
+			wantVerified: record,
+		},
+		{
+			name: "record cannot be read",
+			record: loadResult{
+				err: errors.New("decode allocation launch config: unexpected EOF"),
+			},
 			wantRefused: true,
 		},
 		{
-			name:         "verify refuses",
-			applied:      loadResult{cfg: applied, found: true},
+			name: "verify refuses",
+			applied: loadResult{
+				cfg:   applied,
+				found: true,
+			},
 			verifyErr:    refusal,
 			wantVerified: applied,
 			wantRefused:  true,
@@ -154,10 +195,40 @@ func TestGuardNodeStart(t *testing.T) {
 		wantCalls  []string
 		wantErr    error
 	}{
-		{name: "allocation host allowed", cfg: allocationTestConfig("m"), wantCalls: []string{"persist", "verify", "start"}},
-		{name: "allocation host refused", cfg: allocationTestConfig("m"), verifyErr: refusal, wantCalls: []string{"persist", "verify"}, wantErr: refusal},
-		{name: "persist fails", cfg: allocationTestConfig("m"), persistErr: errors.New("disk full"), wantCalls: []string{"persist"}},
-		{name: "non-allocation host", cfg: plainTestConfig("m"), wantCalls: []string{"start"}},
+		{
+			name: "allocation host allowed",
+			cfg:  allocationTestConfig("m"),
+			wantCalls: []string{
+				"persist",
+				"verify",
+				"start",
+			},
+		},
+		{
+			name:      "allocation host refused",
+			cfg:       allocationTestConfig("m"),
+			verifyErr: refusal,
+			wantCalls: []string{
+				"persist",
+				"verify",
+			},
+			wantErr: refusal,
+		},
+		{
+			name:       "persist fails",
+			cfg:        allocationTestConfig("m"),
+			persistErr: errors.New("disk full"),
+			wantCalls: []string{
+				"persist",
+			},
+		},
+		{
+			name: "non-allocation host",
+			cfg:  plainTestConfig("m"),
+			wantCalls: []string{
+				"start",
+			},
+		},
 	}
 
 	for _, tt := range tests {
