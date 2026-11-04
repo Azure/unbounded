@@ -6,3 +6,4 @@
 
 pub mod cli;
 pub mod object;
+pub mod racer;
