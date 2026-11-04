@@ -366,6 +366,9 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-fmt                        Format the Rust Racer workspace"
+	@echo "  racer-lint                       Check Rust formatting, workspace Clippy, and Racer purity"
+	@echo "  racer-purity-graph               Report pure Racer crates that depend on IO crates (STRICT=1 fails)"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
 	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
@@ -576,6 +579,20 @@ racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluste
 	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer/Cargo.toml --workspace
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
+
+RACER_RUST_TOOLCHAIN ?= 1.96.0
+
+.PHONY: racer-fmt racer-lint racer-purity-graph
+racer-fmt: ## Format the Rust Racer workspace
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all
+
+racer-purity-graph: ## Report pure Racer crates that depend on IO crates (STRICT=1 fails)
+	timeout --signal=TERM --kill-after=10s 300s python3 hack/scripts/racer-purity-graph.py --manifest-path cmd/racer/Cargo.toml $(if $(STRICT),--strict)
+
+racer-lint: racer-purity-graph ## Check Rust formatting, workspace Clippy, and Racer purity
+	timeout --signal=TERM --kill-after=10s 300s cargo +$(RACER_RUST_TOOLCHAIN) fmt --manifest-path cmd/racer/Cargo.toml --all --check
+	timeout --signal=TERM --kill-after=10s 1200s cargo +$(RACER_RUST_TOOLCHAIN) clippy --locked --manifest-path cmd/racer/Cargo.toml --workspace --all-targets -- -D warnings
+	timeout --signal=TERM --kill-after=10s 600s cargo +$(RACER_RUST_TOOLCHAIN) test --locked --manifest-path cmd/racer/Cargo.toml -p racer-core --test purity
 
 RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
 # 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
