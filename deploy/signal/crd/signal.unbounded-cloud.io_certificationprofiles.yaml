@@ -19,9 +19,9 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.checks.size()
-      name: Checks
-      type: integer
+    - jsonPath: .spec.suite.name
+      name: Suite
+      type: string
     - jsonPath: .spec.participants.count
       name: Participants
       type: integer
@@ -48,149 +48,6 @@ spec:
             type: object
           spec:
             properties:
-              checks:
-                description: Checks is an ordered suite. A check's position defines
-                  its stable ID.
-                items:
-                  properties:
-                    backend:
-                      enum:
-                      - Pod
-                      - MPIJob
-                      type: string
-                    backendActiveDeadline:
-                      type: string
-                    gpuCount:
-                      format: int32
-                      minimum: 0
-                      type: integer
-                    scriptKey:
-                      maxLength: 253
-                      minLength: 1
-                      pattern: ^[-._a-zA-Z0-9]+$
-                      type: string
-                    workloadPolicy:
-                      properties:
-                        hostNetwork:
-                          type: boolean
-                        hostPaths:
-                          items:
-                            properties:
-                              mountPath:
-                                maxLength: 4096
-                                minLength: 1
-                                type: string
-                              path:
-                                maxLength: 4096
-                                minLength: 1
-                                type: string
-                            required:
-                            - mountPath
-                            - path
-                            type: object
-                            x-kubernetes-validations:
-                            - message: mountPath must be a clean absolute path
-                              rule: self.mountPath.startsWith('/') && !self.mountPath.contains('//')
-                                && !self.mountPath.contains('/./') && !self.mountPath.contains('/../')
-                                && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')
-                            - message: mountPath must not replace a reserved Project
-                                Signal mount
-                              rule: self.mountPath != '/scripts' && self.mountPath
-                                != '/results'
-                            - message: path must be a clean absolute path under /proc,
-                                /sys, or /var/lib/project-signal
-                              rule: (self.path == '/proc' || self.path.startsWith('/proc/')
-                                || self.path == '/sys' || self.path.startsWith('/sys/')
-                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/'))
-                                && !self.path.contains('//') && !self.path.contains('/./')
-                                && !self.path.contains('/../') && !self.path.endsWith('/.')
-                                && !self.path.endsWith('/..')
-                          maxItems: 16
-                          type: array
-                          x-kubernetes-list-map-keys:
-                          - mountPath
-                          x-kubernetes-list-type: map
-                        ipcLock:
-                          type: boolean
-                        privileged:
-                          type: boolean
-                        resources:
-                          description: ResourceRequirements describes the compute
-                            resource requirements.
-                          properties:
-                            claims:
-                              description: |-
-                                Claims lists the names of resources, defined in spec.resourceClaims,
-                                that are used by this container.
-
-                                This field depends on the
-                                DynamicResourceAllocation feature gate.
-
-                                This field is immutable. It can only be set for containers.
-                              items:
-                                description: ResourceClaim references one entry in
-                                  PodSpec.ResourceClaims.
-                                properties:
-                                  name:
-                                    description: |-
-                                      Name must match the name of one entry in pod.spec.resourceClaims of
-                                      the Pod where this field is used. It makes that resource available
-                                      inside a container.
-                                    type: string
-                                  request:
-                                    description: |-
-                                      Request is the name chosen for a request in the referenced claim.
-                                      If empty, everything from the claim is made available, otherwise
-                                      only the result of this request.
-                                    type: string
-                                required:
-                                - name
-                                type: object
-                              type: array
-                              x-kubernetes-list-map-keys:
-                              - name
-                              x-kubernetes-list-type: map
-                            limits:
-                              additionalProperties:
-                                anyOf:
-                                - type: integer
-                                - type: string
-                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                                x-kubernetes-int-or-string: true
-                              description: |-
-                                Limits describes the maximum amount of compute resources allowed.
-                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                              type: object
-                            requests:
-                              additionalProperties:
-                                anyOf:
-                                - type: integer
-                                - type: string
-                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                                x-kubernetes-int-or-string: true
-                              description: |-
-                                Requests describes the minimum amount of compute resources required.
-                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                              type: object
-                          type: object
-                      type: object
-                  required:
-                  - backend
-                  - backendActiveDeadline
-                  - scriptKey
-                  type: object
-                  x-kubernetes-validations:
-                  - message: backendActiveDeadline must be positive
-                    rule: duration(self.backendActiveDeadline) > duration('0s')
-                  - message: MPIJob checks require a positive gpuCount
-                    rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
-                      > 0)
-                maxItems: 256
-                minItems: 1
-                type: array
-                x-kubernetes-list-type: atomic
               participants:
                 properties:
                   count:
@@ -257,27 +114,19 @@ spec:
                   rule: (has(self.selector.matchLabels) && size(self.selector.matchLabels)
                     > 0) || (has(self.selector.matchExpressions) && size(self.selector.matchExpressions)
                     > 0)
-              scriptBundle:
+              suite:
                 properties:
-                  digest:
-                    description: |-
-                      Digest is the aggregate algorithm-qualified SHA-256 digest derived from
-                      the selected script bytes in check order.
-                    pattern: ^sha256:[0-9a-f]{64}$
-                    type: string
                   name:
                     maxLength: 253
                     minLength: 1
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                     type: string
                 required:
-                - digest
                 - name
                 type: object
             required:
-            - checks
             - participants
-            - scriptBundle
+            - suite
             type: object
         required:
         - spec

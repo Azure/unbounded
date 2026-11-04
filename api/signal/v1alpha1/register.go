@@ -20,6 +20,8 @@ var (
 			&CertificationProfileList{},
 			&CertificationRun{},
 			&CertificationRunList{},
+			&CertificationSuite{},
+			&CertificationSuiteList{},
 		)
 		metav1.AddToGroupVersion(s, GroupVersion)
 

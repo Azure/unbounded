@@ -58,8 +58,8 @@ spec:
                 type: boolean
               checks:
                 description: |-
-                  Checks is the immutable ordered snapshot of the Profile suite. A check's
-                  position defines its stable ID.
+                  Checks is the immutable ordered snapshot of the Suite. A check's position
+                  defines its stable ID.
                 items:
                   properties:
                     backend:
@@ -289,15 +289,41 @@ spec:
                 x-kubernetes-validations:
                 - message: uid is required
                   rule: size(self.uid) > 0
+              suite:
+                properties:
+                  generation:
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  name:
+                    minLength: 1
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
             required:
             - checks
             - participants
             - profile
             - scriptBundle
+            - suite
             type: object
             x-kubernetes-validations:
             - message: profile is immutable
               rule: self.profile == oldSelf.profile
+            - message: suite is immutable
+              rule: self.suite == oldSelf.suite
             - message: participants are immutable
               rule: self.participants == oldSelf.participants
             - message: scriptBundle is immutable
