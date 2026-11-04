@@ -11,7 +11,9 @@
 // directories, and non-directory entries in upper layers hide paths in
 // lower layers, as described in the OCI image layer specification.
 // Symbolic links (also in parent directories) and hard links are followed
-// within the image root.
+// within the image root. A hard link to a file in a lower layer is
+// resolved against the layers up to and including its own, so a later
+// layer that replaces or removes the target does not change the link.
 //
 // # Layer indexes
 //

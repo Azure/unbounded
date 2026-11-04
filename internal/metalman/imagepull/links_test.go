@@ -154,3 +154,63 @@ func TestOpenPrecedenceByArgumentOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestHardlinkResolvesAtItsLayer(t *testing.T) {
+	reg := ipt.NewRegistry(t)
+	ref, _ := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{
+		{Entries: []ipt.Entry{
+			ipt.File("disk/g", []byte("old g")),
+			ipt.File("disk/w", []byte("old w")),
+			ipt.File("disk/s", []byte("same")),
+			ipt.Hardlink("disk/s2", "disk/s"),
+		}},
+		{Entries: []ipt.Entry{
+			ipt.Hardlink("disk/h", "disk/g"),
+			ipt.Hardlink("disk/hw", "disk/w"),
+			ipt.Hardlink("disk/missing", "disk/nope"),
+		}},
+		{Entries: []ipt.Entry{
+			ipt.File("disk/g", []byte("new g")),
+			ipt.Whiteout("disk/w"),
+			ipt.File("disk/nope", []byte("too late")),
+		}},
+	}})
+
+	img := resolve(t, &imagepull.Puller{}, imagepull.Source{Ref: ref})
+
+	// Replacement of the target in an upper layer.
+	expectFile(t, img, "disk/h", "old g")
+	expectFile(t, img, "disk/g", "new g")
+	// Whiteout of the target in an upper layer.
+	expectFile(t, img, "disk/hw", "old w")
+	expectNotFound(t, img, "disk/w")
+	// Same-layer hard link.
+	expectFile(t, img, "disk/s2", "same")
+	// A target that only appears in an upper layer is not visible.
+	expectNotFound(t, img, "disk/missing")
+}
+
+func TestHardlinkToLowerLayer(t *testing.T) {
+	reg := ipt.NewRegistry(t)
+	ref, _ := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{
+		{Files: map[string][]byte{"disk/a": []byte("a")}},
+		{Entries: []ipt.Entry{ipt.Hardlink("disk/b", "disk/a")}},
+	}})
+
+	img := resolve(t, &imagepull.Puller{}, imagepull.Source{Ref: ref})
+
+	expectFile(t, img, "disk/b", "a")
+	expectFile(t, img, "disk/a", "a")
+}
+
+func TestHardlinkHonorsWhiteoutInItsOwnLayer(t *testing.T) {
+	reg := ipt.NewRegistry(t)
+	ref, _ := reg.Push(t, "img", "v1", ipt.ImageSpec{Layers: []ipt.Layer{
+		{Files: map[string][]byte{"disk/a": []byte("a")}},
+		{Entries: []ipt.Entry{ipt.Whiteout("disk/a"), ipt.Hardlink("disk/b", "disk/a")}},
+	}})
+
+	img := resolve(t, &imagepull.Puller{}, imagepull.Source{Ref: ref})
+
+	expectNotFound(t, img, "disk/b")
+}

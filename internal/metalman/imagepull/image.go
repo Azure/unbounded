@@ -237,10 +237,10 @@ func (i *Image) Open(ctx context.Context, names ...string) (*File, error) {
 var implicitDir = &indexEntry{kind: kindDir}
 
 // stat returns the topmost visible entry for the exact path p, without
-// following links, and the layer it is in. A nil entry means p does not
-// exist.
-func (i *Image) stat(ctx context.Context, p string) (int, *indexEntry, error) {
-	for li := len(i.layers) - 1; li >= 0; li-- {
+// following links, and the layer it is in, considering only layers 0
+// through top. A nil entry means p does not exist.
+func (i *Image) stat(ctx context.Context, p string, top int) (int, *indexEntry, error) {
+	for li := top; li >= 0; li-- {
 		x, err := i.layerIndex(ctx, li)
 		if err != nil {
 			return -1, nil, err
@@ -269,6 +269,10 @@ func (i *Image) stat(ctx context.Context, p string) (int, *indexEntry, error) {
 // content, and the layer where name itself was first matched (for
 // precedence between names), which is -1 when name does not exist or the
 // layer indexes could not be loaded.
+//
+// A hard link to a file in a lower layer is resolved against the image as
+// it was at the hard link's layer: upper layers that replace or remove the
+// target do not change the content of the link.
 func (i *Image) lookup(ctx context.Context, name string) (int, *indexEntry, int, error) {
 	first := -1
 	notFound := func() error {
@@ -277,6 +281,9 @@ func (i *Image) lookup(ctx context.Context, name string) (int, *indexEntry, int,
 
 	p := name
 	depth := 0
+	// top is the highest layer visible to the current resolution. It drops
+	// to the hard link's layer when a cross-layer hard link is followed.
+	top := len(i.layers) - 1
 
 	for {
 		if p == "" {
@@ -291,7 +298,7 @@ func (i *Image) lookup(ctx context.Context, name string) (int, *indexEntry, int,
 			next := path.Join(cur, c)
 			last := k == len(comps)-1
 
-			li, e, err := i.stat(ctx, next)
+			li, e, err := i.stat(ctx, next, top)
 			if err != nil {
 				return -1, nil, -1, err
 			}
@@ -322,6 +329,10 @@ func (i *Image) lookup(ctx context.Context, name string) (int, *indexEntry, int,
 				}
 
 				target := e.link
+				if e.kind == kindHardlink {
+					top = li
+				}
+
 				if e.kind == kindSymlink && !path.IsAbs(target) {
 					target = path.Join("/"+cur, target)
 				}
