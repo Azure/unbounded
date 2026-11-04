@@ -14,7 +14,7 @@ use racer_gpu::simulation::read_allocation;
 const GRANULE: u64 = racer_gpu::simulation::GRANULARITY;
 
 thread_local! {
-    /// The simulation, on the GPU helper thread only.
+    /// The simulation, on the GPU coordinator thread only.
     static SIM: RefCell<Option<(Simulation, Environment)>> = const { RefCell::new(None) };
 }
 
@@ -48,7 +48,13 @@ fn live(helper: &GpuHelper) -> Live {
 /// No request holds GPU resources. Contexts stay retained by the helper.
 fn assert_released(helper: &GpuHelper) {
     let live = live(helper);
-    assert_eq!((live.imports, live.streams), (0, 0), "{live:?}");
+    // The executors keep their streams between requests; no request holds
+    // one.
+    assert_eq!(
+        (live.imports, live.streams),
+        (0, helper.executor_streams()),
+        "{live:?}"
+    );
     assert_eq!(helper.open_requests(), 0);
     assert_eq!(helper.leaked(), 0);
 }
@@ -443,7 +449,8 @@ fn body(length: usize) -> Vec<u8> {
 
 /// Slots left for staged ciphertext with the default staging cap.
 fn default_slots() -> usize {
-    (crate::config::DEFAULT_GPU_STAGING_BYTES / crate::gpu::SLOT_BYTES) as usize - 2
+    let staging = crate::config::DEFAULT_GPU_STAGING_BYTES;
+    (staging / crate::gpu::SLOT_BYTES) as usize - crate::gpu::scratch_slots(staging)
 }
 
 /// The memory cache keeps only ciphertext, so a page read before is

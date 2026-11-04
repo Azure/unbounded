@@ -1140,7 +1140,7 @@ impl Fixture {
     /// one at a time and the reactor reaps it before the next connection runs.
     ///
     /// The deadline only catches hangs. Simulated GPU decrypts run the
-    /// bit-serial host GCM emulation on the single helper thread, roughly
+    /// bit-serial host GCM emulation on the GPU executor thread, roughly
     /// 0.4-0.7s per page on one CPU, so a multi-page exchange on a shared CI
     /// runner can legitimately take several seconds.
     fn receive_budgeted(&self, socket: &mut UnixStream, eof: bool, budget: usize) -> Vec<u8> {

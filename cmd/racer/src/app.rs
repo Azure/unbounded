@@ -3822,6 +3822,7 @@ pub(crate) fn gpu_slot(
         staging_bytes: config.gpu_staging_bytes,
         pci_p2pdma: config.gpu_pci_p2pdma,
         peer: config.gpu_peer,
+        ..crate::gpu::GpuOptions::default()
     };
     if mode == GpuMode::Auto && built {
         eprintln!("racer: stage=gpu state=standby start=first-gpu-read");
