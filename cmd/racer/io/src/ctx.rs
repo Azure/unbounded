@@ -26,6 +26,13 @@ enum ClockRepr {
 }
 
 /// A manually advanced clock shared by every role of one simulated world.
+///
+/// Besides local monotonic and wall time it tracks a reference time (the
+/// simulation's true time) so a harness can skew one node's clock: a rate
+/// ([`VirtualClock::set_rate_ppm`]) makes local time run fast or slow against
+/// the reference, and a forward jump ([`VirtualClock::jump`]) moves local
+/// monotonic and wall time at once. With the default rate local and
+/// reference time are identical.
 #[derive(Clone, Debug)]
 pub struct VirtualClock(Arc<VirtualState>);
 
@@ -38,13 +45,83 @@ struct VirtualState {
     times: Mutex<VirtualTimes>,
 }
 
-/// Mutable virtual time, updated together so readers never see a torn advance.
-/// `Duration` and `SystemTime` keep the full range of the host types.
-#[derive(Debug)]
+/// Mutable clock state, updated together under one lock so readers never see a
+/// torn advance. `Duration` and `SystemTime` keep the full range of the host
+/// types.
+#[derive(Clone, Copy, Debug)]
 struct VirtualTimes {
-    elapsed: Duration,
+    /// Reference (true) time since creation.
+    reference: Duration,
 
-    wall: SystemTime,
+    /// Local monotonic time since creation.
+    local: Duration,
+
+    /// Reference and local time when the current rate took effect.
+    segment: (Duration, Duration),
+
+    /// Local rate deviation in parts per million.
+    rate_ppm: i64,
+
+    /// Wall time at local time `wall_base.1`.
+    wall_base: (SystemTime, Duration),
+}
+
+/// Rates are bounded so local time always moves forward and the scaled
+/// arithmetic cannot overflow `u128`.
+const MAX_RATE_PPM: i64 = 1_000_000;
+
+/// `Duration` from nanoseconds, or `None` past `Duration::MAX`.
+fn duration_from_nanos(nanos: u128) -> Option<Duration> {
+    let secs = u64::try_from(nanos / 1_000_000_000).ok()?;
+    // The remainder is below 10^9, so it fits in `u32`.
+    Some(Duration::new(secs, (nanos % 1_000_000_000) as u32))
+}
+
+impl VirtualTimes {
+    fn scale(&self) -> u128 {
+        // `rate_ppm` lies in `-999_999..=1_000_000`, so the scale is positive.
+        (1_000_000 + self.rate_ppm) as u128
+    }
+
+    /// Local time at `reference` under the current segment.
+    fn local_at(&self, reference: Duration) -> Option<Duration> {
+        // At most ~1.8e28 ns times 2e6, well inside `u128`.
+        let delta = (reference - self.segment.0).as_nanos() * self.scale() / 1_000_000;
+        self.segment.1.checked_add(duration_from_nanos(delta)?)
+    }
+
+    /// Smallest reference time at which local time reaches `local`.
+    fn reference_for(&self, local: Duration) -> Option<Duration> {
+        if local <= self.local {
+            return Some(self.reference);
+        }
+        let delta = ((local - self.segment.1).as_nanos() * 1_000_000).div_ceil(self.scale());
+        self.segment.0.checked_add(duration_from_nanos(delta)?)
+    }
+
+    /// Move reference time forward to `reference`, or change nothing if local
+    /// monotonic or wall time would overflow.
+    fn set_reference(&mut self, origin: Instant, reference: Duration) -> Option<()> {
+        if reference > self.reference {
+            let local = self.local_at(reference)?;
+            self.check_local(origin, local)?;
+            self.reference = reference;
+            self.local = local;
+        }
+        Some(())
+    }
+
+    /// Check that `local` is representable as both an `Instant` and a wall time.
+    fn check_local(&self, origin: Instant, local: Duration) -> Option<()> {
+        origin.checked_add(local)?;
+        self.wall_at(local)?;
+        Some(())
+    }
+
+    /// Wall time at local time `local` (`local >= wall_base.1`).
+    fn wall_at(&self, local: Duration) -> Option<SystemTime> {
+        self.wall_base.0.checked_add(local - self.wall_base.1)
+    }
 }
 
 impl Clock {
@@ -120,8 +197,11 @@ impl VirtualClock {
             origin,
             wall_origin: wall,
             times: Mutex::new(VirtualTimes {
-                elapsed: Duration::ZERO,
-                wall,
+                reference: Duration::ZERO,
+                local: Duration::ZERO,
+                segment: (Duration::ZERO, Duration::ZERO),
+                rate_ppm: 0,
+                wall_base: (wall, Duration::ZERO),
             }),
         }))
     }
@@ -136,37 +216,34 @@ impl VirtualClock {
 
     /// Current virtual monotonic time.
     pub fn now(&self) -> Instant {
-        self.0.origin + self.times().elapsed
+        self.0.origin + self.times().local
     }
 
     /// Current virtual wall time.
     pub fn wall_now(&self) -> SystemTime {
-        self.times().wall
+        let times = self.times();
+        // Every stored local time was checked against `wall_at`.
+        times.wall_at(times.local).unwrap_or(times.wall_base.0)
     }
 
     /// Total monotonic time advanced since creation.
     pub fn elapsed(&self) -> Duration {
-        self.times().elapsed
+        self.times().local
     }
 
-    /// Advance monotonic and wall time together, or change neither on overflow.
+    /// Advance local monotonic and wall time together by at least `duration`
+    /// (exactly `duration` at the default rate), or change neither on
+    /// overflow.
     pub fn advance(&self, duration: Duration) -> Result<()> {
         let mut times = self.times();
-        let elapsed = times
-            .elapsed
+        let target = times
+            .local
             .checked_add(duration)
             .ok_or(Error::InvalidInput)?;
-        self.0
-            .origin
-            .checked_add(elapsed)
-            .ok_or(Error::InvalidInput)?;
-        let wall = times
-            .wall
-            .checked_add(duration)
-            .ok_or(Error::InvalidInput)?;
-        times.elapsed = elapsed;
-        times.wall = wall;
-        Ok(())
+        let reference = times.reference_for(target).ok_or(Error::InvalidInput)?;
+        times
+            .set_reference(self.0.origin, reference)
+            .ok_or(Error::InvalidInput)
     }
 
     /// Advance monotonic time to `until` if it is later than now.
@@ -180,7 +257,61 @@ impl VirtualClock {
 
     /// Correct wall time without changing monotonic time or the anchor.
     pub fn set_wall_time(&self, wall: SystemTime) -> Result<()> {
-        self.times().wall = wall;
+        let mut times = self.times();
+        times.wall_base = (wall, times.local);
+        Ok(())
+    }
+
+    /// Reference (true simulation) time since creation.
+    pub fn reference_elapsed(&self) -> Duration {
+        self.times().reference
+    }
+
+    /// Advance reference time to `elapsed` since creation, moving local
+    /// monotonic and wall time at the clock's rate. Earlier values are a
+    /// no-op.
+    pub fn advance_reference_to(&self, elapsed: Duration) -> Result<()> {
+        self.times()
+            .set_reference(self.0.origin, elapsed)
+            .ok_or(Error::InvalidInput)
+    }
+
+    /// The reference time since creation at which local monotonic time
+    /// reaches `local` under the current rate (now, if it already has).
+    pub fn reference_at(&self, local: Instant) -> Option<Duration> {
+        let local = local.checked_duration_since(self.0.origin)?;
+        self.times().reference_for(local)
+    }
+
+    /// Run local time `ppm` parts per million fast (positive) or slow
+    /// (negative) against reference time from now on. `ppm` must lie in
+    /// `-999_999..=1_000_000`.
+    pub fn set_rate_ppm(&self, ppm: i64) -> Result<()> {
+        if ppm <= -MAX_RATE_PPM || ppm > MAX_RATE_PPM {
+            return Err(Error::InvalidInput);
+        }
+        let mut times = self.times();
+        times.segment = (times.reference, times.local);
+        times.rate_ppm = ppm;
+        Ok(())
+    }
+
+    /// The current rate deviation in parts per million.
+    pub fn rate_ppm(&self) -> i64 {
+        self.times().rate_ppm
+    }
+
+    /// Jump local monotonic and wall time forward by `offset` without
+    /// moving reference time (a suspended VM or a stepped clock).
+    pub fn jump(&self, offset: Duration) -> Result<()> {
+        let mut times = self.times();
+        let local = times.local.checked_add(offset).ok_or(Error::InvalidInput)?;
+        times
+            .check_local(self.0.origin, local)
+            .ok_or(Error::InvalidInput)?;
+        // The segment start is at most `local`, so this cannot overflow.
+        times.segment.1 += offset;
+        times.local = local;
         Ok(())
     }
 }
@@ -455,6 +586,54 @@ mod tests {
         let (now, wall) = (clock.now(), clock.wall_now());
         assert!(clock.advance(Duration::MAX).is_err());
         assert_eq!((clock.now(), clock.wall_now()), (now, wall));
+    }
+
+    #[test]
+    fn virtual_clock_rate_and_jump_skew_monotonic_time() {
+        let clock = VirtualClock::new();
+        let start = clock.now();
+        let wall = clock.wall_now();
+        assert!(clock.set_rate_ppm(-1_000_000).is_err());
+        assert!(clock.set_rate_ppm(1_000_001).is_err());
+        clock.set_rate_ppm(500_000).unwrap();
+        assert_eq!(clock.rate_ppm(), 500_000);
+        clock
+            .advance_reference_to(Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(clock.now() - start, Duration::from_millis(15));
+        assert_eq!(
+            clock.wall_now().duration_since(wall).unwrap(),
+            Duration::from_millis(15)
+        );
+        // A local deadline maps back to reference time at the current rate.
+        let at = start + Duration::from_millis(30);
+        assert_eq!(clock.reference_at(at), Some(Duration::from_millis(20)));
+        assert_eq!(clock.reference_at(start), Some(Duration::from_millis(10)));
+        // Local advance moves reference time by the scaled amount.
+        clock.advance_to(at).unwrap();
+        assert_eq!(clock.now(), at);
+        assert_eq!(clock.reference_elapsed(), Duration::from_millis(20));
+        // A rate change only affects later time; earlier references are a no-op.
+        clock.set_rate_ppm(-500_000).unwrap();
+        clock
+            .advance_reference_to(Duration::from_millis(5))
+            .unwrap();
+        clock
+            .advance_reference_to(Duration::from_millis(30))
+            .unwrap();
+        assert_eq!(clock.now() - start, Duration::from_millis(35));
+        clock.jump(Duration::from_millis(1)).unwrap();
+        assert_eq!(clock.now() - start, Duration::from_millis(36));
+        assert_eq!(clock.reference_elapsed(), Duration::from_millis(30));
+        assert_eq!(
+            clock.wall_now().duration_since(wall).unwrap(),
+            Duration::from_millis(36)
+        );
+        clock
+            .advance_reference_to(Duration::from_millis(32))
+            .unwrap();
+        assert_eq!(clock.now() - start, Duration::from_millis(37));
+        assert!(clock.jump(Duration::MAX).is_err());
     }
 
     #[test]
