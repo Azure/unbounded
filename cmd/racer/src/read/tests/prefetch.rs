@@ -281,6 +281,49 @@ fn pooled_membership(
     )
 }
 
+/// A lagging sender that still carries a retained membership in which this
+/// node was a pool member is refused once the current membership moved this
+/// node out of the cache's pool.
+#[test]
+fn a_node_that_left_the_cache_pool_refuses_retained_membership_requests() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let signers = network(2);
+    let mut f = fixture_with(PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let retained = pooled_membership(&mut f, &signers, &[0]);
+    let current = pooled_membership(&mut f, &signers, &[1]);
+    assert!(retained.serves(&f.context.object.cache, signers[0].node()));
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &current, NoPeer::requester());
+    let context = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    for action in [
+        crate::peer::protocol::PrefetchAction::Probe { pages: vec![0] },
+        crate::peer::protocol::PrefetchAction::Fill {
+            pages: vec![0],
+            length: PAGE_BYTES + 7,
+            content_type: None,
+            priority: racer_core::prefetch::Priority::default(),
+        },
+    ] {
+        let response = futures::executor::block_on(crate::prefetch::service::serve(
+            &local,
+            f.page.version.clone(),
+            action,
+            retained.clone(),
+            &context,
+            &f.scope,
+        ))
+        .unwrap();
+        assert!(matches!(response, PeerResponse::StaleMembership));
+    }
+    endpoint.uninstall().unwrap();
+}
+
 /// Pages are placed only over the cache's pool. With this node the only
 /// pool member, it owns every page, so no peer is asked.
 #[test]

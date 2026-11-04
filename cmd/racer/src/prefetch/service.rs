@@ -464,8 +464,14 @@ pub(crate) async fn serve(
         return Ok(PeerResponse::Unavailable);
     }
     // A node outside the cache's pool never owns its pages. The sender ranked
-    // on a membership where it did, so it re-plans on a newer one.
-    if !membership.serves(&version.object.cache, &local.local_node()) {
+    // on a membership where it did, so it re-plans on a newer one. Check this
+    // node's current membership too: a lagging sender may still carry a
+    // retained version from before this node left the pool.
+    let me = local.local_node();
+    let departed = local
+        .current_membership()
+        .is_some_and(|current| !current.serves(&version.object.cache, &me));
+    if departed || !membership.serves(&version.object.cache, &me) {
         return Ok(PeerResponse::StaleMembership);
     }
     Ok(PeerResponse::Prefetch(match action {
