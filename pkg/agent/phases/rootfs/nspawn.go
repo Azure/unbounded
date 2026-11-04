@@ -136,7 +136,7 @@ type nspawnTemplateData struct {
 	// MountDeviceAllow holds DeviceAllow entries (paths or device groups)
 	// declared by host mounts, such as whole device directories.
 	MountDeviceAllow     []string
-	AdditionalHostMounts         []config.AdditionalHostMount
+	AdditionalHostMounts []config.AdditionalHostMount
 	// NvidiaDeviceTargets contains render-ready Bind+DeviceAllow pairs.
 	NvidiaDeviceTargets    []NSpawnDeviceTarget
 	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount

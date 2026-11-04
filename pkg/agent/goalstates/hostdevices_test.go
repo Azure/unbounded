@@ -227,11 +227,11 @@ func TestHostDevices_Paths_MergesDedupesSorts(t *testing.T) {
 	t.Parallel()
 
 	d := HostDevices{
-		KVM:        []string{"/dev/kvm"},
-		Network:    []string{"/dev/net/tun", "/dev/vhost-net"},
-		Block:      []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
+		KVM:               []string{"/dev/kvm"},
+		Network:           []string{"/dev/net/tun", "/dev/vhost-net"},
+		Block:             []string{"/dev/sdb", "/dev/sda", "/dev/kvm"},
 		DeviceDirectories: []config.AdditionalHostMount{{Source: "/dev/infiniband"}},
-		Additional: []string{"/dev/uinput", "/dev/net/tun"},
+		Additional:        []string{"/dev/uinput", "/dev/net/tun"},
 	}
 
 	want := []string{

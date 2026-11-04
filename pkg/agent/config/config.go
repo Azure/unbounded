@@ -272,6 +272,7 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	for i := range out.AdditionalHostMounts {
 		out.AdditionalHostMounts[i].DeviceAllow = slices.Clone(out.AdditionalHostMounts[i].DeviceAllow)
 	}
+
 	if a.Gantry != nil {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
