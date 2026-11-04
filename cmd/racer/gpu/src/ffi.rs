@@ -15,7 +15,7 @@ pub(crate) use crate::gcm::RawVerdict;
 
 /// `RACER_GPU_ABI_VERSION`.
 #[cfg(all(feature = "native", target_os = "linux"))]
-pub(crate) const ABI_VERSION: u32 = 2;
+pub(crate) const ABI_VERSION: u32 = 3;
 
 /// Result codes from `gpu_cuda.h`.
 pub(crate) mod code {
@@ -95,9 +95,8 @@ pub(crate) struct RawDecrypt {
 
     pub nonce: [u8; 12],
 
-    pub check_crc: u32,
-
-    pub expected_crc: u64,
+    /// Must be zero.
+    pub reserved: u32,
 
     pub length: u64,
 
@@ -335,10 +334,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<RawDevice>(), 72);
         assert_eq!(std::mem::offset_of!(RawDevice, ordinal), 48);
         assert_eq!(std::mem::offset_of!(RawDevice, total_memory), 64);
-        assert_eq!(std::mem::size_of::<RawDecrypt>(), 80);
-        assert_eq!(std::mem::offset_of!(RawDecrypt, check_crc), 44);
-        assert_eq!(std::mem::offset_of!(RawDecrypt, aad), 64);
-        assert_eq!(std::mem::size_of::<RawVerdict>(), 16);
+        assert_eq!(std::mem::size_of::<RawDecrypt>(), 72);
+        assert_eq!(std::mem::offset_of!(RawDecrypt, reserved), 44);
+        assert_eq!(std::mem::offset_of!(RawDecrypt, length), 48);
+        assert_eq!(std::mem::offset_of!(RawDecrypt, aad), 56);
+        assert_eq!(std::mem::size_of::<RawVerdict>(), 8);
     }
 
     #[cfg(all(feature = "native", target_os = "linux"))]

@@ -20,36 +20,29 @@ __device__ const uint8_t racer_gcm_sbox[256] = GCM_SBOX_INIT;
 extern "C" __global__ void racer_gcm_partials(const uint8_t *sealed, uint64_t n,
                                               const struct gcm_key *key,
                                               struct gcm_partial *partials, uint64_t chunks) {
-    __shared__ uint64_t table[256];
-    for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) table[i] = gcm_crc64_entry(i);
-    __syncthreads();
     uint64_t j = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (j < chunks) gcm_chunk_partial(table, key, sealed, n, j, &partials[j]);
+    if (j < chunks) gcm_chunk_partial(key, sealed, n, j, &partials[j]);
 }
 
 extern "C" __global__ void racer_gcm_finalize(const uint8_t *sealed, uint64_t n,
                                               const struct gcm_key *key,
                                               const struct gcm_partial *partials, uint64_t chunks,
-                                              uint32_t check_crc, uint64_t expected_crc,
                                               struct gcm_verdict *verdict) {
-    __shared__ uint64_t hi[FINALIZE_THREADS], lo[FINALIZE_THREADS], crc[FINALIZE_THREADS];
+    __shared__ uint64_t hi[FINALIZE_THREADS], lo[FINALIZE_THREADS];
     unsigned t = threadIdx.x;
-    uint64_t h = 0, l = 0, c = 0;
+    uint64_t h = 0, l = 0;
     for (uint64_t j = t; j < chunks; j += FINALIZE_THREADS) {
         struct gcm_block b = gcm_load(partials[j].ghash);
         h ^= b.hi;
         l ^= b.lo;
-        c ^= partials[j].crc;
     }
     hi[t] = h;
     lo[t] = l;
-    crc[t] = c;
     __syncthreads();
     for (unsigned stride = FINALIZE_THREADS / 2; stride; stride >>= 1) {
         if (t < stride) {
             hi[t] ^= hi[t + stride];
             lo[t] ^= lo[t + stride];
-            crc[t] ^= crc[t + stride];
         }
         __syncthreads();
     }
@@ -57,7 +50,7 @@ extern "C" __global__ void racer_gcm_finalize(const uint8_t *sealed, uint64_t n,
         uint8_t ghash[16];
         struct gcm_block b = {hi[0], lo[0]};
         gcm_store(ghash, b);
-        gcm_finalize(key, sealed, n, ghash, crc[0], check_crc, expected_crc, verdict);
+        gcm_finalize(key, sealed, n, ghash, verdict);
     }
 }
 

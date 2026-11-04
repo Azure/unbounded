@@ -70,7 +70,7 @@ static const uint8_t shim_sbox[256] = GCM_SBOX_INIT;
 #define CTR_THREADS 256u
 
 _Static_assert(sizeof(struct gcm_key) <= WORK_VERDICT, "workspace key slot");
-_Static_assert(sizeof(struct gcm_partial) == 32, "partial layout");
+_Static_assert(sizeof(struct gcm_partial) == 16, "partial layout");
 _Static_assert(sizeof(struct gcm_verdict) == sizeof(struct racer_gpu_verdict), "verdict layout");
 
 struct gpu_context {
@@ -621,7 +621,7 @@ int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *p, void *src
     if (!s || !p || buffer(dst, &d) || buffer(src, &from) || from->kind != KIND_STAGING)
         return RACER_GPU_EINVAL;
     if (p->length > RACER_GPU_MAX_DECRYPT || p->aad_length > RACER_GPU_MAX_AAD ||
-        (!p->aad && p->aad_length) || p->check_crc > 1)
+        (!p->aad && p->aad_length) || p->reserved)
         return RACER_GPU_EINVAL;
     if (d->context != s->context || from->context != s->context) return RACER_GPU_EDEVICE;
     if (s->decrypt == 1) return RACER_GPU_EBUSY;
@@ -657,10 +657,8 @@ int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *p, void *src
     CUdeviceptr sealed = from->base + src_offset, out_ptr = d->base + dst_offset;
     CUdeviceptr key_ptr = s->work + WORK_KEY, verdict = s->work + WORK_VERDICT;
     CUdeviceptr partials = s->work + WORK_PARTIALS;
-    uint32_t check = p->check_crc;
-    uint64_t expected = p->expected_crc;
     void *partial_args[] = {&sealed, &n, &key_ptr, &partials, &chunks};
-    void *finalize_args[] = {&sealed, &n, &key_ptr, &partials, &chunks, &check, &expected, &verdict};
+    void *finalize_args[] = {&sealed, &n, &key_ptr, &partials, &chunks, &verdict};
     void *ctr_args[] = {&sealed, &n, &key_ptr, &verdict, &out_ptr};
     uint64_t blocks = (n + 15) / 16;
     rc = drv(cu.cuMemsetD8Async(verdict, 0, sizeof(struct gcm_verdict), s->stream));

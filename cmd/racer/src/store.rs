@@ -311,9 +311,9 @@ impl StoreReader {
     /// Locate a published v2 record's ciphertext on its device for a direct
     /// (cuFile) read, reading and validating only the header through host
     /// memory. Returns None on a miss, for v1 records, and for any record
-    /// this read path would also treat as a miss. The ciphertext checksum is
-    /// not verified here: the consumer must check
-    /// [`DirectRecord::checksum`] before trusting the bytes.
+    /// this read path would also treat as a miss. The ciphertext is not
+    /// verified here: the consumer must check the GCM tag (the GPU does)
+    /// before trusting the bytes.
     pub(crate) fn direct_read<'a>(
         &'a self,
         page: &'a PageId,
@@ -418,7 +418,6 @@ impl StoreReader {
                 token,
                 metadata: entry.metadata.for_pin(),
                 envelope: decoded.header.envelope,
-                checksum: decoded.checksum,
                 ciphertext,
                 read_length,
                 lease: hold,
@@ -433,8 +432,6 @@ pub(crate) struct DirectRecord {
     pub token: ReadToken,
     pub metadata: crate::model::ObjectMetadata,
     pub envelope: PageEnvelope,
-    /// The stored CRC-64 of the sealed page (ciphertext and tag).
-    pub checksum: u64,
     pub ciphertext: DirectCiphertext,
     /// Bytes to transfer from `ciphertext.offset`: the ciphertext length
     /// rounded up to whole 4 KiB blocks when the record holds them.

@@ -819,7 +819,7 @@ unsafe extern "C" fn decrypt(
         if p.length > ffi::MAX_DECRYPT
             || p.aad_length > ffi::MAX_AAD as u64
             || (p.aad.is_null() && p.aad_length > 0)
-            || p.check_crc > 1
+            || p.reserved != 0
         {
             return (code::EINVAL, id(dst));
         }
@@ -847,8 +847,7 @@ unsafe extern "C" fn decrypt(
             unsafe { std::slice::from_raw_parts(p.aad, p.aad_length as usize) }
         };
         let mut out = zeroize::Zeroizing::new(vec![0; n as usize]);
-        let expected = (p.check_crc == 1).then_some(p.expected_crc);
-        let Some(verdict) = gcm::decrypt(&p.key, &p.nonce, aad, sealed, expected, &mut out) else {
+        let Some(verdict) = gcm::decrypt(&p.key, &p.nonce, aad, sealed, &mut out) else {
             return (code::ENOMEM, id(dst));
         };
         let mut rc = code::OK;

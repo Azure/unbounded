@@ -1,30 +1,32 @@
-/* AES-256-GCM decrypt-with-verification and CRC-64/XZ, shared by the CUDA
+/* AES-256-GCM decrypt-with-verification, shared by the CUDA
  * kernels (gcm_kernel.cu), the host shim (gpu_cuda.c), the simulation backend
  * and the CPU tests (gcm_host.c). It compiles as C99 and as CUDA.
  *
  * Racer pages are sealed with XAES-256-GCM (https://c2sp.org/XAES-256-GCM).
  * The CPU derives the per-page AES-256 key and 12-byte GCM nonce, so this file
  * only implements plain AES-256-GCM (NIST SP 800-38D) on the derived values.
- * The sealed page is ciphertext followed by the 16-byte tag; the stored
- * checksum is CRC-64/XZ over the whole sealed page (racer_crypto::crc64 over
- * CiphertextPage::bytes()).
+ * The sealed page is ciphertext followed by the 16-byte tag. The GCM tag is
+ * the only integrity check; there is no separate checksum.
  *
  * The work is split so it runs in parallel:
  *
  *   gcm_prepare        host: key schedule, H, E(K, J0), and the GHASH terms
  *                      that do not depend on the ciphertext (AAD, lengths).
- *   gcm_chunk_partial  one per GCM_CHUNK bytes: CRC of the chunk shifted to
- *                      its final position, and the chunk's GHASH sum
+ *   gcm_chunk_partial  one per GCM_CHUNK bytes: the chunk's GHASH sum
  *                      multiplied by the power of H it has in the full sum.
- *   gcm_finalize       XOR of all partials (both sums are linear), then the
- *                      constant-time tag compare and the CRC compare.
+ *   gcm_finalize       XOR of all partials (the sum is linear), then the
+ *                      constant-time tag compare.
  *   gcm_ctr_block      one per 16-byte block: CTR decryption.
  *
  * GHASH is sum(X_i * H^(m-i+1)) over m blocks, so chunk j with last block
  * b_j contributes Horner(chunk) * H^(nc-b_j+1), where nc is the number of
- * ciphertext blocks. CRC-64/XZ composes like zlib's crc32_combine:
- * crc(A||B) = crc(A) * x^(8|B|) mod P xor crc(B), so each chunk is shifted by
- * the number of bytes after it and all chunks are XORed.
+ * ciphertext blocks.
+ *
+ * Immutable-source invariant: the ciphertext is read twice, once by the
+ * partials (GHASH) and again by gcm_ctr_block after the verdict. The source
+ * must not change between the two reads, or plaintext that was never
+ * authenticated would be written. Callers keep the source buffer owned and
+ * unchanged until the stream that runs the decrypt has completed.
  *
  * Timing: GF(2^128) multiplication is constant time (no secret-dependent
  * branches or indexes). AES uses an S-box lookup with secret indexes, so it is
@@ -47,12 +49,9 @@
 
 /* Bytes of sealed input each partial covers. A multiple of 16. */
 #define GCM_CHUNK 4096u
-/* Reflected CRC-64/XZ (ECMA-182) polynomial. */
-#define GCM_CRC64_POLY 0xC96C5795D7870F42ull
 /* Verdict values. Only GCM_VERDICT_PASS lets CTR decryption write output. */
 #define GCM_VERDICT_NONE 0u
 #define GCM_VERDICT_PASS 0x600Du
-#define GCM_VERDICT_CRC 2u
 #define GCM_VERDICT_TAG 3u
 
 /* FIPS-197 S-box. */
@@ -87,15 +86,12 @@ struct gcm_key {
 /* One chunk's contribution. */
 struct gcm_partial {
     uint8_t ghash[16];
-    uint64_t crc;
-    uint64_t reserved;
 };
 
 /* Result of verification. Same layout as struct racer_gpu_verdict. */
 struct gcm_verdict {
     uint32_t status;
     uint32_t reserved;
-    uint64_t crc;
 };
 
 /* GF(2^128) element in GCM bit order, as two big-endian halves. */
@@ -209,51 +205,6 @@ GCM_FN void gcm_aes256_encrypt(const uint8_t *sbox, const uint8_t *rk, const uin
     for (int i = 0; i < 16; ++i) out[i] = s[i];
 }
 
-/* Entry `i` of the reflected CRC-64/XZ byte table. */
-GCM_FN uint64_t gcm_crc64_entry(unsigned i) {
-    uint64_t c = i;
-    for (int k = 0; k < 8; ++k) c = (c & 1) ? (c >> 1) ^ GCM_CRC64_POLY : c >> 1;
-    return c;
-}
-
-/* Reflected CRC-64/XZ byte table. */
-GCM_FN void gcm_crc64_table(uint64_t table[256]) {
-    for (unsigned i = 0; i < 256; ++i) table[i] = gcm_crc64_entry(i);
-}
-
-/* Complete CRC-64/XZ (init and xorout all ones) of `n` bytes. */
-GCM_FN uint64_t gcm_crc64(const uint64_t *table, const uint8_t *p, uint64_t n) {
-    uint64_t c = ~(uint64_t)0;
-    for (uint64_t i = 0; i < n; ++i) c = table[(c ^ p[i]) & 0xff] ^ (c >> 8);
-    return ~c;
-}
-
-/* a * b mod P in the reflected representation (bit 63 is x^0). */
-GCM_FN uint64_t gcm_crc_mulmod(uint64_t a, uint64_t b) {
-    uint64_t m = 1ull << 63, p = 0;
-    if (!a) return 0;
-    for (;;) {
-        if (a & m) {
-            p ^= b;
-            if ((a & (m - 1)) == 0) break;
-        }
-        m >>= 1;
-        b = (b & 1) ? (b >> 1) ^ GCM_CRC64_POLY : b >> 1;
-    }
-    return p;
-}
-
-/* crc * x^(8n) mod P: moves a complete CRC past n more bytes. */
-GCM_FN uint64_t gcm_crc_shift(uint64_t crc, uint64_t n) {
-    uint64_t p = 1ull << 63, base = 1ull << (63 - 8);
-    while (n) {
-        if (n & 1) p = gcm_crc_mulmod(base, p);
-        base = gcm_crc_mulmod(base, base);
-        n >>= 1;
-    }
-    return gcm_crc_mulmod(p, crc);
-}
-
 /* Number of partials for a page of `n` plaintext bytes. */
 GCM_FN uint64_t gcm_chunks(uint64_t n) {
     return (n + 16 + GCM_CHUNK - 1) / GCM_CHUNK;
@@ -288,14 +239,12 @@ GCM_FN void gcm_prepare(const uint8_t *sbox, const uint8_t key[32], const uint8_
 }
 
 /* Partial `j` over the sealed page (`n` ciphertext bytes then a 16-byte tag). */
-GCM_FN void gcm_chunk_partial(const uint64_t *crc_table, const struct gcm_key *key,
+GCM_FN void gcm_chunk_partial(const struct gcm_key *key,
                               const uint8_t *sealed, uint64_t n, uint64_t j,
                               struct gcm_partial *out) {
     uint64_t total = n + 16;
     uint64_t start = j * GCM_CHUNK;
     uint64_t end = start + GCM_CHUNK < total ? start + GCM_CHUNK : total;
-    out->crc = gcm_crc_shift(gcm_crc64(crc_table, sealed + start, end - start), total - end);
-    out->reserved = 0;
 
     struct gcm_block y = {0, 0};
     uint64_t gend = end < n ? end : n;
@@ -312,17 +261,14 @@ GCM_FN void gcm_chunk_partial(const uint64_t *crc_table, const struct gcm_key *k
     gcm_store(out->ghash, y);
 }
 
-/* Combine reduced partials, check the tag in constant time and the CRC. */
+/* Combine reduced partials and check the tag in constant time. */
 GCM_FN void gcm_finalize(const struct gcm_key *key, const uint8_t *sealed, uint64_t n,
-                         const uint8_t ghash[16], uint64_t crc, uint32_t check_crc,
-                         uint64_t expected_crc, struct gcm_verdict *out) {
+                         const uint8_t ghash[16], struct gcm_verdict *out) {
     uint8_t diff = 0;
     for (int i = 0; i < 16; ++i)
         diff |= (uint8_t)(key->prefix[i] ^ ghash[i] ^ key->ekj0[i] ^ sealed[n + i]);
-    int crc_ok = !check_crc || crc == expected_crc;
-    out->crc = crc;
     out->reserved = 0;
-    out->status = !crc_ok ? GCM_VERDICT_CRC : diff ? GCM_VERDICT_TAG : GCM_VERDICT_PASS;
+    out->status = diff ? GCM_VERDICT_TAG : GCM_VERDICT_PASS;
 }
 
 /* CTR-decrypt block `i` into `out`. Call only after a passing verdict. */

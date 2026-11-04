@@ -5,7 +5,7 @@
 //! plaintext in memory still arrive as [`Fetched::Page`], and so do pages that
 //! the CPU had to produce anyway (origin fills, which encrypt) or that another
 //! reader authenticated first. Every other page arrives as a [`SealedPage`]:
-//! the envelope, the AAD, the expected CRC, the XAES-derived page key, and the
+//! the envelope, the AAD, the XAES-derived page key, and the
 //! ciphertext in host memory or already in GPU staging.
 //!
 //! The derived key is wiped on drop and is never logged: [`SealedPage`] has no
@@ -77,7 +77,7 @@ pub enum SealedSource {
 }
 
 /// A page that only the GPU will authenticate. Nothing here is proof of
-/// authenticity: the GPU checks the CRC and the AEAD tag before it writes.
+/// authenticity: the GPU checks the AEAD tag before it writes.
 pub struct SealedPage {
     pub metadata: ObjectMetadata,
 
@@ -88,9 +88,6 @@ pub struct SealedPage {
 
     /// The XAES-derived AES-256-GCM key and nonce. Wiped on drop.
     pub key: racer_crypto::DerivedPageKey,
-
-    /// The stored CRC-64 of ciphertext and tag, when known.
-    pub expected_crc: Option<u64>,
 
     pub source: SealedSource,
 }
@@ -188,7 +185,6 @@ pub(crate) mod tests {
             metadata: result.metadata.clone(),
             aad: crate::security::page_aad(&envelope).unwrap_or_default(),
             key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
-            expected_crc: Some(result.ciphertext.checksum()),
             envelope,
             source: SealedSource::Host(UnverifiedPage {
                 copy: CiphertextCopy {

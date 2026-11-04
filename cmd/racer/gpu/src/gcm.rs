@@ -16,19 +16,13 @@ pub struct RawVerdict {
 
     /// Always zero.
     pub reserved: u32,
-
-    /// CRC-64/XZ of the sealed page, computed by the kernel.
-    pub crc: u64,
 }
 
 /// Verification did not run.
 pub const VERDICT_NONE: u32 = 0;
 
-/// CRC (if requested) and tag matched; the plaintext was written.
+/// The tag matched; the plaintext was written.
 pub const VERDICT_PASS: u32 = 0x600d;
-
-/// The CRC did not match. Nothing was written.
-pub const VERDICT_CRC: u32 = 2;
 
 /// The tag did not match. Nothing was written.
 pub const VERDICT_TAG: u32 = 3;
@@ -37,8 +31,6 @@ pub const VERDICT_TAG: u32 = 3;
 pub const CHUNK: u64 = 4096;
 
 unsafe extern "C" {
-    fn racer_gcm_host_crc64(data: *const u8, length: u64) -> u64;
-
     fn racer_gcm_host_aes256(key: *const [u8; 32], input: *const [u8; 16], out: *mut [u8; 16]);
 
     fn racer_gcm_host_decrypt(
@@ -48,16 +40,9 @@ unsafe extern "C" {
         aad_len: u64,
         sealed: *const u8,
         n: u64,
-        check_crc: u32,
-        expected_crc: u64,
         out: *mut u8,
         verdict: *mut RawVerdict,
     ) -> c_int;
-}
-
-/// CRC-64/XZ through the chunked combine path the kernels use.
-pub fn crc64(data: &[u8]) -> u64 {
-    unsafe { racer_gcm_host_crc64(data.as_ptr(), data.len() as u64) }
 }
 
 /// One AES-256 block encryption.
@@ -77,7 +62,6 @@ pub fn decrypt(
     nonce: &[u8; 12],
     aad: &[u8],
     sealed: &[u8],
-    expected_crc: Option<u64>,
     out: &mut [u8],
 ) -> Option<RawVerdict> {
     if sealed.len().checked_sub(16) != Some(out.len()) {
@@ -92,8 +76,6 @@ pub fn decrypt(
             aad.len() as u64,
             sealed.as_ptr(),
             out.len() as u64,
-            expected_crc.is_some() as u32,
-            expected_crc.unwrap_or(0),
             out.as_mut_ptr(),
             &mut verdict,
         )
@@ -120,13 +102,6 @@ mod tests {
     }
 
     #[test]
-    /// The CRC-64/XZ check value, and empty input.
-    fn crc64_check_value() {
-        assert_eq!(crc64(b"123456789"), 0x995d_c9bb_df19_39fa);
-        assert_eq!(crc64(b""), 0);
-    }
-
-    #[test]
     /// NIST GCM test case 14: AES-256, zero key, one zero block, no AAD.
     fn gcm_nist_test_case_14() {
         let ciphertext = [
@@ -139,7 +114,7 @@ mod tests {
         ];
         let sealed = [ciphertext, tag].concat();
         let mut out = [1; 16];
-        let verdict = decrypt(&[0; 32], &[0; 12], &[], &sealed, None, &mut out).unwrap();
+        let verdict = decrypt(&[0; 32], &[0; 12], &[], &sealed, &mut out).unwrap();
         assert_eq!(verdict.status, VERDICT_PASS);
         assert_eq!(out, [0; 16]);
     }
@@ -148,7 +123,7 @@ mod tests {
     /// Mismatched output length is refused before any work.
     fn decrypt_rejects_length_mismatch() {
         let mut out = [0; 3];
-        assert!(decrypt(&[0; 32], &[0; 12], &[], &[0; 20], None, &mut out).is_none());
-        assert!(decrypt(&[0; 32], &[0; 12], &[], &[0; 2], None, &mut []).is_none());
+        assert!(decrypt(&[0; 32], &[0; 12], &[], &[0; 20], &mut out).is_none());
+        assert!(decrypt(&[0; 32], &[0; 12], &[], &[0; 2], &mut []).is_none());
     }
 }

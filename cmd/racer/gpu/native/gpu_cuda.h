@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RACER_GPU_ABI_VERSION 2u
+#define RACER_GPU_ABI_VERSION 3u
 
 #define RACER_GPU_OK 0
 #define RACER_GPU_EINVAL (-1)       /* bad argument or handle type */
@@ -59,8 +59,7 @@ struct racer_gpu_device {
 struct racer_gpu_decrypt {
     uint8_t key[32];
     uint8_t nonce[12];
-    uint32_t check_crc; /* 1 to compare CRC-64/XZ with expected_crc */
-    uint64_t expected_crc;
+    uint32_t reserved; /* must be 0 */
     uint64_t length;
     const uint8_t *aad;
     uint64_t aad_length;
@@ -70,16 +69,16 @@ struct racer_gpu_decrypt {
 struct racer_gpu_verdict {
     uint32_t status;
     uint32_t reserved;
-    uint64_t crc;
 };
 
 _Static_assert(sizeof(struct racer_gpu_device) == 72, "device ABI size");
 _Static_assert(offsetof(struct racer_gpu_device, ordinal) == 48, "device ABI offset");
 _Static_assert(offsetof(struct racer_gpu_device, total_memory) == 64, "device ABI offset");
-_Static_assert(sizeof(struct racer_gpu_decrypt) == 80, "decrypt ABI size");
-_Static_assert(offsetof(struct racer_gpu_decrypt, check_crc) == 44, "decrypt ABI offset");
-_Static_assert(offsetof(struct racer_gpu_decrypt, aad) == 64, "decrypt ABI offset");
-_Static_assert(sizeof(struct racer_gpu_verdict) == 16, "verdict ABI size");
+_Static_assert(sizeof(struct racer_gpu_decrypt) == 72, "decrypt ABI size");
+_Static_assert(offsetof(struct racer_gpu_decrypt, reserved) == 44, "decrypt ABI offset");
+_Static_assert(offsetof(struct racer_gpu_decrypt, length) == 48, "decrypt ABI offset");
+_Static_assert(offsetof(struct racer_gpu_decrypt, aad) == 56, "decrypt ABI offset");
+_Static_assert(sizeof(struct racer_gpu_verdict) == 8, "verdict ABI size");
 
 /* Largest page one decrypt call accepts (1 GiB). */
 #define RACER_GPU_MAX_DECRYPT (1ull << 30)
@@ -144,7 +143,7 @@ int racer_gpu_copy_d2h(void *stream, void *dst, void *src, uint64_t src_offset, 
 
 /* Queue verify-then-decrypt of the sealed page at `src + src_offset` (a
  * staging buffer) into `dst + dst_offset`. The destination is written only if
- * the CRC (when requested) and the tag match; the decision is made on the
+ * the tag matches; the decision is made on the
  * device. One decrypt per stream may be outstanding; read its verdict with
  * racer_gpu_verdict after racer_gpu_stream_sync. */
 int racer_gpu_decrypt(void *stream, const struct racer_gpu_decrypt *params, void *src,

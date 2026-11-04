@@ -650,31 +650,16 @@ pub struct DecryptRequest<'a> {
 
     /// Plaintext length. The source holds this many bytes plus the tag.
     pub length: u64,
-
-    /// Stored CRC-64/XZ of the sealed page, if known.
-    pub expected_crc: Option<u64>,
 }
 
 /// The outcome of a GPU decrypt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Verdict {
-    /// Verified and written. `crc` is the sealed page's CRC-64/XZ.
-    Passed {
-        /// CRC-64/XZ of the sealed page.
-        crc: u64,
-    },
-
-    /// The CRC did not match. Nothing was written.
-    CrcMismatch {
-        /// The CRC the GPU computed.
-        crc: u64,
-    },
+    /// The GCM tag matched and the plaintext was written.
+    Passed,
 
     /// The tag did not match. Nothing was written.
-    TagMismatch {
-        /// The CRC the GPU computed.
-        crc: u64,
-    },
+    TagMismatch,
 
     /// Verification did not run (a launch failed). Nothing was written.
     NotRun,
@@ -924,8 +909,7 @@ impl Stream {
         let raw = RawDecrypt {
             key: *request.key,
             nonce: *request.nonce,
-            check_crc: request.expected_crc.is_some() as u32,
-            expected_crc: request.expected_crc.unwrap_or(0),
+            reserved: 0,
             length: request.length,
             aad: request.aad.as_ptr(),
             aad_length: request.aad.len() as u64,
@@ -959,9 +943,8 @@ impl Stream {
         self.shared()
             .check(unsafe { (self.shared().api.verdict)(self.raw.as_ptr(), &mut raw) })?;
         Ok(match raw.status {
-            gcm::VERDICT_PASS => Verdict::Passed { crc: raw.crc },
-            gcm::VERDICT_CRC => Verdict::CrcMismatch { crc: raw.crc },
-            gcm::VERDICT_TAG => Verdict::TagMismatch { crc: raw.crc },
+            gcm::VERDICT_PASS => Verdict::Passed,
+            gcm::VERDICT_TAG => Verdict::TagMismatch,
             _ => Verdict::NotRun,
         })
     }

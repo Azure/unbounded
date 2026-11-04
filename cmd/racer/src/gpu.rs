@@ -60,7 +60,7 @@
 //! request on another GPU first copies the ciphertext into its own scratch
 //! slot 0: over NVLink or PCIe peer-to-peer when [`GpuHelper::peers`] allows
 //! it (`RACER_GPU_PEER=auto`), otherwise, or after a failed peer copy, by
-//! bouncing it through host memory. Each GPU still verifies the CRC and tag
+//! bouncing it through host memory. Each GPU still verifies the tag
 //! itself. A failed peer copy turns that GPU pair off for the life of the
 //! process. The job holds the source `Arc` until it has synchronized, so the
 //! source slot is never reused while a copy may read it.
@@ -371,7 +371,7 @@ pub struct GpuCounters {
     /// Sealed pages the GPU verified and wrote.
     pub decrypted: AtomicU64,
 
-    /// Sealed pages the GPU rejected (CRC or tag mismatch).
+    /// Sealed pages the GPU rejected (tag mismatch).
     pub rejected: AtomicU64,
 
     /// Pages cuFile read straight into staging.
@@ -1321,7 +1321,6 @@ fn probe_decrypt(context: &racer_gpu::Context) -> bool {
         nonce: &[0; 12],
         aad: &[],
         length: 0,
-        expected_crc: None,
     };
     let queued = stream.decrypt(
         &request,
@@ -1907,7 +1906,6 @@ impl Helper {
             nonce: page.key.nonce(),
             aad: &page.aad,
             length,
-            expected_crc: page.expected_crc,
         };
         // A whole page decrypts straight into the import. Part of a page
         // decrypts into scratch first, because the tag covers the whole page
@@ -1928,8 +1926,8 @@ impl Helper {
         }
         queued.and(synchronized).map_err(gpu_error)?;
         match stream.verdict().map_err(gpu_error)? {
-            racer_gpu::Verdict::Passed { .. } => {}
-            racer_gpu::Verdict::CrcMismatch { .. } | racer_gpu::Verdict::TagMismatch { .. } => {
+            racer_gpu::Verdict::Passed => {}
+            racer_gpu::Verdict::TagMismatch => {
                 self.state.counters.rejected.fetch_add(1, Ordering::Relaxed);
                 return Err(Error::CorruptRecord);
             }
@@ -2283,7 +2281,6 @@ mod tests {
                 metadata,
                 aad,
                 key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
-                expected_crc: None,
                 source,
                 envelope,
             });

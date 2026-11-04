@@ -51,13 +51,12 @@ fn page(length: usize) -> Page {
 
 impl Page {
     /// The GPU request.
-    fn request(&self, expected_crc: Option<u64>) -> DecryptRequest<'_> {
+    fn request(&self) -> DecryptRequest<'_> {
         DecryptRequest {
             key: self.derived.key(),
             nonce: self.derived.nonce(),
             aad: &self.aad,
             length: self.plaintext.len() as u64,
-            expected_crc,
         }
     }
 }
@@ -169,7 +168,7 @@ fn import_rejects_out_of_window_and_wrong_device() {
 
 #[test]
 /// Ciphertext staged on the GPU decrypts into the client window; tampered
-/// pages and wrong CRCs leave it untouched.
+/// pages leave it untouched.
 fn decrypt_into_import_verifies_before_writing() {
     let sim = simulation();
     let _env = sim.enter();
@@ -182,7 +181,6 @@ fn decrypt_into_import_verifies_before_writing() {
     let staging = ctx.staging(8192).unwrap();
     let stream = ctx.stream().unwrap();
     let page = page(5000);
-    let crc = racer_crypto::crc64(&page.sealed);
     let dst = Destination::Import(&import);
 
     assert_eq!(stream.verdict(), Err(Error::Busy));
@@ -190,15 +188,15 @@ fn decrypt_into_import_verifies_before_writing() {
         .copy_from_host(Destination::Staging(&staging), 16, page.sealed.clone())
         .unwrap();
     stream
-        .decrypt(&page.request(Some(crc)), &staging, 16, dst, 64)
+        .decrypt(&page.request(), &staging, 16, dst, 64)
         .unwrap();
     // One decrypt per synchronize.
     assert_eq!(
-        stream.decrypt(&page.request(None), &staging, 16, dst, 64),
+        stream.decrypt(&page.request(), &staging, 16, dst, 64),
         Err(Error::Busy)
     );
     stream.synchronize().unwrap();
-    assert_eq!(stream.verdict(), Ok(Verdict::Passed { crc }));
+    assert_eq!(stream.verdict(), Ok(Verdict::Passed));
     assert_eq!(stream.verdict(), Err(Error::Busy));
     assert_eq!(read_allocation(&client, 64, 5000), page.plaintext);
 
@@ -208,41 +206,35 @@ fn decrypt_into_import_verifies_before_writing() {
         .import(client2.try_clone().unwrap(), GRANULARITY, 0..5000)
         .unwrap();
     let dst2 = Destination::Import(&import2);
-    stream
-        .decrypt(&page.request(Some(crc ^ 1)), &staging, 16, dst2, 0)
-        .unwrap();
-    stream.synchronize().unwrap();
-    assert_eq!(stream.verdict(), Ok(Verdict::CrcMismatch { crc }));
-
     let mut tampered = page.sealed.clone();
     tampered[4999] ^= 1;
     stream
         .copy_from_host(Destination::Staging(&staging), 16, tampered)
         .unwrap();
     stream
-        .decrypt(&page.request(None), &staging, 16, dst2, 0)
+        .decrypt(&page.request(), &staging, 16, dst2, 0)
         .unwrap();
     stream.synchronize().unwrap();
-    assert!(matches!(stream.verdict(), Ok(Verdict::TagMismatch { .. })));
+    assert!(matches!(stream.verdict(), Ok(Verdict::TagMismatch)));
     assert!(read_allocation(&client2, 0, 5000).iter().all(|&b| b == 0));
 
     // Out-of-window destination and out-of-range source are refused.
     assert_eq!(
-        stream.decrypt(&page.request(None), &staging, 16, dst2, 1),
+        stream.decrypt(&page.request(), &staging, 16, dst2, 1),
         Err(Error::InvalidRange)
     );
     assert_eq!(
-        stream.decrypt(&page.request(None), &staging, 8192 - 5000, dst2, 0),
+        stream.decrypt(&page.request(), &staging, 8192 - 5000, dst2, 0),
         Err(Error::InvalidRange)
     );
-    let mut big = page.request(None);
+    let mut big = page.request();
     big.length = racer_gpu::MAX_DECRYPT + 1;
     assert_eq!(
         stream.decrypt(&big, &staging, 0, dst2, 0),
         Err(Error::InvalidRequest)
     );
     let long_aad = vec![0; racer_gpu::MAX_AAD + 1];
-    let mut long = page.request(None);
+    let mut long = page.request();
     long.aad = &long_aad;
     assert_eq!(
         stream.decrypt(&long, &staging, 0, dst2, 0),
@@ -263,13 +255,7 @@ fn decrypt_without_kernels_is_unavailable() {
     let stream = ctx.stream().unwrap();
     let page = page(16);
     assert_eq!(
-        stream.decrypt(
-            &page.request(None),
-            &staging,
-            0,
-            Destination::Staging(&out),
-            0
-        ),
+        stream.decrypt(&page.request(), &staging, 0, Destination::Staging(&out), 0),
         Err(Error::KernelUnavailable)
     );
 }

@@ -1269,8 +1269,6 @@ impl Fill {
         let sealed = Box::new(super::sealed::SealedPage {
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
-            // No host bytes to checksum: the GPU checks the AEAD tag.
-            expected_crc: None,
             metadata,
             envelope,
             source: super::sealed::SealedSource::Landed(Arc::new(landed)),
@@ -1288,7 +1286,6 @@ impl Fill {
             metadata: copy.copy.metadata.clone(),
             aad: crate::security::page_aad(&envelope)?,
             key: self.dependencies.crypto.derive_page_key(&envelope)?,
-            expected_crc: copy.copy.ciphertext.cached_checksum(),
             envelope,
             source: super::sealed::SealedSource::Host(copy),
         });
@@ -1355,7 +1352,6 @@ impl Fill {
         let crate::store::DirectRecord {
             token,
             metadata,
-            checksum,
             lease,
             ..
         } = record;
@@ -1370,7 +1366,6 @@ impl Fill {
             envelope,
             aad,
             key,
-            expected_crc: Some(checksum),
             source: super::sealed::SealedSource::Staged {
                 staged: Arc::new(staged),
                 token,

@@ -5,7 +5,7 @@
 //! ciphertext into GPU staging with cuFile, or had a peer land it in GPU
 //! memory, a concurrent sealed fetch for the same GPU, or for a GPU that can
 //! copy from it over a peer path, reuses that ciphertext instead of fetching
-//! it again. Each GPU still checks the CRC and the AEAD tag and decrypts by
+//! it again. Each GPU still checks the AEAD tag and decrypts by
 //! itself: only ciphertext is shared.
 //!
 //! The table never keeps GPU memory alive. It holds weak references, so a
@@ -59,7 +59,6 @@ struct Facts {
     metadata: ObjectMetadata,
     envelope: PageEnvelope,
     aad: Vec<u8>,
-    expected_crc: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -102,7 +101,6 @@ impl SharedCopy {
                 metadata: sealed.metadata.clone(),
                 envelope: sealed.envelope.clone(),
                 aad: sealed.aad.clone(),
-                expected_crc: sealed.expected_crc,
             }),
             held,
         })
@@ -124,7 +122,6 @@ impl SharedCopy {
             envelope: facts.envelope.clone(),
             aad: facts.aad.clone(),
             key: crypto.derive_page_key(&facts.envelope)?,
-            expected_crc: facts.expected_crc,
             source: match &self.held {
                 Held::Staged { staged, token } => SealedSource::Staged {
                     staged: staged.clone(),
@@ -554,7 +551,6 @@ mod tests {
                     ciphertext_length: 17,
                 },
                 aad: vec![],
-                expected_crc: None,
             }),
             held: Held::Landed(landed.clone()),
         };

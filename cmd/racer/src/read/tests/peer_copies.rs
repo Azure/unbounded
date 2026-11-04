@@ -3199,7 +3199,6 @@ mod landing {
             panic!("expected a sealed page");
         };
         assert!(matches!(sealed.source, SealedSource::Landed(_)));
-        assert!(sealed.expected_crc.is_none());
         // One landing request to the first provider, none through the script.
         assert_eq!(l.asked.get(), 1);
         assert!(l.peers.calls.borrow().is_empty());
