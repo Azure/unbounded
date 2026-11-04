@@ -896,12 +896,6 @@ jobs:
             file: images/racer/Containerfile
             arch: arm64
             runner: ubuntu-24.04-arm
-          # Built natively on the target platform since the Rust rewrite, so
-          # arm64 no longer shares the amd64 build path.
-          - name: racer-object
-            file: images/racer-object/Containerfile
-            arch: arm64
-            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
