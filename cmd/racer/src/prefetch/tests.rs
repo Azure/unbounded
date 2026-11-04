@@ -754,27 +754,86 @@ fn owner_promotion_releases_the_prefetch_slot() {
         number: crate::model::PageNumber(1),
         ..page.clone()
     };
-    assert!(
-        prefetch
-            .owner_admit_for_test(&page, Priority::High)
-            .is_none()
-    );
+    let held = prefetch.owner_admit_for_test(&page, Priority::High);
+    assert!(held.is_ok());
     assert_eq!(prefetch.active_fills(), 1);
     // A second fill is deferred while the slot is held.
     assert!(
         prefetch
             .owner_admit_for_test(&other, Priority::High)
-            .is_some()
+            .is_err()
     );
     // Demand joins the prefetch flight and promotes it out of the budget.
     assert!(prefetch.promote(&page));
     assert!(!prefetch.promote(&page));
     assert_eq!(prefetch.active_fills(), 0);
+    let other_fill = prefetch.owner_admit_for_test(&other, Priority::High);
+    assert!(other_fill.is_ok());
+    drop((held, other_fill));
+    assert_eq!(prefetch.active_fills(), 0);
+    assert_eq!(prefetch.filling_for_test(), 0);
+}
+
+/// Dropping an owner fill (for example a cancelled `serve_fill` future)
+/// releases its slot and bookkeeping; a joined admission of the same page
+/// keeps the slot until it is dropped too.
+#[test]
+fn owner_fill_slot_is_released_on_drop_and_refcounted() {
+    let prefetch = super::service::Prefetch::new();
+    prefetch
+        .configure(Config {
+            concurrent_fills: 1,
+            ..Config::default()
+        })
+        .unwrap();
+    let page = crate::model::PageId {
+        version: version(KEY_A, "a1").version,
+        number: crate::model::PageNumber(0),
+    };
+    let other = crate::model::PageId {
+        number: crate::model::PageNumber(1),
+        ..page.clone()
+    };
+    let first = prefetch
+        .owner_admit_for_test(&page, Priority::High)
+        .ok()
+        .unwrap();
+    let second = prefetch
+        .owner_admit_for_test(&page, Priority::Low)
+        .ok()
+        .unwrap();
+    drop(first);
+    // The joined admission still holds the only slot.
+    assert_eq!(prefetch.active_fills(), 1);
     assert!(
         prefetch
             .owner_admit_for_test(&other, Priority::High)
-            .is_none()
+            .is_err()
     );
+    drop(second);
+    assert_eq!(prefetch.active_fills(), 0);
+    assert_eq!(prefetch.filling_for_test(), 0);
+    // A fill future dropped mid-flight releases its slot.
+    let fill = async {
+        let _fill = prefetch.owner_admit_for_test(&other, Priority::High);
+        std::future::pending::<()>().await;
+    };
+    let mut fill = Box::pin(fill);
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    assert!(fill.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(prefetch.active_fills(), 1);
+    drop(fill);
+    assert_eq!(prefetch.active_fills(), 0);
+    assert_eq!(prefetch.filling_for_test(), 0);
+}
+
+/// A long-poll keeps one waker however often it is polled, and removes it
+/// when it ends.
+#[test]
+fn status_waiters_are_deduplicated_and_removed() {
+    let prefetch = super::service::Prefetch::new();
+    let waker = futures::task::noop_waker();
+    assert_eq!(prefetch.wait_for_test(&waker, 100), 1);
 }
 
 #[test]

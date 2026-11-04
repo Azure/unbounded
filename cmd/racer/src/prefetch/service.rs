@@ -20,7 +20,7 @@ use crate::topology::Membership;
 use futures::StreamExt;
 use http1::MessageHead;
 use racer_control_wire::{CacheId, NodeId};
-use racer_core::prefetch::{Deferral, FailCode, OwnerBudget, PageResult};
+use racer_core::prefetch::{Deferral, FailCode, OwnerBudget, OwnerLease, PageResult};
 use racer_object_wire::prefetch::{ErrorCode, PrefetchError, PrefetchRequest, StatusQuery};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -42,6 +42,60 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Concurrent version resolutions per PUT.
 const RESOLVE_CONCURRENCY: usize = 16;
 
+/// Status long-poll wakers, one per waiting request: a poll replaces its own
+/// entry instead of adding another, and a finished wait removes it.
+#[derive(Default)]
+struct Waiters {
+    next: u64,
+    wakers: HashMap<u64, Waker>,
+}
+
+/// One status long-poll's place in [`Prefetch::waiters`]; removed on drop.
+struct Waiter<'a> {
+    prefetch: &'a Prefetch,
+    id: u64,
+}
+
+impl Waiter<'_> {
+    fn register(&self, waker: &Waker) {
+        let mut waiters = self.prefetch.waiters.lock().unwrap();
+        match waiters.wakers.get_mut(&self.id) {
+            Some(current) if current.will_wake(waker) => {}
+            Some(current) => current.clone_from(waker),
+            None => {
+                waiters.wakers.insert(self.id, waker.clone());
+            }
+        }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.prefetch
+            .waiters
+            .lock()
+            .unwrap()
+            .wakers
+            .remove(&self.id);
+    }
+}
+
+/// One owner fill admission. Dropping it, including with a cancelled fill
+/// future, returns the reference so the slot and its bookkeeping are released.
+pub(crate) struct OwnerFill<'a> {
+    prefetch: &'a Prefetch,
+    page: PageId,
+    lease: Option<OwnerLease>,
+}
+
+impl Drop for OwnerFill<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.prefetch.owner_finish(&self.page, lease);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pump {
     running: bool,
@@ -59,7 +113,7 @@ pub struct Prefetch {
     draining: AtomicBool,
     pump: Mutex<Pump>,
     kicked: AtomicBool,
-    waiters: Mutex<Vec<Waker>>,
+    waiters: Mutex<Waiters>,
     next_wake: Mutex<Option<Instant>>,
     metrics: OnceLock<Arc<PrefetchMetrics>>,
 }
@@ -94,7 +148,7 @@ impl Prefetch {
             draining: AtomicBool::new(false),
             pump: Mutex::new(Pump::default()),
             kicked: AtomicBool::new(false),
-            waiters: Mutex::new(Vec::new()),
+            waiters: Mutex::new(Waiters::default()),
             next_wake: Mutex::new(None),
             metrics: OnceLock::new(),
         }
@@ -144,8 +198,18 @@ impl Prefetch {
     }
 
     fn wake_waiters(&self) {
-        for waker in std::mem::take(&mut *self.waiters.lock().unwrap()) {
+        let wakers = std::mem::take(&mut self.waiters.lock().unwrap().wakers);
+        for waker in wakers.into_values() {
             waker.wake();
+        }
+    }
+
+    fn waiter(&self) -> Waiter<'_> {
+        let mut waiters = self.waiters.lock().unwrap();
+        waiters.next += 1;
+        Waiter {
+            prefetch: self,
+            id: waiters.next,
         }
     }
 
@@ -239,11 +303,37 @@ impl Prefetch {
     }
 
     /// Owner admission for one page fill.
-    fn owner_admit(&self, page: &PageId, bytes: u64, priority: Priority) -> Option<PageResult> {
-        match self.owner.lock().unwrap().admit(page.clone(), bytes, now()) {
-            Ok(()) => {
-                self.filling.lock().unwrap().insert(page.clone(), priority);
-                None
+    fn owner_admit(
+        &self,
+        page: &PageId,
+        bytes: u64,
+        priority: Priority,
+    ) -> std::result::Result<OwnerFill<'_>, PageResult> {
+        let now = now();
+        let mut owner = self.owner.lock().unwrap();
+        let expired = owner.expire(now);
+        let admitted = owner.admit(page.clone(), bytes, now);
+        drop(owner);
+        if !expired.is_empty() {
+            let mut filling = self.filling.lock().unwrap();
+            let mut promoted = self.promoted.lock().unwrap();
+            for page in &expired {
+                filling.remove(page);
+                promoted.remove(page);
+            }
+        }
+        match admitted {
+            Ok(lease) => {
+                self.filling
+                    .lock()
+                    .unwrap()
+                    .entry(page.clone())
+                    .or_insert(priority);
+                Ok(OwnerFill {
+                    prefetch: self,
+                    page: page.clone(),
+                    lease: Some(lease),
+                })
             }
             Err((why, wait)) => {
                 if let Some(metrics) = self.metrics()
@@ -251,15 +341,22 @@ impl Prefetch {
                 {
                     metrics.throttled(priority, wait);
                 }
-                Some(PageResult::Deferred {
+                Err(PageResult::Deferred {
                     retry_after_ms: wait.as_millis().clamp(1, u128::from(u32::MAX)) as u32,
                 })
             }
         }
     }
 
-    fn owner_finish(&self, page: &PageId) {
-        self.owner.lock().unwrap().finish(page);
+    fn owner_finish(&self, page: &PageId, lease: OwnerLease) {
+        let mut owner = self.owner.lock().unwrap();
+        owner.finish(page, lease);
+        let held = owner.holds(page);
+        drop(owner);
+        // Another admission still references this fill.
+        if held {
+            return;
+        }
         self.filling.lock().unwrap().remove(page);
         if let Some((priority, at)) = self.promoted.lock().unwrap().remove(page)
             && let Some(metrics) = self.metrics()
@@ -303,8 +400,24 @@ impl Prefetch {
         &self,
         page: &PageId,
         priority: Priority,
-    ) -> Option<PageResult> {
+    ) -> std::result::Result<OwnerFill<'_>, PageResult> {
         self.owner_admit(page, PAGE_BYTES, priority)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn filling_for_test(&self) -> usize {
+        self.filling.lock().unwrap().len() + self.promoted.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_test(&self, waker: &Waker, polls: usize) -> usize {
+        let waiter = self.waiter();
+        for _ in 0..polls {
+            waiter.register(waker);
+        }
+        let during = self.waiters.lock().unwrap().wakers.len();
+        drop(waiter);
+        during + self.waiters.lock().unwrap().wakers.len()
     }
 }
 
@@ -413,15 +526,15 @@ pub(crate) async fn serve_fill(
                 Ok(false) => {}
                 Err(error) => return PageResult::Failed(fail_code(error)),
             }
-            if let Some(deferred) =
-                prefetch.owner_admit(&page, page_length(metadata.length, number), priority)
-            {
-                return deferred;
-            }
+            // Held across the fill: dropping this future releases the slot too.
+            let _fill =
+                match prefetch.owner_admit(&page, page_length(metadata.length, number), priority) {
+                    Ok(fill) => fill,
+                    Err(deferred) => return deferred,
+                };
             let result = directory
                 .prefetch_page(page.clone(), metadata.clone(), membership, context, scope)
                 .await;
-            prefetch.owner_finish(&page);
             result.unwrap_or_else(|error| PageResult::Failed(fail_code(error)))
         }
     });
@@ -963,11 +1076,12 @@ async fn get(
         let until = now() + wait;
         prefetch.wake_at(until);
         let cancellation = scope.cancellation.subscribe().ok();
+        let waiter = prefetch.waiter();
         std::future::poll_fn(|cx| {
             if let Some(cancellation) = &cancellation {
                 cancellation.register(cx.waker());
             }
-            prefetch.waiters.lock().unwrap().push(cx.waker().clone());
+            waiter.register(cx.waker());
             let settled = prefetch
                 .registry
                 .lock()
