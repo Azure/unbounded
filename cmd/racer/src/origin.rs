@@ -3,6 +3,10 @@
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
+pub mod azure;
+pub mod azure_auth;
+pub mod router;
+
 use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::control::Snapshot;

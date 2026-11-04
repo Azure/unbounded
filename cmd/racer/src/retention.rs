@@ -695,6 +695,7 @@ mod tests {
             origin_socket: "/origin".into(),
             priority,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         };
         // "u" holds payload but is unpublished; "e" is published but empty.
         let _held = [
@@ -744,6 +745,7 @@ mod tests {
             origin_socket: "/origin".into(),
             priority,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         };
         // Reference: a fresh full count over the current resident set.
         let check = |policy: &Retention| {
@@ -837,6 +839,7 @@ mod tests {
             origin_socket: "/origin".into(),
             priority,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         };
         const CACHES: usize = 2000;
         const LIMIT: usize = 64;

@@ -297,6 +297,7 @@ impl Availability {
                                 origin_socket,
                                 priority: racer_control_wire::DEFAULT_PRIORITY,
                                 mode,
+                                origin: None,
                             }
                         })
                         .collect(),

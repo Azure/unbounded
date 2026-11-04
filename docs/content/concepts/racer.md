@@ -39,7 +39,7 @@ another fetch.
   rollout to a thousand nodes reads each page from the source a few times at
   most in normal operation, not a thousand times.
 - **Any source.** Racer reads from any store you can write an origin for.
-  Ready-made origins read S3, S3-compatible stores, Azure Blob Storage, and
+  Racer reads Azure Blob Storage itself, and Gantry supplies an origin for
   OCI registries. Racer runs on Linux nodes in any cloud, on-premises, or at
   the edge.
 - **No code changes for most apps.** The
@@ -75,7 +75,7 @@ scale with the cluster instead of running a separate cache tier.
 |----------|----------------|
 | Scale-out of a large job, such as hundreds of inference replicas loading the same model | Source reads depend on the number of pages, not the number of nodes. Serving bandwidth grows with each node that joins, so the cache does not become the bottleneck as the job grows. |
 | GPU or storage-dense nodes with unused local NVMe | Racer turns local disk you already pay for into shared cache. You need no extra machines. |
-| Hybrid, multi-cloud, or edge clusters | The same DaemonSet and API work on every Linux node in the cluster. S3-compatible support covers on-premises object stores. Nothing depends on one cloud's managed services. |
+| Hybrid, multi-cloud, or edge clusters | The same DaemonSet and API work on every Linux node in the cluster. Other stores, such as on-premises object stores, can use an origin written with the Racer SDK. Nothing depends on one cloud's managed services. |
 | Internal or custom data sources | An origin answers two requests, HEAD and GET, through the Go SDK. A new source needs a small adapter, not a new cache product. |
 | Rate-limited, throttled, or costly sources | Only page owners read from the source, and Racer does not silently send reads to the source when the cache fails. Source load stays bounded during both rollouts and failures. |
 | Data that must stay encrypted and verified | Pages are encrypted on node disks and on the wire, and a read only completes if every page passed checks. |

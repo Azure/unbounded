@@ -249,6 +249,7 @@ mod tests {
             origin_socket: o,
             priority: wire::DEFAULT_PRIORITY,
             mode: wire::CacheMode::Cached,
+            origin: None,
         }
     }
 

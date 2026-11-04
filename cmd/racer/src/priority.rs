@@ -189,6 +189,7 @@ mod tests {
             origin_socket: "/origin".into(),
             priority,
             mode: racer_control_wire::CacheMode::Cached,
+            origin: None,
         }
     }
 

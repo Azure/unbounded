@@ -81,7 +81,6 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		})},
 		"default":           {"origin": azureCredential(map[string]any{"default": map[string]any{}})},
 		"default client":    {"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID}})},
-		"default secret":    {"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "azure"}}})},
 		"workload identity": {"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": testClientID}})},
 		"tuning": {"origin": withOrigin(func(o map[string]any) {
 			o["metadataTTL"] = "0s"
@@ -157,12 +156,12 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		"http workload": {map[string]any{"origin": withOrigin(func(o map[string]any) {
 			o["azure"] = map[string]any{"containerURL": "http://account/models", "credential": map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID}}}
 		})}, "containerURL must use https"},
-		"client and secret":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "clientID and secretRef are mutually exclusive"},
-		"malformed secret name": {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "bad/name"}}})}, "name"},
-		"empty secret name":     {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": ""}}})}, "name"},
-		"bad default client":    {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
-		"workload no client":    {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
-		"workload bad tenant":   {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
+		"bad default client":      {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": "not-a-uuid"}})}, "clientID"},
+		"named secretRef":         {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{"name": "azure"}}})}, "secretRef is no longer supported; use clientID or workloadIdentity"},
+		"empty secretRef":         {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"secretRef": map[string]any{}}})}, "secretRef is no longer supported; use clientID or workloadIdentity"},
+		"secretRef with clientID": {map[string]any{"origin": azureCredential(map[string]any{"default": map[string]any{"clientID": testClientID, "secretRef": map[string]any{"name": "azure"}}})}, "secretRef is no longer supported; use clientID or workloadIdentity"},
+		"workload no client":      {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{}})}, "clientID"},
+		"workload bad tenant":     {map[string]any{"origin": azureCredential(map[string]any{"workloadIdentity": map[string]any{"clientID": testClientID, "tenantID": "tenant"}})}, "tenantID"},
 	}
 	for name, tc := range invalid {
 		t.Run("rejects "+name, func(t *testing.T) {

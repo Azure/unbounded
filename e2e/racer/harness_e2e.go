@@ -438,7 +438,6 @@ func (h *harness) dumpDiagnostics(namespaces ...string) {
 		// Metadata only: racer-state holds key material and must not be logged.
 		{"-n", operatorNamespace, "get", "secret", racerStateSecret, "-o", "jsonpath={.metadata.uid} {.metadata.resourceVersion}"},
 		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer", "--all-containers", "--tail=200", "--prefix"},
-		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer-origin", "--all-containers", "--tail=200", "--prefix"},
 		{"get", "sites", "-o", "yaml"},
 		{"-n", operatorNamespace, "get", "ds/gantry", "cm/gantry-config", "-o", "yaml"},
 		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=gantry", "--all-containers", "--tail=200", "--prefix"},

@@ -90,6 +90,7 @@ impl Control {
                             origin_socket,
                             priority: racer_control_wire::DEFAULT_PRIORITY,
                             mode: racer_control_wire::CacheMode::Cached,
+                            origin: None,
                         }
                     })
                     .collect(),
