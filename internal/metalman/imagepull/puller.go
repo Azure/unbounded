@@ -152,6 +152,13 @@ type Puller struct {
 	// MirrorBlobHeaderTimeout bounds each mirror blob request until
 	// response headers arrive. Zero means DefaultMirrorBlobHeaderTimeout;
 	// negative disables the bound.
+	//
+	// When the caller's context has a deadline, this and the other mirror
+	// timeouts are further capped at half of the time remaining when each
+	// mirror request starts, so that a stalled mirror always leaves the
+	// upstream fallback the other half, even when the caller's budget is
+	// shorter than the configured timeout. This cap applies even when a
+	// timeout is disabled.
 	MirrorBlobHeaderTimeout time.Duration
 	// MirrorIdleTimeout bounds how long a mirror response body may stall
 	// without delivering bytes. When it expires the read fails and blob
@@ -402,6 +409,15 @@ func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		header = t.blobHeader
 	}
 
+	idle := t.idle
+
+	// Reserve part of the caller's remaining budget for the upstream
+	// fallback: a mirror attempt may use at most half of it.
+	if limit, ok := mirrorBudget(req.Context()); ok {
+		header = capDuration(header, limit)
+		idle = capDuration(idle, limit)
+	}
+
 	ctx, cancel := context.WithCancelCause(req.Context())
 
 	var timer *time.Timer
@@ -434,9 +450,32 @@ func (t *timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return nil, err
 	}
 
-	resp.Body = newIdleBody(resp.Body, ctx, cancel, t.idle)
+	resp.Body = newIdleBody(resp.Body, ctx, cancel, idle)
 
 	return resp, nil
+}
+
+// mirrorBudget returns the longest a single mirror attempt may wait for
+// headers or stall mid-body under ctx: half the time left before its
+// deadline, so the upstream registry always keeps the other half. ok is
+// false when ctx has no deadline.
+func mirrorBudget(ctx context.Context) (limit time.Duration, ok bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0, false
+	}
+
+	return max(time.Until(deadline)/2, time.Millisecond), true
+}
+
+// capDuration returns d bounded by limit. A non-positive d (no bound) is
+// replaced by limit.
+func capDuration(d, limit time.Duration) time.Duration {
+	if d <= 0 || d > limit {
+		return limit
+	}
+
+	return d
 }
 
 // idleBody cancels its request when no Read completes within the idle

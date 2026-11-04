@@ -61,7 +61,10 @@
 // leaves time for the upstream registry: Puller.MirrorManifestTimeout and
 // Puller.MirrorBlobHeaderTimeout bound the wait for response headers, and
 // Puller.MirrorIdleTimeout bounds a stalled response body, after which the
-// download resumes from the upstream registry. Credentials are sent to the
+// download resumes from the upstream registry. When the caller's context
+// has a deadline, each of these bounds is also capped at half of the time
+// remaining when the mirror request starts, so the upstream fallback always
+// keeps the other half of the caller's budget. Credentials are sent to the
 // mirror too (see Puller.Mirror).
 //
 // # Integrity

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -631,4 +632,69 @@ func TestTemplateRejectsChangedBytesAfterIndexing(t *testing.T) {
 	_, err = readTemplateFile(file)
 	require.ErrorIs(t, err, imagepull.ErrDigestMismatch)
 	require.ErrorIs(t, err, ErrImageUnavailable)
+}
+
+// mirrorPassthroughTransport sends requests for the mirror host unchanged
+// and every other request to the in-memory registry.
+type mirrorPassthroughTransport struct {
+	mirror   string
+	upstream *redirectTransport
+}
+
+func (rt *mirrorPassthroughTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == rt.mirror {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+
+	return rt.upstream.RoundTrip(req)
+}
+
+// A mirror that stalls before sending headers must not consume the whole
+// metadata fetch budget: with the default mirror timeouts (minutes), a
+// fetch budget shorter than those timeouts still resolves metadata from the
+// upstream registry.
+func TestMetadataMemoFallsBackWhenMirrorStalls(t *testing.T) {
+	images := newTestImages(t)
+	images.Push(t, "ghcr.io/test/netboot:v1", map[string][]byte{"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\n")})
+
+	done := make(chan struct{})
+
+	var stalls atomic.Int32
+
+	mirror := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		stalls.Add(1)
+
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+
+	t.Cleanup(func() {
+		close(done)
+		mirror.Close()
+	})
+
+	mirrorURL, err := url.Parse(mirror.URL)
+	require.NoError(t, err)
+
+	puller := &imagepull.Puller{
+		Mirror: mirror.URL,
+		HTTPClient: &http.Client{Transport: &mirrorPassthroughTransport{
+			mirror:   mirrorURL.Host,
+			upstream: &redirectTransport{host: images.Registry.Host()},
+		}},
+	}
+
+	// A scaled-down stand-in for DefaultMetadataFetchTimeout.
+	resolver := &FileResolver{Puller: puller, Metadata: &MetadataMemo{FetchTimeout: 4 * time.Second}}
+
+	// Resolve by digest so the manifest and blobs go through the mirror.
+	tagged, err := (&imagepull.Puller{HTTPClient: images.Puller.HTTPClient}).Resolve(t.Context(), imagepull.Source{Ref: "ghcr.io/test/netboot:v1"})
+	require.NoError(t, err)
+
+	meta, err := resolver.ImageMetadata(t.Context(), ImageSource{Ref: "ghcr.io/test/netboot@" + tagged.Digest()})
+	require.NoError(t, err)
+	require.Equal(t, "shimx64.efi", meta.DHCPBootImageName)
+	require.Positive(t, stalls.Load(), "mirror never stalled")
 }

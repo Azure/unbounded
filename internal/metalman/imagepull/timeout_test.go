@@ -239,3 +239,50 @@ func TestMirrorIdleTimeoutIgnoresSlowConsumer(t *testing.T) {
 		}
 	}
 }
+
+// With the production mirror timeouts (minutes), a caller deadline shorter
+// than those timeouts must still leave time for the upstream fallback.
+func TestMirrorTimeoutsCappedByCallerDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode stallMode
+	}{
+		{"manifest headers stall", stallManifestHeaders},
+		{"blob headers stall", stallBlobHeaders},
+		{"blob body stall", stallBlobBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := ipt.NewRegistry(t)
+			ref, content, _ := pushBigUncompressed(t, upstream, 16*1024)
+			mirror, stalls, _ := stallingMirror(t, upstream, tc.mode)
+
+			// Default timeouts: 30s manifest, 5m blob headers, 1m idle.
+			p := &imagepull.Puller{Mirror: mirror.URL, ChunkSize: 4096, Concurrency: 1}
+
+			tagged := resolve(t, &imagepull.Puller{}, imagepull.Source{Ref: ref})
+
+			// A scaled-down stand-in for netboot's one-minute metadata
+			// deadline, far shorter than the default mirror timeouts.
+			ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+			defer cancel()
+
+			img, err := p.Resolve(ctx, imagepull.Source{Ref: digestRef(ref, tagged.Digest())})
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+
+			data, _, err := img.ReadFile(ctx, "disk/big")
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+
+			if !bytes.Equal(data, content) {
+				t.Fatal("content mismatch")
+			}
+
+			if stalls.Load() == 0 {
+				t.Fatal("mirror never stalled")
+			}
+		})
+	}
+}

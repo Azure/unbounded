@@ -17,8 +17,8 @@ const (
 	DefaultMetadataTTL = time.Minute
 	// DefaultMetadataErrorTTL is how long a failed metadata lookup is reused.
 	DefaultMetadataErrorTTL = 5 * time.Second
-	// metadataFetchTimeout bounds one shared metadata fetch.
-	metadataFetchTimeout = time.Minute
+	// DefaultMetadataFetchTimeout bounds one shared metadata fetch.
+	DefaultMetadataFetchTimeout = time.Minute
 )
 
 // MetadataMemo memoizes parsed disk/metadata.yaml for a short time.
@@ -40,6 +40,11 @@ type MetadataMemo struct {
 	// ErrorTTL is how long a failed lookup is reused. Zero means
 	// DefaultMetadataErrorTTL; a negative value disables error memoization.
 	ErrorTTL time.Duration
+	// FetchTimeout bounds one shared metadata fetch. Zero or less means
+	// DefaultMetadataFetchTimeout. An imagepull.Puller with a mirror caps
+	// each mirror attempt at half of the remaining budget, so a stalled
+	// mirror still leaves time for the upstream registry.
+	FetchTimeout time.Duration
 	// Now returns the current time. Nil means time.Now.
 	Now func() time.Time
 
@@ -84,6 +89,14 @@ func (m *MetadataMemo) now() time.Time {
 	return time.Now()
 }
 
+func (m *MetadataMemo) fetchTimeout() time.Duration {
+	if m.FetchTimeout > 0 {
+		return m.FetchTimeout
+	}
+
+	return DefaultMetadataFetchTimeout
+}
+
 // ttl returns how long a lookup result is reused. Failures and images without
 // metadata.yaml use ErrorTTL, so a newly pushed metadata.yaml is seen quickly.
 func (m *MetadataMemo) ttl(meta *ImageMetadata, err error) time.Duration {
@@ -117,7 +130,7 @@ func (m *MetadataMemo) get(ctx context.Context, src ImageSource, fetch func(cont
 	// The shared fetch must not be canceled when the first caller goes away,
 	// since other callers may be waiting on it.
 	ch := m.group.DoChan(key.flightKey(), func() (any, error) {
-		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metadataFetchTimeout)
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.fetchTimeout())
 		defer cancel()
 
 		meta, err := fetch(fetchCtx, src)
