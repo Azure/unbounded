@@ -73,24 +73,25 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Cache golangci-lint analysis
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/golangci-lint
-          key: golangci-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yaml') }}
-          restore-keys: |
-            golangci-${{ runner.os }}-
+          profile: lint
+          extra-build-paths: ~/.cache/golangci-lint
 
       - name: Install tools
         run: make install-tools
 
       - name: Lint
         run: make lint
+
+      - name: Save Go caches
+        if: success() && github.event_name == 'push'
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: lint
+          save-build-cache: "true"
+          save-mod-cache: "false"
 
   # ---------- Test ----------
   test:
@@ -108,10 +109,9 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: race
 
       - name: Verify go.mod tidy
         run: |
@@ -133,6 +133,15 @@ jobs:
           path: coverage.out
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Save Go caches
+        if: success() && github.event_name == 'push'
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: race
+          save-build-cache: "true"
+          save-mod-cache: "false"
 
   # ---------- Racer Rust workspace ----------
   # Lint, the two workspace feature sets, and the production gates run as
@@ -466,10 +475,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: build
 
       - name: Provision envtest and run Racer API-server race tests
         run: timeout --signal=TERM --kill-after=10s 300s make racer-envtest-ci
@@ -505,10 +513,9 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: race
 
       - name: Run orca-inttest
         run: make orca-inttest
@@ -529,13 +536,21 @@ jobs:
           path: internal/net/html/dist
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: build
 
       - name: Build
         run: make build
+
+      - name: Save Go caches
+        if: success() && github.event_name == 'push'
+        uses: ./.github/actions/setup-go-cached
+        with:
+          phase: save
+          profile: build
+          save-build-cache: "true"
+          save-mod-cache: "true"
 
   # ---------- Vulnerability Check ----------
   govulncheck:
@@ -546,10 +561,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: build
 
       - name: Vulnerability check
         run: make vulncheck
@@ -563,10 +577,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: build
 
       - name: Install tools
         run: make install-tools
@@ -611,10 +624,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: build
 
       - name: Verify pinned clang version
         run: |
@@ -673,10 +685,9 @@ jobs:
         working-directory: frontend
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: ./.github/actions/setup-go-cached
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          profile: build
 
       - name: Provision locked Cargo sources for NOTICE
         run: |
