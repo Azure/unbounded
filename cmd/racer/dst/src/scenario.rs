@@ -84,9 +84,9 @@ pub struct Scenario {
     pub max_steps: u64,
     /// Steps allowed without virtual time advancing (busy-loop detector).
     pub busy_limit: u64,
-    /// Whether nodes use `SimOs::seeded`. Off by default: a seeded SimOs
-    /// stalls an operation whose submission delay runs out (racer-io bug,
-    /// see `tests/world.rs::seeded_sim_os_delay_does_not_stall`).
+    /// Whether node operating systems draw operation delays, completion
+    /// order and cancel order from [`Choices`] (on by default). Off keeps
+    /// FIFO order.
     pub seeded_os: bool,
 }
 
@@ -120,7 +120,7 @@ impl Scenario {
             end: 10 * SECONDS,
             max_steps: 1_000_000,
             busy_limit: 100_000,
-            seeded_os: false,
+            seeded_os: true,
         }
     }
 

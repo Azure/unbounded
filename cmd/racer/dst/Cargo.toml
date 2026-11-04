@@ -8,7 +8,7 @@ description = "Unified deterministic simulation test harness for Racer"
 
 [[bin]]
 name = "racer-dst"
-path = "src/bin/racer-dst.rs"
+path = "src/main.rs"
 
 [dependencies]
 racer-io = { path = "../io" }

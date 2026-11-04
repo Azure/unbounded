@@ -272,13 +272,11 @@ fn catalog_ci_seeds_pass_twice() {
     }
 }
 
-/// racer-io bug found by this harness: with `SimOs::seeded`, an operation
-/// whose random submission delay is decremented to zero is no longer
-/// `runnable()` (`io/src/sim/driver.rs` `runnable` checks `delay != 0` after
-/// `run_turn` already decremented it, and `dirty` was cleared), so the lane
-/// reports `Idle` with the operation still in flight and nothing wakes it.
+/// Regression for a racer-io bug found by this harness: with `SimOs::seeded`,
+/// an operation whose random submission delay counted down to zero was no
+/// longer `runnable()`, so the lane reported `Idle` with the operation still
+/// in flight and nothing woke it.
 #[test]
-#[ignore = "racer-io SimDriver::runnable stalls delayed ops; enable when fixed"]
 fn seeded_sim_os_delay_does_not_stall() {
     let s = Scenario::new("t")
         .seeded_os(true)
