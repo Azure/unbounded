@@ -153,13 +153,7 @@ impl Client {
     /// Metadata of the current version, over a pooled keep-alive connection.
     pub async fn stat(&self, id: &Identity, scratch: &mut Scratch) -> Result<Meta, Failure> {
         let _permit = Self::admit(&self.stat_lane).await?;
-        let request = &mut scratch.request;
-        request.clear();
-        request.extend_from_slice(b"HEAD /v1/objects/");
-        request.extend_from_slice(&id.key);
-        request.extend_from_slice(b" HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: ");
-        request.extend_from_slice(&id.metadata);
-        request.extend_from_slice(b"\r\n\r\n");
+        stat_request(id, &mut scratch.request);
 
         let mut fresh = false;
         loop {
@@ -207,33 +201,7 @@ impl Client {
         scratch: &mut Scratch,
     ) -> Result<Subscription, Failure> {
         let permit = Self::admit(&self.bulk_lane).await?;
-        let request = &mut scratch.request;
-        let mut buf = itoa_buf();
-        request.clear();
-        request.extend_from_slice(b"POST /v1/objects/");
-        request.extend_from_slice(&id.key);
-        request.extend_from_slice(
-            b" HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: ",
-        );
-        request.extend_from_slice(fmt_u64(PAGE_CREDITS, &mut buf));
-        request.extend_from_slice(b"\r\nRacer-Byte-Credits: ");
-        request.extend_from_slice(fmt_u64(PAGE_CREDITS * PAGE_SIZE, &mut buf));
-        request.extend_from_slice(b"\r\n");
-        let at = request.len();
-        request.extend_from_slice(b"Range: ");
-        if range.racer_header(request) {
-            request.extend_from_slice(b"\r\n");
-        } else {
-            request.truncate(at);
-        }
-        if let Some(pin) = pin {
-            request.extend_from_slice(b"If-Match: ");
-            request.extend_from_slice(pin);
-            request.extend_from_slice(b"\r\n");
-        }
-        request.extend_from_slice(b"Racer-Metadata: ");
-        request.extend_from_slice(&id.metadata);
-        request.extend_from_slice(b"\r\n\r\n");
+        subscribe_request(id, pin, range, &mut scratch.request);
 
         let mut stream = self.dial().await?;
         // The subscription keeps the head buffer for already-received body
@@ -250,7 +218,7 @@ impl Client {
         };
         let head = parse_head(&response[..head_len])?;
         let (meta, first, end) = head.subscription(pin)?;
-        let pages = page_count(first, end);
+        let seq = Sequence::new(first, end);
         Ok(Subscription {
             stream,
             buf: response,
@@ -258,12 +226,57 @@ impl Client {
             meta,
             first,
             end,
-            pages,
-            delivered: 0,
-            bytes: 0,
+            pages: seq.pages,
+            seq,
             _permit: permit,
         })
     }
+}
+
+/// Metadata request (Go `Client.Stat`).
+pub fn stat_request(id: &Identity, request: &mut Vec<u8>) {
+    request.clear();
+    request.extend_from_slice(b"HEAD /v1/objects/");
+    request.extend_from_slice(&id.key);
+    request.extend_from_slice(b" HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: ");
+    request.extend_from_slice(&id.metadata);
+    request.extend_from_slice(b"\r\n\r\n");
+}
+
+/// Subscription request: initial credits, the canonical range (omitted for
+/// a full read), and an optional `If-Match` version pin.
+pub fn subscribe_request(
+    id: &Identity,
+    pin: Option<&[u8]>,
+    range: RangeSpec,
+    request: &mut Vec<u8>,
+) {
+    let mut buf = itoa_buf();
+    request.clear();
+    request.extend_from_slice(b"POST /v1/objects/");
+    request.extend_from_slice(&id.key);
+    request.extend_from_slice(
+        b" HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: ",
+    );
+    request.extend_from_slice(fmt_u64(PAGE_CREDITS, &mut buf));
+    request.extend_from_slice(b"\r\nRacer-Byte-Credits: ");
+    request.extend_from_slice(fmt_u64(PAGE_CREDITS * PAGE_SIZE, &mut buf));
+    request.extend_from_slice(b"\r\n");
+    let at = request.len();
+    request.extend_from_slice(b"Range: ");
+    if range.racer_header(request) {
+        request.extend_from_slice(b"\r\n");
+    } else {
+        request.truncate(at);
+    }
+    if let Some(pin) = pin {
+        request.extend_from_slice(b"If-Match: ");
+        request.extend_from_slice(pin);
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"Racer-Metadata: ");
+    request.extend_from_slice(&id.metadata);
+    request.extend_from_slice(b"\r\n\r\n");
 }
 
 fn stale(kind: io::ErrorKind) -> bool {
@@ -669,6 +682,79 @@ impl Frame {
     }
 }
 
+/// Credit returned for a consumed page: page number and length.
+pub fn credit_bytes(f: &Frame) -> [u8; 12] {
+    let mut b = [0u8; 12];
+    b[..8].copy_from_slice(&f.number.to_be_bytes());
+    b[8..].copy_from_slice(&f.length.to_be_bytes());
+    b
+}
+
+/// Frame validation state for one subscription (Go `wire.Sequence`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sequence {
+    first: u64,
+    end: u64,
+    pub pages: u64,
+    delivered: u64,
+    bytes: u64,
+}
+
+impl Sequence {
+    /// Expect the pages covering `[first, end)`.
+    pub fn new(first: u64, end: u64) -> Self {
+        Self {
+            first,
+            end,
+            pages: page_count(first, end),
+            delivered: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Validate the next frame header (Go `wire.Sequence.Accept`). Page
+    /// frames advance the sequence.
+    pub fn accept(&mut self, f: &Frame) -> Result<(), Failure> {
+        let bad = Failure::BadGateway;
+        if f.kind == COMPLETE_FRAME {
+            if f.number != self.pages
+                || self.delivered != self.pages
+                || f.offset != self.end - self.first
+                || self.bytes != f.offset
+                || f.length != 0
+            {
+                return Err(bad);
+            }
+            return Ok(());
+        }
+        if f.kind != PAGE_FRAME
+            || f.length == 0
+            || f.offset < self.first
+            || f.offset >= self.end
+            || f.number != f.offset / PAGE_SIZE
+            || self.delivered == self.pages
+        {
+            return Err(bad);
+        }
+        let start = self.first.max(f.number * PAGE_SIZE);
+        let end = self.end.min((f.number + 1) * PAGE_SIZE);
+        if f.offset != start
+            || u64::from(f.length) != end - start
+            || f.number != self.first / PAGE_SIZE + self.delivered
+        {
+            return Err(bad);
+        }
+        self.delivered += 1;
+        self.bytes += u64::from(f.length);
+        Ok(())
+    }
+
+    /// Whether every page was delivered.
+    pub fn last_page(&self) -> bool {
+        self.delivered == self.pages
+    }
+}
+
 /// An open subscription. Pages arrive strictly in order; the caller consumes
 /// each payload (from `buffered()` first, then the socket) before the next
 /// frame, returning a credit after every page but the last.
@@ -681,8 +767,7 @@ pub struct Subscription {
     pub first: u64,
     pub end: u64,
     pub pages: u64,
-    delivered: u64,
-    bytes: u64,
+    seq: Sequence,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -748,42 +833,11 @@ impl Subscription {
     }
 
     /// Read and validate the next frame header (Go `wire.Sequence.Accept`).
-    /// Page frames come back with `delivered` advanced.
     pub async fn next_frame(&mut self) -> Result<Frame, Failure> {
         let mut raw = [0; FRAME_SIZE];
         self.read_exact(&mut raw).await?;
         let f = Frame::decode(&raw);
-        let bad = Failure::BadGateway;
-        if f.kind == COMPLETE_FRAME {
-            if f.number != self.pages
-                || self.delivered != self.pages
-                || f.offset != self.end - self.first
-                || self.bytes != f.offset
-                || f.length != 0
-            {
-                return Err(bad);
-            }
-            return Ok(f);
-        }
-        if f.kind != PAGE_FRAME
-            || f.length == 0
-            || f.offset < self.first
-            || f.offset >= self.end
-            || f.number != f.offset / PAGE_SIZE
-            || self.delivered == self.pages
-        {
-            return Err(bad);
-        }
-        let start = self.first.max(f.number * PAGE_SIZE);
-        let end = self.end.min((f.number + 1) * PAGE_SIZE);
-        if f.offset != start
-            || u64::from(f.length) != end - start
-            || f.number != self.first / PAGE_SIZE + self.delivered
-        {
-            return Err(bad);
-        }
-        self.delivered += 1;
-        self.bytes += u64::from(f.length);
+        self.seq.accept(&f)?;
         Ok(f)
     }
 
@@ -798,16 +852,14 @@ impl Subscription {
 
     /// Whether the most recent page frame was the last.
     pub fn last_page(&self) -> bool {
-        self.delivered == self.pages
+        self.seq.last_page()
     }
 
     /// Return a consumed page's credit. Racer may finish and close while a
     /// credit is in flight; the next read reports real truncation, so stale
     /// connection errors are ignored here.
     pub async fn credit(&mut self, f: &Frame) -> Result<(), Failure> {
-        let mut b = [0u8; 12];
-        b[..8].copy_from_slice(&f.number.to_be_bytes());
-        b[8..].copy_from_slice(&f.length.to_be_bytes());
+        let b = credit_bytes(f);
         match tokio::time::timeout(BODY_TIMEOUT, self.stream.write_all(&b)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) if stale(e.kind()) => Ok(()),

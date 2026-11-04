@@ -13,7 +13,7 @@ use crate::object::{
     AZURE_VERSION, Api, Condition, Failure, Identity, RangeSpec, Selection, azure_version,
     bucket_key, identity, parse_condition, parse_range, s3_version, split_target, supported_header,
 };
-use crate::racer::{Client, Frame, Scratch, Subscription};
+use crate::racer::{Client, Frame, Meta, Scratch, Subscription};
 use crate::splice::{Pipe, forward, send_more};
 use std::io::IoSlice;
 use std::sync::Arc;
@@ -390,79 +390,8 @@ impl Conn {
         }
     }
 
-    /// Parse the buffered head into connection facts. `None` is a 400.
     fn parse(&self) -> Option<Request> {
-        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-        let mut req = httparse::Request::new(&mut headers);
-        let head_len = match req.parse(&self.rbuf) {
-            Ok(httparse::Status::Complete(n)) => n,
-            _ => return None,
-        };
-        let version = req.version?;
-        let mut hosts = 0;
-        let mut content_length: Option<&[u8]> = None;
-        let mut body = false;
-        let mut close_token = false;
-        let mut keep_alive_token = false;
-        for h in req.headers.iter() {
-            if h.name.eq_ignore_ascii_case("host") {
-                hosts += 1;
-            } else if h.name.eq_ignore_ascii_case("content-length") {
-                let v = h.value.trim_ascii();
-                if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
-                    return None;
-                }
-                if content_length.is_some_and(|old| old != v) {
-                    return None;
-                }
-                content_length = Some(v);
-                body |= v.iter().any(|&c| c != b'0');
-            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                body = true;
-            } else if h.name.eq_ignore_ascii_case("connection") {
-                for token in h.value.split(|&c| c == b',') {
-                    let token = token.trim_ascii();
-                    close_token |= token.eq_ignore_ascii_case(b"close");
-                    keep_alive_token |= token.eq_ignore_ascii_case(b"keep-alive");
-                }
-            }
-        }
-        // HTTP/1.1 requires exactly one Host; HTTP/1.0 allows none.
-        if hosts > 1 || (version == 1 && hosts == 0) {
-            return None;
-        }
-        let target = req.path?.as_bytes();
-        split_target(target)?;
-        let method = req.method?;
-        let (connection, close) = if version == 0 {
-            if keep_alive_token && !close_token {
-                (Connection::KeepAlive, false)
-            } else {
-                (Connection::Close, true)
-            }
-        } else if close_token {
-            (Connection::Close, true)
-        } else {
-            (Connection::Default, false)
-        };
-        // A request body is never read; answer, then close.
-        let (connection, close) = if body {
-            (Connection::Close, true)
-        } else {
-            (connection, close)
-        };
-        let head = method == "HEAD";
-        let method_ok = head || method == "GET";
-        let plan = method_ok.then(|| plan(self.shared.api, &req, head));
-        Some(Request {
-            head,
-            method_ok,
-            options_star: method == "OPTIONS" && target == b"*",
-            head_len,
-            connection,
-            close,
-            plan,
-        })
+        parse_request(self.shared.api, &self.rbuf)
     }
 
     async fn send_failure(&mut self, failure: Failure, head: bool, connection: Connection) -> Next {
@@ -550,12 +479,7 @@ impl Conn {
             let sub = client
                 .subscribe(&plan.id, None, range, &mut self.scratch)
                 .await?;
-            let selection = range
-                .resolve(sub.meta.size)
-                .map_err(|_| Failure::BadGateway)?;
-            if selection.offset != sub.first || selection.offset + selection.length != sub.end {
-                return Err(Failure::BadGateway);
-            }
+            let selection = unpinned_selection(range, sub.meta.size, sub.first, sub.end)?;
             return self
                 .stream_body(sub, &plan, selection, connection, next)
                 .await;
@@ -565,20 +489,22 @@ impl Conn {
             return Err(Failure::PreconditionFailed);
         }
         if plan.if_none.present && plan.if_none.matches(&meta.etag, true) {
-            let mut h = HeadBuilder::new(&mut self.out, 304);
-            h.header("Etag", &meta.etag);
-            if self.shared.api == Api::Azure {
-                h.header("X-Ms-Version", AZURE_VERSION.as_bytes());
-                h.azure_object(&plan.version);
-            }
-            h.finish(connection);
+            not_modified_head(
+                &mut self.out,
+                self.shared.api,
+                &plan.version,
+                &meta.etag,
+                connection,
+            );
             self.body.clear();
             return Ok(self.write_response(next).await);
         }
         let selection = plan.range?.resolve(meta.size)?;
         if head {
-            self.success_head(
-                &plan,
+            success_head(
+                &mut self.out,
+                self.shared.api,
+                &plan.version,
                 &meta.etag,
                 meta.content_type.as_deref(),
                 selection,
@@ -588,11 +514,7 @@ impl Conn {
             return Ok(self.write_response(next).await);
         }
         // Pin the version Stat selected, with the exact resolved range.
-        let range = if selection.offset != 0 || selection.length != 0 {
-            RangeSpec::Closed(selection.offset, selection.offset + selection.length - 1)
-        } else {
-            RangeSpec::Full
-        };
+        let range = pinned_range(selection);
         let sub = client
             .subscribe(&plan.id, Some(&meta.etag), range, &mut self.scratch)
             .await
@@ -601,57 +523,9 @@ impl Conn {
                 Failure::RangeNotSatisfiable(_) => Failure::RangeNotSatisfiable(None),
                 other => other,
             })?;
-        // An ETag pin must not change the headers selected by Stat.
-        if sub.meta.size != meta.size || sub.meta.content_type != meta.content_type {
-            return Err(Failure::BadGateway);
-        }
-        if sub.first != selection.offset || sub.len() != selection.length {
-            // Go's SDK reports a short tail as an unsatisfiable range.
-            if sub.end == sub.meta.size && selection.length > sub.len() {
-                return Err(Failure::RangeNotSatisfiable(None));
-            }
-            return Err(Failure::BadGateway);
-        }
+        check_pinned(&meta, &sub.meta, sub.first, sub.end, selection)?;
         self.stream_body(sub, &plan, selection, connection, next)
             .await
-    }
-
-    /// Success head (Go `sidecarRead.writeHeaders`) without the final CRLF.
-    fn success_head(
-        &mut self,
-        plan: &Plan,
-        etag: &[u8],
-        content_type: Option<&[u8]>,
-        selection: Selection,
-        connection: Connection,
-    ) {
-        let status = if selection.partial { 206 } else { 200 };
-        let mut h = HeadBuilder::new(&mut self.out, status);
-        h.header("Etag", etag);
-        h.header("Accept-Ranges", b"bytes");
-        h.number("Content-Length", selection.length);
-        h.header(
-            "Content-Type",
-            content_type.unwrap_or(b"application/octet-stream"),
-        );
-        match self.shared.api {
-            Api::Azure => {
-                h.header("X-Ms-Version", AZURE_VERSION.as_bytes());
-                h.azure_object(&plan.version);
-            }
-            Api::S3 if !plan.version.is_empty() => {
-                h.header("X-Amz-Version-Id", &plan.version);
-            }
-            Api::S3 => {}
-        }
-        if selection.partial {
-            h.content_range(
-                selection.offset,
-                selection.offset + selection.length - 1,
-                selection.size,
-            );
-        }
-        h.finish(connection);
     }
 
     /// Deliver the subscription payload. Errors returned here happen before
@@ -675,13 +549,29 @@ impl Conn {
             self.body.resize(length as usize, 0);
             read_all(&mut sub, &mut self.body).await?;
             sub.recycle(&mut self.scratch);
-            self.success_head(plan, &etag, content_type.as_deref(), selection, connection);
+            success_head(
+                &mut self.out,
+                self.shared.api,
+                &plan.version,
+                &etag,
+                content_type.as_deref(),
+                selection,
+                connection,
+            );
             return Ok(self.write_response(next).await);
         }
         // Validate the first frame before committing so a broken stream
         // still gets a proper error status.
         let first = sub.next_frame().await?;
-        self.success_head(plan, &etag, content_type.as_deref(), selection, connection);
+        success_head(
+            &mut self.out,
+            self.shared.api,
+            &plan.version,
+            &etag,
+            content_type.as_deref(),
+            selection,
+            connection,
+        );
         self.committed = true;
         if send_more(&self.stream, &self.out).await.is_err() {
             return Ok(Next::Abort);
@@ -747,6 +637,184 @@ impl Conn {
             return self.stream.write_all(&final_byte).await.is_ok();
         }
     }
+}
+
+/// Parse a buffered request head into connection facts. `None` is a 400.
+fn parse_request(api: Api, buf: &[u8]) -> Option<Request> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+    let head_len = match req.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        _ => return None,
+    };
+    let version = req.version?;
+    let mut hosts = 0;
+    let mut content_length: Option<&[u8]> = None;
+    let mut body = false;
+    let mut close_token = false;
+    let mut keep_alive_token = false;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("host") {
+            hosts += 1;
+        } else if h.name.eq_ignore_ascii_case("content-length") {
+            let v = h.value.trim_ascii();
+            if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            if content_length.is_some_and(|old| old != v) {
+                return None;
+            }
+            content_length = Some(v);
+            body |= v.iter().any(|&c| c != b'0');
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            body = true;
+        } else if h.name.eq_ignore_ascii_case("connection") {
+            for token in h.value.split(|&c| c == b',') {
+                let token = token.trim_ascii();
+                close_token |= token.eq_ignore_ascii_case(b"close");
+                keep_alive_token |= token.eq_ignore_ascii_case(b"keep-alive");
+            }
+        }
+    }
+    // HTTP/1.1 requires exactly one Host; HTTP/1.0 allows none.
+    if hosts > 1 || (version == 1 && hosts == 0) {
+        return None;
+    }
+    let target = req.path?.as_bytes();
+    split_target(target)?;
+    let method = req.method?;
+    let (connection, close) = if version == 0 {
+        if keep_alive_token && !close_token {
+            (Connection::KeepAlive, false)
+        } else {
+            (Connection::Close, true)
+        }
+    } else if close_token {
+        (Connection::Close, true)
+    } else {
+        (Connection::Default, false)
+    };
+    // A request body is never read; answer, then close.
+    let (connection, close) = if body {
+        (Connection::Close, true)
+    } else {
+        (connection, close)
+    };
+    let head = method == "HEAD";
+    let method_ok = head || method == "GET";
+    let plan = method_ok.then(|| plan(api, &req, head));
+    Some(Request {
+        head,
+        method_ok,
+        options_star: method == "OPTIONS" && target == b"*",
+        head_len,
+        connection,
+        close,
+        plan,
+    })
+}
+
+/// Success head (Go `sidecarRead.writeHeaders`) without the final CRLF.
+pub(crate) fn success_head(
+    out: &mut Vec<u8>,
+    api: Api,
+    version: &[u8],
+    etag: &[u8],
+    content_type: Option<&[u8]>,
+    selection: Selection,
+    connection: Connection,
+) {
+    let status = if selection.partial { 206 } else { 200 };
+    let mut h = HeadBuilder::new(out, status);
+    h.header("Etag", etag);
+    h.header("Accept-Ranges", b"bytes");
+    h.number("Content-Length", selection.length);
+    h.header(
+        "Content-Type",
+        content_type.unwrap_or(b"application/octet-stream"),
+    );
+    match api {
+        Api::Azure => {
+            h.header("X-Ms-Version", AZURE_VERSION.as_bytes());
+            h.azure_object(version);
+        }
+        Api::S3 if !version.is_empty() => {
+            h.header("X-Amz-Version-Id", version);
+        }
+        Api::S3 => {}
+    }
+    if selection.partial {
+        h.content_range(
+            selection.offset,
+            selection.offset + selection.length - 1,
+            selection.size,
+        );
+    }
+    h.finish(connection);
+}
+
+/// `304 Not Modified` head for a matching `If-None-Match`.
+pub(crate) fn not_modified_head(
+    out: &mut Vec<u8>,
+    api: Api,
+    version: &[u8],
+    etag: &[u8],
+    connection: Connection,
+) {
+    let mut h = HeadBuilder::new(out, 304);
+    h.header("Etag", etag);
+    if api == Api::Azure {
+        h.header("X-Ms-Version", AZURE_VERSION.as_bytes());
+        h.azure_object(version);
+    }
+    h.finish(connection);
+}
+
+/// Cross-check an unconditional subscription: Racer must have selected
+/// exactly what the sidecar resolves for the forwarded range.
+fn unpinned_selection(
+    range: RangeSpec,
+    size: u64,
+    first: u64,
+    end: u64,
+) -> Result<Selection, Failure> {
+    let selection = range.resolve(size).map_err(|_| Failure::BadGateway)?;
+    if selection.offset != first || selection.offset + selection.length != end {
+        return Err(Failure::BadGateway);
+    }
+    Ok(selection)
+}
+
+/// The exact range forwarded with a version pin.
+fn pinned_range(selection: Selection) -> RangeSpec {
+    if selection.offset != 0 || selection.length != 0 {
+        RangeSpec::Closed(selection.offset, selection.offset + selection.length - 1)
+    } else {
+        RangeSpec::Full
+    }
+}
+
+/// Cross-check a pinned subscription against the Stat that chose the pin.
+fn check_pinned(
+    stat: &Meta,
+    sub: &Meta,
+    first: u64,
+    end: u64,
+    selection: Selection,
+) -> Result<(), Failure> {
+    // An ETag pin must not change the headers selected by Stat.
+    if sub.size != stat.size || sub.content_type != stat.content_type {
+        return Err(Failure::BadGateway);
+    }
+    let len = end - first;
+    if first != selection.offset || len != selection.length {
+        // Go's SDK reports a short tail as an unsatisfiable range.
+        if end == sub.size && selection.length > len {
+            return Err(Failure::RangeNotSatisfiable(None));
+        }
+        return Err(Failure::BadGateway);
+    }
+    Ok(())
 }
 
 /// Everything decided from the request alone (Go `sidecar.request` plus
