@@ -139,7 +139,7 @@ type MachineSpec struct {
 
 	// ProviderID identifies the underlying infrastructure resource for this
 	// machine, using a Kubernetes-style provider ID such as
-	// azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
+	// azure:///subscriptions/.../virtualMachines/name
 	//
 	// This is a legacy field. New callers should use Host.External.ProviderID,
 	// Host.External.MachineRef, or Host.Azure.ResourceID.
@@ -289,8 +289,7 @@ func (m *Machine) NodeName() string {
 
 // External provider names.
 const (
-	ExternalProviderAzureVM     = "AzureVM"
-	ExternalProviderOCIInstance = "OCIInstance"
+	ExternalProviderAzureVM = "AzureVM"
 )
 
 // MachineConfigurationRef references a MachineConfiguration and

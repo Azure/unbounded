@@ -476,8 +476,8 @@ impl Fill {
             return Err(Error::InvalidRequest);
         }
         // A subscription opened while the cache was cached can outlive a
-        // switch to passthrough. Passthrough caches retain nothing, so a warm
-        // job or provider cannot hold a usable copy, and the local route must
+        // switch to passthrough. Passthrough caches retain nothing, so a
+        // provider cannot hold a usable copy, and the local route must
         // never contact peers. Fill only the head through the ordinary page
         // flight, which applies the current mode.
         if self.passthrough(&version.object.cache) {
@@ -486,25 +486,6 @@ impl Fill {
                 .metadata_owner
                 .acquire_unobserved(head, membership, context, scope, budget)
                 .await;
-        }
-        let warmed = self
-            .dependencies
-            .metadata_owner
-            .warmed_page(&head, scope)
-            .await?;
-        match warmed {
-            super::dispatch::Warmed::Local(page) => return Ok(*page),
-            super::dispatch::Warmed::Unwarmed => {}
-            // A warm job holds the head on a remote owner. Fill only that page
-            // through the normal path, which reaches the held copy, rather
-            // than selecting pages the warm job may not have finished.
-            super::dispatch::Warmed::Remote => {
-                return self
-                    .dependencies
-                    .metadata_owner
-                    .acquire_unobserved(head, membership, context, scope, budget)
-                    .await;
-            }
         }
         // A new or credit-starved subscriber can lag behind provider completion.
         // Reuse its verified local head before asking for another node transfer.

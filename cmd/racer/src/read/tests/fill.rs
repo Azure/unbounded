@@ -4152,7 +4152,6 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             let mut response = drive(
                 coordinator.read(
                     ClientRequest {
-                        retain: None,
                         kind,
                         origin: OriginContext {
                             object: f.context.object.clone(),

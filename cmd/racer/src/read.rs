@@ -39,11 +39,10 @@ pub(crate) mod gpu_copies;
 pub mod metadata;
 pub mod range_stream;
 pub mod sealed;
-pub mod warm;
+pub mod spill;
 
 /// Metadata and its optional stream, with no independent range to disagree with it.
 pub struct ReadResponse {
-    pub retain_until: Option<std::time::SystemTime>,
     pub metadata: ObjectMetadata,
 
     pub payload: ReadPayload,
@@ -121,7 +120,7 @@ impl Coordinator {
         credentials: Rc<CredentialCrypto>,
         availability: Rc<crate::control::Availability>,
     ) -> Self {
-        streams.directory().warm.attach_metrics(&fill.metrics);
+        streams.directory().prefetch.attach_metrics(&fill.metrics);
         Self {
             snapshots,
             metadata,
@@ -370,11 +369,7 @@ impl Coordinator {
             }
             let membership = snapshot.membership.clone();
             let directory = self.streams.directory();
-            let ClientRequest {
-                kind,
-                origin,
-                retain,
-            } = request;
+            let ClientRequest { kind, origin } = request;
             let selector = match &kind {
                 ReadKind::Subscription { pin, .. }
                 | ReadKind::HostRead { pin, .. }
@@ -418,7 +413,6 @@ impl Coordinator {
                 } => {
                     if metadata.length == 0 && range.is_none() {
                         return Ok(ReadResponse {
-                            retain_until: None,
                             metadata,
                             payload: ReadPayload::Empty,
                         });
@@ -438,52 +432,129 @@ impl Coordinator {
                     }
                     body.configure_subscription(page_credits, byte_credits)?;
                     Ok(ReadResponse {
-                        retain_until: None,
                         metadata,
                         payload: ReadPayload::Stream(body),
                     })
                 }
-                ReadKind::Head | ReadKind::HeadPinned { .. } => {
-                    let passthrough = self.fill.passthrough(&origin.object.cache);
-                    if passthrough && retain.is_some() {
-                        // Passthrough caches hold nothing: refuse the warm
-                        // request and answer the HEAD without retain_until.
-                        self.fill
-                            .metrics
-                            .warm_event(crate::telemetry::WarmEvent::Refused);
-                    }
-                    let retain_until = if let Some(ttl) = retain.filter(|_| !passthrough) {
-                        match self.credentials.local_context(&origin, scope) {
-                            Ok(context) => warm::admit(
-                                directory.clone(),
-                                metadata.clone(),
-                                membership,
-                                context,
-                                ttl,
-                                scope,
-                            )
-                            .await
-                            .ok(),
-                            Err(_) => {
-                                self.fill
-                                    .metrics
-                                    .warm_event(crate::telemetry::WarmEvent::Refused);
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    Ok(ReadResponse {
-                        metadata,
-                        payload: ReadPayload::Empty,
-                        retain_until,
-                    })
-                }
+                ReadKind::Head | ReadKind::HeadPinned { .. } => Ok(ReadResponse {
+                    metadata,
+                    payload: ReadPayload::Empty,
+                }),
                 // Mapped to Subscription above.
                 ReadKind::HostRead { .. } | ReadKind::GpuRead { .. } => Err(Error::Internal),
             }
         })
+    }
+
+    /// The node's worker directory, which owns the prefetch registry.
+    pub(crate) fn prefetch_directory(&self) -> &std::sync::Arc<dispatch::WorkerDirectory> {
+        self.streams.directory()
+    }
+
+    /// The current membership, if a snapshot is published.
+    pub(crate) fn current_membership(&self) -> Option<std::sync::Arc<crate::topology::Membership>> {
+        self.snapshots
+            .current()
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.membership.clone())
+    }
+
+    /// The membership for work on `cache`, or `Unavailable` when the cache is
+    /// not published or not ready.
+    pub(crate) fn cache_membership(
+        &self,
+        cache: &racer_control_wire::CacheId,
+    ) -> Result<std::sync::Arc<crate::topology::Membership>> {
+        let snapshot = self.snapshots.current()?.ok_or(Error::Unavailable)?;
+        if !snapshot.caches.iter().any(|c| &c.id == cache) || !self.availability.metadata(cache) {
+            return Err(Error::Unavailable);
+        }
+        Ok(snapshot.membership.clone())
+    }
+
+    pub(crate) fn cache_passthrough(&self, cache: &racer_control_wire::CacheId) -> bool {
+        self.fill.passthrough(cache)
+    }
+
+    pub(crate) fn local_node(&self) -> racer_control_wire::NodeId {
+        self.fill.dependencies.candidates.node.clone()
+    }
+
+    /// The page's rank-0 owner, the same ranking reads and the warm plan used.
+    pub(crate) async fn rank_owner(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        object: &ObjectId,
+        page: u64,
+        scope: &RequestScope,
+    ) -> Result<Option<racer_control_wire::NodeId>> {
+        Ok(self
+            .fill
+            .dependencies
+            .candidates
+            .candidates_scoped(membership, object, crate::model::PageNumber(page), scope)
+            .await?
+            .ordered
+            .first()
+            .cloned())
+    }
+
+    /// Send one `prefetch` operation directly to `owner`.
+    pub(crate) async fn peer_prefetch(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        owner: &racer_control_wire::NodeId,
+        context: &OriginContext,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+    ) -> Result<PeerResponse> {
+        let mut budget = default_budget(scope);
+        let response = self
+            .fill
+            .dependencies
+            .candidates
+            .request(
+                membership,
+                owner,
+                context,
+                operation,
+                FetchMode::Acquire,
+                scope,
+                &mut budget,
+                1,
+            )
+            .await?;
+        Ok(match response.response() {
+            PeerResponse::Prefetch(results) => PeerResponse::Prefetch(results.clone()),
+            PeerResponse::Overloaded => PeerResponse::Overloaded,
+            PeerResponse::Unavailable => PeerResponse::Unavailable,
+            PeerResponse::Miss => PeerResponse::Miss,
+            PeerResponse::StaleMembership => PeerResponse::StaleMembership,
+            PeerResponse::VersionUnavailable => PeerResponse::VersionUnavailable,
+            PeerResponse::NotFound => PeerResponse::NotFound,
+            PeerResponse::OriginRejected => PeerResponse::OriginRejected,
+            PeerResponse::OriginForbidden => PeerResponse::OriginForbidden,
+            _ => return Err(Error::CorruptRecord),
+        })
+    }
+
+    /// Resolve a version through the normal metadata path.
+    pub(crate) async fn resolve_version(
+        &self,
+        selector: MetadataSelector,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<crate::model::VersionMetadata> {
+        let mut budget = default_budget(scope);
+        let metadata = self
+            .streams
+            .directory()
+            .resolve_with_budget(selector.clone(), membership, context, scope, &mut budget)
+            .await?;
+        validate_metadata(&metadata, &context.object, &selector)?;
+        Ok(metadata.immutable())
     }
 
     /// Admit a client read using the default metadata/bootstrap allowance.
@@ -544,7 +615,7 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Bootstrap { object, .. } => Some(object),
                 PeerOperation::Page { page, .. } => Some(&page.version.object),
                 PeerOperation::Metadata { object, .. } => Some(object),
-                PeerOperation::Warm { version, .. } => Some(&version.object),
+                PeerOperation::Prefetch { version, .. } => Some(&version.object),
             };
             let object_matches = object.is_some_and(|object| object == &request.origin.object);
             use racer_core::read::{ServeAction, ServeFacts, serve_action};
@@ -677,23 +748,27 @@ impl LocalPageService for Coordinator {
                         PeerOperation::Page {
                             page,
                             mode: FetchMode::Acquire,
-                        } => self
-                            .fill
-                            .acquire_ciphertext(
-                                page.clone(),
-                                membership,
-                                &context,
-                                &effective,
-                                &mut budget,
-                            )
-                            .await
-                            .and_then(|page_result| {
-                                page_result.validate_metadata()?;
-                                Ok(PeerResponse::Page {
-                                    metadata: page_result.metadata,
-                                    ciphertext: page_result.ciphertext,
+                        } => {
+                            // A remote demand read joining a prefetch flight
+                            // promotes it.
+                            self.streams.directory().prefetch.promote(&page);
+                            self.fill
+                                .acquire_ciphertext(
+                                    page.clone(),
+                                    membership,
+                                    &context,
+                                    &effective,
+                                    &mut budget,
+                                )
+                                .await
+                                .and_then(|page_result| {
+                                    page_result.validate_metadata()?;
+                                    Ok(PeerResponse::Page {
+                                        metadata: page_result.metadata,
+                                        ciphertext: page_result.ciphertext,
+                                    })
                                 })
-                            }),
+                        }
                         PeerOperation::Metadata {
                             object,
                             selector,
@@ -712,23 +787,9 @@ impl LocalPageService for Coordinator {
                                 validate_metadata(&metadata, &object, &selector)?;
                                 Ok(PeerResponse::Metadata(metadata))
                             }),
-                        PeerOperation::Warm {
-                            version,
-                            lease,
-                            action,
-                        } => {
-                            warm::serve(
-                                self,
-                                warm::Lease {
-                                    requester,
-                                    version,
-                                    lease,
-                                },
-                                action,
-                                membership,
-                                &context,
-                                &effective,
-                                &mut budget,
+                        PeerOperation::Prefetch { version, action } => {
+                            crate::prefetch::service::serve(
+                                self, version, action, membership, &context, &effective,
                             )
                             .await
                         }

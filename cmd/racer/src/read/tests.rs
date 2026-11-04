@@ -26,8 +26,9 @@ mod hot_reads;
 mod passthrough;
 mod peer_copies;
 mod persist_policy;
+mod prefetch;
 mod remote;
-mod warming;
+mod spill;
 
 pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
     use crate::memory::CiphertextBytes;
@@ -2394,7 +2395,7 @@ mod timeouts {
                 | PeerOperation::Page { mode, .. } => {
                     matches!(mode, FetchMode::CopyOnly)
                 }
-                PeerOperation::Warm { .. } => false,
+                PeerOperation::Prefetch { .. } => false,
             };
             let stalled = self.calls.borrow().len() < self.stalled;
             self.calls.borrow_mut().push(Call {

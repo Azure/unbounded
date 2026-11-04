@@ -164,7 +164,6 @@ _SINGLETONS = {
     "racer-object-length",
     "racer-range-start",
     "racer-range-end",
-    "racer-retain-until",
     "racer-delivery",
 }
 

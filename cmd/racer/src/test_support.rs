@@ -285,7 +285,8 @@ pub mod cluster {
         let count = NonZeroUsize::new(16).unwrap();
         let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
         Config {
-            warm: Default::default(),
+            spill: Default::default(),
+            prefetch: Default::default(),
             send_crc_pair: None,
             page_hedge: Default::default(),
             replica_selection: Default::default(),

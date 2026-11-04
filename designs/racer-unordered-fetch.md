@@ -16,8 +16,9 @@ Today the dataplane exposes two ordering modes to clients through the
   per round trip, and only one such selection per object version can run on a
   node at a time. Nothing in the SDK uses it.
 
-Warming also completes pages strictly in order (a contiguous `frontier`), and
-any read of a version that is being warmed waits behind that frontier.
+Warming, which this document originally also changed, has since been removed
+and replaced by prefetch tickets (`designs/racer-prefetch.md`). Prefetch never
+gates or delays reads, so this document no longer has warm rules.
 
 This change removes the ordering choice from the client contract. Ordering
 terminates at the dataplane: the dataplane always fetches out of order and
@@ -31,10 +32,7 @@ always delivers in order.
 - Peers may send pages of the requested range in any order, with more than one
   page in flight per peer.
 - Pages that arrive ahead of the delivery cursor are buffered in memory and
-  spill to disk through the same hold mechanism that warming uses. No new
-  caching mechanism.
-- Warming completes pages out of order, so a warm no longer serializes reads of
-  the version it is warming.
+  spill to disk through the existing hold mechanism. No new caching mechanism.
 
 ## Non-goals
 
@@ -44,19 +42,10 @@ always delivers in order.
 
 ## Design
 
-### 1. Warm progress is a completed set
+### 1. (Removed) Warm progress
 
-`read/warm.rs` tracks progress as a contiguous prefix and completes pages in
-order with `FuturesOrdered`. It changes to:
-
-- A completed-page set per job (bitset over the page range), filled as each
-  page completes, in any order (`FuturesUnordered`, still bounded by the warm
-  window).
-- `wait(page)` is ready as soon as that page is in the set. Placement
-  (`Local` or `Remote`) still comes from the job's `Plan`.
-- A revision change clears the set, as it reset the frontier before.
-- The rule that a remote-held warm page narrows a read to a single page goes
-  away; readers are no longer gated by a prefix.
+This section described warm job progress. Warming is removed; see
+`designs/racer-prefetch.md`.
 
 ### 2. Holds release individual pages
 
@@ -68,9 +57,8 @@ expiry.
 Holds gain per-page holder counts. `reserve_hold_pages` increments the count
 for each member page and `release_hold_pages(version, pages)` decrements it.
 A page whose count reaches zero leaves the hold and becomes evictable like any
-other cached page. Warm holds keep their current behavior; a read's spill pages
-can be released as soon as they are delivered without disturbing a warm (or
-another read) that holds the same page.
+other cached page. A read's spill pages can be released as soon as they are
+delivered without disturbing another read that holds the same page.
 
 ### 3. Per-read fetch job
 
@@ -94,7 +82,7 @@ Each poll:
 1. Refill the window. A page entering it reserves credit and starts a memory
    probe (`cached_page`). Hits become `Ready`. A miss or a failed probe becomes
    `Missing`.
-2. Start a direct fill (`Work::Fetch`: the warm hold first, then normal Fill)
+2. Start a direct fill (`Work::Fetch`, normal Fill)
    for the head page, and for up to `DIRECT_AHEAD = 1` further `Missing`
    page. The head is always filled directly; pages ahead are skipped when
    another read of the version is already selecting or filling them.
@@ -123,14 +111,6 @@ reach the head. A failed selection,
 including its own child deadline, returns its pages to direct fills only. The
 stream's own cancellation and deadline are always fatal.
 
-Warm interaction: a direct fill waits on the warm job only for its own page.
-While a warm job runs for the version, reads start no selections. If a
-selection's head page is held by a remote warm owner, only that page is filled
-through the normal path.
-
-Warm admission no longer needs the node-wide `selecting` check
-(`Scheduler::admit_warm` is removed); warm calls `WarmRegistry::begin`.
-
 #### Spill (optional)
 
 `RACER_RANGE_SPILL_PAGES` (default 0, off; at most 1024) lets a read park
@@ -139,15 +119,15 @@ pages beyond its window on local disk. For pages in
 
 - Reserve one holder on the page's owning worker only (`Work::Hold`, deadline
   `min(60s, remaining request time)`).
-- Fill it through the warm path (`Work::Warm`), which persists it held.
+- Fill it through the spill path (`Work::SpillFill`), which persists it held.
 - When the window reaches the page, read it back from memory or the held disk
-  copy (`Work::WarmLocal`). If that fails, fetch it normally.
+  copy (`Work::WarmLocal`, the local held-copy read). If that fails, fetch it
+  normally.
 - Release the holder (`Work::Release`) once after delivery, and every remaining
   holder on cancel or drop. A hold still pending at that point is released
   once its completion shows it applied. Hold expiry is the backstop.
 - If a hold is refused or a spill fill fails, the read stops spilling and keeps
   only its memory window; the failed page is fetched normally.
-- No spill while a warm job covers the version.
 
 ### 4. Peer protocol: several pages in flight per subscription
 
@@ -163,7 +143,7 @@ subscription (`Entry.pending: Option<u64>`). It becomes a bounded set.
 - Compatibility: `peer/protocol.rs` rejects unknown fields (`agrees()`), so an
   older peer refuses a Subscribe that carries the new field. The reader then
   marks that provider as single-flight and retries without the field. The peer
-  wire `VERSION` does not change, matching how remote warm holds were added.
+  wire `VERSION` does not change.
 
 Implemented as: the wire header `racer-subscription-flights`
 (`Subscription.flights`, `TransferGrant.flights`, both `Option<u16>` at most
@@ -188,11 +168,9 @@ SDK rejects out-of-order pages. Roll the dataplane before the SDK.
 
 ## Testing
 
-- Warm: out-of-order completion wakes exactly the completed page's waiters;
-  revision change clears the set; existing warm tests updated from prefix to
-  set semantics.
 - Holds: refcounted reserve/release, release to zero makes the page
-  evictable, warm hold unaffected by a read release, expiry still applies.
+  evictable, one reader's release leaves another's holder, expiry still
+  applies.
 - Read job: memory hits in the window are ready without fetching earlier
   pages first; an out-of-order completion is buffered and delivered in order;
   selection fan-out to multiple reads; a failed selection falls back to direct

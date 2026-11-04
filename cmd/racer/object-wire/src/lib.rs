@@ -17,6 +17,7 @@
 pub mod client;
 pub mod model;
 pub mod origin;
+pub mod prefetch;
 
 #[cfg(feature = "test-util")]
 pub mod test_util;

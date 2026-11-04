@@ -64,6 +64,26 @@
 // error rather than a silently truncated result, even for a destination
 // that has already received the rest of the data.
 //
+// # Prefetching
+//
+// [Client.Prefetch] submits a ticket of object ranges for Racer to load in the
+// background without returning contents. Racer schedules the missing pages to
+// their owners in the cache cluster, which fill them through the normal read
+// path. Nothing is pinned, so loaded pages are evicted like any other. Tickets
+// are local to the node and kept in memory; after a Racer restart, resubmit
+// the same id and only missing pages are loaded.
+//
+//	status, err := client.Prefetch(ctx, "epoch-17", racersdk.PrefetchSpec{
+//		Refs: []racersdk.PrefetchRef{{Key: key.String(), Metadata: "bucket/path"}},
+//	})
+//
+// Resubmitting the same spec is idempotent. [Client.PrefetchStatus] reports
+// progress and can wait for the ticket to settle, [Client.CancelPrefetch]
+// releases it, and [Client.ListPrefetches] lists this cache's tickets. A
+// [PrefetchWindow] replaces a ticket's desired set as a reader moves forward.
+// [SplitPrefetch] divides a spec that exceeds Racer's per-ticket limits.
+// Rejected requests return a [*PrefetchError].
+//
 // # Serving cache misses
 //
 // Implement [Origin] and pass it to [ServeOrigin]. Racer calls the origin for

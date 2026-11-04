@@ -731,6 +731,62 @@ impl StoreWriter {
         })
     }
 
+    /// Write a prefetched copy to disk without a hold, so it is evicted like
+    /// any other cached page. Success means a completed, published disk write.
+    /// An already indexed copy succeeds at once. Like [`Self::persist_held`],
+    /// keep polling until completion, even after canceling.
+    pub fn persist_prefetched<'a>(
+        &'a self,
+        page: CiphertextCopy,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            scope.check()?;
+            logical_length(&page)?;
+            let id = page.ciphertext.envelope().page.clone();
+            if let Some(entry) = self.index.lookup(&id)? {
+                if !entry.metadata.compatible(&page.metadata.immutable()) {
+                    return Err(Error::CorruptRecord);
+                }
+                return Ok(());
+            }
+            let waiter = WriterWaiter::new(self)?;
+            let dirty = self.admission.reserve_completion(
+                Some(&id.version.object.cache),
+                ResourceClass::DirtyCiphertext,
+                page.ciphertext.bytes().len(),
+            )?;
+            let ticket = self.enqueue(page, dirty)?;
+            loop {
+                waiter.ready(true).await;
+                if let Err(error) = scope.check() {
+                    self.remove_queued_ticket(&id, ticket);
+                    self.slabs.fence_writes().await?;
+                    return Err(error);
+                }
+                if self
+                    .pending
+                    .borrow()
+                    .get(&id)
+                    .is_none_or(|dirty| dirty.ticket != ticket)
+                {
+                    break;
+                }
+                waiter.ready(false).await;
+                if let Err(error) = self.progress(8, scope).await {
+                    self.remove_queued_ticket(&id, ticket);
+                    self.slabs.fence_writes().await?;
+                    return Err(error);
+                }
+            }
+            self.slabs.fence_writes().await?;
+            scope.check()?;
+            // A write superseded or discarded under pressure is not admitted.
+            self.index.lookup(&id)?.ok_or(Error::Unavailable)?;
+            Ok(())
+        })
+    }
+
     fn remove_queued_ticket(&self, page: &PageId, ticket: u64) {
         let position = self.queue.borrow().iter().position(|queued| queued == page);
         if self
