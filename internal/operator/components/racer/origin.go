@@ -54,6 +54,8 @@ func validateOrigin(cache *racerv1.ClusterCache) error {
 			return errors.New("spec.origin.azure.credential must set exactly one of default or workloadIdentity")
 		case c.WorkloadIdentity != nil && c.WorkloadIdentity.ClientID == "":
 			return errors.New("spec.origin.azure.credential.workloadIdentity.clientID is required")
+		case c.Default != nil && c.Default.SecretRef != nil:
+			return errors.New("spec.origin.azure.credential.default.secretRef is no longer supported; use clientID or workloadIdentity")
 		}
 	}
 

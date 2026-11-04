@@ -207,12 +207,20 @@ type AzureCredential struct {
 }
 
 // AzureDefaultCredential configures the node managed identity.
+// +kubebuilder:validation:XValidation:rule="!has(self.secretRef)",message="secretRef is no longer supported; use clientID or workloadIdentity"
 type AzureDefaultCredential struct {
 	// ClientID selects a user-assigned managed identity. When unset, the
 	// system-assigned identity, or the only user-assigned identity, is used.
 	// +kubebuilder:validation:Pattern=`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
 	// +optional
 	ClientID string `json:"clientID,omitempty"`
+
+	// SecretRef is deprecated and unsupported. The Racer dataplane cannot
+	// read Secret credentials, so a cache that sets it is rejected. It stays
+	// in the schema only so that stored caches which still set it are not
+	// pruned into a managed identity credential and instead fail closed.
+	// +optional
+	SecretRef *SecretReference `json:"secretRef,omitempty"`
 }
 
 // AzureWorkloadIdentityCredential configures Microsoft Entra Workload ID.
@@ -233,4 +241,11 @@ type ClusterCacheList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ClusterCache `json:"items"`
+}
+
+// SecretReference names a Secret. Deprecated: see AzureDefaultCredential.SecretRef.
+type SecretReference struct {
+	// Name of the Secret.
+	// +optional
+	Name string `json:"name,omitempty"`
 }

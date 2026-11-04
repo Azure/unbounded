@@ -277,6 +277,9 @@ func TestValidateOriginRejectsInvalidSpecs(t *testing.T) {
 		{"wi-no-client", func(o *racerv1.ObjectOrigin) {
 			o.Azure.Credential = &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{}}
 		}, "clientID is required"},
+		{"default-secret-ref", func(o *racerv1.ObjectOrigin) {
+			o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{SecretRef: &racerv1.SecretReference{Name: "s"}}}
+		}, "secretRef is no longer supported"},
 		{"default-http", func(o *racerv1.ObjectOrigin) {
 			o.Azure.ContainerURL = "http://127.0.0.1:10000/devstoreaccount1/models"
 			o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{}}

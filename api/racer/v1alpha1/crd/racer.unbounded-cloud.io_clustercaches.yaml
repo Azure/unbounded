@@ -156,7 +156,22 @@ spec:
                                   system-assigned identity, or the only user-assigned identity, is used.
                                 pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
                                 type: string
+                              secretRef:
+                                description: |-
+                                  SecretRef is deprecated and unsupported. The Racer dataplane cannot
+                                  read Secret credentials, so a cache that sets it is rejected. It stays
+                                  in the schema only so that stored caches which still set it are not
+                                  pruned into a managed identity credential and instead fail closed.
+                                properties:
+                                  name:
+                                    description: Name of the Secret.
+                                    type: string
+                                type: object
                             type: object
+                            x-kubernetes-validations:
+                            - message: secretRef is no longer supported; use clientID
+                                or workloadIdentity
+                              rule: '!has(self.secretRef)'
                           workloadIdentity:
                             description: |-
                               WorkloadIdentity uses Microsoft Entra Workload ID. The Racer dataplane

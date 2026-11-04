@@ -224,7 +224,8 @@ reads the origin instead. Do these steps before you upgrade:
   the rollout.
 - **`default` caches.** The dataplane gets tokens from IMDS on its own node. Attach
   the identity to every Racer node.
-- **`default.secretRef` caches.** This field was removed. Racer cannot read the
+- **`default.secretRef` caches.** This field is no longer supported, and the API
+  rejects new uses of it. Racer cannot read the
   Secret. If the cluster-control service still sees the field, it rejects the
   whole catalog and keeps the last published one, so no cache changes take
   effect. Before you upgrade, change the cache's `credential` to
