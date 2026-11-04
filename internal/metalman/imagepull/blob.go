@@ -28,13 +28,54 @@ const (
 // openBlob opens a verified reader over the blob described by desc. The
 // endpoints are tried in order; if one fails mid-stream, the read resumes
 // from the next endpoint at the current offset.
-func (i *Image) openBlob(ctx context.Context, desc ispec.Descriptor) (io.ReadCloser, error) {
-	r := &resumeReader{ctx: ctx, eps: i.eps, desc: desc, p: i.puller}
+//
+// When a mirror served any bytes of a blob that later fails verification,
+// the blob is marked so that later reads through this Image skip the
+// mirror and go to the upstream registry only.
+func (i *Image) openBlob(ctx context.Context, desc ispec.Descriptor) (*blobStream, error) {
+	eps := i.eps
+	if i.mirrorAvoided(desc.Digest) {
+		eps = eps[len(eps)-1:]
+	}
+
+	r := &resumeReader{ctx: ctx, eps: eps, desc: desc, p: i.puller}
 	if err := r.openNext(); err != nil {
 		return nil, err
 	}
 
-	return newVerifyReader(r, desc), nil
+	v := newVerifyReader(r, desc)
+	v.onMismatch = func() { i.noteMismatch(desc.Digest, r) }
+
+	return &blobStream{verifyReader: v, rr: r}, nil
+}
+
+// blobStream is a verified blob reader that also reports whether a mirror
+// served any of its bytes.
+type blobStream struct {
+	*verifyReader
+	rr *resumeReader
+}
+
+// fromMirror reports whether a mirror endpoint delivered any bytes.
+func (b *blobStream) fromMirror() bool { return b.rr.mirrorBytes }
+
+// noteMismatch marks blob d as served corrupted by the mirror when the
+// mirror delivered any of the bytes read by r.
+func (i *Image) noteMismatch(d digest.Digest, r *resumeReader) {
+	if r.mirrorBytes {
+		i.badMirror.Store(d, true)
+	}
+}
+
+// mirrorAvoided reports whether blob d must be read from upstream only.
+func (i *Image) mirrorAvoided(d digest.Digest) bool {
+	if len(i.eps) < 2 {
+		return false
+	}
+
+	_, ok := i.badMirror.Load(d)
+
+	return ok
 }
 
 // resumeReader reads a blob from the first working endpoint and, when that
@@ -48,9 +89,12 @@ type resumeReader struct {
 
 	next int // index of the next endpoint to try
 	cur  *blobReader
-	off  int64
-	errs []error
-	err  error
+	// mirrorBytes is set once any endpoint other than the last (the
+	// upstream registry) has delivered bytes.
+	mirrorBytes bool
+	off         int64
+	errs        []error
+	err         error
 }
 
 func (r *resumeReader) openNext() error {
@@ -82,6 +126,10 @@ func (r *resumeReader) Read(p []byte) (int, error) {
 	for {
 		n, err := r.cur.Read(p)
 		r.off += int64(n)
+
+		if n > 0 && r.next < len(r.eps) {
+			r.mirrorBytes = true
+		}
 
 		// Only a bare io.EOF marks the end of the blob: transport errors
 		// such as a dropped connection may wrap io.EOF.
@@ -653,6 +701,8 @@ type verifyReader struct {
 	verifier digest.Verifier
 	n        int64
 	err      error
+	// onMismatch, when set, is called once on a digest mismatch.
+	onMismatch func()
 }
 
 func newVerifyReader(rc io.ReadCloser, desc ispec.Descriptor) *verifyReader {
@@ -681,6 +731,10 @@ func (v *verifyReader) Read(p []byte) (int, error) {
 			v.err = fmt.Errorf("blob %s: got %d bytes, want %d: %w", v.desc.Digest, v.n, v.desc.Size, io.ErrUnexpectedEOF)
 		case !v.verifier.Verified():
 			v.err = fmt.Errorf("blob %s: %w", v.desc.Digest, ErrDigestMismatch)
+
+			if v.onMismatch != nil {
+				v.onMismatch()
+			}
 		default:
 			v.err = io.EOF
 		}

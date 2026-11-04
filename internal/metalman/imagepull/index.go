@@ -86,17 +86,31 @@ func (x *layerIndex) hides(p string) bool {
 }
 
 // buildIndex reads layer li to EOF, verifying the layer digest, and records
-// every entry.
+// every entry. If the layer fails verification after a mirror served any
+// of it, the partial index is discarded and the layer is read again from
+// the upstream registry, starting at offset zero.
 func (i *Image) buildIndex(ctx context.Context, li int) (*layerIndex, error) {
+	x, mirrored, err := i.buildIndexOnce(ctx, li)
+	if err != nil && mirrored && errors.Is(err, ErrDigestMismatch) && i.mirrorAvoided(i.layers[li].Digest) {
+		x, _, err = i.buildIndexOnce(ctx, li)
+	}
+
+	return x, err
+}
+
+// buildIndexOnce is one buildIndex attempt. mirrored reports whether a
+// mirror served any bytes of the layer.
+func (i *Image) buildIndexOnce(ctx context.Context, li int) (x *layerIndex, mirrored bool, err error) {
 	desc := i.layers[li]
 
 	ls, err := i.openLayer(ctx, li)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer ls.Close() //nolint:errcheck // read-only stream
+	defer func() { mirrored = ls.blob.fromMirror() }()
 
-	x := &layerIndex{entries: map[string]*indexEntry{}, dirs: map[string]bool{}, deleted: map[string]bool{}, opaque: map[string]bool{}}
+	x = &layerIndex{entries: map[string]*indexEntry{}, dirs: map[string]bool{}, deleted: map[string]bool{}, opaque: map[string]bool{}}
 
 	for ordinal := 0; ; ordinal++ {
 		hdr, err := ls.tr.Next()
@@ -105,7 +119,7 @@ func (i *Image) buildIndex(ctx context.Context, li int) (*layerIndex, error) {
 		}
 
 		if err != nil {
-			return nil, fmt.Errorf("read layer %s: %w", desc.Digest, err)
+			return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, err)
 		}
 
 		name := cleanName(hdr.Name)
@@ -134,7 +148,7 @@ func (i *Image) buildIndex(ctx context.Context, li int) (*layerIndex, error) {
 
 			h := sha256.New()
 			if _, err := io.Copy(h, ls.tr); err != nil {
-				return nil, fmt.Errorf("read layer %s: %w", desc.Digest, err)
+				return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, err)
 			}
 
 			e.sum = digest.NewDigest(digest.SHA256, h)
@@ -166,10 +180,10 @@ func (i *Image) buildIndex(ctx context.Context, li int) (*layerIndex, error) {
 	// Read the rest of the stream so that the blob digest is verified. The
 	// index is only kept when that succeeds.
 	if err := ls.drain(); err != nil {
-		return nil, fmt.Errorf("read layer %s: %w", desc.Digest, err)
+		return nil, false, fmt.Errorf("read layer %s: %w", desc.Digest, err)
 	}
 
-	return x, nil
+	return x, false, nil
 }
 
 // indexCache is a bounded LRU of layer indexes keyed by layer digest.

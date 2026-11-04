@@ -14,6 +14,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -62,6 +63,9 @@ type Image struct {
 	eps    []*endpoint
 	digest string
 	layers []ispec.Descriptor
+	// badMirror holds the digests of layer blobs the mirror served
+	// corrupted; they are read from the upstream registry only.
+	badMirror sync.Map
 }
 
 // Digest returns the platform manifest digest.
@@ -74,7 +78,7 @@ func (i *Image) Source() Source { return i.src }
 
 // layerStream is an open, decompressed tar stream over one layer.
 type layerStream struct {
-	blob io.ReadCloser
+	blob *blobStream
 	dec  io.Closer
 	r    io.Reader // decompressed stream
 	tr   *tar.Reader
@@ -362,25 +366,40 @@ func (i *Image) lookup(ctx context.Context, name string) (int, *indexEntry, int,
 // ReadFile reads the first file found among names into memory and returns
 // its content and the matched name. Files larger than MaxReadFileSize are
 // rejected.
+//
+// If the content fails verification after a mirror served any of it, the
+// file is read once more from the upstream registry.
 func (i *Image) ReadFile(ctx context.Context, names ...string) ([]byte, string, error) {
+	data, name, retry, err := i.readFile(ctx, names...)
+	if retry {
+		data, name, _, err = i.readFile(ctx, names...)
+	}
+
+	return data, name, err
+}
+
+// readFile is one ReadFile attempt. retry reports a digest mismatch on
+// content a mirror served, which a second attempt reads from upstream.
+func (i *Image) readFile(ctx context.Context, names ...string) ([]byte, string, bool, error) {
 	f, err := i.Open(ctx, names...)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	defer f.Close() //nolint:errcheck // read-only
 
 	if f.Size() > MaxReadFileSize {
-		return nil, "", fmt.Errorf("imagepull: %s is %d bytes, larger than the %d byte limit", f.Name(), f.Size(), MaxReadFileSize)
+		return nil, "", false, fmt.Errorf("imagepull: %s is %d bytes, larger than the %d byte limit", f.Name(), f.Size(), MaxReadFileSize)
 	}
 
 	// File.Read verifies the content digest when the file is read to EOF
 	// from offset 0, so the bytes below are verified.
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return nil, "", err
+		retry := errors.Is(err, ErrDigestMismatch) && f.ls != nil && f.ls.blob.fromMirror()
+		return nil, "", retry, err
 	}
 
-	return data, f.Name(), nil
+	return data, f.Name(), false, nil
 }
 
 // File is an io.ReadSeekCloser over one file in an image. Seek does no I/O.
@@ -532,6 +551,11 @@ func (f *File) verify() error {
 
 	if got := digest.NewDigest(digest.SHA256, f.hasher); got != f.sum {
 		f.err = fmt.Errorf("imagepull: %s in %s: got %s, want %s: %w", f.name, f.img.src.Ref, got, f.sum, ErrDigestMismatch)
+
+		if f.ls != nil {
+			f.img.noteMismatch(f.img.layers[f.layer].Digest, f.ls.blob.rr)
+		}
+
 		return f.err
 	}
 

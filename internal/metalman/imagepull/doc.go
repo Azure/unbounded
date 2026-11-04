@@ -80,4 +80,14 @@
 // offset, such as HTTP Range requests served with http.ServeContent, cannot
 // be verified: the bytes returned come from a layer that has been verified
 // once, but the registry could serve different bytes on a later request.
+//
+// When content fails verification after a mirror served any of it, the
+// blob is marked on the Image so that later reads skip the mirror and go to
+// the upstream registry only. A layer index build that fails this way is
+// discarded and the layer is read again from the upstream registry from
+// offset 0, and Image.ReadFile likewise retries once from upstream. A File
+// being read still returns the error, since it may already have delivered
+// unverified bytes; opening the file again reads from upstream. If the
+// upstream content also fails verification, the error wraps
+// ErrDigestMismatch.
 package imagepull
