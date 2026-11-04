@@ -15,7 +15,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -32,7 +32,7 @@ const COMPLETE_FRAME: u8 = 2;
 /// Pages Racer may send ahead of the reader (the SDK default).
 const PAGE_CREDITS: u64 = 2;
 /// Racer holds an ingress slot per open connection, so only a few idle Stat
-/// connections are kept, shared across all workers.
+/// connections are kept in total, shared by all workers.
 const STAT_IDLE: usize = 4;
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +60,9 @@ struct IdleConn {
 pub struct Client {
     path: PathBuf,
     idle: Mutex<Vec<IdleConn>>,
+    /// Idle connections held by all workers' pools together.
+    idle_total: Arc<AtomicUsize>,
+    /// Process-wide cap on `idle_total`.
     max_idle: usize,
     stat_lane: Arc<Semaphore>,
     bulk_lane: Arc<Semaphore>,
@@ -82,6 +85,7 @@ impl Client {
         Self {
             path,
             idle: Mutex::new(Vec::with_capacity(STAT_IDLE)),
+            idle_total: Arc::new(AtomicUsize::new(0)),
             max_idle: STAT_IDLE.min(max_connections),
             stat_lane: Arc::new(Semaphore::new(max_connections)),
             bulk_lane: Arc::new(Semaphore::new(max_connections)),
@@ -89,25 +93,24 @@ impl Client {
         }
     }
 
-    /// Splits the idle Stat budget across `workers` per-worker pools so the
-    /// process as a whole keeps about `STAT_IDLE` idle connections (at least
-    /// one per worker). Call before creating siblings.
-    pub fn share_idle(mut self, workers: usize) -> Self {
-        self.max_idle = idle_share(self.max_idle, workers);
-        self
-    }
-
     /// A client for another worker: its own idle pool (no cross-thread
-    /// wakeups), sharing this client's read limits so they stay global.
+    /// wakeups), sharing this client's read limits and idle budget so they
+    /// stay global.
     pub fn sibling(&self) -> Self {
         Self {
             path: self.path.clone(),
             idle: Mutex::new(Vec::with_capacity(self.max_idle)),
+            idle_total: self.idle_total.clone(),
             max_idle: self.max_idle,
             stat_lane: self.stat_lane.clone(),
             bulk_lane: self.bulk_lane.clone(),
             jitter: AtomicU64::new(self.jitter.load(Ordering::Relaxed).rotate_left(17) | 1),
         }
+    }
+
+    #[cfg(test)]
+    fn idle_len(&self) -> usize {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     async fn admit(lane: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Failure> {
@@ -140,6 +143,7 @@ impl Client {
         let now = Instant::now();
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(conn) = idle.pop() {
+            self.idle_total.fetch_sub(1, Ordering::Relaxed);
             if now < conn.expires && now.duration_since(conn.idle_since) < IDLE_TIMEOUT {
                 return Some((conn.stream, conn.expires));
             }
@@ -148,8 +152,16 @@ impl Client {
     }
 
     fn recycle(&self, stream: UnixStream, expires: Instant) {
-        let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.len() < self.max_idle {
+        // Reserve a slot in the process-wide budget; without one the
+        // connection is dropped (closed).
+        let reserved = self
+            .idle_total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < self.max_idle).then_some(n + 1)
+            })
+            .is_ok();
+        if reserved {
+            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
             idle.push(IdleConn {
                 stream,
                 expires,
@@ -893,25 +905,74 @@ impl Subscription {
     }
 }
 
-/// Per-worker idle Stat pool size: `total` split across `workers`, at least
-/// one each so every worker can reuse a connection.
-fn idle_share(total: usize, workers: usize) -> usize {
-    (total / workers.max(1)).max(1)
+impl Drop for Client {
+    /// Release the budget held by connections still in this pool.
+    fn drop(&mut self) {
+        let n = self.idle.get_mut().unwrap_or_else(|e| e.into_inner()).len();
+        self.idle_total.fetch_sub(n, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn idle_shares() {
-        assert_eq!(idle_share(4, 1), 4);
-        assert_eq!(idle_share(4, 2), 2);
-        assert_eq!(idle_share(4, 3), 1);
-        assert_eq!(idle_share(4, 4), 1);
-        assert_eq!(idle_share(4, 256), 1);
-        assert_eq!(idle_share(1, 1), 1);
-        assert_eq!(idle_share(4, 0), 4);
+    fn conn() -> UnixStream {
+        UnixStream::pair().unwrap().0
+    }
+
+    fn far() -> Instant {
+        Instant::now() + MAX_CONN_AGE
+    }
+
+    #[tokio::test]
+    async fn idle_budget_is_process_wide() {
+        let a = Client::new(PathBuf::from("/nonexistent"), 64);
+        let workers: Vec<Client> = (0..7).map(|_| a.sibling()).collect();
+        for w in std::iter::once(&a).chain(&workers) {
+            for _ in 0..3 {
+                w.recycle(conn(), far());
+            }
+        }
+        let held: usize = a.idle_len() + workers.iter().map(Client::idle_len).sum::<usize>();
+        assert_eq!(held, STAT_IDLE);
+        assert_eq!(a.idle_total.load(Ordering::Relaxed), STAT_IDLE);
+
+        // Taking a connection frees budget for another worker.
+        let last = workers.iter().rev().find(|w| w.idle_len() > 0).unwrap();
+        let other = workers.iter().find(|w| w.idle_len() == 0).unwrap();
+        assert!(last.pooled().is_some());
+        other.recycle(conn(), far());
+        assert_eq!(other.idle_len(), 1);
+        other.recycle(conn(), far());
+        assert_eq!(other.idle_len(), 1);
+
+        // Dropping a pool releases its budget.
+        drop(workers);
+        assert_eq!(a.idle_total.load(Ordering::Relaxed), a.idle_len());
+    }
+
+    #[tokio::test]
+    async fn idle_budget_respects_max_connections() {
+        let a = Client::new(PathBuf::from("/nonexistent"), 1);
+        let b = a.sibling();
+        a.recycle(conn(), far());
+        b.recycle(conn(), far());
+        assert_eq!(a.idle_len() + b.idle_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_idle_releases_budget() {
+        let a = Client::new(PathBuf::from("/nonexistent"), 64);
+        let b = a.sibling();
+        for _ in 0..STAT_IDLE {
+            a.recycle(conn(), Instant::now());
+        }
+        assert_eq!(a.idle_total.load(Ordering::Relaxed), STAT_IDLE);
+        assert!(a.pooled().is_none());
+        assert_eq!(a.idle_total.load(Ordering::Relaxed), 0);
+        b.recycle(conn(), far());
+        assert_eq!(b.idle_len(), 1);
     }
 
     #[test]
