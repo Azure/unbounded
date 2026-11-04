@@ -271,7 +271,7 @@ fn serve(
     identity: Option<&Identity>,
     tls12: bool,
     connections: usize,
-) -> (std::thread::JoinHandle<Duration>, Arc<AtomicUsize>) {
+) -> (std::thread::JoinHandle<()>, Arc<AtomicUsize>) {
     let config = identity.map(|identity| {
         let versions: &[&rustls::SupportedProtocolVersion] = if tls12 {
             &[&rustls::version::TLS12]
@@ -303,7 +303,6 @@ fn serve(
                 None => serve_connection(tcp, &body),
             }
         }
-        thread_cpu()
     });
     (handle, accepted)
 }
@@ -342,16 +341,6 @@ fn serve_connection(mut stream: impl Read + Write, body: &[u8]) {
         }
         let _ = stream.flush();
     }
-}
-
-fn thread_cpu() -> Duration {
-    rusage(libc::RUSAGE_THREAD)
-}
-fn rusage(who: i32) -> Duration {
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(who, &mut usage) };
-    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
-    tv(usage.ru_utime) + tv(usage.ru_stime)
 }
 
 fn get(range: std::ops::Range<usize>, host: &str) -> MessageHead {
@@ -830,43 +819,4 @@ fn cancelled_userspace_exchange_releases_relay_charge() {
     assert!(fixture.admission.used(Resource::Context) < http1::tls::RELAY_ALLOCATION);
     drop(fixture);
     server.join().unwrap();
-}
-
-/// Report client CPU per GiB for each record-layer placement:
-/// `cargo test -p http1 --release --test tls -- --ignored --nocapture cpu_per_gib`.
-#[test]
-#[ignore = "benchmark"]
-fn cpu_per_gib() {
-    const PAGES: usize = 64;
-    let mut modes = vec![TlsMode::Userspace];
-    if kernel_tls_available() {
-        modes.insert(0, TlsMode::Kernel);
-    }
-    for mode in modes {
-        let identity = identity(&["localhost"]);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (server, _) = serve(listener, Some(&identity), false, 1);
-        let fixture = fixture();
-        let endpoint = tls_endpoint(&identity, address, mode);
-        fetch_pages(&fixture, &endpoint, 1).unwrap();
-        let process = rusage(libc::RUSAGE_SELF);
-        let started = Instant::now();
-        fetch(&fixture, &endpoint, PAGES, false).unwrap();
-        let elapsed = started.elapsed();
-        fixture.pool.close();
-        drop(fixture);
-        let process = rusage(libc::RUSAGE_SELF) - process;
-        let server = server.join().unwrap();
-        let gib = (PAGES * PAGE) as f64 / (1u64 << 30) as f64;
-        // Server CPU includes its handshake and the warm-up page; subtracting it
-        // slightly under-reports client CPU, never inflates it.
-        let client = process.saturating_sub(server);
-        println!(
-            "{mode:?}: client cpu {:.3} s/GiB, wall {:.2} GiB/s (server cpu {:.3} s/GiB)",
-            client.as_secs_f64() / gib,
-            gib / elapsed.as_secs_f64(),
-            server.as_secs_f64() / gib
-        );
-    }
 }
