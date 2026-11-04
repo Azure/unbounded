@@ -10,8 +10,29 @@ import (
 	"testing"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/yaml"
 )
+
+func TestCertificationSuiteKindsRegistered(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	if err := AddToScheme(scheme); err != nil {
+		t.Fatalf("add Signal types to scheme: %v", err)
+	}
+
+	for _, object := range []runtime.Object{&CertificationSuite{}, &CertificationSuiteList{}} {
+		kinds, _, err := scheme.ObjectKinds(object)
+		if err != nil {
+			t.Fatalf("look up registered kind for %T: %v", object, err)
+		}
+
+		if len(kinds) != 1 || kinds[0].GroupVersion() != GroupVersion {
+			t.Fatalf("registered kinds for %T = %v, want Signal v1alpha1", object, kinds)
+		}
+	}
+}
 
 func TestCertificationCheckListContract(t *testing.T) {
 	t.Parallel()
@@ -22,8 +43,8 @@ func TestCertificationCheckListContract(t *testing.T) {
 		schemaPath []string
 	}{
 		{
-			name:       "profile spec",
-			file:       "signal.unbounded-cloud.io_certificationprofiles.yaml",
+			name:       "suite spec",
+			file:       "signal.unbounded-cloud.io_certificationsuites.yaml",
 			schemaPath: []string{"spec", "checks"},
 		},
 		{
@@ -71,19 +92,77 @@ func TestCertificationCheckListContract(t *testing.T) {
 	}
 }
 
-func TestCertificationRunChecksRemainImmutable(t *testing.T) {
+func TestCertificationProfileReferencesSuite(t *testing.T) {
+	t.Parallel()
+
+	crd := readCRD(t, "signal.unbounded-cloud.io_certificationprofiles.yaml")
+
+	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
+
+	suite, found := spec.Properties["suite"]
+	if !found {
+		t.Fatal("generated Profile CRD has no suite reference")
+	}
+
+	if _, found := suite.Properties["name"]; !found {
+		t.Fatal("generated Profile suite reference has no name")
+	}
+
+	if !contains(spec.Required, "suite") {
+		t.Fatal("generated Profile CRD does not require suite")
+	}
+
+	for _, removed := range []string{"checks", "scriptBundle"} {
+		if _, found := spec.Properties[removed]; found {
+			t.Fatalf("generated Profile CRD still owns %s", removed)
+		}
+	}
+}
+
+func TestCertificationRunPinsSuiteAndRemainsImmutable(t *testing.T) {
 	t.Parallel()
 
 	crd := readCRD(t, "signal.unbounded-cloud.io_certificationruns.yaml")
 
 	spec := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
-	for _, validation := range spec.XValidations {
-		if validation.Rule == "self.checks == oldSelf.checks" {
-			return
+
+	suite, found := spec.Properties["suite"]
+	if !found {
+		t.Fatal("generated Run CRD has no pinned suite")
+	}
+
+	for _, property := range []string{"name", "uid", "generation"} {
+		if _, found := suite.Properties[property]; !found {
+			t.Fatalf("generated Run pinned suite has no %s", property)
+		}
+
+		if !contains(suite.Required, property) {
+			t.Fatalf("generated Run pinned suite does not require %s", property)
 		}
 	}
 
-	t.Fatal("generated Run CRD does not preserve checks immutability")
+	if !contains(spec.Required, "suite") {
+		t.Fatal("generated Run CRD does not require suite")
+	}
+
+	requiredRules := map[string]bool{
+		"self.profile == oldSelf.profile":           false,
+		"self.suite == oldSelf.suite":               false,
+		"self.scriptBundle == oldSelf.scriptBundle": false,
+		"self.checks == oldSelf.checks":             false,
+	}
+
+	for _, validation := range spec.XValidations {
+		if _, found := requiredRules[validation.Rule]; found {
+			requiredRules[validation.Rule] = true
+		}
+	}
+
+	for rule, found := range requiredRules {
+		if !found {
+			t.Fatalf("generated Run CRD has no %q immutability rule", rule)
+		}
+	}
 }
 
 func readCRD(t *testing.T, name string) *apiextensionsv1.CustomResourceDefinition {
@@ -105,4 +184,14 @@ func readCRD(t *testing.T, name string) *apiextensionsv1.CustomResourceDefinitio
 	}
 
 	return crd
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+
+	return false
 }

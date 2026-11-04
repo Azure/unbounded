@@ -68,6 +68,15 @@ type PinnedProfile struct {
 }
 
 // +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
+type PinnedSuite struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string    `json:"name"`
+	UID  types.UID `json:"uid"`
+	// +kubebuilder:validation:Minimum=1
+	Generation int64 `json:"generation"`
+}
+
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
 type ScriptBundleReference struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string    `json:"name"`
@@ -105,6 +114,7 @@ type CertificationCheckSnapshot struct {
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
+// +kubebuilder:validation:XValidation:rule="self.suite == oldSelf.suite",message="suite is immutable"
 // +kubebuilder:validation:XValidation:rule="self.participants == oldSelf.participants",message="participants are immutable"
 // +kubebuilder:validation:XValidation:rule="self.scriptBundle == oldSelf.scriptBundle",message="scriptBundle is immutable"
 // +kubebuilder:validation:XValidation:rule="self.checks == oldSelf.checks",message="checks are immutable"
@@ -113,12 +123,13 @@ type CertificationCheckSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.release) || !oldSelf.release || (has(self.release) && self.release)",message="release cannot be cleared"
 type CertificationRunSpec struct {
 	Profile PinnedProfile `json:"profile"`
+	Suite   PinnedSuite   `json:"suite"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
 	Participants []Participant         `json:"participants"`
 	ScriptBundle ScriptBundleReference `json:"scriptBundle"`
-	// Checks is the immutable ordered snapshot of the Profile suite. A check's
-	// position defines its stable ID.
+	// Checks is the immutable ordered snapshot of the Suite. A check's position
+	// defines its stable ID.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=256
 	// +listType=atomic
