@@ -674,7 +674,9 @@ racer-object: racer-object-test racer-object-build ## Test and build the Rust ra
 
 racer-object-build: ## Build the Rust racer-object sidecar (release) into bin/racer-object without tests
 	@mkdir -p bin
-	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" timeout --signal=TERM --kill-after=10s 600s cargo build --locked --release --manifest-path $(RACER_OBJECT_MANIFEST)
+	CARGO_TARGET_DIR="$(RACER_OBJECT_CARGO_TARGET_DIR)" \
+		RACER_OBJECT_VERSION="$(VERSION)" RACER_OBJECT_GIT_COMMIT="$(GIT_COMMIT)" RACER_OBJECT_BUILD_TIME="$(BUILD_TIME)" \
+		timeout --signal=TERM --kill-after=10s 600s cargo build --locked --release --manifest-path $(RACER_OBJECT_MANIFEST)
 	install -m 0755 "$(RACER_OBJECT_CARGO_TARGET_DIR)/release/racer-object" $(RACER_OBJECT_BIN)
 
 racer-object-test: ## Check formatting, run Clippy, and test the racer-object crate
@@ -684,6 +686,9 @@ racer-object-test: ## Check formatting, run Clippy, and test the racer-object cr
 
 image-racer-object-local: ## Build the racer-object container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
 		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
 		-f ./images/racer-object/Containerfile .
 	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))

@@ -14,9 +14,17 @@ WORKDIR /src/cmd/racer-object
 
 # Copy only the standalone crate so unrelated repository changes do not
 # invalidate the build cache.
-COPY cmd/racer-object/Cargo.toml cmd/racer-object/Cargo.lock ./
+COPY cmd/racer-object/Cargo.toml cmd/racer-object/Cargo.lock cmd/racer-object/build.rs ./
 COPY cmd/racer-object/src ./src
-RUN cargo build --locked --release && \
+
+# Version metadata reported by --version, read by src/cli.rs at compile time.
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+RUN RACER_OBJECT_VERSION="${VERSION}" \
+    RACER_OBJECT_GIT_COMMIT="${GIT_COMMIT}" \
+    RACER_OBJECT_BUILD_TIME="${BUILD_TIME}" \
+    cargo build --locked --release && \
     install -D -m 0755 target/release/racer-object /out/racer-object
 
 # Runtime stage
