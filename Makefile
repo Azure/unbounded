@@ -371,6 +371,7 @@ help: ## Show this help
 	@echo "  racer-purity-graph               Report pure Racer crates that depend on IO crates (STRICT=1 fails)"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
 	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
+	@echo "  racer-dst                        Run the Racer DST seed set twice each (DST_SEEDS, DST_STEPS, DST_FILTER)"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -633,6 +634,14 @@ RACER_SIM_TIMEOUT ?= 7200s
 .PHONY: racer-sim
 racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
 	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer/Cargo.toml -p racer-sim -- $(ARGS)
+
+RACER_DST_TIMEOUT ?= 600s
+
+# DST_SEEDS: seed file or count N (seeds 1..=N per scenario); default dst/seeds/{ci,regressions}.txt.
+# DST_STEPS: step budget per run. DST_FILTER: scenario name substring. Each entry runs twice.
+.PHONY: racer-dst
+racer-dst: ## Run the Racer deterministic simulation tests; every seed runs twice and must match
+	DST_SEEDS="$(DST_SEEDS)" DST_STEPS="$(DST_STEPS)" DST_FILTER="$(DST_FILTER)" timeout --signal=TERM --kill-after=10s $(RACER_DST_TIMEOUT) cargo +$(RACER_RUST_TOOLCHAIN) run --locked --manifest-path cmd/racer/Cargo.toml -p racer-dst --bin racer-dst
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
