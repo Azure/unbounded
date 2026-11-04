@@ -10,6 +10,14 @@ import (
 
 type CheckID string
 
+const (
+	// MinCertificationChecks keeps certification suites non-empty.
+	MinCertificationChecks = 1
+	// MaxCertificationChecks bounds CEL immutability cost and persisted Run
+	// status size without making the current suite length part of the API.
+	MaxCertificationChecks = 256
+)
+
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount > 0)",message="MPIJob checks require a positive gpuCount"
 type CertificationCheck struct {
@@ -81,8 +89,10 @@ type ScriptBundleSource struct {
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy  `json:"participants"`
 	ScriptBundle ScriptBundleSource `json:"scriptBundle"`
-	// +kubebuilder:validation:MinItems=15
-	// +kubebuilder:validation:MaxItems=15
+	// Checks is an ordered suite. A check's position defines its stable ID.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=256
+	// +listType=atomic
 	Checks []CertificationCheck `json:"checks"`
 }
 

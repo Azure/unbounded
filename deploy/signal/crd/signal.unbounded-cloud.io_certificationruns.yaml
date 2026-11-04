@@ -57,6 +57,9 @@ spec:
               cancel:
                 type: boolean
               checks:
+                description: |-
+                  Checks is the immutable ordered snapshot of the Profile suite. A check's
+                  position defines its stable ID.
                 items:
                   properties:
                     backend:
@@ -208,9 +211,10 @@ spec:
                   - message: MPIJob checks require a positive gpuCount
                     rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
                       > 0)
-                maxItems: 15
-                minItems: 15
+                maxItems: 256
+                minItems: 1
                 type: array
+                x-kubernetes-list-type: atomic
               participants:
                 items:
                   properties:
@@ -312,6 +316,7 @@ spec:
           status:
             properties:
               checks:
+                description: Checks remains positionally aligned with spec.checks.
                 items:
                   properties:
                     phase:
@@ -329,8 +334,9 @@ spec:
                   required:
                   - phase
                   type: object
-                maxItems: 15
+                maxItems: 256
                 type: array
+                x-kubernetes-list-type: atomic
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
