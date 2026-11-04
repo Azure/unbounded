@@ -7,14 +7,17 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/Azure/unbounded/internal/ociutil"
@@ -153,54 +156,20 @@ func cleanName(name string) string {
 	return strings.TrimPrefix(name, "/")
 }
 
-// whiteouts tracks paths hidden by upper layers.
-type whiteouts struct {
-	deleted map[string]bool
-	opaque  map[string]bool
-}
-
-func newWhiteouts() whiteouts {
-	return whiteouts{deleted: map[string]bool{}, opaque: map[string]bool{}}
-}
-
-func (w whiteouts) merge(o whiteouts) {
-	for k := range o.deleted {
-		w.deleted[k] = true
-	}
-
-	for k := range o.opaque {
-		w.opaque[k] = true
-	}
-}
-
-// hides reports whether name, as found in a lower layer, is hidden.
-func (w whiteouts) hides(name string) bool {
-	if w.deleted[name] {
-		return true
-	}
-
-	for dir := name; ; {
-		dir = path.Dir(dir)
-		if dir == "/" {
-			dir = "."
-		}
-
-		if w.deleted[dir] || w.opaque[dir] {
-			return true
-		}
-
-		if dir == "." {
-			return false
-		}
-	}
-}
+// errNotRegular reports that a matched path is not a regular file.
+var errNotRegular = errors.New("not a regular file")
 
 // Open returns the first file found among names, which are paths relative to
 // the image root such as "disk/vmlinuz". Layers are searched top-down and
-// whiteouts in upper layers hide files in lower layers. Within a layer, the
-// first tar entry matching any of the names wins. Symbolic and hard links are
-// followed within the image. If none of the names exist, the error wraps
-// ErrNotFound.
+// whiteouts in upper layers hide files in lower layers. When several names
+// exist, the one found in the highest layer wins; among names found in the
+// same layer, the earliest argument wins. Symbolic links (including links
+// in parent directories) and hard links are followed within the image. If
+// none of the names exist, the error wraps ErrNotFound.
+//
+// Open uses the Puller's layer indexes and does not read file content. The
+// first time a layer is needed, it is read once in full to build its index;
+// afterwards, missing names are answered without any registry requests.
 //
 // ctx bounds the lifetime of the returned File, including the registry
 // requests made by later Read calls.
@@ -209,137 +178,172 @@ func (i *Image) Open(ctx context.Context, names ...string) (*File, error) {
 		return nil, errors.New("imagepull: Open requires at least one name")
 	}
 
-	cleaned := make([]string, len(names))
-	for k, n := range names {
-		cleaned[k] = cleanName(n)
-	}
+	var (
+		best      *File
+		bestErr   error
+		bestLayer = -1
+	)
 
-	return i.open(ctx, cleaned, "", 0)
-}
+	for _, n := range names {
+		name := cleanName(n)
 
-func (i *Image) open(ctx context.Context, names []string, alias string, depth int) (*File, error) {
-	if depth > maxLinkDepth {
-		return nil, fmt.Errorf("imagepull: too many levels of links resolving %v", names)
-	}
-
-	hidden := newWhiteouts()
-
-	for li := len(i.layers) - 1; li >= 0; li-- {
-		f, layerHidden, err := i.scanLayer(ctx, li, names, alias, hidden, depth)
-		if err != nil || f != nil {
-			return f, err
+		li, e, first, err := i.lookup(ctx, name)
+		if errors.Is(err, ErrNotFound) {
+			continue
 		}
 
-		hidden.merge(layerHidden)
+		if first < 0 {
+			// Registry or index failure.
+			return nil, err
+		}
+
+		if first <= bestLayer {
+			continue
+		}
+
+		bestLayer, best, bestErr = first, nil, err
+		if err == nil {
+			best = &File{
+				img:     i,
+				ctx:     ctx,
+				name:    name,
+				entry:   e.entry,
+				layer:   li,
+				ordinal: e.ordinal,
+				size:    e.size,
+				modTime: e.modTime,
+				sum:     e.sum,
+			}
+		}
+
+		if first == len(i.layers)-1 {
+			break
+		}
 	}
 
-	return nil, fmt.Errorf("%w: %s in %s", ErrNotFound, strings.Join(names, ", "), i.src.Ref)
+	if bestLayer < 0 {
+		return nil, fmt.Errorf("%w: %s in %s", ErrNotFound, strings.Join(names, ", "), i.src.Ref)
+	}
+
+	if bestErr != nil {
+		return nil, bestErr
+	}
+
+	return best, nil
 }
 
-// scanLayer looks for names in layer li. It returns the opened file when
-// found, or the whiteouts the layer contributes for lower layers.
-func (i *Image) scanLayer(ctx context.Context, li int, names []string, alias string, hidden whiteouts, depth int) (*File, whiteouts, error) {
-	ls, err := i.openLayer(ctx, li)
-	if err != nil {
-		return nil, whiteouts{}, err
+// implicitDir is the entry stat returns for a directory that has no tar
+// entry of its own.
+var implicitDir = &indexEntry{kind: kindDir}
+
+// stat returns the topmost visible entry for the exact path p, without
+// following links, and the layer it is in. A nil entry means p does not
+// exist.
+func (i *Image) stat(ctx context.Context, p string) (int, *indexEntry, error) {
+	for li := len(i.layers) - 1; li >= 0; li-- {
+		x, err := i.layerIndex(ctx, li)
+		if err != nil {
+			return -1, nil, err
+		}
+
+		if e := x.entries[p]; e != nil {
+			return li, e, nil
+		}
+
+		// A directory implied by entries below it shadows lower layers just
+		// like an explicit directory entry.
+		if x.dirs[p] {
+			return li, implicitDir, nil
+		}
+
+		if x.hides(p) {
+			return -1, nil, nil
+		}
 	}
 
-	layerHidden := newWhiteouts()
+	return -1, nil, nil
+}
 
-	for ordinal := 0; ; ordinal++ {
-		hdr, err := ls.tr.Next()
-		if errors.Is(err, io.EOF) {
+// lookup resolves name to a regular file, following symbolic links in any
+// path component and hard links. It returns the layer and entry holding the
+// content, and the layer where name itself was first matched (for
+// precedence between names), which is -1 when name does not exist or the
+// layer indexes could not be loaded.
+func (i *Image) lookup(ctx context.Context, name string) (int, *indexEntry, int, error) {
+	first := -1
+	notFound := func() error {
+		return fmt.Errorf("%w: %s in %s", ErrNotFound, name, i.src.Ref)
+	}
+
+	p := name
+	depth := 0
+
+	for {
+		if p == "" {
+			return -1, nil, first, notFound()
+		}
+
+		comps := strings.Split(p, "/")
+		cur := ""
+		restart := false
+
+		for k, c := range comps {
+			next := path.Join(cur, c)
+			last := k == len(comps)-1
+
+			li, e, err := i.stat(ctx, next)
+			if err != nil {
+				return -1, nil, -1, err
+			}
+
+			if e == nil || e == implicitDir {
+				if last {
+					return -1, nil, first, notFound()
+				}
+
+				// Directories need not have their own tar entry.
+				cur = next
+
+				continue
+			}
+
+			if first < 0 && (last || e.kind == kindSymlink) {
+				first = li
+			}
+
+			switch {
+			case e.kind == kindDir && !last:
+				cur = next
+				continue
+			case e.kind == kindSymlink, e.kind == kindHardlink && last && !e.resolved:
+				depth++
+				if depth > maxLinkDepth {
+					return -1, nil, first, fmt.Errorf("imagepull: too many levels of links resolving %s in %s", name, i.src.Ref)
+				}
+
+				target := e.link
+				if e.kind == kindSymlink && !path.IsAbs(target) {
+					target = path.Join("/"+cur, target)
+				}
+
+				p = cleanName(path.Join(append([]string{"/" + target}, comps[k+1:]...)...))
+				restart = true
+			case e.kind == kindReg && last, e.kind == kindHardlink && last:
+				return li, e, first, nil
+			case last:
+				return -1, nil, first, fmt.Errorf("imagepull: %s in %s: %w", next, i.src.Ref, errNotRegular)
+			default:
+				// A non-directory used as a directory.
+				return -1, nil, first, notFound()
+			}
+
 			break
 		}
 
-		if err != nil {
-			_ = ls.Close() //nolint:errcheck // already failing
-			return nil, whiteouts{}, fmt.Errorf("read layer %s: %w", i.layers[li].Digest, err)
-		}
-
-		name := cleanName(hdr.Name)
-		dir, base := path.Split(name)
-		dir = cleanName(dir)
-
-		if dir == "" {
-			dir = "."
-		}
-
-		if base == whiteoutOpaque {
-			layerHidden.opaque[dir] = true
-			continue
-		}
-
-		if strings.HasPrefix(base, whiteoutPrefix) {
-			layerHidden.deleted[cleanName(path.Join(dir, strings.TrimPrefix(base, whiteoutPrefix)))] = true
-			continue
-		}
-
-		if !matches(name, names) || hidden.hides(name) {
-			continue
-		}
-
-		matched := name
-		if alias != "" {
-			matched = alias
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeReg, tar.TypeRegA: //nolint:staticcheck // TypeRegA appears in old archives
-			return &File{
-				img:     i,
-				ctx:     ctx,
-				name:    matched,
-				entry:   name,
-				layer:   li,
-				ordinal: ordinal,
-				size:    hdr.Size,
-				modTime: hdr.ModTime,
-				ls:      ls,
-			}, whiteouts{}, nil
-		case tar.TypeSymlink:
-			_ = ls.Close() //nolint:errcheck // done with this layer
-
-			target := hdr.Linkname
-			if !path.IsAbs(target) {
-				target = path.Join(path.Dir("/"+name), target)
-			}
-
-			f, err := i.open(ctx, []string{cleanName(target)}, matched, depth+1)
-
-			return f, whiteouts{}, err
-		case tar.TypeLink:
-			_ = ls.Close() //nolint:errcheck // done with this layer
-
-			f, err := i.open(ctx, []string{cleanName(hdr.Linkname)}, matched, depth+1)
-
-			return f, whiteouts{}, err
-		default:
-			_ = ls.Close() //nolint:errcheck // done with this layer
-			return nil, whiteouts{}, fmt.Errorf("imagepull: %s in %s is not a regular file (type %q)", name, i.src.Ref, hdr.Typeflag)
+		if !restart {
+			return -1, nil, first, notFound()
 		}
 	}
-
-	// The whole layer was scanned: drain what remains so that the blob is
-	// read to EOF and its digest is verified.
-	err = ls.drain()
-	_ = ls.Close() //nolint:errcheck // read-only stream
-
-	if err != nil {
-		return nil, whiteouts{}, fmt.Errorf("read layer %s: %w", i.layers[li].Digest, err)
-	}
-
-	return nil, layerHidden, nil
-}
-
-func matches(name string, names []string) bool {
-	for _, n := range names {
-		if n == name {
-			return true
-		}
-	}
-
-	return false
 }
 
 // ReadFile reads the first file found among names into memory and returns
@@ -356,6 +360,8 @@ func (i *Image) ReadFile(ctx context.Context, names ...string) ([]byte, string, 
 		return nil, "", fmt.Errorf("imagepull: %s is %d bytes, larger than the %d byte limit", f.Name(), f.Size(), MaxReadFileSize)
 	}
 
+	// File.Read verifies the content digest when the file is read to EOF
+	// from offset 0, so the bytes below are verified.
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return nil, "", err
@@ -365,10 +371,17 @@ func (i *Image) ReadFile(ctx context.Context, names ...string) ([]byte, string, 
 }
 
 // File is an io.ReadSeekCloser over one file in an image. Seek does no I/O.
-// Reading at a position before the current stream offset re-opens the layer
-// and skips to the entry again; reading ahead discards bytes. This lets
-// callers serve Range requests (for example with http.ServeContent) without
-// an on-disk cache. A File is not safe for concurrent use.
+// The layer is opened on the first Read. Reading at a position before the
+// current stream offset re-opens the layer and skips to the entry again;
+// reading ahead discards bytes. This lets callers serve Range requests (for
+// example with http.ServeContent) without an on-disk cache.
+//
+// When the file is read sequentially from offset 0 to EOF, its content is
+// checked against the sha256 recorded in the layer index, and the final
+// Read returns an error wrapping ErrDigestMismatch instead of io.EOF on a
+// mismatch. Reads that start at a non-zero offset cannot be verified.
+//
+// A File is not safe for concurrent use.
 type File struct {
 	img     *Image
 	ctx     context.Context //nolint:containedctx // bounds lazy re-opens done by Read
@@ -378,8 +391,13 @@ type File struct {
 	ordinal int
 	size    int64
 	modTime time.Time
+	sum     digest.Digest
 
 	ls        *layerStream
+	hasher    hash.Hash
+	hashed    int64 // bytes hashed contiguously from offset 0, or -1
+	verified  bool
+	err       error
 	streamPos int64
 	off       int64
 	closed    bool
@@ -402,7 +420,15 @@ func (f *File) Read(p []byte) (int, error) {
 		return 0, errors.New("imagepull: read of closed file")
 	}
 
+	if f.err != nil {
+		return 0, f.err
+	}
+
 	if f.off >= f.size {
+		if err := f.verify(); err != nil {
+			return 0, err
+		}
+
 		return 0, io.EOF
 	}
 
@@ -426,6 +452,7 @@ func (f *File) Read(p []byte) (int, error) {
 	}
 
 	n, err := f.ls.tr.Read(p)
+	f.hash(p[:n])
 	f.off += int64(n)
 	f.streamPos += int64(n)
 
@@ -437,7 +464,54 @@ func (f *File) Read(p []byte) (int, error) {
 		err = nil
 	}
 
+	if err == nil && f.off == f.size {
+		err = f.verify()
+	}
+
 	return n, err
+}
+
+// hash feeds bytes read at f.off into the content hash while reads are
+// contiguous from offset 0.
+func (f *File) hash(b []byte) {
+	if f.off == 0 {
+		f.hasher = sha256.New()
+		f.hashed = 0
+		f.verified = false
+	}
+
+	if f.hasher == nil || f.hashed != f.off {
+		f.hashed = -1
+		return
+	}
+
+	_, _ = f.hasher.Write(b) //nolint:errcheck // hash writes never fail
+	f.hashed += int64(len(b))
+}
+
+// verify checks the content digest once the whole file has been hashed.
+func (f *File) verify() error {
+	if f.verified || f.sum == "" {
+		return nil
+	}
+
+	if f.size == 0 && f.hasher == nil {
+		f.hasher = sha256.New()
+		f.hashed = 0
+	}
+
+	if f.hasher == nil || f.hashed != f.size {
+		return nil
+	}
+
+	if got := digest.NewDigest(digest.SHA256, f.hasher); got != f.sum {
+		f.err = fmt.Errorf("imagepull: %s in %s: got %s, want %s: %w", f.name, f.img.src.Ref, got, f.sum, ErrDigestMismatch)
+		return f.err
+	}
+
+	f.verified = true
+
+	return nil
 }
 
 func (f *File) reopen() error {

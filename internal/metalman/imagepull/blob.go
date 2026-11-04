@@ -25,25 +25,100 @@ const (
 	chunkRetryBackoff = 100 * time.Millisecond
 )
 
-// openBlob opens a verified reader over the blob described by desc, trying
-// each endpoint in order until one returns a usable first response.
+// openBlob opens a verified reader over the blob described by desc. The
+// endpoints are tried in order; if one fails mid-stream, the read resumes
+// from the next endpoint at the current offset.
 func (i *Image) openBlob(ctx context.Context, desc ispec.Descriptor) (io.ReadCloser, error) {
-	var errs []error
-
-	for _, ep := range i.eps {
-		r, err := newBlobReader(ctx, ep, desc, i.puller.chunkSize(), i.puller.concurrency())
-		if err == nil {
-			return newVerifyReader(r, desc), nil
-		}
-
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		errs = append(errs, fmt.Errorf("%s: %w", ep.name, err))
+	r := &resumeReader{ctx: ctx, eps: i.eps, desc: desc, p: i.puller}
+	if err := r.openNext(); err != nil {
+		return nil, err
 	}
 
-	return nil, fmt.Errorf("fetch blob %s: %w", desc.Digest, errors.Join(errs...))
+	return newVerifyReader(r, desc), nil
+}
+
+// resumeReader reads a blob from the first working endpoint and, when that
+// endpoint fails after some bytes were delivered, resumes from the next
+// endpoint at the current offset.
+type resumeReader struct {
+	ctx  context.Context //nolint:containedctx // bounds resumed requests
+	eps  []*endpoint
+	desc ispec.Descriptor
+	p    *Puller
+
+	next int // index of the next endpoint to try
+	cur  *blobReader
+	off  int64
+	errs []error
+	err  error
+}
+
+func (r *resumeReader) openNext() error {
+	for r.next < len(r.eps) {
+		ep := r.eps[r.next]
+		r.next++
+
+		br, err := newBlobReader(r.ctx, ep, r.desc, r.off, r.p)
+		if err == nil {
+			r.cur = br
+			return nil
+		}
+
+		if r.ctx.Err() != nil {
+			return r.ctx.Err()
+		}
+
+		r.errs = append(r.errs, fmt.Errorf("%s: %w", ep.name, err))
+	}
+
+	return fmt.Errorf("fetch blob %s: %w", r.desc.Digest, errors.Join(r.errs...))
+}
+
+func (r *resumeReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	for {
+		n, err := r.cur.Read(p)
+		r.off += int64(n)
+
+		// Only a bare io.EOF marks the end of the blob: transport errors
+		// such as a dropped connection may wrap io.EOF.
+		if err == nil || err == io.EOF { //nolint:errorlint // see above
+			return n, err
+		}
+
+		_ = r.cur.Close() //nolint:errcheck // replacing a failed reader
+		r.cur = nil
+
+		if r.ctx.Err() != nil {
+			r.err = r.ctx.Err()
+			return n, r.err
+		}
+
+		r.errs = append(r.errs, fmt.Errorf("%s at offset %d: %w", r.eps[r.next-1].name, r.off, err))
+
+		if oerr := r.openNext(); oerr != nil {
+			r.err = oerr
+			return n, r.err
+		}
+
+		if n > 0 {
+			return n, nil
+		}
+	}
+}
+
+func (r *resumeReader) Close() error {
+	if r.cur != nil {
+		err := r.cur.Close()
+		r.cur = nil
+
+		return err
+	}
+
+	return nil
 }
 
 type chunkResult struct {
@@ -51,29 +126,42 @@ type chunkResult struct {
 	err  error
 }
 
-// blobReader delivers a blob in order. In ranged mode it fetches chunks
-// concurrently with HTTP Range requests; otherwise it streams one response
-// body.
+// pendingChunk is a prefetched chunk request and the budget it holds.
+type pendingChunk struct {
+	ch     chan chunkResult
+	charge int64
+}
+
+var errBlobReaderClosed = errors.New("blob reader closed")
+
+// blobReader delivers a blob in order from one endpoint, starting at a given
+// offset. In ranged mode it fetches chunks concurrently with HTTP Range
+// requests, holding prefetched chunks within the Puller memory budget;
+// otherwise it streams one response body.
+//
+// A blobReader does not support concurrent Read and Close calls.
 type blobReader struct {
-	ctx    context.Context
+	ctx    context.Context //nolint:containedctx // bounds chunk requests
 	cancel context.CancelFunc
 	ep     *endpoint
 	url    string
 	size   int64
 	chunk  int64
 	conc   int
+	budget *budget
 
-	body    io.Closer // first response body, closed on Close
-	cur     io.Reader
-	ranged  bool
-	next    int64 // offset of the next chunk to schedule
-	pending []chan chunkResult
-	wg      sync.WaitGroup
-	err     error
-	closed  bool
+	body      io.Closer // streamed response body backing cur, if any
+	cur       io.Reader // nil when the next chunk must be loaded
+	curCharge int64
+	ranged    bool
+	next      int64 // offset of the next chunk to schedule
+	pending   []pendingChunk
+	wg        sync.WaitGroup
+	err       error
+	closed    bool
 }
 
-func newBlobReader(parent context.Context, ep *endpoint, desc ispec.Descriptor, chunk int64, conc int) (*blobReader, error) {
+func newBlobReader(parent context.Context, ep *endpoint, desc ispec.Descriptor, off int64, p *Puller) (*blobReader, error) {
 	ctx, cancel := context.WithCancel(auth.AppendRepositoryScope(parent, ep.ref, auth.ActionPull))
 	b := &blobReader{
 		ctx:    ctx,
@@ -81,11 +169,12 @@ func newBlobReader(parent context.Context, ep *endpoint, desc ispec.Descriptor, 
 		ep:     ep,
 		url:    fmt.Sprintf("%s/v2/%s/blobs/%s", ep.baseURL, ep.ref.Repository, desc.Digest),
 		size:   desc.Size,
-		chunk:  chunk,
-		conc:   conc,
+		chunk:  p.chunkSize(),
+		conc:   p.concurrency(),
+		budget: p.state().budget,
 	}
 
-	if err := b.start(); err != nil {
+	if err := b.start(off); err != nil {
 		cancel()
 		return nil, err
 	}
@@ -93,60 +182,137 @@ func newBlobReader(parent context.Context, ep *endpoint, desc ispec.Descriptor, 
 	return b, nil
 }
 
-func (b *blobReader) start() error {
-	if b.conc > 1 && b.size > b.chunk {
-		resp, err := b.get(0, b.chunk-1)
+func (b *blobReader) start(off int64) error {
+	if off >= b.size {
+		b.cur = &exactReader{}
+		return nil
+	}
+
+	if b.conc > 1 && b.size-off > b.chunk {
+		end := off + b.chunk - 1
+
+		resp, err := b.getRetry(off, end)
 		if err != nil {
 			return err
 		}
 
 		switch {
-		case resp.StatusCode == http.StatusPartialContent && contentRangeMatches(resp, 0, b.chunk-1, b.size):
+		case resp.StatusCode == http.StatusPartialContent && contentRangeMatches(resp, off, end, b.size):
 			b.ranged = true
 			b.body = resp.Body
 			b.cur = &exactReader{r: resp.Body, remaining: b.chunk}
-			b.next = b.chunk
+			b.next = end + 1
+			// Start prefetching while the first chunk is streamed.
+			b.schedule()
 
 			return nil
 		case resp.StatusCode == http.StatusOK:
 			// Range is not supported (or ignored, as Gantry does for
 			// bounded ranges): stream the full body sequentially.
-			b.body = resp.Body
-			b.cur = resp.Body
-
-			return nil
+			return b.streamFull(resp, off)
 		case resp.StatusCode == http.StatusPartialContent:
-			// Unusable Content-Range: retry without Range below.
+			// Unusable Content-Range: retry with an open-ended range below.
 			_ = resp.Body.Close() //nolint:errcheck // discarding response
 		default:
 			return statusError(resp)
 		}
 	}
 
-	resp, err := b.get(-1, -1)
+	start := int64(-1)
+	if off > 0 {
+		start = off
+	}
+
+	resp, err := b.getRetry(start, -1)
 	if err != nil {
 		return err
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return b.streamFull(resp, off)
+	case off > 0 && resp.StatusCode == http.StatusPartialContent && contentRangeMatches(resp, off, b.size-1, b.size):
+		b.body = resp.Body
+		b.cur = &exactReader{r: resp.Body, remaining: b.size - off}
+
+		return nil
+	default:
 		return statusError(resp)
+	}
+}
+
+// streamFull streams a 200 response carrying the whole blob, discarding the
+// first off bytes.
+func (b *blobReader) streamFull(resp *http.Response, off int64) error {
+	if off > 0 {
+		if _, err := io.CopyN(io.Discard, resp.Body, off); err != nil {
+			_ = resp.Body.Close() //nolint:errcheck // already failing
+			return fmt.Errorf("skip to offset %d: %w", off, err)
+		}
 	}
 
 	b.body = resp.Body
-	b.cur = resp.Body
+	b.cur = &exactReader{r: resp.Body, remaining: b.size - off}
 
 	return nil
 }
 
-// get issues a blob GET. A negative start omits the Range header.
+// getRetry issues a blob GET, retrying transport errors, 5xx and 429
+// responses up to the endpoint's attempt count.
+func (b *blobReader) getRetry(start, end int64) (*http.Response, error) {
+	var lastErr error
+
+	for attempt := range max(b.ep.attempts, 1) {
+		if attempt > 0 {
+			if err := b.backoff(attempt); err != nil {
+				return nil, err
+			}
+		}
+
+		resp, err := b.get(start, end)
+		if err != nil {
+			if b.ctx.Err() != nil {
+				return nil, b.ctx.Err()
+			}
+
+			lastErr = err
+
+			continue
+		}
+
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = statusError(resp)
+			continue
+		}
+
+		return resp, nil
+	}
+
+	return nil, lastErr
+}
+
+func (b *blobReader) backoff(attempt int) error {
+	select {
+	case <-b.ctx.Done():
+		return b.ctx.Err()
+	case <-time.After(chunkRetryBackoff * time.Duration(attempt)):
+		return nil
+	}
+}
+
+// get issues a blob GET. A negative start omits the Range header; a
+// negative end requests an open-ended range.
 func (b *blobReader) get(start, end int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(b.ctx, http.MethodGet, b.url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if start >= 0 {
+	switch {
+	case start >= 0 && end >= 0:
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	case start >= 0:
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
 	}
 
 	return b.ep.client.Do(req)
@@ -219,78 +385,126 @@ func (b *blobReader) Read(p []byte) (int, error) {
 	}
 
 	for {
-		n, err := b.cur.Read(p)
-		if n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
-			if err != nil && !errors.Is(err, io.EOF) {
+		if b.cur == nil {
+			if err := b.advance(); err != nil {
 				b.err = err
+				return 0, err
+			}
+		}
+
+		n, err := b.cur.Read(p)
+		if errors.Is(err, io.EOF) {
+			// Current chunk or stream is exhausted; release it now.
+			b.releaseCur()
+
+			if !b.ranged {
+				b.err = io.EOF
+				return n, io.EOF
 			}
 
-			return n, b.errOrNil(err)
+			err = nil
 		}
 
-		if err == nil {
-			continue
-		}
-
-		// Current chunk or stream is exhausted.
-		if !b.ranged {
-			b.err = io.EOF
-			return 0, io.EOF
-		}
-
-		if err := b.advance(); err != nil {
+		if err != nil {
 			b.err = err
-			return 0, err
+			return n, err
+		}
+
+		if n > 0 {
+			return n, nil
 		}
 	}
 }
 
-func (b *blobReader) errOrNil(err error) error {
-	if errors.Is(err, io.EOF) && b.ranged {
-		// EOF of a chunk is not EOF of the blob.
-		return nil
+// releaseCur closes the response body backing the current chunk and
+// returns its budget.
+func (b *blobReader) releaseCur() {
+	if b.body != nil {
+		_ = b.body.Close() //nolint:errcheck // exhausted body
+		b.body = nil
 	}
 
-	return err
+	b.budget.release(b.curCharge)
+	b.curCharge = 0
+	b.cur = nil
 }
 
-// advance moves to the next chunk in ranged mode, keeping up to conc chunk
-// requests in flight.
+// advance loads the next chunk in ranged mode.
 func (b *blobReader) advance() error {
-	b.schedule()
-
-	if len(b.pending) == 0 {
+	if !b.ranged {
 		return io.EOF
 	}
 
-	ch := b.pending[0]
+	b.schedule()
+
+	if len(b.pending) == 0 {
+		if b.next >= b.size {
+			return io.EOF
+		}
+
+		// No budget for prefetching: stream the next chunk directly so
+		// that the reader always makes progress.
+		start := b.next
+		end := min(start+b.chunk, b.size) - 1
+
+		body, err := b.streamChunk(start, end)
+		if err != nil {
+			return err
+		}
+
+		b.next = end + 1
+		b.body = body
+		b.cur = &exactReader{r: body, remaining: end - start + 1}
+
+		return nil
+	}
+
+	pc := b.pending[0]
 	b.pending = b.pending[1:]
 
 	var res chunkResult
 	select {
-	case res = <-ch:
+	case res = <-pc.ch:
 	case <-b.ctx.Done():
+		b.budget.release(pc.charge)
 		return b.ctx.Err()
 	}
 
 	if res.err != nil {
+		b.budget.release(pc.charge)
 		return res.err
 	}
 
 	b.cur = bytes.NewReader(res.data)
+	b.curCharge = pc.charge
 	b.schedule()
 
 	return nil
 }
 
+// schedule starts chunk prefetches until conc requests are in flight (the
+// streamed current chunk counts as one), the blob is fully scheduled, or
+// the Puller memory budget is exhausted.
 func (b *blobReader) schedule() {
-	for len(b.pending) < b.conc && b.next < b.size {
+	inflight := len(b.pending)
+	if b.body != nil {
+		inflight++
+	}
+
+	for inflight < b.conc && b.next < b.size {
 		start := b.next
 		end := min(start+b.chunk, b.size) - 1
+		n := end - start + 1
+
+		if !b.budget.tryAcquire(n) {
+			return
+		}
+
 		b.next = end + 1
+		inflight++
 
 		ch := make(chan chunkResult, 1)
-		b.pending = append(b.pending, ch)
+		b.pending = append(b.pending, pendingChunk{ch: ch, charge: n})
 
 		b.wg.Add(1)
 
@@ -303,15 +517,34 @@ func (b *blobReader) schedule() {
 	}
 }
 
+// streamChunk opens a ranged response for one chunk without buffering it.
+func (b *blobReader) streamChunk(start, end int64) (io.ReadCloser, error) {
+	resp, err := b.getRetry(start, end)
+	if err != nil {
+		return nil, fmt.Errorf("fetch blob range %d-%d: %w", start, end, err)
+	}
+
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("fetch blob range %d-%d: %w", start, end, statusError(resp))
+	}
+
+	if !contentRangeMatches(resp, start, end, b.size) {
+		_ = resp.Body.Close() //nolint:errcheck // discarding response
+
+		return nil, fmt.Errorf("unexpected Content-Range %q for bytes %d-%d/%d",
+			resp.Header.Get("Content-Range"), start, end, b.size)
+	}
+
+	return resp.Body, nil
+}
+
 func (b *blobReader) fetchChunk(start, end int64) ([]byte, error) {
 	var lastErr error
 
-	for attempt := range chunkAttempts {
+	for attempt := range max(b.ep.attempts, 1) {
 		if attempt > 0 {
-			select {
-			case <-b.ctx.Done():
-				return nil, b.ctx.Err()
-			case <-time.After(chunkRetryBackoff * time.Duration(attempt)):
+			if err := b.backoff(attempt); err != nil {
+				return nil, err
 			}
 		}
 
@@ -361,24 +594,24 @@ func (b *blobReader) fetchChunkOnce(start, end int64) ([]byte, bool, error) {
 	return data, false, nil
 }
 
-// Close cancels in-flight requests and waits for them to finish.
+// Close cancels in-flight requests, waits for them to finish, and returns
+// the budget held by buffered chunks.
 func (b *blobReader) Close() error {
 	if b.closed {
 		return nil
 	}
 
 	b.closed = true
+	b.err = errBlobReaderClosed
 	b.cancel()
-
-	if b.body != nil {
-		_ = b.body.Close() //nolint:errcheck // canceling
-	}
-
 	b.wg.Wait()
+	b.releaseCur()
 
-	if b.err == nil {
-		b.err = errors.New("blob reader closed")
+	for _, pc := range b.pending {
+		b.budget.release(pc.charge)
 	}
+
+	b.pending = nil
 
 	return nil
 }
@@ -391,7 +624,7 @@ type exactReader struct {
 }
 
 func (e *exactReader) Read(p []byte) (int, error) {
-	if e.remaining <= 0 {
+	if e.remaining <= 0 || e.r == nil {
 		return 0, io.EOF
 	}
 
@@ -442,7 +675,7 @@ func (v *verifyReader) Read(p []byte) (int, error) {
 		}
 	}
 
-	if errors.Is(err, io.EOF) {
+	if err == io.EOF { //nolint:errorlint // wrapped EOFs are transport errors
 		switch {
 		case v.n != v.desc.Size:
 			v.err = fmt.Errorf("blob %s: got %d bytes, want %d: %w", v.desc.Digest, v.n, v.desc.Size, io.ErrUnexpectedEOF)
@@ -464,6 +697,47 @@ func (v *verifyReader) Read(p []byte) (int, error) {
 
 func (v *verifyReader) Close() error { return v.rc.Close() }
 
-// ErrDigestMismatch reports that a blob read to EOF does not match its
-// digest.
+// ErrDigestMismatch reports that content does not match its digest: a blob
+// read to EOF, or a file read sequentially from offset 0 to EOF.
 var ErrDigestMismatch = errors.New("blob digest mismatch")
+
+// budget is a Puller-wide limit on bytes held in prefetched chunks.
+type budget struct {
+	mu   sync.Mutex
+	max  int64
+	used int64
+	peak int64
+}
+
+func newBudget(maxBytes int64) *budget { return &budget{max: maxBytes} }
+
+func (b *budget) tryAcquire(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.used+n > b.max {
+		return false
+	}
+
+	b.used += n
+	b.peak = max(b.peak, b.used)
+
+	return true
+}
+
+func (b *budget) release(n int64) {
+	if n == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	b.used -= n
+	b.mu.Unlock()
+}
+
+func (b *budget) stats() (used, peak int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.used, b.peak
+}

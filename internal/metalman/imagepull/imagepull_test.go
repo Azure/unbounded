@@ -236,8 +236,10 @@ func TestOpenNamePrecedence(t *testing.T) {
 		want, name string
 	}{
 		{[]string{"missing", "disk/first"}, "first", "disk/first"},
-		// Within a layer, the first matching tar entry wins.
-		{[]string{"disk/first", "disk/second"}, "second", "disk/second"},
+		// Within a layer, the first name argument wins, regardless of tar
+		// entry order.
+		{[]string{"disk/first", "disk/second"}, "first", "disk/first"},
+		{[]string{"disk/second", "disk/first"}, "second", "disk/second"},
 		// An upper layer wins over a lower layer regardless of name order.
 		{[]string{"low/first", "up/second"}, "upper second", "up/second"},
 	}
@@ -382,9 +384,10 @@ func TestSmallBlobSingleRequest(t *testing.T) {
 	img := resolve(t, &imagepull.Puller{ChunkSize: 1 << 20}, imagepull.Source{Ref: ref})
 	readFile(t, img, "disk/a")
 
+	// One plain GET builds the layer index, one serves the file.
 	reqs := reg.BlobRequests(reg.LayerDigests(dgst)[0])
-	if len(reqs) != 1 || reqs[0].Range != "" {
-		t.Fatalf("blob requests = %+v, want one plain GET", reqs)
+	if len(reqs) != 2 || reqs[0].Range != "" || reqs[1].Range != "" {
+		t.Fatalf("blob requests = %+v, want two plain GETs", reqs)
 	}
 }
 
@@ -401,8 +404,10 @@ func TestNoRangeFallback(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 
+	// One GET builds the index and one serves the file; the missing file
+	// is answered from the index.
 	if n := len(reg.BlobRequests(layer)); n != 2 {
-		t.Fatalf("blob requests = %d, want 2 (one per Open)", n)
+		t.Fatalf("blob requests = %d, want 2", n)
 	}
 }
 
@@ -469,9 +474,10 @@ func TestBadContentRangeOnFirstChunkFallsBack(t *testing.T) {
 		t.Fatal("content mismatch")
 	}
 
+	// Index build and file read each issue a ranged then a plain request.
 	reqs := reg.BlobRequests(layer)
-	if len(reqs) != 2 || reqs[0].Range == "" || reqs[1].Range != "" {
-		t.Fatalf("blob requests = %+v, want ranged then plain", reqs)
+	if len(reqs) != 4 || reqs[0].Range == "" || reqs[1].Range != "" || reqs[2].Range == "" || reqs[3].Range != "" {
+		t.Fatalf("blob requests = %+v, want ranged then plain, twice", reqs)
 	}
 }
 
@@ -610,11 +616,11 @@ func TestFileServeContent(t *testing.T) {
 		return rec.Body.Bytes()
 	}
 
-	reg.ResetRequests()
-
 	if got := serve("bytes=10-19"); !bytes.Equal(got, content[10:20]) {
 		t.Fatal("bytes=10-19 mismatch")
 	}
+
+	reg.ResetRequests()
 
 	if got := serve("bytes=4000-4009"); !bytes.Equal(got, content[4000:4010]) {
 		t.Fatal("bytes=4000-4009 mismatch")

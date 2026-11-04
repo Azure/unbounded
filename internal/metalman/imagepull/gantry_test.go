@@ -86,7 +86,7 @@ func TestGantryMirror(t *testing.T) {
 	gantry, gantryReqs := startGantry(t, upstream)
 	p := &imagepull.Puller{Mirror: gantry.URL, ChunkSize: 1024, Concurrency: 4}
 
-	// Tag ref: Gantry answers 503 for tags, so the tag resolves upstream.
+	// Tag ref: tags are resolved upstream directly, never via Gantry.
 	img := resolve(t, p, imagepull.Source{Ref: ref})
 	layer := upstream.LayerDigests(img.Digest())[0]
 
@@ -95,15 +95,15 @@ func TestGantryMirror(t *testing.T) {
 		t.Fatal("content mismatch via Gantry")
 	}
 
-	var tagMiss, blobHits int
+	var blobHits int
 
 	for _, r := range gantryReqs() {
 		if r.ns != upstream.Host() {
 			t.Errorf("Gantry request %s has ns=%q, want %q", r.path, r.ns, upstream.Host())
 		}
 
-		if strings.HasSuffix(r.path, "/manifests/v1") && r.status == http.StatusServiceUnavailable {
-			tagMiss++
+		if strings.HasSuffix(r.path, "/manifests/v1") {
+			t.Errorf("tag request reached Gantry: %+v", r)
 		}
 
 		if strings.HasSuffix(r.path, "/blobs/"+layer) && r.status == http.StatusOK {
@@ -111,22 +111,27 @@ func TestGantryMirror(t *testing.T) {
 		}
 	}
 
-	if tagMiss != 1 {
-		t.Errorf("Gantry tag 503s = %d, want 1", tagMiss)
-	}
-
 	// Gantry ignores bounded ranges and answers 200, so the blob is
-	// streamed with a single request.
-	if blobHits != 1 {
-		t.Errorf("Gantry blob 200s = %d, want 1", blobHits)
+	// streamed with a single request each time it is read: once to build
+	// the layer index and once to serve the file.
+	if blobHits != 2 {
+		t.Errorf("Gantry blob 200s = %d, want 2", blobHits)
 	}
 
-	// The tag was resolved upstream; manifests by digest and the blob went
-	// through Gantry, which fetched them from upstream without ns.
+	assertOnlyGantryFetchedContent(t, upstream)
+
+	// The User-Agent check above is meaningful: the puller's own tag
+	// request reached upstream with its User-Agent.
+	var tagReqs int
+
 	for _, r := range upstream.Requests() {
-		if r.Kind == ipt.KindManifest && r.Ref != "v1" && r.Query.Get("ns") != "" {
-			t.Errorf("unexpected direct upstream request %+v", r)
+		if r.Kind == ipt.KindManifest && r.Ref == "v1" && strings.Contains(r.UserAgent, "unbounded-metalman-imagepull") {
+			tagReqs++
 		}
+	}
+
+	if tagReqs == 0 {
+		t.Error("tag was not resolved by the puller against upstream")
 	}
 
 	upstreamBlobReqs := len(upstream.BlobRequests(layer))
@@ -150,11 +155,28 @@ func TestGantryMirror(t *testing.T) {
 		t.Errorf("upstream blob requests on cached pull = %d, want 0", n)
 	}
 
+	assertOnlyGantryFetchedContent(t, upstream)
+
 	// The index was only ever fetched by tag from upstream, so Gantry pulls
 	// it by digest now; the platform manifest comes from Gantry's cache.
 	for _, r := range upstream.Requests() {
 		if r.Kind == ipt.KindManifest && r.Ref != indexDigest {
 			t.Errorf("unexpected upstream manifest request on cached pull: %+v", r)
+		}
+	}
+}
+
+// assertOnlyGantryFetchedContent fails if a manifest-by-digest or blob
+// request reached upstream from the puller rather than from Gantry's origin
+// client. The puller identifies itself with its own User-Agent.
+func assertOnlyGantryFetchedContent(t *testing.T, upstream *ipt.Registry) {
+	t.Helper()
+
+	for _, r := range upstream.Requests() {
+		byDigest := strings.HasPrefix(r.Ref, "sha256:")
+		if (r.Kind == ipt.KindBlob || (r.Kind == ipt.KindManifest && byDigest)) &&
+			strings.Contains(r.UserAgent, "unbounded-metalman-imagepull") {
+			t.Errorf("puller fetched content from upstream directly: %+v", r)
 		}
 	}
 }

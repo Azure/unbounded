@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	cplatforms "github.com/containerd/platforms"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -32,6 +34,15 @@ const (
 	// DefaultChunkSize is the default number of bytes requested per Range
 	// request.
 	DefaultChunkSize int64 = 8 << 20
+	// DefaultMaxBufferedBytes is the default Puller-wide limit on bytes
+	// held in prefetched Range chunks.
+	DefaultMaxBufferedBytes int64 = 256 << 20
+	// DefaultMaxIndexedLayers is the default number of layer indexes kept
+	// in memory by a Puller.
+	DefaultMaxIndexedLayers = 256
+
+	// userAgent identifies requests made by this package.
+	userAgent = "unbounded-metalman-imagepull"
 
 	// maxManifestBytes bounds manifest and index documents.
 	maxManifestBytes int64 = 4 << 20
@@ -70,12 +81,23 @@ type Source struct {
 }
 
 // Puller resolves images and reads files from them. The zero value is usable
-// and pulls directly from the upstream registry.
+// and pulls directly from the upstream registry. A Puller must not be copied
+// after first use; Images resolved by the same Puller share its layer index
+// cache and its prefetch memory budget.
 type Puller struct {
 	// Mirror is an optional registry mirror base URL such as
-	// http://127.0.0.1:5000 (Gantry). When set, manifests and blobs are
-	// requested from the mirror first with ?ns=<upstream registry host>,
-	// falling back to the upstream registry on any mirror error.
+	// http://127.0.0.1:5000 (Gantry). When set, manifests addressed by
+	// digest and blobs are requested from the mirror first with
+	// ?ns=<upstream registry host>, falling back to (or, mid-stream,
+	// resuming from) the upstream registry on any mirror error. Tag
+	// references are always resolved against the upstream registry.
+	//
+	// Source.Credential is sent to the mirror host as well as to the
+	// upstream registry, because Gantry uses it for delegated
+	// authentication against the upstream registry. Use an https mirror, or
+	// a mirror on a trusted local link, when pulling with credentials. A
+	// warning is logged with slog.Default when credentials are used with a
+	// plain http mirror.
 	Mirror string
 	// Concurrency is the maximum number of parallel Range requests per blob.
 	// Zero means DefaultConcurrency; one or less disables parallelism.
@@ -83,19 +105,60 @@ type Puller struct {
 	// ChunkSize is the number of bytes per Range request. Zero or less means
 	// DefaultChunkSize.
 	ChunkSize int64
-	// HTTPClient is the base HTTP client. Nil means retry.DefaultClient for
-	// the upstream registry and a non-retrying client for the mirror, so
-	// that mirror failures fall back to the upstream registry quickly.
+	// MaxBufferedBytes bounds the bytes held in prefetched Range chunks
+	// across all readers of this Puller. Zero or less means
+	// DefaultMaxBufferedBytes. A reader that cannot get budget streams its
+	// next chunk directly instead of prefetching it.
+	MaxBufferedBytes int64
+	// MaxIndexedLayers is the number of layer indexes (tar metadata, not
+	// content) kept in memory, keyed by layer digest. Zero or less means
+	// DefaultMaxIndexedLayers.
+	MaxIndexedLayers int
+	// HTTPClient is the base HTTP client. Nil means a plain client for blob
+	// requests (chunk requests are retried by this package), a retrying
+	// client for upstream manifest requests, and a non-retrying client for
+	// the mirror, so that mirror failures fall back to the upstream
+	// registry quickly.
 	HTTPClient *http.Client
+
+	once     sync.Once
+	st       *pullerState
+	warnOnce sync.Once
+}
+
+// pullerState is shared by all Images resolved by one Puller.
+type pullerState struct {
+	indexes *indexCache
+	budget  *budget
+}
+
+func (p *Puller) state() *pullerState {
+	p.once.Do(func() {
+		maxBytes := p.MaxBufferedBytes
+		if maxBytes <= 0 {
+			maxBytes = DefaultMaxBufferedBytes
+		}
+
+		maxLayers := p.MaxIndexedLayers
+		if maxLayers <= 0 {
+			maxLayers = DefaultMaxIndexedLayers
+		}
+
+		p.st = &pullerState{indexes: newIndexCache(maxLayers), budget: newBudget(maxBytes)}
+	})
+
+	return p.st
 }
 
 // endpoint is one registry (mirror or upstream) that can serve an image.
 type endpoint struct {
 	name    string
 	repo    *remote.Repository
-	client  *auth.Client
+	client  *auth.Client // blob requests
 	baseURL string
 	ref     registry.Reference
+	// attempts is the number of tries per blob request.
+	attempts int
 }
 
 func (p *Puller) concurrency() int {
@@ -140,6 +203,13 @@ func (p *Puller) endpoints(ref registry.Reference, cred auth.Credential) ([]*end
 
 		mirrorURL = u
 		mirrorHost = u.Host
+
+		if u.Scheme == "http" && cred != auth.EmptyCredential {
+			p.warnOnce.Do(func() {
+				slog.Default().Warn("imagepull: sending registry credentials to a plain http mirror",
+					"mirror", mirrorHost, "registry", upstreamHost)
+			})
+		}
 	}
 
 	credFn := func(_ context.Context, host string) (auth.Credential, error) {
@@ -163,24 +233,37 @@ func (p *Puller) endpoints(ref registry.Reference, cred auth.Credential) ([]*end
 		hc := *base
 		hc.Transport = &nsTransport{base: base.Transport, host: mirrorHost, ns: ref.Registry}
 		client := &auth.Client{Client: &hc, Credential: credFn, Cache: cache}
+		client.SetUserAgent(userAgent)
+
 		mref := registry.Reference{Registry: mirrorHost, Repository: ref.Repository, Reference: ref.Reference}
 		repo := &remote.Repository{Reference: mref, Client: client, PlainHTTP: mirrorURL.Scheme == "http"}
 		eps = append(eps, &endpoint{
-			name:    "mirror " + mirrorHost,
-			repo:    repo,
-			client:  client,
-			baseURL: mirrorURL.Scheme + "://" + mirrorHost,
-			ref:     mref,
+			name:     "mirror " + mirrorHost,
+			repo:     repo,
+			client:   client,
+			baseURL:  mirrorURL.Scheme + "://" + mirrorHost,
+			ref:      mref,
+			attempts: 1,
 		})
 	}
 
-	base := p.HTTPClient
-	if base == nil {
-		base = retry.DefaultClient
+	// Blob requests use a plain client: this package retries chunk
+	// requests itself, so a retrying transport would stack retries.
+	// Manifest requests have no package-level retries and use
+	// retry.DefaultClient's policy.
+	blobBase, manifestBase := p.HTTPClient, p.HTTPClient
+	if blobBase == nil {
+		blobBase = &http.Client{}
+		manifestBase = retry.DefaultClient
 	}
 
-	client := &auth.Client{Client: base, Credential: credFn, Cache: cache}
-	repo := &remote.Repository{Reference: ref, Client: client}
+	client := &auth.Client{Client: blobBase, Credential: credFn, Cache: cache}
+	client.SetUserAgent(userAgent)
+
+	manifestClient := &auth.Client{Client: manifestBase, Credential: credFn, Cache: cache}
+	manifestClient.SetUserAgent(userAgent)
+
+	repo := &remote.Repository{Reference: ref, Client: manifestClient}
 	ociutil.ConfigurePlainHTTP(repo)
 
 	scheme := "https"
@@ -189,11 +272,12 @@ func (p *Puller) endpoints(ref registry.Reference, cred auth.Credential) ([]*end
 	}
 
 	eps = append(eps, &endpoint{
-		name:    "registry " + upstreamHost,
-		repo:    repo,
-		client:  client,
-		baseURL: scheme + "://" + upstreamHost,
-		ref:     ref,
+		name:     "registry " + upstreamHost,
+		repo:     repo,
+		client:   client,
+		baseURL:  scheme + "://" + upstreamHost,
+		ref:      ref,
+		attempts: chunkAttempts,
 	})
 
 	return eps, nil
@@ -247,7 +331,14 @@ func (p *Puller) Resolve(ctx context.Context, src Source) (*Image, error) {
 		return nil, err
 	}
 
-	desc, body, err := fetchManifest(ctx, eps, ref.Reference)
+	// Gantry (and mirrors in general) only serve content addressed by
+	// digest, so tags are resolved against the upstream registry directly.
+	tagEps := eps
+	if _, derr := ref.Digest(); derr != nil {
+		tagEps = eps[len(eps)-1:]
+	}
+
+	desc, body, err := fetchManifest(ctx, tagEps, ref.Reference)
 	if err != nil {
 		return nil, fmt.Errorf("fetch manifest %s: %w", src.Ref, err)
 	}

@@ -77,6 +77,8 @@ type Request struct {
 	Query url.Values
 	// CDN reports whether the request reached the redirect target.
 	CDN bool
+	// UserAgent is the User-Agent request header.
+	UserAgent string
 }
 
 // Registry is an in-memory OCI distribution registry backed by httptest.
@@ -274,6 +276,7 @@ func (r *Registry) serve(w http.ResponseWriter, req *http.Request, cdn bool) {
 	r.record(Request{
 		Method: req.Method, Kind: kind, Repo: repo, Ref: ref,
 		Range: req.Header.Get("Range"), Query: req.URL.Query(), CDN: cdn,
+		UserAgent: req.Header.Get("User-Agent"),
 	})
 
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
