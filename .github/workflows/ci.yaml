@@ -662,10 +662,12 @@ jobs:
         run: make install-tools
 
       - name: Install clang/llvm for bpf2go
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang-18 llvm-18 libbpf-dev
+        # Same package list and cache name as the other BPF job, so both share
+        # one cache entry.
+        uses: ./.github/actions/apt-install-cached
+        with:
+          packages: clang-18 llvm-18 libbpf-dev
+          cache-name: bpf-clang
 
       - name: Verify BPF CO-RE pin artifacts
         run: make net-ebpf-verify
@@ -711,14 +713,17 @@ jobs:
           pinned="$(grep -v '^#' bpf/clang-version | grep -v '^$' | head -n1)"
           if [ "$pinned" != "clang-18" ]; then
             echo "::error::bpf/clang-version pins '$pinned' but this CI job installs clang-18."
-            echo "::error::Update the apt-get line in .github/workflows/ci.yaml (verify-bpf-binary job) to match."
+            echo "::error::Update the apt-install-cached packages in .github/workflows/ci.yaml (verify-generated and verify-bpf-binary jobs) to match."
             exit 1
           fi
 
       - name: Install pinned clang for bpf2go
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang-18 libbpf-dev
+        # Same package list and cache name as the other BPF job, so both share
+        # one cache entry.
+        uses: ./.github/actions/apt-install-cached
+        with:
+          packages: clang-18 llvm-18 libbpf-dev
+          cache-name: bpf-clang
 
       - name: Recompile BPF bindings via bpf2go
         run: go generate ./internal/net/ebpf/...
