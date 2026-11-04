@@ -120,6 +120,9 @@ jobs:
         with:
           phase: save
           profile: lint
+          # Must match the restore call: actions/cache versions entries by
+          # their path list, so a different list could not be restored.
+          extra-build-paths: ~/.cache/golangci-lint
           save-build-cache: "true"
           save-mod-cache: "false"
 
