@@ -1119,3 +1119,48 @@ async fn workers_share_listener_and_limits() {
     assert_eq!(result, Ok(()));
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
 }
+
+#[tokio::test]
+async fn handoff_to_stopped_worker_is_served_locally() {
+    use racer_object::server::{Config, Peer, Source, serve};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let racer = FakeRacer::start().await;
+    racer.put("bucket", "key", "", Object::new("data", r#""v""#));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // A peer whose worker already stopped: its inbox is closed.
+    let (inbox, closed) = tokio::sync::mpsc::unbounded_channel();
+    drop(closed);
+    let peer_active = Arc::new(AtomicUsize::new(0));
+    let peers = vec![Peer {
+        inbox,
+        active: peer_active.clone(),
+    }];
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let done = tokio::spawn(serve(
+        Source::Listener { listener, peers },
+        racer_object::racer::Client::new(racer.path.clone(), 4),
+        Config {
+            api: Api::S3,
+            request_timeout: Duration::from_secs(10),
+            slots: slots.clone(),
+            max_connections: 4,
+        },
+        Arc::new(AtomicUsize::new(0)),
+        shutdown,
+    ));
+    // Ties rotate across workers, so some of these pick the stopped peer.
+    for _ in 0..4 {
+        let mut c = Client::connect(addr).await;
+        assert_eq!(c.request("GET", "/bucket/key", &[]).await.status, 200);
+    }
+    assert_eq!(peer_active.load(Ordering::Relaxed), 0);
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), done)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(slots.available_permits(), 4);
+}

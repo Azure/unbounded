@@ -156,8 +156,15 @@ pub async fn serve(
                     // Count it now so back-to-back accepts see it.
                     let peer = &peers[pick - 1];
                     peer.active.fetch_add(1, Ordering::Relaxed);
-                    if peer.inbox.send((stream, permit)).is_err() {
+                    if let Err(mpsc::error::SendError((stream, permit))) =
+                        peer.inbox.send((stream, permit))
+                    {
+                        // The worker has stopped (shutdown races the accept):
+                        // serve the connection here rather than drop it.
                         peer.active.fetch_sub(1, Ordering::Relaxed);
+                        if let Ok(stream) = TcpStream::from_std(stream) {
+                            spawn(stream, permit);
+                        }
                     }
                 }
             }
