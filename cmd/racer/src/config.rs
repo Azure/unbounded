@@ -1051,7 +1051,10 @@ fn cluster_control(
         )?,
         // Members reach this node's peer listener; publish its port.
         peer_port: config.peer_listen.port(),
-        rotation: Default::default(),
+        rotation: racer_cluster_control::Rotation {
+            retained_page_keys: v.unsigned("RACER_RETAINED_PAGE_KEYS").expect("defaulted") as usize,
+            ..Default::default()
+        },
     };
     control.validate().map_err(|error| {
         ConfigError::new(
@@ -3101,6 +3104,29 @@ mod tests {
         let c = control(&[("RACER_OBJECT_IMAGE", ""), ("RACER_POD_IPS", "")]);
         assert!(c.object_image.is_none());
         assert!(c.webhook_alternate.is_none());
+    }
+
+    #[test]
+    fn cluster_control_retained_page_keys() {
+        let c = control(&[]);
+        assert_eq!(
+            c.rotation.retained_page_keys,
+            racer_cluster_control::rules::keyring::DEFAULT_RETAINED_PAGE_KEYS
+        );
+        assert_eq!(c.rotation, racer_cluster_control::Rotation::default());
+        for (value, want) in [("1", 1), ("16", 16)] {
+            let c = control(&[("RACER_RETAINED_PAGE_KEYS", value)]);
+            assert_eq!(c.rotation.retained_page_keys, want);
+        }
+        for bad in ["0", "17", "x"] {
+            assert_eq!(
+                managed_env(&[("RACER_RETAINED_PAGE_KEYS", bad)])
+                    .err()
+                    .unwrap()
+                    .name,
+                "RACER_RETAINED_PAGE_KEYS"
+            );
+        }
     }
 
     #[test]

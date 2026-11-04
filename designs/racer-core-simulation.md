@@ -65,11 +65,11 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
   `MAX_OFFERS_IN_FLIGHT` in `racer_core::liveness`).
 - The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
   `MAX_HOPS = racer_core::route::MAX_LINKS`.
-- `racer-cluster-control` exposes pure step functions in `cluster-control/src/step/` (seat
+- `racer-cluster-control` exposes pure rule functions in `cluster-control/src/rules/` (seat
   lottery and renewal, primary contention and plan pass, seat admission, authorization). Wall
   time and entropy are inputs: `now_micro` takes a
-  `SystemTime` (`cluster-control/src/authority/election.rs:126`) and `new_key` takes an `Entropy`
-  (`cluster-control/src/authority/keyring.rs:352`).
+  `SystemTime` (`cluster-control/src/rules/election.rs:126`) and `new_key` takes an `Entropy`
+  (`cluster-control/src/rules/keyring.rs:370`).
 
 ## Phantom caches
 
@@ -253,7 +253,7 @@ These are production rules that the simulator motivated. Code comments refer to 
 A new member is added to the membership only after it reports that it serves peer links
 (`src/control/session.rs` `mark_serving`). Before that, a listed member would refuse every link
 and reads toward it would fail. Joins are batched by a hold that grows with membership size
-(`join_hold_secs` in `cluster-control/src/step/primary.rs`), so clients stay within one version
+(`join_hold_secs` in `cluster-control/src/rules/primary.rs`), so clients stay within one version
 during large enrollments instead of falling back to full images.
 
 ### Hot page fanout

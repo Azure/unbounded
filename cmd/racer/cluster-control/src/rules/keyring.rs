@@ -191,9 +191,7 @@ impl From<crate::config::Rotation> for Policy {
             prepare_for: r.prepare_for,
             certificate_lifetime: wire::CERTIFICATE_LIFETIME,
             lease_duration: crate::limits::LEASE_DURATION,
-            // TODO: expose as an authority environment setting; the config
-            // table owns env parsing (cluster-control/src/config.rs).
-            retained_page_keys: DEFAULT_RETAINED_PAGE_KEYS,
+            retained_page_keys: r.retained_page_keys,
         }
     }
 }

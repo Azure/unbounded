@@ -18,12 +18,15 @@ pub enum SeatPolicy {
     Fixed(usize),
 }
 
-/// Cache key and issuer root rotation timing.
+/// Cache key and issuer root rotation timing, and page key retention.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rotation {
     pub interval: Duration,
 
     pub prepare_for: Duration,
+
+    /// Readable page keys per cache, in `1..=`[`racer_control_wire::MAX_RETAINED_PAGE_KEYS`].
+    pub retained_page_keys: usize,
 }
 
 impl Default for Rotation {
@@ -31,6 +34,7 @@ impl Default for Rotation {
         Self {
             interval: Duration::from_secs(24 * 3600),
             prepare_for: Duration::from_secs(3600),
+            retained_page_keys: crate::rules::keyring::DEFAULT_RETAINED_PAGE_KEYS,
         }
     }
 }

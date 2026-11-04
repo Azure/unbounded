@@ -846,6 +846,13 @@ const BASE: &[Var] = &[
         "Image injected as the object sidecar.",
     )),
     control(var(
+        "RACER_RETAINED_PAGE_KEYS",
+        Group::Kubernetes,
+        uint(1, racer_control_wire::MAX_RETAINED_PAGE_KEYS as u64, COUNT),
+        Value("7"),
+        "Readable page keys per cache: the active key plus older decrypt keys. Read by the cluster-control authority.",
+    )),
+    control(var(
         "RACER_KUBE_API_CA",
         Group::Kubernetes,
         text(TextKind::Path),
