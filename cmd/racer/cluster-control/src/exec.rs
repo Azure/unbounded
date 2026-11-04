@@ -453,12 +453,12 @@ impl Drop for Changed<'_> {
 
 /// A counting semaphore with an optional bounded FIFO wait.
 /// [`Slots::try_acquire`] fails when full; [`Slots::acquire`] queues until a
-/// deadline. The rules are [`crate::step::admission::WriteQueue`], shared
+/// deadline. The rules are [`crate::rules::admission::WriteQueue`], shared
 /// with the simulator.
 #[derive(Clone)]
 pub struct Slots(Rc<RefCell<SlotQueue>>);
 
-type SlotQueue = crate::step::admission::WriteQueue<Rc<SlotWaiter>>;
+type SlotQueue = crate::rules::admission::WriteQueue<Rc<SlotWaiter>>;
 
 /// A queued [`Slots::acquire`].
 #[derive(Default)]
@@ -525,9 +525,9 @@ impl Slots {
         let waiter = Rc::new(SlotWaiter::default());
         let admit = self.0.borrow_mut().admit(waiter.clone(), waiting);
         match admit {
-            crate::step::admission::Admit::Take => return Some(Slot(self.0.clone())),
-            crate::step::admission::Admit::Full => return None,
-            crate::step::admission::Admit::Wait => {}
+            crate::rules::admission::Admit::Take => return Some(Slot(self.0.clone())),
+            crate::rules::admission::Admit::Full => return None,
+            crate::rules::admission::Admit::Wait => {}
         }
         // From here the waiter is queued: `Pending` marks it gone on any
         // exit, and hands a granted but unclaimed slot to the next waiter.

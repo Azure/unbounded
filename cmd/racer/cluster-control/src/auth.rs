@@ -7,14 +7,14 @@
 //!
 //! Successful reviews and the DaemonSet and ServiceAccount UIDs are cached
 //! briefly and API calls run under a per-process budget; see
-//! [`crate::step::authz`] for the bounds and why they are safe.
+//! [`crate::rules::authz`] for the bounds and why they are safe.
 
 use crate::{
-    authority::members::{NodeInfo, Ownership, PodInfo},
     kube::{KubeError, paths, str_at},
     limits,
+    rules::authz::{self, Bindings, TokenKey},
+    rules::members::{NodeInfo, Ownership, PodInfo},
     shared::Shared,
-    step::authz::{self, Bindings, TokenKey},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use racer_control_wire::{ProtocolFailure, TOKEN_AUDIENCE};
@@ -79,7 +79,7 @@ fn api_failure(shared: &Shared, e: KubeError) -> ProtocolFailure {
 }
 
 /// Validated TokenReview user.
-pub use crate::step::authz::Reviewed as User;
+pub use crate::rules::authz::Reviewed as User;
 
 fn single_extra(user: &Value, key: &str) -> String {
     match user["extra"][format!("authentication.kubernetes.io/{key}")].as_array() {
@@ -146,7 +146,7 @@ pub async fn review(shared: &Shared, token: &str) -> Result<User, ProtocolFailur
 }
 
 /// TokenReview of `token`, from the cache when a successful review of the
-/// same token is younger than [`authz::REVIEW_TTL`]. See [`crate::step::authz`]
+/// same token is younger than [`authz::REVIEW_TTL`]. See [`crate::rules::authz`]
 /// for why reuse is safe.
 async fn reviewed(
     shared: &Shared,

@@ -10,7 +10,10 @@
 
 use crate::{
     DiscoveredEndpoint, SeatPolicy, annotations,
-    authority::{
+    entropy::Entropy,
+    limits, pki,
+    primary::{WebhookSeat, seat_ready, webhook_ips},
+    rules::{
         catalog::{self, CacheInfo},
         election::{self, LeaseObservation, Observer},
         keyring::{self, Offer, Policy},
@@ -19,9 +22,6 @@ use crate::{
         publication::{self, Image, Record},
         state::{self, StateError, StateRecord, Writer},
     },
-    entropy::Entropy,
-    limits, pki,
-    primary::{WebhookSeat, seat_ready, webhook_ips},
     seat::encode_endpoints,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -374,7 +374,7 @@ pub fn discovery(
             let url = o.annotations.get(annotations::ENDPOINT)?;
             let ip = url
                 .strip_prefix("https://")?
-                .parse::<std::net::SocketAddr>()
+                .parse::<core::net::SocketAddr>()
                 .ok()?
                 .ip();
             Some(WebhookSeat {
@@ -426,7 +426,7 @@ impl Contend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{authority::state::Term, entropy::Failing};
+    use crate::{entropy::Failing, rules::state::Term};
     use racer_core::time::SplitMix64;
     use serde_json::json;
 

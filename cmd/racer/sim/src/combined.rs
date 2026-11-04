@@ -885,7 +885,7 @@ mod tests {
         let versions = ctl_counter(&after, "ctl_membership_versions");
         let window = ctl_counter(&after, "ctl_all_enrolled_ns") / SECONDS;
         assert!(
-            versions <= 3 + window / racer_cluster_control::step::primary::JOIN_HOLD_SECS,
+            versions <= 3 + window / racer_cluster_control::rules::primary::JOIN_HOLD_SECS,
             "{versions} versions in {window} s"
         );
         // No client skipped a version on the way.

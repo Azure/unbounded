@@ -384,7 +384,7 @@ pub fn reconcile(
             }
         };
         let endpoint = match selected {
-            Some((_, ip)) => Some(std::net::SocketAddr::new(ip, peer_port).to_string()),
+            Some((_, ip)) => Some(core::net::SocketAddr::new(ip, peer_port).to_string()),
             None => {
                 result.diagnostics.push(Diagnostic {
                     object: node.name.clone(),

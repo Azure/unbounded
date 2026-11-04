@@ -6,10 +6,13 @@
 //! Secret, checks the term (see [`state::Writer`]), and checks the Lease is
 //! still fresh by the monotonic clock.
 
-use crate::step::primary::{Contend, Inventory, PassInputs, PassPlan, discovery, plan_pass};
+use crate::rules::primary::{Contend, Inventory, PassInputs, PassPlan, discovery, plan_pass};
 use crate::{
     annotations,
-    authority::{
+    exec::{self, Signal},
+    kube::{KubeError, paths, str_at},
+    lease, limits,
+    rules::{
         catalog::CacheInfo,
         election::{self, LeaseObservation, Observer},
         keyring::Policy,
@@ -17,9 +20,6 @@ use crate::{
         publication::Image,
         state::{self, Freshness, StateError, StateRecord, Term, Writer, lease_authority},
     },
-    exec::{self, Signal},
-    kube::{KubeError, paths, str_at},
-    lease, limits,
     seat::{self, install_record, state_markers_match},
     shared::{Seat, SeatHolder, Shared},
 };
@@ -131,7 +131,7 @@ struct Term_ {
     /// Seats still at the replaced sequence count as ready until then.
     ready_floor: Cell<Option<(u64, u64, Instant)>>,
     /// Wall time (Unix seconds) this term last committed a new membership
-    /// version; drives the join hold-down (`step::primary::JOIN_HOLD_SECS`).
+    /// version; drives the join hold-down (`rules::primary::JOIN_HOLD_SECS`).
     membership_changed: Cell<Option<u64>>,
 }
 
@@ -946,7 +946,7 @@ mod tests {
                 pod: format!("racer-{n}"),
                 uid: format!("u{n}"),
                 ips: vec![ip.parse().unwrap()],
-                ca: crate::authority::keyring::tests::root(1),
+                ca: crate::rules::keyring::tests::root(1),
             };
             let a = seat(1, "10.0.0.1");
             let v6 = seat(3, "fd00::1");
@@ -1033,7 +1033,7 @@ mod tests {
                 pod: "racer-1".into(),
                 uid: "u1".into(),
                 ips: vec!["10.0.0.1".parse().unwrap()],
-                ca: crate::authority::keyring::tests::root(1),
+                ca: crate::rules::keyring::tests::root(1),
             };
             let yes = || true;
             reconcile_webhook(
@@ -1069,7 +1069,7 @@ mod tests {
                 pod: "racer-1".into(),
                 uid: "u1".into(),
                 ips: vec!["10.0.0.1".parse().unwrap()],
-                ca: crate::authority::keyring::tests::root(1),
+                ca: crate::rules::keyring::tests::root(1),
             };
             let checks = Cell::new(0);
             let fresh = || {
@@ -1113,7 +1113,7 @@ mod tests {
                     published.map(str::to_owned).as_ref(),
                     format!("10.0.0.{n}").parse().unwrap(),
                 ),
-                ca: crate::authority::keyring::tests::root(1),
+                ca: crate::rules::keyring::tests::root(1),
             };
             let seats = [
                 seat(1, Some("10.0.0.1,fd00::1")),
@@ -1156,8 +1156,8 @@ mod tests {
 
     #[test]
     fn pem_roundtrip() {
-        let a = crate::authority::keyring::tests::root(1);
-        let b = crate::authority::keyring::tests::root(1);
+        let a = crate::rules::keyring::tests::root(1);
+        let b = crate::rules::keyring::tests::root(1);
         let p = pem(&[a.clone(), b.clone()]);
         assert_eq!(parse_pem(p.as_bytes()), vec![a, b]);
         assert!(parse_pem(b"").is_empty());

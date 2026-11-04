@@ -1,8 +1,8 @@
 //! Lease JSON conversion and writes.
 
 use crate::{
-    authority::election::{LeaseObservation, LeaseSpec},
     kube::{Kube, KubeError, map_at, paths, str_at},
+    rules::election::{LeaseObservation, LeaseSpec},
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;

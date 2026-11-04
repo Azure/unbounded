@@ -38,7 +38,6 @@
 
 pub mod annotations;
 mod auth;
-pub mod authority;
 mod config;
 mod control;
 pub mod entropy;
@@ -49,10 +48,10 @@ mod lease;
 pub mod limits;
 mod pki;
 mod primary;
+pub mod rules;
 mod seat;
 mod server;
 mod shared;
-pub mod step;
 #[cfg(test)]
 mod tests;
 pub mod webhook;

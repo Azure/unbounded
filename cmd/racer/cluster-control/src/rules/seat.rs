@@ -9,13 +9,13 @@
 //! contends for the initial seats with an exponentially growing window.
 
 use crate::{
-    authority::{
+    entropy::Entropy,
+    lease, limits,
+    rules::{
         election::{self, LeaseObservation, Observer, SeatView},
         publication::Record,
         state::{self, StateError, StateRecord},
     },
-    entropy::Entropy,
-    lease, limits,
     shared::PrimaryView,
 };
 use std::{
@@ -384,7 +384,7 @@ pub fn need_image(record: &StateRecord, image: Option<&Record>, is_primary: bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{annotations, authority::election::LeaseSpec, entropy::Failing, limits};
+    use crate::{annotations, entropy::Failing, limits, rules::election::LeaseSpec};
     use racer_core::time::SplitMix64;
 
     #[test]

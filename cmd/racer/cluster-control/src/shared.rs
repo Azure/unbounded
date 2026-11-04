@@ -2,14 +2,14 @@
 
 use crate::{
     Config,
-    authority::{
-        publication::Image,
-        state::{Freshness, StateRecord},
-    },
     exec::Signal,
     kube::Kube,
     limits,
     pki::{DynamicClientVerifier, SeatIssuer, ServingIdentity},
+    rules::{
+        publication::Image,
+        state::{Freshness, StateRecord},
+    },
 };
 use std::{
     cell::{Cell, RefCell},
@@ -49,7 +49,7 @@ pub struct Serving {
     /// refused for the life of the process.
     pub high_water: Option<StateRecord>,
     /// Records installed so far, by the follower or the primary (see
-    /// [`crate::step::seat::superseded`]).
+    /// [`crate::rules::seat::superseded`]).
     pub installs: u64,
 }
 
@@ -117,10 +117,10 @@ pub struct Shared {
     pub last_error: Cell<Option<crate::Error>>,
     /// Jitter and claim-delay salt. Production: [`crate::entropy::OsEntropy`].
     pub rng: RefCell<Box<dyn crate::entropy::Entropy>>,
-    /// Bearer authorization cache, see [`crate::step::authz`].
-    pub authz: RefCell<crate::step::authz::AuthCache<crate::auth::Caller>>,
+    /// Bearer authorization cache, see [`crate::rules::authz`].
+    pub authz: RefCell<crate::rules::authz::AuthCache<crate::auth::Caller>>,
     /// API call budget for bearer authorization.
-    pub auth_budget: RefCell<crate::step::authz::ApiBudget>,
+    pub auth_budget: RefCell<crate::rules::authz::ApiBudget>,
 }
 
 impl Shared {

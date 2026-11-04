@@ -15,20 +15,19 @@ use std::{
 };
 
 use racer_cluster_control::{
-    PrimaryView, SeatPolicy, annotations,
-    authority::{
+    PrimaryView, SeatPolicy, annotations, limits,
+    rules::{
+        admission::{Admit, Body, Poll, WriteQueue, body_for, start_poll},
+        authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
+        primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
+        seat::{self as rules, Lottery, SeatRenew},
+    },
+    rules::{
         election::{self, LeaseObservation, LeaseSpec},
         keyring::Policy,
         members::{NodeInfo, Owner, Ownership, PodInfo, Readiness},
         publication::{Image, Record},
         state::{self, StateError, StateRecord, Term, Writer},
-    },
-    limits,
-    step::{
-        admission::{Admit, Body, Poll, WriteQueue, body_for, start_poll},
-        authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
-        primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
-        seat::{self as rules, Lottery, SeatRenew},
     },
 };
 use racer_control_wire::ProtocolFailure;
@@ -123,7 +122,7 @@ pub enum AuthModel {
     /// Three uncached authorizations of five API calls each, no budget.
     Legacy,
     /// Two authorizations through the seat's `AuthCache` and `ApiBudget`
-    /// (`step::authz`).
+    /// (`rules::authz`).
     Cached,
 }
 
@@ -2308,7 +2307,7 @@ mod tests {
 
     /// With the legacy authorization model an enrollment storm makes three
     /// full authorizations per client and the API server sheds them with
-    /// 429s part way through. The cached model (`step::authz`) makes at most
+    /// 429s part way through. The cached model (`rules::authz`) makes at most
     /// two, reuses the TokenReview and binding reads, and its adaptive budget
     /// keeps the seats' sum near the API rate, so 429s drop by an order of
     /// magnitude and everyone enrolls sooner.

@@ -5,19 +5,19 @@
 //! name field selector. They read a seat Lease only after a paced, jittered
 //! delay when the primary reports a vacancy, or when no primary is live.
 
-use crate::step::seat::{self as rules, Lottery, SeatRenew};
+use crate::rules::seat::{self as rules, Lottery, SeatRenew};
 use crate::{
     DiscoveredEndpoint, DiscoveredEndpoints, Error, annotations,
-    authority::{
-        election::{self, LeaseObservation},
-        publication::{self, Image},
-        state::{self, lease_authority},
-    },
     exec::{self, Tcp},
     http::{self, Conn, TlsStream},
     kube::{KubeError, escape, paths, str_at},
     lease, limits,
     pki::{self, SeatIssuer, ServingIdentity},
+    rules::{
+        election::{self, LeaseObservation},
+        publication::{self, Image},
+        state::{self, lease_authority},
+    },
     server,
     shared::{CachedIssuer, PrimaryView, Seat, Shared},
 };
@@ -826,11 +826,11 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{authority::election::Observer, step::seat::claim_views};
     use crate::{
-        authority::keyring::{self, Durable, MAX_ROOTS, Offer},
         kube::fake,
+        rules::keyring::{self, Durable, MAX_ROOTS, Offer},
     };
+    use crate::{rules::election::Observer, rules::seat::claim_views};
 
     fn unix(t: SystemTime) -> u64 {
         t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()

@@ -104,7 +104,7 @@ pub const MAX_WEBHOOK_CONNECTIONS: usize = 64;
 pub const MAX_BOOTSTRAPS: usize = 32;
 
 /// Most Kubernetes API calls per second this process spends on bearer
-/// authorization, see [`crate::step::authz::ApiBudget`]. A ceiling: the 429
+/// authorization, see [`crate::rules::authz::ApiBudget`]. A ceiling: the 429
 /// feedback, not this number, sizes the rate in a storm.
 pub const AUTH_API_QPS: f64 = 400.0;
 

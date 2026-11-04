@@ -8,11 +8,11 @@
 
 use crate::{
     auth,
-    authority::publication::Image,
     exec::{self, Listener, Slot, Slots},
     http::{self, Conn, Head, HttpError, TlsStream},
     limits,
     pki::{self, PkiError},
+    rules::publication::Image,
     shared::Shared,
 };
 use racer_control_wire::{self as wire, ErrorResponse, ProtocolFailure};
@@ -98,7 +98,7 @@ impl Drop for PollGuard<'_> {
 }
 
 /// Hold the one long poll `node` may have open, admitted by
-/// [`crate::step::admission::start_poll`] against `current`.
+/// [`crate::rules::admission::start_poll`] against `current`.
 fn admit_poll<'a>(
     set: &'a RefCell<HashSet<String>>,
     node: &str,
@@ -126,7 +126,7 @@ pub fn cursor(query: Option<&str>) -> Result<Option<u64>, ProtocolFailure> {
     Ok(Some(n))
 }
 
-use crate::step::admission::start_poll;
+use crate::rules::admission::start_poll;
 
 fn pki_failure(e: PkiError) -> ProtocolFailure {
     match e {
@@ -1304,10 +1304,10 @@ pub fn pinned_client(certificate: &[u8]) -> Result<Arc<rustls::ClientConfig>, cr
 /// data needs it: a 204 reveals nothing. Data found before waiting may
 /// leave under the authorization just made, but only while that
 /// authorization is younger than
-/// [`crate::step::authz::CALLER_TTL`]; a long write slot
+/// [`crate::rules::authz::CALLER_TTL`]; a long write slot
 /// wait otherwise outlasts it.
 fn bearer_recheck(found: bool, immediate: bool, age: Duration) -> bool {
-    found && (!immediate || age >= crate::step::authz::CALLER_TTL)
+    found && (!immediate || age >= crate::rules::authz::CALLER_TTL)
 }
 
 #[cfg(test)]
@@ -1382,7 +1382,7 @@ mod tests {
 
     #[test]
     fn lagging_seat_cursor_is_unavailable() {
-        let e = crate::step::admission::check_ahead(Some(6), 5).unwrap_err();
+        let e = crate::rules::admission::check_ahead(Some(6), 5).unwrap_err();
         assert_eq!(e, ProtocolFailure::Unavailable);
         let r = String::from_utf8(error_response(e)).unwrap();
         assert!(r.starts_with("HTTP/1.1 503") && r.contains("Retry-After: 1"));
@@ -2272,7 +2272,7 @@ mod tests {
 
     #[test]
     fn bearer_keyring_rechecks_only_after_a_wait() {
-        let ttl = crate::step::authz::CALLER_TTL;
+        let ttl = crate::rules::authz::CALLER_TTL;
         let zero = Duration::ZERO;
         assert!(bearer_recheck(true, false, zero));
         assert!(!bearer_recheck(true, true, zero));

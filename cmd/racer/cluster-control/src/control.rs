@@ -2,12 +2,12 @@
 
 use crate::{
     Config, DiscoveredEndpoints, Error, annotations,
-    authority::rails::{self, Report},
     entropy::{Entropy, OsEntropy},
     exec::{self, Executor, Listener, Notifier, Signal},
     kube::{Kube, KubeConfig, paths, str_at},
     limits,
     pki::DynamicClientVerifier,
+    rules::rails::{self, Report},
     seat, server,
     shared::{Serving, Shared},
 };
