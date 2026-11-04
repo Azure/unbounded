@@ -81,6 +81,21 @@ impl SignalFd {
     }
 }
 
+impl SignalFd {
+    /// Wait on `reactor` for the next signal: a ring poll on the descriptor,
+    /// so a stop signal wakes a parked lane without any periodic tick.
+    pub async fn recv(&self, reactor: &crate::Reactor, ctx: &crate::OpCtx) -> Result<i32> {
+        loop {
+            if let Some(signal) = self.try_read()? {
+                return Ok(signal);
+            }
+            // SAFETY: the kernel pins the open file for the poll; `self`
+            // outlives this future's use of the descriptor number.
+            unsafe { reactor.readable_raw(self.fd.as_raw_fd(), ctx) }.await?;
+        }
+    }
+}
+
 impl AsRawFd for SignalFd {
     /// The signalfd descriptor number.
     fn as_raw_fd(&self) -> RawFd {
@@ -117,5 +132,34 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(SignalFd::new(&[]).unwrap_err(), Error::InvalidInput);
+    }
+
+    #[test]
+    fn a_parked_lane_wakes_on_a_signal() {
+        std::thread::spawn(|| {
+            let Some(reactor) = crate::ring::tests::kernel(4) else {
+                return;
+            };
+            let fd = std::rc::Rc::new(SignalFd::new(&[libc::SIGUSR1]).unwrap());
+            // SAFETY: pthread_self is the calling thread.
+            let thread = unsafe { libc::pthread_self() } as usize;
+            let sender = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                // SAFETY: the target thread blocks SIGUSR1 and outlives this call.
+                unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGUSR1) };
+            });
+            let executor = crate::exec::LocalExecutor::new(Some(reactor.wake_handle()));
+            let (r, f) = (reactor.clone(), fd.clone());
+            let signal = executor
+                .block_on(
+                    &reactor,
+                    async move { f.recv(&r, &crate::OpCtx::none()).await },
+                )
+                .unwrap();
+            assert_eq!(signal.unwrap(), libc::SIGUSR1);
+            sender.join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 }
