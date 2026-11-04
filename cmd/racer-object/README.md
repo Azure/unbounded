@@ -30,7 +30,8 @@ socket directory into the sidecar container. The sidecar connects to
 
 Flags are the same as the Go version: `--cache` (required), `--api`,
 `--listen` (loopback IP and port), `--request-timeout`, `--max-connections`,
-`--debug-listen`, and `--version`. `--flag=value`, `--flag value`, and a
+`--debug-listen`, and `--version`. The Rust version adds `--workers` (see
+[Workers](#workers)). `--flag=value`, `--flag value`, and a
 single dash all work. Invalid arguments print `racer-object: <message>` and
 exit with status 1.
 
@@ -87,8 +88,28 @@ Request flow:
   io-wq worker thread, so it saves no CPU compared to calling `splice(2)` from
   an epoll loop.
 
-The server uses a single-threaded tokio runtime (epoll). The work is mostly
-system calls, and more threads cost more CPU for the same work.
+### Workers
+
+`--workers=N` (1 to 256; default: usable CPUs, at most 4) starts N OS
+threads, each running its own single-threaded tokio runtime (epoll) with its
+own Racer idle connection pool. There is no work stealing:
+
+- The first worker accepts every connection and hands it to the worker
+  serving the fewest connections (one cross-thread wakeup per connection,
+  not per request). A shared listener or `SO_REUSEPORT` would let a few
+  long-lived connections land on one worker, and `SO_REUSEPORT` would also
+  split `--max-connections` per worker.
+- `--max-connections` stays global: one semaphore bounds accepted client
+  connections and another two bound concurrent Racer reads, all shared.
+- SIGTERM or SIGINT stops every worker; each lets in-flight requests finish
+  for up to 5 seconds. The debug listener runs on the first worker.
+- With one worker the binary runs a plain current_thread runtime.
+
+An earlier tokio work-stealing runtime with 2 to 4 threads raised CPU per
+request by 10 to 50 percent (table below). Separate runtimes keep the
+one-thread cost per request and per byte, so the default trades nothing
+measurable for up to 4 times the throughput. The cap of 4 bounds idle threads
+in pods without CPU limits; set `--workers=1` for the smallest footprint.
 
 ### Measurements
 
@@ -107,6 +128,22 @@ that the binary uses.
 With one thread the throughput matched the Go sidecar in these runs (about
 7,000 to 10,000 small requests per second and 1.1 to 1.3 GB/s for large
 objects); the fake Racer was the limit.
+
+Workers, measured with `hack/racer-object-bench` (fake Racer in Rust on
+other CPUs, 10 s per scenario, sidecar CPU only). The host was busy with
+unrelated jobs (load average about 75 on 48 CPUs), so absolute throughput is
+low and noisy; compare columns, not with older runs.
+
+| Scenario, CPUs | Go | workers=1 | workers=2 | workers=4 |
+|---|---|---|---|---|
+| 4 KiB GET, 24 CPUs: rps, CPU us/req | 16,024, 302 | 10,387, 80 | 30,577, 65 | 51,900, 76 |
+| HEAD, 24 CPUs: rps, CPU us/req | 22,705, 169 | 27,934, 35 | 53,032, 37 | 107,159, 36 |
+| 1 MiB GET, 24 CPUs: GB/s, CPU s/GB | 5.45, 0.77 | 2.43, 0.39 | 4.49, 0.41 | 6.60, 0.43 |
+| 64 KiB range, 24 CPUs: GB/s, CPU s/GB | 0.72, 4.69 | 0.38, 2.19 | 0.86, 2.16 | 1.84, 1.99 |
+| 4 KiB GET, 2 CPUs: rps, CPU us/req | 7,975, 245 | 9,115, 88 | 26,303, 73 | 29,085, 67 |
+| 1 MiB GET, 2 CPUs: GB/s, CPU s/GB | 3.31, 0.60 | 2.28, 0.39 | 4.80, 0.42 | 4.50, 0.42 |
+
+Peak RSS was 4 MiB for every Rust setting and 18 to 57 MiB for Go.
 
 ## Diagnostics
 

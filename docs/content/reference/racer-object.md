@@ -45,7 +45,8 @@ Usage: `racer-object sidecar [flags]`.
 | `--api` | `s3` | Client-facing API: `s3` or `azure`. |
 | `--listen` | `127.0.0.1:8080` | Loopback IP literal and port. Non-loopback addresses are rejected. |
 | `--request-timeout` | `5m` | Request timeout. |
-| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer. 1 to 65536. |
+| `--max-connections` | `128` | Client connections accepted at once, and concurrent reads from Racer, across all workers. 1 to 65536. |
+| `--workers` | usable CPUs, at most `4` | Serving threads, each with its own event loop. 1 to 256. The default counts CPUs allowed by the cgroup quota and CPU affinity. Use `1` for the lowest footprint. |
 | `--debug-listen` | empty | Optional `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
 

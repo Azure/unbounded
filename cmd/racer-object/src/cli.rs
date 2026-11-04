@@ -31,7 +31,16 @@ pub enum Command {
 
 const MAX_CONNECTIONS: i64 = 65536;
 const MAX_WORKERS: i64 = 256;
-const DEFAULT_WORKERS: i64 = 1;
+/// The default `--workers` is the usable CPUs (cgroup quota and affinity
+/// included), at most this many.
+const DEFAULT_WORKERS_MAX: usize = 4;
+
+/// Default `--workers`: `min(available_parallelism, 4)`.
+pub fn default_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(DEFAULT_WORKERS_MAX)
+}
 const SOCKET_PATH_LIMIT: usize = 107;
 
 /// Version string (`<version> (commit: <commit>, built: <time>)`), set at
@@ -63,7 +72,7 @@ pub fn sidecar_usage() -> String {
   -version
     \tPrint version
   -workers int
-    \tServing threads, each with its own event loop; 1..256 (default 1)
+    \tServing threads, each with its own event loop; 1..256 (default: usable CPUs, at most 4)
 "
     .to_string()
 }
@@ -93,7 +102,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut debug_listen = String::new();
     let mut timeout = Some(Duration::from_secs(300));
     let mut max_connections: i64 = 128;
-    let mut workers: i64 = DEFAULT_WORKERS;
+    let mut workers = default_workers() as i64;
     let mut show_version = false;
 
     let mut rest = &args[1..];
@@ -379,7 +388,8 @@ mod tests {
         assert_eq!(o.request_timeout, Duration::from_secs(300));
         assert_eq!(o.max_connections, 128);
         assert_eq!(o.debug_listen, None);
-        assert_eq!(o.workers, DEFAULT_WORKERS as usize);
+        assert_eq!(o.workers, default_workers());
+        assert!((1..=4).contains(&o.workers));
 
         let o = options(&[
             "sidecar",

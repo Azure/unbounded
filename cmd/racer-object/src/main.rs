@@ -28,13 +28,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Each worker is an OS thread with its own single-threaded runtime;
-    // workers do not steal work from each other. The sidecar is syscall
-    // bound and moves large bodies with splice(2), so one thread is the most
-    // efficient (CPU per request and per byte), while a work-stealing
-    // runtime measurably raised that cost. More workers raise the maximum
-    // throughput when CPU is available. With one worker (the default) this
-    // is a plain current_thread runtime. See README.md for the measurements.
+    // Each worker is an OS thread with its own single-threaded runtime and
+    // Racer connection pool; workers never steal work from each other. The
+    // calling thread is the first worker and accepts connections, handing
+    // each to the worker serving the fewest. A work-stealing runtime raised
+    // CPU per request; separate runtimes keep the single-thread cost per
+    // request while adding throughput. With one worker this is a plain
+    // current_thread runtime. See README.md for the measurements.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
