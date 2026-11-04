@@ -2,6 +2,42 @@
 
 Racer's node-local read-through cache dataplane and its supporting Rust libraries.
 
+## Configuration
+
+Every environment variable the dataplane accepts is one entry in
+`src/config/table.rs`. That table drives parsing, defaults, per-variable bounds,
+and the generated reference in `docs/content/reference/racer.md`, and it is
+exported to `internal/operator/components/racer/dataplane-settings.json` for the
+operator's checks. After changing the table, regenerate both with
+`BLESS=1 cargo test -p racer config::tests::generated_reference_is_current`;
+the same test fails when they are stale.
+
+- Only `main` reads the process environment (`Config::from_env`). Tests and
+  simulations build a `Config` from an explicit map (`Config::from_map`).
+- Any `RACER_*` variable that the table does not list fails startup. Test
+  harness knobs therefore use other prefixes (for example `DST_SEEDS`).
+- Errors name the variable, its value, and the rule it broke, for example
+  `RACER_RANGE_WINDOW_PAGES="65": must be from 1 to 64`.
+- Budgets that I/O workers share have a `*_PER_WORKER` form (the default,
+  multiplied by the final worker count) and a plain node-wide form (divided
+  among workers). Setting both is an error.
+
+Renamed variables (no compatibility aliases):
+
+| Old | New |
+| --- | --- |
+| `RACER_SLAB_BYTES` | `RACER_SLAB_BYTES_PER_WORKER` |
+| `RACER_FREE_SEGMENT_RESERVE` | `RACER_FREE_SEGMENT_RESERVE_PER_WORKER` |
+| `RACER_ACTIVE_PATH_SEARCHES` | `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `RACER_NEIGHBOR_CONNECTIONS_PER_WORKER` |
+| `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER` |
+| `RACER_TRUST_BUNDLE` | `RACER_CONTROL_TRUST_BUNDLE` |
+| `RACER_SERVICE_ACCOUNT_TOKEN` | `RACER_CONTROL_TOKEN` (also cluster control's token) |
+| `RACER_API_CA` | `RACER_KUBE_API_CA` |
+| `RACER_API_TOKEN` | `RACER_KUBE_API_TOKEN` |
+| `RACER_PEER_PORT` | Removed; the port of `RACER_PEER_LISTEN` is published |
+| `RACER_DST_SEEDS`, `RACER_DST_STEPS`, `RACER_DST_FILTER` | `DST_SEEDS`, `DST_STEPS`, `DST_FILTER` |
+
 
 ## Origin HTTPS
 

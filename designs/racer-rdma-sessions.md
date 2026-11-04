@@ -229,7 +229,7 @@ registered-page retention, and client delivery can still copy data. See
 - Each receive buffer is `MAX_CIPHERTEXT` rounded up to 4 KiB, currently
   16 MiB plus 4 KiB. Rail funding requires at least one such buffer per device.
   Unfunded rails are not activated.
-- `RACER_CONNECTIONS_PER_NEIGHBOR` also sets the per-link grant limit, clamped
+- `RACER_NEIGHBOR_CONNECTIONS_PER_WORKER` also sets the per-link grant limit, clamped
   to 1..4096. The two nodes use the smaller advertised limit for issued grants.
 - The worker command queue holds 64 entries. The application allows up to
   `2 * MAX_DEGREE` links per device.
