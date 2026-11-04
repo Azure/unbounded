@@ -3488,16 +3488,19 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
 }
 
 fn run_corpus(native: bool) {
-    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("RACER_DST_")) {
+    // Harness knobs carry no `RACER_` prefix, so the dataplane's
+    // unknown-variable check never sees them. `DST_VERBOSE` and `DST_COVERAGE`
+    // belong to the page-alloc DST and may share the environment.
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("DST_")) {
         assert!(
             matches!(
                 name.as_str(),
-                "RACER_DST_SEEDS" | "RACER_DST_STEPS" | "RACER_DST_FILTER"
+                "DST_SEEDS" | "DST_STEPS" | "DST_FILTER" | "DST_VERBOSE" | "DST_COVERAGE"
             ),
             "unsupported DST parameter {name}"
         );
     }
-    let custom_seeds = std::env::var("RACER_DST_SEEDS").ok();
+    let custom_seeds = std::env::var("DST_SEEDS").ok();
     let seeds: Vec<u64> = custom_seeds
         .as_deref()
         .unwrap_or("1,7,42")
@@ -3505,7 +3508,7 @@ fn run_corpus(native: bool) {
         .map(|s| s.trim().parse().expect("comma-separated u64 DST seeds"))
         .collect();
     assert!(!seeds.is_empty() && seeds.len() <= 1024);
-    let steps = setting("RACER_DST_STEPS", WEIGHTED_ACTIONS.len(), 512);
+    let steps = setting("DST_STEPS", WEIGHTED_ACTIONS.len(), 512);
     let required = requires_corpus_coverage(custom_seeds.as_deref(), steps);
     let mut counts = BTreeMap::new();
     eprintln!(

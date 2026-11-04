@@ -7,7 +7,8 @@
 //!   `Metadata: true`, optionally selecting a user-assigned identity by client ID.
 //! - Workload identity federation: the projected service account token named by
 //!   `RACER_AZURE_FEDERATED_TOKEN_FILE` (reread on every exchange) is exchanged at
-//!   `${RACER_AZURE_AUTHORITY_HOST:-https://login.microsoftonline.com/}<tenant>/oauth2/v2.0/token`
+//!   `<authority><tenant>/oauth2/v2.0/token`, where the authority is
+//!   `RACER_AZURE_AUTHORITY_HOST` (default `https://login.microsoftonline.com/`),
 //!   with the client credentials grant and a JWT bearer client assertion. Without a
 //!   configured tenant, the tenant comes from a storage `WWW-Authenticate` challenge
 //!   (see [`parse_bearer_challenge`] and [`AzureTokenCache::learn_tenant`]).
@@ -41,12 +42,6 @@ pub const STORAGE_RESOURCE: &str = "https://storage.azure.com/";
 
 /// Token scope for Azure Storage (Entra v2 `scope`).
 pub const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
-
-/// Environment variable naming the federated service account token file.
-pub const FEDERATED_TOKEN_FILE_ENV: &str = "RACER_AZURE_FEDERATED_TOKEN_FILE";
-
-/// Environment variable overriding the Entra authority host.
-pub const AUTHORITY_HOST_ENV: &str = "RACER_AZURE_AUTHORITY_HOST";
 
 /// Default Entra authority host.
 pub const DEFAULT_AUTHORITY_HOST: &str = "https://login.microsoftonline.com/";
@@ -144,7 +139,7 @@ impl From<AuthError> for Error {
     }
 }
 
-/// Token service locations. [`AuthEndpoints::from_env`] gives production values.
+/// Token service locations. [`AuthEndpoints::new`] gives production values.
 #[derive(Clone)]
 pub struct AuthEndpoints {
     /// IMDS endpoint (plain HTTP).
@@ -157,26 +152,24 @@ pub struct AuthEndpoints {
     /// Federated token file for workload identity.
     pub federated_token_file: Option<PathBuf>,
 
-    /// TLS configuration for the authority; `None` loads the origin trust bundle
-    /// ([`http1::tls::trust_bundle_path`]) when the cache is created.
+    /// TLS configuration for the authority; `None` loads `trust_bundle` when
+    /// the cache is created.
     pub tls: Option<Arc<rustls::ClientConfig>>,
+
+    /// Origin trust bundle, used when `tls` is `None`.
+    pub trust_bundle: PathBuf,
 }
 
 impl AuthEndpoints {
-    /// IMDS at 169.254.169.254:80, the authority from [`AUTHORITY_HOST_ENV`], and
-    /// the federated token file from [`FEDERATED_TOKEN_FILE_ENV`].
-    pub fn from_env() -> Self {
-        let authority = std::env::var(AUTHORITY_HOST_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_AUTHORITY_HOST.to_owned());
+    /// IMDS at 169.254.169.254:80 and the configured authority, federated
+    /// token file, and trust bundle.
+    pub fn new(settings: &crate::config::OriginSettings) -> Self {
         Self {
             imds: RemoteEndpoint::http(IMDS_ADDRESS, 80).expect("IMDS literal"),
-            authority,
-            federated_token_file: std::env::var_os(FEDERATED_TOKEN_FILE_ENV)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+            authority: settings.azure_authority_host.clone(),
+            federated_token_file: settings.azure_federated_token_file.clone(),
             tls: None,
+            trust_bundle: settings.trust_bundle.clone(),
         }
     }
 }
@@ -239,6 +232,7 @@ impl AzureTokenCache {
             AzureCredential::WorkloadIdentity { .. } => Some(parse_authority(
                 &endpoints.authority,
                 endpoints.tls.clone(),
+                &endpoints.trust_bundle,
             )?),
             AzureCredential::ManagedIdentity { .. } => None,
         };
@@ -532,6 +526,7 @@ impl AzureTokenSource {
 fn parse_authority(
     url: &str,
     tls: Option<Arc<rustls::ClientConfig>>,
+    trust_bundle: &std::path::Path,
 ) -> Result<(RemoteEndpoint, String), AuthError> {
     let (https, rest) = if let Some(rest) = url.strip_prefix("https://") {
         (true, rest)
@@ -564,7 +559,7 @@ fn parse_authority(
             Some(config) => config,
             None => {
                 // An unreadable trust bundle is a configuration error at construction.
-                let roots = http1::tls::load_trust_bundle(&http1::tls::trust_bundle_path())
+                let roots = http1::tls::load_trust_bundle(trust_bundle)
                     .map_err(|_| AuthError::Configuration)?;
                 http1::tls::client_config(roots)
             }

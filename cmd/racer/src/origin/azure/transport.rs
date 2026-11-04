@@ -80,11 +80,6 @@ struct TrustState {
 }
 
 impl TrustRoots {
-    /// Load from `RACER_ORIGIN_TRUST_BUNDLE`, or the system bundle, when needed.
-    pub fn from_env() -> Self {
-        Self::at(http1::tls::trust_bundle_path())
-    }
-
     /// Load from `path` when needed.
     pub fn at(path: PathBuf) -> Self {
         Self {

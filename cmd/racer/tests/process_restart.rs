@@ -807,8 +807,8 @@ impl Process {
             ("RACER_DIAGNOSTICS_LISTEN", diagnostics.to_string()),
         ]);
         for (name, path) in [
-            ("RACER_TRUST_BUNDLE", "trust.pem"),
-            ("RACER_SERVICE_ACCOUNT_TOKEN", "token"),
+            ("RACER_CONTROL_TRUST_BUNDLE", "trust.pem"),
+            ("RACER_CONTROL_TOKEN", "token"),
             ("RACER_IDENTITY_DIRECTORY", "identity"),
             ("RACER_SLAB_DIRECTORY", "slabs"),
         ] {
@@ -826,13 +826,13 @@ impl Process {
                 ("RACER_REGISTERED_BYTES", "1"),
                 // Current signed-peer envelope progress floor exceeds 1 MiB.
                 ("RACER_REQUEST_CONTEXT_BYTES", "16777216"),
-                ("RACER_SLAB_BYTES", "268435456"),
+                ("RACER_SLAB_BYTES_PER_WORKER", "268435456"),
                 ("RACER_SEGMENT_BYTES", "67108864"),
-                ("RACER_FREE_SEGMENT_RESERVE", "1"),
+                ("RACER_FREE_SEGMENT_RESERVE_PER_WORKER", "1"),
                 ("RACER_QUEUE_ENTRIES", "16"),
                 // Three independent control slots require twelve total connections.
                 ("RACER_CLIENT_CONNECTIONS", "12"),
-                ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "2"),
+                ("RACER_CACHE_ORIGIN_CONNECTIONS_PER_WORKER", "2"),
                 ("RACER_METADATA_ENTRIES", "32"),
                 ("RACER_FLIGHTS", "8"),
                 ("RACER_PIPES", "2"),

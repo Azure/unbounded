@@ -1,4 +1,5 @@
-//! Environment configuration.
+//! Runtime configuration. The dataplane builds it from its environment table
+//! (`racer::config`), so this crate never reads the process environment.
 
 use crate::Error;
 use std::{
@@ -34,7 +35,7 @@ impl Default for Rotation {
     }
 }
 
-/// Runtime configuration, normally read by [`Config::from_env`].
+/// Runtime configuration, built by the dataplane's configuration table.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub namespace: String,
@@ -53,7 +54,7 @@ pub struct Config {
 
     pub webhook_listen: SocketAddr,
 
-    /// Pod IP of the other address family, from `RACER_POD_IPS`, served on
+    /// Pod IP of the other address family, from the Pod's IPs, served on
     /// the webhook port too. A dual-stack Pod's `status.podIP` family need
     /// not match the primary family of the `racer-webhook` Service, which
     /// is the only family the API server reaches through its ClusterIP.
@@ -85,136 +86,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read the environment. Returns `None` outside Kubernetes, when
-    /// `RACER_NAMESPACE` is unset, so standalone fixtures run without control.
-    pub fn from_env() -> Result<Option<Self>, Error> {
-        Self::from_lookup(|name| std::env::var(name).ok())
-    }
-
-    /// Read configuration from any lookup function.
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, Error> {
-        let Some(namespace) = get("RACER_NAMESPACE").filter(|v| !v.is_empty()) else {
-            return Ok(None);
-        };
-        let need = |name: &str| {
-            get(name)
-                .filter(|v| !v.is_empty())
-                .ok_or(Error::InvalidConfiguration)
-        };
-        let pod_name = need("RACER_POD_NAME")?;
-        let pod_uid = need("RACER_POD_UID")?;
-        let node_name = need("RACER_NODE_NAME")?;
-        let pod_ip: IpAddr = need("RACER_POD_IP")?
-            .parse()
-            .map_err(|_| Error::InvalidConfiguration)?;
-        let mut pod_ips = Vec::new();
-        for v in get("RACER_POD_IPS").unwrap_or_default().split(',') {
-            if !v.is_empty() {
-                pod_ips.push(
-                    v.parse::<IpAddr>()
-                        .map_err(|_| Error::InvalidConfiguration)?,
-                );
-            }
-        }
-        // Kubernetes reports at most one Pod IP per family, primary first.
-        if !pod_ips.is_empty()
-            && (pod_ips[0] != pod_ip
-                || pod_ips.len() > 2
-                || (pod_ips.len() == 2 && pod_ips[0].is_ipv6() == pod_ips[1].is_ipv6()))
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-        let seats = match get("RACER_CONTROL_SEATS").as_deref() {
-            None | Some("") | Some("auto") => SeatPolicy::Auto,
-            Some(v) => match v.parse::<usize>() {
-                Ok(n) if (1..=crate::annotations::MAX_SEATS).contains(&n) && v == n.to_string() => {
-                    SeatPolicy::Fixed(n)
-                }
-                _ => return Err(Error::InvalidConfiguration),
-            },
-        };
-        let address = |name: &str, default: &str| -> Result<SocketAddr, Error> {
-            let v = get(name)
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| default.into());
-            let v = if v.starts_with(':') {
-                format!("0.0.0.0{v}")
-            } else {
-                v
-            };
-            if let Ok(address) = v.parse() {
-                return Ok(address);
-            }
-            let (host, port) = v
-                .strip_prefix('[')
-                .and_then(|v| v.split_once("]:"))
-                .ok_or(Error::InvalidConfiguration)?;
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::InvalidConfiguration);
-            }
-            Ok(SocketAddr::new(
-                host.parse().map_err(|_| Error::InvalidConfiguration)?,
-                port.parse().map_err(|_| Error::InvalidConfiguration)?,
-            ))
-        };
-        let host = need("KUBERNETES_SERVICE_HOST")?;
-        let port = get("KUBERNETES_SERVICE_PORT")
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "443".into());
-        port.parse::<u16>()
-            .map_err(|_| Error::InvalidConfiguration)?;
-        let api_server = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        let peer_port = get("RACER_PEER_PORT")
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "8082".into())
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p != 0)
-            .ok_or(Error::InvalidConfiguration)?;
-        let sa = "/var/run/secrets/kubernetes.io/serviceaccount";
-        let webhook_listen = address("RACER_WEBHOOK_LISTEN", ":9443")?;
-        let webhook_alternate = (webhook_listen.ip() == pod_ip)
-            .then(|| {
-                pod_ips
-                    .iter()
-                    .copied()
-                    .find(|ip| ip.is_ipv6() != pod_ip.is_ipv6())
-            })
-            .flatten();
-        let config = Self {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-            pod_ip,
-            seats,
-            control_listen: address("RACER_CONTROL_LISTEN", ":8443")?,
-            webhook_listen,
-            webhook_alternate,
-            object_image: get("RACER_OBJECT_IMAGE").filter(|v| !v.is_empty()),
-            api_server,
-            api_ca: get("RACER_API_CA").map_or_else(|| format!("{sa}/ca.crt").into(), Into::into),
-            api_token: get("RACER_API_TOKEN")
-                .map_or_else(|| format!("{sa}/token").into(), Into::into),
-            control_token: get("RACER_CONTROL_TOKEN")
-                .map_or_else(|| "/var/run/racer-token/token".into(), Into::into),
-            daemonset: get("RACER_DAEMONSET")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "racer".into()),
-            service_account: get("RACER_SERVICE_ACCOUNT")
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "racer".into()),
-            peer_port,
-            rotation: Rotation::default(),
-        };
-        config.validate()?;
-        Ok(Some(config))
-    }
-
     /// Check names and identities.
     pub fn validate(&self) -> Result<(), Error> {
         let label = |v: &str| {
@@ -235,156 +106,5 @@ impl Config {
             return Err(Error::InvalidConfiguration);
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn env(extra: &[(&str, &str)]) -> HashMap<String, String> {
-        let mut m: HashMap<String, String> = [
-            ("RACER_NAMESPACE", "racer-system"),
-            ("RACER_POD_NAME", "racer-abc"),
-            ("RACER_POD_UID", "11111111-1111-4111-8111-111111111111"),
-            ("RACER_NODE_NAME", "node-a"),
-            ("RACER_POD_IP", "10.0.0.5"),
-            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.into(), v.into()))
-        .collect();
-        for (k, v) in extra {
-            m.insert((*k).into(), (*v).into());
-        }
-        m
-    }
-
-    fn parse(m: &HashMap<String, String>) -> Result<Option<Config>, Error> {
-        Config::from_lookup(|k| m.get(k).cloned())
-    }
-
-    #[test]
-    fn absent_namespace_is_standalone() {
-        assert!(Config::from_lookup(|_| None).unwrap().is_none());
-    }
-
-    #[test]
-    fn defaults() {
-        let c = parse(&env(&[])).unwrap().unwrap();
-        assert_eq!(c.seats, SeatPolicy::Auto);
-        assert_eq!(c.control_listen.port(), 8443);
-        assert_eq!(c.webhook_listen.port(), 9443);
-        assert_eq!(c.api_server, "10.96.0.1:443");
-        assert_eq!(c.peer_port, 8082);
-        assert!(c.object_image.is_none());
-    }
-
-    #[test]
-    fn seats_and_ipv6_api() {
-        let c = parse(&env(&[
-            ("RACER_CONTROL_SEATS", "5"),
-            ("KUBERNETES_SERVICE_HOST", "fd00::1"),
-        ]))
-        .unwrap()
-        .unwrap();
-        assert_eq!(c.seats, SeatPolicy::Fixed(5));
-        assert_eq!(c.api_server, "[fd00::1]:443");
-        for bad in ["0", "17", "05", "x"] {
-            assert_eq!(
-                parse(&env(&[("RACER_CONTROL_SEATS", bad)])).unwrap_err(),
-                Error::InvalidConfiguration
-            );
-        }
-    }
-
-    #[test]
-    fn managed_listeners_accept_both_pod_ip_families() {
-        for ip in ["10.244.2.3", "fd00:10:244::3"] {
-            let control = format!("[{ip}]:8443");
-            let webhook = format!("[{ip}]:9443");
-            let c = parse(&env(&[
-                ("RACER_POD_IP", ip),
-                ("RACER_CONTROL_LISTEN", &control),
-                ("RACER_WEBHOOK_LISTEN", &webhook),
-            ]))
-            .unwrap()
-            .unwrap();
-            let ip: IpAddr = ip.parse().unwrap();
-            assert_eq!(c.control_listen, SocketAddr::new(ip, 8443));
-            assert_eq!(c.webhook_listen, SocketAddr::new(ip, 9443));
-        }
-    }
-
-    #[test]
-    fn webhook_also_serves_the_other_pod_ip_family() {
-        let webhook = "[10.0.0.5]:9443";
-        let c = |ips: &str, listen: &str| {
-            parse(&env(&[
-                ("RACER_POD_IPS", ips),
-                ("RACER_WEBHOOK_LISTEN", listen),
-            ]))
-        };
-        let alt = |ips, listen| c(ips, listen).unwrap().unwrap().webhook_alternate;
-        assert_eq!(
-            alt("10.0.0.5,fd00::5", webhook),
-            Some("fd00::5".parse().unwrap())
-        );
-        // Single stack, absent, or not listening on the Pod IP: none.
-        assert_eq!(alt("10.0.0.5", webhook), None);
-        assert_eq!(alt("", webhook), None);
-        assert_eq!(alt("10.0.0.5,fd00::5", "127.0.0.1:9443"), None);
-        // Malformed, not led by status.podIP, duplicate, or same family: rejected.
-        for bad in [
-            "10.0.0.5,nope",
-            "10.0.0.6,fd00::5",
-            "fd00::5,10.0.0.5",
-            "10.0.0.5,10.0.0.5",
-            "10.0.0.5,10.0.0.6",
-            "10.0.0.5,fd00::5,fd00::6",
-        ] {
-            assert_eq!(c(bad, webhook).unwrap_err(), Error::InvalidConfiguration);
-        }
-    }
-
-    #[test]
-    fn listener_address_validation() {
-        for address in ["127.0.0.1:0", "[127.0.0.1]:0", "[::1]:0", ":0"] {
-            let c = parse(&env(&[("RACER_CONTROL_LISTEN", address)]))
-                .unwrap()
-                .unwrap();
-            assert_eq!(c.control_listen.port(), 0);
-        }
-        for bad in [
-            "[10.244.2.3:8443",
-            "10.244.2.3]:8443",
-            "[10.244.2.3]:+8443",
-            "[10.244.2.3]:8443extra",
-            "[10.244.2.3]:65536",
-            "[10.244.2.3]:",
-            "[not-an-ip]:8443",
-            "[]:8443",
-            "fd00:10:244::3:8443",
-        ] {
-            for name in ["RACER_CONTROL_LISTEN", "RACER_WEBHOOK_LISTEN"] {
-                assert_eq!(
-                    parse(&env(&[(name, bad)])).unwrap_err(),
-                    Error::InvalidConfiguration,
-                    "{name}={bad}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn missing_identity_fails() {
-        let mut m = env(&[]);
-        m.remove("RACER_POD_UID");
-        assert_eq!(parse(&m).unwrap_err(), Error::InvalidConfiguration);
-        assert_eq!(
-            parse(&env(&[("RACER_POD_IP", "nope")])).unwrap_err(),
-            Error::InvalidConfiguration
-        );
     }
 }

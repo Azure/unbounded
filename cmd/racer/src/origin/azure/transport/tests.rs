@@ -428,6 +428,7 @@ fn workload_identity_learns_its_tenant_from_the_storage_challenge() {
         authority: format!("https://login.example:{}/", login.port()),
         federated_token_file: Some(token_file),
         tls: Some(http1::tls::client_config(identity.roots.clone())),
+        trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
     }));
     let tokens = AzureTokens::new(caches, reactor.clone())
         .with_resolver(Rc::new(MapResolver::new(vec![login])));
@@ -689,7 +690,7 @@ fn endpoints_for_unpublished_origins_are_dropped() {
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 4)),
         Rc::new(crate::http::client_io(reactor, admission)),
         Rc::new(MapResolver::new(Vec::new())),
-        Arc::new(TrustRoots::from_env()),
+        Arc::new(TrustRoots::at(http1::tls::DEFAULT_TRUST_BUNDLE.into())),
     );
     let origin = |url: &str| {
         OriginDefinition::azure(

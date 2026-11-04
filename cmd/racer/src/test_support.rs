@@ -357,6 +357,8 @@ pub mod cluster {
                 relay_transfers: count,
             },
             scaled_limits: Default::default(),
+            origin: Default::default(),
+            cluster_control: None,
         }
     }
 }

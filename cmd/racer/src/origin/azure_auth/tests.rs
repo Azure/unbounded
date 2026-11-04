@@ -11,6 +11,7 @@ fn imds_endpoints(port: u16) -> AuthEndpoints {
         authority: DEFAULT_AUTHORITY_HOST.into(),
         federated_token_file: None,
         tls: None,
+        trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
     }
 }
 
@@ -170,9 +171,17 @@ fn form_encoding_and_configuration_validation() {
         "https://h:x/",
         "https://h/?q",
     ] {
-        assert!(parse_authority(bad, None).is_err(), "{bad}");
+        assert!(
+            parse_authority(bad, None, std::path::Path::new("/unused")).is_err(),
+            "{bad}"
+        );
     }
-    let (endpoint, prefix) = parse_authority("http://login.example:8080/base", None).unwrap();
+    let (endpoint, prefix) = parse_authority(
+        "http://login.example:8080/base",
+        None,
+        std::path::Path::new("/unused"),
+    )
+    .unwrap();
     assert_eq!(endpoint.authority(), "login.example:8080");
     assert_eq!(prefix, "/base/");
 }
@@ -286,6 +295,7 @@ fn workload_identity_exchanges_federated_token_with_discovered_tenant() {
             authority: format!("https://login.example:{}/", address.port()),
             federated_token_file: Some(token_file.clone()),
             tls: Some(http1::tls::client_config(identity.roots.clone())),
+            trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
         },
     )
     .unwrap();

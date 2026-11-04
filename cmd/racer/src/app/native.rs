@@ -539,17 +539,20 @@ mod tests {
             10 + usize::from(values.contains_key("RACER_MAX_THREADS"))
         );
         assert_eq!(values.get("RACER_CONTROL_SEATS"), Some(&"auto"));
-        let mut config = Config::from_lookup(|name| {
-            Ok(values
-                .get(name)
-                .map(|v| (*v).to_owned())
-                .or_else(|| match name {
-                    "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
-                    "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
-                    _ => None,
-                }))
-        })
-        .unwrap();
+        // Through the map parser, so a stale or misspelled key fails here.
+        let mut environment: std::collections::BTreeMap<String, String> = values
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        environment.insert(
+            "RACER_CLUSTER_ID".into(),
+            "00000000-0000-4000-8000-000000000001".into(),
+        );
+        environment.insert(
+            "RACER_CONTROL_ENDPOINT".into(),
+            "https://control.example".into(),
+        );
+        let mut config = Config::from_map(&environment).unwrap();
         assert_eq!(
             config.enable_rdma,
             cfg!(feature = "rdma") && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
@@ -735,7 +738,7 @@ mod tests {
                     "RACER_RELAY_TRANSFERS" => Some("256".into()),
                     "RACER_PIPES" => Some("128".into()),
                     "RACER_CLIENT_CONNECTIONS" => Some("2048".into()),
-                    "RACER_CONNECTIONS_PER_NEIGHBOR" => Some("16".into()),
+                    "RACER_NEIGHBOR_CONNECTIONS_PER_WORKER" => Some("16".into()),
                     "RACER_QUEUE_ENTRIES" => Some("1024".into()),
                     _ => None,
                 })

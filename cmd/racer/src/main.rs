@@ -56,14 +56,15 @@ impl ClusterControl for Embedded {
 }
 
 fn run() -> std::result::Result<(), (&'static str, Error)> {
-    let mut config = Config::from_env().map_err(|error| ("config", error))?;
+    // The only process-environment read: everything else gets an explicit Config.
+    let mut config = Config::from_env().map_err(|error| {
+        eprintln!("racer: stage=config error={error}");
+        ("config", Error::from(error))
+    })?;
     // Held across cluster bootstrap and the application so SIGTERM/SIGINT stop a
     // managed bootstrap wait; the application shares, never resets, this state.
     let signals = StopSignals::install().map_err(|error| ("signals", error))?;
-    let control = racer_cluster_control::Config::from_env().map_err(|error| {
-        eprintln!("racer: stage=cluster-control-config error={error}");
-        ("cluster-control-config", Error::InvalidConfiguration)
-    })?;
+    let control = config.cluster_control.take();
     // Retained until the application stops; dropping it stops control boundedly.
     // The concrete handle is kept beside the trait object for fatal diagnostics.
     let control = match (control, config.managed()) {

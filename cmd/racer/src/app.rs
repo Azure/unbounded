@@ -241,7 +241,7 @@ impl NodeState {
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
             native: native::NativeNode::default(),
-            azure: crate::origin::azure::AzureNode::from_env(),
+            azure: crate::origin::azure::AzureNode::new(&Default::default()),
             pressure: Default::default(),
         })
     }
@@ -444,7 +444,6 @@ impl Application {
 
     /// Discover resources, enroll the node, and run its worker group until shutdown.
     pub fn run(mut self) -> Result<()> {
-        self.config.validate()?;
         self.discovered_nics = crate::rdma::inventory();
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
@@ -463,11 +462,13 @@ impl Application {
         )?;
         self.config.admission_history_per_worker(plan.pairs.len())?;
         log_worker_plan("final", &plan);
-        self.node = Arc::new(NodeState::with_peer_admission(
+        let mut node = NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
             self.config.peer_admission,
-        )?);
+        )?;
+        node.azure = crate::origin::azure::AzureNode::new(&self.config.origin);
+        self.node = Arc::new(node);
         self.node.workers.configure_spill(self.config.spill)?;
         self.node.workers.prefetch.configure(self.config.prefetch)?;
         Arc::get_mut(&mut self.node)

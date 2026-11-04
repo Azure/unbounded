@@ -121,8 +121,8 @@ fn binary_exits_cleanly_on_signal_during_bootstrap() {
                 ("KUBERNETES_SERVICE_HOST", "127.0.0.1"),
             ])
             .env("KUBERNETES_SERVICE_PORT", api.port().to_string())
-            .env("RACER_API_CA", root.join("ca.crt"))
-            .env("RACER_API_TOKEN", root.join("token"))
+            .env("RACER_KUBE_API_CA", root.join("ca.crt"))
+            .env("RACER_KUBE_API_TOKEN", root.join("token"))
             .env("RACER_CONTROL_TOKEN", root.join("token"))
             .env("RACER_IDENTITY_DIRECTORY", root.join("identity"))
             .env("RACER_SLAB_DIRECTORY", root.join("slabs"))

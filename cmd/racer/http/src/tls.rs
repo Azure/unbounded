@@ -36,7 +36,7 @@ use rustls::{
 use std::{
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     sync::{
         Arc,
@@ -47,9 +47,6 @@ use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 use zeroize::Zeroizing;
 
 pub use rustls;
-
-/// Environment variable naming the PEM trust bundle for origin HTTPS.
-pub const TRUST_BUNDLE_ENV: &str = "RACER_ORIGIN_TRUST_BUNDLE";
 
 /// Default PEM trust bundle (Debian and Ubuntu `ca-certificates`).
 pub const DEFAULT_TRUST_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
@@ -144,13 +141,6 @@ impl TlsClient {
     pub fn server_name(&self) -> &ServerName<'static> {
         &self.name
     }
-}
-
-/// The trust bundle path from [`TRUST_BUNDLE_ENV`], else [`DEFAULT_TRUST_BUNDLE`].
-pub fn trust_bundle_path() -> PathBuf {
-    std::env::var_os(TRUST_BUNDLE_ENV)
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| PathBuf::from(DEFAULT_TRUST_BUNDLE), PathBuf::from)
 }
 
 /// Parse every certificate in a PEM bundle into a root store. Fails if the file

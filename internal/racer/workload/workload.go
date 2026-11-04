@@ -405,7 +405,7 @@ func dataplaneEnvironment(c Config) []corev1.EnvVar {
 		{Name: "RACER_CONTROL_LISTEN", Value: listen(ControlPort)},
 		{Name: "RACER_WEBHOOK_LISTEN", Value: listen(WebhookPort)},
 		{Name: "RACER_OBJECT_IMAGE", Value: c.ObjectImage},
-		{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},
+		{Name: "RACER_CONTROL_TOKEN", Value: "/var/run/racer-token/token"},
 		{Name: "RACER_AZURE_FEDERATED_TOKEN_FILE", Value: AzureTokenFile},
 		// Kubelet creates the hostPath mount with mode 0755. Let the
 		// dataplane create its private 0700 directory beneath it.

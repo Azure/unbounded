@@ -65,11 +65,6 @@ pub struct AzureTokenCaches {
 }
 
 impl AzureTokenCaches {
-    /// Production token endpoints from the environment.
-    pub fn from_env() -> Self {
-        Self::new(AuthEndpoints::from_env())
-    }
-
     pub fn new(endpoints: AuthEndpoints) -> Self {
         Self {
             endpoints,
@@ -319,6 +314,7 @@ mod tests {
             authority: "https://login.microsoftonline.com/".into(),
             federated_token_file: None,
             tls: None,
+            trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
         }));
         let tokens =
             AzureTokens::new(caches, reactor).with_resolver(Rc::new(MapResolver::new(Vec::new())));
@@ -381,6 +377,7 @@ mod tests {
             authority: "https://login.microsoftonline.com/".into(),
             federated_token_file: None,
             tls: None,
+            trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
         }));
         // Two workers sharing the node-wide cache.
         let one = AzureTokens::new(caches.clone(), reactor.clone())
@@ -462,6 +459,7 @@ mod tests {
             authority: "https://login.microsoftonline.com/".into(),
             federated_token_file: None,
             tls: None,
+            trust_bundle: http1::tls::DEFAULT_TRUST_BUNDLE.into(),
         }));
         let tokens = AzureTokens::new(caches.clone(), reactor);
         let origin = |credential: AzureCredential| {

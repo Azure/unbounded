@@ -108,9 +108,6 @@ impl AffinityPlan {
         mut topology: EffectiveTopology,
         rails: &[RailMapping],
     ) -> Result<Self> {
-        if config.io_workers.is_some() || config.crypto_helpers.is_some() {
-            config.validate()?;
-        }
         if let (Some(io), Some(helpers)) = (config.io_workers, config.crypto_helpers) {
             topology.nics.retain(|nic| {
                 nic.numa_node.is_some()

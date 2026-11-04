@@ -265,13 +265,15 @@ pub struct AzureNode {
 }
 
 impl AzureNode {
-    /// Token endpoints and the trust bundle path come from the environment.
+    /// Token endpoints and the trust bundle path come from configuration.
     /// Nothing is read from disk or the network until a cache needs it.
-    pub fn from_env() -> Self {
+    pub fn new(settings: &crate::config::OriginSettings) -> Self {
         Self {
             limits: Arc::default(),
-            tokens: Arc::new(tokens::AzureTokenCaches::from_env()),
-            trust: Arc::new(transport::TrustRoots::from_env()),
+            tokens: Arc::new(tokens::AzureTokenCaches::new(
+                crate::origin::azure_auth::AuthEndpoints::new(settings),
+            )),
+            trust: Arc::new(transport::TrustRoots::at(settings.trust_bundle.clone())),
         }
     }
 }
