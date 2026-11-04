@@ -175,3 +175,34 @@ func TestTFTPTransferTimeoutAbortsTransfer(t *testing.T) {
 	rf := &slowTFTPReaderFrom{tftpReaderFrom: tftpReaderFrom{readerFrom: readerFrom{&out}, ip: "10.0.1.59"}, delay: 300 * time.Millisecond}
 	require.Error(t, srv.readHandler("vmlinuz", rf))
 }
+
+func TestTFTPUserDataTransferDoesNotRecordBootLoader(t *testing.T) {
+	puller := setupImagePuller(t, "ghcr.io/test/image:v1", map[string][]byte{
+		"shimx64.efi": []byte("shim"),
+	})
+	node := &v1alpha3.Machine{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-ud"},
+		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{
+			Image:      "ghcr.io/test/image:v1",
+			DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:0a", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
+		}},
+	}
+	fc := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node).
+		WithIndex(&v1alpha3.Machine{}, indexing.IndexNodeByIP, indexing.IndexNodeByIPFunc).Build()
+	recorder := &recordingTFTPStatusRecorder{}
+	srv := &TFTPServer{
+		FileResolver:   FileResolver{Puller: puller, Reader: fc},
+		StatusRecorder: recorder,
+	}
+
+	var userData bytes.Buffer
+
+	require.NoError(t, srv.readHandler(userDataPath, &tftpReaderFrom{readerFrom: readerFrom{&userData}, ip: "10.0.1.60"}))
+	require.NotEmpty(t, userData.String())
+	require.Empty(t, recorder.calls)
+
+	var shim bytes.Buffer
+
+	require.NoError(t, srv.readHandler("shimx64.efi", &tftpReaderFrom{readerFrom: readerFrom{&shim}, ip: "10.0.1.60"}))
+	require.Equal(t, []string{"node-ud:shimx64.efi"}, recorder.calls)
+}

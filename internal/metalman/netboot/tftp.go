@@ -227,9 +227,13 @@ func (t *TFTPServer) recordBootLoaderDownloaded(ctx context.Context, log *slog.L
 	}
 }
 
+// isInitialBootLoaderDownload reports whether filename is the image's DHCP
+// boot loader. Transfers without a resolved image, such as generated
+// cloud-init user-data, are never boot loader downloads. When the image
+// metadata cannot be read or names no boot loader, any image file counts.
 func (t *TFTPServer) isInitialBootLoaderDownload(ctx context.Context, img *imagepull.Image, filename string) bool {
-	if img == nil {
-		return true
+	if img == nil || filename == userDataPath {
+		return false
 	}
 
 	meta, err := t.PinnedImageMetadata(ctx, img)
