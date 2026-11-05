@@ -799,7 +799,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::os::fd::OwnedFd;
-    use uring_runtime::environment;
 
     struct Producer {
         fd: OwnedFd,
@@ -895,7 +894,9 @@ mod tests {
             Instant::now(),
             std::time::SystemTime::UNIX_EPOCH,
         );
-        let _clock = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _clock = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let reactor = Reactor::<TestScope, ()>::new(12, ());
         let owner = setup(
             reactor
@@ -906,7 +907,8 @@ mod tests {
                 .unwrap(),
         );
         let scope = TestScope {
-            deadline: environment::now() + Duration::from_secs(100),
+            clock: sim_ctx.clock.clone(),
+            deadline: sim_ctx.clock.now() + Duration::from_secs(100),
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
         let mut cx = Context::from_waker(Waker::noop());
@@ -1076,7 +1078,8 @@ mod tests {
             .unwrap();
         let owner = Server::new(submissions.clone(), ()).with_binary(submissions, ());
         let scope = TestScope {
-            deadline: environment::now() + Duration::from_secs(100),
+            clock: racer_io::Clock::host(),
+            deadline: racer_io::Clock::host().now() + Duration::from_secs(100),
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
         let (fd, peer) = sim.socket_pair();
@@ -1189,7 +1192,9 @@ mod tests {
         ] {
             let now = Instant::now();
             let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-            let _clock = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _clock = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let reactor = Reactor::<TestScope, ()>::new(12, ());
             let submissions = reactor
                 .reserve_submissions(CONTROL_SLOTS + BINARY_CONTROL_SLOTS, ())
@@ -1197,6 +1202,7 @@ mod tests {
             let binary = submissions.clone();
             let owner = Server::new(submissions, ()).with_binary(binary, ());
             let scope = TestScope {
+                clock: sim_ctx.clock.clone(),
                 deadline: now + Duration::from_secs(if outcome == "parent" { 4 } else { 100 }),
                 cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
             };
@@ -1632,6 +1638,9 @@ mod tests {
     struct TestScope {
         deadline: Instant,
 
+        /// Time source for deadline checks.
+        clock: racer_io::Clock,
+
         cancellation: uring_runtime::environment::Cancellation,
     }
 
@@ -1642,7 +1651,7 @@ mod tests {
         fn check(&self) -> Result<()> {
             if self.cancellation.is_cancelled() {
                 Err(Error::Cancelled)
-            } else if environment::now() >= self.deadline {
+            } else if self.clock.now() >= self.deadline {
                 Err(Error::DeadlineExceeded)
             } else {
                 Ok(())
@@ -1736,7 +1745,9 @@ mod tests {
         let now = limit - Duration::from_secs(1);
         assert!(now.checked_add(CONNECTION_TIMEOUT).is_none());
         let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-        let _clock = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _clock = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let simulation = Simulation::new();
         let _simulation = simulation.enter();
         let reactor = Reactor::<TestScope, ()>::new(8, ());
@@ -1749,6 +1760,7 @@ mod tests {
             deny_next: Cell::new(false),
         };
         let scope = TestScope {
+            clock: sim_ctx.clock.clone(),
             deadline: limit,
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
@@ -1793,7 +1805,9 @@ mod tests {
             ),
         ] {
             let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-            let _clock = clock.environment(0).enter();
+            let sim_env = clock.environment(0);
+            let _clock = sim_env.enter();
+            let sim_ctx = sim_env.worker_ctx();
             let simulation = Simulation::new();
             let _simulation = simulation.enter();
             let reactor = Reactor::<TestScope, ()>::new(8, ());
@@ -1801,6 +1815,7 @@ mod tests {
             let owner = Server::new(submissions, ());
             let handler = Routes::default();
             let scope = TestScope {
+                clock: sim_ctx.clock.clone(),
                 deadline: now.checked_add(parent_timeout).unwrap(),
                 cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
             };
@@ -1841,7 +1856,9 @@ mod tests {
 
         let now = Instant::now();
         let clock = SimulationClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
-        let _clock = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _clock = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let simulation = Simulation::new();
         let _simulation = simulation.enter();
         let reactor = Reactor::<TestScope, ()>::new(8, ());
@@ -1858,6 +1875,7 @@ mod tests {
             deny_next: Cell::new(false),
         };
         let scope = TestScope {
+            clock: sim_ctx.clock.clone(),
             deadline: now + Duration::from_secs(10),
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
@@ -1961,7 +1979,8 @@ mod tests {
             deny_next: Cell::new(false),
         };
         let scope = TestScope {
-            deadline: environment::now() + Duration::from_secs(10),
+            clock: racer_io::Clock::host(),
+            deadline: racer_io::Clock::host().now() + Duration::from_secs(10),
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2056,7 +2075,8 @@ mod tests {
             deny_next: Cell::new(false),
         };
         let scope = TestScope {
-            deadline: environment::now() + Duration::from_secs(10),
+            clock: racer_io::Clock::host(),
+            deadline: racer_io::Clock::host().now() + Duration::from_secs(10),
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
