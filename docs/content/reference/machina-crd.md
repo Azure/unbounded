@@ -726,7 +726,9 @@ err := controller.AddCapacityToManager(mgr, providers, controller.CapacityOption
 The controller runs only while the manager holds its leader-election lease, so
 enable leader election with a lease ID unique to the provider and Site scope.
 Two deployments must not serve overlapping scopes, such as an unscoped
-deployment next to one scoped to a Site.
+deployment next to one scoped to a Site. Set `EnableAllocationController` to
+also install the MachineAllocation controller, described in
+[MachineAllocation](#machineallocation).
 
 `deploy/machine-ops/04-machineclass-rbac.yaml.tmpl` defines three ClusterRoles
 and no bindings. Bind them to the controller's ServiceAccount:
@@ -738,6 +740,227 @@ and no bindings. Bind them to the controller's ServiceAccount:
 | `unbounded-machineclass-controller-credentials` | `secrets` `get` | A RoleBinding in the credential Secret namespace only. |
 
 The controller's manager also needs its own leader-election Lease permissions.
+
+## MachineAllocation
+
+| Property | Value |
+|----------|-------|
+| Kind | `MachineAllocation` |
+| Plural | `machineallocations` |
+| Short name | `malloc` |
+| Scope | Cluster |
+| Status subresource | Yes |
+
+A `MachineAllocation` is one consumer's request for one machine from a
+`MachineClass`. Its UID owns every provider effect made for it. Every spec
+field except `lifecycle` is immutable.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `spec.consumerRef` | object | Yes | The requesting object: `apiGroup`, `kind`, `name`, and `uid`. |
+| `spec.classRef` | UIDReference | Yes | The exact `MachineClass`, by name and UID. |
+| `spec.resources` | ResourceList | No | The minimum resources the machine must have after overhead. |
+| `spec.requirements` | []Requirement | No | Label requirements on the offering, with `In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, or `Lt`, and an optional `minValues`. |
+| `spec.nodeTemplate` | object | No | `labels`, `taints`, and `startupTaints` the Node registers with. |
+| `spec.lifecycle` | string | No | `Active` (default) or `Released`. It moves only from `Active` to `Released`. |
+
+`spec.lifecycle: Released` is the only thing that authorizes releasing the
+host. A consumer sets it after its own workload and storage steps are done.
+Deleting the allocation, or losing its consumer, fences the host but does not
+release it.
+
+### MachineAllocation controller
+
+The MachineAllocation controller serves an allocation when its provider, taken
+from `status.snapshot` or else from the class `spec.classRef` names, is a
+registration that declares capacity and, when the controller is scoped to a
+Site, the allocation's Site is that Site. An allocation with neither a class nor
+a snapshot is served by every allocation controller and fails with
+`InvalidRequest`. It launches a host in this order:
+
+1. Once the class is `Ready` for its current generation and its live inputs
+   still match the class status, the controller selects an offering, calls the
+   provider's `PlanAllocation`, and writes `status.snapshot`,
+   `status.providerID` (`unbounded:///machineallocations/<uid>`), the planned
+   instance type, zone, capacity type, image, capacity, allocatable, and labels
+   in one status write.
+2. It adds the finalizer `unbounded-cloud.io/machineallocation` and the labels
+   `unbounded-cloud.io/allocation-uid`, `unbounded-cloud.io/consumer-uid`, and
+   `unbounded-cloud.io/machine-class`.
+3. It adds the finalizer `machineallocations.unbounded-cloud.io/<uid>` to the
+   provider-config and bootstrap files `ConfigMap`s. It removes it once the
+   `HostAllocate` has a provider handle or has finished, or when release
+   finishes.
+4. It creates the bootstrap token Secret, then the Machine, then the
+   `HostAllocate` `MachineOperation`, and records the operation in
+   `status.operations.allocate`. Just before it creates the operation it checks
+   that the offering is still `Available` and its `validUntil` has not passed.
+
+The controller never creates the token again once the `HostAllocate` is
+recorded. The recorded `operations.allocate` and `operations.release` can
+never be changed or removed.
+
+An offering is a candidate when it is `Available`, its `validUntil` is in the
+future, every requested resource fits its capacity minus `kubeReserved`,
+`systemReserved`, and `evictionThreshold`, and every requirement matches its
+labels plus `node.kubernetes.io/instance-type`, `topology.kubernetes.io/zone`,
+and `unbounded-cloud.io/capacity-type`. Each requirement with `minValues` needs
+that many distinct values among the candidates. Priced offerings come before
+unpriced ones, then the lower hourly price, then the name. `status.labels` are
+the configuration's node labels, then `spec.nodeTemplate.labels`, then the
+offering's labels, the later ones winning.
+
+Everything the controller creates has a name derived from the allocation UID:
+
+| Object | Name | Finalizer |
+|--------|------|-----------|
+| Machine, and the Node it registers | `ub-<uid without dashes>` | `unbounded-cloud.io/machineallocation` |
+| `HostAllocate` operation | `<machine>-allocate` | `unbounded-cloud.io/machineallocation` |
+| `HostRelease` operation | `<machine>-release` | `unbounded-cloud.io/machineallocation` |
+| Bootstrap token Secret in `kube-system` | `bootstrap-token-<id>`, with a 6-character ID derived from the UID | - |
+
+The Machine is bound to the allocation in `spec.allocationRef`, owned by it,
+and has `host.external` set to the planned provider ID. It has no
+`bootstrapTokenRef`. Its `kubernetes.nodeLabels` are the labels in
+`status.labels` that a kubelet may set on its own Node, and its
+`registerWithTaints` are the configuration taints, the node template taints,
+and the startup taints.
+
+The token Secret carries the `unbounded-cloud.io/site` label, which the daemon
+CSR approver requires, and the `unbounded-cloud.io/allocation-uid` label. A
+Secret with the `unbounded-cloud.io/allocation-uid` label is never chosen as a
+site token, so the token refresher and `kubectl unbounded` never hand it to
+another host.
+
+An allocation retires when `spec.lifecycle` is `Released`, when it is being
+deleted, when its bound Machine is being deleted, or when its consumer is
+terminating or gone. A consumer is observed only for the kinds listed in
+`AllocationConsumerKinds`. A retired allocation is fenced: the controller sets
+`spec.fenced` on the Machine and deletes the token Secret. It never deletes a
+Secret with the token's name that does not carry this allocation's
+`unbounded-cloud.io/allocation-uid` label. Once the Machine is fenced, being
+deleted, or gone, and the token is gone, `Fenced` is `True`. A consumer that
+is lost without setting `Released` leaves the allocation fenced and holding
+with `AwaitingRelease`; set `spec.lifecycle: Released` to release the host.
+
+When release is authorized, the controller waits for the recorded
+`HostAllocate` to finish, creates the `HostRelease` operation, records it in
+`status.operations.release`, and waits for it. The `HostRelease` acts only on
+the resources in `status.ownedResources` and those the `HostAllocate`
+reported. When it completes, the controller removes its finalizers from the
+operations, the Machine, and the input `ConfigMap`s, sets `Released`, and
+removes its own finalizer. An allocation with no recorded `HostAllocate`
+finishes without a `HostRelease`. The controller does not delete the Machine
+or the Node; deleting the allocation garbage-collects the Machine and the
+operations it owns.
+
+| Condition | Status | Reason | Meaning |
+|-----------|--------|--------|---------|
+| `Allocated` | `False` | `ClassNotReady`, `ClassInputsChanged` | Waiting for the class to resolve, or for its inputs to match its status again. Checked again every 15 seconds. |
+| `Allocated` | `False` | `Launching` | The snapshot is written and the `HostAllocate` has not finished. |
+| `Allocated` | `True` | `Allocated` | The `HostAllocate` completed. It does not look at Node readiness. |
+| `Allocated` | `False` | `InsufficientCapacity`, `QuotaExceeded`, `InvalidRequest`, `AuthFailed`, `ProviderConflict`, `ProviderFailed` | A terminal failure, also in `status.failureReason` and `status.failureMessage`. The allocation never launches; release it with `spec.lifecycle: Released`. |
+| `Allocated` | `False` | `SnapshotMissing` | Hold: the finalizer is present but `status.snapshot` is gone, so the status was lost. |
+| `Registered` | `True` | `NodeRegistered` | The Node named after the Machine registered with `status.providerID`. `status.nodeRef` names the first such Node, and the Machine's `kubernetes.nodeRef` is set. |
+| `Registered` | `False` | `NodeNotRegistered`, `NodeConflict` | No such Node, or a Node with that name and another `providerID`. |
+| `Fenced` | `True` | `LifecycleReleased`, `AllocationDeleting`, `ConsumerTerminating`, `ConsumerGone`, `MachineDeleting` | The fence is complete, and the reason names the signal. |
+| `Fenced` | `False` | `Fencing` | The token or the Machine is not yet confirmed. The message names a Secret the controller will not delete. |
+| `Released` | `False` | `AwaitingRelease` | Fenced, and waiting for `spec.lifecycle: Released`. |
+| `Released` | `False` | `AwaitingAllocateOperation` | Waiting for the recorded `HostAllocate` to finish. |
+| `Released` | `False` | `Releasing` | Waiting for the `HostRelease`. |
+| `Released` | `False` | `ReleaseFailed` | Hold: the `HostRelease` failed. |
+| `Released` | `False` | `AllocateOperationMissing`, `ReleaseOperationMissing` | Hold: a recorded operation is gone or was replaced. `AllocateOperationMissing` also sets the `ProviderConflict` failure. |
+| `Released` | `False` | `MachineMissing` | Hold: the Machine is gone before its host was released. |
+| `Released` | `False` | `BeginOutcomeUnknown` | Hold: the `HostAllocate` may have begun and cannot be begun again. |
+| `Released` | `False` | `ProviderConflict` | Hold: a `MachineOperation` with the `HostRelease` name belongs to someone else. |
+| `Released` | `True` | `Released` | The host and the token are released. |
+
+A hold keeps every finalizer and is never retried on a timer. Each needs an
+operator: find and release the provider resources by hand, using the allocation
+UID, `status.ownedResources`, and the operations' status, and then remove the
+finalizers. Never delete or edit an allocation `MachineOperation`, and never
+remove its finalizer, while the allocation exists: the operation is the record
+of what the provider may have started.
+
+### Running HostAllocate and HostRelease
+
+`pkg/machineops/controller.AddToManager` registers a second controller,
+`machineoperation-allocation`, when a selected registration declares capacity.
+It is the only code that calls `HostAllocate` and `HostRelease`; the
+host-operation controller still ignores them. The same manager that installs
+the MachineAllocation controller must call `AddToManager` with the same
+providers.
+
+Before it begins a `HostAllocate`, the path checks that the operation is the
+one the allocation recorded, that neither the allocation nor the Machine is
+fenced, released, or being deleted, that the credential and the Site are the
+instances in the snapshot, and that the input `ConfigMap`s, the token, and the
+providerID match the snapshot. An unrecorded operation under the deterministic
+name waits for the record. Any other failed check fails the operation, or,
+once `Begin` may have run, holds it with the reason in the target message and
+the `Completed` condition, such as `BeginOutcomeUnknown` or
+`AuthorityReplaced`. The user data is `cloud-init` that writes the bootstrap
+files to `/var/lib/unbounded/bootstrap`, runs its `run` file, and then installs
+the agent, verifying `spec.bootstrap.agentArtifact.sha256` when the class sets
+an artifact. The agent's kubelet registers with `status.providerID`. A
+`HostRelease` begins only once `spec.lifecycle` is `Released`, the Machine is
+fenced or being deleted, and the recorded `HostAllocate` has finished.
+
+On a Machine bound to an allocation, `HostReplace`, `HostPowerOn`, and
+`HostPowerOff` fail with `UnsupportedOperation`, and every host operation on a
+fenced or deleting one fails with `MachineFenced`.
+
+### Installing the MachineAllocation controller
+
+```go
+err := controller.AddCapacityToManager(mgr, providers, controller.CapacityOptions{
+	ProviderName:               "ExampleCloud",
+	SiteName:                   "remote",
+	CredentialSecretNamespace:  "unbounded-system",
+	ProviderConfigNamespace:    "unbounded-capacity",
+	EnableAllocationController: true,
+	AllocationConsumerKinds: []schema.GroupVersionKind{
+		{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"},
+	},
+})
+```
+
+| Option | Description |
+|--------|-------------|
+| `EnableAllocationController` | Installs the MachineAllocation controller next to the MachineClass controller. |
+| `AllocationConsumerKinds` | The cluster-scoped consumer kinds whose termination and loss retire an allocation. Each needs `EnableAllocationController`, a `Kind` and a `Version`, and a distinct group and kind. Empty means consumer loss is never observed. Grant the controller `get`, `list`, and `watch` on each. |
+
+`deploy/machine-ops/05-machineallocation-rbac.yaml.tmpl` defines five
+ClusterRoles and no bindings:
+
+| ClusterRole | Grants | Bind with |
+|-------------|--------|-----------|
+| `unbounded-machineallocation-controller` | `machineallocations` read and `patch`, `machineallocations/status` update, `machineclasses`, `sites`, `machineconfigurationversions` and `nodes` read, `machines` read, `create`, `patch` and `allocate`, and `machineoperations` read, `create` and `patch` | A ClusterRoleBinding to the allocation controller. |
+| `unbounded-machineallocation-controller-provider-config` | `configmaps` `get`, `list`, `watch`, `patch` | A RoleBinding in the provider-config namespace only. |
+| `unbounded-machineallocation-controller-bootstrap-tokens` | `secrets` `get`, `create`, `delete` | A RoleBinding in `kube-system` only. |
+| `unbounded-machineallocation-operations` | `machineallocations` and `sites` `get` | A ClusterRoleBinding to the identity that runs `AddToManager`, with `unbounded-machineclass-controller-provider-config` bound in the provider-config namespace. |
+| `unbounded-machineallocation-operations-bootstrap-tokens` | `secrets` `get` | A RoleBinding in `kube-system` only, to the identity that runs `AddToManager`. |
+
+Install the two ValidatingAdmissionPolicies with the roles:
+
+- `unbounded-machine-allocationref`
+  (`06-machine-allocationref-policy.yaml.tmpl`) lets only an identity granted
+  the `allocate` verb on `machines` create a Machine with
+  `spec.allocationRef`.
+- `unbounded-machineallocation-bootstrap-tokens`
+  (`07-machineallocation-bootstrap-token-policy.yaml.tmpl`) limits the Secret
+  creates and deletes in `kube-system` of an identity granted `allocate` on
+  `machines` to bootstrap token Secrets labeled
+  `unbounded-cloud.io/allocation-uid`. An identity allowed `*` on `machines`,
+  such as `cluster-admin` or `system:masters`, is exempt. Never grant the
+  allocation controller `*` on `machines`, because that also lifts its Secret
+  limit.
+
+Both policies fail closed. Upgrade every shared machine-ops controller older
+than the one that ignores `HostAllocate` and `HostRelease`, and every agent
+older than the one with the allocation launch check, before you set
+`EnableAllocationController`: an older machine-ops controller treats
+`HostAllocate` as a host operation, and an older agent starts a fenced host.
 
 ---
 
