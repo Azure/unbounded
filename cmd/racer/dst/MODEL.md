@@ -822,6 +822,10 @@ scenarios at racer-sim defaults (seed 1, and seed 2 where noted):
 | ctl-churn 10,000 | enrolled, membership version, replies | 9,500, 21, 116,007 | 9,500, 21, 116,102 |
 | lagging 10,000 | unreachable polls, client lag p99/max s | 8,136, 8.6 / 79.0 | 7,644, 8.6 / 79.0 |
 | | wall (release), peak RSS | 22.1 s, 163 MB | 11.7 s, 172 MB |
+| enrollment-storm 50,000 | enrolled, all enrolled at, ready seats | 50,000, 170.1 s, 16 | 50,000, 173.8 s, 16 |
+| | API requests, 429s | 174,133, 22,727 | 173,076, 21,610 |
+| | enroll p50/p99 s, client lag p99 s | 68.7 / 137.4, 47.2 | 68.7 / 137.4, 47.2 |
+| | wall (release), peak RSS | 250 s, 799 MB | 90 s, 841 MB |
 
 Every control run has zero hard failures in both. Combined scenarios at racer-sim's test
 sizes (seed 1):
@@ -845,10 +849,20 @@ sizes (seed 1):
 | | origin requests, origin/page | 27,623, 2 | 26,899, 4 |
 | | read latency p50/p99/max ms | 42 / 168 / 3,472 | 47 / 132 / 3,496 |
 | | wall (release), peak RSS | 155 s, 1.02 GB | 142 s, 0.66 GB |
+| full-cold-start 50,000, 400 s, 0.02/s | reads completed / failed | 1,251,722 / 2 | 1,206,928 / 0 |
+| | skipped not enrolled / not member | 75,368 / 27,775 | 114,700 / 42,705 |
+| | origin requests, origin/page | 51,709, 3 | 60,132, 5 |
+| | read latency p50/p99/max ms | 46 / 151 / 4,045 | 48 / 127 / 3,729 |
+| | enrolled, membership version, skew | 50,000, 6, all current | 50,000, 6, all current |
+| | wall (release), peak RSS (per node) | 1,867 s, 5.06 GB (101 KB) | 1,632 s, 3.10 GB (62 KB) |
 | full-failover 10,000, 900 s, 0.02/s | reads completed / failed | 268,752 / 187 | 258,424 / 1,462 |
 | | origin requests, origin/page | 44,199, 6 | 44,715, 8 |
 | | read latency p50/p99/max ms | 42 / 218 / 3,551 | 47 / 157 / 3,473 |
 | | wall (release), peak RSS | 316 s, 1.15 GB | 268 s, 0.64 GB |
+
+The Model counts skipped reads per page (a range read skips each of its pages), which
+accounts for part of its higher skipped counts. The control model's own accounted memory at
+50,000 nodes is 3,639 B/node (`combined.control_memory`).
 
 Membership skew at the end, enrolled counts and membership versions match exactly in every
 combined run. Reads completed are 3-12% lower in the Model because its read load stops
