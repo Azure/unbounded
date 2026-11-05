@@ -283,6 +283,18 @@ the gap is in how often the cap is hit (timing), not in a decision. Whether a wa
 rank 0 should leave the fetch to rank 0 like a congested route does is a production question
 (rank 0 may also shed at its flight entry cap, `flight.rs:56-60`, with no fetch running).
 
+Slow origin (port in progress, `scenarios::slow_origin`, not in the catalog). racer-sim's
+`relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch` (seed 3) asserts one origin
+request per page. The Model (seed 3) asks origin 144 times for 64 pages (max 3 per page) and
+fails 141 of 3,072 reads. `MODEL_DIAG=1`: rank 0 fetches all 64 pages; ranks 1 and 2 fetch 80
+times after rank 0 answered their probe `Miss` (`origin:rankSome(1):OMiss`). Those probes are
+copy-only (`owner_probe:copy_onlytrue:attempts0`, 101 of 262 owner-to-owner probes): the owner
+serving a reader's request did not have the attempts to delegate (`walk.rs:657-661` needs
+`left + 2`), so it probed rank 0 copy-only (`walk.rs:674-677`), got a miss while rank 0 was still
+fetching, and ended `End::Origin`. Open question for the next session: whether racer-sim funds
+owner serving reads differently (reader `owner_funding`, retries' budgets) or this is a Model
+divergence; compare the inherited `route.attempts` at owners with racer-sim's `serve`.
+
 Earlier leads:
 
 - Shared route cache (refuted). A cache entry's routes depend only on its `PathKey`

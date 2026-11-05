@@ -452,6 +452,55 @@ pub fn hung_peers() -> Scenario {
         .end(60 * SECONDS)
 }
 
+/// Ported from racer-sim `relay_shed_rank0_probes_do_not_overlap_a_slow_origin_fetch`
+/// (`sim/tests/contention_scenarios.rs`, seed 3): 300 nodes, 48 readers of one 64-page object
+/// from an 8 MiB/s origin, so rank 0's origin requests queue past the owners' 2 s attempt
+/// timeout; 16 `Relay` transfers per worker and room for 128 waiters per flight. Owners whose
+/// probes of rank 0 time out or are shed by a relay leave the fetch to rank 0: no page is asked
+/// of origin twice, and pings find rank 0 busy, not hung.
+///
+/// Not in [`catalog`] yet: the Model fails `origin-once-per-page` (see `dst/MODEL.md`, "Slow
+/// origin"). Run it with `MODEL_SCENARIO=model-slow-origin MODEL_SEED=3` and the
+/// `scenario_report` test after adding it to the catalog.
+pub fn slow_origin() -> Scenario {
+    const NODES: u32 = 300;
+    let spec = ModelSpec {
+        pages_per_object: 64,
+        storms: vec![storm(0, 0, 48, 100 * MILLIS)],
+        relay_transfers: 16,
+        waiters_per_flight: 128,
+        ..ModelSpec::default()
+    };
+    let total = 48 * u64::from(spec.pages_per_object);
+    let spec = spec
+        .check("every-read-ends", move |r| {
+            let ended = counter(r, "reads_completed") + counter(r, "reads_failed");
+            (ended == total)
+                .then_some(())
+                .ok_or(format!("{ended} of {total} reads ended"))
+        })
+        .check("origin-once-per-page", |r| {
+            let max = r["origin_per_page"]["max_requests_per_page"]
+                .as_u64()
+                .unwrap_or(0);
+            (max == 1)
+                .then_some(())
+                .ok_or(format!("origin per page: {}", r["origin_per_page"]))
+        })
+        .check("rank0-pinged-and-answers", |r| {
+            (counter(r, "silence_pings") > 0)
+                .then_some(())
+                .ok_or("no silence pings".into())
+        });
+    let mut costs = crate::costs::Costs::checked_in();
+    costs.origin_bytes_per_sec = 8 << 20;
+    Scenario::new("model-slow-origin")
+        .nodes(NODES)
+        .model(spec)
+        .costs(costs)
+        .end(60 * SECONDS)
+}
+
 /// Model-only node faults: 64 nodes read twelve objects, one a second, while a drawn schedule crashes and
 /// restarts nodes, partitions node pairs and slows peers. Every read ends, and reads fail only
 /// with `Unavailable` or `Overloaded` after retries.

@@ -208,6 +208,12 @@ pub struct ModelSpec {
     pub random_churn: Option<RandomChurn>,
     /// Most adoption lag of a node (racer-sim `membership_lag_ns`, at most one batch).
     pub membership_lag: Nanos,
+    /// `Relay` transfers per worker; production's default unless a scenario overrides it
+    /// (racer-sim `NodeConfig::relay_transfers`).
+    pub relay_transfers: usize,
+    /// Waiters per flight; production's default unless a scenario overrides it (racer-sim
+    /// `NodeConfig::waiters_per_flight`).
+    pub waiters_per_flight: usize,
     /// Report checks, by name.
     pub checks: Vec<(String, ReportCheck)>,
 }
@@ -243,6 +249,8 @@ impl Default for ModelSpec {
             churn: Vec::new(),
             random_churn: None,
             membership_lag: membership::LAG,
+            relay_transfers: relay_transfers(),
+            waiters_per_flight: flight_limits().waiters_per_flight,
             checks: Vec::new(),
         }
     }
@@ -615,7 +623,7 @@ impl<'s> Model<'s> {
         let nodes = (0..n)
             .map(|node| Node {
                 cores: (0..workers)
-                    .map(|worker| core(node, worker, workers, &versions, &placement, base))
+                    .map(|worker| core(node, worker, workers, &versions, &placement, base, spec))
                     .collect(),
                 stored: Store::new(spec.stored_pages),
                 // Production: half the client request timeout, and the peer attempt timeout for
@@ -1480,6 +1488,17 @@ impl<'s> Model<'s> {
     /// Answer `asker`'s probe at node `to`.
     fn serve(&mut self, asker: Asker, to: u32, page: Page, route: Route) {
         let copy_only = route.copy_only;
+        if self.diag {
+            let owners = self.latest_owners(page);
+            if owners.contains(&asker.from) {
+                let key = format!(
+                    "owner_probe:copy_only{copy_only}:attempts{}:dest_owner{}",
+                    route.attempts,
+                    owners.contains(&to)
+                );
+                *self.report.attempt_errors.entry(key).or_default() += 1;
+            }
+        }
         let now = self.now();
         let worker = owner_worker(page, self.spec.workers.max(1));
         // The destination resolved the request's version (`decide_hop`).
@@ -1744,7 +1763,7 @@ impl<'s> Model<'s> {
                 // relay's worker before it forwards (racer-sim `hop`); none free is `Overloaded`.
                 let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
                 let active = self.relays_active.entry((at, worker)).or_default();
-                if *active >= relay_transfers() {
+                if *active >= self.spec.relay_transfers {
                     self.report.counters.relay_sheds += 1;
                     if self.diag {
                         let m = &self.msgs[&mid];
@@ -2808,6 +2827,7 @@ fn core(
     versions: &Rc<RefCell<Versions>>,
     placement: &Rc<Placement<Phantom>>,
     base: Instant,
+    spec: &ModelSpec,
 ) -> WorkerCore<ModelTypes> {
     // Every closure reads the version this node adopted when the core calls it.
     let (v, p) = (versions.clone(), placement.clone());
@@ -2851,7 +2871,10 @@ fn core(
             mesh,
             helper_of,
         },
-        flight_limits(),
+        FlightLimits {
+            waiters_per_flight: spec.waiters_per_flight,
+            ..flight_limits()
+        },
         64,
         ServeDecision::new(1 << 20),
         SuccessorHints::new(HINT_CAPACITY, HINT_TTL),
