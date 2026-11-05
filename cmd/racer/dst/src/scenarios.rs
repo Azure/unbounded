@@ -796,6 +796,92 @@ pub fn control(plan: &'static str, nodes: u32) -> Scenario {
 /// bursts, a site cut, and in `full-cold-start` a storm on object 0 by every
 /// node at three quarters of the run.
 pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenario {
+    combined_with(name, nodes, rate, secs, &DataFaults::default())
+}
+
+/// racer-sim's data-plane faults of the combined scenarios (`sim/src/combined.rs`
+/// `DataFaults`, `"combined_faults"` in its `--config`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DataFaults {
+    /// No data-plane faults at all when false.
+    pub enabled: bool,
+    /// Slow nodes per thousand (`full-lagging`, `full-cold-start`).
+    pub slow_permille: u32,
+    /// Slowdown factor of a slow node.
+    pub slow_factor: u8,
+    /// Origin 5xx probability during a burst (`full-failover`).
+    pub p5xx: f64,
+    /// Origin 412 probability during a burst (`full-churn`).
+    pub p412: f64,
+    /// Length of each origin error burst.
+    pub burst_ns: Nanos,
+    /// Sites 0 and 1 are cut apart (`full-failover`).
+    pub partition: bool,
+}
+
+impl Default for DataFaults {
+    /// racer-sim's defaults.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            slow_permille: 10,
+            slow_factor: 8,
+            p5xx: 0.3,
+            p412: 0.1,
+            burst_ns: 30 * SECONDS,
+            partition: true,
+        }
+    }
+}
+
+impl DataFaults {
+    /// Apply racer-sim's `"combined_faults"` JSON object (`DataFaults::apply_json`).
+    pub fn apply_json(&mut self, value: &serde_json::Value) -> Result<(), String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| format!("combined_faults: expected an object, got {value}"))?;
+        for (key, v) in obj {
+            let bad = || format!("combined_faults.{key}: invalid value {v}");
+            let probability = || {
+                v.as_f64()
+                    .filter(|p| (0.0..=1.0).contains(p))
+                    .ok_or_else(bad)
+            };
+            match key.as_str() {
+                "enabled" => self.enabled = v.as_bool().ok_or_else(bad)?,
+                "partition" => self.partition = v.as_bool().ok_or_else(bad)?,
+                "slow_permille" => {
+                    self.slow_permille = v
+                        .as_u64()
+                        .filter(|n| *n <= 1000)
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(bad)?;
+                }
+                "slow_factor" => {
+                    self.slow_factor = v
+                        .as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(bad)?;
+                }
+                "p5xx" => self.p5xx = probability()?,
+                "p412" => self.p412 = probability()?,
+                "burst_ns" => self.burst_ns = v.as_u64().ok_or_else(bad)?,
+                _ => return Err(format!("unknown key combined_faults.{key}")),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`combined`] with the data-plane faults `faults`.
+pub fn combined_with(
+    name: &str,
+    nodes: u32,
+    rate: f64,
+    secs: Option<u64>,
+    faults: &DataFaults,
+) -> Scenario {
     let (plan, default) = match name {
         "full-cold-start" => ("enrollment-storm", 400),
         "full-failover" => ("failover", 900),
@@ -819,17 +905,30 @@ pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenari
         ..ModelSpec::default()
     };
     let mut slow = Vec::new();
-    // `DataFaults::slow`: every 100th node (10 per thousand), 8x slower.
+    // `DataFaults::slow`: every `1000 / slow_permille`-th node (by default every 100th), slowed
+    // by `slow_factor` (8).
     let mut slowed = |from: Nanos, until: Nanos| {
-        for node in (50..nodes).step_by(100) {
-            slow.push((from, Fault::SlowPeer { node, factor: 8 }));
+        if !faults.enabled || faults.slow_permille == 0 || faults.slow_factor <= 1 {
+            return;
+        }
+        let stride = (1000 / faults.slow_permille).max(1);
+        for node in (stride / 2..nodes).step_by(stride as usize) {
+            let factor = faults.slow_factor;
+            slow.push((from, Fault::SlowPeer { node, factor }));
             slow.push((until, Fault::SlowPeer { node, factor: 1 }));
         }
     };
     let burst = |from: Nanos, errors: OriginErrors| OriginBurst {
         from,
-        until: from + 30 * SECONDS,
+        until: from + faults.burst_ns,
         errors,
+    };
+    // `DataFaults::origin`: no burst without errors or length.
+    let bursts = |at: &[Nanos], errors: OriginErrors| {
+        if !faults.enabled || errors.p412 + errors.p5xx <= 0.0 || faults.burst_ns == 0 {
+            return Vec::new();
+        }
+        at.iter().map(|from| burst(*from, errors)).collect()
     };
     match name {
         "full-cold-start" => {
@@ -841,24 +940,26 @@ pub fn combined(name: &str, nodes: u32, rate: f64, secs: Option<u64>) -> Scenari
             spec.storms.push(storm(d * 3 / 4, 0, nodes, window));
         }
         "full-failover" => {
-            spec.site_cuts.push(SiteCut {
-                from: d * 2 / 5,
-                until: d / 2,
-                a: 0,
-                b: 1,
-            });
+            if faults.enabled && faults.partition {
+                spec.site_cuts.push(SiteCut {
+                    from: d * 2 / 5,
+                    until: d / 2,
+                    a: 0,
+                    b: 1,
+                });
+            }
             let errors = OriginErrors {
-                p5xx: 0.3,
+                p5xx: faults.p5xx,
                 ..OriginErrors::default()
             };
-            spec.origin_bursts = vec![burst(d / 5, errors), burst(d * 3 / 5, errors)];
+            spec.origin_bursts = bursts(&[d / 5, d * 3 / 5], errors);
         }
         "full-churn" => {
             let errors = OriginErrors {
-                p412: 0.1,
+                p412: faults.p412,
                 ..OriginErrors::default()
             };
-            spec.origin_bursts = vec![burst(d / 2, errors)];
+            spec.origin_bursts = bursts(&[d / 2], errors);
         }
         _ => slowed(d / 10, d * 9 / 10),
     }

@@ -82,6 +82,7 @@
 
 pub mod authority;
 pub mod choices;
+pub mod cli;
 pub mod costs;
 pub mod determinism;
 pub mod engine;

@@ -4,10 +4,16 @@
 //! `1..=N` of every scenario; default `seeds/ci.txt` then
 //! `seeds/regressions.txt`), `DST_STEPS` (step budget per run) and
 //! `DST_FILTER` (scenario name substring).
+//!
+//! With arguments it runs one scenario and writes its JSON report instead, with racer-sim's
+//! command line (`--scenario`, `--nodes`, `--seed`, `--duration`, `--config`, `--out`; see
+//! [`racer_dst::cli`]). It exits 1 when the run fails a check or invariant (the report is
+//! still written) and 2 on a usage error.
 use std::process::ExitCode;
 
 use racer_dst::{
     choices::{SeedEntry, Source, parse_seeds},
+    cli,
     determinism::{run_twice, shrink_failure},
     model,
     scenario::Fidelity,
@@ -72,7 +78,44 @@ fn coverage_parity(entries: &[SeedEntry]) -> u32 {
     1
 }
 
+/// Run one scenario from the command line and write its report.
+fn report(args: &[String]) -> ExitCode {
+    let options = match cli::Options::parse(args) {
+        Ok(options) => options,
+        Err(err) => {
+            eprintln!("racer-dst: {err}\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    let (report, failed) = match cli::run(&options) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("racer-dst: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let text = serde_json::to_string_pretty(&report).expect("report serializes");
+    match &options.out {
+        Some(path) => {
+            if let Err(err) = std::fs::write(path, text + "\n") {
+                eprintln!("racer-dst: write {path}: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+        None => println!("{text}"),
+    }
+    if failed {
+        eprintln!("racer-dst: {}", report["failure"]);
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        return report(&args);
+    }
     let entries = match entries() {
         Ok(entries) => entries,
         Err(e) => {
