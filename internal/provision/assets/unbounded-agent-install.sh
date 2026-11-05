@@ -26,6 +26,10 @@ set -eo pipefail
 #   AGENT_URL             - fully qualified download URL for the agent tarball.
 #                           When set it overrides AGENT_VERSION and
 #                           AGENT_BASE_URL entirely.
+#   AGENT_SHA256          - lowercase hex SHA-256 digest of the agent tarball.
+#                           When set, the tarball is downloaded to a file and
+#                           verified before it is extracted, and the install
+#                           fails on a mismatch.
 #   AGENT_DEBUG           - enable debug mode for unbounded-agent
 #                           (e.g. "1", "true", "yes").
 #   AGENT_PREFLIGHT       - run unbounded-agent preflight before start.
@@ -78,7 +82,14 @@ staging_root="/var/lib/unbounded"
 mkdir -p "${staging_root}"
 tmp_dir="$(mktemp -d "${staging_root}/install.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
-curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
+if [ -n "${AGENT_SHA256:-}" ]; then
+    agent_archive="${tmp_dir}/unbounded-agent.tar.gz"
+    curl -fsSL -o "${agent_archive}" "${AGENT_URL}"
+    echo "${AGENT_SHA256}  ${agent_archive}" | sha256sum -c --quiet -
+    tar -xz -C "${tmp_dir}" -f "${agent_archive}" unbounded-agent
+else
+    curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
+fi
 # Run admission from the staged executable. Bootstrap installs the daemon binary
 # only after acquiring installation ownership; retries cannot overwrite a live
 # current/compatibility binary link before their intent has been accepted.
