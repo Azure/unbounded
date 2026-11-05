@@ -17,6 +17,7 @@
 //! | [`world`] | Nodes, roles ([`world::SimRole`], [`world::LaneRole`]), the one-thread scheduler, faults |
 //! | [`invariants`] | Safety/resource/liveness registration and built-ins |
 //! | [`scenario`] | Builder API: nodes, roles, faults, invariants, bounds, fidelity |
+//! | [`model`] | Model fidelity: byte-free interpreter over real `WorkerCore`s on the cost model |
 //! | [`determinism`] | Double-run trace comparison and failure shrinking |
 //! | [`fixture`] | A minimal racer-io node (two lanes, sim disk, timers, mailbox) |
 //! | [`scenarios`] | Built-in scenario catalog run by `make racer-dst` |
@@ -55,15 +56,16 @@
 //!
 //! # Model fidelity (Phase 5)
 //!
-//! [`scenario::Fidelity::Model`] is reserved. It will run a byte-free
-//! interpreter over the same `WorkerCore` machines: each effect is priced
-//! by [`resources`] (charged on [`world::World::fabric`]) and completed as an
-//! [`engine::Engine`] event instead of a reactor operation. Scenarios,
-//! choices, faults and invariants are shared; only the node factory differs.
-//! Interpreters are dispatch-only (no decisions), which is what makes
-//! Full/Model overlap calibration meaningful.
+//! [`scenario::Fidelity::Model`] runs [`model`]: a byte-free interpreter over the real
+//! `WorkerCore` machines and a real `topology::Placement` (with [`model::phantom`]
+//! rankings). Each effect is priced by [`resources`] and completed as an
+//! [`engine::Engine`] event instead of a reactor operation. A Model scenario carries a
+//! [`model::ModelSpec`] (workload and report checks) instead of a node factory; choices
+//! and the determinism double-run are shared. Interpreters are dispatch-only (no
+//! decisions), which is what makes Full/Model overlap calibration meaningful. What is
+//! modeled is listed in `dst/MODEL.md`.
 //!
-//! # Fuzzing (Phase 10)
+//! //! # Fuzzing (Phase 10)
 //!
 //! The non-workspace `fuzz/` crate feeds libFuzzer bytes to
 //! [`Choices::from_bytes`] and runs a scenario; the shrinking contract in
@@ -82,6 +84,7 @@ pub mod determinism;
 pub mod engine;
 pub mod fixture;
 pub mod invariants;
+pub mod model;
 // Copied from racer-sim with its documentation as is.
 #[allow(missing_docs)]
 pub mod resources;

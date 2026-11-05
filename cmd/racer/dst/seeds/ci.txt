@@ -11,3 +11,6 @@ lane-pair-faults seed=5
 lane-pair-faults seed=6
 lane-pair-faults seed=7
 lane-pair-faults seed=8
+model-concurrent-cold-readers seed=1
+model-concurrent-cold-readers seed=2
+model-concurrent-cold-readers seed=3

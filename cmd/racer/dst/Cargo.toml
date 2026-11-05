@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 racer-io = { path = "../io" }
+racer-core = { path = "../core" }
+topology = { path = "../topology" }
+serde_json = "1"

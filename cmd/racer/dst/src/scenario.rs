@@ -22,6 +22,7 @@ use crate::{
     costs::Costs,
     engine::{MILLIS, Nanos, SECONDS},
     invariants::{Class, Invariant, Probe},
+    model::ModelSpec,
     world::{Fault, NodeFactory, Outcome, World},
 };
 
@@ -32,7 +33,7 @@ pub enum Fidelity {
     #[default]
     Full,
     /// Byte-free interpreter over `WorkerCore` on the FIFO cost model
-    /// (Phase 5). Rejected until then.
+    /// ([`crate::model`]); needs a [`Scenario::model`] spec.
     Model,
 }
 
@@ -92,6 +93,8 @@ pub struct Scenario {
     /// order and cancel order from [`Choices`] (on by default). Off keeps
     /// FIFO order.
     pub seeded_os: bool,
+    /// The Model fidelity workload ([`Fidelity::Model`] only).
+    pub model: Option<Rc<ModelSpec>>,
 }
 
 impl std::fmt::Debug for Scenario {
@@ -125,7 +128,15 @@ impl Scenario {
             max_steps: 1_000_000,
             busy_limit: 100_000,
             seeded_os: true,
+            model: None,
         }
+    }
+
+    /// Run at Model fidelity with `spec`.
+    pub fn model(mut self, spec: ModelSpec) -> Self {
+        self.fidelity = Fidelity::Model;
+        self.model = Some(Rc::new(spec));
+        self
     }
 
     /// Node count.
@@ -286,20 +297,7 @@ impl Scenario {
     /// Run once over `choices`.
     pub fn run(&self, choices: Choices) -> Outcome {
         if self.fidelity == Fidelity::Model {
-            return Outcome {
-                trace: 0,
-                steps: 0,
-                end: 0,
-                draws: 0,
-                quiescent: false,
-                failure: Some(crate::world::Failure {
-                    class: Class::Safety,
-                    name: "fidelity".into(),
-                    at: 0,
-                    step: 0,
-                    message: "Model fidelity arrives in Phase 5".into(),
-                }),
-            };
+            return crate::model::run(self, choices).0;
         }
         match World::new(self, choices.clone()) {
             Ok(world) => world.run(),

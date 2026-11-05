@@ -341,7 +341,7 @@ fn fault_mix_is_drawn_from_choices_and_shrinks_to_nothing() {
 }
 
 #[test]
-fn faults_naming_missing_nodes_and_model_fidelity_are_rejected() {
+fn faults_naming_missing_nodes_and_model_fidelity_without_a_spec_are_rejected() {
     let s = Scenario::new("t").fault(0, Fault::Crash { node: 9 });
     assert_eq!(s.run(Choices::seeded(1)).failure.unwrap().name, "fault");
     let s = Scenario::new("t").fidelity(Fidelity::Model);
