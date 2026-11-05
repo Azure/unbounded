@@ -37,12 +37,12 @@ use http1::MessageHead;
 use http1::StartLine;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::canonical_socket_paths;
+use racer_io::ring::Completion;
 #[cfg(test)]
 use racer_io::ring::IoBuffer;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use uring_runtime::reactor::Completion;
 
 /// OriginClient is the shipping adapter implementation. Scripted implementations
 /// remain for poll-exact cancellation, wake ordering, and reservation-fence tests;

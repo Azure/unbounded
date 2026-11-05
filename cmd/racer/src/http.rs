@@ -13,7 +13,9 @@ use crate::runtime::RequestScope;
 use flow_control::PipeLease;
 use flow_control::PipePool;
 use http1::MessageHead;
+use racer_io::ring::Descriptor;
 use racer_io::ring::SendBuffer;
+use racer_io::ring::SocketAddress;
 #[cfg(test)]
 use std::io;
 use std::path::PathBuf;
@@ -21,8 +23,6 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::task::Waker;
 use std::time::Duration;
-use uring_runtime::reactor::SocketAddress;
-use uring_runtime::reactor::descriptor::Descriptor;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 

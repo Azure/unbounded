@@ -19,6 +19,7 @@
 //! The handler receives only the path and a bounded formatter, selects the response
 //! kind, and observes fixed transport events. Application routes, trusted response
 //! bodies, health, metric names, and connection admission remain with the caller.
+use racer_io::Operation;
 use racer_io::{Error, Result, ring::IoBuffer};
 use std::{
     cell::Cell,
@@ -29,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uring_runtime::{
-    Budget, Operation,
+    Budget,
     reactor::{Reactor, SUBMISSION_BYTES, SubmissionCapacity, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -125,7 +126,7 @@ pub struct BinaryResponse {
 }
 
 /// A runtime scope that can narrow the deadline for a single exchange.
-pub trait Scope: uring_runtime::Scope {
+pub trait Scope: racer_io::Scope {
     /// Narrow the deadline, preserving cancellation and caller metadata.
     fn with_deadline(&self, deadline: Instant) -> Self;
 }
@@ -1870,7 +1871,7 @@ mod tests {
         cancellation: uring_runtime::environment::Cancellation,
     }
 
-    impl uring_runtime::Scope for TestScope {
+    impl racer_io::Scope for TestScope {
         type Error = Error;
 
         /// Prioritize cancellation over deadline expiry.
@@ -1987,7 +1988,7 @@ mod tests {
             deadline: limit,
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
-        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(racer_io::Scope::check(&scope), Ok(()));
         let (fd, peer) = simulation.socket_pair();
         let buffer = owner.buffer(&handler).unwrap();
         assert_eq!(connections.get(), 1);
@@ -2068,8 +2069,8 @@ mod tests {
     /// Report exchange expiry once, keep serving, and release all resources on drain.
     #[test]
     fn serve_classifies_exchange_deadline_without_stopping_listener() {
+        use racer_io::ring::SocketAddress;
         use std::task::{Context, Waker};
-        use uring_runtime::reactor::SocketAddress;
 
         let now = Instant::now();
         let clock = racer_io::SimClock::new_at(1, now, std::time::SystemTime::UNIX_EPOCH);
@@ -2119,7 +2120,7 @@ mod tests {
             reactor.poll_budgeted(32).unwrap();
             assert!(server.as_mut().poll(&mut cx).is_pending());
         }
-        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(racer_io::Scope::check(&scope), Ok(()));
         assert!(owner.serving.get());
         assert_eq!(
             *handler.routes.0.borrow(),
@@ -2143,7 +2144,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nok\n"
         );
         assert_eq!(healthy.try_recv(&mut response).unwrap(), 0);
-        assert_eq!(uring_runtime::Scope::check(&scope), Ok(()));
+        assert_eq!(racer_io::Scope::check(&scope), Ok(()));
         assert_eq!(connections.get(), 0);
         assert_eq!(
             *handler.routes.0.borrow(),

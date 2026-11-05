@@ -813,7 +813,7 @@ fn drive_bootstrap<T>(
         let mut wait = uring_runtime::drivers::next_alarm().map_or(BOOTSTRAP_MAX_PARK, |at| {
             at.saturating_duration_since(reactor.ctx().clock.now())
         });
-        if let Some(recheck) = scope.and_then(uring_runtime::Scope::recheck_within) {
+        if let Some(recheck) = scope.and_then(racer_io::Scope::recheck_within) {
             wait = wait.min(recheck);
         }
         reactor.wait(wait.min(BOOTSTRAP_MAX_PARK))?;

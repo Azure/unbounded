@@ -17,6 +17,7 @@ use ::telemetry::server::Handler;
 use ::telemetry::server::Response;
 use ::telemetry::server::Server;
 use racer_control_wire::NodeId;
+use racer_io::ring::Descriptor;
 use std::cell::OnceCell;
 use std::fmt::Write;
 use std::net::SocketAddr;
@@ -33,7 +34,6 @@ use std::time::Instant;
 #[cfg(test)]
 use uring_runtime::environment;
 use uring_runtime::environment::Deadline;
-use uring_runtime::reactor::descriptor::Descriptor;
 
 mod diagnostics;
 mod forensics;

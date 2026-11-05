@@ -295,7 +295,7 @@ impl RequestScope {
         self.cancellation.cancel()
     }
 }
-impl uring_runtime::Scope for RequestScope {
+impl racer_io::Scope for RequestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
@@ -390,7 +390,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer::{memory::CiphertextPage, runtime::{Reactor, RequestScope}};
-/// use uring_runtime::reactor::descriptor::Descriptor;
+/// use racer_io::ring::Descriptor;
 /// fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
 ///     let _ = r.recv(fd, page, (), scope);
 /// }
@@ -506,7 +506,7 @@ mod tests {
             use std::time::Duration;
             #[test]
             fn untimed_scope_ends_only_by_cancellation_and_narrows_to_bounded() {
-                use uring_runtime::Scope as _;
+                use racer_io::Scope as _;
                 use wire_codec::rest::Scope;
                 let clock = racer_io::ctx::VirtualClock::new();
                 let scope =
@@ -811,15 +811,12 @@ mod tests {
                     .unwrap();
                 let clone = scope.clone();
                 clock.advance(Duration::from_secs(10));
-                assert_eq!(
-                    uring_runtime::Scope::check(&clone),
-                    Err(Error::DeadlineExceeded)
-                );
+                assert_eq!(racer_io::Scope::check(&clone), Err(Error::DeadlineExceeded));
                 let count = Arc::new(Count(AtomicUsize::new(0)));
-                let registration = uring_runtime::Scope::cancel_wait(&clone).unwrap();
+                let registration = racer_io::Scope::cancel_wait(&clone).unwrap();
                 registration.register(&Waker::from(count.clone()));
                 scope.cancel().unwrap();
-                assert_eq!(uring_runtime::Scope::check(&clone), Err(Error::Cancelled));
+                assert_eq!(racer_io::Scope::check(&clone), Err(Error::Cancelled));
                 assert_eq!(count.0.load(Ordering::Relaxed), 1);
             }
             /// Explicit-time checks match the environment clock without reading it.
@@ -878,14 +875,14 @@ mod tests {
 
         mod tests {
             use super::*;
+            use racer_io::ring::Descriptor;
             use racer_io::ring::IoBuffer;
+            use racer_io::ring::SocketAddress;
             use std::os::unix::net::UnixStream;
             use std::task::Context;
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
-            use uring_runtime::reactor::SocketAddress;
-            use uring_runtime::reactor::descriptor::Descriptor;
             use uring_runtime::reactor::simulation;
 
             #[test]

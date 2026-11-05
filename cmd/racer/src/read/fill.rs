@@ -77,9 +77,7 @@ type LocalPlaintextKeys = std::cell::RefCell<
 >;
 
 /// A host descriptor to hand to cuFile, or None for simulated descriptors.
-fn host_descriptor(
-    descriptor: &uring_runtime::reactor::descriptor::Descriptor,
-) -> Option<std::os::fd::OwnedFd> {
+fn host_descriptor(descriptor: &racer_io::ring::Descriptor) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd;
     #[cfg(test)]
     if descriptor.as_sim().is_some() {
@@ -744,7 +742,7 @@ impl Fill {
             exhausted = true;
             // Always yield before the retry. Cancellation never extends the
             // original allowance.
-            uring_runtime::drivers::yield_now().await;
+            racer_io::exec::yield_now().await;
         }
     }
 

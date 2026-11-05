@@ -543,6 +543,21 @@ mod tests {
     }
 }
 
+/// Return `Pending` once after waking the current task, so other ready work
+/// on the same executor runs before this task continues.
+pub async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut yielded, true) {
+            std::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 /// A waker that unparks the calling thread. No thread is spawned.
 pub fn thread_waker() -> std::task::Waker {
     std::task::Waker::from(std::sync::Arc::new(ThreadWake(std::thread::current())))

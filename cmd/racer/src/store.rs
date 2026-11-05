@@ -1792,7 +1792,7 @@ impl DecodedRecord {
 /// The descriptor is the worker-local O_DIRECT
 /// descriptor the slab reads through, suitable for registration with cuFile.
 pub struct DirectCiphertext {
-    pub descriptor: Rc<uring_runtime::reactor::descriptor::Descriptor>,
+    pub descriptor: Rc<racer_io::ring::Descriptor>,
     /// Absolute byte offset of the first ciphertext byte on `descriptor`.
     pub offset: u64,
     /// Ciphertext length in bytes, including the AEAD tag.

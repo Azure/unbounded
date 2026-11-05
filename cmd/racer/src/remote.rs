@@ -20,6 +20,8 @@ use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use http1::tls::TlsClient;
 use http1::tls::rustls;
+use racer_io::ring::Descriptor;
+use racer_io::ring::SocketAddress;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::net::IpAddr;
@@ -29,8 +31,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::reactor::SocketAddress;
-use uring_runtime::reactor::descriptor::Descriptor;
 use zeroize::Zeroizing;
 
 /// How long resolved addresses are reused before [`RemoteEndpoint::resolve`]

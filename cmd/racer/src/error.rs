@@ -5,7 +5,7 @@ use std::fmt;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Worker-local future: deliberately not `Send`, and never drives a hidden executor.
-pub type Operation<'a, T> = uring_runtime::Operation<'a, T, Error>;
+pub type Operation<'a, T> = racer_io::Operation<'a, T, Error>;
 
 /// Declare root failures once, keeping publication phases out of their own causes.
 macro_rules! boundary_errors {
@@ -446,7 +446,7 @@ mod tests {
     fn operation_preserves_local_borrows_and_racer_results() {
         let value = std::rc::Rc::new(7);
         let operation: Operation<'_, _> = Box::pin(async { Ok(*value) });
-        let operation: uring_runtime::Operation<'_, _, Error> = operation;
+        let operation: racer_io::Operation<'_, _, Error> = operation;
         assert_eq!(futures::executor::block_on(operation), Ok(7));
         let operation: Operation<'_, ()> = Box::pin(async { Err(Error::HopBudgetExhausted) });
         assert_eq!(

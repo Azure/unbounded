@@ -32,6 +32,7 @@ use page_alloc::Segments;
 use racer_control_wire::CacheId;
 use racer_control_wire::ClusterId;
 use racer_control_wire::KeyId;
+use racer_io::exec::yield_now;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::Cell;
@@ -39,7 +40,6 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
-use uring_runtime::drivers::yield_now;
 
 pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
 const SLOTS: uring_runtime::reactor::filesystem::checkpoint::Slots<HEADER_BYTES> =

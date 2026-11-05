@@ -180,7 +180,7 @@ impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
         digest: Option<&'a str>,
         limit: usize,
         scope: &'a RequestScope,
-    ) -> uring_runtime::Operation<'a, rest::Response, controlplane::feed::FetchError<Error>> {
+    ) -> racer_io::Operation<'a, rest::Response, controlplane::feed::FetchError<Error>> {
         self.started.set(true);
         self.client.get(path, digest, limit, scope)
     }
@@ -1064,7 +1064,7 @@ pub(super) mod tests {
             digest: Option<&'a str>,
             _: usize,
             _: &'a RequestScope,
-        ) -> uring_runtime::Operation<'a, rest::Response, FetchError<Error>> {
+        ) -> racer_io::Operation<'a, rest::Response, FetchError<Error>> {
             Box::pin(async move {
                 self.requests
                     .borrow_mut()

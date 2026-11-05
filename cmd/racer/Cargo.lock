@@ -213,7 +213,6 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "racer-io",
- "uring-runtime",
  "wire-codec",
 ]
 
@@ -1632,7 +1631,6 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "sha2",
- "uring-runtime",
  "zeroize",
 ]
 

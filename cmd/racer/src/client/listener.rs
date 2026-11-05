@@ -44,7 +44,7 @@ enum Listener {
     Sim(uds_endpoint::simulation::BoundSocket),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::descriptor::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(racer_io::ring::Descriptor, ())> {
         #[cfg(test)]
         if let Some(errno) = FAIL_ACCEPT.with(|fail| fail.take()) {
             return Err(std::io::Error::from_raw_os_error(errno));

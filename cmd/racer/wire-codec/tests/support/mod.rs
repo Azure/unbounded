@@ -3,6 +3,7 @@
 //! This small test-only companion keeps one copy of the fixture machinery while
 //! preserving both external API tests and private connection-pool assertions.
 
+use racer_io::{Scope as _, ring::Descriptor};
 use std::{
     io::{Read, Write},
     net::SocketAddr,
@@ -13,7 +14,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime},
 };
-use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 use wire_codec::rest::{
     Config, Connection, Error as RestError, Identity, Io, Method, Operation, Request, Scope,
     Transport,
@@ -51,7 +51,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone)]
 pub struct TestScope(Instant);
 
-impl uring_runtime::Scope for TestScope {
+impl racer_io::Scope for TestScope {
     type Error = Error;
 
     /// Expire operations after the fixture's absolute deadline.

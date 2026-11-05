@@ -113,8 +113,8 @@ impl Drop for Streaming {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: uring_runtime::reactor::descriptor::Descriptor,
-    ) -> crate::error::Result<uring_runtime::reactor::descriptor::Descriptor> {
+        fd: racer_io::ring::Descriptor,
+    ) -> crate::error::Result<racer_io::ring::Descriptor> {
         // False preserves the accepted socket's existing application policy.
         if self.tcp_nodelay {
             fd.enable_tcp_nodelay(true).map_err(|_| Error::Io)?;
@@ -1154,8 +1154,8 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::descriptor::Descriptor>>>
-        Future for CountedAccept<F>
+    impl<F: Future<Output = crate::error::Result<racer_io::ring::Descriptor>>> Future
+        for CountedAccept<F>
     {
         type Output = F::Output;
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1505,9 +1505,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                    listener,
-                ));
+                let fd = Rc::new(racer_io::ring::Descriptor::from(listener));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);

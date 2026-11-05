@@ -11,6 +11,7 @@ use crate::{
     Segments,
 };
 use racer_io::ring::SharedWriteBuffer;
+use racer_io::{Operation, Scope};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -28,7 +29,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 use uring_runtime::{
-    Budget, Operation, Scope,
+    Budget,
     reactor::{Reactor, descriptor::Descriptor},
 };
 

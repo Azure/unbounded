@@ -4,6 +4,7 @@ use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy
 use http1::tls::{TlsClient, TlsMode, rustls};
 use http1::{Codec, Header, MessageHead, StartLine};
 use racer_io::ring::IoBuffer;
+use racer_io::{Scope, ring::SocketAddress};
 use std::{
     future::Future,
     io::{Read, Write},
@@ -15,11 +16,7 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::{
-    Scope,
-    environment::{Cancellation, now},
-    reactor::SocketAddress,
-};
+use uring_runtime::environment::{Cancellation, now};
 
 const PAGE: usize = 16 << 20;
 

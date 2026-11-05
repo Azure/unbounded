@@ -15,6 +15,7 @@ use page_alloc::{
     AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentId,
     SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
 };
+use racer_io::{Operation, Scope};
 use racer_sim::alloc_model::{SegmentClock, SegmentEntries};
 use std::{
     cell::{Cell, RefCell},
@@ -26,12 +27,9 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-use uring_runtime::{
-    Operation, Scope,
-    reactor::{
-        Reactor,
-        simulation::{Fault, Simulation},
-    },
+use uring_runtime::reactor::{
+    Reactor,
+    simulation::{Fault, Simulation},
 };
 
 const PAGE: u64 = 4096;

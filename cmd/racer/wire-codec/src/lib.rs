@@ -251,9 +251,9 @@ pub mod rest {
     };
 
     /// Owner-local future carrying the caller's transport error type.
-    pub use uring_runtime::Operation;
+    pub use racer_io::Operation;
 
-    use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
+    use racer_io::{Scope as _, ring::Descriptor};
 
     /// Transport failures contain no credentials, headers, or body bytes.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,7 +284,7 @@ pub mod rest {
     pub type Result<T, E = Error> = std::result::Result<T, E>;
 
     /// Narrowing must preserve cancellation and all caller policy, never extend time.
-    pub trait Scope: uring_runtime::Scope {
+    pub trait Scope: racer_io::Scope {
         /// Return the caller's absolute monotonic deadline, or `None` when the
         /// scope is untimed and ends only by cancellation.
         fn deadline(&self) -> Option<Instant>;
@@ -964,7 +964,7 @@ pub mod rest {
             let attempt = scope.narrowed(now + share.min(Duration::from_secs(5)));
             let charge = io.lease()?;
             if let Some(sim) = io.sim() {
-                if let Ok(fd) = sim.connect(uring_runtime::reactor::SocketAddress::Inet(*address)) {
+                if let Ok(fd) = sim.connect(racer_io::ring::SocketAddress::Inet(*address)) {
                     let fd = Rc::new(fd);
                     return Ok(Connected {
                         charge,
@@ -1139,7 +1139,7 @@ pub mod rest {
         async fn step(&mut self, scope: &I::Scope) -> Result<(), I::Error> {
             self.check(scope)?;
             // Even a continuously readable peer must yield to other owner work.
-            uring_runtime::drivers::yield_now().await;
+            racer_io::exec::yield_now().await;
             let mut progress = false;
             if self.tls.wants_write() {
                 match self.tls.write_tls(&mut self.socket.stream) {
@@ -1991,12 +1991,12 @@ pub mod rest {
     /// Bounded UDP DNS on caller-owned readiness. TLS, never DNS, authenticates the host.
     pub mod dns {
         use super::{Error, Io, Result, Scope};
+        use racer_io::{Scope as _, ring::Descriptor};
         use std::{
             net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
             rc::Rc,
             time::Duration,
         };
-        use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 
         /// Resolve through bounded owner-local UDP queries and resolv.conf search rules.
         pub async fn resolve<I: Io + ?Sized>(

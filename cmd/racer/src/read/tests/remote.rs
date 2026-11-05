@@ -539,12 +539,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     };
     let service = async {
         let fd = reactor
-            .accept(
-                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                    listener,
-                )),
-                &scope,
-            )
+            .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
             .await?;
         let connection = crate::http::from_accepted(fd, &admission)?;
         server.serve_connection(connection, &scope).await?;

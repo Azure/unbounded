@@ -13,6 +13,8 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_crypto::identity::PendingIdentity;
 use racer_crypto::identity::SigningIdentity;
+use racer_io::ring::Descriptor;
+use racer_io::ring::SocketAddress;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -20,8 +22,6 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use uring_runtime::environment::SimulationClock;
-use uring_runtime::reactor::SocketAddress;
-use uring_runtime::reactor::descriptor::Descriptor;
 use uring_runtime::reactor::simulation::Fault;
 use uring_runtime::reactor::simulation::Simulation;
 

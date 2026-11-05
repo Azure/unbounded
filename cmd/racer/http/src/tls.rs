@@ -29,6 +29,7 @@
 //! each path is logged once to standard error.
 
 use crate::connection::{ConnectionLease, Context};
+use racer_io::{Scope as _, ring::Descriptor};
 use rustls::{
     ClientConfig, ClientConnection, ConnectionTrafficSecrets, ProtocolVersion, RootCertStore,
     pki_types::{CertificateDer, ServerName, pem::PemObject},
@@ -43,7 +44,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 use zeroize::Zeroizing;
 
 pub use rustls;

@@ -21,12 +21,12 @@ use crate::read::sealed::SealedPage;
 use crate::read::sealed::SealedTarget;
 use crate::runtime::RequestScope;
 use http1::connection::ReceivedDescriptors;
+use racer_io::ring::Descriptor;
 pub use racer_object_wire::client::Destination;
 pub use racer_object_wire::client::DirectDelivery;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
-use uring_runtime::reactor::descriptor::Descriptor;
 
 /// The fewest pages the dataplane fetches ahead for one direct read. Clients
 /// send no credits, so this window, or `range_window_pages` when larger, alone

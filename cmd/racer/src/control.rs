@@ -28,6 +28,7 @@ use racer_control_wire::PublicationSequence;
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
+use racer_io::ring::Descriptor;
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -49,7 +50,6 @@ use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
 use uring_runtime::drivers::Busy;
-use uring_runtime::reactor::descriptor::Descriptor;
 use uring_runtime::reactor::filesystem::secure;
 #[cfg(test)]
 use uring_runtime::reactor::filesystem::secure::{
@@ -1187,7 +1187,7 @@ pub(crate) mod tests {
                 _: Option<&'a str>,
                 _: usize,
                 scope: &'a RequestScope,
-            ) -> uring_runtime::Operation<'a, Response, controlplane::feed::FetchError<Error>>
+            ) -> racer_io::Operation<'a, Response, controlplane::feed::FetchError<Error>>
             {
                 Box::pin(async move {
                     if self.0.replace(true) {

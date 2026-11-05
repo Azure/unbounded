@@ -4078,7 +4078,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
+    let reader = Rc::new(racer_io::ring::Descriptor::from(reader));
     let mut pressure = Vec::new();
     for _ in 0..8 {
         let mut wait = runtime

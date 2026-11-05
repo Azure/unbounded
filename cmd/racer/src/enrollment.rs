@@ -14,6 +14,7 @@ use racer_control_wire::{
     RailMapping,
 };
 use racer_crypto::identity;
+use racer_io::{Operation, Scope};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
@@ -22,12 +23,9 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use uring_runtime::{
-    Operation, Scope,
-    reactor::filesystem::{
-        operations::ReplacementError,
-        secure::{self, Attempts, Host},
-    },
+use uring_runtime::reactor::filesystem::{
+    operations::ReplacementError,
+    secure::{self, Attempts, Host},
 };
 use zeroize::{Zeroize, Zeroizing};
 

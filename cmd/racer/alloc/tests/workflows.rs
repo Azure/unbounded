@@ -3,6 +3,7 @@
 use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segments, Slab};
 use page_alloc::{Charge, SegmentState};
 use racer_io::sim::Fault;
+use racer_io::{Operation, Scope};
 use std::{cell::Cell, path::Path, rc::Rc};
 use std::{
     fs::File,
@@ -13,7 +14,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
-use uring_runtime::{Operation, Scope, reactor::Reactor};
+use uring_runtime::reactor::Reactor;
 
 /// Distinguishes allocator validation errors from runtime completion failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

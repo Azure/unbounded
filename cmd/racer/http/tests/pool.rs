@@ -2,6 +2,7 @@
 use flow_control::{Charge, Policy, Quotas, Rejection};
 use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy, PoolConfig};
 use http1::{Codec, Header, MessageHead, StartLine};
+use racer_io::Scope;
 use racer_io::ring::IoBuffer;
 use std::{
     future::Future,
@@ -17,7 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 use uring_runtime::{
-    Scope,
     environment::{Cancellation, now},
     reactor::{SocketAddress, descriptor::Descriptor},
 };

@@ -819,7 +819,7 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use uring_runtime::reactor::SocketAddress;
+    use racer_io::ring::SocketAddress;
     use uring_runtime::reactor::simulation::Simulation;
     let sim = Simulation::new();
     let _environment = sim.enter();
@@ -1194,7 +1194,7 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
+    let reader = Rc::new(racer_io::ring::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {

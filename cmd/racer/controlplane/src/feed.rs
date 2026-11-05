@@ -1,6 +1,7 @@
 //! Scoped long polls, credential policy, and a single-owner synchronization loop.
 
 use crate::Error;
+use racer_io::{Operation, Scope as _};
 use std::{
     cell::{Cell, RefCell},
     fmt::Display,
@@ -9,7 +10,6 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use uring_runtime::{Operation, Scope as _};
 use wire_codec::rest::{self, Scope as _};
 
 /// Caller-local codec implementation; documents may belong to another crate.

@@ -33,9 +33,9 @@ pub mod delivery {
 
     use crate::connection::{ConnectionLease, Context, OwnedBuffer, Result};
     use flow_control::{PipeLease, Policy, splice_unsupported};
+    use racer_io::ring::Descriptor;
     use racer_io::ring::{IoBuffer, SendBuffer};
     use std::{io, task::Poll, time::Instant};
-    use uring_runtime::reactor::descriptor::Descriptor;
 
     /// Nonblocking staging pipe. Writes/drains expose EINTR and EAGAIN; successful
     /// counts must be bounded by the supplied slice or requested count.
@@ -972,9 +972,9 @@ pub mod relay {
 
     use crate::connection::{ConnectionLease, Context, HttpIo, OwnedBuffer, Result};
     use flow_control::{MAX_PIPE_BYTES, PipeLease, Policy, splice_unsupported};
+    use racer_io::ring::Descriptor;
     use racer_io::ring::IoBuffer;
     use std::{io, ops::Range, rc::Rc};
-    use uring_runtime::reactor::descriptor::Descriptor;
 
     /// Exact opaque HTTP body transit. Does not finish exchanges or select deadlines.
     pub struct Relay<C: Context, P: RelayPipe> {
@@ -1047,8 +1047,8 @@ pub mod relay {
             tick: impl Fn() -> C::Scope,
             retry: impl Fn(C::Error) -> bool,
         ) -> Result<C, Self> {
+            use racer_io::Scope;
             use std::{cell::RefCell, task::Poll};
-            use uring_runtime::Scope;
             let state = Rc::new(RefCell::new(self));
             loop {
                 scope.check()?;
@@ -1785,7 +1785,7 @@ pub mod relay {
 #[cfg(test)]
 mod fixtures {
     use crate::{Error, connection::Endpoint};
-    use uring_runtime::{Scope, reactor::SocketAddress};
+    use racer_io::{Scope, ring::SocketAddress};
 
     /// Keep HTTP and runtime failures distinct in assertions.
     #[derive(Clone, Copy, Debug, PartialEq)]

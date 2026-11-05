@@ -4,6 +4,7 @@ use controlplane::{
     Codec, Error, Feed, Host, Sync, Target,
     feed::{FailureClass, FetchError, Preparation, Schedule, Source},
 };
+use racer_io::{Operation, Scope as _, ring::Descriptor};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -15,7 +16,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use uring_runtime::{Operation, Scope as _, reactor::descriptor::Descriptor};
 use wire_codec::rest;
 
 /// Test adapter error keeps cancellation distinct from retry and replay.
@@ -72,7 +72,7 @@ impl Scope {
     }
 }
 
-impl uring_runtime::Scope for Scope {
+impl racer_io::Scope for Scope {
     type Error = Failure;
 
     fn check(&self) -> Result<(), Failure> {

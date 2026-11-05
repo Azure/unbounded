@@ -4,6 +4,7 @@
 //! allocation. The caller drives the reactor and ticks pool maintenance.
 
 use crate::{Codec, Error, MessageHead, Opaque, StartLine};
+use racer_io::Scope;
 use racer_io::{ring::IoBuffer, ring::SendBuffer};
 use std::{
     cell::{Cell, RefCell},
@@ -15,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uring_runtime::{
-    Budget, Scope,
+    Budget,
     reactor::{Completion, Reactor, SocketAddress, descriptor::Descriptor},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -24,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub type Result<C, T> = std::result::Result<T, <C as Context>::Error>;
 
 /// An owned, lazy operation retaining resources through runtime completion.
-pub type Operation<'a, C, T> = uring_runtime::Operation<'a, T, <C as Context>::Error>;
+pub type Operation<'a, C, T> = racer_io::Operation<'a, T, <C as Context>::Error>;
 
 /// Drain completed connections while retaining the same outstanding accept.
 /// A ready but unconsumed accepted value remains owned until returned or dropped.

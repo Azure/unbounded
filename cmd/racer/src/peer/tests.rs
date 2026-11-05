@@ -1204,9 +1204,7 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-            listener,
-        ));
+        let listener = Rc::new(racer_io::ring::Descriptor::from(listener));
         let canceled = RequestScope::host(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
@@ -1628,12 +1626,7 @@ mod requester_safety {
         };
         let server = async {
             let fd = reactor
-                .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                        listener,
-                    )),
-                    &scope,
-                )
+                .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
                 .await?;
             let conn = crate::http::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
@@ -2602,12 +2595,7 @@ mod subscriptions {
         let scope = request.origin.scope().clone();
         let server_work = async {
             let fd = reactor
-                .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                        listener,
-                    )),
-                    &scope,
-                )
+                .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
                 .await?;
             server
                 .serve_connection(crate::http::from_accepted(fd, &admission)?, &scope)

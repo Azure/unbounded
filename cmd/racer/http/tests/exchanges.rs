@@ -4,6 +4,7 @@ use http1::{
     Codec, Error, Header, MessageHead, StartLine,
     connection::{ConnectionLease, Context, Endpoint, HttpIo, OwnedBuffer},
 };
+use racer_io::Scope;
 use racer_io::ring::IoBuffer;
 use std::{
     future::Future,
@@ -12,10 +13,7 @@ use std::{
     task::{Poll, Waker},
     time::{Duration, Instant},
 };
-use uring_runtime::{
-    Scope,
-    reactor::{Reactor, SocketAddress},
-};
+use uring_runtime::reactor::{Reactor, SocketAddress};
 
 /// Keeps HTTP syntax failures distinct from transport failures.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -496,12 +496,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let destination = async {
             let fd = socket
                 .reactor
-                .accept(
-                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                        listener,
-                    )),
-                    &scope,
-                )
+                .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
                 .await?;
             let connection = crate::http::from_accepted(fd, &admission)?;
             let connection =
@@ -1083,12 +1078,7 @@ fn signed_tcp_case(case: &str) {
     .unwrap();
     let server_work = async {
         let fd = reactor
-            .accept(
-                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                    listener,
-                )),
-                &scope,
-            )
+            .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
             .await?;
         let connection = crate::http::from_accepted(fd, &admission)?;
         server.serve_connection(connection, &listener_scope).await?;
@@ -1446,12 +1436,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let server = async {
         use racer_io::ring::IoBuffer;
         let fd = reactor
-            .accept(
-                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                    listener,
-                )),
-                &scope,
-            )
+            .accept(Rc::new(racer_io::ring::Descriptor::from(listener)), &scope)
             .await?;
         let conn = crate::http::from_accepted(fd, &admission)?;
         let mut conn = crate::peer::protocol::accept(&io, conn, signers[2].clone(), &scope).await?;

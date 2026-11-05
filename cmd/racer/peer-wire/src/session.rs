@@ -2,7 +2,7 @@
 
 use crate::*;
 use http1::connection::{ConnectionLease, HttpIo};
-use uring_runtime::Scope;
+use racer_io::Scope;
 
 const SESSION_TARGET: &str = "/racer/peer/v1/session";
 const SESSION_DOMAIN: &[u8] = b"racer-peer-v1/connection\0";

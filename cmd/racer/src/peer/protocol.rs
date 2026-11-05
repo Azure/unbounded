@@ -2313,9 +2313,7 @@ pub(crate) mod tests {
             let pool = crate::http::new_pool(reactor.clone(), admission.clone(), 2);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-            let listener = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
-                listener,
-            ));
+            let listener = Rc::new(racer_io::ring::Descriptor::from(listener));
             let scope =
                 RequestScope::host(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
                     .unwrap();

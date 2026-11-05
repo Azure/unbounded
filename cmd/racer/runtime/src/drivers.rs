@@ -438,18 +438,7 @@ impl Drop for Busy<'_> {
 }
 
 /// Yield exactly one cooperative turn, waking the current task for its next poll.
-pub async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if std::mem::replace(&mut yielded, true) {
-            Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await
-}
+pub use racer_io::exec::yield_now;
 
 /// Poll after registering cancellation and checking caller-owned scope policy.
 ///

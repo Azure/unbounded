@@ -6,10 +6,8 @@ publish = false
 description = "Generic bounded control feeds, rollout barriers, and immutable publication"
 
 [dependencies]
-uring-runtime = { path = "../runtime" }
 racer-io = { path = "../io" }
 wire-codec = { path = "../wire-codec", features = ["rest"] }
 futures = "0.3"
 
 [dev-dependencies]
-uring-runtime = { path = "../runtime", features = ["simulation"] }

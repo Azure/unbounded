@@ -277,7 +277,7 @@ impl Releases {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-        socket: &Rc<uring_runtime::reactor::descriptor::Descriptor>,
+        socket: &Rc<racer_io::ring::Descriptor>,
         stream: &mut RangeStream,
         outstanding: &mut BTreeMap<PageNumber, u32>,
         current: Option<(crate::model::PageSlice, &crate::http::FinalSend)>,
