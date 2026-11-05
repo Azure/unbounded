@@ -352,7 +352,7 @@ func (n *Node) Configure(ctx context.Context) (containerdChanged, kubeletChanged
 	}
 
 	gs := n.gs.NodeStart
-	containerd := nodestart.ConfigureContainerdOnHost(gs)
+	containerd := nodestart.ConfigureContainerdOnHost(gs, none.ContainerdConfigPath)
 	kubelet := nodestart.ConfigureKubeletOnHost(gs, none.UnitKubelet)
 
 	if err := phases.Parallel(n.p.Log, containerd, kubelet, nodestart.ConfigureLocalDNS(gs)).Do(ctx); err != nil {

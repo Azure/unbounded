@@ -41,6 +41,12 @@ type configureContainerd struct {
 	// own their unit and must never write the distro's containerd.service.
 	skipUnit bool
 
+	// configPath is where the main configuration is written. Empty means
+	// goalstates.ContainerdConfigPath, the path the nspawn machine's
+	// containerd reads. A host-native backend passes its own path so the
+	// distro's /etc/containerd/config.toml is never written.
+	configPath string
+
 	changeTracker
 }
 
@@ -97,7 +103,12 @@ func (c *configureContainerd) ensureContainerdConfig() error {
 		return err
 	}
 
-	dest := c.goalState.Root().Path(goalstates.ContainerdConfigPath)
+	configPath := c.configPath
+	if configPath == "" {
+		configPath = goalstates.ContainerdConfigPath
+	}
+
+	dest := c.goalState.Root().Path(configPath)
 
 	return c.write(dest, buf.Bytes(), 0o644)
 }
@@ -179,10 +190,12 @@ type HostConfigTask interface {
 func (c *changeTracker) Changed() bool { return c.changed }
 
 // ConfigureContainerdOnHost returns a task that writes the containerd
-// configuration at its host paths (the same paths the nspawn machine sees) and
-// leaves the service unit to the host-native backend.
-func ConfigureContainerdOnHost(goalState *goalstates.NodeStart) HostConfigTask {
-	return &configureContainerd{goalState: goalState, skipUnit: true}
+// configuration for a host-native node stack and leaves the service unit to the
+// backend. The main configuration goes to configPath, which the backend's unit
+// passes to containerd; the drop-ins and registry hosts stay at the paths the
+// nspawn machine uses.
+func ConfigureContainerdOnHost(goalState *goalstates.NodeStart, configPath string) HostConfigTask {
+	return &configureContainerd{goalState: goalState, skipUnit: true, configPath: configPath}
 }
 
 type startContainerd struct {

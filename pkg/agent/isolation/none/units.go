@@ -20,6 +20,11 @@ const (
 	UnitKubelet    = "unbounded-kubelet.service"
 )
 
+// ContainerdConfigPath is the agent-owned containerd configuration the
+// containerd unit runs with. It is not the distro's /etc/containerd/config.toml,
+// so a host-native node never writes or deletes a file a host package owns.
+const ContainerdConfigPath = "/etc/unbounded/containerd/config.toml"
+
 // SystemdDir is where the agent writes its units.
 const SystemdDir = "/etc/systemd/system"
 
@@ -34,6 +39,9 @@ type UnitSpec struct {
 	// LocalDNS adds the CoreDNS unit and makes containerd and kubelet depend on
 	// it.
 	LocalDNS bool
+	// ContainerdConfigPath is the configuration containerd runs with. Empty
+	// means ContainerdConfigPath.
+	ContainerdConfigPath string
 }
 
 // DefaultKubeletConfigPath is where the node-start phases write the kubelet
@@ -49,7 +57,7 @@ After=network.target local-fs.target
 
 [Service]
 ExecStartPre=-/sbin/modprobe overlay
-ExecStart=%s/containerd
+ExecStart=%s/containerd --config %s
 Type=notify
 Delegate=yes
 KillMode=process
@@ -65,7 +73,15 @@ OOMScoreAdjust=-999
 
 [Install]
 WantedBy=multi-user.target
-`, s.BinDir)
+`, s.BinDir, s.containerdConfig())
+}
+
+func (s UnitSpec) containerdConfig() string {
+	if s.ContainerdConfigPath == "" {
+		return ContainerdConfigPath
+	}
+
+	return s.ContainerdConfigPath
 }
 
 // RenderKubelet returns the kubelet unit. It orders after and wants the

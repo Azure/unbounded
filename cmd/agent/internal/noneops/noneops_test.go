@@ -271,14 +271,14 @@ func TestConfigureWritesSharedPathsAndNeverDistroUnits(t *testing.T) {
 	require.Equal(t, 1, f.hook.setup)
 
 	for _, p := range []string{
-		"/etc/containerd/config.toml", "/var/lib/kubelet/config.yaml", "/etc/kubernetes/pki/apiserver-client-ca.crt",
+		"/etc/unbounded/containerd/config.toml", "/var/lib/kubelet/config.yaml", "/etc/kubernetes/pki/apiserver-client-ca.crt",
 		"/var/lib/kubelet/bootstrap-kubeconfig", "/etc/unbounded/localdns/Corefile", "/etc/systemd/system/localdns.slice",
 		"/etc/systemd/system/unbounded-kubelet.service.d/20-node-config.conf",
 	} {
 		require.FileExists(t, f.hostPath(p), p)
 	}
 
-	for _, p := range []string{"/etc/systemd/system/kubelet.service", "/etc/systemd/system/containerd.service", "/etc/resolv.conf"} {
+	for _, p := range []string{"/etc/systemd/system/kubelet.service", "/etc/systemd/system/containerd.service", "/etc/resolv.conf", "/etc/containerd/config.toml"} {
 		require.NoFileExists(t, f.hostPath(p), p)
 	}
 
@@ -464,7 +464,7 @@ func TestUpgradeInstallFailureLeavesRunningVersionAlone(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "1.33.0-aaaaaaaa", cur)
 	require.Empty(t, f.h.calls, "nothing was stopped")
-	require.NoFileExists(t, f.hostPath("/etc/containerd/config.toml"), "configuration is not touched before the install succeeds")
+	require.NoFileExists(t, f.hostPath("/etc/unbounded/containerd/config.toml"), "configuration is not touched before the install succeeds")
 }
 
 func TestPruneVersionsKeepsActive(t *testing.T) {
@@ -516,10 +516,10 @@ func seedSharedConfig(t *testing.T, f *fixture) {
 	t.Helper()
 
 	for p, content := range map[string]string{
-		"/etc/containerd/config.toml":          "version = 2 # old\n",
-		goalstates.KubeletConfigurationPath:    "old: kubelet config\n",
-		"/var/lib/kubelet/pki/kubelet-key.pem": "OLD-KEY",
-		"/etc/cni/net.d/10-old.conflist":       "old cni",
+		"/etc/unbounded/containerd/config.toml": "version = 2 # old\n",
+		goalstates.KubeletConfigurationPath:     "old: kubelet config\n",
+		"/var/lib/kubelet/pki/kubelet-key.pem":  "OLD-KEY",
+		"/etc/cni/net.d/10-old.conflist":        "old cni",
 	} {
 		require.NoError(t, os.MkdirAll(filepath.Dir(f.hostPath(p)), 0o755))
 		require.NoError(t, os.WriteFile(f.hostPath(p), []byte(content), 0o600))
@@ -547,7 +547,7 @@ func TestUpgradeRollbackPutsTheSharedConfigurationBack(t *testing.T) {
 	require.NotContains(t, err.Error(), "restore shared configuration")
 
 	// Configure rewrote these and the identity reset removed the credentials.
-	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/containerd/config.toml"))
+	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/unbounded/containerd/config.toml"))
 	assert.Equal(t, "old: kubelet config\n", readHost(t, f, goalstates.KubeletConfigurationPath))
 	assert.Equal(t, "OLD-KEY", readHost(t, f, "/var/lib/kubelet/pki/kubelet-key.pem"), "the credentials the previous version ran with are back")
 	assert.Equal(t, "old", readHost(t, f, goalstates.KubeletKubeconfigPath))
@@ -562,7 +562,7 @@ func TestUpgradeSuccessKeepsTheNewConfigurationAndDropsTheSnapshot(t *testing.T)
 
 	require.NoError(t, f.node.Upgrade(t.Context()))
 
-	assert.NotEqual(t, "version = 2 # old\n", readHost(t, f, "/etc/containerd/config.toml"), "configure wrote the new containerd configuration")
+	assert.NotEqual(t, "version = 2 # old\n", readHost(t, f, "/etc/unbounded/containerd/config.toml"), "configure wrote the new containerd configuration")
 	assert.NoDirExists(t, f.node.configSnapshotDir())
 }
 
@@ -577,7 +577,7 @@ func TestUpgradeFailureBeforeTheSwitchRestoresTheSharedConfiguration(t *testing.
 	err := f.node.Upgrade(t.Context())
 	require.ErrorContains(t, err, "stuck")
 
-	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/containerd/config.toml"))
+	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/unbounded/containerd/config.toml"))
 	assert.Equal(t, "OLD-KEY", readHost(t, f, "/var/lib/kubelet/pki/kubelet-key.pem"))
 	assert.NoDirExists(t, f.node.configSnapshotDir())
 }
@@ -590,7 +590,7 @@ func TestUpgradeInstallFailureLeavesTheSharedConfigurationAndNoSnapshot(t *testi
 
 	require.ErrorContains(t, f.node.Upgrade(t.Context()), "no network")
 
-	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/containerd/config.toml"))
+	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/unbounded/containerd/config.toml"))
 	assert.NoDirExists(t, f.node.configSnapshotDir())
 }
 
@@ -609,7 +609,7 @@ func TestUpgradeRefusesToStartWhenTheSharedConfigurationCannotBeSaved(t *testing
 	require.ErrorContains(t, f.node.Upgrade(t.Context()), "save shared configuration")
 	assert.Empty(t, f.h.calls, "nothing was stopped or started")
 	assert.Equal(t, 0, f.hook.download, "nothing was installed")
-	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/containerd/config.toml"))
+	assert.Equal(t, "version = 2 # old\n", readHost(t, f, "/etc/unbounded/containerd/config.toml"))
 }
 
 func TestUpgradeSnapshotDirDefaultsBelowTheHostRootAndCanBeOverridden(t *testing.T) {

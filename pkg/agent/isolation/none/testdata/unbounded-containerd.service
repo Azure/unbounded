@@ -5,7 +5,7 @@ After=network.target local-fs.target
 
 [Service]
 ExecStartPre=-/sbin/modprobe overlay
-ExecStart=/opt/unbounded/node/current/bin/containerd
+ExecStart=/opt/unbounded/node/current/bin/containerd --config /etc/unbounded/containerd/config.toml
 Type=notify
 Delegate=yes
 KillMode=process
