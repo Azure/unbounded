@@ -331,3 +331,88 @@ fn site_cut_opens_link_circuits_and_routes_around() {
     // racer-sim fails 12 reads at this seed; the scale tolerance is 2x.
     assert!(failed <= 24, "{failed} reads failed");
 }
+
+/// A storm-only Model scenario: `storms` on `nodes` nodes until `end`.
+fn storms(name: &str, nodes: u32, end: u64, spec: model::ModelSpec) -> Scenario {
+    Scenario::new(name)
+        .nodes(nodes)
+        .model(spec)
+        .end(end * racer_dst::engine::SECONDS)
+}
+
+fn storm(at: u64, object: u64, nodes: u32, window: u64) -> model::Storm {
+    model::Storm {
+        at,
+        object,
+        first: 0,
+        nodes,
+        window,
+        range: None,
+    }
+}
+
+fn counter(r: &serde_json::Value, k: &str) -> u64 {
+    r["metrics"]["counters"][k].as_u64().unwrap_or(0)
+}
+
+/// racer-sim `single_reader_then_storm_reuses_copies` (seed 7): one reader fetches an object,
+/// then every node reads it; the origin sees each page once.
+#[test]
+fn single_reader_then_storm_reuses_copies() {
+    use racer_dst::engine::{MILLIS, SECONDS};
+    let spec = model::ModelSpec {
+        storms: vec![storm(0, 3, 1, 1), storm(SECONDS, 3, 64, 100 * MILLIS)],
+        ..model::ModelSpec::default()
+    };
+    let pages = u64::from(spec.pages_per_object);
+    let r = run(storms("single-reader-then-storm", 64, 3, spec), 7);
+    assert_eq!(counter(&r, "reads_completed"), pages * 65);
+    assert_eq!(counter(&r, "origin_requests"), pages);
+    assert!(counter(&r, "peer_bytes") > 0);
+    assert!(counter(&r, "flight_joins") + counter(&r, "local_hits") > 0);
+    assert!(counter(&r, "relays") + counter(&r, "peer_pages") > 0);
+}
+
+/// racer-sim `cold_storm_bounds_origin_per_page` (seed 3): a 300-node cold storm reaches the
+/// origin at most `REPLICAS` times per page.
+#[test]
+fn cold_storm_bounds_origin_per_page() {
+    use racer_dst::engine::MILLIS;
+    let spec = model::ModelSpec {
+        storms: vec![storm(0, 0, 300, 10 * MILLIS)],
+        ..model::ModelSpec::default()
+    };
+    let r = run(storms("cold-storm", 300, 4, spec), 3);
+    let max = r["origin_per_page"]["max_requests_per_page"]
+        .as_u64()
+        .unwrap();
+    assert!(max <= topology::REPLICAS as u64, "{max}");
+    assert_eq!(r["origin_per_page"]["pages"], 16);
+    assert!(counter(&r, "flight_joins") > 0);
+}
+
+/// racer-sim `origin_errors_follow_the_fill_plan` (seed 4): 403 and 5xx fail the fill
+/// (`fills_failed`), and 403 fails reads `OriginForbidden`. racer-sim's `remaining_walks`
+/// (412 continuing the walk) has no Model counter.
+#[test]
+fn origin_errors_follow_the_fill_plan() {
+    use racer_dst::{engine::SECONDS, resources::OriginErrors};
+    let spec = model::ModelSpec {
+        storms: (0..8)
+            .map(|i| storm(i * SECONDS / 4, i, 32, SECONDS / 8))
+            .collect(),
+        origin_errors: OriginErrors {
+            p412: 0.2,
+            p403: 0.05,
+            p5xx: 0.1,
+        },
+        ..model::ModelSpec::default()
+    };
+    let (outcome, r) = model::run(&storms("origin-errors", 32, 30, spec), Choices::seeded(4));
+    assert!(outcome.quiescent, "{}", r["invariants"]);
+    assert!(counter(&r, "origin_403") > 0);
+    assert!(counter(&r, "origin_5xx") > 0);
+    assert!(counter(&r, "origin_412") > 0);
+    assert!(counter(&r, "fills_failed") > 0);
+    assert!(r["metrics"]["errors"]["OriginForbidden"].as_u64() > Some(0));
+}
