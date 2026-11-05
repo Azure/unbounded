@@ -21,15 +21,20 @@ ENV PATH=$PATH:/go/bin
 
 WORKDIR /src
 
+# Cache mount IDs match images/net/Containerfile so builds that share a
+# BuildKit instance (such as the CI build-images job) reuse each other's
+# module and build caches.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY ../../ .
 
 ARG TARGETOS
 ARG TARGETARCH
 
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} make racer-loadgen-build
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build,id=go-build-${TARGETARCH} \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} make racer-loadgen-build
 
 # Runtime stage
 # racer-loadgen is a static benchmark client, so it ships on scratch rather
