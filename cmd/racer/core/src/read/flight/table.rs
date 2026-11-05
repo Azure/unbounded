@@ -171,6 +171,20 @@ impl<K: Eq + Hash + Clone, C: Clone, P: Clone, O, R, S: BuildHasher, T: Clone + 
         self.entries.get(key).map_or(0, |e| e.state.waiters.len())
     }
 
+    /// Whether waiter `id` is attached to `key`.
+    pub fn attached(&self, key: &K, id: u64) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|e| e.state.waiters.contains_key(&id))
+    }
+
+    /// Whether `key` settled to a complete result or a failure.
+    pub fn settled(&self, key: &K) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|e| matches!(e.state.phase, Phase::Complete(_) | Phase::Failed(_)))
+    }
+
     /// Retained operations of `key`.
     pub fn operations(&self, key: &K) -> usize {
         self.entries.get(key).map_or(0, |e| e.operations.len())

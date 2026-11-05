@@ -15,6 +15,23 @@ pub use table::{Fence, FlightTable, Joined, Operation, Ticket};
 /// Opaque wake target chosen by the driver (for example, a simulated task id).
 pub type Token = u64;
 
+/// A [`std::task::Waker`] as a table wake target. Two targets are equal when waking one would wake
+/// the other ([`std::task::Waker::will_wake`]), which is what the entry-capacity queue needs.
+#[derive(Clone, Debug)]
+pub struct WakeTarget(pub std::task::Waker);
+
+impl WakeTarget {
+    pub fn wake(self) {
+        self.0.wake();
+    }
+}
+
+impl PartialEq for WakeTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.will_wake(&other.0)
+    }
+}
+
 /// Table bounds. All dimensions must be nonzero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlightLimits {

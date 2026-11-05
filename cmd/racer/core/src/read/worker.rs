@@ -340,7 +340,7 @@ struct Flight {
 
 struct MetaRequest<Obj> {
     key: CohortKey<Obj>,
-    waiter: u64,
+    waiter: cohort::Member,
     attempts: u32,
     /// The refresh this request leads, when it leads one.
     leading: Option<(EffectId, cohort::Started)>,
@@ -1117,11 +1117,7 @@ impl<T: Types> WorkerCore<T> {
             .metadata
             .join(&key, now, deadline, attempts, |_| Ok(()), &mut wakes)
         {
-            Ok(cohort::Join::Ready(m)) => out.push(Effect::MetadataReady {
-                request,
-                result: Ok(m),
-            }),
-            Ok(cohort::Join::Waiter(waiter)) => {
+            Ok(waiter) => {
                 self.meta_requests.insert(
                     request,
                     MetaRequest {
