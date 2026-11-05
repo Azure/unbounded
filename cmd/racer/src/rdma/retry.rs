@@ -44,8 +44,7 @@ impl NativeRetry {
             if self.immediate.replace(false) {
                 return Ok(());
             }
-            let until = (uring_runtime::environment::now() + Duration::from_millis(1))
-                .min(scope.deadline.0);
+            let until = (scope.clock().now() + Duration::from_millis(1)).min(scope.deadline.0);
             if let Some(reactor) = &self.reactor {
                 reactor
                     .sleep_until(

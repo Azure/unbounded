@@ -372,7 +372,9 @@ impl<T: AzureTransport, K: AzureTokenSource> AzureOrigin<T, K> {
             .limits
             .acquire(&context.object.cache, definition.max_concurrent_requests)?;
         let mut scope = scope.clone();
-        let limit = uring_runtime::environment::now()
+        let limit = scope
+            .clock()
+            .now()
             .checked_add(definition.request_timeout)
             .unwrap_or(scope.deadline.0);
         scope.deadline = Deadline(scope.deadline.0.min(limit));

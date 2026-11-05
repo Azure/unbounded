@@ -565,17 +565,15 @@ impl Session {
     }
 
     /// Token issuance is not a feed; preserve bounded independent renewal retry.
-    fn issuance_backoff(&self) -> Result<Instant> {
+    fn issuance_backoff(&self, ctx: &racer_io::WorkerCtx) -> Result<Instant> {
         let failures = self.issuance_failures.get().saturating_add(1);
         self.issuance_failures.set(failures);
         let mut random = [0; 8];
-        uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+        ctx.rng.fill(&mut random).map_err(|_| Error::Io)?;
         let ceiling = (1u64 << failures.saturating_sub(1).min(5)).min(30) * 1000;
         let delay = Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 999))
             .max(self.issuance_retry_after.take().unwrap_or_default());
-        uring_runtime::environment::now()
-            .checked_add(delay)
-            .ok_or(Error::InvalidRequest)
+        ctx.now().checked_add(delay).ok_or(Error::InvalidRequest)
     }
 
     /// Submit a retry-stable CSR after server-authenticated TLS and a fresh token read.
@@ -628,13 +626,15 @@ impl Session {
             if self
                 .renewal_next
                 .get()
-                .is_some_and(|n| n > uring_runtime::environment::now())
+                .is_some_and(|n| n > scope.clock().now())
             {
                 return Err(Error::Unavailable);
             }
             let result = self.start_inner(scope).await;
             if result.as_ref().is_err_and(|e| transient(*e)) {
-                self.renewal_next.set(Some(self.issuance_backoff()?));
+                self.renewal_next.set(Some(
+                    self.issuance_backoff(&self.enrollment_transport.io()?.reactor.ctx().clone())?,
+                ));
             }
             result
         })
@@ -748,10 +748,7 @@ impl Session {
                     renewed.set(true);
                     self.enrollment_transport
                         .io()?
-                        .sleep(
-                            uring_runtime::environment::now() + Duration::from_secs(1),
-                            scope,
-                        )
+                        .sleep(scope.clock().now() + Duration::from_secs(1), scope)
                         .await?;
                 }
                 #[allow(unreachable_code)]
@@ -862,7 +859,7 @@ impl Session {
             && self
                 .renewal_next
                 .get()
-                .is_none_or(|n| n <= uring_runtime::environment::now())
+                .is_none_or(|n| n <= scope.clock().now())
         {
             let result = async {
                 let nics = self.rails.persist(scope).await?;
@@ -888,7 +885,9 @@ impl Session {
                     if !transient(error) && error != Error::Unauthorized {
                         return Err(error);
                     }
-                    self.renewal_next.set(Some(self.issuance_backoff()?));
+                    self.renewal_next.set(Some(self.issuance_backoff(
+                        &self.enrollment_transport.io()?.reactor.ctx().clone(),
+                    )?));
                     if self
                         .identity()
                         .is_none_or(|i| !i.valid_at(self.auth.enrollment.wall_now()))

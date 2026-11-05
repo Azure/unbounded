@@ -53,7 +53,7 @@ fn attempt_scope(scope: &RequestScope, remaining: usize) -> RequestScope {
     if remaining <= 1 {
         return scope.clone();
     }
-    let now = uring_runtime::environment::now();
+    let now = scope.clock().now();
     let budget = scope.deadline.0.saturating_duration_since(now);
     let share = (budget / remaining as u32)
         .min(ATTEMPT_CAP)
