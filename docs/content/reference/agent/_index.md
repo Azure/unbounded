@@ -9,4 +9,5 @@ bootstrap behavior.
 
 - [Configuration]({{< relref "reference/agent/configuration" >}})
 - [Preflight]({{< relref "reference/agent/preflight" >}})
+- [Isolation Modes]({{< relref "reference/agent/isolation" >}})
 - [systemd-nspawn Isolation]({{< relref "reference/agent/nspawn" >}})
