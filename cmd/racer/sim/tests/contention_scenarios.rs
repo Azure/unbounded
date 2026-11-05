@@ -893,8 +893,11 @@ fn retention_observes_client_reads_including_memory_hits() {
         .filter(|p| !world.owners(*p).contains(&reader))
         .collect();
     assert!(!foreign.is_empty());
-    for p in &foreign {
-        world.engine.at(0, client_read(reader, *p, 0));
+    // Spaced reads: concurrent ones would exceed the 8 route-search slots and, without a search
+    // queue (production), shed and retry, and a retry is another observation.
+    for (i, p) in foreign.iter().enumerate() {
+        let at = i as u64 * 20 * MILLIS;
+        world.engine.at(at, client_read(reader, *p, at));
     }
     world.run(SECONDS);
     let after_first = world.metrics.get("retention_observations");
@@ -929,7 +932,7 @@ fn retention_observes_client_reads_including_memory_hits() {
 
 /// Rankings and route searches yield between CPU slices and hold their placement pin or search slot
 /// meanwhile, so production's concurrency limits reject concurrent work with `Overloaded` without a
-/// search queue. With the production queue, searches beyond the slot limit wait and are woken when
+/// search queue (the default). With a queue, searches beyond the slot limit wait and are woken when
 /// a slot frees, so far fewer are rejected, and none at the default limits.
 #[test]
 fn yielding_searches_hit_production_concurrency_limits() {
@@ -939,7 +942,11 @@ fn yielding_searches_hit_production_concurrency_limits() {
     config.node.active_searches = 1;
     config.storms = vec![Storm::new(0, 2, 600, MILLIS)];
     let mut rejecting = config.clone();
-    rejecting.node.search_queue = 0;
+    assert_eq!(
+        rejecting.node.search_queue, 0,
+        "production default has no queue"
+    );
+    config.node.search_queue = topology::DEFAULT_SEARCH_QUEUE as u32;
     let (_, before) = run_world(rejecting.clone(), 3);
     assert!(counter(&before, "ranking_overloaded") > 0, "{before}");
     let rejected = counter(&before, "route_search_overloaded");

@@ -108,9 +108,19 @@ pub enum Want {
 pub enum Reply {
     /// The exchange failed without a signed response.
     Transport,
+    /// The requester's own route search was shed (`topology::Error::Overloaded`): production
+    /// `request_network` returns `Error::Overloaded`, which is no evidence about the destination.
+    Overloaded,
     Response(ResponseKind),
     /// `Overloaded` signed by the destination itself, not by a relay.
     Shed,
+}
+
+impl Reply {
+    /// No signed response reached the requester.
+    fn is_transport(self) -> bool {
+        matches!(self, Self::Transport | Self::Overloaded)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +223,7 @@ impl Event {
                 probe,
                 match reply {
                     Reply::Transport => 0,
+                    Reply::Overloaded => 2_000,
                     Reply::Response(kind) => 1 + kind as u64,
                     Reply::Shed => 1_000,
                 },
@@ -3324,7 +3335,7 @@ impl NodeWorld {
             None => Err(true),
             Some(Reply::Shed) => Ok((true, false)),
             Some(Reply::Response(kind)) => Ok((!ping.relayed, kind == ResponseKind::Unavailable)),
-            Some(Reply::Transport) => Err(false),
+            Some(Reply::Transport | Reply::Overloaded) => Err(false),
         });
         let Some(alive) = answered else {
             self.metrics.incr("silence_pings_inconclusive");
@@ -3521,16 +3532,16 @@ impl NodeWorld {
             return;
         };
         if holder == m.requester && m.path.len() == 1 {
-            // The requester's own send failed: a transport error.
+            // The requester's own send failed: a transport error. A shed route search fails as
+            // production `request_network` does, with `Overloaded`.
             let probe = m.probe;
             self.msgs.remove(&mid);
-            self.engine.at(
-                self.now(),
-                Event::Reply {
-                    probe,
-                    reply: Reply::Transport,
-                },
-            );
+            let reply = if fault == Fault::Overloaded {
+                Reply::Overloaded
+            } else {
+                Reply::Transport
+            };
+            self.engine.at(self.now(), Event::Reply { probe, reply });
             return;
         }
         let now = self.now();
@@ -4096,7 +4107,7 @@ impl NodeWorld {
             // A relay's answer is cut evidence.
             let relayed = self.offers_relayed.remove(&pid);
             let end = OfferEnd::of(
-                (!relayed && reply != Reply::Transport)
+                (!relayed && !reply.is_transport())
                     .then_some(reply == Reply::Response(ResponseKind::Miss)),
             );
             self.offer_done(node, incarnation, due, end);
@@ -4140,6 +4151,7 @@ impl NodeWorld {
         // production runs.
         let outcome = || match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
+            Reply::Overloaded => Ok(Outcome::Transport(ProbeOutcome::Overloaded)),
             Reply::Shed => Ok(Outcome::Shed),
             Reply::Response(ResponseKind::StaleMembership) => Ok(Outcome::StaleMembership),
             Reply::Response(kind) => {
@@ -4156,7 +4168,7 @@ impl NodeWorld {
         };
         match probe.hedge {
             None if let Some(index) = probe.granted => {
-                if !relayed && reply != Reply::Transport {
+                if !relayed && !reply.is_transport() {
                     // The destination answered this node: it is not hung.
                     let at = self.instant(now);
                     let silence = &mut self.nodes[node as usize].silence;
@@ -4197,6 +4209,11 @@ impl NodeWorld {
                 let reply = match reply {
                     Reply::Transport => FillReply::Failed {
                         error: Error::Unavailable,
+                        sent: true,
+                        scope_live: true,
+                    },
+                    Reply::Overloaded => FillReply::Failed {
+                        error: Error::Overloaded,
                         sent: true,
                         scope_live: true,
                     },

@@ -2073,15 +2073,22 @@ impl<'s> Model<'s> {
             ping: m.ping,
         };
         if holder == asker.from && asker.path.len() == 1 {
-            // The requester's own send failed: a transport error.
+            // The requester's own send failed: a transport error. A shed route search fails as
+            // production `request_network` (`src/peer.rs`) does, with `Overloaded`, which is no
+            // evidence against the destination.
             if let Some(ping) = asker.ping {
                 let now = self.now();
                 return self.end_ping(ping, now, Err(false));
             }
+            let error = if fault == Fault::Overloaded {
+                Error::Overloaded
+            } else {
+                Error::Unavailable
+            };
             let failed = Input::Replied {
                 id: asker.id,
                 reply: Reply::Failed {
-                    error: Error::Unavailable,
+                    error,
                     sent: true,
                     scope_live: true,
                 },
