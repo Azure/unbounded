@@ -407,6 +407,11 @@ impl rest::Scope for Scope {
     }
 }
 
+thread_local! {
+    /// Timers armed by [`TestHost`] on this test thread.
+    static SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// No real transport is used; sleep is an asynchronously delivered test timer.
 struct TestHost;
 
@@ -461,6 +466,7 @@ impl rest::Io for TestHost {
 
 impl Host for TestHost {
     fn sleep<'a>(&'a self, until: Instant, scope: &'a Scope) -> Operation<'a, (), Failure> {
+        SLEEPS.with(|sleeps| sleeps.set(sleeps.get() + 1));
         Box::pin(async move {
             scope.check()?;
             let delay = until
@@ -923,6 +929,42 @@ fn install_retries_during_network_wait_and_retry_after_does_not_advance_acceptan
         );
         sync.shutdown(&Scope::new()).await.unwrap();
         assert!(script.closed.get());
+    });
+}
+
+/// With nothing to prepare or install, a turn waits on the network alone
+/// instead of re-arming the local tick timer during the fetch backoff.
+#[test]
+fn idle_turn_arms_no_tick_timer_during_network_wait() {
+    futures::executor::block_on(async {
+        let target = Installer::new();
+        let script = Script::new([
+            full(1),
+            Reply::Error(
+                Failure::Rest(rest::Error::Unavailable),
+                Some(Duration::from_millis(15)),
+            ),
+            Reply::Error(Failure::Rest(rest::Error::Unavailable), None),
+        ]);
+        let mut sync = driver(script.clone(), target.clone());
+        sync.turn(&Scope::new()).await.unwrap();
+        sync.settle(&Scope::new()).await.unwrap();
+        assert_eq!(sync.status().accepted, Some(1));
+        assert_eq!(
+            sync.turn(&Scope::new()).await.unwrap_err(),
+            Failure::Rest(rest::Error::Unavailable)
+        );
+        let before = SLEEPS.with(std::cell::Cell::get);
+        assert_eq!(
+            sync.turn(&Scope::new()).await.unwrap_err(),
+            Failure::Rest(rest::Error::Unavailable)
+        );
+        assert_eq!(
+            SLEEPS.with(std::cell::Cell::get) - before,
+            1,
+            "only the fetch backoff timer is armed"
+        );
+        sync.shutdown(&Scope::new()).await.unwrap();
     });
 }
 
