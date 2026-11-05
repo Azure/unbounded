@@ -76,6 +76,22 @@ such as which node holds which page.
   unanswered when the requester gives up is a silence timeout for its sender
   (`LINK_TIMEOUTS`), which can start pings. The serving read's inherited budget counts the
   route's links.
+- Relay transfers: a relay reserves one `ResourceClass::Relay` transfer on its worker before
+  it forwards (production `src/peer/server.rs:540`, limit `relay_transfers` 16 per worker,
+  `src/worker.rs:265`, `core/src/admission.rs:145`); none free fails the hop `Overloaded`
+  (`relay_sheds`). The reservation is held until the answer leaves, or for a page until the
+  body has passed (racer-sim `send_reply`, `held`). The run fails if any is still held.
+- Route search slots: production builds its `Paths` with `with_limits(.., active_path_searches)`
+  (`src/app.rs:1320-1333`, `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` default 8,
+  `src/worker.rs:261`) and no wait queue, so a search past 8 running on the worker fails
+  `Overloaded` (`topology/src/paths.rs` `route`, `queue_limit` 0). The Model holds a slot until
+  the search's CPU work is done (`search_sheds`). Divergence: racer-sim adds a 64-entry queue
+  (`sim/src/node/state.rs:218-221`, `with_queue(search_queue)`), which production does not.
+- Pings: a silence ping is a peer request routed over the mesh (production
+  `CandidatePolicy::ping` through `request_traced`, `src/read/candidates.rs:2488-2531`;
+  racer-sim `launch_control`) on `NOTICE_LINKS` links with no remote attempts; the
+  requester's own ping may cross the silent link it tests and detours at least once. The
+  destination answers `Miss` at once; `ping_verdict` classifies the end.
 - Costs: ranking and dispatch on per-worker CPU servers, page transfers on per-node
   NIC transmit and receive servers (over the route, chunked), route searches on the
   holder's worker, payload open on the
@@ -101,10 +117,9 @@ such as which node holds which page.
 - Membership changes come only from scenario churn; the control plane (racer-sim combined
   mode, `Versions::external`, enrollment) is not modeled, and a node that left keeps serving
   peers and relaying.
-- Relay quotas (`ResourceClass::Relay`) and so relay sheds; link circuits (`Circuits`) and
-  route search queueing. Route searches run synchronously against one shared `Paths`
-  cache, so a search never waits for a slot (racer-sim queued 514,580 at 50,000 nodes).
-- Pings travel one direct link; racer-sim routes them (`launch_control`).
+- Link circuits (`Circuits`). Route searches run synchronously against one shared `Paths`
+  cache (production keeps one per worker), so the Model has more cache hits and fewer
+  searches needing a slot.
 - A crash keeps the node's cores and stored pages (production keeps the disk; racer-sim
   drops memory state and in-flight reads). A crashed node's own client reads keep running;
   only its peer server and its replies are gone. Clock faults (`ClockSkew`, `ClockRate`,
@@ -194,56 +209,45 @@ differences:
 ## Scale
 
 Tolerance for the scale cold start (seed 8, every node reads one 16-page object in 10 ms):
-Model failures within 2x of racer-sim's and the same order of magnitude. Met at 10,000 (79
-against 180, origin 25 against 47, p50 356 ms against 335 ms). At 2,000 racer-sim fails none
-and the Model 2. Not met at 50,000, where the Model fails 33x fewer reads than racer-sim (757
-against 24,742); see below.
+Model failures within 2x of racer-sim's and the same order of magnitude.
 
-| Nodes | racer-sim failed | Model failed | Model retries | Model relays | Model origin requests | Model p50 / p99 | Model wall (release test) | Model peak RSS per node |
-|---|---|---|---|---|---|---|---|---|
-| 2,000 | 0 of 32,000 | 2 | 2,383 | not recorded | 43 | 139 ms / 2.1 s | under 2 s | not rerun |
-| 10,000 | 180 (0.11%), 91,915 retries, 47 origin, 248k relays, 3,986 pings, p50 335 ms | 79 (0.05%) | 45,287 | 190,011 | 25 | 356 ms / 2.2 s | 13 s | 88,964 B |
-| 50,000 | 24,742 (3.1%), 757,135 retries, 47 origin, 1,555,149 relays, 15,254 pings, p50 1.48 s | 757 (0.15%) | 371,017 | 1,132,451 | 16 | 1.73 s / 3.06 s | 100 s | 85,616 B |
+| Nodes | racer-sim | Model before relay quotas | Model with relay quotas, search slots, routed pings |
+|---|---|---|---|
+| 10,000 | 180 failed, 47 origin, 3,986 pings, p50 335 ms | 79 failed, 25 origin, 0 pings, p50 356 ms | 134 failed (22,926 relay sheds, 0 search sheds), 25 origin, 0 pings, p50 353 ms / p99 2.19 s, 89,276 B/node, 28 s |
+| 50,000 | 24,742 failed (3.1%), 47 origin, 15,254 pings, p50 1.48 s | 757 failed, 16 origin, 27 pings, p50 1.73 s | 143,726 failed (18%; 1,541,629 relay sheds, 0 search sheds), 17 origin, 39 pings, p50 1.79 s / p99 2.91 s, 89,544 B/node, 221 s (measured before routed pings) |
 
-What closed the gap, with evidence:
+10,000 is within tolerance. 50,000 is not: without relay quotas the Model failed 33x fewer
+reads than racer-sim, with them 5.8x more. The hypothesis that racer-sim's extra failures
+came from relay quotas holds in direction (the quota is what fails reads at 50,000), but the
+Model overshoots. Search slots are not the cause: no Model search found its worker's 8 slots
+busy, because searches cost little CPU and one shared cache serves most of them. Open
+leads, not yet verified: racer-sim's queued searches (514,580) delay requests and spread
+relay load in time, where the Model's instant searches send them in one burst; the Model's
+shared route cache gives every node the same routes, so hot relays concentrate (production
+and racer-sim cache per node); the Model's relays hold their transfer while an `Acquire`
+destination fetches. Next step: per-node route caches at 50,000 and a relay hold breakdown.
 
-- Mesh relays (this change). The hypothesis held: before relays the 10,000-node cold start
-  failed 494 reads with p50 2.16 s and 143,753 retries; with relays it fails 79 with p50
-  356 ms and 45,287 retries. Relays charge each hop a signature and a verification, so
-  the destination owner's crypto and request queues see requests spread over time instead
-  of in one burst, and last-link timeouts (1,408 at 10,000; 7,967 at 50,000) feed silence,
-  so later routes and visit orders skip hanging owners. At 50,000: 10,046 to 757 failures.
-- Signatures. Production verifies every peer request on the crypto helper before the worker
-  dispatches it (`src/peer/server.rs` `verify_request_async`) and signs every response
-  (`sign_response`); racer-sim charges `sign_ns` per request and response and `verify_ns`
-  per hop (`send_reply`, `hop`). Without them, 10k failed 7,105 and 50k 235,631.
-  Divergence, production wins: racer-sim charges the destination's verify without delaying
-  dispatch; production awaits it. The Model awaits it at relays too.
-- Visit order (`visit_order(Spread, ..)` for non-owners), production flight limits (64
-  flights, 64 waiters) and silence demotion.
+Pings: the Model now routes pings like racer-sim and production, but sends few (0 at
+10,000, 39 at 50,000) against racer-sim's 3,986 and 15,254: pings start only from silence
+(rank 0 timeouts and last-link timeouts), and the Model sees fewer of them. Not yet
+explained.
 
-Remaining 50,000-node gap (inference from the racer-sim report of a local run, not yet
-verified by experiment): racer-sim's routes are searched as asynchronous tasks on worker CPU
-with 8 active searches and a queue per node; it queued 514,580 searches and polled 7,967,612
-times, and it reserved a relay quota per hop. The Model has neither (searches finish at
-once, see "Not modeled yet"), and racer-sim shed 909,298 hot-page requests. A per-node
-128-entry route cache (racer-sim's layout) did not change the 10,000 result (78 failures).
-Model pings: 0 at 10,000 and 27 at 50,000 against racer-sim's 3,986 and 15,254; Model pings
-use one direct link and racer-sim routes them.
+Cold start 400 origin requests (36 against 30) are not yet investigated further than the
+note under Tolerances.
+
+What closed the 10,000-node gap earlier: mesh relays (494 to 79 failures), signature costs
+(production `verify_request_async`, `sign_response`), visit order, production flight limits
+and silence demotion.
 
 Flight failure semantics (checked, no change): when a leader's walk fails, production
 fails every waiter with the leader's error unless it is an origin rejection or a
-handed-over deadline/cancellation, which re-elect (`core/src/read/flight.rs` `fail`, used by
-`src/read/flight.rs` `Flights::fail` and `src/read/fill.rs` at the `flights.fail` call;
-waiters return the error in `fill.rs` `AcquisitionEvent::Failed`). racer-sim
-(`finish_fill`) and the core `FlightTable::finish` the Model uses call the same function.
+handed-over deadline/cancellation, which re-elect (`core/src/read/flight.rs` `fail`).
 
-Not ported yet (they need the gaps above): `slow_disk_sheds_persistence...` (persistence
-shedding), the relay quota (`relays_hold_their_reservation_only_while_the_body_streams`,
-`relay_shed_rank0_probes...`), the full-mesh and watch-off variants of the hung-peer test, and
-quota tests in `contention_scenarios.rs`, `sim/tests/mesh_scenarios.rs` (relays and
-routes) and `sim/tests/phantom_memory.rs` (racer-sim memory accounting; see the memory
-section).
+Not ported yet: `slow_disk_sheds_persistence...` (persistence shedding),
+`relays_hold_their_reservation_only_while_the_body_streams` and `relay_shed_rank0_probes...`
+(the quota now exists; the scenarios are not ported), the full-mesh and watch-off variants
+of the hung-peer test, quota tests in `contention_scenarios.rs`, `sim/tests/mesh_scenarios.rs`
+(topology-only mesh metrics) and `sim/tests/phantom_memory.rs` (racer-sim memory accounting).
 
 ## Model-only scenarios
 

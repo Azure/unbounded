@@ -92,6 +92,10 @@ pub struct Counters {
     pub replies_lost: u64,
     /// Most pages any node stores at the end of the run.
     pub stored_pages_max: u64,
+    /// Relays that found no free `Relay` transfer (racer-sim fails the hop `Overloaded`).
+    pub relay_sheds: u64,
+    /// Route searches refused with every search slot busy (racer-sim `route_search_overloaded`).
+    pub search_sheds: u64,
     /// Membership changes (racer-sim `membership_changes`).
     pub membership_changes: u64,
     /// Membership versions published (racer-sim `membership_publications`).
@@ -199,6 +203,8 @@ impl Report {
                     "flights_reelected": c.flights_reelected,
                     "late_answers": c.late_answers,
                     "relays": c.relays,
+                    "relay_sheds": c.relay_sheds,
+                    "search_sheds": c.search_sheds,
                     "membership_changes": c.membership_changes,
                     "membership_publications": c.membership_publications,
                     "stale_membership_replies": c.stale_membership_replies,

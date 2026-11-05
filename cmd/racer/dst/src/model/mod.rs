@@ -33,7 +33,7 @@ use racer_core::{
         demote_unanswered,
         effect::EffectId,
         flight::FlightLimits,
-        hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints},
+        hints::{HINT_CAPACITY, HINT_TTL, NOTICE_LINKS, SuccessorHints},
         peer_error, recoverable, replica_score,
         serve::{Body, Decision, ServeDecision, ServeRequest},
         visit_order,
@@ -284,19 +284,11 @@ enum Ev {
     /// The requester of `msg` gave up: a last link still unanswered is a timeout for its
     /// sender (racer-sim `Event::LastHop`).
     LastHop { msg: u64 },
-    /// A silence ping from `from` reaches `to` (`verified` once `to` checked its signature).
-    Ping {
-        from: u32,
-        to: u32,
-        page: Page,
-        verified: bool,
-    },
-    /// `from`'s ping to `to` ended: [`liveness::ping_verdict`] of its answer.
-    PingDone {
-        from: u32,
-        to: u32,
-        answered: Option<bool>,
-    },
+    /// Silence ping `ping` (a key of `Model::pings`) ended: [`liveness::ping_verdict`] of its
+    /// answer. A ping ends once; later ends are dropped.
+    PingEnd { ping: u64, answered: Option<bool> },
+    /// Silence ping `ping` reached its attempt timeout.
+    PingTimeout { ping: u64 },
     /// `from` sends its due silence pings (production polls them every worker turn).
     PollPings { from: u32 },
     /// Probe `id` of `(node, worker, read)` reached its attempt bound
@@ -347,6 +339,8 @@ enum Ev {
         remote: u32,
         links: u8,
     },
+    /// The relays of `msg` release their `Relay` transfers.
+    Release { msg: u64 },
     /// `node` joins (`live`) or leaves the membership.
     Membership { node: u32, live: bool },
     /// Publish the pending membership changes.
@@ -403,6 +397,8 @@ struct Msg {
     /// The node the request travels to.
     at: u32,
     abandon: Nanos,
+    /// A silence ping (a key of `Model::pings`), answered `Miss` at once by its destination.
+    ping: Option<u64>,
 }
 
 /// Who waits for a serving read's completion.
@@ -427,6 +423,8 @@ struct Asker {
     attempts: u32,
     /// Links the requester charged for the whole route (`AttemptPlan::links`).
     links: u8,
+    /// The silence ping this request is.
+    ping: Option<u64>,
 }
 
 struct Node {
@@ -533,9 +531,16 @@ struct Model<'s> {
     ticking: bool,
     /// Whether an [`Ev::Publish`] is scheduled.
     publishing: bool,
+    /// `Relay` transfers held by each request's relays, as `(node, worker)`.
+    relay_charges: BTreeMap<u64, Vec<(u32, u8)>>,
+    /// `Relay` transfers in use per `(node, worker)`.
+    relays_active: BTreeMap<(u32, u8), usize>,
+    /// When each running route search of a `(node, worker)` finishes.
+    searches: BTreeMap<(u32, u8), Vec<Nanos>>,
     report: Report,
     expected_reads: u64,
-    /// Queued [`Ev::ProbeTimeout`] events.
+    /// Queued [`Ev::ProbeTimeout`], [`Ev::PingTimeout`] and [`Ev::LastHop`] events: bounds that
+    /// are no-ops once their exchange ended.
     timeouts_queued: u64,
     /// `MODEL_DIAG` set: record probe, serve and send breakdowns in `attempt_errors`.
     diag: bool,
@@ -547,6 +552,8 @@ struct Model<'s> {
     /// Last links awaiting their destination's answer: sender, destination, page, send time
     /// (racer-sim `last_hops`).
     last_hops: BTreeMap<u64, (u32, u32, Page, Nanos)>,
+    /// Silence pings in flight by id: requester and destination.
+    pings: BTreeMap<u64, (u32, u32)>,
     /// Partitioned node pairs, smaller id first.
     partitions: BTreeSet<(u32, u32)>,
     /// Route searches: the real `topology::Paths` over exhaustive mesh searches, one cache
@@ -569,6 +576,9 @@ const SERVE_TIMEOUT: Nanos = 5 * SECONDS;
 const MAX_ATTEMPTS: u8 = 4;
 /// A link to an unreachable peer fails after this (racer-sim `NodeConfig::connect_timeout_ns`).
 const CONNECT_TIMEOUT: Nanos = 100 * MILLIS;
+/// Route searches per worker at once (production `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER`
+/// default, `src/worker.rs`; racer-sim `NodeConfig::active_searches`).
+const ACTIVE_SEARCHES: usize = 8;
 /// Entries of the shared route cache.
 const ROUTE_CACHE_ENTRIES: usize = 1 << 16;
 
@@ -637,6 +647,9 @@ impl<'s> Model<'s> {
             next_body: 0,
             ticking: false,
             publishing: false,
+            relay_charges: BTreeMap::new(),
+            relays_active: BTreeMap::new(),
+            searches: BTreeMap::new(),
             report: Report::default(),
             expected_reads: 0,
             timeouts_queued: 0,
@@ -646,6 +659,7 @@ impl<'s> Model<'s> {
             next_msg: 0,
             last_hops: BTreeMap::new(),
             partitions: BTreeSet::new(),
+            pings: BTreeMap::new(),
             paths: Paths::with_limits(ROUTE_CACHE_ENTRIES, ROUTE_CACHE_ENTRIES * 256, 8),
         }
     }
@@ -918,6 +932,7 @@ impl<'s> Model<'s> {
                     _ => {}
                 }
             }
+            Ev::Release { msg } => self.release_relays(msg),
             Ev::LinkDown { msg, holder } => self.fail_hop(msg, holder, Fault::Unavailable),
             Ev::MetadataInput {
                 node,
@@ -984,6 +999,7 @@ impl<'s> Model<'s> {
             }
             Ev::Hop { msg, verified } => self.hop(msg, verified),
             Ev::LastHop { msg } => {
+                self.timeouts_queued -= 1;
                 if let Some((sender, dest, page, sent)) = self.last_hops.remove(&msg) {
                     self.report.counters.silence_timeouts += 1;
                     let (sent, at) = (self.instant(sent), self.instant(now));
@@ -998,13 +1014,19 @@ impl<'s> Model<'s> {
                     }
                 }
             }
-            Ev::Ping {
-                from,
-                to,
-                page,
-                verified,
-            } => self.ping_arrived(from, to, page, verified),
-            Ev::PingDone { from, to, answered } => self.ping_done(from, to, answered),
+            Ev::PingTimeout { ping } => {
+                self.timeouts_queued -= 1;
+                if let Some((from, to)) = self.pings.remove(&ping) {
+                    // Unanswered within the attempt timeout: silent.
+                    let answered = racer_core::liveness::ping_verdict(Err(true));
+                    self.ping_done(from, to, answered);
+                }
+            }
+            Ev::PingEnd { ping, answered } => {
+                if let Some((from, to)) = self.pings.remove(&ping) {
+                    self.ping_done(from, to, answered);
+                }
+            }
             Ev::PollPings { from } => self.poll_pings(from),
             Ev::ProbeTimeout {
                 node,
@@ -1566,12 +1588,14 @@ impl<'s> Model<'s> {
         let sealed = self.sign(to);
         let route = Self::back(&asker, to);
         if !self.alive(&route) {
+            self.release_relays(asker.msg);
             return self.engine.at(now, Ev::BodyEnd { body: key });
         }
-        let Some(end) =
-            self.fabric
-                .transfer_until(sealed, &route, self.spec.page_bytes, asker.abandon)
-        else {
+        let end = self
+            .fabric
+            .transfer_until(sealed, &route, self.spec.page_bytes, asker.abandon);
+        self.release_relays_at(asker.msg, end.unwrap_or(asker.abandon));
+        let Some(end) = end else {
             self.report.counters.replies_abandoned += 1;
             self.engine
                 .at(asker.abandon.max(now), Ev::BodyEnd { body: key });
@@ -1630,20 +1654,20 @@ impl<'s> Model<'s> {
             // A crash fails the connection: link health, not silence.
             self.report.counters.messages_lost += 1;
             self.last_hops.remove(&mid);
-            self.msgs.remove(&mid);
+            self.drop_msg(mid);
             return;
         }
         if self.hung(at) {
             // Accepted, never answered or forwarded; the requester's attempt times out.
             self.report.counters.messages_lost += 1;
-            self.msgs.remove(&mid);
+            self.drop_msg(mid);
             return;
         }
         if now >= m.abandon {
             // The requester gave up: relays and the destination see the upstream connection
             // close and drop the exchange.
             self.report.counters.requests_abandoned += 1;
-            self.msgs.remove(&mid);
+            self.drop_msg(mid);
             return;
         }
         if !verified {
@@ -1675,6 +1699,12 @@ impl<'s> Model<'s> {
                 let asker = self.asker(mid, now);
                 self.reply(&asker, at, ResponseKind::StaleMembership);
             }
+            Hop::Serve if m.ping.is_some() => {
+                // Production mode `ping` is answered `Miss` at once, without looking at the
+                // cache or flights (racer-sim `serve`).
+                let asker = self.asker(mid, now);
+                self.reply(&asker, at, ResponseKind::Miss);
+            }
             Hop::Serve => {
                 let (page, route) = (m.page, m.route);
                 let asker = self.asker(mid, now);
@@ -1682,12 +1712,52 @@ impl<'s> Model<'s> {
             }
             Hop::Relay(plan) => {
                 if plan.outbound == Err(RouteFault::Invalid) {
-                    self.msgs.remove(&mid);
+                    self.drop_msg(mid);
                     return self.violation(format!("relay {at} received a route revisiting it"));
                 }
+                // Production `peer/server.rs` reserves one `ResourceClass::Relay` transfer on the
+                // relay's worker before it forwards (racer-sim `hop`); none free is `Overloaded`.
+                let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
+                let active = self.relays_active.entry((at, worker)).or_default();
+                if *active >= relay_transfers() {
+                    self.report.counters.relay_sheds += 1;
+                    return self.fail_hop(mid, at, Fault::Overloaded);
+                }
+                *active += 1;
+                self.relay_charges
+                    .entry(mid)
+                    .or_default()
+                    .push((at, worker));
                 self.report.counters.relays += 1;
                 self.forward(mid, at, Some(plan));
             }
+        }
+    }
+
+    /// Drop `mid` without an answer: its relays see the exchange end.
+    fn drop_msg(&mut self, mid: u64) {
+        self.msgs.remove(&mid);
+        self.release_relays(mid);
+    }
+
+    /// The relays of `mid` release their `Relay` transfers.
+    fn release_relays(&mut self, mid: u64) {
+        for key in self.relay_charges.remove(&mid).unwrap_or_default() {
+            let active = self.relays_active.get_mut(&key).expect("a charged relay");
+            *active -= 1;
+            if *active == 0 {
+                self.relays_active.remove(&key);
+            }
+        }
+    }
+
+    /// The relays of `mid` release their transfers at `at` (production keeps the reservation
+    /// on the connection while the body streams, `peer/server.rs` `relay.reservation`).
+    fn release_relays_at(&mut self, mid: u64, at: Nanos) {
+        if at <= self.now() {
+            self.release_relays(mid);
+        } else if self.relay_charges.contains_key(&mid) {
+            self.engine.at(at, Ev::Release { msg: mid });
         }
     }
 
@@ -1707,6 +1777,7 @@ impl<'s> Model<'s> {
             version: m.route.version,
             attempts: m.route.attempts,
             links: m.route.charged,
+            ping: m.ping,
         }
     }
 
@@ -1717,7 +1788,10 @@ impl<'s> Model<'s> {
         let at = self.instant(now);
         let m = &self.msgs[&mid];
         let dest = m.dest;
-        if self.nodes[holder as usize].silence.silent(&dest, at) {
+        // Production `shortest_probe_async`: a requester's own ping may use the link to the
+        // destination it holds silent, and always detours past the primary relay.
+        let own_ping = m.ping.is_some() && holder == m.from;
+        if !own_ping && self.nodes[holder as usize].silence.silent(&dest, at) {
             // The destination is a silent next hop of this node.
             return self.fail_hop(mid, holder, Fault::Unavailable);
         }
@@ -1752,11 +1826,15 @@ impl<'s> Model<'s> {
         let mut blocked: Vec<usize> = node
             .silence
             .silent_peers(at)
+            .filter(|p| !(own_ping && **p == dest))
             .filter_map(|p| position(*p))
             .filter(|p| members.is_neighbor(from, *p))
             .collect();
         blocked.sort_unstable();
-        let level = node.detours.level(&dest, at);
+        let mut level = node.detours.level(&dest, at);
+        if own_ping {
+            level = level.max(1);
+        }
         blocked.extend(members.detour(from, to, level));
         let seed = mid.to_be_bytes();
         let query = PathQuery {
@@ -1767,13 +1845,31 @@ impl<'s> Model<'s> {
             blocked: &blocked,
             seed: &seed,
         };
-        let (route, polls) = self.route(&members, query);
+        let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
+        // Production (`src/app.rs` `Paths::with_limits`) runs at most
+        // `RACER_ACTIVE_PATH_SEARCHES_PER_WORKER` (8) searches per worker and queues none: a
+        // search past them fails `Overloaded` (`topology::Paths::route` with no queue). A slot
+        // is held until the search's CPU work is done.
+        let running = {
+            let ends = self.searches.entry((holder, worker)).or_default();
+            ends.retain(|end| *end > now);
+            ends.len()
+        };
+        let (route, polls) = self.route(&members, query, || running < ACTIVE_SEARCHES);
         // racer-sim `spawn`: a cache hit answers on the first poll, each further poll expands
         // up to 32 nodes, on one worker's CPU.
         let costs = self.fabric.costs;
-        let worker = (mid % u64::from(self.spec.workers.max(1))) as u8;
         let cost = polls.saturating_sub(1) * 32 * costs.cpu_path_expand_ns_per_node;
         let ready = self.fabric.cpu(now, holder, worker, cost);
+        if polls > 1 && route != Err(topology::Error::Overloaded) {
+            self.searches
+                .entry((holder, worker))
+                .or_default()
+                .push(ready);
+        }
+        if polls > 1 && route == Err(topology::Error::Overloaded) {
+            self.report.counters.search_sheds += 1;
+        }
         let route = match route {
             Ok(route) => route,
             Err(topology::Error::Overloaded) => {
@@ -1788,19 +1884,27 @@ impl<'s> Model<'s> {
         self.link(mid, holder, plan, next, ready);
     }
 
-    /// Run one route search to completion; returns the route and the polls it took.
+    /// Run one route search to completion; returns the route and the polls it took. A cache
+    /// hit answers on the first poll; a search that has to run needs one of the holder worker's
+    /// search slots (`admit`), or fails `Overloaded`.
     fn route(
         &self,
         members: &Members,
         query: PathQuery<'_>,
+        admit: impl FnOnce() -> bool,
     ) -> (Result<Vec<usize>, topology::Error>, u64) {
         let mut future = std::pin::pin!(self.paths.route(members, query));
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut admit = Some(admit);
         let mut polls = 0;
         loop {
             polls += 1;
             if let std::task::Poll::Ready(route) = future.as_mut().poll(&mut cx) {
                 return (route, polls);
+            }
+            if admit.take().is_some_and(|admit| !admit()) {
+                // Dropping the future cancels the search.
+                return (Err(topology::Error::Overloaded), polls);
             }
             // Searches run one at a time, so a search never waits on another.
             assert!(polls < 1_000, "a route search did not finish");
@@ -1829,6 +1933,7 @@ impl<'s> Model<'s> {
             // The last link: this sender learns whether the destination answers.
             self.last_hops.insert(mid, (holder, next, m.page, now));
             let abandon = m.abandon.max(now + 1);
+            self.timeouts_queued += 1;
             self.engine.at(abandon, Ev::LastHop { msg: mid });
         }
         let signed = self
@@ -1863,9 +1968,14 @@ impl<'s> Model<'s> {
             version: m.route.version,
             attempts: m.route.attempts,
             links: m.route.charged,
+            ping: m.ping,
         };
         if holder == asker.from && asker.path.len() == 1 {
             // The requester's own send failed: a transport error.
+            if let Some(ping) = asker.ping {
+                let now = self.now();
+                return self.end_ping(ping, now, Err(false));
+            }
             let failed = Input::Replied {
                 id: asker.id,
                 reply: Reply::Failed {
@@ -1884,12 +1994,12 @@ impl<'s> Model<'s> {
             return self.engine.at(self.now(), input);
         }
         self.report.counters.relay_failures += 1;
-        match relay_failure(fault, false) {
+        match relay_failure(fault, asker.ping.is_some()) {
             RelayFailure::Respond(r) => self.reply(&asker, holder, response_kind(r)),
             RelayFailure::RespondIfLive(r) if self.now() < m.route.deadline => {
                 self.reply(&asker, holder, response_kind(r));
             }
-            RelayFailure::RespondIfLive(_) => {}
+            RelayFailure::RespondIfLive(_) => self.release_relays(mid),
             RelayFailure::Propagate => self.fail_probe(&asker, holder),
         }
     }
@@ -1944,7 +2054,11 @@ impl<'s> Model<'s> {
     }
 
     /// Send `from`'s due silence pings, at most [`MAX_PINGS_IN_FLIGHT`] at once (production
-    /// `CandidatePolicy::poll_pings` in `src/read/candidates.rs`; racer-sim `poll_pings`).
+    /// `CandidatePolicy::poll_pings` in `src/read/candidates.rs`; racer-sim `poll_pings`). A ping
+    /// is a peer request (`FetchMode::Ping`) routed over the mesh like any other, on a fresh
+    /// grant: no remote attempts, [`NOTICE_LINKS`] links and the peer attempt timeout
+    /// (production `CandidatePolicy::ping` through `request_traced`; racer-sim
+    /// `launch_control`).
     fn poll_pings(&mut self, from: u32) {
         let now = self.now();
         let at = self.instant(now);
@@ -1956,62 +2070,42 @@ impl<'s> Model<'s> {
         for (to, page) in n.silence.due_pings(at, room) {
             self.nodes[from as usize].pings += 1;
             self.report.counters.silence_pings += 1;
-            if self.cut(from, to) {
-                // The link fails: a transport error, inconclusive.
-                let done = Ev::PingDone {
-                    from,
-                    to,
-                    answered: racer_core::liveness::ping_verdict(Err(false)),
-                };
-                self.engine.at(now + CONNECT_TIMEOUT, done);
-                continue;
-            }
-            let signed = self.sign(from);
-            let arrive = self.fabric.message(signed, from, to);
-            // Production pings on a fresh grant bounded by the peer attempt timeout.
-            let ping = Ev::Ping {
+            self.next_msg += 1;
+            let mid = self.next_msg;
+            self.pings.insert(mid, (from, to));
+            let timeout = now + ATTEMPT_TIMEOUT;
+            let version = self.versions.borrow().adopted(from).number;
+            let msg = Msg {
                 from,
-                to,
+                worker: 0,
+                read: ReadId(0),
+                id: EffectId::default(),
+                dest: to,
                 page,
-                verified: false,
+                route: Route {
+                    version,
+                    copy_only: true,
+                    deadline: timeout,
+                    attempts: 0,
+                    links: NOTICE_LINKS,
+                    charged: NOTICE_LINKS,
+                },
+                path: vec![from],
+                at: from,
+                abandon: timeout,
+                ping: Some(mid),
             };
-            self.engine.at(arrive, ping);
+            self.msgs.insert(mid, msg);
+            self.timeouts_queued += 1;
+            self.engine.at(timeout, Ev::PingTimeout { ping: mid });
+            self.forward(mid, from, None);
         }
     }
 
-    /// `from`'s ping reached `to`: verify it, then answer `Miss` at once (production
-    /// `FetchMode::Ping`).
-    fn ping_arrived(&mut self, from: u32, to: u32, page: Page, verified: bool) {
-        let now = self.now();
-        if self.hung(to) {
-            // Unanswered within the ping's bound.
-            let answered = racer_core::liveness::ping_verdict(Err(true));
-            let done = Ev::PingDone { from, to, answered };
-            return self.engine.at(now + ATTEMPT_TIMEOUT, done);
-        }
-        if !verified {
-            let checked = self
-                .fabric
-                .crypto(now, to, self.fabric.costs.crypto_verify_ns);
-            let ping = Ev::Ping {
-                from,
-                to,
-                page,
-                verified: true,
-            };
-            return self.engine.at(checked, ping);
-        }
-        let signed = self.sign(to);
-        let back = self.fabric.message(signed, to, from);
-        // `ping_verdict`: a direct, signed `Miss` from the peer itself is alive.
-        let answered = racer_core::liveness::ping_verdict(Ok((true, false)));
-        let timeout = now + ATTEMPT_TIMEOUT;
-        let (at, answered) = if back <= timeout {
-            (back, answered)
-        } else {
-            (timeout, racer_core::liveness::ping_verdict(Err(true)))
-        };
-        self.engine.at(at, Ev::PingDone { from, to, answered });
+    /// Ping `ping` ends at `at` with the verdict on `answer` (`ping_verdict`).
+    fn end_ping(&mut self, ping: u64, at: Nanos, answer: Result<(bool, bool), bool>) {
+        let answered = racer_core::liveness::ping_verdict(answer);
+        self.engine.at(at, Ev::PingEnd { ping, answered });
     }
 
     /// `from`'s ping to `to` ended (racer-sim `ping_done`; production `LinkHealth::ping_outcome`).
@@ -2032,6 +2126,7 @@ impl<'s> Model<'s> {
 
     /// The serving read on `to` failed without a peer response: a transport failure.
     fn fail_probe(&mut self, asker: &Asker, to: u32) {
+        self.release_relays(asker.msg);
         let now = self.now();
         self.answering(asker, to, now);
         let route = Self::back(asker, to);
@@ -2039,6 +2134,10 @@ impl<'s> Model<'s> {
             return;
         }
         let at = self.message_back(now, &route);
+        if let Some(ping) = asker.ping {
+            // A transport failure proves nothing.
+            return self.end_ping(ping, at, Err(false));
+        }
         self.engine.at(
             at,
             Ev::Input {
@@ -2059,6 +2158,7 @@ impl<'s> Model<'s> {
     }
 
     fn reply(&mut self, asker: &Asker, to: u32, kind: ResponseKind) {
+        self.release_relays(asker.msg);
         let own = self.answering(asker, to, self.now());
         let route = Self::back(asker, to);
         if !self.alive(&route) {
@@ -2066,6 +2166,11 @@ impl<'s> Model<'s> {
         }
         let ready = self.sign(to);
         let at = self.message_back(ready, &route);
+        if let Some(ping) = asker.ping {
+            // A signed answer: alive when the peer itself answered, silent when a relay
+            // answered `Unavailable` (production `CandidatePolicy::ping`).
+            return self.end_ping(ping, at, Ok((own, kind == ResponseKind::Unavailable)));
+        }
         if kind == ResponseKind::StaleMembership {
             // Production `request_traced`: the answering node could not resolve the request's
             // membership, so the remote credits it carried were never used, and neither were the
@@ -2257,6 +2362,7 @@ impl<'s> Model<'s> {
                         path: vec![node],
                         at: node,
                         abandon: timeout,
+                        ping: None,
                     };
                     self.msgs.insert(mid, msg);
                     self.forward(mid, node, None);
@@ -2508,6 +2614,10 @@ impl<'s> Model<'s> {
         if !self.msgs.is_empty() {
             self.violation(format!("{} peer requests never ended", self.msgs.len()));
         }
+        if !self.relay_charges.is_empty() {
+            let held = self.relay_charges.len();
+            self.violation(format!("{held} requests still hold relay transfers"));
+        }
         let c = &self.report.counters;
         let ended = c.reads_completed + c.reads_failed + c.reads_skipped_not_member;
         if ended != self.expected_reads {
@@ -2666,6 +2776,14 @@ fn core(
         OwnerBudget::new(4, 0),
         base,
     )
+}
+
+/// Production `Relay` transfers per worker (`racer_core::admission::Limits::default`
+/// `relay_transfers`, racer-sim `NodeConfig::relay_transfers`).
+fn relay_transfers() -> usize {
+    racer_core::admission::Limits::default()
+        .relay_transfers
+        .get()
 }
 
 /// Production per-worker flight bounds (`racer_core::admission::Limits::default`, racer-sim
