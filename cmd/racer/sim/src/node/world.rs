@@ -521,6 +521,8 @@ struct Msg {
     /// When the requester abandons this exchange (its attempt timeout).
     abandon: Nanos,
     relays: Vec<SimCharge>,
+    /// When the first relay took its `Relay` transfer.
+    relayed_at: Option<Nanos>,
     /// A pinned single-link hedge exchange.
     direct: bool,
     /// An orphan notice's copy offer: answered `Miss` without a body.
@@ -3081,6 +3083,7 @@ impl NodeWorld {
             deadline,
             abandon: self.nanos(plan.attempt_end).max(now + 1),
             relays: Vec::new(),
+            relayed_at: None,
             direct,
             offer: false,
             ping: false,
@@ -3310,6 +3313,7 @@ impl NodeWorld {
             deadline: timeout,
             abandon: timeout,
             relays: Vec::new(),
+            relayed_at: None,
             direct: false,
             offer,
             ping: !offer,
@@ -3633,6 +3637,7 @@ impl NodeWorld {
                     Ok(charge) => {
                         let m = self.msgs.get_mut(&mid).expect("message");
                         m.relays.push(charge);
+                        m.relayed_at.get_or_insert(now);
                         self.forward(mid, at, Some(plan));
                     }
                     Err(_) => {
@@ -4084,6 +4089,12 @@ impl NodeWorld {
             self.note_body(now, &route, m.page, m.version, bytes);
             done
         } else {
+            if let Some(start) = m.relayed_at {
+                // Relays hold their `Relay` transfer until a non-page answer leaves the
+                // destination (compare with the Model's `relay_hold:answered:*`).
+                self.metrics
+                    .observe("relay_hold_answer_ns", ready.saturating_sub(start));
+            }
             let mut t = self.fabric.crypto(ready, from, costs.sign_ns);
             for hop in route.windows(2) {
                 t = self.fabric.message(t, hop[0], hop[1]);

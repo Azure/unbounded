@@ -294,6 +294,9 @@ fn cold_start(nodes: u32) {
         .unwrap();
     assert!((1..=topology::REPLICAS as u64).contains(&max), "{max}");
     assert!(counter(&report, "disk_writes") > 0, "{report}");
+    // Relayed non-page answers (sheds, misses) are recorded apart from bodies.
+    let answer = &report["metrics"]["histograms"]["relay_hold_answer_ns"];
+    assert!(answer["count"].as_u64().unwrap_or(0) > 0, "{answer}");
     let per_node = report["memory"]["accounted_bytes_per_node"]
         .as_u64()
         .unwrap();
