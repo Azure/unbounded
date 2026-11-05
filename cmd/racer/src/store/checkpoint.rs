@@ -1331,7 +1331,7 @@ mod budget_tests {
             WorkerId(0),
             1,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(4096));
         let checkpoint = Rc::new(Checkpointer::new(PathBuf::new(), index, segments.clone()));

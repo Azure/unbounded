@@ -1961,7 +1961,7 @@ pub(crate) mod tests {
         }
 
         fn scope() -> RequestScope {
-            RequestScope::new(
+            RequestScope::host(
                 RequestId([1; 16]),
                 Instant::now() + Duration::from_secs(600),
             )
@@ -1986,7 +1986,7 @@ pub(crate) mod tests {
             );
             let mut engine = PageCryptoEngine::new(CryptoRuntime {
                 port: engine_port,
-                ctx: crate::test_support::ctx(),
+                ctx: racer_io::WorkerCtx::host(),
             });
             let scope = scope();
             let mut work = crypto.encrypt(
@@ -4531,7 +4531,7 @@ pub(crate) mod tests {
             let admission = admission(1);
             let pool = new_pipe_pool(admission.clone());
             let scope =
-                RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
+                RequestScope::host(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
             let mut registrations = Vec::new();
             loop {
@@ -4578,7 +4578,7 @@ pub(crate) mod tests {
                 let admission = admission(1);
                 let pool = new_pipe_pool(admission.clone());
                 let held = pool.acquire().unwrap();
-                let scope = RequestScope::new(
+                let scope = RequestScope::host(
                     RequestId([0; 16]),
                     Instant::now()
                         + if failure == Some(Error::DeadlineExceeded) {
@@ -4617,7 +4617,7 @@ pub(crate) mod tests {
                 drop(held);
                 if failure != Some(Error::Unavailable) {
                     // No stale FIFO entry may prevent the next caller's progress.
-                    let fresh = RequestScope::new(
+                    let fresh = RequestScope::host(
                         RequestId([1; 16]),
                         Instant::now() + Duration::from_secs(5),
                     )

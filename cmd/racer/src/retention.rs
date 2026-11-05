@@ -675,8 +675,10 @@ mod tests {
     fn lazy_scoring_classification_matches_telemetry_cache_disk() {
         use racer_control_wire::CacheDefinition;
         let clock = uring_runtime::environment::SimulationClock::new(52);
-        let _environment = clock.environment(0).enter();
-        let policy = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
+        let policy = Rc::new(Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
             id: id(n),
@@ -701,7 +703,7 @@ mod tests {
             vec![def("a", 1)],
             vec![def("a", 1000), def("b", 1000), def("e", 0)],
         ];
-        let now = uring_runtime::environment::now();
+        let now = sim_ctx.clock.now();
         for table in &tables {
             policy.weights().update(table);
             for capacity in [0, 500, 1000, 1300, u64::MAX] {
@@ -725,8 +727,10 @@ mod tests {
     fn share_basis_is_incremental_across_passes_and_membership_changes() {
         use racer_control_wire::CacheDefinition;
         let clock = uring_runtime::environment::SimulationClock::new(53);
-        let _environment = clock.environment(0).enter();
-        let policy = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
+        let policy = Rc::new(Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap());
         let id = |n: &str| CacheId(n.into());
         let def = |n: &str, priority: u16| CacheDefinition {
             id: id(n),
@@ -742,7 +746,7 @@ mod tests {
             let expected = policy.weights().basis(policy.cache_bytes.borrow().keys());
             assert_eq!(policy.share_basis(), expected);
         };
-        let now = uring_runtime::environment::now();
+        let now = sim_ctx.clock.now();
         // Many resident caches, all published: passes must not rescan.
         let names: Vec<String> = (0..64).map(|n| format!("c{n}")).collect();
         let held: Vec<_> = names
@@ -819,8 +823,10 @@ mod tests {
     fn over_share_candidates_are_bounded_and_exact_with_many_caches() {
         use racer_control_wire::CacheDefinition;
         let clock = uring_runtime::environment::SimulationClock::new(59);
-        let _environment = clock.environment(0).enter();
-        let policy = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
+        let policy = Rc::new(Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap());
         let id = |n: usize| CacheId(format!("c{n:04}"));
         let def = |n: usize, priority: u16| CacheDefinition {
             id: id(n),
@@ -836,7 +842,7 @@ mod tests {
         let capacity = 1_000_000;
         // Reference: classify every resident cache, then compare.
         let check = |policy: &Retention, label: &str| {
-            let scoring = policy.scoring_at(uring_runtime::environment::now(), capacity);
+            let scoring = policy.scoring_at(sim_ctx.clock.now(), capacity);
             let visits = policy.pressure_visits.get();
             let got = scoring.over_share_candidates(LIMIT);
             assert!(
@@ -876,7 +882,7 @@ mod tests {
             } else {
                 held[n].push(policy.indexed_payload(&id(n), 50 + round as u64));
             }
-            let scoring = policy.scoring_at(uring_runtime::environment::now(), capacity);
+            let scoring = policy.scoring_at(sim_ctx.clock.now(), capacity);
             let visits = policy.pressure_visits.get();
             scoring.over_share_candidates(LIMIT);
             assert!(policy.pressure_visits.get() - visits <= LIMIT as u64);
@@ -909,7 +915,7 @@ mod tests {
         // No published catalog: nothing is over share.
         policy.weights().update(&[]);
         check(&policy, "unpublished");
-        let scoring = policy.scoring_at(uring_runtime::environment::now(), capacity);
+        let scoring = policy.scoring_at(sim_ctx.clock.now(), capacity);
         assert!(scoring.over_share_candidates(LIMIT).is_empty());
         // Replacing the table object also rebuilds.
         policy.set_weights(crate::priority::Weights::default());
@@ -922,8 +928,10 @@ mod tests {
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
         let clock = uring_runtime::environment::SimulationClock::new(51);
-        let _environment = clock.environment(0).enter();
-        let policy = Retention::new(4096, 1, crate::test_support::clock()).unwrap();
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
+        let policy = Retention::new(4096, 1, sim_ctx.clock.clone()).unwrap();
         let owned = Rc::new(Cell::new(true));
         let calls = Rc::new(Cell::new(0));
         policy.set_ownership_pass(Rc::new({
@@ -937,7 +945,7 @@ mod tests {
         }));
         policy.track(&page(0));
         policy.touch(&page(0));
-        let now = uring_runtime::environment::now();
+        let now = sim_ctx.clock.now();
         let scoring = policy.scoring_at(now, u64::MAX);
         owned.set(false);
         for _ in 0..256 {
@@ -956,7 +964,7 @@ mod tests {
         assert_eq!(policy.scoring_at(now, u64::MAX).score(&page(1)), 1);
         assert_eq!(calls.get(), 2);
         let disabled =
-            Retention::configured(4096, 1, PERIOD, false, crate::test_support::clock()).unwrap();
+            Retention::configured(4096, 1, PERIOD, false, sim_ctx.clock.clone()).unwrap();
         disabled.set_ownership(Rc::new(|_| true));
         assert_eq!(disabled.scoring_at(now, u64::MAX).score(&page(0)), 0);
     }
@@ -974,7 +982,7 @@ mod tests {
     }
     #[test]
     fn disk_observability_samples_current_class_without_scrape_classification() {
-        let policy = Rc::new(Retention::new(4096, 2, crate::test_support::clock()).unwrap());
+        let policy = Rc::new(Retention::new(4096, 2, racer_io::Clock::host()).unwrap());
         let owned = Rc::new(Cell::new(false));
         let current = owned.clone();
         let calls = Rc::new(Cell::new(0));
@@ -1015,7 +1023,7 @@ mod tests {
     }
     #[test]
     fn readers_latch_before_insert_and_retries_do_not_promote() {
-        let policy = Retention::new(32, 1, crate::test_support::clock()).unwrap();
+        let policy = Retention::new(32, 1, racer_io::Clock::host()).unwrap();
         let first = Interest::default();
         assert!(!policy.observe(&page(0), &first).eligible());
         for n in 1..1000 {
@@ -1032,8 +1040,8 @@ mod tests {
     fn rotation_retains_three_to_four_minutes_and_clears_long_idle() {
         for period in [Duration::from_secs(60), Duration::from_millis(10)] {
             let policy =
-                Retention::configured(4096, 1, period, true, crate::test_support::clock()).unwrap();
-            let start = uring_runtime::environment::now();
+                Retention::configured(4096, 1, period, true, racer_io::Clock::host()).unwrap();
+            let start = racer_io::Clock::host().now();
             let first = Interest::default();
             assert!(!policy.observe_at(&page(0), &first, start).eligible());
             assert!(
@@ -1042,7 +1050,7 @@ mod tests {
                     .eligible()
             );
             let retained =
-                Retention::configured(4096, 1, period, true, crate::test_support::clock()).unwrap();
+                Retention::configured(4096, 1, period, true, racer_io::Clock::host()).unwrap();
             retained.observe_at(&page(0), &Interest::default(), start);
             assert!(
                 retained
@@ -1058,7 +1066,7 @@ mod tests {
     }
     #[test]
     fn ownership_is_current_and_heat_saturates_then_decays() {
-        let policy = Retention::new(4096, 2, crate::test_support::clock()).unwrap();
+        let policy = Retention::new(4096, 2, racer_io::Clock::host()).unwrap();
         assert!(policy.track(&page(0)));
         assert!(policy.track(&page(1)));
         assert!(!policy.track(&page(2)));
@@ -1067,7 +1075,7 @@ mod tests {
         }
         assert_eq!(policy.score(&page(0)), 3);
         assert_eq!(policy.score(&page(1)), 0);
-        let now = uring_runtime::environment::now();
+        let now = racer_io::Clock::host().now();
         assert_eq!(policy.score_at(&page(0), now + Duration::from_secs(60)), 2);
         let owned = Rc::new(Cell::new(true));
         let value = owned.clone();
@@ -1082,7 +1090,7 @@ mod tests {
     #[test]
     fn disabled_is_owned_only_and_metrics_count_once() {
         let policy =
-            Retention::configured(4096, 1, PERIOD, false, crate::test_support::clock()).unwrap();
+            Retention::configured(4096, 1, PERIOD, false, racer_io::Clock::host()).unwrap();
         for _ in 0..10 {
             assert!(!policy.observe(&page(0), &Interest::default()).eligible());
         }
@@ -1100,13 +1108,12 @@ mod tests {
         assert_eq!(snapshot.persistence_accepted, 1);
         assert_eq!(snapshot.filter_set_bits, 0);
         assert!(
-            Retention::configured(4096, 1, Duration::ZERO, true, crate::test_support::clock())
-                .is_err()
+            Retention::configured(4096, 1, Duration::ZERO, true, racer_io::Clock::host()).is_err()
         );
     }
     #[test]
     fn full_identity_and_memory_bounds() {
-        let policy = Retention::new(4096, 2, crate::test_support::clock()).unwrap();
+        let policy = Retention::new(4096, 2, racer_io::Clock::host()).unwrap();
         let a = page(0);
         let mut b = a.clone();
         b.version.etag = crate::model::StrongEtag::test_value("v2");
@@ -1122,7 +1129,7 @@ mod tests {
         }
         assert_eq!(policy.snapshot().heat_entries, 2);
         assert_eq!(policy.snapshot().filter_bits, 4096 * 8);
-        assert!(Retention::new(31, 1, crate::test_support::clock()).is_err());
-        assert!(Retention::new(4096, 0, crate::test_support::clock()).is_err());
+        assert!(Retention::new(31, 1, racer_io::Clock::host()).is_err());
+        assert!(Retention::new(4096, 0, racer_io::Clock::host()).is_err());
     }
 }

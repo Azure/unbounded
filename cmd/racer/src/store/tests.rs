@@ -232,7 +232,7 @@ mod index_pressure {
             WorkerId(0),
             2,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         index.set_page_capacity(2).unwrap();
         let segments = Rc::new(Segments::new(512));
@@ -344,7 +344,7 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     let index = f.store.writer.index();
     index.reserve_hold(&id.version, 1, until).unwrap();
     f.enqueue(copy.clone()).unwrap();
@@ -388,7 +388,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
         .reserve_hold(
             &id.version,
             1,
-            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+            racer_io::Clock::host().wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
@@ -412,7 +412,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     let before = index.hold_epoch(&id.version).unwrap();
     drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
@@ -479,7 +479,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
     assert!(cut.index.entries.is_empty());
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     f.store
         .writer
         .index()
@@ -520,7 +520,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     simulation.inject("write", Fault::Delay(6)).unwrap();
     let request = scope();
@@ -624,7 +624,7 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
             .is_pending()
     );
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     let shard = futures::executor::block_on(snapshot).unwrap();
     assert_eq!(
@@ -657,7 +657,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     f.enqueue(copy.clone()).unwrap();
     assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
@@ -725,7 +725,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
         .reserve_hold(
             &id.version,
             1,
-            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+            racer_io::Clock::host().wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     f.store.writer.busy.set(true);
@@ -762,7 +762,7 @@ fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
         .reserve_hold(
             &id.version,
             1,
-            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+            racer_io::Clock::host().wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     f.enqueue(copy.clone()).unwrap();
@@ -1362,7 +1362,7 @@ impl Fixture {
             WorkerId(0),
             16,
             availability.clone(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(32 * 1024 * 1024));
         let eviction = Rc::new(catalog::SegmentClock::new(
@@ -1755,7 +1755,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
         .reserve_hold(
             &metadata.version,
             1,
-            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+            racer_io::Clock::host().wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     let base = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
@@ -1810,7 +1810,7 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
         .reserve_hold(
             &metadata.version,
             1,
-            uring_runtime::environment::wall_now() + Duration::from_secs(60),
+            racer_io::Clock::host().wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     let budget = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap()
@@ -2828,7 +2828,7 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
     descriptor.version.object.cache = cache.clone();
     let late = bundle_for(&f.admission, descriptor.clone());
     memory.publish(late.clone()).unwrap();
-    let request = RequestScope::new(
+    let request = RequestScope::host(
         RequestId([0; 16]),
         Instant::now() + Duration::from_secs(300),
     )
@@ -3041,7 +3041,7 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
     assert_eq!(f.store.writer.queued_count(), 1);
     assert_eq!(f.store.writer.writes_in_flight(), 1);
     let expired =
-        RequestScope::new(RequestId([9; 16]), Instant::now() - Duration::from_secs(1)).unwrap();
+        RequestScope::host(RequestId([9; 16]), Instant::now() - Duration::from_secs(1)).unwrap();
     let mut drain = f.store.writer.drain(&expired);
     assert!(drain.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.store.writer.queued_count(), 0);
@@ -4279,7 +4279,7 @@ mod checkpoint {
         let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
             AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
         ))));
-        let scope = RequestScope::new(
+        let scope = RequestScope::host(
             crate::model::RequestId([202; 16]),
             Instant::now() + Duration::from_secs(10),
         )
@@ -4327,7 +4327,7 @@ mod checkpoint {
         ))));
         reactor.init().unwrap();
         let scope = || {
-            RequestScope::new(
+            RequestScope::host(
                 crate::model::RequestId([201; 16]),
                 Instant::now() + Duration::from_secs(10),
             )
@@ -4482,7 +4482,7 @@ mod checkpoint {
             WorkerId(0),
             capacity,
             crate::test_support::availability(),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         let segments = Rc::new(Segments::new(g.segment_bytes));
         segments
@@ -5703,7 +5703,7 @@ fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
     assert_eq!(writer.discarded_count(), 1);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
     // A held incoming page is exempt, as in the full-queue path.
-    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    let until = racer_io::Clock::host().wall_now() + Duration::from_secs(60);
     writer
         .index()
         .reserve_hold(&incoming.version, 1, until)

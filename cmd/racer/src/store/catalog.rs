@@ -1423,7 +1423,7 @@ mod tests {
                 WorkerId(0),
                 1,
                 crate::test_support::availability(),
-                crate::test_support::clock(),
+                racer_io::Clock::host(),
             )),
             segments.clone(),
             2,
@@ -1532,7 +1532,7 @@ mod tests {
         let (page, entry) = indexed(descriptor("held", 17), 0);
         drop(segments.append(1024).unwrap());
         index.publish(page.clone(), entry).unwrap();
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index.reserve_hold(&page.version, 2, until).unwrap();
         index.reserve_hold(&page.version, 2, until).unwrap();
         index
@@ -1587,7 +1587,7 @@ mod tests {
             version: version.clone(),
             number: crate::model::PageNumber(number),
         };
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         // One reader holds 0..3 and another independently holds 0 and 2.
         let epoch = index
             .reserve_hold_pages(&version, &page_set(&[0, 1, 2]), until)
@@ -1630,7 +1630,9 @@ mod tests {
     #[test]
     fn stale_hold_page_release_cannot_drop_a_replacement_holder() {
         let clock = uring_runtime::environment::SimulationClock::new(29);
-        let _environment = clock.environment(0).enter();
+        let sim_env = clock.environment(0);
+        let _environment = sim_env.enter();
+        let sim_ctx = sim_env.worker_ctx();
         let segments = Rc::new(segments(1024, 6));
         let index = Rc::new(index(8));
         index.set_page_capacity(6).unwrap();
@@ -1642,17 +1644,13 @@ mod tests {
         let ttl = std::time::Duration::from_secs(10);
         // A read holds page 0, then its hold expires before it delivers.
         let original = index
-            .reserve_hold_pages(
-                &version,
-                &page_set(&[0]),
-                uring_runtime::environment::wall_now() + ttl,
-            )
+            .reserve_hold_pages(&version, &page_set(&[0]), sim_ctx.clock.wall_now() + ttl)
             .unwrap();
         clock.advance(ttl + std::time::Duration::from_secs(1));
         assert_eq!(index.hold_holders(&page), 0);
         // Another reader re-reserves the page; the expired entry is
         // pruned and the replacement is a new epoch.
-        let until = uring_runtime::environment::wall_now() + ttl;
+        let until = sim_ctx.clock.wall_now() + ttl;
         let replacement = index
             .reserve_hold_pages(&version, &page_set(&[0]), until)
             .unwrap();
@@ -1681,7 +1679,7 @@ mod tests {
         drop(segments.append(1024).unwrap());
         index.publish(page.clone(), entry).unwrap();
         let version = page.version.clone();
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let first = index
             .reserve_hold_pages(&version, &page_set(&[0]), until)
             .unwrap();
@@ -1733,7 +1731,7 @@ mod tests {
         index.publish(page.clone(), entry).unwrap();
         let mut unpublished = page.clone();
         unpublished.number = crate::model::PageNumber(1);
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let epoch = index
             .reserve_hold_pages(&page.version, &page_set(&[0, 1]), until)
             .unwrap();
@@ -1782,7 +1780,7 @@ mod tests {
         index.publish(cached.clone(), entry).unwrap();
         let mut primary = cached.clone();
         primary.number = crate::model::PageNumber(1);
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&cached.version, &page_set(&[]), until)
             .unwrap();
@@ -1828,7 +1826,7 @@ mod tests {
             version: version.clone(),
             number: crate::model::PageNumber(number),
         };
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let epoch = index
             .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
             .unwrap();
@@ -1868,7 +1866,7 @@ mod tests {
         let (cached, entry) = indexed(descriptor("union", 3 * crate::model::PAGE_BYTES), 0);
         drop(segments.append(1024).unwrap());
         index.publish(cached.clone(), entry).unwrap();
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&cached.version, &page_set(&[0, 2]), until)
             .unwrap();
@@ -1926,7 +1924,7 @@ mod tests {
             index.publish(page, entry).unwrap();
         }
         let held: Vec<u64> = (0..count).rev().step_by(3).collect();
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&first.version, &page_set(&held), until)
             .unwrap();
@@ -1963,7 +1961,7 @@ mod tests {
             index.publish(page.clone(), entry).unwrap();
             pages.push(page);
         }
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&first.version, &page_set(&[1]), until)
             .unwrap();
@@ -1989,7 +1987,7 @@ mod tests {
         let segments = Rc::new(segments(1024, 8));
         let index = Rc::new(index(8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let (first, entry) = indexed(descriptor("first", 17), 0);
         index.reserve_hold(&first.version, 2, until).unwrap();
         let pending = index.reserve_page_for(&first, false).unwrap();
@@ -2046,7 +2044,7 @@ mod tests {
             .entries
             .get_mut(&first.version)
             .unwrap()
-            .monotonic = uring_runtime::environment::now() - std::time::Duration::from_secs(1);
+            .monotonic = racer_io::Clock::host().now() - std::time::Duration::from_secs(1);
         assert_eq!(index.held_snapshot(), HeldSnapshot::default());
         assert!(
             index.lookup(&first).unwrap().is_some(),
@@ -2063,7 +2061,7 @@ mod tests {
         drop(segments.append(1024).unwrap());
         index.publish(page.clone(), entry).unwrap();
         segments.begin_evict(SegmentId(0)).unwrap();
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         assert_eq!(
             index.reserve_hold(&page.version, 1, until),
             Err(Error::Overloaded)
@@ -2078,7 +2076,7 @@ mod tests {
         let index = Rc::new(index(8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("partial", 17), 0);
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index.reserve_hold(&page.version, 2, until).unwrap();
         assert_eq!(index.held_page_expiry(&page), None);
         drop(segments.append(1024).unwrap());
@@ -2100,7 +2098,7 @@ mod tests {
         index.set_page_capacity(4).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments, 1);
         let version = descriptor("held", 17).version;
-        let now = uring_runtime::environment::wall_now();
+        let now = racer_io::Clock::host().wall_now();
         assert_eq!(
             index.reserve_hold(&version, 1, now),
             Err(Error::InvalidConfiguration)
@@ -2148,7 +2146,7 @@ mod tests {
         let index = Rc::new(index(8));
         let _clock = SegmentClock::new(index.clone(), segments, 1);
         let version = descriptor("ttl", 17).version;
-        let now = uring_runtime::environment::wall_now();
+        let now = racer_io::Clock::host().wall_now();
         index
             .reserve_hold(&version, 1, now + std::time::Duration::from_secs(60))
             .unwrap();
@@ -2166,7 +2164,7 @@ mod tests {
             .entries
             .get_mut(&version)
             .unwrap()
-            .monotonic = uring_runtime::environment::now() - std::time::Duration::from_secs(1);
+            .monotonic = racer_io::Clock::host().now() - std::time::Duration::from_secs(1);
         assert_eq!(index.hold_expiry(&version), None);
         assert_eq!(index.hold_unused(), 0);
     }
@@ -2321,7 +2319,7 @@ mod tests {
             let real = SegmentClock::new(index.clone(), real_segments.clone(), 1);
             let phantom_clock = page_alloc::SegmentClock::new(phantom_segments.clone());
             let phantom = page_alloc::PhantomEntries::<PageId>::default();
-            let now = uring_runtime::environment::now();
+            let now = racer_io::Clock::host().now();
             let mut pages = Vec::new();
             let mut next = 0;
             let mut total_evicted = 0;
@@ -2529,7 +2527,7 @@ mod tests {
     #[test]
     fn second_sight_heat_capacity_and_failed_restore_leave_existing_residency_intact() {
         let index = index(4);
-        let retention = Rc::new(Retention::new(4096, 1, crate::test_support::clock()).unwrap());
+        let retention = Rc::new(Retention::new(4096, 1, racer_io::Clock::host()).unwrap());
         index.set_retention(retention.clone());
         let (page, entry) = indexed(descriptor("resident", 17), 0);
         index.publish(page.clone(), entry.clone()).unwrap();
@@ -2738,7 +2736,7 @@ mod priority_tests {
             crate::test_support::availability_for(
                 weights.iter().map(|(name, _)| cache(name)).collect(),
             ),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         index.set_page_capacity(pages).unwrap();
         let table = crate::priority::Weights::default();
@@ -2890,7 +2888,7 @@ mod priority_tests {
         let victim = index.victim(&index.state.borrow()).unwrap();
         assert_eq!(victim.version.object.cache, cache("b"));
         // Holds still veto eviction even for over-share pages.
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         for page in &b {
             index.reserve_hold(&page.version, 1, until).unwrap();
         }
@@ -2955,7 +2953,7 @@ mod priority_tests {
             WorkerId(0),
             64,
             crate::test_support::availability_for(vec![cache("a"), cache("z")]),
-            crate::test_support::clock(),
+            racer_io::Clock::host(),
         ));
         index.set_page_capacity(84).unwrap();
         let segments = segments(50);
@@ -3014,7 +3012,7 @@ mod priority_tests {
         // Only the first decision builds the order.
         assert_eq!(retention.pressure_counters().0, rebuilds + 1);
         // Held over-share pages fall back to the global window, still bounded.
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         let live: Vec<_> = z
             .iter()
             .filter(|page| index.state.borrow().pages.contains_key(page))
@@ -3045,7 +3043,7 @@ mod priority_tests {
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         drop(segments.append(4 * PAGE as usize).unwrap());
         let (a, z) = window_hides_over_share(&index);
-        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = racer_io::Clock::host().wall_now() + std::time::Duration::from_secs(60);
         index.reserve_hold(&z.version, 1, until).unwrap();
         // A held over-share page is never taken; an under-share page is.
         let victim = index.victim(&index.state.borrow()).unwrap();
@@ -3144,8 +3142,7 @@ mod priority_tests {
             }
         }
         let retention = index.retention();
-        let scoring =
-            retention.scoring_at(uring_runtime::environment::now(), index.disk_capacity());
+        let scoring = retention.scoring_at(racer_io::Clock::host().now(), index.disk_capacity());
         assert!(scoring.over_share(&cache("b")));
         assert!(!scoring.over_share(&cache("a")));
         assert!(
