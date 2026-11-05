@@ -310,6 +310,7 @@ fn fault_mix_is_drawn_from_choices_and_shrinks_to_nothing() {
             max_skew_ns: SECONDS,
             clock_rate: 1,
             max_rate_ppm: 1000,
+            first_node: 0,
         });
     assert!(s.fault_schedule(&Choices::replay(&[])).is_empty());
     let a = s.fault_schedule(&Choices::seeded(4));
@@ -372,4 +373,60 @@ fn seeded_sim_os_delay_does_not_stall() {
     for seed in 0..20 {
         assert_eq!(s.run(Choices::seeded(seed)).failure, None, "seed {seed}");
     }
+}
+
+/// A shared network gives every node the same OS, partitions are applied
+/// and counted, the board is per run, and a crash leaves the shared disk
+/// alone.
+#[test]
+fn shared_network_partitions_and_board() {
+    use racer_io::ring::SocketAddress;
+    #[derive(Default)]
+    struct Seen {
+        last_fault: Cell<u64>,
+        starts: Cell<u32>,
+    }
+    let s = Scenario::new("shared")
+        .nodes(3)
+        .shared_network(|n| SocketAddress::Inet(format!("10.9.0.{}:1", n + 1).parse().unwrap()))
+        .roles(|env| {
+            env.board
+                .get::<Seen>()
+                .starts
+                .set(env.board.get::<Seen>().starts.get() + 1);
+            if env.index == 0 && env.incarnation == 0 {
+                env.os.write_file(Path::new("/shared"), b"x").unwrap();
+            }
+            // Every node sees node 0's file: one disk.
+            assert_eq!(env.os.read_file(Path::new("/shared")).unwrap(), b"x");
+            Ok(Vec::new())
+        })
+        .fault(MILLIS, Fault::Partition { a: 1, b: 0 })
+        .fault(2 * MILLIS, Fault::Partition { a: 2, b: 2 })
+        .fault(3 * MILLIS, Fault::Crash { node: 0 })
+        .fault(4 * MILLIS, Fault::Restart { node: 0 })
+        .fault(5 * MILLIS, Fault::Heal { a: 0, b: 1 })
+        .invariant("observe", Class::Liveness, |probe| {
+            let seen = probe.board.get::<Seen>();
+            seen.last_fault.set(probe.last_fault.unwrap_or(0));
+            if probe.partitions != 0 {
+                return Err(format!("{} partitions left", probe.partitions));
+            }
+            Ok(())
+        })
+        .invariant("partitioned", Class::Liveness, |probe| {
+            let seen = probe.board.get::<Seen>();
+            // Three starts and one restart, in this run only.
+            if seen.starts.get() != 4 || seen.last_fault.get() != 5 * MILLIS {
+                return Err(format!(
+                    "starts {} last fault {}",
+                    seen.starts.get(),
+                    seen.last_fault.get()
+                ));
+            }
+            Ok(())
+        })
+        .end(10 * MILLIS);
+    let out = run_twice(&s, &Source::Seed(3)).unwrap();
+    assert_eq!(out.failure, None);
 }

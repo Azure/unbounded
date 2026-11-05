@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use racer_io::exec::Next;
 
-use crate::engine::Nanos;
+use crate::{engine::Nanos, world::Board};
 
 /// When an invariant is checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,6 +58,12 @@ pub struct Probe<'a> {
     pub roles: &'a [RoleState],
     /// Whether each node is up (not crashed).
     pub up: Vec<bool>,
+    /// The world's per-run shared state (application observers).
+    pub board: &'a Board,
+    /// Partitions in effect.
+    pub partitions: usize,
+    /// World time of the last fault applied, if any.
+    pub last_fault: Option<Nanos>,
 }
 
 /// A check: `Err(message)` fails the run.

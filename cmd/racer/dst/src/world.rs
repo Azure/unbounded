@@ -33,7 +33,9 @@
 //! ([`Fault::ClockJump`]); role deadlines are mapped back to world time
 //! through their node's clock.
 use std::{
+    any::Any,
     cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -105,9 +107,10 @@ impl Tick for DoneFlag {
     }
 }
 
-/// World faults. Crash, restart, slow peer and wall-clock skew act today;
-/// partition and heal are recorded in the trace only until Phase 6 gives
-/// nodes simulated network endpoints.
+/// World faults. Crash, restart, slow peer and clock faults always act.
+/// Partition and heal act when the scenario shares one simulated network
+/// between nodes ([`crate::Scenario::shared_network`]); otherwise they are
+/// recorded in the trace only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
     /// Power loss: drop every role and crash the node's simulated disk.
@@ -120,14 +123,14 @@ pub enum Fault {
         /// Node index.
         node: u32,
     },
-    /// Cut the network between two nodes (placeholder).
+    /// Cut the network between two nodes (needs a shared network).
     Partition {
         /// First node.
         a: u32,
         /// Second node.
         b: u32,
     },
-    /// Undo [`Fault::Partition`] (placeholder).
+    /// Undo [`Fault::Partition`].
     Heal {
         /// First node.
         a: u32,
@@ -232,6 +235,34 @@ impl Reporter {
     }
 }
 
+/// Per-run shared state for one world: typed slots that node factories,
+/// roles and invariant checks of the same run share (for example observers
+/// of an application-level invariant). A fresh world starts with an empty
+/// board, so state never leaks between runs of a scenario.
+#[derive(Clone, Default)]
+pub struct Board(Rc<RefCell<BTreeMap<&'static str, Rc<dyn Any>>>>);
+
+impl Board {
+    /// The slot of type `T`, created with `T::default()` on first use.
+    pub fn get<T: Default + 'static>(&self) -> Rc<T> {
+        let key = std::any::type_name::<T>();
+        let any = self
+            .0
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| Rc::new(T::default()))
+            .clone();
+        any.downcast::<T>()
+            .unwrap_or_else(|_| unreachable!("board slot {key} has another type"))
+    }
+}
+
+impl std::fmt::Debug for Board {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.borrow().keys()).finish()
+    }
+}
+
 /// What a node factory gets to build one node incarnation.
 #[derive(Clone)]
 pub struct NodeEnv {
@@ -240,7 +271,9 @@ pub struct NodeEnv {
     /// 0 at first start, +1 per restart.
     pub incarnation: u32,
     /// The node's simulated OS; survives crashes (the disk is crashed, not
-    /// replaced).
+    /// replaced). With [`crate::Scenario::shared_network`] every node gets
+    /// the same `SimOs`: one network and one disk, and roles label their
+    /// sockets with [`SimOs::enter_endpoint`].
     pub os: SimOs,
     /// The node's clock.
     pub clock: VirtualClock,
@@ -253,6 +286,8 @@ pub struct NodeEnv {
     /// The node's slowdown factor ([`Fault::SlowPeer`]); scales its OS
     /// operation costs.
     pub slow: Rc<Cell<u8>>,
+    /// The world's per-run shared state.
+    pub board: Board,
 }
 
 impl NodeEnv {
@@ -355,6 +390,10 @@ pub struct World<'s> {
     pub fabric: Fabric,
     steps: u64,
     steps_here: u64,
+    board: Board,
+    /// Active partitions as `(min, max)` node pairs.
+    partitions: BTreeSet<(u32, u32)>,
+    last_fault: Option<Nanos>,
 }
 
 impl<'s> World<'s> {
@@ -379,13 +418,20 @@ impl<'s> World<'s> {
             fabric,
             steps: 0,
             steps_here: 0,
+            board: Board::default(),
+            partitions: BTreeSet::new(),
+            last_fault: None,
         };
-        for index in 0..scenario.nodes {
-            let os = if scenario.seeded_os {
+        let new_os = || {
+            if scenario.seeded_os {
                 SimOs::with_choices(choices.clone())
             } else {
                 SimOs::new()
-            };
+            }
+        };
+        let shared = scenario.network.is_some().then(new_os);
+        for index in 0..scenario.nodes {
+            let os = shared.clone().unwrap_or_else(new_os);
             let slow = Rc::new(Cell::new(1u8));
             let (costs, factor) = (scenario.costs, slow.clone());
             os.set_op_cost(move |op| {
@@ -404,6 +450,7 @@ impl<'s> World<'s> {
                 choices: choices.clone(),
                 trace: world.trace.clone(),
                 report: world.report.clone(),
+                board: world.board.clone(),
             };
             world.nodes.push(Node {
                 env,
@@ -459,14 +506,19 @@ impl<'s> World<'s> {
     fn apply(&mut self, fault: Fault) -> Result<(), Failure> {
         let (kind, a, b) = fault.code();
         self.trace.record(TAG_FAULT, kind, a ^ (b << 32));
+        self.last_fault = Some(self.engine.now());
         let valid = |n: u32| (n as usize) < self.nodes.len();
         match fault {
             Fault::Crash { node } if valid(node) => {
                 let n = &mut self.nodes[node as usize];
-                if n.up {
-                    n.roles.clear();
-                    n.up = false;
-                    n.env
+                let was_up = n.up;
+                n.roles.clear();
+                n.up = false;
+                // A shared disk belongs to every node; crashing it would
+                // crash them all.
+                if was_up && self.scenario.network.is_none() {
+                    self.nodes[node as usize]
+                        .env
                         .os
                         .disk()
                         .crash()
@@ -509,7 +561,24 @@ impl<'s> World<'s> {
                     .jump(Duration::from_nanos(ns))
                     .map_err(|e| self.fail(Class::Safety, "clock-jump", format!("{e:?}")))?;
             }
-            Fault::Partition { .. } | Fault::Heal { .. } => {}
+            Fault::Partition { a, b } | Fault::Heal { a, b } if valid(a) && valid(b) => {
+                let Some(endpoint) = self.scenario.network.as_ref() else {
+                    return Ok(());
+                };
+                if a == b {
+                    return Ok(());
+                }
+                let (ea, eb) = (endpoint(a), endpoint(b));
+                let os = &self.nodes[0].env.os;
+                let pair = (a.min(b), a.max(b));
+                if matches!(fault, Fault::Partition { .. }) {
+                    os.partition(ea, eb);
+                    self.partitions.insert(pair);
+                } else {
+                    os.heal(ea, eb);
+                    self.partitions.remove(&pair);
+                }
+            }
             _ => {
                 return Err(self.fail(
                     Class::Safety,
@@ -568,6 +637,9 @@ impl<'s> World<'s> {
             quiescent,
             roles: &roles,
             up: self.nodes.iter().map(|n| n.up).collect(),
+            board: &self.board,
+            partitions: self.partitions.len(),
+            last_fault: self.last_fault,
         };
         for inv in checks {
             (inv.check)(&probe).map_err(|m| self.fail(class, &inv.name, m))?;

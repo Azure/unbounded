@@ -60,6 +60,10 @@ pub struct FaultMix {
     pub max_skew_ns: u64,
     /// Largest clock rate drift in parts per million (capped at 999_999).
     pub max_rate_ppm: u32,
+    /// Lowest node index a fault targets; nodes below it (for example a
+    /// simulated API server) are never crashed, slowed or skewed. The second
+    /// node of a partition may be any node.
+    pub first_node: u32,
 }
 
 /// One scenario.
@@ -95,7 +99,14 @@ pub struct Scenario {
     pub seeded_os: bool,
     /// The Model fidelity workload ([`Fidelity::Model`] only).
     pub model: Option<Rc<ModelSpec>>,
+    /// One simulated OS (network and disk) shared by every node, with each
+    /// node's endpoint label for [`Fault::Partition`]; `None` gives every
+    /// node its own OS.
+    pub network: Option<Endpoints>,
 }
+
+/// Endpoint label of each node on a shared network.
+pub type Endpoints = Rc<dyn Fn(u32) -> racer_io::ring::SocketAddress>;
 
 impl std::fmt::Debug for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -129,6 +140,7 @@ impl Scenario {
             busy_limit: 100_000,
             seeded_os: true,
             model: None,
+            network: None,
         }
     }
 
@@ -224,6 +236,16 @@ impl Scenario {
         self
     }
 
+    /// Share one simulated OS between all nodes; `endpoint(node)` is the
+    /// label the node's sockets carry, which partitions cut.
+    pub fn shared_network(
+        mut self,
+        endpoint: impl Fn(u32) -> racer_io::ring::SocketAddress + 'static,
+    ) -> Self {
+        self.network = Some(Rc::new(endpoint));
+        self
+    }
+
     /// Busy-loop limit.
     pub fn busy_limit(mut self, steps: u64) -> Self {
         self.busy_limit = steps;
@@ -245,7 +267,9 @@ impl Scenario {
         if self.nodes == 0 || weights.iter().all(|w| *w == 0) {
             return out;
         }
-        let node = || choices.below(u64::from(self.nodes)) as u32;
+        let first = mix.first_node.min(self.nodes - 1);
+        let node = || first + choices.below(u64::from(self.nodes - first)) as u32;
+        let any = || choices.below(u64::from(self.nodes)) as u32;
         let downtime = mix.max_downtime.max(MILLIS);
         for _ in 0..count {
             let at = choices.below(self.end);
@@ -256,7 +280,7 @@ impl Scenario {
                     out.push((at + 1 + choices.below(downtime), Fault::Restart { node }));
                 }
                 1 => {
-                    let (a, b) = (node(), node());
+                    let (a, b) = (node(), any());
                     out.push((at, Fault::Partition { a, b }));
                     out.push((at + 1 + choices.below(downtime), Fault::Heal { a, b }));
                 }

@@ -542,6 +542,7 @@ pub fn node_faults() -> Scenario {
             max_skew_ns: 0,
             clock_rate: 0,
             max_rate_ppm: 0,
+            first_node: 0,
         })
         .end(24 * SECONDS)
 }
@@ -638,6 +639,7 @@ pub fn catalog() -> Vec<Scenario> {
                 max_skew_ns: SECONDS,
                 clock_rate: 1,
                 max_rate_ppm: 200_000,
+                first_node: 0,
             })
             .with(all_roles_settled())
             .invariant("bounded-steps-per-node", Class::Safety, |probe| {
