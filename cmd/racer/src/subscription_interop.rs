@@ -127,14 +127,16 @@ impl origin::Origin for GeneratedOrigin {
             scope.check()?;
             authority.validate(&context.object, page.number)?;
             let metadata = metadata(context);
-            let length = metadata.immutable().page_length(page)? as usize;
+            // The fixture publishes the default page size; cut at it explicitly.
+            let size = racer_wire::object::PageSize::DEFAULT;
+            let length = metadata.immutable().page_length_in(page, size)? as usize;
             let mut plaintext = self.0.plaintext(reservation, length)?;
-            let offset = page.number.0 * PAGE_BYTES;
+            let offset = page.number.0 * size.get();
             for (i, byte) in plaintext.bytes_mut()?.iter_mut().enumerate() {
                 *byte = ((offset + i as u64) % 251) as u8;
             }
             Ok(origin::OriginPage {
-                page_size: racer_wire::object::PageSize::DEFAULT,
+                page_size: size,
                 metadata,
                 plaintext,
             })

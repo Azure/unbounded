@@ -2424,7 +2424,7 @@ mod tests {
         assert!(request_head(&clock, &prefetch_request(31, fill(vec![3]))).is_err());
         let head = request_head(&clock, &prefetch_request(31, fill(vec![0, 2]))).unwrap();
         assert_eq!(
-            head.unique("racer-page-size").unwrap().as_deref(),
+            head.unique("racer-page-size").unwrap(),
             Some(b"65536".as_slice())
         );
         let signatures = network(2);

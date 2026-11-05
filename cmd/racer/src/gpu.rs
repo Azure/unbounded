@@ -132,7 +132,9 @@ use std::task::Poll;
 pub const MAX_OPEN: usize = 256;
 
 /// Bytes per staging slot: one sealed page (plaintext and tag), rounded up
-/// to whole 4 KiB blocks so cuFile reads land block aligned.
+/// to whole 4 KiB blocks so cuFile reads land block aligned. Sized for the
+/// largest page (`PAGE_BYTES`), so one slot holds a sealed page at any
+/// cluster page size; a smaller page uses a prefix of its slot.
 pub const SLOT_BYTES: u64 = (PAGE_BYTES + 16).next_multiple_of(4096);
 
 /// Streams each GPU executor keeps in flight: at most this many pages run
