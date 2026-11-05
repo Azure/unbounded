@@ -47,7 +47,9 @@ func NVIDIAToolkitPaths(toolkit goalstates.NvidiaToolkit) []string {
 // names. The task is a no-op when the machine has no NVIDIA GPUs.
 //
 // It changes two host-global files: the toolkit's runtime config and the CDI
-// spec. Both are owned by the toolkit and regenerated, so a reset leaves them.
+// spec. Both are regenerated on every start. A reset removes the CDI spec, which
+// the agent generated, and leaves the toolkit's runtime config, which belongs
+// to the toolkit installation.
 func SetupNVIDIAOnHost(log *slog.Logger, goalState *goalstates.NodeStart) phases.Task {
 	return &setupNVIDIAOnHost{log: log, goalState: goalState, stat: os.Stat}
 }

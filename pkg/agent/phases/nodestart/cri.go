@@ -50,10 +50,8 @@ type configureContainerd struct {
 //
 // The agent reaches this work through StartNode, which builds the task directly
 // so it can tell whether the configuration it wrote differed. This entry point
-// remains for callers outside the agent that compose phases themselves. The
-// task reports through Changed whether it wrote anything, for a caller that
-// restarts containerd only then.
-func ConfigureContainerd(goalState *goalstates.NodeStart) HostConfigTask {
+// remains for callers outside the agent that compose phases themselves.
+func ConfigureContainerd(goalState *goalstates.NodeStart) phases.Task {
 	return &configureContainerd{goalState: goalState}
 }
 
