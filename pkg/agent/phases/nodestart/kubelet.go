@@ -40,10 +40,8 @@ type configureKubelet struct {
 //
 // The agent reaches this work through StartNode, which builds the task directly
 // so it can tell whether the configuration it wrote differed. This entry point
-// remains for callers outside the agent that compose phases themselves. The
-// task reports through Changed whether it wrote anything, for a caller that
-// restarts the kubelet only then.
-func ConfigureKubelet(goalState *goalstates.NodeStart) HostConfigTask {
+// remains for callers outside the agent that compose phases themselves.
+func ConfigureKubelet(goalState *goalstates.NodeStart) phases.Task {
 	return &configureKubelet{goalState: goalState}
 }
 

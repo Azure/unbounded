@@ -155,7 +155,7 @@ func TestSetupNVIDIAOnHostReportsToolFailures(t *testing.T) {
 }
 
 // The shared NVIDIA tasks run through the goal state's Exec, so a node stack
-// that is not an nspawn machine (the container backend) is driven the same way.
+// that is not an nspawn machine is driven the same way.
 func TestSetupNVIDIARoutesCommandsThroughTheGoalStateExec(t *testing.T) {
 	t.Parallel()
 
